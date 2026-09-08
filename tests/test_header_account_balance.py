@@ -677,7 +677,10 @@ def test_the_header_renders_the_cached_balance(nicegui_client, monkeypatch):
         with layout.layout_render('Test'):
             ui.label('body')
 
-    assert '$2,511.90' in _texts(nicegui_client.layout)
+    # The badge is now 'balance / BP'; a _Broker double has no margin accessors,
+    # so its BP reads unknown. The money still has to be there.
+    assert (f'$2,511.90{layout.HEADER_BP_PREFIX}{HEADER_BALANCE_UNAVAILABLE_TEXT}'
+            in _texts(nicegui_client.layout))
 
 
 def test_rendering_the_header_makes_no_broker_call_at_all(nicegui_client, monkeypatch):
@@ -732,13 +735,13 @@ def test_a_header_whose_scope_lookup_explodes_still_renders_the_page(
 
     texts = _texts(nicegui_client.layout)
     assert 'body' in texts, 'the page content must still be drawn'
-    assert HEADER_BALANCE_UNAVAILABLE_TEXT in texts
+    assert any(HEADER_BALANCE_UNAVAILABLE_TEXT in t for t in texts)
 
 
 def test_a_header_whose_decision_explodes_still_renders_the_page(
         nicegui_client, monkeypatch):
     """A bug in the balance logic must cost the balance, not the application."""
-    monkeypatch.setattr(layout, 'header_balance_from_cache',
+    monkeypatch.setattr(layout, 'header_badge_from_cache',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('bad view')))
 
     from nicegui import ui
@@ -834,7 +837,9 @@ def test_the_refresh_updates_the_label_in_place(nicegui_client, monkeypatch):
     with nicegui_client:
         with layout.layout_render('Test'):
             ui.label('body')
-    assert HEADER_BALANCE_UNAVAILABLE_TEXT in _texts(nicegui_client.layout)
+    # Nothing cached yet: BOTH of the badge's figures are a dash.
+    assert any(HEADER_BALANCE_UNAVAILABLE_TEXT in t
+               for t in _texts(nicegui_client.layout))
 
     once = _first_refresh_timer(nicegui_client.layout)
 
@@ -844,7 +849,8 @@ def test_the_refresh_updates_the_label_in_place(nicegui_client, monkeypatch):
 
     asyncio.run(_drive())
 
-    assert '$42.00' in _texts(nicegui_client.layout)
+    assert (f'$42.00{layout.HEADER_BP_PREFIX}{HEADER_BALANCE_UNAVAILABLE_TEXT}'
+            in _texts(nicegui_client.layout))
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +903,8 @@ def test_the_breakdown_lists_every_account_and_a_total(nicegui_client, monkeypat
     assert '$1,000.00' in texts
     assert '$2,200.68' in texts
     assert layout.HEADER_BALANCE_TOTAL_LABEL in texts
-    assert texts.count('$3,200.68') == 2      # the badge, and the Total line
+    assert texts.count('$3,200.68') == 1      # the Total line
+    assert f'$3,200.68{layout.HEADER_BP_PREFIX}' in ''.join(texts)   # and the badge
 
 
 def test_the_breakdown_lists_each_account_exactly_once(nicegui_client, monkeypatch):
@@ -909,7 +916,8 @@ def test_the_breakdown_lists_each_account_exactly_once(nicegui_client, monkeypat
     assert texts.count('Alpaca (X)') == 1
     assert texts.count('Tasty (Y)') == 1
     assert texts.count('$1,000.00') == 2      # one per account line, and no more
-    assert texts.count('$2,000.00') == 2      # the badge and the Total
+    assert texts.count('$2,000.00') == 1      # the Total; the badge carries its BP too
+    assert f'$2,000.00{layout.HEADER_BP_PREFIX}' in ''.join(texts)
 
 
 def test_no_account_is_dropped_from_the_breakdown(nicegui_client, monkeypatch):
@@ -938,7 +946,7 @@ def test_a_single_selected_account_gets_no_breakdown(nicegui_client, monkeypatch
 
     texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, 1)
 
-    assert '$1,000.00' in texts
+    assert f'$1,000.00{layout.HEADER_BP_PREFIX}' in ''.join(texts)
     assert layout.HEADER_BALANCE_TOTAL_LABEL not in texts
     assert '$2,200.68' not in texts
     assert '$3,200.68' not in texts
@@ -951,9 +959,15 @@ def test_the_breakdown_shows_a_genuinely_empty_account_as_zero(nicegui_client, m
     texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
 
     assert '$0.00' in texts
-    assert HEADER_BALANCE_UNAVAILABLE_TEXT not in texts
-    # The badge, the Alpaca leg, and the Total -- the zero leg adds nothing to it.
-    assert texts.count('$1,000.00') == 3
+    # The BALANCE column carries no dash. It is asked of the decision rather than
+    # of the texts because the page now legitimately contains dashes: a _Broker
+    # double has no margin accessors, so every BP cell is unknown.
+    lines = dict(layout.header_balance_breakdown([(1, 'Alpaca (X)'), (2, 'Tasty (Y)')]).lines)
+    assert [lines[label].value.text for label in ('Alpaca (X)', 'Tasty (Y)')] == \
+        ['$1,000.00', '$0.00']
+    # The Alpaca leg and the Total -- the zero leg adds nothing to it.
+    assert texts.count('$1,000.00') == 2
+    assert f'$1,000.00{layout.HEADER_BP_PREFIX}' in ''.join(texts)   # and the badge
     assert layout.HEADER_BALANCE_PARTIAL_SUFFIX not in ''.join(texts)
 
 
@@ -984,7 +998,8 @@ def test_the_breakdown_repaints_when_the_refresh_lands(nicegui_client, monkeypat
 
     texts = _texts(nicegui_client.layout)
     assert '$2,200.68' in texts
-    assert texts.count('$3,200.68') == 2
+    assert texts.count('$3,200.68') == 1                            # the Total line
+    assert f'$3,200.68{layout.HEADER_BP_PREFIX}' in ''.join(texts)  # and the badge
     assert texts.count('Tasty (Y)') == 1, 'the repaint must replace the menu, not append'
 
 
@@ -1006,7 +1021,8 @@ def test_a_breakdown_that_explodes_still_renders_the_page(nicegui_client, monkey
     texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
 
     assert 'body' in texts
-    assert '$3,200.68' in texts, 'the badge itself must survive the breakdown failing'
+    assert f'$3,200.68{layout.HEADER_BP_PREFIX}' in ''.join(texts), \
+        'the badge itself must survive the breakdown failing'
     assert any('breakdown' in e for e in errors), errors
 
 
@@ -1021,7 +1037,7 @@ def test_the_breakdown_reads_one_line_per_account_from_the_cache(monkeypatch):
     view = layout.header_balance_breakdown([(1, 'Alpaca'), (2, 'Tasty')], utcnow=clock)
 
     assert [label for label, _ in view.lines] == ['Alpaca', 'Tasty']
-    assert [line.text for _, line in view.lines] == ['$1,000.00', '$2,200.68']
+    assert [line.value.text for _, line in view.lines] == ['$1,000.00', '$2,200.68']
     assert view.total.text == '$3,200.68'
     assert view.total.available is True
 
@@ -1033,7 +1049,7 @@ def test_a_breakdown_line_for_an_unread_account_is_a_dash_not_a_zero(monkeypatch
 
     view = layout.header_balance_breakdown([(1, 'Alpaca'), (2, 'Tasty')], utcnow=clock)
 
-    unread = dict(view.lines)['Tasty']
+    unread = dict(view.lines)['Tasty'].value
     assert unread.text == HEADER_BALANCE_UNAVAILABLE_TEXT
     assert unread.available is False
     assert 'Tasty' in unread.detail and 'not zero' in unread.detail
@@ -1045,8 +1061,8 @@ def test_a_breakdown_line_that_is_genuinely_zero_is_available(monkeypatch):
     refresh_header_balance_cache([1], utcnow=clock)
 
     line = dict(layout.header_balance_breakdown([(1, 'Alpaca')], utcnow=clock).lines)['Alpaca']
-    assert line.text == '$0.00'
-    assert line.available is True
+    assert line.value.text == '$0.00'
+    assert line.value.available is True
 
 
 def test_selecting_all_reads_every_account_not_just_the_first(monkeypatch):
@@ -1062,3 +1078,107 @@ def test_selecting_one_account_narrows_the_scope_to_it(monkeypatch):
     monkeypatch.setattr(layout, 'get_accounts_for_filter',
                         lambda: [('All', None), ('A (X)', 1), ('B (Y)', 2)])
     assert layout.accounts_in_scope() == [(2, 'B (Y)')]
+
+
+# ---------------------------------------------------------------------------
+# Margin: the badge shows balance AND buying power
+#
+# The badge's headline stays the account VALUE. What margin adds is a second
+# figure -- the stock tradable balance, i.e. what the experts may actually
+# deploy -- and the property these tests pin is that the two figures fail
+# INDEPENDENTLY: a broker that cannot say what its multiplier is still has a
+# balance, and that balance must keep printing.
+# ---------------------------------------------------------------------------
+
+class _MarginBroker(_Broker):
+    """A broker double that also answers the two margin accessors.
+
+    ``tradable=None`` (and ``option_tradable=None``) means "the accessor RAISES",
+    not "it returns nothing": ``get_tradable_balance`` is documented to raise
+    rather than guess when a multiplier or buying power is unknown, so the double
+    fails the same way the real interface does.
+    """
+
+    def __init__(self, *, net_liquidation, tradable=None, option_tradable=None,
+                 broker_bp=None, tradable_raises=None, **kw):
+        super().__init__(net_liquidation=net_liquidation, **kw)
+        self.snapshot.buying_power = broker_bp
+        self._tradable = tradable
+        self._option_tradable = option_tradable
+        self._tradable_raises = tradable_raises
+
+    def get_tradable_balance(self):
+        if self._tradable_raises:
+            raise self._tradable_raises
+        if self._tradable is None:
+            raise ValueError("no tradable")
+        return self._tradable
+
+    def get_option_tradable_balance(self):
+        if self._option_tradable is None:
+            raise ValueError("no option tradable")
+        return self._option_tradable
+
+
+def test_the_badge_reads_balance_slash_bp(monkeypatch):
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0, tradable=18_000.0,
+                                                option_tradable=10_000.0, broker_bp=20_000.0)})
+    layout.refresh_header_balance_cache([1], utcnow=clock)
+
+    view = layout.header_badge_from_cache([(1, 'A')], utcnow=clock)
+
+    assert view.text == '$10,000.00 / BP $18,000.00'
+
+
+def test_a_failed_tradable_read_marks_bp_unknown_but_keeps_the_balance(monkeypatch):
+    """The balance is the headline and must survive an unreadable multiplier."""
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0, broker_bp=1.0,
+                                                tradable_raises=ValueError("no multiplier"))})
+    layout.refresh_header_balance_cache([1], utcnow=clock)
+
+    view = layout.header_badge_from_cache([(1, 'A')], utcnow=clock)
+
+    assert view.text == f'$10,000.00 / BP {HEADER_BALANCE_UNAVAILABLE_TEXT}'
+    assert view.available is True, 'the BADGE state is the balance\'s, not the BP\'s'
+
+
+def test_a_broker_double_without_the_margin_accessors_still_reports_its_balance(monkeypatch):
+    """Every pre-existing _Broker has no get_tradable_balance at all: the balance must
+    survive and BP reads as unknown, never as zero."""
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _Broker(net_liquidation=5.0)})
+    layout.refresh_header_balance_cache([1], utcnow=clock)
+
+    view = layout.header_badge_from_cache([(1, 'A')], utcnow=clock)
+
+    assert view.text == f'$5.00 / BP {HEADER_BALANCE_UNAVAILABLE_TEXT}'
+
+
+def test_the_breakdown_lists_the_four_figures_per_account(monkeypatch):
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0, tradable=18_000.0,
+                                                option_tradable=10_000.0, broker_bp=20_000.0)})
+    layout.refresh_header_balance_cache([1], utcnow=clock)
+
+    bd = layout.header_balance_breakdown([(1, 'A')], utcnow=clock)
+
+    (label, figures), = bd.lines
+    assert label == 'A'
+    assert [f.text for f in (figures.value, figures.tradable, figures.option_tradable,
+                             figures.broker_bp)] == \
+        ['$10,000.00', '$18,000.00', '$10,000.00', '$20,000.00']
+
+
+def test_bp_totals_across_accounts_and_marks_partial_like_the_balance(monkeypatch):
+    """One account's BP unreadable shrinks nothing: the BP total says '(partial)'."""
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=1.0, tradable=2.0, broker_bp=1.0),
+                               2: _MarginBroker(net_liquidation=1.0, tradable=None, broker_bp=1.0)})
+    layout.refresh_header_balance_cache([1, 2], utcnow=clock)
+
+    view = layout.header_badge_from_cache([(1, 'A'), (2, 'B')], utcnow=clock)
+
+    assert view.text == '$2.00 / BP $2.00 (partial)'
+    assert view.partial is False, 'the BALANCE is complete; the BP marker rides in the text'

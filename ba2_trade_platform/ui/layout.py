@@ -1,7 +1,7 @@
 import asyncio
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -105,6 +105,28 @@ HEADER_BALANCE_PARTIAL_DETAIL_FMT = (
 #: The breakdown's last line. Its own constant so the tests and the renderer
 #: cannot disagree about the word.
 HEADER_BALANCE_TOTAL_LABEL = 'Total'
+
+#: What separates the balance from the buying power in the badge. The badge is
+#: ONE slot carrying TWO different numbers -- what the account is WORTH, and what
+#: its experts may DEPLOY (which with margin on is a multiple of the first) -- so
+#: the second is NAMED rather than merely appended: two bare dollar figures side
+#: by side is exactly the ambiguity that gets one of them read as the other.
+#: 'BP' and not 'Buying power' because the header has room for a number, not a
+#: sentence; the tooltip below spells it out.
+HEADER_BP_PREFIX = ' / BP '
+
+#: Appended to the balance's detail to explain the second figure. On its OWN LINE
+#: because the two figures have INDEPENDENT stories: they can disagree about
+#: freshness, and one can be a total that excludes an account while the other is
+#: complete. Running them into one paragraph would read as a single claim about a
+#: single number. '(tradable)' names WHICH buying power this is: what the account
+#: will let an expert deploy, not the broker's own raw figure (that one is in the
+#: breakdown, as 'Broker BP').
+HEADER_BP_DETAIL_FMT = '\nBuying power (tradable): {detail}'
+
+#: The breakdown's column headings, in the order the figures are drawn. One
+#: constant so the header row and the cells beneath it cannot drift apart.
+HEADER_BALANCE_BREAKDOWN_COLUMNS = ('Balance', 'BP', 'Opt BP', 'Broker BP')
 
 HEADER_BALANCE_MARKER = 'header-balance'
 HEADER_BALANCE_BREAKDOWN_MARKER = 'header-balance-breakdown'
@@ -233,19 +255,56 @@ def header_balance(*, value: Optional[float], as_of: Optional[datetime],
                          partial=partial)
 
 
+@dataclass(frozen=True)
+class AccountFigures:
+    """The four money figures one account can report. Pure data; no I/O.
+
+    ``value`` is the headline -- net liquidation, what the account is WORTH.
+    ``tradable`` is what its experts may deploy in STOCK (the balance times the
+    effective margin multiplier; equal to the balance with margin off),
+    ``option_tradable`` the same for options, and ``broker_bp`` the broker's OWN
+    buying-power figure, unscaled by anything this platform decides.
+
+    EACH IS INDEPENDENTLY OPTIONAL, and that independence is the point. With
+    margin on, ``get_tradable_balance`` is documented to RAISE rather than guess
+    when the balance, the multiplier or the buying power is unknown -- while the
+    very same broker answered ``get_account_snapshot`` a microsecond earlier. One
+    figure being unknowable says nothing about the other three.
+
+    ``None`` means UNKNOWN and renders as a dash. It is never ``0.0``: a broker
+    that will not say what an account may deploy is not an account that may
+    deploy nothing.
+    """
+    value: Optional[float] = None
+    tradable: Optional[float] = None
+    option_tradable: Optional[float] = None
+    broker_bp: Optional[float] = None
+
+
 @dataclass
 class _BalanceEntry:
-    """One account's cached value.
+    """One account's cached figures.
 
-    ``value``/``as_of`` describe the last SUCCESSFUL read and are never
+    ``figures``/``as_of`` describe the last SUCCESSFUL read and are never
     overwritten by a failure -- a broker outage must not turn a known balance into
     an unknown one, it must turn a fresh one into a visibly stale one.
     ``attempted_at`` is bumped on every attempt and is what the hourly window is
     measured against, so a failing broker is retried hourly rather than hammered.
     """
-    value: Optional[float] = None
+    figures: AccountFigures = field(default_factory=AccountFigures)
     as_of: Optional[datetime] = None
     attempted_at: Optional[datetime] = None
+
+    @property
+    def value(self) -> Optional[float]:
+        """The headline balance. READ-ONLY, and deliberately so.
+
+        The entry used to BE a value and is now four figures; this keeps the one
+        figure every reader of this cache actually asks for spelled the way it
+        always was. There is no setter: a caller able to set ``value`` alone
+        would leave the other three describing a different broker instant.
+        """
+        return self.figures.value
 
 
 #: account_id -> _BalanceEntry. Process-wide: this is a single-user app and the
@@ -270,17 +329,48 @@ def _lock_for(account_id: int) -> threading.Lock:
         return lock
 
 
-def _read_account_value(account_id: int) -> Optional[float]:
-    """One broker read. BLOCKING -- only ever called inside ``asyncio.to_thread``.
+def _read_account_figures(account_id: int) -> AccountFigures:
+    """One account's four figures. BLOCKING -- only ever called inside ``asyncio.to_thread``.
 
     Imported lazily because ``core.utils``' instance factory pulls the live
     account registry, which must not be a page-import-time dependency.
+
+    ONE ``get_account_snapshot()`` here: the value and the broker's own buying
+    power then describe the SAME broker instant, and TastyTrade (whose snapshot is
+    an uncached REST call) pays for one round trip rather than two.
+
+    WHY EACH MARGIN FIGURE IS TRIED, AND SWALLOWED, SEPARATELY. A figure that
+    cannot be read leaves ONLY that figure unknown; the balance is the headline
+    and must not be blanked because a multiplier was unavailable. Three real ways
+    that happens: a broker that publishes no multiplier or no buying power (the
+    accessor raises by contract rather than guessing), an account object older
+    than margin that does not implement the accessor at all, and any transport
+    error on a later call after the first succeeded. None of them is a reason to
+    stop saying what the account is worth.
     """
     from ..core.utils import get_account_instance_from_id
     account = get_account_instance_from_id(account_id)
     if account is None:
-        return None
-    return account_value_from_snapshot(account.get_account_snapshot())
+        return AccountFigures()
+    snapshot = account.get_account_snapshot()
+
+    def _try(name: str) -> Optional[float]:
+        try:
+            return float(getattr(account, name)())
+        except Exception as e:
+            # WARNING rather than ERROR: with a broker that publishes no
+            # multiplier this is an expected shape of "unknown", and the header
+            # already tells the reader so with a dash. Logged all the same,
+            # because a buying power that quietly stays missing is one nobody
+            # ever investigates.
+            logger.warning(f"Header balance: {name} unreadable for account {account_id}: {e}")
+            return None
+
+    return AccountFigures(
+        value=account_value_from_snapshot(snapshot),
+        tradable=_try('get_tradable_balance'),
+        option_tradable=_try('get_option_tradable_balance'),
+        broker_bp=snapshot.buying_power)
 
 
 def refresh_header_balance_cache(account_ids: Sequence[int], *, force: bool = False,
@@ -327,22 +417,29 @@ def _refresh_one_balance(account_id: int, *, force: bool, utcnow) -> bool:
             return False
 
         try:
-            value = _read_account_value(account_id)
+            figures = _read_account_figures(account_id)
         except Exception as e:
             logger.warning(f"Header balance: could not read account {account_id}: {e}")
-            value = None
+            figures = AccountFigures()
 
         if entry is None:
             entry = _BALANCE_CACHE[account_id] = _BalanceEntry()
         entry.attempted_at = utcnow()
-        if value is None:
-            # A FAILED read is not cached as a value. The previous good figure
-            # stays, and because as_of is untouched it will age into "(stale)"
-            # on its own -- which is the honest outcome, unlike either a dash
-            # that discards a real number or a fresh-looking one that lies.
+        if figures.value is None:
+            # A FAILED read is not cached. The previous good figures stay, and
+            # because as_of is untouched they will age into "(stale)" on their
+            # own -- which is the honest outcome, unlike either a dash that
+            # discards a real number or a fresh-looking one that lies.
+            #
+            # THE HEADLINE IS THE TEST, not any of the margin figures: it comes
+            # from the snapshot everything else here is dated against, so a read
+            # that could not produce it produced nothing worth keeping. And the
+            # four move as ONE SET: a fresh tradable balance stored beside a
+            # kept-from-last-hour value would be two instants under one
+            # timestamp.
             return False
-        changed = entry.value != value
-        entry.value = value
+        changed = entry.figures != figures
+        entry.figures = figures
         entry.as_of = entry.attempted_at
         return changed
     finally:
@@ -355,23 +452,31 @@ def _is_within_window(entry: Optional[_BalanceEntry], now: datetime) -> bool:
     return (now - entry.attempted_at).total_seconds() < HEADER_BALANCE_REFRESH_SECONDS
 
 
-def header_balance_from_cache(accounts: Sequence[Tuple[int, str]], *,
-                              utcnow=_utcnow) -> HeaderBalance:
-    """The header's text for ``accounts``, out of the cache. NO BROKER CALL.
+def header_figure_from_cache(accounts: Sequence[Tuple[int, str]], *,
+                             which: str = 'value',
+                             utcnow=_utcnow) -> HeaderBalance:
+    """ONE of the four figures, totalled over ``accounts``, out of the cache.
 
-    This is the render path: a dict lookup per account and some arithmetic. An
-    account with no cache entry at all reads as UNKNOWN, exactly like one whose
-    broker refused -- we have no figure either way, and inventing one is the whole
-    class of bug this widget is shaped around.
+    NO BROKER CALL. This is the render path: a dict lookup per account and some
+    arithmetic. An account with no cache entry at all reads as UNKNOWN, exactly
+    like one whose broker refused -- we have no figure either way, and inventing
+    one is the whole class of bug this widget is shaped around.
 
-    The total is dated by its OLDEST leg: a sum is only as fresh as its stalest
-    component.
+    ``which`` names the ``AccountFigures`` attribute to total. The SAME loop for
+    every figure on purpose: the balance's rules (a missing leg marks the total
+    partial rather than shrinking it; the total is dated by its OLDEST leg,
+    because a sum is only as fresh as its stalest component) are exactly the
+    rules the buying power needs, and a second hand-written loop is a second
+    place for them to be got wrong.
+
+    Every figure is dated by the entry's ``as_of``, which is the instant the whole
+    set was read -- they come from one read and cannot have separate ages.
     """
     reads: List[Tuple[str, Optional[float]]] = []
     oldest: Optional[datetime] = None
     for account_id, label in accounts:
         entry = _BALANCE_CACHE.get(account_id)
-        value = entry.value if entry is not None else None
+        value = getattr(entry.figures, which) if entry is not None else None
         reads.append((label, value))
         if value is not None and entry is not None and entry.as_of is not None:
             oldest = entry.as_of if oldest is None else min(oldest, entry.as_of)
@@ -380,38 +485,123 @@ def header_balance_from_cache(accounts: Sequence[Tuple[int, str]], *,
                           unreadable=unreadable)
 
 
+def header_balance_from_cache(accounts: Sequence[Tuple[int, str]], *,
+                              utcnow=_utcnow) -> HeaderBalance:
+    """The account VALUE for ``accounts``, out of the cache. NO BROKER CALL.
+
+    Kept as its own name (and its own signature) because "the balance" is what
+    most of this module, and the breakdown's total, actually mean; the generalised
+    loop lives in ``header_figure_from_cache``.
+    """
+    return header_figure_from_cache(accounts, which='value', utcnow=utcnow)
+
+
+def header_badge_from_cache(accounts: Sequence[Tuple[int, str]], *,
+                            utcnow=_utcnow) -> HeaderBalance:
+    """What the badge SAYS: the balance and the buying power. NO BROKER CALL.
+
+    Two figures in one slot, ``$10,000.00 / BP $18,000.00``. The BP is the STOCK
+    tradable balance -- what an expert may actually deploy -- and not the broker's
+    raw buying power, because that is the number the platform's own sizing obeys;
+    the broker's figure is in the breakdown next to it.
+
+    The pair is composed here rather than in ``header_balance`` because they are
+    two independent readings that happen to be printed together: either can be
+    unknown while the other is fine (a broker with no multiplier), and either can
+    be a partial total while the other is complete.
+
+    THE BADGE'S STATE -- the colour and the icon ``_paint`` picks -- is the
+    BALANCE's, deliberately. The balance is the headline; recolouring the whole
+    badge amber because a secondary figure aged would report a problem the reader
+    cannot locate. The BP's own ``(stale)``/``(partial)`` markers ride inside its
+    text, where they sit next to the number they are about, and its detail is
+    appended to the tooltip on its own line.
+    """
+    # ONE ``now`` for both legs: two calls could straddle the stale boundary and
+    # date the same read two different ways.
+    now = utcnow()
+    balance = header_figure_from_cache(accounts, which='value', utcnow=lambda: now)
+    bp = header_figure_from_cache(accounts, which='tradable', utcnow=lambda: now)
+    return HeaderBalance(
+        text=balance.text + HEADER_BP_PREFIX + bp.text,
+        detail=balance.detail + HEADER_BP_DETAIL_FMT.format(detail=bp.detail),
+        available=balance.available, stale=balance.stale, partial=balance.partial)
+
+
+@dataclass(frozen=True)
+class AccountFigureViews:
+    """One account's four figures, each already decided into a ``HeaderBalance``.
+
+    The same four as ``AccountFigures``, in the same order, but rendered: text,
+    tooltip and availability. Separate cells rather than one string because each
+    is separately unknown -- a broker can report a balance, refuse a multiplier
+    and publish no option buying power, and the breakdown has to say exactly
+    which of the three happened.
+    """
+    value: HeaderBalance
+    tradable: HeaderBalance
+    option_tradable: HeaderBalance
+    broker_bp: HeaderBalance
+
+
 @dataclass(frozen=True)
 class HeaderBalanceBreakdown:
     """What the badge says, and what it is made of. Pure.
 
-    ``lines`` is one ``(label, HeaderBalance)`` per account IN SCOPE -- every one
-    of them, whatever its state. An account missing from this list makes no
+    ``lines`` is one ``(label, AccountFigureViews)`` per account IN SCOPE -- every
+    one of them, whatever its state. An account missing from this list makes no
     statement about itself, which is the defect the 'Floating P/L Per Account'
-    card was just fixed for; the three states a line can be in are the same three
+    card was just fixed for; the three states a cell can be in are the same three
     (a figure, a measured ``$0.00``, or ``—`` for could-not-read).
+
+    ``total`` stays the VALUE total, and stays a single ``HeaderBalance``: it is
+    the badge's own balance figure, so the menu's bottom line and the badge can
+    never disagree. The badge's BP total is not repeated here -- the per-account
+    BP column above it is what the menu exists to show.
     """
     total: HeaderBalance
-    lines: Tuple[Tuple[str, HeaderBalance], ...]
+    lines: Tuple[Tuple[str, AccountFigureViews], ...]
+
+
+def _figure_line(value: Optional[float], *, label: str,
+                 as_of: Optional[datetime], now: datetime) -> HeaderBalance:
+    """One breakdown cell, decided by the SAME ``header_balance`` the badge uses.
+
+    ``unreadable`` is passed ONLY when there is nothing to show: naming the label
+    alongside a real value would mark a perfectly good cell ``(partial)``.
+    """
+    return header_balance(value=value, as_of=as_of, now=now,
+                          unreadable=() if value is not None else (label,))
 
 
 def header_balance_breakdown(accounts: Sequence[Tuple[int, str]], *,
                              utcnow=_utcnow) -> HeaderBalanceBreakdown:
-    """The badge PLUS one line per account, out of the cache. NO BROKER CALL.
+    """The total PLUS four figures per account, out of the cache. NO BROKER CALL.
 
-    Also a render-path function: a dict lookup per account. Each line is decided
-    by the same ``header_balance`` the badge uses, so a leg and the total can
+    Also a render-path function: a dict lookup per account. Every cell is decided
+    by the same ``header_balance`` the badge uses, so a cell and the total can
     never describe the same cache entry in two different vocabularies.
+
+    FOUR figures because the badge's two do not explain themselves: a BP that is
+    not twice the balance could be a margin factor below the broker's multiplier,
+    a broker clamping its own buying power, or an option sleeve with different
+    leverage. Balance, stock BP, option BP and the broker's own BP, side by side
+    per account, is what makes that legible without opening the broker.
     """
     now = utcnow()
-    lines: List[Tuple[str, HeaderBalance]] = []
+    lines: List[Tuple[str, AccountFigureViews]] = []
     for account_id, label in accounts:
         entry = _BALANCE_CACHE.get(account_id)
-        value = entry.value if entry is not None else None
+        figures = entry.figures if entry is not None else AccountFigures()
+        # ONE ``as_of`` for all four cells: they came out of one read, so dating
+        # them separately would invent a freshness difference that does not exist.
         as_of = entry.as_of if entry is not None else None
-        # ``unreadable`` only when there is nothing to show: passing the label
-        # alongside a real value would mark a perfectly good leg as partial.
-        lines.append((label, header_balance(value=value, as_of=as_of, now=now,
-                                            unreadable=() if value is not None else (label,))))
+        lines.append((label, AccountFigureViews(
+            value=_figure_line(figures.value, label=label, as_of=as_of, now=now),
+            tradable=_figure_line(figures.tradable, label=label, as_of=as_of, now=now),
+            option_tradable=_figure_line(figures.option_tradable, label=label,
+                                         as_of=as_of, now=now),
+            broker_bp=_figure_line(figures.broker_bp, label=label, as_of=as_of, now=now))))
     return HeaderBalanceBreakdown(
         total=header_balance_from_cache(accounts, utcnow=lambda: now),
         lines=tuple(lines))
@@ -530,11 +720,16 @@ def _render_account_balance():
 
     The timers are per-client elements, so they die with the tab that made them.
 
+    WHAT IT SAYS. The account value, then the buying power the experts may
+    deploy against it: ``$10,000.00 / BP $18,000.00``. With margin off the two are
+    the same number, which is the honest reading of an account with no leverage.
+
     THE BREAKDOWN. Under "All" the badge is one number standing for several
     accounts, and there was no way to see what it was made of. A menu hanging off
-    the badge lists each account and the total. It is only built when there is
-    more than one account in scope: with a single account selected there is
-    nothing to break down and the header is exactly what it was.
+    the badge lists each account's four figures -- balance, stock BP, option BP,
+    the broker's own BP -- and the total. It is only built when there is more than
+    one account in scope: with a single account selected there is nothing to break
+    down and the header is exactly what it was.
     """
     accounts = _scope_or_empty()
     view = _view_or_unknown(accounts)
@@ -580,7 +775,7 @@ def _scope_or_empty() -> List[Tuple[int, str]]:
 
 def _view_or_unknown(accounts: Sequence[Tuple[int, str]]) -> HeaderBalance:
     try:
-        return header_balance_from_cache(accounts)
+        return header_badge_from_cache(accounts)
     except Exception as e:
         logger.error(f"Header balance: could not build the view: {e}", exc_info=True)
         return HeaderBalance(text=HEADER_BALANCE_UNAVAILABLE_TEXT,
@@ -618,13 +813,24 @@ def _paint_breakdown(breakdown, accounts: Sequence[Tuple[int, str]]) -> None:
         view = header_balance_breakdown(accounts)
         breakdown.clear()
         with breakdown:
+            # A GRID, not a row of rows: five columns of money only line up if
+            # every cell is in the same column track, and four figures per account
+            # left to justify-between would zig-zag with the digit count.
             with ui.column().classes('p-3 gap-1 min-w-56'):
-                for label, line in view.lines:
-                    with ui.row().classes('w-full justify-between items-center gap-6'):
+                with ui.grid(columns=5).classes('gap-x-6 gap-y-1 items-center'):
+                    # A blank cell over the account names, then the four headings.
+                    # Without them the reader has four dollar figures and no way to
+                    # tell the stock BP from the broker's.
+                    ui.label('')
+                    for column in HEADER_BALANCE_BREAKDOWN_COLUMNS:
+                        ui.label(column).classes('text-xs text-secondary-custom font-medium')
+                    for label, figures in view.lines:
                         ui.label(label).classes('text-xs text-secondary-custom')
-                        ui.label(line.text).classes(
-                            'text-xs font-medium'
-                            + ('' if line.available else ' text-secondary-custom'))
+                        for cell in (figures.value, figures.tradable,
+                                     figures.option_tradable, figures.broker_bp):
+                            ui.label(cell.text).classes(
+                                'text-xs font-medium'
+                                + ('' if cell.available else ' text-secondary-custom'))
                 ui.separator()
                 with ui.row().classes('w-full justify-between items-center gap-6'):
                     ui.label(HEADER_BALANCE_TOTAL_LABEL).classes('text-xs font-bold')
