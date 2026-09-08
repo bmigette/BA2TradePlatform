@@ -136,3 +136,23 @@ class TestResetSettings:
         with get_db() as session:
             remaining = session.exec(select(ExpertSetting).filter_by(instance_id=expert.id)).all()
         assert remaining == []
+
+
+
+class TestAccountSettingsGuard:
+    """The account settings dialog must never store a margin_factor the account itself
+    would refuse at read time -- the dialog and the account share margin_factor_error."""
+
+    def test_account_settings_reject_a_margin_factor_below_one(self):
+        from ba2_trade_platform.ui.pages.settings import account_settings_error
+        assert account_settings_error({"margin_factor": 0.5}) is not None
+        assert "margin_factor" in account_settings_error({"margin_factor": 0.5})
+        assert account_settings_error({"margin_factor": 1.8}) is None
+        assert account_settings_error({"margin_factor": "2"}) is None
+        assert account_settings_error({}) is None          # not in the form: nothing to check
+
+    def test_a_cleared_margin_factor_field_is_refused_not_stored_as_none(self):
+        # ui.number hands back None when the field is cleared. The default (1.8) applies
+        # only where the key was never saved, so a cleared field must not be SAVED as None.
+        from ba2_trade_platform.ui.pages.settings import account_settings_error
+        assert account_settings_error({"margin_factor": None}) is not None
