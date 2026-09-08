@@ -41,6 +41,18 @@ UNKNOWN_PL_TEXT = 'P/L unknown'
 #: The balance cell when ``get_balance()`` would not answer. Same rule.
 UNKNOWN_BALANCE_TEXT = 'Bal: unknown'
 
+#: The BP cell when the TRADABLE balance could not be worked out -- the broker
+#: published no multiplier, or the accessor raised. Same rule again: not '$0.00'
+#: (which would read as 'this account may deploy nothing') and not blank. The
+#: dash is the one the header uses for a figure it could not read.
+UNKNOWN_BP_TEXT = 'BP: —'
+
+#: Hover text on the BP cell. Broker BP is a DIFFERENT number from the cell's:
+#: the cell is what this platform will let the account deploy, this is what the
+#: broker has left. The second one is what runs out first when something outside
+#: the platform has been trading, which is why it is on screen at all.
+BROKER_BP_TOOLTIP_FMT = 'Broker buying power: {bp}'
+
 #: Appended to a figure that is real but INCOMPLETE -- a total missing an
 #: account, or a row missing a position the broker did not quote. In the text
 #: rather than a tooltip: a marker that needs a hover is one the reader of a
@@ -58,6 +70,7 @@ NO_ACCOUNTS_TEXT = 'No accounts configured'
 
 PL_EXCLUDED_NOTE_FMT = '⚠️ Total excludes {names}: floating P/L could not be measured'
 BALANCE_EXCLUDED_NOTE_FMT = '⚠️ Total balance excludes {names}: balance could not be read'
+BP_EXCLUDED_NOTE_FMT = '⚠️ Total BP excludes {names}: tradable balance could not be read'
 UNPRICED_NOTE_FMT = ('⚠️ {name}: no broker price for {symbols} — that position is '
                      'missing from the row')
 
@@ -74,11 +87,21 @@ class PLRow:
     Those legs are missing from ``pl``, so ``pl`` is real but incomplete: the row
     is rendered with :data:`PARTIAL_SUFFIX` rather than silently understated,
     which is what dropping them did.
+
+    ``tradable`` is the STOCK tradable balance -- the balance times the account's
+    effective margin factor -- which is what its experts may actually deploy, and
+    with margin on that is NOT the balance. ``broker_bp`` is the broker's own
+    remaining buying power, a different question, shown on hover. Same
+    None-is-unknown contract as ``balance``: neither is ever a zero nobody
+    measured, and a margin figure that could not be read leaves ONLY that figure
+    unknown.
     """
     name: str
     pl: Optional[float]
     balance: Optional[float] = None
     unpriced: Tuple[str, ...] = ()
+    tradable: Optional[float] = None
+    broker_bp: Optional[float] = None
 
 
 def combine_measurements(
@@ -270,6 +293,63 @@ class _FloatingPLWidgetBase:
         finally:
             session.close()
 
+    def _read_money(self, account, account_id: int
+                    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """``(balance, tradable, broker_bp)``, each ``None`` when unreadable, never zero.
+
+        ONE copy, called by both row-building paths. It was two, and a figure added
+        to only one of them is a card that tells the truth about half its accounts:
+        the manual path and the expert-driven path draw into the same columns.
+
+        WHY EACH FIGURE IS TRIED, AND SWALLOWED, SEPARATELY. A failed margin read
+        leaves ONLY that figure unknown -- the balance is the headline, and
+        blanking it because a multiplier was unavailable throws away the number
+        that WAS read. Same split, for the same reason, as the header's
+        ``layout._read_account_figures``.
+        """
+        if not self._show_balance:
+            # Per-EXPERT: an expert has no broker relationship, so not one of these
+            # three figures exists for it. Not fetched at all rather than fetched
+            # and hidden -- this runs once per account on every render.
+            return None, None, None
+
+        balance = tradable = broker_bp = None
+        try:
+            bal = account.get_balance()
+            # ``is not None``, never truthiness: an account really worth $0.00
+            # must print $0.00, not 'unknown'.
+            balance = float(bal) if bal is not None else None
+            if bal is None:
+                logger.warning(f"Balance unavailable for account {account_id}; "
+                               f"showing it as unknown rather than as zero")
+        except Exception as e:
+            logger.error(f"Could not fetch balance for account {account_id}: {e}",
+                         exc_info=True)
+
+        try:
+            tradable = float(account.get_tradable_balance())
+        except AttributeError as e:
+            # NOT an unknown, and so NOT a warning: every account this platform
+            # ships implements the accessor, so one that does not is a class that
+            # was never brought under margin -- a defect in the code, which a
+            # WARNING beside the broker's own "no multiplier" would bury.
+            logger.error(f"Account {account_id} ({type(account).__name__}) does not "
+                         f"implement get_tradable_balance -- a defect, not an "
+                         f"unknown: {e}", exc_info=True)
+        except Exception as e:
+            # WARNING: with a broker that publishes no multiplier, the accessor
+            # raising IS the documented shape of "unknown", and the cell already
+            # says so. Logged all the same -- a BP that quietly stays missing is
+            # one nobody ever investigates.
+            logger.warning(f"Tradable balance unavailable for account {account_id}: {e}")
+
+        try:
+            broker_bp = account.get_account_snapshot().buying_power
+        except Exception as e:
+            logger.warning(f"Broker buying power unavailable for account {account_id}: {e}")
+
+        return balance, tradable, broker_bp
+
     def _rows_for_account(
         self, account_id: int, trans_list: List[Tuple[Transaction, str]],
         seed_name: Optional[str], session: Session,
@@ -297,27 +377,19 @@ class _FloatingPLWidgetBase:
                          f"its floating P/L is unknown, not zero")
             return [PLRow(name=name, pl=None) for name in names]
 
-        balance: Optional[float] = None
-        if self._show_balance:
-            try:
-                bal = account.get_balance()
-                # ``is not None``, never truthiness: an account really worth $0.00
-                # must print $0.00, not 'unknown'.
-                balance = float(bal) if bal is not None else None
-                if bal is None:
-                    logger.warning(f"Balance unavailable for account {account_id}; "
-                                   f"showing it as unknown rather than as zero")
-            except Exception as e:
-                logger.error(f"Could not fetch balance for account {account_id}: {e}",
-                             exc_info=True)
-                balance = None
+        # Read BEFORE the position book, and carried into every row below, the
+        # error rows included: a failed position fetch costs the P/L and nothing
+        # else, and a row with no money on it at all reads as an unreachable
+        # account when in fact only its book was.
+        balance, tradable, broker_bp = self._read_money(account, account_id)
 
         try:
             broker_positions = account.get_positions()
         except Exception as e:
             logger.error(f"get_positions() raised for account {account_id}: {e}",
                          exc_info=True)
-            return [PLRow(name=name, pl=None, balance=balance) for name in names]
+            return [PLRow(name=name, pl=None, balance=balance, tradable=tradable,
+                          broker_bp=broker_bp) for name in names]
 
         # TRI-STATE (see ReadOnlyAccountInterface.get_positions): None is a FETCH
         # FAILURE, [] is a genuinely flat account. The old ``if broker_positions:``
@@ -326,7 +398,8 @@ class _FloatingPLWidgetBase:
         if broker_positions is None:
             logger.error(f"get_positions() failed for account {account_id}; its "
                          f"floating P/L is unknown, not zero")
-            return [PLRow(name=name, pl=None, balance=balance) for name in names]
+            return [PLRow(name=name, pl=None, balance=balance, tradable=tradable,
+                          broker_bp=broker_bp) for name in names]
 
         prices: Dict[str, float] = {}
         for pos in broker_positions:
@@ -361,7 +434,8 @@ class _FloatingPLWidgetBase:
             pl_by_name[display_name] += measured
 
         return [PLRow(name=name, pl=pl_by_name[name], balance=balance,
-                      unpriced=tuple(unpriced_by_name[name]))
+                      unpriced=tuple(unpriced_by_name[name]),
+                      tradable=tradable, broker_bp=broker_bp)
                 for name in names]
 
     def _transaction_pl(self, trans: Transaction, prices: Dict[str, float],
@@ -508,6 +582,10 @@ class _FloatingPLWidgetBase:
                 with ui.row().classes('items-center gap-3'):
                     if self._show_balance:
                         ui.label(_balance_text(row.balance)).classes('text-xs text-gray-500')
+                        ui.label(_bp_text(row.tradable)) \
+                            .classes('text-xs text-gray-500') \
+                            .tooltip(BROKER_BP_TOOLTIP_FMT.format(
+                                bp=_money_or_dash(row.broker_bp)))
                     _pl_label(row.pl, partial=bool(row.unpriced), size='text-sm')
 
         ui.separator().classes('my-2')
@@ -515,12 +593,15 @@ class _FloatingPLWidgetBase:
         pl_total, pl_missing = combine_measurements([(r.name, r.pl) for r in rows])
         understated = [r.name for r in rows if r.unpriced]
         bal_total, bal_missing = combine_measurements([(r.name, r.balance) for r in rows])
+        bp_total, bp_missing = combine_measurements([(r.name, r.tradable) for r in rows])
 
         with ui.row().classes('w-full justify-between items-center'):
             ui.label('Total P/L:').classes('text-sm font-bold')
             with ui.row().classes('items-center gap-3'):
                 if self._show_balance:
                     ui.label(_balance_text(bal_total, partial=bool(bal_missing))) \
+                        .classes('text-xs text-gray-500 font-bold')
+                    ui.label(_bp_text(bp_total, partial=bool(bp_missing))) \
                         .classes('text-xs text-gray-500 font-bold')
                 _pl_label(pl_total, partial=bool(pl_missing or understated), size='text-lg')
 
@@ -538,6 +619,9 @@ class _FloatingPLWidgetBase:
         if self._show_balance and bal_missing:
             ui.label(BALANCE_EXCLUDED_NOTE_FMT.format(names=', '.join(bal_missing))) \
                 .classes('text-xs text-orange-600')
+        if self._show_balance and bp_missing:
+            ui.label(BP_EXCLUDED_NOTE_FMT.format(names=', '.join(bp_missing))) \
+                .classes('text-xs text-orange-600')
 
 
 def _balance_text(value: Optional[float], *, partial: bool = False) -> str:
@@ -545,6 +629,22 @@ def _balance_text(value: Optional[float], *, partial: bool = False) -> str:
     if value is None:
         return UNKNOWN_BALANCE_TEXT
     return f'Bal: ${value:,.2f}' + (PARTIAL_SUFFIX if partial else '')
+
+
+def _money_or_dash(value: Optional[float]) -> str:
+    """A figure for a TOOLTIP. Same dash the header shows for a figure it lacks."""
+    return '—' if value is None else f'${value:,.2f}'
+
+
+def _bp_text(value: Optional[float], *, partial: bool = False) -> str:
+    """The 'BP:' cell: the account's TRADABLE balance. ``None`` is unknown.
+
+    ``0.0`` is a measurement -- an account with nothing left to deploy -- and
+    prints as one, for the same reason a $0.00 balance does.
+    """
+    if value is None:
+        return UNKNOWN_BP_TEXT
+    return f'BP: ${value:,.2f}' + (PARTIAL_SUFFIX if partial else '')
 
 
 def _pl_label(value: Optional[float], *, partial: bool, size: str) -> None:
@@ -616,32 +716,25 @@ class FloatingPLPerAccountWidget(_FloatingPLWidgetBase):
                          f"its floating P/L is unknown, not zero")
             return [PLRow(name=name, pl=None)]
 
-        balance: Optional[float] = None
-        if self._show_balance:
-            try:
-                bal = account.get_balance()
-                balance = float(bal) if bal is not None else None
-                if bal is None:
-                    logger.warning(f"Balance unavailable for account {account_id}; "
-                                   f"showing it as unknown rather than as zero")
-            except Exception as e:
-                logger.error(f"Could not fetch balance for account {account_id}: {e}",
-                             exc_info=True)
-                balance = None
+        # The same read as the expert-driven path, from the same helper: the two
+        # paths feed the same columns and must not be able to disagree about them.
+        balance, tradable, broker_bp = self._read_money(account, account_id)
 
         try:
             broker_positions = account.get_positions()
         except Exception as e:
             logger.error(f"get_positions() raised for account {account_id}: {e}",
                          exc_info=True)
-            return [PLRow(name=name, pl=None, balance=balance)]
+            return [PLRow(name=name, pl=None, balance=balance, tradable=tradable,
+                          broker_bp=broker_bp)]
 
         # TRI-STATE, same rule as the base: None is a fetch failure, [] is a
         # genuinely flat (or genuinely empty) account.
         if broker_positions is None:
             logger.error(f"get_positions() failed for account {account_id}; its "
                          f"floating P/L is unknown, not zero")
-            return [PLRow(name=name, pl=None, balance=balance)]
+            return [PLRow(name=name, pl=None, balance=balance, tradable=tradable,
+                          broker_bp=broker_bp)]
 
         total = 0.0
         unpriced: List[str] = []
@@ -658,7 +751,9 @@ class FloatingPLPerAccountWidget(_FloatingPLWidgetBase):
                 continue
             total += float(pl)
 
-        return [PLRow(name=name, pl=total, balance=balance, unpriced=tuple(unpriced))]
+        return [PLRow(name=name, pl=total, balance=balance,
+                      unpriced=tuple(unpriced), tradable=tradable,
+                      broker_bp=broker_bp)]
 
     def _scope_query(self, query, selected_account_id: Optional[int],
                      account_expert_ids: Optional[List[int]]):

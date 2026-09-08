@@ -51,6 +51,7 @@ HOW IT RUNS
 import asyncio
 import importlib
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -502,12 +503,27 @@ class _Broker:
     against a broken widget.
     """
 
-    def __init__(self, positions=_UNSET, balance=None):
+    def __init__(self, positions=_UNSET, balance=None, tradable=_UNSET,
+                 broker_bp=None):
         self._positions = [] if positions is _UNSET else positions
         self._balance = balance
+        # Margin OFF is the default shape, and there the tradable balance IS the
+        # balance. ``tradable=None`` is the other real case: an account that
+        # cannot state one, which production RAISES rather than guesses -- so the
+        # double raises too, instead of quietly handing back a number.
+        self._tradable = balance if tradable is _UNSET else tradable
+        self._broker_bp = broker_bp
 
     def get_balance(self):
         return self._balance
+
+    def get_tradable_balance(self):
+        if self._tradable is None:
+            raise ValueError('no tradable balance: this account has no multiplier')
+        return self._tradable
+
+    def get_account_snapshot(self):
+        return SimpleNamespace(buying_power=self._broker_bp)
 
     def get_positions(self):
         return self._positions
@@ -831,6 +847,12 @@ def test_floating_pl_per_account_says_unknown_when_the_broker_raises(
         def get_balance(self):
             raise RuntimeError('balance boom')
 
+        def get_tradable_balance(self):
+            raise RuntimeError('tradable boom')
+
+        def get_account_snapshot(self):
+            raise RuntimeError('snapshot boom')
+
         def get_positions(self):
             raise RuntimeError('positions boom')
 
@@ -948,6 +970,214 @@ def test_floating_pl_per_account_keeps_a_genuinely_zero_balance(
 
     assert texts.count('Bal: $0.00') == 2           # the row and the total
     assert 'Bal: unknown' not in texts
+
+
+# ---------------------------------------------------------------------------
+# The BP cell: what the account may actually DEPLOY (its tradable balance)
+#
+# The balance is what an account is WORTH; with margin on it is not what the
+# account may TRADE. A card that shows only the balance understates a margin
+# account's capacity by the whole factor, so 'BP:' sits beside 'Bal:' -- and the
+# broker's own remaining buying power, a different number and the one that
+# actually runs out, hangs off that cell as its tooltip.
+#
+# Same three-state contract as the rest of this card: None is unknown and never
+# zero, and a margin figure that could not be read leaves ONLY that figure
+# unknown. The balance is the headline; it is never blanked to punish a
+# multiplier the broker would not publish.
+# ---------------------------------------------------------------------------
+
+def _rows_for_account_card(account_id, widget_cls=FloatingPLPerAccountWidget):
+    """The rows the card WOULD draw, one step before it draws them.
+
+    Same entry point as the render harness (``_calculate_pl_sync``). What a row
+    CARRIES is a separate question from how it is formatted, and asserting only on
+    rendered text lets a money read that never happened hide behind a cell that
+    says 'unknown' for the wrong reason.
+    """
+    widget = widget_cls.__new__(widget_cls)
+    return widget._calculate_pl_sync(account_id, None)
+
+
+def _row(rows, name):
+    """The one row named *name*. Raises if the card did not produce it."""
+    return next(r for r in rows if r.name == name)
+
+
+def test_plrow_carries_tradable_and_broker_bp_and_the_bp_cell_formats_them():
+    """The pure half: the row's two new figures, and the cell that prints them."""
+    row = fpl_mod.PLRow(name='A', pl=1.0, balance=10_000.0,
+                        tradable=18_000.0, broker_bp=20_000.0)
+
+    assert fpl_mod._bp_text(row.tradable) == 'BP: $18,000.00'
+    assert fpl_mod._bp_text(None) == fpl_mod.UNKNOWN_BP_TEXT
+    # The inverse error, the one the balance cell guards too: an account that may
+    # deploy nothing has a MEASURED zero, and must not read as unknown.
+    assert fpl_mod._bp_text(0.0) == 'BP: $0.00'
+    assert fpl_mod._bp_text(2.0, partial=True).endswith(fpl_mod.PARTIAL_SUFFIX)
+    assert fpl_mod._money_or_dash(row.broker_bp) == '$20,000.00'
+    assert fpl_mod._money_or_dash(None) == '—'
+
+
+def test_floating_pl_per_account_rows_carry_the_tradable_balance_and_broker_bp(
+        monkeypatch, manual_account, expert_account):
+    """Both row-building paths read the same three figures.
+
+    The manual path and the expert-driven path each had their OWN copy of the
+    balance fetch; a margin figure added to one of them only is a card that tells
+    the truth about half its accounts. Both shapes are in scope here on purpose.
+    """
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {
+        manual_account: _Broker([], balance=10_000.0, tradable=18_000.0,
+                                broker_bp=20_000.0),
+        other_account: _Broker([], balance=5_000.0, tradable=9_000.0,
+                               broker_bp=4_000.0),
+    })
+
+    rows = _rows_for_account_card(None)
+
+    assert _row(rows, 'Manual').tradable == 18_000.0
+    assert _row(rows, 'Manual').broker_bp == 20_000.0
+    assert _row(rows, 'Automated').tradable == 9_000.0
+    assert _row(rows, 'Automated').broker_bp == 4_000.0
+
+
+def test_floating_pl_per_account_keeps_the_balance_when_the_tradable_read_fails(
+        monkeypatch, manual_account):
+    """A broker that will not state a tradable balance still has a balance.
+
+    ``get_tradable_balance`` raises rather than guessing when the multiplier is
+    unavailable. That is an expected shape of 'unknown' -- a WARNING, and only the
+    BP cell goes dark; blanking the balance too would hide the one figure that WAS
+    read.
+    """
+    _use_brokers(monkeypatch, {manual_account: _Broker([], balance=10_000.0,
+                                                       tradable=None)})
+    warnings = _capture_warnings(monkeypatch, fpl_mod)
+
+    row = _row(_rows_for_account_card(manual_account), 'Manual')
+
+    assert row.tradable is None
+    assert row.balance == 10_000.0
+    assert any('radable' in w for w in warnings), warnings
+
+
+def test_floating_pl_per_account_calls_a_missing_tradable_accessor_a_defect(
+        monkeypatch, expert_account):
+    """An account object with no ``get_tradable_balance`` AT ALL is a code defect.
+
+    Every account this platform ships implements it, so this is not the broker
+    declining to answer -- it is a class that was never brought under margin, and
+    filing it beside the broker's own "no multiplier" WARNINGs is how it stays
+    unnoticed. ERROR, and the accessor is named so the reader knows what is missing.
+    """
+    account_id, _ = expert_account
+
+    class _PreMarginBroker:
+        """An account object from before margin: balance and positions only."""
+
+        def get_balance(self):
+            return 7_500.0
+
+        def get_positions(self):
+            return []
+
+    _use_brokers(monkeypatch, {account_id: _PreMarginBroker()})
+    errors = _capture_errors(monkeypatch, fpl_mod)
+
+    row = _row(_rows_for_account_card(account_id), 'Automated')
+
+    assert row.tradable is None
+    assert row.balance == 7_500.0
+    assert any('get_tradable_balance' in e for e in errors), errors
+
+
+def test_floating_pl_per_account_keeps_the_money_it_read_when_positions_fail(
+        monkeypatch, manual_account):
+    """A failed POSITION read costs the P/L, and nothing else.
+
+    The early-return rows are the easy place to drop figures that were read a
+    moment earlier -- and an account showing 'P/L unknown' with no balance and no
+    BP looks unreachable when in fact only its book was.
+    """
+    _use_brokers(monkeypatch, {manual_account: _Broker(None, balance=500.0,
+                                                       tradable=900.0,
+                                                       broker_bp=1_100.0)})
+    _capture_errors(monkeypatch, fpl_mod)
+
+    row = _row(_rows_for_account_card(manual_account), 'Manual')
+
+    assert row.pl is None
+    assert row.balance == 500.0
+    assert row.tradable == 900.0
+    assert row.broker_bp == 1_100.0
+
+
+def test_floating_pl_per_account_draws_bp_beside_the_balance_and_totals_it(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """The rendered card: a BP cell per row, a BP total, broker BP on hover."""
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {
+        manual_account: _Broker([], balance=10_000.0, tradable=18_000.0,
+                                broker_bp=20_000.0),
+        other_account: _Broker([], balance=5_000.0, tradable=5_000.0,
+                               broker_bp=5_000.0),
+    })
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Bal: $10,000.00' in texts
+    assert 'BP: $18,000.00' in texts
+    assert 'BP: $23,000.00' in texts        # the total, both accounts readable
+    assert fpl_mod.UNKNOWN_BP_TEXT not in texts
+    # The tooltip is the ONLY place the broker's own REMAINING capacity appears;
+    # it is a different question from 'what may this account deploy'.
+    assert 'Broker buying power: $20,000.00' in texts
+
+
+def test_floating_pl_per_account_bp_total_is_partial_and_names_what_it_left_out(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """An unreadable BP never silently disappears out of the BP total.
+
+    Same rule, and the same note shape, as the balance total: '(partial)' says the
+    number is incomplete, and only the note says WHICH account is missing from it.
+    """
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {
+        manual_account: _Broker([], balance=10_000.0, tradable=None),
+        other_account: _Broker([], balance=5_000.0, tradable=5_000.0),
+    })
+    _capture_warnings(monkeypatch, fpl_mod)
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert fpl_mod.UNKNOWN_BP_TEXT in texts           # the row that would not answer
+    assert 'Bal: $10,000.00' in texts                 # its balance survived
+    assert 'BP: $5,000.00 (partial)' in texts         # the total, honestly marked
+    assert any('Manual' in t and 'BP' in t for t in texts), texts
+
+
+def test_the_per_expert_widget_shows_no_bp_cell(
+        nicegui_client, select_account, monkeypatch, expert_account):
+    """BP is an ACCOUNT concept, like the balance beside it.
+
+    An expert has no broker relationship, so a per-expert BP column would have to
+    invent one -- by splitting the account's capacity, or by repeating it under
+    every expert. The per-expert card shows neither figure.
+    """
+    account_id, expert_id = expert_account
+    _open_trade(account_id, 'AAPL', expert_id=expert_id)
+    _use_brokers(monkeypatch, {account_id: _Broker([_price('AAPL', 110.0)],
+                                                   balance=1_000.0,
+                                                   tradable=1_800.0)})
+
+    select_account(account_id)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerExpertWidget)
+
+    assert not [t for t in texts if t.startswith('BP:')], texts
 
 
 def test_floating_pl_per_account_marks_a_manual_row_partial_when_a_position_has_no_broker_pl(
