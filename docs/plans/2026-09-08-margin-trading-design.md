@@ -62,9 +62,11 @@ per-class broker multiplier below. A separate option factor is a follow-up.
 - `AccountSnapshot` gains `option_buying_power: Optional[float]`, filled from
   Alpaca `options_buying_power` and TastyTrade `derivative_buying_power`,
   None elsewhere.
-- No new cache. The snapshot keeps its 5 s TTL and its invalidation on trade
-  operations. TastyTrade gets snapshot invalidation added to
-  `invalidate_balance_cache` to match Alpaca.
+- No new cache. Alpaca's snapshot keeps its 5 s TTL and its invalidation after
+  every submission. TastyTrade has no snapshot cache, so every read is fresh; the
+  tradable-balance path therefore takes ONE snapshot per call and derives
+  multiplier and buying power from it. A TastyTrade snapshot TTL cache is a
+  follow-up if the extra round trip proves costly.
 
 ### Tradable balance
 
@@ -173,3 +175,4 @@ Shared package (`ba2_common`) and trade app both change: bump
 - Bring the portfolio allocator under the margin factor.
 - Separate option margin factor.
 - Backtest account leverage (multiplier > 1 with the Reg-T model it already has).
+- TastyTrade snapshot TTL cache.
