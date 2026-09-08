@@ -843,6 +843,9 @@ MARKER_BAR_ROW = 'pf-bar-row'
 #: only figure on the line whose sign carries a verdict -- so it is the only one
 #: that can be coloured, and NiceGUI colours whole elements.
 MARKER_LABEL_LAST = 'pf-label-last'
+#: The Review button's own progress bar. Marked so a test can assert it exists, is
+#: hidden at rest, and is the SAME element the latch drives.
+MARKER_REVIEW_PROGRESS = 'pf-review-progress'
 MARKER_LABEL_PNL = 'pf-label-pnl'
 #: The fixed-width CELL holding the P&L caption. The caption is two elements now
 #: -- the money with its price return, then the dividend-adjusted return -- because
@@ -1166,11 +1169,19 @@ class ClickLatch:
     never works again. Deliberately NOT one-shot, unlike the dry run's own submit
     latch -- that one guards orders already sent, this one guards a solve that
     ordered nothing, and the user must be able to press it again.
+
+    ``progress`` is an optional bar shown for the run's duration. It is
+    INDETERMINATE and that is not a shortcut: the solve is a broker round trip whose
+    length is set by how many buys need prechecking, and a bar that invented a
+    percentage would be a lie told smoothly. What the user asked for is the answer to
+    "is it doing something" -- the spinner inside the button says that but sits where
+    the label was, so it reads as the button having gone blank.
     """
 
-    def __init__(self, busy_notice: str, button=None):
+    def __init__(self, busy_notice: str, button=None, progress=None):
         self.busy_notice = busy_notice
         self.button = button
+        self.progress = progress
         self.busy = False
 
     async def run(self, factory) -> bool:
@@ -1184,10 +1195,17 @@ class ClickLatch:
         if self.button is not None:
             self.button.set_enabled(False)
             self.button.props('loading')
+        if self.progress is not None:
+            self.progress.set_visibility(True)
         try:
             await factory()
         finally:
+            # Both restored in the finally, for the same reason the latch is: a bar
+            # left running after a failed solve says the page is still working on
+            # something it abandoned.
             self.busy = False
+            if self.progress is not None:
+                self.progress.set_visibility(False)
             if self.button is not None:
                 self.button.props(remove='loading')
                 self.button.set_enabled(True)
@@ -3773,15 +3791,32 @@ async def content() -> None:
                 await _apply_simulation()
 
         with toolbar:
-            review_latch.button = ui.button(
-                REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review) \
-                .props('color=primary') \
-                .tooltip('Solve the plan against the broker and show it for review. '
-                         'Nothing is ordered until you press Submit in the dry run.')
+            # The button and its progress bar are ONE column so the bar is exactly as
+            # wide as the button and sits directly under it. ``gap-0`` because a gap
+            # would read as a separate control rather than as this button's own state.
+            with ui.column().classes('gap-0 items-stretch'):
+                review_latch.button = ui.button(
+                    REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review) \
+                    .props('color=primary') \
+                    .tooltip('Solve the plan against the broker and show it for review. '
+                             'Nothing is ordered until you press Submit in the dry run.')
+                # Indeterminate: see ClickLatch. Hidden until a run starts, and it takes
+                # no vertical space while hidden, so the toolbar does not jump on click.
+                review_latch.progress = ui.linear_progress(
+                    value=0, show_value=False, size='3px') \
+                    .props('indeterminate rounded color=primary') \
+                    .mark(MARKER_REVIEW_PROGRESS)
+                review_latch.progress.set_visibility(False)
+            # ``hide-bottom-space`` is what LINES THESE UP. A Quasar field reserves a
+            # row under itself for the error/hint text it may one day show, so a
+            # labelled select is ~20px taller than a button and the toolbar's
+            # ``items-center`` centres that extra space instead of the box the user
+            # sees. Removing the reservation makes the control as tall as it looks.
             ui.select({VALUATION_MODE_COST: 'Cost basis',
                        VALUATION_MODE_MARKET: 'Market value'},
                       value=mode_state['value'], label='Valuation',
-                      on_change=_set_mode).props('dense outlined').classes('w-44')
+                      on_change=_set_mode) \
+                .props('dense outlined hide-bottom-space').classes('w-44')
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
             ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
@@ -3789,6 +3824,8 @@ async def content() -> None:
             # how every number below is computed, and neither is a number itself.
             ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
             ui.number(label='Simulated base', format='%.2f', min=0,
-                      on_change=_set_simulated_base)                 .props('dense outlined prefix=$').classes('w-40').mark(MARKER_SIM_INPUT)
+                      on_change=_set_simulated_base) \
+                .props('dense outlined hide-bottom-space prefix=$') \
+                .classes('w-40').mark(MARKER_SIM_INPUT)
 
         await _refresh()

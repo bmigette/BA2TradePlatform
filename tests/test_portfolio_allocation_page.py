@@ -8243,3 +8243,68 @@ def test_EVERY_price_fetch_on_this_page_asks_for_the_mark():
             assert "'mark'" in call or '"mark"' in call, (
                 f"{where}: {call.strip()!r} must value at the mark, the price the broker's own "
                 f"net liq is struck at")
+
+
+def test_the_review_button_has_a_progress_bar_that_is_hidden_at_rest(monkeypatch,
+                                                                     nicegui_client,
+                                                                     account_id):
+    """Requested 2026-09-08: "when clicking on the review and submit, can we have a small
+    progressbar inside or below the button?"
+
+    Hidden at rest and taking no vertical space, so the toolbar does not jump when it
+    appears. INDETERMINATE on purpose -- the solve's length is set by how many buys need
+    prechecking, and a bar that invented a percentage would be a lie told smoothly.
+    """
+    monkeypatch.setattr(page, 'get_selected_account_id', lambda: account_id)
+    _use_account(monkeypatch, _Account(account_id, {'manual_trading_enabled': True},
+                                       positions=[], prices={}))
+    _run_in_client(nicegui_client, page.content)
+    # The TOOLBAR, not the label area: the button and its bar live above the label rows,
+    # and this is the same setup the other toolbar tests use.
+    bars = _marked(nicegui_client.layout, page.MARKER_REVIEW_PROGRESS)
+    assert len(bars) == 1, "exactly one progress bar, and it belongs to the Review button"
+    bar = bars[0]
+    assert bar.visible is False, "a bar visible at rest says the page is working when it is not"
+    assert 'indeterminate' in bar._props
+
+
+def test_the_latch_drives_the_bar_it_was_given():
+    """The bar and the button move TOGETHER, and both are restored in the finally: a bar
+    left running after a failed solve says the page is still working on something it
+    abandoned."""
+    import asyncio
+
+    class _Elem:
+        def __init__(self):
+            self.visible = None
+            self.enabled = True
+            self._p = set()
+
+        def set_visibility(self, v):
+            self.visible = v
+
+        def set_enabled(self, v):
+            self.enabled = v
+
+        def props(self, add=None, remove=None):
+            if add:
+                self._p.add(add)
+            if remove:
+                self._p.discard(remove)
+            return self
+
+    bar, button = _Elem(), _Elem()
+    latch = page.ClickLatch('busy', button=button, progress=bar)
+    seen = {}
+
+    async def _work():
+        seen['during'] = (bar.visible, button.enabled)
+        raise RuntimeError("the solve blew up")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(latch.run(_work))
+
+    assert seen['during'] == (True, False), "shown while running, button disabled"
+    assert bar.visible is False and button.enabled is True, \
+        "a failed run must still release both"
+    assert latch.busy is False
