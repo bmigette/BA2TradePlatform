@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta, date
@@ -22,13 +23,21 @@ MARGIN_FACTOR_MIN = 1.0
 def margin_factor_error(value: Any) -> Optional[str]:
     """Why ``value`` is not an acceptable ``margin_factor``; ``None`` when it is. Pure.
 
-    Used by the account settings dialog at save time and by the account itself at
-    read time, so the two can never disagree about what is valid.
+    Used by the account settings dialog at save time (Task 11) and by the account
+    itself at read time (Task 4), so the two can never disagree about what is valid.
     """
+    # A bool is float()-able (True == 1.0) and would read as a legal "no leverage"
+    # factor; the settings table has leaked cross-typed values before (see coerce_bool).
+    if isinstance(value, bool):
+        return f"margin_factor must be a number, got {value!r}"
     try:
         factor = float(value)
     except (TypeError, ValueError):
         return f"margin_factor must be a number, got {value!r}"
+    # NaN compares False against everything, so it would slip past the minimum
+    # and become a NaN tradable balance downstream. Infinity is not a ceiling.
+    if not math.isfinite(factor):
+        return f"margin_factor must be a finite number, got {value!r}"
     if factor < MARGIN_FACTOR_MIN:
         return f"margin_factor must be >= {MARGIN_FACTOR_MIN} (1.0 means no leverage), got {factor}"
     return None
@@ -78,14 +87,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     "required": False,
                     "default": False,
                     "description": "Margin trading enabled",
-                    "tooltip": "Let this account's experts deploy more than the account balance, up to balance x margin factor, never more than the broker's own buying power. Off = experts size against the plain balance.",
+                    "tooltip": "Let this account's experts deploy more than the account balance, up to balance x margin factor, never more than the broker's own buying power. Off = experts size against the plain balance."
                 },
                 "margin_factor": {
                     "type": "float",
                     "required": False,
                     "default": 1.8,
                     "description": "Margin factor (max exposure / balance)",
-                    "tooltip": "Ceiling on total exposure as a multiple of balance: 1.8 means a $10k account never holds more than $18k of positions. Capped by the broker's multiplier. Ignored when margin trading is off. Minimum 1.0.",
+                    "tooltip": "Ceiling on total exposure as a multiple of balance: 1.8 means a $10k account never holds more than $18k of positions. Capped by the broker's multiplier. Ignored when margin trading is off. Minimum 1.0."
                 },
             }
 
