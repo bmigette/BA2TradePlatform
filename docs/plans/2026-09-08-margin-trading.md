@@ -1202,7 +1202,7 @@ def test_plrow_carries_tradable_and_broker_bp_and_the_bp_cell_formats_them():
     from ba2_trade_platform.ui.components.FloatingPLPerAccountWidget import PLRow, _bp_text
     row = PLRow(name='A', pl=1.0, balance=10_000.0, tradable=18_000.0, broker_bp=20_000.0)
     assert _bp_text(row.tradable) == 'BP: $18,000.00'
-    assert _bp_text(None) == 'BP: —'
+    assert _bp_text(None) == 'BP: unknown'
 ```
 Plus one test through the existing row-building harness of that file asserting that a fake account whose `get_tradable_balance()` returns 18k yields `row.tradable == 18_000.0`, and one whose `get_tradable_balance()` raises yields `row.tradable is None` while `row.balance` is still set.
 
@@ -1249,7 +1249,7 @@ Thread `tradable=..., broker_bp=...` into every `PLRow(...)` construction in bot
 ```
 and in the total row a `_bp_text(bp_total, partial=bool(bp_missing))` computed with `combine_measurements([(r.name, r.tradable) for r in rows])`. Add:
 ```python
-UNKNOWN_BP_TEXT = 'BP: —'
+UNKNOWN_BP_TEXT = 'BP: unknown'
 BROKER_BP_TOOLTIP_FMT = 'Broker buying power: {bp}'
 
 

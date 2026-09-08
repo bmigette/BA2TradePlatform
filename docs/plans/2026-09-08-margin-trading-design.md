@@ -176,4 +176,4 @@ Shared package (`ba2_common`) and trade app both change: bump
 - Separate option margin factor.
 - Backtest account leverage (multiplier > 1 with the Reg-T model it already has).
 - TastyTrade snapshot TTL cache.
-- Header: derive tradable figures from the one snapshot (TastyTrade 5 REST -> 2).
+- Header and Floating P/L card: derive tradable figures from the one snapshot (TastyTrade 5 REST -> 2).

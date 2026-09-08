@@ -359,9 +359,15 @@ def _read_account_figures(account_id: int) -> AccountFigures:
     snapshot = account.get_account_snapshot()
 
     def _try(name: str) -> Optional[float]:
-        try:
-            return float(getattr(account, name)())
-        except AttributeError as e:
+        # ASKED BEFORE CALLING, not caught after. "Is the accessor missing?" and
+        # "did the accessor fail?" are different diagnoses at different log
+        # levels, and an ``except AttributeError`` around the call cannot tell
+        # them apart: an AttributeError raised INSIDE a working accessor (a
+        # broker SDK handing back None where an object was expected, say) would
+        # be filed as "this class was never brought under margin" and send the
+        # reader hunting for a method that is right there.
+        fn = getattr(account, name, None)
+        if fn is None:
             # NOT an unknown, and so NOT a warning: every account this platform
             # ships implements both accessors, so an account object that does not
             # is a class that was never brought under margin -- a defect in the
@@ -369,8 +375,10 @@ def _read_account_figures(account_id: int) -> AccountFigures:
             # bury. The header still degrades to a dash; the log says why.
             logger.error(
                 f"Header balance: account {account_id} ({type(account).__name__}) does "
-                f"not implement {name} -- a defect, not an unknown: {e}", exc_info=True)
+                f"not implement {name} -- a defect, not an unknown")
             return None
+        try:
+            return float(fn())
         except Exception as e:
             # WARNING rather than ERROR: with a broker that publishes no
             # multiplier this is an expected shape of "unknown", and the header

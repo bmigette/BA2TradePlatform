@@ -44,8 +44,10 @@ UNKNOWN_BALANCE_TEXT = 'Bal: unknown'
 #: The BP cell when the TRADABLE balance could not be worked out -- the broker
 #: published no multiplier, or the accessor raised. Same rule again: not '$0.00'
 #: (which would read as 'this account may deploy nothing') and not blank. The
-#: dash is the one the header uses for a figure it could not read.
-UNKNOWN_BP_TEXT = 'BP: —'
+#: word, not the header's dash: this cell is LABELLED, and the card already says
+#: 'Bal: unknown' for exactly this state one cell to the left -- the dash is for
+#: the header's unlabelled slot, where there is no room to spell it out.
+UNKNOWN_BP_TEXT = 'BP: unknown'
 
 #: Hover text on the BP cell. Broker BP is a DIFFERENT number from the cell's:
 #: the cell is what this platform will let the account deploy, this is what the
@@ -326,22 +328,31 @@ class _FloatingPLWidgetBase:
             logger.error(f"Could not fetch balance for account {account_id}: {e}",
                          exc_info=True)
 
-        try:
-            tradable = float(account.get_tradable_balance())
-        except AttributeError as e:
+        # ASKED BEFORE CALLING, not caught after. "Does this class have the
+        # accessor?" and "did the accessor fail?" are different diagnoses with
+        # different log levels, and an ``except AttributeError`` cannot tell them
+        # apart: an AttributeError raised INSIDE a working accessor (a broker SDK
+        # returning None where an object was expected, say) would be filed as
+        # "this class was never brought under margin" and send the reader hunting
+        # for a missing method that is right there.
+        fn = getattr(account, 'get_tradable_balance', None)
+        if fn is None:
             # NOT an unknown, and so NOT a warning: every account this platform
             # ships implements the accessor, so one that does not is a class that
             # was never brought under margin -- a defect in the code, which a
             # WARNING beside the broker's own "no multiplier" would bury.
             logger.error(f"Account {account_id} ({type(account).__name__}) does not "
                          f"implement get_tradable_balance -- a defect, not an "
-                         f"unknown: {e}", exc_info=True)
-        except Exception as e:
-            # WARNING: with a broker that publishes no multiplier, the accessor
-            # raising IS the documented shape of "unknown", and the cell already
-            # says so. Logged all the same -- a BP that quietly stays missing is
-            # one nobody ever investigates.
-            logger.warning(f"Tradable balance unavailable for account {account_id}: {e}")
+                         f"unknown")
+        else:
+            try:
+                tradable = float(fn())
+            except Exception as e:
+                # WARNING: with a broker that publishes no multiplier, the accessor
+                # raising IS the documented shape of "unknown", and the cell already
+                # says so. Logged all the same -- a BP that quietly stays missing is
+                # one nobody ever investigates.
+                logger.warning(f"Tradable balance unavailable for account {account_id}: {e}")
 
         try:
             broker_bp = account.get_account_snapshot().buying_power

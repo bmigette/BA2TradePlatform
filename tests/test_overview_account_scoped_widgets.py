@@ -1157,7 +1157,7 @@ def test_floating_pl_per_account_bp_total_is_partial_and_names_what_it_left_out(
     assert fpl_mod.UNKNOWN_BP_TEXT in texts           # the row that would not answer
     assert 'Bal: $10,000.00' in texts                 # its balance survived
     assert 'BP: $5,000.00 (partial)' in texts         # the total, honestly marked
-    assert any('Manual' in t and 'BP' in t for t in texts), texts
+    assert fpl_mod.BP_EXCLUDED_NOTE_FMT.format(names='Manual') in texts, texts
 
 
 def test_the_per_expert_widget_shows_no_bp_cell(
