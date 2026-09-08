@@ -335,8 +335,10 @@ class _FloatingPLWidgetBase:
         # returning None where an object was expected, say) would be filed as
         # "this class was never brought under margin" and send the reader hunting
         # for a missing method that is right there.
+        # ``getattr`` with a default swallows an AttributeError raised INSIDE a property
+        # getter, so the accessors must stay plain methods -- ``callable`` pins that.
         fn = getattr(account, 'get_tradable_balance', None)
-        if fn is None:
+        if fn is None or not callable(fn):
             # NOT an unknown, and so NOT a warning: every account this platform
             # ships implements the accessor, so one that does not is a class that
             # was never brought under margin -- a defect in the code, which a

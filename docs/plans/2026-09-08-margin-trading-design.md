@@ -176,4 +176,6 @@ Shared package (`ba2_common`) and trade app both change: bump
 - Separate option margin factor.
 - Backtest account leverage (multiplier > 1 with the Reg-T model it already has).
 - TastyTrade snapshot TTL cache.
-- Header and Floating P/L card: derive tradable figures from the one snapshot (TastyTrade 5 REST -> 2).
+- Header, Floating P/L card and the live trades `Value / CapReq` column: derive the
+  tradable figures and the effective factor from the one hourly snapshot
+  (TastyTrade 5 REST -> 2), instead of reading them per render.

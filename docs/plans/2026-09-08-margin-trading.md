@@ -1287,23 +1287,29 @@ git commit -am "feat(margin): Floating P/L per account shows BP (tradable) with 
 **Step 1: Write the failing test**
 
 ```python
-"""Live trades 'Value / CapReq': capital requirement = value / margin_factor when the
-account has margin on, else the value itself."""
-from ba2_trade_platform.ui.utils.margin_view import capital_requirement, value_capreq_text
+"""Live trades 'Value / CapReq': capital requirement = value / the account's EFFECTIVE
+margin factor (1.0 with margin off), i.e. the balance the position actually consumes."""
+from ba2_trade_platform.ui.utils.margin_view import (
+    capital_requirement, factors_by_account, value_capreq_text)
 
 
-def test_capreq_equals_value_with_margin_off():
-    assert capital_requirement(1800.0, margin_enabled=False, margin_factor=1.8) == 1800.0
+def test_capreq_equals_value_with_factor_one():
+    assert capital_requirement(1800.0, effective_factor=1.0) == 1800.0
 
 
-def test_capreq_is_value_over_factor_with_margin_on():
-    assert capital_requirement(1800.0, margin_enabled=True, margin_factor=1.8) == 1000.0
+def test_capreq_is_value_over_the_effective_factor():
+    assert capital_requirement(1800.0, effective_factor=1.8) == 1000.0
 
 
 def test_cell_text():
     assert value_capreq_text(1800.0, 1000.0) == '$1,800.00 / $1,000.00'
+    assert value_capreq_text(1800.0, None) == '$1,800.00 / unknown'
     assert value_capreq_text(None, None) == ''
 ```
+
+Plus: a defective factor (non-positive / NaN) is refused by `capital_requirement`, and
+`factors_by_account` leaves out any account whose factor cannot be read or is defective
+(accessor raises, resolver returns None, factor 0.0).
 
 **Step 2: Run to verify failure**
 
@@ -1314,42 +1320,44 @@ Expected: `ModuleNotFoundError: ba2_trade_platform.ui.utils.margin_view`.
 `ba2_trade_platform/ui/utils/margin_view.py`:
 ```python
 """Pure formatting for the margin figures shown on the live trades page."""
-from typing import Optional
+def capital_requirement(value: float, *, effective_factor: float) -> float:
+    """Dollars of the account's own balance this position consumes: value / the
+    EFFECTIVE margin factor (1.0 with margin off; min(margin_factor, broker multiplier)
+    with it on). A non-positive or NaN factor is a defect upstream and is refused
+    rather than divided by."""
+    if not math.isfinite(effective_factor) or effective_factor <= 0:
+        raise ValueError(...)
+    return float(value) / float(effective_factor)
 
 
-def capital_requirement(value: float, *, margin_enabled: bool, margin_factor: float) -> float:
-    """Dollars of the account's own balance this position consumes.
-
-    value / margin_factor with margin on (a $18k position on a 1.8x account ties up
-    $10k of balance); the value itself with margin off.
-    """
-    if not margin_enabled:
-        return float(value)
-    return float(value) / float(margin_factor)
+def factors_by_account(account_ids, *, resolve) -> Dict[int, float]:
+    """The EFFECTIVE margin factor per account, once per render. ``resolve(acc_id)``
+    returns the account instance or None. An account whose factor cannot be read, or
+    whose factor is defective, is LEFT OUT and logged at ERROR, so its rows show the
+    value alone rather than a capital requirement from a guess."""
 
 
 def value_capreq_text(value: Optional[float], capreq: Optional[float]) -> str:
-    if value is None or capreq is None:
-        return ''
-    return f"${value:,.2f} / ${capreq:,.2f}"
+    """'$value / $capreq'; '$value / unknown' when the requirement is unknown -- the
+    column header promises two figures, so a labelled cell spells the word out; '' when
+    there is no value at all."""
 ```
 
 `LiveTradesTable.py:77`: `label='Value / CapReq'` (field stays `value`; sorting stays on `value_numeric` if the table has one, else leave `sortable=True` on the text as today).
 
 `live_trades.py`: where `account_names` is built, ALSO build `factor_by_account: Dict[int, float]` from the account's EFFECTIVE factor (added in Task 4's fix round; 1.0 with margin off, `min(margin_factor, broker multiplier)` with it on, so the cell agrees with the sizing that actually happened rather than with the raw setting):
 ```python
-        from ba2_trade_platform.core.utils import get_account_instance_from_id
-        factor_by_account = {}
-        for acc_id in unique_account_ids:
-            try:
-                acct = get_account_instance_from_id(acc_id, session=session)
-                factor_by_account[acc_id] = acct.effective_margin_factor()
-            except Exception as e:
-                logger.error(f"Effective margin factor unavailable for account {acc_id}: {e}", exc_info=True)
-                # unknown, not "1.0": the cell shows the value alone, see below
+        factor_by_account: Dict[int, float] = factors_by_account(
+            symbols_by_account.keys(),
+            resolve=lambda acc_id: get_account_instance_from_id(acc_id, session=session))
 ```
-and `capital_requirement(value, *, effective_factor)` becomes simply `value / effective_factor` (drop the `margin_enabled` parameter; the factor already encodes "off" as 1.0). Adjust the tests in step 1 accordingly (`capital_requirement(1800.0, effective_factor=1.0) == 1800.0`, `capital_requirement(1800.0, effective_factor=1.8) == 1000.0`).
-and the value cell:
+Scoped to `symbols_by_account` (the accounts with an open position, i.e. the only ones
+that will render a requirement) so a page of nothing but closed trades costs no broker
+call. It sits on the async loader path beside the price fetch because with margin on the
+read touches the broker. An account left out of the map is "unknown", not "1.0": the
+cell then says `/ unknown`, see below.
+
+And the value cell:
 ```python
             value_str = ''
             if txn.quantity and current_price_str:
@@ -1359,11 +1367,9 @@ and the value cell:
                         value = txn.quantity * current_price
                         acc_id = txn_to_account.get(txn.id)
                         factor = factor_by_account.get(acc_id)
-                        if factor is None:
-                            value_str = f"${value:,.2f}"          # factor unreadable: value alone
-                        else:
-                            value_str = value_capreq_text(
-                                value, capital_requirement(value, effective_factor=factor))
+                        capreq = (capital_requirement(value, effective_factor=factor)
+                                  if factor is not None else None)   # unreadable -> "/ unknown"
+                        value_str = value_capreq_text(value, capreq)
                 except Exception as e:
                     logger.debug(f"Could not calculate value for {txn.symbol}: {e}")
 ```

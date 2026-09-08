@@ -15,7 +15,7 @@ from ..components import LiveTradesTable, LiveTradesTableConfig
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from ..utils.perf_logger import PerfLogger
-from ..utils.margin_view import capital_requirement, value_capreq_text
+from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
 
 class LiveTradesTab:
     """Comprehensive transactions management tab with full control over positions."""
@@ -400,19 +400,16 @@ class LiveTradesTab:
                 account_names[acc.id] = acc.name
 
         # The EFFECTIVE margin factor per account (1.0 with margin off, no broker read),
-        # once per account per render rather than per row. Unknown (broker figures
-        # unreadable) is left OUT of the map so the cell shows the value alone -- never
-        # a capital requirement computed from a guessed factor.
-        factor_by_account: Dict[int, float] = {}
-        for acc_id in unique_account_ids:
-            try:
-                acct = get_account_instance_from_id(acc_id, session=session)
-                if acct is None:
-                    raise ValueError("no account instance")
-                factor_by_account[acc_id] = acct.effective_margin_factor()
-            except Exception as e:
-                logger.error(f"Effective margin factor unavailable for account {acc_id}: {e}",
-                             exc_info=True)
+        # once per account per render rather than per row. Scoped to the accounts that
+        # will actually RENDER a requirement -- ``symbols_by_account`` holds only the
+        # accounts with an open position -- so a page of nothing but closed trades costs
+        # no broker call at all. With margin on the read does touch the broker, which is
+        # why it lives here on the async loader path beside the price fetch rather than
+        # in the paint. Deriving the factor from the header's hourly snapshot instead of
+        # reading it per render is a recorded follow-up (see the design doc).
+        factor_by_account: Dict[int, float] = factors_by_account(
+            symbols_by_account.keys(),
+            resolve=lambda acc_id: get_account_instance_from_id(acc_id, session=session))
 
         # Fetch prices in batch for each account
         current_prices = {}
