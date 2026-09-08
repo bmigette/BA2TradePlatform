@@ -119,14 +119,20 @@ HEADER_BP_PREFIX = ' / BP '
 #: because the two figures have INDEPENDENT stories: they can disagree about
 #: freshness, and one can be a total that excludes an account while the other is
 #: complete. Running them into one paragraph would read as a single claim about a
-#: single number. '(tradable)' names WHICH buying power this is: what the account
-#: will let an expert deploy, not the broker's own raw figure (that one is in the
-#: breakdown, as 'Broker BP').
-HEADER_BP_DETAIL_FMT = '\nBuying power (tradable): {detail}'
+#: single number. '(broker, remaining)' names WHICH buying power this is: what the
+#: broker will still let this account buy right now, not the platform's own
+#: ceiling (that one is in the breakdown, as 'Tradable').
+HEADER_BP_DETAIL_FMT = '\nBuying power (broker, remaining): {detail}'
 
 #: The breakdown's column headings, in the order the figures are drawn. One
 #: constant so the header row and the cells beneath it cannot drift apart.
-HEADER_BALANCE_BREAKDOWN_COLUMNS = ('Balance', 'BP', 'Opt BP', 'Broker BP')
+#: BP -- the BROKER's remaining buying power -- comes FIRST because it is the
+#: BADGE's figure, and the breakdown exists to explain the badge: whoever opened
+#: this menu is looking for the number they just read. The two tradable columns
+#: follow as what they are, the PLATFORM's own ceilings on what an expert may
+#: deploy in stock and in options -- a different question, and not the one the
+#: header slot answers.
+HEADER_BALANCE_BREAKDOWN_COLUMNS = ('Balance', 'BP', 'Tradable', 'Opt tradable')
 
 HEADER_BALANCE_MARKER = 'header-balance'
 HEADER_BALANCE_BREAKDOWN_MARKER = 'header-balance-breakdown'
@@ -524,10 +530,18 @@ def header_badge_from_cache(accounts: Sequence[Tuple[int, str]], *,
                             utcnow=_utcnow) -> HeaderBalance:
     """What the badge SAYS: the balance and the buying power. NO BROKER CALL.
 
-    Two figures in one slot, ``$10,000.00 / BP $18,000.00``. The BP is the STOCK
-    tradable balance -- what an expert may actually deploy -- and not the broker's
-    raw buying power, because that is the number the platform's own sizing obeys;
-    the broker's figure is in the breakdown next to it.
+    Two figures in one slot, ``$10,000.00 / BP $20,000.00``. The BP is the
+    BROKER's REMAINING buying power -- what the broker will still let this account
+    buy RIGHT NOW -- and not the platform's own ceiling; the platform's tradable
+    balances are in the breakdown next to it, as 'Tradable' and 'Opt tradable'.
+
+    OPERATOR DECISION, 2026-09-08. It used to be the stock tradable balance, on
+    the reasoning that the platform's own sizing obeys that one. A TastyTrade
+    account with margin off then read ``$3,997.78 / BP $3,997.78`` -- tradable
+    equals the balance -- while holding ~$8k of positions its manual allocator had
+    bought at 2x. The badge was reporting a ceiling nobody was trading against;
+    the figure that was actually running out was the broker's, so that is the one
+    the slot shows.
 
     The pair is composed here rather than in ``header_balance`` because they are
     two independent readings that happen to be printed together: either can be
@@ -545,7 +559,7 @@ def header_badge_from_cache(accounts: Sequence[Tuple[int, str]], *,
     # date the same read two different ways.
     now = utcnow()
     balance = header_figure_from_cache(accounts, which='value', utcnow=lambda: now)
-    bp = header_figure_from_cache(accounts, which='tradable', utcnow=lambda: now)
+    bp = header_figure_from_cache(accounts, which='broker_bp', utcnow=lambda: now)
     return HeaderBalance(
         text=balance.text + HEADER_BP_PREFIX + bp.text,
         detail=balance.detail + HEADER_BP_DETAIL_FMT.format(detail=bp.detail),
@@ -606,11 +620,12 @@ def header_balance_breakdown(accounts: Sequence[Tuple[int, str]], *,
     by the same ``header_balance`` the badge uses, so a cell and the total can
     never describe the same cache entry in two different vocabularies.
 
-    FOUR figures because the badge's two do not explain themselves: a BP that is
-    not twice the balance could be a margin factor below the broker's multiplier,
-    a broker clamping its own buying power, or an option sleeve with different
-    leverage. Balance, stock BP, option BP and the broker's own BP, side by side
-    per account, is what makes that legible without opening the broker.
+    FOUR figures because the badge's two do not explain themselves: a broker BP
+    that is not twice the balance could be capacity already spent on positions, a
+    broker clamping its own buying power, or a platform margin factor set below
+    the broker's multiplier. Balance, the broker's remaining BP, and the
+    platform's stock and option ceilings, side by side per account, is what makes
+    that legible without opening the broker.
     """
     now = utcnow()
     lines: List[Tuple[str, AccountFigureViews]] = []
@@ -750,8 +765,8 @@ def _render_account_balance():
 
     THE BREAKDOWN. Under "All" the badge is one number standing for several
     accounts, and there was no way to see what it was made of. A menu hanging off
-    the badge lists each account's four figures -- balance, stock BP, option BP,
-    the broker's own BP -- and the total. It is only built when there is more than
+    the badge lists each account's four figures -- balance, the broker's remaining
+    BP, stock tradable, option tradable -- and the total. It is only built when there is more than
     one account in scope: with a single account selected there is nothing to break
     down and the header is exactly what it was.
     """
@@ -855,22 +870,26 @@ def _paint_breakdown(breakdown, accounts: Sequence[Tuple[int, str]]) -> None:
                         'gap-x-6 gap-y-1 items-center'):
                     # A blank cell over the account names, then the four headings.
                     # Without them the reader has four dollar figures and no way to
-                    # tell the stock BP from the broker's.
+                    # tell the broker's BP from the platform's two ceilings.
                     ui.label('')
                     for column in HEADER_BALANCE_BREAKDOWN_COLUMNS:
                         ui.label(column).classes(
                             'text-xs text-secondary-custom font-medium text-right')
                     for label, figures in view.lines:
                         ui.label(label).classes('text-xs text-secondary-custom')
-                        for cell in (figures.value, figures.tradable,
-                                     figures.option_tradable, figures.broker_bp):
+                        # BADGE FIGURE FIRST: the broker's BP sits next to the
+                        # balance because that pair IS the badge, and the menu is
+                        # read as its explanation. Tradable and Opt tradable follow
+                        # as the platform's own ceilings.
+                        for cell in (figures.value, figures.broker_bp,
+                                     figures.tradable, figures.option_tradable):
                             ui.label(cell.text).classes(
                                 'text-xs font-medium text-right'
                                 + ('' if cell.available else ' text-secondary-custom'))
                     # THE TOTAL BELONGS IN THE GRID. It is the one number the reader
                     # cross-checks against the badge, so it has to sit in the BALANCE
                     # track: drawn below the grid in its own justify-between row it
-                    # landed under 'Broker BP' and read as a total of that column.
+                    # landed under the last money column and read as a total of it.
                     # The three empty cells keep the row five wide.
                     ui.separator().classes('col-span-5')
                     ui.label(HEADER_BALANCE_TOTAL_LABEL).classes('text-xs font-bold')
