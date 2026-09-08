@@ -230,11 +230,63 @@ def fmp_live_cached(key: str, fetch_fn: Callable[[], Any],
     """
     if _is_ttl_frozen():
         return fetch_fn()
+    return _live_bulk_cache(ttl_seconds).get_or_call(key, fetch_fn)
+
+
+#: Returned by ``fmp_live_cache_get`` when a key is absent. A sentinel rather than
+#: ``None`` because ``None`` is a legitimate cached value for a symbol the provider
+#: has nothing for, and treating that as a miss re-fetches it on every screen.
+FMP_LIVE_CACHE_MISS = object()
+
+
+def _live_bulk_cache(ttl_seconds: float):
+    """The shared TTLCache for one TTL, created on first use. Internal."""
     with _LIVE_BULK_CACHES_LOCK:
         cache = _LIVE_BULK_CACHES.get(ttl_seconds)
         if cache is None:
             cache = _LIVE_BULK_CACHES[ttl_seconds] = TTLCache(ttl_seconds)
-    return cache.get_or_call(key, fetch_fn)
+    return cache
+
+
+def fmp_live_cache_enabled() -> bool:
+    """Whether the live memo is in play at all -- i.e. this is NOT a frozen backtest.
+
+    Exposed so a caller can decide whether a caching-shaped strategy is worth adopting.
+    The screener widens its fetch window to share one payload across passes, which pays
+    for itself only if the payload can be reused; in a frozen run the memo is inert, so
+    the wider window would be extra bytes bought for nothing.
+    """
+    return not _is_ttl_frozen()
+
+
+def fmp_live_cache_get(key: str, ttl_seconds: float = _FMP_LIVE_BULK_TTL_S):
+    """Read a live-cache entry WITHOUT fetching. ``FMP_LIVE_CACHE_MISS`` when absent.
+
+    ``fmp_live_cached`` fetches on a miss, which is right for one payload and wrong
+    for a BATCHED endpoint: to keep batching you must first know which members are
+    missing, and asking through get_or_call would fetch them one at a time. This is
+    the read half of that; ``fmp_live_cache_put`` is the write half.
+
+    A frozen (backtest) run always reports a miss, so the hermetic disk path is
+    reached exactly as before and nothing a backtest does is served from a live memo.
+    """
+    if _is_ttl_frozen():
+        return FMP_LIVE_CACHE_MISS
+    cache = _live_bulk_cache(ttl_seconds)
+    with cache._lock:                                    # noqa: SLF001 - same module
+        item = cache._store.get(key)                     # noqa: SLF001
+        if item is not None and cache._clock() < item[1]:  # noqa: SLF001
+            return item[0]
+    return FMP_LIVE_CACHE_MISS
+
+
+def fmp_live_cache_put(key: str, value, ttl_seconds: float = _FMP_LIVE_BULK_TTL_S) -> None:
+    """Store one entry a batched fetch produced. No-op in a frozen (backtest) run."""
+    if _is_ttl_frozen():
+        return
+    cache = _live_bulk_cache(ttl_seconds)
+    with cache._lock:                                    # noqa: SLF001 - same module
+        cache._store[key] = (value, cache._clock() + cache._ttl)   # noqa: SLF001
 
 
 # --- backtest-only disk cache for per-symbol FMP history payloads -----------

@@ -19,6 +19,13 @@ from ba2_common.logger import logger
 from ba2_common.config import get_app_setting
 
 
+#: How long an EMPTY history answer is remembered before the provider asks again.
+#: Minutes, not hours: an empty window is usually a weekend/holiday tail that will
+#: stay empty for a while, but it can also be a symbol whose first bar is about to
+#: publish, and the rule is that a transient absence must never become a permanent one.
+_EMPTY_HISTORY_MEMO_TTL_S = 600.0
+
+
 class FMPOHLCVProvider(MarketDataProviderInterface):
     """
     Financial Modeling Prep OHLCV data provider.
@@ -55,13 +62,15 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
     # Base URL for FMP API
     BASE_URL = "https://financialmodelingprep.com/api/v3"
     
-    def __init__(self):
+    def __init__(self, *, api_key: Optional[str] = None):
         """Initialize FMP OHLCV provider with caching support."""
         # Call parent __init__ to set up caching
         super().__init__()
         
         # Get API key from settings
-        self.api_key = get_app_setting("FMP_API_KEY")
+        # Maintenance tools can supply a key read from a read-only settings DB
+        # without initializing the application's writable database engine.
+        self.api_key = get_app_setting("FMP_API_KEY") if api_key is None else api_key
         
         if not self.api_key:
             raise ValueError(
@@ -163,7 +172,9 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
         logger.debug(f"FMP API request: {url} with params: {safe_params}")
 
         # Shared FMP GET with backoff retry on 429/5xx + transient errors.
-        from ba2_providers.fmp_common import fmp_http_get
+        from ba2_providers.fmp_common import (
+            FMP_LIVE_CACHE_MISS, fmp_http_get, fmp_live_cache_get, fmp_live_cache_put,
+        )
         import time as _time
         _empty = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
 
@@ -172,6 +183,22 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
         # re-request). fmp_http_get only backs off on HTTP errors (429/5xx), so the empty-200 isn't
         # retried there; do a few backoff'd re-GETs here (each reuses fmp_http_get's own 429/5xx
         # backoff + global rate-limit gate) before giving up.
+        # A WINDOW THAT REALLY IS EMPTY must not be re-asked all day. The retry below is
+        # right for a transient empty-200, but nothing recorded that we had just asked:
+        # prod logged SPY giving up 37 times on 2026-09-08 -- 111 HTTP calls and ~220
+        # seconds of backoff sleeping -- for a weekend tail with no new bars to return.
+        #
+        # SHORT, and deliberately not durable. The platform rule is never to cache a
+        # transient failure as permanent absence, so this remembers "asked recently and
+        # got nothing" for minutes, not for the session: real data appearing is picked up
+        # on the next expiry, while a refresh loop firing every few seconds stops being
+        # multiplied by three.
+        empty_key = f"fmp:empty-history:{symbol}:{params.get('from')}:{params.get('to')}"
+        if fmp_live_cache_get(empty_key, _EMPTY_HISTORY_MEMO_TTL_S) is not FMP_LIVE_CACHE_MISS:
+            logger.debug(f"FMP returned no history for {symbol} moments ago; not re-asking "
+                         f"until that memo expires")
+            return _empty
+
         historical = None
         for _attempt in range(3):
             response = fmp_http_get(url, params=params, symbol=symbol, endpoint="historical-price-full")
@@ -184,6 +211,7 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
                 _time.sleep(2.0 * (_attempt + 1))  # 2s, 4s
         if not historical:
             logger.warning(f"No 'historical' data from FMP for {symbol} after 3 attempts")
+            fmp_live_cache_put(empty_key, True, _EMPTY_HISTORY_MEMO_TTL_S)
             return _empty
         
         # Convert to DataFrame

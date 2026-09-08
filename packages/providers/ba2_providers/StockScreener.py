@@ -19,6 +19,22 @@ from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 
 
+#: ONE window per symbol per day, wide enough for every pass a screen makes.
+#:
+#: WHY A SINGLE WIDE WINDOW instead of the window each caller asks for. A screen calls
+#: _fetch_history_bulk three times with three different lookbacks -- volume/RVOL
+#: (``window + 10``, ~35d), the price-drop filter (``screener_price_drop_days``, a
+#: per-INSTANCE setting) and Weinstein (250d) -- and the cache key carried the exact
+#: from/to dates, so the same symbol was fetched once per pass, and again for every
+#: instance whose price-drop setting differed. Prod on 2026-09-08 ran 10 screens over
+#: universes of 1177/878/641/640/459/304/116/26/18 symbols: roughly 4,200 symbol-history
+#: fetches in a day, none of which could reuse each other.
+#:
+#: 250 (Weinstein) is the widest any pass needs today; 400 leaves room for a longer
+#: filter without re-fragmenting the cache, and the extra bars cost one payload rather
+#: than one request per pass.
+SCREENER_HISTORY_WINDOW_DAYS = 400
+
 class StockScreener:
     """
     Configurable stock screener with screen/enrich/rank pipeline.
@@ -413,7 +429,10 @@ class StockScreener:
         """
         import threading
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from ba2_providers.fmp_common import fmp_http_get, FMPError
+        from ba2_providers.fmp_common import (
+            FMP_LIVE_CACHE_MISS, FMPError, fmp_http_get, fmp_live_cache_enabled,
+            fmp_live_cache_get, fmp_live_cache_put,
+        )
 
         api_key = get_app_setting("FMP_API_KEY")
         if not api_key:
@@ -422,19 +441,47 @@ class StockScreener:
 
         # Re-anchor the window on as_of for the reconstructed path; live path uses now.
         anchor = self._as_of or datetime.now(timezone.utc)
-        from_date = (anchor - timedelta(days=lookback_days + 5)).strftime("%Y-%m-%d")
+        # FETCH WIDE, SERVE NARROW. The cache holds one window per symbol per day
+        # (SCREENER_HISTORY_WINDOW_DAYS) and every caller is sliced back to the lookback
+        # it asked for, so what each pass SEES is unchanged while what the screen FETCHES
+        # collapses from once-per-pass-per-instance to once-per-symbol-per-day.
+        # A caller asking for MORE than the shared window keeps its own wider key rather
+        # than being served short.
+        # LIVE ONLY. In a frozen backtest the memo is inert, so a wider window would be
+        # extra bytes bought for nothing -- and a grid mid-run must keep fetching exactly
+        # what it fetched before.
+        window_days = (max(int(lookback_days), SCREENER_HISTORY_WINDOW_DAYS)
+                       if fmp_live_cache_enabled() else int(lookback_days))
+        from_date = (anchor - timedelta(days=window_days + 5)).strftime("%Y-%m-%d")
         to_date = anchor.strftime("%Y-%m-%d")
         params_base = {"apikey": api_key, "from": from_date, "to": to_date}
+        cutoff = (anchor - timedelta(days=int(lookback_days) + 5)).strftime("%Y-%m-%d")
+
+        def _cache_key(sym: str) -> str:
+            return f"screener:ohlcv:{sym.upper()}:{from_date}:{to_date}"
+
+        # WARM FIRST, then batch only what is missing. Asking through fmp_live_cached
+        # per symbol would fetch the misses one at a time and turn a cold screen into
+        # 1,177 HTTP calls; peeking keeps the chunked endpoint for the cold path.
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        missing: List[str] = []
+        for sym in symbols:
+            hit = fmp_live_cache_get(_cache_key(sym))
+            if hit is FMP_LIVE_CACHE_MISS:
+                missing.append(sym)
+            else:
+                result[sym.upper()] = hit
+        if result:
+            logger.info(f"StockScreener: history cache hit for {len(result)}/{len(symbols)} "
+                        f"symbol(s); fetching {len(missing)}")
+        symbols = missing
 
         chunks = [symbols[i: i + chunk_size] for i in range(0, len(symbols), chunk_size)]
         total_chunks = len(chunks)
         log_every = max(1, total_chunks // 5)  # log ~5 times across the run
 
-        result: Dict[str, List[Dict[str, Any]]] = {}
         result_lock = threading.Lock()
         completed_count = 0
-
-        from ba2_providers.fmp_common import fmp_live_cached
 
         def fetch_chunk(chunk: List[str]):
             joined = ",".join(chunk)
@@ -444,11 +491,11 @@ class StockScreener:
                 # different as_of or lookback never reuses the wrong window. The thresholds that
                 # differ per instance (RVOL / Weinstein / price-drop) are computed FROM this
                 # payload afterwards, so every screener instance wants the identical response.
-                resp = fmp_live_cached(
-                    f"screener:ohlcv:{joined}:{from_date}:{to_date}",
-                    lambda: fmp_http_get(url, params=params_base,
-                                         endpoint="historical-price-full", timeout=15),
-                )
+                # The chunk is no longer the cache key -- each symbol in it is cached
+                # on its own below, so a differently-composed or differently-ordered
+                # chunk still reuses every symbol it shares with an earlier one.
+                resp = fmp_http_get(url, params=params_base,
+                                    endpoint="historical-price-full", timeout=15)
                 data = resp.json()
             except FMPError as e:
                 logger.warning(f"StockScreener: OHLCV chunk failed after retries: {e}")
@@ -466,6 +513,13 @@ class StockScreener:
                 bars = entry.get("historical", [])
                 # FMP returns newest-first; reverse to oldest-first
                 chunk_result[sym] = list(reversed(bars))
+                fmp_live_cache_put(_cache_key(sym), chunk_result[sym])
+            # A symbol the response omitted entirely is cached as EMPTY: the provider
+            # has nothing for it, and re-asking on every pass of every screen is the
+            # most expensive way to learn that. It expires with everything else.
+            for sym in chunk:
+                if sym.upper() not in chunk_result:
+                    fmp_live_cache_put(_cache_key(sym), [])
             return chunk_result
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -486,6 +540,12 @@ class StockScreener:
             f"StockScreener: bulk OHLCV fetched {len(result)}/{len(symbols)} "
             f"symbols ({from_date} to {to_date})"
         )
+        # SERVE NARROW. The cache holds the wide window; every caller gets exactly the
+        # lookback it asked for, so no pass sees bars it did not request and the RVOL
+        # and price-drop windows are the ones they always were.
+        if window_days != int(lookback_days):
+            result = {sym: [b for b in bars if (b.get("date") or "") >= cutoff]
+                      for sym, bars in result.items()}
         return result
 
     def _quotes_from_bars(
