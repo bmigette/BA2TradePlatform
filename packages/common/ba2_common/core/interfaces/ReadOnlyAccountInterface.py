@@ -44,16 +44,23 @@ def margin_factor_error(value: Any) -> Optional[str]:
     return None
 
 
+def effective_factor_for(factor: float, multiplier: float) -> float:
+    """What one dollar of balance may deploy with margin ON: min(factor, multiplier). Pure.
+
+    ``multiplier <= 1.0`` (a cash account) therefore yields 1.0 -- the broker will not
+    lend, so the factor has nothing to scale. ONE expression, so the ceiling
+    (``tradable_balance_for``) and the scaling factor an existing figure is multiplied
+    by (``ReadOnlyAccountInterface.effective_margin_factor``) can never disagree.
+    """
+    return min(float(factor), max(float(multiplier), 1.0))
+
+
 def tradable_balance_for(balance: float, *, margin_enabled: bool, factor: float,
                          multiplier: float) -> float:
-    """balance x min(factor, multiplier) with margin on; balance with it off. Pure.
-
-    ``multiplier <= 1.0`` (a cash account) therefore yields the plain balance even
-    with margin on -- the broker will not lend, so the factor has nothing to scale.
-    """
+    """balance x min(factor, multiplier) with margin on; balance with it off. Pure."""
     if not margin_enabled:
         return float(balance)
-    return float(balance) * min(float(factor), max(float(multiplier), 1.0))
+    return float(balance) * effective_factor_for(factor, multiplier)
 
 
 def over_exposure_threshold(balance: float, *, multiplier: float, factor: float) -> float:
@@ -63,8 +70,13 @@ def over_exposure_threshold(balance: float, *, multiplier: float, factor: float)
     Gross capacity is balance x multiplier; the platform intends to use
     balance x factor; what should still be left is the difference. A factor above
     the multiplier gives a negative threshold, which no remaining BP can be under.
+
+    Grouped as (gross capacity) - (intended exposure) rather than
+    balance x (multiplier - factor): each term is then the same product
+    ``tradable_balance_for`` computes, so the worked example is exact
+    (20000.0 - 18000.0 == 2000.0, where 10_000 * (2.0 - 1.8) is not).
     """
-    return float(balance) * (float(multiplier) - float(factor))
+    return float(balance) * float(multiplier) - float(balance) * float(factor)
 
 
 class ReadOnlyAccountInterface(ExtendableSettingsInterface):
@@ -318,11 +330,17 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     #
     # CONSEQUENCE FOR OVERRIDERS: an adapter that answers the PUBLIC accessor with a
     # constant instead of a snapshot field is NOT consulted by the tradable-balance
-    # path -- BacktestAccount.get_stock_margin_multiplier returns 1.0 while its
-    # snapshot publishes none, so a margin-enabled backtest would RAISE here rather
-    # than read that 1.0. Loudly, not silently, and backtest leverage is an explicit
-    # follow-up in the design; an adapter that needs to be heard here should publish
-    # the figure on its snapshot (or override these helpers) rather than the accessor.
+    # path -- it would RAISE here on the unpublished figure instead. Loudly, not
+    # silently; an adapter that needs to be heard here publishes the figure on its
+    # snapshot (or overrides these helpers), never the accessor alone. BacktestAccount
+    # used to override the accessor and now publishes multiplier 1.0 in
+    # get_account_info() for exactly this reason.
+    #
+    # The OPTION path is the same shape for the same reason: it reads
+    # ``snapshot.option_buying_power`` off the snapshot it already took, so an adapter
+    # that overrides ``get_option_buying_power()`` without publishing the field is
+    # likewise not consulted. (The option MULTIPLIER is the exception: it is a platform
+    # constant, not a snapshot field, so ``get_option_margin_multiplier()`` IS called.)
     def _stock_multiplier_from(self, snapshot: AccountSnapshot) -> float:
         """``get_stock_margin_multiplier``'s body, against a snapshot already taken."""
         multiplier = snapshot.margin_multiplier
@@ -346,7 +364,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """The broker's stock leverage: dollars of buying power per dollar of equity.
 
         Alpaca publishes it as ``TradeAccount.multiplier``; TastyTrade derives 2.0/1.0
-        from ``margin_or_cash``; the backtest account overrides to 1.0. RAISES when the
+        from ``margin_or_cash``; the backtest account publishes 1.0. RAISES when the
         broker published none (IBKR): this number scales position sizes, and a guessed
         multiplier is a guessed order.
         """
@@ -405,22 +423,37 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 f"account {self.id} ({type(self).__name__}): balance unavailable")
         return float(balance)
 
-    def _tradable_balance(self, *, asset: str, multiplier: float,
-                          remaining_bp: Optional[float], bp_known: bool) -> float:
-        """The margin-on branch shared by stock and options.
+    def _effective_factor(self, *, asset: str, balance: float, multiplier: float,
+                          remaining_bp: Optional[float]) -> float:
+        """min(margin_factor, broker multiplier) for this asset class, with the
+        non-marginable and over-exposure diagnostics. Margin is known to be ON here.
 
-        Takes the broker figures as ARGUMENTS and never re-reads the snapshot: its
+        Takes the broker figures as ARGUMENTS and never reads the snapshot itself: its
         caller has already taken exactly one (see ``_stock_multiplier_from``).
+        ``remaining_bp is None`` means the broker published no buying power for this
+        asset class -- its only consumer is the over-exposure warning, which then skips
+        itself and says so.
         """
-        balance = self._plain_balance()
         factor = self._margin_factor()
         if multiplier <= 1.0:
-            logger.warning(
-                f"[Account {self.id}] margin_enabled but the broker reports a non-marginable "
-                f"{asset} account (multiplier {multiplier:g}); tradable {asset} balance stays at "
-                f"the balance ${balance:,.2f}")
-            return float(balance)
-        if not bp_known:
+            if asset == "stock":
+                # An anomaly worth a WARNING: margin was enabled on an account the broker
+                # will not lend against (a cash account), so the factor scales nothing.
+                logger.warning(
+                    f"[Account {self.id}] margin_enabled but the broker reports a non-marginable "
+                    f"{asset} account (multiplier {multiplier:g}); tradable {asset} balance stays at "
+                    f"the balance ${balance:,.2f}")
+            else:
+                # NOT an anomaly: 1.0 is the platform's OWN option default -- long options
+                # are cash-settled at every supported broker and no adapter overrides
+                # get_option_margin_multiplier -- so this is the normal option path, and a
+                # warning here would cry broker anomaly on every single option call.
+                logger.debug(
+                    f"[Account {self.id}] options are cash-settled here (option multiplier "
+                    f"{multiplier:g}); tradable option balance stays at the balance "
+                    f"${balance:,.2f}")
+            return 1.0
+        if remaining_bp is None:
             logger.debug(f"[Account {self.id}] no {asset} buying power published; "
                          f"over-exposure check skipped")
         else:
@@ -431,8 +464,32 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     f"broker buying power ${remaining_bp:,.2f} < ${threshold:,.2f} "
                     f"(balance ${balance:,.2f} x (multiplier {multiplier:g} - factor {factor:g})). "
                     f"Something outside the experts (allocator, manual trades) consumed it.")
-        return tradable_balance_for(balance, margin_enabled=True, factor=factor,
-                                    multiplier=multiplier)
+        return effective_factor_for(factor, multiplier)
+
+    def _tradable_balance(self, *, asset: str, balance: float, multiplier: float,
+                          remaining_bp: Optional[float]) -> float:
+        """The margin-on branch shared by stock and options: balance x the factor."""
+        return float(balance) * self._effective_factor(
+            asset=asset, balance=balance, multiplier=multiplier, remaining_bp=remaining_bp)
+
+    def effective_margin_factor(self) -> float:
+        """tradable STOCK balance / balance: 1.0 with margin off (no snapshot read),
+        else min(margin_factor, broker stock multiplier), 1.0 on a cash account.
+
+        For callers that must SCALE a figure they already hold rather than replace it:
+        the position-size cap keeps its equity denominator and multiplies by this
+        (so a backtest, where balance is spendable cash by design, stays byte-identical
+        with margin off), and the live-trades page divides a position's value by it to
+        show the capital it actually consumes. Same reads and same diagnostics as
+        ``get_tradable_balance``.
+        """
+        if not self._margin_enabled():
+            return 1.0
+        balance = self._plain_balance()
+        snapshot = self.get_account_snapshot()
+        return self._effective_factor(asset="stock", balance=balance,
+                                      multiplier=self._stock_multiplier_from(snapshot),
+                                      remaining_bp=self._buying_power_from(snapshot))
 
     def get_tradable_balance(self) -> float:
         """What this account's experts may deploy in STOCK, in dollars.
@@ -451,10 +508,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         if not self._margin_enabled():
             return self._plain_balance()
+        # The balance FIRST: an account that cannot say what it holds must refuse
+        # without spending a broker round trip to be told a multiplier it cannot use.
+        balance = self._plain_balance()
         snapshot = self.get_account_snapshot()
         return self._tradable_balance(
-            asset="stock", multiplier=self._stock_multiplier_from(snapshot),
-            remaining_bp=self._buying_power_from(snapshot), bp_known=True)
+            asset="stock", balance=balance,
+            multiplier=self._stock_multiplier_from(snapshot),
+            remaining_bp=self._buying_power_from(snapshot))
 
     def get_option_tradable_balance(self) -> float:
         """Same as ``get_tradable_balance`` for OPTIONS, with the option multiplier.
@@ -471,11 +532,12 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         if not self._margin_enabled():
             return self._plain_balance()
+        balance = self._plain_balance()          # before the snapshot; see get_tradable_balance
         snapshot = self.get_account_snapshot()
-        option_bp = snapshot.option_buying_power
         return self._tradable_balance(
-            asset="option", multiplier=self.get_option_margin_multiplier(),
-            remaining_bp=option_bp, bp_known=option_bp is not None)
+            asset="option", balance=balance,
+            multiplier=self.get_option_margin_multiplier(),
+            remaining_bp=snapshot.option_buying_power)
 
     def get_cash_transfers(
         self,

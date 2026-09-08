@@ -17,6 +17,7 @@ import pytest
 from ba2_common.core.account_types import AccountSnapshot
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import (
     ReadOnlyAccountInterface, tradable_balance_for, over_exposure_threshold,
+    effective_factor_for,
 )
 
 
@@ -39,7 +40,17 @@ def test_non_marginable_account_is_the_balance():
 
 
 def test_threshold_is_balance_times_multiplier_minus_factor():
-    assert over_exposure_threshold(10_000.0, multiplier=2.0, factor=1.8) == pytest.approx(2_000.0)
+    # EXACT, not approx: grouped as (gross capacity) - (intended exposure), each term
+    # the same product tradable_balance_for computes. 10_000 * (2.0 - 1.8) is not.
+    assert over_exposure_threshold(10_000.0, multiplier=2.0, factor=1.8) == 2_000.0
+
+
+def test_tradable_balance_equals_balance_times_effective_factor():
+    """ONE expression behind both, so the ceiling and the scaling factor cannot drift."""
+    for factor, multiplier in ((1.8, 2.0), (1.8, 1.5), (1.8, 1.0), (1.0, 4.0)):
+        assert (tradable_balance_for(10_000.0, margin_enabled=True, factor=factor,
+                                     multiplier=multiplier)
+                == 10_000.0 * effective_factor_for(factor, multiplier))
 
 
 def test_threshold_is_negative_when_factor_exceeds_multiplier():
@@ -181,6 +192,25 @@ def test_on_with_cash_account_returns_balance_and_warns(records):
                for lvl, msg in records)
 
 
+def test_option_default_multiplier_is_a_debug_line_not_a_warning(records):
+    """1.0 is the PLATFORM's own option default (no adapter overrides it), so the
+    ordinary option path must not report a broker anomaly on every single call."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    assert acct.get_option_tradable_balance() == 10_000.0
+    assert not any(lvl >= logging.WARNING for lvl, _ in records)
+    hits = [msg for lvl, msg in records
+            if lvl == logging.DEBUG and "cash-settled" in msg]
+    assert len(hits) == 1 and "Account 3" in hits[0]
+
+
+def test_option_side_reads_the_snapshot_exactly_once():
+    """Same one-read rule as the stock side: option buying power comes off the snapshot
+    already taken, not from a second round trip."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    acct.get_option_tradable_balance()
+    assert acct.snapshot_calls == 1
+
+
 def test_on_raises_when_balance_unknown():
     acct = _Stub(balance=None, snapshot=LEVERED, settings=ON)
     with pytest.raises(ValueError, match="balance"):
@@ -225,3 +255,30 @@ def test_option_over_exposure_is_skipped_with_a_debug_line_when_option_bp_unknow
     assert acct.get_option_tradable_balance() == 18_000.0
     assert not any(lvl >= logging.WARNING for lvl, _ in records)
     assert any(lvl == logging.DEBUG and "option buying power" in msg for lvl, msg in records)
+
+
+# ----- effective_margin_factor ---------------------------------------------
+
+def test_effective_factor_is_one_with_margin_off_and_no_snapshot_read():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=OFF)
+    assert acct.effective_margin_factor() == 1.0
+    assert acct.snapshot_calls == 0
+
+
+def test_effective_factor_is_min_of_factor_and_multiplier():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)           # 1.8 vs 2.0
+    assert acct.effective_margin_factor() == 1.8
+    lower = AccountSnapshot(margin_multiplier=1.5, buying_power=15_000.0)   # 1.8 vs 1.5
+    assert _Stub(balance=10_000.0, snapshot=lower, settings=ON).effective_margin_factor() == 1.5
+
+
+def test_effective_factor_is_one_on_a_cash_account():
+    cash = AccountSnapshot(margin_multiplier=1.0, buying_power=10_000.0)
+    assert _Stub(balance=10_000.0, snapshot=cash, settings=ON).effective_margin_factor() == 1.0
+
+
+def test_effective_factor_scales_the_balance_to_the_tradable_balance():
+    """The account-level pin on the same identity the pure test above makes: a caller
+    that SCALES a figure it already holds lands where get_tradable_balance does."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    assert 10_000.0 * acct.effective_margin_factor() == acct.get_tradable_balance()

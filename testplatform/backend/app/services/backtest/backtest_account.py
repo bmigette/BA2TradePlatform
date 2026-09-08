@@ -1852,17 +1852,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """
         return self.equity()
 
-    def get_stock_margin_multiplier(self) -> float:
-        """The simulator runs unlevered. Backtests that need leverage are run with a
-        larger starting balance (operator decision, 2026-09-08 design).
-
-        Stated explicitly because the base interface RAISES on an unpublished
-        multiplier, and this account publishes none in its snapshot.
-        """
-        return 1.0
-
     def get_account_info(self) -> Dict[str, Any]:
-        """Account info dict; exposes ``.equity`` (read by _validate_position_size_limits)."""
+        """Account info dict; exposes ``.equity`` (read by _validate_position_size_limits).
+
+        ``multiplier``: the simulator runs UNLEVERED, and it says so on the SNAPSHOT
+        rather than by overriding ``get_stock_margin_multiplier()``. Publishing the
+        figure is the contract every margin accessor reads -- the base's
+        tradable-balance path derives the multiplier from the snapshot, so an override
+        of the public accessor is simply not consulted and a margin-enabled backtest
+        would raise "published no usable stock margin multiplier". One published 1.0
+        answers all of them: the accessor, the tradable balance, and the portfolio
+        allocator, whose ``default_bp_factor`` now becomes 1.0 explicitly instead of by
+        way of its "broker published no margin multiplier" warning -- numerically the
+        same number, no longer a reported anomaly. Backtests that need leverage are run
+        with a larger starting balance (operator decision, 2026-09-08 design).
+        """
         eq = self.deployed_equity()
         cash = self.get_balance()
         return _AttrDict(
@@ -1871,6 +1875,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 "cash": cash,
                 "equity": eq,
                 "buying_power": max(cash, 0.0),
+                "multiplier": 1.0,
             }
         )
 

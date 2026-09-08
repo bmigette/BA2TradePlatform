@@ -258,8 +258,9 @@ def test_market_order_fills_and_updates_ledger():
 
 
 def test_stock_margin_multiplier_is_one_the_simulator_is_unlevered():
-    """The base interface RAISES when no broker multiplier was published (the simulator
-    publishes none), so the account states its own: 1.0, unlevered."""
+    """The simulator is unlevered and PUBLISHES that on its snapshot, which is where
+    every margin accessor reads it from (an override of the public accessor alone is
+    not consulted by the tradable-balance path)."""
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.price_source import AsOfPriceSource
 
@@ -269,6 +270,9 @@ def test_stock_margin_multiplier_is_one_the_simulator_is_unlevered():
     acct = BacktestAccount(999, ps, CFG)  # no DB needed: the multiplier is a constant
 
     assert acct.get_stock_margin_multiplier() == 1.0
-    # The override is load-bearing, not decorative: the simulator's snapshot carries no
-    # multiplier at all, so without it this call would raise rather than answer 1.0.
-    assert acct.get_account_snapshot().margin_multiplier is None
+    # ... and it is the SNAPSHOT that says so, so the accessor, the tradable balance and
+    # the allocator's default_bp_factor all read the one published figure.
+    assert acct.get_account_snapshot().margin_multiplier == 1.0
+    # Margin off (the default) leaves backtest behaviour byte-identical: the tradable
+    # balance IS the balance, which on this account is spendable cash by design.
+    assert acct.get_tradable_balance() == acct.get_balance()
