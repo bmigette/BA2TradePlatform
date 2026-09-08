@@ -8211,3 +8211,35 @@ def _page_source_text():
 def _ui():
     from nicegui import ui
     return ui
+
+
+def test_EVERY_price_fetch_on_this_page_asks_for_the_mark():
+    """Two fetches price this page and BOTH must be valuations.
+
+    ``build_position_states`` prices the wizard; ``_load_view_payload`` prices the label
+    table. The seam defaults to 'bid', and on 2026-09-08 fixing only the first left MAGY
+    still reading 16.86 against a 42.20 mark on the very screen the discrepancy was reported
+    from -- a 60% understated value driving that row's weight and its next order.
+
+    Asserted by READING THE SOURCE rather than by driving the page, deliberately: the point is
+    that no call site is left on the default, and a behavioural test can only ever cover the
+    ones it happens to exercise. A third fetch added tomorrow fails this the moment it lands.
+    """
+    import inspect
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    sources = {
+        "portfolio_allocation.py::_load_view_payload": inspect.getsource(page._load_view_payload),
+        "portfolio_allocation_service.py::build_position_states":
+            inspect.getsource(svc.build_position_states),
+    }
+    for where, code in sources.items():
+        calls = [ln for ln in code.splitlines() if "get_instrument_current_price(" in ln]
+        assert calls, f"{where}: expected a price fetch here"
+        for call in calls:
+            assert "price_type=" in call, (
+                f"{where}: {call.strip()!r} takes the seam's DEFAULT, which is 'bid' -- what a "
+                f"forced sale would fetch, not what the holding is worth")
+            assert "'mark'" in call or '"mark"' in call, (
+                f"{where}: {call.strip()!r} must value at the mark, the price the broker's own "
+                f"net liq is struck at")

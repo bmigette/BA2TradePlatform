@@ -279,7 +279,12 @@ def _load_view_payload(account_id: int, valuation_mode: str,
 
     prices: Dict[str, Optional[float]] = {}
     if symbols:
-        fetched = account.get_instrument_current_price(symbols)
+        # THE MARK, EXPLICITLY -- see build_position_states for the full reasoning. This is
+        # the SECOND price fetch on this page: the wizard prices through
+        # build_position_states, the label table prices here, and fixing only the first left
+        # MAGY still reading 16.86 on the very screen the discrepancy was reported from.
+        # Both are valuations and both must ask for the same thing.
+        fetched = account.get_instrument_current_price(symbols, price_type='mark')
         if isinstance(fetched, dict):
             prices = dict(fetched)
         else:
