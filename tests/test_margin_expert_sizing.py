@@ -165,6 +165,23 @@ def test_trade_action_virtual_equity_is_none_not_a_number_when_tradable_raises()
     assert action._virtual_equity() is None
 
 
+def test_trade_action_virtual_equity_propagates_a_NON_benign_error(monkeypatch):
+    """ValueError is the NAMED "unknown balance" signal and yields None. A TypeError is a
+    DEFECT, and absorbing it would size every option entry off a silent None instead of
+    surfacing the bug. Under enforce it must come straight back out."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+
+    class _Defective(_Account):
+        def get_option_tradable_balance(self):
+            raise TypeError("defect")
+
+    action = _option_entry_action(
+        _Defective(1, balance=10_000.0, tradable=None, buying_power=None))
+
+    with pytest.raises(TypeError, match="defect"):
+        action._virtual_equity()
+
+
 # --- the account-level per-instrument cap ----------------------------------
 
 class _ExpertWithMoney:

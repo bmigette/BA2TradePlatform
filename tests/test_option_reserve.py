@@ -1,3 +1,5 @@
+import pytest
+
 from ba2_common.core import trade_store as ts
 from ba2_trade_platform.core.interfaces.OptionsAccountInterface import OptionsAccountInterface as OAI
 from ba2_trade_platform.core.db import add_instance
@@ -125,3 +127,19 @@ def test_available_option_buying_power_is_none_when_the_option_tradable_balance_
     assert mock_account.available_option_buying_power() is None
     assert mock_account.check_option_buying_power(1.0) is False
     assert any("balance unavailable" in m for m in errors), errors
+    # WHICH account could not be read: a log line that does not name it cannot be acted on.
+    assert any(f"Account {mock_account.id}" in m for m in errors), errors
+
+
+def test_a_NON_benign_tradable_balance_error_propagates(mock_account, monkeypatch):
+    """ValueError is the NAMED "unknown balance" signal and yields None. A TypeError is a
+    DEFECT: absorbing it would disable the option sleeve for ever while every gate reported
+    a tidy "unavailable". Under enforce it must come straight back out."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+
+    def _defect():
+        raise TypeError("defect")
+    monkeypatch.setattr(mock_account, "get_option_tradable_balance", _defect)
+
+    with pytest.raises(TypeError, match="defect"):
+        mock_account.available_option_buying_power()

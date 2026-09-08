@@ -2551,18 +2551,24 @@ class OptionsAccountInterface(ABC):
         with margin off or on this equals the plain balance until an adapter reports real
         option leverage.
         """
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.logger import logger
+
         pool = self.reserved_option_buying_power_detail()
         if not pool.is_measurable:
             return None
         try:
             bal = self.get_option_tradable_balance()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
             # get_option_tradable_balance RAISES on an unknown balance/multiplier where
             # the old get_balance() returned None; this contract is None-for-unknown (the
             # gates refuse on None), so the raise is translated here -- and LOGGED, because
             # an unknown that is merely swallowed is a silent failure.
-            from ba2_common.logger import logger
-            logger.error(f"[Account {self.id}] option tradable balance unavailable: {e}",
+            # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
+            # signal ``_plain_balance``/``_margin_factor`` raise; any other exception is a
+            # defect, and swallowing it would silently disable the whole option sleeve.
+            absorb_if_benign(e, ValueError, *self._cover_benign_errors())
+            logger.error(f"Account {self.id}: option tradable balance unavailable: {e}",
                          exc_info=True)
             return None
         return bal - pool.total
@@ -2797,7 +2803,9 @@ class OptionsAccountInterface(ABC):
         of this same method, so the gate and the message a refusal carries can never
         disagree about why.
 
-        Measured against the BALANCE, never against ``available_option_buying_power()``:
+        Measured against the account's settled CASH (``cash_available_for_delivery``) --
+        deliberately UNLEVERED, because delivery is paid in cash and option leverage does
+        not fund it -- and never against ``available_option_buying_power()``:
         the reserve pool has already subtracted the very CSP strikes this total is
         charging, so netting the two would double-charge the same cash and refuse a
         fully funded wheel at exactly the size it is funded for.

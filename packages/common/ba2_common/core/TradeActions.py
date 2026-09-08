@@ -2322,7 +2322,11 @@ class _OptionEntryAction(TradeAction):
         margin. None when the account cannot answer, never a guess."""
         try:
             balance = self.account.get_option_tradable_balance()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
+            # signal the tradable-balance path raises. Anything else is a defect, and
+            # absorbing it here would size every option entry off a silent None.
+            absorb_if_benign(e, ValueError)
             logger.error(f"_virtual_equity: option tradable balance unavailable for "
                          f"account {self.account.id}: {e}", exc_info=True)
             return None
