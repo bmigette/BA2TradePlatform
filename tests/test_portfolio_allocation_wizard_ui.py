@@ -2660,6 +2660,10 @@ def test_the_header_and_the_cells_cannot_DRIFT_out_of_step():
     wiz = _wiz()
     names = [name for name, _h, _w, _n in wiz.DRY_RUN_COLUMNS]
 
+    # 18 since 2026-09-08: 'Result' was added before 'Reasons'. The dialog no longer
+    # closes on Submit and hands over to a separate results table -- it stays open and
+    # each row reports its own order on its own line, which needs a column to say it in.
+    #
     # 17 since 2026-09-07: 'Cap req' was added beside 'BP effect'. They had been one
     # column holding the trade's buying-power delta; the capital a POSITION ties up
     # (projected value x margin rate) is a different number answering a different
@@ -2668,7 +2672,7 @@ def test_the_header_and_the_cells_cannot_DRIFT_out_of_step():
     # 16 before that, since 2026-09-05: Order and Sizing collapsed into one column
     # (they said the same word on every trading row) and Outcome was removed, its
     # abnormal values moving into Reasons in red.
-    assert len(names) == len(set(names)) == 17
+    assert len(names) == len(set(names)) == 18
     with pytest.raises(KeyError):
         wiz._col('a-column-the-header-does-not-declare')
 
@@ -2822,3 +2826,81 @@ def test_a_target_block_that_clears_on_refresh_re_enables_submit(nicegui_client)
 
     assert drawn == []
     assert wizard._submit_button.enabled is True
+
+
+class TestTheDialogStaysOpenThroughASubmit:
+    """It used to close the instant Submit was pressed. Requested 2026-09-08."""
+
+    def _wizard(self):
+        # object.__new__, the idiom this file already uses to exercise one method of
+        # the wizard without building a dialog (see the submit-gate test).
+        wiz = object.__new__(_wiz().AllocationWizard)
+        wiz._result_cells = {}
+        wiz._submit_button = _FakeElement()
+        wiz._refresh_button = _FakeElement()
+        wiz._submit_summary = _FakeElement()
+        return wiz
+
+    def test_begin_submit_locks_what_could_change_the_plan(self):
+        """Submit and Refresh both go: a refresh re-renders every row and would throw
+        away the Result cells the run is writing into."""
+        wiz = self._wizard()
+        wiz.begin_submit()
+        assert wiz._submit_button.enabled is False
+        assert wiz._refresh_button.enabled is False
+
+    def test_every_row_says_it_is_sending_before_the_first_order_lands(self):
+        """So the table shows the whole plan queued, rather than appearing to do
+        nothing until the first order comes back."""
+        wiz = self._wizard()
+        wiz._result_cells = {'AAA': _FakeElement(), 'BBB': _FakeElement()}
+        wiz.begin_submit()
+        assert [c.text for c in wiz._result_cells.values()] == \
+               [_wiz().SUBMIT_PENDING_TEXT] * 2
+
+    def test_a_row_reports_on_its_own_line(self):
+        wiz = self._wizard()
+        cell = _FakeElement()
+        wiz._result_cells = {'AAA': cell}
+        wiz.set_row_result('AAA', 'sent', 'text-green-500')
+        assert cell.text == 'sent' and 'text-green-500' in cell.classes_replaced
+
+    def test_an_unknown_symbol_is_ignored_rather_than_raising(self):
+        """The run reports on every row of the plan; the table only holds the rows
+        worth showing (a row already on target is not drawn). Raising here would
+        abandon the painting of the rows that ARE on screen."""
+        wiz = self._wizard()
+        wiz.set_row_result('NOPE', 'sent', 'text-green-500')
+
+    def test_finish_lets_the_user_refresh_but_not_resubmit(self):
+        """This plan has been sent and there is nothing left to send; re-solving is
+        exactly what a user does next after a partial run."""
+        wiz = self._wizard()
+        wiz.begin_submit()
+        wiz.finish_submit('Run 3: 2 sent.')
+        assert wiz._refresh_button.enabled is True
+        assert wiz._submit_button.enabled is False
+        assert wiz._submit_summary.text == 'Run 3: 2 sent.'
+        assert wiz._submit_summary.visible is True
+
+
+class _FakeElement:
+    def __init__(self):
+        self.enabled = True
+        self.text = None
+        self.visible = None
+        self.classes_replaced = ''
+
+    def set_enabled(self, value):
+        self.enabled = value
+
+    def set_text(self, value):
+        self.text = value
+
+    def set_visibility(self, value):
+        self.visible = value
+
+    def classes(self, replace=None, **_kw):
+        if replace is not None:
+            self.classes_replaced = replace
+        return self

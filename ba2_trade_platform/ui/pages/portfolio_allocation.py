@@ -164,8 +164,10 @@ from ..utils.portfolio_allocation_view import (
     label_total_readout,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     important_color_style,
-    format_pnl_caption_parts, missing_quote_symbols, picker_options, pnl_classes,
-    pnl_color, pnl_div_classes, pnl_div_color,
+    SUBMIT_FAILED_FMT, format_pnl_caption_parts, missing_quote_symbols,
+    picker_options, pnl_classes,
+    pnl_color, pnl_div_classes, pnl_div_color, submit_result_cell,
+    submit_summary_line,
     positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
     sort_label_views, store_color_value,
@@ -665,7 +667,8 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
     return base, plan, current, svc.fetch_market_hours(account)
 
 
-def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label):
+def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label,
+                 on_outcome=None):
     """Submit a reviewed plan. Blocking. The service re-checks the market gate."""
     from ...core.utils import get_account_instance_from_id
 
@@ -673,7 +676,7 @@ def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
     return svc.run_allocation(account, plan, current, base, mode=mode,
-                              scope_label=scope_label)
+                              scope_label=scope_label, on_outcome=on_outcome)
 
 
 def _load_income_panel(account_id: int):
@@ -3585,23 +3588,60 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             return svc.validate_plan(get_account_instance_from_id(account_id),
                                      selected_plan)
 
-        open_allocation_wizard(new_base, plan, market=_market_gate_for(hours),
-                               on_refresh=_on_refresh, on_submit=_on_submit,
-                               on_validate=_on_validate)
+        # HELD, because the dialog no longer closes on Submit: the run reports each
+        # row's outcome back into this table while it is still on screen.
+        state['wizard'] = open_allocation_wizard(
+            new_base, plan, market=_market_gate_for(hours),
+            on_refresh=_on_refresh, on_submit=_on_submit, on_validate=_on_validate)
 
     async def _do_submit(selected_plan) -> None:
+        # THE WORKER RECORDS, THE TIMER PAINTS -- the same split the Review bar uses,
+        # and for the same reason: run_allocation executes in asyncio.to_thread, where
+        # a NiceGUI element has no client context.
+        wizard = state.get('wizard')
+        landed: List[Any] = []
+        painted = 0
+
+        def _record(outcome) -> None:
+            landed.append(outcome)
+
+        def _paint() -> None:
+            nonlocal painted
+            if wizard is None:
+                return
+            while painted < len(landed):
+                outcome = landed[painted]
+                painted += 1
+                text, classes = submit_result_cell(outcome)
+                wizard.set_row_result(outcome.symbol, text, classes)
+
+        # Only when there is somewhere to paint. A caller without a wizard -- the
+        # invest-scope path, and every test that drives _do_submit directly -- has no
+        # rows to mark, and a timer serving nothing is a timer to leak.
+        painter = ui.timer(0.2, _paint) if wizard is not None else None
         try:
             result = await asyncio.to_thread(
                 _submit_plan, account_id, selected_plan, state['current'],
-                state['base'], mode=state['mode'], scope_label=state['scope_label'])
+                state['base'], mode=state['mode'], scope_label=state['scope_label'],
+                on_outcome=_record)
         except Exception as e:
             logger.error(f"Allocation submission failed: {e}", exc_info=True)
             ui.notify(f'Submission failed: {e}', type='negative')
+            if wizard is not None:
+                wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e))
             return
+        finally:
+            # One last pass BEFORE the timer stops, or the rows that landed in the
+            # final 200ms never get painted at all.
+            _paint()
+            if painter is not None:
+                painter.deactivate()
         if result['blocked']:
             # The service re-checked the gate on its own, freshly: this dialog can
             # sit open across 16:00 and the banner it was built with is now stale.
             ui.notify(result['blocked_reason'], type='warning')
+            if wizard is not None:
+                wizard.finish_submit(result['blocked_reason'])
             return
         def _on_retry(symbols) -> None:
             """"Retry the N that failed": re-solve and open a FRESH dry run.
@@ -3617,6 +3657,9 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                         f"row(s) on account {account_id}: {', '.join(symbols)}")
             ui.timer(0.1, _run_dry_run, once=True)
 
+        if wizard is not None:
+            wizard.finish_submit(submit_summary_line(result['outcomes'],
+                                                     run_id=result['run_id']))
         render_outcomes(result['outcomes'], run_id=result['run_id'],
                         on_retry=_on_retry)
         note = working_orders_notice(settled=result['settled'],
