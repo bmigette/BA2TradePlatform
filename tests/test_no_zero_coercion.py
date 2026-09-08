@@ -431,7 +431,11 @@ BASELINE: dict = {
     # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 11,
-    "ba2_trade_platform/modules/accounts/IBKRAccount.py": 2,
+    # IBKRAccount.py LEFT the register 2026-09-08: both of its coercions lived in
+    # ``get_cash_balance``/``get_buying_power``, two callerless readers that fabricated
+    # 0.0 on error. They were deleted (``get_buying_power`` had also started shadowing
+    # the base contract, which raises rather than inventing a balance), so the file now
+    # measures 0 and drops out -- BASELINE carries no zeroes. Total below drops by 2.
     "ba2_trade_platform/modules/accounts/TastyTradeAccount.py": 5,
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
     # 17 -> 16: the invested-series accumulator now SKIPS a trade with no qty or
@@ -476,7 +480,7 @@ BASELINE: dict = {
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 171
+BASELINE_TOTAL = 169
 
 
 # =========================================================================== #

@@ -245,24 +245,6 @@ class IBKRAccount(AccountInterface):
             logger.error(f"Error getting IBKR account info: {e}", exc_info=True)
             raise
     
-    def get_cash_balance(self) -> float:
-        """Get available cash balance"""
-        try:
-            account_info = self.get_account_info()
-            return account_info.get("cash", 0.0)
-        except Exception as e:
-            logger.error(f"Error getting cash balance: {e}", exc_info=True)
-            return 0.0
-    
-    def get_buying_power(self) -> float:
-        """Get buying power (available for trading)"""
-        try:
-            account_info = self.get_account_info()
-            return account_info.get("buying_power", 0.0)
-        except Exception as e:
-            logger.error(f"Error getting buying power: {e}", exc_info=True)
-            return 0.0
-    
     def get_positions(self, with_orders: bool = False) -> Optional[List[Position]]:
         """
         Get all positions from IBKR.
