@@ -1201,7 +1201,14 @@ class ClickLatch:
         self.busy = True
         if self.button is not None:
             self.button.set_enabled(False)
-            self.button.props('loading')
+            # `loading` REPLACES the button's content with a spinner -- label, icon and
+            # any child it holds. With a progress bar living inside the button that
+            # swallowed the bar whole, which is why the button showed a spinner and no
+            # progress at all. Where there IS a bar the bar is the better affordance
+            # anyway: it keeps the label readable and says how far along the work is,
+            # which a spinner cannot. The spinner stays for a latch with no bar.
+            if self.progress is None:
+                self.button.props('loading')
         if self.progress is not None:
             # Back to empty first: a bar that opens at last run's 100% reads as
             # "already finished" for the second or two before the first symbol lands.
@@ -1217,7 +1224,8 @@ class ClickLatch:
             if self.progress is not None:
                 self.progress.set_visibility(False)
             if self.button is not None:
-                self.button.props(remove='loading')
+                if self.progress is None:
+                    self.button.props(remove='loading')
                 self.button.set_enabled(True)
         return True
 
@@ -3683,13 +3691,27 @@ async def content() -> None:
         #
         # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
         # elsewhere on the page sit in forms where their natural height is right.
+        # `!important` throughout, and that is not laziness. Quasar sets these heights
+        # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
+        # anything scoped to this toolbar by one class -- so the winner is decided by
+        # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
+        # attempt at this had no effect whatsoever for that reason.
+        #
+        # The field's own top padding is what makes the box taller than a button even
+        # once the control is pinned, so it is zeroed here too.
         ui.add_css(f'''
-            .{TOOLBAR_CLASS} .q-field__control {{ min-height: {TOOLBAR_CONTROL_PX}px;
-                                                  height: {TOOLBAR_CONTROL_PX}px; }}
-            .{TOOLBAR_CLASS} .q-field__marginal {{ height: {TOOLBAR_CONTROL_PX}px; }}
-            .{TOOLBAR_CLASS} .q-field__native {{ padding-top: 0; padding-bottom: 0; }}
-            .{TOOLBAR_CLASS} .q-btn {{ min-height: {TOOLBAR_CONTROL_PX}px;
-                                       height: {TOOLBAR_CONTROL_PX}px; }}
+            .{TOOLBAR_CLASS} .q-field__control {{
+                min-height: {TOOLBAR_CONTROL_PX}px !important;
+                height: {TOOLBAR_CONTROL_PX}px !important; }}
+            .{TOOLBAR_CLASS} .q-field__marginal {{
+                height: {TOOLBAR_CONTROL_PX}px !important; }}
+            .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
+                padding-top: 0 !important; padding-bottom: 0 !important; }}
+            .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
+                padding-top: 0 !important; padding-bottom: 0 !important; }}
+            .{TOOLBAR_CLASS} .q-btn {{
+                min-height: {TOOLBAR_CONTROL_PX}px !important;
+                height: {TOOLBAR_CONTROL_PX}px !important; }}
         ''')
         toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS}')
         body = ui.column().classes('w-full gap-3')
@@ -3853,7 +3875,7 @@ async def content() -> None:
                 review_latch.progress = ui.linear_progress(
                     value=0.0, show_value=False, size='4px') \
                     .props('rounded color=white track-color=transparent') \
-                    .classes('absolute bottom-0 left-0 w-full') \
+                    .classes('absolute bottom-0 left-0 w-full z-10') \
                     .mark(MARKER_REVIEW_PROGRESS)
                 review_latch.progress.set_visibility(False)
             # ``hide-bottom-space`` is what LINES THESE UP. A Quasar field reserves a

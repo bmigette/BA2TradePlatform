@@ -8316,6 +8316,10 @@ def test_the_latch_drives_the_bar_it_was_given():
     assert bar.visible is False and button.enabled is True, \
         "a failed run must still release both"
     assert latch.busy is False
+    # AND NO SPINNER. Quasar's `loading` replaces a button's content -- label, icon
+    # and any child -- so on a button that HOLDS the bar it swallowed it whole and
+    # the button showed a spinner with no progress at all (reported 2026-09-08).
+    assert 'loading' not in button._p
 
 
 def test_the_precheck_reports_every_symbol_it_previews():
@@ -8375,3 +8379,35 @@ def test_a_progress_callback_that_raises_cannot_kill_the_solve():
     out = svc.precheck_plan(_Acct(), plan, available_buying_power=10_000.0, margin={},
                             on_progress=_boom)
     assert out is not None
+
+
+def test_a_latch_with_no_bar_still_gets_the_spinner():
+    """The inverse of the rule above: a button with nothing better to show must keep
+    saying something. The spinner is only wrong where a progress bar has replaced it."""
+    import asyncio
+
+    class _Elem:
+        def __init__(self):
+            self.enabled = True
+            self._p = set()
+
+        def set_enabled(self, v):
+            self.enabled = v
+
+        def props(self, add=None, remove=None):
+            if add:
+                self._p.add(add)
+            if remove:
+                self._p.discard(remove)
+            return self
+
+    button = _Elem()
+    latch = page.ClickLatch('busy', button=button)
+    seen = {}
+
+    async def _work():
+        seen['during'] = set(button._p)
+
+    asyncio.run(latch.run(_work))
+    assert 'loading' in seen['during']
+    assert 'loading' not in button._p, "and removed again afterwards"
