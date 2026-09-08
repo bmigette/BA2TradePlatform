@@ -7,6 +7,7 @@ from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, E
 from ba2_common.core.types import TransactionStatus, OrderDirection, Recommendation
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.db import get_instance, get_db
+from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 
@@ -876,7 +877,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             
             return virtual_balance
             
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
+            # signal ``get_tradable_balance`` raises (``_plain_balance`` / ``_margin_factor``
+            # / the multiplier and buying-power readers). Anything else -- a resolver that
+            # was never wired (``InstanceResolverNotConfigured``), a deleted expert row
+            # (``InstanceNotFound``), a tz/type defect -- is a bug, and absorbing it here
+            # would size every entry this expert makes off a silent None instead of
+            # surfacing it.
+            absorb_if_benign(e, ValueError)
             logger.error(
                 f"Error calculating virtual balance for expert {self.id} "
                 f"(account {account_id}): {e}", exc_info=True)

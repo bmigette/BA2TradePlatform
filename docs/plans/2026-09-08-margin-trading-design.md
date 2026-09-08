@@ -107,7 +107,11 @@ above what was invested. Stock path:
   `account.get_tradable_balance()`. This alone carries the factor into
   `get_available_balance`, the classic risk manager, the Smart Risk Manager
   toolkit, PennyMomentum and order validation.
-- `TradeActions._virtual_equity`: same formula, must agree with the expert.
+- `TradeActions._virtual_equity`: the OPTION tradable balance x pct. It sizes
+  option entries, which draw on option leverage (1.0 at every supported broker
+  today), so it is NOT expected to equal the expert's stock virtual balance --
+  with a stock factor of 1.8 the expert sees 18k and an option entry still sizes
+  off 10k.
 - Risk-per-trade equity input to `compute_risk_based_quantity` (classic RM and
   Smart RM ATR autosize) and `_validate_position_size_limits` (max position %)
   read tradable balance.
@@ -160,8 +164,9 @@ Stays on real equity:
   refused.
 - Over-exposure warning fires at exactly `balance x (mult - factor)` and not
   above it; skipped with option BP None.
-- `get_virtual_balance` and `_virtual_equity` return the same number for the
-  same account (parity pin).
+- `_virtual_equity` = option tradable balance x pct (and NOT the stock virtual
+  balance: reading the stock figure would size every option entry by the stock
+  factor).
 - `available_option_buying_power` uses the option tradable balance.
 - Header combine and live-trades cell formatting, margin on and off.
 
@@ -176,6 +181,10 @@ Shared package (`ba2_common`) and trade app both change: bump
 - Separate option margin factor.
 - Backtest account leverage (multiplier > 1 with the Reg-T model it already has).
 - TastyTrade snapshot TTL cache.
-- Header, Floating P/L card and the live trades `Value / CapReq` column: derive the
-  tradable figures and the effective factor from the one hourly snapshot
-  (TastyTrade 5 REST -> 2), instead of reading them per render.
+- Header / Floating P/L card / live trades: derive tradable figures from the one
+  snapshot (TastyTrade: `get_balance()` is its own REST call, so today's cost is 3
+  calls per account per card render, 2 per tradable-balance read).
+- Memoise merged settings definitions per class (`get_merged_settings_definitions`
+  rebuilds on every unset-key read; ~3.5 µs per call in the backtest sizing loop).
+- `OptionRiskManagement.sleeve_equity` stays on snapshot equity; revisit if an
+  adapter ever reports option leverage > 1.

@@ -204,11 +204,26 @@ def test_option_default_multiplier_is_a_debug_line_not_a_warning(records):
 
 
 def test_option_side_reads_the_snapshot_exactly_once():
-    """Same one-read rule as the stock side: option buying power comes off the snapshot
-    already taken, not from a second round trip."""
+    """At the default 1.0 option multiplier -- every supported broker today -- NO
+    snapshot is taken at all: the factor is already 1.0, and the snapshot's option
+    buying power feeds nothing but an over-exposure warning ``_effective_factor``
+    returns before reaching. TastyTrade's snapshot is an uncached REST call, so a read
+    whose result nobody looks at is a round trip per option sizing call.
+
+    An adapter that reports real option leverage takes exactly ONE, the same one-read
+    rule as the stock side: multiplier and buying power from the same broker instant.
+    """
     acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
     acct.get_option_tradable_balance()
-    assert acct.snapshot_calls == 1
+    assert acct.snapshot_calls == 0
+
+    class _Levered(_Stub):
+        def get_option_margin_multiplier(self):
+            return 2.0
+
+    levered = _Levered(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    levered.get_option_tradable_balance()
+    assert levered.snapshot_calls == 1
 
 
 def test_on_raises_when_balance_unknown():

@@ -27,6 +27,17 @@ Two defects in the same three lines.
 
 Each is paired with its inverse: an Alpaca-shaped object must not regress, and an
 equity the broker genuinely did not publish must STILL be recorded as ``None``.
+
+3. ONE BASE FOR BOTH ENDS (margin design 2026-09-08). The read is now
+   ``account.get_tradable_balance()`` -- ``get_balance()`` with margin off, the
+   snapshot seam once with it on -- because ``SmartRiskManagerGraph`` writes these
+   very columns from ``portfolio_status["account_virtual_equity"]``, which is
+   ``expert.get_virtual_balance()``: the LEVERED tradable balance x pct. Reading
+   snapshot equity here mixed an unlevered number into a levered column, and on a
+   1.8x account the job card showed a phantom ~-44% change across a run that moved
+   nothing. Every double below therefore drives the BALANCE, not just the broker
+   payload: with margin off the two are the same figure, which is why the shape and
+   zero pins above are unaffected.
 """
 import pytest
 from datetime import datetime, timezone
@@ -145,7 +156,15 @@ class _AlpacaShapedAccount(MockAccount):
 
 
 class _MuteAccount(MockAccount):
-    """A broker that published no balance figure at all."""
+    """A broker that published no balance figure at all.
+
+    ``get_tradable_balance()`` RAISES on it (``_plain_balance``: a fabricated balance
+    is a fabricated order size) rather than returning ``None``; the queue's handler
+    turns that into the same recorded unknown, which is the point of the pin.
+    """
+
+    def get_balance(self):
+        return None
 
     def get_account_info(self):
         return {"account_number": "5WX00000"}
@@ -208,6 +227,9 @@ class TestAMeasuredZeroEquityRecordsAsZero:
         float. A drained account measured at $0.00 was recorded as ``None`` -- an
         unknown -- so the operator cannot tell it from an unreachable broker."""
         class _EmptyAccount(MockAccount):
+            def get_balance(self):
+                return 0.0
+
             def get_account_info(self):
                 return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0}
 
@@ -287,6 +309,9 @@ class TestAMeasuredZeroEquityRecordsAsZero:
         """THE INVERSE #3: the equity read is bookkeeping, not the job. A broker that
         raises must not take the whole Smart Risk Manager run down with it."""
         class _ExplodingAccount(MockAccount):
+            def get_balance(self):
+                raise RuntimeError("broker down")
+
             def get_account_info(self):
                 raise RuntimeError("broker down")
 
@@ -302,14 +327,18 @@ class TestAMeasuredZeroEquityRecordsAsZero:
 class TestTheRecordedNumberIsTheEquityItself:
     """Found by mutation: three ways to record a number that is nearly right."""
 
-    def test_it_is_EQUITY_and_not_net_liquidation(self, monkeypatch):
-        """The snapshot mirrors the two when a broker publishes only one, so most
-        brokers cannot tell these apart. One that publishes BOTH can: net
-        liquidation is the headline total, equity is what the sleeve is a share of,
-        and they diverge whenever there are options or a debit balance."""
+    def test_it_is_the_TRADABLE_BALANCE_and_not_the_snapshot_equity(self, monkeypatch):
+        """The two are the same number on a cash account, so most doubles cannot tell
+        them apart. One whose snapshot equity differs from its balance can -- and the
+        tradable balance is what must be recorded, because that is the base the graph
+        writes these same columns from. Equity here would also read as net liquidation
+        on a broker that publishes only one of the two."""
         class _BothAccount(MockAccount):
+            def get_balance(self):
+                return 100_000.0
+
             def get_account_info(self):
-                return {"equity": 100_000.0, "net_liquidation": 250_000.0,
+                return {"equity": 250_000.0, "net_liquidation": 250_000.0,
                         "cash": 25_000.0}
 
         acct_def = create_account_definition()
@@ -323,6 +352,9 @@ class TestTheRecordedNumberIsTheEquityItself:
         would turn a $5,000 hole into $5,000 of buying room, which is the single
         worst thing to hand a risk manager."""
         class _UnderwaterAccount(MockAccount):
+            def get_balance(self):
+                return -5_000.0
+
             def get_account_info(self):
                 return {"equity": -5_000.0, "cash": -5_000.0}
 
@@ -365,6 +397,9 @@ class TestTheRecordedNumberIsTheEquityItself:
     def test_the_cents_are_not_rounded_away(self, monkeypatch):
         """It is a money figure the operator reconciles against the broker."""
         class _PenniesAccount(MockAccount):
+            def get_balance(self):
+                return 100_000.37
+
             def get_account_info(self):
                 return {"equity": 100_000.37}
 
@@ -374,6 +409,28 @@ class TestTheRecordedNumberIsTheEquityItself:
 
         assert initial == pytest.approx(100_000.37, abs=1e-9)
         assert final == pytest.approx(100_000.37, abs=1e-9)
+
+
+class TestTheBaseIsTheSameOneTheGraphUses:
+    """Defect 3: the queue and the graph write the SAME two columns from DIFFERENT
+    bases. ``SmartRiskManagerGraph`` writes ``account_virtual_equity`` --
+    ``expert.get_virtual_balance()``, i.e. the account's TRADABLE balance x the
+    sleeve pct -- so the queue must start from the tradable balance too."""
+
+    def test_the_levered_base_is_what_is_recorded(self, monkeypatch):
+        """An account that may deploy $18k on a $10k balance, at a 50% sleeve, records
+        $9,000 -- exactly ``get_virtual_balance()``. Off the snapshot equity ($100k in
+        this fixture) the same run would have recorded $50,000, and a graph write in
+        between would have shown the difference as a change in the portfolio."""
+        class _LeveredAccount(MockAccount):
+            def get_tradable_balance(self):
+                return 18_000.0
+
+        acct_def = create_account_definition()
+        initial, final, _job = _run(monkeypatch, _LeveredAccount(acct_def.id), pct=50.0)
+
+        assert initial == pytest.approx(9_000.0)
+        assert final == pytest.approx(9_000.0)
 
 
 class TestTheJobRecordIsAnchoredInTime:

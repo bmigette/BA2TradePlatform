@@ -556,14 +556,24 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         governed by their virtual_equity_pct, exactly as before margin existed.
 
         Option buying power may be unpublished: then the warning is skipped (DEBUG).
+
+        NO SNAPSHOT AT THE 1.0 MULTIPLIER, which is every supported broker today: the
+        option factor is then 1.0 whatever the buying power says, and the only consumer
+        of ``remaining_bp`` is the over-exposure warning that ``_effective_factor``
+        returns before ever reaching. Taking one anyway cost TastyTrade an uncached REST
+        round trip per option sizing call to feed a number nothing read.
         """
         if not self._margin_enabled():
             return self._plain_balance()
         balance = self._plain_balance()          # before the snapshot; see get_tradable_balance
+        multiplier = self.get_option_margin_multiplier()
+        if multiplier <= 1.0:
+            return self._tradable_balance(
+                asset="option", balance=balance, multiplier=multiplier,
+                remaining_bp=None)
         snapshot = self.get_account_snapshot()
         return self._tradable_balance(
-            asset="option", balance=balance,
-            multiplier=self.get_option_margin_multiplier(),
+            asset="option", balance=balance, multiplier=multiplier,
             remaining_bp=snapshot.option_buying_power)
 
     def get_cash_transfers(

@@ -109,6 +109,28 @@ def test_a_tradable_balance_error_yields_none_not_a_number():
 
 
 @pytest.mark.usefixtures("reset_test_db")
+def test_a_NON_benign_virtual_balance_error_propagates(monkeypatch):
+    """The counterpart of the test above, and the reason the handler names ValueError
+    rather than absorbing everything: ValueError is the NAMED "unknown balance / bad
+    margin factor" signal the tradable-balance path raises. A TypeError is a DEFECT,
+    and swallowing it would size every entry this expert makes off a silent None --
+    exactly how the ATR tz bug stayed invisible for months."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    acct_def = factories.create_account_definition()
+    inst = factories.create_expert_instance(
+        account_id=acct_def.id, expert="_Expert", virtual_equity_pct=100.0)
+
+    class _Defective(_Account):
+        def get_tradable_balance(self):
+            raise TypeError("defect")
+
+    account = _Defective(acct_def.id, balance=10_000.0, tradable=None, buying_power=None)
+
+    with pytest.raises(TypeError, match="defect"):
+        _with_account(account, _Expert(inst.id).get_virtual_balance)
+
+
+@pytest.mark.usefixtures("reset_test_db")
 def test_available_balance_is_the_levered_figure_when_the_clamp_does_not_bind():
     """The counterpart pin: with broker BP above the levered base, the available
     balance IS the levered figure -- so the clamp test above cannot pass merely
