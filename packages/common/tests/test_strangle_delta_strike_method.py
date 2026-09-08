@@ -63,6 +63,10 @@ class _Acct(OptionsAccountInterface):
     def get_balance(self):
         return 1_000_000.0
 
+    def get_tradable_balance(self):
+        # No margin settings behind this double: what may be deployed IS the balance.
+        return self.get_balance()
+
     def get_account_snapshot(self):
         from ba2_common.core.account_types import AccountSnapshot
         return AccountSnapshot(cash=1_000_000.0, equity=1_000_000.0,

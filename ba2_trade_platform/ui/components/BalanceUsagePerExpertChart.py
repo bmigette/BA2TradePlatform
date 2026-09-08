@@ -74,15 +74,22 @@ class BalanceUsagePerExpertChart:
                     account_cache[acc_id] = get_account_instance_from_id(acc_id, session=session)
                 return account_cache[acc_id]
 
-            # Virtual balance = account balance * virtual_equity_pct. Fetch each
-            # account's balance once (get_balance is cached) instead of calling the
+            # Virtual balance = account TRADABLE balance * virtual_equity_pct (same
+            # base as get_virtual_balance, so a margin account is not painted as
+            # over-allocated). Fetch each account's balance once instead of calling the
             # per-expert get_virtual_balance (which re-fetches balance every time).
             balance_by_account: Dict[int, Optional[float]] = {}
             for expert in experts:
                 acc_id = expert.account_id
                 if acc_id not in balance_by_account:
                     acct = _get_account(acc_id)
-                    balance_by_account[acc_id] = acct.get_balance() if acct else None
+                    try:
+                        balance_by_account[acc_id] = acct.get_tradable_balance() if acct else None
+                    except Exception as e:
+                        # A chart must not invent a denominator: the account is skipped
+                        # (below) and the operator gets the reason in the log.
+                        logger.error(f"Tradable balance unavailable for account {acc_id}: {e}", exc_info=True)
+                        balance_by_account[acc_id] = None
                 account_balance = balance_by_account[acc_id]
                 if account_balance is None:
                     continue

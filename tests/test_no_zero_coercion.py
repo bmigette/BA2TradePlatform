@@ -383,7 +383,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:1548":
+    "packages/common/ba2_common/core/TradeActions.py:1549":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
@@ -399,7 +399,9 @@ ALLOWLIST: dict = {
         "in ENTRY_CROSS_FULL (+1); :1548 after Task 9 added ONE import line "
         "(``from ba2_common.core.earnings_stamp import ...``, line 37) for the earnings "
         "event-date carry-forward -- 1547 + 1 = 1548, and it is the ONLY line this task "
-        "added above 1547: its other two edits sit at ~2888 and ~2976)",
+        "added above 1547: its other two edits sit at ~2888 and ~2976); :1549 after the "
+        "margin Task 6 wrapped the 'Get total virtual equity' comment just above it onto "
+        "a second line (+1)",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",

@@ -34,6 +34,10 @@ class FakeAccount(OptionsAccountInterface):
     def get_balance(self):
         return 100_000.0
 
+    def get_tradable_balance(self):
+        # No margin settings behind this double: what may be deployed IS the balance.
+        return self.get_balance()
+
     def get_account_snapshot(self):
         """The double's balance IS its CASH — the intent this file has always tested.
 

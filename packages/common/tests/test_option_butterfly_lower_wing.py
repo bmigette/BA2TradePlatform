@@ -53,6 +53,10 @@ class _TwoExpiryAccount(OptionsAccountInterface):
     def get_balance(self):
         return 1_000_000.0
 
+    def get_tradable_balance(self):
+        # No margin settings behind this double: what may be deployed IS the balance.
+        return self.get_balance()
+
     def get_instrument_current_price(self, symbol, price_type=None):
         return self._spot
 

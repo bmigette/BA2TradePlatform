@@ -29,6 +29,10 @@ class _FakeAccount:
     def get_balance(self):
         return self._balance
 
+    def get_tradable_balance(self):
+        # No margin settings behind this double: what may be deployed IS the balance.
+        return self.get_balance()
+
 
 def _setup_db():
     db_path = os.path.join(tempfile.mkdtemp(), "opt_sizing_cap.sqlite")

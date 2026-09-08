@@ -1534,7 +1534,8 @@ class IncreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get total virtual equity (allocated capital, not just free cash)
+            # Get total virtual equity from the tradable balance (allocated
+            # capital, not just free cash)
             virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
@@ -1744,7 +1745,8 @@ class DecreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get total virtual equity (allocated capital, not just free cash)
+            # Get total virtual equity from the tradable balance (allocated
+            # capital, not just free cash)
             virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
@@ -2313,8 +2315,17 @@ class _OptionEntryAction(TradeAction):
         return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
-        """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
-        balance = self.account.get_balance()
+        """tradable balance * virtual_equity_pct/100 (defaults to the whole tradable
+        balance when unknown). SAME base as MarketExpertInterface.get_virtual_balance:
+        with margin on both scale by the account's factor, so a share-increase action
+        and the expert's own sizing never disagree about the sleeve's size. None when
+        the account cannot answer (raised), never a guess."""
+        try:
+            balance = self.account.get_tradable_balance()
+        except Exception as e:
+            logger.error(f"_virtual_equity: tradable balance unavailable for account "
+                         f"{self.account.id}: {e}", exc_info=True)
+            return None
         if balance is None:
             return None
         pct = 100.0
