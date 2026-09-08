@@ -79,6 +79,11 @@ class FakeAccount(OptionsAccountInterface):
         # No margin settings behind this double: what may be deployed IS the balance.
         return self.get_balance()
 
+    def get_option_tradable_balance(self):
+        # Same, for the OPTION base an option entry sizes from (long options are
+        # cash-settled, so the option multiplier is 1.0 anyway).
+        return self.get_balance()
+
     def get_account_snapshot(self):
         """The double's balance IS its CASH — the intent this file has always tested.
 

@@ -8,13 +8,22 @@ from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterfa
 from tests import factories
 
 
+_UNSET = object()
+
+
 class _Account:
     """Only what get_virtual_balance / get_available_balance read."""
 
-    def __init__(self, id_val, *, balance, tradable, buying_power):
+    def __init__(self, id_val, *, balance, tradable, buying_power,
+                 option_tradable=_UNSET):
         self.id = id_val
         self._balance, self._tradable, self._bp = balance, tradable, buying_power
+        # The OPTION sleeve's base is its own figure (balance x the option multiplier,
+        # 1.0 at every broker today), so a double that answered the STOCK number for
+        # both could not tell the two callers apart. Defaults to the plain balance.
+        self._option_tradable = balance if option_tradable is _UNSET else option_tradable
         self.tradable_calls = 0
+        self.option_tradable_calls = 0
 
     def get_balance(self):
         return self._balance
@@ -22,6 +31,10 @@ class _Account:
     def get_tradable_balance(self):
         self.tradable_calls += 1
         return self._tradable
+
+    def get_option_tradable_balance(self):
+        self.option_tradable_calls += 1
+        return self._option_tradable
 
     def get_account_info(self):
         return {"buying_power": self._bp}
@@ -107,8 +120,10 @@ def test_available_balance_is_the_levered_figure_when_the_clamp_does_not_bind():
     assert _with_account(account, _Expert(inst.id).get_available_balance) == 18_000.0
 
 # ---------------------------------------------------------------------------
-# The other expert-side readers of the same sleeve: the share-increase/decrease
-# action's own equity figure, and the account-level per-instrument cap.
+# The other expert-side readers of the same sleeve: the OPTION entry action's own
+# equity figure, and the account-level per-instrument cap. (The share-increase /
+# decrease action is not one of them: it sizes off the expert's
+# get_virtual_balance, already on the tradable balance above.)
 # ---------------------------------------------------------------------------
 
 def _option_entry_action(account, expert_recommendation=None):
@@ -123,21 +138,25 @@ def _option_entry_action(account, expert_recommendation=None):
     return action
 
 
-def test_trade_action_virtual_equity_agrees_with_the_expert():
-    """PARITY PIN: TradeActions._virtual_equity and MarketExpertInterface.get_virtual_balance
-    must be the same number for the same account -- one base (tradable), two callers."""
-    account = _Account(1, balance=10_000.0, tradable=18_000.0, buying_power=20_000.0)
+def test_option_entry_virtual_equity_is_the_option_tradable_balance_times_pct():
+    """An option entry sizes off the OPTION tradable balance, not the stock one: long
+    options are cash-settled, so with the stock factor at 1.8 (18k) and the option
+    multiplier at 1.0 the sleeve is still the plain 10k. Reading the stock figure here
+    would size every option entry 1.8x too big."""
+    account = _Account(1, balance=10_000.0, tradable=18_000.0, buying_power=20_000.0,
+                       option_tradable=10_000.0)
     action = _option_entry_action(account)  # no recommendation -> pct defaults to 100
 
-    assert action._virtual_equity() == 18_000.0
-    assert account.tradable_calls == 1
+    assert action._virtual_equity() == 10_000.0
+    assert account.option_tradable_calls == 1
+    assert account.tradable_calls == 0, "the stock tradable balance is not the option base"
 
 
 def test_trade_action_virtual_equity_is_none_not_a_number_when_tradable_raises():
-    """An account that cannot say what it may deploy yields None -- never the
+    """An account that cannot say what it may deploy in options yields None -- never the
     unlevered balance, which would silently disagree with the expert's own sizing."""
     class _Broken(_Account):
-        def get_tradable_balance(self):
+        def get_option_tradable_balance(self):
             raise ValueError("account published no buying power")
 
     action = _option_entry_action(
@@ -172,8 +191,9 @@ def _cap_errors(monkeypatch, factor, quantity, *, max_position_pct=10.0,
                 equity=100_000.0):
     """Run ``_validate_position_size_limits`` for an order of ``quantity`` AAPL @ $100
     against an expert whose per-instrument cap is ``max_position_pct`` of a 100%
-    sleeve, on an account whose ``effective_margin_factor()`` is ``factor`` (or, if
-    ``factor`` is an exception, one that raises it). Returns the error list.
+    sleeve, on an account whose ``effective_margin_factor_from()`` is ``factor`` (or, if
+    ``factor`` is an exception, one that raises it) -- the cap derives the factor from
+    the snapshot it already took for equity. Returns the error list.
 
     The factor is stubbed rather than configured through margin settings so the cap
     is pinned against the contract it consumes, not against how margin is stored.
@@ -189,7 +209,7 @@ def _cap_errors(monkeypatch, factor, quantity, *, max_position_pct=10.0,
     )
 
     class _FactorAccount(MockAccount):
-        def effective_margin_factor(self):
+        def effective_margin_factor_from(self, snapshot):
             if isinstance(factor, Exception):
                 raise factor
             return factor

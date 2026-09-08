@@ -7,8 +7,9 @@ dollar figure exists: they are the same account counted six times.
 
 Oversubscription is deliberate here (when several experts want cash at the same 09:30 the
 losers' orders are simply discarded), so the fix is not to clamp the allocation -- it is to
-stop calling it capital. ``summarize_capital`` counts each ACCOUNT's equity once and reports
-the sleeve total separately, as a percentage of the money that backs it.
+stop calling it capital. ``summarize_capital`` counts each ACCOUNT's TRADABLE capital once
+(levered by the margin factor with margin on, which is why the footer names it "tradable")
+and reports the sleeve total separately, as a percentage of the money that backs it.
 
 These drive the pure summary function; the chart's own rows come from
 calculate_expert_balance_data, covered in test_virtual_equity_zero_pct.py.

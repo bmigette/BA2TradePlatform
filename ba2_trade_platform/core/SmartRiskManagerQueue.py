@@ -100,6 +100,8 @@ def _read_expert_virtual_equity(account_id: int, expert_record, phase: str) -> O
         # it owned the entire account. Same coercion as
         # MarketExpertInterface.get_virtual_balance.
         virtual_equity_pct = expert_record.virtual_equity_pct
+        # deliberately the UNLEVERED figure: this records the run, it does not size it
+        # (margin design 2026-09-08)
         virtual_equity = account_equity * (virtual_equity_pct / 100.0)
         logger.debug(
             f"{phase.capitalize()} portfolio equity: Account=${account_equity:,.2f} "

@@ -277,6 +277,16 @@ def test_effective_factor_is_one_on_a_cash_account():
     assert _Stub(balance=10_000.0, snapshot=cash, settings=ON).effective_margin_factor() == 1.0
 
 
+def test_effective_margin_factor_from_uses_the_given_snapshot_and_reads_none():
+    """A caller that already holds a snapshot hands it over: same factor, no second
+    broker round trip (TastyTrade's snapshot is an uncached REST call), and the
+    multiplier comes from the same instant as the figure being scaled."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+
+    assert acct.effective_margin_factor_from(LEVERED) == 1.8
+    assert acct.snapshot_calls == 0
+
+
 def test_effective_factor_scales_the_balance_to_the_tradable_balance():
     """The account-level pin on the same identity the pure test above makes: a caller
     that SCALES a figure it already holds lands where get_tradable_balance does."""

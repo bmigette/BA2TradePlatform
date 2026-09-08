@@ -1311,8 +1311,11 @@ class AccountInterface(ReadOnlyAccountInterface):
             # the backtest account's get_balance() is spendable cash by design while its
             # snapshot equity is deployed equity, so swapping the denominator would change
             # every backtest. With margin off this multiplies by 1.0 and reads nothing.
+            # The factor comes from the snapshot ALREADY taken above: multiplier and
+            # equity are then the same broker instant, and TastyTrade (whose snapshot is
+            # an uncached REST call) pays for one round trip here, not two.
             try:
-                account_equity *= self.effective_margin_factor()
+                account_equity *= self.effective_margin_factor_from(snapshot)
             except Exception as e:
                 logger.error(
                     f"POSITION SIZE VALIDATION CANNOT RUN for {trading_order.symbol}: "

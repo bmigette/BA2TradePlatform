@@ -2315,16 +2315,16 @@ class _OptionEntryAction(TradeAction):
         return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
-        """tradable balance * virtual_equity_pct/100 (defaults to the whole tradable
-        balance when unknown). SAME base as MarketExpertInterface.get_virtual_balance:
-        with margin on both scale by the account's factor, so a share-increase action
-        and the expert's own sizing never disagree about the sleeve's size. None when
-        the account cannot answer (raised), never a guess."""
+        """OPTION tradable balance * virtual_equity_pct/100 (the whole option tradable
+        balance when the pct is unknown). Option entries are sized from the option
+        leverage, which is 1.0 at every supported broker today, so with the stock factor
+        at 1.8 this stays at the plain balance -- long options cannot be bought on
+        margin. None when the account cannot answer, never a guess."""
         try:
-            balance = self.account.get_tradable_balance()
+            balance = self.account.get_option_tradable_balance()
         except Exception as e:
-            logger.error(f"_virtual_equity: tradable balance unavailable for account "
-                         f"{self.account.id}: {e}", exc_info=True)
+            logger.error(f"_virtual_equity: option tradable balance unavailable for "
+                         f"account {self.account.id}: {e}", exc_info=True)
             return None
         if balance is None:
             return None

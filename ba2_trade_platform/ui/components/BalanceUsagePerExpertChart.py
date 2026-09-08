@@ -104,11 +104,13 @@ class BalanceUsagePerExpertChart:
                     'filled': 0.0,
                     'available': 0.0,  # Will be computed as total - filled - pending
                     'total': virtual_balance,
-                    # The account this SLEEVE draws on, carried per row so the footer can
-                    # total the real capital ONCE per account. Sleeves are routinely
-                    # oversubscribed on purpose (six experts at 60% of one account is
-                    # deliberate here), so summing 'total' across rows counts the same
-                    # dollars up to six times -- see summarize_capital.
+                    # The account this SLEEVE draws on, carried per row so the footer
+                    # can total the TRADABLE capital ONCE per account -- levered by the
+                    # margin factor when margin is on, which is the same base the sleeve
+                    # above is a percent of. Sleeves are routinely oversubscribed on
+                    # purpose (six experts at 60% of one account is deliberate here), so
+                    # summing 'total' across rows counts the same dollars up to six
+                    # times -- see summarize_capital.
                     'account_id': acc_id,
                     'account_total': account_balance,
                 }
@@ -226,11 +228,13 @@ class BalanceUsagePerExpertChart:
         Oversubscription is a deliberate configuration (competing entries simply get
         discarded when the cash runs out), so the number must be SHOWN, not summed away.
 
-        - ``capital``   real money: each account's equity counted ONCE
+        - ``capital``   the TRADABLE capital -- each account's ``get_tradable_balance()``
+          (balance x the margin factor with margin on, the plain balance with it off)
+          counted ONCE, the same base each sleeve above is a percent of
         - ``allocated`` the sum of the sleeves, which may legitimately exceed ``capital``
         - ``filled`` / ``pending`` real dollars in real positions; a transaction belongs to
           exactly one expert, so these do not double-count and are summed across rows
-        - ``available`` capital minus what is actually committed (get_balance is equity)
+        - ``available`` tradable capital minus what is actually committed
         - ``allocated_pct`` None when there is no capital to divide by
         """
         filled = sum(d['filled'] for d in balance_data.values())
@@ -384,7 +388,10 @@ class BalanceUsagePerExpertChart:
                                  else 'font-bold text-blue-600')
             allocated_text = f"Allocated: ${summary['allocated']:,.2f}"
             if pct is not None:
-                allocated_text += f" ({pct:,.0f}% of ${summary['capital']:,.2f})"
+                # "tradable", not a bare dollar figure: with margin on this denominator
+                # is levered (balance x the factor), and a levered number must name what
+                # it is or it reads as the account's cash.
+                allocated_text += f" ({pct:,.0f}% of ${summary['capital']:,.2f} tradable)"
 
             with ui.row().classes('w-full justify-between mt-4 text-sm'):
                 ui.label(f'Total Experts: {len(balance_data)}').classes('text-gray-600')

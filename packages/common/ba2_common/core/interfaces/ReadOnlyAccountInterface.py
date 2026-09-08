@@ -504,8 +504,16 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         if not self._margin_enabled():
             return 1.0
+        return self.effective_margin_factor_from(self.get_account_snapshot())
+
+    def effective_margin_factor_from(self, snapshot: AccountSnapshot) -> float:
+        """``effective_margin_factor()`` for a caller that already holds a snapshot, so
+        the multiplier and the figure being scaled come from the SAME broker instant and
+        TastyTrade (uncached snapshot) pays no second round trip. Margin off -> 1.0
+        without reading the snapshot's fields."""
+        if not self._margin_enabled():
+            return 1.0
         balance = self._plain_balance()
-        snapshot = self.get_account_snapshot()
         return self._effective_factor(asset="stock", balance=balance,
                                       multiplier=self._stock_multiplier_from(snapshot),
                                       remaining_bp=self._buying_power_from(snapshot))
