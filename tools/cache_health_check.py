@@ -47,7 +47,9 @@ import argparse
 import json
 import os
 import random
+from collections import Counter
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -623,6 +625,8 @@ _OPTIONS_PROVIDER_DIRS = {"tastytrade": "TastyTradeOptionsProvider",
 
 def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15,
                          shallow_expiries_threshold: int = 3,
+                         stunted_fraction: float = 0.9,
+                         stunted_active_minutes: int = 120,
                          gap_start: Optional[str] = None, gap_end: Optional[str] = None,
                          provider: str = "tastytrade") -> dict:
     """Coverage + non-triviality of an options parquet store built by
@@ -676,9 +680,27 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
        question (the symbol just hasn't caught up yet), not a gap in the middle of finished work,
        so they are deliberately excluded here to keep this signal specific.
 
+    5. STUNTED SYMBOLS, measured against their PEERS rather than an absolute floor. Points 2
+       and 4 both miss the most damaging shape this store actually produces: a symbol the
+       fetcher ABANDONED partway. ``--discovery synthetic`` plans the same Friday ladder for
+       every underlying and records an EMPTY manifest where a chain genuinely does not exist
+       (a pre-IPO expiry included), so in a finished store every symbol holds the SAME number
+       of partitions -- 349 for a 2020-01-01 window, measured 2026-09-08 across 559 symbols
+       with no second value. That makes the peer MODE an exact oracle, and anything under it
+       incomplete by construction.
+
+       Neither of the other two sees it. ``shallow`` compares against an absolute 3, and an
+       abandoned symbol keeps whatever it had finished -- 13 partitions sails past that. The
+       gap check deliberately looks only INSIDE the span between a symbol's earliest and
+       latest completed expiry, and an abandonment leaves no interior hole: everything missing
+       is *after* the last one it finished. So 15 symbols sitting at 13 (and one at 3) of 349
+       -- 96% of their history gone, from a vendor server crash on 2026-09-06 -- were reported
+       as healthy by every check here. That is what this one exists to catch.
+
     Returns ``{universe_size, covered, zero_partitions: [...], never_started: [...],
-    extra_not_in_universe: [...], shallow: {symbol: n_expiries}, total_partitions,
-    iv_sample: {...}, gaps: {symbol: [missing_expiry_iso, ...]}, gap_window: [start, end]}``.
+    extra_not_in_universe: [...], shallow: {symbol: n_expiries}, stunted: {symbol: n_expiries},
+    expected_expiries: int|None, total_partitions, iv_sample: {...},
+    gaps: {symbol: [missing_expiry_iso, ...]}, gap_window: [start, end]}``.
     """
     from ba2_providers.options.parquet_store import OptionHistoryParquetStore
     from ba2_providers.options.tastytrade import expiry_calendar
@@ -706,6 +728,41 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
     extra_not_in_universe = sorted(present_dirs - universe) if universe else []
     shallow = {sym: n for sym in (universe & with_data if universe else with_data)
               if (n := per_symbol_expiries[sym]) < shallow_expiries_threshold}
+
+    # STUNTED: see docstring point 5. The MODE, not the max or the mean -- the max is one
+    # symbol away from being wrong if any single symbol over-fetched, and a mean is dragged
+    # down by the very partial symbols this is trying to find. The mode is what the ladder
+    # actually is, and it needs a real majority behind it to be trusted at all: with only a
+    # handful of symbols warmed (or a run still early enough that most are partial) there is no
+    # peer group yet, and inventing one would report the whole store as broken. Below that
+    # quorum the check reports nothing and says why, rather than guessing.
+    scored = sorted(universe & with_data) if universe else sorted(with_data)
+    counts = [per_symbol_expiries[s] for s in scored]
+    expected_expiries = None
+    stunted: dict = {}
+    stunted_in_flight: dict = {}
+    if len(counts) >= 20:
+        expected_expiries, hits = Counter(counts).most_common(1)[0]
+        if hits >= max(10, len(counts) // 4):
+            floor_ = expected_expiries * float(stunted_fraction)
+            short = {s: per_symbol_expiries[s] for s in scored
+                     if per_symbol_expiries[s] < floor_}
+            # IN FLIGHT vs ABANDONED. A symbol the warm is writing THIS MINUTE is short of
+            # the ladder for the most ordinary reason there is, and reporting it as damage
+            # sends the operator on a pointless recovery run -- worse, it buries the symbols
+            # that really were abandoned in a list of ones that are fine. Measured 2026-09-08
+            # the two are not close: the 14 abandoned symbols were last written 53 HOURS
+            # earlier, the 4 in flight within the same minute. The symbol directory's mtime
+            # moves as partitions are added, so one stat per short symbol separates them.
+            cutoff = time.time() - stunted_active_minutes * 60
+            for sym, n in short.items():
+                try:
+                    touched = os.stat(os.path.join(store.root, sym)).st_mtime
+                except OSError:
+                    touched = 0.0
+                (stunted_in_flight if touched >= cutoff else stunted)[sym] = n
+        else:
+            expected_expiries = None
 
     # IV/open_interest non-null rate, sampled from symbols that actually HAVE data -- sampling
     # from present_dirs would waste slots on the zero-partition case above (nothing to read).
@@ -776,7 +833,9 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
         "universe_size": len(universe), "covered": covered,
         "zero_partitions": zero_partitions, "never_started": never_started,
         "extra_not_in_universe": extra_not_in_universe,
-        "total_partitions": total_partitions, "shallow": shallow, "iv_sample": iv_res,
+        "total_partitions": total_partitions, "shallow": shallow,
+        "stunted": stunted, "stunted_in_flight": stunted_in_flight,
+        "expected_expiries": expected_expiries, "iv_sample": iv_res,
         "gaps": gaps, "gap_window": [gstart.isoformat(), gend.isoformat()],
         "store_root": store.root, "disk_bytes": store.disk_bytes(),
     }
@@ -785,11 +844,12 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
 def print_options_cache_report(universe_path: Optional[str], iv_sample: int,
                                 gap_start: Optional[str] = None,
                                 gap_end: Optional[str] = None,
-                                provider: str = "tastytrade") -> bool:
+                                provider: str = "tastytrade",
+                                stunted_fraction: float = 0.9) -> bool:
     """Runs check_options_cache and prints a report. Returns True if nothing looks broken."""
     print(f"\n=== options cache ({_OPTIONS_PROVIDER_DIRS[provider]}) ===")
     res = check_options_cache(universe_path, iv_sample, gap_start=gap_start, gap_end=gap_end,
-                              provider=provider)
+                              provider=provider, stunted_fraction=stunted_fraction)
     ok = True
 
     print(f"  store root: {res['store_root']}  ({res['disk_bytes'] / (1 << 30):.2f} GB on disk)")
@@ -822,6 +882,34 @@ def print_options_cache_report(universe_path: Optional[str], iv_sample: int,
             print(f"    [{sym}] {n} expiries")
     else:
         print("  no shallow symbols (every present symbol has a reasonable expiry count).")
+
+    # STUNTED -- the abandoned-partway case. Printed after `shallow` and much louder, because
+    # a symbol at 13 of 349 partitions passes every other check in this function: it is well
+    # clear of the absolute `shallow` floor, and everything it is missing lies AFTER its last
+    # completed expiry, where the gap check deliberately does not look.
+    expected = res.get("expected_expiries")
+    stunted = res.get("stunted") or {}
+    if expected is None:
+        print("  stunted: not assessed -- too few symbols share a partition count for a peer "
+              "ladder to be inferred (a store still early in its first warm).")
+    elif stunted:
+        print(f"  !! STUNTED ({len(stunted)} symbol(s) far below the {expected}-expiry ladder "
+              f"every finished symbol carries). These were ABANDONED mid-fetch; the data is "
+              f"not coming back on its own:")
+        for sym, n in sorted(stunted.items(), key=lambda kv: kv[1]):
+            print(f"    [{sym}] {n} of {expected} expiries  ({n / expected * 100:.0f}%)")
+        print(f"     -> re-run the SAME warm_options_history.py command that built this store; "
+              f"it is resumable and picks up exactly these units.")
+    if res.get("stunted_in_flight"):
+        n = len(res["stunted_in_flight"])
+        print(f"  ({n} further symbol(s) are short of the ladder but were written in the last "
+              f"couple of hours -- a warm is running and has not reached them yet, not damage: "
+              f"{sorted(res['stunted_in_flight'])[:10]})")
+        # A FAILING signal, not a note: this is missing DATA, and a grid that runs on it
+        # silently optimises a strategy over 4% of a symbol's history.
+        ok = False
+    else:
+        print(f"  no stunted symbols (every symbol carries the full {expected}-expiry ladder).")
 
     iv = res["iv_sample"]
     print(f"  IV/open_interest/volume non-null rate (sampled {iv['sampled']} symbol(s), "
@@ -1118,6 +1206,12 @@ def main() -> int:
     ap.add_argument("--options-universe", default=None,
                     help="Symbol list to check options coverage against (default: "
                          "tools/options_universe_large_cap.txt).")
+    ap.add_argument("--options-stunted-fraction", type=float, default=0.9,
+                    help="Flag an options symbol whose completed-expiry count is below this "
+                         "fraction of the peer ladder every finished symbol carries "
+                         "(default 0.9). The peer count is the MODE, so this catches a symbol "
+                         "the fetcher abandoned partway -- which clears the absolute `shallow` "
+                         "floor and leaves no interior gap for the expiry-gap check to see.")
     ap.add_argument("--options-iv-sample", type=int, default=15,
                     help="How many symbols to sample for the IV/open_interest/volume non-null check (default 15).")
     ap.add_argument("--options-gap-start", default=None,
@@ -1155,7 +1249,8 @@ def main() -> int:
         for prov in providers:
             if not print_options_cache_report(args.options_universe, args.options_iv_sample,
                                               args.options_gap_start, args.options_gap_end,
-                                              provider=prov):
+                                              provider=prov,
+                                              stunted_fraction=args.options_stunted_fraction):
                 overall_ok = False
 
     if args.skip_workers:
