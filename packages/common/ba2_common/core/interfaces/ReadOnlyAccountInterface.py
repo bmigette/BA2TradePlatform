@@ -283,6 +283,49 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         return self.get_account_snapshot().equity
 
+    # ------------------------------------------------------------------
+    # MARGIN / LEVERAGE.  Design: docs/plans/2026-09-08-margin-trading-design.md
+    # ------------------------------------------------------------------
+    def get_stock_margin_multiplier(self) -> float:
+        """The broker's stock leverage: dollars of buying power per dollar of equity.
+
+        Alpaca publishes it as ``TradeAccount.multiplier``; TastyTrade derives 2.0/1.0
+        from ``margin_or_cash``; the backtest account overrides to 1.0. RAISES when the
+        broker published none (IBKR): this number scales position sizes, and a guessed
+        multiplier is a guessed order.
+        """
+        multiplier = self.get_account_snapshot().margin_multiplier
+        if multiplier is None:
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published no stock margin "
+                f"multiplier; cannot size with margin")
+        return float(multiplier)
+
+    def get_option_margin_multiplier(self) -> float:
+        """The broker's OPTION leverage. Base default 1.0: long options are cash-settled
+        at every supported broker. An adapter overrides only with a real broker figure."""
+        return 1.0
+
+    def get_buying_power(self) -> float:
+        """The broker's REMAINING stock buying power. RAISES when unpublished.
+
+        Same reason as the multiplier: this caps what may still be deployed, and a
+        fabricated cap is a fabricated order.
+        """
+        bp = self.get_account_snapshot().buying_power
+        if bp is None:
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published no buying power")
+        return float(bp)
+
+    def get_option_buying_power(self) -> Optional[float]:
+        """The broker's remaining OPTION buying power, or ``None`` when unpublished.
+
+        ``None`` is allowed here (unlike ``get_buying_power``) because its only
+        consumer is the over-exposure WARNING, which skips itself and says so.
+        """
+        return self.get_account_snapshot().option_buying_power
+
     def get_cash_transfers(
         self,
         start_date: Optional[date] = None,

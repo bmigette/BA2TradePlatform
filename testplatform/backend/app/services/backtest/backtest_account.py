@@ -1852,6 +1852,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """
         return self.equity()
 
+    def get_stock_margin_multiplier(self) -> float:
+        """The simulator runs unlevered. Backtests that need leverage are run with a
+        larger starting balance (operator decision, 2026-09-08 design).
+
+        Stated explicitly because the base interface RAISES on an unpublished
+        multiplier, and this account publishes none in its snapshot.
+        """
+        return 1.0
+
     def get_account_info(self) -> Dict[str, Any]:
         """Account info dict; exposes ``.equity`` (read by _validate_position_size_limits)."""
         eq = self.deployed_equity()

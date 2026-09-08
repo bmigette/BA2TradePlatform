@@ -255,3 +255,17 @@ def test_market_order_fills_and_updates_ledger():
         assert trades[0]["price"] == pytest.approx(expected_fill)
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_stock_margin_multiplier_is_one_the_simulator_is_unlevered():
+    """The base interface RAISES when no broker multiplier was published (the simulator
+    publishes none), so the account states its own: 1.0, unlevered."""
+    from app.services.backtest.backtest_account import BacktestAccount
+    from app.services.backtest.price_source import AsOfPriceSource
+
+    ps = AsOfPriceSource(ohlcv_provider=None)
+    ps.load_bars("AAPL", _AAPL_BARS)
+    ps.set_clock(datetime(2024, 1, 2))
+    acct = BacktestAccount(999, ps, CFG)  # no DB needed: the multiplier is a constant
+
+    assert acct.get_stock_margin_multiplier() == 1.0
