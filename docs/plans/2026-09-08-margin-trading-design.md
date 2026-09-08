@@ -135,12 +135,22 @@ Stays on real equity:
 
 - Header, top right (`ui/layout.py`): cached header value gains `tradable`
   and `broker_bp` per account. Paint becomes `Balance $X / BP $Y` where BP is
-  the stock tradable balance. The per-account breakdown tooltip lists balance,
-  stock tradable, option tradable and broker BP. Same hourly refresh, stale and
+  the broker's REMAINING buying power (`AccountSnapshot.buying_power`, every
+  broker); the tooltip names it and the per-account breakdown lists balance,
+  broker BP, stock tradable and option tradable. Same hourly refresh, stale and
   partial markers as today; a None for one account keeps the partial marker.
 - Floating P/L per account card (`FloatingPLPerAccountWidget`, the subclass
-  with the Balance column): new `BP` column showing stock tradable, broker BP in
-  the cell tooltip, fetched in the same loop as balance.
+  with the Balance column): new `BP` column showing the broker's remaining
+  buying power, this platform's stock tradable ceiling in the cell tooltip,
+  fetched in the same loop as balance.
+- **Operator decision, 2026-09-08 — BP means the BROKER's number, not ours.**
+  Both readouts first showed the stock tradable balance, on the reasoning that
+  the platform's own sizing obeys it. A TastyTrade account with margin off then
+  showed `$3,997.78 / BP $3,997.78` (tradable == balance) while holding ~$8k of
+  positions its manual allocator had bought at 2x: an account already levered
+  outside this platform's ceiling reads as untouched, and the capacity that was
+  actually running out was invisible. The tradable figures stay one hover or one
+  menu away, where they explain the badge instead of standing in for it.
 - Live trades page (`LiveTradesTable`, `live_trades.py`): column label
   `Value / CapReq`, cell `$value / $capreq`, capreq = value / margin_factor
   when the account has margin on, else equal to value. Sort stays on value. The

@@ -41,19 +41,21 @@ UNKNOWN_PL_TEXT = 'P/L unknown'
 #: The balance cell when ``get_balance()`` would not answer. Same rule.
 UNKNOWN_BALANCE_TEXT = 'Bal: unknown'
 
-#: The BP cell when the TRADABLE balance could not be worked out -- the broker
-#: published no multiplier, or the accessor raised. Same rule again: not '$0.00'
-#: (which would read as 'this account may deploy nothing') and not blank. The
+#: The BP cell when the BROKER's remaining buying power could not be read -- the
+#: snapshot call failed, or the broker publishes none. Same rule again: not
+#: '$0.00' (which would read as 'this account may buy nothing') and not blank. The
 #: word, not the header's dash: this cell is LABELLED, and the card already says
 #: 'Bal: unknown' for exactly this state one cell to the left -- the dash is for
 #: the header's unlabelled slot, where there is no room to spell it out.
 UNKNOWN_BP_TEXT = 'BP: unknown'
 
-#: Hover text on the BP cell. Broker BP is a DIFFERENT number from the cell's:
-#: the cell is what this platform will let the account deploy, this is what the
-#: broker has left. The second one is what runs out first when something outside
-#: the platform has been trading, which is why it is on screen at all.
-BROKER_BP_TOOLTIP_FMT = 'Broker buying power: {bp}'
+#: Hover text on the BP cell. The tradable balance is a DIFFERENT number from the
+#: cell's: the cell is what the BROKER has left, this is the ceiling this
+#: platform's own sizing obeys. The two swapped places on 2026-09-08 because the
+#: broker's is the one that actually runs out -- an account whose manual allocator
+#: already runs at 2x reports a tradable balance equal to its plain balance, and
+#: the cell said the account was untouched while ~$8k of it was already deployed.
+TRADABLE_TOOLTIP_FMT = 'Tradable (platform ceiling): {bp}'
 
 #: Appended to a figure that is real but INCOMPLETE -- a total missing an
 #: account, or a row missing a position the broker did not quote. In the text
@@ -72,7 +74,7 @@ NO_ACCOUNTS_TEXT = 'No accounts configured'
 
 PL_EXCLUDED_NOTE_FMT = '⚠️ Total excludes {names}: floating P/L could not be measured'
 BALANCE_EXCLUDED_NOTE_FMT = '⚠️ Total balance excludes {names}: balance could not be read'
-BP_EXCLUDED_NOTE_FMT = '⚠️ Total BP excludes {names}: tradable balance could not be read'
+BP_EXCLUDED_NOTE_FMT = '⚠️ Total BP excludes {names}: buying power could not be read'
 UNPRICED_NOTE_FMT = ('⚠️ {name}: no broker price for {symbols} — that position is '
                      'missing from the row')
 
@@ -90,10 +92,11 @@ class PLRow:
     is rendered with :data:`PARTIAL_SUFFIX` rather than silently understated,
     which is what dropping them did.
 
-    ``tradable`` is the STOCK tradable balance -- the balance times the account's
-    effective margin factor -- which is what its experts may actually deploy, and
-    with margin on that is NOT the balance. ``broker_bp`` is the broker's own
-    remaining buying power, a different question, shown on hover. Same
+    ``broker_bp`` is the broker's own REMAINING buying power -- what it will still
+    let this account buy right now -- and is what the 'BP:' cell shows.
+    ``tradable`` is the STOCK tradable balance, the balance times the account's
+    effective margin factor: this platform's own ceiling on what its experts may
+    deploy, which is a different question and rides on the cell's hover. Same
     None-is-unknown contract as ``balance``: neither is ever a zero nobody
     measured, and a margin figure that could not be read leaves ONLY that figure
     unknown.
@@ -595,10 +598,10 @@ class _FloatingPLWidgetBase:
                 with ui.row().classes('items-center gap-3'):
                     if self._show_balance:
                         ui.label(_balance_text(row.balance)).classes('text-xs text-gray-500')
-                        ui.label(_bp_text(row.tradable)) \
+                        ui.label(_bp_text(row.broker_bp)) \
                             .classes('text-xs text-gray-500') \
-                            .tooltip(BROKER_BP_TOOLTIP_FMT.format(
-                                bp=_money_or_dash(row.broker_bp)))
+                            .tooltip(TRADABLE_TOOLTIP_FMT.format(
+                                bp=_money_or_dash(row.tradable)))
                     _pl_label(row.pl, partial=bool(row.unpriced), size='text-sm')
 
         ui.separator().classes('my-2')
@@ -606,7 +609,7 @@ class _FloatingPLWidgetBase:
         pl_total, pl_missing = combine_measurements([(r.name, r.pl) for r in rows])
         understated = [r.name for r in rows if r.unpriced]
         bal_total, bal_missing = combine_measurements([(r.name, r.balance) for r in rows])
-        bp_total, bp_missing = combine_measurements([(r.name, r.tradable) for r in rows])
+        bp_total, bp_missing = combine_measurements([(r.name, r.broker_bp) for r in rows])
 
         with ui.row().classes('w-full justify-between items-center'):
             ui.label('Total P/L:').classes('text-sm font-bold')
@@ -650,10 +653,11 @@ def _money_or_dash(value: Optional[float]) -> str:
 
 
 def _bp_text(value: Optional[float], *, partial: bool = False) -> str:
-    """The 'BP:' cell: the account's TRADABLE balance. ``None`` is unknown.
+    """The 'BP:' cell: the broker's REMAINING buying power. ``None`` is unknown.
 
-    ``0.0`` is a measurement -- an account with nothing left to deploy -- and
-    prints as one, for the same reason a $0.00 balance does.
+    ``0.0`` is a measurement -- an account with nothing left to buy -- and prints
+    as one, for the same reason a $0.00 balance does. The platform's own tradable
+    ceiling is the hover, not this.
     """
     if value is None:
         return UNKNOWN_BP_TEXT

@@ -1107,10 +1107,12 @@ def test_selecting_one_account_narrows_the_scope_to_it(monkeypatch):
 # Margin: the badge shows balance AND buying power
 #
 # The badge's headline stays the account VALUE. What margin adds is a second
-# figure -- the stock tradable balance, i.e. what the experts may actually
-# deploy -- and the property these tests pin is that the two figures fail
-# INDEPENDENTLY: a broker that cannot say what its multiplier is still has a
-# balance, and that balance must keep printing.
+# figure -- the BROKER's remaining buying power, i.e. what the broker will still
+# let this account buy (operator decision, 2026-09-08: the platform's own tradable
+# ceiling says nothing about an account somebody has already levered by hand) --
+# and the property these tests pin is that the two figures fail INDEPENDENTLY: a
+# broker that will not state a buying power still has a balance, and that balance
+# must keep printing.
 # ---------------------------------------------------------------------------
 
 class _MarginBroker(_Broker):
@@ -1144,6 +1146,11 @@ class _MarginBroker(_Broker):
 
 
 def test_the_badge_reads_balance_slash_bp(monkeypatch):
+    """The second figure is the BROKER's BP, not either tradable ceiling.
+
+    All four figures are distinct here on purpose: a badge reading the tradable
+    balance (what it did before 2026-09-08) prints $18,000.00 and fails.
+    """
     clock = Clock()
     _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0, tradable=18_000.0,
                                                 option_tradable=10_000.0, broker_bp=20_000.0)})
@@ -1151,14 +1158,15 @@ def test_the_badge_reads_balance_slash_bp(monkeypatch):
 
     view = layout.header_badge_from_cache([(1, 'A')], utcnow=clock)
 
-    assert view.text == '$10,000.00 / BP $18,000.00'
+    assert view.text == '$10,000.00 / BP $20,000.00'
 
 
-def test_a_failed_tradable_read_marks_bp_unknown_but_keeps_the_balance(monkeypatch):
-    """The balance is the headline and must survive an unreadable multiplier."""
+def test_a_missing_broker_bp_marks_bp_unknown_but_keeps_the_balance(monkeypatch):
+    """The balance is the headline and must survive a broker that states no BP."""
     clock = Clock()
-    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0, broker_bp=1.0,
-                                                tradable_raises=ValueError("no multiplier"))})
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0, broker_bp=None,
+                                                tradable=18_000.0,
+                                                option_tradable=10_000.0)})
     layout.refresh_header_balance_cache([1], utcnow=clock)
 
     view = layout.header_badge_from_cache([(1, 'A')], utcnow=clock)
@@ -1167,9 +1175,27 @@ def test_a_failed_tradable_read_marks_bp_unknown_but_keeps_the_balance(monkeypat
     assert view.available is True, 'the BADGE state is the balance\'s, not the BP\'s'
 
 
+def test_a_failed_tradable_read_does_not_touch_the_badge(monkeypatch):
+    """The tradable balance left the badge on 2026-09-08 and must not haunt it.
+
+    An unreadable multiplier is precisely the state that used to blank the BP
+    slot. It now costs the BREAKDOWN one cell and the badge nothing: the two
+    figures are read separately, and only one of them is on the badge.
+    """
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0,
+                                                broker_bp=20_000.0,
+                                                tradable_raises=ValueError("no multiplier"))})
+    layout.refresh_header_balance_cache([1], utcnow=clock)
+
+    view = layout.header_badge_from_cache([(1, 'A')], utcnow=clock)
+
+    assert view.text == '$10,000.00 / BP $20,000.00'
+
+
 def test_a_broker_double_without_the_margin_accessors_still_reports_its_balance(monkeypatch):
-    """Every pre-existing _Broker has no get_tradable_balance at all: the balance must
-    survive and BP reads as unknown, never as zero.
+    """Every pre-existing _Broker publishes no buying power and no margin accessors:
+    the balance must survive and BP reads as unknown, never as zero.
 
     And the missing accessor is logged as a DEFECT, at ERROR. A broker that cannot
     say what its multiplier is is an expected unknown and warns; an account CLASS
@@ -1201,16 +1227,16 @@ def test_the_breakdown_lists_the_four_figures_per_account(monkeypatch):
 
     (label, figures), = bd.lines
     assert label == 'A'
-    assert [f.text for f in (figures.value, figures.tradable, figures.option_tradable,
-                             figures.broker_bp)] == \
-        ['$10,000.00', '$18,000.00', '$10,000.00', '$20,000.00']
+    assert [f.text for f in (figures.value, figures.broker_bp, figures.tradable,
+                             figures.option_tradable)] == \
+        ['$10,000.00', '$20,000.00', '$18,000.00', '$10,000.00']
 
 
 def test_bp_totals_across_accounts_and_marks_partial_like_the_balance(monkeypatch):
     """One account's BP unreadable shrinks nothing: the BP total says '(partial)'."""
     clock = Clock()
-    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=1.0, tradable=2.0, broker_bp=1.0),
-                               2: _MarginBroker(net_liquidation=1.0, tradable=None, broker_bp=1.0)})
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=1.0, tradable=2.0, broker_bp=2.0),
+                               2: _MarginBroker(net_liquidation=1.0, tradable=2.0, broker_bp=None)})
     layout.refresh_header_balance_cache([1, 2], utcnow=clock)
 
     view = layout.header_badge_from_cache([(1, 'A'), (2, 'B')], utcnow=clock)
@@ -1273,16 +1299,17 @@ def test_the_breakdown_headings_match_the_cell_order(nicegui_client, monkeypatch
     # The blank cell above the account names has no text, so the four headings
     # come first, in HEADER_BALANCE_BREAKDOWN_COLUMNS order.
     assert texts[:4] == list(layout.HEADER_BALANCE_BREAKDOWN_COLUMNS), texts
-    for name, money in (('Alpaca (X)', ['$1,000.00', '$2,000.00', '$3,000.00',
-                                        '$4,000.00']),
-                        ('Tasty (Y)', ['$10.00', '$20.00', '$30.00', '$40.00'])):
+    for name, money in (('Alpaca (X)', ['$1,000.00', '$4,000.00', '$2,000.00',
+                                        '$3,000.00']),
+                        ('Tasty (Y)', ['$10.00', '$40.00', '$20.00', '$30.00'])):
         at = texts.index(name)
         assert texts[at:at + 5] == [name] + money, texts
 
     # And the Total is IN THE GRID, in the Balance track. Asked of the elements and
     # not of the texts, because the texts cannot tell the difference: the empty
-    # filler cells carry no text, so a total drawn under 'Broker BP' -- or in a row
-    # of its own below the grid, which is what it used to be -- reads identically.
+    # filler cells carry no text, so a total drawn under the last money column --
+    # or in a row of its own below the grid, which is what it used to be -- reads
+    # identically.
     grid, = [el for el in menu.descendants() if isinstance(el, ui.grid)]
     tail = [c for c in grid.default_slot.children if isinstance(c, ui.label)][-5:]
     assert [c._text for c in tail] == [layout.HEADER_BALANCE_TOTAL_LABEL,

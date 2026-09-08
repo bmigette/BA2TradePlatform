@@ -973,13 +973,15 @@ def test_floating_pl_per_account_keeps_a_genuinely_zero_balance(
 
 
 # ---------------------------------------------------------------------------
-# The BP cell: what the account may actually DEPLOY (its tradable balance)
+# The BP cell: what the BROKER will still let the account buy
 #
 # The balance is what an account is WORTH; with margin on it is not what the
 # account may TRADE. A card that shows only the balance understates a margin
-# account's capacity by the whole factor, so 'BP:' sits beside 'Bal:' -- and the
-# broker's own remaining buying power, a different number and the one that
-# actually runs out, hangs off that cell as its tooltip.
+# account's capacity by the whole factor, so 'BP:' sits beside 'Bal:' -- showing
+# the broker's REMAINING buying power, the number that actually runs out, with
+# this platform's own tradable ceiling hanging off that cell as its tooltip
+# (operator decision, 2026-09-08: an account levered to 2x by a manual allocator
+# reports a tradable balance equal to its plain balance and looks untouched).
 #
 # Same three-state contract as the rest of this card: None is unknown and never
 # zero, and a margin figure that could not be read leaves ONLY that figure
@@ -1009,13 +1011,15 @@ def test_plrow_carries_tradable_and_broker_bp_and_the_bp_cell_formats_them():
     row = fpl_mod.PLRow(name='A', pl=1.0, balance=10_000.0,
                         tradable=18_000.0, broker_bp=20_000.0)
 
-    assert fpl_mod._bp_text(row.tradable) == 'BP: $18,000.00'
+    assert fpl_mod._bp_text(row.broker_bp) == 'BP: $20,000.00'
     assert fpl_mod._bp_text(None) == fpl_mod.UNKNOWN_BP_TEXT
     # The inverse error, the one the balance cell guards too: an account that may
-    # deploy nothing has a MEASURED zero, and must not read as unknown.
+    # buy nothing has a MEASURED zero, and must not read as unknown.
     assert fpl_mod._bp_text(0.0) == 'BP: $0.00'
     assert fpl_mod._bp_text(2.0, partial=True).endswith(fpl_mod.PARTIAL_SUFFIX)
-    assert fpl_mod._money_or_dash(row.broker_bp) == '$20,000.00'
+    # The platform's ceiling is the HOVER's figure, and a distinct number here so
+    # a cell and tooltip swapped back over cannot pass.
+    assert fpl_mod._money_or_dash(row.tradable) == '$18,000.00'
     assert fpl_mod._money_or_dash(None) == '—'
 
 
@@ -1049,8 +1053,8 @@ def test_floating_pl_per_account_keeps_the_balance_when_the_tradable_read_fails(
 
     ``get_tradable_balance`` raises rather than guessing when the multiplier is
     unavailable. That is an expected shape of 'unknown' -- a WARNING, and only the
-    BP cell goes dark; blanking the balance too would hide the one figure that WAS
-    read.
+    row's ``tradable`` (the BP cell's TOOLTIP since 2026-09-08) goes dark;
+    blanking the balance too would hide the one figure that WAS read.
     """
     _use_brokers(monkeypatch, {manual_account: _Broker([], balance=10_000.0,
                                                        tradable=None)})
@@ -1116,7 +1120,7 @@ def test_floating_pl_per_account_keeps_the_money_it_read_when_positions_fail(
 
 def test_floating_pl_per_account_draws_bp_beside_the_balance_and_totals_it(
         nicegui_client, select_account, monkeypatch, manual_account, expert_account):
-    """The rendered card: a BP cell per row, a BP total, broker BP on hover."""
+    """The rendered card: a BP cell per row, a BP total, the tradable on hover."""
     other_account, _ = expert_account
     _use_brokers(monkeypatch, {
         manual_account: _Broker([], balance=10_000.0, tradable=18_000.0,
@@ -1129,12 +1133,12 @@ def test_floating_pl_per_account_draws_bp_beside_the_balance_and_totals_it(
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
 
     assert 'Bal: $10,000.00' in texts
-    assert 'BP: $18,000.00' in texts
-    assert 'BP: $23,000.00' in texts        # the total, both accounts readable
+    assert 'BP: $20,000.00' in texts        # the BROKER's remaining buying power
+    assert 'BP: $25,000.00' in texts        # the total, both accounts readable
     assert fpl_mod.UNKNOWN_BP_TEXT not in texts
-    # The tooltip is the ONLY place the broker's own REMAINING capacity appears;
-    # it is a different question from 'what may this account deploy'.
-    assert 'Broker buying power: $20,000.00' in texts
+    # The tooltip is the ONLY place this platform's own ceiling appears; it is a
+    # different question from 'what will the broker still let this account buy'.
+    assert 'Tradable (platform ceiling): $18,000.00' in texts
 
 
 def test_floating_pl_per_account_bp_total_is_partial_and_names_what_it_left_out(
@@ -1146,8 +1150,10 @@ def test_floating_pl_per_account_bp_total_is_partial_and_names_what_it_left_out(
     """
     other_account, _ = expert_account
     _use_brokers(monkeypatch, {
-        manual_account: _Broker([], balance=10_000.0, tradable=None),
-        other_account: _Broker([], balance=5_000.0, tradable=5_000.0),
+        manual_account: _Broker([], balance=10_000.0, tradable=10_000.0,
+                                broker_bp=None),
+        other_account: _Broker([], balance=5_000.0, tradable=5_000.0,
+                               broker_bp=5_000.0),
     })
     _capture_warnings(monkeypatch, fpl_mod)
 
