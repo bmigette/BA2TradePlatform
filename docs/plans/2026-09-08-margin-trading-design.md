@@ -1,7 +1,7 @@
 # Margin trading (leverage) per account — design
 
 Date: 2026-09-08
-Status: validated in brainstorm, not yet implemented
+Status: implemented on feat/margin-trading (2026-09-08), pending merge to dev at a grid job boundary
 Scope: live platform only. The backtest account keeps multiplier 1.0; a backtest
 that needs leverage is run with a larger starting balance instead.
 
