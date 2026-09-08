@@ -25,6 +25,9 @@ class _FakeAccount:
     def get_balance(self):
         return self._balance
 
+    def get_tradable_balance(self):
+        return self._balance   # margin off in these tests
+
     def get_account_info(self):
         return self._account_info
 

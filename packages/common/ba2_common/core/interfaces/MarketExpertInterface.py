@@ -822,10 +822,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
     def get_virtual_balance(self) -> Optional[float]:
         """
-        Get the virtual balance for this expert based on account balance and virtual_equity_pct.
-        
-        For example, if account balance is $10,000 and virtual_equity_pct is 10,
-        the virtual balance would be $1,000 (10% of account balance).
+        Get the virtual balance for this expert based on the account's tradable balance
+        and virtual_equity_pct.
+
+        For example, if the account's tradable balance is $10,000 and virtual_equity_pct
+        is 10, the virtual balance would be $1,000 (10% of the tradable balance).
         
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
@@ -846,12 +847,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
                 return None
             
-            # Get account balance
-            account_balance = account.get_balance()
-            if account_balance is None:
-                logger.error(f"Could not get balance for account {expert_instance.account_id}")
-                return None
-            
+            # The TRADABLE balance, not the balance: with margin on this is
+            # balance x min(margin_factor, broker multiplier), so every expert-side
+            # figure downstream (available balance, risk sizing, per-instrument cap)
+            # scales with the account's leverage setting. Raises when the broker
+            # published nothing usable; the except below turns that into None,
+            # which every caller already treats as "cannot size". With margin off
+            # (every backtest) it is get_balance() unchanged.
+            account_balance = account.get_tradable_balance()
+
             # Calculate virtual balance based on virtual_equity_pct.
             #
             # NO ``or 100.0``. The column is ``float = Field(default=100.0)`` -- NOT NULL,
@@ -862,7 +866,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_balance = account_balance * (virtual_equity_pct / 100.0)
             
-            logger.debug(f"Expert {self.id}: Account balance=${account_balance}, "
+            logger.debug(f"Expert {self.id}: Account tradable balance=${account_balance}, "
                         f"Virtual equity %={virtual_equity_pct}, Virtual balance=${virtual_balance}")
             
             return virtual_balance
