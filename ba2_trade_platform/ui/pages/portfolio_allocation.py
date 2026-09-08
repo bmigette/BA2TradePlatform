@@ -3714,6 +3714,19 @@ async def content() -> None:
             .{TOOLBAR_CLASS} .q-btn {{
                 min-height: {TOOLBAR_CONTROL_PX}px !important;
                 height: {TOOLBAR_CONTROL_PX}px !important; }}
+
+            /* The Review button's own bar: WHITE on the button's green.
+               Not `color=white track-color=green-8`, which is what it was: Quasar's
+               palette props resolve to its theme colours and land a dark green track
+               under a white sweep on a mid-green button -- three greens, and the bar
+               reads as a shadow. The moving part and the track are addressed directly
+               so the contrast is a decision rather than whatever the palette gives.
+               `__model` covers BOTH renderings: determinate uses one, indeterminate
+               two, and both carry that class. */
+            .{TOOLBAR_CLASS} .q-linear-progress__model {{
+                background: #ffffff !important; opacity: 1 !important; }}
+            .{TOOLBAR_CLASS} .q-linear-progress__track {{
+                background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
         ''')
         toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS}')
         body = ui.column().classes('w-full gap-3')
@@ -3887,8 +3900,8 @@ async def content() -> None:
                 # at 0% and it is where the indeterminate sweep is seen. `transparent`
                 # here meant the control drew nothing until it was already half full.
                 review_latch.progress = ui.linear_progress(
-                    value=0.0, show_value=False, size='4px') \
-                    .props('rounded color=white track-color=green-8 indeterminate') \
+                    value=0.0, show_value=False, size='5px') \
+                    .props('rounded indeterminate') \
                     .classes('absolute bottom-0 left-0 w-full z-10') \
                     .mark(MARKER_REVIEW_PROGRESS)
                 review_latch.progress.set_visibility(False)

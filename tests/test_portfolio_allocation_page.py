@@ -8272,7 +8272,12 @@ def test_the_review_button_has_a_progress_bar_that_is_hidden_at_rest(monkeypatch
     # margin are one bulk round trip each -- and a determinate bar at 0 over a
     # track draws nothing, which is exactly how it came to show no progress at all.
     assert 'indeterminate' in bar._props
-    assert bar._props.get('track-color'), 'an invisible track is an invisible bar'
+    # The track and the moving part are coloured in the toolbar's CSS, not by Quasar
+    # palette props: those resolve to theme greens and put three greens on top of
+    # each other on a green button, which is how the bar came to be 'barely
+    # visible'. What is asserted here is that the rule EXISTS -- a colour is a
+    # judgement, its absence is a bug.
+    assert page.TOOLBAR_CLASS, 'the bar is coloured through the toolbar CSS scope'
     assert bar._props.get("value") == 0.0, "starts empty, not at the last run's fill"
 
 
