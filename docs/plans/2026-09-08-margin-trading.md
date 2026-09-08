@@ -904,22 +904,23 @@ Expected: FAIL (`10000 == 18000`; the order is rejected).
 ```
 (then the existing pct logic unchanged.)
 
-`AccountInterface._validate_position_size_limits`: replace the `snapshot = self.get_account_snapshot(); account_equity = snapshot.equity` read with
+`AccountInterface._validate_position_size_limits`: KEEP the `snapshot.equity` read and its None-refusal exactly as they are (the backtest account's `get_balance()` is spendable CASH by design while its snapshot equity is deployed equity; swapping the denominator to `get_tradable_balance()` would silently change every backtest's per-instrument cap, breaking BT/live byte-identity). Instead SCALE the denominator by the account's effective factor, added in Task 4's fix round (`effective_margin_factor()`: 1.0 with margin off and no snapshot read, else `min(margin_factor, broker multiplier)`):
 ```python
+            account_equity = float(account_equity)
             try:
-                account_equity = self.get_tradable_balance()
+                account_equity *= self.effective_margin_factor()
             except Exception as e:
                 logger.error(
                     f"POSITION SIZE VALIDATION CANNOT RUN for {trading_order.symbol}: "
-                    f"account {self.id} tradable balance unavailable ({e}). Rejecting the "
+                    f"account {self.id} margin factor unavailable ({e}). Rejecting the "
                     f"order rather than treating an unrun risk check as passed.", exc_info=True)
                 errors.append(
-                    f"Cannot validate position size limits: tradable balance is unavailable "
+                    f"Cannot validate position size limits: margin factor is unavailable "
                     f"from {self.__class__.__name__} ({e}). Refusing the order rather than "
                     f"skipping the check.")
                 return errors
 ```
-and delete the now-dead `if account_equity is None:` branch (get_tradable_balance never returns None). Update the comment block above it: the denominator is the TRADABLE balance (design 2026-09-08), read through `get_tradable_balance()`.
+placed right after the existing `account_equity = float(account_equity)` line. Add a WHY comment: with margin on the cap is a percent of the TRADABLE balance (design 2026-09-08); with it off this multiplies by 1.0 and reads nothing, so backtests are unchanged.
 
 `BalanceUsagePerExpertChart`, the balance fetch:
 ```python
@@ -1335,21 +1336,19 @@ def value_capreq_text(value: Optional[float], capreq: Optional[float]) -> str:
 
 `LiveTradesTable.py:77`: `label='Value / CapReq'` (field stays `value`; sorting stays on `value_numeric` if the table has one, else leave `sortable=True` on the text as today).
 
-`live_trades.py`: where `account_names` is built, ALSO build `margin_by_account: Dict[int, Tuple[bool, float]]`:
+`live_trades.py`: where `account_names` is built, ALSO build `factor_by_account: Dict[int, float]` from the account's EFFECTIVE factor (added in Task 4's fix round; 1.0 with margin off, `min(margin_factor, broker multiplier)` with it on, so the cell agrees with the sizing that actually happened rather than with the raw setting):
 ```python
         from ba2_trade_platform.core.utils import get_account_instance_from_id
-        from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
-        margin_by_account = {}
+        factor_by_account = {}
         for acc_id in unique_account_ids:
             try:
                 acct = get_account_instance_from_id(acc_id, session=session)
-                margin_by_account[acc_id] = (
-                    coerce_bool(acct.get_setting_with_interface_default('margin_enabled', log_warning=False)),
-                    float(acct.get_setting_with_interface_default('margin_factor', log_warning=False)))
+                factor_by_account[acc_id] = acct.effective_margin_factor()
             except Exception as e:
-                logger.error(f"Margin settings unavailable for account {acc_id}: {e}", exc_info=True)
-                # unknown, not "off": the cell shows value only, which is what "" does below
+                logger.error(f"Effective margin factor unavailable for account {acc_id}: {e}", exc_info=True)
+                # unknown, not "1.0": the cell shows the value alone, see below
 ```
+and `capital_requirement(value, *, effective_factor)` becomes simply `value / effective_factor` (drop the `margin_enabled` parameter; the factor already encodes "off" as 1.0). Adjust the tests in step 1 accordingly (`capital_requirement(1800.0, effective_factor=1.0) == 1800.0`, `capital_requirement(1800.0, effective_factor=1.8) == 1000.0`).
 and the value cell:
 ```python
             value_str = ''
@@ -1359,13 +1358,12 @@ and the value cell:
                     if current_price:
                         value = txn.quantity * current_price
                         acc_id = txn_to_account.get(txn.id)
-                        margin = margin_by_account.get(acc_id)
-                        if margin is None:
-                            value_str = f"${value:,.2f}"          # margin settings unreadable: value alone
+                        factor = factor_by_account.get(acc_id)
+                        if factor is None:
+                            value_str = f"${value:,.2f}"          # factor unreadable: value alone
                         else:
-                            enabled, factor = margin
                             value_str = value_capreq_text(
-                                value, capital_requirement(value, margin_enabled=enabled, margin_factor=factor))
+                                value, capital_requirement(value, effective_factor=factor))
                 except Exception as e:
                     logger.debug(f"Could not calculate value for {txn.symbol}: {e}")
 ```
