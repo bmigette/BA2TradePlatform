@@ -1233,9 +1233,22 @@ class TradeRiskManagement:
         ExtendableSettingsInterface rejects unknown keys by design. Live equities at Alpaca are
         commission-free, so 0.0 is both the correct live value and an exact no-op; only the
         backtest account carries a non-zero one.
+
+        ASK BEFORE READING. ``get_setting_with_interface_default`` raises AND logs at ERROR for
+        a key the interface never declared -- that is its contract, an undeclared key is
+        normally a bug. Here the key is legitimately undeclared on every live broker (measured on
+        prod 2026-09-09: two ERROR lines per sized candidate on the Alpaca account, then the
+        correct 0.0), so the interface is asked whether it declares the key first and the
+        settings reader is only consulted when it does.
         """
-        for getter in (lambda: account.get_setting_with_interface_default(
-                           'commission_per_trade', log_warning=False),
+        def _declared_setting():
+            definitions = getattr(type(account), 'get_merged_settings_definitions', None)
+            if definitions is None or 'commission_per_trade' not in (definitions() or {}):
+                return None
+            return account.get_setting_with_interface_default(
+                'commission_per_trade', log_warning=False)
+
+        for getter in (_declared_setting,
                        lambda: (getattr(account, '_cfg', None) or {}).get('commission_per_trade')):
             try:
                 v = getter()
