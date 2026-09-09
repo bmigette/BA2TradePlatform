@@ -204,6 +204,28 @@ def test_headroom_is_not_clamped_at_zero():
     assert stock_exposure_headroom(10_000.0, 25_000.0, 0.0) == -15_000.0
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_invalid_entry_quote_is_refused_before_submission(bad):
+    acct = _Acct(id_val=960, balance=10_000.0, snapshot=_snap(), settings=ON, price=bad)
+    with ts.inmem_trades(), pytest.raises(ValueError, match="usable price"):
+        acct.submit_order(_order(acct))
+    assert acct.submitted == []
+
+
+@pytest.mark.parametrize("field", ["limit_price", "quantity", "filled_qty"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_invalid_pending_entry_cannot_poison_headroom(field, bad):
+    acct = _Acct(id_val=961, balance=10_000.0, snapshot=_snap(), settings=ON)
+    with ts.inmem_trades():
+        order_id = _with_entry_order(acct)
+        order = ts.get_or_none(TradingOrder, order_id)
+        setattr(order, field, bad)
+        update_instance(order)
+        with pytest.raises(ValueError, match="Cannot validate account exposure"):
+            acct.submit_order(_order(acct))
+    assert acct.submitted == []
+
+
 # ----- 2. margin off is not merely equal: it is not reached -----------------
 
 def test_margin_off_returns_none_without_reading_the_snapshot():

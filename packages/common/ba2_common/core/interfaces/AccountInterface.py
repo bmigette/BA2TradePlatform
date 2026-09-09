@@ -1,3 +1,4 @@
+import math
 import threading
 from abc import abstractmethod
 from typing import Any, Dict, Optional, List
@@ -316,6 +317,19 @@ class AccountInterface(ReadOnlyAccountInterface):
         # re-entrant. It is left outside so a slow leg submission cannot stall every other
         # entry on the account.)
         with self._submit_lock():
+            # Margin submissions may wait behind another worker holding a detached
+            # copy of this same order. Read broker acceptance inside the lock, before
+            # charging the existing reservation or letting the stale copy send again.
+            if self._margin_enabled() and trading_order.id is not None:
+                from ba2_common.core.trade_store import get_or_none
+                persisted = get_or_none(TradingOrder, trading_order.id)
+                if persisted is not None and persisted.broker_order_id:
+                    if persisted.account_id != self.id or trading_order.account_id != self.id:
+                        raise ValueError("Order account_id does not match this account")
+                    logger.info(
+                        f"Order {persisted.id} already accepted as {persisted.broker_order_id}; "
+                        f"returning persisted order without resubmission")
+                    return persisted
             # Validate the trading order before submission
             validation_result = self._validate_trading_order(trading_order, is_closing_order=is_closing_order)
             if not validation_result['is_valid']:
@@ -1179,7 +1193,7 @@ class AccountInterface(ReadOnlyAccountInterface):
         price = trading_order.limit_price
         if price is None:
             price = self.get_instrument_current_price(trading_order.symbol)
-        if price is None or price <= 0:
+        if price is None or not math.isfinite(float(price)) or price <= 0:
             logger.error(
                 f"ACCOUNT EXPOSURE VALIDATION CANNOT RUN for {trading_order.symbol} on "
                 f"account {self.id}: no usable price ({price!r}), so the order's notional "
@@ -1191,6 +1205,11 @@ class AccountInterface(ReadOnlyAccountInterface):
             return errors
 
         notional = float(trading_order.quantity) * float(price)
+        if not math.isfinite(notional) or notional <= 0:
+            errors.append(
+                f"Cannot validate account exposure for {trading_order.symbol}: "
+                f"invalid order notional {notional!r}. Refusing the order.")
+            return errors
         if notional > breakdown.headroom:
             message = (
                 f"Account {self.id} stock exposure ceiling: order ${notional:,.2f} exceeds "

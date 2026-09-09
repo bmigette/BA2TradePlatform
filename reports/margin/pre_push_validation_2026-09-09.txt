@@ -1,0 +1,94 @@
+Margin release validation, 2026-09-09
+Baseline: dev 512345311d06a3c26aa7c6784ec3b6c98433865a
+Reviewed implementation: 78d8ccdf plus pre-push review corrections
+Release: APP 2026.09.1145 / TEST 2026.09.0025
+
+Runtime: bundled Python 3.12.14, pytest 9.1.0, existing trade/test site-packages.
+Canonical package source paths were inserted from this monorepo.
+Temporary BA2_HOME, DB_FILE and LOG_FOLDER; pytest plugin autoload and cache disabled.
+Backend conftest independently redirects DATABASE_URL to a temporary database.
+Common and live tests ran in separate processes because both use a tests package.
+
+Focused common suite:
+  python -m pytest packages/common/tests/test_stock_exposure_gate.py
+    packages/common/tests/test_margin_finite_inputs.py
+    packages/common/tests/test_position_sizing.py
+    packages/common/tests/test_atr_risk_budget_decoupling.py -q -p no:cacheprovider
+  99 passed in 3.33s.
+
+Focused live suite:
+  python -m pytest tests/test_margin_submit_idempotency.py
+    tests/test_reductions_survive_the_ceiling.py tests/test_margin_capital_mapping.py
+    tests/test_margin_exposure_clamp.py tests/test_margin_finite_inputs_expert.py
+    tests/test_smart_rm_sizing_budget.py tests/test_smart_rm_atr_sizing_seam.py
+    tests/test_smart_rm_autosize_message.py -q -p no:cacheprovider
+  50 passed, 1 warning in 3.88s.
+
+Final live retry gate (after the additional same-side comment correction):
+  python -m pytest tests/test_reductions_survive_the_ceiling.py
+    tests/test_margin_submit_idempotency.py tests/test_washtrade_lock.py
+    tests/test_entry_submit_lock_retry.py -q -p no:cacheprovider
+  42 passed, 1 warning in 6.88s. Overlaps the preceding live suites.
+
+Broader live order/broker paths:
+  python -m pytest tests/test_entry_submit_lock_retry.py tests/test_washtrade_lock.py
+    tests/test_manual_order_submit_protection.py tests/test_protective_leg_capability.py
+    tests/test_portfolio_allocation_submit.py tests/test_margin_expert_sizing.py
+    tests/test_alpaca_margin_info.py tests/test_tastytrade_account.py -q -p no:cacheprovider
+  602 passed, 2 failed, 1 warning in 28.97s.
+  Both failures are the previously recorded baseline failures, unchanged:
+    test_time_in_force_survives_a_broker_round_trip[Ext Overnight]
+    test_time_in_force_survives_a_broker_round_trip[GTC Ext Overnight]
+  The adapter returns GTC for these unsupported overnight mappings.
+  Baseline reference: reports/margin/final_gate_2026-09-09.txt.
+
+Backtest frozen replay and three-way sizing gate (backend working directory):
+  python -m pytest tests/backtest/test_equity_golden_run.py
+    tests/backtest/test_option_golden_run.py tests/backtest/test_equity_cap_e2e.py
+    tests/backtest/test_parity_golden.py tests/backtest/test_margin_live_backtest_parity.py
+    -q -p no:cacheprovider
+  45 passed, 2 xfailed, 2 warnings in 37.32s.
+  Strict xfails: cash/equity balance mismatch after an entry; classic instrument-cap basis.
+  These are unresolved compatibility exceptions, not passing parity cases.
+
+Frozen JSON SHA-256 (all match baseline 51234531 byte for byte):
+  equity_golden_run.json
+    b32b8de5bb42c1355f7e873cb6c738ff57df42b0f167bf3dcf35dfc3766f264b
+  option_leap_golden_run.json
+    f2efadeb179ee6fda85208b3f7bbb3560911ab799118035905bbbb37d0299c21
+  equity_cap_golden.json
+    76cdb6840a84e282f8bc8b670be815c6baa54509c9c5e15a88369df92ec5b342
+
+Regression evidence before fixes:
+  Exposure tests: 10 failures, 46 passes; NaN quote/working-order inputs admitted entries.
+  Closing spelling: 'Closing position after TP/SL cancellation' was classified False.
+  Stale-copy tests with submit_order loaded from 78d8ccdf: 2 failures.
+    Available capacity: fake broker received order IDs [2, 2], expected [2].
+    Exhausted capacity: accepted retry raised a stock exposure refusal.
+  Same-side comment: 'Entry close to moving average' classified as closing; 1 failure.
+  These cases pass with the corrections. Initial fixture-construction/import errors
+  were corrected before using the regression results above.
+
+Full backtest run:
+  Initial command: python -m pytest tests/backtest -q -p no:cacheprovider.
+  Stalled; diagnostic rerun with -v -o faulthandler_timeout=45 showed:
+    test_covered_call_engine.run_result -> DailyBacktestEngine.run
+    -> TradeRiskManagement._ensure_safeguard_stop -> get_latest_atr
+    -> PandasIndicatorCalc -> FMPOHLCVProvider._fetch_daily_data
+    -> fmp_http_get -> _gate_wait.
+  Both stalled test processes were terminated after verifying their commands.
+  This fixture can reach FMP when no indicator provider/cache is supplied.
+  Offline rerun preserves fmp_common._assert_not_hermetic and then raises OSError
+  before the FMP rate wait/network request. This is a runner-only guard, not a
+  production change or fabricated ATR.
+  Offline full result: 1146 passed, 1 failed, 2 skipped, 2 xfailed,
+    22 warnings in 112.43s.
+  Failure: test_zero_coercion_defects::test_whatif_still_works_with_a_real_capital_base
+    final_equity 100000.0, expected 100100.0.
+  Reproduced separately after loading whatif.py from PRE-MARGIN dev 51234531:
+    same failure. Current whatif.py is also byte-identical to that baseline.
+  This is not a new margin regression; it remains unfixed in this release.
+  All 15 ETF trend tests pass separately with this runtime/offline guard; the
+    prior handoff's ETF failure was not reproduced here.
+
+git diff --check: clean.

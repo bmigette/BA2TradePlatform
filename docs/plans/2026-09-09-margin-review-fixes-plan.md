@@ -387,6 +387,14 @@ Recorded, deliberately not fixed here.
 
 ### Follow-ups from the final whole-branch review (recorded, not fixed)
 
+**Pre-push update:** the branch was merged into dev on September 9 at the user's
+request. The [additional release review](../../reports/margin/pre_push_review_2026-09-09.md)
+records three further fixes: non-finite exposure inputs, the missing “closing”
+spelling, and a persisted acceptance check inside the submit lock. The last fix
+addresses the stale-copy and self-reservation retry items below for margin-on
+accounts. Other listed follow-ups remain open. Release versions are APP 1145 /
+TEST 0025; fresh validation is linked from that review.
+
 - The expert-side headroom clamp cannot pass `exclude_order_id` while the gate
   does, so re-submitting an order that already carries a `broker_order_id`
   charges that order against itself in the clamp.

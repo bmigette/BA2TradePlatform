@@ -94,7 +94,11 @@ def stock_exposure_headroom(ceiling: float, gross_exposure: float,
     the refusal message quotes the real overshoot, and a clamped 0.0 would read as
     "exactly full" -- indistinguishable from a healthy fully-deployed account.
     """
-    return float(ceiling) - float(gross_exposure) - float(pending_entries)
+    terms = (float(ceiling), float(gross_exposure), float(pending_entries))
+    headroom = terms[0] - terms[1] - terms[2]
+    if not all(math.isfinite(value) for value in (*terms, headroom)):
+        raise ValueError(f"Cannot measure stock exposure from non-finite values: {terms!r}")
+    return headroom
 
 
 #: Statuses in which an order is WORKING AT THE BROKER: not yet filled, not terminal, so
@@ -787,15 +791,21 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             elif transaction.side != order.side:
                 continue
 
-            filled = order.filled_qty or 0.0
-            remaining = float(order.quantity) - float(filled)
+            filled = 0.0 if order.filled_qty is None else float(order.filled_qty)
+            quantity = float(order.quantity)
+            if (not math.isfinite(quantity) or not math.isfinite(filled)
+                    or quantity < 0 or filled < 0):
+                raise ValueError(
+                    f"account {self.id}: invalid quantities for working order {order.id} "
+                    f"(quantity={quantity!r}, filled={filled!r}); cannot measure pending exposure")
+            remaining = quantity - filled
             if remaining <= 0:
                 continue
 
             price = order.limit_price
             if price is None:
                 price = self.get_instrument_current_price(order.symbol)
-            if price is None or price <= 0:
+            if price is None or not math.isfinite(float(price)) or price <= 0:
                 raise ValueError(
                     f"account {self.id}: no usable price for working order {order.id} "
                     f"({order.symbol}, got {price!r}); cannot measure pending exposure")

@@ -724,12 +724,13 @@ class TradeManager:
             which does not match ``TransactionHelper``'s "Partial close order (triggered
             by TP/SL cancel)" -- a trim that shrinks a position was validated as an open.
 
-        This is the union, and the substring is ``'close'`` so both spellings match:
+        This is the union; both ``'close'`` and ``'closing'`` must be checked:
 
           1. the order has a transaction whose side is OPPOSITE to its own -> closing.
              ``Transaction.side`` is the direction the POSITION points, the same field
              ``_validate_account_exposure`` and ``_pending_stock_entry_notional`` read;
-          2. else a MARKET order whose comment says ``close`` (the platform's own close
+             a same-side order adds exposure regardless of its comment;
+          2. else a MARKET order whose comment says ``close`` or ``closing`` (the platform's own close
              paths write it) -> closing;
           3. else not closing. An order that opens is the default, because mislabelling
              an OPEN as a close would skip the risk checks entirely.
@@ -746,7 +747,9 @@ class TradeManager:
                     f"Order {order.id} ({order.symbol} {order.side}) is CLOSING: "
                     f"transaction {txn.id} side {txn.side} is the opposite side.")
                 return True
-        if order.order_type == OrderType.MARKET and 'close' in comment:
+            if txn:
+                return False  # A comment cannot override a known exposure increase.
+        if order.order_type == OrderType.MARKET and ('close' in comment or 'closing' in comment):
             logger.debug(
                 f"Order {order.id} ({order.symbol} {order.side}) is CLOSING: MARKET order "
                 f"whose comment says close ({order.comment!r}).")

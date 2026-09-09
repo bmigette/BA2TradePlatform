@@ -271,7 +271,11 @@ def test_a_top_up_of_the_same_position_is_still_refused():
 # --------------------------------------------------------------------------
 
 @pytest.mark.usefixtures("reset_test_db")
-def test_is_closing_order_matches_a_partial_close_comment_without_a_transaction():
+@pytest.mark.parametrize("comment", [
+    "Partial close order (triggered by TP/SL cancel)",
+    "Closing position after TP/SL cancellation",
+])
+def test_is_closing_order_matches_a_partial_close_comment_without_a_transaction(comment):
     """The C1 defect verbatim: the old heuristic looked for 'closing' and this comment
     says 'close'. No transaction, so rule 1 cannot answer it either."""
     from ba2_trade_platform.core.TradeManager import TradeManager
@@ -280,7 +284,7 @@ def test_is_closing_order_matches_a_partial_close_comment_without_a_transaction(
     order = factories.create_trading_order(
         account_id=acct_def.id, side=OrderDirection.SELL, quantity=5.0,
         order_type=OrderType.MARKET,
-        comment="Partial close order (triggered by TP/SL cancel)")
+        comment=comment)
 
     assert TradeManager._is_closing_order(order) is True
 
@@ -300,7 +304,8 @@ def test_is_closing_order_reads_an_opposite_side_transaction():
 
 
 @pytest.mark.usefixtures("reset_test_db")
-def test_is_closing_order_says_no_for_a_same_side_order():
+@pytest.mark.parametrize("comment", ["Entry order", "Entry close to moving average"])
+def test_is_closing_order_says_no_for_a_same_side_order(comment):
     """An OPEN mislabelled as a close would skip the risk checks entirely, so the
     default has to be False."""
     from ba2_trade_platform.core.TradeManager import TradeManager
@@ -311,6 +316,6 @@ def test_is_closing_order_says_no_for_a_same_side_order():
     order = factories.create_trading_order(
         account_id=acct_def.id, side=OrderDirection.BUY, quantity=5.0,
         order_type=OrderType.MARKET, transaction_id=txn.id,
-        comment="Entry order")
+        comment=comment)
 
     assert TradeManager._is_closing_order(order) is False
