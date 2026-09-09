@@ -187,7 +187,11 @@ Shared package (`ba2_common`) and trade app both change: bump
 
 ## Follow-ups (not in this change)
 
-- Bring the portfolio allocator under the margin factor.
+- Bring the portfolio allocator's own sizing under the margin factor. The
+  account-wide *ceiling* is now ENFORCED when margin is on (commit d6c1028f):
+  an expert-side clamp, an entry gate and a per-account submit lock cap total
+  marked stock exposure. The allocator still computes its own sizes outside
+  the factor; it is only prevented from exceeding the ceiling.
 - Separate option margin factor.
 - Backtest account leverage (multiplier > 1 with the Reg-T model it already has).
 - TastyTrade snapshot TTL cache.
@@ -198,3 +202,24 @@ Shared package (`ba2_common`) and trade app both change: bump
   rebuilds on every unset-key read; ~3.5 µs per call in the backtest sizing loop).
 - `OptionRiskManagement.sleeve_equity` stays on snapshot equity; revisit if an
   adapter ever reports option leverage > 1.
+
+Deferred items from the 2026-09-09 margin review fixes (see
+`docs/plans/2026-09-09-margin-review-fixes-plan.md` for the full list):
+
+- Live margin-on round-trip cost: one `submit_order` now takes about three
+  snapshots and two pending-order queries under the per-account lock (position
+  size validator, expert headroom clamp, exposure gate), and `describe_capital()`
+  adds one snapshot plus one order scan per sizing decision. TastyTrade's
+  snapshot is an uncached REST call. Compute the StockExposure breakdown once per
+  submit and thread it through.
+- `tradingorder.account_id` and `depends_on_order` are not indexed; the
+  pending-entry query runs per sizing decision against the full orders table
+  (live, margin on).
+- The per-account submit RLock is the one piece of that work reachable with
+  margin off. It serialises only; results are unchanged, and GA trial threads
+  share the backtest account id's lock.
+- IBKR plus `margin_enabled` remains the documented unsupported path: no stock
+  multiplier, so it refuses at the multiplier step.
+- `_validate_account_exposure` catches only `ValueError`; broker exceptions from
+  `get_instrument_current_price` propagate, which is house style under
+  `BA2_ERROR_MODE=enforce`.

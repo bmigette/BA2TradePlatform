@@ -3,6 +3,7 @@
 All application data is temporary; no network, broker submission or production DB
 is used. Assertions record the reviewed behavior, including identified defects.
 Run with the project Python environment from the repository root.
+Records behaviour at 51234531 (pre-fix). Findings 1, 3 and 5 changed on branch fix/margin-review-2026-09-09 (this script's assertions for them now FAIL by design); the durable expectations live in the tests named in docs/plans/2026-09-09-margin-review-fixes-plan.md. Do not run this as a regression test.
 """
 from contextlib import ExitStack
 from datetime import datetime, timezone

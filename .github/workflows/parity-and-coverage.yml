@@ -45,7 +45,14 @@ jobs:
         # test_golden_fixture_is_committed asserts (not skips) when the committed fixture is missing,
         # and the parity tests carry no skipif — so a broken/missing fixture FAILS here (non-zero exit
         # fails the job). No junit skip-parsing needed.
-        run: python -m pytest tests/backtest/test_parity_golden.py -v -p no:cacheprovider
+        #
+        # test_margin_live_backtest_parity.py is the three-way BT / $4k-1x / $2k-2x sizing gate. It
+        # carries two STRICT xfails for the deliberately deferred blockers (finding 6: the backtest
+        # get_balance() cash-vs-equity contract; finding 4: the classic per-instrument ceiling
+        # denominator). Strict means an XPASS FAILS this gate on purpose: either blocker becoming
+        # true silently would move historical backtest numbers, so it must be a separately
+        # versioned, reviewed correction rather than a quiet green build.
+        run: python -m pytest tests/backtest/test_parity_golden.py tests/backtest/test_margin_live_backtest_parity.py -v -p no:cacheprovider
 
       - name: Backtest engine + shared decision suite (blocking)
         working-directory: testplatform/backend

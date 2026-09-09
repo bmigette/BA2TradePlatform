@@ -1,6 +1,8 @@
 # Live-only margin: preserve the unlevered backtest reference
 
-Date: September 9, 2026. Status: **plan only; no implementation changes made**.
+Date: September 9, 2026. Status: **implemented on branch `fix/margin-review-2026-09-09`**
+via [the margin review fixes plan](2026-09-09-margin-review-fixes-plan.md); see the status
+table below for what is done, what is partial and what stays deferred.
 Source: [margin TP/SL review](../../reports/margin/margin_tp_sl_review_2026-09-09.md).
 Reviewed baseline: 512345311d06a3c26aa7c6784ec3b6c98433865a.
 
@@ -32,6 +34,26 @@ This replaces the previous draft proposing backtest leverage. Specifically:
 - Use a normal $4,000 backtest as the reference for $2,000-at-2x live at that state.
 - Preserve existing backtest numerical outputs as compatibility baselines.
 - Honor actual live broker restrictions; the backtest is not permission to bypass them.
+
+## Status table (2026-09-09)
+
+Branch `fix/margin-review-2026-09-09`. Test paths are relative to the repository
+root; `bt/` stands for `testplatform/backend/tests/backtest/`.
+
+| Step | State | Test file(s) | Commit |
+|---|---|---|---|
+| 1 Freeze the reference | done | reports/margin/baseline_goldens_2026-09-09.txt | 681a20cb |
+| 2 Three-way sizing tests | done | bt/test_margin_live_backtest_parity.py | af479f07, 1cfc042a |
+| 3 Normalize live capital | done | packages/common/tests/test_margin_finite_inputs.py, tests/test_margin_finite_inputs_expert.py, packages/common/tests/test_position_sizing.py, tests/test_smart_rm_sizing_budget.py, packages/common/tests/test_atr_risk_budget_decoupling.py | 51b9d1da, e99b36fd, 2036d39a, 7f5bd5b5, 6a906172 |
+| 4 Real capacity enforcement | done | packages/common/tests/test_stock_exposure_gate.py, tests/test_margin_exposure_clamp.py, tests/test_tastytrade_account.py | d6c1028f, b01a475e |
+| 5 Expose the mapping | done | tests/test_margin_capital_mapping.py | 5be52d7d, fb4c9edd |
+| 6 Resolve blockers | partial: pinned, not fixed | bt/test_margin_live_backtest_parity.py (2 strict xfails) | af479f07, 1cfc042a |
+| 7 Release gate | done | .github/workflows/parity-and-coverage.yml | this commit |
+
+Step 6 is partial by decision, not by omission: findings 6 and 4 are pinned as
+strict xfails because fixing either one moves historical backtest numbers. See
+the resolution list in section 6. The equity golden fingerprint recorded in step
+1 is unchanged after every task.
 
 ## Strategy behavior to preserve
 
@@ -197,6 +219,38 @@ Handle the other findings with the same discipline:
 
 **Done when:** each pre-existing discrepancy has a documented resolution or is
 an explicit release blocker, with no hidden historical result changes.
+
+### Resolution (2026-09-09)
+
+- Finding 1 (Smart RM did not use the shared risk-budget resolver): **fixed**.
+  Smart RM now sizes and synthesizes stops through
+  `resolve_sizing_risk_budget_pct`. Classic backtest outputs unchanged
+  (2036d39a, 7f5bd5b5, 6a906172).
+- Finding 3 (gross exposure was not the total marked exposure, and nothing
+  enforced the account ceiling): **fixed**. Exposure is total marked exposure on
+  every broker; the ceiling is enforced by an expert-side clamp, an entry gate
+  and a per-account submit lock, all reachable only with margin on
+  (d6c1028f, b01a475e).
+- Finding 5 (a non-finite broker multiplier, buying power or balance could clamp
+  open instead of refusing): **fixed**. Non-finite input is a loud refusal or a
+  loud skip, never a number (51b9d1da, e99b36fd).
+- Finding 2 (used-exposure accounting): the **ceiling consequence is closed** by
+  the step 4 clamp and gate when margin is on. The expert's own cost-based
+  used-balance accounting is unchanged, which is result-neutral for backtests.
+  Correcting that accounting still needs its own compatibility evidence.
+- Finding 6 (BacktestAccount.get_balance() returns cash while live returns
+  equity, so shared expert math charges a position twice in the backtest:
+  $3,000/$2,000 against $4,000/$3,000): **not fixed, pinned as a strict xfail**.
+  Release blocker for a full parity claim; the correction is separately
+  versioned and is the operator's decision.
+- Finding 4 (classic per-instrument ceiling is available capital times the ratio,
+  900, not virtual capital times the ratio, 1800): **not fixed, pinned as a
+  strict xfail**. Same reason: it changes historical sizing.
+
+Not covered by any test yet:
+
+- Cancel or retry release of the reserve held by a pending entry.
+- Several experts entering concurrently on one account.
 
 ## 7. Strengthen the release gate
 

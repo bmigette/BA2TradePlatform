@@ -234,3 +234,92 @@ Run from `testplatform/backend`. Also run `tests/backtest/test_equity_golden_run
 3. `packages/common/tests -q` full (separately).
 4. `tests -q --ignore=tests/test_portfolio_allocation_page.py` then that file alone; compare against the dev baseline of 24 failures / 7 files (memory `worktree-test-running-quirks`); any NEW failure is ours.
 5. Write the resolution section into the final report to the user (what was fixed, what is pinned, what remains a decision).
+
+---
+
+## Status (2026-09-09)
+
+All six tasks are implemented on branch `fix/margin-review-2026-09-09`. The
+equity golden fingerprint recorded in `reports/margin/baseline_goldens_2026-09-09.txt`
+(step 1) is unchanged after every task.
+
+| Task | Commit(s) |
+|---|---|
+| 0 Baseline freeze and docs | 681a20cb |
+| 1 Non-finite inputs refuse loudly (finding 5) | 51b9d1da, e99b36fd |
+| 2 Smart RM uses the shared budget resolver (finding 1) | 2036d39a, 7f5bd5b5, 6a906172 |
+| 3 Account stock-exposure ceiling (findings 2/3) | d6c1028f, b01a475e |
+| 4 Capital mapping is logged per decision | 5be52d7d, fb4c9edd |
+| 5 Three-way parity gate, blockers pinned | af479f07, 1cfc042a |
+| 6 CI parity gate, plan status, versions | this commit |
+
+Test files per task: T1 `packages/common/tests/test_margin_finite_inputs.py`,
+`tests/test_margin_finite_inputs_expert.py`; T2
+`packages/common/tests/test_position_sizing.py`,
+`tests/test_smart_rm_sizing_budget.py`,
+`packages/common/tests/test_atr_risk_budget_decoupling.py`; T3
+`packages/common/tests/test_stock_exposure_gate.py`,
+`tests/test_margin_exposure_clamp.py`, `tests/test_tastytrade_account.py`; T4
+`tests/test_margin_capital_mapping.py`; T5
+`testplatform/backend/tests/backtest/test_margin_live_backtest_parity.py`
+(18 pass plus 2 strict xfail).
+
+### Deferred / follow-up
+
+Recorded, deliberately not fixed here.
+
+- Findings 6 and 4: NOT fixed by design; pinned as strict xfails in the parity
+  file. Finding 6: `BacktestAccount.get_balance()` is cash, live is equity, so
+  shared expert math charges a position twice in the backtest, $3,000/$2,000
+  against $4,000/$3,000. Finding 4: the classic per-instrument ceiling is
+  available capital times the ratio (900), not virtual capital times the ratio
+  (1800). Both change historical backtest numbers; a separately versioned
+  correction is the operator's decision.
+- Finding 2: the ceiling consequence is closed by the Task 3 clamp and gate
+  (margin on); the expert's own cost-based used-balance accounting is unchanged
+  (result-neutral for backtests).
+- Live margin-on round-trip cost: one `submit_order` now takes about 3 snapshots
+  plus 2 pending-order queries under the per-account lock (position-size
+  validator, expert headroom clamp, exposure gate), and `describe_capital()`
+  adds one snapshot plus one order scan per sizing decision. TastyTrade's
+  snapshot is an uncached REST call. Follow-up: compute the StockExposure
+  breakdown once per submit and thread it through.
+- `tradingorder.account_id` and `depends_on_order` are not indexed; the
+  pending-entry query runs per sizing decision against the full orders table
+  (live, margin on).
+- The per-account submit RLock is the one Task 3 piece reachable with margin off
+  (serialises only; results unchanged; GA trial threads share the backtest
+  account id's lock).
+- `_validate_account_exposure` catches only `ValueError`; broker exceptions from
+  `get_instrument_current_price` propagate (house style under
+  `BA2_ERROR_MODE=enforce`).
+- IBKR plus `margin_enabled` remains the documented unsupported path (no stock
+  multiplier, so it refuses at the multiplier step).
+- Classic RM scales the risk budget by `_regime_scale(expert, 'regime_risk_scale')`;
+  Smart RM does not (known divergence).
+- `SmartRiskManagerToolkit`: `min_stop_loss_pct or 7.0` (explicit-quantity path)
+  and `or 0.0` (auto-size path). A configured 0.0 becomes 7.0 in one place: one
+  setting, two floors. Deferred, pinned in `tests/test_smart_rm_sizing_budget.py`.
+- LIVE behaviour change on the first deploy of a genome with
+  `atr_risk_budget_pct` set (never set on prod or dev as of 2026-09-06 per
+  `tools/migrate_atr_budget_swap.py`): Smart RM explicit-quantity orders are
+  reduced when the budget-implied stop is tighter than `min_stop_loss_pct`.
+- Pre-existing dead branch: `ba2_trade_platform/core/SmartRiskManagerQueue.py:101-109`
+  tests `if account_equity is None` on `get_tradable_balance()`, which raises
+  rather than returning None.
+- `effective_factor_for` (pure) has no finiteness guard; the invariant lives at
+  the call sites.
+- Test-stub duplication: the bare account `_Stub` is copied across
+  `test_margin_finite_inputs`, `test_margin_tradable_balance`,
+  `test_margin_accessors` and `test_stock_exposure_gate`. Extract a shared stub
+  module later.
+- `get_virtual_balance`, `_available_balance_breakdown` and
+  `describe_capital_mapping` repeat the resolve-instance-and-account dance (3
+  copies). A helper is a pure refactor and needs a golden check.
+- The expert seam `describe_capital_mapping` is called bare while the account
+  seams are getattr-guarded; three Smart RM test doubles grew the method.
+- Not covered by any test yet: cancel/retry reserve-release of a pending entry;
+  several experts entering concurrently on one account.
+- Latent, dead today: `BacktestInstanceResolver.get_account_instance_from_transaction`
+  reads `transaction.account_id`, a column `Transaction` does not have (all
+  callers use the live registry).
