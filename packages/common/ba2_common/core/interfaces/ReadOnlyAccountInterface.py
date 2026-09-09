@@ -350,7 +350,15 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             raise ValueError(
                 f"account {self.id} ({type(self).__name__}) published no usable stock margin "
                 f"multiplier ({multiplier!r}); cannot size with margin")
-        return float(multiplier)
+        value = float(multiplier)
+        # 2026-09-09 review, finding 5: NaN loses every comparison, so it survived the
+        # test above AND the min/max in effective_factor_for, which handed back the
+        # configured factor -- an unpublished multiplier read as permission to lever.
+        if not math.isfinite(value):
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published a non-finite stock "
+                f"margin multiplier ({multiplier!r}); cannot size with it")
+        return value
 
     def _buying_power_from(self, snapshot: AccountSnapshot) -> float:
         """``get_buying_power``'s body, against a snapshot already taken."""
@@ -358,7 +366,15 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         if bp is None:
             raise ValueError(
                 f"account {self.id} ({type(self).__name__}) published no buying power")
-        return float(bp)
+        value = float(bp)
+        # 2026-09-09 review, finding 5. A measured 0.0 IS an answer (a fully deployed
+        # account); NaN/inf are not, and the over-exposure ``<`` would lose to a NaN
+        # silently -- skipping the check without ever saying it skipped.
+        if not math.isfinite(value):
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published a non-finite buying "
+                f"power ({bp!r}); cannot size with it")
+        return value
 
     def get_stock_margin_multiplier(self) -> float:
         """The broker's stock leverage: dollars of buying power per dollar of equity.
@@ -421,7 +437,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         if balance is None:
             raise ValueError(
                 f"account {self.id} ({type(self).__name__}): balance unavailable")
-        return float(balance)
+        value = float(balance)
+        # 2026-09-09 review, finding 5: unknown is None OR non-finite, never a number
+        # to size with -- with margin off this figure IS the tradable balance.
+        if not math.isfinite(value):
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published a non-finite balance "
+                f"({balance!r}); cannot size with it")
+        return value
 
     def _effective_factor(self, *, asset: str, balance: float, multiplier: float,
                           remaining_bp: Optional[float]) -> float:
