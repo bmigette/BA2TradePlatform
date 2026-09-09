@@ -1,7 +1,7 @@
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, NamedTuple, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta, date
 from ba2_common.core.account_types import (
     MARKET_HOURS_SOURCE_UNAVAILABLE,
@@ -98,9 +98,19 @@ def stock_exposure_headroom(ceiling: float, gross_exposure: float,
 
 
 #: Statuses in which an order is WORKING AT THE BROKER: not yet filled, not terminal, so
-#: the exposure it will create is still coming. Chosen to be exactly the set
-#: ``AccountInterface._find_opposing_working_order`` already calls "working at the broker",
-#: so the two cannot drift apart about what a live order is.
+#: the exposure it will create is still coming. This IS the set
+#: ``AccountInterface._find_opposing_working_order`` uses (it imports this constant rather
+#: than rebuilding the expression), so the wash-trade gate and the exposure ceiling cannot
+#: drift apart about what a live order is.
+#:
+#: INCLUDED: NEW, OPEN, ACCEPTED, ACCEPTED_FOR_BIDDING, PENDING_NEW, PENDING, HELD,
+#: PENDING_REVIEW, PENDING_CANCEL, PENDING_REPLACE and PARTIALLY_FILLED. The three
+#: "pending_*" states are in on purpose: an order being cancelled or replaced is STILL
+#: working until the broker confirms, and treating it as gone is the direction that lets
+#: exposure through. PENDING is the platform's own pre-send state and would be wrong to
+#: count -- it is admitted here only because the ``broker_order_id`` test in
+#: ``_pending_stock_entry_notional`` removes any order that was never actually sent, which
+#: is the honest discriminator (a row can sit at PENDING after the broker accepted it).
 #:
 #: Deliberately EXCLUDED, and why:
 #:   * FILLED -- already counted, at the broker's mark, in long/short market value. Counting
@@ -118,6 +128,18 @@ def stock_exposure_headroom(ceiling: float, gross_exposure: float,
 #: is already in the market value, same reason as FILLED).
 WORKING_ORDER_STATUSES = frozenset(
     OrderStatus.get_unfilled_statuses() | {OrderStatus.PARTIALLY_FILLED})
+
+
+class StockCapital(NamedTuple):
+    """What ONE broker snapshot says about an account's stock capital.
+
+    A named tuple and not a bare 4-tuple: ``[3]`` at the call site is how a refactor
+    silently swaps the balance for the ceiling.
+    """
+    balance: float               # get_balance(), the account's own equity
+    snapshot: AccountSnapshot    # the snapshot every figure here was read from
+    effective_factor: float      # min(margin_factor, broker multiplier)
+    tradable: float              # balance x effective_factor
 
 
 @dataclass(frozen=True)
@@ -625,10 +647,10 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         if not self._margin_enabled():
             return self._plain_balance()
-        return self._stock_capital_from_snapshot()[3]
+        return self._stock_capital_from_snapshot().tradable
 
-    def _stock_capital_from_snapshot(self) -> Tuple[float, AccountSnapshot, float, float]:
-        """``(balance, snapshot, effective_factor, tradable_balance)`` from ONE snapshot.
+    def _stock_capital_from_snapshot(self) -> StockCapital:
+        """Balance, snapshot, effective factor and tradable balance, from ONE snapshot.
 
         Margin is known to be ON here. Shared by ``get_tradable_balance`` and the exposure
         ceiling so that the CEILING and the GROSS EXPOSURE it is measured against come from
@@ -644,10 +666,20 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             asset="stock", balance=balance,
             multiplier=self._stock_multiplier_from(snapshot),
             remaining_bp=self._buying_power_from(snapshot))
-        return balance, snapshot, factor, balance * factor
+        return StockCapital(balance=balance, snapshot=snapshot, effective_factor=factor,
+                            tradable=balance * factor)
 
     def _gross_stock_exposure_from(self, snapshot: AccountSnapshot) -> float:
-        """long + |short| market value: the dollars of STOCK the broker says are held.
+        """long + |short| market value: TOTAL marked exposure, in dollars.
+
+        DESPITE THE NAME, this is not equity-only. The ceiling is on how much of ONE pot
+        of equity the account has deployed, and an option position is marked against that
+        same pot: an account can be at its limit with no shares at all. Options size their
+        ORDERS from their own sleeve (``get_option_tradable_balance``, with the option
+        multiplier), but they consume the same capital, so they belong in the gross.
+        Alpaca's ``long_market_value``/``short_market_value`` already include derivatives;
+        TastyTrade's adapter sums ``*_equity_value`` and ``*_derivative_value`` to match,
+        so the figure means the same thing at every broker.
 
         ``abs`` and not a subtraction: ``short_market_value`` is NEGATIVE while shorts are
         held (the AccountSnapshot contract; TastyTrade's adapter negates its positive
@@ -655,7 +687,11 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         would let a hedged book lever without limit.
 
         RAISES when either figure is unpublished or non-finite: a guessed exposure is a
-        guessed ceiling, and this is the number a refusal is decided on.
+        guessed ceiling, and this is the number a refusal is decided on. IBKR publishes
+        neither market value -- and no margin multiplier either, so with margin on
+        ``_stock_multiplier_from`` refuses one step earlier and this is never reached.
+        Margin on IBKR is the documented unsupported path, and it fails at the multiplier,
+        not here (pinned: test_stock_exposure_gate, the IBKR-shaped snapshot).
         """
         long_mv, short_mv = snapshot.long_market_value, snapshot.short_market_value
         if long_mv is None or short_mv is None:
@@ -683,12 +719,17 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             never opens one;
           * it is not an option order (options size against the option sleeve, which has
             its own multiplier and its own tradable balance);
-          * its side equals its transaction's side -- a same-side order ADDS to the
-            position, an opposite-side one reduces it.
+          * its side equals ``Transaction.side`` -- a same-side order ADDS to the position,
+            an opposite-side one reduces it. ``Transaction.side`` and NOT the entry order's
+            side, so that this and ``AccountInterface._validate_account_exposure`` decide
+            "same side" from ONE field: two sources for one question is how a gate and its
+            budget come to disagree about which orders they are counting.
         Only the REMAINING quantity counts: the filled part is already in the market value.
 
-        ``exclude_order_id`` drops one row: the order currently being validated, which is
-        persisted before validation runs and would otherwise be charged against itself.
+        ``exclude_order_id`` drops one row: the order currently being validated. A BRAND-NEW
+        entry is not in the table yet (``submit_order`` validates before ``add_instance``),
+        so this matters on the RE-SUBMIT path -- a wash-trade-locked or retried order whose
+        row already exists and would otherwise be charged against itself.
 
         Priced at ``limit_price`` when the order has one, else the current quote. A missing
         or non-positive quote RAISES rather than fabricating a notional -- the alternative
@@ -700,8 +741,12 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         total = 0.0
         # Status and depends_on_order are pushed into the query rather than filtered in
         # Python: live, this runs per sizing decision against an orders table that holds
-        # every order the account has EVER placed, and both columns are indexed. The
-        # remaining predicates need the order's transaction, so they stay here.
+        # every order the account has EVER placed, and ``status`` is indexed, so the
+        # ``IN (...)`` alone removes almost all of that history. ``account_id`` and
+        # ``depends_on_order`` are NOT indexed and are applied as a scan of what is left;
+        # adding indexes for this would be a migration, not a docstring, and the working
+        # set is small enough that it is not warranted. The remaining predicates need the
+        # order's transaction, so they stay in Python.
         candidates = orders_where(account_id=self.id, statuses=WORKING_ORDER_STATUSES,
                                   depends_on_order=None)
         for order in candidates:

@@ -87,6 +87,11 @@ def _balances(**overrides):
         derivative_buying_power=Decimal("25000"),
         long_equity_value=Decimal("75000"),
         short_equity_value=Decimal("0"),
+        # Required fields on the real AccountBalance, and load-bearing: the snapshot's
+        # long/short market value is TOTAL marked exposure (equities + derivatives), so a
+        # stand-in that omits them would map to None and hide the sum.
+        long_derivative_value=Decimal("0"),
+        short_derivative_value=Decimal("0"),
         margin_equity=Decimal("100000"),
         maintenance_requirement=Decimal("18750"),
         net_liquidating_value=Decimal("100000"),
@@ -2073,6 +2078,35 @@ def test_account_snapshot_negates_tastytrades_positive_short_magnitude():
     snapshot = acct.get_account_snapshot()
 
     assert snapshot.short_market_value == -12000.0
+
+
+def test_account_snapshot_market_value_includes_derivatives():
+    """long/short market value is TOTAL marked exposure, options included -- that is what
+    the account-wide margin ceiling measures, and Alpaca's own figures already work that
+    way. An equity-only mapping would read an account holding nothing but options as flat
+    and let it lever without limit."""
+    acct = _bare_account()
+    balances = _balances()
+    balances.long_derivative_value = Decimal("5000")
+    balances.short_derivative_value = Decimal("3000")
+    balances.short_equity_value = Decimal("12000")
+    acct._account.get_balances = AsyncMock(return_value=balances)
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.long_market_value == 80000.0     # 75,000 equity + 5,000 derivative
+    assert snapshot.short_market_value == -15000.0   # -(12,000 + 3,000), negated
+
+
+def test_account_snapshot_market_value_is_none_when_a_component_is_missing():
+    """The sum of a known and an unknown is UNKNOWN. A partial total would understate
+    exposure -- the direction that admits orders -- and the ceiling refuses on None."""
+    acct = _bare_account()
+    balances = _balances()
+    balances.long_derivative_value = None
+    acct._account.get_balances = AsyncMock(return_value=balances)
+
+    assert acct.get_account_snapshot().long_market_value is None
 
 
 def test_account_snapshot_leaves_an_absent_short_value_as_none():

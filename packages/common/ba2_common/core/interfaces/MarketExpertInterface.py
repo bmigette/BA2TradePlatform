@@ -975,12 +975,26 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # has this method, but the resolver is a seam and a host that wires a narrower
             # object must be told the ceiling is not being enforced rather than have this
             # expert silently size without it.
+            #
+            # LATCHED to once per account object, the _non_marginable_warned pattern: this is
+            # a STANDING property of how the seam was wired, not an event, and this method
+            # runs per sizing decision -- unlatched it would emit the same line thousands of
+            # times a run and bury everything else. getattr with a default rather than an
+            # __init__ attribute, for the same reason as there (bare-constructed subclasses).
             headroom_reader = getattr(account, "get_stock_exposure_headroom", None)
             if headroom_reader is None:
-                logger.warning(
+                message = (
                     f"Expert {self.id}: account {expert_instance.account_id} "
                     f"({type(account).__name__}) publishes no stock-exposure ceiling; the "
                     f"account-wide margin ceiling is NOT enforced for this expert")
+                if getattr(account, "_no_exposure_ceiling_warned", False):
+                    logger.debug(message)
+                else:
+                    try:
+                        account._no_exposure_ceiling_warned = True
+                    except AttributeError:
+                        pass    # __slots__ or a frozen double: warn every time rather than crash
+                    logger.warning(message)
             else:
                 headroom = headroom_reader()
                 if headroom is not None and headroom < available_balance:

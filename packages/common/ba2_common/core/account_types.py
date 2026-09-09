@@ -67,6 +67,16 @@ class AccountSnapshot:
     ``build_base_snapshot``) -- so report ``net_liquidation`` as the account's
     headline total value.
 
+    ``long_market_value`` / ``short_market_value`` are TOTAL MARKED EXPOSURE --
+    every position the account holds against its one pot of equity, OPTIONS
+    INCLUDED, not equities only. Alpaca's own figures already work that way; an
+    adapter whose broker reports the two separately MUST sum them (TastyTrade:
+    ``long_equity_value + long_derivative_value``). This is what the account-wide
+    margin ceiling measures (``ReadOnlyAccountInterface.get_stock_exposure_headroom``),
+    so an equity-only figure would let an option book lever without limit. Options
+    still SIZE from their own sleeve (``get_option_tradable_balance``, with the
+    option multiplier); they simply consume the same capital.
+
     ``short_market_value`` is NEGATIVE while shorts are held (the Alpaca
     convention). A broker that publishes a positive magnitude instead
     (TastyTrade's ``short-equity-value``) MUST be negated by its adapter, so

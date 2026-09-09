@@ -9,7 +9,8 @@ from ba2_common.core.types import (
     BrokerOrderErrorReason,
 )
 from ba2_common.core.account_types import OrderImpact
-from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import (
+    WORKING_ORDER_STATUSES, ReadOnlyAccountInterface)
 from ba2_common.core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
 from ba2_common.core.failure_modes import absorb_if_benign
 
@@ -67,6 +68,13 @@ class AccountInterface(ReadOnlyAccountInterface):
     #: same headroom and both pass, so a $12,000 ceiling admits two $10,000 entries. The
     #: lock makes the second thread read the state the first one created.
     #:
+    #: THE ONE PIECE OF THIS FEATURE THAT IS REACHABLE WITH MARGIN OFF. Everything else
+    #: (the headroom read, the expert clamp, the exposure gate) returns before touching the
+    #: broker when ``margin_enabled`` is False; the lock is taken unconditionally because it
+    #: also covers the pre-existing read-decide-act sequences in this method (the wash-trade
+    #: gate, transaction auto-creation). That is safe for backtests: a lock changes the
+    #: ORDER of work, never its result, and each trial has its own in-memory store.
+    #:
     #: Class-level, keyed by id, and reached through ``_submit_lock()`` rather than an
     #: ``__init__`` attribute: the account interfaces are subclassed widely and instantiated
     #: bare (``object.__new__``) in tests, so an ``__init__`` every subclass must call is a
@@ -74,6 +82,11 @@ class AccountInterface(ReadOnlyAccountInterface):
     #: in ReadOnlyAccountInterface. Keyed by id and not by instance so two live objects for
     #: the same broker account (the instance cache can be dropped and rebuilt by /api/reload)
     #: still share one lock.
+    #:
+    #: The key is the BARE account id, not (class, id): a backtest account 1 and a live
+    #: account 1 in the same process would share a lock they need not share. Harmless --
+    #: the cost is serialisation, never a wrong answer -- and the alternative keys a
+    #: process-wide dict on something a subclass could get wrong.
     #:
     #: RLock, not Lock: ``_submit_order_impl`` re-enters ``submit_order`` on the SAME thread
     #: to place protective legs, and a plain Lock would deadlock the entry that owns it.
@@ -577,7 +590,10 @@ class AccountInterface(ReadOnlyAccountInterface):
         Any OTHER opposing order still blocks.
         """
         from sqlmodel import select
-        working = OrderStatus.get_unfilled_statuses() | {OrderStatus.PARTIALLY_FILLED}
+        # THE SHARED CONSTANT, not a rebuilt expression: the exposure ceiling counts a
+        # working order's notional against the account with exactly this set, and two
+        # copies of one definition are two definitions.
+        working = WORKING_ORDER_STATUSES
         with get_db() as session:
             statement = select(TradingOrder).where(
                 TradingOrder.account_id == self.id,
@@ -1075,12 +1091,22 @@ class AccountInterface(ReadOnlyAccountInterface):
             return errors
         transaction_id = getattr(trading_order, 'transaction_id', None)
         if transaction_id is not None:
-            # Same discrimination as _validate_expert_available_balance: the transaction's
-            # ENTRY order says which way the position points, so an opposite-side order is
-            # reducing it. (A brand-new entry has no transaction yet at validation time --
-            # submit_order creates it afterwards -- and correctly falls through as an open.)
-            entry_order = self._get_transaction_entry_order(transaction_id)
-            if entry_order is not None and entry_order.side != trading_order.side:
+            # ``Transaction.side`` says which way the position points (BUY == long), so an
+            # opposite-side order is reducing it. Transaction.side and NOT the entry order's
+            # side -- which is what _validate_expert_available_balance reads -- because
+            # ReadOnlyAccountInterface._pending_stock_entry_notional decides the same
+            # question about the same orders, and a gate that classified an order one way
+            # while the pending sum classified it the other would double-count or miss it.
+            # One field, one answer.
+            #
+            # (A brand-new entry has no transaction yet at validation time -- submit_order
+            # creates it afterwards -- and correctly falls through as an open.)
+            # get_or_none and not get_instance: the same never-raising, dual-path read the
+            # pending sum uses, so a missing transaction row falls through as an OPEN (the
+            # conservative reading) instead of throwing out of the whole validator.
+            from ba2_common.core.trade_store import get_or_none
+            transaction = get_or_none(Transaction, transaction_id)
+            if transaction is not None and transaction.side != trading_order.side:
                 return errors
 
         try:

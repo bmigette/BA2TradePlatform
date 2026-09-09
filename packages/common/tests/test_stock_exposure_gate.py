@@ -33,7 +33,7 @@ import pytest
 
 from ba2_common.core import trade_store as ts
 from ba2_common.core.account_types import AccountSnapshot
-from ba2_common.core.db import add_instance
+from ba2_common.core.db import add_instance, update_instance
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import stock_exposure_headroom
 from ba2_common.core.models import TradingOrder, Transaction
@@ -170,6 +170,21 @@ def records(monkeypatch):
     return seen
 
 
+@pytest.fixture
+def account_records(monkeypatch):
+    """The same, for ReadOnlyAccountInterface -- where the pending-entry diagnostics live."""
+    import sys
+
+    module = sys.modules["ba2_common.core.interfaces.ReadOnlyAccountInterface"]
+    seen = []
+    for name, level in (("debug", logging.DEBUG), ("info", logging.INFO),
+                        ("warning", logging.WARNING), ("error", logging.ERROR)):
+        monkeypatch.setattr(
+            module.logger, name,
+            lambda msg, *a, _lvl=level, **k: seen.append((_lvl, str(msg))))
+    return seen
+
+
 # ----- 1. the pure function -------------------------------------------------
 
 def test_headroom_is_ceiling_minus_gross_minus_pending():
@@ -262,6 +277,30 @@ def test_a_closing_order_is_never_refused():
     assert len(acct.submitted) == 1
 
 
+def test_a_naked_sell_that_opens_a_short_is_gated():
+    """A short is EXPOSURE, not a credit. The gate must not read "SELL" as "reducing":
+    an opening SELL carries no transaction yet, exactly like an opening BUY."""
+    acct = _finding_3_account(id_val=933)
+    with ts.inmem_trades():
+        with pytest.raises(ValueError, match="stock exposure ceiling"):
+            acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=10.0))
+    assert acct.submitted == []
+
+
+def test_adding_to_an_existing_same_side_position_is_gated():
+    """The top-up path: a BUY against a transaction that is already long ADDS exposure,
+    so it faces the ceiling like any other opening order."""
+    acct = _finding_3_account(id_val=934)
+    with ts.inmem_trades():
+        txn_id = add_instance(Transaction(symbol="AAPL", quantity=100.0,
+                                          side=OrderDirection.BUY,
+                                          status=TransactionStatus.OPENED, open_price=100.0))
+        add_instance(_order(acct, qty=100.0, status=OrderStatus.FILLED, transaction_id=txn_id))
+        with pytest.raises(ValueError, match="stock exposure ceiling"):
+            acct.submit_order(_order(acct, qty=10.0, transaction_id=txn_id))
+    assert acct.submitted == []
+
+
 def test_an_option_order_is_not_measured_against_the_stock_ceiling():
     acct = _finding_3_account(id_val=919)
     with ts.inmem_trades():
@@ -329,6 +368,76 @@ def test_a_partially_filled_entry_counts_only_its_remaining_quantity():
         assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
 
 
+def test_a_working_short_entry_consumes_headroom_too():
+    """The pending sum reads Transaction.side, so a SELL against a SHORT transaction is an
+    ENTRY. Counting it as a reduction would hand a short seller unlimited room."""
+    acct = _Acct(id_val=940, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+    with ts.inmem_trades():
+        txn_id = add_instance(Transaction(symbol="MSFT", quantity=50.0,
+                                          side=OrderDirection.SELL,
+                                          status=TransactionStatus.WAITING, open_price=100.0))
+        add_instance(_order(acct, symbol="MSFT", side=OrderDirection.SELL, qty=50.0,
+                            status=OrderStatus.NEW, transaction_id=txn_id,
+                            broker_order_id="brk-s", limit_price=100.0))
+        assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
+
+
+def test_an_option_order_is_not_counted_in_the_pending_sum():
+    """Options consume the same equity, but they are already in the broker's marked
+    exposure once filled, and an unfilled one is sized by the OPTION sleeve -- pricing a
+    contract at its underlying's quote (x quantity, no multiplier) would be a fiction."""
+    acct = _Acct(id_val=941, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+    with ts.inmem_trades():
+        _with_entry_order(acct, asset_class=AssetClass.OPTION,
+                          contract_symbol="MSFT260116C00100000", multiplier=100)
+        assert acct.get_stock_exposure_headroom() == pytest.approx(18_000.0)
+
+
+def test_a_market_pending_entry_is_priced_from_the_current_quote():
+    acct = _Acct(id_val=935, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON,
+                 price=80.0)
+    with ts.inmem_trades():
+        _with_entry_order(acct, limit_price=None)      # a MARKET order has no limit price
+        assert acct.get_stock_exposure_headroom() == pytest.approx(18_000.0 - 50 * 80.0)
+
+
+@pytest.mark.parametrize("bad_price", [None, 0.0])
+def test_an_unpriceable_pending_entry_raises_rather_than_being_skipped(bad_price):
+    """Skipping it would understate the pending total -- a ceiling that fails OPEN, which
+    is the whole failure mode this feature exists to close."""
+    acct = _Acct(id_val=936, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON,
+                 price=bad_price)
+    with ts.inmem_trades():
+        _with_entry_order(acct, limit_price=None)
+        with pytest.raises(ValueError, match="no usable price for working order"):
+            acct.get_stock_exposure_headroom()
+
+
+def test_the_gate_refuses_when_a_pending_entry_cannot_be_priced(records):
+    acct = _Acct(id_val=937, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON,
+                 price=None)
+    with ts.inmem_trades():
+        _with_entry_order(acct, limit_price=None)
+        with pytest.raises(ValueError, match="Cannot validate account exposure"):
+            acct.submit_order(_order(acct, qty=1.0))
+    assert acct.submitted == []
+    assert any(lvl == logging.ERROR and "ACCOUNT EXPOSURE VALIDATION CANNOT RUN" in msg
+               for lvl, msg in records)
+
+
+def test_an_orphaned_transaction_is_counted_as_an_entry_and_says_so(account_records):
+    """It can only REDUCE headroom, so the conservative reading is the safe one -- but a
+    dangling transaction_id is a data defect and must not pass in silence."""
+    acct = _Acct(id_val=938, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+    with ts.inmem_trades():
+        order_id = _with_entry_order(acct)
+        order = ts.store_get(TradingOrder, order_id)
+        order.transaction_id = 424242            # a transaction that does not exist
+        assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
+    assert any(lvl == logging.WARNING and "does not exist" in msg
+               for lvl, msg in account_records)
+
+
 def test_another_accounts_working_entry_does_not_count():
     acct = _Acct(id_val=926, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
     other = _Acct(id_val=927, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
@@ -343,6 +452,19 @@ def test_no_published_market_value_raises():
     acct = _Acct(id_val=928, balance=10_000.0,
                  snapshot=_snap(long_mv=None), settings=ON)
     with pytest.raises(ValueError, match="no long/short market value"):
+        acct.get_stock_exposure_headroom()
+
+
+def test_an_ibkr_shaped_account_refuses_at_the_multiplier_not_the_market_value():
+    """IBKR publishes neither a margin multiplier nor market values. Margin on IBKR is the
+    documented UNSUPPORTED path and was already refused before this feature existed:
+    ``_stock_multiplier_from`` raises first, so the operator gets the message that names
+    the real problem instead of a market-value complaint about a broker whose multiplier
+    was never readable. This pins WHERE the refusal happens, not just that it happens."""
+    acct = _Acct(id_val=939, balance=10_000.0,
+                 snapshot=_snap(multiplier=None, buying_power=None,
+                                long_mv=None, short_mv=None), settings=ON)
+    with pytest.raises(ValueError, match="no usable stock margin multiplier"):
         acct.get_stock_exposure_headroom()
 
 
@@ -400,6 +522,74 @@ def test_two_concurrent_entries_cannot_both_spend_the_same_headroom():
     assert len(refused) == 1, outcomes
     assert "stock exposure ceiling" in outcomes[refused[0]]
     assert acct._snap.long_market_value == pytest.approx(16_000.0)
+
+
+def test_two_concurrent_entries_serialise_through_the_persisted_order_row():
+    """The same race by the PRODUCTION mechanism. Live, the broker does not re-mark the
+    account between two submissions milliseconds apart; what actually changes is that the
+    first order is now a WORKING row with a broker_order_id, which the pending sum picks
+    up. This is therefore the variant that proves the pending term -- not just the lock --
+    is what closes the race."""
+    acct = _Acct(id_val=942, balance=10_000.0,
+                 snapshot=_snap(long_mv=6_000.0, buying_power=20_000.0), settings=ON)
+    acct.impl_delay = 0.05
+
+    def _accept_at_broker(account, order):
+        order.broker_order_id = f"brk-{order.id}"
+        order.status = OrderStatus.NEW
+        update_instance(order)
+
+    acct.on_impl = _accept_at_broker
+
+    outcomes = {}
+
+    def _go(tag):
+        try:
+            acct.submit_order(_order(acct, qty=100.0, symbol=f"PSYM{tag}"))
+            outcomes[tag] = "submitted"
+        except ValueError as e:
+            outcomes[tag] = f"refused: {e}"
+
+    threads = [threading.Thread(target=_go, args=(t,)) for t in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert all(not t.is_alive() for t in threads), "submit_order deadlocked"
+
+    submitted = [tag for tag, out in outcomes.items() if out == "submitted"]
+    refused = [tag for tag, out in outcomes.items() if out != "submitted"]
+    assert len(submitted) == 1, outcomes
+    assert len(refused) == 1, outcomes
+    assert "stock exposure ceiling" in outcomes[refused[0]]
+    assert "pending $10,000.00" in outcomes[refused[0]], outcomes[refused[0]]
+
+
+def test_the_pending_sum_finds_working_orders_on_the_real_sql_path():
+    """Everything above runs inside ``inmem_trades()`` (the backtest store). LIVE takes the
+    other half of ``orders_where``: a real ``status IN (...)`` / ``depends_on_order IS NULL``
+    SELECT. A filter that is right in Python and wrong in SQL would be a ceiling that only
+    works in tests, so the SQL branch gets its own pin."""
+    acct = _Acct(id_val=943, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+
+    txn_id = add_instance(Transaction(symbol="SQLA", quantity=50.0, side=OrderDirection.BUY,
+                                      status=TransactionStatus.WAITING, open_price=100.0))
+    entry_id = add_instance(_order(acct, symbol="SQLA", qty=50.0, status=OrderStatus.NEW,
+                                   transaction_id=txn_id, broker_order_id="brk-sql",
+                                   limit_price=100.0))
+    # A protective leg (excluded by depends_on_order IS NULL) and a filled entry (excluded
+    # by the status IN list) -- the two predicates the SQL path has to get right.
+    add_instance(_order(acct, symbol="SQLA", side=OrderDirection.SELL, qty=50.0,
+                        status=OrderStatus.NEW, transaction_id=txn_id,
+                        broker_order_id="brk-sql-leg", limit_price=90.0,
+                        depends_on_order=entry_id,
+                        depends_order_status_trigger=OrderStatus.FILLED))
+    add_instance(_order(acct, symbol="SQLA", qty=99.0, status=OrderStatus.FILLED,
+                        transaction_id=txn_id, broker_order_id="brk-sql-done",
+                        limit_price=100.0))
+
+    assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
+    assert acct.get_stock_exposure_headroom(exclude_order_id=entry_id) == pytest.approx(18_000.0)
 
 
 def test_the_submit_lock_is_reentrant_so_a_leg_does_not_deadlock():

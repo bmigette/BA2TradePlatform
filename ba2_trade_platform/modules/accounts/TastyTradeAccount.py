@@ -460,8 +460,28 @@ class TastyTradeAccount(AccountInterface):
             except (TypeError, ValueError):
                 return None
 
+        def _marked_total(equity_field, derivative_field):
+            """One side's TOTAL marked value: equities PLUS derivatives.
+
+            ``long_market_value``/``short_market_value`` mean TOTAL marked exposure of the
+            one pot of equity (see ReadOnlyAccountInterface._gross_stock_exposure_from) --
+            Alpaca's own figures already include option positions. Reporting only
+            ``*_equity_value`` here would make an account holding nothing but options read
+            as flat, and the account-wide margin ceiling would let it lever without limit.
+
+            ``None`` when EITHER component is missing: the sum of a known and an unknown is
+            unknown, and a partial total silently UNDERSTATES exposure, which is the
+            direction that admits orders. (Both fields are required on tastytrade's
+            AccountBalance, so in practice this is the failed-fetch case.)
+            """
+            equity_part, derivative_part = _num(equity_field), _num(derivative_field)
+            if equity_part is None or derivative_part is None:
+                return None
+            return equity_part + derivative_part
+
         is_margin = self._is_margin_account()
         net_liquidation = _num("net_liquidating_value")
+        short_marked = _marked_total("short_equity_value", "short_derivative_value")
         return AccountSnapshot(
             cash=_num("cash_balance"),
             equity=net_liquidation,
@@ -471,17 +491,13 @@ class TastyTradeAccount(AccountInterface):
             option_buying_power=_num("derivative_buying_power"),
             margin_multiplier=2.0 if is_margin else 1.0,
             is_margin_account=is_margin,
-            long_market_value=_num("long_equity_value"),
+            long_market_value=_marked_total("long_equity_value", "long_derivative_value"),
             # NEGATED ON PURPOSE. AccountSnapshot pins short_market_value as NEGATIVE
             # while shorts are held (the Alpaca convention), but TastyTrade's
-            # short-equity-value is a POSITIVE MAGNITUDE. Passing it through unchanged
+            # short-*-value fields are POSITIVE MAGNITUDES. Passing them through unchanged
             # makes gross exposure broker-dependent: long + abs(short) and long - short
             # disagree, and no fixture with a zero short can tell the difference.
-            short_market_value=(
-                -_num("short_equity_value")
-                if _num("short_equity_value") is not None
-                else None
-            ),
+            short_market_value=(-short_marked if short_marked is not None else None),
             # TastyTrade's pending_cash is SIGNED (positive = incoming); it is reported
             # as-is rather than clamped, so the caller sees what the broker said.
             pending_transfer_in=_num("pending_cash"),
