@@ -1,3 +1,4 @@
+import threading
 from abc import abstractmethod
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
@@ -60,6 +61,40 @@ class AccountInterface(ReadOnlyAccountInterface):
     #: so the only safe place to fail is BEFORE the broker call.
     supports_protective_legs = True
 
+    #: One RLock per ACCOUNT ID, serialising ``submit_order`` from validation through the
+    #: broker call. The account-wide exposure ceiling is a read-decide-act sequence against
+    #: shared broker state: two threads that read the same pre-trade snapshot both see the
+    #: same headroom and both pass, so a $12,000 ceiling admits two $10,000 entries. The
+    #: lock makes the second thread read the state the first one created.
+    #:
+    #: Class-level, keyed by id, and reached through ``_submit_lock()`` rather than an
+    #: ``__init__`` attribute: the account interfaces are subclassed widely and instantiated
+    #: bare (``object.__new__``) in tests, so an ``__init__`` every subclass must call is a
+    #: fragility this does not warrant -- the same reasoning as ``_non_marginable_warned``
+    #: in ReadOnlyAccountInterface. Keyed by id and not by instance so two live objects for
+    #: the same broker account (the instance cache can be dropped and rebuilt by /api/reload)
+    #: still share one lock.
+    #:
+    #: RLock, not Lock: ``_submit_order_impl`` re-enters ``submit_order`` on the SAME thread
+    #: to place protective legs, and a plain Lock would deadlock the entry that owns it.
+    #:
+    #: Parallel GA trials run as THREADS in one process (trade_store's flag and store are
+    #: thread-local for exactly that reason) and seed the same backtest account id, so they
+    #: share one lock. That costs them nothing measurable: a backtest submission is pure
+    #: Python against an in-memory store, which the GIL already serialises, and no trial's
+    #: RESULT can change -- each has its own store, and the lock only orders the work.
+    #: It cannot deadlock across accounts either: submit_order never submits on another one.
+    _submit_locks: Dict[int, "threading.RLock"] = {}
+    _submit_locks_guard = threading.Lock()
+
+    def _submit_lock(self) -> "threading.RLock":
+        """This account id's submit lock, created on first use."""
+        with AccountInterface._submit_locks_guard:
+            lock = AccountInterface._submit_locks.get(self.id)
+            if lock is None:
+                lock = threading.RLock()
+                AccountInterface._submit_locks[self.id] = lock
+            return lock
 
     @abstractmethod
     def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False, use_complex_order: bool = False) -> Any:
@@ -250,180 +285,198 @@ class AccountInterface(ReadOnlyAccountInterface):
                 f"reporting it as success is not an acceptable outcome."
             )
 
-        # Validate the trading order before submission
-        validation_result = self._validate_trading_order(trading_order, is_closing_order=is_closing_order)
-        if not validation_result['is_valid']:
-            error_msg = f"Order validation failed: {', '.join(validation_result['errors'])}"
-            logger.error(f"Order validation failed for order: {error_msg}")
-            raise ValueError(error_msg)
+        # ONE ORDER AT A TIME PER ACCOUNT, from the risk checks through the broker call.
+        #
+        # The account-wide exposure ceiling (_validate_account_exposure) is a
+        # read-decide-act sequence over shared broker state: without this lock two threads
+        # read the SAME pre-trade snapshot, both find room for their order, and a $12,000
+        # headroom admits two $10,000 entries. TradeManager, the JobManager workers and the
+        # Smart RM toolkit all submit concurrently, so that is the ordinary case, not a race
+        # to be reasoned away. Holding it across _submit_order_impl (and not merely across
+        # validation) is the point: the second thread must read the state the first one
+        # created at the broker, which only exists once the order has been sent.
+        #
+        # The span ENDS at _submit_order_impl. What follows -- attaching TP/SL legs and
+        # recalculating the transaction quantity -- re-enters submit_order for the legs and
+        # is bookkeeping about an order the broker has already accepted, so it does not need
+        # the entry's exclusivity. (It would be correct inside the lock too: the lock is
+        # re-entrant. It is left outside so a slow leg submission cannot stall every other
+        # entry on the account.)
+        with self._submit_lock():
+            # Validate the trading order before submission
+            validation_result = self._validate_trading_order(trading_order, is_closing_order=is_closing_order)
+            if not validation_result['is_valid']:
+                error_msg = f"Order validation failed: {', '.join(validation_result['errors'])}"
+                logger.error(f"Order validation failed for order: {error_msg}")
+                raise ValueError(error_msg)
         
-        # Track if this order is being added to an existing transaction (for quantity recalculation)
-        was_existing_transaction = (hasattr(trading_order, 'transaction_id') and 
-                                    trading_order.transaction_id is not None)
+            # Track if this order is being added to an existing transaction (for quantity recalculation)
+            was_existing_transaction = (hasattr(trading_order, 'transaction_id') and 
+                                        trading_order.transaction_id is not None)
         
-        # Handle transaction requirements based on order type
-        # A CLOSING order with nothing to attach to skips this entirely. It never opens a
-        # position, so there is no transaction to create and none to validate -- and the
-        # auto-creation below would otherwise record a reducing SELL as OPENING A SHORT.
-        #
-        # DECIDED HERE rather than inside _handle_transaction_requirements, which subclasses
-        # override: adding a parameter to an overridable method breaks every override that
-        # does not know about it, at the call, with a TypeError. This keeps that method's
-        # signature exactly as it was, so no subclass can be broken by the change.
-        if is_closing_order and getattr(trading_order, 'transaction_id', None) is None:
-            logger.debug(
-                f"Closing order for {trading_order.symbol} carries no transaction_id and will "
-                f"not be given one: it reduces a broker position this platform does not track "
-                f"through a transaction (a Transaction links quantity to an expert)")
-        else:
-            self._handle_transaction_requirements(trading_order)
+            # Handle transaction requirements based on order type
+            # A CLOSING order with nothing to attach to skips this entirely. It never opens a
+            # position, so there is no transaction to create and none to validate -- and the
+            # auto-creation below would otherwise record a reducing SELL as OPENING A SHORT.
+            #
+            # DECIDED HERE rather than inside _handle_transaction_requirements, which subclasses
+            # override: adding a parameter to an overridable method breaks every override that
+            # does not know about it, at the call, with a TypeError. This keeps that method's
+            # signature exactly as it was, so no subclass can be broken by the change.
+            if is_closing_order and getattr(trading_order, 'transaction_id', None) is None:
+                logger.debug(
+                    f"Closing order for {trading_order.symbol} carries no transaction_id and will "
+                    f"not be given one: it reduces a broker position this platform does not track "
+                    f"through a transaction (a Transaction links quantity to an expert)")
+            else:
+                self._handle_transaction_requirements(trading_order)
         
-        # Sync quantity with the parent order for dependent TP/SL legs.
-        #
-        # A protective leg must cover the position its parent creates, so it inherits the parent's
-        # quantity. The one case where it must NOT is a PARTIAL CLOSE: closing 4 of 5 shares creates
-        # a MARKET sell, and the new TP/SL for the remaining 1 share must keep its own quantity
-        # rather than be resized to 4.
-        #
-        # THIS IS A REGRESSION, not an original defect. Until 1077e2c (2025-12-25, a commit titled
-        # "Refactor UI: LazyTable component, async rendering fixes, modern dark theme") the sync was
-        # unconditional -- `if parent_order and parent_order.quantity:` -- and entry-attached TPs
-        # worked. That commit added `and parent_order.order_type != OrderType.MARKET` to stop a
-        # partial close from resizing the leg for the REMAINING shares. The intent was right; the
-        # test was not, because an ENTRY is a MARKET order too, so it silently took out every
-        # entry-attached TP as collateral. Neither version was correct on its own:
-        #
-        #   pre-1077e2c : entry TP synced (correct)   | partial close wrongly resized (bug)
-        #   1077e2c..   : entry TP left at 0 (bug)    | partial close keeps own qty (correct)
-        #   this        : both correct, discriminated by SIDE
-        #
-        # Measured on prod 2026-08-08: every FMPEarningsDrift
-        # take-profit (WKC/GNTX/CSTL) was created as a SELL_LIMIT with a real price but quantity 0,
-        # hit this branch because its parent was the MARKET entry, kept the 0, and was cancelled by
-        # the broker. Three live positions ran with a stop and NO upside exit, silently -- no error,
-        # just a cancelled order. Dev has 12 more of the same rows; it only looked healthy there
-        # because its other positions use OCO, which carries both legs in one correctly-sized order.
-        #
-        # The real discriminator is SIDE, not order type:
-        #   * entry BUY  -> protective SELL leg : OPPOSITE sides -> the parent is the entry, SYNC.
-        #   * close SELL -> new protective SELL : SAME side      -> partial close, KEEP own qty.
-        # That is exactly the case the original comment describes, expressed in terms of what
-        # actually distinguishes the two.
-        if (trading_order.depends_on_order is not None and
-            trading_order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.SELL_STOP, OrderType.BUY_STOP]):
-            try:
-                parent_order = get_instance(TradingOrder, trading_order.depends_on_order)
-                is_partial_close_parent = (
-                    parent_order is not None
-                    and parent_order.order_type == OrderType.MARKET
-                    and parent_order.side == trading_order.side
-                )
-                if parent_order and parent_order.quantity and not is_partial_close_parent:
-                    if trading_order.quantity != parent_order.quantity:
-                        old_qty = trading_order.quantity
-                        trading_order.quantity = parent_order.quantity
-                        logger.info(
-                            f"Synced TP/SL order quantity with parent entry order: "
-                            f"order {trading_order.id or 'new'} qty {old_qty} → {parent_order.quantity} "
-                            f"(parent order {parent_order.id}, type {parent_order.order_type})"
+            # Sync quantity with the parent order for dependent TP/SL legs.
+            #
+            # A protective leg must cover the position its parent creates, so it inherits the parent's
+            # quantity. The one case where it must NOT is a PARTIAL CLOSE: closing 4 of 5 shares creates
+            # a MARKET sell, and the new TP/SL for the remaining 1 share must keep its own quantity
+            # rather than be resized to 4.
+            #
+            # THIS IS A REGRESSION, not an original defect. Until 1077e2c (2025-12-25, a commit titled
+            # "Refactor UI: LazyTable component, async rendering fixes, modern dark theme") the sync was
+            # unconditional -- `if parent_order and parent_order.quantity:` -- and entry-attached TPs
+            # worked. That commit added `and parent_order.order_type != OrderType.MARKET` to stop a
+            # partial close from resizing the leg for the REMAINING shares. The intent was right; the
+            # test was not, because an ENTRY is a MARKET order too, so it silently took out every
+            # entry-attached TP as collateral. Neither version was correct on its own:
+            #
+            #   pre-1077e2c : entry TP synced (correct)   | partial close wrongly resized (bug)
+            #   1077e2c..   : entry TP left at 0 (bug)    | partial close keeps own qty (correct)
+            #   this        : both correct, discriminated by SIDE
+            #
+            # Measured on prod 2026-08-08: every FMPEarningsDrift
+            # take-profit (WKC/GNTX/CSTL) was created as a SELL_LIMIT with a real price but quantity 0,
+            # hit this branch because its parent was the MARKET entry, kept the 0, and was cancelled by
+            # the broker. Three live positions ran with a stop and NO upside exit, silently -- no error,
+            # just a cancelled order. Dev has 12 more of the same rows; it only looked healthy there
+            # because its other positions use OCO, which carries both legs in one correctly-sized order.
+            #
+            # The real discriminator is SIDE, not order type:
+            #   * entry BUY  -> protective SELL leg : OPPOSITE sides -> the parent is the entry, SYNC.
+            #   * close SELL -> new protective SELL : SAME side      -> partial close, KEEP own qty.
+            # That is exactly the case the original comment describes, expressed in terms of what
+            # actually distinguishes the two.
+            if (trading_order.depends_on_order is not None and
+                trading_order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.SELL_STOP, OrderType.BUY_STOP]):
+                try:
+                    parent_order = get_instance(TradingOrder, trading_order.depends_on_order)
+                    is_partial_close_parent = (
+                        parent_order is not None
+                        and parent_order.order_type == OrderType.MARKET
+                        and parent_order.side == trading_order.side
+                    )
+                    if parent_order and parent_order.quantity and not is_partial_close_parent:
+                        if trading_order.quantity != parent_order.quantity:
+                            old_qty = trading_order.quantity
+                            trading_order.quantity = parent_order.quantity
+                            logger.info(
+                                f"Synced TP/SL order quantity with parent entry order: "
+                                f"order {trading_order.id or 'new'} qty {old_qty} → {parent_order.quantity} "
+                                f"(parent order {parent_order.id}, type {parent_order.order_type})"
+                            )
+                    elif is_partial_close_parent:
+                        logger.debug(
+                            f"TP/SL order {trading_order.id or 'new'} parent {parent_order.id} is a same-side "
+                            f"MARKET close - keeping independent quantity {trading_order.quantity}"
                         )
-                elif is_partial_close_parent:
-                    logger.debug(
-                        f"TP/SL order {trading_order.id or 'new'} parent {parent_order.id} is a same-side "
-                        f"MARKET close - keeping independent quantity {trading_order.quantity}"
-                    )
-                else:
-                    logger.warning(
-                        f"Parent order {trading_order.depends_on_order} not found or has no quantity "
-                        f"for TP/SL order {trading_order.id or 'new'}"
-                    )
-            except Exception as e:
-                logger.error(f"Error syncing TP/SL quantity with parent order: {e}", exc_info=True)
+                    else:
+                        logger.warning(
+                            f"Parent order {trading_order.depends_on_order} not found or has no quantity "
+                            f"for TP/SL order {trading_order.id or 'new'}"
+                        )
+                except Exception as e:
+                    logger.error(f"Error syncing TP/SL quantity with parent order: {e}", exc_info=True)
 
-            # A protective leg with no quantity protects nothing. Submitting it anyway is what made
-            # the prod TP loss invisible: the broker cancels it and the position looks "covered" in
-            # the order list. Refuse loudly instead of sending a doomed order.
-            if not trading_order.quantity or float(trading_order.quantity) <= 0:
-                raise ValueError(
-                    f"Refusing to submit protective {trading_order.order_type} leg for "
-                    f"{trading_order.symbol} with quantity {trading_order.quantity!r}: a zero-quantity "
-                    f"TP/SL is cancelled by the broker and leaves the position unprotected. "
-                    f"(parent order {trading_order.depends_on_order})"
+                # A protective leg with no quantity protects nothing. Submitting it anyway is what made
+                # the prod TP loss invisible: the broker cancels it and the position looks "covered" in
+                # the order list. Refuse loudly instead of sending a doomed order.
+                if not trading_order.quantity or float(trading_order.quantity) <= 0:
+                    raise ValueError(
+                        f"Refusing to submit protective {trading_order.order_type} leg for "
+                        f"{trading_order.symbol} with quantity {trading_order.quantity!r}: a zero-quantity "
+                        f"TP/SL is cancelled by the broker and leaves the position unprotected. "
+                        f"(parent order {trading_order.depends_on_order})"
+                    )
+
+            # Set account_id BEFORE saving to DB
+            trading_order.account_id = self.id
+        
+            # Capture values for logging BEFORE saving (to avoid detached instance errors)
+            symbol = trading_order.symbol
+            side = trading_order.side
+            quantity = trading_order.quantity
+            order_type = trading_order.order_type
+        
+            # CRITICAL: Save order to database BEFORE broker submission
+            # This ensures the order has an ID for error tracking
+            # Use expunge_after_flush=True to allow normal attribute access after save
+            if not trading_order.id:
+                # Save to database - object will be expunged and can be used like a normal Pydantic object
+                order_id = add_instance(trading_order, expunge_after_flush=True)
+                logger.debug(f"Created order {order_id} in database before broker submission")
+            else:
+                # Order already exists - update it to persist transaction_id and other changes
+                update_instance(trading_order)
+                logger.debug(f"Updated existing order {trading_order.id} in database with transaction_id={trading_order.transaction_id}")
+        
+            # Log successful validation (using captured values to avoid any potential issues)
+            logger.info(f"Order validation passed for {symbol} - {side.value} {quantity} @ {order_type.value}")
+
+            # Wash-trade gate (broker-agnostic): an opposite-side order already working at the
+            # broker for this symbol makes most brokers (e.g. Alpaca, code 40310000) reject a
+            # plain market/stop/limit order as a wash trade.
+            #
+            # Brokers exempt COMPLEX orders (bracket/OTO/OCO) from that check — Alpaca's own
+            # rejection says "use complex orders", and this was verified against the live paper
+            # API on 2026-08-05 (see docs/WASHTRADE-LOCK.md for the probe table). So when a
+            # blocker exists and we have at least one protective price to attach, submit the
+            # order as a complex order and let it through rather than locking it.
+            #
+            # Locking is the fallback for orders that cannot form a complex order (no TP and no
+            # SL). It is only safe as a fallback: a lock waits for the blocker to clear, and a
+            # protective stop guarding an open position never does. TradeManager expires locks
+            # that outlive their signal.
+            use_complex_order = False
+            if self._is_washtrade_lock_candidate(trading_order):
+                # A dependent leg's own parent is a genuine bracket pair the broker accepts, so it
+                # must not lock its own leg; any OTHER opposing order still does.
+                blocker = self._find_opposing_working_order(
+                    symbol, side,
+                    exclude_order_id=getattr(trading_order, 'depends_on_order', None),
                 )
+                if blocker is not None:
+                    blocker_status = blocker.status.value if hasattr(blocker.status, 'value') else blocker.status
+                    if tp_price or sl_price:
+                        use_complex_order = True
+                        logger.info(
+                            f"Order {trading_order.id} ({symbol} {side.value}) is blocked by "
+                            f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
+                            f"— submitting as a complex order (tp={tp_price}, sl={sl_price}) instead "
+                            f"of locking; complex orders are exempt from the wash-trade check"
+                        )
+                    else:
+                        trading_order.status = OrderStatus.WASHTRADE_LOCKED
+                        update_instance(trading_order)
+                        logger.info(
+                            f"Order {trading_order.id} ({symbol} {side.value}) set WASHTRADE_LOCKED: "
+                            f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
+                            f"is working at the broker and no TP/SL is available to form a complex "
+                            f"order; will retry on next refresh"
+                        )
+                        return trading_order
 
-        # Set account_id BEFORE saving to DB
-        trading_order.account_id = self.id
-        
-        # Capture values for logging BEFORE saving (to avoid detached instance errors)
-        symbol = trading_order.symbol
-        side = trading_order.side
-        quantity = trading_order.quantity
-        order_type = trading_order.order_type
-        
-        # CRITICAL: Save order to database BEFORE broker submission
-        # This ensures the order has an ID for error tracking
-        # Use expunge_after_flush=True to allow normal attribute access after save
-        if not trading_order.id:
-            # Save to database - object will be expunged and can be used like a normal Pydantic object
-            order_id = add_instance(trading_order, expunge_after_flush=True)
-            logger.debug(f"Created order {order_id} in database before broker submission")
-        else:
-            # Order already exists - update it to persist transaction_id and other changes
-            update_instance(trading_order)
-            logger.debug(f"Updated existing order {trading_order.id} in database with transaction_id={trading_order.transaction_id}")
-        
-        # Log successful validation (using captured values to avoid any potential issues)
-        logger.info(f"Order validation passed for {symbol} - {side.value} {quantity} @ {order_type.value}")
-
-        # Wash-trade gate (broker-agnostic): an opposite-side order already working at the
-        # broker for this symbol makes most brokers (e.g. Alpaca, code 40310000) reject a
-        # plain market/stop/limit order as a wash trade.
-        #
-        # Brokers exempt COMPLEX orders (bracket/OTO/OCO) from that check — Alpaca's own
-        # rejection says "use complex orders", and this was verified against the live paper
-        # API on 2026-08-05 (see docs/WASHTRADE-LOCK.md for the probe table). So when a
-        # blocker exists and we have at least one protective price to attach, submit the
-        # order as a complex order and let it through rather than locking it.
-        #
-        # Locking is the fallback for orders that cannot form a complex order (no TP and no
-        # SL). It is only safe as a fallback: a lock waits for the blocker to clear, and a
-        # protective stop guarding an open position never does. TradeManager expires locks
-        # that outlive their signal.
-        use_complex_order = False
-        if self._is_washtrade_lock_candidate(trading_order):
-            # A dependent leg's own parent is a genuine bracket pair the broker accepts, so it
-            # must not lock its own leg; any OTHER opposing order still does.
-            blocker = self._find_opposing_working_order(
-                symbol, side,
-                exclude_order_id=getattr(trading_order, 'depends_on_order', None),
-            )
-            if blocker is not None:
-                blocker_status = blocker.status.value if hasattr(blocker.status, 'value') else blocker.status
-                if tp_price or sl_price:
-                    use_complex_order = True
-                    logger.info(
-                        f"Order {trading_order.id} ({symbol} {side.value}) is blocked by "
-                        f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
-                        f"— submitting as a complex order (tp={tp_price}, sl={sl_price}) instead "
-                        f"of locking; complex orders are exempt from the wash-trade check"
-                    )
-                else:
-                    trading_order.status = OrderStatus.WASHTRADE_LOCKED
-                    update_instance(trading_order)
-                    logger.info(
-                        f"Order {trading_order.id} ({symbol} {side.value}) set WASHTRADE_LOCKED: "
-                        f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
-                        f"is working at the broker and no TP/SL is available to form a complex "
-                        f"order; will retry on next refresh"
-                    )
-                    return trading_order
-
-        # Call the child class implementation (this will update the order with broker_order_id)
-        # Pass tp_price and sl_price for brokers that support bracket orders
-        # The trading_order object is now detached but all attributes are accessible
-        result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price,
-                                         is_closing_order=is_closing_order,
-                                         use_complex_order=use_complex_order)
+            # Call the child class implementation (this will update the order with broker_order_id)
+            # Pass tp_price and sl_price for brokers that support bracket orders
+            # The trading_order object is now detached but all attributes are accessible
+            result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price,
+                                             is_closing_order=is_closing_order,
+                                             use_complex_order=use_complex_order)
         
         # Set TP and/or SL if provided and order was successfully submitted
         # Use adjust methods which create OCO/OTO orders (avoids code duplication)
@@ -968,11 +1021,110 @@ class AccountInterface(ReadOnlyAccountInterface):
             position_size_errors = self._validate_position_size_limits(trading_order)
             if position_size_errors:
                 errors.extend(position_size_errors)
-                
+
+        # ACCOUNT-WIDE stock exposure ceiling (2026-09-09 review, findings 2 and 3).
+        #
+        # Runs LAST and only on an otherwise-valid order: every term below is priced off
+        # quantity and side, so an order that has already failed the checks above (a missing
+        # quantity, a wrong account_id) would only produce a second, derived complaint about
+        # an order that is refused anyway.
+        #
+        # Skipped for closing orders: reducing exposure can never breach an exposure ceiling.
+        if not errors and not is_closing_order:
+            errors.extend(self._validate_account_exposure(trading_order))
+
         return {
             'is_valid': len(errors) == 0,
             'errors': errors
         }
+
+    def _validate_account_exposure(self, trading_order: TradingOrder) -> List[str]:
+        """Refuse an order that would take the ACCOUNT past ``balance x margin_factor``.
+
+        The last gate before the broker, and the only one that measures the WHOLE account.
+        Every other budget here is per-expert virtual bookkeeping, which cannot see other
+        experts on the same account, manual trades, or the difference between a position's
+        cost and its mark -- the two holes the review demonstrated (an empty expert sizing
+        into a fully-deployed account; a winner charged at cost overstating room by its own
+        unrealised gain).
+
+        ONLY REACHABLE WITH MARGIN ON: ``get_stock_exposure_headroom`` returns None with
+        ``margin_enabled`` off, without reading the broker snapshot, so backtests -- which
+        always run with it off -- do not execute a line of this and are unchanged by
+        construction, not by luck.
+
+        Applies to orders that OPEN or ADD to a stock position, and to nothing else:
+          * a protective TP/SL leg (``depends_on_order``) reduces a position;
+          * an order whose side is opposite to its transaction's reduces it too;
+          * an option order sizes against the option sleeve, which has its own multiplier
+            and its own tradable balance.
+
+        An unreadable exposure is a REFUSAL, never a skip -- same rule as the equity branch
+        of ``_validate_position_size_limits``: an unrun risk check reported as "no problems"
+        is how a ceiling silently stops existing.
+        """
+        errors: List[str] = []
+
+        # --- is this an order that ADDS stock exposure? ------------------------------
+        if trading_order.order_type not in self._PRIMARY_ORDER_TYPES:
+            return errors
+        if getattr(trading_order, 'depends_on_order', None) is not None:
+            return errors
+        if (getattr(trading_order, 'asset_class', None) == AssetClass.OPTION
+                or (getattr(trading_order, 'multiplier', None) not in (None, 1))):
+            return errors
+        transaction_id = getattr(trading_order, 'transaction_id', None)
+        if transaction_id is not None:
+            # Same discrimination as _validate_expert_available_balance: the transaction's
+            # ENTRY order says which way the position points, so an opposite-side order is
+            # reducing it. (A brand-new entry has no transaction yet at validation time --
+            # submit_order creates it afterwards -- and correctly falls through as an open.)
+            entry_order = self._get_transaction_entry_order(transaction_id)
+            if entry_order is not None and entry_order.side != trading_order.side:
+                return errors
+
+        try:
+            breakdown = self._stock_exposure_breakdown(exclude_order_id=trading_order.id)
+        except ValueError as e:
+            logger.error(
+                f"ACCOUNT EXPOSURE VALIDATION CANNOT RUN for {trading_order.symbol} on "
+                f"account {self.id}: {e}. Rejecting the order rather than treating an unrun "
+                f"risk check as passed.", exc_info=True)
+            errors.append(
+                f"Cannot validate account exposure for {trading_order.symbol}: {e}. "
+                f"Refusing the order rather than skipping the check.")
+            return errors
+
+        if breakdown is None:
+            return errors            # margin off: no account-wide ceiling applies
+
+        price = trading_order.limit_price
+        if price is None:
+            price = self.get_instrument_current_price(trading_order.symbol)
+        if price is None or price <= 0:
+            logger.error(
+                f"ACCOUNT EXPOSURE VALIDATION CANNOT RUN for {trading_order.symbol} on "
+                f"account {self.id}: no usable price ({price!r}), so the order's notional "
+                f"cannot be measured against the ceiling. Rejecting the order rather than "
+                f"treating an unrun risk check as passed.")
+            errors.append(
+                f"Cannot validate account exposure for {trading_order.symbol}: no usable "
+                f"price (got {price!r}). Refusing the order rather than skipping the check.")
+            return errors
+
+        notional = float(trading_order.quantity) * float(price)
+        if notional > breakdown.headroom:
+            message = (
+                f"Account {self.id} stock exposure ceiling: order ${notional:,.2f} exceeds "
+                f"remaining headroom ${breakdown.headroom:,.2f} "
+                f"(ceiling ${breakdown.ceiling:,.2f} = balance ${breakdown.balance:,.2f} x "
+                f"factor {breakdown.effective_factor:g}; gross ${breakdown.gross:,.2f}; "
+                f"pending ${breakdown.pending:,.2f}). "
+                f"Reduce exposure or raise margin_factor.")
+            errors.append(message)
+            logger.error(message)
+
+        return errors
 
     def _get_expert_settings_for_validation(self, expert_instance) -> Optional[Dict[str, Any]]:
         """

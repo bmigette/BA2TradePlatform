@@ -951,6 +951,46 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                             f"a manual trade) — clamping to the actual figure")
                 available_balance = actual_available
 
+            # Clamp to the ACCOUNT's remaining stock-exposure headroom (2026-09-09 review,
+            # findings 2 and 3). The clamp above caps this expert at what the account can
+            # still SPEND; this one caps it at what the account may still HOLD.
+            #
+            # They are different numbers, and the review found both directions of the gap:
+            #   * a fully deployed levered account still publishes broker buying power (the
+            #     broker's ceiling is higher than the platform's factor), so an empty expert
+            #     was told it could open a position that took the account past
+            #     balance x margin_factor; and
+            #   * a PROFITABLE position is charged to the expert at entry COST while the
+            #     broker marks it to market, so the expert's own arithmetic overstated its
+            #     room by exactly the unrealised gain ($3,240 reported, $1,440 real).
+            # Neither is visible from inside one expert's virtual bookkeeping, which is why
+            # the ceiling is asked of the ACCOUNT.
+            #
+            # ``None`` means margin is off -- the account answers without reading its
+            # snapshot, so nothing here is reachable in a backtest. A ValueError (unknown
+            # exposure) deliberately falls through to the handler below, which returns None:
+            # "cannot size", the loud refusal, not a fabricated number.
+            #
+            # getattr, not a bare call: every REAL account is a ReadOnlyAccountInterface and
+            # has this method, but the resolver is a seam and a host that wires a narrower
+            # object must be told the ceiling is not being enforced rather than have this
+            # expert silently size without it.
+            headroom_reader = getattr(account, "get_stock_exposure_headroom", None)
+            if headroom_reader is None:
+                logger.warning(
+                    f"Expert {self.id}: account {expert_instance.account_id} "
+                    f"({type(account).__name__}) publishes no stock-exposure ceiling; the "
+                    f"account-wide margin ceiling is NOT enforced for this expert")
+            else:
+                headroom = headroom_reader()
+                if headroom is not None and headroom < available_balance:
+                    logger.info(
+                        f"Expert {self.id}: available ${available_balance:,.2f} exceeds the "
+                        f"account's remaining stock exposure headroom ${headroom:,.2f} — "
+                        f"clamping. The account is at its ceiling (balance x margin_factor), "
+                        f"whatever this expert's own virtual books say.")
+                    available_balance = headroom
+
             logger.debug(f"Expert {self.id}: Virtual balance=${virtual_balance}, "
                         f"Used balance=${used_balance}, Available balance=${available_balance}")
 

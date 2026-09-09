@@ -1,5 +1,6 @@
 import math
 from abc import abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta, date
 from ba2_common.core.account_types import (
@@ -12,6 +13,7 @@ from ba2_common.core.account_types import (
 from threading import Lock
 from ba2_common.logger import logger
 from ba2_common.core.models import AccountSetting
+from ba2_common.core.types import AssetClass, OrderStatus
 from ba2_common.core.interfaces.ExtendableSettingsInterface import (
     ExtendableSettingsInterface, coerce_bool)
 
@@ -77,6 +79,61 @@ def over_exposure_threshold(balance: float, *, multiplier: float, factor: float)
     (20000.0 - 18000.0 == 2000.0, where 10_000 * (2.0 - 1.8) is not).
     """
     return float(balance) * float(multiplier) - float(balance) * float(factor)
+
+
+def stock_exposure_headroom(ceiling: float, gross_exposure: float,
+                            pending_entries: float) -> float:
+    """Dollars of STOCK exposure this account may still ADD. Pure.
+
+    ``ceiling`` is the tradable balance (balance x the effective factor) -- the design's
+    "an account deploys at most balance x margin_factor". ``gross_exposure`` is what the
+    BROKER says is already deployed (long + |short| market value), and ``pending_entries``
+    is what already-working entry orders will add when they fill.
+
+    NEGATIVE when the account is past its ceiling, and deliberately NOT clamped to zero:
+    the refusal message quotes the real overshoot, and a clamped 0.0 would read as
+    "exactly full" -- indistinguishable from a healthy fully-deployed account.
+    """
+    return float(ceiling) - float(gross_exposure) - float(pending_entries)
+
+
+#: Statuses in which an order is WORKING AT THE BROKER: not yet filled, not terminal, so
+#: the exposure it will create is still coming. Chosen to be exactly the set
+#: ``AccountInterface._find_opposing_working_order`` already calls "working at the broker",
+#: so the two cannot drift apart about what a live order is.
+#:
+#: Deliberately EXCLUDED, and why:
+#:   * FILLED -- already counted, at the broker's mark, in long/short market value. Counting
+#:     it here as well would charge every position to the ceiling twice.
+#:   * the terminal set (CLOSED / REJECTED / CANCELED / EXPIRED / STOPPED / ERROR /
+#:     REPLACED) -- nothing is coming.
+#:   * WAITING_TRIGGER and WASHTRADE_LOCKED -- our OWN pre-broker states; the order exists
+#:     in the DB only and creates no exposure until it is actually sent (the
+#:     ``broker_order_id`` test below excludes them a second time).
+#:   * DONE_FOR_DAY, CALCULATED, SUSPENDED -- the broker has stopped working the order for
+#:     now; it is not about to fill.
+#:   * UNKNOWN -- the platform's own default for a row that has not been through a refresh;
+#:     it is not a broker statement about anything.
+#: PARTIALLY_FILLED is INCLUDED and contributes only its REMAINING quantity (the filled part
+#: is already in the market value, same reason as FILLED).
+WORKING_ORDER_STATUSES = frozenset(
+    OrderStatus.get_unfilled_statuses() | {OrderStatus.PARTIALLY_FILLED})
+
+
+@dataclass(frozen=True)
+class StockExposure:
+    """One broker instant's answer to "how much more STOCK may this account hold?".
+
+    Carried as a record rather than a bare number so the refusal can quote every term it
+    was derived from -- an operator reading "$1,000 exceeds $0.00" needs to know whether
+    the ceiling, the existing book or a queue of unfilled entries consumed the room.
+    """
+    balance: float           # get_balance(), the account's own equity
+    effective_factor: float  # min(margin_factor, broker multiplier)
+    ceiling: float           # balance x effective_factor == the tradable balance
+    gross: float             # broker long + |short| market value
+    pending: float           # notional of this account's working, unfilled stock entries
+    headroom: float          # ceiling - gross - pending; negative == past the ceiling
 
 
 class ReadOnlyAccountInterface(ExtendableSettingsInterface):
@@ -568,14 +625,163 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         if not self._margin_enabled():
             return self._plain_balance()
-        # The balance FIRST: an account that cannot say what it holds must refuse
-        # without spending a broker round trip to be told a multiplier it cannot use.
+        return self._stock_capital_from_snapshot()[3]
+
+    def _stock_capital_from_snapshot(self) -> Tuple[float, AccountSnapshot, float, float]:
+        """``(balance, snapshot, effective_factor, tradable_balance)`` from ONE snapshot.
+
+        Margin is known to be ON here. Shared by ``get_tradable_balance`` and the exposure
+        ceiling so that the CEILING and the GROSS EXPOSURE it is measured against come from
+        the SAME broker instant: TastyTrade's snapshot is an uncached REST call, so a second
+        read is both a round trip and, strictly, a different account.
+
+        The balance is read FIRST: an account that cannot say what it holds must refuse
+        without spending a broker round trip to be told a multiplier it cannot use.
+        """
         balance = self._plain_balance()
         snapshot = self.get_account_snapshot()
-        return self._tradable_balance(
+        factor = self._effective_factor(
             asset="stock", balance=balance,
             multiplier=self._stock_multiplier_from(snapshot),
             remaining_bp=self._buying_power_from(snapshot))
+        return balance, snapshot, factor, balance * factor
+
+    def _gross_stock_exposure_from(self, snapshot: AccountSnapshot) -> float:
+        """long + |short| market value: the dollars of STOCK the broker says are held.
+
+        ``abs`` and not a subtraction: ``short_market_value`` is NEGATIVE while shorts are
+        held (the AccountSnapshot contract; TastyTrade's adapter negates its positive
+        magnitude to match). A short is EXPOSURE, so it ADDS to the gross -- netting it off
+        would let a hedged book lever without limit.
+
+        RAISES when either figure is unpublished or non-finite: a guessed exposure is a
+        guessed ceiling, and this is the number a refusal is decided on.
+        """
+        long_mv, short_mv = snapshot.long_market_value, snapshot.short_market_value
+        if long_mv is None or short_mv is None:
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published no long/short market "
+                f"value (long={long_mv!r}, short={short_mv!r}); cannot measure exposure")
+        long_value, short_value = float(long_mv), float(short_mv)
+        if not math.isfinite(long_value) or not math.isfinite(short_value):
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published a non-finite market "
+                f"value (long={long_mv!r}, short={short_mv!r}); cannot measure exposure")
+        return long_value + abs(short_value)
+
+    def _pending_stock_entry_notional(self, exclude_order_id: Optional[int] = None) -> float:
+        """Notional of this account's BROKER-WORKING stock ENTRY orders, in dollars.
+
+        Exposure the broker has not marked yet but is committed to: an unfilled entry is
+        already at the exchange, so a ceiling that ignored it would admit a second entry
+        for the same room and be breached the moment both fill.
+
+        An order counts when ALL of these hold:
+          * it carries a ``broker_order_id`` -- it was actually sent;
+          * its status is in ``WORKING_ORDER_STATUSES`` (see that constant);
+          * it has no ``depends_on_order`` -- a protective TP/SL leg REDUCES a position, it
+            never opens one;
+          * it is not an option order (options size against the option sleeve, which has
+            its own multiplier and its own tradable balance);
+          * its side equals its transaction's side -- a same-side order ADDS to the
+            position, an opposite-side one reduces it.
+        Only the REMAINING quantity counts: the filled part is already in the market value.
+
+        ``exclude_order_id`` drops one row: the order currently being validated, which is
+        persisted before validation runs and would otherwise be charged against itself.
+
+        Priced at ``limit_price`` when the order has one, else the current quote. A missing
+        or non-positive quote RAISES rather than fabricating a notional -- the alternative
+        is a silently understated pending total, i.e. a ceiling that fails open.
+        """
+        from ba2_common.core.trade_store import get_or_none, orders_where
+        from ba2_common.core.models import Transaction
+
+        total = 0.0
+        # Status and depends_on_order are pushed into the query rather than filtered in
+        # Python: live, this runs per sizing decision against an orders table that holds
+        # every order the account has EVER placed, and both columns are indexed. The
+        # remaining predicates need the order's transaction, so they stay here.
+        candidates = orders_where(account_id=self.id, statuses=WORKING_ORDER_STATUSES,
+                                  depends_on_order=None)
+        for order in candidates:
+            if exclude_order_id is not None and order.id == exclude_order_id:
+                continue
+            if not order.broker_order_id:
+                continue
+            # Same option discrimination as MarketExpertInterface._calculate_used_balance
+            # (a multiplier other than 1), widened by the explicit asset_class the models
+            # grew later -- either tell is enough.
+            if (order.asset_class == AssetClass.OPTION
+                    or (order.multiplier is not None and order.multiplier != 1)):
+                continue
+            if order.transaction_id is None:
+                # Entries always get a Transaction (_handle_transaction_requirements);
+                # only an untracked CLOSING order reaches the broker without one, and a
+                # closing order adds no exposure.
+                logger.debug(
+                    f"[Account {self.id}] working order {order.id} ({order.symbol}) has no "
+                    f"transaction; not counted as a pending entry (untracked close)")
+                continue
+            transaction = get_or_none(Transaction, order.transaction_id)
+            if transaction is None:
+                logger.warning(
+                    f"[Account {self.id}] working order {order.id} ({order.symbol}) points at "
+                    f"transaction {order.transaction_id}, which does not exist; counting it as "
+                    f"a pending ENTRY (the conservative reading -- it can only reduce headroom)")
+            elif transaction.side != order.side:
+                continue
+
+            filled = order.filled_qty or 0.0
+            remaining = float(order.quantity) - float(filled)
+            if remaining <= 0:
+                continue
+
+            price = order.limit_price
+            if price is None:
+                price = self.get_instrument_current_price(order.symbol)
+            if price is None or price <= 0:
+                raise ValueError(
+                    f"account {self.id}: no usable price for working order {order.id} "
+                    f"({order.symbol}, got {price!r}); cannot measure pending exposure")
+            total += remaining * float(price)
+        return total
+
+    def _stock_exposure_breakdown(self, exclude_order_id: Optional[int] = None
+                                  ) -> Optional[StockExposure]:
+        """Every term of the stock-exposure ceiling, or ``None`` with margin OFF.
+
+        ``None`` -- and no snapshot read, no order query -- is the whole margin-off
+        contract: backtests run with ``margin_enabled`` False, so this feature cannot
+        reach them and their results are unchanged BY CONSTRUCTION.
+        """
+        if not self._margin_enabled():
+            return None
+        balance, snapshot, factor, ceiling = self._stock_capital_from_snapshot()
+        gross = self._gross_stock_exposure_from(snapshot)
+        pending = self._pending_stock_entry_notional(exclude_order_id)
+        return StockExposure(
+            balance=balance, effective_factor=factor, ceiling=ceiling, gross=gross,
+            pending=pending, headroom=stock_exposure_headroom(ceiling, gross, pending))
+
+    def get_stock_exposure_headroom(self, exclude_order_id: Optional[int] = None
+                                    ) -> Optional[float]:
+        """Dollars of STOCK exposure this account may still add, or ``None`` with margin off.
+
+        ``ceiling - gross - pending``: the tradable balance (balance x effective factor)
+        minus what the broker already marks, minus what this account's working entry orders
+        will add. Negative when the account is past its ceiling.
+
+        This is the ONLY figure that enforces the design's "at most balance x margin_factor"
+        at the ACCOUNT level. Every other budget in the platform is per-expert virtual
+        bookkeeping, which by construction cannot see other experts, manual trades or the
+        difference between a position's cost and its mark.
+
+        ``None`` means "no ceiling applies" (margin off), never "unknown": an unknown
+        exposure RAISES ``ValueError``, and both callers turn that into a refusal.
+        """
+        breakdown = self._stock_exposure_breakdown(exclude_order_id)
+        return None if breakdown is None else breakdown.headroom
 
     def get_option_tradable_balance(self) -> float:
         """Same as ``get_tradable_balance`` for OPTIONS, with the option multiplier.
