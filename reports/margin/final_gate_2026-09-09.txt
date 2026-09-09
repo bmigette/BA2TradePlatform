@@ -1,0 +1,48 @@
+Final gate at 30f41fa9ec15ff9c2141652efb88afec7b6119dc 2026-09-09T12:11:34Z
+=== golden fingerprints
+b32b8de5bb42c1355f7e873cb6c738ff57df42b0f167bf3dcf35dfc3766f264b *tests/backtest/golden/equity_golden_run.json
+f2efadeb179ee6fda85208b3f7bbb3560911ab799118035905bbbb37d0299c21 *tests/backtest/golden/option_leap_golden_run.json
+76cdb6840a84e282f8bc8b670be815c6baa54509c9c5e15a88369df92ec5b342 *tests/backtest/fixtures/equity_cap_golden.json
+=== backend goldens+parity
+XFAIL tests/backtest/test_margin_live_backtest_parity.py::test_backtest_and_live_agree_after_the_first_entry - finding 6: BacktestAccount.get_balance() is cash, live is equity; shared expert math charges the position twice in the backtest ($3,000/$2,000 vs $4,000/$3,000). Deliberately NOT fixed in the leverage feature: changing it moves every backtest result and is a separately versioned correction. See docs/plans/2026-09-09-margin-live-backtest-parity.md section 6.
+XFAIL tests/backtest/test_margin_live_backtest_parity.py::test_the_instrument_ceiling_is_ten_percent_of_the_virtual_equity - finding 4: classic per-instrument ceiling is available x ratio (900), not virtual x ratio (1800); changing it changes historical sizing - deferred, see plan section 6
+45 passed, 2 xfailed, 2 warnings in 220.11s (0:03:40)
+=== full tests/backtest
+  C:\Users\basti\Documents\dev\BA2-margin\testplatform\backend\app\api\backtests.py:138: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+FAILED tests/backtest/test_etf_trend.py::test_real_engine_opens_selected_fund_through_shared_rules
+1 failed, 1147 passed, 1 skipped, 2 xfailed, 4 warnings in 304.95s (0:05:04)
+=== packages/common/tests
+=============== 3492 passed, 297 warnings in 176.12s (0:02:56) ================
+=== root tests (minus allocation page)
+tests\test_accounts\test_broker_error_handling.py ...........            [  3%]
+2026-09-09 14:25:45,710 - ba2_common - db - WARNING - Failed to log activity (async): (sqlite3.OperationalError) no such table: activitylog\r\n[SQL: INSERT INTO activitylog (created_at, severity, type, source_expert_id, source_account_id, description, data) VALUES (?, ?, ?, ?, ?, ?, ?)]\r\n[parameters: ('2026-09-09 12:25:45.702518', 'SUCCESS', 'TRADE_ACTION_NEW', 1, 1, '\u2713 Successfully executed Expertactiontype.Open Straddle for AAPL for new entry', '{"symbol": "AAPL", "action_type": "ExpertActionType.OPEN_STRADDLE", "message": "Submitted straddle for AAPL", "option_strategy": "straddle", "quantit ... (1112 characters truncated) ... ons_met": true, "executed": true, "actions": [{"action_type": "open_straddle", "description": "Open long straddle on AAPL", "action_config": {}}]}]}}')]\r\n(Background on this error at: https://sqlalche.me/e/20/e3q8)\r
+2026-09-09 14:29:05,788 - ba2_trade_platform - TastyTradeAccount - WARNING - [Account 1] Quantity precision fetch failed: 'types.SimpleNamespace' object has no attribute '_get'
+2026-09-09 14:29:05,941 - ba2_trade_platform - TastyTradeAccount - WARNING - [Account 1] Quantity precision fetch failed: 'types.SimpleNamespace' object has no attribute '_get'
+FAILED tests/test_broker_sdk_pins.py::test_tastytrade_is_pinned_to_the_installed_version
+FAILED tests/test_broker_sdk_pins.py::test_alpaca_py_is_pinned_to_the_installed_version
+FAILED tests/test_no_zero_coercion.py::test_no_new_unknown_reads_as_zero - As...
+FAILED tests/test_option_actions.py::test_sell_covered_call_short_of_cover_returns_a_refusal_and_never_raises
+FAILED tests/test_option_intent_migration.py::test_a_database_without_the_columns_gains_all_three
+FAILED tests/test_option_intent_migration.py::test_running_the_upgrade_twice_is_a_no_op
+FAILED tests/test_option_intent_migration.py::test_a_create_all_database_that_already_has_them_upgrades_cleanly
+FAILED tests/test_option_intent_migration.py::test_asset_class_is_not_null_and_defaults_to_the_stored_enum_NAME
+FAILED tests/test_option_intent_migration.py::test_a_row_that_predates_the_column_reads_back_through_the_ORM
+FAILED tests/test_option_intent_migration.py::test_a_historical_option_transaction_is_backfilled_to_OPTION
+FAILED tests/test_option_intent_migration.py::test_the_backfill_separates_option_transactions_from_equity_ones
+FAILED tests/test_option_intent_migration.py::test_a_NULL_multiplier_still_backfills
+FAILED tests/test_option_intent_migration.py::test_a_transaction_whose_children_are_all_equity_stays_EQUITY
+FAILED tests/test_option_intent_migration.py::test_a_transaction_with_no_orders_at_all_stays_EQUITY
+FAILED tests/test_option_intent_migration.py::test_a_transaction_with_both_equity_and_option_children_is_OPTION
+FAILED tests/test_option_intent_migration.py::test_the_backfill_writes_the_NAME_so_the_ORM_reads_an_enum_back
+FAILED tests/test_option_intent_migration.py::test_running_the_backfill_a_second_time_changes_nothing
+FAILED tests/test_option_intent_migration.py::test_the_backfill_only_promotes_and_never_demotes
+FAILED tests/test_option_intent_migration.py::test_the_intent_columns_are_indexed_under_the_names_create_all_uses
+FAILED tests/test_option_intent_migration.py::test_the_migrated_columns_are_the_same_SET_create_all_builds_but_appended
+FAILED tests/test_per_leg_expiry_no_migration.py::test_alembic_still_has_exactly_one_head_and_it_is_unchanged
+FAILED tests/test_tastytrade_account.py::test_time_in_force_survives_a_broker_round_trip[Ext Overnight]
+FAILED tests/test_tastytrade_account.py::test_time_in_force_survives_a_broker_round_trip[GTC Ext Overnight]
+FAILED tests/test_ui_colour_classes_paint.py::test_every_coloured_element_in_the_dry_run_dialog_is_painted
+========== 24 failed, 4487 passed, 15 warnings in 362.92s (0:06:02) ===========
+=== root allocation page
+======================= 456 passed, 1 warning in 40.56s =======================
+DONE

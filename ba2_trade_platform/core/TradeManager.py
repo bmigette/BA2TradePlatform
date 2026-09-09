@@ -683,12 +683,7 @@ class TradeManager:
                         self.logger.debug(msg)
                     continue
 
-                # Infer whether this is a closing order (side opposite to its position).
-                is_closing = False
-                if order.transaction_id:
-                    txn = get_instance(Transaction, order.transaction_id)
-                    if txn and txn.side != order.side:
-                        is_closing = True
+                is_closing = self._is_closing_order(order)
 
                 self.logger.info(
                     f"Symbol {order.symbol} clear — re-submitting WASHTRADE_LOCKED order {order_id} "
@@ -710,6 +705,56 @@ class TradeManager:
                 account.submit_order(order, sl_price=sl_price, is_closing_order=is_closing)
             except Exception as e:
                 self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
+
+    @staticmethod
+    def _is_closing_order(order) -> bool:
+        """Does this order REDUCE a position? One answer, every re-submit path.
+
+        ``is_closing_order`` is what tells ``AccountInterface`` to skip the budget checks
+        that only make sense for spending capital -- the expert's available balance and
+        the account's stock-exposure ceiling. Getting it wrong on a REDUCTION is not a
+        missed optimisation: a fully invested expert (or, with margin on, an account past
+        ``balance x margin_factor``, whose headroom is negative) refuses every quantity,
+        so the order that would have de-risked the book is the one that cannot be placed.
+
+        Two derivations used to live inline and disagreed:
+          * the wash-trade retry read only the transaction, so a transaction-LESS close
+            (``portfolio_allocation_service._sell_untracked_symbol``) came back False;
+          * the dependent-order path read only ``MARKET`` + ``'closing' in comment``,
+            which does not match ``TransactionHelper``'s "Partial close order (triggered
+            by TP/SL cancel)" -- a trim that shrinks a position was validated as an open.
+
+        This is the union, and the substring is ``'close'`` so both spellings match:
+
+          1. the order has a transaction whose side is OPPOSITE to its own -> closing.
+             ``Transaction.side`` is the direction the POSITION points, the same field
+             ``_validate_account_exposure`` and ``_pending_stock_entry_notional`` read;
+          2. else a MARKET order whose comment says ``close`` (the platform's own close
+             paths write it) -> closing;
+          3. else not closing. An order that opens is the default, because mislabelling
+             an OPEN as a close would skip the risk checks entirely.
+
+        A transaction-less closing MARKET order still passes the account exposure gate
+        without this: the gate reads the broker's position book for such orders. This
+        flag is what keeps the EXPERT's available-balance check off it as well.
+        """
+        comment = (order.comment or '').lower()
+        if order.transaction_id:
+            txn = get_instance(Transaction, order.transaction_id)
+            if txn and txn.side != order.side:
+                logger.debug(
+                    f"Order {order.id} ({order.symbol} {order.side}) is CLOSING: "
+                    f"transaction {txn.id} side {txn.side} is the opposite side.")
+                return True
+        if order.order_type == OrderType.MARKET and 'close' in comment:
+            logger.debug(
+                f"Order {order.id} ({order.symbol} {order.side}) is CLOSING: MARKET order "
+                f"whose comment says close ({order.comment!r}).")
+            return True
+        logger.debug(
+            f"Order {order.id} ({order.symbol} {order.side}) is NOT closing: no "
+            f"opposite-side transaction and no close comment on a MARKET order.")
+        return False
 
     @staticmethod
     def _washtrade_lock_age_hours(order) -> Optional[float]:
@@ -1361,13 +1406,8 @@ class TradeManager:
                     # path, so it must carry the same is_closing_order=True its immediate
                     # sibling call gets — otherwise the position-size validation wrongly
                     # blocks a close just because the position grew past the entry cap
-                    # (the position is shrinking, not growing). Same MARKET+"closing"
-                    # comment heuristic close_transaction() already uses elsewhere.
-                    is_closing = (
-                        dependent_order.order_type == OrderType.MARKET and
-                        dependent_order.comment and
-                        'closing' in dependent_order.comment.lower()
-                    )
+                    # (the position is shrinking, not growing).
+                    is_closing = self._is_closing_order(dependent_order)
                     self.logger.info(
                         f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
                         f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "

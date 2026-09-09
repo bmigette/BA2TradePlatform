@@ -206,12 +206,18 @@ Shared package (`ba2_common`) and trade app both change: bump
 Deferred items from the 2026-09-09 margin review fixes (see
 `docs/plans/2026-09-09-margin-review-fixes-plan.md` for the full list):
 
-- Live margin-on round-trip cost: one `submit_order` now takes about three
-  snapshots and two pending-order queries under the per-account lock (position
-  size validator, expert headroom clamp, exposure gate), and `describe_capital()`
-  adds one snapshot plus one order scan per sizing decision. TastyTrade's
-  snapshot is an uncached REST call. Compute the StockExposure breakdown once per
-  submit and thread it through.
+- Live margin-on round-trip cost, and it should be SCHEDULED rather than only
+  recorded: with margin on one `submit_order` costs roughly four snapshots, three
+  balance reads, one `get_account_info()` and a price lookup per pending order,
+  all under the per-account lock -- about eight REST calls on TastyTrade, whose
+  snapshot is uncached (position size validator, expert headroom clamp, exposure
+  gate, plus `describe_capital()` once per sizing decision). Compute the
+  StockExposure breakdown once per submit and thread it through.
+- The expert-side headroom clamp cannot pass `exclude_order_id` while the gate
+  does, so re-submitting an order that already carries a `broker_order_id`
+  charges that order against itself in the clamp (not in the gate).
+- The broker adapters' double-submit guard tests a stale in-memory
+  `broker_order_id`; it should re-read the order row inside the guard.
 - `tradingorder.account_id` and `depends_on_order` are not indexed; the
   pending-entry query runs per sizing decision against the full orders table
   (live, margin on).

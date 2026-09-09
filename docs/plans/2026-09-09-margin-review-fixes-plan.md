@@ -251,7 +251,8 @@ equity golden fingerprint recorded in `reports/margin/baseline_goldens_2026-09-0
 | 3 Account stock-exposure ceiling (findings 2/3) | d6c1028f, b01a475e |
 | 4 Capital mapping is logged per decision | 5be52d7d, fb4c9edd |
 | 5 Three-way parity gate, blockers pinned | af479f07, 1cfc042a |
-| 6 CI parity gate, plan status, versions | this commit |
+| 6 CI parity gate, plan status, versions | 30f41fa9 |
+| 7 Final whole-branch review fixes (C1, C2/I1, I4/I5, M1) | this commit |
 
 Test files per task: T1 `packages/common/tests/test_margin_finite_inputs.py`,
 `tests/test_margin_finite_inputs_expert.py`; T2
@@ -263,6 +264,66 @@ Test files per task: T1 `packages/common/tests/test_margin_finite_inputs.py`,
 `tests/test_margin_capital_mapping.py`; T5
 `testplatform/backend/tests/backtest/test_margin_live_backtest_parity.py`
 (18 pass plus 2 strict xfail).
+
+### Final gate (2026-09-09, at 30f41fa9)
+
+Recorded in `reports/margin/final_gate_2026-09-09.txt`.
+
+- Golden fingerprints IDENTICAL to the step-1 baseline
+  (`reports/margin/baseline_goldens_2026-09-09.txt`): equity, option LEAP and the
+  equity cap fixture. The equity golden was never regenerated.
+- `testplatform/backend` goldens + parity: 45 passed, 2 xfailed, 0 xpassed.
+- `testplatform/backend/tests/backtest` in full: 1147 passed, 1 skipped, 2 xfailed
+  and 1 failure,
+  `test_etf_trend.py::test_real_engine_opens_selected_fund_through_shared_rules`,
+  which is PRE-EXISTING: it fails identically on untouched `dev` at 51234531 with
+  `ModuleNotFoundError: tools.strategy_research`.
+- `packages/common/tests`: 3492 passed.
+- Root `tests` (minus `test_portfolio_allocation_page.py`): 24 failed / 4487
+  passed, and the 24 are the dev baseline's 7 files (broker SDK pins, zero
+  coercion, option actions, option intent migration, per-leg expiry, TastyTrade
+  time-in-force, UI colour classes). `test_portfolio_allocation_page.py` alone:
+  456 passed.
+
+Re-run after the task-7 fixes below, on the same machine: `packages/common/tests`
+3501 passed (the 9 new gate tests); root `tests` minus the allocation page 24
+failed / 4497 passed (the SAME 24 in the same 7 files); `testplatform/backend`
+`tests/backtest` 1147 passed, 1 skipped, 2 xfailed and the same one pre-existing
+`test_etf_trend` failure; goldens + parity 40 passed, 2 xfailed, 0 xpassed. No
+golden file was regenerated or modified.
+
+### Final whole-branch review fixes (task 7)
+
+- **C1** `AccountInterface._validate_expert_available_balance` now SKIPS an order
+  whose side is opposite to its transaction's: a reduction frees capital and can
+  never be unaffordable. The clamp made the old behaviour certain rather than
+  merely possible -- past the ceiling the available balance is negative, so every
+  quantity exceeded it, including `TransactionHelper`'s partial-close trim.
+- **C1** `TradeManager._is_closing_order` replaces two ad-hoc derivations (the
+  wash-trade retry read only the transaction; the dependent-order path only
+  `MARKET` + `'closing' in comment`, which does not match "Partial close order").
+  One helper, both rules, `'close'` as the substring, DEBUG on every branch.
+- **C2 / I1** `_validate_account_exposure` reads the BROKER's signed position for
+  an order with no transaction (new
+  `ReadOnlyAccountInterface.get_signed_position_quantity`, tri-state: number,
+  measured 0.0, or `None` for an unreadable book). An opposite-side holding at
+  least as large as the order is a reduction and is skipped; anything else is
+  gated as the open it is; an unreadable book is a REFUSAL. This is what unblocks
+  `_sell_untracked_symbol`'s wash-trade retry and the UI's manual re-submits,
+  which have no transaction to read.
+- **M1** the `margin_enabled` test is now the FIRST statement of
+  `_validate_account_exposure`, before the order's `Transaction` row is read, so
+  the design doc's "nothing but the lock is reachable with margin off" is true.
+- **I4 / I5** `describe_capital_mapping` catches `KeyError` (the resolver's
+  "unregistered id") as well as `ValueError`, and takes a module-level `_UNSET`
+  sentinel so a caller passing `None` -- its own balance pass FAILED -- gets the
+  "expert balance unavailable" error instead of a silent second pass. Same
+  sentinel on `log_capital_mapping`.
+
+LIVE behaviour change to note alongside the ones below: with the sentinel, a Smart
+RM sizing decision whose balance pass failed now logs the refusal and sizes 0 with
+a reason, where before the mapping quietly re-ran the pass and the decision
+continued off virtual equity with no available cap.
 
 ### Deferred / follow-up
 
@@ -323,3 +384,30 @@ Recorded, deliberately not fixed here.
 - Latent, dead today: `BacktestInstanceResolver.get_account_instance_from_transaction`
   reads `transaction.account_id`, a column `Transaction` does not have (all
   callers use the live registry).
+
+### Follow-ups from the final whole-branch review (recorded, not fixed)
+
+- The expert-side headroom clamp cannot pass `exclude_order_id` while the gate
+  does, so re-submitting an order that already carries a `broker_order_id`
+  charges that order against itself in the clamp.
+- Round-trip cost, and it should be SCHEDULED not merely recorded: with margin on
+  one submit costs about four snapshots, three balance reads, one
+  `get_account_info()` and a price lookup per pending order, under the account
+  lock -- roughly eight REST calls on TastyTrade. Compute the `StockExposure`
+  breakdown once per submit and thread it through.
+- The broker adapters' double-submit guard tests a stale in-memory
+  `broker_order_id`; it should re-read the row inside the guard.
+- The concurrency tests use non-daemon threads and a 50 ms sleep; daemon threads
+  plus a `threading.Barrier` would be deterministic and could not hang a run.
+- `tests/test_margin_exposure_clamp.py`'s margin-off counter test measures the
+  FAKE account's own branch; the real pin for "margin off reads nothing" is in
+  `tests/test_margin_capital_mapping.py`.
+- Option market value is counted in gross exposure while option ORDERS are exempt
+  from the gate, so an all-options account has negative stock headroom.
+- A filled-but-not-yet-refreshed order is counted in both gross and pending
+  (conservative, deliberately).
+- `log_capital_mapping` builds the formatted line before it chooses the level.
+- `_available_balance_breakdown` is a private cross-object call from both risk
+  managers; it wants a public seam.
+- `_validate_account_exposure` now reads the broker's position book for every
+  transaction-less order with margin on: one more round trip on that path.

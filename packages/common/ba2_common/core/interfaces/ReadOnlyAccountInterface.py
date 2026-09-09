@@ -1286,13 +1286,10 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             return 0.0
 
         for pos in positions:
-            pos_symbol = (pos.get('symbol') if isinstance(pos, dict)
-                          else getattr(pos, 'symbol', None))
-            if (pos_symbol or '').strip().upper() != wanted:
+            if self._position_symbol(pos) != wanted:
                 continue
             for field in ('qty_available', 'qty'):
-                raw = (pos.get(field) if isinstance(pos, dict)
-                       else getattr(pos, field, None))
+                raw = self._position_field_value(pos, field)
                 if raw is None:
                     continue
                 try:
@@ -1316,6 +1313,85 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             f"[Account {self.id}] get_available_position_quantity({symbol}): broker's book "
             f"holds no position for this symbol; reporting 0 available (defer, retry next refresh)"
         )
+        return 0.0
+
+    @staticmethod
+    def _position_symbol(pos: Any) -> str:
+        """The symbol of one position row, normalised for comparison.
+
+        ONE reader for both position-quantity methods below: adapters hand back dicts
+        (Alpaca raw, TastyTrade) or objects (Alpaca SDK, IBKR), and a second copy of the
+        shape test is how one of them comes to see a flat account where the other sees a
+        holding.
+        """
+        raw = pos.get('symbol') if isinstance(pos, dict) else getattr(pos, 'symbol', None)
+        return (raw or '').strip().upper()
+
+    @staticmethod
+    def _position_field_value(pos: Any, field: str) -> Any:
+        """One raw field off a position row, whichever shape the adapter hands back."""
+        return pos.get(field) if isinstance(pos, dict) else getattr(pos, field, None)
+
+    def get_signed_position_quantity(self, symbol: str) -> Optional[float]:
+        """The broker's SIGNED holding in ``symbol``: >0 long, <0 short, 0.0 flat.
+
+        TRI-STATE, and the sign is the point. ``get_available_position_quantity`` above
+        answers a different question (may I place a protective leg for this many shares?)
+        and deliberately collapses every unknown into ``0.0``, which DEFERS -- the right
+        answer there, the wrong one here. This method's caller
+        (``AccountInterface._validate_account_exposure``) has to decide whether a
+        transaction-less order OPENS exposure or REDUCES it, and reading "I could not find
+        out" as "flat" would gate a close that is trying to bring the account back under
+        its ceiling. So:
+
+          * a number -- the broker's book, signed (a short is negative);
+          * ``0.0``  -- the fetch SUCCEEDED and the symbol is genuinely not held;
+          * ``None`` -- the position book could NOT be read (``get_positions()`` returned
+            ``None`` or raised), or the row exists but publishes no usable quantity.
+            Callers must refuse, never assume flat.
+
+        Only ``qty`` is read, never ``qty_available``: the encumbered part of a holding is
+        still exposure, and it is exposure this answer is about.
+        """
+        wanted = (symbol or '').strip().upper()
+        try:
+            positions = self.get_positions()
+        except Exception as e:  # noqa: BLE001 -- reported as "unreadable", not as flat
+            logger.error(
+                f"[Account {self.id}] get_signed_position_quantity({symbol}): position "
+                f"fetch raised ({e}); reporting UNREADABLE (None), not a flat position",
+                exc_info=True,
+            )
+            return None
+        if positions is None:
+            logger.error(
+                f"[Account {self.id}] get_signed_position_quantity({symbol}): "
+                f"get_positions() returned None (FETCH FAILURE, not a flat account); "
+                f"reporting UNREADABLE (None)"
+            )
+            return None
+
+        for pos in positions:
+            if self._position_symbol(pos) != wanted:
+                continue
+            raw = self._position_field_value(pos, 'qty')
+            if raw is None:
+                logger.error(
+                    f"[Account {self.id}] position {wanted} publishes no quantity; "
+                    f"reporting UNREADABLE (None) -- a position that exists but cannot be "
+                    f"measured is not a flat one"
+                )
+                return None
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                logger.error(
+                    f"[Account {self.id}] position {wanted}.qty={raw!r} is not numeric; "
+                    f"reporting UNREADABLE (None)"
+                )
+                return None
+
+        # The fetch succeeded and the symbol is not in the book: a MEASURED zero.
         return 0.0
 
     @abstractmethod

@@ -61,6 +61,10 @@ class _Acct(AccountInterface):
         self.submitted = []
         self.impl_delay = 0.0
         self.on_impl = None
+        # The broker's position book. A LIST is a successful fetch (``[]`` == flat);
+        # ``None`` is the tri-state FETCH FAILURE -- see get_positions below.
+        self.positions = []
+        self.position_calls = 0
 
     @property
     def settings(self):
@@ -89,7 +93,8 @@ class _Acct(AccountInterface):
         return self._price
 
     def get_positions(self):
-        return []
+        self.position_calls += 1
+        return self.positions
 
     def get_orders(self, status=None):
         return []
@@ -617,3 +622,131 @@ def test_the_submit_lock_is_reentrant_so_a_leg_does_not_deadlock():
     thread.join(timeout=30)
     assert done.is_set(), "a re-entrant leg submission deadlocked the account lock"
     assert len(acct.submitted) == 2
+
+
+# ----- 9. an order with NO transaction: the untracked-close path ------------
+#
+# ``portfolio_allocation_service._sell_untracked_symbol`` sells a broker holding the
+# platform has no transaction for. It passes is_closing_order=True on the FIRST submit,
+# but every re-submit path that derives the flag from the transaction (the wash-trade
+# retry, the UI's manual submit) gets False -- there is no transaction to read. Such an
+# order then reached this gate looking exactly like a naked short and was refused on an
+# account over its ceiling, stranding the row PENDING with no broker_order_id: the
+# platform refusing to let an over-exposed account reduce its exposure.
+#
+# The broker's own book is the evidence, and the ONLY evidence available here.
+
+
+def test_an_untracked_sell_into_a_long_the_broker_holds_is_not_gated():
+    acct = _finding_3_account(id_val=944)
+    acct.positions = [{"symbol": "AAPL", "qty": "10"}]
+    with ts.inmem_trades():
+        result = acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=10.0))
+    assert result is not None
+    assert len(acct.submitted) == 1
+
+
+def test_an_untracked_buy_that_covers_a_short_the_broker_holds_is_not_gated():
+    """The mirror: a short reports a NEGATIVE quantity, and buying it back reduces."""
+    acct = _finding_3_account(id_val=945)
+    acct.positions = [{"symbol": "AAPL", "qty": -10.0}]
+    with ts.inmem_trades():
+        acct.submit_order(_order(acct, side=OrderDirection.BUY, qty=10.0))
+    assert len(acct.submitted) == 1
+
+
+def test_an_untracked_sell_with_no_position_opens_a_short_and_is_gated():
+    acct = _finding_3_account(id_val=946)
+    acct.positions = []                       # a SUCCESSFUL fetch: genuinely flat
+    with ts.inmem_trades():
+        with pytest.raises(ValueError, match="stock exposure ceiling"):
+            acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=10.0))
+    assert acct.submitted == []
+
+
+def test_an_untracked_sell_larger_than_the_holding_is_gated():
+    """20 against a long 10: ten shares reduce, the other ten OPEN a short. The order is
+    one instruction and cannot be half-skipped, so it faces the ceiling as the (partial)
+    open it is."""
+    acct = _finding_3_account(id_val=947)
+    acct.positions = [{"symbol": "AAPL", "qty": 10.0}]
+    with ts.inmem_trades():
+        with pytest.raises(ValueError, match="stock exposure ceiling"):
+            acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=20.0))
+    assert acct.submitted == []
+
+
+def test_an_untracked_sell_on_a_same_side_holding_is_gated():
+    """Selling while already SHORT extends the short; the broker's book says nothing
+    that makes it a reduction."""
+    acct = _finding_3_account(id_val=948)
+    acct.positions = [{"symbol": "AAPL", "qty": -5.0}]
+    with ts.inmem_trades():
+        with pytest.raises(ValueError, match="stock exposure ceiling"):
+            acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=10.0))
+    assert acct.submitted == []
+
+
+def test_an_unreadable_position_book_is_a_refusal_not_an_assumed_flat(records):
+    """``get_positions()`` is TRI-STATE and ``None`` is a FETCH FAILURE. Reading it as
+    "flat" would gate genuine reductions; reading it as "held" would wave through
+    genuine opens. Neither is available, so the order is refused and says why."""
+    acct = _finding_3_account(id_val=949)
+    acct.positions = None
+    with ts.inmem_trades():
+        with pytest.raises(ValueError, match="position book is unreadable"):
+            acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=10.0))
+    assert acct.submitted == []
+    assert any(lvl == logging.ERROR and "ACCOUNT EXPOSURE VALIDATION CANNOT RUN" in msg
+               for lvl, msg in records)
+
+
+def test_a_position_row_with_no_readable_quantity_is_a_refusal():
+    """A position the broker CONFIRMS but cannot size is not a flat one."""
+    acct = _finding_3_account(id_val=950)
+    acct.positions = [{"symbol": "AAPL", "qty": None}]
+    with ts.inmem_trades():
+        with pytest.raises(ValueError, match="position book is unreadable"):
+            acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=10.0))
+    assert acct.submitted == []
+
+
+def test_a_transaction_backed_order_never_reads_the_position_book():
+    """The transaction answers the question, and the broker round trip is only paid on
+    the path that has no other evidence."""
+    acct = _finding_3_account(id_val=951)
+    with ts.inmem_trades():
+        txn_id = add_instance(Transaction(symbol="AAPL", quantity=100.0,
+                                          side=OrderDirection.BUY,
+                                          status=TransactionStatus.OPENED, open_price=100.0))
+        acct.submit_order(_order(acct, side=OrderDirection.SELL, qty=10.0,
+                                 transaction_id=txn_id))
+    assert acct.position_calls == 0
+
+
+# ----- 10. margin off returns BEFORE any store or broker read ---------------
+
+def test_margin_off_reads_nothing_at_all(monkeypatch):
+    """The design doc claims nothing but the submit lock is reachable with margin off.
+    That was ALMOST true: the gate read the order's Transaction row before it ever
+    checked ``margin_enabled``. The margin test is now the first statement in the body,
+    so a backtest pays for nothing here -- no snapshot, no position book, no store read."""
+    acct = _Acct(id_val=952, balance=10_000.0,
+                 snapshot=_snap(long_mv=18_000.0, buying_power=2_000.0), settings=OFF)
+    reads = []
+    from ba2_common.core import trade_store
+
+    monkeypatch.setattr(trade_store, "orders_where",
+                        lambda *a, **k: reads.append("orders_where") or [])
+    monkeypatch.setattr(trade_store, "get_or_none",
+                        lambda *a, **k: reads.append("get_or_none") or None)
+    with ts.inmem_trades():
+        txn_id = add_instance(Transaction(symbol="AAPL", quantity=100.0,
+                                          side=OrderDirection.BUY,
+                                          status=TransactionStatus.OPENED, open_price=100.0))
+        reads.clear()
+        assert acct._validate_account_exposure(
+            _order(acct, qty=10.0, transaction_id=txn_id)) == []
+    assert acct.snapshot_calls == 0
+    assert acct.position_calls == 0
+    assert reads == []

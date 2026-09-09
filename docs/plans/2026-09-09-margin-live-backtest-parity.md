@@ -48,7 +48,7 @@ root; `bt/` stands for `testplatform/backend/tests/backtest/`.
 | 4 Real capacity enforcement | done | packages/common/tests/test_stock_exposure_gate.py, tests/test_margin_exposure_clamp.py, tests/test_tastytrade_account.py | d6c1028f, b01a475e |
 | 5 Expose the mapping | done | tests/test_margin_capital_mapping.py | 5be52d7d, fb4c9edd |
 | 6 Resolve blockers | partial: pinned, not fixed | bt/test_margin_live_backtest_parity.py (2 strict xfails) | af479f07, 1cfc042a |
-| 7 Release gate | done | .github/workflows/parity-and-coverage.yml | this commit |
+| 7 Release gate | partial: CI gate wired; deterministic paper-account replay before live rollout NOT done | .github/workflows/parity-and-coverage.yml | 30f41fa9 |
 
 Step 6 is partial by decision, not by omission: findings 6 and 4 are pinned as
 strict xfails because fixing either one moves historical backtest numbers. See
@@ -251,6 +251,12 @@ Not covered by any test yet:
 
 - Cancel or retry release of the reserve held by a pending entry.
 - Several experts entering concurrently on one account.
+- Profitable-position parity gap: the headroom clamp is margin-ON only, so an
+  unlevered reference at equal effective capital is not clamped while the levered
+  account is. At L2 equity 2,500 after a $500 gain the levered arm reports a
+  clamped 3,500 where the $4,000 unlevered reference reports 4,000. Inherent to
+  live-only leverage, accepted, and untested: the parity market is flat, so no
+  fixture reaches the state.
 
 ## 7. Strengthen the release gate
 

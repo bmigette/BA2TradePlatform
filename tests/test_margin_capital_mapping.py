@@ -536,3 +536,84 @@ def test_the_smart_rm_logs_the_same_mapping_from_the_same_function(monkeypatch):
             if lvl == logging.INFO and msg.startswith("Capital mapping:")]
     assert len(info) == 1, seen
     assert "equivalent_unlevered_balance=$4,000.00" in info[0]
+
+
+# --------------------------------------------------------------------------
+# The mapping never raises, and "the caller's pass failed" is not "the caller
+# passed nothing" (2026-09-09 final review, I4/I5).
+# --------------------------------------------------------------------------
+
+class _CountingExpert(_Expert):
+    """Counts balance passes. The cost of this diagnostic is the thing under test."""
+
+    def __init__(self, id_val):
+        super().__init__(id_val)
+        self.passes = 0
+
+    def _available_balance_breakdown(self, exclude_transaction_id=None):
+        self.passes += 1
+        return super()._available_balance_breakdown(exclude_transaction_id)
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_a_caller_reporting_a_failed_pass_does_not_trigger_a_second_one():
+    """``None`` is the real answer a FAILED balance pass gives, and the Smart RM hands
+    its pass's result straight through. With ``None`` as the default argument the two
+    were indistinguishable: the mapping quietly re-ran the pass -- an extra broker round
+    trip in the live margin path, describing a different instant than the order was
+    sized from, and hiding the refusal the caller was reporting. The sentinel splits
+    them."""
+    account, expert = _setup(balance=2_000.0)
+    counting = _CountingExpert(expert.id)
+
+    mapping = _with_account(
+        account, lambda: counting.describe_capital_mapping(balances=None))
+
+    assert counting.passes == 0, "a reported failure must not be retried"
+    assert "expert balance unavailable" in mapping["error"]
+    assert mapping["available_balance"] is None
+    assert mapping["tradable_balance"] == 4_000.0, "the account half still stands"
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_omitting_the_argument_still_takes_exactly_one_pass():
+    """The other half of the sentinel: a caller with no pass of its own gets one, once."""
+    account, expert = _setup(balance=2_000.0)
+    counting = _CountingExpert(expert.id)
+
+    mapping = _with_account(account, counting.describe_capital_mapping)
+
+    assert counting.passes == 1
+    assert mapping["available_balance"] == 4_000.0
+    assert "error" not in mapping
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_an_unregistered_account_is_an_error_entry_not_a_raised_keyerror():
+    """The resolver's "unregistered id" is a ``KeyError``
+    (``BacktestInstanceResolver.get_account_instance``), and a DIAGNOSTIC that raises out
+    of the sizing path it is only describing turns a missing log line into a dead
+    order."""
+    from ba2_common.core.instance_resolver import (
+        get_instance_resolver, set_instance_resolver)
+
+    acct_def = factories.create_account_definition()
+    inst = factories.create_expert_instance(
+        account_id=acct_def.id, expert="_Expert", virtual_equity_pct=100.0)
+
+    class _Unregistered:
+        def get_account_instance(self, account_id):
+            raise KeyError(f"no account registered for id={account_id}")
+
+    expert = _Expert(inst.id)
+    log = _Recorder()
+    prev = get_instance_resolver()
+    try:
+        set_instance_resolver(_Unregistered())
+        mapping = log_capital_mapping(expert, log)
+    finally:
+        set_instance_resolver(prev)
+
+    assert "KeyError" in mapping["error"], mapping
+    assert str(acct_def.id) in mapping["error"]
+    assert [lvl for lvl, _ in log.lines] == [logging.ERROR], log.lines

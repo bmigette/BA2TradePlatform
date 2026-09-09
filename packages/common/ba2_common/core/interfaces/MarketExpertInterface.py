@@ -24,6 +24,25 @@ CAPITAL_MAPPING_DOLLAR_KEYS = frozenset({
 })
 
 
+class _Unset:
+    """The "caller passed nothing" sentinel for the capital-mapping ``balances`` argument.
+
+    ``None`` cannot serve: it is the REAL answer a balance pass gives when it could not
+    read the account ("cannot size"), and both risk managers hand their pass's result
+    straight through. With ``None`` as the default, a caller reporting a FAILED pass was
+    indistinguishable from a caller that never took one, so the mapping quietly ran a
+    SECOND pass -- an extra broker round trip in the live margin path, describing a
+    different instant than the order was sized from, and hiding the very refusal the
+    caller was reporting.
+    """
+
+    def __repr__(self) -> str:          # pragma: no cover - diagnostics only
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
 def _add_mapping_error(mapping: Dict[str, Any], message: str) -> None:
     """Record a refusal on the mapping WITHOUT dropping one already there.
 
@@ -1083,7 +1102,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
             return None
 
-    def describe_capital_mapping(self, balances: Optional["ExpertBalance"] = None
+    def describe_capital_mapping(self, balances: Any = _UNSET
                                  ) -> Optional[Dict[str, Any]]:
         """This sizing decision's raw-equity -> deployable-capital mapping, as a dict.
 
@@ -1111,8 +1130,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         ``_available_balance_breakdown()`` (the body of the real
         ``get_available_balance``) and hand that record here, so the mapping explains the
         SAME pass the quantity came from -- not a second one taken microseconds later
-        against a moved book. Omitting it is allowed for other callers and then the
-        breakdown is taken here; no RM path may run the pass twice.
+        against a moved book. OMITTING it is allowed for other callers and then the
+        breakdown is taken here; no RM path may run the pass twice. Passing ``None`` is
+        NOT omitting it: ``None`` is what a FAILED pass returns, and a caller reporting
+        one gets the "expert balance unavailable" error rather than a silent retry. The
+        two cases are told apart by the ``_UNSET`` sentinel, not by ``is None``.
 
         COST, exactly, on top of the breakdown's own reads (which are unchanged by this
         method): margin OFF, NOTHING -- ``describe_capital()`` reads no snapshot and no
@@ -1157,7 +1179,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 mapping.update(capital)
                 mapping["equivalent_unlevered_balance"] = capital["tradable_balance"]
 
-            if balances is None:
+            if balances is _UNSET:
                 balances = self._available_balance_breakdown()
             if balances is None:
                 # Not three quiet Nones on an otherwise ordinary-looking INFO line: the
@@ -1167,11 +1189,19 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             mapping["virtual_balance"] = None if balances is None else balances.virtual
             mapping["used_balance"] = None if balances is None else balances.used
             mapping["available_balance"] = None if balances is None else balances.available
-        except ValueError as e:
-            # The NAMED "unknown broker figure / bad margin factor" signal. Anything
-            # else is a defect and must not be absorbed by a log line's helper -- it
-            # propagates to the sizing caller, which is where it belongs.
-            _add_mapping_error(mapping, str(e))
+        except (ValueError, KeyError) as e:
+            # The NAMED refusals this diagnostic is allowed to absorb:
+            #   * ValueError -- "unknown broker figure / bad margin factor";
+            #   * KeyError   -- the instance resolver's "no account registered for this
+            #     id" (BacktestInstanceResolver raises it; the live registry can too
+            #     after an account is unregistered mid-run).
+            # Anything else is a defect and must not be absorbed by a log line's helper
+            # -- it propagates to the sizing caller, which is where it belongs.
+            #
+            # ``{type}: {e}`` and not bare ``str(e)``: KeyError stringifies to the repr
+            # of its key, so an unmapped account read as ``error='142'`` -- a number with
+            # no sentence around it, in the one line meant to explain a refusal.
+            _add_mapping_error(mapping, f"{type(e).__name__}: {e}")
         return mapping
 
     @staticmethod
@@ -1594,7 +1624,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
 
 def log_capital_mapping(expert: "MarketExpertInterface", log,
-                        balances: Optional["ExpertBalance"] = None
+                        balances: Any = _UNSET
                         ) -> Optional[Dict[str, Any]]:
     """Log ``expert.describe_capital_mapping()`` at the level the mapping deserves.
 
@@ -1606,7 +1636,10 @@ def log_capital_mapping(expert: "MarketExpertInterface", log,
 
     ``balances``: the ``_available_balance_breakdown()`` the caller SIZED FROM. Both risk
     managers take exactly one and pass it here, so the explanation and the quantity come
-    from one pass over one book.
+    from one pass over one book. Passing ``None`` (a pass that FAILED) is a real answer
+    and is forwarded as one -- the mapping then carries "expert balance unavailable" and
+    this function logs at ERROR; only OMITTING the argument lets the mapping take its own
+    pass. Same ``_UNSET`` sentinel as ``describe_capital_mapping``.
 
     Levels: ERROR when the mapping carries an ``"error"`` (a broker figure was
     unknown -- the sizing decision that follows is being made on refused inputs, which

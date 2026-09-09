@@ -1064,14 +1064,18 @@ class AccountInterface(ReadOnlyAccountInterface):
         into a fully-deployed account; a winner charged at cost overstating room by its own
         unrealised gain).
 
-        ONLY REACHABLE WITH MARGIN ON: ``get_stock_exposure_headroom`` returns None with
-        ``margin_enabled`` off, without reading the broker snapshot, so backtests -- which
-        always run with it off -- do not execute a line of this and are unchanged by
-        construction, not by luck.
+        ONLY REACHABLE WITH MARGIN ON, and that test is the FIRST statement in the body,
+        before the order shape is inspected and before any store read: with
+        ``margin_enabled`` off this method costs one settings read and returns, so
+        backtests -- which always run with it off -- do not execute a line of it and are
+        unchanged by construction, not by luck. (It used to read the order's
+        ``Transaction`` row first and only then discover there was no ceiling.)
 
         Applies to orders that OPEN or ADD to a stock position, and to nothing else:
           * a protective TP/SL leg (``depends_on_order``) reduces a position;
           * an order whose side is opposite to its transaction's reduces it too;
+          * an order with NO transaction that sells into a long (or buys back a short)
+            the BROKER holds -- the untracked-close path (see below);
           * an option order sizes against the option sleeve, which has its own multiplier
             and its own tradable balance.
 
@@ -1080,6 +1084,11 @@ class AccountInterface(ReadOnlyAccountInterface):
         is how a ceiling silently stops existing.
         """
         errors: List[str] = []
+
+        # MARGIN OFF -> NO CEILING, and nothing below runs. First statement on purpose:
+        # see the docstring.
+        if not self._margin_enabled():
+            return errors
 
         # --- is this an order that ADDS stock exposure? ------------------------------
         if trading_order.order_type not in self._PRIMARY_ORDER_TYPES:
@@ -1099,14 +1108,57 @@ class AccountInterface(ReadOnlyAccountInterface):
             # while the pending sum classified it the other would double-count or miss it.
             # One field, one answer.
             #
-            # (A brand-new entry has no transaction yet at validation time -- submit_order
-            # creates it afterwards -- and correctly falls through as an open.)
+            # (The gate keys on ``Transaction.side``, not on "does a transaction exist":
+            # a TradeManager-created entry DOES carry one before validation runs, and it
+            # is same-sided, so it falls through as an open. Transaction-LESS orders are
+            # the untracked case handled below.)
             # get_or_none and not get_instance: the same never-raising, dual-path read the
             # pending sum uses, so a missing transaction row falls through as an OPEN (the
             # conservative reading) instead of throwing out of the whole validator.
             from ba2_common.core.trade_store import get_or_none
             transaction = get_or_none(Transaction, transaction_id)
             if transaction is not None and transaction.side != trading_order.side:
+                return errors
+        else:
+            # NO TRANSACTION: the untracked-close path, and the one shape that reaches
+            # this gate while trying to REDUCE exposure.
+            #
+            # ``portfolio_allocation_service._sell_untracked_symbol`` sells a broker
+            # holding the platform has no transaction for; it passes is_closing_order=True
+            # on the first submit, but the wash-trade retry in TradeManager and every UI
+            # manual re-submit derive "is closing" from the transaction -- of which there
+            # is none -- so the order arrives here indistinguishable from a naked short.
+            # Gating it stranded the row PENDING with no broker_order_id on exactly the
+            # accounts that are over their ceiling.
+            #
+            # The BROKER's book is the only evidence available, so it is what decides:
+            # an order on the opposite side of a holding at least as large as itself can
+            # only shrink it. Anything larger opens the remainder as a new position on the
+            # other side and is gated as the open it partly is.
+            held = self.get_signed_position_quantity(trading_order.symbol)
+            if held is None:
+                # UNREADABLE IS NOT FLAT. Assuming flat would gate a genuine reduction;
+                # assuming a holding would wave through a genuine open. Refuse, loudly.
+                logger.error(
+                    f"ACCOUNT EXPOSURE VALIDATION CANNOT RUN for {trading_order.symbol} on "
+                    f"account {self.id}: the broker's position book could not be read, so "
+                    f"an order with no transaction cannot be told apart from a new "
+                    f"position. Rejecting the order rather than treating an unrun risk "
+                    f"check as passed.")
+                errors.append(
+                    f"Cannot validate account exposure for {trading_order.symbol}: the "
+                    f"broker's position book is unreadable. Refusing the order rather "
+                    f"than skipping the check.")
+                return errors
+            reduces = ((trading_order.side == OrderDirection.SELL and held > 0)
+                       or (trading_order.side == OrderDirection.BUY and held < 0))
+            if reduces and abs(held) >= float(trading_order.quantity):
+                logger.debug(
+                    f"Account exposure gate skipped for order {trading_order.id} "
+                    f"({trading_order.symbol} {trading_order.side} "
+                    f"{trading_order.quantity}): no transaction, and the broker holds "
+                    f"{held:g} on the opposite side, so this order REDUCES the account's "
+                    f"exposure (untracked close).")
                 return errors
 
         try:
@@ -1304,18 +1356,43 @@ class AccountInterface(ReadOnlyAccountInterface):
                                            expert_instance, current_price: float) -> List[str]:
         """
         Validate that order doesn't exceed expert's available virtual balance (defense-in-depth).
-        
+
+        A REDUCTION IS NEVER CHARGED TO THE AVAILABLE BALANCE. An order whose side is
+        opposite to its transaction's is shrinking the position, so it FREES capital; the
+        two branches below both ask "does this cost more than the expert has left?", which
+        is a question about spending. Asking it of a trim always had the wrong shape -- a
+        fully invested expert reports ~0 available, and the new-position branch refuses any
+        order priced above that -- and the 2026-09-09 exposure clamp made it certain: with
+        margin on the available balance is clamped to the account's stock headroom, which
+        goes NEGATIVE once the account is past ``balance x margin_factor``, so EVERY
+        quantity exceeds it. The paths that reach here as reductions are exactly the ones
+        that fix that state: ``TransactionHelper``'s partial-close trim (comment "Partial
+        close order (triggered by TP/SL cancel)"), a re-submitted wash-trade-locked close,
+        and any dependent close order. Refusing them is refusing to de-risk.
+
         Args:
             trading_order: The order to validate
             transaction: The transaction associated with the order
             expert_instance: The expert instance
             current_price: Current market price
-            
+
         Returns:
             List[str]: List of error messages (empty if valid)
         """
         errors = []
-        
+
+        # ``Transaction.side`` is the direction the POSITION points (BUY == long), the same
+        # field ``_validate_account_exposure`` and ``_pending_stock_entry_notional`` read,
+        # so all three agree about which orders reduce and which add.
+        if transaction is not None and transaction.side != trading_order.side:
+            logger.debug(
+                f"Expert available-balance check skipped for order {trading_order.id} "
+                f"({trading_order.symbol}): order side {trading_order.side} is opposite to "
+                f"transaction {transaction.id} side {transaction.side}, so this order "
+                f"REDUCES the position and spends no available balance."
+            )
+            return errors
+
         try:
             from ba2_common.core.instance_resolver import get_instance_resolver
 

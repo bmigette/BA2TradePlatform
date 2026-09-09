@@ -36,7 +36,8 @@ duplicated here: pending/partially-filled entries, the account-wide ceiling and
 concurrent entries on one account live in
 ``packages/common/tests/test_stock_exposure_gate.py``; the expert-side headroom clamp
 in ``tests/test_margin_exposure_clamp.py``; missing/non-finite broker figures in
-``tests/test_margin_finite_inputs.py``; the capital mapping in
+``packages/common/tests/test_margin_finite_inputs.py`` and
+``tests/test_margin_finite_inputs_expert.py``; the capital mapping in
 ``tests/test_margin_capital_mapping.py``. Two rows are NOT covered anywhere yet and
 should not be read as passing: the cancel/retry/restart reserve-and-release cycle,
 and SEVERAL EXPERTS entering concurrently on one shared account (the gate's
@@ -774,7 +775,7 @@ def test_the_backtest_charges_the_position_twice_TODAY():
     "charges the position twice in the backtest ($3,000/$2,000 vs $4,000/$3,000). "
     "Deliberately NOT fixed in the leverage feature: changing it moves every backtest "
     "result and is a separately versioned correction. See "
-    "docs/plans/2026-09-09-margin-live-backtest-parity.md section 6."))
+    "docs/plans/2026-09-09-margin-live-backtest-parity.md section 6."), raises=AssertionError)
 def test_backtest_and_live_agree_after_the_first_entry():
     """THE PINNED BLOCKER (plan §6, finding 6).
 
@@ -873,7 +874,8 @@ def test_the_instrument_ceiling_is_ten_percent_of_the_REMAINING_funds_TODAY():
 
 @pytest.mark.xfail(strict=True, reason=(
     "finding 4: classic per-instrument ceiling is available x ratio (900), not virtual x "
-    "ratio (1800); changing it changes historical sizing - deferred, see plan section 6"))
+    "ratio (1800); changing it changes historical sizing - deferred, see plan section 6"),
+    raises=AssertionError)
 def test_the_instrument_ceiling_is_ten_percent_of_the_virtual_equity():
     """THE PINNED BLOCKER (plan §6, finding 4).
 
