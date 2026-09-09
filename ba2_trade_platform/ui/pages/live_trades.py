@@ -13,7 +13,8 @@ from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
-from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
+from ..account_filter_context import get_selected_account_id
+from ..components.account_scope import scope_transactions_to_account
 from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
 
@@ -224,16 +225,23 @@ class LiveTradesTab:
                 AccountDefinition, ExpertInstance.account_id == AccountDefinition.id
             )
             
-            # Apply global account filter from header dropdown
+            # Apply global account filter from header dropdown.
+            #
+            # A transaction belongs to the account ITS ORDERS WERE PLACED ON -- which is
+            # the very rule this page displays: the account column below is read from the
+            # transaction's first order. This used to ask a different question instead,
+            # mapping the account to its ExpertInstance ids and keeping
+            # Transaction.expert_id IN (...), with "no experts -> return empty". Both
+            # halves were wrong, because a transaction's expert is not its account:
+            #   * a manual account (TastyTrade) has NO experts, so the page went blank
+            #     for it while "All" showed its trades;
+            #   * allocator- and hand-created transactions have expert_id IS NULL even on
+            #     expert-driven accounts, so they vanished when their own account was
+            #     selected.
+            # scope_transactions_to_account is the same helper the Overview widgets use,
+            # so the whole UI attributes a transaction one way. None means "All".
             selected_account_id = get_selected_account_id()
-            account_expert_ids = get_expert_ids_for_account(selected_account_id)
-            if account_expert_ids is not None:
-                if account_expert_ids:
-                    base_query = base_query.where(Transaction.expert_id.in_(account_expert_ids))
-                else:
-                    # No experts for selected account - return empty
-                    fetch_timer.stop(f"count=0, total=0 (no experts for account)")
-                    return [], 0
+            base_query = scope_transactions_to_account(base_query, selected_account_id)
 
             # Apply status filter (from page filter controls)
             status_values = self.status_filter.value if hasattr(self, 'status_filter') else ['Waiting', 'Open', 'Closing']
