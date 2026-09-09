@@ -5,6 +5,7 @@ This module implements comprehensive risk management for pending orders,
 including profit-based prioritization, position sizing, and diversification.
 """
 
+import functools
 import time
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
@@ -1315,8 +1316,6 @@ class TradeRiskManagement:
         remaining balance (passed in), and respects any lot_size on the order.
         Returns 0 (order will be deleted as unfunded) when it can't be sized.
         """
-        import functools
-
         from ba2_common.core.position_sizing import (compute_risk_based_quantity,
                                                      resolve_sizing_risk_budget_pct)
 

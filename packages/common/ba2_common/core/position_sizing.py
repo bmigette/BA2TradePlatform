@@ -22,13 +22,13 @@ data-fetch wrapper.
 """
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 
 
-def resolve_sizing_risk_budget_pct(get_setting) -> float:
+def resolve_sizing_risk_budget_pct(get_setting: Callable[[str], Any]) -> float:
     """The %-of-equity DOLLAR-RISK budget for risk-based sizing, for BOTH risk managers.
 
     get_setting(key) -> the expert's setting value (typically

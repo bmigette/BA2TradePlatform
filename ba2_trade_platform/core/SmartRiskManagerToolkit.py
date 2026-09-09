@@ -5,6 +5,7 @@ Provides LangChain-compatible tools for the Smart Risk Manager agent graph.
 All tools are wrappers around existing platform functionality.
 """
 
+import functools
 import json
 from typing import Dict, Any, List, Optional, Annotated
 from datetime import datetime, timedelta, timezone
@@ -1876,8 +1877,6 @@ class SmartRiskManagerToolkit:
         given, else atr_multiplier * ATR. The per-instrument %% cap and available
         balance still apply as ceilings.
         """
-        import functools
-
         from .position_sizing import (compute_risk_based_quantity, get_latest_atr,
                                       resolve_sizing_risk_budget_pct)
         try:
@@ -1900,8 +1899,9 @@ class SmartRiskManagerToolkit:
             min_stop_pct = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 0.0)
             max_pos_pct = float(self.expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent", log_warning=False) or 10.0)
             max_position_value = (equity or 0) * (max_pos_pct / 100.0)
-            # use_atr_stop off -> ignore ATR entirely, size purely off risk_per_trade_pct%
-            # (still floored at min_stop_loss_pct%). Mirrors the classic RM's toggle.
+            # use_atr_stop off -> ignore ATR entirely; the safeguard stop is then purely the
+            # risk_per_trade_pct% DISTANCE (still floored at min_stop_loss_pct%), and the share
+            # count over that distance stays budget_pct's job. Mirrors the classic RM's toggle.
             use_atr_stop = bool(self.expert.get_setting_with_interface_default("use_atr_stop", log_warning=False))
 
             # get_latest_atr now lives in ba2_common.core.position_sizing (Phase 6
@@ -1925,9 +1925,10 @@ class SmartRiskManagerToolkit:
 
             # SAFEGUARD SL FIRST, then size off it — ONE stop distance for both (mirrors the
             # classic RM's _risk_atr_quantity). When the agent gave no SL, synthesize the hard
-            # protective stop (TIGHTER of ATR×mult / risk%, floored at min_stop_loss_pct) and
-            # size against THAT price, so the realized loss at the stop equals risk_per_trade_pct
-            # instead of drifting when the sizing fallback distance and the safeguard disagreed.
+            # protective stop from the DISTANCE gene (TIGHTER of ATR×mult / risk_per_trade_pct%,
+            # floored at min_stop_loss_pct) and size against THAT price, so the realized loss at
+            # the stop equals the resolved BUDGET (budget_pct) instead of drifting when the
+            # sizing fallback distance and the safeguard disagreed.
             effective_sl = sl_price
             if not effective_sl:
                 from .position_sizing import synthesize_safeguard_stop
@@ -1959,16 +1960,28 @@ class SmartRiskManagerToolkit:
                                                order_direction: OrderDirection) -> Dict[str, Any]:
         """Stop-loss for an order the agent gave an explicit QUANTITY but no SL.
 
-        Places the stop where the loss equals the resolved sizing BUDGET of equity for that
-        quantity — the inverse of ``_auto_size_by_risk``, so the same dollar risk governs both
-        directions of the relationship. Returns ``derive_stop_for_quantity``'s dict (sl_price,
-        possibly-reduced quantity, rejected, reason, stop_pct).
+        WHY THE BUDGET AND NOT THE DISTANCE GENE. The quantity is already fixed here, so the
+        only free variable left is the stop PRICE — and it is solved for, not chosen: the stop
+        goes where ``quantity * distance`` equals the sizing budget in dollars. That is
+        literally ``_auto_size_by_risk``'s size formula inverted (there the distance is known
+        and the quantity is solved for), so both directions of the same relationship must read
+        the same budget or an agent-specified quantity would carry a different dollar risk than
+        the identical auto-sized one.
+
+        This does NOT contradict ``_auto_size_by_risk``'s budget-vs-distance split above: there
+        the stop distance is a free choice with no quantity to satisfy, so the no-SL safeguard is
+        placed at the ``risk_per_trade_pct`` DISTANCE gene, mirroring the classic RM's
+        ``_ensure_safeguard_stop``. Budget always answers "how many dollars of risk"; the
+        distance gene answers "how far away is the stop" — only when the distance is
+        under-determined, as it is there and is not here.
+
+        Returns ``derive_stop_for_quantity``'s dict (sl_price, possibly-reduced quantity,
+        rejected, reason, stop_pct) plus ``min_stop_pct`` — the floor actually applied, so the
+        caller's log reports the number this method used rather than re-reading the setting.
 
         Extracted from ``_open_position_internal`` so the budget resolution is unit-testable
         without the DB/account wiring that surrounds the call site.
         """
-        import functools
-
         from .position_sizing import derive_stop_for_quantity, resolve_sizing_risk_budget_pct
 
         cur = self.get_current_price(symbol)
@@ -1976,9 +1989,11 @@ class SmartRiskManagerToolkit:
         risk_pct = resolve_sizing_risk_budget_pct(
             functools.partial(self.expert.get_setting_with_interface_default, log_warning=False))
         min_stop = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 7.0)
-        return derive_stop_for_quantity(equity, cur, int(quantity), risk_pct,
-                                        is_long=(order_direction == OrderDirection.BUY),
-                                        min_stop_pct=min_stop)
+        out = derive_stop_for_quantity(equity, cur, int(quantity), risk_pct,
+                                       is_long=(order_direction == OrderDirection.BUY),
+                                       min_stop_pct=min_stop)
+        out["min_stop_pct"] = min_stop
+        return out
 
     def _open_position_internal(
         self,
@@ -2043,8 +2058,6 @@ class SmartRiskManagerToolkit:
                     # Explicit quantity but no stop: synthesize the SL at the resolved
                     # sizing-budget loss price, reducing qty if it would be tighter than
                     # min_stop_loss_pct, rejecting if 1 share still risks too much.
-                    # (min_stop is re-read here only for the log line below.)
-                    min_stop = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 7.0)
                     d = self._synthesize_stop_for_explicit_quantity(symbol, quantity, order_direction)
                     if d["rejected"]:
                         return {
@@ -2055,7 +2068,7 @@ class SmartRiskManagerToolkit:
                         }
                     if d["quantity"] != quantity:
                         logger.info(f"Reduced {direction} {symbol} qty {quantity} -> {d['quantity']} "
-                                         f"to keep stop >= {min_stop:g}% (synthesized SL ${d['sl_price']}, {d['stop_pct']}%)")
+                                         f"to keep stop >= {d['min_stop_pct']:g}% (synthesized SL ${d['sl_price']}, {d['stop_pct']}%)")
                     quantity = d["quantity"]
                     sl_price = d["sl_price"]
 

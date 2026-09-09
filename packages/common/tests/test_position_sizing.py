@@ -103,7 +103,9 @@ def test_budget_resolver_reads_zero_as_one_percent():
 
 
 def test_budget_resolver_coerces_string_settings():
-    """Settings come back from the DB key-value store as strings (see the deploy-parity traps)."""
+    """Defensive coverage only: both genes are declared float, so the settings store hands them
+    back through value_float as real floats. The float() call is what makes a hand-written or
+    imported string value behave the same instead of raising deep inside the sizing math."""
     from ba2_common.core.position_sizing import resolve_sizing_risk_budget_pct
     assert resolve_sizing_risk_budget_pct(_settings_getter(atr_risk_budget_pct="0.5")) == 0.5
 
