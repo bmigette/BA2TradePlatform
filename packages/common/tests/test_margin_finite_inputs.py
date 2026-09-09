@@ -108,6 +108,17 @@ def test_infinite_multiplier_is_refused():
         acct._stock_multiplier_from(acct.get_account_snapshot())
 
 
+def test_negative_infinite_multiplier_keeps_the_not_usable_message():
+    """-inf is <= 0, so it is caught by the older "no usable multiplier" branch and
+    never reaches the finite check. Pinned so a future reordering of the two guards
+    cannot quietly change which refusal an operator reads."""
+    acct = _Stub(balance=10_000.0, snapshot=AccountSnapshot(margin_multiplier=-INF,
+                                                            buying_power=20_000.0),
+                 settings=ON)
+    with pytest.raises(ValueError, match="account 3"):
+        acct._stock_multiplier_from(acct.get_account_snapshot())
+
+
 # ----- the broker's buying power -------------------------------------------
 
 def test_nan_buying_power_is_refused():
@@ -219,3 +230,61 @@ def test_finite_figures_are_untouched():
                  settings=ON)
     tradable = acct.get_tradable_balance()
     assert tradable == 18_000.0 and math.isfinite(tradable)
+
+
+# ----- the over-exposure check must never skip itself in silence -------------
+# The STOCK path cannot reach this: _buying_power_from raises first. The OPTION path
+# reads snapshot.option_buying_power raw, because None is legal there.
+
+def _log_records(monkeypatch):
+    """(levelno, message) for every line ReadOnlyAccountInterface logs.
+
+    NOT caplog: ba2_common's logger sets propagate = False, so pytest's root handler
+    never sees a record and every log assertion would pass vacuously. Patching the
+    module-under-test's own logger is this package's idiom
+    (test_account_seams._capture_errors, test_margin_tradable_balance.records).
+    """
+    import logging
+    import sys
+
+    module = sys.modules["ba2_common.core.interfaces.ReadOnlyAccountInterface"]
+    seen = []
+    for name, level in (("debug", logging.DEBUG), ("info", logging.INFO),
+                        ("warning", logging.WARNING), ("error", logging.ERROR)):
+        monkeypatch.setattr(
+            module.logger, name,
+            lambda msg, *a, _lvl=level, **k: seen.append((_lvl, str(msg))))
+    return seen
+
+
+def test_non_finite_option_buying_power_skips_the_check_out_loud(monkeypatch):
+    import logging
+
+    records = _log_records(monkeypatch)
+    acct = _Stub(balance=10_000.0, snapshot=AccountSnapshot(margin_multiplier=2.0,
+                                                            buying_power=20_000.0,
+                                                            option_buying_power=NAN),
+                 settings=ON)
+
+    assert acct._tradable_balance(asset="option", balance=10_000.0, multiplier=2.0,
+                                  remaining_bp=NAN) == 18_000.0
+    hits = [msg for lvl, msg in records
+            if lvl == logging.WARNING and "non-finite option buying power" in msg]
+    assert len(hits) == 1 and "Account 3" in hits[0]
+
+
+def test_an_absent_option_buying_power_stays_a_debug_line(monkeypatch):
+    """None is a published absence, not a broken figure: the contrast that keeps the
+    WARNING above meaningful."""
+    import logging
+
+    records = _log_records(monkeypatch)
+    acct = _Stub(balance=10_000.0, snapshot=AccountSnapshot(margin_multiplier=2.0,
+                                                            buying_power=20_000.0),
+                 settings=ON)
+
+    assert acct._tradable_balance(asset="option", balance=10_000.0, multiplier=2.0,
+                                  remaining_bp=None) == 18_000.0
+    assert not any(lvl >= logging.WARNING for lvl, _ in records)
+    assert any(lvl == logging.DEBUG and "no option buying power published" in msg
+               for lvl, msg in records)

@@ -344,13 +344,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     def _stock_multiplier_from(self, snapshot: AccountSnapshot) -> float:
         """``get_stock_margin_multiplier``'s body, against a snapshot already taken."""
         multiplier = snapshot.margin_multiplier
+        value = None if multiplier is None else float(multiplier)
         # 0 or negative is not a leverage figure a broker can mean; treated as
         # unpublished so it raises here instead of sizing every order to zero.
-        if multiplier is None or float(multiplier) <= 0:
+        if value is None or value <= 0:
             raise ValueError(
                 f"account {self.id} ({type(self).__name__}) published no usable stock margin "
                 f"multiplier ({multiplier!r}); cannot size with margin")
-        value = float(multiplier)
         # 2026-09-09 review, finding 5: NaN loses every comparison, so it survived the
         # test above AND the min/max in effective_factor_for, which handed back the
         # configured factor -- an unpublished multiplier read as permission to lever.
@@ -495,9 +495,19 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     f"{multiplier:g}); tradable option balance stays at the balance "
                     f"${balance:,.2f}")
             return 1.0
-        if remaining_bp is None:
-            logger.debug(f"[Account {self.id}] no {asset} buying power published; "
-                         f"over-exposure check skipped")
+        if remaining_bp is None or not math.isfinite(remaining_bp):
+            if remaining_bp is None:
+                logger.debug(f"[Account {self.id}] no {asset} buying power published; "
+                             f"over-exposure check skipped")
+            else:
+                # 2026-09-09 review, finding 5 follow-up. NaN loses the ``<`` below, so the
+                # check used to skip ITSELF without a word. An absent figure (None) is a
+                # published fact and stays DEBUG; a broken one is a broker anomaly. The stock
+                # path never reaches here (``_buying_power_from`` raises first) -- this guards
+                # the OPTION path, which reads ``snapshot.option_buying_power`` raw because
+                # None is legal there.
+                logger.warning(f"[Account {self.id}] non-finite {asset} buying power "
+                               f"({remaining_bp!r}); over-exposure check skipped")
         else:
             threshold = over_exposure_threshold(balance, multiplier=multiplier, factor=factor)
             if remaining_bp < threshold:

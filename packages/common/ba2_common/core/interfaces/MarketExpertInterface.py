@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
@@ -979,9 +980,19 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             if val is None:
                 return None
             try:
-                return float(val)
+                num = float(val)
             except (TypeError, ValueError):
                 return None
+            # 2026-09-09 review, finding 5 follow-up: a non-finite figure fails the clamp
+            # OPEN -- ``actual < available`` is False for NaN, so the expert keeps its larger
+            # virtual number and the broker's real cap silently stops applying. Unusable, the
+            # same as a non-numeric value: say so and fall through to the next candidate name.
+            if not math.isfinite(num):
+                logger.warning(
+                    f"Account {getattr(account, 'id', '?')}: non-finite {name} ({val!r}) in "
+                    f"get_account_info(); ignoring it for the available-balance clamp")
+                return None
+            return num
 
         if info is not None:
             for name in ("buying_power", "cash", "cash_balance", "equity_buying_power"):
