@@ -118,6 +118,22 @@ class _Expert(MarketExpertInterface):
         return None
 
 
+class _Recorder:
+    """A logger-shaped double: which METHOD was called is the assertion."""
+
+    def __init__(self):
+        self.lines = []
+
+    def debug(self, msg, *a, **k):
+        self.lines.append((logging.DEBUG, str(msg)))
+
+    def info(self, msg, *a, **k):
+        self.lines.append((logging.INFO, str(msg)))
+
+    def error(self, msg, *a, **k):
+        self.lines.append((logging.ERROR, str(msg)))
+
+
 def _with_account(account, fn):
     from ba2_common.core.instance_resolver import get_instance_resolver, set_instance_resolver
 
@@ -282,6 +298,101 @@ def test_the_ceiling_terms_travel_with_the_mapping():
     assert mapping["broker_buying_power"] == 4_000.0
 
 
+@pytest.mark.usefixtures("reset_test_db")
+def test_a_provided_balance_pass_is_not_run_a_second_time(monkeypatch):
+    """THE POINT OF THE ``balances`` ARGUMENT. Both risk managers take ONE
+    ``_available_balance_breakdown()`` and hand it here, so the mapping explains the pass
+    the order was sized from -- not a second reading taken microseconds later against a
+    moved book -- and the pass (a transactions query plus a bulk price fetch) runs once.
+
+    What the mapping still costs on top of that, with margin ON, is pinned exactly:
+    ONE more snapshot and ONE more working-order scan, both from ``describe_capital()``
+    measuring gross/pending exposure. The breakdown's headroom clamp took its own
+    reading; sharing them would mean threading the account's StockExposure out through
+    ``get_available_balance``, past the seam guard that lets a narrower account be wired
+    at all. Undercounting this in a docstring is how a round-trip budget goes wrong.
+    """
+    from ba2_common.core import trade_store
+
+    account, expert = _setup(balance=2_000.0)
+    scans = []
+    real_orders_where = trade_store.orders_where
+    monkeypatch.setattr(trade_store, "orders_where",
+                        lambda *a, **k: (scans.append(k) or real_orders_where(*a, **k)))
+
+    balances = _with_account(account, expert._available_balance_breakdown)
+    assert balances.available == 4_000.0
+    snapshots_for_the_pass, scans_for_the_pass = account.snapshot_calls, len(scans)
+
+    mapping = _with_account(
+        account, lambda: expert.describe_capital_mapping(balances=balances))
+
+    assert mapping["available_balance"] == balances.available
+    assert mapping["virtual_balance"] == balances.virtual
+    assert mapping["used_balance"] == balances.used
+    assert account.snapshot_calls - snapshots_for_the_pass == 1
+    assert len(scans) - scans_for_the_pass == 1
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_an_unavailable_expert_balance_is_an_error_not_three_quiet_nones():
+    """A mapping whose expert figures are all None is not an ordinary INFO line: the
+    expert could not say what it may deploy, and the level policy has to see it."""
+    account, expert = _setup(balance=2_000.0)
+
+    class _Broken(_Expert):
+        def _available_balance_breakdown(self, exclude_transaction_id=None):
+            return None
+
+    mapping = _with_account(
+        account, _Broken(expert.id).describe_capital_mapping)
+
+    assert "expert balance unavailable" in mapping["error"]
+    assert mapping["available_balance"] is None
+    assert mapping["tradable_balance"] == 4_000.0, "the account half still stands"
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_an_account_that_publishes_no_description_is_an_error_mapping():
+    """The account is reached through a getattr-guarded seam (a host may wire a narrower
+    object), so the mapping can legitimately come back with no factor in it. That is the
+    ERROR branch -- never a KeyError inside a diagnostic."""
+    acct_def = factories.create_account_definition()
+    inst = factories.create_expert_instance(
+        account_id=acct_def.id, expert="_Expert", virtual_equity_pct=100.0)
+
+    class _NarrowAccount:
+        """Everything the balance pass reads, and no ``describe_capital``."""
+
+        id = acct_def.id
+
+        def get_balance(self):
+            return 2_000.0
+
+        def get_tradable_balance(self):
+            return 2_000.0
+
+        def get_account_info(self):
+            return {"buying_power": 2_000.0}
+
+        def get_instrument_current_price(self, symbol_or_list, price_type="bid"):
+            return {} if isinstance(symbol_or_list, (list, tuple, set)) else 100.0
+
+        def get_stock_exposure_headroom(self, exclude_order_id=None):
+            return None
+
+    expert = _Expert(inst.id)
+    log = _Recorder()
+    mapping = _with_account(_NarrowAccount(),
+                            lambda: log_capital_mapping(expert, log))
+
+    assert "publishes no capital description" in mapping["error"]
+    assert "effective_factor" not in mapping
+    assert mapping["account_id"] == acct_def.id
+    assert mapping["available_balance"] == 2_000.0, "the expert half still stands"
+    assert [lvl for lvl, _ in log.lines] == [logging.ERROR], log.lines
+
+
 # --------------------------------------------------------------------------
 # The log line: the classic risk manager's real sizing entry point.
 # --------------------------------------------------------------------------
@@ -328,8 +439,40 @@ def test_the_classic_rm_logs_the_mapping_at_info_when_leverage_is_in_play(rm_log
 
     lines = _mapping_lines(rm_logs, logging.INFO)
     assert len(lines) == 1, rm_logs
-    assert "'equivalent_unlevered_balance': 4000.0" in lines[0]
+    assert "equivalent_unlevered_balance=$4,000.00" in lines[0]
     assert not _mapping_lines(rm_logs, logging.DEBUG)
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_the_classic_rm_line_says_which_balance_it_sized_from(rm_logs):
+    """ONE pass, one story: the available balance in the mapping must be the very number
+    the risk manager divided into orders. Two passes could differ (a fill lands between
+    them) and the log would then explain a decision that was never made."""
+    account, expert = _setup(balance=2_000.0, pct=50.0)
+
+    (_, _, _, total_virtual_balance, _) = _size_nothing(account, expert)
+
+    line = _mapping_lines(rm_logs, logging.INFO)[0]
+    assert total_virtual_balance == 2_000.0
+    assert f"available_balance=${total_virtual_balance:,.2f}" in line
+    assert "equivalent_unlevered_balance=$4,000.00" in line
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_a_cash_account_with_margin_enabled_is_a_debug_line(rm_logs):
+    """DEBUG is not "margin_enabled is False", it is "leverage is not in play". A broker
+    that will not lend (multiplier 1.0) leaves effective_factor at 1.0 however the
+    setting is spelled, and the quantities then DO correspond to the account's own
+    equity -- nothing to explain."""
+    account, expert = _setup(balance=2_000.0, multiplier=1.0, factor=2.0)
+
+    _size_nothing(account, expert)
+
+    debug = _mapping_lines(rm_logs, logging.DEBUG)
+    assert len(debug) == 1, rm_logs
+    assert "effective_factor=1.0" in debug[0]
+    assert "equivalent_unlevered_balance=$2,000.00" in debug[0]
+    assert not _mapping_lines(rm_logs, logging.INFO)
 
 
 @pytest.mark.usefixtures("reset_test_db")
@@ -355,21 +498,6 @@ def test_a_refused_mapping_is_logged_at_error():
     before it can log anything); the level policy is what is under test here.
     """
     account, expert = _setup(balance=2_000.0, multiplier=float("nan"))
-
-    class _Recorder:
-        """A logger-shaped double: which METHOD was called is the assertion."""
-
-        def __init__(self):
-            self.lines = []
-
-        def debug(self, msg, *a, **k):
-            self.lines.append((logging.DEBUG, str(msg)))
-
-        def info(self, msg, *a, **k):
-            self.lines.append((logging.INFO, str(msg)))
-
-        def error(self, msg, *a, **k):
-            self.lines.append((logging.ERROR, str(msg)))
 
     log = _Recorder()
     mapping = _with_account(account, lambda: log_capital_mapping(expert, log))
@@ -407,4 +535,4 @@ def test_the_smart_rm_logs_the_same_mapping_from_the_same_function(monkeypatch):
     info = [msg for lvl, msg in seen
             if lvl == logging.INFO and msg.startswith("Capital mapping:")]
     assert len(info) == 1, seen
-    assert "'equivalent_unlevered_balance': 4000.0" in info[0]
+    assert "equivalent_unlevered_balance=$4,000.00" in info[0]

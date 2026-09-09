@@ -855,7 +855,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         equivalent UNLEVERED account is one funded with ``tradable_balance``.
 
         Keys (all dollars unless named otherwise):
-          balance, margin_enabled, margin_factor (the stored setting),
+          account_id, balance, margin_enabled, margin_factor (the stored setting),
           broker_multiplier (what the broker will actually lend),
           effective_factor, tradable_balance, broker_buying_power,
           gross_exposure, pending_entries, headroom.
@@ -876,6 +876,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         if not self._margin_enabled():
             balance = self._plain_balance()
             return {
+                "account_id": self.id,
                 "balance": balance,
                 "margin_enabled": False,
                 "margin_factor": None,
@@ -892,6 +893,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         # describe the same broker instant.
         exposure = self._stock_exposure_breakdown()
         return {
+            "account_id": self.id,
             "balance": exposure.balance,
             "margin_enabled": True,
             "margin_factor": self._margin_factor(),   # a settings read; no round trip

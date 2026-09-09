@@ -345,12 +345,19 @@ class TradeRiskManagement:
         # Step 4: Sort orders by expected profit (descending)
         prioritized_orders = self._prioritize_orders_by_profit(orders_with_recommendations)
 
-        # Step 5: Get available balance from expert interface
-        available_balance = expert.get_available_balance()
-        if available_balance is None:
+        # Step 5: Get available balance from expert interface.
+        #
+        # The BREAKDOWN, not get_available_balance(): it is the same pass (that method is
+        # now a one-line wrapper over it) and it also carries the virtual and used figures
+        # the capital-mapping line below reports. Asking for those separately would run
+        # the whole pass -- a transactions query and a bulk price fetch -- a second time,
+        # and would explain a DIFFERENT instant than the one this sizing decision used.
+        balances = expert._available_balance_breakdown()
+        if balances is None:
             error_msg = f"Could not get available balance for expert {expert_instance_id}"
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
+        available_balance = balances.available
         total_virtual_balance = available_balance
         max_equity_per_instrument = total_virtual_balance * max_equity_per_instrument_ratio
         self.logger.info(f"Virtual balance: ${total_virtual_balance:.2f}, "
@@ -359,10 +366,11 @@ class TradeRiskManagement:
         # ...and WHERE that balance came from: raw equity x the effective margin factor.
         # The figures above are the expert's slice of a capital base that, with margin
         # on, is not the account's equity -- without this line a levered live run cannot
-        # be read back against the unlevered backtest it is meant to reproduce. INFO only
-        # when leverage is actually in play; margin off (every backtest) is DEBUG and
-        # costs no broker snapshot. See log_capital_mapping.
-        log_capital_mapping(expert, self.logger)
+        # be read back against the unlevered backtest it is meant to reproduce. Passed
+        # the SAME breakdown, so the line explains the numbers immediately above it
+        # rather than a second reading. INFO only when leverage is actually in play;
+        # margin off (every backtest) is DEBUG and costs no broker snapshot.
+        log_capital_mapping(expert, self.logger, balances=balances)
 
         # Step 6: Get account instance for price lookups (via the injected host resolver)
         from ba2_common.core.instance_resolver import get_instance_resolver

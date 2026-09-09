@@ -13,6 +13,46 @@ from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSet
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 
 
+#: The mapping terms that are DOLLARS, so the log line can render them as money
+#: ($1,234.50) and leave the factors, percentages and ids alone. A ratio printed with a
+#: currency sign (or an amount printed as 4000.0) is how a reader mistakes one for the
+#: other in the one line that exists to stop exactly that confusion.
+CAPITAL_MAPPING_DOLLAR_KEYS = frozenset({
+    "balance", "tradable_balance", "broker_buying_power", "gross_exposure",
+    "pending_entries", "headroom", "virtual_balance", "used_balance",
+    "available_balance", "equivalent_unlevered_balance",
+})
+
+
+def _add_mapping_error(mapping: Dict[str, Any], message: str) -> None:
+    """Record a refusal on the mapping WITHOUT dropping one already there.
+
+    Two things can refuse in one pass (an account that publishes no description AND an
+    expert whose balance is unavailable); a plain assignment would keep only the second
+    and the operator would chase the wrong one.
+    """
+    existing = mapping["error"] if "error" in mapping else None
+    mapping["error"] = f"{existing}; {message}" if existing else message
+
+
+def format_capital_mapping(mapping: Dict[str, Any]) -> str:
+    """The mapping as a compact ``k=v`` line, dollars at 2 dp.
+
+    Not ``repr(dict)``: that prints ``4000.0`` and ``1839.4000000000003`` side by side and
+    reads as debug spew in the one line an operator is meant to check an order against.
+    The DICT itself stays unrounded -- rounding is a presentation choice, and the tests
+    assert on the numbers, not on their rendering.
+    """
+    parts = []
+    for key, value in mapping.items():
+        if (key in CAPITAL_MAPPING_DOLLAR_KEYS and isinstance(value, (int, float))
+                and not isinstance(value, bool)):
+            parts.append(f"{key}=${value:,.2f}")
+        else:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
 class ExpertBalance(NamedTuple):
     """One expert's virtual-equity bookkeeping at one instant, from ONE pass.
 
@@ -1043,7 +1083,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
             return None
 
-    def describe_capital_mapping(self) -> Optional[Dict[str, Any]]:
+    def describe_capital_mapping(self, balances: Optional["ExpertBalance"] = None
+                                 ) -> Optional[Dict[str, Any]]:
         """This sizing decision's raw-equity -> deployable-capital mapping, as a dict.
 
         The account's ``describe_capital()`` (balance, factor, ceiling, exposure) plus
@@ -1066,20 +1107,23 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         line. Returns ``None`` only when there is nothing to describe: the expert row or
         its account is gone, which the reads below already log as an error.
 
-        The three expert figures come from ONE ``_available_balance_breakdown()`` -- the
-        body of the real ``get_available_balance`` -- never recomputed here. A diagnostic
-        that did its own arithmetic would report the numbers it believes rather than the
-        ones the order was sized from, which is the only thing it is for; and asking for
-        the three separately re-ran that whole pass three times per sizing decision,
-        which measured ~11% on the equity golden run.
+        PASS THE ``balances`` THE ORDER WAS SIZED FROM. Both risk managers take one
+        ``_available_balance_breakdown()`` (the body of the real
+        ``get_available_balance``) and hand that record here, so the mapping explains the
+        SAME pass the quantity came from -- not a second one taken microseconds later
+        against a moved book. Omitting it is allowed for other callers and then the
+        breakdown is taken here; no RM path may run the pass twice.
 
-        COST: with margin ON this still takes the ``describe_capital()`` snapshot plus
-        the one ``get_virtual_balance`` takes inside the breakdown (and the broker-BP /
-        headroom reads that already existed) -- the per-submit broker round-trip count is
-        a tracked follow-up (docs/plans/2026-09-08-margin-trading-design.md) and is
-        deliberately not solved by making this function lie. With margin OFF -- every
-        backtest -- ``describe_capital()`` reads no snapshot and no order store, and the
-        cost is one extra balance pass per sizing decision.
+        COST, exactly, on top of the breakdown's own reads (which are unchanged by this
+        method): margin OFF, NOTHING -- ``describe_capital()`` reads no snapshot and no
+        order store. Margin ON, ONE more ``get_account_snapshot()`` and ONE more working-
+        order scan, because ``describe_capital`` measures gross/pending exposure and the
+        breakdown's headroom clamp measured its own; the two readings are separate broker
+        instants by construction. Sharing them would mean threading the account's
+        ``StockExposure`` out through ``get_available_balance``, past the getattr seam
+        guard that lets a narrower account be wired at all -- the per-submit round-trip
+        count is a tracked follow-up (docs/plans/2026-09-08-margin-trading-design.md),
+        and it is not paid for by making this function lie about which instant it read.
         """
         mapping: Dict[str, Any] = {"expert_id": self.id}
         try:
@@ -1094,6 +1138,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
                 return None
 
+            # Before the account's own view: if a seam ever wired an account whose id
+            # disagrees with the expert's, the reader needs to see WHICH account the
+            # figures below were actually read from, so the account's answer wins.
+            mapping["account_id"] = expert_instance.account_id
             mapping["virtual_equity_pct"] = expert_instance.virtual_equity_pct
             # getattr, not a bare call, for the same reason as the exposure clamp above:
             # the resolver is a seam, and a host that wires a narrower object must be
@@ -1101,15 +1149,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # only describing.
             describer = getattr(account, "describe_capital", None)
             if describer is None:
-                mapping["error"] = (
+                _add_mapping_error(mapping, (
                     f"account {expert_instance.account_id} ({type(account).__name__}) "
-                    f"publishes no capital description")
+                    f"publishes no capital description"))
             else:
                 capital = describer()
                 mapping.update(capital)
                 mapping["equivalent_unlevered_balance"] = capital["tradable_balance"]
 
-            balances = self._available_balance_breakdown()
+            if balances is None:
+                balances = self._available_balance_breakdown()
+            if balances is None:
+                # Not three quiet Nones on an otherwise ordinary-looking INFO line: the
+                # expert could not say what it may deploy, and the level policy has to
+                # see that (log_capital_mapping keys off "error").
+                _add_mapping_error(mapping, "expert balance unavailable")
             mapping["virtual_balance"] = None if balances is None else balances.virtual
             mapping["used_balance"] = None if balances is None else balances.used
             mapping["available_balance"] = None if balances is None else balances.available
@@ -1117,7 +1171,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # The NAMED "unknown broker figure / bad margin factor" signal. Anything
             # else is a defect and must not be absorbed by a log line's helper -- it
             # propagates to the sizing caller, which is where it belongs.
-            mapping["error"] = str(e)
+            _add_mapping_error(mapping, str(e))
         return mapping
 
     @staticmethod
@@ -1539,7 +1593,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         return []
 
 
-def log_capital_mapping(expert: "MarketExpertInterface", log) -> Optional[Dict[str, Any]]:
+def log_capital_mapping(expert: "MarketExpertInterface", log,
+                        balances: Optional["ExpertBalance"] = None
+                        ) -> Optional[Dict[str, Any]]:
     """Log ``expert.describe_capital_mapping()`` at the level the mapping deserves.
 
     ONE function, two callers (the classic risk manager and the Smart RM toolkit), so
@@ -1548,13 +1604,18 @@ def log_capital_mapping(expert: "MarketExpertInterface", log) -> Optional[Dict[s
     lands under the module an operator is already reading, and so a test can pin the
     level by patching that module's logger.
 
+    ``balances``: the ``_available_balance_breakdown()`` the caller SIZED FROM. Both risk
+    managers take exactly one and pass it here, so the explanation and the quantity come
+    from one pass over one book.
+
     Levels: ERROR when the mapping carries an ``"error"`` (a broker figure was
     unknown -- the sizing decision that follows is being made on refused inputs, which
-    must never be quiet); INFO when leverage is actually in play
-    (``effective_factor != 1.0``), because then the order quantities do NOT correspond
-    to the account's own equity and an operator needs the mapping to read them; DEBUG
-    otherwise -- margin off is every backtest, where this line would otherwise be
-    emitted once per sizing pass for the whole run and say nothing new.
+    must never be quiet) OR when it carries no ``effective_factor`` at all; INFO when
+    leverage is actually in play (``effective_factor != 1.0``), because then the order
+    quantities do NOT correspond to the account's own equity and an operator needs the
+    mapping to read them; DEBUG otherwise -- margin off is every backtest, where this
+    line would otherwise be emitted once per sizing pass for the whole run and say
+    nothing new.
 
     Returns the mapping (or None when there was nothing to describe) so a caller may
     also record it. It does not raise for the mapping's own known refusals -- an
@@ -1563,15 +1624,20 @@ def log_capital_mapping(expert: "MarketExpertInterface", log) -> Optional[Dict[s
     that swallowed it would leave the sizing path below running on a lie. Callers keep it
     OUT of any handler that turns an exception into a quantity of zero.
     """
-    mapping = expert.describe_capital_mapping()
+    mapping = expert.describe_capital_mapping(balances)
     if mapping is None:
         return None
-    if "error" in mapping:
-        log.error(f"Capital mapping: {mapping}")
+    line = f"Capital mapping: {format_capital_mapping(mapping)}"
+    # The shape is NOT guaranteed: the account is reached through a getattr-guarded seam,
+    # so a host may wire something that publishes no description, and then there is no
+    # factor to judge the line by. A missing factor is therefore the ERROR branch and
+    # never a KeyError -- a diagnostic that crashes on its own payload explains nothing.
+    if "error" in mapping or "effective_factor" not in mapping:
+        log.error(line)
     elif mapping["effective_factor"] != 1.0:
-        log.info(f"Capital mapping: {mapping}")
+        log.info(line)
     else:
-        log.debug(f"Capital mapping: {mapping}")
+        log.debug(line)
     return mapping
 
 

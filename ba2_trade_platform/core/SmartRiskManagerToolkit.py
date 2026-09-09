@@ -20,9 +20,10 @@ from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, Ma
 from .db import get_db, get_instance, add_instance
 from .utils import get_expert_instance_from_id, get_account_instance_from_id
 from .interfaces import MarketExpertInterface
-# The package path, not the in-tree shim: this is the SAME function the classic risk
-# manager logs its capital mapping with, so the two live sizing paths cannot explain
-# their capital differently.
+# ONE function, two callers: the classic risk manager logs its capital mapping with this
+# same object, so the two live sizing paths cannot explain their capital differently.
+# (The in-tree module of that name is a sys.modules alias to this package module, so both
+# import paths are literally the same object -- either spelling would do.)
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from .TransactionHelper import TransactionHelper
 
@@ -1883,6 +1884,11 @@ class SmartRiskManagerToolkit:
         """
         from .position_sizing import (compute_risk_based_quantity, get_latest_atr,
                                       resolve_sizing_risk_budget_pct)
+        # ONE balance pass for this decision: the equity the share count is computed
+        # from, the available balance that caps it, and the capital mapping that explains
+        # both come from this single record. Two calls (get_virtual_balance here,
+        # get_available_balance further down) re-ran the whole pass and could disagree.
+        balances = self.expert._available_balance_breakdown()
         # WHAT CAPITAL THIS IS SIZING AGAINST: raw account equity x the effective margin
         # factor -- the mapping every live sizing decision has to be readable against
         # (the same line the classic RM logs, from the same function). INFO only when
@@ -1892,14 +1898,15 @@ class SmartRiskManagerToolkit:
         # an exception into a quantity of 0, and a DIAGNOSTIC that can silently zero a
         # live position size is exactly the failure mode the project forbids. Out here a
         # defect surfaces as a defect; the mapping's own known refusals (an unpublished
-        # broker figure) are already carried inside it as an "error" entry.
-        log_capital_mapping(self.expert, logger)
+        # broker figure, an unavailable balance) are already carried inside it as an
+        # "error" entry.
+        log_capital_mapping(self.expert, logger, balances=balances)
         try:
             current_price = self.get_current_price(symbol)
             if not current_price or current_price <= 0:
                 return {"quantity": 0, "reason": f"no current price for {symbol}"}
 
-            equity = self.expert.get_virtual_balance()
+            equity = None if balances is None else balances.virtual
             # TWO genes, two jobs -- exactly as the classic RM splits them:
             #   budget_pct : the %-of-equity DOLLAR RISK that sets the SHARE COUNT
             #   risk_pct   : risk_per_trade_pct, which sets the safeguard stop DISTANCE
@@ -1933,10 +1940,7 @@ class SmartRiskManagerToolkit:
                 except Exception as e:
                     logger.warning(f"could not build indicator provider for ATR sizing of {symbol}: {e}")
             atr = None if (sl_price or not use_atr_stop) else get_latest_atr(symbol, indicator_provider, period=atr_period)
-            try:
-                available = self.expert.get_available_balance()
-            except Exception:
-                available = None
+            available = None if balances is None else balances.available
 
             # SAFEGUARD SL FIRST, then size off it — ONE stop distance for both (mirrors the
             # classic RM's _risk_atr_quantity). When the agent gave no SL, synthesize the hard

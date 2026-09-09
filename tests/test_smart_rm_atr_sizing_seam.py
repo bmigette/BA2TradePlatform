@@ -25,12 +25,20 @@ class _StubExpert:
     def get_available_balance(self):
         return 100_000.0
 
-    def describe_capital_mapping(self):
-        """The sizing path now logs the raw-equity -> effective-capital mapping (plan
-        step 5, tests/test_margin_capital_mapping.py). This stub has no account to
-        describe one from, and ``None`` is the interface's own "nothing to describe"
-        answer, so the log line is a no-op here and the ATR seam under test is
-        untouched."""
+    def _available_balance_breakdown(self, exclude_transaction_id=None):
+        """The sizing paths take ONE balance pass and reuse it for equity, the available
+        cap and the capital-mapping log line (plan step 5). This stub answers it with the
+        figures its two accessors above publish, so the arithmetic under test is
+        unchanged."""
+        from ba2_common.core.interfaces.MarketExpertInterface import ExpertBalance
+
+        return ExpertBalance(virtual=self.get_virtual_balance(), used=0.0,
+                             available=self.get_available_balance())
+
+    def describe_capital_mapping(self, balances=None):
+        """This stub has no account to describe a mapping from, and ``None`` is the
+        interface's own "nothing to describe" answer, so the log line is a no-op here and
+        the ATR seam under test is untouched."""
         return None
 
     def get_setting_with_interface_default(self, key, log_warning=True):
