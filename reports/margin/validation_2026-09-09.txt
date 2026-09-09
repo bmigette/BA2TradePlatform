@@ -1,0 +1,50 @@
+Margin / TP-SL targeted review validation, 2026-09-09
+Reviewed HEAD: 512345311d06a3c26aa7c6784ec3b6c98433865a
+Runtime: bundled Python 3.12.14 with existing trade/test site-packages;
+        repository packages/common, packages/providers, packages/experts on sys.path.
+Isolation: temporary BA2_HOME/DB/log paths, pytest plugin autoload disabled,
+           -q -p no:cacheprovider. Test trees run in separate processes.
+
+58 passed (5.41s; one dependency deprecation warning):
+  tests/test_margin_expert_sizing.py
+  tests/test_smart_rm_atr_sizing_seam.py
+  tests/test_tp_sl_validation.py
+  tests/test_option_reserve.py
+  tests/test_available_balance_clamp.py
+  tests/test_smart_rm_portfolio_equity_seam.py
+
+89 passed (4.01s):
+  packages/common/tests/test_margin_accessors.py
+  packages/common/tests/test_margin_settings.py
+  packages/common/tests/test_margin_snapshot.py
+  packages/common/tests/test_margin_tradable_balance.py
+  packages/common/tests/test_position_sizing.py
+  packages/common/tests/test_min_take_profit_floor.py
+  packages/common/tests/test_increase_instrument_share_buying_power.py
+
+6 passed (1.81s):
+  packages/common/tests/test_protective_leg_quantity_sync.py
+  packages/common/tests/test_recalculate_transaction_quantity_no_clobber.py
+  packages/common/tests/test_trade_risk_management_inmem.py
+
+91 passed (4.14s; two dependency deprecation warnings):
+  testplatform/backend/tests/backtest/test_backtest_account_contract.py
+  testplatform/backend/tests/backtest/test_equity_cap.py
+  testplatform/backend/tests/backtest/test_entry_bracket_seeding.py
+  testplatform/backend/tests/backtest/test_entry_bracket_engine.py
+
+Total existing tests: 244 passed.
+
+Additional hermetic review command (with the project dependencies available):
+  python reports/margin/reproduce_margin_review.py
+Result: all assertions passed for four core bracket/risk-sizing combinations
+        and five defect/limitation scenarios in the initial review.
+Follow-up plan validation: reran the probe with the real BacktestAccount cash
+accessor feeding the shared expert methods, confirming the cash/equity mismatch;
+also asserted equivalent capital for $2,000/$1,900/$2,100 at 2x versus
+$4,000/$3,800/$4,200 at 1x. All assertions passed (13 scenarios in total).
+        See reproductions_2026-09-09.json.
+        These assertions confirm current behavior, not fixes.
+
+No application source changed, broker submissions, real HTTP requests,
+production DB writes, dependency installation, or research campaigns.
