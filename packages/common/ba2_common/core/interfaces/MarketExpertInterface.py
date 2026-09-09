@@ -1,7 +1,7 @@
 import math
 from abc import abstractmethod
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, runtime_checkable
 from sqlmodel import Session, select
 from ba2_common.logger import logger
 from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance
@@ -11,6 +11,17 @@ from ba2_common.core.db import get_instance, get_db
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
+
+
+class ExpertBalance(NamedTuple):
+    """One expert's virtual-equity bookkeeping at one instant, from ONE pass.
+
+    A named tuple and not a bare 3-tuple for the same reason as ``StockCapital``: at a
+    call site, ``[1]`` is how "used" and "available" quietly trade places.
+    """
+    virtual: float      # tradable balance x virtual_equity_pct
+    used: float         # what this expert's own open transactions have committed
+    available: float    # virtual - used, then clamped to broker BP and account headroom
 
 
 class MarketExpertInterface(ExtendableSettingsInterface):
@@ -909,6 +920,23 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         Returns:
             Optional[float]: The available balance amount, None if error occurred
         """
+        breakdown = self._available_balance_breakdown(exclude_transaction_id)
+        return None if breakdown is None else breakdown.available
+
+    def _available_balance_breakdown(self, exclude_transaction_id: Optional[int] = None
+                                     ) -> Optional["ExpertBalance"]:
+        """``get_available_balance``'s body, keeping the two intermediates it computes.
+
+        Split out for ``describe_capital_mapping``, which must report virtual, used AND
+        available: asking for them one by one re-ran this whole pass (a transactions
+        query plus a bulk price fetch) three times per sizing decision, and measurably
+        slowed every backtest to log a line about an account that is not even levered.
+        One pass, three figures, and by construction the reported virtual/used are the
+        ones the reported available was actually derived from.
+
+        ``None`` (never a partial record) on any failure, exactly as before: the caller
+        that only wants the available balance must not be able to tell the difference.
+        """
         try:
             # Get virtual balance first
             virtual_balance = self.get_virtual_balance()
@@ -1008,11 +1036,89 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.debug(f"Expert {self.id}: Virtual balance=${virtual_balance}, "
                         f"Used balance=${used_balance}, Available balance=${available_balance}")
 
-            return available_balance
+            return ExpertBalance(virtual=virtual_balance, used=used_balance,
+                                 available=available_balance)
 
         except Exception as e:
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
             return None
+
+    def describe_capital_mapping(self) -> Optional[Dict[str, Any]]:
+        """This sizing decision's raw-equity -> deployable-capital mapping, as a dict.
+
+        The account's ``describe_capital()`` (balance, factor, ceiling, exposure) plus
+        this expert's slice of it::
+
+            expert_id, virtual_equity_pct, virtual_balance, used_balance,
+            available_balance, equivalent_unlevered_balance
+
+        ``equivalent_unlevered_balance`` IS the account's tradable balance, restated
+        under the name the 2026-09-09 review's parity table uses: a live account with
+        equity E, margin on and effective factor f behaves exactly like an UNLEVERED
+        account funded with E x f, and that equivalence is the whole leverage design.
+        Logging it on every live sizing decision is what makes a levered live run
+        checkable against the unlevered backtest it is supposed to reproduce.
+
+        NEVER RAISES. A ``ValueError`` from the account (unpublished or non-finite
+        broker figure, invalid stored factor -- the loud refusals every reader in the
+        margin path makes) becomes an ``"error"`` key alongside whatever was already
+        computed, so the caller can log the refusal at ERROR instead of losing the whole
+        line. Returns ``None`` only when there is nothing to describe: the expert row or
+        its account is gone, which the reads below already log as an error.
+
+        The three expert figures come from ONE ``_available_balance_breakdown()`` -- the
+        body of the real ``get_available_balance`` -- never recomputed here. A diagnostic
+        that did its own arithmetic would report the numbers it believes rather than the
+        ones the order was sized from, which is the only thing it is for; and asking for
+        the three separately re-ran that whole pass three times per sizing decision,
+        which measured ~11% on the equity golden run.
+
+        COST: with margin ON this still takes the ``describe_capital()`` snapshot plus
+        the one ``get_virtual_balance`` takes inside the breakdown (and the broker-BP /
+        headroom reads that already existed) -- the per-submit broker round-trip count is
+        a tracked follow-up (docs/plans/2026-09-08-margin-trading-design.md) and is
+        deliberately not solved by making this function lie. With margin OFF -- every
+        backtest -- ``describe_capital()`` reads no snapshot and no order store, and the
+        cost is one extra balance pass per sizing decision.
+        """
+        mapping: Dict[str, Any] = {"expert_id": self.id}
+        try:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if not expert_instance:
+                logger.error(f"Expert instance {self.id} not found")
+                return None
+            account = get_instance_resolver().get_account_instance(expert_instance.account_id)
+            if not account:
+                logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
+                return None
+
+            mapping["virtual_equity_pct"] = expert_instance.virtual_equity_pct
+            # getattr, not a bare call, for the same reason as the exposure clamp above:
+            # the resolver is a seam, and a host that wires a narrower object must be
+            # told the mapping is unavailable rather than crash the sizing pass it is
+            # only describing.
+            describer = getattr(account, "describe_capital", None)
+            if describer is None:
+                mapping["error"] = (
+                    f"account {expert_instance.account_id} ({type(account).__name__}) "
+                    f"publishes no capital description")
+            else:
+                capital = describer()
+                mapping.update(capital)
+                mapping["equivalent_unlevered_balance"] = capital["tradable_balance"]
+
+            balances = self._available_balance_breakdown()
+            mapping["virtual_balance"] = None if balances is None else balances.virtual
+            mapping["used_balance"] = None if balances is None else balances.used
+            mapping["available_balance"] = None if balances is None else balances.available
+        except ValueError as e:
+            # The NAMED "unknown broker figure / bad margin factor" signal. Anything
+            # else is a defect and must not be absorbed by a log line's helper -- it
+            # propagates to the sizing caller, which is where it belongs.
+            mapping["error"] = str(e)
+        return mapping
 
     @staticmethod
     def _get_actual_available_balance(account: AccountInterface) -> Optional[float]:
@@ -1431,6 +1537,42 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             ]
         """
         return []
+
+
+def log_capital_mapping(expert: "MarketExpertInterface", log) -> Optional[Dict[str, Any]]:
+    """Log ``expert.describe_capital_mapping()`` at the level the mapping deserves.
+
+    ONE function, two callers (the classic risk manager and the Smart RM toolkit), so
+    the two live sizing paths can never explain their capital differently -- the same
+    rule the sizing-budget resolver follows. ``log`` is the CALLER's logger, so the line
+    lands under the module an operator is already reading, and so a test can pin the
+    level by patching that module's logger.
+
+    Levels: ERROR when the mapping carries an ``"error"`` (a broker figure was
+    unknown -- the sizing decision that follows is being made on refused inputs, which
+    must never be quiet); INFO when leverage is actually in play
+    (``effective_factor != 1.0``), because then the order quantities do NOT correspond
+    to the account's own equity and an operator needs the mapping to read them; DEBUG
+    otherwise -- margin off is every backtest, where this line would otherwise be
+    emitted once per sizing pass for the whole run and say nothing new.
+
+    Returns the mapping (or None when there was nothing to describe) so a caller may
+    also record it. It does not raise for the mapping's own known refusals -- an
+    unpublished or non-finite broker figure arrives as that ``"error"`` entry -- but a
+    DEFECT (an object that is not an expert at all) propagates on purpose: a diagnostic
+    that swallowed it would leave the sizing path below running on a lie. Callers keep it
+    OUT of any handler that turns an exception into a quantity of zero.
+    """
+    mapping = expert.describe_capital_mapping()
+    if mapping is None:
+        return None
+    if "error" in mapping:
+        log.error(f"Capital mapping: {mapping}")
+    elif mapping["effective_factor"] != 1.0:
+        log.info(f"Capital mapping: {mapping}")
+    else:
+        log.debug(f"Capital mapping: {mapping}")
+    return mapping
 
 
 @runtime_checkable

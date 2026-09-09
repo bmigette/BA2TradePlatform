@@ -25,6 +25,14 @@ class _StubExpert:
     def get_available_balance(self):
         return 100_000.0
 
+    def describe_capital_mapping(self):
+        """The sizing path now logs the raw-equity -> effective-capital mapping (plan
+        step 5, tests/test_margin_capital_mapping.py). This stub has no account to
+        describe one from, and ``None`` is the interface's own "nothing to describe"
+        answer, so the log line is a no-op here and the ATR seam under test is
+        untouched."""
+        return None
+
     def get_setting_with_interface_default(self, key, log_warning=True):
         return {
             "risk_per_trade_pct": 1.0,

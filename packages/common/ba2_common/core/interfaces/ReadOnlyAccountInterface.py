@@ -140,6 +140,12 @@ class StockCapital(NamedTuple):
     snapshot: AccountSnapshot    # the snapshot every figure here was read from
     effective_factor: float      # min(margin_factor, broker multiplier)
     tradable: float              # balance x effective_factor
+    # The two RAW broker figures the factor was derived from, carried rather than
+    # re-read: they are what ``describe_capital`` must quote to explain the mapping,
+    # and reading them again would either cost a second (different) snapshot or
+    # duplicate the validation in ``_stock_multiplier_from`` / ``_buying_power_from``.
+    multiplier: float            # snapshot.margin_multiplier, validated
+    buying_power: float          # snapshot.buying_power, validated
 
 
 @dataclass(frozen=True)
@@ -156,6 +162,8 @@ class StockExposure:
     gross: float             # broker long + |short| market value
     pending: float           # notional of this account's working, unfilled stock entries
     headroom: float          # ceiling - gross - pending; negative == past the ceiling
+    multiplier: float        # the raw broker multiplier the factor was capped by
+    buying_power: float      # the broker's own remaining buying power, for comparison
 
 
 class ReadOnlyAccountInterface(ExtendableSettingsInterface):
@@ -662,12 +670,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         balance = self._plain_balance()
         snapshot = self.get_account_snapshot()
+        multiplier = self._stock_multiplier_from(snapshot)
+        buying_power = self._buying_power_from(snapshot)
         factor = self._effective_factor(
-            asset="stock", balance=balance,
-            multiplier=self._stock_multiplier_from(snapshot),
-            remaining_bp=self._buying_power_from(snapshot))
+            asset="stock", balance=balance, multiplier=multiplier,
+            remaining_bp=buying_power)
         return StockCapital(balance=balance, snapshot=snapshot, effective_factor=factor,
-                            tradable=balance * factor)
+                            tradable=balance * factor, multiplier=multiplier,
+                            buying_power=buying_power)
 
     def _gross_stock_exposure_from(self, snapshot: AccountSnapshot) -> float:
         """long + |short| market value: TOTAL marked exposure, in dollars.
@@ -802,12 +812,18 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         if not self._margin_enabled():
             return None
-        balance, snapshot, factor, ceiling = self._stock_capital_from_snapshot()
-        gross = self._gross_stock_exposure_from(snapshot)
+        # Attribute access, not a 4-tuple unpack: StockCapital grew two fields for
+        # describe_capital, and a positional unpack is exactly how that swaps a
+        # multiplier in for a ceiling without a single test noticing.
+        capital = self._stock_capital_from_snapshot()
+        gross = self._gross_stock_exposure_from(capital.snapshot)
         pending = self._pending_stock_entry_notional(exclude_order_id)
+        ceiling = capital.tradable
         return StockExposure(
-            balance=balance, effective_factor=factor, ceiling=ceiling, gross=gross,
-            pending=pending, headroom=stock_exposure_headroom(ceiling, gross, pending))
+            balance=capital.balance, effective_factor=capital.effective_factor,
+            ceiling=ceiling, gross=gross, pending=pending,
+            headroom=stock_exposure_headroom(ceiling, gross, pending),
+            multiplier=capital.multiplier, buying_power=capital.buying_power)
 
     def get_stock_exposure_headroom(self, exclude_order_id: Optional[int] = None
                                     ) -> Optional[float]:
@@ -827,6 +843,66 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         breakdown = self._stock_exposure_breakdown(exclude_order_id)
         return None if breakdown is None else breakdown.headroom
+
+    def describe_capital(self) -> Dict[str, Any]:
+        """How this account's RAW EQUITY becomes the capital its experts may deploy.
+
+        Every term of ``balance -> tradable balance``, from ONE broker snapshot, so a
+        sizing decision can be read back as arithmetic instead of reverse-engineered
+        from an order quantity. The mapping an operator needs is
+        ``tradable_balance == balance x effective_factor``, with
+        ``effective_factor == min(margin_factor, broker_multiplier)`` -- i.e. the
+        equivalent UNLEVERED account is one funded with ``tradable_balance``.
+
+        Keys (all dollars unless named otherwise):
+          balance, margin_enabled, margin_factor (the stored setting),
+          broker_multiplier (what the broker will actually lend),
+          effective_factor, tradable_balance, broker_buying_power,
+          gross_exposure, pending_entries, headroom.
+
+        MARGIN OFF returns ``balance``, ``effective_factor 1.0``,
+        ``tradable_balance == balance`` and None for every margin-only term, WITHOUT
+        reading the snapshot, the ``margin_factor`` setting or the order store. That is
+        the whole backtest contract: a description of a margin-off account costs exactly
+        one ``get_balance()``, so nothing here can perturb (or slow) a backtest.
+
+        RAISES ``ValueError`` for the same unknowns ``get_tradable_balance`` /
+        ``get_stock_exposure_headroom`` raise on (unpublished or non-finite balance,
+        multiplier, buying power or market values; an invalid stored factor). A
+        DESCRIPTION of capital that guesses a term is worse than no description --
+        ``MarketExpertInterface.describe_capital_mapping`` is the caller, and it turns
+        the refusal into a logged ``error`` entry rather than a plausible dict.
+        """
+        if not self._margin_enabled():
+            balance = self._plain_balance()
+            return {
+                "balance": balance,
+                "margin_enabled": False,
+                "margin_factor": None,
+                "broker_multiplier": None,
+                "effective_factor": 1.0,
+                "tradable_balance": balance,
+                "broker_buying_power": None,
+                "gross_exposure": None,
+                "pending_entries": None,
+                "headroom": None,
+            }
+        # ONE snapshot and one order query, shared with the ceiling: the multiplier,
+        # the buying power and the market values the factor is judged against must
+        # describe the same broker instant.
+        exposure = self._stock_exposure_breakdown()
+        return {
+            "balance": exposure.balance,
+            "margin_enabled": True,
+            "margin_factor": self._margin_factor(),   # a settings read; no round trip
+            "broker_multiplier": exposure.multiplier,
+            "effective_factor": exposure.effective_factor,
+            "tradable_balance": exposure.ceiling,
+            "broker_buying_power": exposure.buying_power,
+            "gross_exposure": exposure.gross,
+            "pending_entries": exposure.pending,
+            "headroom": exposure.headroom,
+        }
 
     def get_option_tradable_balance(self) -> float:
         """Same as ``get_tradable_balance`` for OPTIONS, with the option multiplier.

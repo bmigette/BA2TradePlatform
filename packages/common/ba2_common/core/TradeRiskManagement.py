@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 
 from ba2_common.core.interfaces import AccountInterface
+from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
 from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
@@ -355,6 +356,13 @@ class TradeRiskManagement:
         self.logger.info(f"Virtual balance: ${total_virtual_balance:.2f}, "
                          f"max per instrument: ${max_equity_per_instrument:.2f} "
                          f"(ratio: {max_equity_per_instrument_ratio:.3f})")
+        # ...and WHERE that balance came from: raw equity x the effective margin factor.
+        # The figures above are the expert's slice of a capital base that, with margin
+        # on, is not the account's equity -- without this line a levered live run cannot
+        # be read back against the unlevered backtest it is meant to reproduce. INFO only
+        # when leverage is actually in play; margin off (every backtest) is DEBUG and
+        # costs no broker snapshot. See log_capital_mapping.
+        log_capital_mapping(expert, self.logger)
 
         # Step 6: Get account instance for price lookups (via the injected host resolver)
         from ba2_common.core.instance_resolver import get_instance_resolver

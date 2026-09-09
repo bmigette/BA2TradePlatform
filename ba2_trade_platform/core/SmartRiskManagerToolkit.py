@@ -20,6 +20,10 @@ from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, Ma
 from .db import get_db, get_instance, add_instance
 from .utils import get_expert_instance_from_id, get_account_instance_from_id
 from .interfaces import MarketExpertInterface
+# The package path, not the in-tree shim: this is the SAME function the classic risk
+# manager logs its capital mapping with, so the two live sizing paths cannot explain
+# their capital differently.
+from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from .TransactionHelper import TransactionHelper
 
 
@@ -1879,6 +1883,17 @@ class SmartRiskManagerToolkit:
         """
         from .position_sizing import (compute_risk_based_quantity, get_latest_atr,
                                       resolve_sizing_risk_budget_pct)
+        # WHAT CAPITAL THIS IS SIZING AGAINST: raw account equity x the effective margin
+        # factor -- the mapping every live sizing decision has to be readable against
+        # (the same line the classic RM logs, from the same function). INFO only when
+        # leverage is in play; margin off costs no broker snapshot.
+        #
+        # OUTSIDE the try on purpose: everything below is wrapped in a handler that turns
+        # an exception into a quantity of 0, and a DIAGNOSTIC that can silently zero a
+        # live position size is exactly the failure mode the project forbids. Out here a
+        # defect surfaces as a defect; the mapping's own known refusals (an unpublished
+        # broker figure) are already carried inside it as an "error" entry.
+        log_capital_mapping(self.expert, logger)
         try:
             current_price = self.get_current_price(symbol)
             if not current_price or current_price <= 0:

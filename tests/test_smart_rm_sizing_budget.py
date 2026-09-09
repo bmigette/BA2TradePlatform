@@ -41,6 +41,14 @@ class _StubExpert:
     def get_setting_with_interface_default(self, key, log_warning=True):
         return self._settings[key]
 
+    def describe_capital_mapping(self):
+        """The sizing paths now log the raw-equity -> effective-capital mapping (plan
+        step 5, tests/test_margin_capital_mapping.py). This stub has no account to
+        describe one from, and ``None`` is the interface's own "nothing to describe"
+        answer, so the log line is a no-op here and the sizing arithmetic under test is
+        untouched."""
+        return None
+
 
 def _make_toolkit(**setting_overrides):
     # Bypass the DB-backed __init__; only the sizing/stop-synthesis paths are exercised.
