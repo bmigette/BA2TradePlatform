@@ -22,8 +22,28 @@ over a real price source with real fills, the two live arms are real
 three experts are real ``MarketExpertInterface`` instances reading real settings rows.
 The only doubles are the BROKER (a snapshot dict) and the market (flat $100 bars).
 
-THE TWO PINNED BLOCKERS (plan §6)
----------------------------------
+WHAT IS AND IS NOT UNDER TEST HERE
+----------------------------------
+All three arms run the SAME ``TradeRiskManagement`` and the SAME expert methods --
+there is no backtest fork of any of them -- so what this file actually exercises is
+the ACCOUNT BOUNDARY: what ``get_balance()`` and ``get_tradable_balance()`` mean on
+each account, and whether everything above them is blind to the difference. That is
+also exactly why finding 6 shows up here and nowhere else: it is a disagreement about
+what ``get_balance()`` MEANS (cash vs equity), not about any sizing rule.
+
+Other rows of plan §2 are covered by their own suites and are deliberately not
+duplicated here: pending/partially-filled entries, the account-wide ceiling and
+concurrent entries on one account live in
+``packages/common/tests/test_stock_exposure_gate.py``; the expert-side headroom clamp
+in ``tests/test_margin_exposure_clamp.py``; missing/non-finite broker figures in
+``tests/test_margin_finite_inputs.py``; the capital mapping in
+``tests/test_margin_capital_mapping.py``. Two rows are NOT covered anywhere yet and
+should not be read as passing: the cancel/retry/restart reserve-and-release cycle,
+and SEVERAL EXPERTS entering concurrently on one shared account (the gate's
+concurrency tests use one expert per account).
+
+THE TWO PINNED BLOCKERS (plan section 6)
+----------------------------------------
 Two pre-existing discrepancies are deliberately NOT fixed by the leverage feature,
 because fixing either would move historical backtest results. Both are pinned here as
 ``xfail(strict=True)`` -- so the day someone corrects the contract, the pin XPASSes and
@@ -74,9 +94,11 @@ def _flat_bars() -> List[Dict[str, Any]]:
              "Close": PRICE, "Volume": 1_000} for d in _BAR_DATES]
 
 
-# Unique ids per world, so a leaked registration from an earlier test can never be
-# mistaken for this one's account/expert (the seam registry is thread-local, not
-# per-test).
+# Unique ids per world -- for BOTH accounts and expert instances. The seam registry is
+# per THREAD, not per test, so an id reused across worlds could resolve to a previous
+# world's dead object; and the inherited price cache is keyed by account id, so a reused
+# account id could serve a stale quote. Every world therefore claims its own block of
+# six ids AND unregisters them again on the way out.
 _IDS = itertools.count(7_100)
 
 
@@ -101,6 +123,26 @@ def _live_account_cls():
             self._snap = snapshot
             self._stored = settings
             self.submitted: List[Any] = []
+            self._held: List[Dict[str, Any]] = []
+
+        def hold(self, symbol: str, *, quantity: float, price: float) -> None:
+            """Move the WHOLE broker view for a long position bought at ``price``.
+
+            Cash and buying power fall by the cost, long market value rises by it,
+            ``get_positions()`` reports the shares -- and EQUITY IS UNCHANGED, because
+            cash left and shares of equal value arrived. Mutating only the two fields
+            this file reads would make the fixture agree with itself for the wrong
+            reason, and would quietly become wrong the moment a consumer looked at cash
+            or positions instead.
+            """
+            cost = quantity * price
+            self._held.append({"symbol": symbol, "qty": quantity, "quantity": quantity,
+                               "avg_price": price, "average_price": price,
+                               "current_price": price, "unrealized_pl": 0.0})
+            self._snap.long_market_value += cost
+            self._snap.buying_power -= cost
+            if self._snap.cash is not None:
+                self._snap.cash -= cost
 
         # -- settings ---------------------------------------------------------
         @property
@@ -131,7 +173,7 @@ def _live_account_cls():
             return PRICE
 
         def get_positions(self):
-            return []
+            return list(self._held)
 
         def get_orders(self, status=None):
             return []
@@ -302,54 +344,70 @@ def parity_world(*, pct: float = 100.0, sizing_mode: str = "notional",
     }
 
     resolver = wire_backtest_seams()
-    ctx = backtest_trading_db(f"margin-parity-{tag}")
-    ctx.__enter__()
-    try:
-        ps = AsOfPriceSource(ohlcv_provider=None)
-        ps.load_bars(SYMBOL, _flat_bars())
-        ps.load_bars(HELD_SYMBOL, _flat_bars())
-        ps.set_clock(_BAR_DATES[0])
+    registered_accounts: List[int] = []
+    registered_experts: List[int] = []
+    with backtest_trading_db(f"margin-parity-{tag}"):
+        try:
+            ps = AsOfPriceSource(ohlcv_provider=None)
+            ps.load_bars(SYMBOL, _flat_bars())
+            ps.load_bars(HELD_SYMBOL, _flat_bars())
+            ps.set_clock(_BAR_DATES[0])
 
-        ruleset_id = seed_ruleset_from_tree(None, name=f"parity-enter-{tag}")
-        live_cls, expert_cls = _live_account_cls(), _parity_expert_cls()
+            ruleset_id = seed_ruleset_from_tree(None, name=f"parity-enter-{tag}")
+            live_cls, expert_cls = _live_account_cls(), _parity_expert_cls()
 
-        seed_account_definition(bt_account_id, cfg)
-        seed_account_definition(l1_account_id)
-        seed_account_definition(l2_account_id)
+            seed_account_definition(bt_account_id, cfg)
+            seed_account_definition(l1_account_id)
+            seed_account_definition(l2_account_id)
 
-        bt_account = BacktestAccount(bt_account_id, ps, cfg)
-        l1_account = live_cls(
-            l1_account_id, balance=l1_balance,
-            snapshot=_snapshot(equity=l1_balance, multiplier=1.0, buying_power=l1_balance),
-            settings={"margin_enabled": False, "margin_factor": 1.8,
-                      "commission_per_trade": 0.0})
-        # The broker lends up to equity x multiplier; that is the buying power a real
-        # margin account publishes while flat.
-        l2_bp = l2_balance * (l2_multiplier if (l2_multiplier or 0) > 1.0 else 1.0)
-        l2_account = live_cls(
-            l2_account_id, balance=l2_balance,
-            snapshot=_snapshot(equity=l2_balance, multiplier=l2_multiplier,
-                               buying_power=l2_bp),
-            settings={"margin_enabled": l2_margin_enabled, "margin_factor": l2_factor,
-                      "commission_per_trade": 0.0})
+            bt_account = BacktestAccount(bt_account_id, ps, cfg)
+            l1_account = live_cls(
+                l1_account_id, balance=l1_balance,
+                snapshot=_snapshot(equity=l1_balance, multiplier=1.0,
+                                   buying_power=l1_balance),
+                settings={"margin_enabled": False, "margin_factor": 1.8,
+                          "commission_per_trade": 0.0})
+            # The broker lends up to equity x multiplier; that is the buying power a real
+            # margin account publishes while flat.
+            l2_bp = l2_balance * (l2_multiplier if (l2_multiplier or 0) > 1.0 else 1.0)
+            l2_account = live_cls(
+                l2_account_id, balance=l2_balance,
+                snapshot=_snapshot(equity=l2_balance, multiplier=l2_multiplier,
+                                   buying_power=l2_bp),
+                settings={"margin_enabled": l2_margin_enabled, "margin_factor": l2_factor,
+                          "commission_per_trade": 0.0})
 
-        arms = []
-        for name, account, account_id in (("BT", bt_account, bt_account_id),
-                                          ("L1", l1_account, l1_account_id),
-                                          ("L2", l2_account, l2_account_id)):
-            resolver.register_account(account_id, account)
-            instance_id = seed_expert_instance(
-                account_id=account_id, expert_class_name="_ParityExpert",
-                enter_market_ruleset_id=ruleset_id, virtual_equity_pct=pct)
-            expert = expert_cls(instance_id)
-            expert.save_settings(_expert_settings(sizing_mode))
-            resolver.register_expert(instance_id, expert)
-            arms.append(_Arm(name=name, account=account, expert=expert,
-                             instance_id=instance_id))
+            def _arm(name: str, account: Any, account_id: int, instance_id: int) -> _Arm:
+                resolver.register_account(account_id, account)
+                registered_accounts.append(account_id)
+                # instance_id is PINNED, not auto-assigned: a fresh :memory: DB restarts
+                # its PK sequence at 1 for every world, so auto-assignment would give
+                # every world the same expert ids 1/2/3 -- and the resolver those ids
+                # live in outlives the DB.
+                seed_expert_instance(
+                    account_id=account_id, expert_class_name="_ParityExpert",
+                    enter_market_ruleset_id=ruleset_id, virtual_equity_pct=pct,
+                    instance_id=instance_id)
+                expert = expert_cls(instance_id)
+                expert.save_settings(_expert_settings(sizing_mode))
+                resolver.register_expert(instance_id, expert)
+                registered_experts.append(instance_id)
+                return _Arm(name=name, account=account, expert=expert,
+                            instance_id=instance_id)
 
-        yield _World(bt=arms[0], l1=arms[1], l2=arms[2], price_source=ps)
-    finally:
-        ctx.__exit__(None, None, None)
+            yield _World(
+                bt=_arm("BT", bt_account, bt_account_id, tag * 10 + 4),
+                l1=_arm("L1", l1_account, l1_account_id, tag * 10 + 5),
+                l2=_arm("L2", l2_account, l2_account_id, tag * 10 + 6),
+                price_source=ps)
+        finally:
+            # The DB dies with the context; the RESOLVER does not -- it is thread-local
+            # and would keep handing out this world's dead accounts and experts to every
+            # later test on this thread.
+            for account_id in registered_accounts:
+                resolver.unregister_account(account_id)
+            for instance_id in registered_experts:
+                resolver.unregister_expert(instance_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -428,6 +486,9 @@ def size_limit_verdict(arm: _Arm, *, quantity: float) -> Tuple[str, ...]:
     # open_price is deliberately left None: this is the WAITING transaction of an order
     # that has not been sent, so it must not become "used balance" for the very check it
     # is the subject of.
+    #
+    # (``Transaction`` carries no account_id -- the account is reached through its
+    # ORDERS, which is why every hand-built order row below sets ``account_id``.)
     transaction_id = add_instance(Transaction(
         symbol=SYMBOL, quantity=quantity, side=OrderDirection.BUY,
         status=TransactionStatus.WAITING, expert_id=arm.instance_id))
@@ -477,6 +538,11 @@ def test_flat_state_is_identical_across_backtest_and_both_live_fundings(pct, siz
         assert reading["virtual"] == pytest.approx(expected_virtual), name
         assert reading["available"] == pytest.approx(expected_virtual), name
         assert reading["quantity"] == pytest.approx(expected_qty), name
+        # An ABSOLUTE pin, not just arm-to-arm: ``_validate_position_size_limits``
+        # wraps its own body in a handler that appends an id-free "could not be
+        # completed" message, so three identical CRASHES would compare equal and this
+        # whole file would stay green while validating nothing.
+        assert reading["verdict_affordable"] == (), name
 
 
 def test_the_bracket_prices_do_not_move_with_the_funding_model():
@@ -524,6 +590,13 @@ def test_a_factor_above_the_broker_multiplier_buys_nothing():
     with parity_world(l2_factor=2.0) as world:
         exact = measure(world.l2, sizing_mode="notional")
     assert greedy == exact
+
+    # Absolute pins as well as equality: three arms that all refused to size would
+    # also be "equal", and $2,000 x 3 would be $6,000 / 60 shares if the factor had
+    # not been bounded.
+    assert greedy["virtual"] == pytest.approx(4_000.0)
+    assert greedy["available"] == pytest.approx(4_000.0)
+    assert greedy["quantity"] == pytest.approx(40.0)
 
 
 def test_margin_off_makes_the_2000_account_a_2000_account_again():
@@ -596,7 +669,7 @@ ENTRY_QTY = 10.0
 ENTRY_NOTIONAL = ENTRY_QTY * PRICE            # $1,000
 
 
-def _open_backtest_position(world: _World) -> None:
+def _open_backtest_position(world: _World, *, starting_cash: float) -> None:
     """Open 10 @ $100 on the REAL BacktestAccount: submit through the inherited
     ``submit_order`` (so every shared validator runs), then step the fill engine with
     ``refresh_orders`` so the ledger actually pays for the shares. Copied from
@@ -622,13 +695,19 @@ def _open_backtest_position(world: _World) -> None:
     filled = arm.account.get_order(order.broker_order_id)
     assert filled.status == OrderStatus.FILLED
     assert filled.open_price == pytest.approx(PRICE)
-    assert arm.account.get_balance() == pytest.approx(4_000.0 - ENTRY_NOTIONAL)
+    assert arm.account.get_balance() == pytest.approx(starting_cash - ENTRY_NOTIONAL)
 
 
 def _open_live_position(arm: _Arm) -> None:
-    """The same position on a live-shaped arm: the broker marks $1,000 of long market
-    value and withholds $1,000 of buying power, EQUITY IS UNCHANGED (cash left, shares
-    arrived), and the platform records the Transaction that consumes the expert's slice."""
+    """The same position on a live-shaped arm, with the WHOLE broker view moved, not just
+    the fields the code under test happens to read.
+
+    The broker marks $1,000 of long market value, holds back $1,000 of buying power and
+    reports $1,000 less CASH; EQUITY IS UNCHANGED, because cash left and shares of equal
+    value arrived. ``get_positions()`` reports the holding too, so the fixture cannot be
+    self-consistent only from the angle this file looks at it. On the platform side, the
+    Transaction and its FILLED entry order are what consume the expert's slice.
+    """
     from ba2_common.core.db import add_instance
     from ba2_common.core.models import Transaction
     from ba2_common.core.types import OrderDirection, OrderStatus, TransactionStatus
@@ -642,16 +721,15 @@ def _open_live_position(arm: _Arm) -> None:
     entry.broker_order_id = f"brk-{arm.instance_id}"
     add_instance(entry)
 
-    arm.account._snap.long_market_value = ENTRY_NOTIONAL
-    arm.account._snap.buying_power -= ENTRY_NOTIONAL
+    arm.account.hold(SYMBOL, quantity=ENTRY_QTY, price=PRICE)
 
 
 @contextlib.contextmanager
-def invested_world():
+def invested_world(*, bt_cash: float = 4_000.0):
     """A world in which every arm holds the SAME position: 10 shares at $100, at zero
     P&L (the market is flat), bought out of the same $4,000 of effective capital."""
-    with parity_world() as world:
-        _open_backtest_position(world)
+    with parity_world(bt_cash=bt_cash) as world:
+        _open_backtest_position(world, starting_cash=bt_cash)
         _open_live_position(world.l1)
         _open_live_position(world.l2)
         yield world
@@ -696,7 +774,7 @@ def test_the_backtest_charges_the_position_twice_TODAY():
     "charges the position twice in the backtest ($3,000/$2,000 vs $4,000/$3,000). "
     "Deliberately NOT fixed in the leverage feature: changing it moves every backtest "
     "result and is a separately versioned correction. See "
-    "docs/plans/2026-09-09-margin-live-backtest-parity.md §6."))
+    "docs/plans/2026-09-09-margin-live-backtest-parity.md section 6."))
 def test_backtest_and_live_agree_after_the_first_entry():
     """THE PINNED BLOCKER (plan §6, finding 6).
 
@@ -731,32 +809,50 @@ def half_invested_world():
     and a fresh candidate in a third symbol."""
     from ba2_common.core.db import add_instance
     from ba2_common.core.models import Transaction
-    from ba2_common.core.types import OrderDirection, TransactionStatus
+    from ba2_common.core.types import OrderDirection, OrderStatus, TransactionStatus
 
     with parity_world(l1_balance=18_000.0) as world:
         arm = world.l1
-        add_instance(Transaction(
+        transaction_id = add_instance(Transaction(
             symbol=HELD_SYMBOL, quantity=90.0, side=OrderDirection.BUY,
             status=TransactionStatus.OPENED, open_price=PRICE, expert_id=arm.instance_id))
-        arm.account._snap.buying_power = 11_000.0
+        held = _candidate(HELD_SYMBOL, quantity=90.0, account_id=arm.account.id)
+        held.transaction_id = transaction_id
+        held.status = OrderStatus.FILLED
+        held.broker_order_id = f"brk-held-{arm.instance_id}"
+        add_instance(held)
+        # The broker's own view of the same $9,000: marked as long exposure, gone from
+        # cash and from buying power (this account is UNLEVERED, so its BP is its cash).
+        arm.account.hold(HELD_SYMBOL, quantity=90.0, price=PRICE)
+        assert arm.account.get_account_snapshot().buying_power == pytest.approx(9_000.0)
         assert arm.expert.get_virtual_balance() == pytest.approx(18_000.0)
         assert arm.expert.get_available_balance() == pytest.approx(9_000.0)
-        yield world, arm
+        yield arm
 
 
 def _size_prioritized(arm: _Arm, ratio: float):
     """``_size_prioritized_orders`` directly -- the sizing core both RM entry points share
     -- because the per-instrument ceiling it computes is a RETURN VALUE, not something a
-    quantity alone can distinguish."""
+    quantity alone can distinguish.
+
+    The 5-tuple is unpacked BY NAME, never by index: if a field is ever inserted ahead of
+    the ceiling, an ``result[-1]`` here would silently start pinning a different number
+    and could flip the strict xfail below to a misattributed XPASS. An arity change breaks
+    this unpack loudly instead.
+    """
     from ba2_common.core.TradeRiskManagement import TradeRiskManagement
     from ba2_common.core.db import get_instance
     from ba2_common.core.models import ExpertInstance
 
     candidate = _candidate(account_id=arm.account.id)
-    result = TradeRiskManagement()._size_prioritized_orders(
-        arm.expert, get_instance(ExpertInstance, arm.instance_id), arm.instance_id,
-        [(candidate, _recommendation(arm.instance_id))], ratio)
-    return candidate, result
+    (orders_to_update, orders_to_delete, symbol_prices,
+     total_virtual_balance, max_equity_per_instrument) = (
+        TradeRiskManagement()._size_prioritized_orders(
+            arm.expert, get_instance(ExpertInstance, arm.instance_id), arm.instance_id,
+            [(candidate, _recommendation(arm.instance_id))], ratio))
+    assert orders_to_update == [candidate] and not orders_to_delete
+    assert symbol_prices[SYMBOL] == pytest.approx(PRICE)
+    return candidate, total_virtual_balance, max_equity_per_instrument
 
 
 def test_the_instrument_ceiling_is_ten_percent_of_the_REMAINING_funds_TODAY():
@@ -766,9 +862,9 @@ def test_the_instrument_ceiling_is_ten_percent_of_the_REMAINING_funds_TODAY():
     not 10% of the $18,000 the expert is allocated. So a half-invested expert's
     "10% per instrument" silently becomes 5% of its book.
     """
-    with half_invested_world() as (_world, arm):
-        candidate, result = _size_prioritized(arm, 0.10)
-        total_virtual_balance, max_equity_per_instrument = result[-2:]
+    with half_invested_world() as arm:
+        candidate, total_virtual_balance, max_equity_per_instrument = _size_prioritized(
+            arm, 0.10)
 
     assert total_virtual_balance == pytest.approx(9_000.0)
     assert max_equity_per_instrument == pytest.approx(900.0)
@@ -777,7 +873,7 @@ def test_the_instrument_ceiling_is_ten_percent_of_the_REMAINING_funds_TODAY():
 
 @pytest.mark.xfail(strict=True, reason=(
     "finding 4: classic per-instrument ceiling is available x ratio (900), not virtual x "
-    "ratio (1800); changing it changes historical sizing — deferred, see plan §6"))
+    "ratio (1800); changing it changes historical sizing - deferred, see plan section 6"))
 def test_the_instrument_ceiling_is_ten_percent_of_the_virtual_equity():
     """THE PINNED BLOCKER (plan §6, finding 4).
 
@@ -788,9 +884,9 @@ def test_the_instrument_ceiling_is_ten_percent_of_the_virtual_equity():
     explicitly out of scope for the (result-neutral) leverage feature and pinned here
     instead.
     """
-    with half_invested_world() as (_world, arm):
-        candidate, result = _size_prioritized(arm, 0.10)
-        max_equity_per_instrument = result[-1]
+    with half_invested_world() as arm:
+        candidate, _total_virtual_balance, max_equity_per_instrument = _size_prioritized(
+            arm, 0.10)
 
     assert max_equity_per_instrument == pytest.approx(1_800.0)
     assert candidate.quantity == 18

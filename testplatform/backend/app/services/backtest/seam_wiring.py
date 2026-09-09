@@ -82,6 +82,17 @@ class BacktestInstanceResolver:
     def register_expert(self, expert_id: int, instance: Any) -> None:
         self._experts_map()[int(expert_id)] = instance
 
+    def unregister_account(self, account_id: int) -> None:
+        """Drop a registration. A run/test that is finished must not leave its account
+        resolvable: the registry is per THREAD, not per run, so a later run on the same
+        thread would otherwise still find a dead object under an id it never registered.
+        Silent on an id that is not registered -- teardown must be idempotent."""
+        self._accounts_map().pop(int(account_id), None)
+
+    def unregister_expert(self, expert_id: int) -> None:
+        """The expert twin of ``unregister_account``; same reason, same idempotence."""
+        self._experts_map().pop(int(expert_id), None)
+
     # -- InstanceResolver Protocol ----------------------------------------------
     def get_account_instance(self, account_id: int) -> Any:
         try:
