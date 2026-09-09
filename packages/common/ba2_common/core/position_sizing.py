@@ -297,9 +297,9 @@ def reconcile_protective_stop(ruleset_sl: Optional[float], safeguard_sl: Optiona
                      nothing tighter to add.
     Neither        -> None.
 
-    Pure function. Shared by the backtest submit tails (daily_engine) so the tighter-wins policy is
-    defined once. (Live currently attaches only the safeguard and does NOT call this — that policy
-    change is intentionally out of scope until separately approved + paper-validated.)
+    Pure function. Shared by the backtest submit tails (daily_engine) and live TradeManager
+    entry/retry submissions so the tighter-wins policy is defined once. Reconciliation changes
+    the attached protection, not the safeguard used to size the position.
     """
     if ruleset_sl and safeguard_sl:
         return max(ruleset_sl, safeguard_sl) if is_long else min(ruleset_sl, safeguard_sl)

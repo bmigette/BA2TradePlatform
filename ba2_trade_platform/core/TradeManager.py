@@ -701,7 +701,7 @@ class TradeManager:
                 sl_price = None
                 if (order.order_type == OrderType.MARKET and not is_closing
                         and not order.depends_on_order):
-                    sl_price = order.stop_price or None
+                    sl_price = self._entry_submit_stop(order, order.stop_price or None)
                 account.submit_order(order, sl_price=sl_price, is_closing_order=is_closing)
             except Exception as e:
                 self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
@@ -943,6 +943,24 @@ class TradeManager:
     _ENTRY_SUBMIT_RETRIES = 3
     _ENTRY_SUBMIT_BACKOFF_S = 2.0
 
+    @staticmethod
+    def _entry_submit_stop(order, safeguard_sl):
+        """Use the backtest's stop policy without changing the RM sizing input.
+
+        The evaluator has already attached the ruleset stop to the transaction.
+        Sending just the safeguard here would overwrite a tighter ruleset leg in
+        AccountInterface's initial_setup block. Read the current transaction on
+        each attempt so a delayed retry also preserves subsequent tightening.
+        """
+        from ba2_common.core.position_sizing import reconcile_protective_stop
+
+        transaction = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+        return reconcile_protective_stop(
+            ruleset_sl=transaction.stop_loss if transaction else None,
+            safeguard_sl=safeguard_sl,
+            is_long=order.side == OrderDirection.BUY,
+        )
+
     def _submit_funded_entry_with_retry(self, account, order, sl_price=None):
         """Submit a funded entry, retrying when the DB (not the broker) is what failed.
 
@@ -969,7 +987,8 @@ class TradeManager:
         last_err = None
         for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
             try:
-                return account.submit_order(order, sl_price=sl_price)
+                submit_sl = self._entry_submit_stop(order, sl_price)
+                return account.submit_order(order, sl_price=submit_sl)
             except Exception as e:  # noqa: BLE001 — classified immediately below
                 if "database is locked" not in str(e).lower():
                     raise  # a real answer from the broker/validator: never re-send
@@ -2062,9 +2081,8 @@ class TradeManager:
                                         f"Failed to stamp protective-leg quantity for order {order.id}: "
                                         f"{leg_err}", exc_info=True)
 
-                                # Live parity: submit with the RM safeguard SL (fo.stop_price) — the
-                                # live path does NOT apply the backtest's tighter-wins merge (that is a
-                                # separate, not-yet-approved live change), so behavior is preserved.
+                                # The submit wrapper reconciles this RM safeguard with the
+                                # transaction's ruleset stop using the same helper as backtests.
                                 self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
                                 submitted_order = self._submit_funded_entry_with_retry(
                                     account, order, sl_price=fo.stop_price or None)

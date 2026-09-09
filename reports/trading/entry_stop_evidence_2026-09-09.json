@@ -1,0 +1,589 @@
+{
+  "read_at_utc": "2026-09-09T16:29:23.460279+00:00",
+  "transactions": [
+    {
+      "id": 127,
+      "symbol": "RARE",
+      "expert_id": 12,
+      "quantity": 10.0,
+      "open_price": 15.12,
+      "stop_loss": 13.608,
+      "take_profit": 19.848799999999997,
+      "open_date": "2026-09-08 13:32:27.847925",
+      "status": "OPENED"
+    },
+    {
+      "id": 128,
+      "symbol": "ANAB",
+      "expert_id": 12,
+      "quantity": 2.0,
+      "open_price": 55.48,
+      "stop_loss": 49.932,
+      "take_profit": 62.057599999999994,
+      "open_date": "2026-09-08 13:32:27.863651",
+      "status": "OPENED"
+    },
+    {
+      "id": 129,
+      "symbol": "VSXY",
+      "expert_id": 10,
+      "quantity": 2.0,
+      "open_price": 74.43,
+      "stop_loss": 65.1312,
+      "take_profit": null,
+      "open_date": "2026-09-08 13:32:27.869257",
+      "status": "OPENED"
+    },
+    {
+      "id": 132,
+      "symbol": "AEHR",
+      "expert_id": 10,
+      "quantity": 1.0,
+      "open_price": 94.375,
+      "stop_loss": 82.5977,
+      "take_profit": null,
+      "open_date": "2026-09-08 13:32:27.871265",
+      "status": "OPENED"
+    },
+    {
+      "id": 133,
+      "symbol": "WLY",
+      "expert_id": 10,
+      "quantity": 3.0,
+      "open_price": 48.9265,
+      "stop_loss": 42.9613,
+      "take_profit": null,
+      "open_date": "2026-09-08 13:32:27.871265",
+      "status": "OPENED"
+    },
+    {
+      "id": 134,
+      "symbol": "WLYB",
+      "expert_id": 10,
+      "quantity": 3.0,
+      "open_price": 49.9,
+      "stop_loss": 43.9136,
+      "take_profit": null,
+      "open_date": "2026-09-08 13:32:27.879432",
+      "status": "OPENED"
+    },
+    {
+      "id": 192,
+      "symbol": "ANAB",
+      "expert_id": 9,
+      "quantity": 3.0,
+      "open_price": 56.4596,
+      "stop_loss": 50.8136,
+      "take_profit": null,
+      "open_date": "2026-09-09 13:33:56.982245",
+      "status": "OPENED"
+    },
+    {
+      "id": 193,
+      "symbol": "NX",
+      "expert_id": 9,
+      "quantity": 10.0,
+      "open_price": 22.13,
+      "stop_loss": 19.919,
+      "take_profit": null,
+      "open_date": "2026-09-09 13:33:56.984242",
+      "status": "OPENED"
+    },
+    {
+      "id": 194,
+      "symbol": "ENOV",
+      "expert_id": 12,
+      "quantity": 14.0,
+      "open_price": 19.9753,
+      "stop_loss": 17.9818,
+      "take_profit": 28.19768,
+      "open_date": "2026-09-09 13:33:56.986249",
+      "status": "OPENED"
+    },
+    {
+      "id": 195,
+      "symbol": "CBIO",
+      "expert_id": 12,
+      "quantity": 14.0,
+      "open_price": 20.6215,
+      "stop_loss": 18.5584,
+      "take_profit": 25.60908,
+      "open_date": "2026-09-09 13:33:56.987250",
+      "status": "OPENED"
+    }
+  ],
+  "experts": [
+    {
+      "id": 7,
+      "expert": "DeterministicScorer",
+      "alias": "goal2020-large_DS_S6top1",
+      "enabled": 1,
+      "virtual_equity_pct": 60.0,
+      "enter_market_ruleset_id": 20,
+      "open_positions_ruleset_id": 21
+    },
+    {
+      "id": 8,
+      "expert": "FMPInsiderClusterBuy",
+      "alias": "goal2020-mid_ICB_S1top1",
+      "enabled": 1,
+      "virtual_equity_pct": 60.0,
+      "enter_market_ruleset_id": 22,
+      "open_positions_ruleset_id": 23
+    },
+    {
+      "id": 9,
+      "expert": "FMPEarningsDrift",
+      "alias": "goal2020-small_ED_S2top1",
+      "enabled": 1,
+      "virtual_equity_pct": 60.0,
+      "enter_market_ruleset_id": 24,
+      "open_positions_ruleset_id": 25
+    },
+    {
+      "id": 10,
+      "expert": "DeterministicScorer",
+      "alias": "goal2020-mid_DS_S6top3",
+      "enabled": 1,
+      "virtual_equity_pct": 60.0,
+      "enter_market_ruleset_id": 26,
+      "open_positions_ruleset_id": 27
+    },
+    {
+      "id": 11,
+      "expert": "FMPEarningsDrift",
+      "alias": "goal2020-mid_ED_S1top1",
+      "enabled": 1,
+      "virtual_equity_pct": 60.0,
+      "enter_market_ruleset_id": 28,
+      "open_positions_ruleset_id": 29
+    },
+    {
+      "id": 12,
+      "expert": "FMPRating",
+      "alias": "goal2020-small_RAT_S1top1",
+      "enabled": 1,
+      "virtual_equity_pct": 60.0,
+      "enter_market_ruleset_id": 30,
+      "open_positions_ruleset_id": 31
+    }
+  ],
+  "analysis_counts": [
+    {
+      "expert_instance_id": 9,
+      "subtype": "ENTER_MARKET",
+      "status": "COMPLETED",
+      "n": 24
+    },
+    {
+      "expert_instance_id": 10,
+      "subtype": "OPEN_POSITIONS",
+      "status": "COMPLETED",
+      "n": 4
+    },
+    {
+      "expert_instance_id": 11,
+      "subtype": "OPEN_POSITIONS",
+      "status": "COMPLETED",
+      "n": 1
+    },
+    {
+      "expert_instance_id": 12,
+      "subtype": "ENTER_MARKET",
+      "status": "COMPLETED",
+      "n": 4
+    },
+    {
+      "expert_instance_id": 12,
+      "subtype": "ENTER_MARKET",
+      "status": "SKIPPED",
+      "n": 15
+    },
+    {
+      "expert_instance_id": 12,
+      "subtype": "OPEN_POSITIONS",
+      "status": "COMPLETED",
+      "n": 2
+    }
+  ],
+  "orders": [
+    {
+      "id": 482,
+      "transaction_id": 127,
+      "symbol": "RARE",
+      "side": "BUY",
+      "order_type": "MARKET",
+      "status": "FILLED",
+      "quantity": 10.0,
+      "filled_avg_price": null,
+      "open_price": 15.12,
+      "limit_price": null,
+      "stop_price": 13.86,
+      "depends_on_order": null,
+      "data": "{\"FMPRating\": {\"target_consensus\": 27.69, \"target_high\": 60, \"target_low\": 16, \"target_median\": 25}}"
+    },
+    {
+      "id": 483,
+      "transaction_id": 127,
+      "symbol": "RARE",
+      "side": "SELL",
+      "order_type": "OCO",
+      "status": "NEW",
+      "quantity": 10.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 19.848799999999997,
+      "stop_price": 13.608,
+      "depends_on_order": 482,
+      "data": "{\"tp_percent_target\": 0.0, \"sl_percent_target\": 0.0, \"tpsl_reference_price\": 15.4, \"sl_rebased_to_fill\": true, \"parent_filled_price\": 15.12}"
+    },
+    {
+      "id": 484,
+      "transaction_id": 128,
+      "symbol": "ANAB",
+      "side": "BUY",
+      "order_type": "MARKET",
+      "status": "FILLED",
+      "quantity": 2.0,
+      "filled_avg_price": null,
+      "open_price": 55.48,
+      "limit_price": null,
+      "stop_price": 51.12,
+      "depends_on_order": null,
+      "data": "{\"FMPRating\": {\"target_consensus\": 77.8, \"target_high\": 90, \"target_low\": 70, \"target_median\": 76}}"
+    },
+    {
+      "id": 485,
+      "transaction_id": 128,
+      "symbol": "ANAB",
+      "side": "SELL",
+      "order_type": "OCO",
+      "status": "NEW",
+      "quantity": 2.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 62.057599999999994,
+      "stop_price": 49.932,
+      "depends_on_order": 484,
+      "data": "{\"tp_percent_target\": 0.0, \"sl_percent_target\": 0.0, \"tpsl_reference_price\": 56.8, \"sl_rebased_to_fill\": true, \"parent_filled_price\": 55.48}"
+    },
+    {
+      "id": 492,
+      "transaction_id": 127,
+      "symbol": "RARE",
+      "side": "SELL",
+      "order_type": "SELL_STOP_LIMIT",
+      "status": "HELD",
+      "quantity": 10.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 13.54,
+      "stop_price": 13.61,
+      "depends_on_order": null,
+      "data": "null"
+    },
+    {
+      "id": 493,
+      "transaction_id": 128,
+      "symbol": "ANAB",
+      "side": "SELL",
+      "order_type": "SELL_STOP_LIMIT",
+      "status": "HELD",
+      "quantity": 2.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 49.68,
+      "stop_price": 49.93,
+      "depends_on_order": null,
+      "data": "null"
+    },
+    {
+      "id": 576,
+      "transaction_id": 192,
+      "symbol": "ANAB",
+      "side": "BUY",
+      "order_type": "MARKET",
+      "status": "FILLED",
+      "quantity": 3.0,
+      "filled_avg_price": null,
+      "open_price": 56.4596,
+      "limit_price": null,
+      "stop_price": 50.76,
+      "depends_on_order": null,
+      "data": "null"
+    },
+    {
+      "id": 577,
+      "transaction_id": 192,
+      "symbol": "ANAB",
+      "side": "SELL",
+      "order_type": "SELL_STOP",
+      "status": "NEW",
+      "quantity": 3.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": null,
+      "stop_price": 50.8136,
+      "depends_on_order": 576,
+      "data": "{\"sl_percent_target\": 0.0, \"tpsl_reference_price\": 56.4, \"sl_rebased_to_fill\": true, \"parent_filled_price\": 56.4596}"
+    },
+    {
+      "id": 578,
+      "transaction_id": 193,
+      "symbol": "NX",
+      "side": "BUY",
+      "order_type": "MARKET",
+      "status": "FILLED",
+      "quantity": 10.0,
+      "filled_avg_price": null,
+      "open_price": 22.13,
+      "limit_price": null,
+      "stop_price": 20.0,
+      "depends_on_order": null,
+      "data": "null"
+    },
+    {
+      "id": 579,
+      "transaction_id": 193,
+      "symbol": "NX",
+      "side": "SELL",
+      "order_type": "SELL_STOP",
+      "status": "NEW",
+      "quantity": 10.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": null,
+      "stop_price": 19.919,
+      "depends_on_order": 578,
+      "data": "{\"sl_percent_target\": 0.0, \"tpsl_reference_price\": 22.22, \"sl_rebased_to_fill\": true, \"parent_filled_price\": 22.13}"
+    },
+    {
+      "id": 580,
+      "transaction_id": 194,
+      "symbol": "ENOV",
+      "side": "BUY",
+      "order_type": "MARKET",
+      "status": "FILLED",
+      "quantity": 14.0,
+      "filled_avg_price": null,
+      "open_price": 19.9753,
+      "limit_price": null,
+      "stop_price": 17.95,
+      "depends_on_order": null,
+      "data": "{\"FMPRating\": {\"target_consensus\": 38.2, \"target_high\": 51, \"target_low\": 27, \"target_median\": 36}}"
+    },
+    {
+      "id": 581,
+      "transaction_id": 194,
+      "symbol": "ENOV",
+      "side": "SELL",
+      "order_type": "OCO",
+      "status": "NEW",
+      "quantity": 14.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 28.19768,
+      "stop_price": 17.9818,
+      "depends_on_order": 580,
+      "data": "{\"tp_percent_target\": 0.0, \"sl_percent_target\": 0.0, \"tpsl_reference_price\": 19.94, \"sl_rebased_to_fill\": true, \"parent_filled_price\": 19.9753}"
+    },
+    {
+      "id": 582,
+      "transaction_id": 195,
+      "symbol": "CBIO",
+      "side": "BUY",
+      "order_type": "MARKET",
+      "status": "FILLED",
+      "quantity": 14.0,
+      "filled_avg_price": null,
+      "open_price": 20.6215,
+      "limit_price": null,
+      "stop_price": 18.8,
+      "depends_on_order": null,
+      "data": "{\"FMPRating\": {\"target_consensus\": 31.25, \"target_high\": 35, \"target_low\": 26, \"target_median\": 32}}"
+    },
+    {
+      "id": 583,
+      "transaction_id": 195,
+      "symbol": "CBIO",
+      "side": "SELL",
+      "order_type": "OCO",
+      "status": "NEW",
+      "quantity": 14.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 25.60908,
+      "stop_price": 18.5584,
+      "depends_on_order": 582,
+      "data": "{\"tp_percent_target\": 0.0, \"sl_percent_target\": 0.0, \"tpsl_reference_price\": 20.89, \"sl_rebased_to_fill\": true, \"parent_filled_price\": 20.6215}"
+    },
+    {
+      "id": 584,
+      "transaction_id": 194,
+      "symbol": "ENOV",
+      "side": "SELL",
+      "order_type": "SELL_STOP_LIMIT",
+      "status": "HELD",
+      "quantity": 14.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 17.89,
+      "stop_price": 17.98,
+      "depends_on_order": null,
+      "data": "null"
+    },
+    {
+      "id": 585,
+      "transaction_id": 195,
+      "symbol": "CBIO",
+      "side": "SELL",
+      "order_type": "SELL_STOP_LIMIT",
+      "status": "HELD",
+      "quantity": 14.0,
+      "filled_avg_price": null,
+      "open_price": null,
+      "limit_price": 18.47,
+      "stop_price": 18.56,
+      "depends_on_order": null,
+      "data": "null"
+    }
+  ],
+  "rules": [
+    {
+      "ruleset_id": 24,
+      "name": "goal2020-small_ED_S2top1 enter_market",
+      "rule_name": "enter-buy-4",
+      "triggers": "{\"cond_0\": {\"event_type\": \"bullish\"}, \"cond_1\": {\"event_type\": \"has_no_position\"}, \"cond_2\": {\"event_type\": \"confidence\", \"operator\": \">\", \"value\": 45.0}, \"cond_3\": {\"event_type\": \"days_since_last_close\", \"operator\": \">\", \"value\": 20.0}}",
+      "actions": "{\"a0\": {\"action_type\": \"buy\"}}",
+      "continue_processing": 0
+    },
+    {
+      "ruleset_id": 25,
+      "name": "goal2020-small_ED_S2top1 open_positions",
+      "rule_name": "goal2020-small_ED_S2top1-open_positions-0",
+      "triggers": "{\"cond_0\": {\"event_type\": \"bearish\"}}",
+      "actions": "{\"a0\": {\"action_type\": \"close\"}}",
+      "continue_processing": 0
+    },
+    {
+      "ruleset_id": 25,
+      "name": "goal2020-small_ED_S2top1 open_positions",
+      "rule_name": "goal2020-small_ED_S2top1-open_positions-1",
+      "triggers": "{\"cond_0\": {\"event_type\": \"current_rating_negative\"}}",
+      "actions": "{\"a0\": {\"action_type\": \"close\"}}",
+      "continue_processing": 0
+    },
+    {
+      "ruleset_id": 25,
+      "name": "goal2020-small_ED_S2top1 open_positions",
+      "rule_name": "goal2020-small_ED_S2top1-open_positions-2",
+      "triggers": "{\"cond_0\": {\"event_type\": \"profit_loss_percent\", \"operator\": \">\", \"value\": 52.0}}",
+      "actions": "{\"a0\": {\"action_type\": \"close\"}}",
+      "continue_processing": 0
+    },
+    {
+      "ruleset_id": 25,
+      "name": "goal2020-small_ED_S2top1 open_positions",
+      "rule_name": "goal2020-small_ED_S2top1-open_positions-3",
+      "triggers": "{\"cond_0\": {\"event_type\": \"has_position\"}}",
+      "actions": "{\"a0\": {\"action_type\": \"adjust_stop_loss\", \"reference_value\": \"order_open_price\", \"value\": -6.0}}",
+      "continue_processing": 0
+    },
+    {
+      "ruleset_id": 30,
+      "name": "goal2020-small_RAT_S1top1 enter_market",
+      "rule_name": "enter-buy-2-2",
+      "triggers": "{\"cond_0\": {\"event_type\": \"bullish\"}, \"cond_1\": {\"event_type\": \"confidence\", \"operator\": \">=\", \"value\": 80.0}, \"cond_2\": {\"event_type\": \"has_no_position\"}}",
+      "actions": "{\"a0\": {\"action_type\": \"buy\"}, \"a1\": {\"action_type\": \"adjust_take_profit\", \"reference_value\": \"expert_target_price\", \"value\": -14.0}, \"a2\": {\"action_type\": \"adjust_stop_loss\", \"reference_value\": \"order_open_price\", \"value\": -4.0}}",
+      "continue_processing": 0
+    },
+    {
+      "ruleset_id": 30,
+      "name": "goal2020-small_RAT_S1top1 enter_market",
+      "rule_name": "enter-buy-3-2",
+      "triggers": "{\"cond_0\": {\"event_type\": \"bullish\"}, \"cond_1\": {\"event_type\": \"confidence\", \"operator\": \">=\", \"value\": 45.0}, \"cond_2\": {\"event_type\": \"has_no_position\"}}",
+      "actions": "{\"a0\": {\"action_type\": \"buy\"}, \"a1\": {\"action_type\": \"adjust_take_profit\", \"reference_value\": \"expert_target_price\", \"value\": 8.0}, \"a2\": {\"action_type\": \"adjust_stop_loss\", \"reference_value\": \"order_open_price\", \"value\": -18.0}}",
+      "continue_processing": 0
+    },
+    {
+      "ruleset_id": 31,
+      "name": "goal2020-small_RAT_S1top1 open_positions",
+      "rule_name": "goal2020-small_RAT_S1top1-open_positions-0",
+      "triggers": "{\"cond_0\": {\"event_type\": \"has_position\"}}",
+      "actions": "{\"a0\": {\"action_type\": \"adjust_stop_loss\", \"reference_value\": \"order_open_price\", \"value\": -18.0}}",
+      "continue_processing": 0
+    }
+  ],
+  "settings": [
+    {
+      "instance_id": 9,
+      "key": "atr_multiplier",
+      "value_float": 5.5,
+      "value_str": null,
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 9,
+      "key": "min_stop_loss_pct",
+      "value_float": 10.0,
+      "value_str": null,
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 9,
+      "key": "risk_per_trade_pct",
+      "value_float": 1.5,
+      "value_str": null,
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 9,
+      "key": "sizing_mode",
+      "value_float": null,
+      "value_str": "notional",
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 9,
+      "key": "use_atr_stop",
+      "value_float": null,
+      "value_str": null,
+      "value_json": "false"
+    },
+    {
+      "instance_id": 12,
+      "key": "atr_multiplier",
+      "value_float": 5.5,
+      "value_str": null,
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 12,
+      "key": "min_stop_loss_pct",
+      "value_float": 10.0,
+      "value_str": null,
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 12,
+      "key": "risk_per_trade_pct",
+      "value_float": 1.25,
+      "value_str": null,
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 12,
+      "key": "sizing_mode",
+      "value_float": null,
+      "value_str": "notional",
+      "value_json": "{}"
+    },
+    {
+      "instance_id": 12,
+      "key": "use_atr_stop",
+      "value_float": null,
+      "value_str": null,
+      "value_json": "false"
+    }
+  ]
+}
