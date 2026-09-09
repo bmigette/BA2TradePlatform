@@ -28,6 +28,22 @@ from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 
 
+def resolve_sizing_risk_budget_pct(get_setting) -> float:
+    """The %-of-equity DOLLAR-RISK budget for risk-based sizing, for BOTH risk managers.
+
+    get_setting(key) -> the expert's setting value (typically
+    ``functools.partial(expert.get_setting_with_interface_default, log_warning=False)``).
+    Prefers ``atr_risk_budget_pct``; when that is None falls back to ``risk_per_trade_pct``
+    (which ALSO sets the stop DISTANCE in the classic RM -- one gene doing two jobs was the
+    2026-08-16 defect). ``float(x or 1.0)`` semantics are kept on purpose: it is the classic
+    RM's historical behaviour and every backtest result depends on it.
+    """
+    budget = get_setting("atr_risk_budget_pct")
+    if budget is None:
+        budget = get_setting("risk_per_trade_pct")
+    return float(budget or 1.0)
+
+
 def compute_risk_based_quantity(
     equity: float,
     current_price: float,

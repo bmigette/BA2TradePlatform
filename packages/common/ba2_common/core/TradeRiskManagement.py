@@ -1315,22 +1315,21 @@ class TradeRiskManagement:
         remaining balance (passed in), and respects any lot_size on the order.
         Returns 0 (order will be deleted as unfunded) when it can't be sized.
         """
-        from ba2_common.core.position_sizing import compute_risk_based_quantity
+        import functools
+
+        from ba2_common.core.position_sizing import (compute_risk_based_quantity,
+                                                     resolve_sizing_risk_budget_pct)
 
         equity = expert.get_virtual_balance()
-        # SIZING budget. Prefer the dedicated atr_risk_budget_pct; fall back to risk_per_trade_pct
-        # when unset so a config that never declared the gene behaves exactly as before. The two
-        # are decoupled because risk_per_trade_pct ALSO sets the stop DISTANCE
-        # (synthesize_safeguard_stop, via _ensure_safeguard_stop below) in both sizing modes --
-        # one gene doing two jobs meant a range wide enough for stop search drove the risk-based
-        # size past the per-instrument cap, collapsing risk_atr onto notional.
+        # SIZING budget -- see resolve_sizing_risk_budget_pct for the atr_risk_budget_pct ->
+        # risk_per_trade_pct precedence. The Smart Risk Manager calls the SAME resolver, so a
+        # config cannot size differently live than it does in a backtest (review finding 1).
         #
-        # THIS is the function dd1f912e meant to edit; it changed the stop synthesiser instead,
-        # leaving the two genes wired to each other's jobs. See _ensure_safeguard_stop.
-        _budget = expert.get_setting_with_interface_default('atr_risk_budget_pct', log_warning=False)
-        if _budget is None:
-            _budget = expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False)
-        risk_pct = float(_budget or 1.0)
+        # THIS is the function dd1f912e (2026-08-16) meant to edit; it changed the stop
+        # synthesiser instead, leaving the two genes wired to each other's jobs. See
+        # _ensure_safeguard_stop.
+        risk_pct = resolve_sizing_risk_budget_pct(
+            functools.partial(expert.get_setting_with_interface_default, log_warning=False))
         atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
         min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)
 

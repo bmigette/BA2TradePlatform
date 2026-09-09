@@ -57,3 +57,97 @@ def test_an_absent_notional_ceiling_still_means_no_ceiling():
                                       max_position_value=None)
     assert out["quantity"] == 10
     assert out["capped_by"] is None
+
+
+# ---------------------------------------------------------------------------------------------
+# resolve_sizing_risk_budget_pct — the ONE sizing-budget resolver shared by the classic risk
+# manager (TradeRiskManagement._risk_atr_quantity) and the live Smart Risk Manager
+# (SmartRiskManagerToolkit). Review finding 1 (2026-09-09): they read different settings, so the
+# same config sized 18 shares in a backtest and 180 shares live.
+# ---------------------------------------------------------------------------------------------
+
+def _settings_getter(**settings):
+    """A get_setting(key) callable over an explicit dict (missing key -> None, as the expert's
+    get_setting_with_interface_default returns for an undeclared setting)."""
+    return lambda key: settings.get(key)
+
+
+def test_budget_resolver_prefers_atr_risk_budget_pct():
+    from ba2_common.core.position_sizing import resolve_sizing_risk_budget_pct
+    got = resolve_sizing_risk_budget_pct(
+        _settings_getter(atr_risk_budget_pct=0.5, risk_per_trade_pct=5.0))
+    assert got == 0.5
+
+
+def test_budget_resolver_falls_back_to_risk_per_trade_pct_when_budget_unset():
+    """A config that never declared the budget gene must behave exactly as before it existed."""
+    from ba2_common.core.position_sizing import resolve_sizing_risk_budget_pct
+    got = resolve_sizing_risk_budget_pct(
+        _settings_getter(atr_risk_budget_pct=None, risk_per_trade_pct=5.0))
+    assert got == 5.0
+
+
+def test_budget_resolver_defaults_to_one_percent_when_both_unset():
+    from ba2_common.core.position_sizing import resolve_sizing_risk_budget_pct
+    assert resolve_sizing_risk_budget_pct(_settings_getter()) == 1.0
+
+
+def test_budget_resolver_reads_zero_as_one_percent():
+    """Documented QUIRK, pinned deliberately: ``float(x or 1.0)`` turns a 0 budget into 1.0
+    rather than into "no position". Every backtest result depends on this historical behaviour,
+    so the shared resolver keeps it instead of quietly fixing it here."""
+    from ba2_common.core.position_sizing import resolve_sizing_risk_budget_pct
+    got = resolve_sizing_risk_budget_pct(
+        _settings_getter(atr_risk_budget_pct=0, risk_per_trade_pct=5.0))
+    assert got == 1.0
+
+
+def test_budget_resolver_coerces_string_settings():
+    """Settings come back from the DB key-value store as strings (see the deploy-parity traps)."""
+    from ba2_common.core.position_sizing import resolve_sizing_risk_budget_pct
+    assert resolve_sizing_risk_budget_pct(_settings_getter(atr_risk_budget_pct="0.5")) == 0.5
+
+
+# ---------------------------------------------------------------------------------------------
+# CLASSIC RM PINS. Backtests only ever run the classic risk manager, so its sizing must stay
+# byte-identical across the shared-resolver refactor. These two cases are the review probe's
+# (reports/margin/reproduce_margin_review.py): $18 000 virtual equity, price 100, stop 95.
+# ---------------------------------------------------------------------------------------------
+
+def _classic_pin_quantity(atr_risk_budget_pct):
+    from types import SimpleNamespace
+    from ba2_common.core import regime_overlay
+    from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+    from ba2_common.core.types import OrderDirection
+
+    regime_overlay.reset_stressed()  # unstressed -> every regime scale is an exact no-op
+    settings = {
+        "atr_risk_budget_pct": atr_risk_budget_pct,
+        "risk_per_trade_pct": 5.0,
+        "atr_multiplier": 2.0,
+        "min_stop_loss_pct": 0.0,
+        "use_atr_stop": False,
+        "commission_per_trade": 0.0,
+        "max_virtual_equity_per_instrument_percent": 100.0,
+    }
+    expert = SimpleNamespace(
+        id=1,
+        get_virtual_balance=lambda: 18_000.0,
+        get_setting_with_interface_default=lambda key, **kw: settings[key],
+    )
+    account = SimpleNamespace(
+        id=1, get_setting_with_interface_default=lambda key, **kw: settings[key])
+    order = SimpleNamespace(id=1, symbol="NEW", side=OrderDirection.BUY, quantity=0,
+                            stop_price=95.0, limit_price=None, open_price=100.0, data={})
+    return TradeRiskManagement()._risk_atr_quantity(
+        order, "NEW", 100.0, expert, 18_000.0, 18_000.0, account)
+
+
+def test_classic_risk_atr_sizes_off_the_budget_gene():
+    """PIN: budget 0.5% of $18 000 = $90 risk / $5 stop distance = 18 shares."""
+    assert _classic_pin_quantity(0.5) == 18
+
+
+def test_classic_risk_atr_falls_back_to_risk_per_trade_pct():
+    """PIN: no budget gene -> risk_per_trade_pct 5% = $900 / $5 = 180 shares."""
+    assert _classic_pin_quantity(None) == 180

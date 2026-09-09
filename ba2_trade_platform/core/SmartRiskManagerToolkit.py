@@ -1870,18 +1870,30 @@ class SmartRiskManagerToolkit:
                            sl_price: Optional[float]) -> Dict[str, Any]:
         """Risk-based share count for the smart risk manager. Returns {quantity, ...}.
 
-        Mirrors the classic risk manager: cap the dollar loss at risk_per_trade_pct
-        of equity; share count = risk$ / distance-to-stop, where the stop distance
-        is |price - sl_price| when an SL is given, else atr_multiplier * ATR. The
-        per-instrument %% cap and available balance still apply as ceilings.
+        Mirrors the classic risk manager: cap the dollar loss at the resolved sizing
+        BUDGET (resolve_sizing_risk_budget_pct) of equity; share count = risk$ /
+        distance-to-stop, where the stop distance is |price - sl_price| when an SL is
+        given, else atr_multiplier * ATR. The per-instrument %% cap and available
+        balance still apply as ceilings.
         """
-        from .position_sizing import compute_risk_based_quantity, get_latest_atr
+        import functools
+
+        from .position_sizing import (compute_risk_based_quantity, get_latest_atr,
+                                      resolve_sizing_risk_budget_pct)
         try:
             current_price = self.get_current_price(symbol)
             if not current_price or current_price <= 0:
                 return {"quantity": 0, "reason": f"no current price for {symbol}"}
 
             equity = self.expert.get_virtual_balance()
+            # TWO genes, two jobs -- exactly as the classic RM splits them:
+            #   budget_pct : the %-of-equity DOLLAR RISK that sets the SHARE COUNT
+            #   risk_pct   : risk_per_trade_pct, which sets the safeguard stop DISTANCE
+            # Sizing off risk_per_trade_pct here is review finding 1 (2026-09-09): with
+            # atr_risk_budget_pct=0.5 / risk_per_trade_pct=5 the backtest's classic RM bought
+            # 18 shares and this method bought 180 for the same config.
+            budget_pct = resolve_sizing_risk_budget_pct(
+                functools.partial(self.expert.get_setting_with_interface_default, log_warning=False))
             risk_pct = float(self.expert.get_setting_with_interface_default("risk_per_trade_pct", log_warning=False) or 1.0)
             atr_mult = float(self.expert.get_setting_with_interface_default("atr_multiplier", log_warning=False) or 2.0)
             atr_period = int(self.expert.get_setting_with_interface_default("atr_period", log_warning=False) or 14)
@@ -1924,7 +1936,7 @@ class SmartRiskManagerToolkit:
                     atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
 
             result = compute_risk_based_quantity(
-                equity=equity, current_price=current_price, risk_per_trade_pct=risk_pct,
+                equity=equity, current_price=current_price, risk_per_trade_pct=budget_pct,
                 stop_price=effective_sl, atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct,
                 max_position_value=max_position_value, available_balance=available,
             )
@@ -1942,6 +1954,31 @@ class SmartRiskManagerToolkit:
         except Exception as e:
             logger.warning(f"_auto_size_by_risk failed for {symbol}: {e}")
             return {"quantity": 0, "reason": str(e)}
+
+    def _synthesize_stop_for_explicit_quantity(self, symbol: str, quantity,
+                                               order_direction: OrderDirection) -> Dict[str, Any]:
+        """Stop-loss for an order the agent gave an explicit QUANTITY but no SL.
+
+        Places the stop where the loss equals the resolved sizing BUDGET of equity for that
+        quantity — the inverse of ``_auto_size_by_risk``, so the same dollar risk governs both
+        directions of the relationship. Returns ``derive_stop_for_quantity``'s dict (sl_price,
+        possibly-reduced quantity, rejected, reason, stop_pct).
+
+        Extracted from ``_open_position_internal`` so the budget resolution is unit-testable
+        without the DB/account wiring that surrounds the call site.
+        """
+        import functools
+
+        from .position_sizing import derive_stop_for_quantity, resolve_sizing_risk_budget_pct
+
+        cur = self.get_current_price(symbol)
+        equity = self.expert.get_virtual_balance()
+        risk_pct = resolve_sizing_risk_budget_pct(
+            functools.partial(self.expert.get_setting_with_interface_default, log_warning=False))
+        min_stop = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 7.0)
+        return derive_stop_for_quantity(equity, cur, int(quantity), risk_pct,
+                                        is_long=(order_direction == OrderDirection.BUY),
+                                        min_stop_pct=min_stop)
 
     def _open_position_internal(
         self,
@@ -2003,17 +2040,12 @@ class SmartRiskManagerToolkit:
                             "symbol": symbol, "quantity": 0, "direction": direction,
                         }
                 elif sl_price is None:
-                    # Explicit quantity but no stop: synthesize the SL at the
-                    # risk_per_trade_pct loss price, reducing qty if it would be
-                    # tighter than min_stop_loss_pct, rejecting if 1 share still risks too much.
-                    from .position_sizing import derive_stop_for_quantity
-                    cur = self.get_current_price(symbol)
-                    equity = self.expert.get_virtual_balance()
-                    risk_pct = float(self.expert.get_setting_with_interface_default("risk_per_trade_pct", log_warning=False) or 1.0)
+                    # Explicit quantity but no stop: synthesize the SL at the resolved
+                    # sizing-budget loss price, reducing qty if it would be tighter than
+                    # min_stop_loss_pct, rejecting if 1 share still risks too much.
+                    # (min_stop is re-read here only for the log line below.)
                     min_stop = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 7.0)
-                    d = derive_stop_for_quantity(equity, cur, int(quantity), risk_pct,
-                                                 is_long=(order_direction == OrderDirection.BUY),
-                                                 min_stop_pct=min_stop)
+                    d = self._synthesize_stop_for_explicit_quantity(symbol, quantity, order_direction)
                     if d["rejected"]:
                         return {
                             "success": False,
