@@ -1,4 +1,4 @@
-"""Prewarm writes its history files FROM ITS WORKER THREADS, from one shared fetcher table.
+"""Prewarm writes its history files FROM ITS WORKER THREADS, through one shared run.
 
 The 2026-09-10 live-replay readiness audit ("Two prewarm tooling gaps",
 ``reports/trading/live_backtest_replay_readiness_2026-09-10.md``) found the backend/API prewarm
@@ -7,8 +7,9 @@ handler entering ``frozen_ttl_cache()`` on the SUBMITTING thread only. That flag
 ``fmp_history_disk_cached`` took its live-passthrough branch: the fetches went out, the task
 reported success, and NOT ONE cache file was written. The audit reproduced it with the real cache
 helper, a fake payload and a temp directory (``prewarm_thread_probe.json``: api_pattern_wrote_file
-false, cli_pattern_wrote_file true, network_calls 0). That probe is the first test here, both
-halves of it, so the bug cannot come back silently.
+false, cli_pattern_wrote_file true, network_calls 0). That probe is the first test here, and the
+fixed pattern is now tested where it lives -- ``prewarm_fetchers.run_prewarm``, the one call both
+entry points make.
 
 Everything runs against the REAL ``fmp_history_disk_cached`` with fake ``fetch_fn``s and a temp
 ``CACHE_FOLDER``. ``socket.socket.connect`` is patched to raise for the whole module: any test
@@ -42,7 +43,7 @@ END = datetime(2026, 9, 10, tzinfo=timezone.utc)
 # --------------------------------------------------------------------------- fixtures
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
-    """Zero network, enforced at the transport. A prewarm test that fetches for real would
+    """Zero network, enforced at the transport. A prewarm test that fetched for real would
     otherwise pass while proving nothing about the cache."""
     def _refuse(self, address):  # noqa: ANN001
         raise AssertionError(f"prewarm test attempted a network connection to {address!r}")
@@ -63,76 +64,45 @@ def _history_file(cache_root, namespace: str, symbol: str):
 
 
 # --------------------------------------------------------------------------- the audit's probe
-def _run_pool_pattern(namespace: str, symbol: str, payload, *, with_initializer: bool,
-                      with_sentinel: bool):
-    """Run one fetch through a ThreadPoolExecutor exactly as a prewarm entry point does."""
+def test_submitting_thread_freeze_alone_writes_nothing(cache_root):
+    """The bug, reproduced: freeze on the submitting thread only. The fetch happens, the caller
+    gets its data, and the worker thread — never frozen — writes no cache file at all. Kept as a
+    negative control for the shared run below, which does it right."""
+    payload = [{"date": "2026-09-01", "eps": 1.0}]
     calls = []
 
-    def _fetch():
-        calls.append(symbol)
-        return payload
-
     def _work(sym):
-        return fmp_history_disk_cached(namespace, sym, _fetch)
+        return fmp_history_disk_cached("probe_old", sym, lambda: (calls.append(sym) or payload))
 
-    sentinel = persist_empty_sentinel() if with_sentinel else _nullcontext()
-    kwargs = {"initializer": set_ttl_frozen, "initargs": (True,)} if with_initializer else {}
-    with frozen_ttl_cache(), sentinel:
-        with ThreadPoolExecutor(max_workers=1, **kwargs) as ex:
-            result = ex.submit(_work, symbol).result()
-    return result, calls
+    with frozen_ttl_cache():                      # no initializer, no sentinel: the old handler
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            result = ex.submit(_work, "AAA").result()
 
-
-class _nullcontext:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *exc):
-        return False
-
-
-def test_old_handler_pattern_returns_data_but_writes_nothing(cache_root):
-    """The bug, reproduced: freeze on the submitting thread only. The fetch happens, the caller
-    gets its data, and the worker thread — never frozen — writes no cache file at all."""
-    payload = [{"date": "2026-09-01", "eps": 1.0}]
-    result, calls = _run_pool_pattern("probe_old", "AAA", payload,
-                                      with_initializer=False, with_sentinel=False)
     assert result == payload and calls == ["AAA"]
     assert not _history_file(cache_root, "probe_old", "AAA").exists()
 
 
-def test_worker_initializer_pattern_writes_the_history_file(cache_root):
-    """The fix: ``initializer=set_ttl_frozen`` sets the thread-local flag INSIDE each worker."""
-    payload = [{"date": "2026-09-01", "eps": 1.0}]
-    result, calls = _run_pool_pattern("probe_new", "AAA", payload,
-                                      with_initializer=True, with_sentinel=True)
-    assert result == payload and calls == ["AAA"]
-    written = _history_file(cache_root, "probe_new", "AAA")
-    assert written.exists()
-    assert json.loads(written.read_text()) == payload
-
-
-# --------------------------------------------------------------------------- the real handler
+# --------------------------------------------------------------------------- the shared run
 class _StubFetchers:
-    """Stands in for ``PrewarmFetchers`` so the handler's EXECUTOR pattern is what is under
-    test here (the real fetchers are exercised by the insider tests below)."""
+    """Stands in for ``PrewarmFetchers`` so ``run_prewarm``'s freeze/pool/counting block is what
+    is under test (the real fetchers are exercised by the estimator-input tests below)."""
 
-    def __init__(self, fetch_result, namespace="stub_history"):
+    def __init__(self, fetch_result, namespace="stub_history", raiser=None):
+        import app.services.prewarm_fetchers as pf
         self.fetch_result = fetch_result
         self.namespace = namespace
+        self.raiser = raiser            # (symbol) -> raise, to test failure handling
         self.symbols = []
         self.senate_latest_calls = 0
+        self.logs = []
+        # Derived from the shared table, so an expert added there is covered here too.
+        self.table = {name: self._do for name in pf.FETCHER_METHODS}
 
     def _do(self, sym):
         self.symbols.append(sym)
+        if self.raiser is not None:
+            self.raiser(sym)
         fmp_history_disk_cached(self.namespace, sym, lambda: self.fetch_result)
-
-    @property
-    def table(self):
-        return {"FMPRating": self._do, "FMPEarningsDrift": self._do,
-                "FMPInsiderClusterBuy": self._do, "FactorRanker": self._do,
-                "FMPSenateTraderWeight": self._do, "FinnHubRating": self._do,
-                "DeterministicScorer": self._do}
 
     def validate(self, experts):
         return [e for e in experts if e not in self.table]
@@ -141,95 +111,100 @@ class _StubFetchers:
         self.senate_latest_calls += 1
 
     def log(self, message):
-        pass
+        self.logs.append(message)
 
 
-@pytest.fixture
-def handler_with_stub(monkeypatch):
-    """The real ``handle_prewarm``, with the fetcher table stubbed at the shared seam."""
-    monkeypatch.setenv("FMP_API_KEY", "TEST-FMP-KEY")
+def _run(stub, experts, symbols, workers=2):
     import app.services.prewarm_fetchers as pf
-    handler = importlib.import_module("app.services.data_build_handler")
-
-    def _install(stub):
-        monkeypatch.setattr(pf, "build_fetchers", lambda **kwargs: stub)
-        return handler
-
-    return _install
+    return pf.run_prewarm(stub, experts, symbols, workers, end=END)
 
 
-def test_handle_prewarm_writes_history_from_its_worker_threads(cache_root, handler_with_stub):
+def test_run_prewarm_writes_history_from_its_worker_threads(cache_root):
     payload_rows = [{"symbol": "AAA", "grade": "Buy"}]
-    stub = _StubFetchers(payload_rows, namespace="handler_history")
-    handler = handler_with_stub(stub)
+    stub = _StubFetchers(payload_rows, namespace="run_history")
 
-    result = handler.handle_prewarm("t-1", {"symbols": ["AAA", "BBB"], "workers": 2,
-                                            "experts": ["FMPRating"]})
+    summary = _run(stub, ["FMPRating"], ["AAA", "BBB"])
 
-    assert result["status"] == "completed", result
-    assert result["summary"]["errors"] == 0
+    assert summary["errors"] == 0 and summary["cached"] == {"FMPRating": 2}
     assert sorted(stub.symbols) == ["AAA", "BBB"]
     for sym in ("AAA", "BBB"):
-        written = _history_file(cache_root, "handler_history", sym)
-        assert written.exists(), f"{sym}: handler prewarm wrote no cache file"
+        written = _history_file(cache_root, "run_history", sym)
+        assert written.exists(), f"{sym}: the shared run wrote no cache file"
         assert json.loads(written.read_text()) == payload_rows
 
 
-def test_handle_prewarm_persists_the_checked_empty_sentinel(cache_root, handler_with_stub):
+def test_run_prewarm_persists_the_checked_empty_sentinel(cache_root):
     """A symbol FMP genuinely has no data for is cached as ``[]`` — "checked, no data" — so a
     hermetic backtest stops reading it as the fatal "never pre-warmed" of an absent file."""
-    stub = _StubFetchers([], namespace="handler_empty")
-    handler = handler_with_stub(stub)
+    stub = _StubFetchers([], namespace="run_empty")
 
-    result = handler.handle_prewarm("t-2", {"symbols": ["ZZZ"], "workers": 1,
-                                            "experts": ["FMPRating"]})
+    _run(stub, ["FMPRating"], ["ZZZ"], workers=1)
 
-    assert result["status"] == "completed", result
-    written = _history_file(cache_root, "handler_empty", "ZZZ")
+    written = _history_file(cache_root, "run_empty", "ZZZ")
     assert written.exists(), "no sentinel written for a checked-empty result"
     assert json.loads(written.read_text()) == []
 
 
-def test_handle_prewarm_covers_all_seven_experts(handler_with_stub, monkeypatch):
-    """Every expert in the shared table is warmable through the API handler — it used to know
-    only three, and DeterministicScorer got FRED but no per-symbol history at all."""
+def test_run_prewarm_covers_all_seven_experts(cache_root):
+    """Every expert in the shared table is warmable from either entry point — the handler used
+    to know only three, and DeterministicScorer got FRED but no per-symbol history at all."""
     import app.services.prewarm_fetchers as pf
-    stub = _StubFetchers([{"x": 1}], namespace="handler_all")
-    handler = handler_with_stub(stub)
-    # FRED is economy-wide and network-bound; the DS per-SYMBOL path is what is under test.
-    monkeypatch.setattr(handler, "_prewarm_fred",
-                        lambda *a, **k: {"refreshed": 0, "fresh": 0, "errors": 0})
+    stub = _StubFetchers([{"x": 1}], namespace="run_all")
 
-    result = handler.handle_prewarm("t-3", {"symbols": ["AAA"], "workers": 1,
-                                            "experts": list(pf.EXPERT_NAMES)})
+    summary = _run(stub, list(pf.EXPERT_NAMES), ["AAA"], workers=1)
 
-    assert result["status"] == "completed", result
-    assert result["summary"]["skipped"] == []
-    assert result["summary"]["cached"] == {name: 1 for name in pf.EXPERT_NAMES}
+    assert summary["skipped"] == []
+    assert summary["cached"] == {name: 1 for name in pf.EXPERT_NAMES}
+    assert summary["senate_latest"] is True
+    assert summary["senate_skill_scores"] is False
+    assert any("trader-skill" in n for n in summary["notes"])
+
+
+def test_run_prewarm_warms_the_unscoped_senate_feed_with_no_per_symbol_work(cache_root):
+    """``--experts FMPSenateTraderCopy`` has no per-symbol fetcher, but basket-mode Copy still
+    reads the unscoped ALL_FULL_HISTORY feed — so it must be warmed before the empty-work exit."""
+    stub = _StubFetchers([{"x": 1}], namespace="run_copy")
+
+    summary = _run(stub, ["FMPSenateTraderCopy"], ["AAA"], workers=1)
+
     assert stub.senate_latest_calls == 1
+    assert stub.symbols == []
+    assert summary["skipped"] == ["FMPSenateTraderCopy"]
+    assert any("no per-symbol" in n for n in summary["notes"])
 
 
-def test_cli_prewarm_writes_history_from_its_worker_threads(cache_root, monkeypatch):
-    """The other entry point, end to end through ``_cmd_prewarm``: same shared table, same
-    worker-thread persistence. Guards the CLI half of the move."""
+def test_run_prewarm_counts_a_symbol_failure_and_redacts_the_key(cache_root):
+    """One instrument's data gap must not abort a 500-symbol warm — and the log carries the
+    exception TYPE plus a redacted message, never the api key FMP quotes back in its errors."""
+    def _boom(sym):
+        raise ValueError("500 Server Error for url: https://fmp/api/v3/x?apikey=SECRET123&y=1")
+
+    stub = _StubFetchers([{"x": 1}], namespace="run_fail", raiser=_boom)
+
+    summary = _run(stub, ["FMPRating"], ["AAA"], workers=1)
+
+    assert summary["errors"] == 1 and summary["cached"] == {}
+    assert summary["failures"] == [
+        "FMPRating/AAA: ValueError: 500 Server Error for url: "
+        "https://fmp/api/v3/x?apikey=<redacted>&y=1"]
+    assert "SECRET123" not in " ".join(stub.logs)
+
+
+def test_config_error_from_a_worker_aborts_the_whole_run(cache_root):
+    """A configuration gap is NOT a per-symbol error: it would repeat for every remaining
+    symbol, so it escapes the pool by name instead of being counted 500 times."""
     import app.services.prewarm_fetchers as pf
-    stub = _StubFetchers([{"symbol": "CLI1", "grade": "Buy"}], namespace="cli_history")
-    monkeypatch.setattr(pf, "build_fetchers", lambda **kwargs: stub)
-    monkeypatch.setenv("FMP_API_KEY", "TEST-FMP-KEY")
-    monkeypatch.setenv("FINNHUB_API_KEY", "TEST-FINNHUB-KEY")
 
-    launcher = _load_launcher()
-    rc = launcher._cmd_prewarm(argparse.Namespace(
-        symbols="CLI1", experts="FMPRating", workers=1, end="2026-09-10",
-        start=None, expert_settings=None))
+    def _boom(sym):
+        raise pf.PrewarmConfigError("finnhub_api_key not configured")
 
-    assert rc == 0
-    assert stub.symbols == ["CLI1"]
-    written = _history_file(cache_root, "cli_history", "CLI1")
-    assert written.exists(), "CLI prewarm wrote no cache file"
+    stub = _StubFetchers([{"x": 1}], namespace="run_cfg", raiser=_boom)
+
+    with pytest.raises(pf.PrewarmConfigError, match="finnhub_api_key"):
+        _run(stub, ["FinnHubRating"], ["AAA", "BBB"], workers=1)
 
 
-# --------------------------------------------------------------------------- one fetcher table
+# --------------------------------------------------------------- both entry points, one run
 def _load_launcher():
     launcher = os.path.normpath(os.path.join(_BACKEND, "..", "ba2test_launcher.py"))
     spec = importlib.util.spec_from_file_location("ba2test_launcher_prewarm_test", launcher)
@@ -238,70 +213,121 @@ def _load_launcher():
     return mod
 
 
-class _BuildFetchersCalled(Exception):
-    """Raised by the stubbed builder so each entry point stops right after resolving it."""
+def _prewarm_args(**over):
+    args = {"symbols": "AAA", "experts": "FMPRating", "workers": 1, "end": "2026-09-10",
+            "start": None}
+    args.update(over)
+    return argparse.Namespace(**args)
 
 
-def test_launcher_and_handler_resolve_the_same_fetcher_table(monkeypatch):
-    """Both prewarm entry points build their table from ``prewarm_fetchers.build_fetchers``.
+class _FetchersBuilt(Exception):
+    """Raised by the stubbed class so each entry point stops right after resolving it."""
 
-    Patching that ONE attribute stops both, which is only possible because neither carries its
-    own copy of the fetchers any more.
-    """
+
+def test_both_entry_points_build_the_same_fetchers(monkeypatch):
+    """Patching the ONE shared class stops both entry points, which is only possible because
+    neither carries its own copy of the fetchers any more."""
     import app.services.prewarm_fetchers as pf
     calls = []
 
     def _record(**kwargs):
         calls.append(kwargs)
-        raise _BuildFetchersCalled("stubbed shared builder")
+        raise _FetchersBuilt("stubbed shared fetchers")
 
-    monkeypatch.setattr(pf, "build_fetchers", _record)
-    monkeypatch.setenv("FMP_API_KEY", "TEST-FMP-KEY")
-    monkeypatch.setenv("FINNHUB_API_KEY", "TEST-FINNHUB-KEY")
+    monkeypatch.setattr(pf, "PrewarmFetchers", _record)
+    monkeypatch.setattr(pf, "resolve_keys", lambda: {"fmp": "K", "finnhub": "F"})
 
     handler = importlib.import_module("app.services.data_build_handler")
-    result = handler.handle_prewarm("t-4", {"symbols": ["AAA"], "experts": ["FMPRating"]})
-    assert result["status"] == "failed" and "stubbed shared builder" in result["error"]
+    result = handler.handle_prewarm("t-1", {"symbols": ["AAA"], "experts": ["FMPRating"]})
+    assert result["status"] == "failed" and "stubbed shared fetchers" in result["error"]
 
     launcher = _load_launcher()
-    args = argparse.Namespace(symbols="AAA", experts="FMPRating", workers=1, end=None,
-                              start=None, expert_settings=None)
-    with pytest.raises(_BuildFetchersCalled):
-        launcher._cmd_prewarm(args)
+    with pytest.raises(_FetchersBuilt):
+        launcher._cmd_prewarm(_prewarm_args())
 
-    assert len(calls) == 2, "both entry points must go through the shared builder"
-    assert all(set(c) >= {"fmp_key", "end_date", "finnhub_key", "expert_settings"} for c in calls)
+    assert len(calls) == 2, "both entry points must build the shared fetchers"
+    assert all(set(c) == {"fmp_key", "end_date", "finnhub_key", "log"} for c in calls)
 
 
-def test_the_table_covers_seven_experts_and_is_built_once(monkeypatch):
+def test_cli_prewarm_writes_history_from_its_worker_threads(cache_root, monkeypatch):
+    """The CLI end to end through ``_cmd_prewarm``: same shared run, same worker-thread
+    persistence, and it still returns 0 and prints its summary."""
+    import app.services.prewarm_fetchers as pf
+    stub = _StubFetchers([{"symbol": "CLI1", "grade": "Buy"}], namespace="cli_history")
+    monkeypatch.setattr(pf, "PrewarmFetchers", lambda **kwargs: stub)
+    monkeypatch.setattr(pf, "resolve_keys", lambda: {"fmp": "K", "finnhub": "F"})
+
+    launcher = _load_launcher()
+    rc = launcher._cmd_prewarm(_prewarm_args(symbols="CLI1"))
+
+    assert rc == 0
+    assert stub.symbols == ["CLI1"]
+    assert _history_file(cache_root, "cli_history", "CLI1").exists()
+
+
+def test_missing_fmp_key_fails_both_entry_points(monkeypatch):
+    import app.services.prewarm_fetchers as pf
+    monkeypatch.setattr(pf, "resolve_keys", lambda: {"fmp": None, "finnhub": None})
+
+    handler = importlib.import_module("app.services.data_build_handler")
+    result = handler.handle_prewarm("t-2", {"symbols": ["AAA"], "experts": ["FMPRating"]})
+    assert result["status"] == "failed" and "FMP_API_KEY" in result["error"]
+
+    launcher = _load_launcher()
+    assert launcher._cmd_prewarm(_prewarm_args()) == 1
+
+
+def test_missing_finnhub_key_fails_both_entry_points(monkeypatch):
+    """Resolved up front by ``validate``, before a single fetch — not once per symbol."""
+    import app.services.prewarm_fetchers as pf
+    monkeypatch.setattr(pf, "resolve_keys", lambda: {"fmp": "K", "finnhub": None})
+
+    handler = importlib.import_module("app.services.data_build_handler")
+    result = handler.handle_prewarm("t-3", {"symbols": ["AAA"], "experts": ["FinnHubRating"]})
+    assert result["status"] == "failed" and "finnhub" in result["error"]
+
+    launcher = _load_launcher()
+    assert launcher._cmd_prewarm(_prewarm_args(experts="FinnHubRating")) == 1
+
+
+def test_senate_scalper_bounds_have_one_source():
+    """The GA grid's scalper gene floor and the prewarm's skip read the SAME two numbers, so a
+    grid edit cannot silently make the prewarm skip traders a trial still needs."""
+    import app.services.prewarm_fetchers as pf
+    launcher = _load_launcher()
+    params = launcher._EXPERT_OPT["FMPSenateTraderWeight"]["expert_params"]
+    gene = params["min_trader_avg_hold_days"]
+    fixed = launcher._EXPERT_OPT["FMPSenateTraderWeight"]["fixed_settings"]
+
+    assert gene["min"] == pf.SENATE_SCALPER_BOUNDS["hold_floor_days"]
+    assert fixed["min_trader_hold_roundtrips"] == pf.SENATE_SCALPER_BOUNDS["hold_min_roundtrips"]
+    # 0 would mean "filter disabled", which makes the prewarm's scalper skip unsound.
+    assert pf.SENATE_SCALPER_BOUNDS["hold_floor_days"] > 0
+
+
+def test_the_table_covers_seven_experts_and_is_built_once():
     import app.services.prewarm_fetchers as pf
     assert set(pf.FETCHER_METHODS) == {
         "FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy", "FactorRanker",
         "FMPSenateTraderWeight", "FinnHubRating", "DeterministicScorer",
     }
-    a = pf.build_fetchers(fmp_key="K", end_date=END, finnhub_key="F",
-                          senate_hold_floor_days=1.0, senate_hold_min_roundtrips=3)
-    b = pf.build_fetchers(fmp_key="K", end_date=END, finnhub_key="F",
-                          senate_hold_floor_days=1.0, senate_hold_min_roundtrips=3)
+    a = pf.PrewarmFetchers(fmp_key="K", end_date=END, finnhub_key="F")
+    b = pf.PrewarmFetchers(fmp_key="K", end_date=END, finnhub_key="F")
     assert set(a.table) == set(pf.FETCHER_METHODS)
     # Two entry points get two instances but the SAME functions — one implementation.
     for name in pf.FETCHER_METHODS:
         assert a.table[name].__func__ is b.table[name].__func__
 
 
-def test_unwarmable_expert_is_refused_up_front():
-    """A configuration gap fails once, before any fetch, instead of N times mid-run."""
+def test_unknown_expert_is_reported_not_raised():
     import app.services.prewarm_fetchers as pf
-    f = pf.build_fetchers(fmp_key="K", end_date=END, finnhub_key=None,
-                          senate_hold_floor_days=None, senate_hold_min_roundtrips=None)
+    f = pf.PrewarmFetchers(fmp_key="K", end_date=END, finnhub_key=None)
     assert f.validate(["FMPRating", "NotAnExpert"]) == ["NotAnExpert"]
     with pytest.raises(pf.PrewarmConfigError, match="finnhub"):
         f.validate(["FinnHubRating"])
-    with pytest.raises(pf.PrewarmConfigError, match="senate_hold_floor_days"):
-        f.validate(["FMPSenateTraderWeight"])
 
 
-# --------------------------------------------------------------- insider model-mode inputs
+# ------------------------------------------------------- estimator inputs (union semantics)
 @pytest.fixture
 def fake_fmp(monkeypatch):
     """Real providers, faked transport: every FMP call returns an empty payload, so each read
@@ -326,65 +352,24 @@ def fake_fmp(monkeypatch):
     monkeypatch.setattr(details_mod, "fmp_http_get", lambda *a, **k: _EmptyResponse())
 
 
-def _run_insider(expert_settings, symbol):
+def _warm(method_name, symbol):
     import app.services.prewarm_fetchers as pf
-    f = pf.build_fetchers(fmp_key="TEST-FMP-KEY", end_date=END, finnhub_key=None,
-                          senate_hold_floor_days=None, senate_hold_min_roundtrips=None,
-                          expert_settings=expert_settings)
+    f = pf.PrewarmFetchers(fmp_key="TEST-FMP-KEY", end_date=END, finnhub_key=None)
     with frozen_ttl_cache(), persist_empty_sentinel():
-        f.do_insider(symbol)
+        getattr(f, method_name)(symbol)
 
 
-def test_insider_model_mode_warms_the_estimator_namespaces(cache_root, fake_fmp):
-    """``expected_profit_mode='model'`` makes ``_gather`` call ``fetch_estimator_inputs``, which
-    reads quarterly past earnings + earnings estimates. Warm those or the deployed model-mode
-    instance replays/backtests against two namespaces prewarm never wrote."""
-    _run_insider({"FMPInsiderClusterBuy": {"expected_profit_mode": "model"}}, "MODLA")
+@pytest.mark.parametrize("method,own_namespace,symbol", [
+    ("do_insider", "insider_v2", "INSDA"),
+    ("do_earnings_drift", "past_earnings_quarterly", "DRFTA"),
+])
+def test_estimator_inputs_are_warmed_unconditionally(cache_root, fake_fmp, method,
+                                                     own_namespace, symbol):
+    """``expected_profit_mode`` is a GA GENE for both of these experts, so prewarm cannot know
+    which trial will call ``analyst_target_model.fetch_estimator_inputs``. Warm its two
+    namespaces for every symbol — the union, exactly like FactorRanker warms every factor."""
+    _warm(method, symbol)
 
-    assert _history_file(cache_root, "insider_v2", "MODLA").exists()
-    assert _history_file(cache_root, "past_earnings_quarterly", "MODLA").exists()
-    assert _history_file(cache_root, "earnings_estimates_quarterly", "MODLA").exists()
-
-
-def test_insider_static_mode_warms_only_insider_transactions(cache_root, fake_fmp):
-    """Default (static) mode never fetches the estimator inputs, so prewarm must not either —
-    two extra FMP calls per symbol for data the expert will not read."""
-    _run_insider({"FMPInsiderClusterBuy": {"expected_profit_mode": "static"}}, "STATB")
-
-    assert _history_file(cache_root, "insider_v2", "STATB").exists()
-    assert not _history_file(cache_root, "past_earnings_quarterly", "STATB").exists()
-    assert not _history_file(cache_root, "earnings_estimates_quarterly", "STATB").exists()
-
-
-def test_insider_without_supplied_settings_uses_the_declared_default(cache_root, fake_fmp):
-    """No settings supplied -> the expert's own DECLARED default (static), which is what a
-    default-configured instance actually reads. Not a guess made up by prewarm."""
-    from ba2_experts.FMPInsiderClusterBuy import FMPInsiderClusterBuy
-    assert FMPInsiderClusterBuy.get_settings_definitions()["expected_profit_mode"]["default"] \
-        == "static"
-
-    _run_insider(None, "DEFLT")
-
-    assert _history_file(cache_root, "insider_v2", "DEFLT").exists()
-    assert not _history_file(cache_root, "past_earnings_quarterly", "DEFLT").exists()
-
-
-def test_insider_null_setting_raises_instead_of_assuming_a_mode(cache_root, fake_fmp):
-    import app.services.prewarm_fetchers as pf
-    with pytest.raises(pf.PrewarmConfigError, match="expected_profit_mode"):
-        _run_insider({"FMPInsiderClusterBuy": {"expected_profit_mode": None}}, "NULLX")
-
-
-def test_insider_undeclared_setting_raises(cache_root, fake_fmp, monkeypatch):
-    """If the knob is renamed away, prewarm fails loudly rather than falling back to a
-    hardcoded 'static' and silently under-warming every model-mode instance."""
-    from ba2_experts.FMPInsiderClusterBuy import FMPInsiderClusterBuy
-    real = FMPInsiderClusterBuy.get_settings_definitions
-
-    def _without_the_key():
-        return {k: v for k, v in real().items() if k != "expected_profit_mode"}
-
-    monkeypatch.setattr(FMPInsiderClusterBuy, "get_settings_definitions",
-                        staticmethod(_without_the_key))
-    with pytest.raises(KeyError, match="expected_profit_mode"):
-        _run_insider(None, "GONEX")
+    assert _history_file(cache_root, own_namespace, symbol).exists()
+    assert _history_file(cache_root, "past_earnings_quarterly", symbol).exists()
+    assert _history_file(cache_root, "earnings_estimates_quarterly", symbol).exists()

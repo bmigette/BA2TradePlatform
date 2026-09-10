@@ -7,8 +7,8 @@ tasks on the task queue so the React UI can drive them without blocking the requ
     (CLI ``_cmd_build_screener_metrics``).
   * ``build_options``         — wraps ``app.services.backtest.fetch_options.build_cache``
     (CLI ``_cmd_fetch_options``).
-  * ``prewarm``               — wraps the per-symbol FMP-history disk-cache pre-warm
-    (CLI ``_cmd_prewarm``).
+  * ``prewarm``               — wraps ``app.services.prewarm_fetchers.run_prewarm``, the
+    SAME per-symbol FMP-history disk-cache pre-warm the CLI ``_cmd_prewarm`` runs.
 
 Contract matches the other handlers (``handle_daily_backtest`` etc.):
 ``handler(task_id: str, payload: dict) -> result dict``; a returned ``{'status':'failed',...}``
@@ -47,21 +47,6 @@ def _resolve_fred_key() -> str:
             from ba2_common.config import get_app_setting
 
             key = get_app_setting("fred_api_key")
-        except Exception:  # noqa: BLE001
-            key = None
-    return key
-
-
-def _resolve_finnhub_key() -> str:
-    """Same resolution order as FMP. Only FinnHubRating needs it, so an absent key is not an
-    error here — ``PrewarmFetchers.validate`` refuses it, and only when that expert is asked
-    for."""
-    key = os.getenv("FINNHUB_API_KEY")
-    if not key:
-        try:
-            from ba2_common.config import get_app_setting
-
-            key = get_app_setting("finnhub_api_key")
         except Exception:  # noqa: BLE001
             key = None
     return key
@@ -235,42 +220,27 @@ def handle_build_options(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any
 def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Pre-build the per-symbol FMP-history disk cache for the grid experts.
 
-    Runs the SAME fetchers ``ba2-test prewarm`` runs -- literally the same table, from
-    ``app.services.prewarm_fetchers`` -- so the two entry points are interchangeable. Before
-    2026-09-11 they were not: this handler knew 3 of the 7 experts, warmed no per-symbol data
-    at all for DeterministicScorer (only FRED), and -- worst -- entered ``frozen_ttl_cache()``
-    on the SUBMITTING thread only. That flag is thread-local, so every pool worker ran
-    un-frozen: ``fmp_history_disk_cached`` took its live passthrough branch, the fetches went
-    out over the network, and NOT ONE cache file was written, while the task reported success
-    (2026-09-10 live-replay readiness audit, "Two prewarm tooling gaps"). ``initializer=
-    set_ttl_frozen`` sets the flag from inside each worker thread; ``persist_empty_sentinel``
-    (a module global, so it does reach the workers) makes a genuinely-empty history readable
-    as "checked, no data" instead of an eternal prewarm gap.
+    Argument parsing and reporting only: the run itself is
+    ``app.services.prewarm_fetchers.run_prewarm``, the same call ``ba2-test prewarm`` makes, so
+    the two entry points cannot drift. They had drifted badly. This handler knew 3 of the 7
+    experts, warmed no per-symbol data at all for DeterministicScorer (only FRED), and -- worst
+    -- entered ``frozen_ttl_cache()`` on the SUBMITTING thread only. That flag is thread-local,
+    so every pool worker ran un-frozen: ``fmp_history_disk_cached`` took its live passthrough
+    branch, the fetches went out over the network, and NOT ONE cache file was written, while the
+    task reported success (2026-09-10 live-replay readiness audit, "Two prewarm tooling gaps").
 
     Required payload keys: symbols (list). Optional: experts (list; default the 3 core
-    rating/signal experts), workers (default 5), end (ISO; default now), expert_settings
-    (mapping expert class name -> that instance's settings, for settings that change WHICH
-    histories the expert reads), senate_hold_floor_days + senate_hold_min_roundtrips (required
-    only when warming the senate experts; the GA grid's gentlest scalper-filter setting).
+    rating/signal experts), workers (default 5), end (ISO; default now).
     """
     if payload.get("symbols") is None:
         return {"status": "failed", "error": "payload.symbols is required"}
 
     try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         from datetime import timezone as _tz
 
-        from ba2_providers.fmp_common import (
-            frozen_ttl_cache, persist_empty_sentinel, set_ttl_frozen,
-        )
-
         from app.services.prewarm_fetchers import (
-            build_fetchers, PrewarmConfigError, SENATE_EXPERTS,
+            PrewarmConfigError, PrewarmFetchers, resolve_keys, run_prewarm,
         )
-
-        key = _resolve_fmp_key()
-        if not key:
-            return {"status": "failed", "error": "FMP_API_KEY not configured"}
 
         symbols = payload["symbols"]
         if isinstance(symbols, str):
@@ -279,7 +249,8 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not symbols:
             return {"status": "failed", "error": "payload.symbols must be non-empty"}
 
-        experts = payload.get("experts") or ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy"]
+        experts = payload.get("experts") or ["FMPRating", "FMPEarningsDrift",
+                                             "FMPInsiderClusterBuy"]
         if isinstance(experts, str):
             experts = [e.strip() for e in experts.split(",") if e.strip()]
         workers = int(payload.get("workers", 5))
@@ -292,22 +263,6 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             end_date = datetime.now(_tz.utc)
 
-        fetchers = build_fetchers(
-            fmp_key=key,
-            end_date=end_date,
-            finnhub_key=_resolve_finnhub_key(),
-            senate_hold_floor_days=payload.get("senate_hold_floor_days"),
-            senate_hold_min_roundtrips=payload.get("senate_hold_min_roundtrips"),
-            expert_settings=payload.get("expert_settings"),
-            log=logger.info,
-        )
-        # Refuse missing configuration UP FRONT (one message) rather than once per symbol.
-        try:
-            skipped = fetchers.validate(experts)
-        except PrewarmConfigError as e:
-            return {"status": "failed", "error": str(e)}
-        table = fetchers.table
-
         # DeterministicScorer's macro series are economy-wide, so they are refreshed once here
         # rather than entering the per-symbol work list (its per-symbol financial histories DO
         # enter it, through the shared fetcher table, same as the CLI).
@@ -316,54 +271,18 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             fred_summary = _prewarm_fred(float(payload.get("fred_max_age_hours", 24.0)))
             logger.info(f"prewarm task {task_id}: FRED {fred_summary}")
 
-        work = []
-        for expert in experts:
-            if expert in skipped:
-                continue
-            for sym in symbols:
-                work.append((expert, sym, table[expert]))
+        keys = resolve_keys()
+        try:
+            fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
+                                       finnhub_key=keys["finnhub"], log=logger.info)
+            summary = run_prewarm(fetchers, experts, symbols, workers, end=end_date)
+        except PrewarmConfigError as e:
+            # A configuration gap, not a data gap: it would repeat for every remaining symbol,
+            # so the whole task fails instead of reporting a partial warm as success.
+            logger.error(f"prewarm task {task_id} refused: {e}", exc_info=True)
+            return {"status": "failed", "error": str(e)}
 
-        if not work:
-            return {
-                "status": "completed",
-                "summary": {"cached": {}, "errors": 0, "skipped": skipped,
-                            "fred": fred_summary,
-                            "note": "no per-symbol disk-cached experts to pre-warm"},
-            }
-
-        counts: Dict[str, int] = {}
-        errors = 0
-        # THE FREEZE GATE MUST REACH THE WORKERS (see this function's docstring): the context
-        # manager covers this thread, the initializer covers each pool thread. Removing either
-        # one silently turns the whole run into live passthrough fetches that write nothing.
-        with frozen_ttl_cache(), persist_empty_sentinel():
-            with ThreadPoolExecutor(max_workers=max(1, workers),
-                                    initializer=set_ttl_frozen, initargs=(True,)) as ex:
-                futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
-                for fut in as_completed(futures):
-                    expert, sym = futures[fut]
-                    try:
-                        fut.result()
-                        counts[expert] = counts.get(expert, 0) + 1
-                    except Exception as e:  # noqa: BLE001 — one bad symbol must not abort
-                        errors += 1
-                        logger.warning(f"prewarm {expert}/{sym} failed: {e}")
-
-            # Unscoped "latest disclosures" warm (basket-mode _gather_all's
-            # congress_senate_latest / congress_house_latest "ALL_FULL_HISTORY" keys,
-            # deep-paginated) — independent of any universe symbol, so it runs once, serially,
-            # still inside the freeze gate. Same step the CLI runs.
-            senate_latest = False
-            if any(e in experts for e in SENATE_EXPERTS):
-                fetchers.do_senate_latest()
-                senate_latest = True
-
-        summary = {"cached": counts, "errors": errors, "skipped": skipped,
-                   "symbols": len(symbols), "fred": fred_summary,
-                   "senate_latest": senate_latest,
-                   # The CLI's trader-SKILL score prewarm (--start) is GA-grid-specific and is
-                   # NOT run here; say so rather than let a caller assume it happened.
-                   "senate_skill_scores": "not run (ba2-test prewarm --start only)"}
+        summary["fred"] = fred_summary
         logger.info(f"prewarm task {task_id}: {summary}")
         return {"status": "completed", "summary": summary}
     except Exception as e:  # noqa: BLE001

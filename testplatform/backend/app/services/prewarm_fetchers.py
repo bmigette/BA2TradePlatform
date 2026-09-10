@@ -1,4 +1,4 @@
-"""The ONE per-expert prewarm fetcher table, shared by BOTH prewarm entry points.
+"""The ONE prewarm implementation: the per-expert fetcher table AND the run that drives it.
 
 ``ba2-test prewarm`` (``ba2test_launcher._cmd_prewarm``) and the API/queue handler
 (``app.services.data_build_handler.handle_prewarm``) used to carry two independent copies of
@@ -6,26 +6,36 @@ this: the CLI knew seven experts, the handler three, and only the CLI warmed
 DeterministicScorer's per-symbol financial histories. The 2026-09-10 live-replay readiness
 audit ("Two prewarm tooling gaps") found the two entry points were NOT interchangeable -- a
 prewarm driven from the UI reported success having written a fraction of what the CLI writes.
-One table, one set of fetchers, imported by both, is the fix: an expert added here is warmed
-by both entry points or by neither.
+So the fetchers, the freeze gate, the thread pool, the error handling and the counting all live
+here; an entry point contributes argument parsing and reporting, nothing else.
 
-Each fetcher warms exactly the ``fmp_history`` namespaces its expert's ``_gather`` reads, by
+Each fetcher warms exactly the ``fmp_history`` namespaces its expert's ``_gather`` can read, by
 calling the SAME data-layer function the expert calls -- never a hand-rolled re-implementation
 of the fetch, so the warmed surface cannot drift away from the read surface.
 
-THE FREEZE GATE IS THE CALLER'S JOB, AND IT IS THREAD-LOCAL. ``fmp_history_disk_cached`` only
-writes to disk while ``ba2_providers.fmp_common``'s thread-local ttl-freeze flag is set (live
-is a straight passthrough), so a caller running these fetchers in a ``ThreadPoolExecutor``
-MUST pass ``initializer=set_ttl_frozen, initargs=(True,)`` -- entering ``frozen_ttl_cache()``
-on the submitting thread alone leaves every worker un-frozen, fetching over the network and
-writing nothing. ``persist_empty_sentinel()`` (a module global, so it does reach the workers)
-belongs around the same block, so a symbol FMP genuinely has no data for is cached as ``[]``
-("checked, no data") instead of looking forever like a prewarm gap.
+UNION SEMANTICS, NOT PER-INSTANCE SEMANTICS. A fetcher warms every namespace its expert MIGHT
+read, not the ones one particular configuration will read. The GA varies the settings that
+decide (``expected_profit_mode`` is a gene for both FMPEarningsDrift and FMPInsiderClusterBuy;
+``factor_weight_*`` for FactorRanker), so a grid prewarm cannot steer on any instance's
+settings: every trial in a run would need a different warm. Warming the union costs two extra
+per-symbol fetches; warming less costs a hermetic trial an ``FMPHistoryCacheMiss`` mid-run.
+
+THE FREEZE GATE IS THREAD-LOCAL, WHICH IS WHY ``run_prewarm`` OWNS IT. ``fmp_history_disk_cached``
+only writes to disk while ``ba2_providers.fmp_common``'s thread-local ttl-freeze flag is set
+(live is a straight passthrough). Entering ``frozen_ttl_cache()`` on the submitting thread alone
+leaves every pool worker un-frozen: the fetches go out over the network and NOTHING is written,
+while the run reports success. ``initializer=set_ttl_frozen`` sets the flag from inside each
+worker thread. ``persist_empty_sentinel()`` (a module global, so it does reach the workers) makes
+a genuinely-empty history read back as "checked, no data" instead of an eternal prewarm gap.
 """
 from __future__ import annotations
 
 import logging
+import os
+import re
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
@@ -43,20 +53,66 @@ FETCHER_METHODS: Dict[str, str] = {
     "DeterministicScorer": "do_deterministic_scorer",
 }
 
-#: The experts prewarm can warm, in table order (for CLI help / API validation messages).
+#: The experts prewarm can warm, in table order (CLI help / API validation messages).
 EXPERT_NAMES = tuple(FETCHER_METHODS)
 
 #: Experts whose warming needs the congressional-disclosure feeds (the per-symbol fetcher plus
 #: the one-shot unscoped "latest disclosures" warm, ``do_senate_latest``).
 SENATE_EXPERTS = ("FMPSenateTraderWeight", "FMPSenateTraderCopy")
 
+#: The GENTLEST scalper-filter setting any GA trial for FMPSenateTraderWeight will ever use.
+#: A trader excluded by EVEN this setting is excluded by every stricter one too, so no trial can
+#: reach their trades and ``warm_new_traders`` skips warming their (often thousands of)
+#: buy-symbol price histories.
+#:
+#: ONE SOURCE, read by both the prewarm and the GA grid: ``ba2test_launcher._EXPERT_OPT``
+#: imports these values for the ``min_trader_avg_hold_days`` gene floor and the fixed
+#: ``min_trader_hold_roundtrips``. They used to be spelled out in the grid and read back out of
+#: it by the prewarm, which meant only the CLI could see them, and a grid edit could silently
+#: desync the skip from what the GA actually searches. ``hold_floor_days`` is DELIBERATELY > 0
+#: (never "filter disabled"): at 0 a trial could ask for traders this skip never warmed.
+SENATE_SCALPER_BOUNDS: Dict[str, Any] = {"hold_floor_days": 1.0, "hold_min_roundtrips": 3}
+
+#: API keys are quoted verbatim inside FMP/Finnhub HTTP error text. A prewarm log/summary is not
+#: a place to leak one.
+_SECRET_QS = re.compile(r"((?:apikey|api_key|apiKey|token)=)[^&\s'\"]+")
+
 
 class PrewarmConfigError(ValueError):
     """A requested expert cannot be warmed with the configuration it was given.
 
-    Raised UP FRONT (``validate``), before any fetch runs, so missing configuration surfaces as
-    one clear message instead of N per-symbol failures -- or, worse, a run that reports success.
+    Distinct from a per-symbol fetch failure on purpose: a data gap for one instrument is
+    survivable (that symbol is counted as an error and the run continues), while a
+    configuration gap would repeat identically for every remaining symbol. So this type is
+    named by ``run_prewarm``'s per-symbol handler and re-raised, and both entry points report it
+    as a failed run.
     """
+
+
+def redact(text: str) -> str:
+    """Strip API-key query values out of a message bound for a log or a task summary."""
+    return _SECRET_QS.sub(r"\1<redacted>", text)
+
+
+def resolve_keys() -> Dict[str, Optional[str]]:
+    """The API keys prewarm needs: env first, then the app-settings DB (the order the providers
+    and ``ba2-test fetch-cache`` use). ONE resolver for both entry points.
+
+    An absent key comes back ``None`` rather than raising here: FMP is refused by
+    ``PrewarmFetchers`` itself, and Finnhub only matters when FinnHubRating is asked for
+    (``validate``).
+    """
+    def _setting(key: str) -> Optional[str]:
+        try:
+            from ba2_common.config import get_app_setting
+            return get_app_setting(key)
+        except Exception:  # noqa: BLE001 - no DB / no settings row: the env answer stands
+            return None
+
+    return {
+        "fmp": os.getenv("FMP_API_KEY") or _setting("FMP_API_KEY"),
+        "finnhub": os.getenv("FINNHUB_API_KEY") or _setting("finnhub_api_key"),
+    }
 
 
 class PrewarmFetchers:
@@ -65,24 +121,16 @@ class PrewarmFetchers:
     Construction is cheap: providers/experts are built lazily on first use, so an instance
     covering all seven experts costs nothing for the experts a given run does not warm.
 
-    Args are keyword-only and have NO defaults on purpose (no-defaults rule): a caller states
-    every input, and one it cannot supply is passed explicitly as ``None`` and refused by
-    ``validate`` rather than silently standing in for a real value.
-
-    ``expert_settings`` maps expert class name -> that instance's settings dict (the settings a
-    live/backtest instance would run with). It steers settings-DEPENDENT warming -- today
-    FMPInsiderClusterBuy's ``expected_profit_mode`` (see ``do_insider``). An expert absent from
-    the mapping is warmed with its own DECLARED settings defaults (``get_settings_definitions``),
-    which is the platform's ordinary settings resolution; a key absent from THOSE raises.
+    Args are keyword-only and have NO defaults (no-defaults rule): a caller states every input,
+    and one it cannot supply is passed explicitly as ``None`` and refused -- by the constructor
+    for the FMP key, by ``validate`` for Finnhub -- rather than silently standing in for a real
+    value.
     """
 
     def __init__(self, *,
-                 fmp_key: str,
+                 fmp_key: Optional[str],
                  end_date: datetime,
                  finnhub_key: Optional[str],
-                 senate_hold_floor_days: Optional[float],
-                 senate_hold_min_roundtrips: Optional[int],
-                 expert_settings: Optional[Dict[str, Dict[str, Any]]] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         if not fmp_key:
             raise PrewarmConfigError(
@@ -90,12 +138,11 @@ class PrewarmFetchers:
         self.fmp_key = fmp_key
         self.end_date = end_date
         self.finnhub_key = finnhub_key
-        self.senate_hold_floor_days = senate_hold_floor_days
-        self.senate_hold_min_roundtrips = senate_hold_min_roundtrips
-        self.expert_settings: Dict[str, Dict[str, Any]] = expert_settings or {}
         self._log_fn = log if log is not None else logger.info
 
-        # Lazily-built provider/expert singletons (shared across the whole run's symbols).
+        # Lazily-built provider/expert singletons, shared across the whole run's symbols.
+        # Thread-safe enough for the pool below: they hold the API key and nothing else, and
+        # every read they do goes through the shared disk cache (stateless, key-only providers).
         self._details_provider = None
         self._insider_provider = None
         self._finnhub_expert = None
@@ -104,7 +151,7 @@ class PrewarmFetchers:
         # prolific trader is discovered from dozens of symbols, and re-walking their whole
         # history each time is pure wasted CPU (the disk/memory cache already prevented the
         # redundant NETWORK fetch, not the Python-side work of getting there). Lock-guarded
-        # because the caller runs the per-symbol fetchers concurrently.
+        # because the pool runs the per-symbol fetchers concurrently.
         self.senate_expert = None
         self.senate_seen_traders: set = set()
         self._senate_warmed_skill_syms: set = set()
@@ -117,24 +164,18 @@ class PrewarmFetchers:
         return {name: getattr(self, meth) for name, meth in FETCHER_METHODS.items()}
 
     def validate(self, experts: List[str]) -> List[str]:
-        """Refuse an unwarmable request BEFORE any fetch runs; return the unknown experts.
+        """Resolve everything configuration-dependent BEFORE any fetch runs; return the unknown
+        experts.
 
-        Unknown experts are RETURNED (the caller reports them as skipped, as both entry points
-        already did); a KNOWN expert this instance is not configured to warm RAISES, because
-        that one would otherwise fail per symbol, repeatedly, mid-run.
+        Unknown experts are RETURNED (the run reports them as skipped, as both entry points
+        always did); a KNOWN expert this instance is not configured to warm RAISES, because that
+        one would otherwise fail per symbol, repeatedly, for the whole run.
         """
         unknown = [e for e in experts if e not in FETCHER_METHODS]
         if "FinnHubRating" in experts and not self.finnhub_key:
             raise PrewarmConfigError(
                 "finnhub_api_key not configured (set FINNHUB_API_KEY or the app-setting) - "
                 "required to warm FinnHubRating.")
-        if any(e in experts for e in SENATE_EXPERTS):
-            if self.senate_hold_floor_days is None or self.senate_hold_min_roundtrips is None:
-                raise PrewarmConfigError(
-                    "senate_hold_floor_days / senate_hold_min_roundtrips are required to warm "
-                    f"{', '.join(SENATE_EXPERTS)} (the GA grid's gentlest scalper-filter "
-                    "setting; the CLI reads both from _EXPERT_OPT['FMPSenateTraderWeight'], the "
-                    "API takes them as payload keys).")
         return unknown
 
     def log(self, message: str) -> None:
@@ -156,27 +197,6 @@ class PrewarmFetchers:
             self._insider_provider = FMPInsiderProvider()
         return self._insider_provider
 
-    def _expert_setting(self, expert_name: str, cls: Any, key: str) -> Any:
-        """Resolve one setting for *expert_name* the way the platform resolves settings.
-
-        The instance's own value wins when the caller supplied one; otherwise the expert's
-        DECLARED default from ``get_settings_definitions()`` -- the same two steps
-        ``_setting_or_default`` takes. There is no inline default anywhere in the chain: a key
-        that is not declared raises ``KeyError``, and an explicitly-null value raises, so a
-        renamed/removed knob fails loudly here instead of silently warming the wrong surface.
-        """
-        settings = (self.expert_settings[expert_name]
-                    if expert_name in self.expert_settings else None)
-        if settings is not None and key in settings:
-            value = settings[key]
-            if value is None:
-                raise PrewarmConfigError(
-                    f"{expert_name}.{key} was supplied as null - prewarm cannot tell which "
-                    f"histories that instance reads. Give it a real value, or omit the key to "
-                    f"use the expert's declared default.")
-            return value
-        return cls.get_settings_definitions()[key]["default"]
-
     def _warm_estimator_inputs(self, sym: str) -> None:
         """Warm ``analyst_target_model.fetch_estimator_inputs``' two namespaces for *sym*.
 
@@ -190,6 +210,10 @@ class PrewarmFetchers:
         cache namespace every warmed file on disk already uses -- see get_earnings_estimates'
         own docstring). ``lookback_periods`` only trims in Python after the fetch; the cached
         payload is the full per-symbol history either way.
+
+        Warmed UNCONDITIONALLY by every expert that can select the model (see the module
+        docstring on union semantics): ``expected_profit_mode`` is a GA gene, so which mode a
+        given trial runs is not knowable at prewarm time.
         """
         det = self._details()
         det.get_past_earnings(symbol=sym, frequency="quarterly", end_date=self.end_date,
@@ -208,27 +232,26 @@ class PrewarmFetchers:
         fetch_analyst_grades_cached(self.fmp_key, sym)   # dated individual grades (rating-recency)
 
     def do_earnings_drift(self, sym: str) -> None:
+        """Quarterly earnings history, plus the price-target model's inputs: with
+        ``expected_profit_mode='model'`` this expert's ``_gather`` also calls
+        ``fetch_estimator_inputs``, and that mode is a GA gene."""
         self._details().get_past_earnings(
             sym, frequency="quarterly", end_date=self.end_date,
             lookback_periods=8, format_type="dict")
+        self._warm_estimator_inputs(sym)
 
     def do_insider(self, sym: str) -> None:
-        """Insider transactions -- plus, in model mode, the price-target model's inputs.
+        """Insider transactions, plus the price-target model's inputs.
 
-        ``FMPInsiderClusterBuy._gather`` fetches ``estimator_inputs`` ONLY when
-        ``expected_profit_mode == 'model'`` (opt-in I/O, default off), so warming them
-        unconditionally would burn two extra FMP calls per symbol on every static-mode run,
-        and never warming them leaves a model-mode run reading two namespaces prewarm never
-        wrote -- exactly the gap the 2026-09-10 readiness audit found on the deployed
-        model-mode instance. Steer on the instance's own resolved setting instead.
+        ``FMPInsiderClusterBuy._gather`` fetches ``estimator_inputs`` when
+        ``expected_profit_mode == 'model'``. That is a GA gene here too, and the deployed live
+        instance runs the model mode -- the 2026-09-10 readiness audit found it replaying
+        against two namespaces prewarm never wrote.
         """
         self._insider().get_insider_transactions(
             sym, end_date=self.end_date, lookback_days=400, as_of=self.end_date,
             format_type="dict")
-        from ba2_experts.FMPInsiderClusterBuy import FMPInsiderClusterBuy
-        if self._expert_setting("FMPInsiderClusterBuy", FMPInsiderClusterBuy,
-                                "expected_profit_mode") == "model":
-            self._warm_estimator_inputs(sym)
+        self._warm_estimator_inputs(sym)
 
     def do_deterministic_scorer(self, sym: str) -> None:
         """DeterministicScorer: warm the SAME fmp_history namespaces its ``_gather`` reads --
@@ -324,12 +347,12 @@ class PrewarmFetchers:
         for name in new_traders:
             history = s._fetch_trader_history(name) or []  # warms congress_trader_history (once)
             # Scalper skip: a trader excluded by even the grid's gentlest filter setting
-            # contributes to NO GA trial's signal, so their (potentially thousands of)
-            # buy-symbols are dead weight - skip the price-history warm entirely for them.
+            # (SENATE_SCALPER_BOUNDS) contributes to NO GA trial's signal, so their (potentially
+            # thousands of) buy-symbols are dead weight - skip their price-history warm.
             hold_info = s._calculate_trader_avg_hold_days(history)
             if (hold_info["avg_hold_days"] is not None
-                    and hold_info["roundtrips"] >= self.senate_hold_min_roundtrips
-                    and hold_info["avg_hold_days"] < self.senate_hold_floor_days):
+                    and hold_info["roundtrips"] >= SENATE_SCALPER_BOUNDS["hold_min_roundtrips"]
+                    and hold_info["avg_hold_days"] < SENATE_SCALPER_BOUNDS["hold_floor_days"]):
                 continue
             new_skill_syms = []
             with self._senate_lock:
@@ -358,7 +381,8 @@ class PrewarmFetchers:
         """Warm the UNSCOPED 'latest disclosures' cache entries (``congress_senate_latest/
         ALL_FULL_HISTORY``, ``congress_house_latest/ALL_FULL_HISTORY``) that basket-mode
         ``_gather_all`` reads -- a DIFFERENT namespace from the per-symbol entries
-        ``do_senate`` warms, and independent of any universe symbol, so it runs ONCE per run.
+        ``do_senate`` warms, and independent of any universe symbol, so it runs ONCE per run
+        (including for a run that has no per-symbol work at all, e.g. FMPSenateTraderCopy alone).
 
         DEEP PAGINATION (``full_history=True``) on purpose: the single-page fetch reaches back
         ~4 months, which left basket-mode FMPSenateTraderWeight scoring ``trades=0`` for EVERY
@@ -375,15 +399,83 @@ class PrewarmFetchers:
         self.warm_new_traders(s, senate_latest + house_latest)
 
 
-def build_fetchers(*, fmp_key: str, end_date: datetime, finnhub_key: Optional[str],
-                   senate_hold_floor_days: Optional[float],
-                   senate_hold_min_roundtrips: Optional[int],
-                   expert_settings: Optional[Dict[str, Dict[str, Any]]] = None,
-                   log: Optional[Callable[[str], None]] = None) -> PrewarmFetchers:
-    """Build the shared fetcher set. BOTH prewarm entry points go through this function --
-    it is the seam that makes "the CLI and the API warm the same thing" testable."""
-    return PrewarmFetchers(
-        fmp_key=fmp_key, end_date=end_date, finnhub_key=finnhub_key,
-        senate_hold_floor_days=senate_hold_floor_days,
-        senate_hold_min_roundtrips=senate_hold_min_roundtrips,
-        expert_settings=expert_settings, log=log)
+def run_prewarm(fetchers: PrewarmFetchers, experts: List[str], symbols: List[str], workers: int,
+                *, end: datetime) -> Dict[str, Any]:
+    """Warm *experts* x *symbols*, and return what was written. THE prewarm run.
+
+    Owns the freeze gate, the worker-thread initializer, the empty-result sentinel, the
+    per-symbol error handling and the one-shot senate warm, so neither entry point can get any
+    of them subtly wrong (the API handler did: see the module docstring).
+
+    Raises ``PrewarmConfigError`` -- from ``validate`` up front, or out of a worker -- for a
+    configuration gap the run cannot survive. A per-SYMBOL failure is counted instead: one
+    instrument's data gap must not abort a 500-symbol warm.
+    """
+    from ba2_providers.fmp_common import (
+        frozen_ttl_cache, persist_empty_sentinel, set_ttl_frozen,
+    )
+
+    t0 = time.time()
+    skipped = fetchers.validate(experts)
+    for name in skipped:
+        fetchers.log(f">> skipping unknown expert '{name}' (no disk-cached history fetcher)")
+
+    table = fetchers.table
+    work = []  # list of (expert, symbol, fetch_callable)
+    for expert in experts:
+        if expert in skipped:
+            continue
+        for sym in symbols:
+            work.append((expert, sym, table[expert]))
+
+    counts: Dict[str, int] = {}
+    failures: List[str] = []
+    errors = 0
+    senate_latest = False
+
+    with frozen_ttl_cache(), persist_empty_sentinel():
+        # BEFORE the per-symbol work, so a run whose experts have no per-symbol fetcher at all
+        # (``--experts FMPSenateTraderCopy``) still warms the unscoped feed it needs.
+        if any(e in experts for e in SENATE_EXPERTS):
+            fetchers.do_senate_latest()
+            senate_latest = True
+
+        if work:
+            with ThreadPoolExecutor(max_workers=max(1, workers),
+                                    initializer=set_ttl_frozen, initargs=(True,)) as ex:
+                futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
+                for fut in as_completed(futures):
+                    expert, sym = futures[fut]
+                    try:
+                        fut.result()
+                        counts[expert] = counts.get(expert, 0) + 1
+                    except PrewarmConfigError:
+                        # Not a per-symbol data gap: it would repeat for every remaining symbol.
+                        raise
+                    except Exception as e:  # noqa: BLE001 — one bad symbol must not abort
+                        errors += 1
+                        # Type + redacted text: an FMP/Finnhub error quotes the failing URL,
+                        # api key and all.
+                        detail = f"{type(e).__name__}: {redact(str(e))}"
+                        failures.append(f"{expert}/{sym}: {detail}")
+                        fetchers.log(f"!! prewarm {expert}/{sym} failed: {detail}")
+
+    notes = []
+    if not work:
+        notes.append("no per-symbol disk-cached experts to pre-warm")
+    # The trader-SKILL score prewarm is GA-grid-specific and driven by the CLI's --start; say so
+    # rather than let a caller read its absence as "done".
+    notes.append("senate trader-skill scores not prewarmed (ba2-test prewarm --start only)")
+
+    return {
+        "cached": counts,
+        "errors": errors,
+        "failures": failures,
+        "skipped": skipped,
+        "symbols": len(symbols),
+        "senate_latest": senate_latest,
+        "senate_skill_scores": False,
+        "notes": notes,
+        "end": end.isoformat(),
+        "elapsed_seconds": round(time.time() - t0, 1),
+    }

@@ -113,6 +113,9 @@ Claude-Session: https://claude.ai/code/session_019YvcXA7kBWFVimxiNSSnNX
 
 **Commit:** `fix(prewarm): backend prewarm persists history from worker threads; one fetcher table; Insider model-mode dependencies (spec step 4 slice)`.
 
+**Amendment (review, 2026-09-11):** "warm the estimator inputs when the instance's `expected_profit_mode == "model"`" was wrong — that setting is a GA gene for BOTH `FMPEarningsDrift` and `FMPInsiderClusterBuy` (`_EXPERT_OPT`), so a grid prewarm cannot steer on any instance's settings; the settings gate is replaced by UNION semantics (both fetchers warm `past_earnings_quarterly` + `earnings_estimates_quarterly` unconditionally, like `do_factorranker` warms every factor).
+Also from the review: the freeze gate + pool + counting moved into the shared module as `run_prewarm(...)` (each entry point keeps only arg parsing and reporting), `PrewarmConfigError` fails the whole run in both entry points, and the senate scalper bounds now live in `prewarm_fetchers.SENATE_SCALPER_BOUNDS` with `_EXPERT_OPT` referencing them (one source).
+
 ---
 
 ### Task 5: Docs, versions, gate
