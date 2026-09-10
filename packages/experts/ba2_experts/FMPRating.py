@@ -22,6 +22,16 @@ from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 from ba2_providers.fmp_common import fmp_http_get, FMPError, TTLCache, fmp_history_disk_cached
 
 
+def symbol_identity(args):
+    """Request identity of the per-symbol FMP fetches below: the symbol, nothing else.
+
+    Named (not an inline lambda per decorator) because the offline replay tape
+    imports it to look a recorded response up by exactly the identity the tap
+    wrote -- and because five copies of one dict is five chances to drift.
+    """
+    return {"symbol": args["symbol"]}
+
+
 # Process-wide short-TTL caches so the many experts that analyze overlapping
 # universes don't each re-fetch the same symbol's FMP data within a run. Keyed by
 # symbol; shared across all FMPRating instances.
@@ -490,8 +500,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
-    @observe_provider("fmp", "price_target_consensus",
-                      identity=lambda a: {"symbol": a["symbol"]})
+    @observe_provider("fmp", "price_target_consensus", identity=symbol_identity)
     def _fetch_price_target_consensus(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
         Fetch price target consensus from FMP API.
@@ -536,8 +545,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # Deduped across experts within the TTL window.
         return _CONSENSUS_CACHE.get_or_call(symbol, _do_fetch)
     
-    @observe_provider("fmp", "upgrade_downgrade_consensus",
-                      identity=lambda a: {"symbol": a["symbol"]})
+    @observe_provider("fmp", "upgrade_downgrade_consensus", identity=symbol_identity)
     def _fetch_upgrade_downgrade(self, symbol: str) -> Optional[list]:
         """
         Fetch analyst upgrade/downgrade summary from FMP API.
@@ -596,8 +604,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         "strongSell": ("analystRatingsStrongSell", "strongSell"),
     }
 
-    @observe_provider("fmp", "grades_historical",
-                      identity=lambda a: {"symbol": a["symbol"]})
+    @observe_provider("fmp", "grades_historical", identity=symbol_identity)
     def _fetch_grades_historical(self, symbol: str) -> list:
         """Fetch the FULL dated analyst-grade history for a symbol (backtest path).
 
@@ -614,8 +621,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # inline _do_fetch + TTLCache/disk-cache wrapping.
         return fetch_grades_historical_cached(self._api_key, symbol)
 
-    @observe_provider("fmp", "price_target_history",
-                      identity=lambda a: {"symbol": a["symbol"]})
+    @observe_provider("fmp", "price_target_history", identity=symbol_identity)
     def _fetch_price_target_history(self, symbol: str) -> list:
         """Fetch the FULL dated individual analyst price-target history (backtest path).
 
@@ -631,8 +637,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # Behaviour is byte-identical to the prior inline _do_fetch + cache wrapping.
         return fetch_price_target_history_cached(self._api_key, symbol)
 
-    @observe_provider("fmp", "analyst_grades",
-                      identity=lambda a: {"symbol": a["symbol"]})
+    @observe_provider("fmp", "analyst_grades", identity=symbol_identity)
     def _fetch_analyst_grades(self, symbol: str) -> list:
         """Fetch the FULL dated INDIVIDUAL analyst-grade history (rating-recency path).
 

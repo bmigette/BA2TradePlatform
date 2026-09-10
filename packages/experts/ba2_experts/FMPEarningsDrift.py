@@ -56,8 +56,17 @@ _CALENDAR_CACHE_TTL_SECONDS = 4 * 3600
 _CALENDAR_CACHE = TTLCache(_CALENDAR_CACHE_TTL_SECONDS)
 
 
-@observe_provider("fmp", "earning_calendar",
-                  identity=lambda a: {"from": a["from_date"], "to": a["to_date"]})
+def earning_calendar_identity(args):
+    """What makes a bulk earnings-calendar response what it is: its date range.
+
+    Named (not an inline lambda) so the offline replay tape can build the SAME
+    identity to look the recorded calendar up by it. The api key is deliberately
+    absent -- it is not part of what makes the response what it is.
+    """
+    return {"from": args["from_date"], "to": args["to_date"]}
+
+
+@observe_provider("fmp", "earning_calendar", identity=earning_calendar_identity)
 def _fetch_earnings_calendar_by_symbol(api_key: str, from_date: str, to_date: str) -> Dict[str, dict]:
     """Market-wide earnings calendar for [from_date, to_date], deduped to the LATEST row per
     symbol, keyed upper-case. ONE API call regardless of universe size — no symbol list, so

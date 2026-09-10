@@ -34,16 +34,23 @@ def ohlcv_get(provider, symbol, as_of=None, lookback=400, interval="1d", format_
     return provider.get_ohlcv_data(symbol, end_date=end, lookback_days=lookback, interval=interval)
 
 
-@observe_provider(
-    "provider_cache", "insider_get",
-    identity=lambda a: {
-        "provider": type(a["provider"]).__name__,
-        "symbol": a["symbol"],
-        "as_of": a["as_of"],
-        "lookback": a["lookback"],
-        "format_type": a["format_type"],
-    },
-)
+def insider_get_identity(args):
+    """What makes an ``insider_get`` response what it is.
+
+    Named (not an inline lambda) because the offline replay tape has to build the
+    SAME identity to look a recorded response up by it -- two copies of this dict
+    would drift and turn a real match into a silent miss.
+    """
+    return {
+        "provider": type(args["provider"]).__name__,
+        "symbol": args["symbol"],
+        "as_of": args["as_of"],
+        "lookback": args["lookback"],
+        "format_type": args["format_type"],
+    }
+
+
+@observe_provider("provider_cache", "insider_get", identity=insider_get_identity)
 def insider_get(provider, symbol, as_of=None, lookback=30, format_type="dict"):
     """Insider transactions. ``as_of`` is threaded so the corrected provider enforces
     the no-lookahead filingDate anchor when set; with ``as_of=None`` the live
@@ -64,17 +71,19 @@ def statement_get(provider, symbol, statement, as_of=None, frequency="annual",
               as_of=as_of, format_type=format_type)
 
 
-@observe_provider(
-    "provider_cache", "past_earnings_get",
-    identity=lambda a: {
-        "provider": type(a["provider"]).__name__,
-        "symbol": a["symbol"],
-        "as_of": a["as_of"],
-        "frequency": a["frequency"],
-        "lookback_periods": a["lookback_periods"],
-        "format_type": a["format_type"],
-    },
-)
+def past_earnings_get_identity(args):
+    """What makes a ``past_earnings_get`` response what it is (see above)."""
+    return {
+        "provider": type(args["provider"]).__name__,
+        "symbol": args["symbol"],
+        "as_of": args["as_of"],
+        "frequency": args["frequency"],
+        "lookback_periods": args["lookback_periods"],
+        "format_type": args["format_type"],
+    }
+
+
+@observe_provider("provider_cache", "past_earnings_get", identity=past_earnings_get_identity)
 def past_earnings_get(provider, symbol, as_of=None, frequency="quarterly",
                       lookback_periods=1, format_type="dict"):
     """Historical earnings up to ``as_of``. The provider's existing report-date

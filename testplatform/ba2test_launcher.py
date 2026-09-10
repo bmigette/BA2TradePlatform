@@ -50,8 +50,21 @@ def _parse_symbols_arg(raw: str) -> list:
     return [s.strip().upper() for s in raw.replace(",", " ").split() if s.strip()]
 
 
+#: The directory the user actually ran the command from. ``_enter_backend`` chdirs
+#: into ``backend/``, so a relative path typed on the command line has to be
+#: resolved against this instead of against the process cwd.
+_CALLER_CWD = os.getcwd()
+
+
+def _caller_path(raw: str) -> str:
+    """A command-line path, resolved against the directory the user ran from."""
+    return os.path.abspath(os.path.join(_CALLER_CWD, os.path.expanduser(raw)))
+
+
 def _enter_backend() -> str:
     """Put ``backend/`` on the path and chdir into it (the app's import + cwd root)."""
+    global _CALLER_CWD
+    _CALLER_CWD = os.getcwd()
     repo_root = os.path.dirname(os.path.abspath(__file__))
     backend = os.path.join(repo_root, "backend")
     if not os.path.isdir(backend):
@@ -918,6 +931,43 @@ def _cmd_cache_clear(args) -> int:
         res = cache_manager.clear_all(before=before)
     print(json.dumps(res, indent=2, default=str))
     return 0
+
+
+# --- replay (offline replay of a recorded live session) --------------------------------
+def _cmd_replay(args) -> int:
+    """``inventory`` / ``experts`` / ``gather`` over one exported replay bundle.
+
+    Everything runs offline: the services enter the replay isolation (hermetic
+    FMP, a closed socket layer, refusing instance/provider resolvers) and read
+    only the bundle. Nothing here opens the trading database.
+    """
+    from app.services.replay import expert_replay, gather_tape, inventory
+
+    bundle = _caller_path(args.bundle)
+    if not os.path.isdir(bundle):
+        sys.exit(f"ba2-test: {bundle} is not a directory")
+    out = _caller_path(args.out) if getattr(args, "out", None) else None
+
+    if args.replay_cmd == "inventory":
+        counted = inventory.run(bundle, out)
+        print(inventory.to_markdown(counted))
+        if out:
+            print(f"-- wrote {os.path.join(out, inventory.INVENTORY_NAME)}")
+        return 0
+
+    from ba2_common.core.replay import ReplayStatus
+
+    module = expert_replay if args.replay_cmd == "experts" else gather_tape
+    report = module.run(bundle, out)
+    print(report.to_markdown())
+    if out:
+        print(f"-- wrote {os.path.join(out, report.capability + '.md')}")
+    # A DIFFERENCE is a finding: something reproduced differently, which is what
+    # this command exists to surface, so it exits non-zero and a CI step can gate
+    # on it. A missing_capture is not a finding about the calculation -- it says
+    # the session cannot answer for that analysis -- so it does not fail the run;
+    # the report and `replay inventory` are where coverage is read.
+    return 0 if report.counts()[ReplayStatus.COVERAGE_DIFFERENCE] == 0 else 1
 
 
 # --- backtest run tracking (the shared `backtests` results table) ----------------------
@@ -6279,6 +6329,22 @@ def main(argv: "list | None" = None) -> int:
 
     sub.add_parser("cache-usage", help="Show cache disk usage per type.")
 
+    # replay: offline replay of an exported live-capture session (spec step 3).
+    rpl = sub.add_parser("replay", help="Offline replay of a recorded live session bundle.")
+    rplsub = rpl.add_subparsers(dest="replay_cmd", required=True)
+    rpi = rplsub.add_parser("inventory",
+                            help="What the session contains (counts, coverage, gaps).")
+    rpi.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpi.add_argument("--out", default=None, help="Write inventory.json/.md here.")
+    rpe = rplsub.add_parser("experts",
+                            help="Re-run _process on each recorded bundle and diff the result.")
+    rpe.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpe.add_argument("--out", default=None, help="Write the report here.")
+    rpg = rplsub.add_parser("gather",
+                            help="Re-run the live _gather against the recorded provider tape.")
+    rpg.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpg.add_argument("--out", default=None, help="Write the report here.")
+
     # runs: manage tracked backtest runs (the shared `backtests` results table).
     rp = sub.add_parser("runs", help="List / save / delete tracked backtest runs.")
     rsub = rp.add_subparsers(dest="runs_cmd", required=True)
@@ -6668,6 +6734,7 @@ def main(argv: "list | None" = None) -> int:
         "cache-usage": lambda: _cmd_cache_usage(args),
         "cache-clear": lambda: _cmd_cache_clear(args),
         "runs": lambda: _cmd_runs(args),
+        "replay": lambda: _cmd_replay(args),
         "report": lambda: _cmd_report(args),
         "optimize": lambda: _cmd_optimize(args),
         "optimize-batch": lambda: _cmd_optimize_batch(args),
