@@ -65,6 +65,12 @@ class _Acct(AccountInterface):
         # ``None`` is the tri-state FETCH FAILURE -- see get_positions below.
         self.positions = []
         self.position_calls = 0
+        # The BROKER's order book, keyed by broker_order_id. Empty means "the broker
+        # agrees with the local row" -- get_order below echoes it. A test that needs the
+        # broker to disagree (a fill the local row has not learned about) registers the
+        # broker's version here; ``None`` models a fetch the broker could not answer.
+        self.broker_orders = {}
+        self.broker_order_reads = []
 
     @property
     def settings(self):
@@ -100,7 +106,18 @@ class _Acct(AccountInterface):
         return []
 
     def get_order(self, order_id):
-        return None
+        """The BROKER's view of ONE order, by broker id.
+
+        Default: echo the local row, i.e. a broker in step with the platform -- which is
+        what every pre-existing case in this file assumes, so their pending totals are
+        unchanged. ``broker_orders`` overrides one id to model the gap the ceiling has to
+        survive: the broker has filled it, the local row has not been refreshed yet.
+        """
+        self.broker_order_reads.append(order_id)
+        if order_id in self.broker_orders:
+            return self.broker_orders[order_id]
+        matches = ts.orders_where(account_id=self.id, broker_order_id=order_id)
+        return matches[0] if matches else None
 
     def symbols_exist(self, symbols):
         return {s: True for s in symbols}
@@ -772,3 +789,145 @@ def test_margin_off_reads_nothing_at_all(monkeypatch):
     assert acct.snapshot_calls == 0
     assert acct.position_calls == 0
     assert reads == []
+
+
+# ----- 11. the broker reconciles the local row (2026-09-10 review, finding 2) ------
+#
+# The local orders table is refreshed on a schedule. A market order fills at the broker
+# in milliseconds, so between the fill and the next refresh_orders() the row still says
+# PENDING_NEW with a NULL filled_qty while the shares are ALREADY in the snapshot's
+# long_market_value. The ceiling reads both, so those shares were charged twice and the
+# headroom collapsed: production 2026-09-10 read $29.02 of room while $942.69 was real,
+# and refused two funded entries (SAIL $466.02, AVAV $437.86) that never reached the
+# broker. The pending sum now asks the BROKER what is still working.
+
+
+def _broker_view(acct, *, status, quantity, filled_qty=None, broker_order_id="brk-1"):
+    """What the BROKER says about one order -- the adapters return exactly this shape
+    (a TradingOrder built by alpaca_order_to_tradingorder / tastytrade_order_to_tradingorder)."""
+    return TradingOrder(account_id=acct.id, symbol="MSFT", quantity=quantity,
+                        side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                        status=status, filled_qty=filled_qty,
+                        broker_order_id=broker_order_id)
+
+
+def test_a_locally_pending_entry_the_broker_has_filled_is_not_pending():
+    """The double count itself: the fill is in long_market_value, so counting the local
+    row's untouched quantity charges the same shares to the ceiling twice."""
+    acct = _Acct(id_val=953, balance=10_000.0, snapshot=_snap(long_mv=5_000.0), settings=ON)
+    with ts.inmem_trades():
+        _with_entry_order(acct, status=OrderStatus.PENDING_NEW, filled_qty=None)
+        acct.broker_orders["brk-1"] = _broker_view(
+            acct, status=OrderStatus.FILLED, quantity=50.0, filled_qty=50.0)
+        assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
+
+
+def test_an_entry_cancelled_at_the_broker_is_not_pending_either():
+    acct = _Acct(id_val=954, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+    with ts.inmem_trades():
+        _with_entry_order(acct, status=OrderStatus.PENDING_NEW, filled_qty=None)
+        acct.broker_orders["brk-1"] = _broker_view(
+            acct, status=OrderStatus.CANCELED, quantity=50.0, filled_qty=0.0)
+        assert acct.get_stock_exposure_headroom() == pytest.approx(18_000.0)
+
+
+def test_a_partial_fill_at_the_broker_counts_only_the_brokers_remainder():
+    """The local row has learned nothing (filled_qty NULL); the broker has 20 of 50 done."""
+    acct = _Acct(id_val=955, balance=10_000.0, snapshot=_snap(long_mv=2_000.0), settings=ON)
+    with ts.inmem_trades():
+        _with_entry_order(acct, status=OrderStatus.PENDING_NEW, filled_qty=None)
+        acct.broker_orders["brk-1"] = _broker_view(
+            acct, status=OrderStatus.PARTIALLY_FILLED, quantity=50.0, filled_qty=20.0)
+        # 18,000 ceiling - 2,000 marked - 30 still working x 100
+        assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
+
+
+def test_an_unreadable_broker_order_counts_the_local_remainder_and_warns(account_records):
+    """``None`` is not "nothing is working". The local remainder OVER-states exposure,
+    which refuses an entry instead of over-exposing the account -- and it says so."""
+    acct = _Acct(id_val=956, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+    with ts.inmem_trades():
+        _with_entry_order(acct, status=OrderStatus.PENDING_NEW, filled_qty=None)
+        acct.broker_orders["brk-1"] = None              # the single-order fetch failed
+        assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
+    hits = [msg for lvl, msg in account_records
+            if lvl == logging.WARNING and "could not read the broker's view" in msg]
+    assert len(hits) == 1, account_records
+    assert "brk-1" in hits[0] and "MSFT" in hits[0]
+
+
+def test_an_unparseable_broker_status_is_unreadable_not_done(account_records):
+    """UNKNOWN is what the adapters produce from a status they cannot map. Reading it as
+    "done" would DROP real exposure from the total -- the direction that fails open."""
+    acct = _Acct(id_val=957, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+    with ts.inmem_trades():
+        _with_entry_order(acct, status=OrderStatus.PENDING_NEW, filled_qty=None)
+        acct.broker_orders["brk-1"] = _broker_view(
+            acct, status=OrderStatus.UNKNOWN, quantity=50.0, filled_qty=None)
+        assert acct.get_stock_exposure_headroom() == pytest.approx(13_000.0)
+    assert any(lvl == logging.WARNING and "could not read the broker's view" in msg
+               for lvl, msg in account_records)
+
+
+def test_exactly_one_broker_read_per_countable_working_order():
+    """Live there are a handful of working entries at a time, and this runs per sizing
+    decision: one round trip each, and none at all for an order that is already excluded."""
+    acct = _Acct(id_val=958, balance=10_000.0, snapshot=_snap(long_mv=0.0), settings=ON)
+    with ts.inmem_trades():
+        parent = _with_entry_order(acct)                      # counted
+        _with_entry_order(acct, status=OrderStatus.FILLED,    # excluded: locally done
+                          filled_qty=50.0, broker_order_id="brk-done")
+        _with_entry_order(acct, side=OrderDirection.SELL,     # excluded: protective leg
+                          depends_on_order=parent,
+                          depends_order_status_trigger=OrderStatus.FILLED,
+                          broker_order_id="brk-leg")
+        acct.broker_order_reads.clear()
+        acct.get_stock_exposure_headroom()
+    assert acct.broker_order_reads == ["brk-1"]
+
+
+def test_margin_off_never_asks_the_broker_about_an_order():
+    """BACKTEST PIN. The breakdown returns None before any of this, so a backtest pays
+    for no snapshot, no store read and no broker round trip -- by construction."""
+    acct = _Acct(id_val=959, balance=10_000.0, snapshot=_snap(long_mv=18_000.0), settings=OFF)
+    with ts.inmem_trades():
+        _with_entry_order(acct)
+        assert acct.get_stock_exposure_headroom() is None
+    assert acct.broker_order_reads == []
+    assert acct.snapshot_calls == 0
+
+
+def test_the_2026_09_10_double_count_that_refused_two_funded_entries():
+    """The production shape, with the review's own numbers.
+
+    Equity $2,004.14 x factor 1.8 = a $3,607.45 ceiling (Alpaca reports multiplier 4, so
+    the platform's factor is the binding one). $1,703.40 was already marked, then NAVN,
+    TTAN and CHWY filled for $955.02 -- into long_market_value -- while their local rows
+    still read PENDING_NEW with a NULL filled_qty. Counting those rows as pending charged
+    the $955.02 twice and left NEGATIVE headroom, so SAIL ($466.02) and AVAV ($437.86)
+    were refused. The real figure, logged two minutes later once the orders refreshed,
+    was $942.69 with no pending entries.
+    """
+    fills = [("NAVN", 22.0, 20.2050, "brk-navn"),
+             ("TTAN", 8.0, 56.1594, "brk-ttan"),
+             ("CHWY", 3.0, 20.4115, "brk-chwy")]
+    filled_notional = sum(qty * price for _, qty, price, _ in fills)      # 955.02
+    acct = _Acct(id_val=960, balance=2_004.14, settings=ON,
+                 snapshot=_snap(multiplier=4.0, buying_power=3_944.31,
+                                long_mv=1_703.40 + filled_notional))
+    with ts.inmem_trades():
+        for symbol, qty, price, broker_id in fills:
+            _with_entry_order(acct, symbol=symbol, qty=qty, limit_price=price,
+                              status=OrderStatus.PENDING_NEW, filled_qty=None,
+                              broker_order_id=broker_id)
+            acct.broker_orders[broker_id] = _broker_view(
+                acct, status=OrderStatus.FILLED, quantity=qty, filled_qty=qty,
+                broker_order_id=broker_id)
+        breakdown = acct._stock_exposure_breakdown()
+
+    assert breakdown.ceiling == pytest.approx(3_607.45, abs=0.01)
+    assert breakdown.gross == pytest.approx(2_658.42, abs=0.01)
+    assert breakdown.pending == 0.0, "the fills are in the gross; they are not also pending"
+    assert breakdown.headroom == pytest.approx(949.03, abs=0.01)
+    # Both refused entries fit in the real headroom; the double count left -$5.99.
+    assert breakdown.headroom > 466.02 + 437.86

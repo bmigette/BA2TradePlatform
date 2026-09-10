@@ -719,6 +719,59 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 f"value (long={long_mv!r}, short={short_mv!r}); cannot measure exposure")
         return long_value + abs(short_value)
 
+    def get_broker_order_remaining_quantity(self, order) -> Optional[float]:
+        """The quantity the BROKER still has working on ``order``; ``None`` when unreadable.
+
+        The local orders table is refreshed on a schedule, so between a fill and the next
+        ``refresh_orders()`` a row keeps its pre-fill status and a NULL ``filled_qty`` while
+        the broker has ALREADY marked the shares into ``long_market_value``. The exposure
+        ceiling reads both figures, so those same shares were counted twice -- once in the
+        gross, once in the pending total -- and the headroom collapsed. Production,
+        2026-09-10: NAVN/TTAN/CHWY (about $955) filled at 15:32:23-30, headroom read $29.02
+        at 15:32:34 and two funded entries (SAIL, AVAV) were refused; eight seconds after
+        the order refresh the same account reported $942.69 with no pending entries.
+
+        Asking the BROKER what is still working removes the double count at its source.
+        This is a single-order read through the adapter's existing ``get_order`` wrapper --
+        no second SDK call site -- and it is called only for orders that would otherwise be
+        counted, of which a live account has a handful at a time.
+
+        Returns:
+            The unfilled quantity the broker reports (0.0 once the order is filled or
+            terminal at the broker), or ``None`` when the broker's view cannot be read --
+            the order is unknown to it, the fetch failed, or the figures it published are
+            not usable. ``None`` is never "nothing is working": the caller falls back to
+            the LOCAL remaining quantity, which over- rather than under-states exposure.
+        """
+        broker_order_id = order.broker_order_id
+        if not broker_order_id:
+            return None
+        broker_order = self.get_order(broker_order_id)
+        if broker_order is None:
+            # Both live adapters log the broker error themselves and return None.
+            return None
+        status = getattr(broker_order, "status", None)
+        if status in (OrderStatus.FILLED,) or status in OrderStatus.get_terminal_statuses():
+            return 0.0
+        if status not in WORKING_ORDER_STATUSES:
+            # UNKNOWN (an unparseable broker status) lands here. Reading it as "done"
+            # would drop real exposure from the total, so it is an unreadable answer.
+            return None
+        quantity = getattr(broker_order, "quantity", None)
+        filled = getattr(broker_order, "filled_qty", None)
+        if quantity is None:
+            return None
+        try:
+            # A broker that publishes no fill figure for a working order has told us
+            # nothing about it; the whole quantity is still the conservative reading.
+            quantity = float(quantity)
+            filled = 0.0 if filled is None else float(filled)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(quantity) or not math.isfinite(filled):
+            return None
+        return max(quantity - filled, 0.0)
+
     def _pending_stock_entry_notional(self, exclude_order_id: Optional[int] = None) -> float:
         """Notional of this account's BROKER-WORKING stock ENTRY orders, in dollars.
 
@@ -738,7 +791,10 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             side, so that this and ``AccountInterface._validate_account_exposure`` decide
             "same side" from ONE field: two sources for one question is how a gate and its
             budget come to disagree about which orders they are counting.
-        Only the REMAINING quantity counts: the filled part is already in the market value.
+        Only the REMAINING quantity counts: the filled part is already in the market value,
+        and "remaining" is asked of the BROKER
+        (``get_broker_order_remaining_quantity``) rather than read off the local row --
+        see the note at that call for the double count this closes.
 
         ``exclude_order_id`` drops one row: the order currently being validated. A BRAND-NEW
         entry is not in the table yet (``submit_order`` validates before ``add_instance``),
@@ -801,6 +857,30 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             remaining = quantity - filled
             if remaining <= 0:
                 continue
+
+            # RECONCILE against the broker before counting. The local row is only as fresh
+            # as the last refresh_orders(), and a market order fills in milliseconds: its
+            # shares are in the snapshot's market value (counted in the gross) while this
+            # row still says PENDING_NEW with a NULL filled_qty. Counting the local figure
+            # then charges the SAME shares twice and the headroom collapses -- the
+            # 2026-09-10 double count that refused two funded entries. refresh_orders() is
+            # deliberately NOT called here: it has side effects, and this is a read.
+            broker_remaining = self.get_broker_order_remaining_quantity(order)
+            if broker_remaining is None:
+                logger.warning(
+                    f"[Account {self.id}] could not read the broker's view of working order "
+                    f"{order.id} ({order.symbol}, broker id {order.broker_order_id}); "
+                    f"counting the LOCAL remaining {remaining:g} against the exposure "
+                    f"ceiling. That over-states exposure if it has since filled, which "
+                    f"refuses an entry rather than over-exposing the account.")
+            else:
+                remaining = broker_remaining
+                if remaining <= 0:
+                    logger.debug(
+                        f"[Account {self.id}] working order {order.id} ({order.symbol}) is "
+                        f"already filled or done at the broker; its exposure is in the "
+                        f"market value, not the pending total")
+                    continue
 
             price = order.limit_price
             if price is None:
