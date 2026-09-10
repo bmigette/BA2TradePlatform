@@ -46,6 +46,7 @@ class _LogRecorder:
         self.warning_msgs = []
         self.error_msgs = []
         self.info_msgs = []
+        self.debug_msgs = []
 
     def warning(self, msg, *a, **k):
         self.warning_msgs.append(str(msg))
@@ -57,20 +58,26 @@ class _LogRecorder:
         self.info_msgs.append(str(msg))
 
     def debug(self, msg, *a, **k):
-        pass
+        self.debug_msgs.append(str(msg))
 
 
 class _FakeAccount:
     """A live-shaped account double that records every call the safety net makes."""
 
-    def __init__(self, account_id, prices, positions, raise_on_close=()):
+    def __init__(self, account_id, prices, positions, raise_on_close=(), market_open=True):
         self.id = account_id
+        self._market_open = market_open
+        self.market_open_calls = 0
         self._prices = prices          # symbol -> price (None == unavailable)
         self._positions = positions    # symbol -> signed qty (None == unreadable book)
         self._raise_on_close = set(raise_on_close)
         self.price_calls = []
         self.position_calls = []
         self.closed = []
+
+    def is_market_open(self, *, now=None):
+        self.market_open_calls += 1
+        return self._market_open
 
     def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
         self.price_calls.append(symbol_or_symbols)
@@ -344,3 +351,35 @@ def test_the_oco_stop_leg_limit_is_the_stop_moved_by_the_cushion(side, factor):
     assert request.order_class == OrderClass.OCO
     assert float(request.stop_loss.stop_price) == STOP
     assert float(request.stop_loss.limit_price) == round(STOP * factor, 2)
+
+
+# --------------------------------------------------------------------------- #
+# Market-hours gate (operator decision 2026-09-10: only act while the market is open)
+# --------------------------------------------------------------------------- #
+
+def test_market_closed_means_no_price_read_and_no_close():
+    """After hours the latest quote may be a stale or one-sided print; the sweep must not
+    act on it. Nothing is read and nothing is closed -- the next in-hours refresh decides."""
+    acct_def = create_account_definition()
+    _position(acct_def, "RARE")
+    account = _FakeAccount(acct_def.id, {"RARE": LONG_TRIGGER - 0.01}, {"RARE": 10.0},
+                           market_open=False)
+
+    _, rec = _run(account)
+
+    assert account.market_open_calls == 1
+    assert account.price_calls == []
+    assert account.position_calls == []
+    assert account.closed == []
+    assert any("market not open" in m for m in rec.debug_msgs)
+
+
+def test_market_open_is_consulted_before_any_close():
+    acct_def = create_account_definition()
+    txn = _position(acct_def, "RARE")
+    account = _FakeAccount(acct_def.id, {"RARE": LONG_TRIGGER - 0.01}, {"RARE": 10.0})
+
+    _run(account)
+
+    assert account.market_open_calls == 1
+    assert account.closed == [txn.id]

@@ -400,12 +400,23 @@ class TradeManager:
         position book that cannot be read is likewise a skip, not a close. Each
         transaction is handled independently: one failure logs and the loop continues.
 
-        No market-hours check. A market close submitted after hours is queued to the next
-        open — which is the very fill the backtest models.
+        Runs ONLY while the broker reports the regular session open (step 0 below); an after-hours quote is not trusted.
         """
         from sqlmodel import Session, select
         from .db import get_db
         from .types import AssetClass, TransactionStatus
+
+        # 0) ONLY WHILE THE MARKET IS OPEN (operator decision 2026-09-10). Outside regular
+        # hours the latest quote can be a stale or one-sided after-hours print on a thin
+        # name, and acting on it would queue a market sell for the open that no real trade
+        # justified. Nothing is lost by waiting: the first refresh after the bell (at most
+        # one interval later) still catches an overnight gap, and the open is exactly where
+        # the backtest fills a gapped stop. ``is_market_open`` FAILS CLOSED (an unreadable
+        # clock reads as not open), so a broken clock pauses the sweep, never the reverse.
+        if not account.is_market_open():
+            self.logger.debug(
+                f"Breached-stop sweep for account {account.id}: market not open, skipped")
+            return
 
         # 1) The watch list: OPENED equity transactions of THIS account (transactions link
         #    to an account only through their orders) that actually have a stop to breach.
