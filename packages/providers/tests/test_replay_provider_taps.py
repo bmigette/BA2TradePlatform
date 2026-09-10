@@ -168,6 +168,49 @@ def test_the_payload_is_frozen_against_later_mutation():
     assert _payloads(context)[0]["transactions"][0]["value"] == 1
 
 
+def test_a_failing_provider_propagates_unchanged_and_records_nothing():
+    """A tap observes RETURNS. There is no return here, so there is nothing to record.
+
+    Recording the attempt would put a row in the store that no replay can use and
+    that reads like a response; swallowing the error would be worse still. The
+    exception must arrive at the caller exactly as the provider raised it.
+    """
+    boom = ValueError("FMP quota exhausted")
+
+    class _Failing:
+        def get_insider_transactions(self, *a, **k):
+            raise boom
+
+    context = _context()
+    with use_capture_context(context):
+        with pytest.raises(ValueError) as excinfo:
+            insider_get(_Failing(), "AAPL")
+
+    assert excinfo.value is boom, "the tap re-wrapped or replaced the exception"
+    assert _observations(context) == [], (
+        "a failed fetch has no return value to observe")
+    assert context.capture_failures == {}, (
+        "a provider failure is not a RECORDING failure and must not be counted as one")
+
+
+def test_a_broken_identity_function_never_breaks_the_call(monkeypatch):
+    """A defect in the recording code degrades coverage, not the provider call."""
+    from ba2_common.core.replay import observe as observe_module
+
+    @observe_provider("test", "explodes",
+                      identity=lambda a: 1 / 0)          # a bug in the tap itself
+    def _fetch(value):
+        return {"value": value}
+
+    context = _context()
+    with use_capture_context(context):
+        result = _fetch(7)
+
+    assert result == {"value": 7}, "the caller must still get its value"
+    assert context.capture_failures, "the degradation must be counted"
+    assert context.health.total >= 1
+
+
 # --------------------------------------------------------------------------- #
 # 3. No credential ever reaches the store
 # --------------------------------------------------------------------------- #

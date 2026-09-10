@@ -16,6 +16,7 @@ import pytest
 
 from ba2_common.core.replay.codec import (
     CODEC_VERSION,
+    CodecDrift,
     UnsafeEnumReference,
     UnsupportedCaptureType,
     content_hash,
@@ -290,6 +291,106 @@ def test_an_unsupported_value_inside_a_dataclass_is_refused_with_its_path():
     with pytest.raises(UnsupportedCaptureType) as excinfo:
         encode(rec)
     assert excinfo.value.path == '$.raw_outputs["junk"]'
+
+
+def test_a_dataclass_with_a_non_init_field_is_refused_at_encode():
+    """A field __init__ cannot take is a field a replay would silently lose."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class WithComputed:
+        value: int = 1
+        computed: int = _dc.field(init=False, default=0)
+
+    WithComputed.__module__ = "ba2_common.core.test_double"
+    with pytest.raises(UnsupportedCaptureType) as excinfo:
+        encode({"d": WithComputed()})
+    assert "non-init" in excinfo.value.type_name
+
+
+def test_a_dataclass_with_an_initvar_is_refused_at_encode():
+    """An InitVar is required by __init__ but is not a field: unreplayable."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class WithInitVar:
+        value: int = 1
+        seed: _dc.InitVar[int] = 0
+
+        def __post_init__(self, seed):
+            pass
+
+    WithInitVar.__module__ = "ba2_common.core.test_double"
+    with pytest.raises(UnsupportedCaptureType) as excinfo:
+        encode({"d": WithInitVar()})
+    assert "InitVar" in excinfo.value.type_name
+
+
+def _dataclass_payload(type_name, fields):
+    """Hand-build a stored ``$dataclass`` object, as a record written earlier would be."""
+    return _raw_json_object({"$dataclass": {"type": type_name, "fields": fields}})
+
+
+def test_a_field_added_since_the_record_replays_when_it_has_a_default():
+    """Adding an optional field must not make every older record unreadable."""
+    from ba2_common.core.types import Recommendation
+
+    # A record written before ``target_price`` existed: everything else present.
+    data = _dataclass_payload(
+        "ba2_common.core.types.Recommendation",
+        {
+            "signal": {"$enum": "ba2_common.core.types.OrderRecommendation.HOLD"},
+            "confidence": 0.0,
+            "current_price": 1.0,
+            "details": "",
+            "expected_profit_percent": None,
+            "raw_outputs": {},
+            "skip": False,
+            "skip_reason": None,
+        },
+    )
+    restored = decode("json", data, {"codec_version": CODEC_VERSION})
+    assert isinstance(restored, Recommendation)
+    assert restored.target_price is None, "the class supplied its own default"
+
+
+def test_a_field_removed_since_the_record_is_typed_drift_naming_the_field():
+    """A record naming a field the class no longer has cannot be replayed honestly."""
+    data = _dataclass_payload(
+        "ba2_common.core.types.Recommendation",
+        {
+            "signal": {"$enum": "ba2_common.core.types.OrderRecommendation.HOLD"},
+            "confidence": 0.0,
+            "current_price": 1.0,
+            "gone_since_2025": "whatever this used to mean",
+        },
+    )
+    with pytest.raises(CodecDrift) as excinfo:
+        decode("json", data, {"codec_version": CODEC_VERSION})
+    assert excinfo.value.field == "gone_since_2025"
+    assert "Recommendation" in excinfo.value.type_name
+
+
+def test_a_required_field_added_since_the_record_is_typed_drift():
+    """Nothing can supply a new REQUIRED field, so the record is not replayable."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class Grew:
+        value: int
+        added_required: int
+
+    Grew.__module__ = "ba2_common.core.types"
+    import ba2_common.core.types as types_module
+
+    types_module.Grew = Grew
+    try:
+        data = _dataclass_payload("ba2_common.core.types.Grew", {"value": 1})
+        with pytest.raises(CodecDrift) as excinfo:
+            decode("json", data, {"codec_version": CODEC_VERSION})
+        assert excinfo.value.field == "added_required"
+    finally:
+        del types_module.Grew
 
 
 # --------------------------------------------------------------------------- refusals

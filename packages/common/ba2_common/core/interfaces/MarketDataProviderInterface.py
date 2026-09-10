@@ -49,7 +49,7 @@ def _ohlcv_cache_counters():
 def _ohlcv_provenance(args, before):
     from ba2_common.core import native_cache
 
-    if not args.get("use_cache", True):
+    if not args["use_cache"]:
         # Caching disabled: the frame can only have come from the source.
         return ReplayStatus.PROVENANCE_NETWORK
     if before is None:

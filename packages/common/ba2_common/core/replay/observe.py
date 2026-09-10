@@ -13,6 +13,12 @@ identity, classify its provenance or freeze its payload counts the failure on th
 analysis's :class:`~ba2_common.core.replay.context.CaptureHealth` and returns the
 provider's value unchanged: capture is observational, and a broken recorder must
 never turn a working fetch into a failed analysis.
+
+**BA2_ERROR_MODE.** That is a deliberate opt-out from the house "broad handlers
+propagate" rule, and it applies ONLY to the recording work -- never to the
+wrapped call, whose exception propagates untouched and unrecorded. The loudness
+that replaces propagation is the health counter plus one ERROR per analysis (see
+:mod:`ba2_common.core.replay.context`).
 """
 from __future__ import annotations
 

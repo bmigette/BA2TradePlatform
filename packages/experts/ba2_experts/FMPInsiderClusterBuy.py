@@ -367,12 +367,12 @@ Confidence: {confidence:.1f}%
             # replaces. This body has no early return -- _process never sets
             # skip=True for this expert (see _build_export_metrics), so every path
             # either reaches a recommendation or raises, and both are recorded.
-            with self._analysis_capture(market_analysis, settings,
-                                        self._use_case_of(market_analysis)):
+            use_case = self._use_case_of(market_analysis)
+            with self._analysis_capture(market_analysis, settings, use_case):
                 bundle, rec = self._gather_and_process(
                     providers, settings,
                     market_analysis=market_analysis,
-                    use_case=self._use_case_of(market_analysis),
+                    use_case=use_case,
                     validate=self._require_current_price,
                 )
 

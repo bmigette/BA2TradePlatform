@@ -23,6 +23,7 @@ from ba2_common.core.replay.clock import ReplayMiss, replay_now
 from ba2_common.core.replay.codec import (
     CODEC_VERSION,
     ENUM_MODULE_PREFIXES,
+    CodecDrift,
     Encoded,
     UnsafeEnumReference,
     UnsupportedCaptureType,
@@ -34,6 +35,7 @@ from ba2_common.core.replay.codec import (
 from ba2_common.core.replay.context import (
     CaptureContext,
     CaptureHealth,
+    MissingSkipReason,
     PendingObservation,
     capture_aware_submit,
     capture_scope,
@@ -80,6 +82,7 @@ __all__ = [
     "ProviderObservation",
     "CoverageEntry",
     "Encoded",
+    "CodecDrift",
     "UnsupportedCaptureType",
     "UnsafeEnumReference",
     "ENUM_MODULE_PREFIXES",
@@ -95,6 +98,7 @@ __all__ = [
     "ObjectHashMismatch",
     "CaptureContext",
     "CaptureHealth",
+    "MissingSkipReason",
     "PendingObservation",
     "capture_scope",
     "current_capture",

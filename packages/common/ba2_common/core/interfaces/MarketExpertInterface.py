@@ -12,6 +12,7 @@ from ba2_common.core.db import get_instance, get_db
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
+from ba2_common.core.replay.context import MissingSkipReason
 
 
 #: The mapping terms that are DOLLARS, so the log line can render them as money
@@ -774,12 +775,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
     def _analysis_capture(self, market_analysis: Optional["MarketAnalysis"],
                           settings: Optional[Dict[str, Any]], use_case: str):
-        """A recording scope for ONE live analysis; a no-op when capture is off.
+        """RETURNS a context manager recording ONE live analysis (no-op when off).
 
         Wrap the whole live body (gather, process AND the skip/error branches that
         follow) so every outcome is recorded, not only the ones that reach a
-        recommendation. Yields the CaptureContext, or ``None`` when capture is
-        off -- callers must therefore test the context before using it.
+        recommendation. The manager yields the CaptureContext, or ``None`` when
+        capture is off -- a caller that binds it with ``as`` must therefore test
+        it before use.
         """
         from ba2_common.core.replay import capture_scope, get_replay_store
 
@@ -885,22 +887,36 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 context.set_outcome(error=exc)
             raise
         if context is not None:
-            context.set_outcome(recommendation=recommendation)
+            self._record_outcome(context, recommendation)
         return bundle, recommendation
 
     @staticmethod
-    def _record_skip(reason: str) -> None:
-        """Record that this analysis ended in a skip (no-op when capture is off).
+    def _record_outcome(context, recommendation) -> None:
+        """Link what the analysis actually produced: a skip, or a recommendation.
 
-        Every early ``return`` in a live ``run_analysis`` body goes through here:
-        an unrecorded skip is a silently missing coverage row, which reads as a
-        recording gap rather than as the decision it actually was.
+        ONE place decides this for every expert, because the two live call sites
+        that used to decide it themselves could (and did) disagree about whether a
+        skip also leaves a recommendation on the row. ``_process`` returns the
+        skip verdict inside the Recommendation, so this is the only place that
+        needs to know.
+
+        A skip with no reason is a defect in the expert's Recommendation, not a
+        recording failure: it is recorded as the analysis's ERROR, naming the
+        contract it broke, rather than as a reasonless skip nobody can act on or
+        an invented reason.
         """
-        from ba2_common.core.replay import current_capture
+        # getattr, not attribute access: the basket experts return a LIST of
+        # recommendations from their own orchestrators. None of them routes
+        # through here today, and if one ever does, recording must not be the
+        # thing that raises an AttributeError into a live analysis.
+        if not getattr(recommendation, "skip", False):
+            context.set_outcome(recommendation=recommendation)
+            return
+        try:
+            context.set_skip(getattr(recommendation, "skip_reason", None))
+        except MissingSkipReason as exc:
+            context.set_outcome(error=exc)
 
-        context = current_capture()
-        if context is not None:
-            context.set_outcome(skip_reason=reason)
 
     def _resolve_settings(self, keys) -> Dict[str, Any]:
         """Resolve the given setting keys to a plain dict via the live default-resolver.

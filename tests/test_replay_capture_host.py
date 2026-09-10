@@ -12,6 +12,7 @@ it does not:
 * the batch id reaches the RECORD and nothing else -- never a trading row.
 """
 import os
+from datetime import datetime, timezone
 
 import pytest
 
@@ -43,8 +44,12 @@ def _enable():
 # --------------------------------------------------------------------------- #
 # The switch
 # --------------------------------------------------------------------------- #
-def test_missing_setting_is_created_as_false_and_capture_stays_off(cache_root):
+def test_missing_setting_is_created_as_false_and_capture_stays_off(cache_root, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING)
     assert get_setting(replay_capture.CAPTURE_SETTING_KEY) is None
+    caplog.clear()
 
     store = replay_capture.initialize_replay_capture()
 
@@ -55,6 +60,9 @@ def test_missing_setting_is_created_as_false_and_capture_stays_off(cache_root):
         "creates AppSetting rows)")
     assert not os.path.exists(replay_capture.store_root()), (
         "capture off must not create a store directory")
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "the FIRST run legitimately has no setting row; warning about it teaches "
+        f"readers to ignore warnings: {[r.message for r in caplog.records]}")
 
 
 @pytest.mark.parametrize("spelling", ["true", "True", "1", "yes"])
@@ -136,6 +144,184 @@ def test_the_rollover_check_is_free_on_the_same_day(cache_root):
 
     for _ in range(5):
         assert store.current_session_id() == first
+
+
+# --------------------------------------------------------------------------- #
+# Every account class's quote read is tapped
+# --------------------------------------------------------------------------- #
+def _account_classes():
+    """Every concrete broker account class the live platform can instantiate."""
+    from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
+    from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
+
+    return [AlpacaAccount, IBKRAccount, TastyTradeAccount]
+
+
+@pytest.mark.parametrize("account_class", _account_classes(),
+                         ids=lambda c: c.__name__)
+def test_every_account_classes_quote_read_is_tapped(account_class):
+    """An OVERRIDE of get_instrument_current_price silently loses the base tap.
+
+    Inheriting the base method inherits its tap; overriding it replaces both, and
+    nothing about that is visible at the call site -- the quote simply stops being
+    recorded for that broker. IBKRAccount already did this once. The guard is on
+    the resolved attribute, so it holds however the class gets the method.
+    """
+    method = account_class.get_instrument_current_price
+    assert hasattr(method, "__wrapped__"), (
+        f"{account_class.__name__}.get_instrument_current_price is not tapped: an "
+        f"override must carry @observe_provider, or it must not override at all")
+
+
+def test_the_ibkr_override_records_the_quote_it_returned(tmp_path):
+    """The override's own tap: identity, provenance, and the value untouched."""
+    from ba2_common.core.replay import (
+        CaptureContext,
+        CaptureHealth,
+        ReplayStatus,
+        use_capture_context,
+    )
+    from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
+
+    # IBKRAccount is itself abstract (it leaves several AccountInterface methods
+    # unimplemented), so drive its override through a minimal concrete subclass --
+    # which is also what the live registry would have to provide.
+    class _ConcreteIBKR(IBKRAccount):
+        def _get_instrument_current_price_impl(self, *a, **k):
+            raise AssertionError("the override must not fall through to the base impl")
+
+        def _submit_order_impl(self, *a, **k): ...
+        def adjust_sl(self, *a, **k): ...
+        def adjust_tp(self, *a, **k): ...
+        def adjust_tp_sl(self, *a, **k): ...
+        def get_balance(self, *a, **k): ...
+        def get_order(self, *a, **k): ...
+        def get_orders(self, *a, **k): ...
+        def refresh_positions(self, *a, **k): ...
+        def symbols_exist(self, *a, **k): ...
+
+    account = _ConcreteIBKR.__new__(_ConcreteIBKR)
+    account.id = 77
+    account._connected = False          # IBKRAccount.__del__ reads it
+    account._ensure_connected = lambda: None
+    account._create_contract = lambda symbol: object()
+
+    class _Ticker:
+        last = 123.5
+        close = 120.0
+
+    class _IB:
+        def reqMktData(self, contract):
+            return _Ticker()
+
+        def sleep(self, seconds):
+            pass
+
+    account.ib = _IB()
+
+    context = CaptureContext(
+        analysis_meta={
+            "analysis_id": "A1", "attempt_id": "T1", "session_id": "S1",
+            "expert_class": "X", "expert_instance_id": 1, "symbol": "AAPL",
+            "use_case": "enter_market", "scheduled_at": None,
+            "started_at": datetime.now(timezone.utc),
+        },
+        health=CaptureHealth(),
+    )
+    with use_capture_context(context):
+        price = account.get_instrument_current_price("AAPL")
+
+    assert price == 123.5
+    observed = [pending.observation for pending in context.observations]
+    assert len(observed) == 1
+    assert (observed[0].provider, observed[0].method) == (
+        "broker", "get_instrument_current_price")
+    assert observed[0].request_identity["symbols"] == ["AAPL"]
+    assert observed[0].request_identity["account_class"] == "_ConcreteIBKR"
+    assert IBKRAccount.get_instrument_current_price.__wrapped__ is not None, (
+        "the method under test is IBKR's own tapped override, not the base method")
+    assert "price_type" not in observed[0].request_identity, (
+        "this override takes no price_type; the record must not invent one")
+    assert observed[0].provenance == ReplayStatus.PROVENANCE_NETWORK, (
+        "the override keeps no memo -- every call is a broker read")
+    assert context.observations[0].payload == 123.5
+
+
+# --------------------------------------------------------------------------- #
+# The rollover must not stall concurrent analyses
+# --------------------------------------------------------------------------- #
+def test_the_rollover_does_not_hold_the_lock_while_finalizing(cache_root):
+    """Finalizing drains the writer. Draining under the lock stalls every worker.
+
+    At the first analysis after midnight UTC one thread rolls the session. If it
+    finalizes the OLD session while holding the process-wide lock, every other
+    analysis blocks behind it for as long as the writer takes (up to the drain
+    timeout) -- a recording detail delaying trading decisions. The new session
+    must be visible, and the lock free, before any draining starts.
+    """
+    import threading
+
+    _enable()
+    store = replay_capture.initialize_replay_capture()
+    first = store.session_id
+
+    finalize_entered = threading.Event()
+    release_finalize = threading.Event()
+    finalized = []
+
+    def slow_finalize(session_id, timeout=None):
+        finalize_entered.set()
+        release_finalize.wait(10.0)
+        finalized.append(session_id)
+        return 0
+
+    store.finalize_session = slow_finalize
+    replay_capture._SESSION_DATE = "2020-01-01"
+
+    roller = threading.Thread(target=replay_capture._roll_session_if_needed)
+    roller.start()
+    try:
+        assert finalize_entered.wait(5.0), "the rollover never reached finalize"
+
+        # While the old session is still being finalized, a SECOND analysis's
+        # rollover check must return immediately with the new session.
+        done = threading.Event()
+        seen = {}
+
+        def second_analysis():
+            seen["session"] = store.current_session_id()
+            done.set()
+
+        threading.Thread(target=second_analysis).start()
+        assert done.wait(3.0), (
+            "a concurrent analysis blocked behind the finalize -- the lock is "
+            "still held while draining")
+        assert seen["session"] != first
+        assert seen["session"] == store.session_id
+    finally:
+        release_finalize.set()
+        roller.join(10.0)
+
+    assert finalized == [first], "the previous session must still be finalized"
+
+
+def test_the_rollover_finalizes_with_a_short_timeout(cache_root):
+    """A trading thread waits SECONDS on the writer at most, not the full drain."""
+    _enable()
+    store = replay_capture.initialize_replay_capture()
+    seen = {}
+
+    def record_timeout(session_id, timeout=None):
+        seen["timeout"] = timeout
+        return 0
+
+    store.finalize_session = record_timeout
+    replay_capture._SESSION_DATE = "2020-01-01"
+    replay_capture._roll_session_if_needed()
+
+    assert seen["timeout"] == replay_capture.ROLLOVER_DRAIN_TIMEOUT
+    assert replay_capture.ROLLOVER_DRAIN_TIMEOUT <= 5.0
 
 
 # --------------------------------------------------------------------------- #

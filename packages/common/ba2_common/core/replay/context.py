@@ -8,6 +8,14 @@ raised inside recording reaches the expert.
 
 Absence of a context means capture is off -- there is no null-object stand-in to
 mistake for a live recorder.
+
+**BA2_ERROR_MODE.** The house rule is that a broad handler propagates unless the
+site names the type. Recording is the deliberate exception, and this module is
+where the exception lives: an analysis that fails to RECORD must still trade. The
+loudness that replaces propagation is explicit -- a :class:`CaptureHealth` counter
+by kind, a per-analysis ``capture_failures`` map on the record itself, one ERROR
+log per analysis, and a ``missing_capture`` coverage row -- so a swallowed
+recording failure is still visible in four places, just not in the trading path.
 """
 from __future__ import annotations
 
@@ -28,6 +36,7 @@ from ba2_common.logger import logger
 
 __all__ = [
     "CaptureHealth",
+    "MissingSkipReason",
     "CaptureContext",
     "PendingObservation",
     "ReplayMiss",
@@ -63,6 +72,24 @@ class ReplayMiss(Exception):
         self.analysis_id = analysis_id
         self.request_identity = request_identity
         self.detail = detail
+
+
+class MissingSkipReason(ValueError):
+    """A skip was recorded without saying what it skipped on.
+
+    ``Recommendation(skip=True, skip_reason=None)`` is a contract violation by the
+    expert, not a recording failure: the live orchestrators branch on the reason,
+    and a coverage report that says "skip" with no reason is a row nobody can act
+    on. :meth:`CaptureContext.set_skip` therefore requires a reason, which makes
+    the empty case impossible to record by construction.
+    """
+
+    def __init__(self, analysis_id):
+        super().__init__(
+            f"analysis {analysis_id}: a skip must carry a reason "
+            f"(Recommendation.skip_reason was empty)"
+        )
+        self.analysis_id = analysis_id
 
 
 class CaptureHealth:
@@ -266,6 +293,23 @@ class CaptureContext:
                 self._error = _format_error(error)
         except Exception as exc:
             self._note_failure("outcome snapshot failed", exc)
+
+    def set_skip(self, skip_reason: str) -> None:
+        """Record that the analysis ended in a SKIP, with the reason it skipped on.
+
+        The reason is required (:class:`MissingSkipReason` otherwise) -- there is
+        no way to record a reasonless skip through this API.
+
+        A skip is an outcome in its own right, so any recommendation object
+        snapshotted before it is dropped: a row that carried BOTH would say the
+        analysis produced a recommendation AND skipped, and a reader would have
+        to guess which one the live platform acted on.
+        """
+        if skip_reason is None or not str(skip_reason).strip():
+            raise MissingSkipReason(self.analysis_id)
+        self._objects.pop("recommendation", None)
+        self._outcome = ReplayStatus.OUTCOME_SKIP
+        self._skip_reason = str(skip_reason)
 
     def record_observation(
         self,

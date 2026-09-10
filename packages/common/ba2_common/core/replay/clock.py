@@ -9,6 +9,13 @@ freeze the process-wide clock across concurrent live workers."
 Hence: ``as_of`` still wins (the historical branch selector is untouched), a live
 process with no capture context reads the wall clock exactly as before, and the
 context is per-analysis (a ContextVar), never process-wide.
+
+**Reads are an ORDERED LIST, so never read the clock from a pooled worker.**
+Replay hands the recorded reads back in the order they were recorded; two workers
+racing for the next read record (and would replay) in whatever order they happen
+to win, which is not reproducible. Provider taps are safe inside a pool -- they
+are matched by request identity -- but a ``replay_now()`` call is not. Read the
+evaluation time once, on the analysis thread, and pass it into the fan-out.
 """
 from __future__ import annotations
 

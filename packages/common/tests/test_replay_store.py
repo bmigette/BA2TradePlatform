@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from ba2_common.core.replay._spawn_child import SHARED_PAYLOAD, write_session_in_child
 from ba2_common.core.replay.codec import content_hash, encode
 from ba2_common.core.replay.schemas import (
     AnalysisRecord,
@@ -279,49 +280,19 @@ def test_open_sessions_are_marked_interrupted_on_restart(tmp_path):
 # --------------------------------------------------------------------------- concurrency
 
 
-def _write_session_in_child(root, session_id, count):
-    """Top-level worker: spawn-safe on Windows."""
-    from ba2_common.core.replay.codec import encode as child_encode
-    from ba2_common.core.replay.schemas import ReplayStatus as Status
-    from ba2_common.core.replay.store import ObjectRef as Ref
-    from ba2_common.core.replay.store import ObjectStore as Store
-    from ba2_common.core.replay.store import ReplayIndex as Index
-
-    index = Index(os.path.join(root, "index.sqlite"))
-    store = Store(root, index=index)
-    index.begin_session(_session(session_id))
-    observations = []
-    refs = []
-    for seq in range(count):
-        kind, data, _cmeta, _ = child_encode({"session": session_id, "seq": seq})
-        payload_hash = store.put(kind, data)
-        refs.append(Ref(hash=payload_hash, kind=kind, size=len(data)))
-        observations.append(_observation(session_id, f"{session_id}-a1", seq, payload_hash))
-    index.commit_analysis(
-        _analysis(
-            session_id=session_id,
-            analysis_id=f"{session_id}-a1",
-            observation_ids=[o.observation_id for o in observations],
-        ),
-        observations=observations,
-        objects=refs,
-        verify_objects=store,
-    )
-    # Both children publish this IDENTICAL object: two processes racing on the
-    # same content-addressed path must both succeed (Windows os.replace can fail
-    # when the loser's destination is held open by the other).
-    shared_kind, shared_data, _smeta, _ = child_encode({"shared": "both children write me"})
-    store.put(shared_kind, shared_data)
-    index.update_session_status(session_id, Status.SESSION_FINALIZED, ended_at=UTC_NOW)
-    index.close()
-    return 0
+# The child target lives in ``ba2_common.core.replay._spawn_child``, NOT here.
+# ``spawn`` re-imports the target by qualified name in a fresh interpreter, and
+# this file's package is importable as ``tests`` -- as are three other test
+# packages in this repo. Which one the child resolved depended on the order
+# pytest inserted those roots, i.e. on which files the run collected, so the
+# child died with ModuleNotFoundError in a full run and passed on its own.
 
 
 def test_two_processes_write_the_same_root_concurrently(tmp_path):
     root = str(tmp_path)
     ctx = mp.get_context("spawn")
     procs = [
-        ctx.Process(target=_write_session_in_child, args=(root, f"s{n}", 50))
+        ctx.Process(target=write_session_in_child, args=(root, f"s{n}", 50))
         for n in (1, 2)
     ]
     for proc in procs:
@@ -338,7 +309,7 @@ def test_two_processes_write_the_same_root_concurrently(tmp_path):
 
     # the object both children published exists exactly once, uncorrupted
     store = ObjectStore(tmp_path, index=index)
-    kind, data, _meta, _ = encode({"shared": "both children write me"})
+    kind, data, _meta, _ = encode(SHARED_PAYLOAD)
     shared_hash = content_hash(kind, data)
     assert store.exists(shared_hash)
     assert store.get(shared_hash)[1] == data

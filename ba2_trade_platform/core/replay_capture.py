@@ -35,7 +35,7 @@ from ba2_common.core.replay import (
 )
 
 from ..logger import logger
-from .db import add_instance, get_setting
+from .db import add_instance
 from .models import AppSetting
 
 #: The app setting that turns capture on. Created as "false" on first read.
@@ -47,6 +47,14 @@ STORE_LAYOUT = "v1"
 
 #: The exchange the recorded decisions are made against.
 EXCHANGE_TZ = "America/New_York"
+
+#: How long a session rollover waits for the writer before reporting what it
+#: could not flush. SHORT on purpose: the rollover happens on an analysis thread
+#: at the first analysis after midnight UTC, and a slow disk must delay a trading
+#: decision by seconds at most. Whatever is still queued is reported by ``drain``
+#: and leaves the old session marked ``interrupted`` -- an honest, visible gap
+#: rather than a stalled worker.
+ROLLOVER_DRAIN_TIMEOUT = 2.0
 
 #: The expert classes whose live analyses this delivery records (spec section 5).
 #: Named explicitly: an expert that is NOT in this list is uncovered, and a
@@ -92,9 +100,24 @@ def get_current_batch() -> Optional[str]:
 # Lifecycle
 # --------------------------------------------------------------------------- #
 def capture_enabled() -> bool:
-    """Read (creating on first use) the ``replay_capture_enabled`` app setting."""
-    value = get_setting(CAPTURE_SETTING_KEY)
-    if value is None:
+    """Read (creating on first use) the ``replay_capture_enabled`` app setting.
+
+    Reads the row directly rather than through ``get_setting``: on the FIRST run
+    the row legitimately does not exist yet, and ``get_setting`` logs that absence
+    as a WARNING. A warning that fires on the expected path is noise that teaches
+    readers to ignore warnings. A real failure (no database, a broken schema) is
+    not swallowed here -- it propagates to :func:`initialize_replay_capture`,
+    which logs it as the ERROR it is and leaves capture off.
+    """
+    from sqlmodel import select
+
+    from .db import get_db
+
+    with get_db() as session:
+        row = session.exec(
+            select(AppSetting).where(AppSetting.key == CAPTURE_SETTING_KEY)
+        ).first()
+    if row is None:
         add_instance(AppSetting(key=CAPTURE_SETTING_KEY, value_str="false"))
         logger.info(
             f"Created {CAPTURE_SETTING_KEY} AppSetting with default value: false"
@@ -102,7 +125,7 @@ def capture_enabled() -> bool:
         return False
     # coerce_bool, not `== 'true'`: a value written as 1/"1"/"True" means the same
     # thing to whoever set it, and raises loudly on a spelling nothing can mean.
-    return coerce_bool(value)
+    return coerce_bool(row.value_str)
 
 
 def store_root() -> str:
@@ -149,7 +172,18 @@ def initialize_replay_capture() -> Optional[ReplayStore]:
 
 
 def shutdown_replay_capture(timeout: float = 30.0) -> None:
-    """Finalize the open session, drain the writer and uninstall the store."""
+    """Finalize the open session, drain the writer and uninstall the store.
+
+    THE LIVE APP HAS NO SHUTDOWN PATH that reaches here: nothing calls
+    ``shutdown_worker_queue`` either, and the process is stopped outright. That
+    is by design, not an oversight to fix by inventing an atexit hook that would
+    run during interpreter teardown -- the recovery is at the OTHER end.
+    :func:`initialize_replay_capture` calls ``mark_interrupted_sessions()`` when
+    it opens the store, so a session the previous process left ``open`` becomes
+    ``interrupted`` and its analyses stay visible in coverage instead of reading
+    as a complete session. This function exists for the callers that DO have a
+    lifecycle: tests, tools, and any future orderly shutdown.
+    """
     try:
         with _LOCK:
             store = get_replay_store()
@@ -197,9 +231,18 @@ def _roll_session_if_needed() -> None:
     """Start a new session when the UTC date has changed (called per analysis).
 
     A session is the unit an export ships and a replay reads, so it is bounded by
-    something an operator can name. The check is a string compare against the
-    open session's date; the rollover itself finalizes the old session so its
-    status is ``finalized``, not left ``open`` forever.
+    something an operator can name. The check is a string compare against the open
+    session's date; the rollover finalizes the old session so its status is
+    ``finalized``, not left ``open`` forever.
+
+    ORDER MATTERS, because this runs on an analysis thread. The new session is
+    opened INSIDE the lock -- one thread wins the race, everyone else sees the new
+    date and returns immediately -- and the old session is finalized OUTSIDE it,
+    with a short timeout. Finalizing under the lock (as this first did) meant one
+    thread waiting up to 30 seconds on the writer while every concurrent analysis
+    queued behind it at the very first analysis after midnight. What the writer
+    cannot flush in time is reported by ``drain`` and marks that session
+    ``interrupted``: a visible gap, not a stalled worker.
     """
     store = get_replay_store()
     if store is None:
@@ -211,13 +254,13 @@ def _roll_session_if_needed() -> None:
         if _SESSION_DATE == today:          # another thread rolled it first
             return
         previous = store.session_id
-        if previous is not None:
-            store.finalize_session(previous)
         new_session = _begin_session(store)
         logger.info(
             f"Replay capture session rolled at the UTC date change: "
             f"{previous} -> {new_session}"
         )
+    if previous is not None:
+        store.finalize_session(previous, timeout=ROLLOVER_DRAIN_TIMEOUT)
 
 
 # --------------------------------------------------------------------------- #

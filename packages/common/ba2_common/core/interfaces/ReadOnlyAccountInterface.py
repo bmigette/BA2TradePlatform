@@ -164,10 +164,38 @@ class StockExposure:
 # recorded as such -- it is simply marked ``memo_cache`` rather than ``network``,
 # so a replay can tell a fresh broker read from a reused one.
 # --------------------------------------------------------------------------- #
-def _price_provenance(args, before):
+def quote_identity(args):
+    """The identity of a quote read, for any account class's signature.
+
+    Shared so an OVERRIDE records the same shape as the base method (see
+    ``IBKRAccount.get_instrument_current_price``, whose signature takes a single
+    ``symbol`` and no ``price_type``). ``price_type`` appears only when the
+    method actually has one -- an override that does not take it is not made to
+    claim a price type it never asked for.
+    """
+    account = args["self"]
+    symbols = args["symbol_or_symbols"] if "symbol_or_symbols" in args else args["symbol"]
+    identity = {
+        "account_class": type(account).__name__,
+        "account_id": getattr(account, "id", None),
+        "symbols": symbols if isinstance(symbols, list) else [symbols],
+    }
+    if "price_type" in args:
+        identity["price_type"] = args["price_type"]
+    return identity
+
+
+def quote_provenance(args, before):
+    """``memo_cache`` when every requested symbol was already memoized, else ``network``.
+
+    ``before`` is the set of symbols the TTL memo could already answer, taken
+    before the call. An account that keeps no memo (it goes to the broker every
+    time) passes ``before=None`` -- there is nothing to be uncertain about, and
+    ``network`` is simply what happened.
+    """
     if before is None:
         return ReplayStatus.PROVENANCE_UNKNOWN
-    requested = args["symbol_or_symbols"]
+    requested = args["symbol_or_symbols"] if "symbol_or_symbols" in args else args["symbol"]
     requested = requested if isinstance(requested, list) else [requested]
     # Every requested symbol was already memoized => nothing was fetched.
     if requested and all(symbol in before for symbol in requested):
@@ -1680,16 +1708,10 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
 
     @observe_provider(
         "broker", "get_instrument_current_price",
-        identity=lambda a: {
-            "account_class": type(a["self"]).__name__,
-            "account_id": getattr(a["self"], "id", None),
-            "symbols": (a["symbol_or_symbols"] if isinstance(a["symbol_or_symbols"], list)
-                        else [a["symbol_or_symbols"]]),
-            "price_type": a["price_type"],
-        },
+        identity=quote_identity,
         before=lambda a: a["self"]._cached_price_symbols(
             a["symbol_or_symbols"], a["price_type"]),
-        provenance=lambda a, result, before: _price_provenance(a, before),
+        provenance=lambda a, result, before: quote_provenance(a, before),
     )
     def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
         """

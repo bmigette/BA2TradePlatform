@@ -872,19 +872,15 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             providers = self._live_providers()
             # Recorded live analysis (spec step 2): a no-op when capture is off,
             # in which case this is exactly the gather/process pair it replaces.
-            with self._analysis_capture(market_analysis, settings,
-                                        self._use_case_of(market_analysis)):
+            # _gather_and_process links the outcome -- including the skip verdict
+            # the early return below acts on.
+            use_case = self._use_case_of(market_analysis)
+            with self._analysis_capture(market_analysis, settings, use_case):
                 bundle, rec = self._gather_and_process(
                     providers, settings,
                     market_analysis=market_analysis,
-                    use_case=self._use_case_of(market_analysis),
+                    use_case=use_case,
                 )
-                # Record the skip outcome INSIDE the scope (the early return itself
-                # is below, after the scope has submitted): a skip that went
-                # unrecorded would read as a capture gap rather than as the
-                # decision it actually was.
-                if rec.skip:
-                    self._record_skip(rec.skip_reason)
 
             if rec.skip:
                 market_analysis.state = {

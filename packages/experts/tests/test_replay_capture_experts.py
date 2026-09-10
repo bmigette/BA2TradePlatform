@@ -560,6 +560,9 @@ def test_fmp_rating_skip_is_recorded_with_its_reason(tmp_path):
     record = on["records"][0]
     assert record.outcome == ReplayStatus.OUTCOME_SKIP
     assert record.skip_reason == "no consensus data"
+    assert record.recommendation_object is None, (
+        "a skip row must not also carry a recommendation -- a reader would have to "
+        "guess which of the two the live platform acted on")
     assert record.bundle_capture_status == ReplayStatus.CAPTURE_CAPTURED
     assert on["market_analysis"].status == MarketAnalysisStatus.SKIPPED
     assert on["market_analysis"].state["skip_reason"] == "no_analyst_coverage"
@@ -575,6 +578,7 @@ def test_deterministic_scorer_skip_is_recorded_with_its_reason(tmp_path):
     record = on["records"][0]
     assert record.outcome == ReplayStatus.OUTCOME_SKIP
     assert record.skip_reason == "insufficient_history"
+    assert record.recommendation_object is None
     assert on["market_analysis"].status == MarketAnalysisStatus.SKIPPED
 
 
@@ -622,6 +626,46 @@ def test_a_price_guard_failure_is_recorded_as_an_error(tmp_path):
 
     assert records[0].outcome == ReplayStatus.OUTCOME_ERROR
     assert "Unable to get current price" in records[0].error
+
+
+def test_a_skip_with_no_reason_is_recorded_as_the_contract_breach_it_is(tmp_path):
+    """``skip=True`` with no reason is a defect in the EXPERT, not in the recorder.
+
+    Recording it as a reasonless skip would put a row in the store that no
+    coverage report can act on; blaming the recorder ("capture degraded") would
+    point at the wrong code. The record names the broken contract, and the live
+    analysis still completes exactly as it would have.
+    """
+    from ba2_common.core.types import OrderRecommendation, Recommendation
+
+    expert, settings, patches, counters, reset = _deterministic_scorer_case()
+    reset()
+
+    def reasonless_skip(self, bundle, settings, as_of=None):
+        return Recommendation(
+            signal=OrderRecommendation.HOLD, confidence=0.0, current_price=1.0,
+            details="something was missing", expected_profit_percent=0.0,
+            skip=True, skip_reason=None)
+
+    expert._process = reasonless_skip.__get__(expert, type(expert))
+    market_analysis = _market_analysis("AAPL", expert.id)
+
+    with ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
+        stack.enter_context(freeze_now_for_live_path())
+        store = stack.enter_context(capture_to(tmp_path / "noreason"))
+        expert.run_analysis("AAPL", market_analysis)
+        records = list(store.index.analyses("S-TEST"))
+
+    assert get_instance(
+        MarketAnalysis, market_analysis.id).status == MarketAnalysisStatus.SKIPPED, (
+        "the live outcome is unchanged -- only the RECORD says the contract broke")
+    assert records[0].outcome == ReplayStatus.OUTCOME_ERROR
+    assert "skip" in records[0].error and "reason" in records[0].error
+    assert records[0].skip_reason is None
+    assert records[0].capture_failures == {}, (
+        "an expert contract breach must not be counted as capture degradation")
 
 
 def test_an_unsupported_bundle_value_is_a_gap_not_a_failed_analysis(tmp_path):
@@ -793,3 +837,7 @@ def test_every_recorded_expert_routes_its_live_path_through_the_capture_scope():
             f"{expert_class.__name__}.run_analysis no longer uses the recorded pair")
         assert "self._gather(" not in source, (
             f"{expert_class.__name__}.run_analysis gathers outside the recorded pair")
+        assert "_record_skip" not in source, (
+            f"{expert_class.__name__}.run_analysis records the skip itself; "
+            f"_gather_and_process owns the outcome so the experts cannot disagree "
+            f"about whether a skip also leaves a recommendation on the row")

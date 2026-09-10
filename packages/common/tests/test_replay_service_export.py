@@ -443,3 +443,52 @@ def test_concurrent_observations_land_as_distinct_index_rows(tmp_path):
         (("symbol", f"S{n}"),) for n in range(6)
     }
     store.close()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_dead_writer_thread_degrades_to_a_visible_drop_without_blocking(tmp_path):
+    """The writer can die (disk full, an unhandled bug). Submit must not.
+
+    A queue nobody consumes fills silently and then blocks the caller -- which is
+    a trading thread. So a full queue drops the record with a health counter and a
+    ``missing_capture`` coverage row, and ``submit`` returns immediately: the
+    analysis loses its RECORD, never its trade, and the gap is visible in three
+    places rather than in none.
+    """
+    import time
+
+    store = ReplayStore(tmp_path, writer="thread", queue_maxsize=2)
+    try:
+        store.begin_session(_session("s-dead"))
+
+        # Kill the writer the way an unhandled failure would: SystemExit is not an
+        # Exception, so the loop's own handler does not catch it and the thread
+        # ends. Nothing consumes the queue after this.
+        def _die(pending):
+            raise SystemExit("writer died")
+
+        store._write_pending = _die
+        _record_one_analysis(store, analysis_id="a-kills-writer", session_id="s-dead")
+        for _ in range(200):                       # wait for the thread to be gone
+            if store._thread is None or not store._thread.is_alive():
+                break
+            time.sleep(0.02)
+        assert not store._thread.is_alive(), "the writer did not actually die"
+
+        started = time.monotonic()
+        for index in range(6):
+            _record_one_analysis(store, analysis_id=f"a{index}", session_id="s-dead")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, "submit blocked on a queue nobody is draining"
+        assert store.health.queue_saturation == 4, (
+            f"expected the 4 records past the queue depth to be counted as "
+            f"saturation, got {store.health.as_dict()}")
+
+        coverage = {c.analysis_id: c for c in store.index.coverage("s-dead")}
+        assert len(coverage) == 4
+        for entry in coverage.values():
+            assert entry.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+            assert "saturated" in entry.detail
+    finally:
+        store.close(timeout=2.0)

@@ -410,3 +410,42 @@ def test_a_clean_analysis_records_no_failures():
         ctx.set_bundle({"symbol": "AAPL"})
         ctx.set_outcome(skip_reason="done")
     assert store.submitted[0][0].capture_failures == {}
+
+
+# --------------------------------------------------------------------------- skip
+
+
+def test_a_skip_records_its_reason_and_no_recommendation_object():
+    """A row must say ONE thing: the analysis skipped, and on what.
+
+    Carrying a recommendation object as well would leave a reader guessing which
+    of the two the live platform acted on.
+    """
+    from ba2_common.core.replay.context import MissingSkipReason  # noqa: F401
+
+    context = CaptureContext(analysis_meta=_meta(), health=CaptureHealth())
+    context.set_outcome(recommendation={"signal": "HOLD"})
+    context.set_skip("no consensus data")
+
+    record = context.build_record()
+    assert record.outcome == ReplayStatus.OUTCOME_SKIP
+    assert record.skip_reason == "no consensus data"
+    assert "recommendation" not in context.objects, (
+        "a skip must not also leave a recommendation on the row")
+
+
+def test_a_reasonless_skip_is_a_typed_error_not_a_degraded_capture():
+    """``skip=True`` with no reason is a CONTRACT breach, not a recording failure.
+
+    Reporting it as "capture degraded" would blame the recorder for a defect in
+    the expert, and would leave a skip row nobody can act on.
+    """
+    from ba2_common.core.replay.context import MissingSkipReason
+
+    context = CaptureContext(analysis_meta=_meta(), health=CaptureHealth())
+    for empty in (None, "", "   "):
+        with pytest.raises(MissingSkipReason):
+            context.set_skip(empty)
+    assert context.capture_failures == {}, (
+        "a contract breach must not be counted as capture degradation")
+    assert context.health.total == 0

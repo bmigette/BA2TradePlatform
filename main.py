@@ -166,18 +166,19 @@ def initialize_system():
     
     job_manager.start()
 
-    # Initialize worker queue system
-    logger.info("Initializing worker queue system...")
-    initialize_worker_queue()
-
-    # Live input capture (spec step 2). AFTER the worker queue so the workers it
-    # started find the store already installed on their first analysis, and after
-    # init_db() because the on/off switch is an AppSetting. Off by default: with
-    # replay_capture_enabled=false this installs nothing and every tap stays a
-    # passthrough.
+    # Live input capture (spec step 2). BEFORE the worker queue: the queue starts
+    # worker threads that begin executing persisted tasks immediately, and an
+    # analysis that starts before the store is installed is simply not recorded.
+    # After init_db() because the on/off switch is an AppSetting. Off by default:
+    # with replay_capture_enabled=false this installs nothing and every tap stays
+    # a passthrough.
     logger.info("Initializing replay capture...")
     from ba2_trade_platform.core.replay_capture import initialize_replay_capture
     initialize_replay_capture()
+
+    # Initialize worker queue system
+    logger.info("Initializing worker queue system...")
+    initialize_worker_queue()
     
     # Initialize Smart Risk Manager queue system
     logger.info("Initializing Smart Risk Manager queue system...")

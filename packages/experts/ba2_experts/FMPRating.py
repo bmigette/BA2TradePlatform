@@ -1313,28 +1313,23 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
             self._gather_max_analyst_age = int(settings.get("max_analyst_age_months", 0) or 0)
             providers = self._live_providers()
             # Recorded live analysis (spec step 2). The scope spans the gather, the
-            # guard, the calculation and the skip verdict, so every outcome is
-            # captured -- not only the ones that reach a recommendation. With
-            # capture off the scope is a no-op and _gather_and_process is exactly
-            # the gather/guard/process sequence it replaces, in the same order.
-            with self._analysis_capture(market_analysis, settings,
-                                        self._use_case_of(market_analysis)):
+            # guard and the calculation; _gather_and_process links the outcome,
+            # including the skip verdict below, so every path is captured -- not
+            # only the ones that reach a recommendation. With capture off the
+            # scope is a no-op and _gather_and_process is exactly the
+            # gather/guard/process sequence it replaces, in the same order.
+            use_case = self._use_case_of(market_analysis)
+            with self._analysis_capture(market_analysis, settings, use_case):
                 bundle, rec = self._gather_and_process(
                     providers, settings,
                     market_analysis=market_analysis,
-                    use_case=self._use_case_of(market_analysis),
+                    use_case=use_case,
                     # current_price is required for the calculation (live-data, no
                     # fallback). The no-coverage skip below does not need a price,
                     # but a genuine missing-price is still a hard error BEFORE
                     # _process runs (preserves the live guard).
                     validate=self._require_price_when_covered,
                 )
-                # Record the skip outcome INSIDE the scope (the early return
-                # itself is below, after the scope has submitted): a skip that
-                # went unrecorded would read as a capture gap rather than as the
-                # decision it actually was.
-                if rec.skip:
-                    self._record_skip(rec.skip_reason)
                 current_price = bundle["current_price"]
                 consensus_data = bundle["consensus_data"]
                 upgrade_data = bundle["upgrade_data"]

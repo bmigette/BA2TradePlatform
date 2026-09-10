@@ -85,6 +85,7 @@ _TAGS = (
 
 __all__ = [
     "CODEC_VERSION",
+    "CodecDrift",
     "KIND_JSON",
     "KIND_ARROW",
     "ENUM_MODULE_PREFIXES",
@@ -122,6 +123,28 @@ class UnsafeEnumReference(ValueError):
             f"{ENUM_MODULE_PREFIXES}"
         )
         self.reference = reference
+
+
+class CodecDrift(ValueError):
+    """A stored record no longer matches the class it names.
+
+    The point of recording a dataclass by NAME is that a replay rebuilds the real
+    object; that only holds while the class still has the fields the record was
+    written with. When it does not -- a field renamed or removed, a new required
+    field added, a field that cannot be passed to the constructor -- the honest
+    answer is "this record cannot be replayed against today's code", not an
+    object silently missing a field, nor a bare ``TypeError`` out of ``__init__``
+    that reads like a bug in the replay tool.
+    """
+
+    def __init__(self, type_name: str, field: str, reason: str):
+        super().__init__(
+            f"recorded {type_name} does not match the current class: "
+            f"field {field!r} {reason}"
+        )
+        self.type_name = type_name
+        self.field = field
+        self.reason = reason
 
 
 class Encoded(NamedTuple):
@@ -245,6 +268,12 @@ def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, Non
         reference = f"{cls.__module__}.{cls.__qualname__}"
         if not _enum_module_allowed(cls.__module__):
             raise UnsupportedCaptureType(f"dataclass({reference})", path)
+        for name, spec in getattr(cls, "__dataclass_fields__", {}).items():
+            # An InitVar is required by __init__ but is NOT listed by fields(), so
+            # a record written without it could never be replayed.
+            if str(getattr(spec, "_field_type", "")).endswith("INITVAR"):
+                raise UnsupportedCaptureType(
+                    f"dataclass({reference}) with InitVar field {name!r}", path)
         if any(not field.init for field in dataclasses.fields(obj)):
             # A non-init field cannot be handed back to the constructor, so a
             # replay would silently rebuild a DIFFERENT object. Refuse it here,
@@ -465,8 +494,31 @@ def _decode_dataclass(payload: Mapping[str, Any], frames: FrameSource) -> Any:
     cls = getattr(importlib.import_module(module_name), class_name, None)
     if not (isinstance(cls, type) and dataclasses.is_dataclass(cls)):
         raise UnsafeEnumReference(reference)
-    fields = {name: _decode_value(item, frames)
-              for name, item in payload["fields"].items()}
+    # Validate the record against TODAY's class BEFORE constructing anything, so
+    # drift is reported as drift (naming the field) instead of surfacing as a
+    # TypeError from __init__ or as an object quietly missing a value.
+    recorded = payload["fields"]
+    current = {field.name: field for field in dataclasses.fields(cls)}
+    for name in recorded:
+        spec = current.get(name)
+        if spec is None:
+            raise CodecDrift(reference, name, "is no longer a field of this class")
+        if not spec.init:
+            raise CodecDrift(reference, name, "can no longer be passed to __init__")
+    for name, spec in current.items():
+        if name in recorded or not spec.init:
+            continue
+        # A field ADDED since the record was written is replayable when the class
+        # can supply it itself; without a default there is nothing to supply.
+        if (spec.default is dataclasses.MISSING
+                and spec.default_factory is dataclasses.MISSING):
+            raise CodecDrift(
+                reference, name, "was added since this record and has no default")
+    for name, spec in getattr(cls, "__dataclass_fields__", {}).items():
+        if str(getattr(spec, "_field_type", "")).endswith("INITVAR"):
+            raise CodecDrift(reference, name, "is an InitVar and cannot be replayed")
+
+    fields = {name: _decode_value(item, frames) for name, item in recorded.items()}
     return cls(**fields)
 
 
