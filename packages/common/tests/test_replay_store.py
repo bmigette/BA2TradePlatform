@@ -7,6 +7,7 @@ half-referenced analysis. Two processes writing concurrently must both succeed.
 """
 import multiprocessing as mp
 import os
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -103,9 +104,9 @@ def _observation(session_id, analysis_id, seq, payload_hash):
 
 def test_put_is_content_addressed_and_idempotent(tmp_path):
     store = ObjectStore(tmp_path)
-    kind, data, meta, _ = encode({"a": 1})
-    first = store.put(kind, data, meta)
-    second = store.put(kind, data, meta)
+    kind, data, _meta, _ = encode({"a": 1})
+    first = store.put(kind, data)
+    second = store.put(kind, data)
     assert first == second == content_hash(kind, data)
     assert store.exists(first)
     path = store.path_for(first, kind)
@@ -116,12 +117,12 @@ def test_put_is_content_addressed_and_idempotent(tmp_path):
 
 def test_get_returns_kind_bytes_and_meta(tmp_path):
     store = ObjectStore(tmp_path)
-    kind, data, meta, _ = encode({"a": 1, "b": None})
-    object_hash = store.put(kind, data, meta)
+    kind, data, _meta, _ = encode({"a": 1, "b": None})
+    object_hash = store.put(kind, data)
     got_kind, got_data, got_meta = store.get(object_hash)
     assert got_kind == kind
     assert got_data == data
-    assert got_meta["codec_version"] == meta["codec_version"]
+    assert got_meta["codec_version"] == _meta["codec_version"]
 
 
 def test_get_of_a_missing_object_raises(tmp_path):
@@ -132,8 +133,8 @@ def test_get_of_a_missing_object_raises(tmp_path):
 
 def test_corrupted_object_raises_on_read(tmp_path):
     store = ObjectStore(tmp_path)
-    kind, data, meta, _ = encode({"a": 1})
-    object_hash = store.put(kind, data, meta)
+    kind, data, _meta, _ = encode({"a": 1})
+    object_hash = store.put(kind, data)
     path = store.path_for(object_hash, kind)
     path.write_bytes(b'{"codec_version":1,"object_kind":"json","payload":{"a":2}}')
     with pytest.raises(ObjectHashMismatch):
@@ -142,8 +143,8 @@ def test_corrupted_object_raises_on_read(tmp_path):
 
 def test_no_temp_files_are_left_behind(tmp_path):
     store = ObjectStore(tmp_path)
-    kind, data, meta, _ = encode({"a": 1})
-    store.put(kind, data, meta)
+    kind, data, _meta, _ = encode({"a": 1})
+    store.put(kind, data)
     leftovers = [p for p in (tmp_path / "objects").rglob("*.tmp")]
     assert leftovers == []
 
@@ -157,16 +158,16 @@ def test_object_written_without_an_index_commit_is_an_orphan(tmp_path):
     store = ObjectStore(tmp_path, index=index)
     index.begin_session(_session())
 
-    referenced_kind, referenced_data, referenced_meta, _ = encode({"kept": True})
-    referenced = store.put(referenced_kind, referenced_data, referenced_meta)
+    referenced_kind, referenced_data, _rmeta, _ = encode({"kept": True})
+    referenced = store.put(referenced_kind, referenced_data)
     index.commit_analysis(
         _analysis(bundle_object=referenced, bundle_capture_status=ReplayStatus.CAPTURE_CAPTURED),
         objects=[ObjectRef(hash=referenced, kind=referenced_kind, size=len(referenced_data))],
         verify_objects=store,
     )
 
-    orphan_kind, orphan_data, orphan_meta, _ = encode({"crashed": True})
-    orphan = store.put(orphan_kind, orphan_data, orphan_meta)
+    orphan_kind, orphan_data, _ometa, _ = encode({"crashed": True})
+    orphan = store.put(orphan_kind, orphan_data)
 
     orphans = list(store.iter_orphans(grace_seconds=0))
     assert orphans == [orphan]
@@ -179,8 +180,8 @@ def test_object_written_without_an_index_commit_is_an_orphan(tmp_path):
 def test_orphans_inside_the_grace_period_are_not_listed(tmp_path):
     index = ReplayIndex(tmp_path / "index.sqlite")
     store = ObjectStore(tmp_path, index=index)
-    kind, data, meta, _ = encode({"fresh": True})
-    store.put(kind, data, meta)
+    kind, data, _meta, _ = encode({"fresh": True})
+    store.put(kind, data)
     assert list(store.iter_orphans(grace_seconds=3600)) == []
     assert len(list(store.iter_orphans(grace_seconds=0))) == 1
     index.close()
@@ -211,8 +212,8 @@ def test_sessions_analyses_observations_and_coverage_round_trip(tmp_path):
     store = ObjectStore(tmp_path, index=index)
     index.begin_session(_session())
 
-    kind, data, meta, _ = encode({"consensus": [{"targetHigh": 1.5}]})
-    payload_hash = store.put(kind, data, meta)
+    kind, data, _meta, _ = encode({"consensus": [{"targetHigh": 1.5}]})
+    payload_hash = store.put(kind, data)
     observation = _observation("s1", "a1", 0, payload_hash)
     record = _analysis(
         bundle_object=payload_hash,
@@ -292,8 +293,8 @@ def _write_session_in_child(root, session_id, count):
     observations = []
     refs = []
     for seq in range(count):
-        kind, data, meta, _ = child_encode({"session": session_id, "seq": seq})
-        payload_hash = store.put(kind, data, meta)
+        kind, data, _cmeta, _ = child_encode({"session": session_id, "seq": seq})
+        payload_hash = store.put(kind, data)
         refs.append(Ref(hash=payload_hash, kind=kind, size=len(data)))
         observations.append(_observation(session_id, f"{session_id}-a1", seq, payload_hash))
     index.commit_analysis(
@@ -306,6 +307,11 @@ def _write_session_in_child(root, session_id, count):
         objects=refs,
         verify_objects=store,
     )
+    # Both children publish this IDENTICAL object: two processes racing on the
+    # same content-addressed path must both succeed (Windows os.replace can fail
+    # when the loser's destination is held open by the other).
+    shared_kind, shared_data, _smeta, _ = child_encode({"shared": "both children write me"})
+    store.put(shared_kind, shared_data)
     index.update_session_status(session_id, Status.SESSION_FINALIZED, ended_at=UTC_NOW)
     index.close()
     return 0
@@ -329,4 +335,55 @@ def test_two_processes_write_the_same_root_concurrently(tmp_path):
     total = len(index.observations("s1-a1")) + len(index.observations("s2-a1"))
     assert total == 100
     assert len(index.referenced_hashes()) == 100
+
+    # the object both children published exists exactly once, uncorrupted
+    store = ObjectStore(tmp_path, index=index)
+    kind, data, _meta, _ = encode({"shared": "both children write me"})
+    shared_hash = content_hash(kind, data)
+    assert store.exists(shared_hash)
+    assert store.get(shared_hash)[1] == data
+    assert len(list((tmp_path / "objects").rglob(f"{shared_hash}*"))) == 1
+    index.close()
+
+
+def test_close_only_touches_this_threads_connection(tmp_path):
+    """sqlite3 refuses a cross-thread close; the file must still be unlocked."""
+    index = ReplayIndex(tmp_path / "index.sqlite")
+    index.begin_session(_session())
+    errors = []
+
+    def _worker():
+        index.begin_session(_session("s-worker"))  # opens this thread's connection
+        assert index.close() >= 1  # the main thread's connection is still open
+        errors.extend(())
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert errors == []
+
+    assert index.close() == 0
+    # Windows keeps an open sqlite handle locked: a rename proves both closed.
+    target = tmp_path / "index.sqlite.moved"
+    os.replace(tmp_path / "index.sqlite", target)
+    assert target.exists()
+
+
+def test_index_reopens_after_close_so_late_gaps_are_still_recorded(tmp_path):
+    index = ReplayIndex(tmp_path / "index.sqlite")
+    index.begin_session(_session())
+    index.close()
+    index.record_coverage(
+        [
+            CoverageEntry(
+                session_id="s1",
+                analysis_id="late",
+                capability=ReplayStatus.CAPABILITY_RECORDED_EXPERT,
+                status=ReplayStatus.COVERAGE_MISSING_CAPTURE,
+                detail="arrived after close",
+            )
+        ]
+    )
+    assert [c.analysis_id for c in index.coverage("s1")] == ["late"]
     index.close()

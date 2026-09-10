@@ -6,6 +6,9 @@ CaptureHealth and logged once per analysis, never raised into the expert.
 back the recorded reads in order — running out is a loud ReplayMiss, never a
 fresh wall-clock read.
 """
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -14,8 +17,10 @@ from ba2_common.core.replay.clock import ReplayMiss, replay_now
 from ba2_common.core.replay.context import (
     CaptureContext,
     CaptureHealth,
+    capture_aware_submit,
     capture_scope,
     current_capture,
+    run_in_capture_context,
     use_capture_context,
 )
 from ba2_common.core.replay.schemas import ReplayStatus
@@ -305,3 +310,103 @@ def test_replay_mode_still_honours_an_explicit_as_of():
     ctx = CaptureContext.for_replay(analysis_id="a1", clock_reads=[])
     with use_capture_context(ctx):
         assert replay_now(as_of) is as_of
+
+
+# --------------------------------------------------------------------------- concurrency
+
+
+def test_concurrent_observations_get_distinct_ids(monkeypatch):
+    """Two provider calls racing inside one analysis must not share an id.
+
+    A shared id is silently destructive: the index writes observations with
+    INSERT OR REPLACE, so the second row would overwrite the first.
+    """
+    from ba2_common.core.replay import context as context_module
+
+    real_freeze = context_module.freeze
+
+    def _slow_freeze(obj):
+        time.sleep(0.01)  # widen the window between drawing a seq and appending
+        return real_freeze(obj)
+
+    monkeypatch.setattr(context_module, "freeze", _slow_freeze)
+
+    store = _FakeStore()
+    ids = []
+    with capture_scope(store, _meta()) as ctx:
+        def _record(n):
+            ids.append(
+                ctx.record_observation(
+                    provider="fmp",
+                    method="quote",
+                    request_identity={"symbol": f"S{n}"},
+                    payload=[n],
+                    provenance=ReplayStatus.PROVENANCE_NETWORK,
+                )
+            )
+
+        threads = [threading.Thread(target=_record, args=(n,)) for n in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not any(t.is_alive() for t in threads)
+        ctx.set_outcome(skip_reason="done")
+
+    assert len(ids) == 6
+    assert len(set(ids)) == 6
+    record, _objects, observations = store.submitted[0]
+    assert len(observations) == 6
+    assert len(set(record.observation_ids)) == 6
+    assert sorted(p.observation.invocation_seq for p in observations) == [0, 1, 2, 3, 4, 5]
+
+
+def test_pool_workers_only_see_the_context_through_the_helpers():
+    """A ContextVar does not cross into a ThreadPoolExecutor worker by itself."""
+    store = _FakeStore()
+    with capture_scope(store, _meta()) as ctx:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert pool.submit(current_capture).result(timeout=30) is None
+            assert capture_aware_submit(pool, current_capture).result(timeout=30) is ctx
+            wrapped = run_in_capture_context(current_capture)
+            assert pool.submit(wrapped).result(timeout=30) is ctx
+            # safe to reuse the same wrapper concurrently (executor.map style)
+            assert list(pool.map(lambda _: wrapped(), range(4))) == [ctx] * 4
+        ctx.set_outcome(skip_reason="done")
+
+
+def test_a_clock_read_inside_a_pool_worker_is_recorded_via_the_helper():
+    store = _FakeStore()
+    with capture_scope(store, _meta()) as ctx:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(run_in_capture_context(replay_now)).result(timeout=30)
+        ctx.set_outcome(skip_reason="done")
+    assert len(store.submitted[0][0].clock_reads) == 1
+
+
+def test_the_record_carries_this_analysis_own_failure_counts(monkeypatch):
+    from ba2_common.core.replay import context as context_module
+
+    monkeypatch.setattr(context_module.logger, "error", lambda *a, **k: None)
+    store = _FakeStore()
+    with capture_scope(store, _meta()) as ctx:
+        ctx.set_bundle({"bad": _Unfreezable()})
+        ctx.record_observation(
+            provider="fmp",
+            method="x",
+            request_identity={},
+            payload=_Unfreezable(),
+            provenance=ReplayStatus.PROVENANCE_UNKNOWN,
+        )
+        ctx.set_outcome(skip_reason="done")
+    record = store.submitted[0][0]
+    assert record.capture_failures == {"other": 2}
+    assert record.capture_gaps == ()
+
+
+def test_a_clean_analysis_records_no_failures():
+    store = _FakeStore()
+    with capture_scope(store, _meta()) as ctx:
+        ctx.set_bundle({"symbol": "AAPL"})
+        ctx.set_outcome(skip_reason="done")
+    assert store.submitted[0][0].capture_failures == {}

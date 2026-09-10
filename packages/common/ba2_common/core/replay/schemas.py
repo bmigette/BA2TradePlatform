@@ -216,7 +216,14 @@ class AnalysisRecord(_Record):
 
     ``settings_object`` / ``bundle_object`` / ``recommendation_object`` are
     content hashes into the object store, or ``None`` when that piece was not
-    captured -- ``bundle_capture_status`` says why.
+    captured -- ``bundle_capture_status`` says why for the bundle, and
+    ``capture_gaps`` names every role (``settings``/``bundle``/``recommendation``/
+    ``observation:<id>``) whose object could not be encoded.
+
+    ``capture_failures`` counts this analysis's own recording degradation by
+    :class:`~ba2_common.core.replay.context.CaptureHealth` kind, so one bad
+    analysis is visible in the record itself and not only in a process-wide
+    counter.
     """
 
     analysis_id: str
@@ -240,11 +247,13 @@ class AnalysisRecord(_Record):
     error: Optional[str] = None
     observation_ids: Sequence[str] = ()
     branch_flags: Mapping[str, Any] = field(default_factory=dict)
+    capture_gaps: Sequence[str] = ()
+    capture_failures: Mapping[str, int] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
 
     _DATETIME_FIELDS = ("scheduled_at", "started_at", "finished_at")
-    _SEQUENCE_FIELDS = ("clock_reads", "observation_ids")
-    _MAPPING_FIELDS = ("branch_flags",)
+    _SEQUENCE_FIELDS = ("clock_reads", "observation_ids", "capture_gaps")
+    _MAPPING_FIELDS = ("branch_flags", "capture_failures")
 
     def object_hashes(self) -> Tuple[str, ...]:
         """Every object this record references, in a stable order."""

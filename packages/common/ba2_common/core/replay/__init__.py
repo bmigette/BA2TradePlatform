@@ -5,11 +5,26 @@ and 4. This package defines WHAT is recorded and HOW it is stored; it decides
 nothing about where. It imports no provider, broker, DB model or live-platform
 module and reads no configured path -- the host injects the store root and
 installs the store through :func:`set_replay_store`.
+
+The ONE deliberate exception to "reads no configured path" is
+``from ba2_common.logger import logger``: the house logger transitively imports
+``ba2_common.config`` to place its log files. That is logging only -- no replay
+root, cache root or database path is ever read from config here.
+
+**Thread pools.** The capture context lives in a ``ContextVar``, which does NOT
+propagate into ``ThreadPoolExecutor`` workers: a provider tap running in a pooled
+worker would silently record nothing. Anything that fans a gather out across a
+pool must submit through :func:`capture_aware_submit` (one copied
+``contextvars.Context`` per task) or wrap the callable with
+:func:`run_in_capture_context` (safe to reuse concurrently, e.g. with
+``executor.map``); :func:`use_capture_context` re-enters a context explicitly.
 """
 from ba2_common.core.replay.clock import ReplayMiss, replay_now
 from ba2_common.core.replay.codec import (
     CODEC_VERSION,
+    ENUM_MODULE_PREFIXES,
     Encoded,
+    UnsafeEnumReference,
     UnsupportedCaptureType,
     content_hash,
     decode,
@@ -20,8 +35,10 @@ from ba2_common.core.replay.context import (
     CaptureContext,
     CaptureHealth,
     PendingObservation,
+    capture_aware_submit,
     capture_scope,
     current_capture,
+    run_in_capture_context,
     use_capture_context,
 )
 from ba2_common.core.replay.schemas import (
@@ -58,6 +75,8 @@ __all__ = [
     "CoverageEntry",
     "Encoded",
     "UnsupportedCaptureType",
+    "UnsafeEnumReference",
+    "ENUM_MODULE_PREFIXES",
     "encode",
     "decode",
     "freeze",
@@ -74,6 +93,8 @@ __all__ = [
     "capture_scope",
     "current_capture",
     "use_capture_context",
+    "run_in_capture_context",
+    "capture_aware_submit",
     "replay_now",
     "ReplayMiss",
     "ReplayStore",

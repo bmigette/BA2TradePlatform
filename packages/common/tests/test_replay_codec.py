@@ -16,6 +16,7 @@ import pytest
 
 from ba2_common.core.replay.codec import (
     CODEC_VERSION,
+    UnsafeEnumReference,
     UnsupportedCaptureType,
     content_hash,
     decode,
@@ -301,3 +302,143 @@ def test_content_hash_is_stable_and_content_addressed():
     assert content_hash(first.kind, first.data) == content_hash(second.kind, second.data)
     assert content_hash("json", b"{}") != content_hash("arrow", b"{}")
     assert len(content_hash(first.kind, first.data)) == 64
+
+
+# --------------------------------------------------------------------------- tag safety
+
+
+def test_user_dict_keys_that_look_like_tags_round_trip_as_plain_dicts():
+    """A provider payload may legitimately contain a key named like a codec tag."""
+    payloads = [
+        {"$decimal": "1.5"},
+        {"$float": "nan"},
+        {"$date": "2024-01-01"},
+        {"$enum": "os.system"},
+        {"$frame": {"hash": "deadbeef"}},
+        {"$np": {"dtype": "int64", "value": 1}},
+        {"$$decimal": 1},
+        {"$decimal": "1.5", "other": 2},
+        {"nested": [{"$enum": "os.system"}]},
+    ]
+    for payload in payloads:
+        back = _roundtrip(payload)
+        assert back == payload, payload
+        assert type(back) is dict
+
+
+def test_escaped_keys_do_not_collide_across_levels():
+    obj = {"$$$x": 1, "$x": 2, "x": 3}
+    back = _roundtrip(obj)
+    assert back == obj
+    assert list(back.keys()) == ["$$$x", "$x", "x"]
+
+
+def _raw_json_object(payload: dict) -> bytes:
+    import json as _json
+
+    return _json.dumps(
+        {"codec_version": CODEC_VERSION, "object_kind": "json", "payload": payload}
+    ).encode("utf-8")
+
+
+def test_an_enum_payload_cannot_import_an_arbitrary_module():
+    data = _raw_json_object({"$enum": "os.path.join"})
+    with pytest.raises(UnsafeEnumReference) as excinfo:
+        decode("json", data, {"codec_version": CODEC_VERSION})
+    assert "os.path" in str(excinfo.value)
+
+
+def test_capturing_an_enum_outside_the_allowlist_is_a_capture_gap():
+    import enum as _enum
+
+    Outside = _enum.Enum("Outside", ["A"])  # __module__ is this test module
+    with pytest.raises(UnsupportedCaptureType) as excinfo:
+        encode({"e": Outside.A})
+    assert excinfo.value.path == '$["e"]'
+    assert "Enum(" in excinfo.value.type_name
+
+
+def test_an_unknown_tag_in_stored_bytes_is_refused():
+    data = _raw_json_object({"$whatever": 1})
+    with pytest.raises(ValueError, match="unknown capture tag"):
+        decode("json", data, {"codec_version": CODEC_VERSION})
+
+
+# --------------------------------------------------------------------------- numpy time
+
+
+@pytest.mark.parametrize("unit", ["D", "s", "ms", "us", "ns"])
+def test_numpy_datetime64_and_timedelta64_round_trip_in_every_unit(unit):
+    stamp = np.datetime64("2024-03-01T14:30:00", unit) if unit != "D" else np.datetime64("2024-03-01", "D")
+    delta = np.timedelta64(7, unit)
+    back = _roundtrip({"t": stamp, "d": delta})
+    assert back["t"] == stamp and back["t"].dtype == stamp.dtype
+    assert back["d"] == delta and back["d"].dtype == delta.dtype
+
+
+def test_numpy_nat_round_trips_as_nat():
+    value = np.datetime64("NaT", "ns")
+    back = _roundtrip({"t": value})
+    assert np.isnat(back["t"])
+    assert back["t"].dtype == value.dtype
+
+
+# --------------------------------------------------------------------------- stability
+
+
+def test_frame_hashes_do_not_depend_on_the_pyarrow_or_pandas_version():
+    import json as _json
+
+    from ba2_common.core.replay.codec import _strip_env_metadata
+
+    enc = encode(_wide_frame())
+    assert b'"creator"' not in enc.data
+    assert b'"pandas_version"' not in enc.data
+
+    base = _json.loads(
+        _json.dumps({"columns": [], "index_columns": [], "creator": {}, "pandas_version": ""})
+    )
+    first = dict(base, creator={"library": "pyarrow", "version": "24.0.0"}, pandas_version="2.3.3")
+    second = dict(base, creator={"library": "pyarrow", "version": "9.9.9"}, pandas_version="1.0.0")
+    stripped = [
+        _strip_env_metadata({b"pandas": _json.dumps(meta).encode("utf-8")})[b"pandas"]
+        for meta in (first, second)
+    ]
+    assert stripped[0] == stripped[1]
+
+
+def test_datetime_decode_restores_the_zone_name_so_re_encoding_is_byte_stable():
+    values = {
+        "ny": pd.Timestamp("2024-03-01 09:30", tz=NY).to_pydatetime(),
+        "utc": datetime(2024, 3, 1, 14, 30, tzinfo=timezone.utc),
+        "naive": datetime(2024, 3, 1, 9, 30),
+    }
+    first = encode(values)
+    back = decode(first.kind, first.data, first.meta)
+    assert str(back["ny"].tzinfo) == NY
+    second = encode(back)
+    assert second.data == first.data
+
+
+def test_arrow_objects_carry_and_check_their_codec_version():
+    enc = encode(_wide_frame())
+    from ba2_common.core.replay.codec import extract_meta
+
+    assert extract_meta(enc.kind, enc.data)["codec_version"] == CODEC_VERSION
+
+
+def test_caller_meta_that_contradicts_the_object_is_an_error():
+    enc = encode(_wide_frame())
+    with pytest.raises(ValueError, match="pandas_type"):
+        decode(enc.kind, enc.data, {**enc.meta, "pandas_type": "series"})
+
+
+def test_freeze_handles_shared_and_cyclic_references():
+    shared = {"n": 1}
+    cyclic: dict = {"shared_a": shared, "shared_b": shared}
+    cyclic["self"] = cyclic
+    snapshot = freeze(cyclic)
+    assert snapshot["shared_a"] is snapshot["shared_b"]
+    assert snapshot["self"] is snapshot
+    shared["n"] = 2
+    assert snapshot["shared_a"]["n"] == 1

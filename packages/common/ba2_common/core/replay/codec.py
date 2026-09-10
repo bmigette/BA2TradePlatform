@@ -14,10 +14,23 @@ SEPARATE Arrow IPC object per DataFrame/Series referenced from that tree by
 content hash, and :class:`UnsupportedCaptureType` for anything else -- a refusal
 that the caller records as a capture gap, never a coercion.
 
+Two properties that are easy to lose and expensive to discover later:
+
+* **Tags are escaped, not assumed.** A provider payload may legitimately contain
+  a key named ``$decimal`` or ``$enum``. Every user dict key starting with ``$``
+  is written with a doubled sigil and unescaped on decode, so a payload can never
+  be re-read as a different value -- and ``$enum`` can never be used to import an
+  arbitrary module (resolution is limited to :data:`ENUM_MODULE_PREFIXES`).
+* **Hashes are environment-stable.** pyarrow stamps its own version and the
+  pandas version into the table's pandas metadata; both are stripped before the
+  IPC bytes are written, so the same frame content-addresses identically across
+  hosts and after a pyarrow/pandas upgrade.
+
 Host-neutral: stdlib + pandas/numpy/pyarrow only.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib
 import json
@@ -25,6 +38,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -35,19 +49,46 @@ CODEC_VERSION = 1
 KIND_JSON = "json"
 KIND_ARROW = "arrow"
 
+#: Enum classes may only be resolved from these module prefixes. A capture is
+#: data, not code: an ``$enum`` payload must never be able to name an arbitrary
+#: importable module.
+ENUM_MODULE_PREFIXES = (
+    "ba2_common.",
+    "ba2_providers.",
+    "ba2_experts.",
+    "ba2_trade_platform.",
+)
+
 #: Arrow schema-metadata key holding this codec's frame meta, so the object's
 #: bytes alone fully determine its meaning (content addressing stays honest).
 _ARROW_META_KEY = b"ba2_replay"
 
+#: pandas-metadata keys that carry the writing environment's versions.
+_ENV_METADATA_KEYS = ("creator", "pandas_version")
+
 #: Sentinel column name for a Series stored as a one-column table.
 _SERIES_COLUMN = "__ba2_replay_series__"
+
+_TAGS = (
+    "$enum",
+    "$float",
+    "$nat",
+    "$timestamp",
+    "$datetime",
+    "$date",
+    "$decimal",
+    "$np",
+    "$frame",
+)
 
 __all__ = [
     "CODEC_VERSION",
     "KIND_JSON",
     "KIND_ARROW",
+    "ENUM_MODULE_PREFIXES",
     "Encoded",
     "UnsupportedCaptureType",
+    "UnsafeEnumReference",
     "encode",
     "decode",
     "content_hash",
@@ -70,6 +111,17 @@ class UnsupportedCaptureType(TypeError):
         self.path = path
 
 
+class UnsafeEnumReference(ValueError):
+    """An ``$enum`` payload named a module outside :data:`ENUM_MODULE_PREFIXES`."""
+
+    def __init__(self, reference: str):
+        super().__init__(
+            f"refusing to resolve enum reference {reference!r}: module is not one of "
+            f"{ENUM_MODULE_PREFIXES}"
+        )
+        self.reference = reference
+
+
 class Encoded(NamedTuple):
     """``(kind, data, meta)`` plus the separate frame objects it references.
 
@@ -84,7 +136,11 @@ class Encoded(NamedTuple):
     sides: Tuple["Encoded", ...] = ()
 
     def frame_map(self) -> Dict[str, "Encoded"]:
-        """``{content_hash: Encoded}`` for the referenced frame objects."""
+        """``{content_hash: Encoded}`` for the referenced frame objects.
+
+        Re-hashes each side (sha256 over the IPC bytes): an object cannot carry
+        its own hash inside itself, so this is the only way to key them.
+        """
         return {content_hash(side.kind, side.data): side for side in self.sides}
 
 
@@ -119,6 +175,15 @@ def encode(obj: Any) -> Encoded:
     return Encoded(kind=KIND_JSON, data=data, meta=meta, sides=tuple(sides))
 
 
+def _escape_key(key: str) -> str:
+    """User keys starting with ``$`` get a doubled sigil so tags stay unambiguous."""
+    return f"${key}" if key.startswith("$") else key
+
+
+def _unescape_key(key: str) -> str:
+    return key[1:] if key.startswith("$$") else key
+
+
 def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, None]) -> Any:
     # Order matters: bool before int, Enum before str/int (str-Enums are str),
     # pandas NaT/Timestamp before datetime, numpy scalars before float/int.
@@ -128,7 +193,12 @@ def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, Non
         return obj
     if isinstance(obj, Enum):
         cls = type(obj)
-        return {"$enum": f"{cls.__module__}.{cls.__qualname__}.{obj.name}"}
+        reference = f"{cls.__module__}.{cls.__qualname__}.{obj.name}"
+        if not _enum_module_allowed(cls.__module__):
+            # Capturing it would produce a record replay must refuse to decode:
+            # report the gap now, where the health counter can see it.
+            raise UnsupportedCaptureType(f"Enum({reference})", path)
+        return {"$enum": reference}
     if obj is pd.NaT:
         return {"$nat": True}
     if isinstance(obj, pd.Timestamp):
@@ -160,7 +230,7 @@ def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, Non
         for key, value in obj.items():
             if not isinstance(key, str):
                 raise UnsupportedCaptureType(type(key).__name__, path)
-            out[key] = _encode_value(value, f'{path}["{key}"]', sides, seen)
+            out[_escape_key(key)] = _encode_value(value, f'{path}["{key}"]', sides, seen)
         return out
     if isinstance(obj, (pd.DataFrame, pd.Series)):
         frame = _encode_frame(obj, path)
@@ -170,6 +240,13 @@ def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, Non
             sides.append(frame)
         return {"$frame": {"hash": frame_hash, "pandas_type": frame.meta["pandas_type"]}}
     raise UnsupportedCaptureType(type(obj).__name__, path)
+
+
+def _enum_module_allowed(module_name: str) -> bool:
+    return any(
+        module_name == prefix.rstrip(".") or module_name.startswith(prefix)
+        for prefix in ENUM_MODULE_PREFIXES
+    )
 
 
 def _datetime_payload(value: datetime) -> Dict[str, Any]:
@@ -190,25 +267,49 @@ def _numpy_payload(
 ) -> Dict[str, Any]:
     dtype = obj.dtype
     if dtype.kind in ("M", "m"):
-        # datetime64 / timedelta64: .item() loses the unit at ns precision.
-        return {"dtype": dtype.str, "value": str(obj)}
+        # datetime64 / timedelta64: store the raw ticks in the dtype's own unit.
+        # `.item()` is lossy (ns returns a plain int, us returns a datetime) and
+        # `str()` cannot be parsed back into a timedelta64 at all. NaT's sentinel
+        # tick value round-trips as NaT.
+        return {"dtype": dtype.str, "ticks": int(obj.astype("int64"))}
     return {"dtype": dtype.str, "value": _encode_value(obj.item(), path, sides, seen)}
 
 
+def _strip_env_metadata(metadata: Optional[Mapping[bytes, bytes]]) -> Dict[bytes, bytes]:
+    """Drop the writing environment's version stamps from pandas metadata.
+
+    pyarrow writes ``creator`` (its own version) and ``pandas_version`` into the
+    ``b"pandas"`` schema metadata. Keeping them would make identical frame
+    content hash differently on another host or after an upgrade, defeating
+    content addressing and the byte-exact replay comparison.
+    """
+    out: Dict[bytes, bytes] = dict(metadata or {})
+    raw = out.get(b"pandas")
+    if raw is None:
+        return out
+    pandas_meta = json.loads(raw.decode("utf-8"))
+    for key in _ENV_METADATA_KEYS:
+        pandas_meta.pop(key, None)
+    out[b"pandas"] = json.dumps(
+        pandas_meta, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return out
+
+
 def _encode_frame(obj: Union[pd.DataFrame, pd.Series], path: str) -> Encoded:
-    sides_meta: Dict[str, Any] = {
+    frame_meta: Dict[str, Any] = {
         "codec_version": CODEC_VERSION,
         "object_kind": KIND_ARROW,
     }
     if isinstance(obj, pd.Series):
-        sides_meta["pandas_type"] = "series"
-        sides_meta["series_name"] = _encode_value(obj.name, f"{path}.name", [], {})
+        frame_meta["pandas_type"] = "series"
+        frame_meta["series_name"] = _encode_value(obj.name, f"{path}.name", [], {})
         frame = obj.to_frame(name=_SERIES_COLUMN)
     else:
-        sides_meta["pandas_type"] = "dataframe"
+        frame_meta["pandas_type"] = "dataframe"
         frame = obj
-    sides_meta["row_count"] = int(len(frame))
-    sides_meta["columns"] = [
+    frame_meta["row_count"] = int(len(frame))
+    frame_meta["columns"] = [
         _encode_value(column, f"{path}.columns", [], {}) for column in frame.columns
     ]
     try:
@@ -217,15 +318,15 @@ def _encode_frame(obj: Union[pd.DataFrame, pd.Series], path: str) -> Encoded:
         raise UnsupportedCaptureType(
             f"{type(obj).__name__}({exc.__class__.__name__}: {exc})", path
         ) from exc
-    metadata = dict(table.schema.metadata or {})
+    metadata = _strip_env_metadata(table.schema.metadata)
     metadata[_ARROW_META_KEY] = json.dumps(
-        sides_meta, allow_nan=False, ensure_ascii=False, separators=(",", ":")
+        frame_meta, allow_nan=False, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
     table = table.replace_schema_metadata(metadata)
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
-    return Encoded(kind=KIND_ARROW, data=sink.getvalue().to_pybytes(), meta=sides_meta)
+    return Encoded(kind=KIND_ARROW, data=sink.getvalue().to_pybytes(), meta=frame_meta)
 
 
 # --------------------------------------------------------------------------- decode
@@ -282,37 +383,70 @@ def _decode_value(node: Any, frames: FrameSource) -> Any:
     if len(node) == 1:
         tag = next(iter(node))
         value = node[tag]
-        if tag == "$enum":
-            module_name, class_name, member = value.rsplit(".", 2)
-            cls = getattr(importlib.import_module(module_name), class_name)
-            return cls[member]
-        if tag == "$float":
-            return float(value)
-        if tag == "$nat":
-            return pd.NaT
-        if tag == "$timestamp":
-            return _decode_timestamp(value)
-        if tag == "$datetime":
-            return datetime.fromisoformat(value["iso"])
-        if tag == "$date":
-            return date.fromisoformat(value)
-        if tag == "$decimal":
-            return Decimal(value)
-        if tag == "$np":
-            return _decode_numpy(value, frames)
-        if tag == "$frame":
-            data, frame_meta = _resolve_frame(frames, value["hash"])
-            return _decode_frame(data, frame_meta)
-    return {key: _decode_value(item, frames) for key, item in node.items()}
+        if tag in _TAGS:
+            return _decode_tag(tag, value, frames)
+        if tag.startswith("$") and not tag.startswith("$$"):
+            raise ValueError(f"unknown capture tag {tag!r}")
+    return {_unescape_key(key): _decode_value(item, frames) for key, item in node.items()}
+
+
+def _decode_tag(tag: str, value: Any, frames: FrameSource) -> Any:
+    if tag == "$enum":
+        return _decode_enum(value)
+    if tag == "$float":
+        return float(value)
+    if tag == "$nat":
+        return pd.NaT
+    if tag == "$timestamp":
+        return _decode_timestamp(value)
+    if tag == "$datetime":
+        return _decode_datetime(value)
+    if tag == "$date":
+        return date.fromisoformat(value)
+    if tag == "$decimal":
+        return Decimal(value)
+    if tag == "$np":
+        return _decode_numpy(value, frames)
+    data, frame_meta = _resolve_frame(frames, value["hash"])
+    return _decode_frame(data, frame_meta)
+
+
+def _decode_enum(reference: str) -> Enum:
+    module_name, class_name, member = reference.rsplit(".", 2)
+    if not _enum_module_allowed(module_name):
+        raise UnsafeEnumReference(reference)
+    cls = getattr(importlib.import_module(module_name), class_name)
+    if not (isinstance(cls, type) and issubclass(cls, Enum)):
+        raise UnsafeEnumReference(reference)
+    return cls[member]
+
+
+def _restore_zone(value: datetime, payload: Mapping[str, Any]) -> datetime:
+    """Re-attach the recorded zone NAME so decode -> re-encode is byte-stable.
+
+    ``fromisoformat`` only recovers a fixed offset, which would re-encode as
+    ``UTC-05:00`` instead of ``America/New_York``. A name zoneinfo cannot
+    resolve leaves the instant and its offset untouched.
+    """
+    tzname = payload["tzname"]
+    if not tzname or str(value.tzinfo) == tzname:
+        return value
+    try:
+        zone = ZoneInfo(tzname)
+    except Exception:
+        return value
+    return value.astimezone(zone)
+
+
+def _decode_datetime(payload: Mapping[str, Any]) -> datetime:
+    value = datetime.fromisoformat(payload["iso"])
+    if payload["naive"]:
+        return value
+    return _restore_zone(value, payload)
 
 
 def _decode_timestamp(payload: Mapping[str, Any]) -> pd.Timestamp:
-    """Restore a pandas Timestamp, including its named zone when it had one.
-
-    The ISO string already pins the instant and the UTC offset; ``tzname`` only
-    restores the *label* (``America/New_York`` rather than ``UTC-05:00``). A zone
-    name pandas cannot resolve leaves the instant and offset untouched.
-    """
+    """Restore a pandas Timestamp, including its named zone when it had one."""
     stamp = pd.Timestamp(payload["iso"])
     if payload["naive"]:
         return stamp
@@ -327,6 +461,8 @@ def _decode_timestamp(payload: Mapping[str, Any]) -> pd.Timestamp:
 
 def _decode_numpy(payload: Mapping[str, Any], frames: FrameSource) -> np.generic:
     dtype = np.dtype(payload["dtype"])
+    if dtype.kind in ("M", "m"):
+        return np.array([payload["ticks"]], dtype="int64").astype(dtype)[0]
     value = _decode_value(payload["value"], frames)
     return np.array([value], dtype=dtype)[0]
 
@@ -335,18 +471,28 @@ def _decode_frame(data: bytes, meta: Optional[Mapping[str, Any]]) -> Union[pd.Da
     reader = pa.ipc.open_stream(pa.BufferReader(data))
     table = reader.read_all()
     embedded = _arrow_meta(table.schema)
-    effective = dict(embedded)
+    version = embedded["codec_version"]
+    if version != CODEC_VERSION:
+        raise ValueError(f"codec_version {version} is not supported (expected {CODEC_VERSION})")
     if meta is not None:
-        effective.update({k: v for k, v in meta.items() if k in embedded or k == "row_count"})
+        # The object's own metadata is authoritative -- it is what the content
+        # hash covers. A caller-supplied meta that disagrees means the index and
+        # the bytes have diverged, which is an error, not something to merge.
+        for key, value in meta.items():
+            if key in embedded and embedded[key] != value:
+                raise ValueError(
+                    f"frame meta mismatch for {key!r}: object says {embedded[key]!r}, "
+                    f"caller says {value!r}"
+                )
     frame = table.to_pandas()
-    expected_rows = effective["row_count"]
+    expected_rows = embedded["row_count"]
     if len(frame) != expected_rows:
         raise ValueError(
             f"row_count mismatch decoding frame: {len(frame)} rows, meta says {expected_rows}"
         )
-    if effective["pandas_type"] == "series":
+    if embedded["pandas_type"] == "series":
         series = frame[_SERIES_COLUMN].copy()
-        series.name = _decode_value(effective["series_name"], None)
+        series.name = _decode_value(embedded["series_name"], None)
         return series
     return frame
 
@@ -400,25 +546,45 @@ def freeze(obj: Any) -> Any:
     """A deep, copy-based snapshot: later mutation by the expert cannot reach it.
 
     DataFrames/Series are deep-copied, containers are rebuilt, immutable scalars
-    are shared. Types the codec will later refuse are copied here anyway -- the
+    are shared, and a shared/cyclic reference is copied once (``memo``).
+
+    LIMIT, deliberately: a DataFrame ``copy(deep=True)`` copies the blocks, not
+    the Python objects an ``object``-dtype cell points at. A bundle that stores a
+    mutable object INSIDE a frame cell is not isolated by this call -- and such a
+    frame is refused by :func:`encode` anyway, which is where that gap is
+    reported. Types the codec will later refuse are copied here regardless; the
     refusal (and the capture gap it records) belongs to :func:`encode`.
     """
+    return _freeze(obj, {})
+
+
+def _freeze(obj: Any, memo: Dict[int, Any]) -> Any:
     if obj is None or isinstance(obj, (bool, int, float, str, bytes, Decimal, Enum)):
         return obj
     if isinstance(obj, (datetime, date, np.generic)):
         return obj
+    key = id(obj)
+    if key in memo:
+        return memo[key]
     if isinstance(obj, (pd.DataFrame, pd.Series, pd.Index)):
-        return obj.copy(deep=True)
-    if isinstance(obj, np.ndarray):
-        return obj.copy()
-    if isinstance(obj, dict):
-        return {key: freeze(value) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [freeze(item) for item in obj]
-    if isinstance(obj, tuple):
-        return tuple(freeze(item) for item in obj)
-    if isinstance(obj, (set, frozenset)):
-        return type(obj)(freeze(item) for item in obj)
-    import copy
-
-    return copy.deepcopy(obj)
+        copied: Any = obj.copy(deep=True)
+    elif isinstance(obj, np.ndarray):
+        copied = obj.copy()
+    elif isinstance(obj, dict):
+        copied = {}
+        memo[key] = copied
+        for name, value in obj.items():
+            copied[name] = _freeze(value, memo)
+    elif isinstance(obj, list):
+        copied = []
+        memo[key] = copied
+        for item in obj:
+            copied.append(_freeze(item, memo))
+    elif isinstance(obj, tuple):
+        copied = tuple(_freeze(item, memo) for item in obj)
+    elif isinstance(obj, (set, frozenset)):
+        copied = type(obj)(_freeze(item, memo) for item in obj)
+    else:
+        copied = copy.deepcopy(obj, memo)
+    memo[key] = copied
+    return copied

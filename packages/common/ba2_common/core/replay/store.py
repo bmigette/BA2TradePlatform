@@ -83,16 +83,23 @@ class ObjectStore:
         self.objects_dir.mkdir(parents=True, exist_ok=True)
         self._index = index
 
-    def path_for(self, object_hash: str, kind: str) -> Path:
+    def relative_path_for(self, object_hash: str, kind: str) -> Path:
+        """The object's path RELATIVE to the store root (what an export records)."""
         if kind not in _EXTENSIONS:
             raise ValueError(f"unknown object kind {kind!r}")
-        return self.objects_dir / object_hash[:2] / f"{object_hash}{_EXTENSIONS[kind]}"
+        return Path("objects") / object_hash[:2] / f"{object_hash}{_EXTENSIONS[kind]}"
 
-    def put(self, kind: str, data: bytes, meta: Optional[Dict[str, Any]] = None) -> str:
+    def path_for(self, object_hash: str, kind: str) -> Path:
+        return self.root / self.relative_path_for(object_hash, kind)
+
+    def put(self, kind: str, data: bytes) -> str:
         """Publish ``data`` atomically and return its content hash.
 
-        Idempotent: an object that is already published is left untouched (it is
-        immutable, so identical bytes are already there).
+        Idempotent, and safe when two PROCESSES publish the same object at once:
+        both can miss the existence check, and on Windows the loser's
+        ``os.replace`` then fails because a reader holds the destination open.
+        The name IS the content, so a destination that already hashes correctly
+        means the object is published -- by us or by the other writer.
         """
         object_hash = content_hash(kind, data)
         path = self.path_for(object_hash, kind)
@@ -110,7 +117,12 @@ class ObjectStore:
                 raise ObjectHashMismatch(
                     f"object {object_hash} did not survive the write to {tmp}"
                 )
-            os.replace(tmp, path)
+            try:
+                os.replace(tmp, path)
+            except OSError:
+                if not (path.exists() and content_hash(kind, path.read_bytes()) == object_hash):
+                    raise
+            _fsync_directory(path.parent)
         finally:
             if tmp.exists():
                 tmp.unlink()
@@ -238,7 +250,7 @@ class ReplayIndex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._busy_timeout_ms = busy_timeout_ms
         self._local = threading.local()
-        self._connections: List[sqlite3.Connection] = []
+        self._connections: Dict[int, sqlite3.Connection] = {}
         self._connections_lock = threading.Lock()
         self._create_schema()
 
@@ -256,7 +268,7 @@ class ReplayIndex:
         conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         self._local.conn = conn
         with self._connections_lock:
-            self._connections.append(conn)
+            self._connections[threading.get_ident()] = conn
         return conn
 
     def _create_schema(self) -> None:
@@ -265,15 +277,34 @@ class ReplayIndex:
             for statement in _SCHEMA:
                 conn.execute(statement)
 
-    def close(self) -> None:
+    def close(self) -> int:
+        """Close THIS thread's connection; return how many foreign ones remain.
+
+        sqlite3 refuses a cross-thread ``close()``, so every thread closes its
+        own (the writer thread does it when it stops). Residue is a DEBUG fact,
+        not an error: it is reported so a Windows lock on ``index.sqlite`` can be
+        traced to the thread still holding it.
+
+        The index is reopenable: a later call lazily creates a fresh connection.
+        That is deliberate -- a capture gap discovered after shutdown (a late
+        submit) must still be able to write its coverage row.
+        """
+        ident = threading.get_ident()
         with self._connections_lock:
-            connections, self._connections = self._connections, []
-        for conn in connections:
+            conn = self._connections.pop(ident, None)
+            remaining = len(self._connections)
+        if conn is not None:
             try:
                 conn.close()
             except sqlite3.Error as exc:
                 logger.error(f"replay index: failed to close a connection: {exc}", exc_info=True)
         self._local = threading.local()
+        if remaining:
+            logger.debug(
+                f"replay index {self.path.name}: {remaining} connection(s) still open in "
+                f"other thread(s); each closes its own"
+            )
+        return remaining
 
     # -- writes
 
@@ -422,18 +453,6 @@ class ReplayIndex:
         with _transaction(conn):
             _write_coverage(conn, entries)
 
-    def register_objects(self, objects: Sequence[ObjectRef]) -> None:
-        """Reference objects without an analysis (used by partial bootstraps)."""
-        now = _now_iso()
-        conn = self._connection()
-        with _transaction(conn):
-            for ref in objects:
-                conn.execute(
-                    "INSERT OR IGNORE INTO objects (hash, kind, size, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (ref.hash, ref.kind, ref.size, now),
-                )
-
     # -- reads
 
     def list_sessions(self) -> List[SessionRecord]:
@@ -499,12 +518,6 @@ class ReplayIndex:
         rows = self._connection().execute("SELECT hash FROM objects").fetchall()
         return {row["hash"] for row in rows}
 
-    def object_refs(self) -> List[ObjectRef]:
-        rows = self._connection().execute(
-            "SELECT hash, kind, size FROM objects ORDER BY hash"
-        ).fetchall()
-        return [ObjectRef(hash=r["hash"], kind=r["kind"], size=r["size"]) for r in rows]
-
 
 # --------------------------------------------------------------------------- helpers
 
@@ -526,7 +539,13 @@ class _transaction:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc_type is None:
-            self._conn.execute("COMMIT")
+            try:
+                self._conn.execute("COMMIT")
+            except Exception:
+                # A failed COMMIT leaves the transaction open: end it, then let
+                # the failure surface rather than silently holding the write lock.
+                self._conn.execute("ROLLBACK")
+                raise
         else:
             self._conn.execute("ROLLBACK")
         return False
@@ -545,6 +564,27 @@ def _write_coverage(conn: sqlite3.Connection, entries: Iterable[CoverageEntry]) 
                 entry.detail,
             ),
         )
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Durably publish the directory entry where the platform supports it.
+
+    Windows has no ``O_DIRECTORY`` and cannot open a directory as a file, so this
+    is a no-op there; the object bytes themselves were already fsynced.
+    """
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        fd = os.open(str(directory), os.O_DIRECTORY)
+    except OSError as exc:
+        logger.debug(f"replay store: directory fsync unavailable for {directory}: {exc}")
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        logger.debug(f"replay store: directory fsync failed for {directory}: {exc}")
+    finally:
+        os.close(fd)
 
 
 def _dumps(payload: Dict[str, Any]) -> str:

@@ -12,6 +12,7 @@ mistake for a live recorder.
 from __future__ import annotations
 
 import contextvars
+import functools
 import queue
 import threading
 from contextlib import contextmanager
@@ -33,6 +34,8 @@ __all__ = [
     "capture_scope",
     "current_capture",
     "use_capture_context",
+    "run_in_capture_context",
+    "capture_aware_submit",
 ]
 
 _CURRENT: contextvars.ContextVar[Optional["CaptureContext"]] = contextvars.ContextVar(
@@ -82,21 +85,25 @@ class CaptureHealth:
         with self._lock:
             self._counts[kind] += 1
 
+    def count(self, kind: str) -> int:
+        with self._lock:
+            return self._counts[kind]
+
     @property
     def queue_saturation(self) -> int:
-        return self._counts[self.QUEUE_SATURATION]
+        return self.count(self.QUEUE_SATURATION)
 
     @property
     def disk_error(self) -> int:
-        return self._counts[self.DISK_ERROR]
+        return self.count(self.DISK_ERROR)
 
     @property
     def unsupported_type(self) -> int:
-        return self._counts[self.UNSUPPORTED_TYPE]
+        return self.count(self.UNSUPPORTED_TYPE)
 
     @property
     def other(self) -> int:
-        return self._counts[self.OTHER]
+        return self.count(self.OTHER)
 
     @property
     def total(self) -> int:
@@ -167,7 +174,9 @@ class CaptureContext:
         self.analysis_id: str = self.meta["analysis_id"]
 
         self._objects: Dict[str, Any] = {}
-        self._observations: List[PendingObservation] = []
+        self._observations: Dict[int, PendingObservation] = {}
+        self._next_seq = 0
+        self._failures: Dict[str, int] = {}
         self._clock_reads: List[str] = []
         self._replay_reads: Iterator[str] = iter(list(clock_reads))
         self._bundle_status = ReplayStatus.CAPTURE_NOT_ATTEMPTED
@@ -234,9 +243,6 @@ class CaptureContext:
             self._bundle_status = ReplayStatus.CAPTURE_FAILED
             self._note_failure("bundle snapshot failed", exc)
 
-    def set_bundle_status(self, status: str) -> None:
-        self._bundle_status = status
-
     def set_outcome(self, *, recommendation=None, skip_reason=None, error=None) -> None:
         """Record what the analysis actually produced: a recommendation, a skip or an error."""
         given = [name for name, value in
@@ -274,11 +280,19 @@ class CaptureContext:
         published_at: Optional[datetime] = None,
         first_observed_at: Optional[datetime] = None,
     ) -> Optional[str]:
-        """Record one provider return at its return boundary (cache hits included)."""
+        """Record one provider return at its return boundary (cache hits included).
+
+        Concurrency: the invocation number is drawn from a monotonic counter under
+        the lock and never reused, so two provider calls racing inside one
+        analysis (thread pools inside a gather) cannot be handed the same
+        ``observation_id`` -- which the index would silently collapse into one row.
+        The expensive part (freezing the payload) happens outside the lock.
+        """
         try:
             with self._lock:
-                seq = len(self._observations)
-                observation_id = f"{self.analysis_id}#{seq:04d}"
+                seq = self._next_seq
+                self._next_seq += 1
+            observation_id = f"{self.meta['session_id']}:{self.analysis_id}#{seq:06d}"
             now = _utc_now()
             observation = ProviderObservation(
                 observation_id=observation_id,
@@ -301,7 +315,7 @@ class CaptureContext:
             )
             pending = PendingObservation(observation=observation, payload=freeze(payload))
             with self._lock:
-                self._observations.append(pending)
+                self._observations[seq] = pending
             return observation_id
         except Exception as exc:
             self._note_failure(f"observation {provider}.{method} not recorded", exc)
@@ -309,7 +323,8 @@ class CaptureContext:
 
     def record_clock_read(self, value: datetime) -> None:
         try:
-            self._clock_reads.append(value.isoformat())
+            with self._lock:
+                self._clock_reads.append(value.isoformat())
         except Exception as exc:
             self._note_failure("clock read not recorded", exc)
 
@@ -359,8 +374,9 @@ class CaptureContext:
             recommendation_object=None,
             skip_reason=self._skip_reason,
             error=error,
-            observation_ids=[p.observation.observation_id for p in self._observations],
+            observation_ids=[p.observation.observation_id for p in self.observations],
             branch_flags=dict(self.meta["branch_flags"]) if "branch_flags" in self.meta else {},
+            capture_failures=self.capture_failures,
         )
 
     @property
@@ -369,7 +385,8 @@ class CaptureContext:
 
     @property
     def observations(self) -> List[PendingObservation]:
-        return list(self._observations)
+        with self._lock:
+            return [self._observations[seq] for seq in sorted(self._observations)]
 
     def submit_to(self, store) -> None:
         """Hand the finished record to the store. Failures stay inside recording."""
@@ -380,8 +397,19 @@ class CaptureContext:
 
     # -- failure boundary
 
+    @property
+    def capture_failures(self) -> Dict[str, int]:
+        """Per-analysis degradation counts by kind (empty when nothing failed)."""
+        with self._lock:
+            return dict(self._failures)
+
     def _note_failure(self, message: str, exc: BaseException) -> None:
-        self.health.record(classify_failure(exc))
+        kind = classify_failure(exc)
+        self.health.record(kind)
+        with self._lock:
+            if kind not in self._failures:
+                self._failures[kind] = 0
+            self._failures[kind] += 1
         if self._error_logged:
             return
         self._error_logged = True
@@ -438,6 +466,41 @@ def use_capture_context(context: Optional[CaptureContext]):
         yield context
     finally:
         _CURRENT.reset(token)
+
+
+def run_in_capture_context(fn):
+    """Wrap ``fn`` so it keeps the CURRENT capture context when another thread runs it.
+
+    A ``ContextVar`` is per-thread: a worker inside a ``ThreadPoolExecutor`` sees
+    NO capture context, so provider taps and the clock seam inside a pooled
+    gather would silently record nothing. Wrap the callable at submit time --
+    where the context is still active -- and the worker re-enters it.
+
+    Unlike handing a single ``contextvars.Context`` to several workers (which
+    raises once two of them enter it at the same time), this wrapper only
+    re-installs the capture ContextVar and is safe to reuse concurrently, e.g.
+    with ``executor.map``.
+    """
+    context = current_capture()
+
+    @functools.wraps(fn)
+    def _runner(*args, **kwargs):
+        if context is None:
+            return fn(*args, **kwargs)
+        with use_capture_context(context):
+            return fn(*args, **kwargs)
+
+    return _runner
+
+
+def capture_aware_submit(executor, fn, *args, **kwargs):
+    """``executor.submit(fn, ...)`` with the caller's full context copied into the task.
+
+    Uses ``contextvars.copy_context().run`` -- one fresh copy per submission, so
+    concurrent tasks never share a Context object.
+    """
+    context = contextvars.copy_context()
+    return executor.submit(context.run, functools.partial(fn, *args, **kwargs))
 
 
 @contextmanager

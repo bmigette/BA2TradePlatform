@@ -8,6 +8,7 @@ refused.
 """
 import json
 import threading
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -285,4 +286,160 @@ def test_health_is_shared_between_store_and_context(tmp_path):
         assert ctx.health is store.health
         ctx.set_outcome(skip_reason="done")
     store.finalize_session("s1")
+    store.close()
+
+
+# --------------------------------------------------------------------------- closed store
+
+
+def test_submitting_after_close_is_dropped_visibly_not_silently(tmp_path, monkeypatch):
+    from ba2_common.core.replay import service as service_module
+
+    monkeypatch.setattr(service_module.logger, "error", lambda *a, **k: None)
+    store = ReplayStore(tmp_path, writer="thread")
+    store.begin_session(_session())
+    _record_one_analysis(store, analysis_id="a-early")
+    store.finalize_session("s1")
+    store.close()
+
+    _record_one_analysis(store, analysis_id="a-late")  # must not raise, must not vanish
+
+    assert store.closed
+    assert store.health.other == 1
+    dropped = [c for c in store.index.coverage("s1") if c.analysis_id == "a-late"]
+    assert len(dropped) == 1
+    assert dropped[0].status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "closed" in dropped[0].detail
+    assert [a.analysis_id for a in store.index.analyses("s1")] == ["a-early"]
+    store.index.close()
+
+
+def test_drain_is_bounded_and_finalize_reports_what_never_landed(tmp_path, monkeypatch):
+    from ba2_common.core.replay import service as service_module
+
+    monkeypatch.setattr(service_module.logger, "error", lambda *a, **k: None)
+    store = ReplayStore(tmp_path, writer="thread", queue_maxsize=8)
+    store.begin_session(_session())
+
+    release = threading.Event()
+    original = store._write_pending
+    monkeypatch.setattr(
+        store, "_write_pending", lambda pending: (release.wait(timeout=30), original(pending))[1]
+    )
+
+    for n in range(3):
+        _record_one_analysis(store, analysis_id=f"a{n}")
+
+    started = time.monotonic()
+    remaining = store.finalize_session("s1", timeout=0.2)
+    assert time.monotonic() - started < 10, "finalize must not hang on a stuck writer"
+    assert remaining > 0
+    assert store.health.queue_saturation > 0
+    sessions = {s.session_id: s for s in store.index.list_sessions()}
+    assert sessions["s1"].status == ReplayStatus.SESSION_INTERRUPTED
+
+    release.set()
+    store.close(timeout=10)
+
+
+def test_a_writer_failure_leaves_a_missing_capture_row(tmp_path, monkeypatch):
+    from ba2_common.core.replay import service as service_module
+
+    monkeypatch.setattr(service_module.logger, "error", lambda *a, **k: None)
+    store = ReplayStore(tmp_path, writer="thread")
+    store.begin_session(_session())
+
+    def _boom(pending):
+        raise OSError("disk went away")
+
+    monkeypatch.setattr(store, "_write_pending", _boom)
+    _record_one_analysis(store, analysis_id="a-doomed")
+    assert store.drain(timeout=10) == 0
+
+    assert store.health.disk_error == 1
+    coverage = store.index.coverage("s1")
+    assert [c.analysis_id for c in coverage] == ["a-doomed"]
+    assert coverage[0].status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "writer failed" in coverage[0].detail
+    assert store.index.analyses("s1") == []
+    store.close()
+
+
+# --------------------------------------------------------------------------- capture gaps
+
+
+class _Opaque:
+    """A value the codec refuses (a capture gap), but freeze copies happily."""
+
+
+def test_an_unsupported_settings_object_is_a_named_gap_not_a_silent_one(tmp_path, monkeypatch):
+    from ba2_common.core.replay import service as service_module
+
+    monkeypatch.setattr(service_module.logger, "error", lambda *a, **k: None)
+    store = ReplayStore(tmp_path, writer="sync")
+    store.begin_session(_session())
+    with capture_scope(store, _meta(settings={"opaque": _Opaque()})) as ctx:
+        ctx.set_bundle({"symbol": "AAPL"})
+        ctx.set_outcome(recommendation={"signal": "HOLD"})
+    store.finalize_session("s1")
+
+    record = store.index.analyses("s1")[0]
+    assert record.capture_gaps == ("settings",)
+    assert record.settings_object is None
+    assert record.bundle_object is not None  # the rest of the analysis is intact
+    assert record.recommendation_object is not None
+    assert store.health.unsupported_type == 1
+
+    coverage = store.index.coverage("s1")
+    assert len(coverage) == 1
+    assert coverage[0].status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "settings" in coverage[0].detail
+    store.close()
+
+
+def test_an_unsupported_bundle_is_marked_unsupported(tmp_path, monkeypatch):
+    from ba2_common.core.replay import service as service_module
+
+    monkeypatch.setattr(service_module.logger, "error", lambda *a, **k: None)
+    store = ReplayStore(tmp_path, writer="sync")
+    store.begin_session(_session())
+    with capture_scope(store, _meta()) as ctx:
+        ctx.set_bundle({"opaque": _Opaque()})
+        ctx.set_outcome(skip_reason="no data")
+    store.finalize_session("s1")
+
+    record = store.index.analyses("s1")[0]
+    assert record.bundle_capture_status == ReplayStatus.CAPTURE_UNSUPPORTED
+    assert record.capture_gaps == ("bundle",)
+    assert record.outcome == ReplayStatus.OUTCOME_SKIP
+    store.close()
+
+
+def test_concurrent_observations_land_as_distinct_index_rows(tmp_path):
+    store = ReplayStore(tmp_path, writer="sync")
+    store.begin_session(_session())
+    with capture_scope(store, _meta()) as ctx:
+        def _record(n):
+            ctx.record_observation(
+                provider="fmp",
+                method="quote",
+                request_identity={"symbol": f"S{n}"},
+                payload=[n],
+                provenance=ReplayStatus.PROVENANCE_NETWORK,
+            )
+
+        threads = [threading.Thread(target=_record, args=(n,)) for n in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        ctx.set_outcome(skip_reason="done")
+    store.finalize_session("s1")
+
+    observations = store.index.observations("a1")
+    assert len(observations) == 6
+    assert len({o.observation_id for o in observations}) == 6
+    assert {tuple(o.request_identity.items()) for o in observations} == {
+        (("symbol", f"S{n}"),) for n in range(6)
+    }
     store.close()
