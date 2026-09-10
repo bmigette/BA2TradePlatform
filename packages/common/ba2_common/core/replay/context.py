@@ -1,0 +1,469 @@
+"""The per-analysis capture context (spec step 1, sections 3 and 4).
+
+"Recording is observational; it must not turn an otherwise valid trade into a
+skipped trade or silently mark a gap as complete." So every public method here
+is a boundary: it does its work, and if that work fails it counts the failure in
+:class:`CaptureHealth`, logs it ONCE per analysis at ERROR, and returns. Nothing
+raised inside recording reaches the expert.
+
+Absence of a context means capture is off -- there is no null-object stand-in to
+mistake for a live recorder.
+"""
+from __future__ import annotations
+
+import contextvars
+import queue
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
+
+import pandas as pd
+
+from ba2_common.core.replay.codec import UnsupportedCaptureType, freeze
+from ba2_common.core.replay.schemas import AnalysisRecord, ProviderObservation, ReplayStatus
+from ba2_common.logger import logger
+
+__all__ = [
+    "CaptureHealth",
+    "CaptureContext",
+    "PendingObservation",
+    "ReplayMiss",
+    "capture_scope",
+    "current_capture",
+    "use_capture_context",
+]
+
+_CURRENT: contextvars.ContextVar[Optional["CaptureContext"]] = contextvars.ContextVar(
+    "ba2_replay_capture_context", default=None
+)
+
+
+class ReplayMiss(Exception):
+    """Replay needed a recorded value that the bundle does not contain.
+
+    Raised instead of falling back to a wall clock, a live request or a
+    historical estimate -- a miss is a coverage fact, not something to paper over.
+    """
+
+    def __init__(self, kind: str, *, analysis_id=None, request_identity=None, detail=None):
+        parts = [f"replay miss ({kind})"]
+        if analysis_id is not None:
+            parts.append(f"analysis={analysis_id}")
+        if request_identity is not None:
+            parts.append(f"request={request_identity}")
+        if detail is not None:
+            parts.append(str(detail))
+        super().__init__("; ".join(parts))
+        self.kind = kind
+        self.analysis_id = analysis_id
+        self.request_identity = request_identity
+        self.detail = detail
+
+
+class CaptureHealth:
+    """Visible capture failure counters (spec section 3: "raise a visible capture
+    health error"). Thread-safe; shared by every analysis of one store."""
+
+    QUEUE_SATURATION = "queue_saturation"
+    DISK_ERROR = "disk_error"
+    UNSUPPORTED_TYPE = "unsupported_type"
+    OTHER = "other"
+    KINDS = (QUEUE_SATURATION, DISK_ERROR, UNSUPPORTED_TYPE, OTHER)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: Dict[str, int] = {kind: 0 for kind in self.KINDS}
+
+    def record(self, kind: str) -> None:
+        if kind not in self._counts:
+            raise ValueError(f"unknown capture health kind {kind!r}")
+        with self._lock:
+            self._counts[kind] += 1
+
+    @property
+    def queue_saturation(self) -> int:
+        return self._counts[self.QUEUE_SATURATION]
+
+    @property
+    def disk_error(self) -> int:
+        return self._counts[self.DISK_ERROR]
+
+    @property
+    def unsupported_type(self) -> int:
+        return self._counts[self.UNSUPPORTED_TYPE]
+
+    @property
+    def other(self) -> int:
+        return self._counts[self.OTHER]
+
+    @property
+    def total(self) -> int:
+        with self._lock:
+            return sum(self._counts.values())
+
+    def as_dict(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+
+def classify_failure(exc: BaseException) -> str:
+    """Which health counter a recording failure belongs to."""
+    if isinstance(exc, UnsupportedCaptureType):
+        return CaptureHealth.UNSUPPORTED_TYPE
+    if isinstance(exc, queue.Full):
+        return CaptureHealth.QUEUE_SATURATION
+    if isinstance(exc, OSError):
+        return CaptureHealth.DISK_ERROR
+    return CaptureHealth.OTHER
+
+
+@dataclass(frozen=True)
+class PendingObservation:
+    """An observation record plus the frozen payload the writer still has to encode."""
+
+    observation: ProviderObservation
+    payload: Any
+
+
+_REQUIRED_META = (
+    "analysis_id",
+    "attempt_id",
+    "session_id",
+    "expert_class",
+    "expert_instance_id",
+    "symbol",
+    "use_case",
+    "scheduled_at",
+    "started_at",
+)
+
+
+class CaptureContext:
+    """Everything one analysis records, held in a ContextVar for the duration.
+
+    In ``capture`` mode it accumulates clock reads, provider observations, the
+    normalized bundle and the outcome. In ``replay`` mode it hands back the
+    recorded clock reads in order (see :func:`ba2_common.core.replay.clock.replay_now`).
+    """
+
+    def __init__(
+        self,
+        *,
+        analysis_meta: Mapping[str, Any],
+        health: CaptureHealth,
+        mode: str = ReplayStatus.MODE_CAPTURE,
+        clock_reads: Sequence[str] = (),
+    ):
+        missing = [key for key in _REQUIRED_META if key not in analysis_meta]
+        if missing:
+            raise KeyError(f"analysis_meta is missing required key(s): {missing}")
+        if mode == ReplayStatus.MODE_CAPTURE and analysis_meta["started_at"] is None:
+            raise ValueError("analysis_meta['started_at'] is required in capture mode")
+        self.meta: Dict[str, Any] = dict(analysis_meta)
+        self.health = health
+        self.mode = mode
+        self.analysis_id: str = self.meta["analysis_id"]
+
+        self._objects: Dict[str, Any] = {}
+        self._observations: List[PendingObservation] = []
+        self._clock_reads: List[str] = []
+        self._replay_reads: Iterator[str] = iter(list(clock_reads))
+        self._bundle_status = ReplayStatus.CAPTURE_NOT_ATTEMPTED
+        self._outcome: Optional[str] = None
+        self._skip_reason: Optional[str] = None
+        self._error: Optional[str] = None
+        self._error_logged = False
+        self._lock = threading.Lock()
+
+        if "settings" in self.meta:
+            self.set_settings(self.meta["settings"])
+
+    # -- mode
+
+    @classmethod
+    def current(cls) -> Optional["CaptureContext"]:
+        """The active context, or None when capture is off (see :func:`current_capture`)."""
+        return _CURRENT.get()
+
+    @property
+    def has_outcome(self) -> bool:
+        return self._outcome is not None
+
+    @property
+    def is_replay(self) -> bool:
+        return self.mode == ReplayStatus.MODE_REPLAY
+
+    @classmethod
+    def for_replay(cls, *, analysis_id: str, clock_reads: Sequence[str], **meta) -> "CaptureContext":
+        """A replay-mode context: no recording, recorded clock reads only."""
+        base: Dict[str, Any] = {
+            "analysis_id": analysis_id,
+            "attempt_id": analysis_id,
+            "session_id": "replay",
+            "expert_class": "",
+            "expert_instance_id": None,
+            "symbol": "",
+            "use_case": "",
+            "scheduled_at": None,
+            "started_at": None,
+        }
+        base.update(meta)
+        return cls(
+            analysis_meta=base,
+            health=CaptureHealth(),
+            mode=ReplayStatus.MODE_REPLAY,
+            clock_reads=clock_reads,
+        )
+
+    # -- recording boundary
+
+    def set_settings(self, settings: Any) -> None:
+        try:
+            self._objects["settings"] = freeze(settings)
+        except Exception as exc:  # never propagate into the expert
+            self._note_failure("settings snapshot failed", exc)
+
+    def set_bundle(self, bundle: Any) -> None:
+        """Snapshot the normalized ``_gather`` bundle before ``_process`` runs."""
+        try:
+            self._objects["bundle"] = freeze(bundle)
+            self._bundle_status = ReplayStatus.CAPTURE_CAPTURED
+        except Exception as exc:
+            self._bundle_status = ReplayStatus.CAPTURE_FAILED
+            self._note_failure("bundle snapshot failed", exc)
+
+    def set_bundle_status(self, status: str) -> None:
+        self._bundle_status = status
+
+    def set_outcome(self, *, recommendation=None, skip_reason=None, error=None) -> None:
+        """Record what the analysis actually produced: a recommendation, a skip or an error."""
+        given = [name for name, value in
+                 (("recommendation", recommendation), ("skip_reason", skip_reason), ("error", error))
+                 if value is not None]
+        if len(given) != 1:
+            self._note_failure(
+                f"set_outcome needs exactly one of recommendation/skip_reason/error, got {given}",
+                ValueError("ambiguous outcome"),
+            )
+            return
+        try:
+            if recommendation is not None:
+                self._objects["recommendation"] = freeze(recommendation)
+                self._outcome = ReplayStatus.OUTCOME_RECOMMENDATION
+            elif skip_reason is not None:
+                self._outcome = ReplayStatus.OUTCOME_SKIP
+                self._skip_reason = str(skip_reason)
+            else:
+                self._outcome = ReplayStatus.OUTCOME_ERROR
+                self._error = _format_error(error)
+        except Exception as exc:
+            self._note_failure("outcome snapshot failed", exc)
+
+    def record_observation(
+        self,
+        *,
+        provider: str,
+        method: str,
+        request_identity: Mapping[str, Any],
+        payload: Any,
+        provenance: str,
+        response_class: Optional[str] = None,
+        fetched_at: Optional[datetime] = None,
+        published_at: Optional[datetime] = None,
+        first_observed_at: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Record one provider return at its return boundary (cache hits included)."""
+        try:
+            with self._lock:
+                seq = len(self._observations)
+                observation_id = f"{self.analysis_id}#{seq:04d}"
+            now = _utc_now()
+            observation = ProviderObservation(
+                observation_id=observation_id,
+                session_id=self.meta["session_id"],
+                analysis_ids=[self.analysis_id],
+                provider=provider,
+                method=method,
+                request_identity=dict(request_identity),
+                invocation_seq=seq,
+                payload_object=None,
+                payload_kind=payload_kind_of(payload),
+                response_class=response_class or response_class_of(payload),
+                content_hash=None,
+                fetched_at=fetched_at,
+                observed_at=now,
+                consumed_at=now,
+                published_at=published_at,
+                first_observed_at=first_observed_at,
+                provenance=provenance,
+            )
+            pending = PendingObservation(observation=observation, payload=freeze(payload))
+            with self._lock:
+                self._observations.append(pending)
+            return observation_id
+        except Exception as exc:
+            self._note_failure(f"observation {provider}.{method} not recorded", exc)
+            return None
+
+    def record_clock_read(self, value: datetime) -> None:
+        try:
+            self._clock_reads.append(value.isoformat())
+        except Exception as exc:
+            self._note_failure("clock read not recorded", exc)
+
+    def next_clock_read(self) -> datetime:
+        """Replay mode: the next recorded read. Exhausted is a loud ReplayMiss."""
+        try:
+            recorded = next(self._replay_reads)
+        except StopIteration:
+            raise ReplayMiss("clock_read", analysis_id=self.analysis_id) from None
+        return datetime.fromisoformat(recorded)
+
+    def set_branch_flag(self, name: str, value: Any) -> None:
+        try:
+            flags = dict(self.meta["branch_flags"]) if "branch_flags" in self.meta else {}
+            flags[name] = value
+            self.meta["branch_flags"] = flags
+        except Exception as exc:
+            self._note_failure(f"branch flag {name} not recorded", exc)
+
+    # -- finishing
+
+    def build_record(self) -> AnalysisRecord:
+        outcome = self._outcome
+        error = self._error
+        if outcome is None:
+            # No silent failure: an analysis that recorded nothing is an error,
+            # not an absent row that quietly shrinks the coverage total.
+            outcome = ReplayStatus.OUTCOME_ERROR
+            error = "analysis ended without a recorded outcome"
+        return AnalysisRecord(
+            analysis_id=self.analysis_id,
+            attempt_id=self.meta["attempt_id"],
+            session_id=self.meta["session_id"],
+            expert_class=self.meta["expert_class"],
+            expert_instance_id=self.meta["expert_instance_id"],
+            symbol=self.meta["symbol"],
+            use_case=self.meta["use_case"],
+            scheduled_at=self.meta["scheduled_at"],
+            started_at=self.meta["started_at"],
+            finished_at=_utc_now(),
+            settings_hash=None,
+            settings_object=None,
+            bundle_object=None,
+            bundle_capture_status=self._bundle_status,
+            clock_reads=list(self._clock_reads),
+            outcome=outcome,
+            recommendation_object=None,
+            skip_reason=self._skip_reason,
+            error=error,
+            observation_ids=[p.observation.observation_id for p in self._observations],
+            branch_flags=dict(self.meta["branch_flags"]) if "branch_flags" in self.meta else {},
+        )
+
+    @property
+    def objects(self) -> Dict[str, Any]:
+        return dict(self._objects)
+
+    @property
+    def observations(self) -> List[PendingObservation]:
+        return list(self._observations)
+
+    def submit_to(self, store) -> None:
+        """Hand the finished record to the store. Failures stay inside recording."""
+        try:
+            store.submit(self.build_record(), objects=self.objects, observations=self.observations)
+        except Exception as exc:
+            self._note_failure("analysis record not submitted", exc)
+
+    # -- failure boundary
+
+    def _note_failure(self, message: str, exc: BaseException) -> None:
+        self.health.record(classify_failure(exc))
+        if self._error_logged:
+            return
+        self._error_logged = True
+        logger.error(
+            f"replay capture degraded for analysis {self.analysis_id} "
+            f"({self.meta['expert_class']}/{self.meta['symbol']}): {message}: {exc}"
+        )
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_error(error: Any) -> str:
+    if isinstance(error, BaseException):
+        return f"{type(error).__name__}: {error}"
+    return str(error)
+
+
+def payload_kind_of(payload: Any) -> str:
+    if payload is None:
+        return ReplayStatus.PAYLOAD_NONE
+    if isinstance(payload, (pd.DataFrame, pd.Series)):
+        return ReplayStatus.PAYLOAD_FRAME
+    if isinstance(payload, (dict, list)):
+        return ReplayStatus.PAYLOAD_JSON
+    return ReplayStatus.PAYLOAD_SCALAR
+
+
+def response_class_of(payload: Any) -> str:
+    """Classify a return WITHOUT coercing it: empty is a fact, not a missing value."""
+    if payload is None:
+        return ReplayStatus.RESPONSE_EMPTY
+    if isinstance(payload, (pd.DataFrame, pd.Series)):
+        return ReplayStatus.RESPONSE_EMPTY if len(payload) == 0 else ReplayStatus.RESPONSE_DATA
+    if isinstance(payload, (dict, list, tuple, str)):
+        return ReplayStatus.RESPONSE_EMPTY if len(payload) == 0 else ReplayStatus.RESPONSE_DATA
+    return ReplayStatus.RESPONSE_DATA
+
+
+def current_capture() -> Optional[CaptureContext]:
+    """The active capture/replay context, or None when capture is off."""
+    return _CURRENT.get()
+
+
+@contextmanager
+def use_capture_context(context: Optional[CaptureContext]):
+    """Install ``context`` for the duration of the block (used by replay)."""
+    token = _CURRENT.set(context)
+    try:
+        yield context
+    finally:
+        _CURRENT.reset(token)
+
+
+@contextmanager
+def capture_scope(store, analysis_meta: Mapping[str, Any]):
+    """Open a recording scope around one live analysis.
+
+    ``store is None`` means capture is off: the block runs with no context at
+    all, which is what every provider tap and the clock seam check for.
+    """
+    if store is None:
+        yield None
+        return
+    try:
+        context = CaptureContext(analysis_meta=analysis_meta, health=store.health)
+    except Exception as exc:
+        store.health.record(classify_failure(exc))
+        logger.error(f"replay capture could not open a scope: {exc}", exc_info=True)
+        yield None
+        return
+    token = _CURRENT.set(context)
+    try:
+        yield context
+    except BaseException as exc:
+        if not context.has_outcome:
+            context.set_outcome(error=exc)
+        raise
+    finally:
+        _CURRENT.reset(token)
+        context.submit_to(store)
