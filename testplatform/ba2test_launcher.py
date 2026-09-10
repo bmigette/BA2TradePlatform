@@ -245,10 +245,13 @@ def _cmd_prewarm(args) -> int:
     in from the trade app-settings DB by _enter_backend). Runs each expert's per-symbol
     history fetch in a ThreadPoolExecutor, INSIDE frozen_ttl_cache() so the BACKTEST-ONLY
     disk cache layer is engaged (the freeze gate is what enables disk writes; live passes
-    through to the API). FactorRanker is skipped — its factor data is not disk-cached.
+    through to the API).
+
+    The fetchers themselves live in app.services.prewarm_fetchers, shared with the API/queue
+    handler (app.services.data_build_handler.handle_prewarm) so both entry points warm the
+    same surface.
     """
     import time
-    import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from ba2_providers.fmp_common import (
         frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel, set_ttl_frozen,
@@ -301,179 +304,55 @@ def _cmd_prewarm(args) -> int:
         if start_date.tzinfo is None:
             start_date = start_date.replace(tzinfo=_tz.utc)
 
-    # Build the (expert, symbol) work items. Each item is a callable doing the cached fetch.
-    from ba2_experts.FMPRating import (
-        fetch_grades_historical_cached, fetch_price_target_history_cached,
-        fetch_analyst_grades_cached,
-    )
-    from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
-    from ba2_providers.insider.FMPInsiderProvider import FMPInsiderProvider
+    # Settings-DEPENDENT warming. Some experts read a DIFFERENT set of namespaces depending on
+    # how the instance being prewarmed is configured -- today FMPInsiderClusterBuy's
+    # expected_profit_mode='model', which reads two namespaces its default 'static' mode never
+    # touches (see PrewarmFetchers.do_insider). JSON object {"<ExpertClass>": {"<setting>":
+    # value}}, or @file. Omitted -> every expert is warmed with its own DECLARED settings
+    # defaults, which is what a default-configured instance reads.
+    expert_settings = None
+    if args.expert_settings:
+        _raw_settings = args.expert_settings
+        if _raw_settings.startswith("@"):
+            with open(_caller_path(_raw_settings[1:]), encoding="utf-8") as _f:
+                _raw_settings = _f.read()
+        expert_settings = json.loads(_raw_settings)
+        if not isinstance(expert_settings, dict):
+            sys.exit("ba2-test prewarm: --expert-settings must be a JSON OBJECT mapping expert "
+                     "class name -> that instance's settings dict.")
 
-    # Lazily construct the providers once (thread-safe enough: they only hold the API key
-    # + do stateless reads through the shared disk cache).
-    _details_provider = None
-    _insider_provider = None
+    # The per-(expert, symbol) fetchers live in ONE shared module, imported by BOTH prewarm
+    # entry points (this CLI and app.services.data_build_handler.handle_prewarm). They used to
+    # be two independent copies -- seven experts here, three there -- so a prewarm driven from
+    # the UI reported success having written a fraction of what this command writes (2026-09-10
+    # live-replay readiness audit). Adding an expert to prewarm_fetchers.FETCHER_METHODS now
+    # reaches both entry points or neither.
+    from app.services.prewarm_fetchers import build_fetchers, PrewarmConfigError
 
-    def _do_fmprating(sym: str) -> None:
-        fetch_grades_historical_cached(key, sym)
-        fetch_price_target_history_cached(key, sym)
-        fetch_analyst_grades_cached(key, sym)   # dated individual grades (rating-recency filter)
-
-    def _do_earnings_drift(sym: str) -> None:
-        nonlocal _details_provider
-        if _details_provider is None:
-            _details_provider = FMPCompanyDetailsProvider()
-        _details_provider.get_past_earnings(
-            sym, frequency="quarterly", end_date=end_date,
-            lookback_periods=8, format_type="dict")
-
-    def _do_insider(sym: str) -> None:
-        nonlocal _insider_provider
-        if _insider_provider is None:
-            _insider_provider = FMPInsiderProvider()
-        _insider_provider.get_insider_transactions(
-            sym, end_date=end_date, lookback_days=400, as_of=end_date,
-            format_type="dict")
-
-    # DeterministicScorer: warm the SAME fmp_history namespaces its _gather reads --
-    # annual income/balance/cashflow statements (point-in-time F-Score / Altman Z /
-    # quality / value / growth inputs; the backtest filters them by filing date in
-    # Python) + the dated analyst-grade history for the OPTIONAL analyst section
-    # (weight default 0, but the grid may switch it on). OHLCV comes from the
-    # fetch-cache parquet (same reminder as FactorRanker below).
-    def _do_deterministic_scorer(sym: str) -> None:
-        nonlocal _details_provider
-        if _details_provider is None:
-            _details_provider = FMPCompanyDetailsProvider()
-        for fn in (_details_provider.get_income_statement,
-                   _details_provider.get_balance_sheet,
-                   _details_provider.get_cashflow_statement):
-            fn(symbol=sym, frequency="annual", end_date=end_date,
-               lookback_periods=6, as_of=end_date, format_type="dict")
-        fetch_grades_historical_cached(key, sym)
-        # EARNINGS/PEAD + the ANALYST price-target leg read these two namespaces.
-        # They MUST be warmed here or a hermetic trial with w_earnings>0 /
-        # w_analyst>0 aborts on a cache miss -- loudly now that the fetchers no
-        # longer swallow it, but still an aborted trial.
-        _details_provider.get_past_earnings(symbol=sym, frequency="quarterly",
-                                            end_date=end_date, lookback_periods=16,
-                                            format_type="dict")
-        fetch_price_target_history_cached(key, sym)
-
-    # FactorRanker (bypass/rebalance expert): warm ALL of its factor inputs by calling the SAME
-    # data-layer fetchers the rebalance path uses (so coverage auto-tracks the real fetch surface
-    # and can't drift). Per symbol this writes the fmp_history namespaces income_statement_annual /
-    # balance_sheet_annual / cashflow_statement_annual (value+quality), past_earnings_quarterly +
-    # earnings_estimates_quarterly (pead), AND the 1d OHLCV parquet (momentum + value as_of price).
-    # All factor inputs are fetched regardless of weight because the GA varies factor_weight_* per
-    # individual — any factor can be active. ohlcv_provider is intentionally omitted so the fetchers
-    # construct an FMPOHLCVProvider() and the parquet path engages.
-    # NOTE: this warms the FACTOR stage of the default static universe. It does NOT warm the
-    # min_price universe price-guard or the live screener path — neither is reachable from the
-    # static NDQ30 grid (FactorRanker pins universe_source=static; min_price/screener are not in its
-    # optimize params). OHLCV is warmed only for ~400d ending at end_date; for a multi-bar backtest
-    # span run `ba2-test fetch-cache --timeframes 1d` over [start-warmup, end] (reminder printed below).
-    from ba2_experts.FactorRanker import data as _fr_data
-
-    def _do_factorranker(sym: str) -> None:
-        _fr_data.fetch_value_inputs([sym], as_of=end_date)    # income/balance/cashflow annual + OHLCV as_of price
-        _fr_data.fetch_quality_inputs([sym], as_of=end_date)  # income/balance/cashflow annual (disk hits)
-        _fr_data.fetch_pead_inputs([sym], as_of=end_date)     # past_earnings + earnings_estimates quarterly
-        _fr_data.fetch_close_prices([sym], as_of=end_date)    # momentum: 1d OHLCV parquet
-
-    # FMPSenateTraderWeight: warm the SAME fmp_history namespaces _gather reads — per-symbol
-    # senate/house trades (congress_{chamber}_trades) + the symbol's full daily price history
-    # (historical_price_full), plus each DISCLOSED trader's full history (congress_trader_history,
-    # keyed by trader name, discovered from the trades). A bare instance (no DB row) carries just
-    # the FMP key + a logger — all the fetch methods need. (The OHLCV current-price leg of _gather
-    # is served by the fetch-cache parquet, not fmp_history, so it's out of prewarm's scope.)
-    #
-    # Dedup state is SHARED across every universe symbol's _do_senate call (not per-call locals):
-    # the same prolific trader (e.g. one member of Congress with 10k+ disclosed trades) is
-    # discovered from dozens of different universe symbols, and re-iterating their whole history
-    # + re-warming their buy-symbols each time was pure wasted CPU (the disk/memory price cache
-    # already prevented redundant NETWORK fetches, but not the redundant Python-side work of
-    # getting there). Lock-guarded since the ThreadPoolExecutor runs _do_senate concurrently.
-    _senate_expert = None
-    _senate_seen_traders: set = set()
-    _senate_warmed_skill_syms: set = set()
-    _senate_lock = threading.Lock()
-    # Scalper-skip floor: the GENTLEST scalper filter any GA trial for this expert will ever
-    # use (the grid's min_trader_avg_hold_days floor + the fixed min_trader_hold_roundtrips).
-    # A trader who fails EVEN this gentlest setting fails every stricter setting in the grid
-    # too, so their skill-symbols are unreachable by any trial — safe to skip warming them.
-    # Read from _EXPERT_OPT (not hardcoded) so a future grid change can't silently desync
-    # prewarm from what the GA actually searches.
+    # The GENTLEST scalper filter any GA trial for FMPSenateTraderWeight will ever use (the
+    # grid's min_trader_avg_hold_days floor + the fixed min_trader_hold_roundtrips). A trader who
+    # fails EVEN this gentlest setting fails every stricter setting in the grid too, so their
+    # skill-symbols are unreachable by any trial -- safe to skip warming them. Read from
+    # _EXPERT_OPT (not hardcoded) so a future grid change can't silently desync prewarm from what
+    # the GA actually searches.
     _senate_opt = _EXPERT_OPT["FMPSenateTraderWeight"]
-    _senate_hold_floor_days = float(_senate_opt["expert_params"]["min_trader_avg_hold_days"]["min"])
-    _senate_hold_min_roundtrips = int(_senate_opt["fixed_settings"]["min_trader_hold_roundtrips"])
-
-    def _ensure_senate_expert():
-        nonlocal _senate_expert
-        if _senate_expert is None:
-            import logging as _lg
-            from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
-            with _senate_lock:
-                if _senate_expert is None:
-                    s = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
-                    s._api_key = key
-                    s.logger = _lg.getLogger("senate-prewarm")
-                    _senate_expert = s
-        return _senate_expert
-
-    def _warm_new_traders(s, trades) -> None:
-        """Discover new (not-yet-seen) traders from ``trades`` and warm their full disclosure
-        history + skill-relevant buy-symbol price history. Shared by ``_do_senate`` (traders
-        discovered via the per-symbol ``-trades`` endpoint) and ``_do_senate_latest`` (traders
-        discovered via the unscoped ``-latest`` endpoint) -- a trader who only shows up in the
-        unscoped feed (e.g. one whose per-symbol history was never queried because none of
-        THIS run's universe symbols happen to trigger it) still needs their
-        ``congress_trader_history`` cache entry warmed, or ``_gather_all``'s Stage 2 hits a
-        hermetic ``FMPHistoryCacheMiss`` for them mid-backtest (found empirically running
-        senate_profile_basket_verify.py after the ``_do_senate_latest`` fix alone: the unscoped
-        feed surfaces traders like "Debbie Wasserman Schultz" that the per-symbol loop over a
-        498-symbol universe never happened to discover)."""
-        new_traders = []
-        with _senate_lock:
-            for trade in trades:
-                name = s._trader_name(trade)
-                if name and name not in _senate_seen_traders:
-                    _senate_seen_traders.add(name)
-                    new_traders.append(name)
-        # Skill scoring (2026-07 upgrade) reads the price history of every symbol in each
-        # trader's scored past BUYS. Warm ALL unique buy symbols — not just the most-recent-N
-        # as of today — because at an early backtest as_of (e.g. 2022) the scorer's "most
-        # recent completed buys" are OLDER trades whose symbols a today-anchored cap would
-        # miss, hard-failing the hermetic run (FMPHistoryCacheMiss). Symbols FMP has no data
-        # for (delisted/bonds) persist as the [] sentinel, which the scorer skips cleanly.
-        for name in new_traders:
-            history = s._fetch_trader_history(name) or []  # warms congress_trader_history (once)
-            # Scalper skip: a trader excluded by even the grid's gentlest filter setting
-            # contributes to NO GA trial's signal, so their (potentially thousands of)
-            # buy-symbols are dead weight — skip the price-history warm entirely for them.
-            hold_info = s._calculate_trader_avg_hold_days(history)
-            if (hold_info["avg_hold_days"] is not None
-                    and hold_info["roundtrips"] >= _senate_hold_min_roundtrips
-                    and hold_info["avg_hold_days"] < _senate_hold_floor_days):
-                continue
-            new_skill_syms = []
-            with _senate_lock:
-                for t in history:
-                    ttype = str(t.get('type', '')).lower()
-                    if 'purchase' not in ttype and 'buy' not in ttype:
-                        continue
-                    ssym = str(t.get('symbol', '')).upper()
-                    if ssym and ssym not in _senate_warmed_skill_syms:
-                        _senate_warmed_skill_syms.add(ssym)
-                        new_skill_syms.append(ssym)
-            for ssym in new_skill_syms:
-                s._get_price_at_date(ssym, end_date)  # warms historical_price_full (once, ever)
-
-    def _do_senate(sym: str) -> None:
-        s = _ensure_senate_expert()
-        trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
-        s._get_price_at_date(sym, end_date)  # warms historical_price_full (full history, once)
-        _warm_new_traders(s, trades)
+    fetchers = build_fetchers(
+        fmp_key=key,
+        end_date=end_date,
+        finnhub_key=finnhub_key,
+        senate_hold_floor_days=float(
+            _senate_opt["expert_params"]["min_trader_avg_hold_days"]["min"]),
+        senate_hold_min_roundtrips=int(
+            _senate_opt["fixed_settings"]["min_trader_hold_roundtrips"]),
+        expert_settings=expert_settings,
+        log=lambda msg: print(msg, flush=True),
+    )
+    # Fail on missing configuration UP FRONT (one message) instead of once per symbol mid-run.
+    try:
+        unknown_experts = fetchers.validate(experts)
+    except PrewarmConfigError as e:
+        sys.exit(f"ba2-test prewarm: {e}")
+    _EXPERT_FETCHERS = fetchers.table
 
     def _do_senate_scores(start: datetime, end: datetime) -> None:
         """Proactively compute FMPSenateTraderWeight's trader-SKILL cache
@@ -499,9 +378,9 @@ def _cmd_prewarm(args) -> int:
         reachable through real trade-qualification logic in ``_calculate_recommendation`` — a
         far bigger, non-grid-shaped key space that doesn't fit this same day x combo loop.
         """
-        if _senate_expert is None or not _senate_seen_traders:
+        if fetchers.senate_expert is None or not fetchers.senate_seen_traders:
             return
-        s = _senate_expert
+        s = fetchers.senate_expert
         from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
         min_past = int(FMPSenateTraderWeight._setting_or_default(None, "skill_min_past_trades"))
         max_past = int(FMPSenateTraderWeight._setting_or_default(None, "skill_max_past_trades"))
@@ -537,14 +416,15 @@ def _cmd_prewarm(args) -> int:
         from ba2_experts.FMPSenateTraderWeight import set_scoring_cache_max
         set_scoring_cache_max(len(horizon_values) * len(lookback_values))
 
-        total = len(days) * len(horizon_values) * len(lookback_values) * len(_senate_seen_traders)
+        total = (len(days) * len(horizon_values) * len(lookback_values)
+                 * len(fetchers.senate_seen_traders))
         print(f">> senate skill prewarm: {len(days)} trading days x {len(horizon_values)} horizons "
-              f"x {len(lookback_values)} lookbacks x {len(_senate_seen_traders)} traders "
+              f"x {len(lookback_values)} lookbacks x {len(fetchers.senate_seen_traders)} traders "
               f"({total} score computations)", flush=True)
         done_scores = 0
         t_scores = time.time()
         from ba2_experts.FMPSenateTraderWeight import _parse_ymd_utc as _parse_disc_date
-        for trader_idx, name in enumerate(_senate_seen_traders, start=1):
+        for trader_idx, name in enumerate(fetchers.senate_seen_traders, start=1):
             history = s._fetch_trader_history(name) or []
             # CRITICAL: slice the history to disclosures known as-of EACH day, exactly like
             # _gather does (FMPSenateTraderWeight.py, "Stage 2": ``[h for h in history if
@@ -573,7 +453,7 @@ def _cmd_prewarm(args) -> int:
                             lookback_months=lookback, is_live=False)
                         done_scores += 1
             if trader_idx % 25 == 0:
-                print(f"   senate skill prewarm: {trader_idx}/{len(_senate_seen_traders)} traders, "
+                print(f"   senate skill prewarm: {trader_idx}/{len(fetchers.senate_seen_traders)} traders, "
                       f"{done_scores}/{total} scores ({time.time() - t_scores:.0f}s elapsed)", flush=True)
         # Flush EVERY shard this loop touched, each to its OWN path. The loops above walk
         # len(horizon_values) x len(lookback_values) skill shards, and scoring runs with
@@ -594,89 +474,13 @@ def _cmd_prewarm(args) -> int:
                   f"{expected_shards}. Shards were evicted before the flush and their scores are "
                   f"LOST. Re-run with BA2_SCORING_LRU_MAX={expected_shards} or higher.", flush=True)
 
-    def _do_senate_latest() -> None:
-        """Warm the UNSCOPED 'latest disclosures' cache entries (``congress_senate_latest/
-        ALL_FULL_HISTORY``, ``congress_house_latest/ALL_FULL_HISTORY``) that
-        FMPSenateTraderWeight's basket-mode ``_gather_all`` (``analyzes_as_basket = True``,
-        senate-basket-dispatch plan Task 5) reads via ``_fetch_senate_trades(symbol=None,
-        full_history=True)``/``_fetch_house_trades(symbol=None, full_history=True)`` -- a
-        DIFFERENT disk-cache namespace from the per-symbol ``congress_senate_trades__<SYM>``/
-        ``congress_house_trades__<SYM>`` entries ``_do_senate`` above warms (those are keyed per
-        symbol; this is keyed by the fixed name ``"ALL_FULL_HISTORY"``, see
-        ``_fetch_congress_trades`` in ``expert_mixins.py``).
-
-        Nothing warmed this before Task 5 added the basket dispatch path: the per-symbol prewarm
-        loop above only ever calls ``_fetch_senate_trades(sym)``/``_fetch_house_trades(sym)`` with
-        a real symbol, never ``symbol=None``. A real hermetic backtest of basket-mode
-        FMPSenateTraderWeight therefore failed immediately with ``FMPHistoryCacheMiss`` on every
-        bar ("congress_senate_latest/ALL_FULL_HISTORY not pre-warmed") until this was added.
-
-        DEEP PAGINATION (not the original page-0-only fetch): confirmed empirically 2026-07-18
-        that the original single-page fetch (``full_history=False``, ~4 months of disclosures)
-        left basket-mode FMPSenateTraderWeight scoring ``trades=0, fitness=-1e9`` for EVERY
-        individual across a full 2023-2026 GA matrix grid -- the unscoped fetch simply didn't
-        reach back far enough for the backtest to ever see a trade. ``full_history=True`` here
-        paginates the ``{chamber}-latest`` feed to its end (verified in
-        ``build_senate_universe.py`` to reach back to ~2012/2019 for senate/house respectively)
-        instead of a single page, and writes to the SEPARATE ``"ALL_FULL_HISTORY"`` cache key so
-        a shallow-cached "ALL" entry from before this fix (or from some other still-shallow
-        caller, e.g. FMPSenateTraderCopy's live path) can never silently satisfy this deep read
-        -- see ``_fetch_congress_trades``'s "Pagination-depth design" docstring for the full
-        reasoning. One (slower, multi-page) fetch each -- still independent of any universe
-        symbol, so it runs once regardless of how many symbols are being pre-warmed.
-
-        Also warms every trader DISCOVERED via this unscoped feed through the same
-        ``_warm_new_traders`` path ``_do_senate`` uses -- the unscoped feed's trader set does
-        NOT equal the per-symbol loop's trader set (a trader can appear in the disclosures
-        without ever being surfaced by any of THIS run's universe symbols' own per-symbol
-        ``-trades`` history), so skipping this would leave ``_gather_all``'s Stage 2 hitting a
-        hermetic miss on those traders mid-backtest.
-        """
-        s = _ensure_senate_expert()
-        print(">> senate: warming unscoped 'latest disclosures' feed (congress_senate_latest/"
-              "congress_house_latest, ALL_FULL_HISTORY, full pagination)...", flush=True)
-        senate_latest = s._fetch_senate_trades(symbol=None, full_history=True) or []
-        house_latest = s._fetch_house_trades(symbol=None, full_history=True) or []
-        print(f"   senate: {len(senate_latest)} senate + {len(house_latest)} house rows "
-              f"fetched (full pagination)", flush=True)
-        _warm_new_traders(s, senate_latest + house_latest)
-
-    # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the
-    # Finnhub key + a logger (all _fetch_recommendation_trends needs).
-    _finnhub_expert = None
-
-    def _do_finnhub(sym: str) -> None:
-        nonlocal _finnhub_expert
-        if _finnhub_expert is None:
-            if not finnhub_key:
-                sys.exit("ba2-test prewarm: finnhub_api_key not configured (set FINNHUB_API_KEY or "
-                         "the app-setting) — required to warm FinnHubRating.")
-            import logging as _lg
-            from ba2_experts.FinnHubRating import FinnHubRating
-            e = FinnHubRating.__new__(FinnHubRating)
-            e._api_key = finnhub_key
-            e.logger = _lg.getLogger("finnhub-prewarm")
-            _finnhub_expert = e
-        _finnhub_expert._fetch_recommendation_trends(sym)
-
-    _EXPERT_FETCHERS = {
-        "FMPRating": _do_fmprating,
-        "FMPEarningsDrift": _do_earnings_drift,
-        "FMPInsiderClusterBuy": _do_insider,
-        "FactorRanker": _do_factorranker,
-        "FMPSenateTraderWeight": _do_senate,
-        "FinnHubRating": _do_finnhub,
-        "DeterministicScorer": _do_deterministic_scorer,
-    }
-
     work = []  # list of (expert, symbol, fetch_callable)
     for expert in experts:
-        fetcher = _EXPERT_FETCHERS.get(expert)
-        if fetcher is None:
+        if expert in unknown_experts:
             print(f">> skipping unknown expert '{expert}' (no disk-cached history fetcher)")
             continue
         for sym in symbols:
-            work.append((expert, sym, fetcher))
+            work.append((expert, sym, _EXPERT_FETCHERS[expert]))
 
     if not work:
         print("ba2-test prewarm: no disk-cached experts to pre-warm; nothing to do.")
@@ -724,10 +528,10 @@ def _cmd_prewarm(args) -> int:
         # Copy without Weight in the same run must warm it too, or it hits a cache miss on
         # the first bar.
         if "FMPSenateTraderWeight" in experts or "FMPSenateTraderCopy" in experts:
-            _do_senate_latest()
+            fetchers.do_senate_latest()
 
         # Skill-score prewarm runs AFTER the per-symbol loop above (needs its fully-populated
-        # _senate_seen_traders), and serially (not thread-pooled — it's CPU-bound in-memory work
+        # fetchers.senate_seen_traders), and serially (not thread-pooled — it's CPU-bound in-memory work
         # over already-warmed price history, not network fetches). Still inside the freeze gate:
         # a trader-history/price cache miss here would otherwise fall through to the "live: never
         # persist" branch same as the per-symbol fetchers above.
@@ -6260,8 +6064,15 @@ def main(argv: "list | None" = None) -> int:
     pw.add_argument("--experts", default="FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy",
                     help="Comma-separated experts to pre-warm. Supported: FMPRating, "
                          "FMPEarningsDrift, FMPInsiderClusterBuy, FactorRanker, "
-                         "FMPSenateTraderWeight, FinnHubRating. Default: the 3 core rating/signal "
-                         "experts (pass the others explicitly).")
+                         "FMPSenateTraderWeight, FinnHubRating, DeterministicScorer. Default: "
+                         "the 3 core rating/signal experts (pass the others explicitly).")
+    pw.add_argument("--expert-settings", dest="expert_settings", default=None,
+                    help="JSON object {\"<ExpertClass>\": {\"<setting>\": value}}, or @file, "
+                         "giving the settings of the INSTANCE being prewarmed. Only needed for "
+                         "settings that change WHICH histories the expert reads (today: "
+                         "FMPInsiderClusterBuy's expected_profit_mode='model', which also reads "
+                         "past_earnings_quarterly + earnings_estimates_quarterly). Omitted: the "
+                         "experts' declared settings defaults.")
     pw.add_argument("--workers", type=int, default=5, help="Parallel fetch threads (default 5).")
     pw.add_argument("--end", default=None,
                     help="ISO end date for the earnings/insider in-Python filter (default today).")

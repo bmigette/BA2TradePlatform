@@ -13,7 +13,7 @@ Routing:
     (registered in main.py); these are single tasks.
 """
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -60,9 +60,17 @@ class BuildOptionsRequest(BaseModel):
 class PrewarmRequest(BaseModel):
     """Pre-build the per-symbol FMP-history disk cache — mirrors CLI prewarm."""
     symbols: List[str]
-    experts: Optional[List[str]] = None      # default: the 3 disk-cached history experts
+    experts: Optional[List[str]] = None      # default: the 3 core rating/signal experts
     workers: Optional[int] = 5
     end: Optional[str] = None                # ISO end date (default now)
+    # The instance's settings, for settings that change WHICH histories an expert reads
+    # (today: FMPInsiderClusterBuy's expected_profit_mode='model'). Expert class name ->
+    # settings dict. Omitted: the experts' declared settings defaults.
+    expert_settings: Optional[Dict[str, Dict[str, Any]]] = None
+    # Required only when warming FMPSenateTraderWeight/Copy: the GA grid's gentlest
+    # scalper-filter setting (CLI reads both from _EXPERT_OPT).
+    senate_hold_floor_days: Optional[float] = None
+    senate_hold_min_roundtrips: Optional[int] = None
 
 
 @router.post("/build-ohlcv")
@@ -163,6 +171,12 @@ def prewarm(req: PrewarmRequest):
         payload["experts"] = req.experts
     if req.end is not None:
         payload["end"] = req.end
+    if req.expert_settings is not None:
+        payload["expert_settings"] = req.expert_settings
+    if req.senate_hold_floor_days is not None:
+        payload["senate_hold_floor_days"] = req.senate_hold_floor_days
+    if req.senate_hold_min_roundtrips is not None:
+        payload["senate_hold_min_roundtrips"] = req.senate_hold_min_roundtrips
     task_id = get_task_queue().queue_task(
         task_type="prewarm",
         name=f"Prewarm FMP history: {len(symbols)} symbols",

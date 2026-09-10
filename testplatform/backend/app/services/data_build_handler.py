@@ -52,6 +52,21 @@ def _resolve_fred_key() -> str:
     return key
 
 
+def _resolve_finnhub_key() -> str:
+    """Same resolution order as FMP. Only FinnHubRating needs it, so an absent key is not an
+    error here — ``PrewarmFetchers.validate`` refuses it, and only when that expert is asked
+    for."""
+    key = os.getenv("FINNHUB_API_KEY")
+    if not key:
+        try:
+            from ba2_common.config import get_app_setting
+
+            key = get_app_setting("finnhub_api_key")
+        except Exception:  # noqa: BLE001
+            key = None
+    return key
+
+
 def _prewarm_fred(max_age_hours: float = 24.0) -> Dict[str, Any]:
     """Refresh the FRED macro series DeterministicScorer reads.
 
@@ -220,10 +235,23 @@ def handle_build_options(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any
 def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Pre-build the per-symbol FMP-history disk cache for the grid experts.
 
-    Mirrors ``ba2test_launcher._cmd_prewarm``: runs each (expert, symbol) cached fetch inside
-    ``frozen_ttl_cache()`` (which engages the backtest-only disk cache) across a thread pool.
-    Required payload keys: symbols (list). Optional: experts (list; default the 3 disk-cached
-    history experts), workers (default 5), end (ISO; default now).
+    Runs the SAME fetchers ``ba2-test prewarm`` runs -- literally the same table, from
+    ``app.services.prewarm_fetchers`` -- so the two entry points are interchangeable. Before
+    2026-09-11 they were not: this handler knew 3 of the 7 experts, warmed no per-symbol data
+    at all for DeterministicScorer (only FRED), and -- worst -- entered ``frozen_ttl_cache()``
+    on the SUBMITTING thread only. That flag is thread-local, so every pool worker ran
+    un-frozen: ``fmp_history_disk_cached`` took its live passthrough branch, the fetches went
+    out over the network, and NOT ONE cache file was written, while the task reported success
+    (2026-09-10 live-replay readiness audit, "Two prewarm tooling gaps"). ``initializer=
+    set_ttl_frozen`` sets the flag from inside each worker thread; ``persist_empty_sentinel``
+    (a module global, so it does reach the workers) makes a genuinely-empty history readable
+    as "checked, no data" instead of an eternal prewarm gap.
+
+    Required payload keys: symbols (list). Optional: experts (list; default the 3 core
+    rating/signal experts), workers (default 5), end (ISO; default now), expert_settings
+    (mapping expert class name -> that instance's settings, for settings that change WHICH
+    histories the expert reads), senate_hold_floor_days + senate_hold_min_roundtrips (required
+    only when warming the senate experts; the GA grid's gentlest scalper-filter setting).
     """
     if payload.get("symbols") is None:
         return {"status": "failed", "error": "payload.symbols is required"}
@@ -231,7 +259,14 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from datetime import timezone as _tz
-        from ba2_providers.fmp_common import frozen_ttl_cache
+
+        from ba2_providers.fmp_common import (
+            frozen_ttl_cache, persist_empty_sentinel, set_ttl_frozen,
+        )
+
+        from app.services.prewarm_fetchers import (
+            build_fetchers, PrewarmConfigError, SENATE_EXPERTS,
+        )
 
         key = _resolve_fmp_key()
         if not key:
@@ -257,64 +292,36 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             end_date = datetime.now(_tz.utc)
 
-        from ba2_experts.FMPRating import (
-            fetch_grades_historical_cached,
-            fetch_price_target_history_cached,
-            fetch_analyst_grades_cached,
+        fetchers = build_fetchers(
+            fmp_key=key,
+            end_date=end_date,
+            finnhub_key=_resolve_finnhub_key(),
+            senate_hold_floor_days=payload.get("senate_hold_floor_days"),
+            senate_hold_min_roundtrips=payload.get("senate_hold_min_roundtrips"),
+            expert_settings=payload.get("expert_settings"),
+            log=logger.info,
         )
-        from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
-            FMPCompanyDetailsProvider,
-        )
-        from ba2_providers.insider.FMPInsiderProvider import FMPInsiderProvider
+        # Refuse missing configuration UP FRONT (one message) rather than once per symbol.
+        try:
+            skipped = fetchers.validate(experts)
+        except PrewarmConfigError as e:
+            return {"status": "failed", "error": str(e)}
+        table = fetchers.table
 
-        _details_provider = {"p": None}
-        _insider_provider = {"p": None}
-
-        def _do_fmprating(sym: str) -> None:
-            fetch_grades_historical_cached(key, sym)
-            fetch_price_target_history_cached(key, sym)
-            fetch_analyst_grades_cached(key, sym)   # dated individual grades (rating-recency)
-
-        def _do_earnings_drift(sym: str) -> None:
-            if _details_provider["p"] is None:
-                _details_provider["p"] = FMPCompanyDetailsProvider()
-            _details_provider["p"].get_past_earnings(
-                sym, frequency="quarterly", end_date=end_date,
-                lookback_periods=8, format_type="dict",
-            )
-
-        def _do_insider(sym: str) -> None:
-            if _insider_provider["p"] is None:
-                _insider_provider["p"] = FMPInsiderProvider()
-            _insider_provider["p"].get_insider_transactions(
-                sym, end_date=end_date, lookback_days=400, as_of=end_date,
-                format_type="dict",
-            )
-
-        fetchers = {
-            "FMPRating": _do_fmprating,
-            "FMPEarningsDrift": _do_earnings_drift,
-            "FMPInsiderClusterBuy": _do_insider,
-        }
-
-        # DeterministicScorer's macro series are economy-wide, so they are refreshed once
-        # here rather than entering the per-symbol work list.
+        # DeterministicScorer's macro series are economy-wide, so they are refreshed once here
+        # rather than entering the per-symbol work list (its per-symbol financial histories DO
+        # enter it, through the shared fetcher table, same as the CLI).
         fred_summary = None
         if "DeterministicScorer" in experts:
             fred_summary = _prewarm_fred(float(payload.get("fred_max_age_hours", 24.0)))
             logger.info(f"prewarm task {task_id}: FRED {fred_summary}")
 
         work = []
-        skipped = []
         for expert in experts:
-            if expert == "DeterministicScorer":
-                continue          # handled above; nothing per-symbol to fetch
-            fetcher = fetchers.get(expert)
-            if fetcher is None:
-                skipped.append(expert)
+            if expert in skipped:
                 continue
             for sym in symbols:
-                work.append((expert, sym, fetcher))
+                work.append((expert, sym, table[expert]))
 
         if not work:
             return {
@@ -326,8 +333,12 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
         counts: Dict[str, int] = {}
         errors = 0
-        with frozen_ttl_cache():
-            with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        # THE FREEZE GATE MUST REACH THE WORKERS (see this function's docstring): the context
+        # manager covers this thread, the initializer covers each pool thread. Removing either
+        # one silently turns the whole run into live passthrough fetches that write nothing.
+        with frozen_ttl_cache(), persist_empty_sentinel():
+            with ThreadPoolExecutor(max_workers=max(1, workers),
+                                    initializer=set_ttl_frozen, initargs=(True,)) as ex:
                 futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
                 for fut in as_completed(futures):
                     expert, sym = futures[fut]
@@ -338,8 +349,21 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                         errors += 1
                         logger.warning(f"prewarm {expert}/{sym} failed: {e}")
 
+            # Unscoped "latest disclosures" warm (basket-mode _gather_all's
+            # congress_senate_latest / congress_house_latest "ALL_FULL_HISTORY" keys,
+            # deep-paginated) — independent of any universe symbol, so it runs once, serially,
+            # still inside the freeze gate. Same step the CLI runs.
+            senate_latest = False
+            if any(e in experts for e in SENATE_EXPERTS):
+                fetchers.do_senate_latest()
+                senate_latest = True
+
         summary = {"cached": counts, "errors": errors, "skipped": skipped,
-                   "symbols": len(symbols)}
+                   "symbols": len(symbols), "fred": fred_summary,
+                   "senate_latest": senate_latest,
+                   # The CLI's trader-SKILL score prewarm (--start) is GA-grid-specific and is
+                   # NOT run here; say so rather than let a caller assume it happened.
+                   "senate_skill_scores": "not run (ba2-test prewarm --start only)"}
         logger.info(f"prewarm task {task_id}: {summary}")
         return {"status": "completed", "summary": summary}
     except Exception as e:  # noqa: BLE001
