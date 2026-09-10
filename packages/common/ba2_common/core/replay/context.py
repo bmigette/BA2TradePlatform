@@ -26,7 +26,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pandas as pd
 
@@ -42,6 +42,7 @@ __all__ = [
     "ReplayMiss",
     "capture_scope",
     "current_capture",
+    "record_branch_flag",
     "use_capture_context",
     "run_in_capture_context",
     "capture_aware_submit",
@@ -189,6 +190,8 @@ class CaptureContext:
         health: CaptureHealth,
         mode: str = ReplayStatus.MODE_CAPTURE,
         clock_reads: Sequence[str] = (),
+        clock_read_phases: Sequence[str] = (),
+        phase: str = ReplayStatus.PHASE_UNKNOWN,
     ):
         missing = [key for key in _REQUIRED_META if key not in analysis_meta]
         if missing:
@@ -205,7 +208,15 @@ class CaptureContext:
         self._next_seq = 0
         self._failures: Dict[str, int] = {}
         self._clock_reads: List[str] = []
-        self._replay_reads: Iterator[str] = iter(list(clock_reads))
+        self._clock_read_phases: List[str] = []
+        self._phase = phase
+        # Replay: the recorded reads split by the phase that took them, so a
+        # replay of _process cannot be handed _gather's read (and vice versa).
+        self._replay_by_phase: Dict[str, List[str]] = {}
+        self._replay_untagged = bool(clock_reads) and len(clock_reads) != len(clock_read_phases)
+        if not self._replay_untagged:
+            for value, read_phase in zip(clock_reads, clock_read_phases):
+                self._replay_by_phase.setdefault(read_phase, []).append(value)
         self._bundle_status = ReplayStatus.CAPTURE_NOT_ATTEMPTED
         self._outcome: Optional[str] = None
         self._skip_reason: Optional[str] = None
@@ -232,8 +243,16 @@ class CaptureContext:
         return self.mode == ReplayStatus.MODE_REPLAY
 
     @classmethod
-    def for_replay(cls, *, analysis_id: str, clock_reads: Sequence[str], **meta) -> "CaptureContext":
-        """A replay-mode context: no recording, recorded clock reads only."""
+    def for_replay(cls, *, analysis_id: str, clock_reads: Sequence[str],
+                   clock_read_phases: Sequence[str] = (),
+                   phase: str = ReplayStatus.PHASE_UNKNOWN, **meta) -> "CaptureContext":
+        """A replay-mode context: no recording, recorded clock reads only.
+
+        ``phase`` says WHICH half of the recorded pair is being replayed, and only
+        that half's reads are handed back. Replaying ``_process`` from the front of
+        a flat list would feed it ``_gather``'s evaluation time -- a different
+        instant, silently.
+        """
         base: Dict[str, Any] = {
             "analysis_id": analysis_id,
             "attempt_id": analysis_id,
@@ -251,6 +270,8 @@ class CaptureContext:
             health=CaptureHealth(),
             mode=ReplayStatus.MODE_REPLAY,
             clock_reads=clock_reads,
+            clock_read_phases=clock_read_phases,
+            phase=phase,
         )
 
     # -- recording boundary
@@ -294,20 +315,27 @@ class CaptureContext:
         except Exception as exc:
             self._note_failure("outcome snapshot failed", exc)
 
-    def set_skip(self, skip_reason: str) -> None:
+    def set_skip(self, skip_reason: str, recommendation: Any = None) -> None:
         """Record that the analysis ended in a SKIP, with the reason it skipped on.
 
         The reason is required (:class:`MissingSkipReason` otherwise) -- there is
         no way to record a reasonless skip through this API.
 
-        A skip is an outcome in its own right, so any recommendation object
-        snapshotted before it is dropped: a row that carried BOTH would say the
-        analysis produced a recommendation AND skipped, and a reader would have
-        to guess which one the live platform acted on.
+        The skipping ``Recommendation`` is kept alongside it. ``outcome`` is what
+        says what the live platform acted on (``skip``), so there is no ambiguity
+        in storing the object too -- and there IS a cost in dropping it: a skip
+        carries a current_price, details and often a confidence, and a replay that
+        only had the reason could not tell a skip whose details changed from one
+        that did not. Recording the reason alone was the earlier behaviour and it
+        made those fields unreplayable.
         """
         if skip_reason is None or not str(skip_reason).strip():
             raise MissingSkipReason(self.analysis_id)
-        self._objects.pop("recommendation", None)
+        if recommendation is not None:
+            try:
+                self._objects["recommendation"] = freeze(recommendation)
+            except Exception as exc:
+                self._note_failure("skip recommendation snapshot failed", exc)
         self._outcome = ReplayStatus.OUTCOME_SKIP
         self._skip_reason = str(skip_reason)
 
@@ -370,19 +398,47 @@ class CaptureContext:
             self._note_failure(f"observation {provider}.{method} not recorded", exc)
             return None
 
+    @property
+    def phase(self) -> str:
+        """Which half of the recorded pair is running right now."""
+        return self._phase
+
+    def set_phase(self, phase: str) -> None:
+        """Enter ``gather`` or ``process``.
+
+        In capture mode this tags the reads that follow; in replay mode it selects
+        which recorded reads :meth:`next_clock_read` hands back. Set by
+        ``_gather_and_process`` around each half, so the two can never be mixed up
+        by an expert that reads a clock in both.
+        """
+        if phase not in ReplayStatus.PHASES:
+            self._note_failure(f"unknown analysis phase {phase!r}",
+                               ValueError(f"unknown analysis phase {phase!r}"))
+            return
+        self._phase = phase
+
     def record_clock_read(self, value: datetime) -> None:
         try:
             with self._lock:
                 self._clock_reads.append(value.isoformat())
+                self._clock_read_phases.append(self._phase)
         except Exception as exc:
             self._note_failure("clock read not recorded", exc)
 
     def next_clock_read(self) -> datetime:
-        """Replay mode: the next recorded read. Exhausted is a loud ReplayMiss."""
-        try:
-            recorded = next(self._replay_reads)
-        except StopIteration:
-            raise ReplayMiss("clock_read", analysis_id=self.analysis_id) from None
+        """Replay mode: the next recorded read OF THIS PHASE. Exhausted is a loud miss."""
+        if self._replay_untagged:
+            raise ReplayMiss(
+                "clock_read_phase", analysis_id=self.analysis_id,
+                detail="the recorded reads carry no phase, so none can be replayed "
+                       "into a single half of the pair without guessing")
+        with self._lock:
+            queue = self._replay_by_phase.get(self._phase)
+            if not queue:
+                raise ReplayMiss(
+                    "clock_read", analysis_id=self.analysis_id,
+                    detail=f"no unread {self._phase} clock read remains")
+            recorded = queue.pop(0)
         return datetime.fromisoformat(recorded)
 
     def set_branch_flag(self, name: str, value: Any) -> None:
@@ -419,6 +475,7 @@ class CaptureContext:
             bundle_object=None,
             bundle_capture_status=self._bundle_status,
             clock_reads=list(self._clock_reads),
+            clock_read_phases=list(self._clock_read_phases),
             outcome=outcome,
             recommendation_object=None,
             skip_reason=self._skip_reason,
@@ -516,6 +573,24 @@ def response_class_of(payload: Any) -> str:
 def current_capture() -> Optional[CaptureContext]:
     """The active capture/replay context, or None when capture is off."""
     return _CURRENT.get()
+
+
+def record_branch_flag(name: str, value: Any) -> None:
+    """Record WHICH branch of a gather/process the live analysis actually took.
+
+    A branch is not derivable from the observations it produced: "there is a
+    calendar response on the tape" and "the calendar branch ran" are different
+    statements, and a replay that infers the second from the first will happily
+    run the OTHER branch when the response is missing and call the result a
+    match. So the branch is recorded as a fact at the point the decision is made.
+
+    A no-op with no capture context, and in replay mode (where the recorded flag
+    is what is being read, not rewritten).
+    """
+    context = current_capture()
+    if context is None or context.is_replay:
+        return
+    context.set_branch_flag(name, value)
 
 
 @contextmanager

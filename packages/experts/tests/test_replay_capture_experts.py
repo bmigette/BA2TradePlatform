@@ -150,6 +150,15 @@ def _assert_identical(off, on):
             b.price_at_date, b.details)
 
 
+def _decode_object(root, object_hash):
+    """Decode one stored object out of a closed store (tests read what was written)."""
+    store = ReplayStore(root, writer="sync")
+    try:
+        return store.decode_object(object_hash)
+    finally:
+        store.close()
+
+
 def _assert_bundle_equal(captured, fresh):
     assert set(captured) == set(fresh), (
         f"captured bundle keys differ: {sorted(captured)} vs {sorted(fresh)}")
@@ -560,9 +569,14 @@ def test_fmp_rating_skip_is_recorded_with_its_reason(tmp_path):
     record = on["records"][0]
     assert record.outcome == ReplayStatus.OUTCOME_SKIP
     assert record.skip_reason == "no consensus data"
-    assert record.recommendation_object is None, (
-        "a skip row must not also carry a recommendation -- a reader would have to "
-        "guess which of the two the live platform acted on")
+    assert record.recommendation_object is not None, (
+        "a skip carries its Recommendation too: `outcome` already says what the "
+        "live platform acted on, and the object is what lets a replay compare the "
+        "current_price, details and confidence a skip still carries. Recording "
+        "only the reason left those fields unreplayable")
+    skipped = _decode_object(tmp_path / "skip", record.recommendation_object)
+    assert skipped.skip is True and skipped.skip_reason == "no consensus data"
+    assert skipped.current_price == 100.0
     assert record.bundle_capture_status == ReplayStatus.CAPTURE_CAPTURED
     assert on["market_analysis"].status == MarketAnalysisStatus.SKIPPED
     assert on["market_analysis"].state["skip_reason"] == "no_analyst_coverage"
@@ -578,7 +592,8 @@ def test_deterministic_scorer_skip_is_recorded_with_its_reason(tmp_path):
     record = on["records"][0]
     assert record.outcome == ReplayStatus.OUTCOME_SKIP
     assert record.skip_reason == "insufficient_history"
-    assert record.recommendation_object is None
+    skipped = _decode_object(tmp_path / "dsskip", record.recommendation_object)
+    assert skipped.skip is True and skipped.details.startswith("Insufficient OHLCV history")
     assert on["market_analysis"].status == MarketAnalysisStatus.SKIPPED
 
 

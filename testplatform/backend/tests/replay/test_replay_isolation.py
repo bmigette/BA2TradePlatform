@@ -22,7 +22,11 @@ from ba2_common.core import TradeConditions, instance_resolver
 from ba2_common.core.replay import ReplayMiss, ReplayStatus
 
 from app.services.replay import expert_replay, gather_tape
-from app.services.replay.isolation import ReplayIsolationBreach, replay_isolation
+from app.services.replay.isolation import (
+    HERMETIC_ESCAPE_HATCH,
+    ReplayIsolationBreach,
+    replay_isolation,
+)
 from tests.replay import ALL_IDS, INSIDER_ID, SCORER_ID, capture_session, drop_observations
 
 
@@ -35,13 +39,42 @@ def session(tmp_path_factory) -> Path:
 # --------------------------------------------------------------------------- #
 # 1. The locks refuse
 # --------------------------------------------------------------------------- #
-def test_the_transport_is_closed():
+@pytest.mark.parametrize("call", ["connect", "connect_ex"])
+def test_the_transport_is_closed(call):
+    """``connect_ex`` is the same syscall with an error code instead of a raise.
+
+    Patching only ``connect`` would leave a caller that prefers ``connect_ex`` a
+    quiet way out of the isolation.
+    """
     with replay_isolation() as probe:
         with pytest.raises(ReplayMiss) as excinfo:
-            socket.socket().connect(("financialmodelingprep.com", 443))
+            getattr(socket.socket(), call)(("financialmodelingprep.com", 443))
     assert isinstance(excinfo.value, ReplayIsolationBreach)
     assert "financialmodelingprep.com" in str(excinfo.value)
     assert probe.network_attempts, "a blocked connect must be visible, not only refused"
+    assert probe.network_attempts[0].startswith(call)
+
+
+def test_isolation_refuses_to_start_while_the_fmp_escape_hatch_is_set(monkeypatch):
+    """One lock disabled while the report still says "offline" is the worst outcome."""
+    monkeypatch.setenv(HERMETIC_ESCAPE_HATCH, "1")
+    with pytest.raises(ReplayIsolationBreach) as excinfo:
+        with replay_isolation():
+            pytest.fail("isolation started with its FMP lock reopened")
+    assert HERMETIC_ESCAPE_HATCH in str(excinfo.value)
+
+
+def test_the_escape_hatch_check_does_not_leave_the_seams_patched(monkeypatch):
+    before = (socket.socket.connect,
+              instance_resolver.get_instance_resolver(),
+              TradeConditions.get_provider_resolver())
+    monkeypatch.setenv(HERMETIC_ESCAPE_HATCH, "1")
+    with pytest.raises(ReplayIsolationBreach):
+        with replay_isolation():
+            pass
+    assert (socket.socket.connect,
+            instance_resolver.get_instance_resolver(),
+            TradeConditions.get_provider_resolver()) == before
 
 
 def test_resolving_a_live_instance_or_provider_is_a_breach():
@@ -67,13 +100,13 @@ def test_the_fmp_layer_is_hermetic_inside_the_isolation():
 
 
 def test_every_seam_is_restored_even_when_the_body_raises():
-    before = (socket.socket.connect,
+    before = (socket.socket.connect, socket.socket.connect_ex,
               instance_resolver.get_instance_resolver(),
               TradeConditions.get_provider_resolver())
     with pytest.raises(RuntimeError):
         with replay_isolation():
             raise RuntimeError("boom")
-    assert (socket.socket.connect,
+    assert (socket.socket.connect, socket.socket.connect_ex,
             instance_resolver.get_instance_resolver(),
             TradeConditions.get_provider_resolver()) == before
 

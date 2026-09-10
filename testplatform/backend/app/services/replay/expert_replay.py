@@ -14,7 +14,9 @@ recorded one.
 Two rules that are easy to lose:
 
 * **The recorded output is never an input.** It is decoded only to compare
-  against, after ``_process`` has already returned.
+  against, after ``_process`` has already returned. A recorded SKIP is compared
+  the same way: the skipping ``Recommendation`` is recorded too, so its price,
+  details and confidence are checked and not just its reason.
 * **Equality is exact.** "numeric equality uses exact serialized values [...]
   No broad 'close enough' tolerance may hide a changed signal, threshold
   crossing, share quantity or stop tick." (spec section 8) Comparison is
@@ -44,7 +46,7 @@ from ba2_common.core.replay import (
 from ba2_common.core.types import Recommendation
 
 from app.services.replay.isolation import refuse, replay_isolation
-from app.services.replay.report import AnalysisResult, ReplayReport
+from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
 
 __all__ = [
     "RECORDED_EXPERTS",
@@ -111,11 +113,20 @@ def build_replay_expert(expert_class_name: str, analysis: AnalysisRecord):
     return expert
 
 
-def replay_context(analysis: AnalysisRecord) -> CaptureContext:
-    """A replay-mode context feeding back this analysis's recorded clock reads."""
+def replay_context(analysis: AnalysisRecord, phase: str) -> CaptureContext:
+    """A replay-mode context feeding back this analysis's recorded clock reads.
+
+    ``phase`` selects WHICH half's reads are replayed. FMPRating reads a clock in
+    both halves -- the price-target window in ``_gather``, the rating-recency
+    window in ``_process`` -- so replaying ``_process`` from the front of a flat
+    list would hand it the gather instant instead, silently and only sometimes
+    visibly.
+    """
     return CaptureContext.for_replay(
         analysis_id=analysis.analysis_id,
         clock_reads=analysis.clock_reads,
+        clock_read_phases=analysis.clock_read_phases,
+        phase=phase,
         expert_class=analysis.expert_class,
         symbol=analysis.symbol,
         use_case=analysis.use_case,
@@ -258,7 +269,7 @@ def replay_analysis(bundle: SessionBundle, analysis: AnalysisRecord) -> Analysis
 
     produced: Any = None
     raised: Optional[BaseException] = None
-    with use_capture_context(replay_context(analysis)):
+    with use_capture_context(replay_context(analysis, ReplayStatus.PHASE_PROCESS)):
         try:
             produced = expert._process(data_bundle, settings, as_of=None)
         except ReplayMiss as miss:
@@ -272,7 +283,17 @@ def replay_analysis(bundle: SessionBundle, analysis: AnalysisRecord) -> Analysis
             # not" can be reported instead of masked.
             raised = exc
 
-    return _classify(bundle, analysis, produced, raised, result)
+    try:
+        return _classify(bundle, analysis, produced, raised, result)
+    except ReplayMiss as miss:
+        # The COMPARISON needed something it could not get -- a field the codec
+        # refuses, a recorded object that will not decode. That is one analysis's
+        # coverage gap; it must not abort the report for the other 500.
+        return result(ReplayStatus.COVERAGE_MISSING_CAPTURE,
+                      f"the comparison could not run: {miss}")
+    except Exception as exc:  # noqa: BLE001 -- same containment, one row at a time
+        return result(ReplayStatus.COVERAGE_MISSING_CAPTURE,
+                      f"the comparison could not run: {type(exc).__name__}: {exc}")
 
 
 def _classify(bundle: SessionBundle, analysis: AnalysisRecord, produced: Any,
@@ -305,7 +326,23 @@ def _classify(bundle: SessionBundle, analysis: AnalysisRecord, produced: Any,
         if replayed_reason != analysis.skip_reason:
             return result(ReplayStatus.COVERAGE_DIFFERENCE, "a different skip reason",
                           [("skip_reason", str(analysis.skip_reason), str(replayed_reason))])
-        return result(ReplayStatus.COVERAGE_MATCH, f"skip reproduced: {replayed_reason}")
+        if analysis.recommendation_object is None:
+            # A skip recorded WITHOUT its Recommendation (an older bundle, or the
+            # Sep-10 bootstrap): the reason matched, and that is all this session
+            # can answer for. Saying "match" would claim the skip's price, details
+            # and confidence were checked when nothing compared them.
+            return result(ReplayStatus.COVERAGE_MISSING_CAPTURE,
+                          f"the skip reason reproduced ({replayed_reason}) but the "
+                          f"skipping recommendation was not recorded, so its other "
+                          f"fields could not be compared")
+        recorded = bundle.decode(analysis.recommendation_object)
+        diffs = compare_recommendations(recorded, produced)
+        if not diffs:
+            return result(ReplayStatus.COVERAGE_MATCH, f"skip reproduced: {replayed_reason}")
+        changed = ", ".join(name for name, _r, _p in diffs[:5])
+        return result(ReplayStatus.COVERAGE_DIFFERENCE,
+                      f"the skip reproduced but {len(diffs)} field(s) differ: {changed}",
+                      diffs)
 
     # outcome == recommendation
     if analysis.recommendation_object is None:
@@ -342,6 +379,11 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     with replay_isolation():
         for analysis in bundle.analyses:
             report.results.append(replay_analysis(bundle, analysis))
+    # Running a capability IS the coverage fact, so it is written back into the
+    # bundle: otherwise `replay inventory` still reports `not_run` for a
+    # capability that has just been run, and the two commands disagree about the
+    # same session.
+    merge_coverage(bundle_dir, report)
     if out_dir is not None:
         report.write(out_dir)
     return report

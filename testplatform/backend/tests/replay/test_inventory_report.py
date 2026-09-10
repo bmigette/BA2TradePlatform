@@ -3,12 +3,17 @@
 "Include HOLD/skipped/failed analyses in totals; never report 100% by dropping
 unavailable rows." (spec section 8) The skip and the error row are the ones a
 counting bug loses first, so they are asserted by name.
+
+And a capability that HAS been run must stop reading as ``not_run``: a replay
+result nobody wrote back is a report that disagrees with the session it came
+from, one command later.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,12 +21,13 @@ import pytest
 
 from ba2_common.core.replay import ReplayStatus
 
-from app.services.replay import inventory
+from app.services.replay import expert_replay, gather_tape, inventory
 from app.services.replay.report import STATUS_ORDER
 from tests.replay import ALL_IDS, capture_session
 
 #: repo/testplatform/backend/tests/replay/<this file>
 LAUNCHER = Path(__file__).resolve().parents[3] / "ba2test_launcher.py"
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 @pytest.fixture(scope="module")
@@ -30,11 +36,12 @@ def session(tmp_path_factory) -> Path:
     return capture_session(root / "store", root / "export")
 
 
-def _launcher():
-    spec = importlib.util.spec_from_file_location("ba2test_launcher_under_test", LAUNCHER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+@pytest.fixture
+def bundle_copy(session, tmp_path) -> Path:
+    """A private copy: running a capability WRITES coverage back into the bundle."""
+    target = tmp_path / "bundle"
+    shutil.copytree(session, target)
+    return target
 
 
 # --------------------------------------------------------------------------- #
@@ -46,13 +53,13 @@ def test_totals_include_the_skip_and_the_error(session):
     assert report["totals"]["analyses"] == len(ALL_IDS)
     assert report["analyses_by_outcome"] == {
         ReplayStatus.OUTCOME_ERROR: 1,
-        ReplayStatus.OUTCOME_RECOMMENDATION: 4,
+        ReplayStatus.OUTCOME_RECOMMENDATION: 6,
         ReplayStatus.OUTCOME_SKIP: 1,
     }
     assert sum(report["analyses_by_expert"].values()) == len(ALL_IDS)
     assert report["analyses_by_expert"] == {
-        "DeterministicScorer": 1, "FMPEarningsDrift": 1,
-        "FMPInsiderClusterBuy": 2, "FMPRating": 2}
+        "DeterministicScorer": 1, "FMPEarningsDrift": 2,
+        "FMPInsiderClusterBuy": 2, "FMPRating": 3}
     assert report["skip_reasons"] == {"no consensus data": 1}
 
 
@@ -61,11 +68,16 @@ def test_capture_status_observations_and_clock_reads_are_broken_out(session):
 
     assert report["bundle_capture_status"] == {ReplayStatus.CAPTURE_CAPTURED: len(ALL_IDS)}
     methods = report["observations_by_provider_method"]
-    assert methods["broker.get_instrument_current_price"] == 5
+    assert methods["broker.get_instrument_current_price"] == len(ALL_IDS) - 1, (
+        "every analysis reads a quote except DeterministicScorer, whose "
+        "current_price is the last close of the OHLCV frame it already fetched")
     assert methods["provider_cache.insider_get"] == 2
-    assert methods["fmp.price_target_consensus"] == 2
+    assert methods["market_data.get_ohlcv_data"] == 2, (
+        "the DeterministicScorer symbol and its benchmark are two recorded reads")
+    assert methods["fmp.earning_calendar"] == 1
     assert sum(methods.values()) == report["totals"]["observations"]
-    assert report["observations_by_provenance"][ReplayStatus.PROVENANCE_NETWORK] == 5
+    assert report["observations_by_provenance"][ReplayStatus.PROVENANCE_NETWORK] == (
+        len(ALL_IDS) - 1), "one fresh broker quote per analysis that reads one"
 
     clock = report["clock_reads"]
     assert clock["analyses_with_reads"] + clock["analyses_without_reads"] == len(ALL_IDS)
@@ -95,40 +107,94 @@ def test_the_written_inventory_names_the_session_and_the_gaps(session, tmp_path)
 
 
 # --------------------------------------------------------------------------- #
-# 2. The CLI
+# 2. Running a capability is written back as coverage
 # --------------------------------------------------------------------------- #
-@pytest.fixture
-def launcher_cwd():
-    """``main()`` chdirs into backend/; put the caller's cwd back afterwards."""
-    original = os.getcwd()
-    try:
-        yield
-    finally:
-        os.chdir(original)
+def test_running_experts_then_inventory_reports_the_capability_as_run(bundle_copy):
+    """The two commands must agree about the same bundle, in that order."""
+    before = inventory.run(bundle_copy)["coverage_by_capability"]
+    assert before[ReplayStatus.CAPABILITY_RECORDED_EXPERT][
+        ReplayStatus.COVERAGE_NOT_RUN] == len(ALL_IDS)
+
+    report = expert_replay.run(bundle_copy)
+    after = inventory.run(bundle_copy)["coverage_by_capability"]
+    rows = after[ReplayStatus.CAPABILITY_RECORDED_EXPERT]
+
+    assert rows[ReplayStatus.COVERAGE_MATCH] == report.counts()[ReplayStatus.COVERAGE_MATCH]
+    assert rows[ReplayStatus.COVERAGE_NOT_RUN] == 0, (
+        "inventory still says not_run for a capability that has just been run")
+    assert sum(rows.values()) == len(ALL_IDS)
+
+
+def test_the_two_capabilities_keep_their_own_coverage(bundle_copy):
+    expert_replay.run(bundle_copy)
+    gather_tape.run(bundle_copy)
+    coverage = inventory.run(bundle_copy)["coverage_by_capability"]
+
+    assert coverage[ReplayStatus.CAPABILITY_RECORDED_EXPERT][
+        ReplayStatus.COVERAGE_MATCH] == len(ALL_IDS)
+    gather_rows = coverage[ReplayStatus.CAPABILITY_GATHER_TAPE]
+    assert gather_rows[ReplayStatus.COVERAGE_MISSING_CAPTURE] == 1, (
+        "the DeterministicScorer gather gap must survive as its own coverage row")
+    assert coverage[ReplayStatus.CAPABILITY_HISTORICAL][
+        ReplayStatus.COVERAGE_NOT_RUN] == len(ALL_IDS)
+
+
+def test_a_second_run_replaces_its_own_rows_rather_than_appending(bundle_copy):
+    expert_replay.run(bundle_copy)
+    expert_replay.run(bundle_copy)
+    rows = inventory.run(bundle_copy)["coverage_by_capability"][
+        ReplayStatus.CAPABILITY_RECORDED_EXPERT]
+    assert sum(rows.values()) == len(ALL_IDS), "coverage rows accumulated across runs"
+
+
+# --------------------------------------------------------------------------- #
+# 3. The CLI (in a subprocess: main() chdirs, loads .env and points a DB engine)
+# --------------------------------------------------------------------------- #
+def _run_cli(*args, cwd) -> subprocess.CompletedProcess:
+    """Drive the launcher out-of-process.
+
+    ``main()`` calls ``_enter_backend()``, which chdirs, loads ``.env`` and
+    rebinds the shared DB engine -- all process-wide. Importing and calling it
+    inside pytest would leave those side effects behind for every test that runs
+    afterwards, so the CLI is exercised where it actually lives: its own process.
+    """
+    return subprocess.run(
+        [sys.executable, str(LAUNCHER), *args],
+        cwd=str(cwd), capture_output=True, text=True, timeout=300,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(
+            str(REPO_ROOT / "packages" / name) for name in ("common", "providers", "experts"))},
+    )
 
 
 @pytest.mark.parametrize("command", ["inventory", "experts", "gather"])
-def test_the_cli_parses_and_runs_each_replay_command(command, session, tmp_path,
-                                                     launcher_cwd, capsys):
-    module = _launcher()
+def test_the_cli_parses_and_runs_each_replay_command(command, bundle_copy, tmp_path):
     out = tmp_path / command
-    code = module.main(["replay", command, "--bundle", str(session), "--out", str(out)])
-    printed = capsys.readouterr().out
+    result = _run_cli("replay", command, "--bundle", str(bundle_copy), "--out", str(out),
+                      cwd=tmp_path)
 
-    assert code == 0, printed
+    assert result.returncode == 0, result.stdout + result.stderr
     assert out.is_dir()
     if command == "inventory":
         assert (out / inventory.INVENTORY_NAME).is_file()
-        assert "Replay session inventory" in printed
+        assert "Replay session inventory" in result.stdout
     else:
         capability = (ReplayStatus.CAPABILITY_RECORDED_EXPERT if command == "experts"
                       else ReplayStatus.CAPABILITY_GATHER_TAPE)
         assert (out / f"{capability}.md").is_file()
         assert (out / f"{capability}.json").is_file()
-        assert "Capability run:" in printed
+        assert "Capability run:" in result.stdout
 
 
-def test_the_cli_refuses_a_bundle_that_is_not_there(tmp_path, launcher_cwd):
-    module = _launcher()
-    with pytest.raises(SystemExit):
-        module.main(["replay", "inventory", "--bundle", str(tmp_path / "nope")])
+def test_the_cli_takes_a_bundle_path_relative_to_where_it_was_run(bundle_copy):
+    """``main()`` chdirs into backend/; a typed path must still mean what it said."""
+    result = _run_cli("replay", "inventory", "--bundle", bundle_copy.name,
+                      cwd=bundle_copy.parent)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "S-REPLAY-TEST" in result.stdout
+
+
+def test_the_cli_refuses_a_bundle_that_is_not_there(tmp_path):
+    result = _run_cli("replay", "inventory", "--bundle", str(tmp_path / "nope"),
+                      cwd=tmp_path)
+    assert result.returncode != 0
+    assert "not a directory" in (result.stdout + result.stderr)

@@ -23,9 +23,21 @@ defects:
   of the recorded identity, so a tape account that did not carry them could
   never match).
 * **A boundary that was never tapped cannot be served.** DeterministicScorer's
-  statements, macro and index reads bypass the tapped provider methods, so its
-  gather-tape row is ``missing_capture`` naming the first request that was not on
-  the tape -- not a green row, and not a live fetch.
+  statement and macro reads go straight to provider methods that carry no tap, so
+  its gather-tape row is ``missing_capture`` naming the FIRST request that was not
+  on the tape -- not a green row, and not a live fetch. (Its OHLCV read is a
+  different story and used to be the blocker: the window it asked for carried a
+  raw ``datetime.now()`` at both ends, which is part of the request identity, so
+  the recorded frame could never be matched. That read now goes through
+  ``replay_now``; see the identity rule in
+  :mod:`ba2_common.core.replay.observe`.)
+
+**Branches come from the RECORD, never from the tape.** "There is a calendar
+response on the tape" and "the calendar branch ran" are different statements.
+Inferring the second from the first means a missing response silently reroutes
+the replay down the other branch and its bundle gets compared as if the recorded
+branch had produced it -- so the branch is read from ``branch_flags``, and a
+recorded branch whose response is absent is a ``missing_capture``.
 """
 from __future__ import annotations
 
@@ -59,7 +71,7 @@ from app.services.replay.expert_replay import (
     replay_context,
 )
 from app.services.replay.isolation import refuse, replay_isolation
-from app.services.replay.report import AnalysisResult, ReplayReport
+from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
 
 __all__ = ["ReplayTape", "TapeProviderBundle", "run"]
 
@@ -77,10 +89,44 @@ def _key(provider: str, method: str, identity: Any) -> str:
 
     Sanitized on both sides so a datetime, an Enum or a credential-shaped key is
     rendered exactly as the tap rendered it when the observation was recorded.
+
+    No ``default=`` fallback: a value the sanitizer could not render is a defect
+    in the identity, and repr-ing it would build a key that silently depends on a
+    memory address. It raises a typed miss instead.
     """
-    canonical = json.dumps(sanitize_identity(identity), sort_keys=True,
-                           allow_nan=False, ensure_ascii=False, default=repr)
+    _refuse_non_finite(identity, provider, method)
+    safe = sanitize_identity(identity)
+    try:
+        canonical = json.dumps(safe, sort_keys=True, allow_nan=False, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise refuse("tape_identity", request_identity={"provider": provider,
+                                                        "method": method},
+                     detail=f"the request identity is not representable: {exc}") from exc
     return f"{provider}.{method}|{canonical}"
+
+
+def _refuse_non_finite(identity: Any, provider: str, method: str, path: str = "") -> None:
+    """A NaN (or inf) anywhere in an identity makes the request unmatchable.
+
+    ``NaN != NaN``, so a recorded NaN key can never be looked up again by any
+    honest means -- the sanitizer renders it as the string ``'nan'`` and a match
+    on that would be an accident of formatting, not an identity match. It is a
+    ``missing_capture`` (this request cannot be served from the tape), never a
+    ``difference`` (which would claim the calculation disagreed).
+    """
+    if isinstance(identity, float):
+        if identity != identity or identity in (float("inf"), float("-inf")):
+            raise refuse("tape_identity_non_finite",
+                         request_identity={"provider": provider, "method": method,
+                                           "path": path or "identity"},
+                         detail=f"a non-finite value ({identity!r}) cannot be matched")
+        return
+    if isinstance(identity, dict):
+        for key, value in identity.items():
+            _refuse_non_finite(value, provider, method, f"{path}[{key!r}]")
+    elif isinstance(identity, (list, tuple)):
+        for index, value in enumerate(identity):
+            _refuse_non_finite(value, provider, method, f"{path}[{index}]")
 
 
 class ReplayTape:
@@ -100,9 +146,6 @@ class ReplayTape:
             self._entries.setdefault(key, []).append(payload)
 
     # -- reading
-
-    def methods(self) -> Tuple[str, ...]:
-        return tuple(f"{o.provider}.{o.method}" for o in self._observations)
 
     def has(self, provider: str, method: str) -> bool:
         return any(o.provider == provider and o.method == method
@@ -367,6 +410,20 @@ def _setting(settings: Dict[str, Any], key: str, analysis: AnalysisRecord) -> An
     return settings[key]
 
 
+def _branch(analysis: AnalysisRecord, flag: str) -> Any:
+    """Which branch the LIVE gather took, read off the record.
+
+    A miss when the flag is absent, because the alternative -- inferring the
+    branch from which observations happen to be present -- is exactly how a
+    missing response turns into a confident match down the other branch.
+    """
+    if flag not in analysis.branch_flags:
+        raise refuse("branch_flag", analysis_id=analysis.analysis_id,
+                     request_identity={"branch_flag": flag},
+                     detail="the record does not say which branch the live gather took")
+    return analysis.branch_flags[flag]
+
+
 def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, Any],
              analysis: AnalysisRecord, stack: ExitStack) -> TapeProviderBundle:
     """Set the gather-time attributes live resolved before ``_gather``, and wire the tape.
@@ -382,6 +439,11 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
     expert._get_current_price = lambda symbol: account.get_instrument_current_price(symbol)
 
     if expert_class == "FMPRating":
+        branch = _branch(analysis, "fmp_rating_branch")
+        if branch != "live_snapshot":
+            raise refuse("branch", analysis_id=analysis.analysis_id,
+                         request_identity={"fmp_rating_branch": branch},
+                         detail="gather-tape replays the LIVE snapshot branch only")
         expert._gather_window_days = int(_setting(settings, "price_target_window_days", analysis))
         expert._gather_max_analyst_age = int(
             _setting(settings, "max_analyst_age_months", analysis) or 0)
@@ -399,11 +461,14 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
         expert._gather_max_days_since_report = int(
             _setting(settings, "max_days_since_report", analysis))
         expert._gather_expected_profit_mode = _setting(settings, "expected_profit_mode", analysis)
-        details = (_fmp_details_provider(tape)
-                   if tape.has("fmp", "earning_calendar") else None)
-        if details is not None:
+        # The RECORD says which branch ran, not the tape. When the calendar branch
+        # ran, the tape presents an FMP-typed provider (the branch is chosen by
+        # isinstance) and serves the bulk calendar; if that response is missing the
+        # gather MISSES -- it does not quietly take the per-symbol branch instead.
+        if bool(_branch(analysis, "earnings_calendar_branch")):
             stack.enter_context(_earnings_calendar_from_tape(tape))
-        return TapeProviderBundle(tape, details=details)
+            return TapeProviderBundle(tape, details=_fmp_details_provider(tape))
+        return TapeProviderBundle(tape)
 
     if expert_class == "FMPInsiderClusterBuy":
         expert._gather_lookback_days = int(_setting(settings, "lookback_days", analysis))
@@ -481,7 +546,7 @@ def replay_gather(bundle: SessionBundle, analysis: AnalysisRecord) -> AnalysisRe
         with ExitStack() as stack:
             providers = _prepare(analysis.expert_class, expert, tape, settings,
                                  analysis, stack)
-            with use_capture_context(replay_context(analysis)):
+            with use_capture_context(replay_context(analysis, ReplayStatus.PHASE_GATHER)):
                 produced = expert._gather(providers, as_of=None)
     except ReplayMiss as miss:
         return result(ReplayStatus.COVERAGE_MISSING_CAPTURE, str(miss))
@@ -489,7 +554,16 @@ def replay_gather(bundle: SessionBundle, analysis: AnalysisRecord) -> AnalysisRe
         return result(ReplayStatus.COVERAGE_DIFFERENCE,
                       f"the live gather failed on the tape: {type(exc).__name__}: {exc}")
 
-    diffs = compare_values(recorded_bundle, produced, "bundle")
+    try:
+        diffs = compare_values(recorded_bundle, produced, "bundle")
+    except ReplayMiss as miss:
+        # The COMPARISON could not run (a bundle field the codec refuses). One
+        # analysis's coverage gap, not a reason to abandon the whole report.
+        return result(ReplayStatus.COVERAGE_MISSING_CAPTURE,
+                      f"the comparison could not run: {miss}")
+    except Exception as exc:  # noqa: BLE001 -- same containment, one row at a time
+        return result(ReplayStatus.COVERAGE_MISSING_CAPTURE,
+                      f"the comparison could not run: {type(exc).__name__}: {exc}")
     if not diffs:
         return result(ReplayStatus.COVERAGE_MATCH, "gather reproduced the recorded bundle")
     changed = ", ".join(name for name, _r, _p in diffs[:5])
@@ -511,6 +585,7 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     with replay_isolation():
         for analysis in bundle.analyses:
             report.results.append(replay_gather(bundle, analysis))
+    merge_coverage(bundle_dir, report)
     if out_dir is not None:
         report.write(out_dir)
     return report

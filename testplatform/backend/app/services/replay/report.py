@@ -18,10 +18,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ba2_common.core.replay import CoverageEntry, ReplayStatus
+from ba2_common.core.replay.schemas import SCHEMA_VERSION
+from ba2_common.core.replay.service import COVERAGE_NAME
 
 __all__ = [
     "AnalysisResult",
     "ReplayReport",
+    "merge_coverage",
     "STAGE_ROWS",
     "CAPABILITY_TITLES",
     "STATUS_ORDER",
@@ -52,6 +55,10 @@ CAPABILITY_TITLES: Dict[str, str] = {
 #: The spec section 8 stage table. ``capability`` names the capability whose
 #: results fill the row; ``None`` means this delivery cannot fill it at all, so
 #: the row is ``not_run`` by construction (spec steps 5-6, later deliveries).
+#: The Rules-and-sizing and Execution rows are what
+#: ``app/services/backtest/parity_harness.py`` already compares for a BACKTEST;
+#: the spec-step-6 decision trace is where that machinery meets a recorded LIVE
+#: session, and these rows stay ``not_run`` until it does.
 STAGE_ROWS: Tuple[Tuple[str, str, Optional[str]], ...] = (
     ("Selection",
      "Candidate coverage, filters, ranked order, selected/held symbols",
@@ -163,6 +170,23 @@ class ReplayReport:
             "says nothing about another.",
         ]
 
+    def stage_rows(self) -> List[Tuple[str, str, str, Optional[str]]]:
+        """``(stage, compared fields, status, capability)`` -- ONE rendering.
+
+        The markdown table and the JSON both read this, so the two cannot end up
+        saying different things about the same stage.
+        """
+        counts = self.counts()
+        summary = ", ".join(f"{name} {counts[name]}"
+                            for name in STATUS_ORDER if counts[name])
+        out: List[Tuple[str, str, str, Optional[str]]] = []
+        for stage, fields_text, capability in STAGE_ROWS:
+            status = ((summary or ReplayStatus.COVERAGE_NOT_RUN)
+                      if capability == self.capability
+                      else ReplayStatus.COVERAGE_NOT_RUN)
+            out.append((stage, fields_text, status, capability))
+        return out
+
     def to_markdown(self) -> str:
         counts = self.counts()
         lines: List[str] = [
@@ -181,11 +205,7 @@ class ReplayReport:
 
         lines += ["", "## Stages (spec section 8)", "",
                   "| Stage | Compared fields | Status |", "|---|---|---|"]
-        summary = ", ".join(f"{name} {counts[name]}"
-                            for name in STATUS_ORDER if counts[name])
-        for stage, fields_text, capability in STAGE_ROWS:
-            status = (summary or ReplayStatus.COVERAGE_NOT_RUN) \
-                if capability == self.capability else ReplayStatus.COVERAGE_NOT_RUN
+        for stage, fields_text, status, _capability in self.stage_rows():
             lines.append(f"| {stage} | {fields_text} | {status} |")
 
         lines += ["", "## Analyses", "",
@@ -226,10 +246,9 @@ class ReplayReport:
                     "stage": stage,
                     "compared_fields": fields_text,
                     "capability": capability,
-                    "status": ("reported" if capability == self.capability
-                               else ReplayStatus.COVERAGE_NOT_RUN),
+                    "status": status,
                 }
-                for stage, fields_text, capability in STAGE_ROWS
+                for stage, fields_text, status, capability in self.stage_rows()
             ],
             "results": [r.to_mapping() for r in self.results],
         }
@@ -245,8 +264,51 @@ class ReplayReport:
         return out
 
 
+def merge_coverage(bundle_dir, report: "ReplayReport") -> Path:
+    """Write this run's coverage rows back into the bundle's ``coverage.json``.
+
+    Running a capability IS a coverage fact about the session, so it belongs with
+    the session and not only in a report directory the next command will not
+    read. Without this, ``replay inventory`` still says ``not_run`` for a
+    capability that has just been run, and the two commands disagree about the
+    same bundle.
+
+    Rows are replaced per ``(capability, analysis_id)``, never wholesale: the
+    capture-time rows (the ``missing_capture`` a degraded recording already
+    wrote) survive for any analysis this run did not cover.
+    """
+    path = Path(bundle_dir) / COVERAGE_NAME
+    existing: List[Dict[str, Any]] = []
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        existing = list(payload["entries"])
+    replaced = {(report.capability, result.analysis_id) for result in report.results}
+    kept = [row for row in existing
+            if (row["capability"], row["analysis_id"]) not in replaced]
+    merged = kept + [entry.to_mapping() for entry in report.coverage_entries()]
+    path.write_text(
+        json.dumps({"schema_version": SCHEMA_VERSION,
+                    "session_id": report.session_id,
+                    "entries": merged},
+                   indent=2, allow_nan=False, ensure_ascii=False),
+        encoding="utf-8")
+    return path
+
+
+#: Longest cell the markdown table renders before saying so.
+_CELL_LIMIT = 300
+
+
 def _cell(text: Any) -> str:
-    """One markdown table cell: no pipes, no newlines, bounded length."""
+    """One markdown table cell: no pipes, no newlines, bounded length.
+
+    A truncated cell SAYS it was truncated. A silently clipped diff reads like a
+    complete value that happens to end oddly; the JSON beside it always carries
+    the whole thing.
+    """
     value = "" if text is None else str(text)
     value = value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
-    return value if len(value) <= 300 else value[:297] + "..."
+    if len(value) <= _CELL_LIMIT:
+        return value
+    return (f"{value[:_CELL_LIMIT]}... (truncated, {len(value)} chars; "
+            f"the full value is in the JSON report)")

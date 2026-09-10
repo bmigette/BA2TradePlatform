@@ -18,6 +18,17 @@ pool must submit through :func:`capture_aware_submit` (one copied
 ``contextvars.Context`` per task) or wrap the callable with
 :func:`run_in_capture_context` (safe to reuse concurrently, e.g. with
 ``executor.map``); :func:`use_capture_context` re-enters a context explicitly.
+
+**Two invariants that are cheap to state and expensive to rediscover.**
+
+* *Clock reads are phase-tagged.* An analysis reads the evaluation clock in both
+  halves of the recorded pair, so every read carries the phase (``gather`` /
+  ``process``) that took it and a replay of one half consumes only that half's
+  reads -- see :class:`~ba2_common.core.replay.schemas.ReplayStatus`.
+* *No request-identity key may carry an un-replayed wall clock.* An identity is
+  what a replay looks a response up by; a ``datetime.now()`` inside one makes the
+  recorded request unmatchable forever. See
+  :mod:`ba2_common.core.replay.observe`.
 """
 from ba2_common.core.replay.clock import ReplayMiss, replay_now
 from ba2_common.core.replay.codec import (
@@ -40,6 +51,7 @@ from ba2_common.core.replay.context import (
     capture_aware_submit,
     capture_scope,
     current_capture,
+    record_branch_flag,
     run_in_capture_context,
     use_capture_context,
 )
@@ -102,6 +114,7 @@ __all__ = [
     "PendingObservation",
     "capture_scope",
     "current_capture",
+    "record_branch_flag",
     "use_capture_context",
     "run_in_capture_context",
     "capture_aware_submit",

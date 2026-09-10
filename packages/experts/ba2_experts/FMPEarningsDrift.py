@@ -38,7 +38,8 @@ from ba2_common.core.types import (
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.replay import (
-    ReplayStatus, observe_provider, record_observation, replay_now,
+    ReplayMiss, ReplayStatus, observe_provider, record_branch_flag, record_observation,
+    replay_now,
 )
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
@@ -293,7 +294,13 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         skip_detail_fetch = False
         # LIVE-ONLY calendar shortcut (see module docstring). Backtest (as_of set) never enters
         # this branch, so grid/backtest results are byte-identical to before this change.
-        if as_of is None and isinstance(details_provider, FMPCompanyDetailsProvider):
+        calendar_branch = as_of is None and isinstance(details_provider, FMPCompanyDetailsProvider)
+        # Which branch ran is a RECORDED FACT, not something a replay may infer
+        # from which observations happen to be on the tape: inferring it would let
+        # a missing calendar response silently reroute the replay down the
+        # per-symbol branch and call the resulting bundle a match.
+        record_branch_flag("earnings_calendar_branch", calendar_branch)
+        if calendar_branch:
             try:
                 api_key = details_provider.api_key
                 max_days = int(self._gather_max_days_since_report)
@@ -326,11 +333,17 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
                         skip_detail_fetch = True
                     # else: report exists but the calendar is missing the analyst estimate ->
                     # fall through to the per-symbol detail fetch below.
+            except ReplayMiss:
+                # A replay that cannot serve this branch must STOP, not fall back:
+                # falling back would run the other branch and report its bundle as
+                # if the calendar branch had produced it.
+                raise
             except Exception as e:  # noqa: BLE001 -- best-effort optimization; never break the run
                 self.logger.debug(
                     f"Earnings calendar shortcut failed for {symbol}, falling back to "
                     f"per-symbol fetch: {e}")
 
+        record_branch_flag("earnings_detail_fetch", not skip_detail_fetch)
         if not skip_detail_fetch:
             data = past_earnings_get(
                 details_provider, symbol, as_of=as_of,

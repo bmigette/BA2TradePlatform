@@ -19,6 +19,16 @@ propagate" rule, and it applies ONLY to the recording work -- never to the
 wrapped call, whose exception propagates untouched and unrecorded. The loudness
 that replaces propagation is the health counter plus one ERROR per analysis (see
 :mod:`ba2_common.core.replay.context`).
+
+**THE IDENTITY RULE: no identity key may carry an un-replayed wall-clock value.**
+A request identity is what a replay looks a recorded response up BY, so a key
+holding ``datetime.now()`` makes the recorded request unreproducible by
+construction: the replay computes a different instant, the lookup misses, and the
+observation that WAS recorded can never be used. Any time-derived key must come
+from :func:`ba2_common.core.replay.clock.replay_now` (which returns the recorded
+read when replaying) or from an ``as_of`` the caller supplied. This is not
+theoretical: DeterministicScorer's OHLCV window carried a raw ``datetime.now()``
+at both ends, which silently made every recorded DS OHLCV frame unmatchable.
 """
 from __future__ import annotations
 
@@ -72,8 +82,13 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
     value, and anything else its ``repr`` -- lossy on purpose, and only for the
     IDENTITY: the payload itself goes through the exact codec.
     """
-    if value is None or isinstance(value, (bool, int, str)):
+    if value is None or isinstance(value, (bool, int)):
         return value
+    if isinstance(value, str):
+        # Redact HERE, not only at the top level: a credential embedded in a URL
+        # sitting one dict deep is exactly as exported as one sitting at the root,
+        # and the top-level-only version missed every nested case.
+        return _SECRET_IN_VALUE.sub(_REDACTED, value)
     if isinstance(value, float):
         # NaN/inf are not JSON: keep them visible as text rather than dropped.
         return value if value == value and value not in (float("inf"), float("-inf")) else repr(value)
@@ -101,15 +116,10 @@ def sanitize_identity(identity: Optional[Mapping[str, Any]]) -> dict:
     """Drop every credential-shaped key and make the rest JSON-encodable."""
     if not identity:
         return {}
-    out = {}
-    for key, value in identity.items():
-        if _is_secret_key(key):
-            continue
-        safe = _json_safe(value)
-        if isinstance(safe, str):
-            safe = _SECRET_IN_VALUE.sub(_REDACTED, safe)
-        out[str(key)] = safe
-    return out
+    # The redaction itself lives in _json_safe, so it applies at every depth --
+    # a credential in a nested URL is as exported as one at the root.
+    return {str(key): _json_safe(value)
+            for key, value in identity.items() if not _is_secret_key(key)}
 
 
 def record_observation(

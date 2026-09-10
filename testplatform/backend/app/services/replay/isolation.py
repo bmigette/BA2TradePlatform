@@ -7,18 +7,32 @@ lookup. Every unexpected dependency is a typed replay miss with analysis/request
 ID."
 
 Four locks, entered together by :func:`replay_isolation` before any replay
-command touches a bundle:
+command touches a bundle. They do NOT all have the same scope, and the difference
+matters:
 
-1. ``hermetic_fmp_history()`` -- the FMP layer's own "never fetch" mode, so a
+1. ``hermetic_fmp_history()`` -- the FMP layer own "never fetch" mode, so a
    provider that would have gone to FMP raises there rather than here.
-2. ``socket.socket.connect`` -- the transport itself. Anything that gets past
-   the layers above (a library with its own HTTP client, a stray `requests`
-   call) dies at the socket with a :class:`ReplayMiss`, not with a timeout.
+   **THREAD-LOCAL** (``ba2_providers.fmp_common._tls``): a replay that fanned out
+   across a thread pool would leave its workers outside this lock, with only
+   locks 2-4 still holding. Replay is single-threaded per analysis for exactly
+   that reason. It also has an ESCAPE HATCH --
+   ``BA2_HERMETIC_ALLOW_NETWORK=1`` reopens it -- so :func:`replay_isolation`
+   REFUSES TO START while that variable is set, rather than run with one lock
+   quietly disabled and still call itself offline.
+2. ``socket.socket.connect`` and ``socket.socket.connect_ex`` -- the transport
+   itself. **PROCESS-WIDE**: patching a method on the ``socket`` class affects
+   every thread and every library in the process, which is what makes it a real
+   backstop, and also why a replay command owns its process for its duration.
+   Name resolution is NOT patched (``socket.getaddrinfo`` still answers), so a
+   DNS lookup can still leave the machine; nothing can be sent or received over
+   the address it returns.
 3. The instance resolver -- a loud stub. Resolving an expert or an account is
    how replay would reach a live broker and the trading database; the pattern is
    ``packages/experts/tests/test_golden_live_vs_asof.py::_host_seams``.
+   **PROCESS-WIDE** (a module-level seam in ``ba2_common.core.instance_resolver``).
 4. The provider resolver -- the same, one layer down: ``_live_providers()``
-   must not be able to hand a replay a real FMP provider.
+   must not be able to hand a replay a real FMP provider. **PROCESS-WIDE**
+   (``ba2_common.core.TradeConditions``).
 
 Nothing here opens a trading database, and nothing here has a fallback: a miss
 is a coverage fact the report prints, never something to paper over with a live
@@ -26,6 +40,7 @@ read.
 """
 from __future__ import annotations
 
+import os
 import socket
 import threading
 from contextlib import ExitStack, contextmanager
@@ -34,7 +49,17 @@ from typing import Any, List, Optional
 
 from ba2_common.core.replay import ReplayMiss
 
-__all__ = ["IsolationProbe", "replay_isolation", "ReplayIsolationBreach"]
+__all__ = ["IsolationProbe", "replay_isolation", "ReplayIsolationBreach",
+           "HERMETIC_ESCAPE_HATCH"]
+
+#: The env var that reopens the ``hermetic_fmp_history`` network lock. Replay
+#: refuses to run while it is set (see :func:`replay_isolation`).
+HERMETIC_ESCAPE_HATCH = "BA2_HERMETIC_ALLOW_NETWORK"
+
+#: Both outbound socket calls. ``connect_ex`` is the same syscall with an
+#: error-code return instead of an exception, so patching only ``connect`` would
+#: leave a quiet way out.
+_BLOCKED_SOCKET_CALLS = ("connect", "connect_ex")
 
 
 class ReplayIsolationBreach(ReplayMiss):
@@ -110,12 +135,12 @@ def _stub_provider_resolver(probe: IsolationProbe):
     return get_provider
 
 
-def _blocked_connect(probe: IsolationProbe):
+def _blocked_connect(probe: IsolationProbe, method: str):
     def connect(self, address, *args, **kwargs):
-        probe.note(probe.network_attempts, str(address))
+        probe.note(probe.network_attempts, f"{method}:{_address_text(address)}")
         raise ReplayIsolationBreach(
             "network",
-            request_identity={"address": _address_text(address)},
+            request_identity={"address": _address_text(address), "call": method},
             detail="replay is offline; the transport is closed",
         )
 
@@ -135,32 +160,46 @@ def replay_isolation():
     Restores each seam on exit, including when the body raises -- a replay run
     must not leave a process with its instance resolver stubbed out.
 
-    PROCESS-WIDE while it is entered (``socket.socket.connect`` and the two host
-    seams are module state), so a replay command owns the process for its
-    duration. That is what "replay runs in an isolated process" means here; it is
-    not something to nest inside a live application.
+    Three of the four locks are PROCESS-WIDE while it is entered and one is
+    thread-local (see the module docstring), so a replay command owns its process
+    for the duration. That is what "replay runs in an isolated process" means
+    here; it is not something to nest inside a live application.
+
+    Refuses to start when ``BA2_HERMETIC_ALLOW_NETWORK=1`` is set: that variable
+    reopens the FMP lock, and running with three of four locks while reporting
+    "offline" is the kind of quiet degradation this module exists to prevent.
     """
     from ba2_common.core import TradeConditions, instance_resolver
     from ba2_providers.fmp_common import hermetic_fmp_history
 
+    if os.environ.get(HERMETIC_ESCAPE_HATCH) == "1":
+        raise ReplayIsolationBreach(
+            "isolation_disabled",
+            request_identity={"env": HERMETIC_ESCAPE_HATCH},
+            detail="this variable reopens the FMP network lock; unset it before replaying",
+        )
+
     probe = IsolationProbe()
-    previous_connect = socket.socket.connect
+    previous_socket = {name: getattr(socket.socket, name)
+                       for name in _BLOCKED_SOCKET_CALLS}
     previous_instance = instance_resolver.get_instance_resolver()
     previous_provider = TradeConditions.get_provider_resolver()
 
     with ExitStack() as stack:
         stack.enter_context(hermetic_fmp_history())
-        socket.socket.connect = _blocked_connect(probe)
+        for name in _BLOCKED_SOCKET_CALLS:
+            setattr(socket.socket, name, _blocked_connect(probe, name))
         instance_resolver.set_instance_resolver(_StubInstanceResolver(probe))
         TradeConditions.set_provider_resolver(_stub_provider_resolver(probe))
         stack.callback(TradeConditions.set_provider_resolver, previous_provider)
         stack.callback(instance_resolver.set_instance_resolver, previous_instance)
-        stack.callback(_restore_connect, previous_connect)
+        stack.callback(_restore_socket, previous_socket)
         yield probe
 
 
-def _restore_connect(previous) -> None:
-    socket.socket.connect = previous
+def _restore_socket(previous) -> None:
+    for name, original in previous.items():
+        setattr(socket.socket, name, original)
 
 
 def refuse(kind: str, analysis_id: Optional[str] = None,

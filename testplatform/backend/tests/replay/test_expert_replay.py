@@ -7,22 +7,34 @@ capture -> export -> load -> re-run -> compare.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from ba2_common.core.replay import ReplayStatus, load_bundle
+from ba2_common.core.replay import (
+    ReplayStatus,
+    load_bundle,
+    replay_now,
+    use_capture_context,
+)
 
 from app.services.replay import expert_replay
+from app.services.replay.expert_replay import replay_context
 from tests.replay import (
     ALL_IDS,
+    BOTH_PHASE_IDS,
+    CALENDAR_ID,
     DRIFT_ID,
     ERROR_ID,
     RATING_ID,
+    RECENCY_ID,
     SCORER_ID,
     SKIP_ID,
     capture_session,
+    edit_analysis,
     rebuild_bundle_object,
+    rebuild_object,
 )
 
 
@@ -44,6 +56,11 @@ def bundle_copy(session, tmp_path) -> Path:
 
 def _by_id(report):
     return {result.analysis_id: result for result in report.results}
+
+
+def _reads(record, phase):
+    return [value for value, read_phase
+            in zip(record.clock_reads, record.clock_read_phases) if read_phase == phase]
 
 
 # --------------------------------------------------------------------------- #
@@ -86,7 +103,45 @@ def test_the_dataframe_bundle_round_trips(session):
 
 
 # --------------------------------------------------------------------------- #
-# 2. A changed input is REPORTED, never masked
+# 2. The clock read handed to _process is the PROCESS one
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("analysis_id", BOTH_PHASE_IDS)
+def test_the_process_phase_replays_its_own_read_not_the_gather_one(session, analysis_id):
+    """An expert that reads a clock in BOTH halves is the case a flat list breaks.
+
+    FMPRating times its price-target window in ``_gather`` and its rating-recency
+    window in ``_process``; EarningsDrift builds its calendar window in ``_gather``
+    and ages the report in ``_process``. Replaying either from the front of one
+    undifferentiated list hands ``_process`` the gather instant -- quietly, and
+    only sometimes with a visible effect.
+    """
+    bundle = load_bundle(session)
+    record = next(a for a in bundle.analyses if a.analysis_id == analysis_id)
+
+    gather_reads = _reads(record, ReplayStatus.PHASE_GATHER)
+    process_reads = _reads(record, ReplayStatus.PHASE_PROCESS)
+    assert gather_reads and process_reads, "this fixture must read a clock in both halves"
+    assert gather_reads[0] != process_reads[0], (
+        "the two phases recorded the same instant, so this assertion has no teeth")
+
+    with use_capture_context(replay_context(record, ReplayStatus.PHASE_PROCESS)):
+        assert replay_now() == datetime.fromisoformat(process_reads[0])
+
+    with use_capture_context(replay_context(record, ReplayStatus.PHASE_GATHER)):
+        assert replay_now() == datetime.fromisoformat(gather_reads[0])
+
+
+def test_a_bundle_without_phase_tags_refuses_rather_than_guessing(bundle_copy):
+    """An older bundle cannot be split back into phases, and does not pretend to."""
+    edit_analysis(bundle_copy, RECENCY_ID, clock_read_phases=[])
+
+    result = _by_id(expert_replay.run(bundle_copy))[RECENCY_ID]
+    assert result.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "clock_read_phase" in result.detail
+
+
+# --------------------------------------------------------------------------- #
+# 3. A changed input is REPORTED, never masked
 # --------------------------------------------------------------------------- #
 def test_a_changed_bundle_input_is_reported_as_a_field_difference(bundle_copy):
     """Alter the recorded earnings surprise: the decision moves, and the diff says so."""
@@ -116,57 +171,60 @@ def test_the_recorded_recommendation_is_an_EXPECTATION_not_an_input(bundle_copy)
     """Tamper with the recorded OUTPUT: replay must recompute and disagree.
 
     If the recorded recommendation were fed back as an input (or copied to the
-    result), a tampered expectation would still read as a match -- which is the
-    single failure mode that would make the whole report worthless.
+    result), a tampered expectation would still read as a match -- the single
+    failure mode that would make the whole report worthless.
     """
-    manifest_path = bundle_copy / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    entry = next(a for a in manifest["analyses"] if a["analysis_id"] == RATING_ID)
+    def bump(recommendation):
+        recommendation.confidence = recommendation.confidence + 11.0
 
-    from ba2_common.core.replay import encode
-    from ba2_common.core.replay.store import ObjectStore
-    from ba2_common.core.replay.codec import decode
-
-    store = ObjectStore(bundle_copy)
-    kind, data, meta = store.get(entry["recommendation_object"])
-    recommendation = decode(kind, data, meta, frames=store.get)
-    recommendation.confidence = recommendation.confidence + 11.0
-    encoded = encode(recommendation)
-    new_hash = store.put(encoded.kind, encoded.data)
-    manifest["objects"].append({
-        "hash": new_hash, "kind": encoded.kind, "size": len(encoded.data),
-        "path": store.relative_path_for(new_hash, encoded.kind).as_posix()})
-    entry["recommendation_object"] = new_hash
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    rebuild_object(bundle_copy, RATING_ID, "recommendation_object", bump)
 
     rating = _by_id(expert_replay.run(bundle_copy))[RATING_ID]
     assert rating.status == ReplayStatus.COVERAGE_DIFFERENCE
     assert [name for name, _r, _p in rating.field_diffs] == ["confidence"]
 
 
+def test_a_skip_compares_every_field_not_only_its_reason(bundle_copy):
+    """A skip carries a price and details; changing one must be a difference.
+
+    Recording only the reason left those fields unreplayable: the row would have
+    matched on the reason alone while the skip's own text had moved.
+    """
+    def retext(recommendation):
+        recommendation.details = "No analyst coverage (rewritten)"
+
+    rebuild_object(bundle_copy, SKIP_ID, "recommendation_object", retext)
+
+    skip = _by_id(expert_replay.run(bundle_copy))[SKIP_ID]
+    assert skip.status == ReplayStatus.COVERAGE_DIFFERENCE
+    assert [name for name, _r, _p in skip.field_diffs] == ["details"]
+    assert "skip reproduced but" in skip.detail
+
+
+def test_a_skip_recorded_without_its_recommendation_is_not_a_match(bundle_copy):
+    """The reason alone is not the whole outcome, and must not be reported as it."""
+    edit_analysis(bundle_copy, SKIP_ID, recommendation_object=None)
+
+    skip = _by_id(expert_replay.run(bundle_copy))[SKIP_ID]
+    assert skip.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "could not be compared" in skip.detail
+
+
 # --------------------------------------------------------------------------- #
-# 3. What cannot be replayed says so
+# 4. What cannot be replayed says so -- one row at a time
 # --------------------------------------------------------------------------- #
 def test_an_expert_outside_the_recorded_four_is_unsupported(bundle_copy):
-    manifest_path = bundle_copy / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    entry = next(a for a in manifest["analyses"] if a["analysis_id"] == RATING_ID)
-    entry["expert_class"] = "ETFTrend"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    edit_analysis(bundle_copy, RATING_ID, expert_class="ETFTrend")
 
     result = _by_id(expert_replay.run(bundle_copy))[RATING_ID]
     assert result.status == ReplayStatus.COVERAGE_UNSUPPORTED
     assert "ETFTrend" in result.detail
-    assert result.status != ReplayStatus.COVERAGE_MATCH
 
 
 def test_an_analysis_without_a_captured_bundle_is_missing_capture(bundle_copy):
-    manifest_path = bundle_copy / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    entry = next(a for a in manifest["analyses"] if a["analysis_id"] == SCORER_ID)
-    entry["bundle_capture_status"] = ReplayStatus.CAPTURE_NOT_ATTEMPTED
-    entry["bundle_object"] = None
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    edit_analysis(bundle_copy, SCORER_ID,
+                  bundle_capture_status=ReplayStatus.CAPTURE_NOT_ATTEMPTED,
+                  bundle_object=None)
 
     report = expert_replay.run(bundle_copy)
     result = _by_id(report)[SCORER_ID]
@@ -174,8 +232,31 @@ def test_an_analysis_without_a_captured_bundle_is_missing_capture(bundle_copy):
     assert report.total == len(ALL_IDS), "an unreplayable analysis was dropped from the total"
 
 
+def test_one_uncomparable_row_does_not_abort_the_whole_report(bundle_copy):
+    """A poisoned row is ONE coverage gap, not the end of the run.
+
+    Here the manifest points an analysis's ``recommendation_object`` at a bundle
+    object, so the comparison is handed a dict where a ``Recommendation`` should
+    be. Before the comparison was contained, that exception escaped ``run()`` and
+    every other analysis in the session went unreported.
+    """
+    manifest = json.loads((bundle_copy / "manifest.json").read_text(encoding="utf-8"))
+    scorer = next(a for a in manifest["analyses"] if a["analysis_id"] == SCORER_ID)
+    edit_analysis(bundle_copy, CALENDAR_ID,
+                  recommendation_object=scorer["bundle_object"])
+
+    report = expert_replay.run(bundle_copy)
+    results = _by_id(report)
+
+    assert report.total == len(ALL_IDS)
+    assert results[CALENDAR_ID].status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "the comparison could not run" in results[CALENDAR_ID].detail
+    healthy = {i: r.status for i, r in results.items() if i != CALENDAR_ID}
+    assert set(healthy.values()) == {ReplayStatus.COVERAGE_MATCH}, healthy
+
+
 # --------------------------------------------------------------------------- #
-# 4. The written report
+# 5. The written report
 # --------------------------------------------------------------------------- #
 def test_the_report_is_written_and_states_what_did_not_run(session, tmp_path):
     out = tmp_path / "report"
@@ -196,3 +277,28 @@ def test_the_report_is_written_and_states_what_did_not_run(session, tmp_path):
         ReplayStatus.CAPABILITY_HISTORICAL,
         ReplayStatus.CAPABILITY_DECISION,
     }
+
+
+def test_the_markdown_and_the_json_agree_about_every_stage(session, tmp_path):
+    """One rendering of the stage status, so the two files cannot diverge."""
+    out = tmp_path / "report"
+    report = expert_replay.run(session, out)
+    capability = ReplayStatus.CAPABILITY_RECORDED_EXPERT
+    markdown = (out / f"{capability}.md").read_text(encoding="utf-8")
+    payload = json.loads((out / f"{capability}.json").read_text(encoding="utf-8"))
+
+    for row in payload["stages"]:
+        line = next(l for l in markdown.splitlines() if l.startswith(f"| {row['stage']} |"))
+        assert line.rstrip().endswith(f"| {row['status']} |"), (row, line)
+    assert [row["status"] for row in payload["stages"]].count(
+        ReplayStatus.COVERAGE_NOT_RUN) == 4
+
+
+def test_a_long_diff_cell_says_that_it_was_truncated(bundle_copy):
+    """A silently clipped cell reads like a complete value that ends oddly."""
+    from app.services.replay.report import _CELL_LIMIT, _cell
+
+    long_value = "x" * (_CELL_LIMIT + 50)
+    rendered = _cell(long_value)
+    assert "truncated" in rendered
+    assert str(len(long_value)) in rendered

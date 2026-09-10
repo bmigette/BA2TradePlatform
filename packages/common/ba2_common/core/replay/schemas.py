@@ -94,6 +94,20 @@ class ReplayStatus:
     MODE_CAPTURE = "capture"
     MODE_REPLAY = "replay"
 
+    # analysis phase -- which half of the recorded pair a clock read belongs to.
+    # An analysis reads the clock in BOTH halves (FMPRating times its price-target
+    # window in _gather and its rating-recency window in _process), so a flat list
+    # of reads cannot be replayed into one half alone: the first read of the list
+    # would be a gather read handed to _process. Every read is tagged with the
+    # phase it happened in, and a replay of one phase consumes only that phase's
+    # reads.
+    PHASE_GATHER = "gather"
+    PHASE_PROCESS = "process"
+    #: A read taken outside the recorded pair. It belongs to no phase, so no
+    #: phase replay will consume it -- which is loud, not silent.
+    PHASE_UNKNOWN = "unknown"
+    PHASES = (PHASE_GATHER, PHASE_PROCESS, PHASE_UNKNOWN)
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -220,6 +234,11 @@ class AnalysisRecord(_Record):
     ``capture_gaps`` names every role (``settings``/``bundle``/``recommendation``/
     ``observation:<id>``) whose object could not be encoded.
 
+    ``clock_reads`` and ``clock_read_phases`` are parallel: entry *i* of the first
+    is the evaluation time that was read, entry *i* of the second says whether
+    ``_gather`` or ``_process`` read it. A replay of one phase consumes only that
+    phase's reads (see :class:`ReplayStatus`).
+
     ``capture_failures`` counts this analysis's own recording degradation by
     :class:`~ba2_common.core.replay.context.CaptureHealth` kind, so one bad
     analysis is visible in the record itself and not only in a process-wide
@@ -241,6 +260,8 @@ class AnalysisRecord(_Record):
     bundle_object: Optional[str] = None
     bundle_capture_status: str = ReplayStatus.CAPTURE_NOT_ATTEMPTED
     clock_reads: Sequence[str] = ()
+    #: One phase per entry of ``clock_reads``, same order and same length.
+    clock_read_phases: Sequence[str] = ()
     outcome: str
     recommendation_object: Optional[str] = None
     skip_reason: Optional[str] = None
@@ -252,7 +273,7 @@ class AnalysisRecord(_Record):
     schema_version: int = SCHEMA_VERSION
 
     _DATETIME_FIELDS = ("scheduled_at", "started_at", "finished_at")
-    _SEQUENCE_FIELDS = ("clock_reads", "observation_ids", "capture_gaps")
+    _SEQUENCE_FIELDS = ("clock_reads", "clock_read_phases", "observation_ids", "capture_gaps")
     _MAPPING_FIELDS = ("branch_flags", "capture_failures")
 
     def object_hashes(self) -> Tuple[str, ...]:

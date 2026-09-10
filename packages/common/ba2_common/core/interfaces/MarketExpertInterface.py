@@ -865,9 +865,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         Returns ``(bundle, recommendation)``. An exception from ``_process`` (or
         from ``validate``) is recorded as the outcome and re-raised UNCHANGED.
         """
-        from ba2_common.core.replay import current_capture
+        from ba2_common.core.replay import ReplayStatus, current_capture
 
         context = current_capture()
+        if context is not None:
+            # Tag every clock read taken inside _gather as a GATHER read. An expert
+            # that reads a clock in BOTH halves (FMPRating times its price-target
+            # window here and its rating-recency window in _process) would otherwise
+            # record one flat list that no replay can split back apart.
+            context.set_phase(ReplayStatus.PHASE_GATHER)
         bundle = self._gather(providers, as_of=None)
         if context is not None:
             context.set_branch_flag("as_of_is_none", True)
@@ -879,6 +885,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # _process can mutate anything the gather returned.
             context.set_bundle(bundle)
         try:
+            if context is not None:
+                context.set_phase(ReplayStatus.PHASE_PROCESS)
             if validate is not None:
                 validate(bundle)
             recommendation = self._process(bundle, settings, as_of=None)
@@ -904,6 +912,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         recording failure: it is recorded as the analysis's ERROR, naming the
         contract it broke, rather than as a reasonless skip nobody can act on or
         an invented reason.
+
+        A skip carries the whole ``Recommendation`` into the record, not only its
+        reason: ``outcome`` already says the platform skipped, and the object is
+        what lets a replay compare the current_price, details and confidence a
+        skip still carries.
         """
         # getattr, not attribute access: the basket experts return a LIST of
         # recommendations from their own orchestrators. None of them routes
@@ -913,7 +926,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             context.set_outcome(recommendation=recommendation)
             return
         try:
-            context.set_skip(getattr(recommendation, "skip_reason", None))
+            context.set_skip(getattr(recommendation, "skip_reason", None), recommendation)
         except MissingSkipReason as exc:
             context.set_outcome(error=exc)
 

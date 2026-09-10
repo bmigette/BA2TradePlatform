@@ -46,6 +46,7 @@ from ba2_common.core.replay import (
     ReplayStore,
     SessionRecord,
 )
+from ba2_common.core.replay import sanitize_identity
 from ba2_common.core.replay.context import payload_kind_of, response_class_of
 from ba2_common.core.types import OrderRecommendation, Recommendation
 
@@ -125,15 +126,16 @@ def _analysis(payload: Dict[str, Any], row: Dict[str, Any], experts: Dict[int, s
     created_at = _utc(row["created_at"])
     recommendation_row = recommendations.get(row["id"])
 
+    gaps: List[str] = []
     objects: Dict[str, Any] = {}
     if recommendation_row is not None:
-        objects["recommendation"] = _recommendation(recommendation_row)
+        objects["recommendation"] = _recommendation(recommendation_row, gaps)
         outcome = ReplayStatus.OUTCOME_RECOMMENDATION
         skip_reason = None
         error = None
     elif row["status"] == "SKIPPED":
         outcome = ReplayStatus.OUTCOME_SKIP
-        skip_reason = _skip_reason(row)
+        skip_reason = _skip_reason(row, gaps)
         error = None
     else:
         outcome = ReplayStatus.OUTCOME_ERROR
@@ -141,7 +143,7 @@ def _analysis(payload: Dict[str, Any], row: Dict[str, Any], experts: Dict[int, s
         error = f"status={row['status']} with no persisted recommendation"
 
     observations = _observations(analysis_id, row, expert_class,
-                                 outputs_by_analysis.get(row["id"], []))
+                                 outputs_by_analysis.get(row["id"], []), gaps)
     record = AnalysisRecord(
         analysis_id=analysis_id,
         attempt_id=analysis_id,
@@ -163,17 +165,30 @@ def _analysis(payload: Dict[str, Any], row: Dict[str, Any], experts: Dict[int, s
         observation_ids=[o.observation.observation_id for o in observations],
         branch_flags={"bootstrap": True,
                       "source": "live_inputs.json",
-                      "day": payload["day"]},
+                      "day": payload["day"],
+                      # Named gaps, not an absence: a reader has to be able to see
+                      # WHICH fields the source could not supply for this row.
+                      "bootstrap_gaps": gaps},
     )
     return record, objects, observations
 
 
-def _recommendation(row: Dict[str, Any]) -> Recommendation:
+def _recommendation(row: Dict[str, Any], gaps: List[str]) -> Recommendation:
     """The recommendation live PRODUCED, rebuilt from its persisted row.
 
     Stored as an expected OUTPUT only: "Expected recommendations and order outputs
     are stored separately and must not be fed back as replay inputs." (spec s3)
+
+    ``raw_outputs`` is whatever the row actually held. When the row held nothing
+    usable the result carries an explicit MISSING MARKER rather than an empty
+    dict: ``{}`` is a legitimate value a live analysis can produce, and using it
+    for "not recorded" would make the two indistinguishable in the one direction
+    that matters.
     """
+    raw_outputs, marker = _parse_json_object(row["data"], "recommendation.data")
+    if marker is not None:
+        gaps.append(marker)
+        raw_outputs = {_MISSING_KEY: marker}
     return Recommendation(
         signal=OrderRecommendation[row["recommended_action"]],
         confidence=row["confidence"],
@@ -181,14 +196,15 @@ def _recommendation(row: Dict[str, Any]) -> Recommendation:
         details=row["details"],
         expected_profit_percent=row["expected_profit_percent"],
         target_price=row["target_price"],
-        raw_outputs=_json_or_empty(row["data"]),
+        raw_outputs=raw_outputs,
         skip=False,
         skip_reason=None,
     )
 
 
 def _observations(analysis_id: str, row: Dict[str, Any], expert_class: str,
-                  outputs: List[Dict[str, Any]]) -> List[PendingObservation]:
+                  outputs: List[Dict[str, Any]],
+                  gaps: List[str]) -> List[PendingObservation]:
     """The FMPRating payloads the analysis consumed, as recorded observations."""
     by_type = {output["type"]: output for output in outputs}
     out: List[PendingObservation] = []
@@ -196,14 +212,23 @@ def _observations(analysis_id: str, row: Dict[str, Any], expert_class: str,
         output = by_type.get(output_type)
         if output is None:
             continue
-        payload = json.loads(output["text"])
+        payload, marker = _parse_json_value(output["text"], f"{output_type}.text")
+        if marker is not None:
+            # An output row that will not parse is not a response. Recording it as
+            # one would put a payload on the tape that never existed.
+            gaps.append(marker)
+            continue
         observation = ProviderObservation(
             observation_id=f"{SESSION_ID}:{analysis_id}#{len(out):06d}",
             session_id=SESSION_ID,
             analysis_ids=[analysis_id],
             provider=provider,
             method=method,
-            request_identity={"symbol": row["symbol"]},
+            # The SAME sanitizer the live taps use, for both halves: a bootstrap
+            # is not a licence to write an identity or a payload shaped
+            # differently from a recorded one -- and the export must never carry a
+            # credential that happened to be persisted in an output row.
+            request_identity=sanitize_identity({"symbol": row["symbol"]}),
             invocation_seq=len(out),
             payload_kind=payload_kind_of(payload),
             response_class=response_class_of(payload),
@@ -217,26 +242,66 @@ def _observations(analysis_id: str, row: Dict[str, Any], expert_class: str,
             first_observed_at=None,
             provenance=ReplayStatus.PROVENANCE_UNKNOWN,
         )
-        out.append(PendingObservation(observation=observation, payload=payload))
+        out.append(PendingObservation(observation=observation,
+                                      payload=_sanitized_payload(payload)))
     return out
 
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def _skip_reason(row: Dict[str, Any]) -> str:
-    state = _json_or_empty(row["state"])
-    reason = state.get("skip_reason") if isinstance(state, dict) else None
-    # A skip with no recorded reason is a gap in the SOURCE, said out loud rather
-    # than filled in with a guess.
-    return str(reason) if reason else "skip reason not recorded on the analysis row"
+def _skip_reason(row: Dict[str, Any], gaps: List[str]) -> str:
+    state, marker = _parse_json_object(row["state"], "analysis.state")
+    if marker is not None:
+        gaps.append(marker)
+        return f"{_MISSING_KEY}: {marker}"
+    if "skip_reason" not in state or not state["skip_reason"]:
+        # A skip with no recorded reason is a gap in the SOURCE, said out loud
+        # rather than filled in with a guess.
+        marker = "analysis.state carries no skip_reason"
+        gaps.append(marker)
+        return f"{_MISSING_KEY}: {marker}"
+    return str(state["skip_reason"])
 
 
-def _json_or_empty(text: Any) -> Dict[str, Any]:
-    if not text:
-        return {}
-    value = json.loads(text) if isinstance(text, str) else text
-    return value if isinstance(value, dict) else {}
+#: Prefix every value this tool could NOT recover carries. It is deliberately
+#: not a valid signal, reason or payload, so a marker can never be mistaken for
+#: a recorded value further down the line.
+_MISSING_KEY = "__bootstrap_missing__"
+
+
+def _parse_json_value(text: Any, field: str):
+    """``(value, None)`` when ``text`` parses, ``(None, marker)`` when it does not."""
+    if text is None or text == "":
+        return None, f"{field} is absent"
+    if not isinstance(text, str):
+        return text, None
+    try:
+        return json.loads(text), None
+    except (TypeError, ValueError) as exc:
+        return None, f"{field} is not parseable JSON ({exc})"
+
+
+def _parse_json_object(text: Any, field: str):
+    """The same for a value that must be an OBJECT; a non-object is a gap, not {}."""
+    value, marker = _parse_json_value(text, field)
+    if marker is not None:
+        return {}, marker
+    if value is None:
+        return {}, f"{field} is null"
+    if not isinstance(value, dict):
+        return {}, f"{field} is a {type(value).__name__}, not an object"
+    return value, None
+
+
+def _sanitized_payload(payload: Any) -> Any:
+    """Run a recovered payload through the SAME sanitizer the live taps use.
+
+    ``sanitize_identity`` takes a mapping, so a list payload is wrapped and
+    unwrapped -- which keeps ONE implementation of "what may be persisted"
+    instead of a second, quietly divergent one for the bootstrap.
+    """
+    return sanitize_identity({"payload": payload})["payload"]
 
 
 def _utc(text: str) -> datetime:

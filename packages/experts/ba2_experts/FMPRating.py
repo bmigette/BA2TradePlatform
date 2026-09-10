@@ -14,7 +14,7 @@ from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
-from ba2_common.core.replay import observe_provider, replay_now
+from ba2_common.core.replay import observe_provider, record_branch_flag, replay_now
 from ba2_common.core.provider_utils import parse_provider_date
 from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
@@ -369,6 +369,12 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # (and a hermetic backtest without the gene never requires the grades cache).
         max_age = int(getattr(self, "_gather_max_analyst_age", 0) or 0)
         analyst_grades = None
+        # Which branch ran is a RECORDED FACT: the live snapshot path and the
+        # as_of reconstruction path consume DIFFERENT endpoints, so a replay must
+        # read the branch off the record rather than guess it from the tape.
+        record_branch_flag("fmp_rating_branch",
+                           "live_snapshot" if as_of is None else "as_of_reconstruction")
+        record_branch_flag("fmp_rating_analyst_grades", max_age > 0)
         if as_of is None:
             # LIVE path — unchanged: current consensus snapshots.
             consensus_data = self._fetch_price_target_consensus(symbol)

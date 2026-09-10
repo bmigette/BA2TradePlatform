@@ -229,6 +229,17 @@ def test_sanitize_redacts_a_credential_embedded_in_a_value():
     assert "symbol=AAPL" in out["url"]
 
 
+def test_sanitize_redacts_a_credential_NESTED_inside_a_value():
+    """A key one dict deep is exactly as exported as one at the root."""
+    out = sanitize_identity({"request": {
+        "rows": [{"url": "https://fmp/x?symbol=AAPL&apikey=S3CRET"}],
+        "apikey": "S3CRET",
+    }})
+    blob = repr(out)
+    assert "S3CRET" not in blob, blob
+    assert "symbol=AAPL" in blob
+
+
 def test_no_recorded_identity_contains_an_api_key():
     """The end-to-end guarantee across every tap exercised in this module."""
     context = _context()

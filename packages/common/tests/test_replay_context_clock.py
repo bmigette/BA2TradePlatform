@@ -293,7 +293,10 @@ def test_replay_mode_returns_the_recorded_reads_then_raises():
         "2026-09-10T13:00:00+00:00",
         "2026-09-10T13:00:05+00:00",
     ]
-    ctx = CaptureContext.for_replay(analysis_id="a1", clock_reads=recorded)
+    ctx = CaptureContext.for_replay(
+        analysis_id="a1", clock_reads=recorded,
+        clock_read_phases=[ReplayStatus.PHASE_PROCESS, ReplayStatus.PHASE_PROCESS],
+        phase=ReplayStatus.PHASE_PROCESS)
     with use_capture_context(ctx):
         assert ctx.mode == ReplayStatus.MODE_REPLAY
         assert replay_now() == datetime(2026, 9, 10, 13, 0, tzinfo=timezone.utc)
@@ -303,6 +306,66 @@ def test_replay_mode_returns_the_recorded_reads_then_raises():
     assert excinfo.value.kind == "clock_read"
     assert excinfo.value.analysis_id == "a1"
     assert current_capture() is None
+
+
+# --------------------------------------------------------------------------- phases
+
+
+def test_reads_are_tagged_with_the_phase_that_took_them():
+    """An expert reads a clock in BOTH halves; the record has to say which is which."""
+    context = CaptureContext(analysis_meta=_meta(), health=CaptureHealth())
+    with use_capture_context(context):
+        context.set_phase(ReplayStatus.PHASE_GATHER)
+        gathered = replay_now()
+        context.set_phase(ReplayStatus.PHASE_PROCESS)
+        processed = replay_now()
+
+    record = context.build_record()
+    assert list(record.clock_read_phases) == [ReplayStatus.PHASE_GATHER,
+                                              ReplayStatus.PHASE_PROCESS]
+    assert list(record.clock_reads) == [gathered.isoformat(), processed.isoformat()]
+
+
+def test_a_phase_replays_only_its_own_reads():
+    """Replaying _process must not be handed _gather's instant (the C1 defect)."""
+    gather_read = "2026-09-10T13:00:00+00:00"
+    process_read = "2026-09-10T13:00:09+00:00"
+    reads = [gather_read, process_read]
+    phases = [ReplayStatus.PHASE_GATHER, ReplayStatus.PHASE_PROCESS]
+
+    process = CaptureContext.for_replay(analysis_id="a1", clock_reads=reads,
+                                        clock_read_phases=phases,
+                                        phase=ReplayStatus.PHASE_PROCESS)
+    with use_capture_context(process):
+        assert replay_now() == datetime.fromisoformat(process_read), (
+            "the process phase was handed the gather read")
+        with pytest.raises(ReplayMiss):
+            replay_now()
+
+    gather = CaptureContext.for_replay(analysis_id="a1", clock_reads=reads,
+                                       clock_read_phases=phases,
+                                       phase=ReplayStatus.PHASE_GATHER)
+    with use_capture_context(gather):
+        assert replay_now() == datetime.fromisoformat(gather_read)
+
+
+def test_untagged_recorded_reads_refuse_to_replay_into_a_phase():
+    """A bundle with no phases cannot be split back apart -- and says so."""
+    ctx = CaptureContext.for_replay(analysis_id="a1",
+                                    clock_reads=["2026-09-10T13:00:00+00:00"],
+                                    clock_read_phases=[],
+                                    phase=ReplayStatus.PHASE_PROCESS)
+    with use_capture_context(ctx):
+        with pytest.raises(ReplayMiss) as excinfo:
+            replay_now()
+    assert excinfo.value.kind == "clock_read_phase"
+
+
+def test_an_unknown_phase_is_a_recording_failure_not_a_silent_tag():
+    context = CaptureContext(analysis_meta=_meta(), health=CaptureHealth())
+    context.set_phase("sideways")
+    assert context.phase == ReplayStatus.PHASE_UNKNOWN
+    assert context.capture_failures, "an unknown phase must be counted, not accepted"
 
 
 def test_replay_mode_still_honours_an_explicit_as_of():
@@ -415,23 +478,32 @@ def test_a_clean_analysis_records_no_failures():
 # --------------------------------------------------------------------------- skip
 
 
-def test_a_skip_records_its_reason_and_no_recommendation_object():
-    """A row must say ONE thing: the analysis skipped, and on what.
+def test_a_skip_records_its_reason_AND_the_skipping_recommendation():
+    """``outcome`` says what the platform acted on; the object says what it held.
 
-    Carrying a recommendation object as well would leave a reader guessing which
-    of the two the live platform acted on.
+    The row is unambiguous either way -- ``outcome`` is ``skip``, full stop -- and
+    keeping the object is what lets a replay compare the current_price, details
+    and confidence a skipping Recommendation still carries. Recording the reason
+    alone left every one of those fields unreplayable.
     """
     from ba2_common.core.replay.context import MissingSkipReason  # noqa: F401
 
     context = CaptureContext(analysis_meta=_meta(), health=CaptureHealth())
-    context.set_outcome(recommendation={"signal": "HOLD"})
-    context.set_skip("no consensus data")
+    context.set_skip("no consensus data", {"signal": "HOLD", "current_price": 12.5})
 
     record = context.build_record()
     assert record.outcome == ReplayStatus.OUTCOME_SKIP
     assert record.skip_reason == "no consensus data"
-    assert "recommendation" not in context.objects, (
-        "a skip must not also leave a recommendation on the row")
+    assert context.objects["recommendation"] == {"signal": "HOLD", "current_price": 12.5}
+
+
+def test_a_skip_without_a_recommendation_still_records_the_reason():
+    context = CaptureContext(analysis_meta=_meta(), health=CaptureHealth())
+    context.set_skip("no consensus data")
+
+    record = context.build_record()
+    assert record.outcome == ReplayStatus.OUTCOME_SKIP
+    assert "recommendation" not in context.objects
 
 
 def test_a_reasonless_skip_is_a_typed_error_not_a_degraded_capture():
