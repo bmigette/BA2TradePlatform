@@ -65,22 +65,6 @@ def tradable_balance_for(balance: float, *, margin_enabled: bool, factor: float,
     return float(balance) * effective_factor_for(factor, multiplier)
 
 
-def over_exposure_threshold(balance: float, *, multiplier: float, factor: float) -> float:
-    """The remaining-buying-power level below which gross exposure has passed the
-    platform's own ceiling. Pure.
-
-    Gross capacity is balance x multiplier; the platform intends to use
-    balance x factor; what should still be left is the difference. A factor above
-    the multiplier gives a negative threshold, which no remaining BP can be under.
-
-    Grouped as (gross capacity) - (intended exposure) rather than
-    balance x (multiplier - factor): each term is then the same product
-    ``tradable_balance_for`` computes, so the worked example is exact
-    (20000.0 - 18000.0 == 2000.0, where 10_000 * (2.0 - 1.8) is not).
-    """
-    return float(balance) * float(multiplier) - float(balance) * float(factor)
-
-
 def stock_exposure_headroom(ceiling: float, gross_exposure: float,
                             pending_entries: float) -> float:
     """Dollars of STOCK exposure this account may still ADD. Pure.
@@ -586,27 +570,27 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     f"{multiplier:g}); tradable option balance stays at the balance "
                     f"${balance:,.2f}")
             return 1.0
-        if remaining_bp is None or not math.isfinite(remaining_bp):
-            if remaining_bp is None:
-                logger.debug(f"[Account {self.id}] no {asset} buying power published; "
-                             f"over-exposure check skipped")
-            else:
-                # 2026-09-09 review, finding 5 follow-up. NaN loses the ``<`` below, so the
-                # check used to skip ITSELF without a word. An absent figure (None) is a
-                # published fact and stays DEBUG; a broken one is a broker anomaly. The stock
-                # path never reaches here (``_buying_power_from`` raises first) -- this guards
-                # the OPTION path, which reads ``snapshot.option_buying_power`` raw because
-                # None is legal there.
-                logger.warning(f"[Account {self.id}] non-finite {asset} buying power "
-                               f"({remaining_bp!r}); over-exposure check skipped")
-        else:
-            threshold = over_exposure_threshold(balance, multiplier=multiplier, factor=factor)
-            if remaining_bp < threshold:
-                logger.warning(
-                    f"[Account {self.id}] {asset} exposure is past the margin ceiling: remaining "
-                    f"broker buying power ${remaining_bp:,.2f} < ${threshold:,.2f} "
-                    f"(balance ${balance:,.2f} x (multiplier {multiplier:g} - factor {factor:g})). "
-                    f"Something outside the experts (allocator, manual trades) consumed it.")
+        # NO over-exposure test here any more (2026-09-10 review, finding 4). It compared
+        # remaining broker buying power against balance x (multiplier - factor), which
+        # assumes BP == balance x multiplier - gross exposure. That does not hold at
+        # Alpaca, which publishes DAY-TRADING buying power: on $2,004 of equity it reports
+        # multiplier 4, so the threshold was ~$4,409 -- above any buying power the account
+        # could ever have -- and the warning fired 1,139 times in one session while the
+        # MEASURED gross exposure ($1,703) sat comfortably under the $3,607 ceiling. The
+        # warning now lives in ``_stock_exposure_breakdown``, which compares the ceiling
+        # against exposure the broker actually marks instead of inferring it from BP.
+        #
+        # What remains worth saying here is whether the broker's own figure is usable at
+        # all (2026-09-09 review, finding 5 follow-up): an ABSENT figure is a published
+        # fact and stays DEBUG, a NON-FINITE one is a broker anomaly. The stock path never
+        # reaches either branch (``_buying_power_from`` raises first) -- this guards the
+        # OPTION path, which reads ``snapshot.option_buying_power`` raw because None is
+        # legal there.
+        if remaining_bp is None:
+            logger.debug(f"[Account {self.id}] no {asset} buying power published")
+        elif not math.isfinite(remaining_bp):
+            logger.warning(f"[Account {self.id}] non-finite {asset} buying power "
+                           f"({remaining_bp!r}); the broker's figure is unusable")
         return effective_factor_for(factor, multiplier)
 
     def _tradable_balance(self, *, asset: str, balance: float, multiplier: float,
@@ -909,11 +893,53 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         gross = self._gross_stock_exposure_from(capital.snapshot)
         pending = self._pending_stock_entry_notional(exclude_order_id)
         ceiling = capital.tradable
+        headroom = stock_exposure_headroom(ceiling, gross, pending)
+        self._report_over_exposure(ceiling=ceiling, gross=gross, pending=pending,
+                                   headroom=headroom)
         return StockExposure(
             balance=capital.balance, effective_factor=capital.effective_factor,
-            ceiling=ceiling, gross=gross, pending=pending,
-            headroom=stock_exposure_headroom(ceiling, gross, pending),
+            ceiling=ceiling, gross=gross, pending=pending, headroom=headroom,
             multiplier=capital.multiplier, buying_power=capital.buying_power)
+
+    def _report_over_exposure(self, *, ceiling: float, gross: float, pending: float,
+                              headroom: float) -> None:
+        """Say ONCE, per account, that this account has passed its own stock-exposure
+        ceiling -- and once again when it comes back under.
+
+        MEASURED, not inferred: ``gross`` is what the BROKER marks and ``pending`` is what
+        this account's working entries will add, which is exactly what a refusal is decided
+        on. The old warning guessed exposure from remaining buying power and was wrong at
+        every broker that publishes intraday BP (2026-09-10 review, finding 4).
+
+        LATCHED because this runs on every sizing read: an account sitting at its ceiling
+        would otherwise repeat the identical line hundreds of times a session (1,139
+        yesterday) and bury everything else. The state CHANGE is the event -- crossing is a
+        WARNING, staying over is DEBUG, and coming back under is an INFO so the recovery is
+        visible without going looking for it.
+
+        ``getattr`` with a default rather than an ``__init__`` attribute, matching the
+        non-marginable warning above: the account interfaces are subclassed widely and are
+        instantiated bare in tests.
+        """
+        over = headroom < 0                      # i.e. gross + pending > ceiling
+        was_over = getattr(self, "_over_exposed", False)
+        if over:
+            message = (
+                f"[Account {self.id}] stock exposure is past the margin ceiling: gross "
+                f"${gross:,.2f} + pending ${pending:,.2f} > ceiling ${ceiling:,.2f} "
+                f"(balance x the effective margin factor), i.e. ${-headroom:,.2f} over. "
+                f"New entries are refused until it comes back under.")
+            if was_over:
+                logger.debug(message)
+            else:
+                self._over_exposed = True
+                logger.warning(message)
+        elif was_over:
+            self._over_exposed = False
+            logger.info(
+                f"[Account {self.id}] stock exposure is back under the margin ceiling: "
+                f"gross ${gross:,.2f} + pending ${pending:,.2f} against ceiling "
+                f"${ceiling:,.2f}, leaving ${headroom:,.2f} of headroom.")
 
     def get_stock_exposure_headroom(self, exclude_order_id: Optional[int] = None
                                     ) -> Optional[float]:

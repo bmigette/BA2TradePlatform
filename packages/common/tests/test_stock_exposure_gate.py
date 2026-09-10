@@ -931,3 +931,103 @@ def test_the_2026_09_10_double_count_that_refused_two_funded_entries():
     assert breakdown.headroom == pytest.approx(949.03, abs=0.01)
     # Both refused entries fit in the real headroom; the double count left -$5.99.
     assert breakdown.headroom > 466.02 + 437.86
+
+
+# ----- 12. the over-exposure warning is measured and latched (finding 4) ----------
+#
+# The old warning lived in _effective_factor and compared remaining broker buying power
+# against balance x (multiplier - factor). That assumes BP == balance x multiplier -
+# gross exposure, which is false at Alpaca: it publishes the DAY-TRADING multiplier (4),
+# so on $2,004 of equity the threshold was ~$4,409 -- more than any buying power the
+# account could ever hold -- and the line fired 1,139 times in one session while the
+# MEASURED gross ($1,703) sat under the $3,607 ceiling. The warning now comes from the
+# exposure breakdown, off the same terms a refusal is decided on, and latches per account.
+
+
+def _over_ceiling_account(id_val, *, long_mv=19_000.0):
+    """$10,000 x 1.8 = an $18,000 ceiling, with the broker marking more than that.
+    Multiplier 4 and generous buying power: the production shape, in which the OLD rule
+    warned unconditionally and the new one must decide on exposure alone."""
+    return _Acct(id_val=id_val, balance=10_000.0, settings=ON,
+                 snapshot=_snap(multiplier=4.0, buying_power=25_000.0, long_mv=long_mv))
+
+
+def test_over_exposure_warns_once_then_stays_quiet_and_says_when_it_recovers(account_records):
+    acct = _over_ceiling_account(961)
+
+    for _ in range(3):
+        assert acct.get_stock_exposure_headroom() == pytest.approx(-1_000.0)
+    warnings = [msg for lvl, msg in account_records
+                if lvl == logging.WARNING and "past the margin ceiling" in msg]
+    debugs = [msg for lvl, msg in account_records
+              if lvl == logging.DEBUG and "past the margin ceiling" in msg]
+    assert len(warnings) == 1, account_records
+    assert len(debugs) == 2, "staying over the ceiling must not repeat the WARNING"
+    assert "$19,000.00" in warnings[0] and "$18,000.00" in warnings[0]
+    assert "$1,000.00 over" in warnings[0]
+
+    account_records.clear()
+    acct._snap.long_market_value = 12_000.0            # positions closed
+    assert acct.get_stock_exposure_headroom() == pytest.approx(6_000.0)
+    recovered = [msg for lvl, msg in account_records
+                 if lvl == logging.INFO and "back under the margin ceiling" in msg]
+    assert len(recovered) == 1, account_records
+    assert not any(lvl >= logging.WARNING for lvl, _ in account_records)
+
+
+def test_the_latch_re_arms_so_a_second_breach_is_reported(account_records):
+    """Latched on the state CHANGE, not "warn once ever": an account that goes over,
+    recovers and goes over again is three events, and all three must be visible."""
+    acct = _over_ceiling_account(962)
+    acct.get_stock_exposure_headroom()                 # over -> WARNING
+    acct._snap.long_market_value = 12_000.0
+    acct.get_stock_exposure_headroom()                 # under -> INFO
+    acct._snap.long_market_value = 19_000.0
+    acct.get_stock_exposure_headroom()                 # over -> WARNING again
+
+    warnings = [msg for lvl, msg in account_records
+                if lvl == logging.WARNING and "past the margin ceiling" in msg]
+    assert len(warnings) == 2, account_records
+
+
+def test_exactly_at_the_ceiling_is_not_over_it(account_records):
+    """Zero headroom is a full account, not a breached one."""
+    acct = _over_ceiling_account(963, long_mv=18_000.0)
+    assert acct.get_stock_exposure_headroom() == pytest.approx(0.0)
+    assert not any(lvl >= logging.WARNING for lvl, _ in account_records), account_records
+
+
+@pytest.mark.parametrize("buying_power", [0.0, 1.0, 2_000.0, 25_000.0, 39_443.1])
+def test_no_warning_below_the_ceiling_whatever_the_buying_power_is(buying_power,
+                                                                   account_records):
+    """The production false positive, pinned: multiplier 4 and ANY remaining BP, with
+    gross comfortably under the ceiling. The old rule warned on every one of these."""
+    acct = _Acct(id_val=964, balance=2_004.14, settings=ON,
+                 snapshot=_snap(multiplier=4.0, buying_power=buying_power,
+                                long_mv=1_703.40))
+    assert acct.get_stock_exposure_headroom() == pytest.approx(3_607.452 - 1_703.40)
+    assert not any(lvl >= logging.WARNING for lvl, _ in account_records), account_records
+
+
+def test_a_pending_entry_can_push_an_account_over_the_ceiling(account_records):
+    """The warning reads the SAME two terms the refusal does, so it cannot disagree with
+    the gate about whether the account is over."""
+    acct = _Acct(id_val=965, balance=10_000.0, settings=ON,
+                 snapshot=_snap(multiplier=4.0, buying_power=25_000.0, long_mv=15_000.0))
+    with ts.inmem_trades():
+        assert acct.get_stock_exposure_headroom() == pytest.approx(3_000.0)
+        assert not any(lvl >= logging.WARNING for lvl, _ in account_records)
+        _with_entry_order(acct)                        # 50 @ 100 still working
+        assert acct.get_stock_exposure_headroom() == pytest.approx(-2_000.0)
+    hits = [msg for lvl, msg in account_records
+            if lvl == logging.WARNING and "past the margin ceiling" in msg]
+    assert len(hits) == 1 and "pending $5,000.00" in hits[0]
+
+
+def test_margin_off_never_reports_over_exposure(account_records):
+    """BACKTEST PIN: the breakdown returns None before the report is reached, so a
+    backtest cannot emit this line however deployed the account is."""
+    acct = _Acct(id_val=966, balance=10_000.0, settings=OFF,
+                 snapshot=_snap(multiplier=4.0, buying_power=0.0, long_mv=99_000.0))
+    assert acct.get_stock_exposure_headroom() is None
+    assert account_records == []

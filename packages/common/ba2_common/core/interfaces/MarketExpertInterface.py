@@ -1085,7 +1085,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             else:
                 headroom = headroom_reader()
                 if headroom is not None and headroom < available_balance:
-                    logger.info(
+                    # DEBUG, not INFO (2026-09-10 review, finding 4): this fires on EVERY
+                    # balance read -- 353 times in one production session -- and the clamp
+                    # is the normal, healthy operation of the ceiling, not an event. The
+                    # account itself reports the abnormal case (past the ceiling) once per
+                    # state change, in ReadOnlyAccountInterface._report_over_exposure.
+                    logger.debug(
                         f"Expert {self.id}: available ${available_balance:,.2f} exceeds the "
                         f"account's remaining stock exposure headroom ${headroom:,.2f} — "
                         f"clamping. The account is at its ceiling (balance x margin_factor), "

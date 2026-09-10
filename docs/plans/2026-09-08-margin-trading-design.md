@@ -85,18 +85,45 @@ broker BP through the existing probe, so per-order safety is unchanged.
 
 ### Over-exposure warning
 
-Broker BP is remaining capacity. With balance 10k, stock multiplier 2 and
-factor 1.8, gross capacity is 20k and the platform intends to use 18k, so once
-broker BP drops under 2k something has pushed exposure past the platform's own
-ceiling (allocator, manual trades, another tool). Rule, evaluated when
-`get_tradable_balance()` runs with margin on:
+**Revised 2026-09-10 (production review, finding 4).** The original rule inferred
+exposure from remaining broker buying power:
 
-    warn when broker_bp < balance x (multiplier - margin_factor)
+    warn when broker_bp < balance x (multiplier - margin_factor)     # WITHDRAWN
 
-Message names account id, balance, multiplier, factor and broker BP. Same test
-per class: stock against `buying_power`, option against `option_buying_power`.
-When the option figure is None the check is skipped with a DEBUG line, never
-computed on a guess.
+That is only valid if `broker_bp == balance x multiplier - gross exposure`, and
+Alpaca publishes the **day-trading** multiplier: on $2,004 of equity it reports
+4, so the threshold was ~$4,409 -- more than any buying power the account could
+ever hold. The line fired 1,139 times in a single session while the measured
+gross exposure ($1,703) sat well under the $3,607 ceiling. It was evidence of
+nothing.
+
+Exposure is now measured, not inferred. `_stock_exposure_breakdown()` already
+computes the three terms a refusal is decided on, so the warning is raised there
+from the same numbers:
+
+    over-exposed when gross + pending > ceiling      (i.e. headroom < 0)
+
+where `gross` is the broker's long + |short| market value and `pending` is the
+notional of this account's working entry orders. Message names the account,
+gross, pending, the ceiling and the overshoot.
+
+**Latched per account**, because this runs on every sizing read:
+
+| transition | level |
+|---|---|
+| under -> over | WARNING (once) |
+| over -> over | DEBUG |
+| over -> under | INFO (once) |
+
+The latch re-arms, so a second breach after a recovery is reported again.
+Remaining broker BP is no longer part of any warning; `_effective_factor` still
+reports an ABSENT option buying power at DEBUG and a NON-FINITE one at WARNING,
+which is a broker-anomaly check, not a ceiling test.
+
+The per-expert "available ... exceeds the account's remaining stock exposure
+headroom -- clamping" line in `MarketExpertInterface.get_available_balance` is
+DEBUG: the clamp is the ceiling working normally and fires on every read (353
+times in the same session). The abnormal case is reported by the account, once.
 
 ## Consumers switched to tradable balance
 
@@ -163,8 +190,8 @@ Stays on real equity:
 - Missing broker BP, balance or multiplier raises. Callers already treat a
   missing available balance as "reject the order"; an exception lands in the
   job log instead of silently sizing to cash.
-- Warnings (non-marginable account with margin on; over-exposure) are logged
-  once per call. Throttle to once per snapshot TTL only if it proves noisy.
+- The non-marginable-account warning is logged once per account (DEBUG after).
+  The over-exposure warning is latched on the state change; see above.
 
 ## Tests (`tests/`)
 
@@ -172,8 +199,10 @@ Stays on real equity:
   balance x factor; broker multiplier below factor wins; multiplier 1.0
   returns balance and warns; missing BP/multiplier raises; factor < 1.0
   refused.
-- Over-exposure warning fires at exactly `balance x (mult - factor)` and not
-  above it; skipped with option BP None.
+- Over-exposure warning fires once when `gross + pending` crosses the ceiling,
+  stays DEBUG while it is over, and reports the recovery once at INFO; never
+  fires below the ceiling whatever the broker's buying power says
+  (`packages/common/tests/test_stock_exposure_gate.py`).
 - `_virtual_equity` = option tradable balance x pct (and NOT the stock virtual
   balance: reading the stock figure would size every option entry by the stock
   factor).
