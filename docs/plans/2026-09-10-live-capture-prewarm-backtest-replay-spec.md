@@ -479,6 +479,47 @@ a new paper session, then production observation after the tests above. Existing
 account/protection findings can become replay regressions without changing
 historical strategy calculations in this work.
 
+## 12. Status (first delivery, 2026-09-11)
+
+Branch `feat/live-capture-replay` (from dev 82baaa10). Task plan:
+`2026-09-10-live-capture-replay-implementation-plan.md`. Capture ships OFF.
+
+| Step | State | Where | Commits |
+|---|---|---|---|
+| 1 Contract/store | done | `packages/common/ba2_common/core/replay/` (schemas, codec, store, context, clock, service, observe) | 9e851b6b, 7d408b25 |
+| 2 Live expert recording | done for the four deployed expert classes | `MarketExpertInterface._gather_and_process`, taps in FMPRating/FMPEarningsDrift/cached_get/StockScreener/OHLCV/quote (incl. IBKR), `replay_now` clock seam, host `ba2_trade_platform/core/replay_capture.py`, `main.py`, `WorkerQueue` | 7ffe2518, 402d82b5 |
+| 3 Expert replay | done: `recorded_expert` and `gather_tape` capabilities, inventory/report, CLI | `testplatform/backend/app/services/replay/`, `ba2test replay inventory\|experts\|gather --bundle <dir>`, `tools/replay_bootstrap_2026_09_10.py` | 1280820e, 9c2c573e |
+| 4 Warm service | slice only: backend prewarm persists from worker threads, one fetcher table (`prewarm_fetchers.run_prewarm`), estimator inputs warmed for Drift and Insider unconditionally, senate bounds from one source | `testplatform/backend/app/services/prewarm_fetchers.py`, `data_build_handler.py`, launcher | fa69a8eb, 0bf432e0 |
+| 5 Historical comparison | not started | | |
+| 6 Decision/sizing trace | not started | | |
+| 7 Pilot rollout | not started (no UI counters; setting exists) | | |
+
+How to use:
+
+- Enable capture on an instance: set app setting `replay_capture_enabled` to `true` and
+  restart. Records land under `<instance cache>/replay/v1/` (index.sqlite + objects). Health
+  counters via `ba2_trade_platform.core.replay_capture.get_capture_health()`.
+- Export/replay: `ba2-test replay inventory --bundle <session-export>`,
+  `ba2-test replay experts --bundle <dir> [--out <dir>]`, `ba2-test replay gather --bundle <dir>`.
+  `experts`/`gather` exit 1 on any `difference`; `missing_capture` is coverage, not failure.
+- September 10 bootstrap: `tools/replay_bootstrap_2026_09_10.py <live_inputs.json> <out>`
+  yields a PARTIAL session (no normalized bundles were recorded that day), so every analysis
+  reports `missing_capture` by design.
+
+Known limits recorded by the reviews:
+
+- A recorded-bundle `match` is not a live/backtest match; only the two capabilities above run.
+- DeterministicScorer gather-tape: OHLCV identity is replayable (`data.fetch_ohlcv` reads
+  `replay_now`), but statements/macro/index reads are un-taped and report `missing_capture`
+  naming the first un-taped request. Rule: no request-identity key may carry an un-replayed
+  wall-clock value.
+- `absorb_if_benign` can swallow `ReplayMiss` under non-enforce error modes; a never-absorb
+  registry in `failure_modes` is owed.
+- `shutdown_replay_capture()` has no app shutdown path; interrupt-and-recover at next
+  startup is the live lifecycle.
+- Live capture cost is bounded by the writer queue (64 items); p95 latency budget not yet
+  measured on a live session (acceptance test 10 pending a paper session).
+
 References:
 
 - [Replay readiness audit](../../reports/trading/live_backtest_replay_readiness_2026-09-10.md)
