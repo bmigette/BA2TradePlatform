@@ -1,3 +1,3 @@
 # Application version — format: YYYY.MM.NNNNN
 # NNNNN is the sequential build number; increment it on every push.
-APP_VERSION = "2026.09.1148"
+APP_VERSION = "2026.09.1149"

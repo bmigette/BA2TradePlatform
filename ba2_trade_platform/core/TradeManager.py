@@ -7,11 +7,16 @@ expert settings, rulesets, and trading permissions.
 
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
+import math
 import threading
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
+# ONE constant, TWO readers: the OCO stop leg places its limit this far through the stop,
+# and _force_close_breached_stops below decides a stop was jumped by the same number. See
+# the constant's own comment in AlpacaAccount for why they can never be allowed to drift.
+from ..modules.accounts.AlpacaAccount import OCO_STOP_LIMIT_CUSHION
 
 
 # Serializes account refreshes across all entry points (scheduled job, immediate job,
@@ -324,6 +329,19 @@ class TradeManager:
                     # broker (no-op for non-options accounts). Idempotent.
                     self._reconcile_account_option_activities(account)
 
+                    # SAFETY NET: a stop-LIMIT exit leg that a gap jumped can never fill,
+                    # leaving an open position with no stop under it. Force-close those at
+                    # market. Runs LAST, on the freshly-refreshed order/position/transaction
+                    # state above. Idempotent, and isolated so a price/DB failure here
+                    # cannot cost the rest of the refresh.
+                    try:
+                        self._force_close_breached_stops(account)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error force-closing breached stops for {account_def.name}: {e}",
+                            exc_info=True,
+                        )
+
                 except Exception as e:
                     self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
                     continue
@@ -346,6 +364,199 @@ class TradeManager:
         finally:
             _REFRESH_LOCK.release()
     
+    # Reason stamped on a transaction the safety net closes, and the string an operator
+    # greps for. Distinct from "tp_sl_filled": nothing filled — that is the whole problem.
+    STOP_BREACH_CLOSE_REASON = "stop_breached_forced_close"
+
+    def _force_close_breached_stops(self, account):
+        """Force-close, at market, any position whose stop the market has passed without
+        the broker's stop leg filling.
+
+        LIVE-ONLY BY CONSTRUCTION. ``TradeManager`` runs only in the live platform; the
+        backtest engine never calls this refresh path. It exists precisely to make live
+        agree with the backtest:
+
+        WHY. Alpaca exits go out as an OCO whose stop leg is a stop-LIMIT, with the limit
+        placed ``OCO_STOP_LIMIT_CUSHION`` through the stop so an ordinary trigger still
+        fills (``AlpacaAccount._submit_order_impl``). When a gap clears BOTH the stop and
+        that cushion in one print, the triggered leg becomes a limit order on the wrong
+        side of the market: it rests unfilled, the OCO stays working, and the position is
+        open with no stop beneath it. Prod saw exactly this on 2026-09-10 (RARE, ENOV).
+        The backtest, by contrast, models every stop as a MARKET stop that fills at the
+        stop or at the gap open (``backtest_account._gap_stop_fill``), so the two diverge
+        on the days that hurt most. This closes that gap rather than widening the cushion,
+        which would only move the cliff.
+
+        THE RULE. For each OPENED **equity** transaction of ``account`` carrying a
+        ``stop_loss``, breached means the price is past the stop by more than the cushion:
+        a long below ``stop * (1 - cushion)``, a short above ``stop * (1 + cushion)``.
+        Inside the cushion the triggered limit can still fill normally, so we leave it to
+        the broker. Options are skipped: an option transaction's ``symbol`` is the
+        UNDERLYING and its stop is not a share price.
+
+        WHAT IT REFUSES TO DO. Nothing is closed on an assumption. A price that is
+        missing, non-finite or non-positive is UNKNOWN, and unknown is not "safe" — the
+        symbol is skipped with a WARNING, never closed and never presumed healthy. A
+        position book that cannot be read is likewise a skip, not a close. Each
+        transaction is handled independently: one failure logs and the loop continues.
+
+        No market-hours check. A market close submitted after hours is queued to the next
+        open — which is the very fill the backtest models.
+        """
+        from sqlmodel import Session, select
+        from .db import get_db
+        from .types import AssetClass, TransactionStatus
+
+        # 1) The watch list: OPENED equity transactions of THIS account (transactions link
+        #    to an account only through their orders) that actually have a stop to breach.
+        watched = []
+        with Session(get_db().bind) as session:
+            open_txns = session.exec(
+                select(Transaction).join(TradingOrder).where(
+                    TradingOrder.account_id == account.id,
+                    Transaction.status == TransactionStatus.OPENED,
+                ).distinct()
+            ).all()
+            for txn in open_txns:
+                if txn.asset_class == AssetClass.OPTION or txn.multiplier not in (None, 1):
+                    continue
+                if txn.stop_loss is None or not txn.symbol:
+                    continue
+                # Plain tuples, so nothing below depends on a live ORM session.
+                watched.append((txn.id, txn.symbol, txn.side, float(txn.stop_loss)))
+
+        if not watched:
+            return
+
+        # 2) One bulk price call for every watched symbol.
+        symbols = sorted({symbol for _, symbol, _, _ in watched})
+        prices = account.get_instrument_current_price(symbols)
+        if not isinstance(prices, dict):
+            self.logger.error(
+                f"[Account {account.id}] breached-stop check: bulk price fetch for "
+                f"{len(symbols)} symbol(s) returned {type(prices).__name__}, not a mapping; "
+                f"no position can be checked this pass"
+            )
+            return
+
+        for txn_id, symbol, side, stop in watched:
+            try:
+                if symbol not in prices:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: no price returned for "
+                        f"{symbol} (transaction {txn_id}); skipping — an unknown price is not "
+                        f"a healthy position, it is an unchecked one"
+                    )
+                    continue
+                raw_price = prices[symbol]
+                if raw_price is None:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: price unavailable for "
+                        f"{symbol} (transaction {txn_id}); skipping this pass"
+                    )
+                    continue
+                price = float(raw_price)
+                if not math.isfinite(price) or price <= 0:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: unusable price "
+                        f"{raw_price!r} for {symbol} (transaction {txn_id}); skipping"
+                    )
+                    continue
+
+                if side == OrderDirection.BUY:
+                    threshold = stop * (1.0 - OCO_STOP_LIMIT_CUSHION)
+                    breached = price < threshold
+                elif side == OrderDirection.SELL:
+                    threshold = stop * (1.0 + OCO_STOP_LIMIT_CUSHION)
+                    breached = price > threshold
+                else:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: transaction {txn_id} "
+                        f"({symbol}) has an unrecognised side {side!r}; skipping"
+                    )
+                    continue
+
+                if not breached:
+                    continue
+
+                # 3) NEVER close on a guess: the position must still be at the broker, on
+                #    the side we think we hold. None means the book could not be read.
+                held_qty = account.get_signed_position_quantity(symbol)
+                if held_qty is None:
+                    self.logger.warning(
+                        f"[Account {account.id}] {symbol} stop {stop} appears breached at "
+                        f"{price}, but the broker position book is UNREADABLE; not closing "
+                        f"transaction {txn_id} on a guess"
+                    )
+                    continue
+                still_held = (held_qty > 0) if side == OrderDirection.BUY else (held_qty < 0)
+                if not still_held:
+                    self.logger.warning(
+                        f"[Account {account.id}] {symbol} stop {stop} appears breached at "
+                        f"{price}, but the broker reports qty={held_qty} for a "
+                        f"{side.value if hasattr(side, 'value') else side} position; nothing "
+                        f"to close for transaction {txn_id} (the reconciler owns this case)"
+                    )
+                    continue
+
+                # 4) Idempotency: close_transaction moves the row to CLOSING, so a later
+                #    refresh finds it out of OPENED. Re-read anyway — the watch list was
+                #    built before the price and position round-trips above.
+                txn = get_instance(Transaction, txn_id)
+                if txn.status != TransactionStatus.OPENED:
+                    continue
+
+                self.logger.warning(
+                    f"[Account {account.id}] STOP BREACHED WITHOUT FILLING: {symbol} "
+                    f"{side.value if hasattr(side, 'value') else side} transaction {txn_id}, "
+                    f"stop={stop}, price={price}, cushion={OCO_STOP_LIMIT_CUSHION:.3%}. The "
+                    f"stop-limit exit leg cannot fill from here — force-closing at market."
+                )
+
+                result = account.close_transaction(txn_id)
+                if not isinstance(result, dict):
+                    raise ValueError(
+                        f"close_transaction({txn_id}) returned {type(result).__name__}, "
+                        f"not a result dict"
+                    )
+                success = bool(result['success'])
+
+                txn = get_instance(Transaction, txn_id)
+                if success:
+                    # Stamp WHY, so the closure is attributable once the market close fills.
+                    txn.close_reason = self.STOP_BREACH_CLOSE_REASON
+                    update_instance(txn)
+                else:
+                    self.logger.error(
+                        f"[Account {account.id}] force-close of breached-stop transaction "
+                        f"{txn_id} ({symbol}) FAILED: {result['message']}. The position is "
+                        f"still open and unprotected — it will be retried next refresh."
+                    )
+
+                # Same activity-log helper every other close path uses.
+                from ba2_common.core.utils import log_close_order_activity
+                log_close_order_activity(
+                    transaction=txn,
+                    account_id=account.id,
+                    success=success,
+                    error_message=None if success else result['message'],
+                    close_order_id=result['close_order_id'],
+                    quantity=txn.quantity,
+                    side=(OrderDirection.SELL if side == OrderDirection.BUY
+                          else OrderDirection.BUY),
+                    canceled_count=result['canceled_count'],
+                    deleted_count=result['deleted_count'],
+                )
+
+            except Exception as e:
+                # One bad transaction must never cost the others their safety net.
+                self.logger.error(
+                    f"[Account {account.id}] breached-stop check failed for transaction "
+                    f"{txn_id} ({symbol}): {e}",
+                    exc_info=True,
+                )
+                continue
+
     def _reconcile_account_option_activities(self, account):
         """Reconcile broker option lifecycle events (assignment / exercise / expiry)
         against the local Transaction ledger for one account.

@@ -44,6 +44,18 @@ _DIVIDEND_KEY_PREFIX = "DIV:"
 # Calendar.__init__ with strptime("%Y-%m-%d %H:%M") (alpaca/trading/models.py:374-388).
 _MARKET_TZ = pytz.timezone("America/New_York")
 
+# How far THROUGH its stop price the OCO stop leg's limit price is placed, so that a
+# normally-triggered stop still fills (a stop-LIMIT with limit == stop rests unfilled the
+# moment the market ticks past it).
+#
+# THIS NUMBER HAS TWO READERS AND MUST STAY ONE CONSTANT. The other is
+# TradeManager._force_close_breached_stops: on a gap that jumps the stop AND this cushion
+# in a single print, the triggered leg becomes a limit order on the wrong side of the
+# market and never fills, leaving the position open and unprotected (prod 2026-09-10:
+# RARE/ENOV). That safety net force-closes exactly the positions this cushion could not
+# protect, so it has to measure the breach with the very same number.
+OCO_STOP_LIMIT_CUSHION = 0.005
+
 
 def _to_market_utc(value: Optional[datetime]) -> Optional[datetime]:
     """Normalise a broker datetime to tz-aware UTC.
@@ -1438,7 +1450,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 rounded_sl_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
                 # Stop-loss limit price should be slightly worse than stop price to ensure execution
                 rounded_sl_limit_price = self._round_price(
-                    rounded_sl_stop_price * 0.995 if side == OrderSide.SELL else rounded_sl_stop_price * 1.005,
+                    rounded_sl_stop_price * (1.0 - OCO_STOP_LIMIT_CUSHION) if side == OrderSide.SELL
+                    else rounded_sl_stop_price * (1.0 + OCO_STOP_LIMIT_CUSHION),
                     trading_order.symbol
                 )
                 
