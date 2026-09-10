@@ -65,22 +65,6 @@ def tradable_balance_for(balance: float, *, margin_enabled: bool, factor: float,
     return float(balance) * effective_factor_for(factor, multiplier)
 
 
-def over_exposure_threshold(balance: float, *, multiplier: float, factor: float) -> float:
-    """The remaining-buying-power level below which gross exposure has passed the
-    platform's own ceiling. Pure.
-
-    Gross capacity is balance x multiplier; the platform intends to use
-    balance x factor; what should still be left is the difference. A factor above
-    the multiplier gives a negative threshold, which no remaining BP can be under.
-
-    Grouped as (gross capacity) - (intended exposure) rather than
-    balance x (multiplier - factor): each term is then the same product
-    ``tradable_balance_for`` computes, so the worked example is exact
-    (20000.0 - 18000.0 == 2000.0, where 10_000 * (2.0 - 1.8) is not).
-    """
-    return float(balance) * float(multiplier) - float(balance) * float(factor)
-
-
 def stock_exposure_headroom(ceiling: float, gross_exposure: float,
                             pending_entries: float) -> float:
     """Dollars of STOCK exposure this account may still ADD. Pure.
@@ -586,27 +570,27 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     f"{multiplier:g}); tradable option balance stays at the balance "
                     f"${balance:,.2f}")
             return 1.0
-        if remaining_bp is None or not math.isfinite(remaining_bp):
-            if remaining_bp is None:
-                logger.debug(f"[Account {self.id}] no {asset} buying power published; "
-                             f"over-exposure check skipped")
-            else:
-                # 2026-09-09 review, finding 5 follow-up. NaN loses the ``<`` below, so the
-                # check used to skip ITSELF without a word. An absent figure (None) is a
-                # published fact and stays DEBUG; a broken one is a broker anomaly. The stock
-                # path never reaches here (``_buying_power_from`` raises first) -- this guards
-                # the OPTION path, which reads ``snapshot.option_buying_power`` raw because
-                # None is legal there.
-                logger.warning(f"[Account {self.id}] non-finite {asset} buying power "
-                               f"({remaining_bp!r}); over-exposure check skipped")
-        else:
-            threshold = over_exposure_threshold(balance, multiplier=multiplier, factor=factor)
-            if remaining_bp < threshold:
-                logger.warning(
-                    f"[Account {self.id}] {asset} exposure is past the margin ceiling: remaining "
-                    f"broker buying power ${remaining_bp:,.2f} < ${threshold:,.2f} "
-                    f"(balance ${balance:,.2f} x (multiplier {multiplier:g} - factor {factor:g})). "
-                    f"Something outside the experts (allocator, manual trades) consumed it.")
+        # NO over-exposure test here any more (2026-09-10 review, finding 4). It compared
+        # remaining broker buying power against balance x (multiplier - factor), which
+        # assumes BP == balance x multiplier - gross exposure. That does not hold at
+        # Alpaca, which publishes DAY-TRADING buying power: on $2,004 of equity it reports
+        # multiplier 4, so the threshold was ~$4,409 -- above any buying power the account
+        # could ever have -- and the warning fired 1,139 times in one session while the
+        # MEASURED gross exposure ($1,703) sat comfortably under the $3,607 ceiling. The
+        # warning now lives in ``_stock_exposure_breakdown``, which compares the ceiling
+        # against exposure the broker actually marks instead of inferring it from BP.
+        #
+        # What remains worth saying here is whether the broker's own figure is usable at
+        # all (2026-09-09 review, finding 5 follow-up): an ABSENT figure is a published
+        # fact and stays DEBUG, a NON-FINITE one is a broker anomaly. The stock path never
+        # reaches either branch (``_buying_power_from`` raises first) -- this guards the
+        # OPTION path, which reads ``snapshot.option_buying_power`` raw because None is
+        # legal there.
+        if remaining_bp is None:
+            logger.debug(f"[Account {self.id}] no {asset} buying power published")
+        elif not math.isfinite(remaining_bp):
+            logger.warning(f"[Account {self.id}] non-finite {asset} buying power "
+                           f"({remaining_bp!r}); the broker's figure is unusable")
         return effective_factor_for(factor, multiplier)
 
     def _tradable_balance(self, *, asset: str, balance: float, multiplier: float,
@@ -719,6 +703,59 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 f"value (long={long_mv!r}, short={short_mv!r}); cannot measure exposure")
         return long_value + abs(short_value)
 
+    def get_broker_order_remaining_quantity(self, order) -> Optional[float]:
+        """The quantity the BROKER still has working on ``order``; ``None`` when unreadable.
+
+        The local orders table is refreshed on a schedule, so between a fill and the next
+        ``refresh_orders()`` a row keeps its pre-fill status and a NULL ``filled_qty`` while
+        the broker has ALREADY marked the shares into ``long_market_value``. The exposure
+        ceiling reads both figures, so those same shares were counted twice -- once in the
+        gross, once in the pending total -- and the headroom collapsed. Production,
+        2026-09-10: NAVN/TTAN/CHWY (about $955) filled at 15:32:23-30, headroom read $29.02
+        at 15:32:34 and two funded entries (SAIL, AVAV) were refused; eight seconds after
+        the order refresh the same account reported $942.69 with no pending entries.
+
+        Asking the BROKER what is still working removes the double count at its source.
+        This is a single-order read through the adapter's existing ``get_order`` wrapper --
+        no second SDK call site -- and it is called only for orders that would otherwise be
+        counted, of which a live account has a handful at a time.
+
+        Returns:
+            The unfilled quantity the broker reports (0.0 once the order is filled or
+            terminal at the broker), or ``None`` when the broker's view cannot be read --
+            the order is unknown to it, the fetch failed, or the figures it published are
+            not usable. ``None`` is never "nothing is working": the caller falls back to
+            the LOCAL remaining quantity, which over- rather than under-states exposure.
+        """
+        broker_order_id = order.broker_order_id
+        if not broker_order_id:
+            return None
+        broker_order = self.get_order(broker_order_id)
+        if broker_order is None:
+            # Both live adapters log the broker error themselves and return None.
+            return None
+        status = getattr(broker_order, "status", None)
+        if status in (OrderStatus.FILLED,) or status in OrderStatus.get_terminal_statuses():
+            return 0.0
+        if status not in WORKING_ORDER_STATUSES:
+            # UNKNOWN (an unparseable broker status) lands here. Reading it as "done"
+            # would drop real exposure from the total, so it is an unreadable answer.
+            return None
+        quantity = getattr(broker_order, "quantity", None)
+        filled = getattr(broker_order, "filled_qty", None)
+        if quantity is None:
+            return None
+        try:
+            # A broker that publishes no fill figure for a working order has told us
+            # nothing about it; the whole quantity is still the conservative reading.
+            quantity = float(quantity)
+            filled = 0.0 if filled is None else float(filled)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(quantity) or not math.isfinite(filled):
+            return None
+        return max(quantity - filled, 0.0)
+
     def _pending_stock_entry_notional(self, exclude_order_id: Optional[int] = None) -> float:
         """Notional of this account's BROKER-WORKING stock ENTRY orders, in dollars.
 
@@ -738,7 +775,10 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             side, so that this and ``AccountInterface._validate_account_exposure`` decide
             "same side" from ONE field: two sources for one question is how a gate and its
             budget come to disagree about which orders they are counting.
-        Only the REMAINING quantity counts: the filled part is already in the market value.
+        Only the REMAINING quantity counts: the filled part is already in the market value,
+        and "remaining" is asked of the BROKER
+        (``get_broker_order_remaining_quantity``) rather than read off the local row --
+        see the note at that call for the double count this closes.
 
         ``exclude_order_id`` drops one row: the order currently being validated. A BRAND-NEW
         entry is not in the table yet (``submit_order`` validates before ``add_instance``),
@@ -802,6 +842,30 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             if remaining <= 0:
                 continue
 
+            # RECONCILE against the broker before counting. The local row is only as fresh
+            # as the last refresh_orders(), and a market order fills in milliseconds: its
+            # shares are in the snapshot's market value (counted in the gross) while this
+            # row still says PENDING_NEW with a NULL filled_qty. Counting the local figure
+            # then charges the SAME shares twice and the headroom collapses -- the
+            # 2026-09-10 double count that refused two funded entries. refresh_orders() is
+            # deliberately NOT called here: it has side effects, and this is a read.
+            broker_remaining = self.get_broker_order_remaining_quantity(order)
+            if broker_remaining is None:
+                logger.warning(
+                    f"[Account {self.id}] could not read the broker's view of working order "
+                    f"{order.id} ({order.symbol}, broker id {order.broker_order_id}); "
+                    f"counting the LOCAL remaining {remaining:g} against the exposure "
+                    f"ceiling. That over-states exposure if it has since filled, which "
+                    f"refuses an entry rather than over-exposing the account.")
+            else:
+                remaining = broker_remaining
+                if remaining <= 0:
+                    logger.debug(
+                        f"[Account {self.id}] working order {order.id} ({order.symbol}) is "
+                        f"already filled or done at the broker; its exposure is in the "
+                        f"market value, not the pending total")
+                    continue
+
             price = order.limit_price
             if price is None:
                 price = self.get_instrument_current_price(order.symbol)
@@ -829,11 +893,53 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         gross = self._gross_stock_exposure_from(capital.snapshot)
         pending = self._pending_stock_entry_notional(exclude_order_id)
         ceiling = capital.tradable
+        headroom = stock_exposure_headroom(ceiling, gross, pending)
+        self._report_over_exposure(ceiling=ceiling, gross=gross, pending=pending,
+                                   headroom=headroom)
         return StockExposure(
             balance=capital.balance, effective_factor=capital.effective_factor,
-            ceiling=ceiling, gross=gross, pending=pending,
-            headroom=stock_exposure_headroom(ceiling, gross, pending),
+            ceiling=ceiling, gross=gross, pending=pending, headroom=headroom,
             multiplier=capital.multiplier, buying_power=capital.buying_power)
+
+    def _report_over_exposure(self, *, ceiling: float, gross: float, pending: float,
+                              headroom: float) -> None:
+        """Say ONCE, per account, that this account has passed its own stock-exposure
+        ceiling -- and once again when it comes back under.
+
+        MEASURED, not inferred: ``gross`` is what the BROKER marks and ``pending`` is what
+        this account's working entries will add, which is exactly what a refusal is decided
+        on. The old warning guessed exposure from remaining buying power and was wrong at
+        every broker that publishes intraday BP (2026-09-10 review, finding 4).
+
+        LATCHED because this runs on every sizing read: an account sitting at its ceiling
+        would otherwise repeat the identical line hundreds of times a session (1,139
+        yesterday) and bury everything else. The state CHANGE is the event -- crossing is a
+        WARNING, staying over is DEBUG, and coming back under is an INFO so the recovery is
+        visible without going looking for it.
+
+        ``getattr`` with a default rather than an ``__init__`` attribute, matching the
+        non-marginable warning above: the account interfaces are subclassed widely and are
+        instantiated bare in tests.
+        """
+        over = headroom < 0                      # i.e. gross + pending > ceiling
+        was_over = getattr(self, "_over_exposed", False)
+        if over:
+            message = (
+                f"[Account {self.id}] stock exposure is past the margin ceiling: gross "
+                f"${gross:,.2f} + pending ${pending:,.2f} > ceiling ${ceiling:,.2f} "
+                f"(balance x the effective margin factor), i.e. ${-headroom:,.2f} over. "
+                f"New entries are refused until it comes back under.")
+            if was_over:
+                logger.debug(message)
+            else:
+                self._over_exposed = True
+                logger.warning(message)
+        elif was_over:
+            self._over_exposed = False
+            logger.info(
+                f"[Account {self.id}] stock exposure is back under the margin ceiling: "
+                f"gross ${gross:,.2f} + pending ${pending:,.2f} against ceiling "
+                f"${ceiling:,.2f}, leaving ${headroom:,.2f} of headroom.")
 
     def get_stock_exposure_headroom(self, exclude_order_id: Optional[int] = None
                                     ) -> Optional[float]:

@@ -390,3 +390,86 @@ def test_alpaca_snapshot_carries_options_buying_power():
     snap = acct.get_account_snapshot()
 
     assert snap.option_buying_power == 4321.0
+
+
+# ----- the exposure ceiling's broker reconciliation (2026-09-10 review, finding 2) ---
+#
+# _pending_stock_entry_notional asks the account how much of a locally-working entry the
+# BROKER still has outstanding, because a market order fills in milliseconds while the
+# local row keeps its PENDING_NEW status and NULL filled_qty until the next refresh --
+# and the fill is already in long_market_value, so counting the local figure charged the
+# same shares to the ceiling twice. The generic implementation reads through this
+# adapter's existing get_order wrapper; these pin what Alpaca's own objects turn into.
+
+
+def _alpaca_order(status, *, qty="50", filled_qty="0"):
+    """A real pydantic Order, quantities as STRINGS exactly like Alpaca sends them."""
+    from datetime import datetime, timezone
+
+    from alpaca.trading.enums import OrderClass, OrderSide, OrderType, TimeInForce
+    from alpaca.trading.models import Order
+
+    now = datetime.now(timezone.utc)
+    return Order(id=uuid4(), client_order_id="42", created_at=now, updated_at=now,
+                 submitted_at=now, order_class=OrderClass.SIMPLE,
+                 time_in_force=TimeInForce.DAY, status=status, extended_hours=False,
+                 symbol="MSFT", qty=qty, filled_qty=filled_qty, type=OrderType.MARKET,
+                 side=OrderSide.BUY)
+
+
+def _local_entry(broker_order_id="brk-1"):
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType
+
+    return TradingOrder(account_id=1, symbol="MSFT", quantity=50.0,
+                        side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                        status=OrderStatus.PENDING_NEW, filled_qty=None,
+                        broker_order_id=broker_order_id)
+
+
+def test_broker_remaining_is_zero_once_alpaca_reports_the_entry_filled():
+    """The production case: local row still PENDING_NEW with a NULL filled_qty, the
+    broker has it FILLED and the shares already in long_market_value."""
+    from alpaca.trading.enums import OrderStatus as AlpacaOrderStatus
+
+    acct = _bare_account()
+    acct.client.get_order_by_id.return_value = _alpaca_order(
+        AlpacaOrderStatus.FILLED, qty="50", filled_qty="50")
+
+    assert acct.get_broker_order_remaining_quantity(_local_entry()) == 0.0
+    acct.client.get_order_by_id.assert_called_once_with("brk-1")
+
+
+def test_broker_remaining_is_the_unfilled_part_of_a_partial_fill():
+    from alpaca.trading.enums import OrderStatus as AlpacaOrderStatus
+
+    acct = _bare_account()
+    acct.client.get_order_by_id.return_value = _alpaca_order(
+        AlpacaOrderStatus.PARTIALLY_FILLED, qty="50", filled_qty="20")
+
+    assert acct.get_broker_order_remaining_quantity(_local_entry()) == 30.0
+
+
+def test_broker_remaining_is_the_whole_quantity_while_the_entry_is_still_working():
+    from alpaca.trading.enums import OrderStatus as AlpacaOrderStatus
+
+    acct = _bare_account()
+    acct.client.get_order_by_id.return_value = _alpaca_order(
+        AlpacaOrderStatus.NEW, qty="50", filled_qty="0")
+
+    assert acct.get_broker_order_remaining_quantity(_local_entry()) == 50.0
+
+
+def test_broker_remaining_is_none_when_the_fetch_fails():
+    """get_order logs and returns None on a broker error; None must stay None so the
+    caller falls back to the LOCAL remainder instead of reading it as "nothing left"."""
+    acct = _bare_account()
+    acct.client.get_order_by_id.side_effect = RuntimeError("broker down")
+
+    assert acct.get_broker_order_remaining_quantity(_local_entry()) is None
+
+
+def test_an_order_that_never_reached_the_broker_is_not_asked_about():
+    acct = _bare_account()
+    assert acct.get_broker_order_remaining_quantity(_local_entry(broker_order_id=None)) is None
+    acct.client.get_order_by_id.assert_not_called()

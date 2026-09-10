@@ -1,11 +1,12 @@
 """Tradable balance = balance x min(margin_factor, broker multiplier) with margin on;
-balance with it off. Plus the over-exposure warning threshold.
+balance with it off.
 
-Worked example the operator gave: balance 10k, broker multiplier 2 (20k gross
-capacity), factor 1.8 (platform deploys at most 18k). Once the broker's REMAINING
-buying power drops under 20k - 18k = 2k, gross exposure has passed the platform's
-own ceiling -- something outside the experts (allocator, manual trade) consumed
-it -- and that is the WARNING.
+The over-exposure WARNING used to live here too, as a test on remaining broker buying
+power against balance x (multiplier - factor). It was removed on 2026-09-10 (production
+review, finding 4): that formula assumes BP == balance x multiplier - gross exposure,
+which is false at Alpaca, whose published multiplier is the DAY-TRADING one. The account
+now measures gross exposure directly and warns from ``_stock_exposure_breakdown``, once
+per state change -- pinned in test_stock_exposure_gate.py.
 
 The log pins use the ``records`` fixture below rather than ``caplog``; see its
 docstring for why caplog cannot work against this package's logger.
@@ -16,8 +17,7 @@ import pytest
 
 from ba2_common.core.account_types import AccountSnapshot
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import (
-    ReadOnlyAccountInterface, tradable_balance_for, over_exposure_threshold,
-    effective_factor_for,
+    ReadOnlyAccountInterface, tradable_balance_for, effective_factor_for,
 )
 
 
@@ -39,23 +39,12 @@ def test_non_marginable_account_is_the_balance():
     assert tradable_balance_for(10_000.0, margin_enabled=True, factor=1.8, multiplier=1.0) == 10_000.0
 
 
-def test_threshold_is_balance_times_multiplier_minus_factor():
-    # EXACT, not approx: grouped as (gross capacity) - (intended exposure), each term
-    # the same product tradable_balance_for computes. 10_000 * (2.0 - 1.8) is not.
-    assert over_exposure_threshold(10_000.0, multiplier=2.0, factor=1.8) == 2_000.0
-
-
 def test_tradable_balance_equals_balance_times_effective_factor():
     """ONE expression behind both, so the ceiling and the scaling factor cannot drift."""
     for factor, multiplier in ((1.8, 2.0), (1.8, 1.5), (1.8, 1.0), (1.0, 4.0)):
         assert (tradable_balance_for(10_000.0, margin_enabled=True, factor=factor,
                                      multiplier=multiplier)
                 == 10_000.0 * effective_factor_for(factor, multiplier))
-
-
-def test_threshold_is_negative_when_factor_exceeds_multiplier():
-    # then no remaining-BP figure can ever be below it: the warning cannot fire
-    assert over_exposure_threshold(10_000.0, multiplier=1.5, factor=1.8) < 0
 
 
 # ----- the account methods --------------------------------------------------
@@ -250,16 +239,16 @@ def test_on_raises_on_a_bad_factor():
         acct.get_tradable_balance()
 
 
-def test_over_exposure_warns_below_threshold_and_not_at_it(records):
-    snap_at = AccountSnapshot(margin_multiplier=2.0, buying_power=2_000.0)     # exactly 20k-18k
-    snap_below = AccountSnapshot(margin_multiplier=2.0, buying_power=1_999.0)
-    _Stub(balance=10_000.0, snapshot=snap_at, settings=ON).get_tradable_balance()
-    assert not any("past the margin ceiling" in msg for _, msg in records)
-    records.clear()
-    _Stub(balance=10_000.0, snapshot=snap_below, settings=ON).get_tradable_balance()
-    hits = [msg for lvl, msg in records
-            if lvl == logging.WARNING and "past the margin ceiling" in msg]
-    assert len(hits) == 1 and "1,999.00" in hits[0] and "2,000.00" in hits[0]
+def test_low_buying_power_alone_never_warns_about_the_ceiling(records):
+    """The removed rule, kept as a negative pin. Remaining broker BP says nothing about
+    the platform's ceiling: the tradable balance is a function of balance, factor and
+    multiplier only, and low BP is a perfectly ordinary state of a deployed account."""
+    for buying_power in (0.0, 1.0, 1_999.0, 2_000.0, 50_000.0):
+        records.clear()
+        snapshot = AccountSnapshot(margin_multiplier=4.0, buying_power=buying_power)
+        assert _Stub(balance=10_000.0, snapshot=snapshot,
+                     settings=ON).get_tradable_balance() == 18_000.0
+        assert not any(lvl >= logging.WARNING for lvl, _ in records), (buying_power, records)
 
 
 def test_option_over_exposure_is_skipped_with_a_debug_line_when_option_bp_unknown(records):

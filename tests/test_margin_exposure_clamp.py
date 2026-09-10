@@ -98,13 +98,14 @@ def _with_account(account, fn):
 
 @pytest.fixture
 def errors(monkeypatch):
-    """ERROR/INFO lines from MarketExpertInterface. Not caplog: ba2_common's logger
+    """DEBUG/INFO/ERROR lines from MarketExpertInterface. Not caplog: ba2_common's logger
     sets propagate=False, so caplog would see nothing and pass vacuously."""
     import sys
 
     module = sys.modules["ba2_common.core.interfaces.MarketExpertInterface"]
     seen = []
-    for name, level in (("info", logging.INFO), ("error", logging.ERROR)):
+    for name, level in (("debug", logging.DEBUG), ("info", logging.INFO),
+                        ("error", logging.ERROR)):
         monkeypatch.setattr(
             module.logger, name,
             lambda msg, *a, _lvl=level, **k: seen.append((_lvl, str(msg))))
@@ -130,7 +131,10 @@ def _finding_2_expert(margin_enabled, **account_kw):
 def test_available_balance_is_clamped_to_the_account_headroom(errors):
     account, expert = _finding_2_expert(margin_enabled=True)
     assert _with_account(account, expert.get_available_balance) == pytest.approx(1_440.0)
-    assert any(lvl == logging.INFO and "stock exposure" in msg for lvl, msg in errors), errors
+    # DEBUG, not INFO: the clamp is the ceiling working normally and fires on every read
+    # (353 times in one production session). The account reports the abnormal case.
+    assert any(lvl == logging.DEBUG and "stock exposure" in msg for lvl, msg in errors), errors
+    assert not any(lvl >= logging.INFO and "stock exposure" in msg for lvl, msg in errors)
 
 
 @pytest.mark.usefixtures("reset_test_db")
