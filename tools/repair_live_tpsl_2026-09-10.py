@@ -46,7 +46,7 @@ SL_RULE_PCT = -4.0
 SL_REPAIRS = [127, 128, 194, 195]
 
 
-def main(apply: bool) -> int:
+def main(apply: bool, force_sl=frozenset(), only=None) -> int:
     wire_all_seams()
     from ba2_trade_platform.core.utils import get_account_instance_from_id
     account = get_account_instance_from_id(ACCOUNT_ID)
@@ -61,6 +61,8 @@ def main(apply: bool) -> int:
         txn = get_instance(Transaction, tid)
         plan.append(("SL", txn, round(float(txn.open_price) * (1 + SL_RULE_PCT / 100.0), 4)))
 
+    if only:
+        plan = [row for row in plan if row[1].id in only]
     symbols = sorted({t.symbol for _, t, _ in plan})
     prices = account.get_instrument_current_price(symbols)
     failures = 0
@@ -70,8 +72,12 @@ def main(apply: bool) -> int:
                  f"TP {txn.take_profit} SL {txn.stop_loss} now {px}")
         if txn.status not in (TransactionStatus.OPENED,):
             print(f"SKIP  {state} -> not OPENED"); continue
-        if kind == "SL" and px is not None and target >= float(px):
+        if kind == "SL" and px is not None and target >= float(px) and txn.id not in force_sl:
             print(f"SKIP  {state} -> new SL {target} is not below the current price"); failures += 1; continue
+        if kind == "SL" and txn.id in force_sl:
+            # Operator decision 2026-09-10 ("Stop at 4% it's fine"): the rule stop is placed
+            # even though the price is already below it, so it executes at once.
+            print(f"FORCE {state} -> SL {target} is at/above the current price {px}; it will trigger immediately")
         if kind == "TP" and px is not None and target <= float(px):
             print(f"SKIP  {state} -> new TP {target} is not above the current price"); failures += 1; continue
         print(f"{'APPLY' if apply else 'PLAN '} {kind} {target}  <- {state}")
@@ -91,4 +97,11 @@ def main(apply: bool) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(apply="--apply" in sys.argv))
+    # --force-sl 127,194,195 : place the rule stop even when the market is already below it.
+    forced = frozenset()
+    if "--force-sl" in sys.argv:
+        forced = frozenset(int(x) for x in sys.argv[sys.argv.index("--force-sl") + 1].split(","))
+    only = None
+    if "--only" in sys.argv:
+        only = frozenset(int(x) for x in sys.argv[sys.argv.index("--only") + 1].split(","))
+    sys.exit(main(apply="--apply" in sys.argv, force_sl=forced, only=only))
