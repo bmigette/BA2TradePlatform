@@ -26,7 +26,7 @@ import math as _math
 import random
 import time as _time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -1158,6 +1158,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             data = optimizer.get_checkpoint_data(generation, population)
             data["fingerprint"] = ckpt_fingerprint   # refuse to resume into a changed gene space
             data["partial"] = partial               # resume INTO this generation, not after it
+            # The best entries SO FAR, so a resumed run's top-N persist can still see the
+            # winners found before the interruption. See _elite_slice for why this is cheap
+            # (and why the older "it would embed every trial's trades JSON" reading was wrong).
+            data["top_results"] = _elite_slice(all_results, CHECKPOINT_ELITE_COUNT)
             _save_checkpoint(ckpt_task_id, data)
 
         def _trial_key_for(decoded_flat: Dict[str, Any]) -> str:
@@ -1442,16 +1446,24 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             logger.warning(
                 f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
                 f"{start_gen}/{ga['generations']} from checkpoint {ckpt_task_id}")
-            # KNOWN LIMITATION: ``all_results`` restarts empty, so this row records only the
-            # trials evaluated AFTER the resume -- the earlier ones stay on the interrupted run's
-            # own row. The SEARCH is unaffected (population, elites, best_individual and both RNG
-            # states are all restored -- true only since the Python RNG state was made to survive
-            # the JSON checkpoint column; before that its setstate() raised "state vector must be
-            # a tuple", was swallowed as a warning, and a resumed run silently diverged. See
-            # genetic._jsonable_to_py_state and tests/test_determinism_helpers.py), and elites
-            # re-appear in later generations, so best_params is intact; only the top-N candidate
-            # POOL is thinner than an uninterrupted run's.
-            # Carrying all_results in the checkpoint would embed every trial's trades JSON in it.
+            # The SEARCH was already safe across a resume (population, elites, best_individual
+            # and all three RNG states are restored -- true only since the Python RNG state was
+            # made to survive the JSON checkpoint column; before that its setstate() raised
+            # "state vector must be a tuple", was swallowed as a warning, and a resumed run
+            # silently diverged. See genetic._jsonable_to_py_state and
+            # tests/test_determinism_helpers.py). What was NOT safe is the top-N PERSIST, which
+            # ranks off ``all_results`` -- and that restarted empty here, so the winners found
+            # before the interruption could never be saved as Backtests.
+            #
+            # matrix3, 2026-09-09: the box rebooted mid-job; sen-S5-goal2020-risk_atr resumed and
+            # finished with best_fitness 5.5741 (bit-identical to the interrupted run), but its
+            # row carried 16 entries instead of ~190, its best PERSISTED row scored 5.2598, and
+            # the 5.5741 genome sitting in best_params was never written as a Backtest. Every
+            # saved S5 row understated the cell.
+            #
+            # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
+            # the note this replaces -- see _elite_slice.
+            _seed_all_results_from_checkpoint(ckpt, all_results)
         else:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
             # optimization's individuals, but run this job's OWN fresh --generations budget from
@@ -2255,6 +2267,115 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> s
     }
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+# Relative gap between a top-N re-run's own fitness and the GA score it was chosen for, beyond
+# which the two are treated as DIFFERENT STRATEGIES rather than the same one measured twice.
+#
+# RELATIVE, because this code ranks metrics on very different scales. 0.1% is far above the
+# float-summation noise a re-run can legitimately show (pool ordering moves the last bits) and far
+# below any gap a real config difference produces -- the documented screener-hoisted-state case
+# moved fitness by tens of percent.
+RERUN_FITNESS_TOL_REL = 1e-3
+
+# Absolute floor so a ga_fitness of exactly 0 still compares (a relative tolerance of 0 would
+# make every non-zero re-run infinitely divergent, and every zero one a division by zero).
+_RERUN_FITNESS_TOL_ABS = 1e-9
+
+
+def _numeric(v: Any) -> Optional[float]:
+    """*v* as a float if it is a real number, else None. ``bool`` is not a number here."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def rerun_fitness_divergence(
+    ga_fitness: Any, rerun_fitness: Any, *, tol_rel: float = RERUN_FITNESS_TOL_REL
+) -> Optional[Dict[str, Any]]:
+    """None when a re-run reproduces the score its genome was ranked on; else the discrepancy.
+
+    A top-N genome from the GA's FINAL generation is persisted from the results the GA itself
+    computed, so it agrees by construction. Any EARLIER genome is RE-RUN from a config rebuilt
+    out of the STORED ``optimization_config`` with the screener hoisted state RE-DERIVED at
+    re-run time -- either of which can have moved since the run. When it has, the persisted row
+    carries plausible metrics for a strategy that is no longer the one that earned the fitness,
+    and nothing on the row says so. (The handler already documents one such case: without
+    re-applying the hoisted state "the persisted top-N silently diverge from their fitness".)
+
+    Comparing the two numbers cannot say WHICH field drifted, but it says that one did -- which
+    is the difference between a silent wrong answer and a loud one worth investigating.
+
+    Returns ``{ga_fitness, rerun_fitness, delta, pct, tol}``. ``pct`` is None against a zero
+    base. Unknown inputs (no ``ga_fitness`` on a pre-migration-030 row, a non-numeric) yield
+    None: unknown is not the same as divergent, and this check must never cost a persisted row.
+    """
+    ga = _numeric(ga_fitness)
+    rerun = _numeric(rerun_fitness)
+    if ga is None or rerun is None:
+        return None
+    delta = rerun - ga
+    tol = max(abs(ga) * float(tol_rel), _RERUN_FITNESS_TOL_ABS)
+    if abs(delta) <= tol:
+        return None
+    return {
+        "ga_fitness": ga,
+        "rerun_fitness": rerun,
+        "delta": delta,
+        "pct": (100.0 * delta / ga) if ga else None,
+        "tol": tol,
+    }
+
+
+# How many of the best ``all_results`` entries ride along in a checkpoint. Bounded so the
+# checkpoint column cannot grow with the run: it is rewritten once per generation (and every
+# ``partial_checkpoint_every`` trials on top of that), so an unbounded copy of a 40x8 search
+# would mean rewriting hundreds of entries dozens of times.
+#
+# 20 comfortably covers the ``--save-top N`` the grids actually use (5). MEASURED on opt 489
+# (186 trials): one entry is 1,949 bytes, a top-10 slice is 19 KB and the WHOLE all_results is
+# 359 KB, against a checkpoint column already carrying 64 KB of population + RNG state. The
+# note this replaced -- "carrying all_results would embed every trial's trades JSON" -- misread
+# the schema: an entry's ``trades`` is an int COUNT, not the trade list.
+CHECKPOINT_ELITE_COUNT = 20
+
+
+def _elite_slice(all_results: Optional[List[Dict[str, Any]]], n: int) -> List[Dict[str, Any]]:
+    """The ``n`` best entries of *all_results* by fitness, highest first.
+
+    Never raises: a failed trial records ``fitness: None`` and must sort as worst rather than
+    blowing up a checkpoint write, because a checkpoint failure costs hours of compute.
+    """
+    if not all_results:
+        return []
+    ranked = sorted(
+        all_results,
+        key=lambda r: (r.get("fitness") if isinstance(r.get("fitness"), (int, float)) else -1e18),
+        reverse=True,
+    )
+    return ranked[:n]
+
+
+def _seed_all_results_from_checkpoint(
+    ckpt: Optional[Dict[str, Any]], all_results: List[Dict[str, Any]]
+) -> None:
+    """APPEND a resumed checkpoint's carried elites onto this run's ``all_results``, in place.
+
+    Appends rather than replaces so it composes with whatever the resumed run has already
+    recorded. Duplicates are harmless: ``_persist_top_backtests`` de-duplicates on rounded
+    fitness, and an elite that survives into a later generation is re-recorded there anyway.
+
+    Tolerates a missing or malformed ``top_results``: every checkpoint written before this
+    change lacks the key (including the ones on disk for jobs still queued), and the worst
+    acceptable outcome for a resume is the old thinner candidate pool -- never a crashed job
+    that throws away the generations it was resuming.
+    """
+    if not isinstance(ckpt, dict):
+        return
+    carried = ckpt.get("top_results")
+    if not isinstance(carried, list):
+        return
+    all_results.extend(r for r in carried if isinstance(r, dict))
 
 
 def _save_checkpoint(task_id: str, checkpoint_data: Dict[str, Any]) -> None:

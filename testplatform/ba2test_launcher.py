@@ -5893,7 +5893,26 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             # /run-trial-full path and the no-re-run (final-generation) rows identically.
             try:
                 from app.services.strategy_fitness import compute_fitness as _cf
-                _cf(opt.fitness_metric, out["results"])
+                from app.services.strategy_optimization_handler import rerun_fitness_divergence
+                _rerun_fit = _cf(opt.fitness_metric, out["results"])
+                # FIDELITY GATE. This row was chosen for `ga_fitness`; it is being saved with the
+                # metrics of a run performed LATER, from a config rebuilt out of the stored
+                # optimization_config with the screener hoisted state re-derived. If those two
+                # scores disagree, the row is not the strategy that earned its rank -- and a row
+                # that reads as finished, with plausible numbers, is exactly what somebody
+                # deploys. Say so on the row and in the log rather than persisting it silently.
+                _div = rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit)
+                if _div is not None:
+                    _pct = "n/a" if _div["pct"] is None else f"{_div['pct']:+.1f}%"
+                    print(f"    !! TOP{rank} RE-RUN DIVERGED from its GA score: "
+                          f"ga={_div['ga_fitness']:.6g} rerun={_div['rerun_fitness']:.6g} "
+                          f"({_pct}). This row is NOT the strategy that earned that rank -- "
+                          f"the stored optimization_config or the re-derived screener state has "
+                          f"moved since the run. Re-verify before deploying it.")
+                    # Onto the row: _persist_results copies non-curve keys into bt.results, so
+                    # the warning survives the log and travels with the Backtest.
+                    out["results"]["rerun_fitness"] = _div["rerun_fitness"]
+                    out["results"]["ga_fitness_divergence"] = _div["delta"]
             except Exception as _e:  # noqa: BLE001 -- never lose a persisted row over telemetry
                 print(f"    TOP{rank} fitness annotation failed: {_e!r}")
             _persist_results(db, bt, out["results"])
