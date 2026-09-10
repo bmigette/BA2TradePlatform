@@ -41,6 +41,12 @@ from ba2_common.core.replay.context import (
     run_in_capture_context,
     use_capture_context,
 )
+from ba2_common.core.replay.observe import (
+    SECRET_KEY_TOKENS,
+    observe_provider,
+    record_observation,
+    sanitize_identity,
+)
 from ba2_common.core.replay.schemas import (
     SCHEMA_VERSION,
     AnalysisRecord,
@@ -95,6 +101,10 @@ __all__ = [
     "use_capture_context",
     "run_in_capture_context",
     "capture_aware_submit",
+    "observe_provider",
+    "record_observation",
+    "sanitize_identity",
+    "SECRET_KEY_TOKENS",
     "replay_now",
     "ReplayMiss",
     "ReplayStore",

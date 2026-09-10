@@ -180,6 +180,8 @@ class ReplayStore:
         self.health = CaptureHealth()
         self.writer = writer
         self._closed = False
+        self._session_id: Optional[str] = None
+        self._session_hook = None
         self._queue: Optional["queue.Queue"] = None
         self._thread: Optional[threading.Thread] = None
         if writer == "thread":
@@ -197,10 +199,39 @@ class ReplayStore:
 
     def begin_session(self, session: SessionRecord) -> None:
         self.index.begin_session(session)
+        self._session_id = session.session_id
         logger.info(
             f"replay capture: session {session.session_id} open "
             f"(instance {session.instance_id}, app {session.app_version})"
         )
+
+    def set_session_hook(self, hook) -> None:
+        """Install the host's session-rollover check (``None`` removes it).
+
+        The host -- not this package -- decides when a session ends (the live
+        platform rolls at the UTC date change). The hook is called at the START
+        of each analysis and may call :meth:`begin_session` again; whatever it
+        leaves behind is the session the analysis is recorded into.
+        """
+        self._session_hook = hook
+
+    @property
+    def session_id(self) -> Optional[str]:
+        """The open session, or ``None`` when no session has been begun."""
+        return self._session_id
+
+    def current_session_id(self) -> Optional[str]:
+        """The session THIS analysis belongs to, after the host's rollover check."""
+        hook = self._session_hook
+        if hook is not None:
+            try:
+                hook()
+            except Exception as exc:
+                self.health.record(classify_failure(exc))
+                logger.error(
+                    f"replay capture: session rollover check failed: {exc}", exc_info=True
+                )
+        return self._session_id
 
     def finalize_session(self, session_id: str, *, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> int:
         """Drain the writer, then mark the session.

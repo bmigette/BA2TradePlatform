@@ -238,6 +238,60 @@ def test_missing_frame_reference_is_an_error_not_a_none():
         decode(enc.kind, enc.data, enc.meta, frames={})
 
 
+# --------------------------------------------------------------------------- dataclasses
+
+
+def test_a_platform_dataclass_round_trips_as_itself():
+    """The OUTPUT of every recorded analysis is a dataclass: it must come back as one.
+
+    Encoding it as an anonymous dict would leave a replay comparing shapes
+    instead of objects -- and nothing would notice a field that stopped being
+    recorded at all.
+    """
+    from ba2_common.core.types import OrderRecommendation, Recommendation
+
+    original = Recommendation(
+        signal=OrderRecommendation.BUY, confidence=78.1, current_price=101.5,
+        details="two analysts raised", expected_profit_percent=12.25,
+        target_price=None, raw_outputs={"calc": {"final": 0.42}},
+        skip=False, skip_reason=None,
+    )
+    encoded = encode(original)
+    restored = decode(encoded.kind, encoded.data, encoded.meta)
+
+    assert isinstance(restored, Recommendation)
+    assert restored == original
+    # Re-encoding is byte-stable, which is what makes an exact diff meaningful.
+    assert encode(restored).data == encoded.data
+
+
+def test_a_dataclass_outside_the_allowlist_is_a_capture_gap():
+    """A capture is data, not code: only types this platform owns may be rebuilt."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class Outside:                      # __module__ is this test module
+        value: int = 1
+
+    with pytest.raises(UnsupportedCaptureType) as excinfo:
+        encode({"d": Outside()})
+    assert excinfo.value.path == '$["d"]'
+    assert "dataclass(" in excinfo.value.type_name
+
+
+def test_an_unsupported_value_inside_a_dataclass_is_refused_with_its_path():
+    """The fields go through the same encoder, so nothing sneaks in inside one."""
+    from ba2_common.core.types import OrderRecommendation, Recommendation
+
+    rec = Recommendation(
+        signal=OrderRecommendation.HOLD, confidence=0.0, current_price=1.0,
+        raw_outputs={"junk": timedelta(days=1)},
+    )
+    with pytest.raises(UnsupportedCaptureType) as excinfo:
+        encode(rec)
+    assert excinfo.value.path == '$.raw_outputs["junk"]'
+
+
 # --------------------------------------------------------------------------- refusals
 
 

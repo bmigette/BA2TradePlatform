@@ -16,6 +16,8 @@ from ba2_common.core.models import AccountSetting
 from ba2_common.core.types import AssetClass, OrderStatus
 from ba2_common.core.interfaces.ExtendableSettingsInterface import (
     ExtendableSettingsInterface, coerce_bool)
+from ba2_common.core.replay.observe import observe_provider
+from ba2_common.core.replay.schemas import ReplayStatus
 
 
 #: A margin_factor below 1.0 would let an account deploy LESS than its balance,
@@ -152,6 +154,25 @@ class StockExposure:
     headroom: float          # ceiling - gross - pending; negative == past the ceiling
     multiplier: float        # the raw broker multiplier the factor was capped by
     buying_power: float      # the broker's own remaining buying power, for comparison
+
+
+# --------------------------------------------------------------------------- #
+# Replay capture (spec step 2): quote provenance.
+#
+# "Record provider responses at the return boundary, including memory/disk cache
+# hits." A quote served from the TTL memo is a real input to the decision and is
+# recorded as such -- it is simply marked ``memo_cache`` rather than ``network``,
+# so a replay can tell a fresh broker read from a reused one.
+# --------------------------------------------------------------------------- #
+def _price_provenance(args, before):
+    if before is None:
+        return ReplayStatus.PROVENANCE_UNKNOWN
+    requested = args["symbol_or_symbols"]
+    requested = requested if isinstance(requested, list) else [requested]
+    # Every requested symbol was already memoized => nothing was fetched.
+    if requested and all(symbol in before for symbol in requested):
+        return ReplayStatus.PROVENANCE_MEMO_CACHE
+    return ReplayStatus.PROVENANCE_NETWORK
 
 
 class ReadOnlyAccountInterface(ExtendableSettingsInterface):
@@ -1634,6 +1655,42 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 self._SYMBOL_LOCKS[lock_key] = Lock()
             return self._SYMBOL_LOCKS[lock_key]
 
+    def _cached_price_symbols(self, symbol_or_symbols, price_type):
+        """Which of these symbols are ALREADY memo-cached and unexpired (capture only).
+
+        Read-only and lock-held, exactly like the fast path below: it answers
+        "would this call have to fetch?" without fetching anything itself. Used by
+        the replay tap to record provenance, never by the price logic.
+        """
+        from ba2_common import config
+
+        symbols = (symbol_or_symbols if isinstance(symbol_or_symbols, list)
+                   else [symbol_or_symbols])
+        now = datetime.now(timezone.utc)
+        fresh = set()
+        with self._CACHE_LOCK:
+            account_cache = self._GLOBAL_PRICE_CACHE.get(self.id, {})
+            for symbol in symbols:
+                cached = account_cache.get(f"{symbol}:{price_type}")
+                if cached is None:
+                    continue
+                if (now - cached['timestamp']).total_seconds() < config.PRICE_CACHE_TIME:
+                    fresh.add(symbol)
+        return fresh
+
+    @observe_provider(
+        "broker", "get_instrument_current_price",
+        identity=lambda a: {
+            "account_class": type(a["self"]).__name__,
+            "account_id": getattr(a["self"], "id", None),
+            "symbols": (a["symbol_or_symbols"] if isinstance(a["symbol_or_symbols"], list)
+                        else [a["symbol_or_symbols"]]),
+            "price_type": a["price_type"],
+        },
+        before=lambda a: a["self"]._cached_price_symbols(
+            a["symbol_or_symbols"], a["price_type"]),
+        provenance=lambda a, result, before: _price_provenance(a, before),
+    )
     def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
         """
         Get the current market price for instrument(s) with caching. Supports both single and bulk fetching.

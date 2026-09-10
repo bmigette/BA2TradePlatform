@@ -19,6 +19,14 @@ module docstring).
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ba2_common.core.replay.observe import observe_provider
+
+# Replay capture (spec step 2): the uniform alias layer is where the insider and
+# past-earnings inputs actually enter an expert, so it is where they are recorded
+# -- at the RETURN, cache hits included, with no extra request. ``as_of`` is part
+# of the identity because it selects the point-in-time window; the api key is not
+# passed here at all, and the tap drops credential-shaped keys regardless.
+
 
 def ohlcv_get(provider, symbol, as_of=None, lookback=400, interval="1d", format_type="dict"):
     """OHLCV time-series up to ``as_of`` (close). ``as_of=None`` => now (live)."""
@@ -26,6 +34,16 @@ def ohlcv_get(provider, symbol, as_of=None, lookback=400, interval="1d", format_
     return provider.get_ohlcv_data(symbol, end_date=end, lookback_days=lookback, interval=interval)
 
 
+@observe_provider(
+    "provider_cache", "insider_get",
+    identity=lambda a: {
+        "provider": type(a["provider"]).__name__,
+        "symbol": a["symbol"],
+        "as_of": a["as_of"],
+        "lookback": a["lookback"],
+        "format_type": a["format_type"],
+    },
+)
 def insider_get(provider, symbol, as_of=None, lookback=30, format_type="dict"):
     """Insider transactions. ``as_of`` is threaded so the corrected provider enforces
     the no-lookahead filingDate anchor when set; with ``as_of=None`` the live
@@ -46,6 +64,17 @@ def statement_get(provider, symbol, statement, as_of=None, frequency="annual",
               as_of=as_of, format_type=format_type)
 
 
+@observe_provider(
+    "provider_cache", "past_earnings_get",
+    identity=lambda a: {
+        "provider": type(a["provider"]).__name__,
+        "symbol": a["symbol"],
+        "as_of": a["as_of"],
+        "frequency": a["frequency"],
+        "lookback_periods": a["lookback_periods"],
+        "format_type": a["format_type"],
+    },
+)
 def past_earnings_get(provider, symbol, as_of=None, frequency="quarterly",
                       lookback_periods=1, format_type="dict"):
     """Historical earnings up to ``as_of``. The provider's existing report-date

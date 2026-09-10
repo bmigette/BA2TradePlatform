@@ -275,6 +275,7 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
         from datetime import timedelta as _td
         from concurrent.futures import ThreadPoolExecutor
         from ba2_providers.fmp_common import fmp_http_get
+        from ba2_common.core.replay.context import run_in_capture_context
 
         def _day(d):
             return d.date() if hasattr(d, "date") else pd.Timestamp(d).date()
@@ -306,7 +307,11 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
         if windows:
             max_workers = max(1, min(int(_os.environ.get("FMP_FETCH_WORKERS", "8")), len(windows)))
             with ThreadPoolExecutor(max_workers=max_workers) as _ex:
-                for chunk in _ex.map(_fetch_window, windows):
+                # run_in_capture_context: identity when capture is off; with a
+                # capture context active it re-enters it inside each worker so a
+                # tap below this fan-out still records (spec step 2). Safe to
+                # reuse concurrently, unlike a shared contextvars.Context.
+                for chunk in _ex.map(run_in_capture_context(_fetch_window), windows):
                     if chunk:
                         records.extend(chunk)
 

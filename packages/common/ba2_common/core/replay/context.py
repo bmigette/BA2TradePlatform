@@ -287,12 +287,17 @@ class CaptureContext:
         analysis (thread pools inside a gather) cannot be handed the same
         ``observation_id`` -- which the index would silently collapse into one row.
         The expensive part (freezing the payload) happens outside the lock.
+
+        The id is keyed on the ATTEMPT, not the analysis: a re-run of the same
+        host analysis id is a second attempt (the index keys analyses on
+        ``(analysis_id, attempt_id)``), and keying on the analysis alone would
+        make the retry's observations collide with the first attempt's.
         """
         try:
             with self._lock:
                 seq = self._next_seq
                 self._next_seq += 1
-            observation_id = f"{self.meta['session_id']}:{self.analysis_id}#{seq:06d}"
+            observation_id = f"{self.meta['session_id']}:{self.meta['attempt_id']}#{seq:06d}"
             now = _utc_now()
             observation = ProviderObservation(
                 observation_id=observation_id,
@@ -402,6 +407,17 @@ class CaptureContext:
         """Per-analysis degradation counts by kind (empty when nothing failed)."""
         with self._lock:
             return dict(self._failures)
+
+    def note_failure(self, message: str, exc: BaseException) -> None:
+        """Count a recording failure raised OUTSIDE this class (a provider tap).
+
+        The taps in :mod:`ba2_common.core.replay.observe` do work of their own --
+        binding arguments, building an identity, probing provenance -- and a
+        failure there is exactly the same kind of event as a failure in here: it
+        degrades coverage, it is counted and logged once, and it never reaches
+        the expert.
+        """
+        self._note_failure(message, exc)
 
     def _note_failure(self, message: str, exc: BaseException) -> None:
         kind = classify_failure(exc)

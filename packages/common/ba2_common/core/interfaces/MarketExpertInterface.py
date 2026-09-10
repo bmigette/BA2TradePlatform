@@ -1,5 +1,6 @@
 import math
 from abc import abstractmethod
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, List, NamedTuple, Optional, Protocol, runtime_checkable
 from sqlmodel import Session, select
@@ -41,6 +42,38 @@ class _Unset:
 
 
 _UNSET = _Unset()
+
+
+@contextmanager
+def _null_capture_scope():
+    """The "capture is off" scope: no context, no recording, no cost."""
+    yield None
+
+
+_CAPTURE_BATCH_PROVIDER = None
+
+
+def set_capture_batch_provider(provider) -> None:
+    """Install (or clear with ``None``) the host's current-batch-id callable."""
+    global _CAPTURE_BATCH_PROVIDER
+    _CAPTURE_BATCH_PROVIDER = provider
+
+
+def _current_capture_batch():
+    """The live host's current analysis batch id, when the host installed one.
+
+    Host-injected through :func:`set_capture_batch_provider` so this package keeps
+    knowing nothing about the live worker queue. The batch id is recorded on the
+    analysis RECORD only -- never written to a trading row.
+    """
+    provider = _CAPTURE_BATCH_PROVIDER
+    if provider is None:
+        return None
+    try:
+        return provider()
+    except Exception as e:
+        logger.error(f"replay capture: batch id unavailable: {e}", exc_info=True)
+        return None
 
 
 def _add_mapping_error(mapping: Dict[str, Any], message: str) -> None:
@@ -728,6 +761,146 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """The single BacktestInterface method. Runs the SAME _gather+_process as live."""
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
+
+    # ---- Live capture (spec step 2) ----------------------------------
+    #
+    # "At the actual live call site, resolve settings, gather inputs, snapshot the
+    # normalized bundle, run the existing calculation and link its actual output.
+    # Capture skip/error paths as well as successful BUY/SELL/HOLD results."
+    #
+    # Both helpers are no-ops when no replay store is installed (the default), so
+    # a live run with capture OFF executes byte-identically to the two bare calls
+    # they replace: same gather, same process, same provider call counts.
+
+    def _analysis_capture(self, market_analysis: Optional["MarketAnalysis"],
+                          settings: Optional[Dict[str, Any]], use_case: str):
+        """A recording scope for ONE live analysis; a no-op when capture is off.
+
+        Wrap the whole live body (gather, process AND the skip/error branches that
+        follow) so every outcome is recorded, not only the ones that reach a
+        recommendation. Yields the CaptureContext, or ``None`` when capture is
+        off -- callers must therefore test the context before using it.
+        """
+        from ba2_common.core.replay import capture_scope, get_replay_store
+
+        store = get_replay_store()
+        if store is None:
+            return _null_capture_scope()
+        try:
+            meta = self._build_analysis_meta(store, market_analysis, settings, use_case)
+        except Exception as e:
+            # Never let a recording problem stop an analysis from running.
+            logger.error(f"replay capture: could not describe the analysis: {e}", exc_info=True)
+            return _null_capture_scope()
+        if meta is None:
+            return _null_capture_scope()
+        return capture_scope(store, meta)
+
+    def _build_analysis_meta(self, store, market_analysis, settings, use_case):
+        """The identity of one analysis attempt, or ``None`` when it cannot be built."""
+        import uuid
+        from datetime import timezone as _tz
+
+        session_id = store.current_session_id()
+        if session_id is None:
+            logger.error(
+                "replay capture is enabled but no session is open; this analysis is "
+                "not recorded and coverage is incomplete"
+            )
+            return None
+        analysis_id = getattr(market_analysis, "id", None)
+        analysis_id = str(analysis_id) if analysis_id is not None else f"anon-{uuid.uuid4().hex}"
+        symbol = getattr(market_analysis, "symbol", None)
+        created_at = getattr(market_analysis, "created_at", None)
+        if created_at is not None and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=_tz.utc)
+        meta = {
+            "analysis_id": analysis_id,
+            # One row per ATTEMPT: a re-run of the same MarketAnalysis is a second
+            # attempt, not an overwrite of the first.
+            "attempt_id": uuid.uuid4().hex,
+            "session_id": session_id,
+            "expert_class": type(self).__name__,
+            "expert_instance_id": getattr(self, "id", None),
+            "symbol": str(symbol) if symbol is not None else "",
+            "use_case": str(use_case),
+            "scheduled_at": created_at,
+            "started_at": datetime.now(_tz.utc),
+        }
+        if settings is not None:
+            meta["settings"] = settings
+        batch_id = _current_capture_batch()
+        if batch_id is not None:
+            meta["branch_flags"] = {"batch_id": batch_id}
+        return meta
+
+    @staticmethod
+    def _use_case_of(market_analysis: Optional["MarketAnalysis"]) -> str:
+        """The analysis's use case as the plain string the record stores."""
+        subtype = getattr(market_analysis, "subtype", None)
+        if subtype is None:
+            return ""
+        return getattr(subtype, "value", str(subtype))
+
+    def _gather_and_process(self, providers: "ProviderBundle", settings: Dict[str, Any], *,
+                            market_analysis: Optional["MarketAnalysis"] = None,
+                            use_case: str = "", validate=None) -> tuple:
+        """The live pair, recorded: ``_gather(as_of=None)`` then ``_process(as_of=None)``.
+
+        With no capture scope active this is EXACTLY the two calls it replaces --
+        same order, same arguments, same return values, nothing else executed.
+        With one active it additionally snapshots the normalized bundle before
+        ``_process`` runs and links the actual outcome afterwards. ``as_of`` stays
+        ``None`` on both calls: capture must never switch a live analysis onto the
+        historical branch (spec section 4).
+
+        ``validate`` is the live guard some experts run BETWEEN the two calls (a
+        missing quote is a hard error before the calculation runs, not after it):
+        it is called with the bundle and may raise, and its exception is recorded
+        and re-raised exactly like one from ``_process``. Keeping it here rather
+        than at the call site is what lets every expert share one recorded pair.
+
+        Returns ``(bundle, recommendation)``. An exception from ``_process`` (or
+        from ``validate``) is recorded as the outcome and re-raised UNCHANGED.
+        """
+        from ba2_common.core.replay import current_capture
+
+        context = current_capture()
+        bundle = self._gather(providers, as_of=None)
+        if context is not None:
+            context.set_branch_flag("as_of_is_none", True)
+            context.set_branch_flag("use_case", str(use_case))
+            analysis_id = getattr(market_analysis, "id", None)
+            if analysis_id is not None:
+                context.set_branch_flag("market_analysis_id", analysis_id)
+            # freeze() lives inside set_bundle: the snapshot is taken here, BEFORE
+            # _process can mutate anything the gather returned.
+            context.set_bundle(bundle)
+        try:
+            if validate is not None:
+                validate(bundle)
+            recommendation = self._process(bundle, settings, as_of=None)
+        except BaseException as exc:
+            if context is not None:
+                context.set_outcome(error=exc)
+            raise
+        if context is not None:
+            context.set_outcome(recommendation=recommendation)
+        return bundle, recommendation
+
+    @staticmethod
+    def _record_skip(reason: str) -> None:
+        """Record that this analysis ended in a skip (no-op when capture is off).
+
+        Every early ``return`` in a live ``run_analysis`` body goes through here:
+        an unrecorded skip is a silently missing coverage row, which reads as a
+        recording gap rather than as the decision it actually was.
+        """
+        from ba2_common.core.replay import current_capture
+
+        context = current_capture()
+        if context is not None:
+            context.set_outcome(skip_reason=reason)
 
     def _resolve_settings(self, keys) -> Dict[str, Any]:
         """Resolve the given setting keys to a plain dict via the live default-resolver.

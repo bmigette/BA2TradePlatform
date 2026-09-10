@@ -31,6 +31,7 @@ Host-neutral: stdlib + pandas/numpy/pyarrow only.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import importlib
 import json
@@ -49,9 +50,9 @@ CODEC_VERSION = 1
 KIND_JSON = "json"
 KIND_ARROW = "arrow"
 
-#: Enum classes may only be resolved from these module prefixes. A capture is
-#: data, not code: an ``$enum`` payload must never be able to name an arbitrary
-#: importable module.
+#: Enum and dataclass types may only be resolved from these module prefixes. A
+#: capture is data, not code: an ``$enum`` or ``$dataclass`` payload must never be
+#: able to name an arbitrary importable module.
 ENUM_MODULE_PREFIXES = (
     "ba2_common.",
     "ba2_providers.",
@@ -71,6 +72,7 @@ _SERIES_COLUMN = "__ba2_replay_series__"
 
 _TAGS = (
     "$enum",
+    "$dataclass",
     "$float",
     "$nat",
     "$timestamp",
@@ -232,6 +234,31 @@ def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, Non
                 raise UnsupportedCaptureType(type(key).__name__, path)
             out[_escape_key(key)] = _encode_value(value, f'{path}["{key}"]', sides, seen)
         return out
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        # The value objects the platform passes around -- Recommendation above
+        # all -- are dataclasses, and the OUTPUT of every recorded analysis is
+        # one. Encoding it as a named record (rather than as an anonymous dict)
+        # is what lets a replay rebuild the real object and compare it field by
+        # field. Its fields go through this same encoder, so an unsupported value
+        # INSIDE one is still refused, with its path.
+        cls = type(obj)
+        reference = f"{cls.__module__}.{cls.__qualname__}"
+        if not _enum_module_allowed(cls.__module__):
+            raise UnsupportedCaptureType(f"dataclass({reference})", path)
+        if any(not field.init for field in dataclasses.fields(obj)):
+            # A non-init field cannot be handed back to the constructor, so a
+            # replay would silently rebuild a DIFFERENT object. Refuse it here,
+            # where the gap is counted, rather than drop it quietly.
+            raise UnsupportedCaptureType(
+                f"dataclass({reference}) with non-init field(s)", path)
+        return {"$dataclass": {
+            "type": reference,
+            "fields": {
+                field.name: _encode_value(
+                    getattr(obj, field.name), f'{path}.{field.name}', sides, seen)
+                for field in dataclasses.fields(obj)
+            },
+        }}
     if isinstance(obj, (pd.DataFrame, pd.Series)):
         frame = _encode_frame(obj, path)
         frame_hash = content_hash(frame.kind, frame.data)
@@ -393,6 +420,8 @@ def _decode_value(node: Any, frames: FrameSource) -> Any:
 def _decode_tag(tag: str, value: Any, frames: FrameSource) -> Any:
     if tag == "$enum":
         return _decode_enum(value)
+    if tag == "$dataclass":
+        return _decode_dataclass(value, frames)
     if tag == "$float":
         return float(value)
     if tag == "$nat":
@@ -419,6 +448,26 @@ def _decode_enum(reference: str) -> Enum:
     if not (isinstance(cls, type) and issubclass(cls, Enum)):
         raise UnsafeEnumReference(reference)
     return cls[member]
+
+
+def _decode_dataclass(payload: Mapping[str, Any], frames: FrameSource) -> Any:
+    """Rebuild a recorded dataclass, refusing anything outside the allowlist.
+
+    Same rule as ``$enum``: the reference names a type, and only a type this
+    platform owns may be imported and constructed. Anything else -- a name
+    outside the allowlist, a name that is not a dataclass -- is refused rather
+    than instantiated.
+    """
+    reference = payload["type"]
+    module_name, _, class_name = reference.rpartition(".")
+    if not module_name or not _enum_module_allowed(module_name):
+        raise UnsafeEnumReference(reference)
+    cls = getattr(importlib.import_module(module_name), class_name, None)
+    if not (isinstance(cls, type) and dataclasses.is_dataclass(cls)):
+        raise UnsafeEnumReference(reference)
+    fields = {name: _decode_value(item, frames)
+              for name, item in payload["fields"].items()}
+    return cls(**fields)
 
 
 def _restore_zone(value: datetime, payload: Mapping[str, Any]) -> datetime:
