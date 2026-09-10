@@ -2269,6 +2269,64 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> s
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
 
+# Relative gap between a top-N re-run's own fitness and the GA score it was chosen for, beyond
+# which the two are treated as DIFFERENT STRATEGIES rather than the same one measured twice.
+#
+# RELATIVE, because this code ranks metrics on very different scales. 0.1% is far above the
+# float-summation noise a re-run can legitimately show (pool ordering moves the last bits) and far
+# below any gap a real config difference produces -- the documented screener-hoisted-state case
+# moved fitness by tens of percent.
+RERUN_FITNESS_TOL_REL = 1e-3
+
+# Absolute floor so a ga_fitness of exactly 0 still compares (a relative tolerance of 0 would
+# make every non-zero re-run infinitely divergent, and every zero one a division by zero).
+_RERUN_FITNESS_TOL_ABS = 1e-9
+
+
+def _numeric(v: Any) -> Optional[float]:
+    """*v* as a float if it is a real number, else None. ``bool`` is not a number here."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def rerun_fitness_divergence(
+    ga_fitness: Any, rerun_fitness: Any, *, tol_rel: float = RERUN_FITNESS_TOL_REL
+) -> Optional[Dict[str, Any]]:
+    """None when a re-run reproduces the score its genome was ranked on; else the discrepancy.
+
+    A top-N genome from the GA's FINAL generation is persisted from the results the GA itself
+    computed, so it agrees by construction. Any EARLIER genome is RE-RUN from a config rebuilt
+    out of the STORED ``optimization_config`` with the screener hoisted state RE-DERIVED at
+    re-run time -- either of which can have moved since the run. When it has, the persisted row
+    carries plausible metrics for a strategy that is no longer the one that earned the fitness,
+    and nothing on the row says so. (The handler already documents one such case: without
+    re-applying the hoisted state "the persisted top-N silently diverge from their fitness".)
+
+    Comparing the two numbers cannot say WHICH field drifted, but it says that one did -- which
+    is the difference between a silent wrong answer and a loud one worth investigating.
+
+    Returns ``{ga_fitness, rerun_fitness, delta, pct, tol}``. ``pct`` is None against a zero
+    base. Unknown inputs (no ``ga_fitness`` on a pre-migration-030 row, a non-numeric) yield
+    None: unknown is not the same as divergent, and this check must never cost a persisted row.
+    """
+    ga = _numeric(ga_fitness)
+    rerun = _numeric(rerun_fitness)
+    if ga is None or rerun is None:
+        return None
+    delta = rerun - ga
+    tol = max(abs(ga) * float(tol_rel), _RERUN_FITNESS_TOL_ABS)
+    if abs(delta) <= tol:
+        return None
+    return {
+        "ga_fitness": ga,
+        "rerun_fitness": rerun,
+        "delta": delta,
+        "pct": (100.0 * delta / ga) if ga else None,
+        "tol": tol,
+    }
+
+
 # How many of the best ``all_results`` entries ride along in a checkpoint. Bounded so the
 # checkpoint column cannot grow with the run: it is rewritten once per generation (and every
 # ``partial_checkpoint_every`` trials on top of that), so an unbounded copy of a 40x8 search
