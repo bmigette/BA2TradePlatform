@@ -698,3 +698,132 @@ def test_a_ranking_that_cannot_be_read_is_reported_not_swallowed(monkeypatch):
 
     assert fields == {}
     assert any("AAA" in w and "unreadable" in w for w in warnings), warnings
+
+
+# =========================================================================================
+# RE-REVIEW 2026-09-11: a refusal must quote what the sizer actually said
+#
+# ``compute_risk_based_quantity`` can refuse BEFORE it ever divides the budget: no equity, a
+# budget that resolves to zero (reachable with regime_risk_scale 0), or no stop, no ATR and
+# no min-stop floor to imply one. It names each case in ``result["reason"]`` -- which was
+# logged and thrown away -- and the record then asserted a sentence about "the risk budget
+# not covering one share at the stop distance recorded beside it" with neither number on the
+# row. The row has to say what the sizer said.
+# =========================================================================================
+
+def test_a_risk_atr_order_with_no_stop_at_all_records_the_sizers_own_reason():
+    """Budget positive (atr_risk_budget_pct), stop synthesis disabled, no ATR and no floor:
+    the sizer never reaches the division, so there is no share count to explain."""
+    pair = _pair("AAA")
+    expert = _FakeExpert(settings={"sizing_mode": "risk_atr", "atr_risk_budget_pct": 1.0,
+                                   "risk_per_trade_pct": -1.0, "min_stop_loss_pct": 0.0},
+                         equity=100_000.0)
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000_000.0, prices={"AAA": 100.0},
+                      expert=expert)
+    t = traces["AAA"]
+
+    assert pair[0].stop_price is None, "the premise: no stop was synthesised"
+    assert t["quantity"] == 0
+    assert "qty_by_risk" not in t, "the budget was never divided, so no count exists"
+    assert "no stop price" in t["refusal_reason"], t["refusal_reason"]
+
+
+def test_that_refusal_is_what_the_row_says(candidate_recorded):
+    pair = _pair("AAA")
+    order = pair[0]
+    expert = _FakeExpert(settings={"sizing_mode": "risk_atr", "atr_risk_budget_pct": 1.0,
+                                   "risk_per_trade_pct": -1.0, "min_stop_loss_pct": 0.0},
+                         equity=100_000.0)
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000_000.0, prices={"AAA": 100.0},
+                      expert=expert)
+    row = candidate_recorded(candidates=[pair], unfunded=[order], prices={"AAA": 100.0},
+                             traces={id(order): traces["AAA"]})["AAA"]
+
+    assert "no stop price" in row["reason"], row["reason"]
+    assert "stop distance recorded beside it" not in row["reason"], (
+        "there is no stop distance on this row to point at")
+
+
+def test_an_equityless_expert_gets_the_sizers_words_too():
+    pair = _pair("AAA")
+    expert = _FakeExpert(settings={"sizing_mode": "risk_atr", "risk_per_trade_pct": 1.0,
+                                   "min_stop_loss_pct": 5.0}, equity=0.0)
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000_000.0, prices={"AAA": 100.0},
+                      expert=expert)
+
+    assert traces["AAA"]["refusal_reason"] == "no equity"
+    assert "risk_dollars" not in traces["AAA"]
+
+
+def test_the_budget_sentence_survives_where_the_budget_really_did_bind(candidate_recorded):
+    """The other half: the sizer DID divide, and bought nothing. Then the budget and the
+    stop distance are both on the row and the sentence can point at them."""
+    pair = _pair("AAA")
+    order = pair[0]
+    expert = _FakeExpert(settings={"sizing_mode": "risk_atr", "risk_per_trade_pct": 0.001,
+                                   "min_stop_loss_pct": 5.0}, equity=100_000.0)
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000_000.0, prices={"AAA": 100.0},
+                      expert=expert)
+    row = candidate_recorded(candidates=[pair], unfunded=[order], prices={"AAA": 100.0},
+                             traces={id(order): traces["AAA"]})["AAA"]
+
+    assert traces["AAA"]["qty_by_risk"] == 0
+    assert row["binding"] == "risk_atr"
+    assert "risk budget" in row["reason"], row["reason"]
+
+
+# -----------------------------------------------------------------------------------------
+# An unknown clamp name must not pass for "nothing clamped"
+# -----------------------------------------------------------------------------------------
+
+def test_a_clamp_name_the_record_cannot_map_is_reported(monkeypatch):
+    """Leaving ``risk_atr`` standing is the safe fallback, but doing it quietly means a new
+    clamp in the sizer shows up as "the budget bound it" on every affected row, for as long
+    as nobody notices."""
+    warnings = []
+    monkeypatch.setattr(trm.logger, "warning", warnings.append)
+    mgr = _manager()
+
+    assert mgr._clamp_binding("a_new_clamp") is None
+    assert any("a_new_clamp" in w for w in warnings), warnings
+
+
+def test_a_clamp_name_it_knows_is_mapped_quietly(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(trm.logger, "warning", warnings.append)
+    mgr = _manager()
+
+    assert mgr._clamp_binding("notional") == "instrument_cap"
+    assert mgr._clamp_binding("balance") == "balance"
+    assert mgr._clamp_binding(None) is None
+    assert warnings == []
+
+
+def test_the_map_covers_every_clamp_the_sizer_can_report():
+    """Pins the two vocabularies together at the source. A third clamp added to
+    ``compute_risk_based_quantity`` fails HERE, at the map, rather than quietly in a run
+    record months later."""
+    import re
+    from pathlib import Path
+
+    source = Path(trm.__file__).resolve().parents[0] / "position_sizing.py"
+    produced = set(re.findall(r'out\["capped_by"\]\s*=\s*"([^"]+)"',
+                              source.read_text(encoding="utf-8")))
+
+    assert produced == set(trm._RISK_CLAMP_BINDINGS), (
+        f"the sizer reports {sorted(produced)}; the record maps "
+        f"{sorted(trm._RISK_CLAMP_BINDINGS)}")
+
+
+def test_an_instrument_config_that_cannot_be_read_is_reported_not_swallowed(monkeypatch):
+    """It costs the entire Weight column, which is half of what the record was extended
+    for -- and a silently empty column reads as "no weights are configured"."""
+    class _Boom:
+        def _get_enabled_instruments_config(self):
+            raise RuntimeError("settings are down")
+
+    warnings = []
+    monkeypatch.setattr(trm.logger, "warning", warnings.append)
+
+    assert trm.TradeRiskManagement._safe_instrument_config(_Boom()) == {}
+    assert any("settings are down" in w for w in warnings), warnings

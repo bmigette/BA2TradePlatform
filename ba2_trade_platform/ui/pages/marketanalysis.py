@@ -181,33 +181,68 @@ def _rm_score_inputs(d) -> str:
 def _rm_qty_detail(d) -> str:
     """The operands the share count was solved from, or ''.
 
-    The two ceilings for a notional size; the risk budget and the count it alone bought for
-    a risk_atr one. Absent terms are simply not shown -- an old row has none of them and
-    gets no tooltip at all rather than a tooltip full of dashes.
+    The two ceilings for a notional size; the risk budget, the count it alone bought and the
+    stop it was solved against for a risk_atr one. Absent terms are simply not shown -- an
+    old row has none of them and gets no tooltip at all rather than one full of dashes.
+
+    Every number goes through ``_rm_num``. These come out of a JSON column, and a value that
+    is not a number would otherwise raise INSIDE the dialog and take down the whole run --
+    including the rows that were fine.
     """
     parts = []
     if d.get('max_qty_by_instrument') is not None:
-        parts.append(f"cap ceiling {d['max_qty_by_instrument']:,.2f} sh")
+        parts.append(f"cap ceiling {_rm_num(d['max_qty_by_instrument'], ',.2f')} sh")
     if d.get('max_qty_by_balance') is not None:
-        parts.append(f"balance ceiling {d['max_qty_by_balance']:,.2f} sh")
+        parts.append(f"balance ceiling {_rm_num(d['max_qty_by_balance'], ',.2f')} sh")
     if d.get('risk_budget_pct') is not None:
-        risk = f"risk budget {d['risk_budget_pct']:g}%"
+        risk = f"risk budget {_rm_num(d['risk_budget_pct'], 'g')}%"
         if d.get('risk_dollars') is not None:
-            risk += f" (${d['risk_dollars']:,.0f})"
+            risk += f" (${_rm_num(d['risk_dollars'], ',.0f')})"
         if d.get('qty_by_risk') is not None:
-            risk += f" → {d['qty_by_risk']:g} sh"
+            risk += f" → {_rm_num(d['qty_by_risk'], 'g')} sh"
         parts.append(risk)
-    if d.get('stop_distance_pct') is not None:
-        parts.append(f"stop {d['stop_distance_pct']:.1f}% away")
+    stop_price, stop_pct = d.get('stop_price'), d.get('stop_distance_pct')
+    if stop_price is not None:
+        stop = f"stop {_rm_num(stop_price, ',.2f')}"
+        if stop_pct is not None:
+            stop += f" ({_rm_num(stop_pct, '.1f')}% away)"
+        parts.append(stop)
+    elif stop_pct is not None:
+        # The distance without a price: risk sizing can imply a stop distance from the
+        # min-stop floor without a stop price ever being written to the order.
+        parts.append(f"stop {_rm_num(stop_pct, '.1f')}% away")
     return ' · '.join(parts)
 
 
 def _rm_binding_detail(d) -> str:
-    """What the binding limit had already been spent on, or ''."""
-    if d.get('existing_allocation') is None:
+    """What the binding limit had already been spent on, or ''.
+
+    Nothing at all when the symbol held nothing: "already held $0.00" is noise on every
+    first entry, and reads as a measurement the reader then has to go and check.
+    """
+    held = d.get('existing_allocation')
+    if held is None or held == 0:
         return ''
-    return (f"this symbol already held ${d['existing_allocation']:,.2f} against its "
+    return (f"this symbol already held ${_rm_num(held, ',.2f')} against its "
             f"per-instrument cap")
+
+
+def classic_run_detail_legend(decisions) -> str:
+    """The paragraph under the table, or '' when it would describe the wrong thing.
+
+    Gated on the RANK -- the same predicate ``classic_run_detail_rows`` orders by -- and not
+    on the score. An old classic run carries scores but no ranks, so a score gate printed a
+    legend explaining a funding sequence those rows were not in.
+    """
+    if not any(d.get('rank') is not None for d in (decisions or [])):
+        return ''
+    return ('Rows are in FUNDING order: the manager funds down the score ranking until the '
+            'budget runs out, so a refusal is explained by where it sits in this list. '
+            'Score is expected profit % weighted by confidence '
+            '(compute_order_priority_score). Cap avail is what the per-instrument limit '
+            'still allowed this symbol; Balance is the budget before → after the order; '
+            'Binding is the constraint that set the final quantity. Hover Qty for the '
+            'ceilings it was solved from.')
 
 
 def classic_run_context_lines(context) -> list:
@@ -1144,11 +1179,16 @@ class JobMonitoringTab:
         Every symbol the manager RECEIVED is listed, funded or not, because the point of
         the record is the ones that were not.
 
-        Rows read in FUNDING order (see ``classic_run_detail_rows``), which answers the
-        question a reader actually opens this with -- "why did THIS one not trade?" -- with
-        the sequence itself: the ranking, the budget falling row by row, and the constraint
-        that bound each size. Refusals no longer float to the top; they are where they
-        happened, which is what makes them legible.
+        A RANKED run (the classic manager) reads in FUNDING order, which answers the question
+        a reader actually opens this with -- "why did THIS one not trade?" -- with the
+        sequence itself: the ranking, the budget falling row by row, and the constraint that
+        bound each size. Its refusals sit where they happened rather than at the top, which
+        is what makes them legible.
+
+        A run with no ranking anywhere -- the OPTION manager, and every classic run recorded
+        before the rank existed -- keeps REFUSALS FIRST, because there is no funding sequence
+        to follow and the refusals are what the screen was opened for. Both orderings live in
+        ``classic_run_detail_rows``.
         """
         from ba2_common.core.db import get_instance
         from ba2_common.core.models import RiskManagerRun
@@ -1213,15 +1253,9 @@ class JobMonitoringTab:
                 </q-td>
             ''')
 
-            if any(d.get('score') is not None for d in decisions):
-                ui.label(
-                    'Rows are in FUNDING order: the manager funds down the score ranking '
-                    'until the budget runs out, so a refusal is explained by where it sits '
-                    'in this list. Score is expected profit % weighted by confidence '
-                    '(compute_order_priority_score). Cap avail is what the per-instrument '
-                    'limit still allowed this symbol; Balance is the budget before → after '
-                    'the order; Binding is the constraint that set the final quantity.'
-                ).classes('text-xs text-gray-500 mt-1')
+            legend = classic_run_detail_legend(decisions)
+            if legend:
+                ui.label(legend).classes('text-xs text-gray-500 mt-1')
 
             if not rows:
                 ui.label('This run received no symbols.').classes('text-sm text-gray-500 mt-2')

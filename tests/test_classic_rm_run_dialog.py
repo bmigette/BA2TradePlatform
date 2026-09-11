@@ -282,3 +282,57 @@ def test_the_rank_column_cannot_be_sorted_away():
     columns = {c['name']: c for c in ma.classic_run_detail_columns()}
 
     assert not columns['rank'].get('sortable')
+
+
+# =========================================================================================
+# RE-REVIEW 2026-09-11: the dialog's own formatting must not be able to raise, the legend
+# must describe the order the rows are actually in, and a recorded stop has to be visible.
+# =========================================================================================
+
+def test_the_legend_describes_the_order_the_rows_are_in():
+    """It explains FUNDING order, so it may only appear when the rows are in one. Gated on
+    the score, an old (unranked) run showed a legend describing a sequence it did not have."""
+    ranked = [decision("AAA", OUTCOME_FUNDED, "funded at 1", quantity=1.0, rank=1, score=9.0)]
+    unranked = [decision("AAA", OUTCOME_FUNDED, "funded at 1", quantity=1.0, score=9.0)]
+
+    assert 'FUNDING order' in ma.classic_run_detail_legend(ranked)
+    assert ma.classic_run_detail_legend(unranked) == ''
+    assert ma.classic_run_detail_legend([]) == ''
+
+
+def test_the_stop_a_risk_sized_order_was_solved_against_is_shown():
+    """It is recorded on the row; a recorded number the screen never draws is, to the
+    person reading the screen, not recorded."""
+    rows = ma.classic_run_detail_rows([
+        decision("AAA", OUTCOME_FUNDED, "funded at 12", quantity=12.0, rank=1,
+                 binding="risk_atr", risk_budget_pct=1.0, qty_by_risk=12.0,
+                 stop_price=92.0, stop_distance_pct=8.0)])
+
+    assert '92.00' in rows[0]['qty_detail'], rows[0]['qty_detail']
+    assert '8.0%' in rows[0]['qty_detail']
+
+
+def test_a_stored_value_that_is_not_a_number_cannot_break_the_dialog():
+    """The row comes out of a JSON column. Anything that ever wrote a string into it would
+    otherwise take down the whole dialog -- including the rows that are fine."""
+    rows = ma.classic_run_detail_rows([
+        decision("AAA", OUTCOME_UNFUNDED, "sized to zero", binding="balance",
+                 max_qty_by_instrument="not a number", max_qty_by_balance=85.0,
+                 existing_allocation="also not a number")])
+
+    assert 'not a number' in rows[0]['qty_detail']
+    assert '85' in rows[0]['qty_detail']
+    assert 'also not a number' in rows[0]['binding_detail']
+
+
+def test_a_symbol_that_held_nothing_is_not_told_it_held_nothing():
+    """"already held $0.00" is noise on every first entry, and reads as a measurement the
+    reader has to check."""
+    rows = ma.classic_run_detail_rows([
+        decision("AAA", OUTCOME_FUNDED, "funded at 10", quantity=10.0, rank=1,
+                 binding="instrument_cap", existing_allocation=0.0),
+        decision("BBB", OUTCOME_FUNDED, "funded at 4", quantity=4.0, rank=2,
+                 binding="instrument_cap", existing_allocation=400.0)])
+
+    assert rows[0]['binding_detail'] == ''
+    assert '400.00' in rows[1]['binding_detail']

@@ -70,6 +70,7 @@ DECISION_TRACE_FIELDS = (
     "existing_allocation", "cap_available", "balance_before",
     "max_qty_by_instrument", "max_qty_by_balance", "balance_after", "binding",
     "stop_price", "stop_distance_pct", "risk_budget_pct", "risk_dollars", "qty_by_risk",
+    "refusal_reason",
 )
 
 
@@ -685,6 +686,26 @@ class TradeRiskManagement:
         except Exception as e:  # noqa: BLE001 -- see _open_trace
             self.logger.warning(f"Could not restore sizing operands {sorted(fields)}: {e}")
 
+    def _clamp_binding(self, capped_by) -> Optional[str]:
+        """The binding a sizer clamp means, or ``None`` when nothing clamped.
+
+        A name the map does not know is REPORTED, not shrugged off: returning None quietly
+        leaves ``risk_atr`` standing, so a clamp added to ``compute_risk_based_quantity``
+        would show up as "the risk budget bound it" on every affected row until somebody
+        happened to notice. None is still what is returned -- inventing a binding for an
+        unknown clamp would be worse -- but the mismatch is now in the log, and
+        ``test_the_map_covers_every_clamp_the_sizer_can_report`` fails at the map itself.
+        """
+        if capped_by is None:
+            return None
+        binding = _RISK_CLAMP_BINDINGS.get(capped_by)
+        if binding is None:
+            logger.warning(
+                f"risk sizing reported an unknown clamp {capped_by!r}; the run record cannot "
+                f"name the limit that bound this order and will report the sizing mode "
+                f"instead. Add it to _RISK_CLAMP_BINDINGS.")
+        return binding
+
     @staticmethod
     def _run_context_with_permissions(run_record, *, enable_buy, enable_sell) -> Dict[str, Any]:
         """The sizing pass's own context, plus the two permissions the CALLER read.
@@ -781,7 +802,11 @@ class TradeRiskManagement:
         """
         try:
             return expert._get_enabled_instruments_config() or {}
-        except Exception:  # noqa: BLE001 -- observability only
+        except Exception as e:  # noqa: BLE001 -- observability only
+            # SAID OUT LOUD: this costs the whole Weight column, and an empty one reads as
+            # "no instrument weights are configured" rather than "they could not be read".
+            logger.warning(f"Could not read the instrument weight configuration for the run "
+                           f"record; the Weight column will be empty: {e}")
             return {}
 
     def _decision_extras(self, order, traces, weights) -> Dict[str, Any]:
@@ -846,6 +871,15 @@ class TradeRiskManagement:
             return ("sized below one whole round lot, so nothing was bought — a partial lot "
                     "is unusable to the strategy that asked for the lot size")
         if binding == BINDING_RISK_ATR:
+            # Only when the sizer actually DIVIDED the budget -- ``qty_by_risk`` is recorded
+            # at that division and nowhere else. Before it, the sizer can refuse for want of
+            # equity, of a budget, or of any stop to measure against, and then neither the
+            # budget nor the stop distance is on this row for the sentence to point at. Its
+            # own words are, so they are what is quoted.
+            if extras.get("qty_by_risk") is None:
+                refusal = extras.get("refusal_reason")
+                return (f"risk-based sizing refused before sizing: {refusal}" if refusal
+                        else "risk-based sizing bought no shares and gave no reason")
             return ("risk-based sizing bought no shares: the risk budget on this row does "
                     "not cover one share at the stop distance recorded beside it")
         if binding is not None:
@@ -1735,7 +1769,7 @@ class TradeRiskManagement:
         # the mode standing.
         risk_per_share = result["risk_per_share"]
         self._trace_note(trace, binding=BINDING_RISK_ATR)
-        self._trace_note(trace, binding=_RISK_CLAMP_BINDINGS.get(result["capped_by"]))
+        self._trace_note(trace, binding=self._clamp_binding(result["capped_by"]))
         self._trace_note(
             trace,
             risk_budget_pct=risk_pct,
@@ -1744,6 +1778,12 @@ class TradeRiskManagement:
             stop_distance_pct=(None if not risk_per_share or current_price <= 0
                                else risk_per_share / current_price * 100.0),
             qty_by_risk=result["qty_by_risk"] if "qty_by_risk" in result else None,
+            # THE SIZER'S OWN WORDS, kept instead of only logged. It can refuse BEFORE it
+            # ever divides the budget -- no equity, a budget that resolved to zero, no stop
+            # and nothing to imply one -- and in those cases the row has no budget and no
+            # stop distance to explain itself with. Empty string when it did size, so
+            # _trace_note's "absent means not recorded" still reads correctly.
+            refusal_reason=result["reason"] or None,
         )
 
         qty = int(result["quantity"])
