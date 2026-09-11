@@ -49,9 +49,9 @@ import sys
 import threading
 import time as _time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -242,6 +242,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "keep using tools/run_option_warmup_parallel.py's --workers "
                         "(separate processes) instead; this is for providers whose session "
                         "must be shared in-process.")
+    p.add_argument("--narrow-fallback-years", type=float, default=1.0,
+                   help="``--wide`` only. When a symbol's wide request fails every retry, "
+                        "re-ask for it in windows of this many YEARS instead of one request "
+                        "for the whole span (default 1.0; 0 disables the fallback).\n"
+                        "WHY: the wide shape asks for every expiration at once, and for the "
+                        "largest chains that stream dies mid-flight every time -- measured "
+                        "2026-09-10/11, 16 symbols (COST, CVX, CRWD, DAL, VRT ...) each gave "
+                        "up with their ENTIRE ladder unfetched, on the first request, four "
+                        "attempts running. Retrying an over-large request just fails four "
+                        "times instead of once; making it smaller is the only thing that "
+                        "changes the outcome.")
     p.add_argument("--wide", action="store_true",
                    help="ThetaData only. Fetch each underlying's WHOLE chain per request "
                         "(expiration='*') instead of looping expiry by expiry, then fan the "
@@ -798,6 +809,29 @@ class _SharedProgress:
             return self.done, self.total
 
 
+def window_slices(start: date, end: date, years: float) -> List[Tuple[date, date]]:
+    """``[start, end]`` cut into consecutive windows of ``years``, oldest first. Pure.
+
+    OLDEST FIRST, and contiguous, because the caller's incremental flush closes an expiry
+    the moment a bar dated after it arrives. That is only sound while bar dates never go
+    backwards, so the slices must be walked in order -- the same guarantee
+    ``fetch_underlying_eod_bars`` makes within one window, extended across several.
+
+    ``years <= 0`` (or a span already inside one slice) returns a single window, which makes
+    the fallback a no-op rather than a special case at the call site.
+    """
+    if years <= 0:
+        return [(start, end)]
+    step = max(1, int(round(years * 365)))
+    out: List[Tuple[date, date]] = []
+    cur = start
+    while cur <= end:
+        stop = min(end, cur + timedelta(days=step - 1))
+        out.append((cur, stop))
+        cur = stop + timedelta(days=1)
+    return out or [(start, end)]
+
+
 def run_symbol_units(units: Sequence[SymbolUnit], provider,
                      store: OptionHistoryParquetStore, start: date, end: date,
                      ns: argparse.Namespace, *, clock: Callable[[], datetime],
@@ -898,6 +932,76 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
             if attempt < max(1, ns.max_retries):
                 sleep(backoff)
                 backoff *= 2
+
+        if not completed and pending and getattr(ns, "narrow_fallback_years", 0) > 0:
+            # NARROW FALLBACK. The wide request is exhausted; ask for the same symbol in
+            # smaller windows before giving up on it. Everything the flush already wrote is
+            # durable and `pending` holds only what is still owed, so this re-buffers the
+            # remainder and nothing is written twice.
+            #
+            # ``high_water`` restarts at None because we re-walk from the beginning of the
+            # span; the slices are contiguous and oldest-first, so bar dates still never go
+            # backwards and the flush stays sound.
+            slices = window_slices(start, end, ns.narrow_fallback_years)
+            if len(slices) > 1:
+                log(f"  [{unit.underlying}] wide request exhausted with {len(pending)} "
+                    f"partition(s) owed; retrying in {len(slices)} narrower window(s)")
+                by_expiry = {}
+                high_water = None
+                salvaged = True
+                for w_start, w_end in slices:
+                    if not pending:
+                        break                      # everything owed has been written
+                    for attempt in range(1, max(1, ns.max_retries) + 1):
+                        try:
+                            for bar in provider.fetch_underlying_eod_bars(
+                                    unit.underlying, start=w_start, end=w_end):
+                                expiry = parse_occ_expiry(bar.occ_symbol)
+                                if expiry is None or expiry not in pending:
+                                    continue
+                                by_expiry.setdefault(expiry, []).append(bar)
+                                if high_water is None or bar.bar_date > high_water:
+                                    high_water = bar.bar_date
+                                    for done in [e for e in by_expiry if e < high_water]:
+                                        _flush(done)
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:  # noqa: BLE001 — classified, never swallowed
+                            if not _is_transient(e):
+                                log(f"  [{unit.underlying} {w_start}..{w_end}] narrow "
+                                    f"attempt {attempt} failed (permanent, not retrying): "
+                                    f"{type(e).__name__}: {e}")
+                                break
+                            log(f"  [{unit.underlying} {w_start}..{w_end}] narrow attempt "
+                                f"{attempt} failed: {type(e).__name__}: {e}")
+                            if attempt < max(1, ns.max_retries):
+                                sleep(ns.backoff)
+                        else:
+                            break
+                    else:
+                        # EVERY attempt on this window failed, so the SYMBOL is not salvaged
+                        # and nothing buffered will be written.
+                        #
+                        # NOT a partial salvage, and that is deliberate. A contract may be
+                        # listed years before it expires -- a LEAPS expiring 2025 trades from
+                        # 2023 -- so an expiry in a LATER window can own bars in this one.
+                        # Writing its partition now would look complete and silently omit
+                        # them, which is worse than owing the symbol another run: a truncated
+                        # partition carries a manifest saying it is done, and nothing ever
+                        # looks at it again.
+                        #
+                        # The windows already flushed mid-pass are durable and keep their
+                        # partitions; everything still owed stays in `pending`.
+                        salvaged = False
+                        continue
+                # SALVAGED, not "nothing left owed". Expiries still buffered here are the
+                # TAIL -- nothing dated later than them was ever seen -- and the block below
+                # writes exactly those, the same way it does after a successful wide fetch.
+                # Requiring an empty `pending` here would fail every symbol on its last
+                # expiry and re-fetch the whole ladder next run.
+                completed = salvaged
+                if completed:
+                    log(f"  [{unit.underlying}] recovered via narrow windows")
 
         if not completed:
             # Whatever the flush already wrote is durable and is NOT counted as failed --
