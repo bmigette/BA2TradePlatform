@@ -1,0 +1,34 @@
+Gate for feat/classic-rm-run-trace at 378ab54a0f18a4c54f5444d13177f3fa2e392503 2026-09-11T16:55:37Z (from dev 39d1713a)
+
+Commits:
+378ab54a fix(risk-manager): risk_atr refusals quote the sizer's own reason; unmapped clamp names are reported; tooltips never raise
+1de81e77 fix(risk-manager): run record names the constraint that actually bound (risk_atr clamps), reason text agrees with the binding, options refusals stay first, unique row keys
+a379efe4 feat(risk-manager): the classic run record explains ranking and allocation — rank, score inputs, capital mapping, per-order sizing operands and the binding constraint (live candidate path included)
+
+=== pre/post byte-identical real-data backtests (pre = dev 3e34440a worktree; same harness/window as the replay gate)
+=== pre vs rm3 (378ab54a)
+FMPRating IDENTICAL
+FMPEarningsDrift IDENTICAL
+FMPInsiderClusterBuy IDENTICAL
+DeterministicScorer IDENTICAL
+DONE
+
+RM branch gate at 378ab54a0f18a4c54f5444d13177f3fa2e392503 2026-09-11T15:05:13Z
+=== packages/common
+FAILED packages/common/tests/test_replay_store.py::test_two_processes_write_the_same_root_concurrently
+========== 1 failed, 3641 passed, 297 warnings in 193.02s (0:03:13) ===========
+=== root (minus portfolio allocation)
+========== 25 failed, 3421 passed, 15 warnings in 282.01s (0:04:42) ===========
+failed/error files:
+      2 FAILED tests/test_broker_sdk_pins.py
+      2 FAILED tests/test_no_zero_coercion.py
+      1 FAILED tests/test_option_actions.py
+     16 FAILED tests/test_option_intent_migration.py
+      1 FAILED tests/test_per_leg_expiry_no_migration.py
+      2 FAILED tests/test_tastytrade_account.py
+      1 FAILED tests/test_ui_colour_classes_paint.py
+RM_GATE_DONE
+packages/common: the one failure (test_replay_store concurrency, a spawn test) passed alone (13 passed) and the branch does not touch ba2_common.core.replay -> load flake (three jobs ran concurrently).
+root: 25 failures in the same 7 files as the dev baseline.
+Implementer runs: root RM set 170 passed; packages/common -k risk/sizing/rm/exposure/position 487 passed; backend golden + margin parity 21 passed, 2 xfailed; golden b32b8de5bb42c1355f7e873cb6c738ff57df42b0f167bf3dcf35dfc3766f264b.
+Reviews: spec (sonnet) COMPLIANT; quality (opus) CHANGES REQUIRED -> fixed 1de81e77; re-review APPROVED -> 378ab54a squashed its two observability items.

@@ -23,6 +23,57 @@ if TYPE_CHECKING:
     from ba2_common.core.interfaces import MarketExpertInterface
 
 
+# ---------------------------------------------------------------------------------------------
+# THE BINDING CONSTRAINT: which limit actually produced the quantity.
+#
+# Named, and recorded from the BRANCH THAT RAN -- never re-derived afterwards by comparing the
+# recorded numbers. Two constraints are routinely equal to the cent (a symbol whose cap headroom
+# IS the remaining balance), and several of them (the weight, the lot floor, the minimum-one-share
+# rescue) leave no trace in the operands at all, so an after-the-fact comparison reports a limit
+# that did not decide anything. The whole point of the record is to answer "why THIS size", and a
+# plausible-looking guess is worse than no answer.
+# ---------------------------------------------------------------------------------------------
+BINDING_INSTRUMENT_CAP = "instrument_cap"       # the per-instrument equity ceiling
+BINDING_BALANCE = "balance"                     # the remaining budget
+BINDING_WEIGHT = "weight"                       # the per-instrument weight% shrank it
+BINDING_DIVERSIFICATION = "diversification"     # diversification_factor reserved the rest
+BINDING_MIN_ONE_SHARE = "min_one_share"         # rounding gave 0, the one-share floor rescued it
+BINDING_LOT_SIZE = "lot_size"                   # rounded down to a whole round lot
+BINDING_RISK_ATR = "risk_atr"                   # sized by distance-to-stop (risk_atr mode)
+BINDING_EARLY_SKIP_CAP = "early_skip_cap"       # one share did not fit under the cap
+BINDING_EARLY_SKIP_BALANCE = "early_skip_balance"   # one share did not fit in the budget
+BINDING_NO_PRICE = "no_price"                   # unmeasurable: no price, so no limit can be named
+
+#: ``compute_risk_based_quantity``'s own ``capped_by`` -> the binding it means. The sizer
+#: speaks in terms of what it clamped ('notional' = the per-instrument notional ceiling,
+#: 'balance' = cash); the record speaks in terms of the limit the operator configured. One
+#: map, so the two vocabularies are joined in a single place rather than at each call.
+_RISK_CLAMP_BINDINGS = {
+    "notional": BINDING_INSTRUMENT_CAP,
+    "balance": BINDING_BALANCE,
+}
+
+SIZING_BINDINGS = (
+    BINDING_INSTRUMENT_CAP, BINDING_BALANCE, BINDING_WEIGHT, BINDING_DIVERSIFICATION,
+    BINDING_MIN_ONE_SHARE, BINDING_LOT_SIZE, BINDING_RISK_ATR, BINDING_EARLY_SKIP_CAP,
+    BINDING_EARLY_SKIP_BALANCE, BINDING_NO_PRICE,
+)
+
+#: The trace fields that become part of a decision ROW, in the order they read.
+#:
+#: An ALLOWLIST, not "everything in the trace": the trace is a working record kept inside the
+#: sizing loop and anything added to it there would otherwise land in a JSON column of the
+#: database by accident. ``quantity``/``price``/``cost`` are deliberately absent -- the decision
+#: builder owns those, because a REFUSED row must carry no quantity at all (see ``decision``).
+DECISION_TRACE_FIELDS = (
+    "rank", "score", "profit_pct", "confidence", "weight",
+    "existing_allocation", "cap_available", "balance_before",
+    "max_qty_by_instrument", "max_qty_by_balance", "balance_after", "binding",
+    "stop_price", "stop_distance_pct", "risk_budget_pct", "risk_dollars", "qty_by_risk",
+    "refusal_reason",
+)
+
+
 def compute_order_priority_score(expected_profit_percent: float | None,
                                  confidence: float | None) -> float:
     """Confidence-aware priority score for ranking pending orders (higher = funded first).
@@ -223,10 +274,12 @@ class TradeRiskManagement:
             
             # Steps 4-8: prioritize + resolve balance/account/allocations + size (SHARED with the
             # in-memory candidate path, size_candidate_orders — see _size_prioritized_orders).
+            run_record: Dict[str, Any] = {}
             (orders_to_update, orders_to_delete, symbol_prices,
              total_virtual_balance, max_equity_per_instrument) = self._size_prioritized_orders(
                 expert, expert_instance, expert_instance_id,
-                orders_with_recommendations, max_equity_per_instrument_ratio)
+                orders_with_recommendations, max_equity_per_instrument_ratio,
+                run_record=run_record)
 
             # Step 9: Update orders in database
             updated_in_db, failed_in_db = self._update_orders_in_database(orders_to_update)
@@ -260,12 +313,9 @@ class TradeRiskManagement:
                 # shows the weight that was actually applied rather than a re-read that
                 # could have changed since.
                 instrument_weights=self._safe_instrument_config(expert),
-                context={
-                    "available_balance": total_virtual_balance,
-                    "max_per_instrument": max_equity_per_instrument,
-                    "enable_buy": enable_buy,
-                    "enable_sell": enable_sell,
-                },
+                traces=run_record.get("traces"),
+                context=self._run_context_with_permissions(
+                    run_record, enable_buy=enable_buy, enable_sell=enable_sell),
             )
 
             # Log activity for risk manager execution
@@ -330,7 +380,8 @@ class TradeRiskManagement:
     # Shared sizing core + in-memory candidate path (temp-order-list order flow)
     # ------------------------------------------------------------------------------------------
     def _size_prioritized_orders(self, expert, expert_instance, expert_instance_id,
-                                 orders_with_recommendations, max_equity_per_instrument_ratio):
+                                 orders_with_recommendations, max_equity_per_instrument_ratio,
+                                 run_record=None):
         """Steps 4-8 of the classic RM sizing: prioritize by expected profit, resolve available
         balance + account + existing allocations, and compute per-order quantities.
 
@@ -341,6 +392,14 @@ class TradeRiskManagement:
         (``size_candidate_orders``). Returns
         ``(orders_to_update, orders_to_delete, symbol_prices, total_virtual_balance,
         max_equity_per_instrument)``.
+
+        ``run_record``: an OUT dict for the run RECORD -- filled with ``"context"`` (the capital
+        this pass sized against) and ``"traces"`` (the per-order operands, keyed by
+        ``id(order)``). An out-parameter and not two more return values on purpose: this
+        5-tuple is unpacked positionally by callers outside this module (the margin parity
+        pins, which assert on ``result[-1]``/``result[-2:]`` precisely because the ceiling is a
+        return value), and widening it would silently re-point those at a different field.
+        Omitting it costs nothing and is exactly today's behaviour.
         """
         # Step 4: Sort orders by expected profit (descending)
         prioritized_orders = self._prioritize_orders_by_profit(orders_with_recommendations)
@@ -370,7 +429,11 @@ class TradeRiskManagement:
         # the SAME breakdown, so the line explains the numbers immediately above it
         # rather than a second reading. INFO only when leverage is actually in play;
         # margin off (every backtest) is DEBUG and costs no broker snapshot.
-        log_capital_mapping(expert, self.logger, balances=balances)
+        # The RETURN is kept, not discarded: it is the mapping this pass already paid for, and
+        # it carries the equity -> tradable -> factor half of the run record's capital line.
+        # Recording it costs nothing; asking the account again would cost a broker round trip
+        # and would describe a different instant than the quantities below.
+        capital = log_capital_mapping(expert, self.logger, balances=balances)
 
         # Step 6: Get account instance for price lookups (via the injected host resolver)
         from ba2_common.core.instance_resolver import get_instance_resolver
@@ -385,9 +448,17 @@ class TradeRiskManagement:
         self.logger.debug(f"Existing allocations for expert {expert_instance_id}: {existing_allocations}")
 
         # Step 8: Calculate quantities for prioritized orders
+        context = self._run_context(
+            balances=balances, capital=capital,
+            max_per_instrument=max_equity_per_instrument,
+            max_per_instrument_ratio=max_equity_per_instrument_ratio)
+        traces: Dict[int, Dict[str, Any]] = {}
         orders_to_update, orders_to_delete, symbol_prices = self._calculate_order_quantities(
             prioritized_orders, total_virtual_balance, max_equity_per_instrument,
-            existing_allocations, account, expert)
+            existing_allocations, account, expert, traces=traces, context=context)
+        if run_record is not None:
+            run_record["context"] = context
+            run_record["traces"] = traces
         return (orders_to_update, orders_to_delete, symbol_prices,
                 total_virtual_balance, max_equity_per_instrument)
 
@@ -456,8 +527,10 @@ class TradeRiskManagement:
         if not pairs:
             return []
 
+        run_record: Dict[str, Any] = {}
         orders_to_update, orders_to_delete, symbol_prices, available_balance, max_per_instrument = (
-            self._size_prioritized_orders(expert, expert_instance, expert_instance_id, pairs, ratio))
+            self._size_prioritized_orders(expert, expert_instance, expert_instance_id, pairs, ratio,
+                                          run_record=run_record))
         for o in (orders_to_delete or []):
             self.logger.debug(f"candidate {o.symbol} {o.side} not funded by RM (qty=0) — dropped "
                               f"(temp-list flow: never persisted)")
@@ -474,12 +547,9 @@ class TradeRiskManagement:
             orders_to_update=orders_to_update,
             orders_to_delete=orders_to_delete,
             symbol_prices=symbol_prices,
-            context={
-                "available_balance": available_balance,
-                "max_per_instrument": max_per_instrument,
-                "enable_buy": enable_buy,
-                "enable_sell": enable_sell,
-            },
+            traces=run_record.get("traces"),
+            context=self._run_context_with_permissions(
+                run_record, enable_buy=enable_buy, enable_sell=enable_sell),
         )
         return funded
 
@@ -563,6 +633,165 @@ class TradeRiskManagement:
         self.logger.info(f"Filtered {len(filtered_orders)} orders from {len(orders)} based on permissions")
         return filtered_orders
     
+    # ------------------------------------------------------------------------------------------
+    # The sizing TRACE: the operands, captured where they are computed
+    # ------------------------------------------------------------------------------------------
+    def _open_trace(self, traces, order, **fields) -> Optional[Dict[str, Any]]:
+        """Start this order's trace inside ``traces`` and return it (``None`` on failure).
+
+        KEYED BY ``id(order)`` -- python identity -- because that is the ONE key both classic
+        paths have. The candidate path's orders are transient and have no ``.id`` at all (see
+        ``_record_candidate_run``), and identity separates two pending orders for the same
+        symbol exactly as the order id did. Every order object survives the whole pass in the
+        caller's list, so an id cannot be reused mid-run.
+
+        NEVER RAISES: a trace is an observation of a sizing decision that has already been
+        made, and losing one must cost the annotation, not the order.
+        """
+        try:
+            trace: Dict[str, Any] = {}
+            traces[id(order)] = trace
+        except Exception as e:  # noqa: BLE001 -- observability must not fail the sizing loop
+            self.logger.warning(f"Could not open a sizing trace for "
+                                f"{getattr(order, 'symbol', '?')}: {e}")
+            return None
+        self._trace_note(trace, **fields)
+        return trace
+
+    def _trace_note(self, trace: Optional[Dict[str, Any]], **fields) -> None:
+        """Record operands on a trace, dropping the ones that are not known.
+
+        ABSENT means "not recorded" (the UI draws a dash); ``0`` means "measured, and it was
+        zero" -- a real and different outcome for a quantity or a balance. So ``None`` values
+        are dropped and zeros are kept.
+        """
+        if trace is None:
+            return
+        try:
+            trace.update({k: v for k, v in fields.items() if v is not None})
+        except Exception as e:  # noqa: BLE001 -- see _open_trace
+            self.logger.warning(f"Could not record sizing operands {sorted(fields)}: {e}")
+
+    def _trace_overwrite(self, trace: Optional[Dict[str, Any]], **fields) -> None:
+        """Record operands INCLUDING the ones that are ``None``.
+
+        The one case ``_trace_note`` cannot express: putting a field back to what it was
+        when what it was is "nothing". Used by the weight revert, where the weight has
+        already been written as the binding and has to be taken back off.
+        """
+        if trace is None:
+            return
+        try:
+            trace.update(fields)
+        except Exception as e:  # noqa: BLE001 -- see _open_trace
+            self.logger.warning(f"Could not restore sizing operands {sorted(fields)}: {e}")
+
+    def _clamp_binding(self, capped_by) -> Optional[str]:
+        """The binding a sizer clamp means, or ``None`` when nothing clamped.
+
+        A name the map does not know is REPORTED, not shrugged off: returning None quietly
+        leaves ``risk_atr`` standing, so a clamp added to ``compute_risk_based_quantity``
+        would show up as "the risk budget bound it" on every affected row until somebody
+        happened to notice. None is still what is returned -- inventing a binding for an
+        unknown clamp would be worse -- but the mismatch is now in the log, and
+        ``test_the_map_covers_every_clamp_the_sizer_can_report`` fails at the map itself.
+        """
+        if capped_by is None:
+            return None
+        binding = _RISK_CLAMP_BINDINGS.get(capped_by)
+        if binding is None:
+            logger.warning(
+                f"risk sizing reported an unknown clamp {capped_by!r}; the run record cannot "
+                f"name the limit that bound this order and will report the sizing mode "
+                f"instead. Add it to _RISK_CLAMP_BINDINGS.")
+        return binding
+
+    @staticmethod
+    def _run_context_with_permissions(run_record, *, enable_buy, enable_sell) -> Dict[str, Any]:
+        """The sizing pass's own context, plus the two permissions the CALLER read.
+
+        The permissions gate which orders even reach the sizing, so they belong in the run's
+        context; but they are read one level above the sizing core, by each entry point.
+
+        No fall-back for the capital figures. ``_size_prioritized_orders`` fills the context
+        before it returns, and if it does NOT return, neither entry point reaches the
+        recorder at all -- so a "missing context" floor here could only ever have papered
+        over a sizing pass that never happened.
+        """
+        context = dict(run_record.get("context") or {})
+        context["enable_buy"] = enable_buy
+        context["enable_sell"] = enable_sell
+        return context
+
+    @staticmethod
+    def _ranking_fields(recommendation, instrument_configs, symbol) -> Dict[str, Any]:
+        """What the RANKING saw for this order. Never raises (returns ``{}``).
+
+        These are the two numbers that actually allocate, and they are recorded for REFUSED
+        orders as well -- that is the point: the score of a symbol that lost IS the reason
+        it lost, and it can only be read against the scores that won if every row carries it.
+
+          score   ``compute_order_priority_score(profit%, confidence)`` -- the sort key the
+                  funding order was built from, carried WITH its two inputs so the number can
+                  be re-derived instead of trusted.
+          weight  the per-instrument weight% the sized quantity is multiplied by, read from
+                  the SAME map the sizing multiplies by, a few lines below.
+        """
+        try:
+            profit_pct = getattr(recommendation, "expected_profit_percent", None)
+            confidence = getattr(recommendation, "confidence", None)
+            fields: Dict[str, Any] = {
+                "score": round(compute_order_priority_score(profit_pct, confidence), 4),
+                "profit_pct": None if profit_pct is None else float(profit_pct),
+                "confidence": None if confidence is None else float(confidence),
+            }
+            config = (instrument_configs or {}).get(symbol)
+            # ``.get("weight")`` with NO default: an instrument configured without a weight
+            # is "not configured" (the UI draws a dash), never a recorded 100%.
+            if isinstance(config, dict) and config.get("weight") is not None:
+                fields["weight"] = float(config["weight"])
+            return fields
+        except Exception as e:  # noqa: BLE001 -- an annotation must not reach the sizing loop
+            # SAID OUT LOUD. This costs the score column, which is the thing the record
+            # exists for; swallowed, the run would look as though the ranking simply had
+            # nothing to report. The module logger, because this is a staticmethod (the two
+            # instance helpers beside it log through self.logger for the same reason).
+            logger.warning(f"Could not read what the ranking saw for {symbol}: {e}")
+            return {}
+
+    @staticmethod
+    def _run_context(*, balances, capital, max_per_instrument,
+                     max_per_instrument_ratio) -> Dict[str, Any]:
+        """The capital this pass sized against, as one record. Pure; never raises.
+
+        ONE builder for both classic paths, from the two readings the sizing already took:
+        the ``_available_balance_breakdown()`` it sized from and the capital mapping
+        ``log_capital_mapping`` returned for that same breakdown. Nothing here reads the
+        account again -- a second reading would describe a different instant than the
+        quantities came from.
+
+        A figure the sizing did not read is OMITTED. An account that publishes no capital
+        description (the getattr seam, and every backtest double) leaves equity/tradable/
+        factor absent rather than 0.0: a zero equity reads as a measured, broke account.
+        """
+        context: Dict[str, Any] = {}
+        # The chain the reader follows: equity -> tradable (x margin factor) -> this expert's
+        # allocation% -> virtual -> what its own open positions hold -> what is left.
+        for key, source_key in (("equity", "balance"),
+                                ("tradable_balance", "tradable_balance"),
+                                ("margin_factor", "effective_factor"),
+                                ("allocation_pct", "virtual_equity_pct")):
+            value = (capital or {}).get(source_key)
+            if value is not None:
+                context[key] = value
+        if balances is not None:
+            context["virtual_balance"] = balances.virtual
+            context["used_balance"] = balances.used
+            context["available_balance"] = balances.available
+        context["max_per_instrument"] = max_per_instrument
+        context["max_per_instrument_ratio"] = max_per_instrument_ratio
+        return context
+
     @staticmethod
     def _safe_instrument_config(expert) -> dict:
         """The expert's per-instrument weight map, or ``{}``. Never raises.
@@ -573,23 +802,197 @@ class TradeRiskManagement:
         """
         try:
             return expert._get_enabled_instruments_config() or {}
-        except Exception:  # noqa: BLE001 -- observability only
+        except Exception as e:  # noqa: BLE001 -- observability only
+            # SAID OUT LOUD: this costs the whole Weight column, and an empty one reads as
+            # "no instrument weights are configured" rather than "they could not be read".
+            logger.warning(f"Could not read the instrument weight configuration for the run "
+                           f"record; the Weight column will be empty: {e}")
             return {}
+
+    def _decision_extras(self, order, traces, weights) -> Dict[str, Any]:
+        """The ranking + sizing fields for one order's decision row, omitting the unknown.
+
+        An ABSENT key means "not recorded", which the UI draws as a dash. A 0.0 would read as
+        a measurement -- "scored zero", "no weight", "capped at nothing" -- which is a real
+        and different outcome, so a value the pass did not produce is left out.
+
+        ONE resolver for BOTH classic paths. The same function decorating both records is
+        what makes the dialog able to render either without asking which manager wrote it.
+        """
+        trace = (traces or {}).get(id(order)) or {}
+        row = {key: trace[key] for key in DECISION_TRACE_FIELDS
+               if key in trace and trace[key] is not None}
+        if "weight" not in row:
+            # The caller-supplied weight map, for a record built without a sizing trace
+            # (the DB path's own callers, and every stored run older than the trace).
+            weight = (weights or {}).get(str(getattr(order, "symbol", "")).upper())
+            if weight is not None:
+                row["weight"] = float(weight)
+        return row
+
+    @staticmethod
+    def _unfunded_reason(price, cap, extras) -> str:
+        """Why this symbol got nothing, in the terms the BINDING names.
+
+        The sentence and the ``binding`` column have to be the same claim. They were not:
+        the sentence was re-derived by comparing the price against the FULL per-instrument
+        cap, while the branch that actually refused had compared it against what was LEFT
+        under that cap -- the cap minus this symbol's existing position, and after the regime
+        scale. A half-invested symbol therefore showed "Binding: early_skip_cap" beside a
+        sentence quoting a ceiling it never met, or (worse) a sentence blaming the budget.
+
+        So each binding quotes ITS OWN operand, off the trace. Only a record with no trace at
+        all -- every run written before the trace existed -- keeps the old comparison, which
+        is the best that can be said when the operands were never captured.
+        """
+        if price is None:
+            # UNMEASURABLE stays unmeasurable: with no price there is no way to say which
+            # limit bound this order, and naming one would be a guess.
+            return ("sized to zero; no price was available, so the binding "
+                    "limit cannot be identified")
+        price = float(price)
+        binding = extras.get("binding")
+        room = extras.get("cap_available")
+        budget = extras.get("balance_before")
+
+        if binding == BINDING_EARLY_SKIP_CAP and room is not None:
+            return (f"one share at {price:,.2f} exceeds the {float(room):,.2f} this symbol "
+                    f"had left under its per-instrument cap")
+        if binding == BINDING_EARLY_SKIP_BALANCE and budget is not None:
+            return (f"one share at {price:,.2f} exceeds the {float(budget):,.2f} of budget "
+                    f"still unspent when this symbol's turn came")
+        if binding == BINDING_INSTRUMENT_CAP and room is not None:
+            return (f"sized to zero; the per-instrument cap left {float(room):,.2f} for this "
+                    f"symbol, not enough for a share at {price:,.2f}")
+        if binding == BINDING_BALANCE and budget is not None:
+            return (f"sized to zero; the {float(budget):,.2f} of budget still unspent did "
+                    f"not cover a share at {price:,.2f}")
+        if binding == BINDING_LOT_SIZE:
+            return ("sized below one whole round lot, so nothing was bought — a partial lot "
+                    "is unusable to the strategy that asked for the lot size")
+        if binding == BINDING_RISK_ATR:
+            # Only when the sizer actually DIVIDED the budget -- ``qty_by_risk`` is recorded
+            # at that division and nowhere else. Before it, the sizer can refuse for want of
+            # equity, of a budget, or of any stop to measure against, and then neither the
+            # budget nor the stop distance is on this row for the sentence to point at. Its
+            # own words are, so they are what is quoted.
+            if extras.get("qty_by_risk") is None:
+                refusal = extras.get("refusal_reason")
+                return (f"risk-based sizing refused before sizing: {refusal}" if refusal
+                        else "risk-based sizing bought no shares and gave no reason")
+            return ("risk-based sizing bought no shares: the risk budget on this row does "
+                    "not cover one share at the stop distance recorded beside it")
+        if binding is not None:
+            # A binding this sentence has no wording for. Named rather than guessed at --
+            # the column and the sentence still agree, which is the property that matters.
+            return f"sized to zero; the binding constraint was {binding}"
+
+        # NO TRACE: a legacy row. Same comparison it has always carried.
+        if cap is not None and price > float(cap):
+            return (f"one share at {price:,.2f} exceeds the "
+                    f"{float(cap):,.2f} per-instrument cap")
+        return ("sized to zero; the remaining budget did not cover one "
+                f"share at {price:,.2f}")
+
+    def _build_run_decisions(self, *, received, permission_keys, recommended_keys,
+                             funded_by_key, unfunded_keys, prices, cap,
+                             traces=None, weights=None) -> List[Dict[str, Any]]:
+        """One decision row per RECEIVED order -- the SAME builder for both classic paths.
+
+        Keyed by ``id(order)`` throughout (see ``_open_trace``): the DB path's orders have a
+        persisted id and the candidate path's do not, and identity is the one key both have.
+        It separates two pending orders carrying the same symbol just as the order id did,
+        which collapsing by ticker would not.
+
+        Ordered by the RECEIVED list, so the record reads in the order the manager actually
+        worked rather than in the order the outcomes happened to be collected.
+
+        ``recommended_keys`` is ``None`` on a path where an order CANNOT lose its
+        recommendation (the candidate path receives ``(order, rec)`` pairs by construction);
+        passing a set opts into the DB path's missing-recommendation gate. None is not an
+        empty set: an empty set would refuse every order as unranked.
+        """
+        from ba2_common.core.risk_manager_run import (
+            OUTCOME_FUNDED, OUTCOME_NO_RECOMMENDATION, OUTCOME_PERMISSION, OUTCOME_UNFUNDED,
+            decision)
+
+        decisions: List[Dict[str, Any]] = []
+        for order in (received or []):
+            symbol = order.symbol
+            side = getattr(order.side, "value", order.side)
+            key = id(order)
+            extras = self._decision_extras(order, traces, weights)
+            if key in permission_keys:
+                # No extras: it was dropped BEFORE the ranking, so it has no rank, no score
+                # and no binding limit. Inventing any of them would put it in a funding
+                # order it never entered.
+                decisions.append(decision(
+                    symbol, OUTCOME_PERMISSION,
+                    f"{side} entries are disabled for this expert", side=side))
+            elif recommended_keys is not None and key not in recommended_keys:
+                decisions.append(decision(
+                    symbol, OUTCOME_NO_RECOMMENDATION,
+                    "no linked recommendation, so the order could not be ranked "
+                    "against the others", side=side, **extras))
+            elif key in funded_by_key:
+                raw_qty = funded_by_key[key].quantity
+                if raw_qty is None:
+                    # UNMEASURABLE, not zero. The sizing pass put this order in the FUNDED
+                    # list, so it will be submitted; a 0 here would record it as "funded at
+                    # nothing" -- a size the reader could reconcile against the cap and
+                    # believe. The quantity key is omitted entirely and the defect is named
+                    # instead. Not raised: the caller is wrapped, and a raise would lose the
+                    # record for every OTHER symbol in the run.
+                    decisions.append(decision(
+                        symbol, OUTCOME_FUNDED,
+                        "funded, but the order carries no quantity — the size is "
+                        "UNMEASURABLE (not zero); repair the order's quantity",
+                        side=side, **extras))
+                    continue
+                qty = float(raw_qty)
+                price = prices.get(symbol)
+                # The cost is stated because the cap it is measured against is in the run's
+                # context -- a funded row the reader can check, beside the refused ones they
+                # came for.
+                cost = None if price is None else round(qty * float(price), 2)
+                decisions.append(decision(
+                    symbol, OUTCOME_FUNDED,
+                    (f"funded at {qty:g}" if cost is None
+                     else f"funded at {qty:g} (~{cost:,.2f})"),
+                    quantity=qty, side=side, price=price, cost=cost, **extras))
+            elif key in unfunded_keys:
+                price = prices.get(symbol)
+                decisions.append(decision(symbol, OUTCOME_UNFUNDED,
+                                          self._unfunded_reason(price, cap, extras),
+                                          side=side, price=price, **extras))
+            else:
+                # Reached the sizing core and came back neither funded nor deleted --
+                # possible when automated opening is on but the delete pass was skipped.
+                # Recorded as unexplained rather than dropped, so an uninstrumented path is
+                # visible instead of silently absent.
+                decisions.append(decision(
+                    symbol, OUTCOME_UNFUNDED,
+                    "not funded by the sizing pass and not queued for deletion",
+                    side=side, **extras))
+        return decisions
 
     def _record_classic_run(self, *, expert_instance_id, account_id, started_at,
                             pending_orders, dropped_by_permission,
                             orders_with_recommendations, orders_to_update,
                             orders_to_delete, symbol_prices, context,
-                            instrument_weights=None) -> None:
-        """Turn this pass's drop points into one ``RiskManagerRun``.
+                            instrument_weights=None, traces=None) -> None:
+        """Turn this pass's drop points into one ``RiskManagerRun`` (the DB-pending path).
 
-        Keyed by ORDER ID, not by symbol. Two pending orders can carry the same symbol
-        (two recommendations, or a reversal), and collapsing them by ticker would report
-        one outcome for two different decisions -- and silently hide whichever lost.
-        The symbol is carried alongside for display.
+        Every drop point is represented: the permission filter, the missing-recommendation
+        gate, and the sizing core's funded/unfunded split. The rows themselves are built by
+        ``_build_run_decisions``, shared with the live candidate path.
 
-        Ordered by the RECEIVED list, so the record reads in the order the manager
-        actually worked rather than in the order the outcomes happened to be collected.
+        ``traces``: the sizing core's per-order operands (``_size_prioritized_orders``'
+        ``run_record``). Optional -- a record without one still writes every row, just
+        without the ranking and sizing columns.
+
+        ``instrument_weights``: the weight map, for a caller that has no trace. The trace
+        carries the weight the sizing ACTUALLY multiplied by and wins when both are present.
         """
         try:
             # The backtest check comes FIRST, before any decision is built. record_run
@@ -600,127 +1003,33 @@ class TradeRiskManagement:
             if inmem_trades_active():
                 return
 
-            from ba2_common.core.risk_manager_run import (
-                MODE_CLASSIC, OUTCOME_FUNDED, OUTCOME_NO_RECOMMENDATION,
-                OUTCOME_PERMISSION, OUTCOME_UNFUNDED, decision, record_run)
+            from ba2_common.core.risk_manager_run import MODE_CLASSIC, record_run
 
-            permission_ids = {o.id for o in (dropped_by_permission or [])}
-            recommended_ids = {o.id for o, _rec in (orders_with_recommendations or [])}
-
-            # WHAT THE RANKING SAW, per order. The record said which symbols were funded
-            # and why the others were not, and never what the manager DECIDED ON -- so a
-            # symbol refused for being outranked could not be checked against the ones
-            # that outranked it. These are the two numbers that actually allocate:
-            #
-            #   score   compute_order_priority_score(profit%, confidence) -- the sort key
-            #           the funding order is built from. Carried WITH its two inputs, so
-            #           the number can be re-derived rather than trusted.
-            #   weight  the per-instrument weight% from expert settings, which multiplies
-            #           the sized quantity (see the sizing core's "Apply instrument
-            #           weight" step).
-            #
-            # Recorded for REFUSED rows too, and that is the point: the score of a symbol
-            # that lost is the explanation for its refusal.
-            ranking: Dict[int, Dict[str, Any]] = {}
-            for _order, _rec in (orders_with_recommendations or []):
-                profit_pct = getattr(_rec, "expected_profit_percent", None)
-                confidence = getattr(_rec, "confidence", None)
-                ranking[_order.id] = {
-                    "score": round(compute_order_priority_score(profit_pct, confidence), 4),
-                    "confidence": None if confidence is None else float(confidence),
-                    "profit_pct": None if profit_pct is None else float(profit_pct),
-                }
-
-            # PASSED IN, from the caller that already holds the expert. This manager has
-            # no expert of its own -- it is handed one per call -- so reading the setting
-            # here would mean re-fetching the instance purely to annotate a record.
             weights: Dict[str, float] = {}
             for _sym, _cfg in (instrument_weights or {}).items():
                 if isinstance(_cfg, dict) and _cfg.get("weight") is not None:
                     weights[str(_sym).upper()] = float(_cfg["weight"])
 
-            def _alloc(order) -> Dict[str, Any]:
-                """The allocation inputs for one order, omitting what is not known.
+            # WHAT THE RANKING SAW, for every order that reached it -- including the ones the
+            # sizing core never traced, because it never sized them (no price, an error) or
+            # because this caller took no trace at all. The SAME ``_ranking_fields`` the
+            # sizing core uses, so "what the ranking saw" has one definition; the trace wins
+            # where both speak, since it was taken at the decision itself.
+            merged: Dict[int, Dict[str, Any]] = {}
+            for _order, _rec in (orders_with_recommendations or []):
+                merged[id(_order)] = self._ranking_fields(_rec, None, _order.symbol)
+            for _key, _trace in (traces or {}).items():
+                merged[_key] = {**merged.get(_key, {}), **_trace}
 
-                An ABSENT key means "not recorded", which the UI draws as a dash. A 0.0
-                would read as "scored zero", which is a real and different outcome.
-                """
-                out = dict(ranking.get(order.id) or {})
-                weight = weights.get(str(order.symbol).upper())
-                if weight is not None:
-                    out["weight"] = weight
-                return {k: v for k, v in out.items() if v is not None}
-            funded_by_id = {o.id: o for o in (orders_to_update or [])}
-            unfunded_ids = {o.id for o in (orders_to_delete or [])}
-            prices = symbol_prices or {}
-            cap = context.get("max_per_instrument")
-
-            decisions = []
-            for order in (pending_orders or []):
-                symbol = order.symbol
-                side = getattr(order.side, "value", order.side)
-                if order.id in permission_ids:
-                    decisions.append(decision(
-                        symbol, OUTCOME_PERMISSION,
-                        f"{side} entries are disabled for this expert", side=side))
-                elif order.id not in recommended_ids:
-                    decisions.append(decision(
-                        symbol, OUTCOME_NO_RECOMMENDATION,
-                        "no linked recommendation, so the order could not be ranked "
-                        "against the others", side=side, **_alloc(order)))
-                elif order.id in funded_by_id:
-                    funded = funded_by_id[order.id]
-                    raw_qty = funded.quantity
-                    if raw_qty is None:
-                        # UNMEASURABLE, not zero. The sizing pass put this order in the
-                        # FUNDED list, so it will be submitted; a 0 here would record it
-                        # as "funded at nothing" -- a size the reader could reconcile
-                        # against the cap and believe. The quantity key is omitted
-                        # entirely, and the defect is named instead. Not raised: this
-                        # method is wrapped, and a raise would lose the record for every
-                        # OTHER symbol in the run.
-                        decisions.append(decision(
-                            symbol, OUTCOME_FUNDED,
-                            "funded, but the order carries no quantity — the size is "
-                            "UNMEASURABLE (not zero); repair the order's quantity",
-                            side=side, **_alloc(order)))
-                        continue
-                    qty = float(raw_qty)
-                    price = prices.get(symbol)
-                    # The cost is stated because the cap it is measured against is in the
-                    # run's context -- a funded row the reader can check, beside the
-                    # refused ones they came for.
-                    cost = None if price is None else round(qty * float(price), 2)
-                    decisions.append(decision(
-                        symbol, OUTCOME_FUNDED,
-                        (f"funded at {qty:g}" if cost is None
-                         else f"funded at {qty:g} (~{cost:,.2f})"),
-                        quantity=qty, side=side, price=price, cost=cost,
-                        **_alloc(order)))
-                elif order.id in unfunded_ids:
-                    price = prices.get(symbol)
-                    # UNMEASURABLE stays unmeasurable: with no price there is no way to
-                    # say which limit bound this order, and naming one would be a guess.
-                    if price is None:
-                        why = ("sized to zero; no price was available, so the binding "
-                               "limit cannot be identified")
-                    elif cap is not None and float(price) > float(cap):
-                        why = (f"one share at {float(price):,.2f} exceeds the "
-                               f"{float(cap):,.2f} per-instrument cap")
-                    else:
-                        why = ("sized to zero; the remaining budget did not cover one "
-                               f"share at {float(price):,.2f}")
-                    decisions.append(decision(symbol, OUTCOME_UNFUNDED, why,
-                                              side=side, price=price, **_alloc(order)))
-                else:
-                    # Reached the sizing core and came back neither funded nor deleted --
-                    # possible when automated opening is on but the delete pass was
-                    # skipped. Recorded as unexplained rather than dropped, so an
-                    # uninstrumented path is visible instead of silently absent.
-                    decisions.append(decision(
-                        symbol, OUTCOME_UNFUNDED,
-                        "not funded by the sizing pass and not queued for deletion",
-                        side=side, **_alloc(order)))
+            decisions = self._build_run_decisions(
+                received=pending_orders or [],
+                permission_keys={id(o) for o in (dropped_by_permission or [])},
+                recommended_keys={id(o) for o, _rec in (orders_with_recommendations or [])},
+                funded_by_key={id(o): o for o in (orders_to_update or [])},
+                unfunded_keys={id(o) for o in (orders_to_delete or [])},
+                prices=symbol_prices or {},
+                cap=context.get("max_per_instrument"),
+                traces=merged, weights=weights)
 
             record_run(expert_instance_id=expert_instance_id, account_id=account_id,
                        mode=MODE_CLASSIC, decisions=decisions, context=context,
@@ -733,7 +1042,7 @@ class TradeRiskManagement:
     def _record_candidate_run(self, *, expert_instance_id, account_id, started_at,
                               candidates, dropped_by_permission,
                               orders_to_update, orders_to_delete, symbol_prices,
-                              context) -> None:
+                              context, traces=None) -> None:
         """The in-memory-candidate twin of ``_record_classic_run``.
 
         ``size_candidate_orders`` (the LIVE enter path) never persists a qty=0 order — that
@@ -741,80 +1050,39 @@ class TradeRiskManagement:
         decisions by. Candidates are correlated by python IDENTITY (``id(order)``) instead,
         the same technique the permission filter a few lines up in ``size_candidate_orders``
         already uses; object identity survives ``_size_prioritized_orders`` because it mutates
-        the SAME order objects in place rather than returning new ones.
+        the SAME order objects in place rather than returning new ones. The shared builder
+        keys BOTH paths that way, so the two records cannot drift apart.
 
-        No ``OUTCOME_NO_RECOMMENDATION`` case here, unlike the DB path: every candidate this
-        method receives already carries its ``ExpertRecommendation`` by construction (a
-        ``(order, rec)`` pair) — the DB path's pending orders can lose that link, candidates
-        never had one to lose.
+        No ``OUTCOME_NO_RECOMMENDATION`` case here, unlike the DB path (hence
+        ``recommended_keys=None``): every candidate this method receives already carries its
+        ``ExpertRecommendation`` by construction (a ``(order, rec)`` pair) — the DB path's
+        pending orders can lose that link, candidates never had one to lose.
 
         Found 2026-09-02: this recording was wired ONLY into ``review_and_prioritize_pending_
         orders`` (the DB-pending-order path), which dev's live orders do not actually go
         through (they arrive already-sized via this method), leaving ``risk_manager_run``
         permanently empty despite the classic manager genuinely running every day.
+
+        Found 2026-09-11: and when it was wired in, it built its rows by hand instead of
+        through the DB path's builder — so the score/weight columns 5edf15de added showed a
+        dash on every row of every run production has ever recorded.
         """
         try:
             from ba2_common.core.trade_store import inmem_trades_active
             if inmem_trades_active():
                 return
 
-            from ba2_common.core.risk_manager_run import (
-                MODE_CLASSIC, OUTCOME_FUNDED, OUTCOME_PERMISSION, OUTCOME_UNFUNDED,
-                decision, record_run)
+            from ba2_common.core.risk_manager_run import MODE_CLASSIC, record_run
 
-            permission_ids = {id(o) for o in (dropped_by_permission or [])}
-            funded_by_id = {id(o): o for o in (orders_to_update or [])}
-            unfunded_ids = {id(o) for o in (orders_to_delete or [])}
-            prices = symbol_prices or {}
-            cap = context.get("max_per_instrument")
-
-            decisions = []
-            for order, _rec in (candidates or []):
-                symbol = order.symbol
-                side = getattr(order.side, "value", order.side)
-                oid = id(order)
-                if oid in permission_ids:
-                    decisions.append(decision(
-                        symbol, OUTCOME_PERMISSION,
-                        f"{side} entries are disabled for this expert", side=side))
-                elif oid in funded_by_id:
-                    funded = funded_by_id[oid]
-                    raw_qty = funded.quantity
-                    if raw_qty is None:
-                        # UNMEASURABLE, not zero -- see the identical branch in
-                        # _record_classic_run for why.
-                        decisions.append(decision(
-                            symbol, OUTCOME_FUNDED,
-                            "funded, but the order carries no quantity — the size is "
-                            "UNMEASURABLE (not zero); repair the order's quantity",
-                            side=side))
-                        continue
-                    qty = float(raw_qty)
-                    price = prices.get(symbol)
-                    cost = None if price is None else round(qty * float(price), 2)
-                    decisions.append(decision(
-                        symbol, OUTCOME_FUNDED,
-                        (f"funded at {qty:g}" if cost is None
-                         else f"funded at {qty:g} (~{cost:,.2f})"),
-                        quantity=qty, side=side, price=price, cost=cost))
-                elif oid in unfunded_ids:
-                    price = prices.get(symbol)
-                    if price is None:
-                        why = ("sized to zero; no price was available, so the binding "
-                               "limit cannot be identified")
-                    elif cap is not None and float(price) > float(cap):
-                        why = (f"one share at {float(price):,.2f} exceeds the "
-                               f"{float(cap):,.2f} per-instrument cap")
-                    else:
-                        why = ("sized to zero; the remaining budget did not cover one "
-                               f"share at {float(price):,.2f}")
-                    decisions.append(decision(symbol, OUTCOME_UNFUNDED, why,
-                                              side=side, price=price))
-                else:
-                    decisions.append(decision(
-                        symbol, OUTCOME_UNFUNDED,
-                        "not funded by the sizing pass and not queued for deletion",
-                        side=side))
+            decisions = self._build_run_decisions(
+                received=[o for o, _rec in (candidates or [])],
+                permission_keys={id(o) for o in (dropped_by_permission or [])},
+                recommended_keys=None,
+                funded_by_key={id(o): o for o in (orders_to_update or [])},
+                unfunded_keys={id(o) for o in (orders_to_delete or [])},
+                prices=symbol_prices or {},
+                cap=context.get("max_per_instrument"),
+                traces=traces)
 
             record_run(expert_instance_id=expert_instance_id, account_id=account_id,
                        mode=MODE_CLASSIC, decisions=decisions, context=context,
@@ -959,10 +1227,12 @@ class TradeRiskManagement:
         max_equity_per_instrument: float,
         existing_allocations: Dict[str, float],
         account: AccountInterface,
-        expert: 'MarketExpertInterface'
+        expert: 'MarketExpertInterface',
+        traces: Optional[Dict[int, Dict[str, Any]]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> List[TradingOrder]:
         """Calculate appropriate quantities for each order.
-        
+
         Args:
             prioritized_orders: List of (order, recommendation) tuples sorted by profit
             total_virtual_balance: Total available balance for trading
@@ -970,12 +1240,26 @@ class TradeRiskManagement:
             existing_allocations: Dict of symbol -> allocated amount
             account: Account instance for fetching current prices
             expert: Expert instance for accessing instrument weight configurations
+            traces: OUT map ``id(order) -> operands`` for the run record. Filled from the
+                values this method already computes -- the rank it funded in, the two share
+                ceilings, the balance before and after, and the BRANCH that set the final
+                quantity (``binding``). Observation only: nothing read back, nothing that can
+                change a quantity, and every write guarded (see ``_open_trace``).
+            context: OUT dict for the run record's per-run figures, extended here with the
+                knobs only this method reads (sizing mode, diversification, regime scale,
+                commission). ``None`` for both is exactly today's behaviour.
         """
         updated_orders = []
         remaining_balance = total_virtual_balance
         early_skipped_count = 0  # Track orders skipped early due to unaffordability
         instrument_allocations = existing_allocations.copy()
-        
+        # A caller that wants no record still writes into a throwaway, so the loop below has
+        # one shape instead of a `if traces is not None` beside every operand it captures.
+        if traces is None:
+            traces = {}
+        if context is None:
+            context = {}
+
         # Get instrument weight configurations from expert settings
         instrument_configs = expert._get_enabled_instruments_config()
         self.logger.debug(f"Retrieved instrument weight configurations: {len(instrument_configs)} instruments")
@@ -1009,7 +1293,18 @@ class TradeRiskManagement:
                 f"Regime overlay: stressed market -> regime_risk_scale={risk_scale:g}, "
                 f"max per instrument ${max_equity_per_instrument:.2f} -> ${scaled_cap:.2f}")
             max_equity_per_instrument = scaled_cap
-        
+
+        # The knobs only THIS method reads, into the run record. The regime scale is recorded
+        # ALWAYS -- 1.0 is the answer "the market was not stressed", and leaving it out would
+        # make an unstressed run indistinguishable from a run of the code that had no overlay.
+        # The scaled cap is recorded only when it differs, since otherwise it is the cap
+        # already in the context and a second identical number invites a hunt for the change.
+        context["sizing_mode"] = sizing_mode
+        context["diversification_factor"] = diversification_factor
+        context["regime_risk_scale"] = risk_scale
+        if risk_scale != 1.0:
+            context["max_per_instrument_scaled"] = max_equity_per_instrument
+
         # Group orders by symbol for diversity calculation
         orders_by_symbol = {}
         for order, recommendation in prioritized_orders:
@@ -1027,20 +1322,34 @@ class TradeRiskManagement:
         symbol_prices = account.get_instrument_current_price(all_symbols)
         self.logger.info(f"Bulk fetched {len(symbol_prices)} prices in single API call")
         
-        for order, recommendation in prioritized_orders:
+        # ``rank`` is the 1-based position in the FUNDING order -- the list is already sorted by
+        # the priority score, so rank 1 is served first and the budget runs out somewhere down
+        # this loop. It is the single most useful thing the record can carry: a refused symbol's
+        # rank, next to the ranks that got the money, IS the explanation for its refusal.
+        for rank, (order, recommendation) in enumerate(prioritized_orders, 1):
+            trace = None    # bound BEFORE the try, so the handler can always reach it
             try:
                 symbol = order.symbol
                 current_allocation = instrument_allocations.get(symbol, 0.0)
                 available_for_instrument = max_equity_per_instrument - current_allocation
-                
+                trace = self._open_trace(
+                    traces, order, rank=rank,
+                    existing_allocation=current_allocation,
+                    cap_available=available_for_instrument,
+                    balance_before=remaining_balance,
+                    **self._ranking_fields(recommendation, instrument_configs, symbol))
+
                 # Get current market price from bulk-fetched prices
                 current_price = symbol_prices.get(symbol) if symbol_prices else None
                 if current_price is None:
                     self.logger.error(f"Could not get current price for {symbol}, skipping order {order.id}")
                     order.quantity = 0
+                    self._trace_note(trace, binding=BINDING_NO_PRICE, quantity=0,
+                                     balance_after=remaining_balance)
                     updated_orders.append(order)
                     continue
-                
+                self._trace_note(trace, price=current_price)
+
                 # Log calculation inputs
                 self.logger.info(f"Order {order.id} ({symbol}) - Calculating quantity:")
                 self.logger.info(f"  Inputs: price=${current_price:.2f}, remaining_balance=${remaining_balance:.2f}, "
@@ -1058,17 +1367,21 @@ class TradeRiskManagement:
                                       f"${available_for_instrument:.2f} (can't afford 1 share within limit) - marking for deletion")
                     order.quantity = 0
                     early_skipped_count += 1
+                    self._trace_note(trace, binding=BINDING_EARLY_SKIP_CAP, quantity=0,
+                                     balance_after=remaining_balance)
                     updated_orders.append(order)
                     continue
-                
+
                 if remaining_balance < current_price:
                     self.logger.warning(f"  ⚡ EARLY SKIP: {symbol} price ${current_price:.2f} exceeds remaining balance "
                                       f"${remaining_balance:.2f} (can't afford 1 share) - marking for deletion")
                     order.quantity = 0
                     early_skipped_count += 1
+                    self._trace_note(trace, binding=BINDING_EARLY_SKIP_BALANCE, quantity=0,
+                                     balance_after=remaining_balance)
                     updated_orders.append(order)
                     continue
-                
+
                 # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
                 # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
                 sized_by_risk = False
@@ -1080,6 +1393,8 @@ class TradeRiskManagement:
                         max_position_value=available_for_instrument,
                         available_balance=remaining_balance,
                         account=account,
+                        trace=trace,
+                        context=context,
                     )
                 else:
                     # notional mode still sizes purely by equity/balance below (unaffected), but
@@ -1102,22 +1417,39 @@ class TradeRiskManagement:
                     _commission = self._commission_per_trade(account)
                     max_quantity_by_balance = (max(0, (remaining_balance - _commission) / current_price)
                                                if current_price > 0 else 0)
-                
+
                     self.logger.info(f"  Calculated: max_qty_by_instrument={max_quantity_by_instrument:.2f} shares, "
                                    f"max_qty_by_balance={max_quantity_by_balance:.2f} shares")
-                
+                    self._trace_note(trace,
+                                     max_qty_by_instrument=max_quantity_by_instrument,
+                                     max_qty_by_balance=max_quantity_by_balance)
+                    # The commission the balance ceiling reserved -- an ACCOUNT setting, read
+                    # here, so the record carries the figure the sizing actually used rather
+                    # than a re-read of a settings row that may have changed since.
+                    context["commission_per_trade"] = _commission
+
                     # Standard allocation logic — respect the user's per-instrument limit.
                     # No special-case bypass: a symbol whose 1-share price exceeds the cap is
                     # simply not bought (early-skipped above), never forced through at qty=1.
                     if available_for_instrument <= 0:
                         quantity = 0
+                        self._trace_note(trace, binding=BINDING_INSTRUMENT_CAP)
                         self.logger.info(f"  Result: quantity=0 (no available equity for {symbol}, limit exceeded)")
                     elif remaining_balance <= current_price:
                         quantity = 0
+                        self._trace_note(trace, binding=BINDING_BALANCE)
                         self.logger.info(f"  Result: quantity=0 (insufficient remaining balance: ${remaining_balance:.2f} < ${current_price:.2f})")
                     else:
                         # Use the minimum of the two constraints
                         max_quantity = min(max_quantity_by_instrument, max_quantity_by_balance)
+                        # WHICH of the two the min took, recorded AT the min. Reading it back
+                        # off the two numbers afterwards is a coin toss whenever they are
+                        # equal -- which is the normal case for a fully deployed expert.
+                        self._trace_note(
+                            trace,
+                            binding=(BINDING_INSTRUMENT_CAP
+                                     if max_quantity_by_instrument <= max_quantity_by_balance
+                                     else BINDING_BALANCE))
                         self.logger.info(f"  Using min of constraints: max_quantity={max_quantity:.2f} shares")
 
                         # For diversification, prefer smaller positions when multiple instruments available
@@ -1129,6 +1461,7 @@ class TradeRiskManagement:
                             # default 1.0 = off, so this only runs when explicitly lowered)
                             original_max = max_quantity
                             max_quantity *= diversification_factor
+                            self._trace_note(trace, binding=BINDING_DIVERSIFICATION)
                             self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
                                           f"applied factor {diversification_factor}: {original_max:.2f} -> {max_quantity:.2f} shares")
 
@@ -1139,6 +1472,7 @@ class TradeRiskManagement:
                         # Ensure we don't allocate less than 1 share unless we can't afford it
                         if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
                             quantity = 1
+                            self._trace_note(trace, binding=BINDING_MIN_ONE_SHARE)
                             self.logger.info(f"  Minimum allocation enforced: setting quantity to 1 share "
                                           f"(had funds: max_by_balance={max_quantity_by_balance:.2f}, "
                                           f"max_by_instrument={max_quantity_by_instrument:.2f})")
@@ -1148,18 +1482,27 @@ class TradeRiskManagement:
                         instrument_weight = instrument_configs[symbol].get('weight', 100.0)
                         if instrument_weight != 100.0:  # Only apply if weight is non-default
                             original_quantity = quantity
+                            # The limit that stood BEFORE the weight touched the size, so the
+                            # revert below can put it back. A reverted weight bound nothing.
+                            # ``is not None``, not truthiness: an empty dict is a LIVE trace
+                            # (the operands simply have not been written into it yet), and
+                            # reading it as "no trace" would drop the restore below.
+                            binding_before_weight = (
+                                trace.get("binding") if trace is not None else None)
                             weighted_quantity = quantity * (instrument_weight / 100.0)
                             self.logger.info(f"  Instrument weight {instrument_weight}%: "
                                            f"{original_quantity} shares * {instrument_weight/100:.2f} = {weighted_quantity:.2f} shares")
                         
                             # Second rounding: weighted quantity to int
                             quantity = max(0, int(weighted_quantity))
+                            self._trace_note(trace, binding=BINDING_WEIGHT)
                             self.logger.info(f"  Second rounding: {weighted_quantity:.2f} -> {quantity} shares (int conversion)")
-                        
+
                             # CRITICAL: Ensure minimum quantity of 1 if we have funds for at least 1 share
                             # This covers the case where weighting reduces quantity below 1 after rounding
                             if quantity == 0 and max_quantity_by_balance >= 1:
                                 quantity = 1
+                                self._trace_note(trace, binding=BINDING_MIN_ONE_SHARE)
                                 self.logger.info(f"  Minimum allocation enforced after weighting: setting quantity to 1 share "
                                               f"(weighted calc gave 0 but max_by_balance={max_quantity_by_balance:.2f})")
                         
@@ -1168,6 +1511,10 @@ class TradeRiskManagement:
                             if weighted_cost > remaining_balance or weighted_cost > available_for_instrument:
                                 # Revert to original quantity if weighted amount exceeds limits
                                 quantity = original_quantity
+                                # OVERWRITE, not note: _trace_note drops None, and here None
+                                # is the answer -- "nothing had bound it yet" -- which must
+                                # replace the weight rather than be discarded.
+                                self._trace_overwrite(trace, binding=binding_before_weight)
                                 self.logger.info(f"  Weight {instrument_weight}% would exceed limits "
                                               f"(cost ${weighted_cost:.2f} > remaining ${remaining_balance:.2f} or available ${available_for_instrument:.2f}), "
                                               f"keeping original quantity {quantity}")
@@ -1185,6 +1532,7 @@ class TradeRiskManagement:
                         f"(lot_size={(order.data or {}).get('lot_size')})"
                     )
                     quantity = lot_size
+                    self._trace_note(trace, binding=BINDING_LOT_SIZE)
 
                 # Update order with calculated quantity
                 order.quantity = quantity
@@ -1193,20 +1541,29 @@ class TradeRiskManagement:
                     total_cost = quantity * current_price
                     remaining_balance -= total_cost
                     instrument_allocations[symbol] = current_allocation + total_cost
-                    
+
                     self.logger.info(f"  ✓ FINAL: Allocated {quantity} shares of {symbol} at ${current_price:.2f} "
                                    f"(cost: ${total_cost:.2f}, ROI: {recommendation.expected_profit_percent:.2f}%)")
                     self.logger.info(f"  Updated balances: remaining=${remaining_balance:.2f}, "
                                    f"{symbol}_allocation=${instrument_allocations[symbol]:.2f}")
+                    self._trace_note(trace, quantity=quantity, cost=total_cost,
+                                     balance_after=remaining_balance)
                 else:
                     self.logger.warning(f"  ✗ FINAL: Set quantity to 0 for {symbol} - insufficient funds or limits reached")
-                
+                    # No cost: nothing was allocated, and 0.00 in the money column reads as a
+                    # position that was sized and happened to be free.
+                    self._trace_note(trace, quantity=0, balance_after=remaining_balance)
+
                 updated_orders.append(order)
-                
+
             except Exception as e:
                 absorb_if_benign(e)
                 self.logger.error(f"Error calculating quantity for order {order.id}: {e}", exc_info=True)
                 order.quantity = 0
+                # The trace stops where the sizing stopped. No binding is named: nothing
+                # DECIDED this size, the pass failed -- which the decision's own ERROR-shaped
+                # reason has to say, not a limit invented here.
+                self._trace_note(trace, quantity=0)
                 updated_orders.append(order)
         
         total_allocated = total_virtual_balance - remaining_balance
@@ -1337,13 +1694,23 @@ class TradeRiskManagement:
 
     def _risk_atr_quantity(self, order, symbol: str, current_price: float, expert,
                            max_position_value: float, available_balance: float,
-                           account=None) -> int:
+                           account=None, trace=None, context=None) -> int:
         """Risk-based share count for one order (risk_atr sizing mode).
 
         Stop distance comes from the order's explicit SL price when present, else
         atr_multiplier * ATR. Result is clamped by the per-instrument cap and the
         remaining balance (passed in), and respects any lot_size on the order.
         Returns 0 (order will be deleted as unfunded) when it can't be sized.
+
+        ``trace``: the run record's per-order trace. The risk operands are recorded from what
+        the sizer already returns -- the budget, the dollar risk, the stop it keyed off and
+        the share count that budget alone bought -- so a risk_atr size can be checked without
+        re-running the formula (and without a SECOND formula here that could disagree with it).
+
+        ``context``: the run record's per-run figures. Only the commission is written here,
+        and only because this mode's cash clamp is the one that reads it -- in ``notional``
+        mode the same figure is recorded by the caller. Without this, a risk_atr run's record
+        would show no commission at all, which reads as "none was charged".
         """
         from ba2_common.core.position_sizing import (compute_risk_based_quantity,
                                                      resolve_sizing_risk_budget_pct)
@@ -1376,14 +1743,49 @@ class TradeRiskManagement:
         self._ensure_safeguard_stop(order, symbol, current_price, expert)
 
         lot = (order.data or {}).get('lot_size') if order.data else None
+        # Hoisted to a local ONLY so the run record can report the same figure the cash clamp
+        # reserved -- the same single call, in the same place in the sequence, as before.
+        commission = self._commission_per_trade(account)
+        if context is not None:
+            context["commission_per_trade"] = commission
         result = compute_risk_based_quantity(
             equity=equity, current_price=current_price, risk_per_trade_pct=risk_pct,
             stop_price=order.stop_price, atr=None, atr_multiplier=atr_mult,
             min_stop_pct=min_stop_pct,
             max_position_value=max_position_value, available_balance=available_balance,
-            commission_per_trade=self._commission_per_trade(account),
+            commission_per_trade=commission,
             lot_size=int(lot) if lot else None,
         )
+        # The operands, straight off the result -- ``stop_distance_pct`` is the same
+        # risk-per-share the sizer used, expressed against the price so a 7% stop is legible
+        # as one; it is a rendering of that number, not a second measurement of the stop.
+        #
+        # AND WHICH LIMIT ACTUALLY BOUND IT. risk_atr sizes off the risk budget and THEN
+        # clamps to the per-instrument ceiling and to cash, so the mode is the answer only
+        # while nothing clamped: an order the cap cut from 200 shares to 10 was bound by the
+        # cap, and recording "risk_atr" there sends the reader to check a budget that was not
+        # the limit. ``capped_by`` is the sizer's own report of which clamp trimmed it, taken
+        # from the branch that ran; ``None`` (no clamp) is dropped by _trace_note and leaves
+        # the mode standing.
+        risk_per_share = result["risk_per_share"]
+        self._trace_note(trace, binding=BINDING_RISK_ATR)
+        self._trace_note(trace, binding=self._clamp_binding(result["capped_by"]))
+        self._trace_note(
+            trace,
+            risk_budget_pct=risk_pct,
+            risk_dollars=result["risk_dollars"],
+            stop_price=order.stop_price,
+            stop_distance_pct=(None if not risk_per_share or current_price <= 0
+                               else risk_per_share / current_price * 100.0),
+            qty_by_risk=result["qty_by_risk"] if "qty_by_risk" in result else None,
+            # THE SIZER'S OWN WORDS, kept instead of only logged. It can refuse BEFORE it
+            # ever divides the budget -- no equity, a budget that resolved to zero, no stop
+            # and nothing to imply one -- and in those cases the row has no budget and no
+            # stop distance to explain itself with. Empty string when it did size, so
+            # _trace_note's "absent means not recorded" still reads correctly.
+            refusal_reason=result["reason"] or None,
+        )
+
         qty = int(result["quantity"])
         if qty <= 0:
             self.logger.warning(f"  risk_atr sizing -> 0 for {symbol}: {result['reason']}")

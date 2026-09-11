@@ -84,8 +84,10 @@ def compute_risk_based_quantity(
         lot_size: round-lot constraint (e.g. 100); quantity is floored to a multiple.
 
     Returns:
-        dict with: quantity (int), risk_per_share, risk_dollars, reason (str when
-        quantity is 0 explaining why), capped_by (None | 'notional' | 'balance').
+        dict with: quantity (int), risk_per_share, risk_dollars, qty_by_risk (the
+        pre-clamp count the risk budget alone bought, absent when sizing refused
+        before reaching it), reason (str when quantity is 0 explaining why),
+        capped_by (None | 'notional' | 'balance').
     """
     out = {"quantity": 0, "risk_per_share": None, "risk_dollars": None,
            "reason": "", "capped_by": None}
@@ -134,6 +136,11 @@ def compute_risk_based_quantity(
     out["risk_per_share"] = risk_per_share
 
     qty = int(risk_dollars // risk_per_share)
+    # The share count the RISK BUDGET alone buys, before the notional/cash/lot clamps below.
+    # Reported, not recomputed by the caller: the run record needs to show whether the budget
+    # or a clamp produced the final size, and a caller re-deriving this from risk_dollars and
+    # risk_per_share would be a second copy of the formula, free to drift from this one.
+    out["qty_by_risk"] = qty
     if qty < 1:
         out["reason"] = (f"risk budget ${risk_dollars:.2f} too small for risk/share "
                          f"${risk_per_share:.2f} (need a wider risk % or tighter stop)")
