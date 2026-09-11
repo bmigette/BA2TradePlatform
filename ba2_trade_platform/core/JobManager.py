@@ -358,6 +358,9 @@ class JobManager:
                 # order / transaction reconciliation stopped for 4 days while the
                 # process kept trading (2026-07-23 incident).
                 self._schedule_account_refresh_job()
+                # Same trap, second occupant: the post-close warm and its daily
+                # close re-resolve are non-expert jobs too.
+                self._schedule_warm_jobs()
 
         logger.info("Expert schedules refreshed successfully")
     
@@ -603,6 +606,31 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling expert jobs: {e}", exc_info=True)
     
+    def _schedule_warm_jobs(self):
+        """Re-establish the background warm's scheduled jobs, if the warm is running.
+
+        ``remove_all_jobs()`` deletes every non-expert job, and this is the other pair
+        that has to come back with ``_schedule_account_refresh_job`` (see the 2026-07-23
+        note there): the post-close warm and the daily job that re-reads the exchange
+        close. Without this the first ``/api/reload`` dropped both until the process
+        restarted -- weeks, for this application -- while the warm queue stayed up and
+        kept accepting batch work, so nothing said the tails had stopped being extended.
+
+        Guarded on the QUEUE, not on the setting: if the warm did not start (off, or it
+        failed to initialize) there is nothing for these jobs to drive, and scheduling
+        them would have a refresh bring a warm to life that startup deliberately did
+        not. ``schedule_settlement_job`` re-adds the re-resolve job itself.
+        """
+        try:
+            from .warm_service import get_warm_queue, schedule_settlement_job
+
+            if get_warm_queue() is None:
+                return
+            schedule_settlement_job(self)
+        except Exception as e:
+            logger.error(f"Could not re-establish the warm jobs after a full schedule "
+                         f"refresh: {e}", exc_info=True)
+
     def _schedule_account_refresh_job(self):
         """Schedule the account refresh job based on the app setting."""
         try:

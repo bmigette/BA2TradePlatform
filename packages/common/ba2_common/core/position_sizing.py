@@ -21,11 +21,12 @@ function has no DB/IO so it is unit-testable; ``get_latest_atr`` is the thin
 data-fetch wrapper.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.replay import replay_now
 
 
 def resolve_sizing_risk_budget_pct(get_setting: Callable[[str], Any]) -> float:
@@ -330,11 +331,18 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
     if indicator_provider is None:
         logger.warning(f"get_latest_atr: no indicator_provider injected for {symbol}")
         return None
+    # replay_now(end_date) reads that wall clock THROUGH the evaluation-clock seam:
+    # ``end_date`` is part of the indicator request's identity, and an identity key
+    # holding an un-replayed datetime.now() can never be matched again, so the
+    # recorded ATR read would be unreproducible by construction (see
+    # ba2_common.core.replay.observe). A caller that PASSES end_date -- every
+    # backtest does -- gets it back unchanged: as-of semantics are untouched.
+    end_date = replay_now(end_date)
     try:
         # Pull a window comfortably longer than the ATR period for a stable value.
         lookback = max(period * 4, 60)
         result = indicator_provider.get_indicator(
-            symbol, "atr", end_date=end_date or datetime.now(timezone.utc),
+            symbol, "atr", end_date=end_date,
             lookback_days=lookback, interval=interval, format_type="dict", period=period,
         )
         # The indicator dict format exposes a flat float list under "values".

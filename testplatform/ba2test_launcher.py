@@ -267,7 +267,7 @@ def _cmd_prewarm(args) -> int:
         frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel,
     )
     from app.services.prewarm_fetchers import (
-        PrewarmConfigError, PrewarmFetchers, resolve_keys, run_prewarm,
+        PrewarmConfigError, PrewarmFetchers, prewarm_fred, resolve_keys, run_prewarm,
     )
 
     # ONE key resolver, shared with the API handler (env first, then the app-settings DB).
@@ -433,6 +433,18 @@ def _cmd_prewarm(args) -> int:
     # error handling and the one-shot senate warm all live in run_prewarm, shared with the API
     # handler — the handler had a subtly different (broken) copy of exactly that block until
     # 2026-09-11. This command contributes argument parsing and the printout below, nothing else.
+    # DeterministicScorer's macro series are economy-wide, so they are refreshed ONCE here
+    # rather than entering the per-symbol work list. Through the shared module, not a local
+    # copy: this command warmed no macro series at all while the only implementation lived
+    # inside the API handler, so `ba2-test prewarm --experts DeterministicScorer` produced a
+    # cache a hermetic DS trial still aborted on (fred_series.get_series_as_of RAISES on a
+    # missing file).
+    fred_summary = None
+    if "DeterministicScorer" in experts:
+        fred_summary = prewarm_fred(args.fred_max_age_hours,
+                                    log=lambda msg: print(msg, flush=True))
+        print(f">> FRED macro series: {fred_summary}", flush=True)
+
     try:
         summary = run_prewarm(fetchers, experts, symbols, args.workers, end=end_date)
     except PrewarmConfigError as e:
@@ -456,12 +468,16 @@ def _cmd_prewarm(args) -> int:
                   "for the full backtest date range (otherwise they're computed lazily per-trial, "
                   "which under-covers a multi-year grid — see _do_senate_scores docstring).")
 
+    summary["fred"] = fred_summary
+
     print("\n>> pre-warm summary")
     for expert in experts:
         print(f"   {expert}: {summary['cached'].get(expert, 0)}/{len(symbols)} symbols cached")
     print(f"   errors: {summary['errors']}")
     print(f"   elapsed: {summary['elapsed_seconds']:.1f}s")
     print(f"   cache dir: {_fmp_history_cache_dir()}")
+    if fred_summary is not None:
+        print(f"   fred: {fred_summary}")
     for note in summary["notes"]:
         print(f"   note: {note}")
     # FactorRanker's momentum/value factors read the 1d OHLCV PARQUET cache (separate from the
@@ -651,20 +667,40 @@ def _cmd_cache_clear(args) -> int:
     return 0
 
 
+#: How much history ``replay warm-plan`` asks for beyond an adapter's own lookback.
+#: Mirrors the live host's ``warm_service.WARM_WINDOW_DAYS`` so a CLI plan and a host
+#: plan over the same session agree on what is required.
+_WARM_PLAN_WINDOW_DAYS = 730
+#: Marks the child process ``replay warm`` re-executes with CACHE_FOLDER set.
+_WARM_CHILD_ENV = "BA2_WARM_CHILD"
+#: Longest a CLI warm waits for its queue to drain before reporting and stopping.
+_WARM_JOIN_TIMEOUT_S = 3600.0
+
+
 # --- replay (offline replay of a recorded live session) --------------------------------
 def _cmd_replay(args) -> int:
-    """``inventory`` / ``experts`` / ``gather`` over one exported replay bundle.
+    """``inventory`` / ``experts`` / ``gather`` / ``historical`` over one bundle.
 
     Everything runs offline: the services enter the replay isolation (hermetic
     FMP, a closed socket layer, refusing instance/provider resolvers) and read
     only the bundle. Nothing here opens the trading database.
+
+    ``historical`` additionally reads a PINNED cache root, and does so in a child
+    process with ``CACHE_FOLDER`` set before import -- the only way every cache
+    reader points at the same root (see ``app.services.replay.historical``).
     """
+    if args.replay_cmd == "warm":
+        return _cmd_replay_warm(args)
+
     from app.services.replay import expert_replay, gather_tape, inventory
 
     bundle = _caller_path(args.bundle)
     if not os.path.isdir(bundle):
         sys.exit(f"ba2-test: {bundle} is not a directory")
     out = _caller_path(args.out) if getattr(args, "out", None) else None
+
+    if args.replay_cmd == "warm-plan":
+        return _cmd_replay_warm_plan(args, bundle, out)
 
     if args.replay_cmd == "inventory":
         counted = inventory.run(bundle, out)
@@ -675,17 +711,176 @@ def _cmd_replay(args) -> int:
 
     from ba2_common.core.replay import ReplayStatus
 
-    module = expert_replay if args.replay_cmd == "experts" else gather_tape
-    report = module.run(bundle, out)
+    if args.replay_cmd == "historical":
+        from app.services.replay import historical
+
+        cache_root = _caller_path(args.cache_root)
+        if not os.path.isdir(cache_root):
+            sys.exit(f"ba2-test: {cache_root} is not a directory")
+        report = historical.run(bundle, cache_root, out, timeout=args.timeout)
+    else:
+        module = expert_replay if args.replay_cmd == "experts" else gather_tape
+        report = module.run(bundle, out)
     print(report.to_markdown())
     if out:
         print(f"-- wrote {os.path.join(out, report.capability + '.md')}")
     # A DIFFERENCE is a finding: something reproduced differently, which is what
     # this command exists to surface, so it exits non-zero and a CI step can gate
-    # on it. A missing_capture is not a finding about the calculation -- it says
-    # the session cannot answer for that analysis -- so it does not fail the run;
-    # the report and `replay inventory` are where coverage is read.
+    # on it. A missing_capture / missing_history / revision_unknown is not a
+    # finding about the calculation -- it says the session or the cache root
+    # cannot answer for that analysis -- so it does not fail the run; the report
+    # and `replay inventory` are where coverage is read.
+    #
+    # For `historical` a non-zero exit means "read the diffs", NOT "this is a
+    # defect": spec section 8 is explicit that a historical comparison "does not
+    # assume zero difference is always attainable", and an endpoint/vintage
+    # difference is expected evidence. Gate a CI step on it only where the pinned
+    # root is meant to reproduce the session exactly.
     return 0 if report.counts()[ReplayStatus.COVERAGE_DIFFERENCE] == 0 else 1
+
+
+def _cmd_replay_warm_plan(args, bundle: str, out) -> int:
+    """What the analyses in a bundle need that ``--cache-root`` does not already hold.
+
+    NO NETWORK, by construction: the resolver maps settings to typed requirements and
+    the planner only stats and reads files. This is lifecycle step 1 ("plan without
+    network") and the thing an operator reviews before any bandwidth is spent.
+
+    The roots are inspected READ-ONLY, so pointing this at the production cache is
+    safe; ``replay warm`` is the only command that writes, and only into the plan's
+    first root.
+    """
+    from datetime import timezone as _tz
+
+    from ba2_common.core.replay import load_bundle
+    from ba2_common.core.replay.dependencies import (
+        MissingDependencySetting, Window, required_replay_inputs,
+    )
+    import ba2_experts.replay_dependencies  # noqa: F401 - registers the per-expert adapters
+    from ba2_providers.warm import planner
+
+    roots = [_caller_path(r) for r in args.cache_root]
+    if args.as_of_now:
+        as_of_now = datetime.fromisoformat(args.as_of_now)
+        if as_of_now.tzinfo is None:
+            as_of_now = as_of_now.replace(tzinfo=_tz.utc)
+    else:
+        as_of_now = datetime.now(_tz.utc)
+
+    session = load_bundle(bundle)
+    window = Window(start=as_of_now - timedelta(days=_WARM_PLAN_WINDOW_DAYS), end=as_of_now)
+    groups = {}
+    for record in session.analyses:
+        if record.settings_object is None:
+            print(f"!! {record.analysis_id} ({record.expert_class}) recorded no settings; "
+                  f"its dependencies cannot be resolved")
+            continue
+        key = (record.expert_class, record.settings_object)
+        group = groups.setdefault(
+            key, {"settings": session.decode(record.settings_object), "symbols": set()})
+        if record.symbol:
+            group["symbols"].add(record.symbol)
+
+    requirements = []
+    for (expert_class, _hash), group in sorted(groups.items()):
+        try:
+            # The RULES are not in the bundle (they are not an expert input), so a CLI plan
+            # covers the expert's own declarations only. The rule/RM extras (ATR, earnings,
+            # cooldown) come from the live host, which can read the instance's ruleset.
+            requirements.extend(required_replay_inputs(
+                expert_class, group["settings"], None, sorted(group["symbols"]), window))
+        except MissingDependencySetting as e:
+            print(f"!! cannot resolve {expert_class}: {e}")
+
+    plan = planner.plan(requirements, roots, as_of_now=as_of_now)
+    print(plan.to_markdown())
+    if out:
+        os.makedirs(out, exist_ok=True)
+        path = os.path.join(out, "warm_plan.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(plan.to_json())
+        print(f"-- wrote {path}")
+    else:
+        print(plan.to_json())
+    return 0
+
+
+def _cmd_replay_warm(args) -> int:
+    """Execute a warm plan: download only what it lists as missing or stale.
+
+    THE CACHE ROOT IS SET BEFORE IMPORT, IN A CHILD PROCESS. ``ba2_common.config``,
+    ``native_cache`` and ``fred_series`` all read ``CACHE_FOLDER`` at IMPORT time, so a
+    warm into an isolated root cannot be arranged by assigning to a module attribute
+    afterwards -- half the writers would still target the ambient cache. The child is
+    this same launcher with ``CACHE_FOLDER`` in its environment (the pattern
+    ``ba2_common.core.replay._spawn_child`` documents), and it verifies on entry that
+    the root it imported with is the one the plan names.
+    """
+    import subprocess
+
+    from ba2_providers.warm import planner
+
+    plan_path = _caller_path(args.plan)
+    with open(plan_path, "r", encoding="utf-8") as fh:
+        plan = planner.WarmPlan.from_json(fh.read())
+    if not plan.roots:
+        sys.exit("ba2-test replay warm: the plan names no cache root to write into")
+    root = os.path.abspath(plan.roots[0])
+
+    if os.environ.get(_WARM_CHILD_ENV) != "1":
+        env = dict(os.environ)
+        env["CACHE_FOLDER"] = root
+        env[_WARM_CHILD_ENV] = "1"
+        print(f">> warming into {root} (child process; CACHE_FOLDER set before import)")
+        # IN THE DIRECTORY THE USER RAN FROM, not this process's cwd. ``_enter_backend``
+        # has chdir'd into backend/ by now, and the child re-reads the SAME argv: its own
+        # ``_CALLER_CWD`` is whatever it starts in, so spawning it here made
+        # ``--plan plan.json`` resolve against the backend -- a file the user never named.
+        return subprocess.call([sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                               env=env, cwd=_CALLER_CWD)
+
+    import ba2_common.config as _cfg
+    if os.path.abspath(_cfg.CACHE_FOLDER) != root:
+        sys.exit(f"ba2-test replay warm: this process imported CACHE_FOLDER="
+                 f"{_cfg.CACHE_FOLDER}, but the plan writes into {root}; refusing to warm a "
+                 f"root half the cache readers do not point at")
+
+    from ba2_common.core.warm.budget import unknown_reserve_for
+    from ba2_experts.warm_fetchers import DefaultWarmFetcher
+    from ba2_providers.warm.seams import new_warm_budget, new_warm_queue
+    from app.services.prewarm_fetchers import resolve_fred_key, resolve_keys
+    import ba2_experts.replay_dependencies  # noqa: F401 - registers the per-expert adapters
+
+    keys = resolve_keys()
+    budget = new_warm_budget(allowance_bytes=int(args.allowance_mib * 1024 * 1024),
+                             unknown_reserve_bytes=unknown_reserve_for(plan))
+    queue = new_warm_queue(
+        workers=args.workers, budget=budget,
+        fetcher=DefaultWarmFetcher(
+            # A timeseries requirement names its OWN provider; this is only the
+            # indicator stack's, for an ATR whose underlying series has no provider of
+            # its own in the requirement.
+            indicator_ohlcv_provider=args.indicator_ohlcv_provider,
+            # The PLAN's instant, deliberately fixed: this command executes one
+            # reviewed plan, and a window that moved while it ran would ask for
+            # something the plan did not price. (The live host passes "now" instead.)
+            end_date_provider=lambda: datetime.fromisoformat(plan.created_at),
+            fmp_key=keys["fmp"], fred_key=resolve_fred_key()))
+    queue.start()
+    try:
+        enqueued = queue.submit_plan(plan)
+        print(f">> {len(enqueued)} requirement(s) enqueued; "
+              f"{len(plan.entries) - len(enqueued)} already satisfied")
+        if not queue.join(timeout=_WARM_JOIN_TIMEOUT_S):
+            print(f"!! warm still running after {_WARM_JOIN_TIMEOUT_S}s; stopping. "
+                  f"Re-plan and re-run to continue.")
+    finally:
+        queue.stop(timeout=10.0)
+    stats = queue.stats()
+    print(json.dumps(stats, indent=2, default=str))
+    # A pause is a FINDING (the allowance ran out, or the provider rate-limited), so it
+    # exits non-zero and a script can react; a per-symbol data gap is not.
+    return 1 if stats["paused"] else 0
 
 
 # --- backtest run tracking (the shared `backtests` results table) ----------------------
@@ -5992,6 +6187,10 @@ def main(argv: "list | None" = None) -> int:
                          "compute trader-skill scores for every trading day in [start, end] instead "
                          "of leaving them to lazy per-trial computation (see _do_senate_scores). "
                          "Ignored by the other experts.")
+    pw.add_argument("--fred-max-age-hours", type=float, default=24.0,
+                    help="Refresh a FRED macro series only when its cache file is older than "
+                         "this (default 24h, matching the API handler). Only consumed when "
+                         "DeterministicScorer is being warmed.")
 
     bm = sub.add_parser("build-screener-metrics", help="Build/extend the screener METRIC store (parquet).")
     bm.add_argument("--store", default=_DEFAULT_SCREENER_STORE_DIR,
@@ -6066,6 +6265,43 @@ def main(argv: "list | None" = None) -> int:
                             help="Re-run the live _gather against the recorded provider tape.")
     rpg.add_argument("--bundle", required=True, help="Exported session directory.")
     rpg.add_argument("--out", default=None, help="Write the report here.")
+    rph = rplsub.add_parser(
+        "historical",
+        help="Re-run each recorded analysis through analyze_as_of against a PINNED cache "
+             "root and diff the inputs and the recommendation. Offline.")
+    rph.add_argument("--bundle", required=True, help="Exported session directory.")
+    rph.add_argument("--cache-root", required=True,
+                     help="The pinned cache root to reconstruct from (what `replay warm` "
+                          "filled). Read-only; a root with no pin manifest answers "
+                          "revision_unknown, because nothing recorded its revisions.")
+    rph.add_argument("--out", default=None, help="Write the report here.")
+    rph.add_argument("--timeout", type=float, default=None,
+                     help="Seconds the reconstruction child may take (default: scales with "
+                          "the number of analyses). A child that runs out of time still "
+                          "reports everything it committed; the rest name the timeout.")
+    rpw = rplsub.add_parser(
+        "warm-plan",
+        help="What a bundle's analyses need that a cache root does not hold. NO network.")
+    rpw.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpw.add_argument("--cache-root", required=True, action="append", dest="cache_root",
+                     help="Cache root to inspect READ-ONLY. Repeatable; the FIRST is the "
+                          "writable root a warm would fill, the rest are shared roots that "
+                          "can satisfy a requirement but are never written to.")
+    rpw.add_argument("--as-of-now", default=None,
+                     help="ISO instant to measure staleness against (default: now, UTC). Pass "
+                          "the session's own time to reproduce an earlier plan exactly.")
+    rpw.add_argument("--out", default=None, help="Write the plan JSON here.")
+    rpm = rplsub.add_parser(
+        "warm", help="Execute a warm plan: download only what it lists as missing or stale.")
+    rpm.add_argument("--plan", required=True, help="A plan JSON written by `replay warm-plan`.")
+    rpm.add_argument("--workers", type=int, default=2,
+                     help="Warm worker threads (default 2, the pilot value).")
+    rpm.add_argument("--allowance-mib", type=float, default=100.0,
+                     help="Daily download allowance in MiB (default 100, the pilot value).")
+    rpm.add_argument("--indicator-ohlcv-provider", default="yfinance",
+                     help="Registry name of the OHLCV provider the INDICATOR stack reads "
+                          "(default yfinance, the live host's wiring). Price-series "
+                          "requirements name their own provider and ignore this.")
 
     # runs: manage tracked backtest runs (the shared `backtests` results table).
     rp = sub.add_parser("runs", help="List / save / delete tracked backtest runs.")

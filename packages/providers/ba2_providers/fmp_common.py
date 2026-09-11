@@ -13,10 +13,12 @@ Providers that assume a list then crash when they slice/index the dict
 * unexpected dict -> ``FMPError`` immediately (raw payload logged, no retry)
 """
 
+import contextvars
 import os as _os
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional
 
 import requests
@@ -180,7 +182,14 @@ def _record_hermetic_miss(namespace: str, symbol: str):
 @contextmanager
 def persist_empty_sentinel():
     """Within this context a genuinely-empty FMP history is cached as ``[]`` (prewarm sentinel).
-    Used by ``ba2-test prewarm`` so no-data symbols don't perpetually look 'not pre-warmed'."""
+    Used by ``ba2-test prewarm`` so no-data symbols don't perpetually look 'not pre-warmed'.
+
+    PROCESS-WIDE on purpose, and it has to stay that way: ``run_prewarm`` enters this on the
+    SUBMITTING thread and relies on the flag reaching its ``ThreadPoolExecutor`` workers (the
+    freeze flag next to it is thread-local, which is exactly why that one needs an
+    ``initializer``). Anything that must NOT reach sibling threads uses
+    :func:`thread_persist_empty_sentinel` instead.
+    """
     global _PERSIST_EMPTY_SENTINEL
     prev = _PERSIST_EMPTY_SENTINEL
     _PERSIST_EMPTY_SENTINEL = True
@@ -188,6 +197,38 @@ def persist_empty_sentinel():
         yield
     finally:
         _PERSIST_EMPTY_SENTINEL = prev
+
+
+@contextmanager
+def thread_persist_empty_sentinel(enabled: bool = True):
+    """Sentinel semantics for THIS THREAD ONLY, overriding the process-wide flag.
+
+    The warm worker runs inside the LIVE trading process, where the process-global
+    :func:`persist_empty_sentinel` would be a shared mutation: a concurrent backtest thread
+    (frozen, so it does reach the persist branch) would start writing ``[]`` sentinels it never
+    asked for, and "checked, FMP has nothing" is a claim only a deliberate warm may make. Spec
+    section 9: "process-global empty-sentinel flags must not leak into concurrent live work."
+
+    The override is consulted BEFORE the global (see ``_persist_empty_sentinel_enabled``), so a
+    warm thread can also turn the sentinel OFF inside a process that turned it on.
+    """
+    prev = getattr(_tls, "persist_empty_sentinel", None)
+    _tls.persist_empty_sentinel = bool(enabled)
+    try:
+        yield
+    finally:
+        _tls.persist_empty_sentinel = prev
+
+
+def _persist_empty_sentinel_enabled() -> bool:
+    """Whether a genuine empty is persisted as the ``[]`` sentinel right now.
+
+    This thread's explicit override wins; otherwise the process-wide prewarm flag.
+    """
+    override = getattr(_tls, "persist_empty_sentinel", None)
+    if override is not None:
+        return override
+    return _PERSIST_EMPTY_SENTINEL
 
 
 # --- live-only short-TTL cache for SETTINGS-INDEPENDENT bulk fetches --------
@@ -368,8 +409,12 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
                                       or (_time.time() - _os.path.getmtime(path)) / 86400.0 <= max_age_days):
             with open(path, "r") as fh:
                 return _json.load(fh)
-    except Exception:  # corrupt / partial / unreadable -> re-fetch (or raise, hermetic)
-        pass
+    except Exception as e:  # corrupt / partial / unreadable -> re-fetch (or raise, hermetic)
+        # NAMED, at WARNING. A silently unreadable cache file re-downloads its payload on
+        # every single read, forever, and the only symptom is a provider bill.
+        logger.warning(
+            f"fmp_history cache file {path} could not be read ({type(e).__name__}: {e}); "
+            f"re-fetching it")
 
     # HERMETIC backtest: NEVER network-fetch — a miss means the data wasn't pre-warmed.
     # ONE missing symbol DISABLES THAT SYMBOL; MANY abort the run. See _record_hermetic_miss.
@@ -388,7 +433,7 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     #    file then means "checked, no data" (no signal) while an ABSENT file still means "never
     #    warmed" (fatal in a hermetic backtest), so no-data instruments stop looking like prewarm
     #    gaps. The atomic tmp+replace means a concurrent reader never sees a half-written file.
-    to_persist = data if data else ([] if _PERSIST_EMPTY_SENTINEL else None)
+    to_persist = data if data else ([] if _persist_empty_sentinel_enabled() else None)
     if to_persist is not None:
         tmp = None
         try:
@@ -397,12 +442,15 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
             with open(tmp, "w") as fh:
                 _json.dump(to_persist, fh)
             _os.replace(tmp, path)  # atomic
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"fmp_history cache file {path} could not be written "
+                f"({type(e).__name__}: {e}); this payload will be re-fetched next run")
             if tmp:
                 try:
                     _os.remove(tmp)  # never leave a half-written tmp behind
-                except OSError:
-                    pass
+                except OSError as cleanup_error:
+                    logger.warning(f"could not remove the temp file {tmp}: {cleanup_error}")
     return data
 
 
@@ -577,6 +625,247 @@ def _gate_arm(delay: float) -> None:
         _GATE_UNTIL = max(_GATE_UNTIL, _now() + max(0.0, delay))
 
 
+def gate_remaining_seconds() -> float:
+    """How long the SHARED FMP cooldown still has to run (0.0 when it is not armed).
+
+    Read-only; arming stays internal. Exposed for the warm budget, which must pause
+    background work while a 429/5xx backoff is in force so the remaining allowance goes to
+    live requests first (spec section 6, "Live requests retain priority").
+    """
+    with _GATE_LOCK:
+        return max(0.0, _GATE_UNTIL - _now())
+
+
+# ---- Request / byte accounting by purpose ------------------------------------------------------
+# Spec section 6: "Track requests/bytes by endpoint and purpose: normal live, capture overhead
+# (must be zero network), and warmup." Nothing measured this before, so "capture adds zero
+# requests" and "warm stayed inside its allowance" were both unfalsifiable claims.
+#
+# The purpose is a ContextVar, not a thread-local, because the callers that need to tag their
+# work fan out through ``ThreadPoolExecutor`` (prewarm) and ``capture_aware_submit`` (gather),
+# both of which copy a ``contextvars.Context`` into the worker. A thread-local would have
+# reported every pooled warm fetch as "live".
+#: The purposes a request can be made for. ``capture`` must never appear with a non-zero count:
+#: recording reads what live already fetched and issues no request of its own.
+PURPOSE_LIVE = "live"
+PURPOSE_CAPTURE = "capture"
+PURPOSE_WARM = "warm"
+PURPOSES = (PURPOSE_LIVE, PURPOSE_CAPTURE, PURPOSE_WARM)
+
+_fmp_purpose: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "fmp_purpose", default=PURPOSE_LIVE)
+
+#: ``{utc_day: {(purpose, endpoint): {"requests": int, "bytes": int}}}``. Kept per UTC day so a
+#: daily allowance is measured against a day and an old day cannot silently consume today's.
+_PURPOSE_STATS: dict = {}
+_PURPOSE_LOCK = _threading.Lock()
+
+
+def current_fmp_purpose() -> str:
+    """What the requests made from this context are being made FOR."""
+    return _fmp_purpose.get()
+
+
+@contextmanager
+def fmp_purpose(purpose: str):
+    """Tag every FMP request made inside this context (and in contexts copied from it)."""
+    if purpose not in PURPOSES:
+        raise ValueError(f"unknown FMP request purpose {purpose!r}; expected one of {PURPOSES}")
+    token = _fmp_purpose.set(purpose)
+    try:
+        yield
+    finally:
+        _fmp_purpose.reset(token)
+
+
+def _utc_day() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+#: Where an attempt whose endpoint name failed :func:`validate_endpoint_key` is counted.
+#: One fixed key, never the offending text: the whole reason the name is refused is that
+#: a URL carries the symbol and, on some FMP paths, the API key.
+MALFORMED_ENDPOINT_KEY = "malformed"
+
+
+def validate_endpoint_key(endpoint: str) -> str:
+    """The stripped endpoint NAME, or ``ValueError`` saying why it is not one.
+
+    ``endpoint`` must be short. The counters are keyed by it, and a full URL -- which
+    carries the symbol and, on some FMP paths, the API KEY -- would both explode the key
+    space and put a credential in a log line. A caller that cannot name its endpoint has
+    a bug, not a counting problem.
+
+    THE RULE LIVES HERE, ON ITS OWN, so it can be stated strictly without a meter being
+    able to fail a market-data fetch: :func:`record_fmp_request` runs on the live path,
+    before the request and outside any try, and coerces a rejected name instead of
+    raising it (see there). Anything that wants the rule enforced -- a test, a caller
+    that builds a key ahead of time -- calls this.
+    """
+    name = (endpoint or "").strip()
+    if not name:
+        raise ValueError(
+            "record_fmp_request needs a short endpoint name to key the counters by; pass the "
+            "endpoint, never the URL (it carries the symbol and, on some paths, the api key)")
+    if "?" in name or "://" in name or len(name) > _MAX_ENDPOINT_KEY:
+        raise ValueError(
+            f"endpoint {name[:40]!r}... does not look like an endpoint NAME; pass the short "
+            f"path segment (e.g. 'price-target'), never a URL")
+    return name
+
+
+#: Fingerprints of the malformed endpoint values already warned about, so a mis-named
+#: endpoint used on every fetch warns ONCE per process, not once per request.
+_MALFORMED_WARNED: set = set()
+
+
+def _warn_malformed_endpoint_once(endpoint: object) -> None:
+    """One WARNING per distinct offending value, describing its SHAPE, never its text.
+
+    The value is refused precisely because it may be a URL carrying the API key, so
+    the log line must not quote it -- not even a prefix (the key sits at a different
+    offset on every base URL). Length and the two tell-tale markers are enough to find
+    the call site; the fingerprint lets two log lines be matched without the text.
+    """
+    import hashlib
+
+    text = endpoint if isinstance(endpoint, str) else repr(endpoint)
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+    with _PURPOSE_LOCK:
+        if digest in _MALFORMED_WARNED:
+            return
+        _MALFORMED_WARNED.add(digest)
+    logger.warning(
+        f"FMP request counter: an endpoint value is not an endpoint NAME (length {len(text)}, "
+        f"query={'?' in text}, scheme={'://' in text}, fingerprint {digest}); pass the short "
+        f"path segment, e.g. 'price-target', never a URL. The attempt is counted under "
+        f"{MALFORMED_ENDPOINT_KEY!r}; further requests with this value are not logged.")
+
+
+def _counter_key(endpoint: str) -> str:
+    """``endpoint`` as a counter key, falling back to ``malformed``. Never raises."""
+    try:
+        return validate_endpoint_key(endpoint)
+    except ValueError:
+        return MALFORMED_ENDPOINT_KEY
+
+
+def record_fmp_request(endpoint: str, nbytes: Optional[int] = None) -> None:
+    """Count one FMP/FRED request ATTEMPT against (today, purpose, endpoint).
+
+    WHAT IS COUNTED. Every attempt, including the ones that came back 429 or 5xx and were
+    retried: a rate-limited attempt consumed a request slot at the provider, and a counter
+    that hid it would under-report exactly the traffic that caused the throttling. BYTES are
+    added only when a body actually arrived -- an attempt that failed transferred nothing to
+    charge the allowance for.
+
+    ``nbytes`` is ``None`` when the response cannot report a size (a stubbed getter in a test,
+    a streamed body, an fmpsdk call whose payload is already decoded): the attempt is still
+    counted and the byte total is left alone rather than padded with a guess. A budget that
+    silently invents bytes is not a measurement.
+
+    ``endpoint`` is REQUIRED and must satisfy :func:`validate_endpoint_key`. A name that does
+    not is a WARNING and is counted under :data:`MALFORMED_ENDPOINT_KEY`, never raised: this
+    runs on the live fetch path, before the request and outside any try (``fmp_http_get``,
+    ``fmp_list_call``), so raising here turned a mis-named endpoint -- a logging defect -- into
+    a failed market-data fetch. The attempt is real and stays counted; only the key it is
+    charged to is lost, and the offending text never becomes a key (that is the point of the
+    rule). Callers that want the rule enforced call the validator directly.
+    """
+    name = _counter_key(endpoint)
+    if name == MALFORMED_ENDPOINT_KEY:
+        _warn_malformed_endpoint_once(endpoint)
+    day = _utc_day()
+    key = (current_fmp_purpose(), name)
+    with _PURPOSE_LOCK:
+        # One day at a time: yesterday's counters are dropped as soon as a request lands on a
+        # new day, which is the "reset per UTC day" the allowance is defined against.
+        if day not in _PURPOSE_STATS:
+            _PURPOSE_STATS.clear()
+            _PURPOSE_STATS[day] = {}
+        entry = _PURPOSE_STATS[day].setdefault(key, {"requests": 0, "bytes": 0})
+        entry["requests"] += 1
+        if nbytes:
+            entry["bytes"] += int(nbytes)
+
+
+#: Longest endpoint name the counters accept as a key (see ``record_fmp_request``).
+_MAX_ENDPOINT_KEY = 64
+
+
+def get_purpose_stats() -> dict:
+    """Today's request/byte counters as ``{purpose: {"requests", "bytes", "endpoints": {...}}}``.
+
+    A purpose with no requests today is absent rather than reported as zero-of-nothing; a caller
+    that wants the full shape reads ``PURPOSES``.
+    """
+    day = _utc_day()
+    out: dict = {}
+    with _PURPOSE_LOCK:
+        for (purpose, endpoint), entry in _PURPOSE_STATS.get(day, {}).items():
+            bucket = out.setdefault(purpose, {"requests": 0, "bytes": 0, "endpoints": {}})
+            bucket["requests"] += entry["requests"]
+            bucket["bytes"] += entry["bytes"]
+            bucket["endpoints"][endpoint] = dict(entry)
+    return out
+
+
+def reset_purpose_stats() -> None:
+    """Drop every counter (tests, and an explicit operator reset)."""
+    with _PURPOSE_LOCK:
+        _PURPOSE_STATS.clear()
+
+
+def record_fmp_bytes(endpoint: str, nbytes: Optional[int]) -> None:
+    """Add transferred bytes to an attempt already counted by :func:`record_fmp_request`.
+
+    Keyed through the SAME coercion as the request it belongs to, silently: the request
+    already warned, and a URL that cannot be a request key must not become a byte key
+    either (it carries the api key on some paths).
+    """
+    if not nbytes:
+        return
+    name = _counter_key(endpoint)
+    day = _utc_day()
+    key = (current_fmp_purpose(), name)
+    with _PURPOSE_LOCK:
+        entry = _PURPOSE_STATS.setdefault(day, {}).setdefault(key, {"requests": 0, "bytes": 0})
+        entry["bytes"] += int(nbytes)
+
+
+def _decoded_payload_bytes(payload) -> Optional[int]:
+    """The size of an ALREADY-DECODED payload, as a stand-in for its wire bytes.
+
+    ``fmpsdk`` hands back parsed JSON, so the response object -- and with it the true
+    compressed transfer size -- is gone by the time this sees it. The serialized length is
+    the honest available measure: same order of magnitude, systematically LARGER than the
+    gzipped wire bytes, which is the safe direction for a budget (it can only end up
+    pausing early, never overspending silently). Labelled here, and in the setting's
+    documentation, as an approximation rather than reported as measured wire bytes.
+    """
+    try:
+        import json as _json
+
+        return len(_json.dumps(payload, default=str))
+    except Exception as e:  # noqa: BLE001 - a size estimate must never break a data fetch
+        logger.warning(f"FMP byte accounting: payload size unavailable ({type(e).__name__}: {e})")
+        return None
+
+
+def _response_bytes(resp) -> Optional[int]:
+    """The size of a response body, or ``None`` when it cannot be read without consuming it."""
+    try:
+        content = getattr(resp, "content", None)
+        if content is not None:
+            return len(content)
+    except Exception as e:  # noqa: BLE001 - a size read must never break a data fetch
+        logger.warning(
+            f"FMP byte accounting: could not size a {type(resp).__name__} response "
+            f"({type(e).__name__}: {e}); the request is counted, its bytes are not")
+        return None
+    return None
+
+
 def fmp_http_get(
     url: str,
     params: Optional[dict] = None,
@@ -610,6 +899,10 @@ def fmp_http_get(
         # Respect any GLOBAL cooldown armed by a concurrent 429 before firing (prevents the storm).
         _gate_wait(sleep)
 
+        # Counted BEFORE the outcome is known: this attempt reached the provider (or tried
+        # to), which is what a rate-limit budget has to see. Bytes are added below, only on
+        # a response that actually carried a body.
+        record_fmp_request(endpoint or "unknown")
         try:
             resp = getter(url, params=params, timeout=timeout)
         except requests.exceptions.RequestException as e:
@@ -638,6 +931,8 @@ def fmp_http_get(
 
         # Any other 4xx (401/404/...) is a non-retryable client error -> raise.
         resp.raise_for_status()
+        # The attempt was already counted above; add what the body actually cost.
+        record_fmp_bytes(endpoint or "unknown", _response_bytes(resp))
         return resp
 
     logger.error(
@@ -683,11 +978,24 @@ def fmp_list_call(
         if attempt > 0:
             sleep(delays[attempt - 1])
 
+        # COUNTED HERE TOO, not only in fmp_http_get. This wrapper carries the DOMINANT
+        # warm traffic -- the three statement histories and the earnings calendar all come
+        # through fmpsdk, which does its own HTTP -- so a budget that only saw fmp_http_get
+        # governed the minority of the bytes it claimed to govern.
+        record_fmp_request(endpoint or "fmp_list_call")
+
         result = fn()
         last_payload = result
 
         # Legitimate results.
         if isinstance(result, list):
+            # SIZING IS WARM-BUDGET MACHINERY. ``_decoded_payload_bytes`` json.dumps the
+            # whole payload, and on the live path nothing reads the result -- so every
+            # live statement/earnings fetch paid a full serialization of its own response
+            # for a counter no budget consults. The ATTEMPT stays counted in every
+            # purpose; only the sizing is skipped where it has no consumer.
+            if current_fmp_purpose() != PURPOSE_LIVE:
+                record_fmp_bytes(endpoint or "fmp_list_call", _decoded_payload_bytes(result))
             return result
         if result is None:
             return []

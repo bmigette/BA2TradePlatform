@@ -52,10 +52,11 @@ Callers that need tighter accuracy than ~20% on ~70% of names should not lean on
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.replay import ReplayMiss, replay_now
 from ba2_common.logger import logger
 
 #: A P/E anchored on a near-zero EPS is not a valuation (see module docstring). 80x is already
@@ -74,10 +75,6 @@ DEFAULT_MAX_EXPECTED_PROFIT_PERCENT = 100.0
 VALID_METHODS = ("forward", "trailing")
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 # --------------------------------------------------------------------------- #
 # I/O (Phase 1 _gather half) -- mirrors DeterministicScorer/data.py's fetch_past_earnings /
 # fetch_statements conventions: absorb_if_benign, empty-on-failure so a data gap degrades this
@@ -93,13 +90,24 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
     genuine data gap, never raises for that case (a hermetic/defect error still propagates via
     ``absorb_if_benign``).
     """
-    ref = as_of if as_of is not None else _utcnow()
+    # replay_now(as_of), not a raw wall clock: ``ref`` is the ``end_date`` /
+    # ``as_of_date`` of the two TAPPED requests below, and an identity key holding an
+    # un-replayed ``datetime.now()`` can never be matched again -- the recorded
+    # response would be unreproducible by construction (see
+    # ba2_common.core.replay.observe). as_of given => returned unchanged, so the
+    # historical path keeps its exact semantics.
+    ref = replay_now(as_of)
     det = providers.fundamentals_details()
 
     try:
         past = det.get_past_earnings(symbol=symbol, frequency="quarterly", end_date=ref,
                                      lookback_periods=4, format_type="dict")
         earnings = past.get("earnings", []) if isinstance(past, dict) else []
+    except ReplayMiss:
+        # An offline replay whose tape lacks this response must stop and say so,
+        # never degrade to an empty section that then compares as a plausible
+        # bundle. Ahead of absorb_if_benign, and independent of BA2_ERROR_MODE.
+        raise
     except Exception as e:  # noqa: BLE001 - hermetic/defect errors re-raise via absorb_if_benign
         absorb_if_benign(e)
         logger.warning("analyst_target_model: past-earnings fetch failed for %s: %s", symbol, e)
@@ -116,6 +124,8 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
         est = det.get_earnings_estimates(symbol=symbol, frequency="quarterly", as_of_date=ref,
                                          lookback_periods=2, format_type="dict")
         estimates = est.get("estimates", []) if isinstance(est, dict) else []
+    except ReplayMiss:
+        raise                       # see the earnings fetch above
     except Exception as e:  # noqa: BLE001 - hermetic/defect errors re-raise via absorb_if_benign
         absorb_if_benign(e)
         logger.warning("analyst_target_model: earnings-estimates fetch failed for %s: %s",

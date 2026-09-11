@@ -133,10 +133,33 @@ def test_the_two_capabilities_keep_their_own_coverage(bundle_copy):
     assert coverage[ReplayStatus.CAPABILITY_RECORDED_EXPERT][
         ReplayStatus.COVERAGE_MATCH] == len(ALL_IDS)
     gather_rows = coverage[ReplayStatus.CAPABILITY_GATHER_TAPE]
-    assert gather_rows[ReplayStatus.COVERAGE_MISSING_CAPTURE] == 1, (
-        "the DeterministicScorer gather gap must survive as its own coverage row")
+    assert gather_rows[ReplayStatus.COVERAGE_MATCH] == len(ALL_IDS), (
+        "every recorded gather is tape-serveable now, including the scorer's")
+    assert sum(gather_rows.values()) == len(ALL_IDS), (
+        "the gather-tape capability keeps its own row per analysis")
     assert coverage[ReplayStatus.CAPABILITY_HISTORICAL][
         ReplayStatus.COVERAGE_NOT_RUN] == len(ALL_IDS)
+
+
+def test_the_report_payload_declares_the_shape_it_actually_writes(bundle_copy):
+    """The JSON schema tag must move when the shape does.
+
+    A consumer keys on ``schema`` to know what the file holds. This payload changed
+    twice after ``/1`` was minted -- stage rows carry ``capabilities`` (plural, a
+    list) where they carried a single ``capability``, and a field diff now carries
+    the numeric deltas -- so a reader written against ``/1`` and handed one of these
+    silently reads a shape that is not the one it was written for.
+    """
+    report = expert_replay.run(bundle_copy)
+    payload = report.to_mapping()
+
+    assert payload["schema"] == "ba2_replay_report/2"
+    assert all("capabilities" in row and "capability" not in row
+               for row in payload["stages"]), (
+        "the stage rows are the /2 shape; the tag must say so")
+    diff_keys = {key for result in payload["results"]
+                 for diff in result["field_diffs"] for key in diff}
+    assert not diff_keys or "abs_delta" in diff_keys
 
 
 def test_a_second_run_replaces_its_own_rows_rather_than_appending(bundle_copy):

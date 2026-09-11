@@ -27,6 +27,7 @@ Two rules that are easy to lose:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
@@ -44,6 +45,7 @@ from ba2_common.core.replay import (
     use_capture_context,
 )
 from ba2_common.core.types import Recommendation
+from ba2_common.logger import logger
 
 from app.services.replay.isolation import refuse, replay_isolation
 from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
@@ -51,6 +53,7 @@ from app.services.replay.report import AnalysisResult, ReplayReport, merge_cover
 __all__ = [
     "RECORDED_EXPERTS",
     "build_replay_expert",
+    "compare_recommendations",
     "compare_values",
     "run",
 ]
@@ -137,57 +140,190 @@ def replay_context(analysis: AnalysisRecord, phase: str) -> CaptureContext:
 # --------------------------------------------------------------------------- #
 # Exact comparison
 # --------------------------------------------------------------------------- #
-def compare_values(recorded: Any, produced: Any, path: str = "") -> List[Tuple[str, str, str]]:
+def compare_values(recorded: Any, produced: Any, path: str = "", *,
+                   with_deltas: bool = False) -> List[Any]:
     """Every difference between two captured values, as ``(path, recorded, produced)``.
 
     Exact by default (codec bytes), structural for frames. Containers are walked
     so a difference is reported at the field that actually moved rather than as
     "the whole bundle differs".
+
+    ``with_deltas`` returns :class:`~app.services.replay.report.FieldDiff` objects
+    for EVERY difference -- with the absolute and relative distance attached to the
+    numeric leaves and absent from the rest --
+    spec section 8 asks the historical comparison for "absolute/relative input
+    differences", and a pair of reprs cannot say whether a price moved by a cent
+    or by a factor of thirty. It is OFF by default so the recorded-expert and
+    gather-tape reports keep their exact previous shape, and it never affects
+    EQUALITY: the match criterion is the codec bytes either way, with no
+    tolerance anywhere.
     """
     label = path or "value"
     if isinstance(recorded, (pd.DataFrame, pd.Series)) or isinstance(produced, (pd.DataFrame, pd.Series)):
-        return _compare_frames(recorded, produced, label)
+        return _compare_frames(recorded, produced, label, with_deltas=with_deltas)
     if isinstance(recorded, dict) and isinstance(produced, dict):
-        diffs: List[Tuple[str, str, str]] = []
+        diffs: List[Any] = []
         for key in sorted(set(recorded) | set(produced), key=str):
             if key not in recorded:
-                diffs.append((f"{label}[{key!r}]", "<absent>", _text(produced[key])))
+                diffs.append(_structural_diff(f"{label}[{key!r}]", "<absent>",
+                                              _text(produced[key]), with_deltas))
             elif key not in produced:
-                diffs.append((f"{label}[{key!r}]", _text(recorded[key]), "<absent>"))
+                diffs.append(_structural_diff(f"{label}[{key!r}]", _text(recorded[key]),
+                                              "<absent>", with_deltas))
             else:
-                diffs += compare_values(recorded[key], produced[key], f"{label}[{key!r}]")
+                diffs += compare_values(recorded[key], produced[key], f"{label}[{key!r}]",
+                                        with_deltas=with_deltas)
         return diffs
     if isinstance(recorded, (list, tuple)) and isinstance(produced, (list, tuple)):
         if len(recorded) != len(produced):
-            return [(f"{label} (length)", str(len(recorded)), str(len(produced)))]
+            return [_structural_diff(f"{label} (length)", str(len(recorded)),
+                                     str(len(produced)), with_deltas)]
         diffs = []
         for index, (left, right) in enumerate(zip(recorded, produced)):
-            diffs += compare_values(left, right, f"{label}[{index}]")
+            diffs += compare_values(left, right, f"{label}[{index}]",
+                                    with_deltas=with_deltas)
         return diffs
     if _encoded_bytes(recorded, label) == _encoded_bytes(produced, label):
         return []
+    if with_deltas:
+        return [_leaf_diff(label, recorded, produced)]
     return [(label, _text(recorded), _text(produced))]
 
 
-def _compare_frames(recorded: Any, produced: Any, label: str) -> List[Tuple[str, str, str]]:
+def _is_number(value: Any) -> bool:
+    """A real number. ``bool`` is excluded: True/False is a branch, not a magnitude."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _structural_diff(label: str, recorded: str, produced: str, with_deltas: bool):
+    """A difference with no distance to report, in whichever shape the caller asked for."""
+    if not with_deltas:
+        return (label, recorded, produced)
+    from app.services.replay.report import FieldDiff
+
+    return FieldDiff(field=label, recorded=recorded, produced=produced)
+
+
+def _leaf_diff(label: str, recorded: Any, produced: Any):
+    """One differing leaf, with the numeric distance attached where there is one.
+
+    A NaN (or an infinity) on either side is NOT a distance. Carrying it would
+    abort ``report.write`` (``allow_nan=False``) and, if it ever reached a reader,
+    would be a non-number presented as a measurement -- so the row records that the
+    distance is not finite and leaves the numbers out.
+    """
+    from app.services.replay.report import FieldDiff
+
+    if not (_is_number(recorded) and _is_number(produced)):
+        return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced))
+    absolute = abs(float(produced) - float(recorded))
+    if not math.isfinite(absolute):
+        return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
+                         delta_not_finite=True)
+    if float(recorded) == 0.0:
+        return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
+                         abs_delta=absolute, rel_delta=None, rel_delta_undefined=True)
+    relative = absolute / abs(float(recorded))
+    if not math.isfinite(relative):
+        return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
+                         delta_not_finite=True)
+    return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
+                     abs_delta=absolute, rel_delta=relative)
+
+
+def _compare_frames(recorded: Any, produced: Any, label: str, *,
+                    with_deltas: bool = False) -> List[Any]:
     """Frames are compared STRUCTURALLY, not by bytes.
 
     Arrow IPC bytes carry environment-dependent buffer padding and dictionary
     layout, so two frames that are equal cell for cell can serialize
     differently. ``pandas.testing`` compares dtypes, index, column order and
     every value -- which is what "the same frame" actually means.
+
+    With ``with_deltas`` and two ALIGNED frames (same shape, index and columns)
+    the numeric cells are additionally measured, and the row carries the LARGEST
+    absolute and relative cell distance. A frame-level maximum rather than one
+    row per cell: a 600-bar OHLCV series that shifted by a split would otherwise
+    emit thousands of rows, and the largest distance is the number that says
+    whether the drift is a rounding artefact or a different series.
     """
     if type(recorded) is not type(produced):
-        return [(label, _text(recorded), _text(produced))]
+        return [_structural_diff(label, _text(recorded), _text(produced), with_deltas)]
     try:
         if isinstance(recorded, pd.DataFrame):
             pd.testing.assert_frame_equal(recorded, produced, check_exact=True)
         else:
             pd.testing.assert_series_equal(recorded, produced, check_exact=True)
     except AssertionError as exc:
-        return [(label, f"{type(recorded).__name__} shape={_shape(recorded)}",
-                 f"{type(produced).__name__} shape={_shape(produced)}: {exc}")]
+        left = f"{type(recorded).__name__} shape={_shape(recorded)}"
+        right = f"{type(produced).__name__} shape={_shape(produced)}: {exc}"
+        if with_deltas:
+            return [_frame_diff(label, recorded, produced, left, right)]
+        return [(label, left, right)]
     return []
+
+
+def _frame_diff(label: str, recorded: Any, produced: Any, left: str, right: str):
+    """The frame row, with the largest numeric cell distance when the two align."""
+    from app.services.replay.report import FieldDiff
+
+    summary = _frame_numeric_extremes(recorded, produced)
+    if summary is None:
+        return FieldDiff(field=label, recorded=left, produced=right)
+    cells, absolute, relative = summary
+    return FieldDiff(
+        field=f"{label} (largest of {cells} differing numeric cell(s))",
+        recorded=left, produced=right, abs_delta=absolute, rel_delta=relative,
+        rel_delta_undefined=relative is None)
+
+
+def _frame_numeric_extremes(recorded: Any, produced: Any):
+    """``(differing cells, max abs delta, max rel delta)`` for two ALIGNED frames.
+
+    ``None`` when they cannot be aligned (a different shape, index or column set
+    is a structural difference, not a distance), and ``relative`` is ``None``
+    when every differing cell had a zero baseline.
+    """
+    try:
+        left = recorded.to_frame() if isinstance(recorded, pd.Series) else recorded
+        right = produced.to_frame() if isinstance(produced, pd.Series) else produced
+        if left.shape != right.shape or not left.index.equals(right.index) \
+                or not left.columns.equals(right.columns):
+            return None
+        numeric = [c for c in left.columns
+                   if pd.api.types.is_numeric_dtype(left[c])
+                   and pd.api.types.is_numeric_dtype(right[c])
+                   and left[c].dtype != bool and right[c].dtype != bool]
+        if not numeric:
+            return None
+        delta = (right[numeric].astype(float) - left[numeric].astype(float)).abs()
+        differing = delta.gt(0)
+        cells = int(differing.to_numpy().sum())
+        if not cells:
+            return None
+        # ``.max().max()`` (pandas, NaN-SKIPPING) rather than numpy's: a single NaN
+        # cell -- a bar the reconstruction has no value for -- propagates through
+        # ``ndarray.max`` and turns the whole frame's distance into NaN, which then
+        # aborts ``report.write``. What is wanted is the largest distance among the
+        # cells that HAVE one.
+        absolute = float(delta.max().max())
+        if not math.isfinite(absolute):
+            return None
+        base = left[numeric].astype(float).abs()
+        ratio = delta.where(differing & base.gt(0)) / base.where(base.gt(0))
+        relative = float(ratio.max().max()) if ratio.notna().to_numpy().any() else None
+        if relative is not None and not math.isfinite(relative):
+            relative = None
+        return cells, absolute, relative
+    except Exception as exc:  # noqa: BLE001 -- the diff itself already stands
+        # NAMED, at WARNING: the diff is still reported without its distance, but a
+        # measurement that silently stops being taken is how a report quietly gets
+        # less useful with nobody noticing.
+        logger.warning(
+            f"replay: could not measure the numeric distance between two frames "
+            f"({type(exc).__name__}: {exc}); the difference is reported without it",
+            exc_info=True)
+        return None
 
 
 def _shape(frame: Any) -> str:
@@ -209,15 +345,17 @@ def _text(value: Any) -> str:
     return repr(value)
 
 
-def compare_recommendations(recorded: Recommendation,
-                            produced: Any) -> List[Tuple[str, str, str]]:
-    """Field-by-field, in declaration order."""
+def compare_recommendations(recorded: Recommendation, produced: Any, *,
+                            with_deltas: bool = False) -> List[Any]:
+    """Field-by-field, in declaration order. See :func:`compare_values` for ``with_deltas``."""
     if not isinstance(produced, Recommendation):
-        return [("type", type(recorded).__name__, type(produced).__name__)]
-    diffs: List[Tuple[str, str, str]] = []
+        return [_structural_diff("type", type(recorded).__name__,
+                                 type(produced).__name__, with_deltas)]
+    diffs: List[Any] = []
     for spec in dataclass_fields(Recommendation):
         diffs += compare_values(getattr(recorded, spec.name),
-                                getattr(produced, spec.name), spec.name)
+                                getattr(produced, spec.name), spec.name,
+                                with_deltas=with_deltas)
     return diffs
 
 
@@ -228,16 +366,7 @@ def replay_analysis(bundle: SessionBundle, analysis: AnalysisRecord) -> Analysis
     """Re-run ``_process`` for one recorded analysis and classify the outcome."""
     def result(status: str, detail: str = "",
                field_diffs: Sequence[Tuple[str, str, str]] = ()) -> AnalysisResult:
-        return AnalysisResult(
-            analysis_id=analysis.analysis_id,
-            expert_class=analysis.expert_class,
-            symbol=analysis.symbol,
-            use_case=analysis.use_case,
-            recorded_outcome=analysis.outcome,
-            status=status,
-            detail=detail,
-            field_diffs=tuple(field_diffs),
-        )
+        return AnalysisResult.for_analysis(analysis, status, detail, field_diffs)
 
     if analysis.expert_class not in RECORDED_EXPERTS:
         return result(ReplayStatus.COVERAGE_UNSUPPORTED,

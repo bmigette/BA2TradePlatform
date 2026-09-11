@@ -55,16 +55,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 def _load_module_direct(name: str, filepath: str):
     """Load a single .py file as a module, mocking heavy dependencies."""
-    # Mock the logger dependency before loading
+    # Mock the logger dependency before loading -- for the LOAD only. The previous
+    # sys.modules bindings are put back afterwards; a mock left behind is bound by
+    # every host module first imported later in the session (see the same note in
+    # tests/test_penny_gainers_fix.py).
     mock_logger = MagicMock()
+    _MISSING = object()
+    saved = {n: sys.modules.get(n, _MISSING)
+             for n in ("ba2_trade_platform", "ba2_trade_platform.logger")}
     if "ba2_trade_platform.logger" not in sys.modules:
         sys.modules["ba2_trade_platform"] = MagicMock()
         sys.modules["ba2_trade_platform.logger"] = MagicMock(logger=mock_logger)
-    spec = importlib.util.spec_from_file_location(name, filepath)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    try:
+        spec = importlib.util.spec_from_file_location(name, filepath)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for n, previous in saved.items():
+            if previous is _MISSING:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = previous
 
 
 # Load the conditions module directly (only depends on logger + numpy/pandas/pytz)

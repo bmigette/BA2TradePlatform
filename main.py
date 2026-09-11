@@ -176,6 +176,14 @@ def initialize_system():
     from ba2_trade_platform.core.replay_capture import initialize_replay_capture
     initialize_replay_capture()
 
+    # Background warm service (spec step 4). AFTER replay capture (its batch-end
+    # hook resolves what the CAPTURED analyses declared) and after the JobManager
+    # started (it registers the post-close warm on that scheduler). Off by default:
+    # with warm_enabled=false this creates the settings rows and nothing else.
+    logger.info("Initializing warm service...")
+    from ba2_trade_platform.core.warm_service import initialize_warm_service
+    initialize_warm_service(job_manager=job_manager)
+
     # Initialize worker queue system
     logger.info("Initializing worker queue system...")
     initialize_worker_queue()

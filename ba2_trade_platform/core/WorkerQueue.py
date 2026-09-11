@@ -1142,6 +1142,17 @@ class WorkerQueue:
                             )
                         except Exception as e:
                             logger.warning(f"Failed to log batch end for {task.batch_id}: {e}")
+
+                        # Lifecycle step 3 (spec section 6): as each batch finishes,
+                        # queue only the historical dependencies its analyses newly
+                        # require. A no-op call when warming is off, and wrapped
+                        # anyway -- a warm may never delay or fail a trading path.
+                        try:
+                            from .warm_service import on_analysis_batch_end
+                            on_analysis_batch_end(task.batch_id)
+                        except Exception as e:
+                            logger.warning(
+                                f"Warm batch-end hook failed for {task.batch_id}: {e}")
                 except Exception as e:
                     logger.warning(f"Error tracking batch completion for {task.batch_id}: {e}")
             

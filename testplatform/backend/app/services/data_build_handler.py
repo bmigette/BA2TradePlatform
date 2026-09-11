@@ -40,53 +40,22 @@ def _resolve_fmp_key() -> str:
 
 
 def _resolve_fred_key() -> str:
-    """Same resolution order as FMP. The FRED key lives in AppSetting, not .env."""
-    key = os.getenv("FRED_API_KEY")
-    if not key:
-        try:
-            from ba2_common.config import get_app_setting
-
-            key = get_app_setting("fred_api_key")
-        except Exception:  # noqa: BLE001
-            key = None
-    return key
+    """Re-export: the ONE resolver now lives in ``prewarm_fetchers`` beside the run it
+    serves, so the CLI reaches it too (it never warmed FRED at all while this was here).
+    Kept as a name because existing callers/tests import it from this module."""
+    from app.services.prewarm_fetchers import resolve_fred_key
+    return resolve_fred_key()
 
 
 def _prewarm_fred(max_age_hours: float = 24.0) -> Dict[str, Any]:
-    """Refresh the FRED macro series DeterministicScorer reads.
+    """Re-export of ``prewarm_fetchers.prewarm_fred`` (see :func:`_resolve_fred_key`).
 
-    Global, not per-symbol: these are 9 economy-wide series, so they are fetched once per
-    run rather than once per (expert, symbol) like the FMP history caches.
-
-    This exists because ``fred_series.get_series_as_of`` RAISES on a missing cache file
-    rather than reaching for the network -- a backtest must never silently run on absent
-    macro data. That contract is only safe if something populates the cache first, and
-    this is it. The files land under CACHE_FOLDER, so remote workers receive them with
-    the rest of the cache sync automatically.
+    The two sinks are SPLIT here. Passing ``logger.info`` for both reported a series
+    that could not be refreshed below the level this service logs at, so the only
+    surviving trace was an ``errors`` count in the returned summary.
     """
-    import time
-
-    from ba2_providers.macro import fred_series
-
-    key = _resolve_fred_key()
-    if not key:
-        # Not fatal to the whole prewarm: only DeterministicScorer needs it, and saying
-        # so precisely beats failing a 500-symbol FMP prewarm over a missing macro key.
-        return {"error": "fred_api_key not configured (AppSetting or FRED_API_KEY)"}
-
-    refreshed = skipped = errors = 0
-    for sid in fred_series.SERIES_SPEC:
-        path = fred_series.cache_path(sid)
-        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) / 3600.0 < max_age_hours:
-            skipped += 1
-            continue
-        try:
-            fred_series.refresh_series(sid, key)
-            refreshed += 1
-        except Exception as e:  # noqa: BLE001 — one series must not abort the prewarm
-            errors += 1
-            logger.warning(f"prewarm FRED {sid} failed: {e}")
-    return {"refreshed": refreshed, "fresh": skipped, "errors": errors}
+    from app.services.prewarm_fetchers import prewarm_fred
+    return prewarm_fred(max_age_hours, log=logger.info, warn=logger.warning)
 
 
 def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -22,15 +22,16 @@ defects:
   whose class name and id are taken from the recorded observation (they are part
   of the recorded identity, so a tape account that did not carry them could
   never match).
-* **A boundary that was never tapped cannot be served.** DeterministicScorer's
-  statement and macro reads go straight to provider methods that carry no tap, so
-  its gather-tape row is ``missing_capture`` naming the FIRST request that was not
-  on the tape -- not a green row, and not a live fetch. (Its OHLCV read is a
-  different story and used to be the blocker: the window it asked for carried a
-  raw ``datetime.now()`` at both ends, which is part of the request identity, so
-  the recorded frame could never be matched. That read now goes through
-  ``replay_now``; see the identity rule in
-  :mod:`ba2_common.core.replay.observe`.)
+* **A boundary that was never tapped cannot be served.** Every boundary a
+  recorded expert reads is tapped as of the second delivery -- including
+  DeterministicScorer's statements, its dated analyst history and its FRED macro
+  reads, which used to make its gather-tape row a declared ``missing_capture``.
+  What made that possible is the identity rule (see
+  :mod:`ba2_common.core.replay.observe`): each of those requests carries a window
+  that used to be a raw ``datetime.now()`` and is now a recorded ``replay_now``
+  read, so the replayed request is the recorded one and the tape can be keyed on
+  it. A boundary added later without a tap is still a ``missing_capture`` naming
+  the first request that was not on the tape -- never a live fetch.
 
 **Branches come from the RECORD, never from the tape.** "There is a calendar
 response on the tape" and "the calendar branch ran" are different statements.
@@ -63,6 +64,12 @@ from ba2_common.core.replay import (
 from ba2_experts.FMPEarningsDrift import earning_calendar_identity
 from ba2_experts.FMPRating import symbol_identity
 from ba2_providers.cache.cached_get import insider_get_identity, past_earnings_get_identity
+from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
+    earnings_estimates_identity,
+    past_earnings_identity,
+    statement_identity,
+)
+from ba2_providers.macro.fred_series import series_identity
 
 from app.services.replay.expert_replay import (
     RECORDED_EXPERTS,
@@ -203,13 +210,40 @@ def _actor_class(base: type, recorded_name: str) -> type:
 
 def _actor_name(tape: ReplayTape, provider: str, method: str, field: str) -> str:
     """The recorded actor name for a tapped method; all observations must agree."""
-    names = {identity[field] for identity in tape.identities(provider, method)
-             if field in identity}
+    return _actor_name_across(tape, field, (provider, method))
+
+
+#: Every tapped boundary a fundamentals-details provider can be recorded under.
+#: One analysis reaches it through one or two of them (EarningsDrift goes through
+#: the ``cached_get`` alias AND the provider method; DeterministicScorer only
+#: through the provider methods), so the tape actor's NAME -- which is part of
+#: those identities -- has to be taken from whichever ones were recorded.
+_DETAILS_BOUNDARIES = (
+    ("provider_cache", "past_earnings_get"),
+    ("fundamentals_details", "get_past_earnings"),
+    ("fundamentals_details", "get_balance_sheet"),
+    ("fundamentals_details", "get_income_statement"),
+    ("fundamentals_details", "get_cashflow_statement"),
+    ("fundamentals_details", "get_earnings_estimates"),
+)
+
+
+def _actor_name_across(tape: ReplayTape, field: str, *boundaries) -> str:
+    """The recorded actor name across several boundaries; they must all agree.
+
+    Two different names for one actor inside one analysis is not something to
+    pick a winner from: it means the record does not say which object answered,
+    so the replay refuses rather than guessing.
+    """
+    names = set()
+    for provider, method in boundaries:
+        names.update(identity[field] for identity in tape.identities(provider, method)
+                     if field in identity)
     if not names:
         return UNRECORDED_ACTOR
     if len(names) > 1:
         raise refuse("tape_ambiguous_actor", analysis_id=tape.analysis_id,
-                     request_identity={"provider": provider, "method": method,
+                     request_identity={"boundaries": [f"{p}.{m}" for p, m in boundaries],
                                        field: sorted(str(n) for n in names)},
                      detail="one analysis recorded several actors for one method")
     return str(next(iter(names)))
@@ -228,8 +262,74 @@ class _TapeInsiderProvider(_TapeActor):
             "lookback": lookback_days, "format_type": format_type}))
 
 
-class _TapeDetailsMixin:
-    """The fundamentals-details methods the recorded experts actually call."""
+class _TapeStatementsMixin:
+    """The fundamentals-details methods, served from the PROVIDER-METHOD taps.
+
+    DeterministicScorer and the analyst-target estimator call these methods
+    directly (never through the ``cached_get`` alias layer), so this is the shape
+    their reads were recorded in. Every signature mirrors the provider's exactly,
+    defaults included: the identity is built from the bound arguments, so a
+    default that differed here would build a key the tap never wrote.
+    """
+
+    def _statement(self, method, symbol, frequency, end_date, start_date,
+                   lookback_periods, as_of, format_type):
+        return self._tape.take("fundamentals_details", method, statement_identity({
+            "self": self, "symbol": symbol, "frequency": frequency,
+            "start_date": start_date, "end_date": end_date,
+            "lookback_periods": lookback_periods, "as_of": as_of,
+            "format_type": format_type}))
+
+    def get_balance_sheet(self, symbol, frequency="annual", end_date=None,
+                          start_date=None, lookback_periods=None, as_of=None,
+                          format_type="markdown"):
+        return self._statement("get_balance_sheet", symbol, frequency, end_date,
+                               start_date, lookback_periods, as_of, format_type)
+
+    def get_income_statement(self, symbol, frequency="annual", end_date=None,
+                             start_date=None, lookback_periods=None, as_of=None,
+                             format_type="markdown"):
+        return self._statement("get_income_statement", symbol, frequency, end_date,
+                               start_date, lookback_periods, as_of, format_type)
+
+    def get_cashflow_statement(self, symbol, frequency="annual", end_date=None,
+                               start_date=None, lookback_periods=None, as_of=None,
+                               format_type="markdown"):
+        return self._statement("get_cashflow_statement", symbol, frequency, end_date,
+                               start_date, lookback_periods, as_of, format_type)
+
+    def get_past_earnings(self, symbol, frequency="annual", end_date=None,
+                          lookback_periods=8, format_type="markdown"):
+        return self._tape.take(
+            "fundamentals_details", "get_past_earnings", past_earnings_identity({
+                "self": self, "symbol": symbol, "frequency": frequency,
+                "end_date": end_date, "lookback_periods": lookback_periods,
+                "format_type": format_type}))
+
+    def get_earnings_estimates(self, symbol, frequency="annual", as_of_date=None,
+                               lookback_periods=4, format_type="markdown"):
+        return self._tape.take(
+            "fundamentals_details", "get_earnings_estimates",
+            earnings_estimates_identity({
+                "self": self, "symbol": symbol, "frequency": frequency,
+                "as_of_date": as_of_date, "lookback_periods": lookback_periods,
+                "format_type": format_type}))
+
+
+class _TapeDetailsMixin(_TapeStatementsMixin):
+    """The same provider, for the experts that reach it through ``cached_get``.
+
+    THE CONSTRAINT: one live ``get_past_earnings`` call through the alias layer
+    records TWO observations under two different identities -- the alias's
+    (``provider_cache.past_earnings_get``, carrying the uniform as_of/lookback
+    request) and the provider method's (``fundamentals_details.get_past_earnings``,
+    carrying the window that answered it). A tape actor has ONE
+    ``get_past_earnings``, so it can serve only one of them, and choosing by "which
+    one is on the tape" would be exactly the inference this module refuses
+    everywhere else. So the choice is made by EXPERT in :func:`_prepare`: the two
+    experts that call the alias get this class, the ones that call the provider
+    method directly get :class:`_TapeStatementsMixin`'s version.
+    """
 
     def get_past_earnings(self, symbol, frequency="quarterly", end_date=None,
                           lookback_periods=1, format_type="dict", **_kw):
@@ -239,24 +339,13 @@ class _TapeDetailsMixin:
                 "frequency": frequency, "lookback_periods": lookback_periods,
                 "format_type": format_type}))
 
-    def _refuse_statement(self, statement, symbol, **kwargs):
-        raise refuse("tape", analysis_id=self._tape.analysis_id,
-                     request_identity={"statement": statement, "symbol": symbol,
-                                       **{k: repr(v) for k, v in kwargs.items()}},
-                     detail="financial statements are not a tapped boundary in this delivery")
-
-    def get_balance_sheet(self, symbol, *a, **kw):
-        self._refuse_statement("balance_sheet", symbol, **kw)
-
-    def get_income_statement(self, symbol, *a, **kw):
-        self._refuse_statement("income_statement", symbol, **kw)
-
-    def get_cashflow_statement(self, symbol, *a, **kw):
-        self._refuse_statement("cashflow_statement", symbol, **kw)
-
 
 class _TapeDetailsProvider(_TapeDetailsMixin, _TapeActor):
     """For every expert except FMPEarningsDrift (which needs an FMP-typed provider)."""
+
+
+class _TapeStatementsProvider(_TapeStatementsMixin, _TapeActor):
+    """For the experts that call the provider methods directly (DeterministicScorer)."""
 
 
 class _TapeOHLCVProvider(_TapeActor):
@@ -315,7 +404,7 @@ class TapeProviderBundle:
             _actor_name(tape, "market_data", "get_ohlcv_data", "provider"))(tape)
         self._details = details if details is not None else _actor_class(
             _TapeDetailsProvider,
-            _actor_name(tape, "provider_cache", "past_earnings_get", "provider"))(tape)
+            _actor_name_across(tape, "provider", *_DETAILS_BOUNDARIES))(tape)
 
     def ohlcv(self):
         return self._ohlcv
@@ -369,7 +458,7 @@ def _fmp_details_provider(tape: ReplayTape):
     provider for this expert subclasses the real one (constructed without its
     ``__init__``, which reads settings) and overrides everything it is asked for.
     """
-    name = _actor_name(tape, "provider_cache", "past_earnings_get", "provider")
+    name = _actor_name_across(tape, "provider", *_DETAILS_BOUNDARIES)
     base = _fmp_details_base()
     cls = _actor_class(base, name)
     provider = cls.__new__(cls)
@@ -379,6 +468,63 @@ def _fmp_details_provider(tape: ReplayTape):
     # it must exist. An explicit sentinel, never a real key.
     provider.api_key = "replay-tape"
     return provider
+
+
+def _tape_statements_provider(tape: ReplayTape) -> Any:
+    """A details provider carrying the recorded provider class name (part of the
+    statement identities) whose every method reads from the tape."""
+    return _actor_class(_TapeStatementsProvider,
+                        _actor_name_across(tape, "provider", *_DETAILS_BOUNDARIES))(tape)
+
+
+@contextmanager
+def _macro_series_from_tape(tape: ReplayTape):
+    """Serve the FRED point-in-time reads from the tape.
+
+    ``DeterministicScorer.data.fetch_macro_series`` calls the module-level
+    ``fred_series.get_series_as_of`` directly (the macro store is a flat per-series
+    file, not a provider), so the tape has to stand in for the module attribute the
+    way it does for the bulk earnings calendar.
+    """
+    module = importlib.import_module("ba2_providers.macro.fred_series")
+    original = module.get_series_as_of
+
+    def from_tape(series_id, as_of):
+        return tape.take("macro", "get_series_as_of",
+                         series_identity({"series_id": series_id, "as_of": as_of}))
+
+    module.get_series_as_of = from_tape
+    try:
+        yield
+    finally:
+        module.get_series_as_of = original
+
+
+@contextmanager
+def _analyst_history_from_tape(tape: ReplayTape):
+    """Serve the dated grades / price-target histories from the tape.
+
+    These are FMPRating's MODULE-level cached fetchers -- the single boundary both
+    it and DeterministicScorer record through -- imported inside
+    ``data.fetch_grades_history`` / ``fetch_price_targets``, so replacing the
+    module attribute is what the replay can reach.
+    """
+    module = importlib.import_module("ba2_experts.FMPRating")
+    originals = {name: getattr(module, name) for name in
+                 ("fetch_grades_historical_cached", "fetch_price_target_history_cached")}
+
+    def from_tape(method):
+        def fetch(api_key, symbol):
+            return tape.take("fmp", method, symbol_identity({"symbol": symbol}))
+        return fetch
+
+    module.fetch_grades_historical_cached = from_tape("grades_historical")
+    module.fetch_price_target_history_cached = from_tape("price_target_history")
+    try:
+        yield
+    finally:
+        for name, original in originals.items():
+            setattr(module, name, original)
 
 
 @contextmanager
@@ -486,14 +632,30 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
         def _refuse_api_key():
             raise refuse("fmp_api_key", analysis_id=analysis.analysis_id,
                          request_identity={"expert_class": expert_class},
-                         detail="the dated grades/target fetches are not a tapped boundary")
+                         detail="this gather weighted the analyst section at zero, so "
+                                "the live path never read an FMP key")
 
+        # The RECORD says whether the live gather had a key, not the tape. Inferring
+        # it from "is there an analyst response on the tape?" is how a missing
+        # response quietly reroutes the replay down the no-coverage branch, whose
+        # empty bundle then compares as a plausible DIFFERENCE instead of the
+        # missing capture it is.
         expert._get_fmp_api_key = _refuse_api_key
-        # The module memoizes OHLCV per symbol across calls; one analysis's frame
-        # must never be served to the next one's gather.
+        if expert._gather_w_analyst > 0:
+            if bool(_branch(analysis, "ds_analyst_key_present")):
+                stack.enter_context(_analyst_history_from_tape(tape))
+                # A sentinel, never a key: the tape answers both fetches and nothing
+                # on this path uses the value.
+                expert._get_fmp_api_key = lambda: "replay-tape"
+            else:
+                expert._get_fmp_api_key = lambda: None
+        # The macro read is unconditional in this gather.
+        stack.enter_context(_macro_series_from_tape(tape))
+        # The module memoizes OHLCV (and the macro series) per key across calls; one
+        # analysis's frame must never be served to the next one's gather.
         ds_data.reset_caches()
         stack.callback(ds_data.reset_caches)
-        return TapeProviderBundle(tape)
+        return TapeProviderBundle(tape, details=_tape_statements_provider(tape))
 
     raise refuse("expert_class", analysis_id=analysis.analysis_id,
                  request_identity={"expert_class": expert_class},
@@ -512,11 +674,7 @@ def _fmp_symbol_fetch(tape: ReplayTape, method: str) -> Callable[[str], Any]:
 def replay_gather(bundle: SessionBundle, analysis: AnalysisRecord) -> AnalysisResult:
     def result(status: str, detail: str = "",
                field_diffs: Sequence[Tuple[str, str, str]] = ()) -> AnalysisResult:
-        return AnalysisResult(
-            analysis_id=analysis.analysis_id, expert_class=analysis.expert_class,
-            symbol=analysis.symbol, use_case=analysis.use_case,
-            recorded_outcome=analysis.outcome, status=status, detail=detail,
-            field_diffs=tuple(field_diffs))
+        return AnalysisResult.for_analysis(analysis, status, detail, field_diffs)
 
     if analysis.expert_class not in RECORDED_EXPERTS:
         return result(ReplayStatus.COVERAGE_UNSUPPORTED,

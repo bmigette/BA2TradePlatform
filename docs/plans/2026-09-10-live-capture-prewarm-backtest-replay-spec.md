@@ -479,20 +479,24 @@ a new paper session, then production observation after the tests above. Existing
 account/protection findings can become replay regressions without changing
 historical strategy calculations in this work.
 
-## 12. Status (first delivery, 2026-09-11)
+## 12. Status (2026-09-11, after the second delivery)
 
-Branch `feat/live-capture-replay` (from dev 82baaa10). Task plan:
-`2026-09-10-live-capture-replay-implementation-plan.md`. Capture ships OFF.
+First delivery: branch `feat/live-capture-replay` (from dev 82baaa10), merged as 3e34440a; task
+plan `2026-09-10-live-capture-replay-implementation-plan.md`. Second delivery: branch
+`feat/live-capture-replay-2` (from dev 3e34440a); task plan
+`2026-09-11-live-capture-replay-second-delivery-plan.md`. Capture is ON in production since
+2026-09-11 08:28 (operator decision); the warm service ships with `warm_enabled=false`.
 
 | Step | State | Where | Commits |
 |---|---|---|---|
 | 1 Contract/store | done | `packages/common/ba2_common/core/replay/` (schemas, codec, store, context, clock, service, observe) | 9e851b6b, 7d408b25 |
 | 2 Live expert recording | done for the four deployed expert classes | `MarketExpertInterface._gather_and_process`, taps in FMPRating/FMPEarningsDrift/cached_get/StockScreener/OHLCV/quote (incl. IBKR), `replay_now` clock seam, host `ba2_trade_platform/core/replay_capture.py`, `main.py`, `WorkerQueue` | 7ffe2518, 402d82b5 |
 | 3 Expert replay | done: `recorded_expert` and `gather_tape` capabilities, inventory/report, CLI | `testplatform/backend/app/services/replay/`, `ba2test replay inventory\|experts\|gather --bundle <dir>`, `tools/replay_bootstrap_2026_09_10.py` | 1280820e, 9c2c573e |
-| 4 Warm service | slice only: backend prewarm persists from worker threads, one fetcher table (`prewarm_fetchers.run_prewarm`), estimator inputs warmed for Drift and Insider unconditionally, senate bounds from one source | `testplatform/backend/app/services/prewarm_fetchers.py`, `data_build_handler.py`, launcher | fa69a8eb, 0bf432e0 |
-| 5 Historical comparison | not started | | |
-| 6 Decision/sizing trace | not started | | |
-| 7 Pilot rollout | not started (no UI counters; setting exists) | | |
+| 2b Remaining taps (§5) | done: DeterministicScorer statements/macro/index/analyst reads, FRED, ATR, estimator inputs; clock seams; analysis-keyed macro memo; complete indicator identity | `FMPCompanyDetailsProvider`, `fred_series`, `analyst_target_model`, `position_sizing.get_latest_atr`, DS `data.py` | 93fb9725, 8761e861 |
+| 4 Warm service | done: dependency resolver + adapters, network-free planner over pinned/shared roots, budgets, low-priority warm queue, host worker with settings `warm_enabled` (false), `warm_workers` (2), `warm_daily_allowance_mib` (100), `warm_settlement_offset_minutes` (90); backend prewarm persists from worker threads, one fetcher table, estimator inputs warmed for Drift and Insider unconditionally | `ba2_common.core.replay.dependencies`, `ba2_common.core.warm`, `ba2_providers.warm` (planner, roots, seams), `ba2_experts.warm_fetchers` / `replay_dependencies`, `ba2_trade_platform/core/warm_service.py`, `testplatform/backend/app/services/prewarm_fetchers.py`, CLI `replay warm-plan` / `replay warm` | fa69a8eb, 0bf432e0, b6b62b39, b38322ce |
+| 5 Historical comparison | done: `historical` capability re-runs `analyze_as_of` in a child process pinned to a cache root (CACHE_FOLDER set before import, hermetic FMP, transport closed, offline credentials), records the historical bundle under a derived session in the same store, diffs inputs (with absolute/relative deltas) and recommendation, classifies `match` / `difference` / `missing_history` / `revision_unknown` / `unsupported`; pin manifest verified per run | `testplatform/backend/app/services/replay/historical.py`, CLI `replay historical --bundle <dir> --cache-root <pinned> [--timeout]` | 6cc7e1bb, 5e11ce14, 1bc2fcd8 |
+| 6 Decision/sizing trace | DROPPED (operator decision 2026-09-11): the DB already records the classic run (`RiskManagerRun`: received/funded/refused with reasons, balance and cap in force), the orders with final TP/SL and the fills; the extra stream (raw broker operands at read time, submit-lock order, validator outcomes, protection chain, fill links) serves live order-path debugging, not the live-vs-backtest question. The useful remainder — ranking and allocation operands — is delivered as an enrichment of `RiskManagerRun` on branch `feat/classic-rm-run-trace` instead. | | |
+| 7 Pilot rollout | reduced: capture ON in prod; warm settings exist (get-or-create, OFF); no settings card, health badge, retention GC, export CLI or paper acceptance script were built (not needed for the operator's goal). Health counters remain readable via `get_capture_health()`. | | |
 
 How to use:
 
@@ -502,6 +506,16 @@ How to use:
 - Export/replay: `ba2-test replay inventory --bundle <session-export>`,
   `ba2-test replay experts --bundle <dir> [--out <dir>]`, `ba2-test replay gather --bundle <dir>`.
   `experts`/`gather` exit 1 on any `difference`; `missing_capture` is coverage, not failure.
+- Warm the backtest cache for what a session read: `ba2-test replay warm-plan --bundle <dir>
+  --cache-root <writable root> [--cache-root <shared root> ...] [--as-of-now <iso>] --out plan.json`
+  (no network), then `ba2-test replay warm --plan plan.json [--workers 2] [--allowance-mib 100]`.
+- Compare live decisions with the backtest path on a pinned root: `ba2-test replay historical
+  --bundle <dir> --cache-root <pinned root> [--out <dir>] [--timeout <s>]`. Exit 1 on any
+  `difference`; `missing_history` / `revision_unknown` are coverage, not failure. The report
+  fills the "Expert inputs" and "Recommendation" stages with per-field diffs and deltas.
+- Live host warm worker: app settings `warm_enabled` (false), `warm_workers`,
+  `warm_daily_allowance_mib`, `warm_settlement_offset_minutes`; enqueue-only at analysis batch
+  end, never holds a trading lock.
 - September 10 bootstrap: `tools/replay_bootstrap_2026_09_10.py <live_inputs.json> <out>`
   yields a PARTIAL session (no normalized bundles were recorded that day), so every analysis
   reports `missing_capture` by design.
@@ -509,10 +523,10 @@ How to use:
 Known limits recorded by the reviews:
 
 - A recorded-bundle `match` is not a live/backtest match; only the two capabilities above run.
-- DeterministicScorer gather-tape: OHLCV identity is replayable (`data.fetch_ohlcv` reads
-  `replay_now`), but statements/macro/index reads are un-taped and report `missing_capture`
-  naming the first un-taped request. Rule: no request-identity key may carry an un-replayed
-  wall-clock value.
+- Rule kept from the first delivery: no request-identity key may carry an un-replayed
+  wall-clock value (the DeterministicScorer statements/macro/index gap is closed, 93fb9725).
+- Historical comparison reads a pinned root in a child process; a session with several hundred
+  analyses runs sequentially in that child (timeout scales with the job count).
 - `absorb_if_benign` can swallow `ReplayMiss` under non-enforce error modes; a never-absorb
   registry in `failure_modes` is owed.
 - `shutdown_replay_capture()` has no app shutdown path; interrupt-and-recover at next

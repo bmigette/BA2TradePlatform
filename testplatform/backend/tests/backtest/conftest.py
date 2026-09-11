@@ -21,71 +21,90 @@ Important safety properties:
 """
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
 import pytest
 
 
-def _ensure_live_tree_on_path() -> None:
-    """Put the repo root (the checkout's ``ba2_trade_platform`` live tree) on ``sys.path``.
+def checkout_root() -> Path:
+    """The checkout THIS conftest belongs to: the ancestor holding the live tree.
 
-    A handful of live<->backtest parity tests (``test_option_breaker_parity.py``,
-    ``test_per_leg_expiry_parity.py``) import the LIVE tree directly -- e.g.
-    ``ba2_trade_platform.modules.accounts.AlpacaAccount`` -- to prove identity/parity against
-    the real live account classes, not a double. ``ba2_trade_platform`` lives at the repo root
-    (three directories above ``testplatform/backend``), which is on no import path when pytest
-    runs from ``testplatform/backend`` (the working directory this suite is always run from),
-    so those imports raise ``ModuleNotFoundError`` unless something adds it. Walk up from this
-    file (rather than hard-coding a parent count) to the first ancestor that actually contains
-    a ``ba2_trade_platform`` package, and prepend it.
+    Walked (rather than a hard-coded parent count) so moving the suite cannot
+    silently point it somewhere else.
     """
-    try:
-        import ba2_trade_platform  # noqa: F401  (already importable -- nothing to do)
-        return
-    except ModuleNotFoundError:
-        pass
-
     here = Path(__file__).resolve()
     for candidate in here.parents:
         if (candidate / "ba2_trade_platform" / "__init__.py").is_file():
-            sys.path.insert(0, str(candidate))
-            return
+            return candidate
+    raise RuntimeError(
+        f"no checkout root above {here}: nothing here contains ba2_trade_platform/")
 
 
-
-def _ensure_launcher_on_path() -> None:
-    """Put ``testplatform/`` on ``sys.path`` so ``import ba2test_launcher`` works.
-
-    ``ba2test_launcher.py`` sits one level ABOVE the working directory this suite runs from,
-    and nothing installs it: CI pip-installs packages/{common,providers,experts} and nothing
-    else. On a dev box a bare ``import ba2test_launcher`` resolves anyway, through the editable
-    install of ``ba2test_app`` -- a .pth finder that exists only because someone once ran
-    ``pip install -e`` on the testplatform tree. So such an import collects locally and raises
-    ``ModuleNotFoundError`` on CI, which pytest reports as "Interrupted: 1 error during
-    collection" and exit code 2: the whole tests/backtest step fails with no test having run.
-    That is exactly what test_inert_rm_toggles_stay_off.py did, and it left CI red from the
-    commit that added it (a0acd65d) until 2026-09-07.
-
-    Fixed HERE rather than per-file so the next test to need the launcher cannot reintroduce
-    it. Walk up to the ancestor that actually holds the module, the same way
-    ``_ensure_live_tree_on_path`` locates the live tree, instead of counting parents.
-    """
+def module_is_under(module, root: Path) -> bool:
+    """Is this imported module's file inside ``root``?"""
+    path = getattr(module, "__file__", None)
+    if path is None:
+        return False
     try:
-        import ba2test_launcher  # noqa: F401  (already importable -- nothing to do)
-        return
-    except ModuleNotFoundError:
-        pass
-
-    here = Path(__file__).resolve()
-    for candidate in here.parents:
-        if (candidate / "ba2test_launcher.py").is_file():
-            sys.path.insert(0, str(candidate))
-            return
+        Path(path).resolve().relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
-_ensure_live_tree_on_path()
-_ensure_launcher_on_path()
+def _ensure_from_this_checkout(name: str, directory: Path, root: Path) -> None:
+    """Make ``import name`` resolve inside THIS checkout, or fail loudly.
+
+    Two problems, one function.
+
+    (1) ``ba2_trade_platform`` (the live tree, imported by the live<->backtest
+    parity tests) and ``ba2test_launcher`` are on no import path when pytest runs
+    from ``testplatform/backend``, and CI installs neither -- so a bare import
+    raises ``ModuleNotFoundError`` and the whole step dies during collection. That
+    is what ``test_inert_rm_toggles_stay_off.py`` did to CI (red from a0acd65d to
+    2026-09-07).
+
+    (2) On a dev box those imports DO resolve -- through the venv's editable
+    installs, which point at the MAIN checkout by absolute path. In a git worktree
+    that silently runs another checkout's code: importing the main
+    ``ba2test_launcher`` also puts the MAIN ``testplatform/backend`` on
+    ``sys.path`` (it does that at import time), so every later ``app.*`` import
+    comes from there too. Measured, not theorised: it made this worktree's
+    ``tests/replay`` fail against a stale ``gather_tape`` whenever ``tests/backtest``
+    was collected in the same run, with a message describing code that no longer
+    exists here.
+
+    So: APPEND this checkout's directory (append, never insert -- the repo root
+    holds a ``tests`` package of its own, and putting it ahead of the working
+    directory would shadow ``tests.replay``), import, and then VERIFY the file we
+    got is inside this checkout. A module already imported from elsewhere cannot be
+    re-pointed safely once objects are bound to it, so that case raises instead of
+    pretending: a loud stop beats a run that silently measures another checkout.
+    """
+    module = sys.modules.get(name)
+    if module is None:
+        if str(directory) not in sys.path:
+            sys.path.append(str(directory))
+        try:
+            module = importlib.import_module(name)
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                f"{name} is not importable from this checkout ({directory})") from exc
+    if not module_is_under(module, root):
+        raise RuntimeError(
+            f"{name} resolved to {getattr(module, '__file__', '?')}, which is OUTSIDE "
+            f"this checkout ({root}). That is the venv's editable install pointing at "
+            f"another checkout; this suite would silently exercise its code. Run pytest "
+            f"from this checkout's testplatform/backend, and check that its pytest.ini "
+            f"pythonpath still lists this checkout's packages."
+        )
+
+
+_ROOT = checkout_root()
+_ensure_from_this_checkout("ba2_trade_platform", _ROOT, _ROOT)
+_ensure_from_this_checkout("ba2test_launcher", _ROOT / "testplatform", _ROOT)
 
 # Dummy credential values seeded into the throwaway test DB so provider __init__ calls
 # that read get_app_setting(...) do not raise. These are NOT real keys.

@@ -34,7 +34,7 @@ from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
-from ba2_common.core.replay import replay_now
+from ba2_common.core.replay import record_branch_flag, replay_now
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
@@ -384,6 +384,12 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         target_rows: list = []
         if float(getattr(self, "_gather_w_analyst", 0.0) or 0.0) > 0:
             api_key = self._get_fmp_api_key()
+            # The record says which branch ran. Without this flag a replay would have
+            # to infer "was there a key?" from whether the tape happens to hold an
+            # analyst response -- and an absent response would then quietly reroute it
+            # down the no-coverage branch, whose empty bundle compares as a plausible
+            # DIFFERENCE instead of the missing capture it is.
+            record_branch_flag("ds_analyst_key_present", bool(api_key))
             if api_key:
                 grades_rows = data.fetch_grades_history(api_key, symbol)
                 target_rows = data.fetch_price_targets(api_key, symbol)

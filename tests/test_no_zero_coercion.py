@@ -377,9 +377,10 @@ ALLOWLIST: dict = {
     "ba2_trade_platform/ui/components/performance_charts.py:459":
         "loss half of the same win-rate count; 0 is excluded from both tallies rather than "
         "scored as either",
-    "testplatform/backend/app/services/data_build_handler.py:157":
+    "testplatform/backend/app/services/data_build_handler.py:126":
         "screener CONFIG bound: an absent price_min means 'no minimum', which is what 0.0 "
-        "expresses; it is not a quote",
+        "expresses; it is not a quote (was :157 before the prewarm handler moved to "
+        "prewarm_fetchers.run_prewarm, :121 before prewarm_fred gained its warn sink)",
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",

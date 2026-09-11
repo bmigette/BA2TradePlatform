@@ -21,13 +21,18 @@ to an empty section that then compares as a plausible bundle.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from ba2_common.core.failure_modes import absorb_if_benign
-from ba2_common.core.replay import ReplayMiss, replay_now
+from ba2_common.core.replay import (
+    ReplayMiss,
+    ReplayStatus,
+    record_observation,
+    replay_now,
+)
 from ba2_common.logger import logger
 from ba2_providers.fmp_common import TTLCache
 
@@ -49,6 +54,13 @@ OHLCV_LOOKBACK_DAYS = 600
 
 INDEX_SYMBOL = "SPY"
 
+# The FRED series ``fetch_macro_series`` reads, in the order it reads them. Declared
+# here rather than inline in the fetcher so the replay-dependency adapter
+# (``ba2_experts.replay_dependencies``) names EXACTLY what the fetcher reads: a second
+# hand-kept copy of this tuple is how a warm plan silently stops covering a series the
+# expert still asks for. Every id must exist in ``fred_series.SERIES_SPEC``.
+MACRO_SERIES_IDS = ("VIXCLS", "UNRATE", "BAA10Y", "T10Y3M")
+
 
 def reset_caches() -> None:
     """Drop every process-wide cache (tests, and the live /api/reload path).
@@ -60,11 +72,6 @@ def reset_caches() -> None:
     for cache in (_OHLCV_CACHE, _STATEMENTS_CACHE, _GRADES_CACHE, _MACRO_CACHE):
         with cache._lock:               # type: ignore[attr-defined]
             cache._store.clear()        # type: ignore[attr-defined]
-
-
-def _utcnow() -> datetime:
-    """tz-aware now (utcnow() is deprecated AND naive, which poisons date math)."""
-    return datetime.now(timezone.utc)
 
 
 def _slice_to_as_of(df: pd.DataFrame, as_of: Optional[datetime]) -> Optional[pd.DataFrame]:
@@ -145,7 +152,12 @@ def fetch_statements(providers, symbol: str, as_of: Optional[datetime],
     {'balance': [...], 'income': [...], 'cashflow': [...]} (provider dict
     format, snake_case fields).
     """
-    ref = as_of if as_of is not None else _utcnow()
+    # replay_now(as_of), not a raw wall clock: ``ref`` becomes the ``end_date`` of
+    # three tapped statement requests, and an identity key holding an un-replayed
+    # ``datetime.now()`` can never be matched again -- the recorded response would
+    # be unreproducible by construction (see ba2_common.core.replay.observe).
+    # as_of given => returned unchanged, so the historical path is untouched.
+    ref = replay_now(as_of)
     det = providers.fundamentals_details()
     out: Dict[str, Any] = {}
     for key, fn in (("balance", det.get_balance_sheet),
@@ -214,7 +226,9 @@ def fetch_past_earnings(providers, symbol: str, as_of: Optional[datetime],
     which additionally needs its FILING date checked. 16 quarters gives the SUE
     standardization (4 years) enough dispersion history.
     """
-    ref = as_of if as_of is not None else _utcnow()
+    # replay_now(as_of): ``ref`` is the tapped request's ``end_date`` (see
+    # fetch_statements above).
+    ref = replay_now(as_of)
     det = providers.fundamentals_details()
     try:
         out = det.get_past_earnings(symbol=symbol, frequency="quarterly", end_date=ref,
@@ -329,22 +343,55 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
 
     # str(): as_of may be a datetime (engine) or an ISO string (tools/tests), and
     # get_series_as_of accepts both -- the memo key must not care which.
+    #
+    # ONE KEY FOR THE WHOLE PROCESS on the live path. These four series are
+    # economy-wide: identical for every symbol in a batch and for every analysis in
+    # a tick, which is the entire reason the memo exists (~95ms of series rebuilding
+    # per analysis without it). CAPTURE MUST NOT CHANGE THAT. A key of
+    # "analysis:<id>" turned the memo off for exactly the runs it was measuring --
+    # an instrument that changes what it measures is not an instrument -- and the
+    # thing it was reaching for (every analysis's bundle carrying its macro reads)
+    # is what ``_series`` records below, without touching the cache.
     _key_suffix = str(as_of) if as_of is not None else "live"
 
     def _series(series_id: str):
-        return _MACRO_CACHE.get_or_call(
-            f"{series_id}__{_key_suffix}",
-            lambda: fred_series.get_series_as_of(series_id, as_of))
+        """The series, and the observation that says this analysis read it.
 
+        The tap on ``get_series_as_of`` records the analysis that actually LOADED;
+        an analysis served out of the memo never enters that function, so its
+        bundle would hold macro values with no observation behind them --
+        unreplayable, and silently so. The memo hit is therefore recorded here,
+        through the same identity the tap writes (``series_identity``, imported
+        rather than restated) and the same provenance: this store never reaches the
+        network, so every value here came off disk whichever path served it.
+        """
+        loaded = []
+
+        def _load():
+            loaded.append(series_id)
+            return fred_series.get_series_as_of(series_id, as_of)
+
+        series = _MACRO_CACHE.get_or_call(f"{series_id}__{_key_suffix}", _load)
+        if not loaded:
+            record_observation(
+                provider="macro", method="get_series_as_of",
+                identity=fred_series.series_identity(
+                    {"series_id": series_id, "as_of": as_of}),
+                payload=series, provenance=ReplayStatus.PROVENANCE_DISK_CACHE)
+        return series
+
+    # Keyed by MACRO_SERIES_IDS so the tuple the dependency adapter declares is the
+    # tuple this function reads.
+    vix_id, unrate_id, oas_id, spread_id = MACRO_SERIES_IDS
     try:
-        vix = _series("VIXCLS")
+        vix = _series(vix_id)
         out["vix"] = float(vix.iloc[-1]) if len(vix) else None
-        out["unrate_series"] = _series("UNRATE")
+        out["unrate_series"] = _series(unrate_id)
         # Credit: Moody's Baa less 10y, NOT the ICE HY OAS the key name still reflects
         # -- FRED serves ICE indices on a rolling ~3y licence. credit_score z-scores
         # its input, so the substitution is unit-safe.
-        out["oas_series"] = _series("BAA10Y")
-        out["spread_10y3m_series"] = _series("T10Y3M")
+        out["oas_series"] = _series(oas_id)
+        out["spread_10y3m_series"] = _series(spread_id)
     except ReplayMiss:
         raise
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise

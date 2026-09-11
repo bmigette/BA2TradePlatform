@@ -41,12 +41,12 @@ from tests.replay import (
     _scorer_frame,
 )
 
-#: The analyses whose whole live gather routes through TAPPED boundaries.
-#: DeterministicScorer is deliberately absent: its statement and macro reads go
-#: to provider methods that carry no tap, so its gather cannot be served from a
-#: tape in this delivery -- an explicit coverage gap, asserted below rather than
-#: left to be discovered as a mystery `difference`.
-TAPE_SERVEABLE = tuple(i for i in ALL_IDS if i != SCORER_ID)
+#: The analyses whose whole live gather routes through TAPPED boundaries -- all of
+#: them, including DeterministicScorer: its statements, its dated analyst history
+#: and its FRED macro reads are tapped as of the second delivery, and the windows
+#: they ask for come from recorded clock reads, so the replayed requests are the
+#: recorded ones.
+TAPE_SERVEABLE = ALL_IDS
 
 
 @pytest.fixture(scope="module")
@@ -137,15 +137,52 @@ def test_the_scorer_ohlcv_request_identity_is_reproducible_under_replay():
         "the window still ends at a wall clock nobody recorded")
 
 
-def test_a_boundary_that_was_never_tapped_names_the_first_missing_request(session):
-    """DS gets PAST its OHLCV read now, and misses on the first un-taped one."""
-    result = _by_id(gather_tape.run(session))[SCORER_ID]
+def test_the_scorer_gather_is_served_from_the_tape_end_to_end(session):
+    """Every DS boundary -- OHLCV, statements, analyst history, FRED -- replays.
 
+    This row used to be a declared ``missing_capture`` naming the statements read:
+    the boundaries under ``data.fetch_statements``/``fetch_macro_series`` carried
+    no tap, so nothing about them was ever recorded. It is a MATCH now, which is
+    the only honest way to say that the gap is closed.
+    """
+    result = _by_id(gather_tape.run(session))[SCORER_ID]
+    assert result.status == ReplayStatus.COVERAGE_MATCH, result.detail
+
+
+@pytest.mark.parametrize("method,named", [
+    ("get_balance_sheet", "get_balance_sheet"),
+    ("get_series_as_of", "get_series_as_of"),
+    ("grades_historical", "grades_historical"),
+])
+def test_dropping_one_scorer_response_names_the_request_it_cannot_serve(
+        bundle_copy, method, named):
+    """A boundary whose response is gone is a NAMED miss, never a quiet fallback.
+
+    Each of these is a read the scorer's gather makes through a different kind of
+    seam -- a provider method, a module-level macro file, a module-level FMP
+    fetcher -- so one parametrization per seam is one regression each.
+    """
+    assert drop_observations(bundle_copy, SCORER_ID, method) >= 1
+
+    result = _by_id(gather_tape.run(bundle_copy))[SCORER_ID]
+    assert result.status == ReplayStatus.COVERAGE_MISSING_CAPTURE, result.detail
+    assert named in result.detail
+
+
+def test_a_record_that_does_not_say_whether_the_scorer_had_an_fmp_key_is_a_miss(
+        bundle_copy):
+    """The analyst branch comes from the RECORD, like every other branch.
+
+    Without the flag the replay would have to infer "was there an API key?" from
+    whether the tape happens to hold an analyst response -- and a missing response
+    would then reroute it down the no-coverage branch, whose empty grades/target
+    lists compare as a plausible DIFFERENCE instead of the missing capture it is.
+    """
+    edit_analysis(bundle_copy, SCORER_ID, branch_flags={"as_of_is_none": True})
+
+    result = _by_id(gather_tape.run(bundle_copy))[SCORER_ID]
     assert result.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
-    assert "replay miss" in result.detail
-    assert "balance_sheet" in result.detail, (
-        "the OHLCV read is served from the tape now; the FIRST un-taped request is "
-        "the statements read, and the report has to name it")
+    assert "branch" in result.detail
 
 
 # --------------------------------------------------------------------------- #

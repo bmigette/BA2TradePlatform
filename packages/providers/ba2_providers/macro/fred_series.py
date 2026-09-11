@@ -39,6 +39,8 @@ import pandas as pd
 import requests
 
 from ba2_common.config import CACHE_FOLDER
+from ba2_common.core.replay.observe import observe_provider
+from ba2_common.core.replay.schemas import ReplayStatus
 from ba2_common.logger import logger
 
 API_URL = "https://api.stlouisfed.org/fred/series/observations"
@@ -129,8 +131,15 @@ def fetch_full_history(series_id: str, api_key: str) -> List[dict]:
         params["realtime_start"] = _REALTIME_MIN
         params["realtime_end"] = _REALTIME_MAX
 
+    # Counted in the SAME purpose counters as FMP (spec section 6: requests and bytes by
+    # endpoint and purpose). A warm that refreshes nine macro series is real background
+    # traffic, and an allowance that could not see it was governing the wrong half.
+    from ba2_providers.fmp_common import record_fmp_bytes, record_fmp_request
+
+    record_fmp_request("fred-observations")
     resp = requests.get(API_URL, params=params, timeout=60)
     resp.raise_for_status()
+    record_fmp_bytes("fred-observations", len(getattr(resp, "content", b"") or b""))
     payload = resp.json()
     if "error_message" in payload:
         raise RuntimeError(f"FRED rejected {sid}: {payload['error_message']}")
@@ -183,8 +192,27 @@ def reset_cache() -> None:
     _MEM.clear()
 
 
+def series_identity(args):
+    """What makes a point-in-time FRED read what it is: the series and the cut.
+
+    Named (not an inline lambda) because the offline replay tape imports it to
+    look a recorded series up by exactly the identity the tap wrote. ``as_of`` is
+    taken AS THE CALLER PASSED IT (``None`` on the live path, which means "every
+    vintage published so far"): normalizing it here would build a key the caller
+    cannot reproduce.
+    """
+    return {"series_id": args["series_id"], "as_of": args["as_of"]}
+
+
+@observe_provider("macro", "get_series_as_of", identity=series_identity,
+                  provenance=ReplayStatus.PROVENANCE_DISK_CACHE)
 def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
     """Return the series as it was KNOWN at *as_of*, indexed by observation date.
+
+    Recorded at this boundary (provenance ``disk_cache``): this function NEVER
+    reaches the network -- it reads the synced cache file (or the in-process memo
+    of it) and raises when the series was not warmed -- so every return here came
+    off disk by construction.
 
     ``as_of=None`` means "latest" (the live path). For vintage series the cut is on
     first-publication date, so a backtest standing on 2024-01-31 cannot see January's
