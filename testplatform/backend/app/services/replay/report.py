@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ba2_common.core.replay import CoverageEntry, ReplayStatus
 from ba2_common.core.replay.schemas import SCHEMA_VERSION
@@ -23,6 +23,7 @@ from ba2_common.core.replay.service import COVERAGE_NAME
 
 __all__ = [
     "AnalysisResult",
+    "FieldDiff",
     "ReplayReport",
     "merge_coverage",
     "STAGE_ROWS",
@@ -118,6 +119,68 @@ STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
 
 
 @dataclass(frozen=True)
+class FieldDiff:
+    """One differing field, and -- for a numeric one -- HOW FAR it moved.
+
+    Spec section 8: "Historical comparison reports absolute/relative input
+    differences and resulting decision differences." A pair of reprs answers
+    "different?" but not "by how much", and a 0.3% price drift and a 30x one read
+    identically in a table of reprs.
+
+    The deltas are REPORTING only. Equality stays exact -- ``rel_delta`` is never
+    compared against a tolerance, and a diff with a tiny delta is still a
+    ``difference``. "No broad 'close enough' tolerance may hide a changed signal,
+    threshold crossing, share quantity or stop tick."
+
+    ``rel_delta`` is ``None`` when the recorded value is 0 (there is no relative
+    change from nothing) and that case is rendered as such rather than as 0.0 or
+    as an infinity, so a reader can tell "no relative change" from "not defined".
+    """
+
+    field: str
+    recorded: str
+    produced: str
+    #: ``abs(produced - recorded)`` for a numeric leaf; ``None`` for anything else.
+    abs_delta: Optional[float] = None
+    #: ``abs_delta / abs(recorded)``; ``None`` when not numeric OR recorded == 0.
+    rel_delta: Optional[float] = None
+    #: True when this IS a numeric diff whose ``rel_delta`` is undefined (recorded
+    #: is 0). Distinguishes "no relative delta because the baseline is zero" from
+    #: "no relative delta because this is not a number".
+    rel_delta_undefined: bool = False
+
+    @classmethod
+    def coerce(cls, value: Any) -> "FieldDiff":
+        """Accept a plain ``(field, recorded, produced)`` triple or a FieldDiff."""
+        if isinstance(value, FieldDiff):
+            return value
+        field, recorded, produced = value
+        return cls(field=field, recorded=recorded, produced=produced)
+
+    def delta_text(self) -> str:
+        """``Δ 0.2 (16.7%)`` -- empty for a non-numeric diff."""
+        if self.abs_delta is None:
+            return ""
+        if self.rel_delta is not None:
+            return f"Δ {self.abs_delta:.6g} ({self.rel_delta * 100:.3g}%)"
+        if self.rel_delta_undefined:
+            return f"Δ {self.abs_delta:.6g} (relative undefined: recorded is 0)"
+        return f"Δ {self.abs_delta:.6g}"
+
+    def to_mapping(self) -> Dict[str, Any]:
+        """The JSON shape. Numeric keys appear ONLY on a numeric diff, so a
+        capability that reports no deltas keeps its previous output exactly."""
+        out: Dict[str, Any] = {"field": self.field, "recorded": self.recorded,
+                               "produced": self.produced}
+        if self.abs_delta is not None:
+            out["abs_delta"] = self.abs_delta
+            out["rel_delta"] = self.rel_delta
+            if self.rel_delta is None:
+                out["rel_delta_undefined"] = self.rel_delta_undefined
+        return out
+
+
+@dataclass(frozen=True)
 class AnalysisResult:
     """One analysis, one capability: what happened and why."""
 
@@ -128,8 +191,35 @@ class AnalysisResult:
     recorded_outcome: str
     status: str
     detail: str = ""
-    #: Per-field differences as ``(field, recorded, produced)`` rendered text.
-    field_diffs: Sequence[Tuple[str, str, str]] = ()
+    #: Per-field differences. Plain ``(field, recorded, produced)`` triples are
+    #: accepted and normalized to :class:`FieldDiff` here, so every caller --
+    #: including the two that predate the deltas -- lands on one shape.
+    field_diffs: Sequence[FieldDiff] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "field_diffs", tuple(FieldDiff.coerce(d) for d in self.field_diffs))
+
+    @classmethod
+    def for_analysis(cls, analysis: Any, status: str, detail: str = "",
+                     field_diffs: Sequence[Any] = ()) -> "AnalysisResult":
+        """Build a row from the recorded :class:`AnalysisRecord` it is about.
+
+        ONE builder for all three capabilities. The three modules each had their
+        own copy of this mapping, so a field added to the row (or a record field
+        renamed) had to be found in three places -- and a row that named the wrong
+        analysis is the one defect a coverage report cannot survive.
+        """
+        return cls(
+            analysis_id=analysis.analysis_id,
+            expert_class=analysis.expert_class,
+            symbol=analysis.symbol,
+            use_case=analysis.use_case,
+            recorded_outcome=analysis.outcome,
+            status=status,
+            detail=detail,
+            field_diffs=tuple(field_diffs),
+        )
 
     def to_mapping(self) -> Dict[str, Any]:
         return {
@@ -140,10 +230,7 @@ class AnalysisResult:
             "recorded_outcome": self.recorded_outcome,
             "status": self.status,
             "detail": self.detail,
-            "field_diffs": [
-                {"field": name, "recorded": recorded, "produced": produced}
-                for name, recorded, produced in self.field_diffs
-            ],
+            "field_diffs": [diff.to_mapping() for diff in self.field_diffs],
         }
 
     def coverage_entry(self, session_id: str, capability: str) -> CoverageEntry:
@@ -165,6 +252,14 @@ class ReplayReport:
     capability: str
     results: List[AnalysisResult] = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    #: Optional PER-STAGE status for each result, as ``{stage: {analysis_id: status}}``.
+    #: A capability that fills more than one stage must say what happened at EACH of
+    #: them: rolling one analysis-level status into both rows reports "difference" on
+    #: Expert inputs for an analysis whose inputs matched and whose recommendation
+    #: moved -- which points a reader at the wrong stage. Stages not listed here fall
+    #: back to the analysis-level roll-up, which is exactly right for a capability
+    #: that fills only one stage.
+    stage_results: Dict[str, Dict[str, str]] = field(default_factory=dict)
     #: Capability-specific evidence merged into the JSON report, keyed by the
     #: capability name (e.g. ``{"historical": {"cache_root": ..., "isolation": ...}}``).
     #: A run's conditions ARE part of its result -- which cache root answered, and
@@ -219,16 +314,36 @@ class ReplayReport:
         The markdown table and the JSON both read this, so the two cannot end up
         saying different things about the same stage.
         """
-        counts = self.counts()
-        summary = ", ".join(f"{name} {counts[name]}"
-                            for name in STATUS_ORDER if counts[name])
         out: List[Tuple[str, str, str, Tuple[str, ...]]] = []
         for stage, fields_text, capabilities in STAGE_ROWS:
-            status = ((summary or ReplayStatus.COVERAGE_NOT_RUN)
-                      if self.capability in capabilities
-                      else ReplayStatus.COVERAGE_NOT_RUN)
-            out.append((stage, fields_text, status, capabilities))
+            if self.capability not in capabilities:
+                out.append((stage, fields_text, ReplayStatus.COVERAGE_NOT_RUN, capabilities))
+                continue
+            out.append((stage, fields_text, self._stage_summary(stage), capabilities))
         return out
+
+    def _stage_summary(self, stage: str) -> str:
+        """``match 3, difference 1`` for one stage, from its own counts when it has them."""
+        per_stage = self.stage_results.get(stage)
+        if per_stage is None:
+            counts = self.counts()
+        else:
+            if len(per_stage) != self.total:
+                # "Include HOLD/skipped/failed analyses in totals; never report 100%
+                # by dropping unavailable rows." A stage that answers for fewer
+                # analyses than the report holds is a shrunken total, not a stage.
+                raise ValueError(
+                    f"stage {stage!r} carries {len(per_stage)} rows for {self.total} "
+                    f"analyses; every analysis must be represented at every stage the "
+                    f"capability fills")
+            counts = {status: 0 for status in STATUS_ORDER}
+            for status in per_stage.values():
+                if status not in counts:
+                    raise ValueError(f"unknown replay status {status!r} for stage {stage!r}")
+                counts[status] += 1
+        summary = ", ".join(f"{name} {counts[name]}"
+                            for name in STATUS_ORDER if counts[name])
+        return summary or ReplayStatus.COVERAGE_NOT_RUN
 
     def to_markdown(self) -> str:
         counts = self.counts()
@@ -266,9 +381,11 @@ class ReplayReport:
             for result in differences:
                 lines.append(
                     f"### {result.analysis_id} -- {result.expert_class}/{result.symbol}")
-                lines += ["", "| Field | Recorded | Produced |", "|---|---|---|"]
-                for name, recorded, produced in result.field_diffs:
-                    lines.append(f"| {name} | {_cell(recorded)} | {_cell(produced)} |")
+                lines += ["", "| Field | Recorded | Produced | Delta |",
+                          "|---|---|---|---|"]
+                for diff in result.field_diffs:
+                    lines.append(f"| {diff.field} | {_cell(diff.recorded)} | "
+                                 f"{_cell(diff.produced)} | {_cell(diff.delta_text())} |")
                 lines.append("")
         return "\n".join(lines) + "\n"
 

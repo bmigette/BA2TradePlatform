@@ -714,7 +714,10 @@ def _cmd_replay(args) -> int:
     if args.replay_cmd == "historical":
         from app.services.replay import historical
 
-        report = historical.run(bundle, _caller_path(args.cache_root), out)
+        cache_root = _caller_path(args.cache_root)
+        if not os.path.isdir(cache_root):
+            sys.exit(f"ba2-test: {cache_root} is not a directory")
+        report = historical.run(bundle, cache_root, out, timeout=args.timeout)
     else:
         module = expert_replay if args.replay_cmd == "experts" else gather_tape
         report = module.run(bundle, out)
@@ -6265,6 +6268,10 @@ def main(argv: "list | None" = None) -> int:
                           "filled). Read-only; a root with no pin manifest answers "
                           "revision_unknown, because nothing recorded its revisions.")
     rph.add_argument("--out", default=None, help="Write the report here.")
+    rph.add_argument("--timeout", type=float, default=None,
+                     help="Seconds the reconstruction child may take (default: scales with "
+                          "the number of analyses). A child that runs out of time still "
+                          "reports everything it committed; the rest name the timeout.")
     rpw = rplsub.add_parser(
         "warm-plan",
         help="What a bundle's analyses need that a cache root does not hold. NO network.")

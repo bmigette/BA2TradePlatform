@@ -327,6 +327,17 @@ def registered_experts() -> Tuple[str, ...]:
     return tuple(sorted(_ADAPTERS))
 
 
+def adapter_for(expert_class: str) -> Optional[Adapter]:
+    """The registered adapter for ``expert_class``, or ``None``.
+
+    The ONE way to ask "is this expert declared?". Inferring it from the SHAPE of
+    a requirement list (one entry, kind ``unsupported``) reads a data value as a
+    control signal: an adapter that legitimately returned such a requirement would
+    be mistaken for an unregistered class, and the two mean opposite things.
+    """
+    return _ADAPTERS.get(expert_class)
+
+
 def expert_replay_inputs(
     expert_class: str,
     settings: Mapping[str, Any],
@@ -351,7 +362,7 @@ def expert_replay_inputs(
     """
     if not isinstance(window, Window):
         raise TypeError(f"window must be a Window, got {type(window).__name__}")
-    adapter = _ADAPTERS.get(expert_class)
+    adapter = adapter_for(expert_class)
     if adapter is None:
         return [unsupported_requirement(
             expert_class,
@@ -379,9 +390,9 @@ def required_replay_inputs(
     ``unsupported`` requirement and NOTHING else: its reads are undeclared, so
     appending the rule extras would present a partial list as a complete one.
     """
+    if adapter_for(expert_class) is None:
+        return expert_replay_inputs(expert_class, settings, universe, window)
     requirements = expert_replay_inputs(expert_class, settings, universe, window)
-    if len(requirements) == 1 and requirements[0].kind == KIND_UNSUPPORTED:
-        return requirements
     requirements.extend(
         rule_requirements(settings, rules, _clean_symbols(universe), window))
     return dedupe(requirements)
@@ -589,6 +600,7 @@ __all__ = [
     "PLATFORM_PROVIDER",
     "Requirement",
     "Window",
+    "adapter_for",
     "as_bool",
     "dedupe",
     "expert_replay_inputs",

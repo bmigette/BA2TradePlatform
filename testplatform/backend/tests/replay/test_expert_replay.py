@@ -156,11 +156,11 @@ def test_a_changed_bundle_input_is_reported_as_a_field_difference(bundle_copy):
     drift = results[DRIFT_ID]
 
     assert drift.status == ReplayStatus.COVERAGE_DIFFERENCE
-    changed = {name for name, _recorded, _produced in drift.field_diffs}
+    changed = {diff.field for diff in drift.field_diffs}
     assert "signal" in changed, f"the decision change was not reported: {drift.field_diffs}"
     assert {"confidence", "details"} <= changed
-    signal_row = next(row for row in drift.field_diffs if row[0] == "signal")
-    assert "BUY" in signal_row[1] and "HOLD" in signal_row[2]
+    signal_row = next(d for d in drift.field_diffs if d.field == "signal")
+    assert "BUY" in signal_row.recorded and "HOLD" in signal_row.produced
 
     others = {i: r.status for i, r in results.items() if i != DRIFT_ID}
     assert set(others.values()) == {ReplayStatus.COVERAGE_MATCH}, (
@@ -181,7 +181,7 @@ def test_the_recorded_recommendation_is_an_EXPECTATION_not_an_input(bundle_copy)
 
     rating = _by_id(expert_replay.run(bundle_copy))[RATING_ID]
     assert rating.status == ReplayStatus.COVERAGE_DIFFERENCE
-    assert [name for name, _r, _p in rating.field_diffs] == ["confidence"]
+    assert [diff.field for diff in rating.field_diffs] == ["confidence"]
 
 
 def test_a_skip_compares_every_field_not_only_its_reason(bundle_copy):
@@ -197,7 +197,7 @@ def test_a_skip_compares_every_field_not_only_its_reason(bundle_copy):
 
     skip = _by_id(expert_replay.run(bundle_copy))[SKIP_ID]
     assert skip.status == ReplayStatus.COVERAGE_DIFFERENCE
-    assert [name for name, _r, _p in skip.field_diffs] == ["details"]
+    assert [diff.field for diff in skip.field_diffs] == ["details"]
     assert "skip reproduced but" in skip.detail
 
 

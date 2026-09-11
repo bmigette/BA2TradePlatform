@@ -674,11 +674,7 @@ def _fmp_symbol_fetch(tape: ReplayTape, method: str) -> Callable[[str], Any]:
 def replay_gather(bundle: SessionBundle, analysis: AnalysisRecord) -> AnalysisResult:
     def result(status: str, detail: str = "",
                field_diffs: Sequence[Tuple[str, str, str]] = ()) -> AnalysisResult:
-        return AnalysisResult(
-            analysis_id=analysis.analysis_id, expert_class=analysis.expert_class,
-            symbol=analysis.symbol, use_case=analysis.use_case,
-            recorded_outcome=analysis.outcome, status=status, detail=detail,
-            field_diffs=tuple(field_diffs))
+        return AnalysisResult.for_analysis(analysis, status, detail, field_diffs)
 
     if analysis.expert_class not in RECORDED_EXPERTS:
         return result(ReplayStatus.COVERAGE_UNSUPPORTED,
