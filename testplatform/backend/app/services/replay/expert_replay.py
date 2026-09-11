@@ -27,6 +27,7 @@ Two rules that are easy to lose:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
@@ -44,6 +45,7 @@ from ba2_common.core.replay import (
     use_capture_context,
 )
 from ba2_common.core.types import Recommendation
+from ba2_common.logger import logger
 
 from app.services.replay.isolation import refuse, replay_isolation
 from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
@@ -146,8 +148,9 @@ def compare_values(recorded: Any, produced: Any, path: str = "", *,
     so a difference is reported at the field that actually moved rather than as
     "the whole bundle differs".
 
-    ``with_deltas`` additionally attaches the absolute and relative distance to
-    every NUMERIC leaf, as a :class:`~app.services.replay.report.FieldDiff` --
+    ``with_deltas`` returns :class:`~app.services.replay.report.FieldDiff` objects
+    for EVERY difference -- with the absolute and relative distance attached to the
+    numeric leaves and absent from the rest --
     spec section 8 asks the historical comparison for "absolute/relative input
     differences", and a pair of reprs cannot say whether a price moved by a cent
     or by a factor of thirty. It is OFF by default so the recorded-expert and
@@ -162,16 +165,19 @@ def compare_values(recorded: Any, produced: Any, path: str = "", *,
         diffs: List[Any] = []
         for key in sorted(set(recorded) | set(produced), key=str):
             if key not in recorded:
-                diffs.append((f"{label}[{key!r}]", "<absent>", _text(produced[key])))
+                diffs.append(_structural_diff(f"{label}[{key!r}]", "<absent>",
+                                              _text(produced[key]), with_deltas))
             elif key not in produced:
-                diffs.append((f"{label}[{key!r}]", _text(recorded[key]), "<absent>"))
+                diffs.append(_structural_diff(f"{label}[{key!r}]", _text(recorded[key]),
+                                              "<absent>", with_deltas))
             else:
                 diffs += compare_values(recorded[key], produced[key], f"{label}[{key!r}]",
                                         with_deltas=with_deltas)
         return diffs
     if isinstance(recorded, (list, tuple)) and isinstance(produced, (list, tuple)):
         if len(recorded) != len(produced):
-            return [(f"{label} (length)", str(len(recorded)), str(len(produced)))]
+            return [_structural_diff(f"{label} (length)", str(len(recorded)),
+                                     str(len(produced)), with_deltas)]
         diffs = []
         for index, (left, right) in enumerate(zip(recorded, produced)):
             diffs += compare_values(left, right, f"{label}[{index}]",
@@ -189,18 +195,40 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _structural_diff(label: str, recorded: str, produced: str, with_deltas: bool):
+    """A difference with no distance to report, in whichever shape the caller asked for."""
+    if not with_deltas:
+        return (label, recorded, produced)
+    from app.services.replay.report import FieldDiff
+
+    return FieldDiff(field=label, recorded=recorded, produced=produced)
+
+
 def _leaf_diff(label: str, recorded: Any, produced: Any):
-    """One differing leaf, with the numeric distance attached where there is one."""
+    """One differing leaf, with the numeric distance attached where there is one.
+
+    A NaN (or an infinity) on either side is NOT a distance. Carrying it would
+    abort ``report.write`` (``allow_nan=False``) and, if it ever reached a reader,
+    would be a non-number presented as a measurement -- so the row records that the
+    distance is not finite and leaves the numbers out.
+    """
     from app.services.replay.report import FieldDiff
 
     if not (_is_number(recorded) and _is_number(produced)):
         return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced))
     absolute = abs(float(produced) - float(recorded))
+    if not math.isfinite(absolute):
+        return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
+                         delta_not_finite=True)
     if float(recorded) == 0.0:
         return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
                          abs_delta=absolute, rel_delta=None, rel_delta_undefined=True)
+    relative = absolute / abs(float(recorded))
+    if not math.isfinite(relative):
+        return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
+                         delta_not_finite=True)
     return FieldDiff(field=label, recorded=_text(recorded), produced=_text(produced),
-                     abs_delta=absolute, rel_delta=absolute / abs(float(recorded)))
+                     abs_delta=absolute, rel_delta=relative)
 
 
 def _compare_frames(recorded: Any, produced: Any, label: str, *,
@@ -220,7 +248,7 @@ def _compare_frames(recorded: Any, produced: Any, label: str, *,
     whether the drift is a rounding artefact or a different series.
     """
     if type(recorded) is not type(produced):
-        return [(label, _text(recorded), _text(produced))]
+        return [_structural_diff(label, _text(recorded), _text(produced), with_deltas)]
     try:
         if isinstance(recorded, pd.DataFrame):
             pd.testing.assert_frame_equal(recorded, produced, check_exact=True)
@@ -273,14 +301,28 @@ def _frame_numeric_extremes(recorded: Any, produced: Any):
         cells = int(differing.to_numpy().sum())
         if not cells:
             return None
-        absolute = float(delta.to_numpy().max())
+        # ``.max().max()`` (pandas, NaN-SKIPPING) rather than numpy's: a single NaN
+        # cell -- a bar the reconstruction has no value for -- propagates through
+        # ``ndarray.max`` and turns the whole frame's distance into NaN, which then
+        # aborts ``report.write``. What is wanted is the largest distance among the
+        # cells that HAVE one.
+        absolute = float(delta.max().max())
+        if not math.isfinite(absolute):
+            return None
         base = left[numeric].astype(float).abs()
         ratio = delta.where(differing & base.gt(0)) / base.where(base.gt(0))
-        # ``.max().max()`` (not numpy's) so the all-zero-baseline case comes back as
-        # "undefined" instead of as NaN dressed up as a number.
         relative = float(ratio.max().max()) if ratio.notna().to_numpy().any() else None
+        if relative is not None and not math.isfinite(relative):
+            relative = None
         return cells, absolute, relative
-    except Exception:  # noqa: BLE001 -- a distance is a nicety; the diff itself already stands
+    except Exception as exc:  # noqa: BLE001 -- the diff itself already stands
+        # NAMED, at WARNING: the diff is still reported without its distance, but a
+        # measurement that silently stops being taken is how a report quietly gets
+        # less useful with nobody noticing.
+        logger.warning(
+            f"replay: could not measure the numeric distance between two frames "
+            f"({type(exc).__name__}: {exc}); the difference is reported without it",
+            exc_info=True)
         return None
 
 
@@ -307,7 +349,8 @@ def compare_recommendations(recorded: Recommendation, produced: Any, *,
                             with_deltas: bool = False) -> List[Any]:
     """Field-by-field, in declaration order. See :func:`compare_values` for ``with_deltas``."""
     if not isinstance(produced, Recommendation):
-        return [("type", type(recorded).__name__, type(produced).__name__)]
+        return [_structural_diff("type", type(recorded).__name__,
+                                 type(produced).__name__, with_deltas)]
     diffs: List[Any] = []
     for spec in dataclass_fields(Recommendation):
         diffs += compare_values(getattr(recorded, spec.name),

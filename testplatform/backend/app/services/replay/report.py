@@ -148,6 +148,12 @@ class FieldDiff:
     #: is 0). Distinguishes "no relative delta because the baseline is zero" from
     #: "no relative delta because this is not a number".
     rel_delta_undefined: bool = False
+    #: True when the two sides ARE numbers but the distance between them is not
+    #: finite (a NaN on either side, an infinity). There is no honest answer to
+    #: "how far did it move" then -- and a NaN in the payload would abort
+    #: ``report.write`` (``allow_nan=False``) or, worse, serialize as ``NaN`` and
+    #: be read back as a number. The fact is recorded instead of the non-number.
+    delta_not_finite: bool = False
 
     @classmethod
     def coerce(cls, value: Any) -> "FieldDiff":
@@ -158,20 +164,30 @@ class FieldDiff:
         return cls(field=field, recorded=recorded, produced=produced)
 
     def delta_text(self) -> str:
-        """``Δ 0.2 (16.7%)`` -- empty for a non-numeric diff."""
+        """``abs 0.2 (16.7%)`` -- empty for a diff with no numeric distance.
+
+        ASCII ONLY. ``ba2-test replay historical`` prints the markdown straight to
+        the console, and a Windows console on cp1252 cannot encode a greek delta:
+        the whole command would die with a UnicodeEncodeError after the work was
+        done, on the one report that carries the most information.
+        """
+        if self.delta_not_finite:
+            return "delta not finite (nan/inf)"
         if self.abs_delta is None:
             return ""
         if self.rel_delta is not None:
-            return f"Δ {self.abs_delta:.6g} ({self.rel_delta * 100:.3g}%)"
+            return f"abs {self.abs_delta:.6g} ({self.rel_delta * 100:.3g}%)"
         if self.rel_delta_undefined:
-            return f"Δ {self.abs_delta:.6g} (relative undefined: recorded is 0)"
-        return f"Δ {self.abs_delta:.6g}"
+            return f"abs {self.abs_delta:.6g} (relative undefined: recorded is 0)"
+        return f"abs {self.abs_delta:.6g}"
 
     def to_mapping(self) -> Dict[str, Any]:
         """The JSON shape. Numeric keys appear ONLY on a numeric diff, so a
         capability that reports no deltas keeps its previous output exactly."""
         out: Dict[str, Any] = {"field": self.field, "recorded": self.recorded,
                                "produced": self.produced}
+        if self.delta_not_finite:
+            out["delta_not_finite"] = True
         if self.abs_delta is not None:
             out["abs_delta"] = self.abs_delta
             out["rel_delta"] = self.rel_delta
@@ -190,6 +206,11 @@ class AnalysisResult:
     use_case: str
     recorded_outcome: str
     status: str
+    #: The recorded ATTEMPT this row is about. A re-run of one live analysis is a
+    #: second attempt (the store keys analyses on ``(analysis_id, attempt_id)``),
+    #: so the analysis id alone does not identify a row -- and anything that keys
+    #: on it, per-stage counts included, silently collapses the retry.
+    attempt_id: Optional[str] = None
     detail: str = ""
     #: Per-field differences. Plain ``(field, recorded, produced)`` triples are
     #: accepted and normalized to :class:`FieldDiff` here, so every caller --
@@ -217,9 +238,15 @@ class AnalysisResult:
             use_case=analysis.use_case,
             recorded_outcome=analysis.outcome,
             status=status,
+            attempt_id=getattr(analysis, "attempt_id", None),
             detail=detail,
             field_diffs=tuple(field_diffs),
         )
+
+    @property
+    def row_id(self) -> str:
+        """What identifies this ROW: the attempt when there is one, else the analysis."""
+        return self.attempt_id or self.analysis_id
 
     def to_mapping(self) -> Dict[str, Any]:
         return {
@@ -229,6 +256,7 @@ class AnalysisResult:
             "use_case": self.use_case,
             "recorded_outcome": self.recorded_outcome,
             "status": self.status,
+            "attempt_id": self.attempt_id,
             "detail": self.detail,
             "field_diffs": [diff.to_mapping() for diff in self.field_diffs],
         }

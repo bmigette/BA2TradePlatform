@@ -586,7 +586,7 @@ def test_a_numeric_difference_reports_its_absolute_and_relative_distance(bundle,
     assert eps.rel_delta == pytest.approx(0.1 / 1.2)
     assert eps.rel_delta_undefined is False
     # the one-line detail carries it too, not only the table
-    assert "Δ" in result.detail
+    assert "abs 0.1" in result.detail
 
     payload = json.loads(
         (out / f"{ReplayStatus.CAPABILITY_HISTORICAL}.json").read_text(encoding="utf-8"))
@@ -596,7 +596,7 @@ def test_a_numeric_difference_reports_its_absolute_and_relative_distance(bundle,
     assert row["rel_delta"] == pytest.approx(0.1 / 1.2)
     markdown = (out / f"{ReplayStatus.CAPABILITY_HISTORICAL}.md").read_text(encoding="utf-8")
     assert "| Field | Recorded | Produced | Delta |" in markdown
-    assert "Δ 0.1" in markdown
+    assert "abs 0.1" in markdown
 
 
 def test_a_zero_baseline_reports_an_undefined_relative_delta_not_a_number():
@@ -1201,3 +1201,209 @@ def test_the_warm_plan_is_built_once_per_distinct_configuration(bundle, pinned_r
 
     assert again is first
     assert other_day is not first
+
+
+# --------------------------------------------------------------------------- #
+# 20. Every diff a delta-aware comparison produces has to SURVIVE the report
+# --------------------------------------------------------------------------- #
+def _report_for(bundle_dir, result_diffs, tmp_path):
+    """Render one synthetic row through the full report machinery."""
+    from app.services.replay.report import AnalysisResult, ReplayReport
+
+    analysis = load_bundle(bundle_dir).analyses[0]
+    result = AnalysisResult.for_analysis(
+        analysis, ReplayStatus.COVERAGE_DIFFERENCE,
+        historical._detail_for(result_diffs), result_diffs)
+    report = ReplayReport(
+        session_id="s", bundle_dir=str(bundle_dir),
+        capability=ReplayStatus.CAPABILITY_HISTORICAL, results=[result],
+        stage_results=historical._stage_results([result]))
+    report.write(tmp_path)
+    return report
+
+
+def test_a_bundle_key_the_reconstruction_did_not_produce_reaches_the_report(bundle,
+                                                                            tmp_path):
+    """A key only one side has yields a diff with NO numeric distance -- and must not
+    be a different TYPE from the ones that have one.
+
+    ``compare_values(with_deltas=True)`` used to fall back to a bare triple for an
+    absent key, a length mismatch and a frame type mismatch. The row detail then
+    asked every diff for its ``delta_text()`` and an ``AttributeError`` escaped the
+    per-analysis containment, taking the whole report with it AFTER the child had
+    already done all the work.
+    """
+    from app.services.replay.expert_replay import compare_values
+
+    diffs = compare_values({"a": 1}, {"a": 1, "b": 2}, "inputs", with_deltas=True)
+
+    assert [d.field for d in diffs] == ["inputs['b']"]
+    assert diffs[0].abs_delta is None
+    assert diffs[0].delta_text() == ""
+    report = _report_for(bundle, diffs, tmp_path)
+    assert "inputs['b']" in report.to_markdown()
+
+
+def test_a_length_mismatch_reaches_the_report(bundle, tmp_path):
+    from app.services.replay.expert_replay import compare_values
+
+    diffs = compare_values({"a": [1]}, {"a": [1, 2]}, "inputs", with_deltas=True)
+
+    assert [d.field for d in diffs] == ["inputs['a'] (length)"]
+    report = _report_for(bundle, diffs, tmp_path)
+    assert "(length)" in report.to_markdown()
+
+
+def test_a_frame_type_mismatch_reaches_the_report(bundle, tmp_path):
+    from app.services.replay.expert_replay import compare_values
+
+    diffs = compare_values({"a": pd.DataFrame({"x": [1]})}, {"a": pd.Series([1])},
+                           "inputs", with_deltas=True)
+
+    assert [d.field for d in diffs] == ["inputs['a']"]
+    assert diffs[0].abs_delta is None
+    _report_for(bundle, diffs, tmp_path)
+
+
+def test_a_recommendation_compared_against_the_wrong_type_reaches_the_report(bundle,
+                                                                             tmp_path):
+    from app.services.replay.expert_replay import compare_recommendations
+
+    recorded = load_bundle(bundle).decode(
+        load_bundle(bundle).analyses[0].recommendation_object)
+    diffs = compare_recommendations(recorded, "not a recommendation", with_deltas=True)
+
+    assert [d.field for d in diffs] == ["type"]
+    _report_for(bundle, diffs, tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# 21. A distance that is not a number is not a distance
+# --------------------------------------------------------------------------- #
+def test_a_nan_leaf_reports_no_delta_and_still_serializes(bundle, tmp_path):
+    """``report.write`` dumps with ``allow_nan=False``: a NaN delta kills the file.
+
+    And it would be meaningless anyway -- "how far did it move" has no answer when
+    one side is not a number. The row says so explicitly instead of carrying NaN.
+    """
+    from app.services.replay.expert_replay import compare_values
+
+    diffs = compare_values({"x": float("nan")}, {"x": 5.0}, "inputs", with_deltas=True)
+
+    assert diffs[0].abs_delta is None
+    assert diffs[0].rel_delta is None
+    assert diffs[0].delta_not_finite is True
+    assert "not finite" in diffs[0].delta_text()
+
+    report = _report_for(bundle, diffs, tmp_path)
+    payload = json.loads(
+        (tmp_path / f"{ReplayStatus.CAPABILITY_HISTORICAL}.json").read_text(
+            encoding="utf-8"))
+    assert payload["results"][0]["field_diffs"][0]["delta_not_finite"] is True
+
+
+def test_a_nan_cell_does_not_poison_a_frames_largest_distance(bundle, tmp_path):
+    """One NaN cell used to make the whole frame's absolute distance NaN."""
+    from app.services.replay.expert_replay import compare_values
+
+    left = pd.DataFrame({"Close": [10.0, float("nan"), 30.0]})
+    right = pd.DataFrame({"Close": [10.0, 22.0, 31.0]})
+
+    diffs = compare_values(left, right, "inputs", with_deltas=True)
+
+    assert diffs[0].abs_delta == pytest.approx(1.0)
+    assert diffs[0].rel_delta == pytest.approx(1.0 / 30.0)
+    _report_for(bundle, diffs, tmp_path)
+
+
+def test_an_all_nan_frame_column_reports_no_distance_at_all(bundle, tmp_path):
+    from app.services.replay.expert_replay import compare_values
+
+    left = pd.DataFrame({"Close": [float("nan"), float("nan")]})
+    right = pd.DataFrame({"Close": [1.0, 2.0]})
+
+    diffs = compare_values(left, right, "inputs", with_deltas=True)
+
+    assert diffs[0].abs_delta is None
+    _report_for(bundle, diffs, tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# 22. Two attempts of one analysis are two rows, at every stage
+# --------------------------------------------------------------------------- #
+def duplicate_attempt(bundle_dir, analysis_id: str, attempt_id: str) -> None:
+    """Add a SECOND recorded attempt of one analysis to the manifest.
+
+    A re-run of a live analysis is a second attempt (the index keys analyses on
+    ``(analysis_id, attempt_id)``), and both are rows the report has to carry.
+    """
+    root = Path(bundle_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    entry = next(a for a in manifest["analyses"] if a["analysis_id"] == analysis_id)
+    manifest["analyses"].append({**entry, "attempt_id": attempt_id})
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, allow_nan=False, ensure_ascii=False),
+        encoding="utf-8")
+
+
+def test_two_attempts_of_one_analysis_are_two_rows_at_every_stage(bundle, pinned_root,
+                                                                  tmp_path):
+    """Per-stage counts keyed on the analysis id silently collapse a retry.
+
+    The report then holds two rows while a stage holds one, and the totals guard
+    turns that into a ValueError out of ``to_markdown`` -- i.e. a retried analysis
+    made the report unrenderable.
+    """
+    duplicate_attempt(bundle, ANALYSIS_ID, "second-attempt")
+    out = tmp_path / "report"
+
+    report = historical.run(bundle, pinned_root, out)
+
+    assert report.total == 2
+    assert [r.status for r in report.results] == [ReplayStatus.COVERAGE_MATCH] * 2
+    rows = {stage: status for stage, _f, status, _c in report.stage_rows()}
+    assert rows[historical.STAGE_EXPERT_INPUTS] == "match 2"
+    assert rows[historical.STAGE_RECOMMENDATION] == "match 2"
+    assert (out / f"{ReplayStatus.CAPABILITY_HISTORICAL}.md").exists()
+
+
+# --------------------------------------------------------------------------- #
+# 23. The report is printed to a console, and consoles are not all UTF-8
+# --------------------------------------------------------------------------- #
+def test_the_delta_text_is_ascii(bundle, tmp_path):
+    """``ba2-test replay historical`` prints the markdown; cp1252 cannot encode U+0394."""
+    from app.services.replay.expert_replay import compare_values
+
+    diffs = compare_values({"x": 1.2}, {"x": 1.1}, "inputs", with_deltas=True)
+    text = diffs[0].delta_text()
+
+    assert text.encode("cp1252")
+    assert text.startswith("abs ")
+    markdown = _report_for(bundle, diffs, tmp_path).to_markdown()
+    assert markdown.encode("cp1252")
+
+
+def test_a_module_imported_inside_the_context_is_restored_too(monkeypatch):
+    """A reconstruction imports provider modules lazily, INSIDE the context.
+
+    Restoring only what was bound at entry would leave such a module holding the
+    offline closure for the rest of the process -- refusing every settings read
+    long after the replay finished.
+    """
+    import sys
+    import types
+
+    import ba2_common.config as config
+
+    original = config.get_app_setting
+    monkeypatch.setitem(sys.modules, "ba2_fake_late_import", None)
+
+    with historical.offline_credentials():
+        late = types.ModuleType("ba2_fake_late_import")
+        # what ``from ba2_common.config import get_app_setting`` binds right now
+        late.get_app_setting = config.get_app_setting
+        sys.modules["ba2_fake_late_import"] = late
+        assert late.get_app_setting("FMP_API_KEY") == historical.OFFLINE_API_KEY
+
+    assert late.get_app_setting is original
+    assert config.get_app_setting is original

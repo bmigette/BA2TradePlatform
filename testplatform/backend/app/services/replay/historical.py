@@ -498,8 +498,20 @@ class _PlanCache:
             return self._plans[key]
         # start=None: this command asks whether the ARTIFACT is on the pinned root,
         # and for the per-symbol FMP histories there is no range parameter to ask
-        # for a narrower one. How deep a SERIES has to reach is still judged (see
-        # _coverage_verdict), from the requirement's own window.
+        # for a narrower one.
+        #
+        # What that means for a SERIES, precisely: only the adapters that derive
+        # their own start survive it -- DeterministicScorer
+        # (``window.trailing(OHLCV_LOOKBACK_DAYS)``) and FMPInsiderClusterBuy
+        # (``window.trailing(lookback_days)``) hand the planner a real span and get
+        # the prefix and hole checks. FMPRating and FMPEarningsDrift pass this
+        # window straight through, so their price requirement carries
+        # ``start=None`` and ``_judge_timeseries`` can only judge the TAIL (is the
+        # newest bar at least the last completed session before the as_of). A
+        # series with a hole in the middle of their lookback is therefore not
+        # detected here; it is a warm-plan question, and this command reports the
+        # tail shortfall it CAN see (see _coverage_verdict) rather than implying
+        # more.
         requirements = expert_replay_inputs(
             analysis.expert_class, settings, [analysis.symbol],
             Window(start=None, end=as_of))
@@ -603,6 +615,12 @@ def _stage_results(results: Sequence[AnalysisResult]) -> Dict[str, Dict[str, str
     ``match`` at "Expert inputs" and a ``difference`` at "Recommendation". Rolling
     one analysis-level status into both rows points the reader at the wrong stage
     -- and the historical report is the one that fills two stages at once.
+
+    Keyed on ``AnalysisResult.row_id`` -- the ATTEMPT -- for the same reason the
+    rest of this module is: a re-run of one live analysis is a second recorded
+    attempt and a second row. Keyed on the analysis id, two attempts collapse into
+    one entry, the stage then answers for fewer analyses than the report holds, and
+    the totals guard turns a retried analysis into an unrenderable report.
     """
     inputs: Dict[str, str] = {}
     recommendation: Dict[str, str] = {}
@@ -610,15 +628,15 @@ def _stage_results(results: Sequence[AnalysisResult]) -> Dict[str, Dict[str, str
         if result.status != ReplayStatus.COVERAGE_DIFFERENCE:
             # Every other status is a statement about the analysis as a whole (it
             # was not run, not covered, or reproduced), so both stages carry it.
-            inputs[result.analysis_id] = result.status
-            recommendation[result.analysis_id] = result.status
+            inputs[result.row_id] = result.status
+            recommendation[result.row_id] = result.status
             continue
         names = [diff.field for diff in result.field_diffs]
-        inputs[result.analysis_id] = (
+        inputs[result.row_id] = (
             ReplayStatus.COVERAGE_DIFFERENCE
             if any(name.startswith(_INPUT_PREFIXES) for name in names)
             else ReplayStatus.COVERAGE_MATCH)
-        recommendation[result.analysis_id] = (
+        recommendation[result.row_id] = (
             ReplayStatus.COVERAGE_DIFFERENCE
             if any(name.startswith(_RECOMMENDATION_PREFIX) for name in names)
             else ReplayStatus.COVERAGE_MATCH)
@@ -836,9 +854,16 @@ def _compare(bundle: SessionBundle, job: _Job, produced: Optional[AnalysisRecord
               "with an empty payload rather than failing")
 
     try:
-        diffs, path_notes = _branch_diffs(analysis, produced)
-        diffs += list(_input_diffs(bundle, analysis, produced, decode_object))
-        diffs += list(_decision_diffs(bundle, analysis, produced, decode_object))
+        raw, path_notes = _branch_diffs(analysis, produced)
+        raw += list(_input_diffs(bundle, analysis, produced, decode_object))
+        raw += list(_decision_diffs(bundle, analysis, produced, decode_object))
+        # COERCE INSIDE THE TRY. Every comparison here is asked for its numeric
+        # distance below, so a diff that arrived in some other shape must become a
+        # FieldDiff before it can reach that -- and if some future comparison hands
+        # back something that cannot, it has to be this analysis's row rather than
+        # an AttributeError escaping into the caller and taking the whole report
+        # with it, after the child has already done all of the work.
+        diffs: List[FieldDiff] = [FieldDiff.coerce(diff) for diff in raw]
     except ReplayMiss as miss:
         return AnalysisResult.for_analysis(
             analysis, ReplayStatus.COVERAGE_MISSING_CAPTURE,
@@ -853,10 +878,9 @@ def _compare(bundle: SessionBundle, job: _Job, produced: Optional[AnalysisRecord
     revision = ("; reconstruction inputs of unknown revision: "
                 + "; ".join(job.revision_notes)) if job.revision_notes else ""
     if diffs:
-        changed = ", ".join(_diff_summary(diff) for diff in diffs[:5])
         return AnalysisResult.for_analysis(
             analysis, ReplayStatus.COVERAGE_DIFFERENCE,
-            f"{len(diffs)} field(s) differ: {changed}{revision}{caveat}", diffs)
+            f"{_detail_for(diffs)}{revision}{caveat}", diffs)
     if job.revision_notes:
         return AnalysisResult.for_analysis(
             analysis, ReplayStatus.COVERAGE_REVISION_UNKNOWN,
@@ -869,8 +893,19 @@ def _compare(bundle: SessionBundle, job: _Job, produced: Optional[AnalysisRecord
         "recommendation" + caveat)
 
 
+def _detail_for(diffs: Sequence[FieldDiff], limit: int = 5) -> str:
+    """The one-line summary of a set of differences, distances included.
+
+    Bounded at ``limit`` fields: the full set is in the row's ``field_diffs`` (and
+    in the report's own tables), and a detail line that grows with the diff count
+    is unreadable in the coverage row it also becomes.
+    """
+    changed = ", ".join(_diff_summary(FieldDiff.coerce(diff)) for diff in diffs[:limit])
+    return f"{len(diffs)} field(s) differ: {changed}"
+
+
 def _diff_summary(diff: FieldDiff) -> str:
-    """``field (Δ 0.2 (16.7%))`` -- the distance belongs in the one-line detail too."""
+    """``field (abs 0.2 (16.7%))`` -- the distance belongs in the one-line detail too."""
     delta = diff.delta_text()
     return f"{diff.field} ({delta})" if delta else diff.field
 
@@ -1003,6 +1038,12 @@ def offline_credentials():
     and ``ba2_experts.FMPRating`` hold their own. Walking ``sys.modules`` for the
     ORIGINAL object finds every one of them and cannot mistake an unrelated
     same-named function for a binding to patch.
+
+    The sweep is repeated on EXIT, for the replacement this time. A module imported
+    while the context is open -- and a reconstruction imports provider modules
+    lazily -- binds the offline closure, and restoring only the modules seen at
+    entry would leave that binding refusing every settings read for the rest of the
+    process.
     """
     import ba2_common.config as config
 
@@ -1016,9 +1057,15 @@ def offline_credentials():
             detail="the historical replay does not open the trading database; a setting "
                    "that steers a calculation must come from the recorded settings")
 
-    targets = [module for module in list(sys.modules.values())
-               if module is not None
-               and getattr(module, "get_app_setting", None) is original]
+    def _bound_to(function):
+        found = [module for module in list(sys.modules.values())
+                 if module is not None
+                 and getattr(module, "get_app_setting", None) is function]
+        if config not in found and config.get_app_setting is function:
+            found.append(config)
+        return found
+
+    targets = _bound_to(original)
     if config not in targets:
         targets.append(config)
     for module in targets:
@@ -1026,7 +1073,7 @@ def offline_credentials():
     try:
         yield tuple(getattr(m, "__name__", "?") for m in targets)
     finally:
-        for module in targets:
+        for module in set(targets) | set(_bound_to(_offline_get_app_setting)):
             module.get_app_setting = original
 
 
