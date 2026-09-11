@@ -149,3 +149,17 @@ one config per recorded expert class (FMPRating, FMPEarningsDrift, FMPInsiderClu
 DeterministicScorer) over a short 2024 window on symbols the shared cache already covers.
 
 Goldens byte-identical; full backend (`tests/backtest`, `tests/replay`, warm tests), `packages/common|experts|providers`, root suite vs the 25-failure dev baseline; a real dev-instance paper session captured for one analysis batch and replayed end to end (`inventory`, `experts`, `gather`, `decisions`, `historical` against a pinned root) with the acceptance script.
+
+---
+
+## Status (2026-09-11)
+
+| Task | State | Commits |
+|---|---|---|
+| A Remaining taps | done, reviewed | 93fb9725, 8761e861 |
+| B Warm service | done, reviewed | b6b62b39, b38322ce |
+| C Historical comparison | done, two review rounds | 6cc7e1bb, 5e11ce14, 1bc2fcd8 |
+| D Decision/execution trace | DROPPED by operator decision (2026-09-11): the DB's `RiskManagerRun`, orders and fills already answer the question; the extra stream served order-path debugging only. Ranking/allocation operands are added to `RiskManagerRun` on `feat/classic-rm-run-trace` instead. | (partial work discarded) |
+| E Pilot rollout | reduced to the close-out: spec §12 status, version bumps at push, final gate | this section |
+
+Final gate results are recorded in `reports/trading/replay_final_gate_2026-09-11b.txt`.
