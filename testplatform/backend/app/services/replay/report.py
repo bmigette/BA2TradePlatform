@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from ba2_common.core.replay import CoverageEntry, ReplayStatus
 from ba2_common.core.replay.schemas import SCHEMA_VERSION
@@ -26,6 +26,7 @@ __all__ = [
     "ReplayReport",
     "merge_coverage",
     "STAGE_ROWS",
+    "CAPABILITY_CAVEATS",
     "CAPABILITY_TITLES",
     "STATUS_ORDER",
 ]
@@ -52,29 +53,67 @@ CAPABILITY_TITLES: Dict[str, str] = {
     ReplayStatus.CAPABILITY_DECISION: "decision and execution comparison",
 }
 
-#: The spec section 8 stage table. ``capability`` names the capability whose
-#: results fill the row; ``None`` means this delivery cannot fill it at all, so
-#: the row is ``not_run`` by construction (spec steps 5-6, later deliveries).
+#: What a ``match`` in each capability does and does NOT establish. Per capability
+#: because the four establish different things and one shared sentence is wrong for
+#: three of them -- the recorded-expert caveat ("historical reconstruction is not
+#: validated here") reads as a contradiction on a HISTORICAL report, which is
+#: exactly the kind of quietly-misleading header spec section 2 forbids ("A
+#: successful normalized-bundle replay must never be labelled a complete
+#: live/backtest match").
+CAPABILITY_CAVEATS: Dict[str, str] = {
+    ReplayStatus.CAPABILITY_RECORDED_EXPERT:
+        "A match proves only that the shared expert calculation, given the inputs live "
+        "actually consumed, reproduces what live actually produced. It is **NOT** a "
+        "live/backtest match: `_gather`, historical reconstruction, selection, rules, "
+        "sizing and execution are not validated here.",
+    ReplayStatus.CAPABILITY_GATHER_TAPE:
+        "A match proves only that the live `_gather` maps the recorded provider returns "
+        "into the recorded normalized bundle. It says nothing about whether those returns "
+        "could be reconstructed historically, nor about selection, rules, sizing or "
+        "execution.",
+    ReplayStatus.CAPABILITY_HISTORICAL:
+        "A match proves that the `analyze_as_of` reconstruction from the named cache root "
+        "produced the same inputs and the same recommendation as live. It is a statement "
+        "about THAT root: a different or later-warmed root can differ, and selection, "
+        "rules, sizing and execution are not validated here. A **difference** is evidence "
+        "of reconstruction, coverage, timing or revision drift -- it is not automatically "
+        "a defect, and zero difference is not always attainable (spec section 8).",
+    ReplayStatus.CAPABILITY_DECISION:
+        "A match proves that the recorded rules, sizing and protection decisions recompute "
+        "from the recorded account state. Broker fills and rejections are observations, "
+        "not a promise that a fill model reproduces the market.",
+}
+
+#: The spec section 8 stage table. ``capabilities`` names EVERY capability whose
+#: results can fill the row; an empty tuple means this delivery cannot fill it at
+#: all, so the row is ``not_run`` by construction (spec step 6, a later delivery).
 #: The Rules-and-sizing and Execution rows are what
 #: ``app/services/backtest/parity_harness.py`` already compares for a BACKTEST;
 #: the spec-step-6 decision trace is where that machinery meets a recorded LIVE
 #: session, and these rows stay ``not_run`` until it does.
-STAGE_ROWS: Tuple[Tuple[str, str, Optional[str]], ...] = (
+#:
+#: A stage can be filled by MORE THAN ONE capability and they do not mean the same
+#: thing. "Expert inputs" is a gather-tape row when the bundle was rebuilt from the
+#: recorded provider returns, and a historical row when it was rebuilt from a pinned
+#: cache root -- the first proves the mapping, the second measures reconstruction
+#: drift. Only the capability that actually ran fills the row in ITS report.
+STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("Selection",
      "Candidate coverage, filters, ranked order, selected/held symbols",
-     None),
+     ()),
     ("Expert inputs",
-     "Normalized _gather bundle rebuilt from the recorded provider returns",
-     ReplayStatus.CAPABILITY_GATHER_TAPE),
+     "Normalized _gather bundle rebuilt from the recorded provider returns "
+     "(gather tape) or from a pinned historical cache root (historical)",
+     (ReplayStatus.CAPABILITY_GATHER_TAPE, ReplayStatus.CAPABILITY_HISTORICAL)),
     ("Recommendation",
      "Skip reason, signal, confidence, expected profit, current price, target",
-     ReplayStatus.CAPABILITY_RECORDED_EXPERT),
+     (ReplayStatus.CAPABILITY_RECORDED_EXPERT, ReplayStatus.CAPABILITY_HISTORICAL)),
     ("Rules and sizing",
      "Branch, eligibility, operands/budget, intended side/quantity, TP/SL",
-     None),
+     ()),
     ("Execution",
      "Submit attempts/rejections, partial/full fills, final active protection",
-     None),
+     ()),
 )
 
 
@@ -126,6 +165,12 @@ class ReplayReport:
     capability: str
     results: List[AnalysisResult] = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    #: Capability-specific evidence merged into the JSON report, keyed by the
+    #: capability name (e.g. ``{"historical": {"cache_root": ..., "isolation": ...}}``).
+    #: A run's conditions ARE part of its result -- which cache root answered, and
+    #: whether anything tried to leave the machine -- and a reader that has only the
+    #: report must be able to see them. Refused if it would overwrite a standard key.
+    extra: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------- accessors
     @property
@@ -163,15 +208,13 @@ class ReplayReport:
             "",
             "**Capabilities NOT run:** " + "; ".join(not_run) + ".",
             "",
-            "A recorded match proves only that the shared expert calculation, given the "
-            "inputs live actually consumed, reproduces what live actually produced. It is "
-            "**NOT** a live/backtest match: historical reconstruction, selection, rules, "
-            "sizing and execution are not validated here, and a `match` in one capability "
-            "says nothing about another.",
+            CAPABILITY_CAVEATS[self.capability],
+            "",
+            "A `match` in one capability says nothing about another.",
         ]
 
-    def stage_rows(self) -> List[Tuple[str, str, str, Optional[str]]]:
-        """``(stage, compared fields, status, capability)`` -- ONE rendering.
+    def stage_rows(self) -> List[Tuple[str, str, str, Tuple[str, ...]]]:
+        """``(stage, compared fields, status, capabilities)`` -- ONE rendering.
 
         The markdown table and the JSON both read this, so the two cannot end up
         saying different things about the same stage.
@@ -179,12 +222,12 @@ class ReplayReport:
         counts = self.counts()
         summary = ", ".join(f"{name} {counts[name]}"
                             for name in STATUS_ORDER if counts[name])
-        out: List[Tuple[str, str, str, Optional[str]]] = []
-        for stage, fields_text, capability in STAGE_ROWS:
+        out: List[Tuple[str, str, str, Tuple[str, ...]]] = []
+        for stage, fields_text, capabilities in STAGE_ROWS:
             status = ((summary or ReplayStatus.COVERAGE_NOT_RUN)
-                      if capability == self.capability
+                      if self.capability in capabilities
                       else ReplayStatus.COVERAGE_NOT_RUN)
-            out.append((stage, fields_text, status, capability))
+            out.append((stage, fields_text, status, capabilities))
         return out
 
     def to_markdown(self) -> str:
@@ -205,7 +248,7 @@ class ReplayReport:
 
         lines += ["", "## Stages (spec section 8)", "",
                   "| Stage | Compared fields | Status |", "|---|---|---|"]
-        for stage, fields_text, status, _capability in self.stage_rows():
+        for stage, fields_text, status, _capabilities in self.stage_rows():
             lines.append(f"| {stage} | {fields_text} | {status} |")
 
         lines += ["", "## Analyses", "",
@@ -230,7 +273,7 @@ class ReplayReport:
         return "\n".join(lines) + "\n"
 
     def to_mapping(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "schema": "ba2_replay_report/1",
             "capability": self.capability,
             "session_id": self.session_id,
@@ -245,13 +288,20 @@ class ReplayReport:
                 {
                     "stage": stage,
                     "compared_fields": fields_text,
-                    "capability": capability,
+                    "capabilities": list(capabilities),
                     "status": status,
                 }
-                for stage, fields_text, status, capability in self.stage_rows()
+                for stage, fields_text, status, capabilities in self.stage_rows()
             ],
             "results": [r.to_mapping() for r in self.results],
         }
+        overlap = sorted(set(self.extra) & set(payload))
+        if overlap:
+            raise ValueError(
+                f"the {self.capability} report's extra evidence would overwrite the "
+                f"standard report key(s) {overlap}")
+        payload.update(self.extra)
+        return payload
 
     def write(self, out_dir) -> Path:
         """Write ``<capability>.md`` and ``<capability>.json``; return the directory."""

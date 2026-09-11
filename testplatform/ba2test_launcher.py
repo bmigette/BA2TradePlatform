@@ -679,11 +679,15 @@ _WARM_JOIN_TIMEOUT_S = 3600.0
 
 # --- replay (offline replay of a recorded live session) --------------------------------
 def _cmd_replay(args) -> int:
-    """``inventory`` / ``experts`` / ``gather`` over one exported replay bundle.
+    """``inventory`` / ``experts`` / ``gather`` / ``historical`` over one bundle.
 
     Everything runs offline: the services enter the replay isolation (hermetic
     FMP, a closed socket layer, refusing instance/provider resolvers) and read
     only the bundle. Nothing here opens the trading database.
+
+    ``historical`` additionally reads a PINNED cache root, and does so in a child
+    process with ``CACHE_FOLDER`` set before import -- the only way every cache
+    reader points at the same root (see ``app.services.replay.historical``).
     """
     if args.replay_cmd == "warm":
         return _cmd_replay_warm(args)
@@ -707,16 +711,28 @@ def _cmd_replay(args) -> int:
 
     from ba2_common.core.replay import ReplayStatus
 
-    module = expert_replay if args.replay_cmd == "experts" else gather_tape
-    report = module.run(bundle, out)
+    if args.replay_cmd == "historical":
+        from app.services.replay import historical
+
+        report = historical.run(bundle, _caller_path(args.cache_root), out)
+    else:
+        module = expert_replay if args.replay_cmd == "experts" else gather_tape
+        report = module.run(bundle, out)
     print(report.to_markdown())
     if out:
         print(f"-- wrote {os.path.join(out, report.capability + '.md')}")
     # A DIFFERENCE is a finding: something reproduced differently, which is what
     # this command exists to surface, so it exits non-zero and a CI step can gate
-    # on it. A missing_capture is not a finding about the calculation -- it says
-    # the session cannot answer for that analysis -- so it does not fail the run;
-    # the report and `replay inventory` are where coverage is read.
+    # on it. A missing_capture / missing_history / revision_unknown is not a
+    # finding about the calculation -- it says the session or the cache root
+    # cannot answer for that analysis -- so it does not fail the run; the report
+    # and `replay inventory` are where coverage is read.
+    #
+    # For `historical` a non-zero exit means "read the diffs", NOT "this is a
+    # defect": spec section 8 is explicit that a historical comparison "does not
+    # assume zero difference is always attainable", and an endpoint/vintage
+    # difference is expected evidence. Gate a CI step on it only where the pinned
+    # root is meant to reproduce the session exactly.
     return 0 if report.counts()[ReplayStatus.COVERAGE_DIFFERENCE] == 0 else 1
 
 
@@ -6239,6 +6255,16 @@ def main(argv: "list | None" = None) -> int:
                             help="Re-run the live _gather against the recorded provider tape.")
     rpg.add_argument("--bundle", required=True, help="Exported session directory.")
     rpg.add_argument("--out", default=None, help="Write the report here.")
+    rph = rplsub.add_parser(
+        "historical",
+        help="Re-run each recorded analysis through analyze_as_of against a PINNED cache "
+             "root and diff the inputs and the recommendation. Offline.")
+    rph.add_argument("--bundle", required=True, help="Exported session directory.")
+    rph.add_argument("--cache-root", required=True,
+                     help="The pinned cache root to reconstruct from (what `replay warm` "
+                          "filled). Read-only; a root with no pin manifest answers "
+                          "revision_unknown, because nothing recorded its revisions.")
+    rph.add_argument("--out", default=None, help="Write the report here.")
     rpw = rplsub.add_parser(
         "warm-plan",
         help="What a bundle's analyses need that a cache root does not hold. NO network.")

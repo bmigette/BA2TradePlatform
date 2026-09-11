@@ -24,7 +24,10 @@ key and the requirement it was needed for.
 *The expert class alone cannot describe a trade.* The active rules and the risk
 manager read data too (ATR, the earnings calendar, the cooldown ledger), so
 :func:`required_replay_inputs` appends :func:`rule_requirements` to every
-supported expert's list.
+supported expert's list. :func:`expert_replay_inputs` is the half WITHOUT those
+extras, for the one caller that genuinely asks a narrower question -- the
+historical comparison, which rebuilds and diffs an expert's INPUTS and must not
+be blocked on an ATR series that comparison never reads.
 
 Nothing here reaches a network, a database or a cache: it maps configuration to
 typed declarations. Deciding whether a declaration is already satisfied is the
@@ -324,22 +327,27 @@ def registered_experts() -> Tuple[str, ...]:
     return tuple(sorted(_ADAPTERS))
 
 
-def required_replay_inputs(
+def expert_replay_inputs(
     expert_class: str,
     settings: Mapping[str, Any],
-    rules: Any,
     universe: Sequence[str],
     window: Window,
 ) -> List[Requirement]:
-    """Everything a replay of ``expert_class`` over ``universe`` needs on disk.
+    """What the EXPERT ITSELF reads -- its adapter's declarations and nothing else.
 
-    The expert's own adapter first, then the rule/risk-manager extras derived from
-    ``rules`` and ``settings`` (:func:`rule_requirements`) -- the expert class alone
-    cannot describe what a trade reads.
+    Separate from :func:`required_replay_inputs` because the two answer different
+    questions and one caller genuinely wants only this half. The historical
+    comparison (spec step 5) rebuilds an expert's ``_gather``/``_process`` from a
+    pinned cache root and compares the INPUTS: the ATR series, the earnings
+    calendar and the cooldown ledger a RULE reads belong to the decision
+    comparison (step 6), and folding them in here would block an expert-input
+    comparison on an artifact that comparison never touches -- and would demand
+    risk-manager settings (``use_atr_stop``, ``sizing_mode``, ``atr_period``) the
+    caller may not hold.
 
     An expert class with no registered adapter resolves to exactly one
-    ``unsupported`` requirement and NOTHING else: its reads are undeclared, so
-    appending the rule extras would present a partial list as a complete one.
+    ``unsupported`` requirement: its reads are undeclared, which is the opposite
+    of "nothing is needed".
     """
     if not isinstance(window, Window):
         raise TypeError(f"window must be a Window, got {type(window).__name__}")
@@ -350,9 +358,32 @@ def required_replay_inputs(
             f"no replay-dependency adapter is registered for {expert_class}; its provider "
             f"reads are undeclared (registered: {', '.join(registered_experts()) or 'none'})",
         )]
-    symbols = _clean_symbols(universe)
-    requirements = list(adapter(settings, symbols, window))
-    requirements.extend(rule_requirements(settings, rules, symbols, window))
+    return dedupe(adapter(settings, _clean_symbols(universe), window))
+
+
+def required_replay_inputs(
+    expert_class: str,
+    settings: Mapping[str, Any],
+    rules: Any,
+    universe: Sequence[str],
+    window: Window,
+) -> List[Requirement]:
+    """Everything a replay of ``expert_class`` over ``universe`` needs on disk.
+
+    The expert's own adapter first (:func:`expert_replay_inputs`), then the
+    rule/risk-manager extras derived from ``rules`` and ``settings``
+    (:func:`rule_requirements`) -- the expert class alone cannot describe what a
+    trade reads.
+
+    An expert class with no registered adapter resolves to exactly one
+    ``unsupported`` requirement and NOTHING else: its reads are undeclared, so
+    appending the rule extras would present a partial list as a complete one.
+    """
+    requirements = expert_replay_inputs(expert_class, settings, universe, window)
+    if len(requirements) == 1 and requirements[0].kind == KIND_UNSUPPORTED:
+        return requirements
+    requirements.extend(
+        rule_requirements(settings, rules, _clean_symbols(universe), window))
     return dedupe(requirements)
 
 
@@ -560,6 +591,7 @@ __all__ = [
     "Window",
     "as_bool",
     "dedupe",
+    "expert_replay_inputs",
     "iter_rule_event_types",
     "register_adapter",
     "registered_experts",
