@@ -28,8 +28,8 @@ supported expert's list.
 
 Nothing here reaches a network, a database or a cache: it maps configuration to
 typed declarations. Deciding whether a declaration is already satisfied is the
-planner's job (``app.services.warm.planner``), and fetching it is the warm
-worker's.
+planner's job (``ba2_providers.warm.planner``), and fetching it is the warm
+fetcher's (``ba2_experts.warm_fetchers``).
 """
 from __future__ import annotations
 
@@ -125,13 +125,18 @@ def as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if value is None:
-        return False
+        # NOT False. A setting present-but-null is a broken row, not an "off" switch, and
+        # reading it as off silently drops the ATR declaration from the plan -- the same
+        # failure shape as a missing key, so it fails the same way.
+        raise ValueError(
+            "a boolean setting is present but null; set it to true/false rather than "
+            "leaving it unset (null is not 'off')")
     if isinstance(value, (int, float)):
         return bool(value)
     text = str(value).strip().lower()
     if text in ("1", "true", "yes", "on"):
         return True
-    if text in ("0", "false", "no", "off", ""):
+    if text in ("0", "false", "no", "off"):
         return False
     raise ValueError(f"cannot read {value!r} as a boolean setting value")
 
@@ -273,11 +278,14 @@ def unsupported_requirement(expert_class: str, detail: str) -> Requirement:
 
 
 def dedupe(requirements: Iterable[Requirement]) -> List[Requirement]:
-    """First-wins dedupe by :attr:`Requirement.key`, preserving order.
+    """Dedupe by :attr:`Requirement.key`, keeping first-seen ORDER.
 
-    First-wins on purpose: a REQUIRED declaration reached before the same payload's
-    optional twin must not be demoted to optional by the later one. Where both
-    exist the non-optional copy is kept even if it arrives second.
+    Which COPY survives is decided by ``optional``, not by arrival: where the same
+    payload is declared both required and optional, the REQUIRED one wins whichever
+    came first. A required declaration demoted to optional by a later twin would be
+    warmed last and dropped first by the budget -- a real input treated as a nice-to-
+    have. The surviving copy keeps the position of the first occurrence, so a plan
+    reads in declaration order.
     """
     out: Dict[str, Requirement] = {}
     for req in requirements:
@@ -390,16 +398,22 @@ ATR_LOOKBACK_MIN_DAYS = 60
 
 
 def iter_rule_event_types(rules: Any) -> List[str]:
-    """Every ``event_type`` mentioned by ``rules``, in encounter order.
+    """Every event type mentioned by ``rules``, in encounter order.
 
     Accepts what the callers actually hold: a sequence of ``EventAction`` rows
-    (``.triggers`` -> ``{key: {"event_type": ...}}``), the same thing as plain
-    dicts (an exported ruleset), a ruleset-shaped mapping with ``event_actions``,
-    or a bare sequence of event-type strings. ``None`` is no rules.
+    (``.triggers`` -> ``{key: {"event_type": ...}}``), the same thing as plain dicts (an
+    exported ruleset), a ruleset-shaped mapping with ``event_actions``, or a bare
+    sequence of event-type strings. ``None`` is no rules.
 
-    Anything else raises: silently reading zero event types out of a shape this
-    does not understand would drop the ATR and earnings declarations from the plan
-    while every log still said the resolver ran.
+    TWO SPELLINGS, both read. ``event_type`` is what ``TradeActionEvaluator`` reads; some
+    exported and older rulesets spell the same field ``type``. Reading only the first
+    would silently drop every condition in such a ruleset -- the plan would then be
+    missing the earnings calendar and the ATR series while every log said the resolver
+    ran -- so ``type`` is read as a fallback and a trigger that carries BOTH with
+    different values is refused rather than resolved by a coin toss.
+
+    A trigger dict that names NEITHER raises. Yielding zero event types for it is
+    indistinguishable, at the plan, from a ruleset with no data conditions.
     """
     if rules is None:
         return []
@@ -417,12 +431,24 @@ def iter_rule_event_types(rules: Any) -> List[str]:
             raise TypeError(
                 f"rule {rule!r} has no 'triggers'; pass EventAction rows, their dict form, "
                 f"or plain event-type strings")
-        for trigger in (triggers or {}).values():
+        for name, trigger in (triggers or {}).items():
             if not isinstance(trigger, Mapping):
-                continue
+                raise TypeError(
+                    f"trigger {name!r} is a {type(trigger).__name__}, not a mapping; a rule "
+                    f"this resolver cannot read must not be silently skipped")
             event_type = trigger.get("event_type")
-            if event_type:
-                out.append(str(event_type))
+            legacy = trigger.get("type")
+            if event_type and legacy and str(event_type) != str(legacy):
+                raise ValueError(
+                    f"trigger {name!r} carries both event_type={event_type!r} and "
+                    f"type={legacy!r}; which condition it declares is ambiguous")
+            resolved = event_type or legacy
+            if not resolved:
+                raise ValueError(
+                    f"trigger {name!r} names no event type (neither 'event_type' nor 'type'); "
+                    f"a rule whose condition cannot be read would silently drop its data "
+                    f"requirements from the warm plan")
+            out.append(str(resolved))
     return out
 
 

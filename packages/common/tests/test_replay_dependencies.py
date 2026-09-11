@@ -97,15 +97,21 @@ def test_require_setting_returns_a_falsy_value_rather_than_treating_it_as_absent
 
 @pytest.mark.parametrize("value,expected", [
     (True, True), (False, False), ("true", True), ("1", True), ("0", False),
-    ("False", False), (1, True), (0, False), (None, False), ("", False),
+    ("False", False), (1, True), (0, False),
 ])
 def test_as_bool_reads_every_spelling_a_setting_row_can_hold(value, expected):
     assert dep.as_bool(value) is expected
 
 
-def test_as_bool_refuses_a_spelling_that_means_nothing():
+@pytest.mark.parametrize("value", ["maybe", None, ""])
+def test_as_bool_refuses_anything_that_does_not_mean_a_boolean(value):
+    """``None`` included: a present-but-null row is broken, not "off".
+
+    Reading it as False silently drops the ATR declaration from the plan, which is the
+    same damage a missing key does -- so it fails the same way.
+    """
     with pytest.raises(ValueError):
-        dep.as_bool("maybe")
+        dep.as_bool(value)
 
 
 # --------------------------------------------------------------------------- #

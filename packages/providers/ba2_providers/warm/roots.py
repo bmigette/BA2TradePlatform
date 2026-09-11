@@ -72,9 +72,11 @@ def materialize_pinned_root(plan, source_roots: Sequence[str], dest: str, *,
     of every requirement THIS run fetched; those files are stamped
     ``warmed`` and everything else ``legacy_history_unknown_revision``.
 
-    Returns the manifest. Idempotent: running it again over an unchanged plan
-    rewrites the same bytes and produces the same manifest, which is what makes a
-    comparison repeatable.
+    Returns the manifest. Running it again over an unchanged plan reproduces the same
+    FILES -- same bytes, same hashes, same provenance -- which is what makes a
+    comparison repeatable. The manifest itself is not byte-identical between runs: it
+    carries its own ``created_at``, deliberately, because when a pin was taken is part
+    of the evidence.
     """
     dest_path = os.path.abspath(dest)
     for root in source_roots:

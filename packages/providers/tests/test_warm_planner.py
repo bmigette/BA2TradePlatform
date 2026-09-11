@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from ba2_common.core.replay import dependencies as dep
-from app.services.warm import planner
+from ba2_providers.warm import planner
 
 NOW = datetime(2026, 9, 11, 20, 0, tzinfo=timezone.utc)
 WINDOW = dep.Window(start=NOW - timedelta(days=365), end=NOW)
@@ -236,51 +236,129 @@ def test_a_missing_fred_series_is_missing(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Parquet coverage
+# Parquet coverage: prefix, holes and tail
 # --------------------------------------------------------------------------- #
-def test_a_parquet_covering_the_window_end_is_present(tmp_path):
-    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d",
-                   ["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"])
+#: A short window, so a "complete" series is a handful of bars rather than a year of
+#: them. Ends on a Friday afternoon; ``SHORT_WINDOW.end`` is inside the session.
+SHORT_WINDOW = dep.Window(start=datetime(2026, 8, 31, 0, 0, tzinfo=timezone.utc), end=NOW)
 
-    result = planner.plan([_timeseries_req("AAPL")], [str(tmp_path)], as_of_now=NOW)
+
+def _sessions(window):
+    """The exchange sessions the window contains, as UTC dates."""
+    from ba2_common.core import market_calendar
+
+    return [close.astimezone(timezone.utc).date()
+            for _open, close in market_calendar.nyse_regular_sessions(
+                window.start.date(), window.end.date())]
+
+
+def _complete_dates(window):
+    return [d.isoformat() for d in _sessions(window)]
+
+
+def test_a_series_covering_every_session_in_the_window_is_present(tmp_path):
+    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d", _complete_dates(SHORT_WINDOW))
+
+    result = planner.plan([_timeseries_req("AAPL", window=SHORT_WINDOW)], [str(tmp_path)],
+                          as_of_now=NOW)
 
     entry = result.entries[0]
-    assert entry.status == planner.STATUS_PRESENT
-    assert entry.rows == 4
-    assert entry.max_date is not None
+    assert entry.status == planner.STATUS_PRESENT, entry.detail
+    assert entry.rows == len(_complete_dates(SHORT_WINDOW))
 
 
-def test_a_parquet_whose_tail_stops_short_of_the_window_is_stale(tmp_path):
-    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d", ["2026-08-01", "2026-08-02"])
+def test_a_series_that_starts_after_the_window_does_is_stale_on_its_missing_prefix(tmp_path):
+    """A 600-day lookback served by a 3-day file is not coverage."""
+    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d",
+                   _complete_dates(SHORT_WINDOW)[-3:])
 
-    result = planner.plan([_timeseries_req("AAPL")], [str(tmp_path)], as_of_now=NOW)
+    result = planner.plan([_timeseries_req("AAPL", window=SHORT_WINDOW)], [str(tmp_path)],
+                          as_of_now=NOW)
 
     entry = result.entries[0]
     assert entry.status == planner.STATUS_STALE
     assert entry.action == planner.ACTION_REFRESH
-    assert "2026-08-02" in entry.detail
+    assert "prefix missing" in entry.detail
+
+
+def test_a_series_with_holes_inside_the_window_is_stale(tmp_path):
+    """Rows are counted against the exchange calendar, not against max(date)."""
+    dates = _complete_dates(SHORT_WINDOW)
+    holed = [dates[0]] + dates[len(dates) // 2:]        # the first half is missing
+
+    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d", holed)
+
+    entry = planner.plan([_timeseries_req("AAPL", window=SHORT_WINDOW)], [str(tmp_path)],
+                         as_of_now=NOW).entries[0]
+
+    assert entry.status == planner.STATUS_STALE
+    assert "holes" in entry.detail
+
+
+def test_one_missing_session_is_tolerated_rather_than_treated_as_a_hole(tmp_path):
+    """Halts and sparse trading are real; the spec forbids manufacturing candles."""
+    dates = _complete_dates(SHORT_WINDOW)
+    with_gap = dates[:1] + dates[2:]
+
+    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d", with_gap)
+
+    entry = planner.plan([_timeseries_req("AAPL", window=SHORT_WINDOW)], [str(tmp_path)],
+                         as_of_now=NOW).entries[0]
+
+    assert entry.status == planner.STATUS_PRESENT, entry.detail
+
+
+def test_a_daily_tail_is_measured_against_the_last_COMPLETED_session(tmp_path):
+    """Mid-session, today's daily bar does not exist yet -- and that is not staleness.
+
+    Comparing against the wall-clock DATE marked every daily requirement stale on
+    every batch, which re-downloaded the full history each time.
+    """
+    dates = _complete_dates(SHORT_WINDOW)
+    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d", dates)
+    midsession = datetime(2026, 9, 11, 15, 0, tzinfo=timezone.utc)   # 11:00 New York
+    window = dep.Window(start=SHORT_WINDOW.start, end=midsession)
+
+    entry = planner.plan([_timeseries_req("AAPL", window=window)], [str(tmp_path)],
+                         as_of_now=midsession).entries[0]
+
+    assert entry.status == planner.STATUS_PRESENT, entry.detail
+
+
+def test_a_series_whose_tail_stops_days_short_is_stale(tmp_path):
+    dates = _complete_dates(SHORT_WINDOW)
+    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "1d", dates[:-3])
+
+    entry = planner.plan([_timeseries_req("AAPL", window=SHORT_WINDOW)], [str(tmp_path)],
+                         as_of_now=NOW).entries[0]
+
+    assert entry.status == planner.STATUS_STALE
+    assert "tail stops" in entry.detail
 
 
 def test_a_legacy_interval_spelling_on_disk_still_resolves(tmp_path):
     """``5m`` must find the ``_5min`` file the FMP writer produced, or every intraday
     cache in the platform reads as missing."""
+    window = dep.Window(start=NOW, end=NOW)
     _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "5min", [NOW.isoformat()])
 
-    result = planner.plan([_timeseries_req("AAPL", interval="5m")], [str(tmp_path)],
-                          as_of_now=NOW)
+    entry = planner.plan([_timeseries_req("AAPL", interval="5m", window=window)],
+                         [str(tmp_path)], as_of_now=NOW).entries[0]
 
-    assert result.entries[0].status == planner.STATUS_PRESENT
-    assert result.entries[0].path.endswith("AAPL_5min.parquet")
+    assert entry.status == planner.STATUS_PRESENT, entry.detail
+    assert entry.path.endswith("AAPL_5min.parquet")
 
 
 def test_an_intraday_series_is_compared_at_timestamp_granularity_not_by_day(tmp_path):
     """A daily bar covers the day it is stamped with; a 5-minute bar covers only itself."""
-    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "5min", ["2026-09-11T13:30:00+00:00"])
+    window = dep.Window(start=NOW - timedelta(hours=8), end=NOW)
+    _write_parquet(tmp_path, "FMPOHLCVProvider", "AAPL", "5min",
+                   ["2026-09-11T13:30:00+00:00"])
 
-    result = planner.plan([_timeseries_req("AAPL", interval="5m")], [str(tmp_path)],
-                          as_of_now=NOW)
+    entry = planner.plan([_timeseries_req("AAPL", interval="5m", window=window)],
+                         [str(tmp_path)], as_of_now=NOW).entries[0]
 
-    assert result.entries[0].status == planner.STATUS_STALE
+    assert entry.status == planner.STATUS_STALE
 
 
 def test_an_empty_parquet_is_missing_not_present(tmp_path):
@@ -300,29 +378,28 @@ def test_an_unknown_ohlcv_provider_name_is_refused_rather_than_guessed(tmp_path)
 # --------------------------------------------------------------------------- #
 # Indicators
 # --------------------------------------------------------------------------- #
+def _indicator_req(window=None):
+    return dep.Requirement(provider="indicators", namespace="atr_14", symbol="AAPL",
+                           window=window or SHORT_WINDOW, interval="1d",
+                           kind=dep.KIND_INDICATOR, optional=False, reason="t")
+
+
 def test_an_indicator_resolves_against_whatever_provider_directory_holds_the_series(tmp_path):
     """Which OHLCV source backs the indicator provider is HOST wiring, so search them all."""
     _write_parquet(tmp_path, "YFinanceDataProvider", "AAPL", "1d",
-                   ["2026-09-10", "2026-09-11"])
-    req = dep.Requirement(provider="indicators", namespace="atr_14", symbol="AAPL",
-                          window=WINDOW.trailing(60), interval="1d", kind=dep.KIND_INDICATOR,
-                          optional=False, reason="t")
+                   _complete_dates(SHORT_WINDOW))
 
-    result = planner.plan([req], [str(tmp_path)], as_of_now=NOW)
+    entry = planner.plan([_indicator_req()], [str(tmp_path)], as_of_now=NOW).entries[0]
 
-    assert result.entries[0].status == planner.STATUS_PRESENT
-    assert "YFinanceDataProvider" in result.entries[0].path
+    assert entry.status == planner.STATUS_PRESENT, entry.detail
+    assert "YFinanceDataProvider" in entry.path
 
 
 def test_an_indicator_with_no_series_anywhere_is_missing_and_names_where_it_looked(tmp_path):
-    req = dep.Requirement(provider="indicators", namespace="atr_14", symbol="AAPL",
-                          window=WINDOW.trailing(60), interval="1d", kind=dep.KIND_INDICATOR,
-                          optional=False, reason="t")
+    entry = planner.plan([_indicator_req()], [str(tmp_path)], as_of_now=NOW).entries[0]
 
-    result = planner.plan([req], [str(tmp_path)], as_of_now=NOW)
-
-    assert result.entries[0].status == planner.STATUS_MISSING
-    assert "AAPL_1d.parquet" in result.entries[0].detail
+    assert entry.status == planner.STATUS_MISSING
+    assert "AAPL_1d.parquet" in entry.detail
 
 
 # --------------------------------------------------------------------------- #

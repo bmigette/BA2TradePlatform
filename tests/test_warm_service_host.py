@@ -15,6 +15,7 @@ budget, and when. Four things must hold:
 """
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -75,6 +76,12 @@ def cache_root(tmp_path, monkeypatch):
     finally:
         warm_service.shutdown_warm_service(timeout=5.0)
         set_replay_store(None)
+
+
+def _account_definition():
+    from ba2_trade_platform.core.models import AccountDefinition
+
+    return AccountDefinition(name="test", provider="AlpacaAccount")
 
 
 def _enable():
@@ -187,7 +194,35 @@ def _start_queue(monkeypatch, fetcher):
     return queue
 
 
-def test_the_batch_hook_enqueues_only_what_the_roots_do_not_hold(cache_root, monkeypatch):
+def test_the_batch_hook_returns_immediately_without_touching_the_filesystem(cache_root,
+                                                                            monkeypatch):
+    """It runs in a TRADING worker's ``finally``; resolving a batch there delays the
+    next analysis for work that has no deadline (spec section 6)."""
+    import os
+
+    _open_capture_store(cache_root / "replay", FMPRATING_SETTINGS)
+    queue = _start_queue(monkeypatch, lambda req: None)
+    caller = threading.current_thread().ident
+    scans = []
+
+    real_scandir = os.scandir
+
+    def _watched_scandir(path="."):
+        if threading.current_thread().ident == caller:
+            scans.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _watched_scandir)
+
+    assert warm_service.on_analysis_batch_end("batch-1") == 1
+    caller_scans = list(scans)
+    assert queue.join(timeout=10.0)
+
+    assert caller_scans == [], (
+        f"the hook listed cache directories on the trading thread: {caller_scans}")
+
+
+def test_the_queued_job_enqueues_only_what_the_roots_do_not_hold(cache_root, monkeypatch):
     import ba2_trade_platform.config as config
 
     _open_capture_store(cache_root / "replay", FMPRATING_SETTINGS)
@@ -195,33 +230,32 @@ def test_the_batch_hook_enqueues_only_what_the_roots_do_not_hold(cache_root, mon
     os.makedirs(history, exist_ok=True)
     with open(os.path.join(history, "price_target__AAPL.json"), "w", encoding="utf-8") as fh:
         fh.write('[{"t": 1}]')
-    fetched = []
-    queue = _start_queue(monkeypatch, lambda req: fetched.append(req.key))
+    queue = _start_queue(monkeypatch, lambda req: None)
 
-    enqueued = warm_service.on_analysis_batch_end("batch-1")
-    queue.join(timeout=10.0)
+    warm_service.on_analysis_batch_end("batch-1")
+    assert queue.join(timeout=10.0)
 
     keys = set(queue.warmed_keys())
-    assert enqueued > 0
+    assert keys, "the job must have run and enqueued the gaps"
     assert not any("price_target" in k for k in keys), (
         "a payload already on the root is not work")
     assert any("grades_historical" in k for k in keys), (
         "a payload the root lacks must be enqueued")
 
 
-def test_the_batch_hook_ignores_analyses_from_another_batch(cache_root, monkeypatch):
+def test_the_job_ignores_analyses_from_another_batch(cache_root, monkeypatch):
     _open_capture_store(cache_root / "replay", FMPRATING_SETTINGS, batch_id="other")
     queue = _start_queue(monkeypatch, lambda req: None)
 
-    assert warm_service.on_analysis_batch_end("batch-1") == 0
+    assert warm_service.plan_and_enqueue_batch("batch-1") == 0
 
 
 def test_an_expert_without_an_adapter_enqueues_nothing_but_is_not_an_error(cache_root,
                                                                           monkeypatch):
     _open_capture_store(cache_root / "replay", FMPRATING_SETTINGS, expert="FactorRanker")
-    queue = _start_queue(monkeypatch, lambda req: None)
+    _start_queue(monkeypatch, lambda req: None)
 
-    assert warm_service.on_analysis_batch_end("batch-1") == 0, (
+    assert warm_service.plan_and_enqueue_batch("batch-1") == 0, (
         "an unsupported expert is reported by the plan, never downloaded for")
 
 
@@ -230,10 +264,19 @@ def test_a_settings_dict_missing_a_key_the_resolver_needs_warms_nothing_and_says
     _open_capture_store(cache_root / "replay", {"max_analyst_age_months": 0})
     _start_queue(monkeypatch, lambda req: None)
 
-    assert warm_service.on_analysis_batch_end("batch-1") == 0
+    assert warm_service.plan_and_enqueue_batch("batch-1") == 0
     assert any("use_atr_stop" in m for m in host_errors), (
         "the missing key must be named; warming a configuration the analysis did not "
         "run with is worse than warming nothing")
+
+
+def test_the_batch_hook_is_a_no_op_when_the_batch_is_already_queued(cache_root, monkeypatch):
+    _open_capture_store(cache_root / "replay", FMPRATING_SETTINGS)
+    queue = _start_queue(monkeypatch, lambda req: None)
+    queue.stop(timeout=2.0)          # nothing drains, so the first job stays queued
+
+    assert warm_service.on_analysis_batch_end("batch-1") == 1
+    assert warm_service.on_analysis_batch_end("batch-1") == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -252,6 +295,45 @@ def test_the_post_close_job_is_scheduled_at_the_close_plus_the_settlement_offset
     assert fields["hour"] == "17" and fields["minute"] == "30", (
         "16:00 close + the 90-minute settlement offset")
     assert str(trigger.timezone) == "America/New_York"
+
+
+def test_the_job_is_re_resolved_daily(cache_root):
+    """An exchange that changes its hours must not wait for a process restart."""
+    warm_service.ensure_settings()
+    jobs = _FakeJobManager()
+
+    warm_service.schedule_settlement_job(
+        jobs, close_time_provider=lambda: (16, 0, "America/New_York"))
+
+    assert warm_service.WARM_RERESOLVE_JOB_ID in jobs._scheduler.jobs
+
+
+@pytest.mark.parametrize("close_utc,expected_local", [
+    # Alpaca normalises its clock to UTC. Winter: 16:00 New York is 21:00 UTC.
+    (datetime(2026, 1, 15, 21, 0, tzinfo=timezone.utc), 16),
+    # Summer (EDT): the SAME 16:00 local close is 20:00 UTC. Reading the hour off the
+    # instant's own tzinfo gives 21 and 20 -- an hour of silent DST drift.
+    (datetime(2026, 7, 15, 20, 0, tzinfo=timezone.utc), 16),
+])
+def test_the_close_is_read_in_the_exchange_zone_not_the_brokers(cache_root, monkeypatch,
+                                                               close_utc, expected_local):
+    from ba2_common.core.account_types import MarketHours
+
+    class _Account:
+        def get_market_hours(self):
+            return MarketHours(is_open=False, next_close=close_utc,
+                               close_at=close_utc, source="broker", as_of=close_utc)
+
+    monkeypatch.setattr(warm_service, "get_account_instance_from_id", None, raising=False)
+    monkeypatch.setattr("ba2_trade_platform.core.utils.get_account_instance_from_id",
+                        lambda account_id: _Account())
+    add_instance(_account_definition())
+
+    hour, minute, tz_name = warm_service.resolve_market_close()
+
+    assert (hour, minute) == (expected_local, 0)
+    assert tz_name == "America/New_York", (
+        "the CRON needs the exchange zone, or APScheduler cannot follow the DST change")
 
 
 def test_no_job_is_scheduled_when_no_account_can_report_its_close(cache_root, host_errors):

@@ -33,12 +33,14 @@ requirement's own window, and the FRED age from an explicit argument.
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from ba2_common.logger import logger
 from ba2_common.core.replay.dependencies import (
     KIND_HISTORY,
     KIND_INDICATOR,
@@ -185,22 +187,22 @@ class WarmPlan:
         """
         return sum(e.estimated_bytes or 0 for e in self.pending())
 
-    def measured_median_bytes(self) -> Optional[int]:
-        """The median of every byte figure this plan MEASURED.
+    def measured_sizes(self) -> List[int]:
+        """Every byte figure this plan MEASURED, unaggregated.
 
         Both halves count: an artifact that exists contributes its own size, and a
         missing one contributes the median of its comparable files (itself measured).
-        Every number here came off a real file.
+        Every number here came off a real file on a real root.
 
-        This is the honest basis for what to reserve for an unknown-size response.
-        ``None`` when the roots held nothing at all -- in which case a caller must be
-        told to warm from a seeded root rather than be handed an invented number.
+        Returned raw rather than as one statistic because the consumer decides the
+        summary: the budget takes a HIGH quantile for an unknown-size reservation
+        (``ba2_common.core.warm.budget.unknown_reserve_for``), while a report may want
+        the median. An empty list means the roots held nothing at all -- in which case
+        a caller must be told to seed the root rather than handed an invented number.
         """
         sizes = [e.size_bytes for e in self.entries if e.size_bytes]
         sizes += [e.estimated_bytes for e in self.entries if e.estimated_bytes]
-        if not sizes:
-            return None
-        return int(statistics.median(sizes))
+        return sizes
 
     def to_mapping(self) -> Dict[str, Any]:
         return {
@@ -448,59 +450,182 @@ def _inspect_timeseries(req: Requirement, roots: Sequence[str],
                 looked.append(relpath)
                 if not os.path.exists(path):
                     continue
-                rows, max_date = _parquet_coverage(path)
-                size = os.path.getsize(path)
-                if not rows:
-                    return PlanEntry(
-                        requirement=req, status=STATUS_MISSING, action=ACTION_FETCH,
-                        source_root=root, path=path, size_bytes=size, rows=rows,
-                        estimated_bytes=measured.median_for_dir(provider_dir),
-                        detail="the parquet holds no bars (a broken cache, not coverage)")
-                needed_end = req.window.end if req.window else None
-                if needed_end is not None and not _covers_end(max_date, needed_end, req.interval):
-                    return PlanEntry(
-                        requirement=req, status=STATUS_STALE, action=ACTION_REFRESH,
-                        source_root=root, path=path, size_bytes=size, rows=rows,
-                        max_date=max_date.isoformat() if max_date else None,
-                        estimated_bytes=measured.median_for_dir(provider_dir),
-                        detail=(f"tail stops at "
-                                f"{max_date.date().isoformat() if max_date else 'unknown'}, "
-                                f"before the requested window end "
-                                f"{needed_end.date().isoformat()}"))
-                return PlanEntry(
-                    requirement=req, status=STATUS_PRESENT, action=ACTION_NONE,
-                    source_root=root, path=path, size_bytes=size, rows=rows,
-                    max_date=max_date.isoformat() if max_date else None,
-                    detail=f"{rows} bars")
+                return _judge_timeseries(req, root, path, provider_dir, measured)
     return PlanEntry(
         requirement=req, status=STATUS_MISSING, action=ACTION_FETCH,
         estimated_bytes=measured.median_for_dir(provider_dirs[0]) if provider_dirs else None,
-        detail=f"no series file under any configured root (looked for {', '.join(sorted(set(looked)))})")
+        detail=(f"no series file under any configured root (looked for "
+                f"{', '.join(sorted(set(looked)))})"))
+
+
+def _judge_timeseries(req: Requirement, root: str, path: str, provider_dir: str,
+                      measured: "_SizeIndex") -> PlanEntry:
+    """Does the parquet at ``path`` actually COVER the requirement's window?
+
+    Three ways it can fail, and only the last one was checked before:
+
+    * **no bars at all** -- a broken cache file, which must be allowed to refill;
+    * **a missing PREFIX** -- the file starts after the window does. A 600-day
+      DeterministicScorer lookback served by a file whose first bar is 30 days old is
+      not coverage, and reporting it ``present`` is how a replay silently scores a
+      momentum factor off a third of its history (spec section 6: "Fetch missing
+      prefixes, holes and tails");
+    * **HOLES** -- rows inside the window, compared against the number of trading
+      sessions the exchange calendar says the window contains. Tolerated up to
+      ``_SESSION_COVERAGE_TOLERANCE``: halts, IPO gaps and sparse trading are real,
+      and the spec forbids manufacturing candles for them, so the check reports a
+      material shortfall rather than demanding an exact match;
+    * **a short TAIL** -- the newest bar is older than the window needs.
+
+    When the calendar itself cannot answer (``MarketCalendarUnavailable``: no
+    ``pandas_market_calendars``), the hole check is SKIPPED and said so in the detail.
+    Guessing a session count from weekday arithmetic would manufacture a gap on every
+    holiday week.
+    """
+    rows, min_date, max_date, rows_in_window = _parquet_coverage(path, req.window)
+    size = os.path.getsize(path)
+    estimate = measured.median_for_dir(provider_dir)
+    common = dict(requirement=req, source_root=root, path=path, size_bytes=size, rows=rows,
+                  max_date=max_date.isoformat() if max_date else None)
+
+    if not rows:
+        return PlanEntry(status=STATUS_MISSING, action=ACTION_FETCH, estimated_bytes=estimate,
+                         detail="the parquet holds no bars (a broken cache, not coverage)",
+                         **common)
+
+    window = req.window
+    if window is not None and window.start is not None:
+        if min_date is None or not _covers_start(min_date, window.start, req.interval):
+            return PlanEntry(
+                status=STATUS_STALE, action=ACTION_REFRESH, estimated_bytes=estimate,
+                detail=(f"prefix missing: the series starts at "
+                        f"{min_date.date().isoformat() if min_date else 'unknown'}, after the "
+                        f"requested window start {window.start.date().isoformat()}"),
+                **common)
+
+    if window is not None and not _covers_end(max_date, window.end, req.interval):
+        return PlanEntry(
+            status=STATUS_STALE, action=ACTION_REFRESH, estimated_bytes=estimate,
+            detail=(f"tail stops at "
+                    f"{max_date.date().isoformat() if max_date else 'unknown'}, before the "
+                    f"last session the window requires "
+                    f"{_required_tail_date(window.end, req.interval).isoformat()}"),
+            **common)
+
+    expected = _expected_sessions(req, window)
+    if expected is None:
+        return PlanEntry(status=STATUS_PRESENT, action=ACTION_NONE,
+                         detail=f"{rows} bars (hole check skipped: no exchange calendar)",
+                         **common)
+    # ALWAYS at least one session of slack, on top of the percentage. A halt, an
+    # unlisted day or a symbol that simply did not print is a single missing bar, and on
+    # a short window (nine sessions, say) one absence is 11% -- so a pure percentage
+    # would report every such series as holed and re-download it forever.
+    allowed_missing = max(1, int(math.ceil(expected * _SESSION_COVERAGE_TOLERANCE)))
+    if expected - rows_in_window > allowed_missing:
+        return PlanEntry(
+            status=STATUS_STALE, action=ACTION_REFRESH, estimated_bytes=estimate,
+            detail=(f"holes: {rows_in_window} bars inside the window against "
+                    f"{expected} trading sessions (up to {allowed_missing} missing is "
+                    f"tolerated for halts and sparse trading)"),
+            **common)
+    return PlanEntry(status=STATUS_PRESENT, action=ACTION_NONE,
+                     detail=f"{rows} bars, {rows_in_window} of {expected} sessions in window",
+                     **common)
 
 
 #: Canonical intervals whose bars are stamped at a DAY (or coarser) boundary. Their
-#: coverage is compared by DATE: a daily series whose newest bar is today's does
-#: cover a window that ends at 20:00 today, and comparing the timestamps would
-#: report every complete daily cache in the platform as stale forever.
+#: coverage is compared by DATE: a daily series whose newest bar is the last COMPLETED
+#: session does cover a window that ends at 20:00 that day, and comparing timestamps
+#: would report every complete daily cache in the platform as stale forever.
 _DAY_OR_COARSER = ("1d", "1wk", "1mo")
+
+#: How much of the calendar's session count a series may be missing inside the window
+#: before the plan calls it holed. Halts, IPO gaps, sparse trading and a symbol that
+#: simply did not trade every session are real and must NOT be "repaired" by
+#: manufacturing candles (spec section 6), so this asks for a MATERIAL shortfall --
+#: measured against the exchange calendar, not against weekday arithmetic.
+_SESSION_COVERAGE_TOLERANCE = 0.05
+
+
+def _is_daily_or_coarser(interval: str) -> bool:
+    from ba2_common.core import native_cache
+
+    return native_cache.normalize_interval(interval) in _DAY_OR_COARSER
+
+
+def _required_tail_date(needed_end: datetime, interval: str):
+    """The newest bar a daily series must hold to cover a window ending at ``needed_end``.
+
+    The LAST COMPLETED SESSION at that instant, from the exchange calendar -- not the
+    calendar date. A batch that runs at 14:00 New York asks for a window ending now,
+    and today's daily bar does not exist yet: comparing against today's date would
+    mark every daily requirement stale on every batch and re-download the whole
+    history each time. Falls back to the instant's own date when no calendar is
+    available (then the old, stricter behaviour applies and says so).
+    """
+    if not _is_daily_or_coarser(interval):
+        return needed_end.date()
+    try:
+        from ba2_common.core import market_calendar
+
+        sessions = market_calendar.nyse_regular_sessions(
+            (needed_end - timedelta(days=14)).date(), needed_end.date())
+    except Exception:  # noqa: BLE001 - no calendar available: fall back to the date
+        return needed_end.date()
+    completed = [close for _open, close in sessions if close <= needed_end]
+    if not completed:
+        return needed_end.date()
+    return completed[-1].astimezone(timezone.utc).date()
 
 
 def _covers_end(max_date: Optional[datetime], needed_end: datetime, interval: str) -> bool:
     """Whether a series whose newest bar is ``max_date`` reaches ``needed_end``."""
     if max_date is None:
         return False
-    from ba2_common.core import native_cache
-
-    if native_cache.normalize_interval(interval) in _DAY_OR_COARSER:
-        return max_date.date() >= needed_end.date()
+    if _is_daily_or_coarser(interval):
+        return max_date.date() >= _required_tail_date(needed_end, interval)
     return max_date >= needed_end
 
 
-def _parquet_coverage(path: str) -> Tuple[Optional[int], Optional[datetime]]:
-    """``(rows, newest effective date)`` from a parquet, read-only.
+def _covers_start(min_date: datetime, needed_start: datetime, interval: str) -> bool:
+    """Whether a series whose OLDEST bar is ``min_date`` reaches back to ``needed_start``.
 
-    The row count comes from the footer (O(1)). The max date needs the column, so
-    only the date column is read -- never the whole frame.
+    Daily series compare by date. A tolerance is deliberately NOT applied: a symbol
+    that IPO'd inside the window has no earlier bars and nothing can fetch them, but
+    the plan cannot tell that from a truncated cache, so it reports the prefix gap and
+    the fetch settles it (an unchanged complete history is not re-fetched -- the fetch
+    writes the same file and the next plan reports ``present``).
+    """
+    if _is_daily_or_coarser(interval):
+        return min_date.date() <= needed_start.date()
+    return min_date <= needed_start
+
+
+def _expected_sessions(req: Requirement, window) -> Optional[int]:
+    """Trading sessions the exchange calendar says ``window`` contains, or ``None``.
+
+    ``None`` means "no calendar could answer" -- the hole check is then skipped rather
+    than estimated. Only daily (or coarser) series are checked: an intraday session
+    count would need the bar size and the early-close schedule, which this does not
+    model.
+    """
+    if window is None or window.start is None or not _is_daily_or_coarser(req.interval):
+        return None
+    try:
+        from ba2_common.core import market_calendar
+
+        sessions = market_calendar.nyse_regular_sessions(window.start.date(), window.end.date())
+    except Exception:  # noqa: BLE001 - no pandas_market_calendars: skip, never guess
+        return None
+    return len(sessions) or None
+
+
+def _parquet_coverage(path: str, window=None):
+    """``(rows, oldest, newest, rows_inside_window)`` from a parquet, read-only.
+
+    The row count comes from the footer (O(1)). The dates need the column, so ONLY the
+    date column is read -- never the whole frame.
     """
     try:
         import pyarrow.parquet as pq
@@ -510,20 +635,25 @@ def _parquet_coverage(path: str) -> Tuple[Optional[int], Optional[datetime]]:
         pf = pq.ParquetFile(path)
         rows = int(pf.metadata.num_rows)
         if rows == 0:
-            return 0, None
+            return 0, None, None, 0
         names = set(pf.schema_arrow.names)
         column = "effective_date" if "effective_date" in names else (
             "Date" if "Date" in names else None)
         if column is None:
-            return rows, None
+            return rows, None, None, 0
         import pandas as pd
 
         values = pd.to_datetime(pf.read(columns=[column]).column(column).to_pandas(), utc=True)
         if values.empty:
-            return rows, None
-        return rows, values.max().to_pydatetime()
-    except Exception:  # noqa: BLE001 - an unreadable cache file is a gap, not a crash
-        return None, None
+            return rows, None, None, 0
+        in_window = int(len(values))
+        if window is not None and window.start is not None:
+            in_window = int(((values >= pd.Timestamp(window.start)) &
+                             (values <= pd.Timestamp(window.end))).sum())
+        return rows, values.min().to_pydatetime(), values.max().to_pydatetime(), in_window
+    except Exception as e:  # noqa: BLE001 - an unreadable cache file is a gap, not a crash
+        logger.warning(f"warm planner: could not read parquet coverage for {path}: {e}")
+        return None, None, None, 0
 
 
 # --------------------------------------------------------------------------- #
@@ -534,17 +664,21 @@ class _SizeIndex:
 
     Spec section 6 asks for estimated bytes; an estimate has to come from somewhere
     real, so it is the MEDIAN size of comparable files already on the roots (same
-    ``fmp_history`` namespace, or same provider/``fred`` directory). When there is
-    nothing comparable the answer is ``None`` -- a made-up number would make the
-    whole reservation fiction.
+    ``fmp_history`` namespace, or same provider / ``fred`` directory). When there is
+    nothing comparable the answer is ``None`` -- a made-up number would make the whole
+    reservation fiction.
 
-    Lazy and cached: a plan for 400 symbols lists one directory once.
+    ONE SCAN PER DIRECTORY, bucketed. ``fmp_history`` holds tens of thousands of files
+    on a real installation, and the first version re-scanned the whole directory once
+    per NAMESPACE -- so a DeterministicScorer plan (statements x3 + earnings + grades +
+    targets) walked it six times before a single byte was warmed. The directory is now
+    listed once and every namespace bucket comes out of that listing.
     """
 
     def __init__(self, roots: Sequence[str]) -> None:
         self._roots = list(roots)
         self._dirs: Dict[str, List[int]] = {}
-        self._namespaces: Dict[str, List[int]] = {}
+        self._namespaces: Optional[Dict[str, List[int]]] = None
 
     def _scan_dir(self, name: str) -> List[int]:
         if name in self._dirs:
@@ -565,6 +699,28 @@ class _SizeIndex:
         sizes = [s for s in self._scan_dir(name) if s > 0]
         return int(statistics.median(sizes)) if sizes else None
 
+    def _history_buckets(self) -> Dict[str, List[int]]:
+        """``namespace -> [sizes]`` from a SINGLE listing of every root's fmp_history."""
+        if self._namespaces is not None:
+            return self._namespaces
+        buckets: Dict[str, List[int]] = {}
+        for root in self._roots:
+            directory = os.path.join(root, "fmp_history")
+            if not os.path.isdir(directory):
+                continue
+            with os.scandir(directory) as it:
+                for entry in it:
+                    if not entry.is_file():
+                        continue
+                    namespace, sep, _rest = entry.name.partition("__")
+                    if not sep:
+                        continue
+                    size = entry.stat().st_size
+                    if size > 0:
+                        buckets.setdefault(namespace, []).append(size)
+        self._namespaces = buckets
+        return buckets
+
     def median_for_namespace(self, namespace: str) -> Optional[int]:
         """Median size of the ``fmp_history`` files in ONE namespace.
 
@@ -572,21 +728,7 @@ class _SizeIndex:
         ``income_statement_annual`` payload differ by an order of magnitude, and an
         estimate that mixes them tells the budget nothing.
         """
-        if namespace not in self._namespaces:
-            prefix = f"{namespace}__"
-            sizes: List[int] = []
-            for root in self._roots:
-                directory = os.path.join(root, "fmp_history")
-                if not os.path.isdir(directory):
-                    continue
-                with os.scandir(directory) as it:
-                    for entry in it:
-                        if entry.is_file() and entry.name.startswith(prefix):
-                            size = entry.stat().st_size
-                            if size > 0:
-                                sizes.append(size)
-            self._namespaces[namespace] = sizes
-        sizes = self._namespaces[namespace]
+        sizes = self._history_buckets().get(namespace, [])
         return int(statistics.median(sizes)) if sizes else None
 
 

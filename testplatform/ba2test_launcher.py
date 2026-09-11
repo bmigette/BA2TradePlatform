@@ -738,7 +738,7 @@ def _cmd_replay_warm_plan(args, bundle: str, out) -> int:
         MissingDependencySetting, Window, required_replay_inputs,
     )
     import ba2_experts.replay_dependencies  # noqa: F401 - registers the per-expert adapters
-    from app.services.warm import planner
+    from ba2_providers.warm import planner
 
     roots = [_caller_path(r) for r in args.cache_root]
     if args.as_of_now:
@@ -799,7 +799,7 @@ def _cmd_replay_warm(args) -> int:
     """
     import subprocess
 
-    from app.services.warm import planner
+    from ba2_providers.warm import planner
 
     plan_path = _caller_path(args.plan)
     with open(plan_path, "r", encoding="utf-8") as fh:
@@ -822,18 +822,22 @@ def _cmd_replay_warm(args) -> int:
                  f"{_cfg.CACHE_FOLDER}, but the plan writes into {root}; refusing to warm a "
                  f"root half the cache readers do not point at")
 
+    from ba2_common.core.warm.budget import unknown_reserve_for
+    from ba2_experts.warm_fetchers import DefaultWarmFetcher
+    from ba2_providers.warm.seams import new_warm_budget, new_warm_queue
     from app.services.prewarm_fetchers import resolve_fred_key, resolve_keys
-    from app.services.warm.budget import WarmBudget, unknown_reserve_for
-    from app.services.warm.worker import DefaultWarmFetcher, WarmQueue
     import ba2_experts.replay_dependencies  # noqa: F401 - registers the per-expert adapters
 
     keys = resolve_keys()
-    budget = WarmBudget(allowance_bytes=int(args.allowance_mib * 1024 * 1024),
-                        unknown_reserve_bytes=unknown_reserve_for(plan))
-    queue = WarmQueue(
+    budget = new_warm_budget(allowance_bytes=int(args.allowance_mib * 1024 * 1024),
+                             unknown_reserve_bytes=unknown_reserve_for(plan))
+    queue = new_warm_queue(
         workers=args.workers, budget=budget,
         fetcher=DefaultWarmFetcher(
-            ohlcv_provider=args.ohlcv_provider,
+            # A timeseries requirement names its OWN provider; this is only the
+            # indicator stack's, for an ATR whose underlying series has no provider of
+            # its own in the requirement.
+            indicator_ohlcv_provider=args.indicator_ohlcv_provider,
             end_date=datetime.fromisoformat(plan.created_at),
             fmp_key=keys["fmp"], fred_key=resolve_fred_key()))
     queue.start()
@@ -6254,9 +6258,10 @@ def main(argv: "list | None" = None) -> int:
                      help="Warm worker threads (default 2, the pilot value).")
     rpm.add_argument("--allowance-mib", type=float, default=100.0,
                      help="Daily download allowance in MiB (default 100, the pilot value).")
-    rpm.add_argument("--ohlcv-provider", default="fmp",
-                     help="Registry name of the OHLCV provider price series are fetched "
-                          "through (default fmp, what LiveProviderBundle hands every expert).")
+    rpm.add_argument("--indicator-ohlcv-provider", default="yfinance",
+                     help="Registry name of the OHLCV provider the INDICATOR stack reads "
+                          "(default yfinance, the live host's wiring). Price-series "
+                          "requirements name their own provider and ignore this.")
 
     # runs: manage tracked backtest runs (the shared `backtests` results table).
     rp = sub.add_parser("runs", help="List / save / delete tracked backtest runs.")

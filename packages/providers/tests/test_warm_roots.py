@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from ba2_common.core.replay import dependencies as dep
-from app.services.warm import planner, roots
+from ba2_providers.warm import planner, roots
 
 NOW = datetime(2026, 9, 11, 20, 0, tzinfo=timezone.utc)
 WINDOW = dep.Window(start=NOW - timedelta(days=365), end=NOW)

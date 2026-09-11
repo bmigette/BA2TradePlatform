@@ -60,6 +60,12 @@ EXPERT_NAMES = tuple(FETCHER_METHODS)
 #: the one-shot unscoped "latest disclosures" warm, ``do_senate_latest``).
 SENATE_EXPERTS = ("FMPSenateTraderWeight", "FMPSenateTraderCopy")
 
+#: How far back ``do_insider`` warms insider transactions. Union semantics: the widest
+#: window any GA trial's ``lookback_days`` gene can ask for, so no trial hits a gap. (A
+#: REPLAY warm asks for the recorded instance's own lookback instead -- it answers for one
+#: configuration, not for a search space.)
+INSIDER_PREWARM_LOOKBACK_DAYS = 400
+
 #: The GENTLEST scalper-filter setting any GA trial for FMPSenateTraderWeight will ever use.
 #: A trader excluded by EVEN this setting is excluded by every stricter one too, so no trial can
 #: reach their trades and ``warm_new_traders`` skips warming their (often thousands of)
@@ -202,11 +208,13 @@ class PrewarmFetchers:
         self.finnhub_key = finnhub_key
         self._log_fn = log if log is not None else logger.info
 
-        # Lazily-built provider/expert singletons, shared across the whole run's symbols.
+        # THE shared namespace -> fetch table (ba2_experts.warm_fetchers). It owns the
+        # lazily-built, run-shared provider singletons this class used to build itself.
         # Thread-safe enough for the pool below: they hold the API key and nothing else, and
         # every read they do goes through the shared disk cache (stateless, key-only providers).
-        self._details_provider = None
-        self._insider_provider = None
+        from ba2_experts.warm_fetchers import NamespaceFetchers
+
+        self._namespaces = NamespaceFetchers()
         self._finnhub_expert = None
 
         # Senate dedup state is SHARED across every universe symbol's do_senate call: the same
@@ -245,19 +253,30 @@ class PrewarmFetchers:
 
     # -------------------------------------------------------------- internals
     def _details(self):
-        """The shared FMPCompanyDetailsProvider (statements / earnings / estimates)."""
-        if self._details_provider is None:
-            from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
-                FMPCompanyDetailsProvider,
-            )
-            self._details_provider = FMPCompanyDetailsProvider()
-        return self._details_provider
+        """The shared FMPCompanyDetailsProvider (statements / earnings / estimates).
+
+        Comes from the shared namespace table, which caches it the same way this class
+        used to -- one provider per run, built on first use.
+        """
+        return self._namespaces.details()
 
     def _insider(self):
-        if self._insider_provider is None:
-            from ba2_providers.insider.FMPInsiderProvider import FMPInsiderProvider
-            self._insider_provider = FMPInsiderProvider()
-        return self._insider_provider
+        return self._namespaces.insider()
+
+    def _warm(self, namespace: str, sym: str, lookback_days=None) -> None:
+        """Warm ONE fmp_history namespace through the shared table.
+
+        THE table (``ba2_experts.warm_fetchers``), not a second copy of the calls. The
+        per-expert methods below are now lists of namespace names; the calls themselves
+        -- endpoint, depth, keyword spelling -- live beside the experts that read them,
+        so the warm service and this prewarm cannot drift apart the way the CLI and the
+        API handler once did.
+        """
+        from ba2_experts.warm_fetchers import NamespaceRequest
+
+        self._namespaces.fetch(NamespaceRequest(
+            namespace=namespace, symbol=sym, end_date=self.end_date,
+            fmp_key=self.fmp_key, lookback_days=lookback_days))
 
     def _warm_estimator_inputs(self, sym: str) -> None:
         """Warm ``analyst_target_model.fetch_estimator_inputs``' two namespaces for *sym*.
@@ -267,39 +286,30 @@ class PrewarmFetchers:
         ``FMPCompanyDetailsProvider.get_past_earnings`` / ``get_earnings_estimates``
         (``packages/experts/ba2_experts/analyst_target_model.py``, ``fetch_estimator_inputs``)
         -> the ``past_earnings_quarterly`` and ``earnings_estimates_quarterly`` fmp_history
-        namespaces. Both calls mirror that function exactly, including the "quarterly" spelling
-        of the estimates namespace (FMP always returns ANNUAL rows there; "quarterly" is the
-        cache namespace every warmed file on disk already uses -- see get_earnings_estimates'
-        own docstring). ``lookback_periods`` only trims in Python after the fetch; the cached
-        payload is the full per-symbol history either way.
+        namespaces. Which two those are is stated ONCE, in
+        ``ba2_experts.warm_fetchers.ESTIMATOR_NAMESPACES``, so this prewarm and the replay
+        dependency adapter cannot disagree about what "model mode" needs.
 
         Warmed UNCONDITIONALLY by every expert that can select the model (see the module
         docstring on union semantics): ``expected_profit_mode`` is a GA gene, so which mode a
         given trial runs is not knowable at prewarm time.
         """
-        det = self._details()
-        det.get_past_earnings(symbol=sym, frequency="quarterly", end_date=self.end_date,
-                              lookback_periods=4, format_type="dict")
-        det.get_earnings_estimates(symbol=sym, frequency="quarterly", as_of_date=self.end_date,
-                                   lookback_periods=2, format_type="dict")
+        from ba2_experts.warm_fetchers import ESTIMATOR_NAMESPACES
+
+        for namespace in ESTIMATOR_NAMESPACES:
+            self._warm(namespace, sym)
 
     # --------------------------------------------------------------- fetchers
     def do_fmprating(self, sym: str) -> None:
-        from ba2_experts.FMPRating import (
-            fetch_grades_historical_cached, fetch_price_target_history_cached,
-            fetch_analyst_grades_cached,
-        )
-        fetch_grades_historical_cached(self.fmp_key, sym)
-        fetch_price_target_history_cached(self.fmp_key, sym)
-        fetch_analyst_grades_cached(self.fmp_key, sym)   # dated individual grades (rating-recency)
+        """Consensus reconstruction inputs + the dated individual grades (rating-recency)."""
+        for namespace in ("grades_historical", "price_target", "analyst_grades"):
+            self._warm(namespace, sym)
 
     def do_earnings_drift(self, sym: str) -> None:
         """Quarterly earnings history, plus the price-target model's inputs: with
         ``expected_profit_mode='model'`` this expert's ``_gather`` also calls
         ``fetch_estimator_inputs``, and that mode is a GA gene."""
-        self._details().get_past_earnings(
-            sym, frequency="quarterly", end_date=self.end_date,
-            lookback_periods=8, format_type="dict")
+        self._warm("past_earnings_quarterly", sym)
         self._warm_estimator_inputs(sym)
 
     def do_insider(self, sym: str) -> None:
@@ -310,9 +320,7 @@ class PrewarmFetchers:
         instance runs the model mode -- the 2026-09-10 readiness audit found it replaying
         against two namespaces prewarm never wrote.
         """
-        self._insider().get_insider_transactions(
-            sym, end_date=self.end_date, lookback_days=400, as_of=self.end_date,
-            format_type="dict")
+        self._warm("insider_v2", sym, lookback_days=INSIDER_PREWARM_LOOKBACK_DAYS)
         self._warm_estimator_inputs(sym)
 
     def do_deterministic_scorer(self, sym: str) -> None:
@@ -324,17 +332,10 @@ class PrewarmFetchers:
         last two MUST be warmed here or a hermetic trial with w_earnings>0 / w_analyst>0 aborts
         on a cache miss. OHLCV comes from the fetch-cache parquet, not from here.
         """
-        from ba2_experts.FMPRating import (
-            fetch_grades_historical_cached, fetch_price_target_history_cached,
-        )
-        det = self._details()
-        for fn in (det.get_income_statement, det.get_balance_sheet, det.get_cashflow_statement):
-            fn(symbol=sym, frequency="annual", end_date=self.end_date,
-               lookback_periods=6, as_of=self.end_date, format_type="dict")
-        fetch_grades_historical_cached(self.fmp_key, sym)
-        det.get_past_earnings(symbol=sym, frequency="quarterly", end_date=self.end_date,
-                              lookback_periods=16, format_type="dict")
-        fetch_price_target_history_cached(self.fmp_key, sym)
+        for namespace in ("income_statement_annual", "balance_sheet_annual",
+                          "cashflow_statement_annual", "grades_historical",
+                          "past_earnings_quarterly", "price_target"):
+            self._warm(namespace, sym)
 
     def do_factorranker(self, sym: str) -> None:
         """FactorRanker (bypass/rebalance expert): warm ALL of its factor inputs by calling the

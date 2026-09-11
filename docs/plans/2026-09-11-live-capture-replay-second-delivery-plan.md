@@ -72,6 +72,47 @@ import came from there — which made `tests/replay` fail against a stale `gathe
 
 **Commit:** `feat(warm): dependency resolver, network-free planner, budgets, pinned roots and a low-priority warm queue (spec step 4)`.
 
+**Amendment (review, 2026-09-11).** The FILE LIST above put the warm service in
+`testplatform/backend/app/services/warm/`, and that was wrong: the live trading app runs the
+same warm, so reaching it meant appending the backend directory to `sys.path` from inside
+`ba2_trade_platform` — an edge the spec's §8 layering does not allow, and one that would make a
+trade-only deployment silently unable to warm. What shipped is a three-way split, with the two
+entry points reduced to hosts:
+
+| Piece | Where | Why there |
+|---|---|---|
+| `WarmQueue`, `WarmBudget`, `RemainingGap`, `BudgetExhausted`, `unknown_reserve_for` | `packages/common/ba2_common/core/warm/` | pure mechanism; the meter, the rate-limit gate, the per-thread setup and the per-item context are INJECTED, so it imports no provider |
+| `planner`, `roots`, `seams` | `packages/providers/ba2_providers/warm/` | cache-layout knowledge (`fmp_history/`, `fred/`, `<ProviderClass>/<SYM>_<interval>.parquet`) plus the FMP-backed meter/gate/freeze/sentinel/purpose seams |
+| `DefaultWarmFetcher` + the one namespace→fetch table (`NamespaceFetchers`) | `packages/experts/ba2_experts/warm_fetchers.py` | the declaration and the fetch that satisfies it move together; `prewarm_fetchers` now COMPOSES this table instead of carrying a second copy of the calls |
+| settings, hooks, CronTrigger, CLI arg parsing | `ba2_trade_platform/core/warm_service.py`, `ba2test_launcher`, `app/services/warm/__init__.py` (re-export shim) | policy: whether, with what budget, when, on whose behalf |
+
+Eight behavioural corrections landed with it. (1) `DefaultWarmFetcher` fetches a **timeseries
+requirement through the provider it names** and uses the injected indicator-stack provider only
+for `kind="indicator"` — the first version wrote `YFinanceDataProvider`'s directory for a `fmp`
+price requirement the planner resolves against `FMPOHLCVProvider`'s, so every re-plan reported it
+`missing` and re-downloaded it forever. (2) A budget **pause is recoverable and counted**: it
+lifts when the allowance can cover the item that blocked it (in practice the UTC day rollover),
+logs ONE warning per episode, and reports `paused_dropped`; the batch hook logs what was enqueued
+AND that the warm is paused. (3) The **batch-end hook is enqueue-only** — it submits one "plan
+this batch" job and returns, because it runs in a trading worker's `finally` and resolving a batch
+walks the capture index, the database and the cache directories; `_SizeIndex` also lists
+`fmp_history` once and buckets it by namespace instead of re-scanning per namespace. (4) The
+purpose counters cover **`fmp_list_call` and FRED**, which carry the dominant warm traffic (the
+statements and the earnings calendar go through fmpsdk), and count **every attempt** including
+rate-limited ones, with bytes only on success; `fmp_list_call`'s bytes are the decoded payload
+size, documented as an over-estimate of the wire. (5) Parquet coverage checks the window **START
+and holes** (against `market_calendar` sessions, tolerating at least one missing session for halts)
+as well as the tail. (6) A daily tail is measured against the **last completed session**, not the
+wall-clock date, so daily requirements are not stale on every batch before the bar exists.
+(7) The settlement job resolves the close in **`market_calendar.NY_TZ`** rather than the instant's
+own tzinfo (Alpaca normalises to UTC → an hour of silent DST drift) and re-resolves itself daily;
+holidays and early closes are explicitly not modelled. (8) A **failed fetch is forgotten** so a
+later plan retries it, and its key is exposed in `stats()["failed_keys"]`.
+
+**Commit:** `refactor(warm): warm mechanism in ba2_common, planner/roots in ba2_providers,
+fetchers beside the experts; provider-correct timeseries warm, recoverable pause, enqueue-only
+hook, full budget accounting, prefix/hole coverage, DST-safe settlement (Task B review)`.
+
 ### Task C: Historical comparison (spec step 5)
 
 **Files:** `testplatform/backend/app/services/replay/historical.py`: `run(bundle_dir, cache_root, out_dir)`: for each captured analysis, run in a **subprocess** (CACHE_FOLDER=pinned root set before import; `hermetic_fmp_history`; network denied) `expert.analyze_as_of(recorded_evaluation_time, BacktestContext(providers=LiveProviderBundle(get_provider), settings=recorded settings, as_of=...))` with the capture machinery recording the historical bundle (a `historical` capture scope in the same store under a derived session id), then diff: input fields (targets/rating buckets, report/EPS, insider rows, estimates + revision provenance, OHLCV/statement periods/values) and recommendation; statuses `match|difference|missing_history|revision_unknown|unsupported|not_run`; `revision_unknown` when the requirement's artifact provenance is `legacy_history_unknown_revision` or the estimate snapshot postdates the live consumption; coverage capability `historical`; report stage "Expert inputs" and "Recommendation" populated; CLI `replay historical --bundle <dir> --cache-root <pinned>`. The recorded evaluation time is the analysis's first `process`-phase clock read (or `started_at` when none).

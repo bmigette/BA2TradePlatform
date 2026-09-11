@@ -1,10 +1,13 @@
 """Live host wiring for the background warm service (spec step 4, section 6).
 
-``app.services.warm`` decides WHAT is missing and HOW to close it;
-``ba2_common.core.replay.dependencies`` + ``ba2_experts.replay_dependencies``
-decide what a configuration needs. This module is the only place that decides
-WHETHER this installation warms anything, WITH WHAT BUDGET, and WHEN --
-the same division ``replay_capture`` draws for recording.
+``ba2_common.core.warm`` is the mechanism (a budgeted queue), ``ba2_providers.warm``
+knows the cache layout (what is on disk, what a pinned copy looks like),
+``ba2_experts.warm_fetchers`` performs the fetch, and
+``ba2_common.core.replay.dependencies`` + ``ba2_experts.replay_dependencies`` decide
+what a configuration needs. This module is the only place that decides WHETHER this
+installation warms anything, WITH WHAT BUDGET, and WHEN -- the same division
+``replay_capture`` draws for recording, and the reason nothing here reaches into the
+test platform's tree (spec section 8).
 
 **Off by default and independently of capture.** ``warm_enabled`` is created as
 ``"false"`` on first read (there is no alembic migration for AppSetting rows).
@@ -27,7 +30,6 @@ trade. The queue holds no account lock and runs on its own threads.
   Paris-time close", so the time comes from the account's own ``get_market_hours``.
 """
 import os
-import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,6 +51,19 @@ WARM_ENABLED_KEY = "warm_enabled"
 #: Worker threads. Two, low priority, sharing the FMP gate (spec section 6 pilot).
 WARM_WORKERS_KEY = "warm_workers"
 #: The daily background download allowance, in MiB (spec section 6 pilot: 100).
+#:
+#: WHAT IT GOVERNS, exactly -- an allowance whose coverage is vague is not a control:
+#:
+#: * every FMP request made under the ``warm`` purpose, whether it goes through
+#:   ``fmp_http_get`` (price history, price targets, grades, estimates) or through
+#:   ``fmp_list_call``/fmpsdk (the three statement histories and the earnings calendar,
+#:   which are the BULK of a warm), plus the FRED macro refreshes;
+#: * bytes are the response body where one was measurable, and the DECODED payload size
+#:   for the fmpsdk path (the response object is gone by then) -- systematically larger
+#:   than the gzipped wire, so the budget errs toward pausing early;
+#: * it does NOT govern live analysis traffic, capture (which issues no request of its
+#:   own), or ``ba2-test prewarm`` (an operator-driven bulk warm with its own
+#:   supervision).
 WARM_ALLOWANCE_KEY = "warm_daily_allowance_mib"
 #: How long after the exchange close to wait for the provider to settle before
 #: extending price tails and pinning artifacts.
@@ -65,6 +80,11 @@ WARM_DEFAULTS: Dict[str, str] = {
 
 #: The scheduled settlement job's id.
 WARM_SETTLEMENT_JOB_ID = "warm_settlement_job"
+#: The job that re-reads the exchange close and re-schedules the one above.
+WARM_RERESOLVE_JOB_ID = "warm_settlement_reresolve_job"
+#: When (exchange-local) the close time is re-read. Before the open, so a change takes
+#: effect on the day it is published rather than the day after.
+WARM_RERESOLVE_HOUR = 8
 
 #: How much history a batch-end warm asks for when an adapter does not state its own
 #: lookback. Two years: longer than the deepest lookback any adapted expert declares
@@ -79,36 +99,6 @@ PINNED_SUBDIR = os.path.join("replay", "pinned")
 
 _LOCK = threading.RLock()
 _QUEUE = None
-
-
-class WarmServiceUnavailable(RuntimeError):
-    """The warm implementation is not present in this deployment."""
-
-
-def _ensure_backend_importable() -> str:
-    """Make ``app.services.warm`` importable from this checkout, and say so if it is not.
-
-    The planner/budget/worker/pin code lives in ``testplatform/backend`` -- one
-    repository, two installable trees, and only the test platform installs its
-    ``app`` package. Rather than duplicate the implementation on this side, the host
-    puts its OWN checkout's backend directory on ``sys.path`` (derived from this
-    file, never from an installed distribution, so a worktree warms with its own
-    code -- the same trap ``testplatform/backend/pytest.ini`` documents).
-
-    APPENDED, not inserted: a path prepended here would shadow this application's
-    own modules. A deployment without the test platform raises
-    :class:`WarmServiceUnavailable`, which leaves warming off with a clear reason
-    instead of an ImportError from four frames down.
-    """
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    backend = os.path.join(repo, "testplatform", "backend")
-    if not os.path.isdir(backend):
-        raise WarmServiceUnavailable(
-            f"the warm service implementation ({backend}) is not part of this deployment; "
-            f"background warming is unavailable")
-    if backend not in sys.path:
-        sys.path.append(backend)
-    return backend
 
 
 # --------------------------------------------------------------------------- #
@@ -205,23 +195,22 @@ def initialize_warm_service(job_manager=None):
                     f"downloads and no scheduled warm job")
                 return None
 
-            _ensure_backend_importable()
-            from app.services.warm.budget import WarmBudget
-            from app.services.warm.worker import DefaultWarmFetcher, WarmQueue
+            from ba2_experts.warm_fetchers import DefaultWarmFetcher
+            from ba2_providers.warm.seams import new_warm_budget, new_warm_queue
 
             # The adapters have to be REGISTERED before anything resolves a
             # requirement; importing the module is what registers them.
             import ba2_experts.replay_dependencies  # noqa: F401
 
-            budget = WarmBudget(
+            budget = new_warm_budget(
                 allowance_bytes=warm_daily_allowance_bytes(),
                 unknown_reserve_bytes=_unknown_reserve_bytes(),
             )
-            queue = WarmQueue(
+            queue = new_warm_queue(
                 workers=warm_workers(),
                 budget=budget,
                 fetcher=DefaultWarmFetcher(
-                    ohlcv_provider=_indicator_ohlcv_provider(),
+                    indicator_ohlcv_provider=_indicator_ohlcv_provider(),
                     end_date=datetime.now(timezone.utc),
                     fmp_key=_api_key("FMP_API_KEY", "FMP_API_KEY"),
                     fred_key=_api_key("FRED_API_KEY", "fred_api_key"),
@@ -263,9 +252,8 @@ def _unknown_reserve_bytes() -> int:
     pauses with a gap report -- honest, and impossible to mistake for a working
     budget -- rather than being sized by a guess.
     """
-    _ensure_backend_importable()
-    from app.services.warm import planner
-    from app.services.warm.budget import WarmBudgetError, unknown_reserve_for
+    from ba2_common.core.warm.budget import WarmBudgetError, unknown_reserve_for
+    from ba2_providers.warm import planner
 
     empty = planner.plan([], cache_roots(), as_of_now=datetime.now(timezone.utc))
     try:
@@ -307,15 +295,40 @@ def _api_key(env_name: str, setting_key: str) -> Optional[str]:
 # Trigger 1: the end of an analysis batch
 # --------------------------------------------------------------------------- #
 def on_analysis_batch_end(batch_id: str) -> int:
-    """Enqueue what the analyses in ``batch_id`` declared and the roots do not hold.
+    """Queue the batch for warming. Returns 1 when a job was queued, 0 when not.
 
-    Returns the number of requirements enqueued (0 when warming is off, when nothing
-    was recorded, or when everything is already present).
+    ENQUEUE-ONLY, and that is the whole point. This runs in the ``finally`` of an
+    analysis worker -- a TRADING thread -- and resolving a batch means walking the
+    capture index, decoding settings objects, reading the instance's rulesets out of
+    the database, listing cache directories and reading parquet footers. Doing that
+    here delayed the worker that had just finished an analysis and was about to pick
+    up the next one, for work that has no deadline at all. So the hook submits one
+    job and returns; :func:`plan_and_enqueue_batch` runs it on a warm thread.
 
-    Reads the configuration out of the CAPTURE STORE, not out of the database: the
-    settings that matter are the ones the recorded analysis actually ran with, and an
-    instance edited between the analysis and this hook would otherwise warm for a
-    configuration that never ran.
+    Spec section 6: background warmup "must not ... delay scheduled trading to
+    finish".
+    """
+    queue = get_warm_queue()
+    if queue is None:
+        return 0
+    try:
+        submitted = queue.submit_job(f"plan:{batch_id}",
+                                     lambda: plan_and_enqueue_batch(batch_id))
+        if not submitted:
+            logger.debug(f"warm: batch {batch_id} is already queued for planning")
+        return 1 if submitted else 0
+    except Exception as e:
+        logger.error(f"warm: batch-end hook failed for {batch_id}: {e}", exc_info=True)
+        return 0
+
+
+def plan_and_enqueue_batch(batch_id: str) -> int:
+    """Resolve, plan and enqueue one batch. Runs on a WARM thread, never on a trading one.
+
+    Returns the number of requirements enqueued. Reads the configuration out of the
+    CAPTURE STORE, not out of the database: the settings that matter are the ones the
+    recorded analysis actually ran with, and an instance edited between the analysis
+    and this hook would otherwise warm for a configuration that never ran.
     """
     queue = get_warm_queue()
     if queue is None:
@@ -326,8 +339,7 @@ def on_analysis_batch_end(batch_id: str) -> int:
             logger.debug(f"warm: batch {batch_id} recorded no analyses to resolve")
             return 0
 
-        _ensure_backend_importable()
-        from app.services.warm import planner
+        from ba2_providers.warm import planner
 
         now = datetime.now(timezone.utc)
         window = Window(start=now - timedelta(days=WARM_WINDOW_DAYS), end=now)
@@ -337,7 +349,7 @@ def on_analysis_batch_end(batch_id: str) -> int:
                 requirements.extend(required_replay_inputs(
                     expert_class, group["settings"], group["rules"],
                     sorted(group["symbols"]), window))
-            except MissingDependencySetting as e:
+            except (MissingDependencySetting, ValueError) as e:
                 logger.error(
                     f"warm: cannot resolve {expert_class}'s dependencies for batch "
                     f"{batch_id}: {e}. Nothing is warmed for it rather than warming a "
@@ -347,13 +359,20 @@ def on_analysis_batch_end(batch_id: str) -> int:
         plan = planner.plan(requirements, cache_roots(), as_of_now=now)
         enqueued = queue.submit_plan(plan)
         totals = plan.totals()
+        stats = queue.stats()
+        # What was enqueued AND what was not: a "12 enqueued" line next to a silently
+        # paused queue reads as progress when nothing is being downloaded at all.
         logger.info(
             f"warm: batch {batch_id} resolved {len(requirements)} requirement(s); "
             f"{totals['present'] + totals['checked_empty']} already on disk, "
-            f"{len(enqueued)} enqueued")
+            f"{len(enqueued)} enqueued, "
+            f"{totals['pending'] - len(enqueued)} already queued or in flight"
+            + (f"; WARM IS PAUSED ({stats['paused_dropped']} item(s) dropped so far, "
+               f"{stats['remaining_bytes'] / 1048576.0:.1f} MiB allowance left)"
+               if stats["paused"] else ""))
         return len(enqueued)
     except Exception as e:
-        logger.error(f"warm: batch-end hook failed for {batch_id}: {e}", exc_info=True)
+        logger.error(f"warm: planning batch {batch_id} failed: {e}", exc_info=True)
         return 0
 
 
@@ -430,10 +449,23 @@ def schedule_settlement_job(job_manager, close_time_provider=None) -> Optional[s
     """Schedule the daily post-close warm, or refuse and say why.
 
     The time is the ACCOUNT's exchange close plus ``warm_settlement_offset_minutes``.
-    There is no fallback close time: an installation whose accounts cannot answer
-    gets no job and an ERROR in the log, because a guessed close would run the warm
-    against a half-published session and pin an incomplete artifact as if it were
-    final (spec section 6: "Exchanges, holidays and DST determine the close").
+    There is no fallback close time: an installation whose accounts cannot answer gets
+    no job and an ERROR in the log, because a guessed close would run the warm against
+    a half-published session and pin an incomplete artifact as if it were final (spec
+    section 6: "Exchanges, holidays and DST determine the close").
+
+    THE ZONE IS THE EXCHANGE'S, NOT THE TIMESTAMP'S. Alpaca normalises its clock to
+    UTC, so reading the zone off the instant's own ``tzinfo`` produced a job pinned to
+    21:00 UTC -- right in winter, an hour early all summer, and silently so. The
+    instant is CONVERTED into ``market_calendar.NY_TZ`` and the cron is given that
+    zone, which is what makes APScheduler follow the DST change.
+
+    NOT MODELLED, deliberately: holidays and early closes. The trigger is Mon-Fri at a
+    fixed local time; on a holiday it runs and finds nothing new (a warm is idempotent
+    and a plan over unchanged data enqueues nothing), and on an early close it runs
+    late rather than early. Modelling those needs the exchange calendar at TRIGGER
+    time, which APScheduler's cron cannot express -- the job re-resolves itself daily
+    instead (see ``_reschedule_settlement_job``).
     """
     try:
         provider = close_time_provider or resolve_market_close
@@ -460,21 +492,59 @@ def schedule_settlement_job(job_manager, close_time_provider=None) -> Optional[s
             max_instances=1,
             coalesce=True,
         )
+        # RE-RESOLVED DAILY. The close time is read from the broker once, here, and an
+        # exchange that changes its hours (or an account that could not answer at
+        # startup and can now) would otherwise keep the startup answer until the next
+        # restart -- which for this application is measured in weeks.
+        _schedule_daily_reresolve(job_manager)
         logger.info(
             f"Post-close warm scheduled for {at.hour:02d}:{at.minute:02d} {tz_name}, Mon-Fri "
-            f"(exchange close {hour:02d}:{minute:02d} + {offset}m settlement offset)")
+            f"(exchange close {hour:02d}:{minute:02d} + {offset}m settlement offset); "
+            f"holidays and early closes are not modelled -- a run that finds nothing new "
+            f"enqueues nothing")
         return WARM_SETTLEMENT_JOB_ID
     except Exception as e:
         logger.error(f"warm: could not schedule the post-close job: {e}", exc_info=True)
         return None
 
 
+def _schedule_daily_reresolve(job_manager) -> None:
+    """Re-read the exchange close once a day, before the session opens."""
+    from apscheduler.triggers.cron import CronTrigger
+
+    from ba2_common.core import market_calendar
+
+    def _reresolve():
+        try:
+            schedule_settlement_job(job_manager)
+        except Exception as e:  # noqa: BLE001 - a scheduling refresh may never break the app
+            logger.error(f"warm: daily close re-resolve failed: {e}", exc_info=True)
+
+    job_manager._scheduler.add_job(
+        func=_reresolve,
+        trigger=CronTrigger(hour=WARM_RERESOLVE_HOUR, minute=0, day_of_week="mon-fri",
+                            timezone=str(market_calendar.NY_TZ)),
+        id=WARM_RERESOLVE_JOB_ID,
+        name="Post-close Warm Reschedule",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+
 def resolve_market_close() -> Optional[Tuple[int, int, str]]:
     """``(hour, minute, tz)`` of the exchange close, from the first account that knows.
+
+    The hour and minute are read in the EXCHANGE's zone
+    (``market_calendar.NY_TZ``), never in whatever zone the broker happened to stamp
+    the instant with: Alpaca normalises to UTC, and taking 21:00 UTC at face value
+    schedules the job an hour early for the whole of daylight saving.
 
     ``None`` when no account can answer -- a failure, not a default.
     """
     from sqlmodel import select
+
+    from ba2_common.core import market_calendar
 
     from .db import get_db
     from .models import AccountDefinition
@@ -491,8 +561,8 @@ def resolve_market_close() -> Optional[Tuple[int, int, str]]:
             close = hours.close_at or hours.next_close
             if not hours.is_known or close is None:
                 continue
-            local = close.astimezone(close.tzinfo)
-            return local.hour, local.minute, str(close.tzinfo)
+            local = close.astimezone(market_calendar.NY_TZ)
+            return local.hour, local.minute, str(market_calendar.NY_TZ)
         except Exception as e:  # noqa: BLE001 - try the next account
             logger.warning(f"warm: account {account_id} could not report market hours: {e}")
     return None
@@ -511,9 +581,8 @@ def run_settlement_warm() -> Optional[str]:
         logger.info("warm: settlement job ran with warming off; nothing to do")
         return None
     try:
-        _ensure_backend_importable()
-        from app.services.warm import planner
-        from app.services.warm.roots import materialize_pinned_root
+        from ba2_providers.warm import planner
+        from ba2_providers.warm.roots import materialize_pinned_root
 
         now = datetime.now(timezone.utc)
         requirements = _session_requirements(now)
@@ -558,7 +627,7 @@ def _session_requirements(now: datetime):
                 requirements.extend(required_replay_inputs(
                     expert_class, group["settings"], group["rules"],
                     sorted(group["symbols"]), window))
-            except MissingDependencySetting as e:
+            except (MissingDependencySetting, ValueError) as e:
                 logger.error(f"warm: settlement cannot resolve {expert_class}: {e}")
     return requirements
 
@@ -568,16 +637,17 @@ __all__ = [
     "WARM_ALLOWANCE_KEY",
     "WARM_DEFAULTS",
     "WARM_ENABLED_KEY",
+    "WARM_RERESOLVE_JOB_ID",
     "WARM_SETTLEMENT_JOB_ID",
     "WARM_SETTLEMENT_OFFSET_KEY",
     "WARM_WINDOW_DAYS",
     "WARM_WORKERS_KEY",
-    "WarmServiceUnavailable",
     "cache_roots",
     "ensure_settings",
     "get_warm_queue",
     "initialize_warm_service",
     "on_analysis_batch_end",
+    "plan_and_enqueue_batch",
     "pinned_root_for",
     "resolve_market_close",
     "run_settlement_warm",

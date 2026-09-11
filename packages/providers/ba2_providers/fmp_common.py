@@ -13,10 +13,12 @@ Providers that assume a list then crash when they slice/index the dict
 * unexpected dict -> ``FMPError`` immediately (raw payload logged, no retry)
 """
 
+import contextvars
 import os as _os
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional
 
 import requests
@@ -407,8 +409,12 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
                                       or (_time.time() - _os.path.getmtime(path)) / 86400.0 <= max_age_days):
             with open(path, "r") as fh:
                 return _json.load(fh)
-    except Exception:  # corrupt / partial / unreadable -> re-fetch (or raise, hermetic)
-        pass
+    except Exception as e:  # corrupt / partial / unreadable -> re-fetch (or raise, hermetic)
+        # NAMED, at WARNING. A silently unreadable cache file re-downloads its payload on
+        # every single read, forever, and the only symptom is a provider bill.
+        logger.warning(
+            f"fmp_history cache file {path} could not be read ({type(e).__name__}: {e}); "
+            f"re-fetching it")
 
     # HERMETIC backtest: NEVER network-fetch — a miss means the data wasn't pre-warmed.
     # ONE missing symbol DISABLES THAT SYMBOL; MANY abort the run. See _record_hermetic_miss.
@@ -436,12 +442,15 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
             with open(tmp, "w") as fh:
                 _json.dump(to_persist, fh)
             _os.replace(tmp, path)  # atomic
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"fmp_history cache file {path} could not be written "
+                f"({type(e).__name__}: {e}); this payload will be re-fetched next run")
             if tmp:
                 try:
                     _os.remove(tmp)  # never leave a half-written tmp behind
-                except OSError:
-                    pass
+                except OSError as cleanup_error:
+                    logger.warning(f"could not remove the temp file {tmp}: {cleanup_error}")
     return data
 
 
@@ -636,9 +645,6 @@ def gate_remaining_seconds() -> float:
 # work fan out through ``ThreadPoolExecutor`` (prewarm) and ``capture_aware_submit`` (gather),
 # both of which copy a ``contextvars.Context`` into the worker. A thread-local would have
 # reported every pooled warm fetch as "live".
-import contextvars as _contextvars
-from datetime import datetime as _datetime, timezone as _timezone
-
 #: The purposes a request can be made for. ``capture`` must never appear with a non-zero count:
 #: recording reads what live already fetched and issues no request of its own.
 PURPOSE_LIVE = "live"
@@ -646,7 +652,7 @@ PURPOSE_CAPTURE = "capture"
 PURPOSE_WARM = "warm"
 PURPOSES = (PURPOSE_LIVE, PURPOSE_CAPTURE, PURPOSE_WARM)
 
-_fmp_purpose: "_contextvars.ContextVar[str]" = _contextvars.ContextVar(
+_fmp_purpose: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "fmp_purpose", default=PURPOSE_LIVE)
 
 #: ``{utc_day: {(purpose, endpoint): {"requests": int, "bytes": int}}}``. Kept per UTC day so a
@@ -673,18 +679,39 @@ def fmp_purpose(purpose: str):
 
 
 def _utc_day() -> str:
-    return _datetime.now(_timezone.utc).date().isoformat()
+    return datetime.now(timezone.utc).date().isoformat()
 
 
-def _record_fmp_request(endpoint: str, nbytes: Optional[int]) -> None:
-    """Count one completed FMP request against (today, purpose, endpoint).
+def record_fmp_request(endpoint: str, nbytes: Optional[int] = None) -> None:
+    """Count one FMP/FRED request ATTEMPT against (today, purpose, endpoint).
 
-    ``nbytes`` is ``None`` when the response object cannot report a size (a stubbed getter in a
-    test, a streamed body): the request is still counted and the byte total is left alone rather
-    than padded with a guess -- a budget that silently invents bytes is not a measurement.
+    WHAT IS COUNTED. Every attempt, including the ones that came back 429 or 5xx and were
+    retried: a rate-limited attempt consumed a request slot at the provider, and a counter
+    that hid it would under-report exactly the traffic that caused the throttling. BYTES are
+    added only when a body actually arrived -- an attempt that failed transferred nothing to
+    charge the allowance for.
+
+    ``nbytes`` is ``None`` when the response cannot report a size (a stubbed getter in a test,
+    a streamed body, an fmpsdk call whose payload is already decoded): the attempt is still
+    counted and the byte total is left alone rather than padded with a guess. A budget that
+    silently invents bytes is not a measurement.
+
+    ``endpoint`` is REQUIRED and must be short. The counters are keyed by it, and a full URL
+    -- which carries the symbol and, on some FMP paths, the API KEY -- would both explode the
+    key space and put a credential in a log line. A caller that cannot name its endpoint has
+    a bug, not a counting problem.
     """
+    name = (endpoint or "").strip()
+    if not name:
+        raise ValueError(
+            "record_fmp_request needs a short endpoint name to key the counters by; pass the "
+            "endpoint, never the URL (it carries the symbol and, on some paths, the api key)")
+    if "?" in name or "://" in name or len(name) > _MAX_ENDPOINT_KEY:
+        raise ValueError(
+            f"endpoint {name[:40]!r}... does not look like an endpoint NAME; pass the short "
+            f"path segment (e.g. 'price-target'), never a URL")
     day = _utc_day()
-    key = (current_fmp_purpose(), endpoint or "unknown")
+    key = (current_fmp_purpose(), name)
     with _PURPOSE_LOCK:
         # One day at a time: yesterday's counters are dropped as soon as a request lands on a
         # new day, which is the "reset per UTC day" the allowance is defined against.
@@ -695,6 +722,10 @@ def _record_fmp_request(endpoint: str, nbytes: Optional[int]) -> None:
         entry["requests"] += 1
         if nbytes:
             entry["bytes"] += int(nbytes)
+
+
+#: Longest endpoint name the counters accept as a key (see ``record_fmp_request``).
+_MAX_ENDPOINT_KEY = 64
 
 
 def get_purpose_stats() -> dict:
@@ -720,13 +751,47 @@ def reset_purpose_stats() -> None:
         _PURPOSE_STATS.clear()
 
 
+def record_fmp_bytes(endpoint: str, nbytes: Optional[int]) -> None:
+    """Add transferred bytes to an attempt already counted by :func:`record_fmp_request`."""
+    if not nbytes:
+        return
+    name = (endpoint or "").strip() or "unknown"
+    day = _utc_day()
+    key = (current_fmp_purpose(), name)
+    with _PURPOSE_LOCK:
+        entry = _PURPOSE_STATS.setdefault(day, {}).setdefault(key, {"requests": 0, "bytes": 0})
+        entry["bytes"] += int(nbytes)
+
+
+def _decoded_payload_bytes(payload) -> Optional[int]:
+    """The size of an ALREADY-DECODED payload, as a stand-in for its wire bytes.
+
+    ``fmpsdk`` hands back parsed JSON, so the response object -- and with it the true
+    compressed transfer size -- is gone by the time this sees it. The serialized length is
+    the honest available measure: same order of magnitude, systematically LARGER than the
+    gzipped wire bytes, which is the safe direction for a budget (it can only end up
+    pausing early, never overspending silently). Labelled here, and in the setting's
+    documentation, as an approximation rather than reported as measured wire bytes.
+    """
+    try:
+        import json as _json
+
+        return len(_json.dumps(payload, default=str))
+    except Exception as e:  # noqa: BLE001 - a size estimate must never break a data fetch
+        logger.warning(f"FMP byte accounting: payload size unavailable ({type(e).__name__}: {e})")
+        return None
+
+
 def _response_bytes(resp) -> Optional[int]:
     """The size of a response body, or ``None`` when it cannot be read without consuming it."""
     try:
         content = getattr(resp, "content", None)
         if content is not None:
             return len(content)
-    except Exception:  # noqa: BLE001 - a size read must never break a data fetch
+    except Exception as e:  # noqa: BLE001 - a size read must never break a data fetch
+        logger.warning(
+            f"FMP byte accounting: could not size a {type(resp).__name__} response "
+            f"({type(e).__name__}: {e}); the request is counted, its bytes are not")
         return None
     return None
 
@@ -764,6 +829,10 @@ def fmp_http_get(
         # Respect any GLOBAL cooldown armed by a concurrent 429 before firing (prevents the storm).
         _gate_wait(sleep)
 
+        # Counted BEFORE the outcome is known: this attempt reached the provider (or tried
+        # to), which is what a rate-limit budget has to see. Bytes are added below, only on
+        # a response that actually carried a body.
+        record_fmp_request(endpoint or "unknown")
         try:
             resp = getter(url, params=params, timeout=timeout)
         except requests.exceptions.RequestException as e:
@@ -792,10 +861,8 @@ def fmp_http_get(
 
         # Any other 4xx (401/404/...) is a non-retryable client error -> raise.
         resp.raise_for_status()
-        # Counted AFTER raise_for_status so the counters describe requests that actually
-        # returned data. Retries and rate-limited attempts are deliberately not counted as
-        # payload: they consumed a request slot, not an allowance of bytes.
-        _record_fmp_request(endpoint or url, _response_bytes(resp))
+        # The attempt was already counted above; add what the body actually cost.
+        record_fmp_bytes(endpoint or "unknown", _response_bytes(resp))
         return resp
 
     logger.error(
@@ -841,11 +908,18 @@ def fmp_list_call(
         if attempt > 0:
             sleep(delays[attempt - 1])
 
+        # COUNTED HERE TOO, not only in fmp_http_get. This wrapper carries the DOMINANT
+        # warm traffic -- the three statement histories and the earnings calendar all come
+        # through fmpsdk, which does its own HTTP -- so a budget that only saw fmp_http_get
+        # governed the minority of the bytes it claimed to govern.
+        record_fmp_request(endpoint or "fmp_list_call")
+
         result = fn()
         last_payload = result
 
         # Legitimate results.
         if isinstance(result, list):
+            record_fmp_bytes(endpoint or "fmp_list_call", _decoded_payload_bytes(result))
             return result
         if result is None:
             return []

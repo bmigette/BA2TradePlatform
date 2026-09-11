@@ -131,8 +131,15 @@ def fetch_full_history(series_id: str, api_key: str) -> List[dict]:
         params["realtime_start"] = _REALTIME_MIN
         params["realtime_end"] = _REALTIME_MAX
 
+    # Counted in the SAME purpose counters as FMP (spec section 6: requests and bytes by
+    # endpoint and purpose). A warm that refreshes nine macro series is real background
+    # traffic, and an allowance that could not see it was governing the wrong half.
+    from ba2_providers.fmp_common import record_fmp_bytes, record_fmp_request
+
+    record_fmp_request("fred-observations")
     resp = requests.get(API_URL, params=params, timeout=60)
     resp.raise_for_status()
+    record_fmp_bytes("fred-observations", len(getattr(resp, "content", b"") or b""))
     payload = resp.json()
     if "error_message" in payload:
         raise RuntimeError(f"FRED rejected {sid}: {payload['error_message']}")
