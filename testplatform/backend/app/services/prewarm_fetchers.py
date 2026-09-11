@@ -138,8 +138,8 @@ def resolve_fred_key() -> Optional[str]:
     return key
 
 
-def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] = None
-                 ) -> Dict[str, Any]:
+def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] = None,
+                 warn: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """Refresh the FRED macro series DeterministicScorer reads.
 
     Global, not per-symbol: these are economy-wide series, so they are fetched once per
@@ -156,12 +156,23 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
     warmed every per-symbol history and NO macro series at all -- the CLI half of the
     same "two prewarm tooling gaps" finding that moved the fetcher table here. Both
     entry points now call this one function.
+
+    TWO SINKS. ``log`` takes the progress; ``warn`` takes a series that could not be
+    refreshed. They were one, and the API caller passed ``logger.info`` -- so a failed
+    series was reported BELOW the level the backend logs at, and the only other trace
+    was an ``errors`` count inside a summary dict. The next thing to touch that series
+    is a hermetic trial that aborts on the missing file with no trace of why.
+
+    ``warn`` defaults to ``log`` when a caller supplied one (the CLI prints both to
+    stdout, where both are equally visible) and to ``logger.warning`` otherwise -- never
+    to ``logger.info``.
     """
     import time
 
     from ba2_providers.macro import fred_series
 
     say = log if log is not None else logger.info
+    complain = warn if warn is not None else (log if log is not None else logger.warning)
     key = resolve_fred_key()
     if not key:
         # Not fatal to the whole prewarm: only DeterministicScorer needs it, and saying
@@ -179,7 +190,7 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
             refreshed += 1
         except Exception as e:  # noqa: BLE001 - one series must not abort the prewarm
             errors += 1
-            say(f"!! prewarm FRED {sid} failed: {redact(str(e))}")
+            complain(f"!! prewarm FRED {sid} failed: {redact(str(e))}")
     return {"refreshed": refreshed, "fresh": skipped, "errors": errors}
 
 

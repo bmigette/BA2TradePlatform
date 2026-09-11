@@ -27,7 +27,12 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from ba2_common.core.failure_modes import absorb_if_benign
-from ba2_common.core.replay import ReplayMiss, current_capture, replay_now
+from ba2_common.core.replay import (
+    ReplayMiss,
+    ReplayStatus,
+    record_observation,
+    replay_now,
+)
 from ba2_common.logger import logger
 from ba2_providers.fmp_common import TTLCache
 
@@ -276,14 +281,6 @@ def fetch_index_closes(providers, as_of: Optional[datetime],
     return df["Close"]
 
 
-def _drop_macro_entries(key_suffix: str) -> None:
-    """Drop one analysis's macro memo entries (see ``fetch_macro_series``)."""
-    with _MACRO_CACHE._lock:            # type: ignore[attr-defined]
-        for key in [k for k in _MACRO_CACHE._store  # type: ignore[attr-defined]
-                    if str(k).endswith(f"__{key_suffix}")]:
-            del _MACRO_CACHE._store[key]   # type: ignore[attr-defined]
-
-
 def _observation_series(rows: Any) -> Optional[pd.Series]:
     """FRED-style [{date, value}, ...] -> ascending float Series.
 
@@ -347,29 +344,41 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
     # str(): as_of may be a datetime (engine) or an ISO string (tools/tests), and
     # get_series_as_of accepts both -- the memo key must not care which.
     #
-    # The live key is THE ANALYSIS, not the clock. Capture has to see each recorded
-    # analysis read these series (a memo shared across analyses records the first
-    # one's reads and none of the rest, leaving every later bundle unreplayable),
-    # and keying on a clock read instead would defeat the memo entirely -- a new key
-    # per tick, an unbounded pile of Series in a cache that only evicts on read, and
-    # STILL a shared key for two analyses inside one tick. With capture off there is
-    # no analysis to key on and the constant "live" key is exactly the behaviour
-    # this memo has always had.
-    context = current_capture()
-    if as_of is not None:
-        _key_suffix = str(as_of)
-    elif context is not None:
-        _key_suffix = f"analysis:{context.analysis_id}"
-        # Whoever adds a per-analysis entry removes it: this memo is process-wide
-        # and a live instance runs analyses for weeks.
-        context.on_close(lambda: _drop_macro_entries(_key_suffix))
-    else:
-        _key_suffix = "live"
+    # ONE KEY FOR THE WHOLE PROCESS on the live path. These four series are
+    # economy-wide: identical for every symbol in a batch and for every analysis in
+    # a tick, which is the entire reason the memo exists (~95ms of series rebuilding
+    # per analysis without it). CAPTURE MUST NOT CHANGE THAT. A key of
+    # "analysis:<id>" turned the memo off for exactly the runs it was measuring --
+    # an instrument that changes what it measures is not an instrument -- and the
+    # thing it was reaching for (every analysis's bundle carrying its macro reads)
+    # is what ``_series`` records below, without touching the cache.
+    _key_suffix = str(as_of) if as_of is not None else "live"
 
     def _series(series_id: str):
-        return _MACRO_CACHE.get_or_call(
-            f"{series_id}__{_key_suffix}",
-            lambda: fred_series.get_series_as_of(series_id, as_of))
+        """The series, and the observation that says this analysis read it.
+
+        The tap on ``get_series_as_of`` records the analysis that actually LOADED;
+        an analysis served out of the memo never enters that function, so its
+        bundle would hold macro values with no observation behind them --
+        unreplayable, and silently so. The memo hit is therefore recorded here,
+        through the same identity the tap writes (``series_identity``, imported
+        rather than restated) and the same provenance: this store never reaches the
+        network, so every value here came off disk whichever path served it.
+        """
+        loaded = []
+
+        def _load():
+            loaded.append(series_id)
+            return fred_series.get_series_as_of(series_id, as_of)
+
+        series = _MACRO_CACHE.get_or_call(f"{series_id}__{_key_suffix}", _load)
+        if not loaded:
+            record_observation(
+                provider="macro", method="get_series_as_of",
+                identity=fred_series.series_identity(
+                    {"series_id": series_id, "as_of": as_of}),
+                payload=series, provenance=ReplayStatus.PROVENANCE_DISK_CACHE)
+        return series
 
     # Keyed by MACRO_SERIES_IDS so the tuple the dependency adapter declares is the
     # tuple this function reads.

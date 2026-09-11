@@ -26,6 +26,7 @@ from datetime import datetime
 
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
 from ba2_common.core.replay.observe import observe_provider, tapped_boundary
+from ba2_common.logger import logger
 
 
 def indicator_identity(args):
@@ -92,15 +93,29 @@ class MarketIndicatorsInterface(DataProviderInterface):
         deeper subclass from wrapping a wrapper (which would record one call
         twice). With capture off the wrapper is one ``is None`` check. See the
         module docstring for what this does not reach.
+
+        THIS RUNS AT IMPORT TIME, for every indicator provider in the platform, so
+        anything that raises here propagates out of the ``class`` statement and out
+        of ``main.initialize_system()`` -- the application would fail to BOOT because
+        an observability wrapper could not be attached. Capture is instrumentation:
+        it may lose an observation, it may not take the platform down. A tap that
+        cannot be built therefore leaves that one method untapped and says which one,
+        instead of raising.
         """
         super().__init_subclass__(**kwargs)
         implementation = cls.__dict__.get("get_indicator")
         if implementation is None or getattr(implementation, "__isabstractmethod__", False):
             return
-        if tapped_boundary(implementation) is not None:
-            return
-        cls.get_indicator = observe_provider(
-            "indicators", "get_indicator", identity=indicator_identity)(implementation)
+        try:
+            if tapped_boundary(implementation) is not None:
+                return
+            cls.get_indicator = observe_provider(
+                "indicators", "get_indicator", identity=indicator_identity)(implementation)
+        except Exception as e:  # noqa: BLE001 - a tap must never stop the app from booting
+            logger.error(
+                f"replay capture could not tap {cls.__module__}.{cls.__name__}."
+                f"get_indicator ({type(e).__name__}: {e}); the provider works but its "
+                f"indicator reads are NOT recorded", exc_info=True)
 
     # Centralized indicator metadata - all providers share this catalog
     ALL_INDICATORS = {

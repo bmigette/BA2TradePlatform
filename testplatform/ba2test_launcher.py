@@ -832,8 +832,12 @@ def _cmd_replay_warm(args) -> int:
         env["CACHE_FOLDER"] = root
         env[_WARM_CHILD_ENV] = "1"
         print(f">> warming into {root} (child process; CACHE_FOLDER set before import)")
+        # IN THE DIRECTORY THE USER RAN FROM, not this process's cwd. ``_enter_backend``
+        # has chdir'd into backend/ by now, and the child re-reads the SAME argv: its own
+        # ``_CALLER_CWD`` is whatever it starts in, so spawning it here made
+        # ``--plan plan.json`` resolve against the backend -- a file the user never named.
         return subprocess.call([sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
-                               env=env)
+                               env=env, cwd=_CALLER_CWD)
 
     import ba2_common.config as _cfg
     if os.path.abspath(_cfg.CACHE_FOLDER) != root:

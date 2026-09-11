@@ -419,7 +419,10 @@ class ReplayReport:
 
     def to_mapping(self) -> Dict[str, Any]:
         payload = {
-            "schema": "ba2_replay_report/1",
+            # /2: a stage row carries ``capabilities`` (a list) where /1 carried a
+            # single ``capability``, and a field diff carries the numeric deltas.
+            # A consumer keys on this to know which shape it was handed.
+            "schema": "ba2_replay_report/2",
             "capability": self.capability,
             "session_id": self.session_id,
             "bundle_dir": self.bundle_dir,

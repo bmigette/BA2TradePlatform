@@ -865,38 +865,52 @@ def test_the_live_macro_memo_still_serves_repeated_calls_from_memory():
         f"5 live calls should load each of the 4 series once; loaded {loads}")
 
 
-def test_each_analysis_records_its_own_macro_reads_and_leaves_no_memo_behind(tmp_path):
-    """Capture ON: every analysis records 4 macro observations, and the memo empties.
+def test_two_analyses_share_the_macro_memo_and_both_record_their_reads(tmp_path):
+    """Capture ON: ONE read of each series across two analyses, and BOTH record it.
 
-    Two failure modes, one key. A memo shared across analyses (the constant "live"
-    key) serves the second analysis from the first one's entries, so its bundle
-    holds macro values whose reads were never recorded -- unreplayable, and silently
-    so. A memo keyed per analysis that nobody clears grows by four pandas Series per
-    analysis for as long as the instance runs.
+    These are four economy-wide FRED series, identical for every symbol in a batch, so
+    the memo that serves them is a live optimisation (~95ms of series rebuilding per
+    analysis without it). Capture must not switch it off -- an instrument that changes
+    what it measures is not an instrument.
+
+    The other half of the same requirement: a memo HIT still has to reach the bundle.
+    An analysis served from the memo whose macro reads went unrecorded carries macro
+    values with no observation behind them -- unreplayable, and silently so. So the
+    read is recorded at the memo, not only at the loader: the tap on
+    ``get_series_as_of`` records the analysis that actually loaded, and
+    ``fetch_macro_series`` records the ones served out of memory.
     """
     from ba2_common.core.replay import capture_scope
     from ba2_experts.DeterministicScorer import data
 
     recorded = {}
     with capture_to(tmp_path / "macro") as store:
-        with _seeded_fred():
-            data.reset_caches()
-            for analysis_id in ("A1", "A2"):
-                with capture_scope(store, _macro_meta(analysis_id)) as context:
-                    context.set_phase(ReplayStatus.PHASE_GATHER)
-                    context.set_skip("test scope")
-                    data.fetch_macro_series(None, None)
-                    recorded[analysis_id] = [
-                        pending.observation.request_identity["series_id"]
-                        for pending in context.observations]
+        with _seeded_fred() as fred_series:
+            reads = []
+            original = fred_series.get_series_as_of
+            fred_series.get_series_as_of = lambda series_id, as_of: (
+                reads.append(series_id), original(series_id, as_of))[1]
+            try:
+                data.reset_caches()
+                for analysis_id in ("A1", "A2"):
+                    with capture_scope(store, _macro_meta(analysis_id)) as context:
+                        context.set_phase(ReplayStatus.PHASE_GATHER)
+                        context.set_skip("test scope")
+                        data.fetch_macro_series(None, None)
+                        recorded[analysis_id] = [
+                            pending.observation.request_identity["series_id"]
+                            for pending in context.observations
+                            if pending.observation.provider == "macro"]
+            finally:
+                fred_series.get_series_as_of = original
+                data.reset_caches()
 
+    assert sorted(reads) == ["BAA10Y", "T10Y3M", "UNRATE", "VIXCLS"], (
+        f"the second analysis rebuilt the series instead of reading the memo: {reads}")
     assert sorted(recorded["A1"]) == ["BAA10Y", "T10Y3M", "UNRATE", "VIXCLS"]
     assert sorted(recorded["A2"]) == sorted(recorded["A1"]), (
-        "the second analysis was served from the first one's memo, so its macro "
-        "inputs entered the bundle with no observation behind them")
-    assert data._MACRO_CACHE._store == {}, (
-        f"the closed analyses left {len(data._MACRO_CACHE._store)} macro entries in a "
-        f"process-wide memo")
+        "the analysis served from the memo recorded nothing, so its macro inputs "
+        "entered the bundle with no observation behind them")
 
 
 # --------------------------------------------------------------------------- #

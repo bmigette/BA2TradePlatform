@@ -682,6 +682,46 @@ def _utc_day() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+#: Where an attempt whose endpoint name failed :func:`validate_endpoint_key` is counted.
+#: One fixed key, never the offending text: the whole reason the name is refused is that
+#: a URL carries the symbol and, on some FMP paths, the API key.
+MALFORMED_ENDPOINT_KEY = "malformed"
+
+
+def validate_endpoint_key(endpoint: str) -> str:
+    """The stripped endpoint NAME, or ``ValueError`` saying why it is not one.
+
+    ``endpoint`` must be short. The counters are keyed by it, and a full URL -- which
+    carries the symbol and, on some FMP paths, the API KEY -- would both explode the key
+    space and put a credential in a log line. A caller that cannot name its endpoint has
+    a bug, not a counting problem.
+
+    THE RULE LIVES HERE, ON ITS OWN, so it can be stated strictly without a meter being
+    able to fail a market-data fetch: :func:`record_fmp_request` runs on the live path,
+    before the request and outside any try, and coerces a rejected name instead of
+    raising it (see there). Anything that wants the rule enforced -- a test, a caller
+    that builds a key ahead of time -- calls this.
+    """
+    name = (endpoint or "").strip()
+    if not name:
+        raise ValueError(
+            "record_fmp_request needs a short endpoint name to key the counters by; pass the "
+            "endpoint, never the URL (it carries the symbol and, on some paths, the api key)")
+    if "?" in name or "://" in name or len(name) > _MAX_ENDPOINT_KEY:
+        raise ValueError(
+            f"endpoint {name[:40]!r}... does not look like an endpoint NAME; pass the short "
+            f"path segment (e.g. 'price-target'), never a URL")
+    return name
+
+
+def _counter_key(endpoint: str) -> str:
+    """``endpoint`` as a counter key, falling back to ``malformed``. Never raises."""
+    try:
+        return validate_endpoint_key(endpoint)
+    except ValueError:
+        return MALFORMED_ENDPOINT_KEY
+
+
 def record_fmp_request(endpoint: str, nbytes: Optional[int] = None) -> None:
     """Count one FMP/FRED request ATTEMPT against (today, purpose, endpoint).
 
@@ -696,20 +736,20 @@ def record_fmp_request(endpoint: str, nbytes: Optional[int] = None) -> None:
     counted and the byte total is left alone rather than padded with a guess. A budget that
     silently invents bytes is not a measurement.
 
-    ``endpoint`` is REQUIRED and must be short. The counters are keyed by it, and a full URL
-    -- which carries the symbol and, on some FMP paths, the API KEY -- would both explode the
-    key space and put a credential in a log line. A caller that cannot name its endpoint has
-    a bug, not a counting problem.
+    ``endpoint`` is REQUIRED and must satisfy :func:`validate_endpoint_key`. A name that does
+    not is a WARNING and is counted under :data:`MALFORMED_ENDPOINT_KEY`, never raised: this
+    runs on the live fetch path, before the request and outside any try (``fmp_http_get``,
+    ``fmp_list_call``), so raising here turned a mis-named endpoint -- a logging defect -- into
+    a failed market-data fetch. The attempt is real and stays counted; only the key it is
+    charged to is lost, and the offending text never becomes a key (that is the point of the
+    rule). Callers that want the rule enforced call the validator directly.
     """
-    name = (endpoint or "").strip()
-    if not name:
-        raise ValueError(
-            "record_fmp_request needs a short endpoint name to key the counters by; pass the "
-            "endpoint, never the URL (it carries the symbol and, on some paths, the api key)")
-    if "?" in name or "://" in name or len(name) > _MAX_ENDPOINT_KEY:
-        raise ValueError(
-            f"endpoint {name[:40]!r}... does not look like an endpoint NAME; pass the short "
-            f"path segment (e.g. 'price-target'), never a URL")
+    name = _counter_key(endpoint)
+    if name == MALFORMED_ENDPOINT_KEY:
+        logger.warning(
+            f"FMP request counter: {endpoint!r:.60} is not an endpoint NAME (pass the short "
+            f"path segment, e.g. 'price-target', never a URL); the attempt is counted under "
+            f"{MALFORMED_ENDPOINT_KEY!r}")
     day = _utc_day()
     key = (current_fmp_purpose(), name)
     with _PURPOSE_LOCK:
@@ -752,10 +792,15 @@ def reset_purpose_stats() -> None:
 
 
 def record_fmp_bytes(endpoint: str, nbytes: Optional[int]) -> None:
-    """Add transferred bytes to an attempt already counted by :func:`record_fmp_request`."""
+    """Add transferred bytes to an attempt already counted by :func:`record_fmp_request`.
+
+    Keyed through the SAME coercion as the request it belongs to, silently: the request
+    already warned, and a URL that cannot be a request key must not become a byte key
+    either (it carries the api key on some paths).
+    """
     if not nbytes:
         return
-    name = (endpoint or "").strip() or "unknown"
+    name = _counter_key(endpoint)
     day = _utc_day()
     key = (current_fmp_purpose(), name)
     with _PURPOSE_LOCK:
@@ -919,7 +964,13 @@ def fmp_list_call(
 
         # Legitimate results.
         if isinstance(result, list):
-            record_fmp_bytes(endpoint or "fmp_list_call", _decoded_payload_bytes(result))
+            # SIZING IS WARM-BUDGET MACHINERY. ``_decoded_payload_bytes`` json.dumps the
+            # whole payload, and on the live path nothing reads the result -- so every
+            # live statement/earnings fetch paid a full serialization of its own response
+            # for a counter no budget consults. The ATTEMPT stays counted in every
+            # purpose; only the sizing is skipped where it has no consumer.
+            if current_fmp_purpose() != PURPOSE_LIVE:
+                record_fmp_bytes(endpoint or "fmp_list_call", _decoded_payload_bytes(result))
             return result
         if result is None:
             return []

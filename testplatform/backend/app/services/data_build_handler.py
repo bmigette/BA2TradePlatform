@@ -48,9 +48,14 @@ def _resolve_fred_key() -> str:
 
 
 def _prewarm_fred(max_age_hours: float = 24.0) -> Dict[str, Any]:
-    """Re-export of ``prewarm_fetchers.prewarm_fred`` (see :func:`_resolve_fred_key`)."""
+    """Re-export of ``prewarm_fetchers.prewarm_fred`` (see :func:`_resolve_fred_key`).
+
+    The two sinks are SPLIT here. Passing ``logger.info`` for both reported a series
+    that could not be refreshed below the level this service logs at, so the only
+    surviving trace was an ``errors`` count in the returned summary.
+    """
     from app.services.prewarm_fetchers import prewarm_fred
-    return prewarm_fred(max_age_hours, log=logger.info)
+    return prewarm_fred(max_age_hours, log=logger.info, warn=logger.warning)
 
 
 def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:

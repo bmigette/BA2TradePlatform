@@ -193,14 +193,80 @@ def test_fred_refreshes_are_counted_in_the_same_ledger(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 # The endpoint key
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("bad", [
+BAD_KEYS = [
     "",
     "   ",
     "https://financialmodelingprep.com/api/v3/price-target?apikey=SECRET",
     "price-target?apikey=SECRET",
     "x" * 200,
-])
+]
+
+
+@pytest.mark.parametrize("bad", BAD_KEYS)
 def test_a_url_or_an_empty_name_is_refused_as_a_counter_key(bad):
-    """The key must not carry a symbol -- or, on some FMP paths, the API key."""
+    """The key must not carry a symbol -- or, on some FMP paths, the API key.
+
+    The rule is stated by the VALIDATOR, which is what a caller consults and what
+    this pins. The counter itself does not raise it at a fetch (see below).
+    """
     with pytest.raises(ValueError):
-        fmp_common.record_fmp_request(bad)
+        fmp_common.validate_endpoint_key(bad)
+
+
+@pytest.mark.parametrize("bad", BAD_KEYS)
+def test_a_malformed_endpoint_is_counted_not_raised(bad):
+    """A meter must never be able to fail a live fetch.
+
+    ``record_fmp_request`` is called on the LIVE path, before the request, outside
+    any try (``fmp_http_get``, ``fmp_list_call``). Raising there turned a mis-named
+    endpoint -- a logging defect -- into a failed market-data fetch. The attempt is
+    counted under one fixed ``malformed`` key instead, which is both honest (the
+    request happened) and safe (no URL, and no api key, becomes a counter key).
+    """
+    fmp_common.record_fmp_request(bad, nbytes=10)
+
+    endpoints = fmp_common.get_purpose_stats()["live"]["endpoints"]
+    assert endpoints == {fmp_common.MALFORMED_ENDPOINT_KEY: {"requests": 1, "bytes": 10}}
+    assert not any("SECRET" in key for key in endpoints), (
+        "a rejected endpoint name must not survive as a counter key -- that is the "
+        "credential leak the validator exists to prevent")
+
+
+def test_a_malformed_endpoint_does_not_fail_the_fetch_it_meters():
+    """The whole point: the response still comes back."""
+    resp = _get(b"y" * 20,
+                endpoint="https://financialmodelingprep.com/api/v3/x?apikey=SECRET")
+
+    assert resp.content == b"y" * 20
+    assert fmp_common.get_purpose_stats()["live"]["endpoints"][
+        fmp_common.MALFORMED_ENDPOINT_KEY]["requests"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Byte accounting is warm-budget machinery, not live overhead
+# --------------------------------------------------------------------------- #
+def test_a_live_list_call_is_counted_without_serializing_its_payload(monkeypatch):
+    """``_decoded_payload_bytes`` json.dumps the WHOLE payload to size it.
+
+    That measurement exists for the warm allowance. On the live path nothing reads
+    it, so every live statement/earnings fetch was paying a full JSON serialization
+    of its own response for a counter no budget consults. The request is still
+    counted -- what is skipped is only the sizing.
+    """
+    calls = []
+    monkeypatch.setattr(fmp_common, "_decoded_payload_bytes",
+                        lambda payload: calls.append(payload))
+
+    fmp_common.fmp_list_call(lambda: [{"symbol": "AAPL"}], symbol="AAPL", endpoint="income")
+
+    assert calls == [], "a live fetch serialized its payload for the warm byte counter"
+    stats = fmp_common.get_purpose_stats()["live"]
+    assert stats["endpoints"]["income"]["requests"] == 1, "the REQUEST is still counted"
+
+
+def test_a_warm_list_call_still_measures_its_payload(monkeypatch):
+    """The allowance the sizing serves must keep seeing the bytes."""
+    with fmp_common.fmp_purpose(fmp_common.PURPOSE_WARM):
+        fmp_common.fmp_list_call(lambda: [{"symbol": "AAPL"}], symbol="AAPL", endpoint="income")
+
+    assert fmp_common.get_purpose_stats()["warm"]["bytes"] > 0
