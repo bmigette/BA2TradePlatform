@@ -54,14 +54,30 @@ class _CapturedErrors(logging.Handler):
 
 @pytest.fixture
 def host_errors():
-    from ba2_trade_platform.logger import logger as host_logger
+    # The logger object warm_service HOLDS, not a fresh import of the name: a test
+    # earlier in the session that reloads ``ba2_trade_platform.logger`` leaves this
+    # module bound to the old object, and a handler on the new one sees nothing.
+    # Likewise a leaked ``logging.disable(...)`` or ``logger.disabled`` from another
+    # file would silently empty this list; both are lifted for the test and restored.
+    from ba2_trade_platform.core import warm_service
+    host_logger = warm_service.logger
 
     handler = _CapturedErrors()
+    saved_disable = logging.root.manager.disable
+    saved_disabled = host_logger.disabled
+    saved_level = host_logger.level
+    logging.disable(logging.NOTSET)
+    host_logger.disabled = False
+    if host_logger.level > logging.ERROR:
+        host_logger.setLevel(logging.ERROR)
     host_logger.addHandler(handler)
     try:
         yield handler.messages
     finally:
         host_logger.removeHandler(handler)
+        host_logger.setLevel(saved_level)
+        host_logger.disabled = saved_disabled
+        logging.disable(saved_disable)
 
 
 @pytest.fixture
