@@ -24,6 +24,10 @@ class LiveTradesTab:
     def __init__(self):
         self.transactions_container = None
         self.live_trades_table: LiveTradesTable = None
+        # Totals strip under the table. Held on the instance because the data loader (which
+        # knows the filtered set) and the renderer (which owns the labels) are different calls.
+        self._totals_row = None
+        self._totals: Dict[str, float] = {}
         self.selected_transaction = None
         self.batch_operations_container = None
         # Note: render() is now async and should be awaited after construction
@@ -284,6 +288,13 @@ class LiveTradesTab:
             # Get total count for pagination
             count_query = select(func.count()).select_from(base_query.subquery())
             total_count = session.exec(count_query).one()
+
+            # Totals over the WHOLE FILTERED SET, not this page -- a total that changed when you
+            # turned the page would be worse than none. Computed off `base_query` before the
+            # offset/limit below is applied, and covering ONLY these transactions: manual broker
+            # positions are not Transactions, so they are excluded by construction (which is the
+            # difference from the Overview page, whose total is every position the broker holds).
+            self._compute_filtered_totals(session, base_query)
 
             # Apply sorting
             # Keys are column NAMES (Quasar sends column name as sortBy, not field)
@@ -627,6 +638,128 @@ class LiveTradesTab:
 
         return (has_tp_defined and not has_valid_tp_order) or (has_sl_defined and not has_valid_sl_order)
 
+    def _compute_filtered_totals(self, session, base_query) -> None:
+        """Sum cost basis, market value and unrealised P/L over every transaction the current
+        filters match, and stash them on ``self._totals`` for the strip under the table.
+
+        COST BASIS is exact and free -- ``quantity * open_price`` straight off the rows, no
+        prices needed. MARKET VALUE needs a live price per symbol, so it reuses the same bulk
+        per-account fetch the row builder uses; symbols whose price is unavailable contribute
+        their cost basis instead of nothing, so the value total can never read as a loss that
+        is really a missing quote. ``priced``/``total`` is recorded so the strip can say when
+        the picture is incomplete rather than quietly showing a wrong number.
+
+        Never raises: a totals strip is worth less than the table it sits under.
+        """
+        from ...core.types import TransactionStatus
+
+        totals = {'cost': 0.0, 'value': 0.0, 'pnl': 0.0, 'count': 0, 'priced': 0, 'unfilled': 0}
+        try:
+            rows = list(session.exec(base_query).all())
+            txn_ids = [t.id for t, _e in rows]
+            acc_by_txn = self._account_ids_for_transactions(session, txn_ids)
+            by_account: Dict[Any, set] = {}
+            entries = []
+            for txn, _expert in rows:
+                # Only trades that actually HOLD something. The default status filter includes
+                # WAITING, and a waiting order has not been filled -- it owns no shares and has
+                # committed no money, so adding qty*open_price for it would overstate the cost
+                # basis with capital that has not left the account. Counted separately and
+                # named on the strip instead of being silently folded in or silently dropped.
+                if txn.status not in (TransactionStatus.OPENED, TransactionStatus.CLOSING):
+                    totals['unfilled'] += 1
+                    continue
+                qty = float(txn.quantity or 0)
+                open_price = float(txn.open_price or 0)
+                if not qty or not open_price:
+                    continue
+                acc_id = acc_by_txn.get(txn.id)
+                entries.append((txn.symbol, qty, open_price, acc_id))
+                by_account.setdefault(acc_id, set()).add(txn.symbol)
+
+            prices: Dict[str, float] = {}
+            for acc_id, symbols in by_account.items():
+                if acc_id is None or not symbols:
+                    continue
+                try:
+                    inst = get_account_instance_from_id(acc_id)
+                    if inst:
+                        got = inst.get_instrument_current_price(list(symbols))
+                        if got:
+                            prices.update(got)
+                except Exception as e:  # noqa: BLE001 -- one bad account must not void the total
+                    logger.debug(f"totals: price fetch failed for account {acc_id}: {e}")
+
+            for symbol, qty, open_price, _acc in entries:
+                cost = qty * open_price
+                totals['cost'] += cost
+                totals['count'] += 1
+                px = prices.get(symbol)
+                if px:
+                    totals['value'] += qty * float(px)
+                    totals['priced'] += 1
+                else:
+                    totals['value'] += cost      # unpriced -> flat, never a phantom loss
+            totals['pnl'] = totals['value'] - totals['cost']
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not compute live-trade totals: {e}")
+        self._totals = totals
+        self._refresh_totals_row()
+
+    def _account_ids_for_transactions(self, session, txn_ids: List[int]) -> Dict[int, int]:
+        """``{transaction_id: account_id}`` for all *txn_ids* in ONE query.
+
+        A transaction belongs to the account ITS ORDERS WERE PLACED ON -- the same rule the
+        ACCOUNT column uses -- so the price fetch asks the broker that actually holds the
+        position. Batched deliberately: this runs inside a loader that auto-refreshes every
+        30 seconds, and a query per transaction would make the strip cost more than the table.
+        """
+        if not txn_ids:
+            return {}
+        from sqlmodel import col   # local, matching this module's existing style
+        try:
+            # ``TradingOrder.account_id`` directly -- the same field the ACCOUNT column reads
+            # off the transaction's first order. (There is no TradingOrder.expert_id; the
+            # expert is reached through Transaction or ExpertRecommendation, see
+            # TradingOrder.get_expert_id -- but the account is right here, so do not detour.)
+            pairs = session.exec(
+                select(TradingOrder.transaction_id, TradingOrder.account_id)
+                .where(col(TradingOrder.transaction_id).in_(txn_ids))
+                .order_by(col(TradingOrder.id))
+            ).all()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"totals: account mapping failed: {e}")
+            return {}
+        out: Dict[int, int] = {}
+        for txn_id, account_id in pairs:
+            if txn_id is not None and account_id is not None:
+                out.setdefault(txn_id, account_id)   # first order wins, as the column does
+        return out
+
+    def _refresh_totals_row(self) -> None:
+        """Repaint the totals strip from ``self._totals`` (no-op before it is rendered)."""
+        if self._totals_row is None:
+            return
+        t = self._totals
+        self._totals_row.clear()
+        with self._totals_row:
+            ui.label('TOTAL (open trades):').classes('text-sm font-bold text-secondary-custom')
+            ui.label(f"Cost: ${t.get('cost', 0.0):,.2f}").classes('text-sm font-semibold')
+            pnl = t.get('pnl', 0.0)
+            pl_color = 'number-positive' if pnl >= 0 else 'number-negative'
+            ui.label(f"Unrealized P/L: ${pnl:,.2f}").classes(f'text-sm font-bold {pl_color}')
+            ui.label(f"Market Value: ${t.get('value', 0.0):,.2f}").classes('text-sm font-semibold')
+            notes = []
+            priced, count = t.get('priced', 0), t.get('count', 0)
+            if count and priced < count:
+                # Say it out loud rather than letting the unpriced rows read as flat.
+                notes.append(f'{count - priced} of {count} unpriced, shown at cost')
+            if t.get('unfilled'):
+                notes.append(f"{t['unfilled']} waiting, not counted")
+            if notes:
+                ui.label('(' + '; '.join(notes) + ')').classes(
+                    'text-xs text-secondary-custom italic')
+
     async def _render_transactions_table_async(self):
         """Render the main transactions table using LiveTradesTable component."""
         logger.debug("[RENDER] _render_transactions_table_async() - START")
@@ -653,6 +786,16 @@ class LiveTradesTab:
 
         # Render the table
         await self.live_trades_table.render()
+
+        # Totals strip, under the table and matching the Overview page's shape (cost ->
+        # unrealised P/L -> market value). Created AFTER render() so it sits below the
+        # pagination controls; the data loader has usually already run by now, so paint it
+        # immediately from whatever it stored and let later loads repaint it.
+        ui.separator().classes('my-2')
+        self._totals_row = ui.row().classes(
+            'w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-t border-white/10')
+        self._refresh_totals_row()
+
         logger.debug("[RENDER] _render_transactions_table_async() - END")
 
     def _handle_edit_transaction(self, transaction_id: int):

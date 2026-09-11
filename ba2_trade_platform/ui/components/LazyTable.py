@@ -478,11 +478,15 @@ class LazyTable:
             # Left side: page size selector
             with ui.row().classes('items-center gap-2'):
                 ui.label('Rows per page:').classes('text-sm')
+                # `outlined dense` is what makes the value legible. A bare ui.select renders
+                # Quasar's standard field -- which reserves vertical space for a floating label
+                # this control does not have -- so inside a w-24 box the selected number was
+                # clipped to a sliver. `options-dense` keeps the popup tight to match.
                 ui.select(
                     options=self.config.page_size_options,
                     value=self._page_size,
                     on_change=lambda e: asyncio.create_task(self._on_page_size_change(e.value))
-                ).classes('w-24')
+                ).props('outlined dense options-dense').classes('w-28')
             
             # Center: pagination info
             self._pagination_label = ui.label('Loading...').classes('text-sm text-gray-600')

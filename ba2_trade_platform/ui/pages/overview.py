@@ -1576,16 +1576,35 @@ class AccountOverviewTab:
                 
                 # Calculate totals from all positions
                 def calculate_totals():
-                    total_qty = sum(float(pos['qty']) if isinstance(pos['qty'], (int, float)) else 0 for pos in all_positions)
-                    total_pl = sum(float(pos['unrealized_pl']) if isinstance(pos['unrealized_pl'], (int, float)) else 0 for pos in all_positions)
-                    total_mv = sum(float(pos['market_value']) if isinstance(pos['market_value'], (int, float)) else 0 for pos in all_positions)
-                    return total_qty, total_pl, total_mv
-                
-                total_qty, total_pl, total_mv = calculate_totals()
-                
+                    """Cost basis, unrealised P/L and market value across every position.
+
+                    COST, not quantity: summing share counts across different instruments adds
+                    apples to oranges -- 1 share at $410 and 44 at $3 total "45" of nothing. Cost
+                    basis is the money actually committed, so it pairs with market value to show
+                    the whole picture (committed -> worth now -> the difference).
+                    """
+                    def _num(v):
+                        return float(v) if isinstance(v, (int, float)) else 0.0
+
+                    total_cost = 0.0
+                    for pos in all_positions:
+                        cb = pos.get('cost_basis')
+                        if isinstance(cb, (int, float)):
+                            total_cost += float(cb)
+                        else:
+                            # Providers that do not report cost_basis (see TastyTradeAccount,
+                            # which derives it) -- reconstruct it rather than silently
+                            # under-reporting the total.
+                            total_cost += abs(_num(pos.get('qty'))) * _num(pos.get('avg_entry_price'))
+                    total_pl = sum(_num(pos.get('unrealized_pl')) for pos in all_positions)
+                    total_mv = sum(_num(pos.get('market_value')) for pos in all_positions)
+                    return total_cost, total_pl, total_mv
+
+                total_cost, total_pl, total_mv = calculate_totals()
+
                 with ui.row().classes('w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-t border-white/10'):
                     ui.label('TOTAL:').classes('text-sm font-bold text-secondary-custom')
-                    ui.label(f'Qty: {total_qty:.2f}').classes('text-sm font-semibold')
+                    ui.label(f'Cost: ${total_cost:,.2f}').classes('text-sm font-semibold')
                     pl_color = 'number-positive' if total_pl >= 0 else 'number-negative'
                     ui.label(f'Unrealized P/L: ${total_pl:,.2f}').classes(f'text-sm font-bold {pl_color}')
                     ui.label(f'Market Value: ${total_mv:,.2f}').classes('text-sm font-semibold')
