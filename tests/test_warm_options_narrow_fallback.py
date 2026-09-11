@@ -226,3 +226,101 @@ def test_a_failed_window_leaves_the_symbol_owed_rather_than_truncated(monkeypatc
     assert store.written == {},         "a failed window must not leave a partition claiming to be complete"
     assert stats.units_failed == len(expiries), "the whole symbol stays owed"
     assert any("GIVING UP" in l for l in logs)
+
+
+def test_a_failed_window_stops_the_walk_instead_of_writing_past_it(monkeypatch):
+    """MEASURED LIVE 2026-09-11, and the first version of this fix got it wrong.
+
+    CNC's 2020 window died; the walk carried on and the 2021+ windows flushed 355 partitions.
+    A contract expiring 2021-05-28 trades from 2020, so its partition was written without its
+    2020 bars, under a manifest saying COMPLETE -- undetectable, and never revisited.
+
+    The rule the code now keeps: stop at the FIRST failed window. What closed before it is
+    provably whole (an expiry is flushed only once a later-dated bar arrives, so it closed
+    inside an earlier window, and windows are walked oldest-first); what comes after is not
+    fetched at all rather than fetched incompletely.
+    """
+    # 2020 expiry closes inside window 1; 2021 fails; the 2023 LEAPS would be flushed by
+    # window 4 while owning bars in the window that died.
+    expiries = [date(2020, 6, 19), date(2023, 6, 16)]
+
+    class _BadSecondWindow(_Provider):
+        def fetch_underlying_eod_bars(self, symbol, *, start, end):
+            self.calls.append((start, end))
+            if (end - start).days >= 365 * 3:
+                raise RuntimeError("StatusCode.INTERNAL")          # the wide call
+            if start.year == 2021:
+                raise RuntimeError("StatusCode.INTERNAL")          # the window that dies
+            for b in self._bars:
+                if start <= b.bar_date <= end:
+                    yield b
+
+    bars = [_Bar("X0", date(2020, 5, 20)),       # the 2020 expiry's own bars
+            _Bar("X1", date(2020, 6, 30)),       # a later bar in window 1: closes the 2020 expiry
+            _Bar("X1", date(2021, 3, 1)),        # the LEAPS' bars in the window that dies
+            _Bar("X1", date(2023, 5, 15))]
+    prov = _BadSecondWindow(365 * 3, bars)
+
+    stats, store, logs = _run(monkeypatch, prov, expiries=expiries, narrow_years=1.0)
+
+    assert (date(2023, 6, 16)) not in store.written,         "a partition whose history spans the failed window must NOT be written"
+    assert (date(2020, 6, 19)) in [e for _u, e in store.written],         "what closed before the failure is whole and must be kept"
+    # And the proof it is a stop, not a filter: nothing after the failed window is requested.
+    assert not [c for c in prov.calls if c[0].year > 2021],         f"the walk must stop at the failed window, got {prov.calls}"
+
+
+class _SilentProvider:
+    """A provider whose stream closes cleanly having yielded nothing.
+
+    MEASURED 2026-09-11 against ThetaData: twelve underlyings -- COP, COST, COTY, CPB, CRWD,
+    CSX, CTSH, CVE, CVNA, CVS, CVX, DAL -- each answered in about a second with an empty
+    stream and no error, on the same afternoon the vendor was failing their neighbours with
+    an INTERNAL ArrayIndexOutOfBounds. It is a vendor fault wearing the shape of an answer.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def fetch_underlying_eod_bars(self, symbol, *, start, end):
+        self.calls.append((start, end))
+        return iter(())
+
+
+def test_an_empty_stream_is_a_failure_not_an_empty_market(monkeypatch):
+    """THE POISONING. Before this, a silent vendor wrote every partition as EMPTY.
+
+    4,763 manifests were written in one run asserting that ConocoPhillips and Costco had no
+    listed options for six years. A partition marked empty is never re-read, so the vendor's
+    silence became a permanent fact about the market -- the worst failure shape there is,
+    because the store afterwards looks complete.
+    """
+    expiries = [date(2020, 6, 19), date(2022, 6, 17), date(2025, 6, 20)]
+    prov = _SilentProvider()
+
+    stats, store, logs = _run(monkeypatch, prov, expiries=expiries, narrow_years=1.0)
+
+    assert store.written == {},         f"silence must write NOTHING, got {store.written}"
+    assert stats.units_failed == len(expiries), "the symbol stays owed"
+    assert any("EMPTY stream" in l for l in logs), logs
+
+
+def test_the_empty_stream_is_retried_like_any_other_failure(monkeypatch):
+    """It is a failed attempt, so it gets the same retries -- a one-off blip costs nothing."""
+    prov = _SilentProvider()
+    _run(monkeypatch, prov, expiries=[date(2020, 6, 19)], narrow_years=0, retries=3)
+    assert len(prov.calls) == 3, f"expected 3 wide attempts, got {prov.calls}"
+
+
+def test_a_symbol_with_nothing_left_to_fetch_is_not_called_a_failure(monkeypatch):
+    """The guard keys on PENDING work, not on the bar count: a symbol whose partitions were
+    all flushed mid-stream ends with an empty tail and must still count as done."""
+    expiries = [date(2020, 6, 19), date(2021, 6, 18)]
+    # A later-dated bar closes both expiries mid-stream, so `pending` empties before the end.
+    bars = [_Bar("X0", date(2020, 5, 20)), _Bar("X1", date(2021, 5, 20)),
+            _Bar("X1", date(2021, 7, 1))]
+    prov = _Provider(wide_span_days=10 ** 6, bars=bars)   # the wide call succeeds
+
+    stats, store, logs = _run(monkeypatch, prov, expiries=expiries, narrow_years=1.0)
+
+    assert stats.units_failed == 0, logs
+    assert len(store.written) == len(expiries), store.written

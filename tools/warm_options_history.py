@@ -902,9 +902,11 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
         for attempt in range(1, max(1, ns.max_retries) + 1):
             by_expiry = {}
             high_water: Optional[date] = None
+            bars_seen = 0
             try:
                 for bar in provider.fetch_underlying_eod_bars(unit.underlying,
                                                               start=start, end=end):
+                    bars_seen += 1
                     expiry = parse_occ_expiry(bar.occ_symbol)
                     if expiry is None or expiry not in pending:
                         # Not a partition this run owes: unparseable, already COMPLETE/EMPTY
@@ -927,8 +929,27 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                 log(f"  [{unit.underlying}] attempt {attempt} failed: "
                     f"{type(e).__name__}: {e}")
             else:
-                completed = True
-                break
+                if bars_seen or not pending:
+                    completed = True
+                    break
+                # AN EMPTY STREAM IS NOT AN ANSWER. The request succeeded and delivered
+                # nothing, which is treated as a failed attempt and never as "this symbol has
+                # no options data".
+                #
+                # MEASURED 2026-09-11: the vendor answered COP, COST, COTY, CPB, CRWD, CSX,
+                # CTSH, CVE, CVNA, CVS, CVX and DAL with a stream that closed cleanly and
+                # yielded nothing, in about a second each. The tail flush below then wrote
+                # every one of their ~338 partitions as EMPTY — 4,700 manifests asserting
+                # that ConocoPhillips and Costco had no listed options for six years. Nothing
+                # ever re-reads a partition once it is marked empty, so the vendor's silence
+                # had become a permanent fact about the market.
+                #
+                # The cost is that a symbol which genuinely has nothing is retried and then
+                # reported failed on every pass. That is the right way round: a loud repeated
+                # failure is cheap to notice; a silent false "empty" is not noticeable at all.
+                log(f"  [{unit.underlying}] attempt {attempt} returned an EMPTY stream with "
+                    f"{len(pending)} partition(s) pending — treated as a failure, not as "
+                    f"'no data'")
             if attempt < max(1, ns.max_retries):
                 sleep(backoff)
                 backoff *= 2
@@ -949,6 +970,7 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                 by_expiry = {}
                 high_water = None
                 salvaged = True
+                narrow_bars_seen = 0
                 for w_start, w_end in slices:
                     if not pending:
                         break                      # everything owed has been written
@@ -956,6 +978,7 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                         try:
                             for bar in provider.fetch_underlying_eod_bars(
                                     unit.underlying, start=w_start, end=w_end):
+                                narrow_bars_seen += 1
                                 expiry = parse_occ_expiry(bar.occ_symbol)
                                 if expiry is None or expiry not in pending:
                                     continue
@@ -979,26 +1002,39 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                         else:
                             break
                     else:
-                        # EVERY attempt on this window failed, so the SYMBOL is not salvaged
-                        # and nothing buffered will be written.
+                        # EVERY attempt on this window failed. STOP THE WALK HERE — do not
+                        # try the later windows.
                         #
-                        # NOT a partial salvage, and that is deliberate. A contract may be
-                        # listed years before it expires -- a LEAPS expiring 2025 trades from
-                        # 2023 -- so an expiry in a LATER window can own bars in this one.
-                        # Writing its partition now would look complete and silently omit
-                        # them, which is worse than owing the symbol another run: a truncated
-                        # partition carries a manifest saying it is done, and nothing ever
-                        # looks at it again.
+                        # MEASURED 2026-09-11, and the reason this is a `break` and not a
+                        # `continue`: CNC's 2020 window died, the walk carried on, and the
+                        # 2021+ windows flushed 355 partitions. A contract expiring 2021-05-28
+                        # trades from 2020, so its partition was written WITHOUT its 2020 bars
+                        # and with a manifest saying COMPLETE — invisible, and never revisited.
+                        # Continuing past a failed window manufactures exactly the truncation
+                        # the incremental flush is otherwise safe from.
                         #
-                        # The windows already flushed mid-pass are durable and keep their
-                        # partitions; everything still owed stays in `pending`.
+                        # What was already flushed BEFORE this window is kept, and that is
+                        # sound rather than a compromise: an expiry is flushed only once a bar
+                        # dated after it arrives, so it closed inside an EARLIER window, and
+                        # the windows are walked oldest-first — its whole life therefore lies
+                        # in windows that succeeded. Everything still owed stays in `pending`
+                        # for the next run.
                         salvaged = False
-                        continue
+                        break
                 # SALVAGED, not "nothing left owed". Expiries still buffered here are the
                 # TAIL -- nothing dated later than them was ever seen -- and the block below
                 # writes exactly those, the same way it does after a successful wide fetch.
                 # Requiring an empty `pending` here would fail every symbol on its last
                 # expiry and re-fetch the whole ladder next run.
+                # A SINGLE window may legitimately be empty -- a symbol listed in 2023 has
+                # nothing in 2020 -- but a walk that saw no bar in ANY window is the vendor
+                # being silent, not the market being empty, and must not flush the tail as
+                # EMPTY. Same rule as the wide path above, applied to the whole walk.
+                if salvaged and narrow_bars_seen == 0 and pending:
+                    log(f"  [{unit.underlying}] every narrow window returned an EMPTY stream "
+                        f"with {len(pending)} partition(s) pending — treated as a failure, "
+                        f"not as 'no data'")
+                    salvaged = False
                 completed = salvaged
                 if completed:
                     log(f"  [{unit.underlying}] recovered via narrow windows")
