@@ -3,6 +3,14 @@ Interface for technical market indicators providers.
 
 This interface defines methods for retrieving technical indicators like RSI, MACD,
 SMA, EMA, etc. from various data providers.
+
+REPLAY CAPTURE. ``get_indicator`` is the boundary the ATR that sizes a live position
+enters through (``ba2_common.core.position_sizing.get_latest_atr``), so it is
+recorded like every other provider return. The tap cannot sit on the abstract method
+-- an implementation OVERRIDES it, which would replace the decorator along with the
+body -- so :meth:`MarketIndicatorsInterface.__init_subclass__` applies it to each
+concrete implementation as the class is created. That is what makes the guarantee
+hold for a provider written later, instead of depending on its author remembering.
 """
 
 from abc import abstractmethod
@@ -10,6 +18,28 @@ from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime
 
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
+from ba2_common.core.replay.observe import observe_provider
+
+
+def indicator_identity(args):
+    """What makes an indicator response what it is.
+
+    Named (not an inline lambda) because the offline replay tape imports it to look
+    a recorded indicator up by exactly the identity the tap wrote; a second copy
+    would drift and turn a real match into a silent miss.
+
+    ``period`` is absent from the interface signature but present on the
+    implementations ``get_latest_atr`` drives (it selects the ATR window, i.e. a
+    different answer), so it is read when the bound call has it and recorded as
+    ``None`` when the implementation takes no such parameter -- never guessed.
+    """
+    return {
+        "symbol": args["symbol"],
+        "indicator": args["indicator"],
+        "period": args["period"] if "period" in args else None,
+        "interval": args["interval"],
+        "end_date": args["end_date"],
+    }
 
 
 class MarketIndicatorsInterface(DataProviderInterface):
@@ -34,6 +64,26 @@ class MarketIndicatorsInterface(DataProviderInterface):
         """
         pass
     
+    def __init_subclass__(cls, **kwargs):
+        """Tap this subclass's own ``get_indicator`` for replay capture.
+
+        Only a concrete implementation defined ON this class is wrapped: an
+        abstract redeclaration has nothing to record, an inherited method is
+        already tapped on the class that defined it, and ``_replay_tapped`` stops a
+        deeper subclass from wrapping a wrapper (which would record one call
+        twice). With capture off the wrapper is one ``is None`` check.
+        """
+        super().__init_subclass__(**kwargs)
+        implementation = cls.__dict__.get("get_indicator")
+        if implementation is None or getattr(implementation, "__isabstractmethod__", False):
+            return
+        if getattr(implementation, "_replay_tapped", False):
+            return
+        tapped = observe_provider("indicators", "get_indicator",
+                                  identity=indicator_identity)(implementation)
+        tapped._replay_tapped = True
+        cls.get_indicator = tapped
+
     # Centralized indicator metadata - all providers share this catalog
     ALL_INDICATORS = {
         # Moving Averages

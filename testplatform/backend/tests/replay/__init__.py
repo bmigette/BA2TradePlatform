@@ -255,6 +255,12 @@ def rating_case(analysis_id: str = RATING_ID, *, consensus_rows=None,
             return _Resp(list(rows))
         if endpoint == "upgrades-downgrades-consensus":
             return _Resp(list(upgrades))
+        # The dated price-target history is faked at the HTTP layer, not by
+        # replacing ``fetch_price_target_history_cached``: that module-level
+        # function IS the tap (DeterministicScorer calls it directly), so patching
+        # it out would delete the observation the gather tape has to serve.
+        if endpoint == "price-target":
+            return _Resp([dict(row) for row in targets])
         raise AssertionError(f"unexpected FMP endpoint {endpoint!r}")
 
     expert = module.FMPRating.__new__(module.FMPRating)
@@ -269,12 +275,11 @@ def rating_case(analysis_id: str = RATING_ID, *, consensus_rows=None,
     expert._gather_max_analyst_age = max_analyst_age_months
     patches = [
         mock.patch.object(module, "fmp_http_get", fake_http_get),
-        mock.patch.object(module, "fetch_price_target_history_cached",
-                          lambda api_key, sym: list(targets)),
         mock.patch.object(module, "fetch_analyst_grades_cached",
                           lambda api_key, sym: list(grades)),
         mock.patch.object(module, "_CONSENSUS_CACHE", module.TTLCache(300)),
         mock.patch.object(module, "_UPGRADE_CACHE", module.TTLCache(300)),
+        mock.patch.object(module, "_PRICE_TARGET_HISTORY_CACHE", module.TTLCache(300)),
     ]
     return Case(expert, settings, patches, FakeMarketAnalysis(analysis_id, symbol))
 
@@ -394,41 +399,104 @@ def insider_case(analysis_id: str = INSIDER_ID, *, malformed_rows: bool = False)
                 validate=expert._require_current_price, expects_error=malformed_rows)
 
 
-def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400) -> Case:
-    """DeterministicScorer with a REAL tapped OHLCV read behind ``data.fetch_ohlcv``.
+#: FMP's raw per-symbol statement payloads, keyed by the disk-cache namespace the
+#: provider asks for. Faked UNDER the provider's tap, so the production method and
+#: its production identity are what the capture records.
+_SCORER_HISTORY = {
+    "balance_sheet_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                              "reportedCurrency": "USD", "totalAssets": 1_000.0,
+                              "totalLiabilities": 400.0,
+                              "totalStockholdersEquity": 600.0}],
+    "income_statement_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                                 "revenue": 500.0, "netIncome": 50.0,
+                                 "grossProfit": 200.0, "operatingIncome": 80.0}],
+    "cash_flow_statement_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                                    "operatingCashFlow": 90.0, "freeCashFlow": 60.0}],
+    "cashflow_statement_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                                   "operatingCashFlow": 90.0, "freeCashFlow": 60.0}],
+}
 
-    Its statement and macro reads stay stubbed: those boundaries carry no tap, so
-    they are a declared gather-tape gap and the replay is expected to miss on the
-    first of them (see ``test_gather_tape``).
+#: The FRED files the macro section reads, seeded into the module's in-process memo
+#: so the REAL (tapped) point-in-time read runs with no disk and no network.
+_SCORER_FRED = {
+    "VIXCLS": [{"date": "2026-09-09", "value": "14.5"},
+               {"date": "2026-09-10", "value": "15.5"}],
+    "UNRATE": [{"date": "2026-07-01", "value": "4.1", "realtime_start": "2026-08-02"},
+               {"date": "2026-08-01", "value": "4.2", "realtime_start": "2026-09-05"}],
+    "BAA10Y": [{"date": "2026-09-09", "value": "1.8"},
+               {"date": "2026-09-10", "value": "1.9"}],
+    "T10Y3M": [{"date": "2026-09-09", "value": "0.4"},
+               {"date": "2026-09-10", "value": "0.5"}],
+}
+
+_SCORER_GRADES = [{"date": _days_ago_iso(6), "analystRatingsStrongBuy": 6,
+                   "analystRatingsbuy": 4, "analystRatingsHold": 2,
+                   "analystRatingsSell": 1, "analystRatingsStrongSell": 0}]
+_SCORER_TARGETS = [{"publishedDate": _days_ago_iso(2), "priceTarget": 120.0},
+                   {"publishedDate": _days_ago_iso(8), "priceTarget": 116.0}]
+
+
+def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400) -> Case:
+    """DeterministicScorer over its REAL data module -- no ``data.*`` stubs.
+
+    Every fake sits BELOW a tapped boundary: the OHLCV tap, the fundamentals-details
+    provider methods, FMP's dated grades/price-target fetchers and the FRED
+    point-in-time read. Stubbing ``data.fetch_statements``/``fetch_macro_series``
+    (as this fixture used to) sat ABOVE all of them, recorded nothing, and made the
+    scorer's gather-tape row a permanent ``missing_capture``.
     """
     from ba2_experts.DeterministicScorer import DeterministicScorer, data
+    from ba2_providers.fmp_common import TTLCache
+    from ba2_providers.macro import fred_series
+
+    # importlib for both: each package re-exports the CLASS under its module's name.
+    details_module = importlib.import_module(
+        "ba2_providers.fundamentals.details.FMPCompanyDetailsProvider")
+    rating = importlib.import_module("ba2_experts.FMPRating")
 
     frame = _scorer_frame(bars)
     provider = TapedOHLCV(frame)
+    fundamentals = details_module.FMPCompanyDetailsProvider.__new__(
+        details_module.FMPCompanyDetailsProvider)
+    fundamentals.api_key = "TEST-API-KEY"
+
+    def fake_history(namespace, symbol, fetch_fn, *args, **kwargs):
+        if namespace not in _SCORER_HISTORY:
+            raise AssertionError(f"unexpected statement namespace {namespace!r}")
+        return [dict(row) for row in _SCORER_HISTORY[namespace]]
+
+    def fake_http_get(url, params=None, **kwargs):
+        endpoint = kwargs["endpoint"]
+        if endpoint == "grades-historical":
+            return _Resp([dict(row) for row in _SCORER_GRADES])
+        if endpoint == "price-target":
+            return _Resp([dict(row) for row in _SCORER_TARGETS])
+        raise AssertionError(f"unexpected FMP endpoint {endpoint!r}")
+
     expert = DeterministicScorer.__new__(DeterministicScorer)
     expert.id = 14
     expert.logger = logging.getLogger("replayfixture.DeterministicScorer")
-    expert._get_fmp_api_key = lambda: None
+    expert._get_fmp_api_key = lambda: "TEST-API-KEY"
     settings = {"w_technical": 1.0, "w_fundamental": 0.0, "w_analyst": 0.5, "w_macro": 0.0,
                 "w_earnings": 0.0, "macro_mode": "off", "min_history_days": 260,
                 "index_symbol": "SPY", "use_model_target": False,
                 "theta_buy": 0.2, "theta_sell": -0.2}
-    expert._live_providers = lambda: LiveProviderBundle(_resolver({"ohlcv": provider}))
+    expert._live_providers = lambda: LiveProviderBundle(_resolver({
+        "ohlcv": provider, "fundamentals_details": fundamentals}))
     expert._gather_w_analyst = settings["w_analyst"]
     expert._gather_w_earnings = settings["w_earnings"]
     expert._gather_index_symbol = settings["index_symbol"]
     expert._gather_use_model_target = settings["use_model_target"]
     data.reset_caches()
     patches = [
-        mock.patch.object(data, "fetch_statements",
-                          lambda providers, symbol, as_of, lookback_periods=6: {
-                              "income": [], "balance": [], "cashflow": []}),
-        mock.patch.object(data, "fetch_past_earnings",
-                          lambda providers, symbol, as_of, lookback_periods=16: []),
-        mock.patch.object(data, "fetch_macro_series",
-                          lambda providers, as_of: {"vix": None, "unrate_series": None,
-                                                    "spread_10y3m_series": None,
-                                                    "oas_series": None}),
+        mock.patch.object(details_module, "fmp_history_disk_cached", fake_history),
+        mock.patch.object(rating, "fmp_http_get", fake_http_get),
+        mock.patch.object(rating, "_GRADES_HISTORICAL_CACHE", TTLCache(300)),
+        mock.patch.object(rating, "_PRICE_TARGET_HISTORY_CACHE", TTLCache(300)),
+        # The memo IS the disk for this fixture: no file is read and none is written.
+        mock.patch.dict(fred_series._MEM,
+                        {sid: [dict(row) for row in rows]
+                         for sid, rows in _SCORER_FRED.items()}, clear=True),
     ]
     return Case(expert, settings, patches, FakeMarketAnalysis(analysis_id, "GOOG"))
 

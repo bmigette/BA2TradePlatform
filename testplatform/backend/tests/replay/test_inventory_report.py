@@ -133,8 +133,10 @@ def test_the_two_capabilities_keep_their_own_coverage(bundle_copy):
     assert coverage[ReplayStatus.CAPABILITY_RECORDED_EXPERT][
         ReplayStatus.COVERAGE_MATCH] == len(ALL_IDS)
     gather_rows = coverage[ReplayStatus.CAPABILITY_GATHER_TAPE]
-    assert gather_rows[ReplayStatus.COVERAGE_MISSING_CAPTURE] == 1, (
-        "the DeterministicScorer gather gap must survive as its own coverage row")
+    assert gather_rows[ReplayStatus.COVERAGE_MATCH] == len(ALL_IDS), (
+        "every recorded gather is tape-serveable now, including the scorer's")
+    assert sum(gather_rows.values()) == len(ALL_IDS), (
+        "the gather-tape capability keeps its own row per analysis")
     assert coverage[ReplayStatus.CAPABILITY_HISTORICAL][
         ReplayStatus.COVERAGE_NOT_RUN] == len(ALL_IDS)
 

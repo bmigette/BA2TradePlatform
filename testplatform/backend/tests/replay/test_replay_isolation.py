@@ -162,8 +162,10 @@ def test_a_missing_observation_misses_at_the_tape_not_at_the_socket(session, tmp
         "the replay tried to reach the network instead of reporting a tape miss")
     assert probes[0].instance_resolutions == [], (
         "the replay tried to resolve a live instance")
-    # DeterministicScorer's gather is not tape-serveable, and its miss must ALSO
-    # be a local tape miss rather than an attempted fetch.
+    # The scorer's gather reads the widest set of boundaries in the fixture --
+    # statements, a macro file and two module-level FMP fetchers -- and every one
+    # of them must be answered from the tape, with no socket and no live provider
+    # lookup behind it.
     scorer = next(r for r in report.results if r.analysis_id == SCORER_ID)
-    assert scorer.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert scorer.status == ReplayStatus.COVERAGE_MATCH, scorer.detail
     assert probes[0].provider_resolutions == []

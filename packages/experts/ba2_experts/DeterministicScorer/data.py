@@ -21,7 +21,7 @@ to an empty section that then compares as a plausible bundle.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -60,11 +60,6 @@ def reset_caches() -> None:
     for cache in (_OHLCV_CACHE, _STATEMENTS_CACHE, _GRADES_CACHE, _MACRO_CACHE):
         with cache._lock:               # type: ignore[attr-defined]
             cache._store.clear()        # type: ignore[attr-defined]
-
-
-def _utcnow() -> datetime:
-    """tz-aware now (utcnow() is deprecated AND naive, which poisons date math)."""
-    return datetime.now(timezone.utc)
 
 
 def _slice_to_as_of(df: pd.DataFrame, as_of: Optional[datetime]) -> Optional[pd.DataFrame]:
@@ -145,7 +140,12 @@ def fetch_statements(providers, symbol: str, as_of: Optional[datetime],
     {'balance': [...], 'income': [...], 'cashflow': [...]} (provider dict
     format, snake_case fields).
     """
-    ref = as_of if as_of is not None else _utcnow()
+    # replay_now(as_of), not a raw wall clock: ``ref`` becomes the ``end_date`` of
+    # three tapped statement requests, and an identity key holding an un-replayed
+    # ``datetime.now()`` can never be matched again -- the recorded response would
+    # be unreproducible by construction (see ba2_common.core.replay.observe).
+    # as_of given => returned unchanged, so the historical path is untouched.
+    ref = replay_now(as_of)
     det = providers.fundamentals_details()
     out: Dict[str, Any] = {}
     for key, fn in (("balance", det.get_balance_sheet),
@@ -214,7 +214,9 @@ def fetch_past_earnings(providers, symbol: str, as_of: Optional[datetime],
     which additionally needs its FILING date checked. 16 quarters gives the SUE
     standardization (4 years) enough dispersion history.
     """
-    ref = as_of if as_of is not None else _utcnow()
+    # replay_now(as_of): ``ref`` is the tapped request's ``end_date`` (see
+    # fetch_statements above).
+    ref = replay_now(as_of)
     det = providers.fundamentals_details()
     try:
         out = det.get_past_earnings(symbol=symbol, frequency="quarterly", end_date=ref,
@@ -329,7 +331,14 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
 
     # str(): as_of may be a datetime (engine) or an ISO string (tools/tests), and
     # get_series_as_of accepts both -- the memo key must not care which.
-    _key_suffix = str(as_of) if as_of is not None else "live"
+    #
+    # The LIVE key is the recorded evaluation instant, not the constant "live": a
+    # process that captures an analysis and then replays one holds both runs' macro
+    # reads in this one memo, and a shared key would serve the replay the value the
+    # capture cached -- a hit that skips the tapped read the replay is there to
+    # reproduce. replay_now(as_of) returns as_of unchanged when it is given, so the
+    # historical key (and every backtest) is byte-identical to before.
+    _key_suffix = str(as_of) if as_of is not None else str(replay_now(None))
 
     def _series(series_id: str):
         return _MACRO_CACHE.get_or_call(

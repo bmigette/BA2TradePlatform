@@ -24,6 +24,7 @@ import pytest
 
 from ba2_common.core.backtest_context import LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
+from ba2_common.core.interfaces.MarketDataProviderInterface import ohlcv_identity
 from ba2_common.core.models import ExpertRecommendation, MarketAnalysis
 from ba2_common.core.replay import (
     ReplayStatus,
@@ -31,6 +32,7 @@ from ba2_common.core.replay import (
     SessionRecord,
     encode,
     get_replay_store,
+    observe_provider,
     set_replay_store,
 )
 from ba2_common.core.types import AnalysisUseCase, MarketAnalysisStatus
@@ -163,13 +165,32 @@ def _assert_bundle_equal(captured, fresh):
     assert set(captured) == set(fresh), (
         f"captured bundle keys differ: {sorted(captured)} vs {sorted(fresh)}")
     for key, expected in fresh.items():
-        got = captured[key]
-        if isinstance(expected, pd.DataFrame):
-            pd.testing.assert_frame_equal(got, expected)
-        elif isinstance(expected, pd.Series):
-            pd.testing.assert_series_equal(got, expected)
-        else:
-            assert got == expected, f"bundle[{key!r}] differs: {got!r} != {expected!r}"
+        _assert_value_equal(captured[key], expected, f"bundle[{key!r}]")
+
+
+def _assert_value_equal(got, expected, path):
+    """Compare one bundle value, descending into containers.
+
+    A plain ``==`` cannot compare a dict that HOLDS a frame (DeterministicScorer's
+    ``macro_inputs`` holds three FRED Series): dict equality compares the Series
+    element-wise and then asks for its truth value, which raises rather than
+    failing the comparison it looks like it is making.
+    """
+    if isinstance(expected, pd.DataFrame):
+        pd.testing.assert_frame_equal(got, expected)
+    elif isinstance(expected, pd.Series):
+        pd.testing.assert_series_equal(got, expected)
+    elif isinstance(expected, dict):
+        assert isinstance(got, dict) and set(got) == set(expected), (
+            f"{path} keys differ: {got!r} != {expected!r}")
+        for key, value in expected.items():
+            _assert_value_equal(got[key], value, f"{path}[{key!r}]")
+    elif isinstance(expected, (list, tuple)):
+        assert len(got) == len(expected), f"{path} length differs"
+        for index, value in enumerate(expected):
+            _assert_value_equal(got[index], value, f"{path}[{index}]")
+    else:
+        assert got == expected, f"{path} differs: {got!r} != {expected!r}"
 
 
 # --------------------------------------------------------------------------- #
@@ -216,11 +237,14 @@ def _fmp_rating_case():
         if endpoint == "upgrades-downgrades-consensus":
             counters["upgrades"] += 1
             return _Resp(upgrade)
+        # The dated price-target history is faked at the HTTP layer, not by
+        # replacing ``fetch_price_target_history_cached``: that function IS the tap
+        # (DeterministicScorer calls it directly), so patching it out would silently
+        # delete the observation this fixture exists to assert.
+        if endpoint == "price-target":
+            counters["price_targets"] += 1
+            return _Resp([dict(row) for row in price_targets])
         raise AssertionError(f"unexpected FMP endpoint {endpoint!r}")
-
-    def fake_price_targets(api_key, symbol):
-        counters["price_targets"] += 1
-        return list(price_targets)
 
     def fake_grades(api_key, symbol):
         counters["grades"] += 1
@@ -239,7 +263,6 @@ def _fmp_rating_case():
 
     patches = [
         mock.patch.object(mod, "fmp_http_get", fake_http_get),
-        mock.patch.object(mod, "fetch_price_target_history_cached", fake_price_targets),
         mock.patch.object(mod, "fetch_analyst_grades_cached", fake_grades),
     ]
 
@@ -248,6 +271,7 @@ def _fmp_rating_case():
         # "identical call counts" would be true for the wrong reason.
         mod._CONSENSUS_CACHE = TTLCache(300)
         mod._UPGRADE_CACHE = TTLCache(300)
+        mod._PRICE_TARGET_HISTORY_CACHE = TTLCache(300)
         for key in counters:
             counters[key] = 0
 
@@ -339,34 +363,114 @@ def _ds_frame(bars=400):
     })
 
 
+class _TapedOHLCV:
+    """A fake OHLCV body behind the PRODUCTION tap and the PRODUCTION identity.
+
+    ``MarketDataProviderInterface.get_ohlcv_data`` cannot be driven directly here
+    (its body reads and writes the real parquet cache), and what this fixture
+    needs is the tap, not the cache. The identity function is IMPORTED rather than
+    restated so the recorded identity is production's.
+    """
+
+    def __init__(self, frame, counters):
+        self.frame = frame
+        self._counters = counters
+
+    @observe_provider("market_data", "get_ohlcv_data", identity=ohlcv_identity)
+    def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d",
+                       use_cache=True, max_cache_age_hours=24, lookback_days=30):
+        self._counters["ohlcv"] += 1
+        return self.frame.copy()
+
+
+#: FMP's raw per-symbol history payloads, keyed by the disk-cache namespace the
+#: provider asks for. Replaced UNDER the provider's tap, so the production method,
+#: its production identity and its production formatting all run.
+_DS_HISTORY = {
+    "balance_sheet_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                              "reportedCurrency": "USD", "totalAssets": 1_000.0,
+                              "totalLiabilities": 400.0,
+                              "totalStockholdersEquity": 600.0}],
+    "income_statement_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                                 "revenue": 500.0, "netIncome": 50.0,
+                                 "grossProfit": 200.0, "operatingIncome": 80.0}],
+    "cash_flow_statement_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                                    "operatingCashFlow": 90.0, "freeCashFlow": 60.0}],
+    "cashflow_statement_annual": [{"date": "2025-12-31", "fillingDate": "2026-02-05",
+                                   "operatingCashFlow": 90.0, "freeCashFlow": 60.0}],
+}
+
+#: The FRED files DeterministicScorer's macro section reads, seeded into the
+#: module's in-process memo so the REAL (tapped) point-in-time read runs offline.
+_DS_FRED = {
+    "VIXCLS": [{"date": "2026-06-11", "value": "14.5"},
+               {"date": "2026-06-12", "value": "15.5"}],
+    "UNRATE": [{"date": "2026-04-01", "value": "4.1", "realtime_start": "2026-05-02"},
+               {"date": "2026-05-01", "value": "4.2", "realtime_start": "2026-06-05"}],
+    "BAA10Y": [{"date": "2026-06-11", "value": "1.8"},
+               {"date": "2026-06-12", "value": "1.9"}],
+    "T10Y3M": [{"date": "2026-06-11", "value": "0.4"},
+               {"date": "2026-06-12", "value": "0.5"}],
+}
+
+_DS_GRADES = [{"date": "2026-06-01", "analystRatingsStrongBuy": 6,
+               "analystRatingsbuy": 4, "analystRatingsHold": 2,
+               "analystRatingsSell": 1, "analystRatingsStrongSell": 0}]
+_DS_TARGETS = [{"publishedDate": "2026-06-10", "priceTarget": 120.0},
+               {"publishedDate": "2026-06-04", "priceTarget": 116.0}]
+
+
 def _deterministic_scorer_case(bars=400):
+    """DeterministicScorer over the REAL data module: no ``data.*`` stubs.
+
+    Every fake here sits BELOW a tapped boundary -- the OHLCV tap, the
+    fundamentals-details provider methods, FMP's grades/price-target fetchers and
+    the FRED point-in-time read -- so what the store ends up holding is what a live
+    session would hold. Stubbing ``data.fetch_statements``/``fetch_macro_series``
+    (as this fixture used to) sat ABOVE all of them and recorded nothing, which is
+    how those boundaries stayed unrecorded for a whole delivery.
+    """
     from unittest import mock
 
     from ba2_experts.DeterministicScorer import DeterministicScorer, data
+    from ba2_providers.fmp_common import TTLCache
+    from ba2_providers.macro import fred_series
+
+    # importlib for both: each package re-exports the CLASS under its module's
+    # name, so a plain import would hand back a class and every patch below would
+    # land on the wrong object.
+    details_module = importlib.import_module(
+        "ba2_providers.fundamentals.details.FMPCompanyDetailsProvider")
+    rating = importlib.import_module("ba2_experts.FMPRating")
 
     frame = _ds_frame(bars)
-    counters = {"ohlcv": 0, "statements": 0, "earnings": 0, "macro": 0, "index": 0}
+    counters = {"ohlcv": 0, "statements": 0, "fmp_http": 0, "fred": 0}
 
-    def fake_ohlcv(providers, symbol, as_of, lookback_days=None):
-        counters["ohlcv"] += 1
-        return frame.copy()
-
-    def fake_statements(providers, symbol, as_of, lookback_periods=6):
+    def fake_history(namespace, symbol, fetch_fn, *a, **kw):
         counters["statements"] += 1
-        return {"income": [], "balance": [], "cashflow": []}
+        if namespace not in _DS_HISTORY:
+            raise AssertionError(f"unexpected statement namespace {namespace!r}")
+        return [dict(row) for row in _DS_HISTORY[namespace]]
 
-    def fake_earnings(providers, symbol, as_of, lookback_periods=16):
-        counters["earnings"] += 1
-        return []
+    def fake_http_get(url, params=None, **kw):
+        endpoint = kw["endpoint"]
+        counters["fmp_http"] += 1
+        if endpoint == "grades-historical":
+            return _Resp([dict(row) for row in _DS_GRADES])
+        if endpoint == "price-target":
+            return _Resp([dict(row) for row in _DS_TARGETS])
+        raise AssertionError(f"unexpected FMP endpoint {endpoint!r}")
 
-    def fake_macro(providers, as_of):
-        counters["macro"] += 1
-        return {"vix": None, "unrate_series": None,
-                "spread_10y3m_series": None, "oas_series": None}
+    original_load = fred_series._load
 
-    def fake_index(providers, as_of, index_symbol="SPY"):
-        counters["index"] += 1
-        return frame["Close"].copy()
+    def counting_load(series_id):
+        counters["fred"] += 1
+        return original_load(series_id)
+
+    provider = _TapedOHLCV(frame, counters)
+    fundamentals = details_module.FMPCompanyDetailsProvider.__new__(
+        details_module.FMPCompanyDetailsProvider)
+    fundamentals.api_key = "TEST-API-KEY"
 
     expert = DeterministicScorer.__new__(DeterministicScorer)
     expert.id = 14
@@ -376,7 +480,7 @@ def _deterministic_scorer_case(bars=400):
     expert._gather_w_earnings = 0.0
     expert._gather_index_symbol = "SPY"
     expert._gather_use_model_target = False
-    expert._get_fmp_api_key = lambda: None
+    expert._get_fmp_api_key = lambda: "TEST-API-KEY"
     settings = {
         "w_technical": 1.0, "w_fundamental": 0.0, "w_analyst": 0.5, "w_macro": 0.0,
         "w_earnings": 0.0, "macro_mode": "off", "min_history_days": 260,
@@ -384,17 +488,24 @@ def _deterministic_scorer_case(bars=400):
         "theta_buy": 0.2, "theta_sell": -0.2,
     }
     expert._resolve_settings = lambda keys: dict(settings)
-    expert._live_providers = lambda: LiveProviderBundle(_resolver({"ohlcv": FakeOHLCV()}))
+    expert._live_providers = lambda: LiveProviderBundle(_resolver({
+        "ohlcv": provider, "fundamentals_details": fundamentals}))
 
     patches = [
-        mock.patch.object(data, "fetch_ohlcv", fake_ohlcv),
-        mock.patch.object(data, "fetch_statements", fake_statements),
-        mock.patch.object(data, "fetch_past_earnings", fake_earnings),
-        mock.patch.object(data, "fetch_macro_series", fake_macro),
-        mock.patch.object(data, "fetch_index_closes", fake_index),
+        mock.patch.object(details_module, "fmp_history_disk_cached", fake_history),
+        mock.patch.object(rating, "fmp_http_get", fake_http_get),
+        mock.patch.object(fred_series, "_load", counting_load),
     ]
 
     def reset():
+        # Fresh memos: without this, run 2 is served from run 1's caches and
+        # "identical call counts" would be true for the wrong reason.
+        data.reset_caches()
+        rating._GRADES_HISTORICAL_CACHE = TTLCache(300)
+        rating._PRICE_TARGET_HISTORY_CACHE = TTLCache(300)
+        # The FRED memo IS the disk in this fixture: seeded, not cleared.
+        fred_series._MEM.update({sid: [dict(r) for r in rows]
+                                 for sid, rows in _DS_FRED.items()})
         for key in counters:
             counters[key] = 0
 
@@ -416,15 +527,16 @@ CASES = {
 
 #: Tapped provider calls the LIVE path of each fixture actually routes through.
 #: FMPRating: the two consensus snapshots + the price-target history behind the
-#: target count. EarningsDrift/Insider: the cached_get alias layer. The
-#: DeterministicScorer fixture stubs its data module ABOVE the tapped provider
-#: boundaries, so it records none -- stated as a number rather than left as
-#: "some", so a tap that stopped firing is a failure and not a shrug.
+#: target count. EarningsDrift/Insider: the cached_get alias layer.
+#: DeterministicScorer: its own OHLCV window (1) + the index window (1) + three
+#: statements + the dated grades and price-target histories (2) + four FRED
+#: series = 11. Stated as a number rather than left as "some", so a tap that
+#: stopped firing is a failure and not a shrug.
 EXPECTED_OBSERVATIONS = {
     "FMPRating": 3,
     "FMPEarningsDrift": 1,
     "FMPInsiderClusterBuy": 1,
-    "DeterministicScorer": 0,
+    "DeterministicScorer": 11,
 }
 
 #: Which experts read an evaluation clock on their live path. Insider does not --
@@ -541,6 +653,102 @@ def test_fmp_rating_records_the_consensus_endpoints_it_consumed(tmp_path):
                for o in on["observations"]), (
         "an FMP helper cannot tell a fresh fetch from a TTL-memo hit, so its "
         "provenance stays honestly unknown rather than claiming 'network'")
+
+
+def test_deterministic_scorer_records_every_boundary_its_gather_read(tmp_path):
+    """Statements, macro, the index window and the dated analyst history.
+
+    These reads used to be invisible: the fixture stubbed ``data.fetch_*`` ABOVE
+    the provider boundaries and the boundaries themselves carried no tap, so a
+    DeterministicScorer analysis recorded nothing but its own bundle. The counts
+    below are per METHOD, so one tap falling silent is a named failure.
+    """
+    root = tmp_path / "scorer"
+    on = _run(CASES["DeterministicScorer"], capture_root=root)
+
+    methods = sorted(o.method for o in on["observations"])
+    assert methods == [
+        "get_balance_sheet", "get_cashflow_statement", "get_income_statement",
+        "get_ohlcv_data", "get_ohlcv_data",
+        "get_series_as_of", "get_series_as_of", "get_series_as_of", "get_series_as_of",
+        "grades_historical", "price_target_history",
+    ]
+
+    by_method = {}
+    for observation in on["observations"]:
+        by_method.setdefault(observation.method, []).append(observation)
+
+    # The index window is a SECOND OHLCV request, recorded in its own right.
+    assert sorted(o.request_identity["symbol"]
+                  for o in by_method["get_ohlcv_data"]) == ["AAPL", "SPY"]
+    assert sorted(o.request_identity["series_id"]
+                  for o in by_method["get_series_as_of"]) == [
+        "BAA10Y", "T10Y3M", "UNRATE", "VIXCLS"]
+    assert all(o.request_identity["as_of"] is None
+               for o in by_method["get_series_as_of"]), (
+        "the live macro read asks for every vintage published so far")
+    assert by_method["get_balance_sheet"][0].request_identity["end_date"] == (
+        on["records"][0].clock_reads[1]), (
+        "the statement window must end at a RECORDED clock read -- an un-replayed "
+        "datetime.now() in a request identity can never be matched again")
+
+    store = ReplayStore(root, writer="sync")
+    try:
+        payloads = {method: store.decode_object(observations[0].payload_object)
+                    for method, observations in by_method.items()}
+    finally:
+        store.close()
+    assert payloads["get_balance_sheet"]["statements"][0]["total_assets"] == 1_000.0
+    assert payloads["price_target_history"][0]["priceTarget"] == 120.0
+    assert list(payloads["get_series_as_of"]) in ([14.5, 15.5], [4.1], [1.8, 1.9],
+                                                  [0.4, 0.5])
+
+
+def test_the_dated_analyst_history_is_recorded_once_per_call(tmp_path):
+    """One boundary, one record -- whichever caller reaches it.
+
+    DeterministicScorer imports ``fetch_grades_historical_cached`` directly while
+    FMPRating reaches the same function through its instance method. With the tap
+    on BOTH levels the expert's call would be recorded twice (one fetch, two
+    observations); with it only on the instance method every DS read went
+    unrecorded. It sits on the fetcher, and this pins both halves of that.
+    """
+    from ba2_common.core.replay import CaptureContext, CaptureHealth, use_capture_context
+
+    on = _run(CASES["DeterministicScorer"], capture_root=tmp_path / "once")
+    methods = [o.method for o in on["observations"]]
+    assert methods.count("grades_historical") == 1
+    assert methods.count("price_target_history") == 1
+    scorer_identity = next(o.request_identity for o in on["observations"]
+                           if o.method == "grades_historical")
+
+    # The same session, now through FMPRating's instance method.
+    expert, _settings, patches, _counters, reset = CASES["DeterministicScorer"]()
+    reset()
+    mod = importlib.import_module("ba2_experts.FMPRating")
+    rating = mod.FMPRating.__new__(mod.FMPRating)
+    rating._api_key = "TEST-API-KEY"
+    rating.logger = logging.getLogger("capture.FMPRating.delegation")
+
+    context = CaptureContext(
+        analysis_meta={"analysis_id": "A2", "attempt_id": "T2", "session_id": "S-TEST",
+                       "expert_class": "FMPRating", "expert_instance_id": 11,
+                       "symbol": "AAPL", "use_case": "enter_market",
+                       "scheduled_at": None, "started_at": NOW},
+        health=CaptureHealth())
+    with ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
+        stack.enter_context(use_capture_context(context))
+        rows = rating._fetch_grades_historical("AAPL")
+
+    observed = [pending.observation for pending in context.observations]
+    assert len(observed) == 1, (
+        "the instance method wraps an already-tapped fetcher: one call, one record")
+    assert observed[0].method == "grades_historical"
+    assert observed[0].request_identity == scorer_identity, (
+        "both callers must record the SAME identity, or a tape can serve only one")
+    assert rows and rows[0]["analystRatingsStrongBuy"] == 6
 
 
 # --------------------------------------------------------------------------- #

@@ -39,6 +39,8 @@ import pandas as pd
 import requests
 
 from ba2_common.config import CACHE_FOLDER
+from ba2_common.core.replay.observe import observe_provider
+from ba2_common.core.replay.schemas import ReplayStatus
 from ba2_common.logger import logger
 
 API_URL = "https://api.stlouisfed.org/fred/series/observations"
@@ -183,8 +185,27 @@ def reset_cache() -> None:
     _MEM.clear()
 
 
+def series_identity(args):
+    """What makes a point-in-time FRED read what it is: the series and the cut.
+
+    Named (not an inline lambda) because the offline replay tape imports it to
+    look a recorded series up by exactly the identity the tap wrote. ``as_of`` is
+    taken AS THE CALLER PASSED IT (``None`` on the live path, which means "every
+    vintage published so far"): normalizing it here would build a key the caller
+    cannot reproduce.
+    """
+    return {"series_id": args["series_id"], "as_of": args["as_of"]}
+
+
+@observe_provider("macro", "get_series_as_of", identity=series_identity,
+                  provenance=ReplayStatus.PROVENANCE_DISK_CACHE)
 def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
     """Return the series as it was KNOWN at *as_of*, indexed by observation date.
+
+    Recorded at this boundary (provenance ``disk_cache``): this function NEVER
+    reaches the network -- it reads the synced cache file (or the in-process memo
+    of it) and raises when the series was not warmed -- so every return here came
+    off disk by construction.
 
     ``as_of=None`` means "latest" (the live path). For vintage series the cut is on
     first-publication date, so a backtest standing on 2024-01-31 cannot see January's

@@ -80,9 +80,18 @@ def _memo_provider_date(row: dict, key: str):
     return cached
 
 
+@observe_provider("fmp", "grades_historical", identity=symbol_identity)
 def fetch_grades_historical_cached(api_key: str, symbol: str) -> list:
     """Fetch the FULL dated analyst-grade history for a symbol (backtest path),
     WITHOUT needing an FMPRating instance.
+
+    THE TAP LIVES HERE, not on ``FMPRating._fetch_grades_historical``. Two callers
+    reach this history -- the expert's instance method and DeterministicScorer's
+    ``data.fetch_grades_history``, which imports this function directly -- and a
+    tap on the instance method recorded only the first of them. Moving it to the
+    single function both go through records BOTH, exactly once per call: the
+    instance method now delegates to an already-tapped callee rather than wrapping
+    a second tap around it, so no call is recorded twice.
 
     Same body as ``FMPRating._fetch_grades_historical``'s inner ``_do_fetch``, wrapped
     through the in-process TTLCache -> backtest-only disk cache -> FMP network chain so
@@ -108,9 +117,15 @@ def fetch_grades_historical_cached(api_key: str, symbol: str) -> list:
         symbol, lambda: fmp_history_disk_cached("grades_historical", symbol, _do_fetch))
 
 
+@observe_provider("fmp", "price_target_history", identity=symbol_identity)
 def fetch_price_target_history_cached(api_key: str, symbol: str) -> list:
     """Fetch the FULL dated individual analyst price-target history (backtest path),
     WITHOUT needing an FMPRating instance.
+
+    THE TAP LIVES HERE, for the same reason as ``fetch_grades_historical_cached``
+    above: DeterministicScorer imports this function directly, so a tap on the
+    expert's instance method missed every DS read of it. One boundary, one record
+    per call.
 
     Same body as ``FMPRating._fetch_price_target_history``'s inner ``_do_fetch``, wrapped
     through the same TTLCache -> disk-cache -> network chain. Endpoint:
@@ -610,7 +625,6 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         "strongSell": ("analystRatingsStrongSell", "strongSell"),
     }
 
-    @observe_provider("fmp", "grades_historical", identity=symbol_identity)
     def _fetch_grades_historical(self, symbol: str) -> list:
         """Fetch the FULL dated analyst-grade history for a symbol (backtest path).
 
@@ -624,10 +638,11 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
 
         # Delegate to the module-level fetcher (reusable by the optimization pre-warm,
         # which has no FMPRating instance). Behaviour is byte-identical to the prior
-        # inline _do_fetch + TTLCache/disk-cache wrapping.
+        # inline _do_fetch + TTLCache/disk-cache wrapping. THE REPLAY TAP IS ON THAT
+        # FETCHER, not on this method: DeterministicScorer calls it directly, and one
+        # boundary recording once per call is what keeps the two callers comparable.
         return fetch_grades_historical_cached(self._api_key, symbol)
 
-    @observe_provider("fmp", "price_target_history", identity=symbol_identity)
     def _fetch_price_target_history(self, symbol: str) -> list:
         """Fetch the FULL dated individual analyst price-target history (backtest path).
 
@@ -641,6 +656,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
 
         # Delegate to the module-level fetcher (reusable by the optimization pre-warm).
         # Behaviour is byte-identical to the prior inline _do_fetch + cache wrapping.
+        # The replay tap is on that fetcher (see _fetch_grades_historical above).
         return fetch_price_target_history_cached(self._api_key, symbol)
 
     @observe_provider("fmp", "analyst_grades", identity=symbol_identity)
