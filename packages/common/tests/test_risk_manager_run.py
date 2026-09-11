@@ -302,3 +302,82 @@ def test_a_live_candidate_run_is_persisted_distinguishing_funded_permission_and_
     assert by_symbol["AAPL"]["quantity"] == 12.0
     assert by_symbol["MSFT"]["outcome"] == OUTCOME_PERMISSION
     assert by_symbol["TSLA"]["outcome"] == OUTCOME_UNFUNDED
+
+
+# ---------------------------------------------------------------------------------------
+# The ROW, once the sizing trace is in it (2026-09-11)
+#
+# The record now carries what the manager ranked and allocated on -- the rank, the score's
+# inputs, the capital each order was measured against and the constraint that produced its
+# size. Two things must hold for that to survive the trip through the database:
+# the row has to be JSON, and a row written before any of it existed has to keep rendering.
+# ---------------------------------------------------------------------------------------
+
+def test_a_row_carrying_the_sizing_trace_is_json_and_comes_back_unchanged(expert_instance_id):
+    """``decisions`` is a JSON column. A float that is not a float (a numpy scalar, a
+    Decimal) serialises to something nobody can read back, and it fails at WRITE time --
+    i.e. at the end of a real sizing pass, having lost the whole run's explanation."""
+    import json
+
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import RiskManagerRun
+
+    row = decision(
+        "AAPL", OUTCOME_FUNDED, "funded at 12 (~1,200.00)", quantity=12.0, side="BUY",
+        price=100.0, cost=1_200.0, rank=1, score=12.0, profit_pct=30.0, confidence=40.0,
+        weight=60.0, existing_allocation=0.0, cap_available=2_000.0,
+        balance_before=5_000.0, max_qty_by_instrument=20.0, max_qty_by_balance=50.0,
+        balance_after=3_800.0, binding="instrument_cap")
+
+    run_id = record_run(expert_instance_id=expert_instance_id, account_id=None,
+                        mode=MODE_CLASSIC, decisions=[row],
+                        context={"equity": 10_000.0, "regime_risk_scale": 1.0,
+                                 "sizing_mode": "notional"})
+    assert run_id is not None
+
+    saved = next(r for r in get_all_instances(RiskManagerRun) if r.id == run_id)
+    assert json.loads(json.dumps(saved.decisions)) == saved.decisions
+    assert saved.decisions[0] == row
+    assert saved.context["sizing_mode"] == "notional"
+
+
+def test_a_run_recorded_before_the_trace_existed_still_reads(expert_instance_id):
+    """Every row production has written so far has neither rank nor binding. They are not
+    migrated (the JSON columns absorb new keys), so absence has to stay legal -- the UI
+    draws a dash for it."""
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import RiskManagerRun
+
+    run_id = record_run(
+        expert_instance_id=expert_instance_id, account_id=None, mode=MODE_CLASSIC,
+        decisions=[decision("AAPL", OUTCOME_FUNDED, "funded at 12", quantity=12.0,
+                            side="BUY", price=100.0, cost=1_200.0)],
+        context={"available_balance": 5_000.0, "max_per_instrument": 2_000.0,
+                 "enable_buy": True, "enable_sell": False})
+
+    saved = next(r for r in get_all_instances(RiskManagerRun) if r.id == run_id)
+    old = saved.decisions[0]
+    assert old["outcome"] == OUTCOME_FUNDED
+    for key in ("rank", "binding", "balance_before", "score"):
+        assert key not in old
+
+
+def test_the_row_never_carries_a_trace_key_nobody_declared(expert_instance_id):
+    """The trace is a WORKING record inside the sizing loop; the row is an allowlist of it
+    (``DECISION_TRACE_FIELDS``). Without that, anything a future sizing step jots down
+    lands in a database column by accident."""
+    from ba2_common.core.TradeRiskManagement import DECISION_TRACE_FIELDS, TradeRiskManagement
+
+    class _Order:
+        symbol = "AAPL"
+
+    order = _Order()
+    rm = TradeRiskManagement.__new__(TradeRiskManagement)
+    rm.logger = __import__("logging").getLogger("test")
+    extras = rm._decision_extras(
+        order, {id(order): {"rank": 2, "binding": "balance", "score": 1.0,
+                            "scratch_note": "not for the database"}}, {})
+
+    assert set(extras) <= set(DECISION_TRACE_FIELDS)
+    assert "scratch_note" not in extras
+    assert extras["rank"] == 2 and extras["binding"] == "balance"

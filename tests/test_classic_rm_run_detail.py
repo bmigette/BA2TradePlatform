@@ -45,7 +45,7 @@ def recorded(monkeypatch):
     monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: False)
 
     def _run(*, pending, recs, funded=(), unfunded=(), permission=(),
-             prices=None, weights=None):
+             prices=None, weights=None, traces=None):
         mgr = object.__new__(trm.TradeRiskManagement)
         import logging
         mgr.logger = logging.getLogger("test")
@@ -57,6 +57,7 @@ def recorded(monkeypatch):
             symbol_prices=prices or {},
             context={"max_per_instrument": 1000.0},
             instrument_weights=weights or {},
+            traces=traces or {},
         )
         return {d["symbol"]: d for d in captured.get("decisions", [])}
 
@@ -134,3 +135,388 @@ def test_a_settings_failure_costs_the_weight_and_not_the_run():
             raise RuntimeError("settings are down")
 
     assert trm.TradeRiskManagement._safe_instrument_config(_Boom()) == {}
+
+
+# =========================================================================================
+# THE LIVE PATH, AND WHAT IT ALLOCATED ON
+#
+# Everything above drives ``_record_classic_run`` -- the DB-pending-order path. The LIVE
+# enter path is ``size_candidate_orders`` -> ``_record_candidate_run``, and 5edf15de added
+# the ranking fields to the DB path ONLY: production run 10 (2026-09-11, 3 funded of 3)
+# carries symbol/outcome/reason/quantity/side/price/cost and nothing else, so the dialog
+# draws "-" for Score and Weight on every row an operator has ever looked at.
+#
+# The fix is ONE builder for both paths, fed by a per-order SIZING TRACE captured where the
+# operands exist (inside the sizing core) rather than re-derived afterwards from the
+# numbers -- re-deriving is how "which limit bound this order" becomes a guess.
+# =========================================================================================
+import logging
+
+from ba2_common.core.types import OrderDirection
+
+
+class _SizingOrder:
+    """A candidate order: transient, no ``.id`` -- correlated by python identity."""
+
+    def __init__(self, symbol, side=OrderDirection.BUY, data=None, oid=None):
+        self.id = oid
+        self.symbol = symbol
+        self.side = side
+        self.quantity = None
+        self.stop_price = None
+        self.data = data or {}
+
+
+class _FakeExpert:
+    def __init__(self, settings=None, instruments=None, equity=100_000.0):
+        self._settings = dict(settings or {})
+        self._instruments = dict(instruments or {})
+        self._equity = equity
+
+    def get_setting_with_interface_default(self, name, log_warning=True):
+        return self._settings.get(name)          # a test double, not a settings read
+
+    def _get_enabled_instruments_config(self):
+        return self._instruments
+
+    def get_virtual_balance(self):
+        return self._equity
+
+
+class _FakeAccount:
+    def __init__(self, prices):
+        self._prices = dict(prices)
+
+    def get_instrument_current_price(self, symbols):
+        return {s: self._prices[s] for s in symbols if s in self._prices}
+
+
+def _manager():
+    mgr = object.__new__(trm.TradeRiskManagement)
+    mgr.logger = logging.getLogger("test")
+    mgr.indicator_provider = None
+    mgr.as_of = None
+    return mgr
+
+
+def _size(pairs, *, balance, cap, prices, expert=None, allocations=None):
+    """Drive the REAL sizing core and hand back the trace it captured, keyed by symbol."""
+    mgr = _manager()
+    traces, context = {}, {}
+    mgr._calculate_order_quantities(
+        pairs, balance, cap, dict(allocations or {}), _FakeAccount(prices),
+        expert or _FakeExpert(), traces=traces, context=context)
+    return {o.symbol: traces[id(o)] for o, _rec in pairs if id(o) in traces}, context
+
+
+def _pair(symbol, *, profit=10.0, confidence=80.0, data=None):
+    order = _SizingOrder(symbol, data=data)
+    return order, _Rec(profit=profit, confidence=confidence)
+
+
+# -----------------------------------------------------------------------------------------
+# The trace: which constraint actually produced the quantity
+# -----------------------------------------------------------------------------------------
+
+def test_an_order_capped_by_the_instrument_limit_says_so_with_its_operands():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0})
+    t = traces["AAA"]
+
+    assert t["binding"] == "instrument_cap"
+    assert t["rank"] == 1
+    assert t["price"] == 100.0
+    assert t["cap_available"] == 1_000.0
+    assert t["max_qty_by_instrument"] == pytest.approx(10.0)
+    assert t["max_qty_by_balance"] == pytest.approx(1_000.0)
+    assert t["quantity"] == 10
+    assert t["cost"] == pytest.approx(1_000.0)
+    assert t["balance_before"] == 100_000.0
+    assert t["balance_after"] == pytest.approx(99_000.0)
+
+
+def test_an_order_capped_by_the_remaining_balance_says_balance():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=550.0, cap=1_000_000.0, prices={"AAA": 100.0})
+    t = traces["AAA"]
+
+    assert t["binding"] == "balance"
+    assert t["quantity"] == 5
+    assert t["max_qty_by_balance"] == pytest.approx(5.5)
+
+
+def test_the_weight_that_shrank_the_size_is_the_binding_constraint():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0},
+                      expert=_FakeExpert(instruments={"AAA": {"weight": 50.0}}))
+    t = traces["AAA"]
+
+    assert t["weight"] == 50.0
+    assert t["quantity"] == 5, "10 shares by cap, halved by the 50% weight"
+    assert t["binding"] == "weight"
+
+
+def test_a_symbol_too_expensive_for_its_cap_is_an_early_skip_against_the_cap():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=50.0, prices={"AAA": 100.0})
+    t = traces["AAA"]
+
+    assert t["binding"] == "early_skip_cap"
+    assert t["quantity"] == 0
+    assert t["cap_available"] == 50.0
+    assert "max_qty_by_instrument" not in t, "it never reached the sizing arithmetic"
+
+
+def test_a_symbol_the_remaining_balance_cannot_reach_is_an_early_skip_against_balance():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=50.0, cap=1_000_000.0, prices={"AAA": 100.0})
+
+    assert traces["AAA"]["binding"] == "early_skip_balance"
+
+
+def test_a_symbol_with_no_price_records_no_price_rather_than_a_guessed_limit():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={})
+
+    assert traces["AAA"]["binding"] == "no_price"
+    assert "price" not in traces["AAA"]
+
+
+def test_a_lot_constrained_order_names_the_lot_size():
+    pair = _pair("AAA", data={"lot_size": 100})
+    traces, _ = _size([pair], balance=100_000.0, cap=15_000.0, prices={"AAA": 100.0})
+    t = traces["AAA"]
+
+    assert t["quantity"] == 100, "150 shares by cap, rounded down to one whole lot"
+    assert t["binding"] == "lot_size"
+
+
+def test_risk_atr_sizing_carries_the_risk_operands():
+    pair = _pair("AAA")
+    expert = _FakeExpert(settings={"sizing_mode": "risk_atr", "risk_per_trade_pct": 1.0,
+                                   "min_stop_loss_pct": 5.0}, equity=100_000.0)
+    traces, context = _size([pair], balance=100_000.0, cap=1_000_000.0,
+                            prices={"AAA": 100.0}, expert=expert)
+    t = traces["AAA"]
+
+    assert t["binding"] == "risk_atr"
+    assert t["risk_budget_pct"] == pytest.approx(1.0)
+    assert t["risk_dollars"] == pytest.approx(1_000.0)
+    assert t["stop_price"] == pytest.approx(pair[0].stop_price)
+    assert t["stop_distance_pct"] > 0
+    assert t["qty_by_risk"] >= t["quantity"]
+    assert context["sizing_mode"] == "risk_atr"
+    # The cash clamp reads the commission in THIS mode too; a run whose record omitted it
+    # would read as "no commission was charged".
+    assert context["commission_per_trade"] == 0.0
+
+
+def test_the_balance_chains_from_one_order_to_the_next():
+    """``balance_after`` of the first IS ``balance_before`` of the second. Without that
+    the reader cannot follow the money down the ranking, which is the whole record."""
+    first, second = _pair("AAA"), _pair("BBB")
+    traces, _ = _size([first, second], balance=100_000.0, cap=1_000.0,
+                      prices={"AAA": 100.0, "BBB": 100.0})
+
+    assert traces["AAA"]["rank"] == 1 and traces["BBB"]["rank"] == 2
+    assert traces["BBB"]["balance_before"] == pytest.approx(traces["AAA"]["balance_after"])
+
+
+def test_an_existing_position_shows_up_as_the_allocation_that_shrank_the_cap():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0},
+                      allocations={"AAA": 400.0})
+    t = traces["AAA"]
+
+    assert t["existing_allocation"] == 400.0
+    assert t["cap_available"] == pytest.approx(600.0)
+    assert t["quantity"] == 6
+
+
+# -----------------------------------------------------------------------------------------
+# The run context: the capital mapping the sizing read, and nothing it did not
+# -----------------------------------------------------------------------------------------
+
+class _Balances:
+    virtual, used, available = 20_000.0, 5_000.0, 15_000.0
+
+
+def test_the_context_records_the_capital_the_sizing_was_measured_against():
+    context = trm.TradeRiskManagement._run_context(
+        balances=_Balances(),
+        capital={"balance": 10_000.0, "tradable_balance": 20_000.0,
+                 "effective_factor": 2.0, "virtual_equity_pct": 100.0},
+        max_per_instrument=1_500.0, max_per_instrument_ratio=0.1)
+
+    assert context["equity"] == 10_000.0
+    assert context["tradable_balance"] == 20_000.0
+    assert context["margin_factor"] == 2.0
+    assert context["allocation_pct"] == 100.0
+    assert context["virtual_balance"] == 20_000.0
+    assert context["used_balance"] == 5_000.0
+    assert context["available_balance"] == 15_000.0
+    assert context["max_per_instrument"] == 1_500.0
+    assert context["max_per_instrument_ratio"] == pytest.approx(0.1)
+
+
+def test_a_capital_figure_the_sizing_never_read_is_absent_not_zero():
+    """An account that publishes no capital description leaves the margin half of the
+    line EMPTY. A 0 equity would read as a measured, broke account."""
+    context = trm.TradeRiskManagement._run_context(
+        balances=_Balances(), capital=None,
+        max_per_instrument=1_500.0, max_per_instrument_ratio=0.1)
+
+    for absent in ("equity", "tradable_balance", "margin_factor", "allocation_pct"):
+        assert absent not in context
+    assert context["available_balance"] == 15_000.0
+
+
+def test_the_sizing_knobs_are_recorded_from_the_pass_that_used_them():
+    expert = _FakeExpert(settings={"diversification_factor": 0.5, "sizing_mode": "notional"})
+    _, context = _size([_pair("AAA")], balance=100_000.0, cap=1_000.0,
+                       prices={"AAA": 100.0}, expert=expert)
+
+    assert context["sizing_mode"] == "notional"
+    assert context["diversification_factor"] == 0.5
+    assert context["regime_risk_scale"] == 1.0, "recorded ALWAYS, 1.0 when unstressed"
+    assert context["commission_per_trade"] == 0.0
+
+
+# -----------------------------------------------------------------------------------------
+# One builder, both paths
+# -----------------------------------------------------------------------------------------
+
+@pytest.fixture
+def both_paths(monkeypatch):
+    """BOTH recorders behind ONE capture, so a test can compare what they wrote.
+
+    One sink and not two fixtures: each fixture would patch ``record_run`` in turn and the
+    second patch would quietly swallow the first path's decisions -- the test would then be
+    comparing a row against nothing.
+    """
+    captured = {}
+
+    def _fake_record_run(**kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        return 1
+
+    monkeypatch.setattr("ba2_common.core.risk_manager_run.record_run", _fake_record_run)
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: False)
+
+    class _Paths:
+        @staticmethod
+        def candidate(*, candidates, funded=(), unfunded=(), permission=(), prices=None,
+                      traces=None):
+            _manager()._record_candidate_run(
+                expert_instance_id=1, account_id=1, started_at=None,
+                candidates=list(candidates), dropped_by_permission=list(permission),
+                orders_to_update=list(funded), orders_to_delete=list(unfunded),
+                symbol_prices=prices or {}, context={"max_per_instrument": 1000.0},
+                traces=traces or {})
+            return {d["symbol"]: d for d in captured["decisions"]}
+
+        @staticmethod
+        def classic(*, pending, recs, funded=(), unfunded=(), permission=(), prices=None,
+                    traces=None):
+            _manager()._record_classic_run(
+                expert_instance_id=1, account_id=1, started_at=None,
+                pending_orders=list(pending), dropped_by_permission=list(permission),
+                orders_with_recommendations=list(recs),
+                orders_to_update=list(funded), orders_to_delete=list(unfunded),
+                symbol_prices=prices or {}, context={"max_per_instrument": 1000.0},
+                traces=traces or {})
+            return {d["symbol"]: d for d in captured["decisions"]}
+
+    return _Paths
+
+
+@pytest.fixture
+def candidate_recorded(both_paths):
+    """``_record_candidate_run`` -- the LIVE enter path -- and its decisions."""
+    return both_paths.candidate
+
+
+def test_the_live_candidate_path_records_what_it_ranked_and_allocated_on(candidate_recorded):
+    """THE BUG. Production run 10 shows "-" for Score and Weight on every row because the
+    candidate path built its decisions without any of this."""
+    pair = _pair("AAA", profit=30.0, confidence=40.0)
+    order = pair[0]
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0},
+                      expert=_FakeExpert(instruments={"AAA": {"weight": 100.0}}))
+    row = candidate_recorded(candidates=[pair], funded=[order], prices={"AAA": 100.0},
+                             traces={id(order): traces["AAA"]})["AAA"]
+
+    assert row["outcome"] == "FUNDED"
+    assert row["score"] == pytest.approx(compute_order_priority_score(30.0, 40.0), abs=1e-4)
+    assert row["confidence"] == 40.0 and row["profit_pct"] == 30.0
+    assert row["weight"] == 100.0
+    assert row["rank"] == 1
+    assert row["binding"] == "instrument_cap"
+    assert row["balance_before"] == 100_000.0 and row["balance_after"] == 99_000.0
+    assert row["cap_available"] == 1_000.0
+
+
+def test_both_paths_produce_the_same_row_shape(both_paths):
+    """One builder, or the two records drift and the dialog has to know which wrote it."""
+    pair = _pair("AAA", profit=30.0, confidence=40.0)
+    order = pair[0]
+    order.id = 1
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0})
+    trace = {id(order): traces["AAA"]}
+
+    db_row = both_paths.classic(pending=[order], recs=[pair], funded=[order],
+                                prices={"AAA": 100.0}, traces=trace)["AAA"]
+    candidate_row = both_paths.candidate(candidates=[pair], funded=[order],
+                                         prices={"AAA": 100.0}, traces=trace)["AAA"]
+
+    assert set(db_row) == set(candidate_row)
+    assert db_row == candidate_row
+
+
+def test_a_permission_refusal_has_no_rank_because_it_was_never_ranked(candidate_recorded):
+    pair = _pair("AAA")
+    row = candidate_recorded(candidates=[pair], permission=[pair[0]])["AAA"]
+
+    assert row["outcome"] == "REFUSED_PERMISSION"
+    assert "rank" not in row and "binding" not in row
+
+
+def test_a_refused_row_still_carries_the_sizing_it_was_refused_by(candidate_recorded):
+    """A symbol the budget ran out on has a rank, a score and a binding constraint --
+    that IS the answer to "why not this one"."""
+    pair = _pair("AAA")
+    order = pair[0]
+    traces, _ = _size([pair], balance=50.0, cap=1_000_000.0, prices={"AAA": 100.0})
+    row = candidate_recorded(candidates=[pair], unfunded=[order], prices={"AAA": 100.0},
+                             traces={id(order): traces["AAA"]})["AAA"]
+
+    assert row["outcome"] == "REFUSED_UNFUNDED"
+    assert row["binding"] == "early_skip_balance"
+    assert row["rank"] == 1
+    assert "quantity" not in row, "a refused symbol was never sized"
+
+
+def test_a_run_recorded_without_a_trace_still_writes_its_row(candidate_recorded):
+    """Old rows, and any path that has no trace, must still record. The new keys are
+    ABSENT (the UI draws a dash), never invented."""
+    pair = _pair("AAA")
+    row = candidate_recorded(candidates=[pair], funded=[pair[0]], prices={"AAA": 100.0})["AAA"]
+
+    assert row["outcome"] == "FUNDED"
+    assert "binding" not in row and "rank" not in row
+
+
+def test_a_broken_trace_costs_the_annotation_and_not_the_sizing():
+    """The trace only OBSERVES. A failure to record one must never reach the sizing loop."""
+    class _Hostile(dict):
+        def __setitem__(self, *a, **kw):
+            raise RuntimeError("trace store is on fire")
+
+    pair = _pair("AAA")
+    mgr = _manager()
+    orders_to_update, _, _ = mgr._calculate_order_quantities(
+        [pair], 100_000.0, 1_000.0, {}, _FakeAccount({"AAA": 100.0}), _FakeExpert(),
+        traces=_Hostile(), context={})
+
+    assert orders_to_update == [pair[0]] and pair[0].quantity == 10
