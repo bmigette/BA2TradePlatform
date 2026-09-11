@@ -289,6 +289,29 @@ def plan(requirements: Sequence[Requirement], roots: Sequence[str], *,
     )
 
 
+def measured_root_sizes(roots: Sequence[str]) -> List[int]:
+    """Every warm-artifact size ON these roots, unaggregated. No requirements needed.
+
+    ``WarmPlan.measured_sizes`` can only report what its ENTRIES measured, so a caller
+    holding no requirements yet -- the live host sizing its unknown-size reservation at
+    startup -- got an empty list from a plan over an empty list, whatever the root
+    actually held. It then had no basis for a reservation and said the root was empty.
+
+    The directories scanned are the ones a warm WRITES: ``fmp_history``, ``fred``, and
+    each OHLCV provider's parquet directory. Not a recursive walk of the root, which
+    would fold in caches no warm produces (option chains, screener stores) and skew the
+    quantile the reservation is taken from.
+    """
+    from ba2_providers import OHLCV_PROVIDERS
+
+    index = _SizeIndex([str(r) for r in roots])
+    names = ["fmp_history", "fred"] + [cls.__name__ for cls in OHLCV_PROVIDERS.values()]
+    sizes: List[int] = []
+    for name in dict.fromkeys(names):
+        sizes += [size for size in index.scan_dir(name) if size > 0]
+    return sizes
+
+
 def _inspect(req: Requirement, roots: Sequence[str], as_of_now: datetime,
              fred_max_age_hours: float, measured: "_SizeIndex") -> PlanEntry:
     if req.kind == KIND_HISTORY:
@@ -680,7 +703,8 @@ class _SizeIndex:
         self._dirs: Dict[str, List[int]] = {}
         self._namespaces: Optional[Dict[str, List[int]]] = None
 
-    def _scan_dir(self, name: str) -> List[int]:
+    def scan_dir(self, name: str) -> List[int]:
+        """Every file size in one cache sub-directory across the roots (memoized)."""
         if name in self._dirs:
             return self._dirs[name]
         sizes: List[int] = []
@@ -696,7 +720,7 @@ class _SizeIndex:
         return sizes
 
     def median_for_dir(self, name: str) -> Optional[int]:
-        sizes = [s for s in self._scan_dir(name) if s > 0]
+        sizes = [s for s in self.scan_dir(name) if s > 0]
         return int(statistics.median(sizes)) if sizes else None
 
     def _history_buckets(self) -> Dict[str, List[int]]:
@@ -738,6 +762,7 @@ __all__ = [
     "ACTION_REFRESH",
     "ACTION_REPORT",
     "FRED_MAX_AGE_HOURS",
+    "measured_root_sizes",
     "PLAN_VERSION",
     "PlanEntry",
     "STATUS_CHECKED_EMPTY",

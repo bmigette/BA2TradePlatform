@@ -255,10 +255,22 @@ def unknown_reserve_for(plan) -> int:
     root has no basis for any reservation, and the honest answer is to say so rather
     than to pick a number that makes the budget look enforced.
     """
-    sizes = plan.measured_sizes()
+    return unknown_reserve_from_sizes(plan.measured_sizes())
+
+
+def unknown_reserve_from_sizes(sizes: Sequence[int]) -> int:
+    """The same reservation, from sizes measured any other way.
+
+    A caller that has no requirements yet -- the live host sizing this at startup --
+    cannot get them from a plan (a plan over no requirements measures nothing, whatever
+    the root holds) and measures the root directly instead
+    (``ba2_providers.warm.planner.measured_root_sizes``). The QUANTILE must still be the
+    one ``unknown_reserve_for`` takes, so both go through here rather than through two
+    copies of the same number.
+    """
     if not sizes:
         raise WarmBudgetError(
-            "this plan measured no artifact on any root, so there is no basis for an "
+            "nothing measured an artifact on any root, so there is no basis for an "
             "unknown-size reservation; seed the root (ba2-test prewarm) or state the "
             "reserve explicitly before warming")
     return quantile(sizes, _UNKNOWN_RESERVE_QUANTILE)
@@ -286,4 +298,5 @@ __all__ = [
     "WarmBudgetError",
     "quantile",
     "unknown_reserve_for",
+    "unknown_reserve_from_sizes",
 ]

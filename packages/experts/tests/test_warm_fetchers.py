@@ -42,7 +42,8 @@ def _indicator_req(symbol="AAPL", window=None):
 
 def _fetcher(indicator_provider="yfinance", **kwargs):
     return warm_fetchers.DefaultWarmFetcher(
-        indicator_ohlcv_provider=indicator_provider, end_date=NOW,
+        indicator_ohlcv_provider=indicator_provider,
+        end_date_provider=kwargs.pop("end_date_provider", lambda: NOW),
         fmp_key=kwargs.pop("fmp_key", "a-key"), fred_key=kwargs.pop("fred_key", None),
         **kwargs)
 
@@ -150,6 +151,31 @@ def test_the_insider_lookback_comes_from_the_requirements_own_window():
                                                          end=NOW)))
 
     assert seen == {"namespace": "insider_v2", "lookback": 120}
+
+
+def test_the_reference_date_is_read_at_each_fetch_not_at_construction():
+    """A live warm fetcher outlives the day it was built.
+
+    The host builds ONE of these at startup and the queue keeps it for the life of the
+    process -- weeks. A ``datetime.now()`` frozen into it at construction was then the
+    ``end_date`` of every statement, earnings, estimates and insider warm from then on,
+    so from day two the warm asked for a window that ended in the past and the tail it
+    was supposed to extend never arrived.
+    """
+    clock = [NOW]
+    seen = []
+
+    class _Table(warm_fetchers.NamespaceFetchers):
+        def fetch(self, request):
+            seen.append(request.end_date)
+
+    fetcher = _fetcher(namespace_fetchers=_Table(), end_date_provider=lambda: clock[0])
+    fetcher(_history_req("price_target"))
+    clock[0] = NOW + timedelta(days=1)
+    fetcher(_history_req("price_target"))
+
+    assert seen == [NOW, NOW + timedelta(days=1)], (
+        f"the reference date was frozen at construction: {seen}")
 
 
 # --------------------------------------------------------------------------- #

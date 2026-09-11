@@ -217,6 +217,14 @@ class DefaultWarmFetcher:
     provider of the INDICATOR stack (which OHLCV source backs the host's indicator
     provider is host wiring and cannot be inferred here).
 
+    THE REFERENCE DATE IS A CALLABLE, read at each fetch. The live host builds ONE of
+    these at startup and the warm queue holds it for the life of the process -- weeks.
+    A ``datetime`` frozen in at construction became the ``end_date`` of every
+    statement, earnings, estimates and insider warm from then on, so from day two the
+    warm asked for a window ending in the past and the tail it exists to extend never
+    arrived. It has NO default (see the paragraph above): "now, UTC" is a decision the
+    caller states, and an unstated one is exactly what hid this.
+
     A ``timeseries`` requirement is fetched through the provider IT NAMES, not through
     the indicator stack's. Getting that wrong is not a cosmetic mismatch: the planner
     resolves a ``fmp`` price requirement against ``FMPOHLCVProvider``'s directory, so a
@@ -224,11 +232,12 @@ class DefaultWarmFetcher:
     on every re-plan and re-download it forever.
     """
 
-    def __init__(self, *, indicator_ohlcv_provider: str, end_date: datetime,
+    def __init__(self, *, indicator_ohlcv_provider: str,
+                 end_date_provider: Callable[[], datetime],
                  fmp_key: Optional[str], fred_key: Optional[str],
                  namespace_fetchers: Optional[NamespaceFetchers] = None) -> None:
         self.indicator_ohlcv_provider = indicator_ohlcv_provider
-        self.end_date = end_date
+        self.end_date_provider = end_date_provider
         self.fmp_key = fmp_key
         self.fred_key = fred_key
         self._namespaces = namespace_fetchers or NamespaceFetchers()
@@ -251,7 +260,8 @@ class DefaultWarmFetcher:
             lookback_days = max(1, (window.end - window.start).days)
         self._namespaces.fetch(NamespaceRequest(
             namespace=requirement.namespace, symbol=requirement.symbol,
-            end_date=self.end_date, fmp_key=self.fmp_key, lookback_days=lookback_days))
+            end_date=self.end_date_provider(), fmp_key=self.fmp_key,
+            lookback_days=lookback_days))
 
     def _fetch_series(self, requirement: Requirement) -> None:
         from ba2_providers.macro import fred_series

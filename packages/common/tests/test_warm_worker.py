@@ -14,18 +14,34 @@ The queue runs INSIDE the live trading process, which is what most of this is ab
   for the same payload must fetch it once.
 """
 import threading
+from datetime import datetime, timezone
 
 import pytest
 
 from ba2_common.core.warm import worker as warm_worker
 from ba2_common.core.warm.budget import WarmBudget
 
+DAY_ONE = datetime(2026, 9, 10, 20, 0, tzinfo=timezone.utc)
+DAY_TWO = datetime(2026, 9, 11, 20, 0, tzinfo=timezone.utc)
+
+
+class _Window:
+    def __init__(self, end):
+        self.start = None
+        self.end = end
+
 
 class _Requirement:
-    """The only thing the queue needs of a requirement: a key."""
+    """What the queue needs of a requirement: a key, and the window it covers.
 
-    def __init__(self, key):
+    The window is not part of the KEY (two callers asking for the same per-symbol
+    payload over different spans are one fetch), which is exactly why the queue has
+    to read it separately to tell a repeat from an extension.
+    """
+
+    def __init__(self, key, window=None):
         self.key = key
+        self.window = window
 
 
 class _Entry:
@@ -195,7 +211,13 @@ def test_an_entry_that_is_not_fetch_or_refresh_is_never_enqueued(queue_factory):
     assert q.submit_plan(_Plan([_Entry(_Requirement("a"), action="report")])) == []
 
 
-def test_resubmitting_a_plan_the_queue_already_completed_enqueues_nothing(queue_factory):
+def test_resubmitting_an_unchanged_plan_enqueues_nothing(queue_factory):
+    """The SAME request twice is one fetch -- the dedupe this queue exists for.
+
+    Scoped to "unchanged": a completed key is not permanently unfetchable (see the
+    settlement tests below), it is only not re-fetched for a request that asks for
+    nothing the first one did not already get.
+    """
     rec = _Recorder()
     q = queue_factory(rec)
     plan = _Plan([_Entry(_Requirement("a"))])
@@ -203,6 +225,71 @@ def test_resubmitting_a_plan_the_queue_already_completed_enqueues_nothing(queue_
     assert q.submit_plan(plan) == ["a"]
     assert q.join(timeout=5.0)
     assert q.submit_plan(plan) == []
+
+    assert rec.calls == ["a"]
+
+
+def test_the_daily_settlement_refresh_of_a_completed_key_still_runs(queue_factory):
+    """THE POST-CLOSE PRICE TAIL, which worked on day one only.
+
+    The requirement key deliberately EXCLUDES the window, and a completed key stayed
+    in the dedupe set for the life of the process. So the settlement plan's
+    ``refresh`` for a series this morning's batch had already fetched was dropped as
+    "already queued": the tail extension ran the first day the process was up and
+    never again, while the queue reported a clean skip.
+
+    A ``refresh`` is the PLANNER's statement that what is on disk does not satisfy the
+    requirement (stale file, short tail, holes). It is never raised for an artifact
+    the plan found sufficient, so honouring it cannot re-fetch an unchanged payload.
+    """
+    rec = _Recorder()
+    q = queue_factory(rec)
+
+    assert q.submit_plan(_Plan([_Entry(_Requirement("a", _Window(DAY_ONE)))])) == ["a"]
+    assert q.join(timeout=5.0)
+
+    settlement = _Plan([_Entry(_Requirement("a", _Window(DAY_TWO)),
+                               action=warm_worker.ACTION_REFRESH)])
+    assert q.submit_plan(settlement) == ["a"], "the post-close tail extension was dropped"
+    assert q.join(timeout=5.0)
+
+    assert rec.calls == ["a", "a"]
+
+
+def test_a_completed_key_asked_for_a_later_window_runs_again(queue_factory):
+    """An extension is not a repeat, whatever the plan called the action."""
+    rec = _Recorder()
+    q = queue_factory(rec)
+
+    q.submit(_Requirement("a", _Window(DAY_ONE)))
+    assert q.join(timeout=5.0)
+    assert q.submit(_Requirement("a", _Window(DAY_TWO))) is True
+    assert q.join(timeout=5.0)
+
+    assert rec.calls == ["a", "a"]
+
+
+def test_a_completed_key_asked_for_the_same_window_does_not(queue_factory):
+    rec = _Recorder()
+    q = queue_factory(rec)
+
+    q.submit(_Requirement("a", _Window(DAY_ONE)))
+    assert q.join(timeout=5.0)
+
+    assert q.submit(_Requirement("a", _Window(DAY_ONE))) is False
+    assert rec.calls == ["a"]
+
+
+def test_a_key_still_in_flight_is_never_enqueued_twice(queue_factory):
+    """The dedupe that matters most: two workers fetching one payload is a race, not
+    a shared fetch. A refresh must not get past THAT."""
+    rec = _Recorder(delay=0.3)
+    q = queue_factory(rec, workers=2)
+
+    assert q.submit(_Requirement("a", _Window(DAY_ONE))) is True
+    assert q.submit(_Requirement("a", _Window(DAY_TWO)),
+                    action=warm_worker.ACTION_REFRESH) is False
+    assert q.join(timeout=5.0)
 
     assert rec.calls == ["a"]
 

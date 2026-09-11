@@ -34,6 +34,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from ba2_common.core.db import InstanceNotFound
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.replay import get_replay_store
 from ba2_common.core.replay.dependencies import (
@@ -211,7 +212,12 @@ def initialize_warm_service(job_manager=None):
                 budget=budget,
                 fetcher=DefaultWarmFetcher(
                     indicator_ohlcv_provider=_indicator_ohlcv_provider(),
-                    end_date=datetime.now(timezone.utc),
+                    # READ AT EACH FETCH, not frozen here. This fetcher is built once
+                    # and held by the queue for the life of the process (weeks), so a
+                    # single datetime taken here became the end_date of every statement
+                    # and earnings warm from day two onward -- a window ending in the
+                    # past, which is the opposite of the tail extension it is for.
+                    end_date_provider=lambda: datetime.now(timezone.utc),
                     fmp_key=_api_key("FMP_API_KEY", "FMP_API_KEY"),
                     fred_key=_api_key("FRED_API_KEY", "fred_api_key"),
                 ),
@@ -246,18 +252,22 @@ def shutdown_warm_service(timeout: float = 5.0) -> None:
 def _unknown_reserve_bytes() -> int:
     """What to reserve for a response whose size nothing measured.
 
-    Derived from what an empty plan over the real roots measures, so the number
-    comes off this installation's own files. When the root holds nothing at all the
-    reserve is the whole allowance: the FIRST item then consumes it and the warm
-    pauses with a gap report -- honest, and impossible to mistake for a working
-    budget -- rather than being sized by a guess.
+    Measured off the ARTIFACTS ON THE ROOT, so the number comes from this
+    installation's own files. It used to be taken from ``plan([], roots, ...)``, and a
+    plan's measurements come from its ENTRIES -- a plan over no requirements has none,
+    so the measurement was empty whatever the root held: the startup log announced an
+    empty root and the reserve silently became the whole allowance, which the second
+    unmeasurable item then pauses the warm on.
+
+    When the root really does hold nothing the reserve IS the whole allowance: the
+    first item consumes it and the warm pauses with a gap report -- honest, and
+    impossible to mistake for a working budget -- rather than being sized by a guess.
     """
-    from ba2_common.core.warm.budget import WarmBudgetError, unknown_reserve_for
+    from ba2_common.core.warm.budget import WarmBudgetError, unknown_reserve_from_sizes
     from ba2_providers.warm import planner
 
-    empty = planner.plan([], cache_roots(), as_of_now=datetime.now(timezone.utc))
     try:
-        return unknown_reserve_for(empty)
+        return unknown_reserve_from_sizes(planner.measured_root_sizes(cache_roots()))
     except WarmBudgetError:
         logger.warning(
             "warm service: no artifact on the cache root to size an unknown-size "
@@ -418,25 +428,38 @@ def _rules_for_instance(expert_instance_id: Optional[int]):
     come from the database. An instance that has since been deleted yields ``None``
     -- the expert's own declarations still resolve; the rule extras cannot, and that
     is visible as their absence rather than as a wrong answer.
+
+    THROUGH ``ruleset_event_actions``, never ``ruleset.event_actions``. Every accessor
+    here hands back a DETACHED row (``expunge_after_flush``), so touching that lazy
+    relationship outside its session raises ``DetachedInstanceError`` -- which the
+    broad handler below turned into a warning and ``None``. Every rule-derived
+    requirement silently stopped being warmed while the log said the resolver ran.
+    The loader runs the join inside a session and materialises the rows, in
+    ``order_index`` order.
     """
     if expert_instance_id is None:
         return None
     try:
-        from .db import get_instance
-        from .models import ExpertInstance, Ruleset
+        from ba2_common.core.db import ruleset_event_actions
 
+        from .db import get_instance
+        from .models import ExpertInstance
+
+        # get_instance RAISES InstanceNotFound; it never returns None, so an
+        # ``is None`` guard here would be dead code standing in for the real path.
         instance = get_instance(ExpertInstance, expert_instance_id)
-        if instance is None:
-            return None
         actions = []
         for ruleset_id in (instance.enter_market_ruleset_id,
                            instance.open_positions_ruleset_id):
             if ruleset_id is None:
                 continue
-            ruleset = get_instance(Ruleset, ruleset_id)
-            if ruleset is not None:
-                actions.extend(ruleset.event_actions)
+            actions.extend(ruleset_event_actions(ruleset_id))
         return actions
+    except InstanceNotFound:
+        logger.info(
+            f"warm: expert instance {expert_instance_id} no longer exists; its rules "
+            f"cannot be resolved (the expert's own declarations still stand)")
+        return None
     except Exception as e:  # noqa: BLE001 - the expert's own declarations still stand
         logger.warning(f"warm: rules for expert instance {expert_instance_id} unavailable: {e}")
         return None

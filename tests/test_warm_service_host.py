@@ -300,6 +300,118 @@ def test_the_batch_hook_is_a_no_op_when_the_batch_is_already_queued(cache_root, 
 
 
 # --------------------------------------------------------------------------- #
+# The rules half of a batch's requirements
+# --------------------------------------------------------------------------- #
+def _instance_with_an_earnings_rule():
+    """An ExpertInstance whose enter-market ruleset holds one days_to_earnings rule.
+
+    ``days_to_earnings`` is the rule condition that adds data requirements: it reads
+    the quarterly earnings calendar (with the annual estimates as the documented
+    fallback) for every symbol in the universe. Nothing else about a ruleset warms
+    anything -- the ATR requirement comes from the expert's own ``use_atr_stop``
+    setting, not from a rule.
+    """
+    from ba2_trade_platform.core.db import add_instance as _add
+    from ba2_trade_platform.core.models import (
+        AccountDefinition, EventAction, ExpertInstance, Ruleset, RulesetEventActionLink,
+    )
+    from ba2_trade_platform.core.types import AnalysisUseCase, ExpertEventRuleType
+
+    account_id = _add(AccountDefinition(name="warm-rules", provider="AlpacaAccount"))
+    ruleset_id = _add(Ruleset(name="enter", type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+                              subtype=AnalysisUseCase.ENTER_MARKET))
+    action_id = _add(EventAction(
+        type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+        subtype=AnalysisUseCase.ENTER_MARKET,
+        name="skip around earnings",
+        triggers={"t1": {"event_type": "days_to_earnings", "operator": "<", "value": 5}},
+        actions={"a1": {"action_type": "reject_recommendation"}}))
+    # The link row has a COMPOSITE primary key and no ``id``, so it goes in through a
+    # session rather than through ``add_instance`` (which returns the new id).
+    from ba2_common.core.db import get_db
+
+    with get_db() as session:
+        session.add(RulesetEventActionLink(ruleset_id=ruleset_id, eventaction_id=action_id,
+                                           order_index=0))
+        session.commit()
+    return _add(ExpertInstance(account_id=account_id, expert="FMPRating", enabled=True,
+                               enter_market_ruleset_id=ruleset_id))
+
+
+def test_the_rules_of_an_instance_are_read_outside_the_session_that_loaded_it(cache_root):
+    """``get_instance`` hands back a DETACHED row, so ``ruleset.event_actions`` -- a lazy
+    relationship -- raises DetachedInstanceError. The broad handler turned that into a
+    warning and ``None``: every rule-derived requirement silently stopped being warmed
+    while the log said the resolver had run."""
+    instance_id = _instance_with_an_earnings_rule()
+
+    actions = warm_service._rules_for_instance(instance_id)
+
+    assert actions, "the instance's rules came back empty (the detached-relationship trap)"
+    assert [a.triggers["t1"]["event_type"] for a in actions] == ["days_to_earnings"]
+
+
+def test_an_instance_that_no_longer_exists_is_not_an_error(cache_root, host_errors):
+    """An expert deleted between the analysis and this hook: its own declarations still
+    resolve, the rule extras cannot, and that is an absence rather than a wrong answer."""
+    assert warm_service._rules_for_instance(999_999) is None
+    assert host_errors == []
+
+
+def test_a_rule_condition_adds_its_requirement_to_the_batch(cache_root, monkeypatch):
+    """End to end: the earnings calendar the rule reads is enqueued for the symbol."""
+    instance_id = _instance_with_an_earnings_rule()
+    _open_capture_store(cache_root / "replay", FMPRATING_SETTINGS, instance_id=instance_id)
+    queue = _start_queue(monkeypatch, lambda req: None)
+
+    # Resolved on THIS thread, not through the batch hook: the test database is an
+    # in-memory SQLite, which SQLAlchemy serves per-thread, so a warm worker resolving
+    # the instance would open an empty one. The hook's own contract (submit a job and
+    # return) is pinned by its own test.
+    warm_service.plan_and_enqueue_batch("batch-1")
+    assert queue.join(timeout=10.0)
+
+    keys = set(queue.warmed_keys())
+    assert any("past_earnings_quarterly" in k for k in keys), (
+        f"the days_to_earnings rule's calendar was never warmed; enqueued {sorted(keys)}")
+
+
+# --------------------------------------------------------------------------- #
+# The unknown-size reservation
+# --------------------------------------------------------------------------- #
+def test_the_unknown_reserve_is_measured_on_the_real_root(cache_root):
+    """It was derived from a plan over an EMPTY requirement list.
+
+    ``measured_sizes()`` reads the plan's ENTRIES, and a plan over no requirements has
+    none -- so the measurement was empty whatever the root held, ``unknown_reserve_for``
+    always raised, and the startup log claimed there was no artifact to size from while
+    the reserve silently became the whole daily allowance (the second unmeasurable item
+    then pauses the warm).
+    """
+    import ba2_trade_platform.config as config
+
+    history = os.path.join(config.CACHE_FOLDER, "fmp_history")
+    os.makedirs(history, exist_ok=True)
+    for name, size in (("price_target__AAPL.json", 400), ("grades_historical__AAPL.json", 900)):
+        with open(os.path.join(history, name), "w", encoding="utf-8") as fh:
+            fh.write("x" * size)
+    warm_service.ensure_settings()
+
+    reserve = warm_service._unknown_reserve_bytes()
+
+    assert 400 <= reserve <= 900, (
+        f"the reserve must come off the files on the root, got {reserve}")
+    assert reserve < warm_service.warm_daily_allowance_bytes()
+
+
+def test_an_empty_root_still_reserves_the_whole_allowance_and_says_so(cache_root):
+    """No basis for any reservation is stated, never guessed."""
+    warm_service.ensure_settings()
+
+    assert warm_service._unknown_reserve_bytes() == warm_service.warm_daily_allowance_bytes()
+
+
+# --------------------------------------------------------------------------- #
 # The post-close job
 # --------------------------------------------------------------------------- #
 def test_the_post_close_job_is_scheduled_at_the_close_plus_the_settlement_offset(cache_root):

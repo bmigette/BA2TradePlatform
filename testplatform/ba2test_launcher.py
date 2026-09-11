@@ -861,7 +861,10 @@ def _cmd_replay_warm(args) -> int:
             # indicator stack's, for an ATR whose underlying series has no provider of
             # its own in the requirement.
             indicator_ohlcv_provider=args.indicator_ohlcv_provider,
-            end_date=datetime.fromisoformat(plan.created_at),
+            # The PLAN's instant, deliberately fixed: this command executes one
+            # reviewed plan, and a window that moved while it ran would ask for
+            # something the plan did not price. (The live host passes "now" instead.)
+            end_date_provider=lambda: datetime.fromisoformat(plan.created_at),
             fmp_key=keys["fmp"], fred_key=resolve_fred_key()))
     queue.start()
     try:

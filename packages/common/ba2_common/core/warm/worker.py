@@ -56,6 +56,21 @@ class _Item:
     key: str
     requirement: Any
     estimated_bytes: Optional[int]
+    #: What the plan asked for. ``refresh`` means the planner judged what is on disk
+    #: insufficient for this requirement, which is what lets it past a completed key.
+    action: str = ACTION_FETCH
+
+    @property
+    def window_end(self):
+        """The newest instant this request covers, or ``None`` when it names no window.
+
+        Read from the requirement rather than from the key: the key deliberately
+        EXCLUDES the window (two callers asking for the same per-symbol payload over
+        different spans are one fetch), so it is the only thing that can tell a repeat
+        from an extension.
+        """
+        window = self.requirement.window
+        return window.end if window is not None else None
 
 
 @dataclass
@@ -89,9 +104,13 @@ class WarmQueue:
         self._running = False
         self._lock = threading.Lock()
         self._done = threading.Condition(self._lock)
-        #: Keys enqueued, in flight or finished -- the dedupe set.
+        #: Keys enqueued or in flight -- the dedupe set. A key LEAVES it when its item
+        #: finishes, however it finished; what a completed key may be re-submitted for
+        #: is decided against ``_completed_window`` (see ``_supersedes_completed``).
         self._seen: set = set()
         self._completed: set = set()
+        #: ``key -> the window end that was fetched``, for the completed keys.
+        self._completed_window: Dict[str, Any] = {}
         self._failed_keys: set = set()
         self._in_flight = 0
         self._fetched = 0
@@ -141,15 +160,19 @@ class WarmQueue:
         return self._running
 
     # -- submission -------------------------------------------------------- #
-    def submit(self, requirement: Any, estimated_bytes: Optional[int] = None) -> bool:
+    def submit(self, requirement: Any, estimated_bytes: Optional[int] = None,
+               action: str = ACTION_FETCH) -> bool:
         """Enqueue one requirement. ``False`` when it is already known (a duplicate).
 
         Deduping at ENQUEUE time, not at fetch time: two experts on the same symbol
         declare the same payload, and two workers each discovering the file half way
         through the other's write is not a shared fetch, it is a race.
+
+        ``action`` is the plan's verdict on what is already on disk; see
+        :meth:`_supersedes_completed` for what it changes.
         """
         return self._enqueue(_Item(key=requirement.key, requirement=requirement,
-                                   estimated_bytes=estimated_bytes))
+                                   estimated_bytes=estimated_bytes, action=action))
 
     def submit_job(self, key: str, run: Callable[[], Any]) -> bool:
         """Enqueue LOCAL work (resolve + plan). No budget is reserved: it downloads nothing.
@@ -164,10 +187,49 @@ class WarmQueue:
             if item.key in self._seen:
                 self._skipped += 1
                 return False
+            if item.key in self._completed and not self._supersedes_completed(item):
+                self._skipped += 1
+                return False
             self._seen.add(item.key)
             self._in_flight += 1
         self._queue.put(item)
         return True
+
+    def _supersedes_completed(self, item) -> bool:
+        """Whether this request asks for something the completed fetch did not get.
+
+        THE POST-CLOSE TAIL EXTENSION DEPENDS ON THIS. A requirement key excludes the
+        window, and a completed key used to stay in the dedupe set for the life of the
+        process -- so the daily settlement ``refresh`` for a series this morning's batch
+        had already fetched was dropped as "already queued". The tail extension ran on
+        day one and never again, and the queue reported a clean skip while it happened.
+
+        Two things get past a completed key, and nothing else:
+
+        * a ``refresh``, which is the PLANNER's statement that what is on disk does not
+          satisfy the requirement (stale file, missing prefix, holes, short tail). It is
+          never raised for an artifact the plan found sufficient, so honouring it cannot
+          re-fetch an unchanged payload;
+        * a strictly LATER window end than the one that was fetched -- an extension is
+          not a repeat, whatever the plan called it.
+
+        A key still enqueued or in flight is not reached here at all (``_seen`` is
+        checked first): two workers on one payload is the race the dedupe exists for,
+        and a refresh must not be allowed past that.
+
+        Caller holds ``self._lock``.
+        """
+        if not isinstance(item, _Item):
+            return True
+        if item.action == ACTION_REFRESH:
+            return True
+        fetched_end = self._completed_window[item.key]
+        requested_end = item.window_end
+        if fetched_end is None or requested_end is None:
+            # One of the two names no window, so "later" has no meaning here. Treat it
+            # as the same request rather than guessing in the direction of a download.
+            return False
+        return requested_end > fetched_end
 
     def submit_plan(self, plan) -> List[str]:
         """Enqueue everything the plan marked as work. Returns the keys enqueued.
@@ -185,7 +247,7 @@ class WarmQueue:
         for entry in plan.pending():
             if entry.action not in (ACTION_FETCH, ACTION_REFRESH):
                 continue
-            if self.submit(entry.requirement, entry.estimated_bytes):
+            if self.submit(entry.requirement, entry.estimated_bytes, action=entry.action):
                 enqueued.append(entry.requirement.key)
         return enqueued
 
@@ -357,7 +419,12 @@ class WarmQueue:
         self._budget.settle(key)
         with self._lock:
             self._fetched += 1
+            # Out of the enqueued/in-flight set and into the completed one: what a
+            # LATER request may do with this key is decided by _supersedes_completed,
+            # not by a set that nothing ever removes from.
+            self._seen.discard(key)
             self._completed.add(key)
+            self._completed_window[key] = item.window_end
             self._failed_keys.discard(key)
 
     def _pending_keys(self) -> Sequence[str]:

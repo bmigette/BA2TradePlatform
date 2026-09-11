@@ -437,3 +437,32 @@ def test_a_root_that_does_not_exist_is_not_created(tmp_path):
 
     assert not absent.exists()
     assert result.entries[0].status == planner.STATUS_MISSING
+
+
+# --------------------------------------------------------------------------- #
+# Sizing a root with no requirements in hand
+# --------------------------------------------------------------------------- #
+def test_root_sizes_are_measurable_without_any_requirements(tmp_path):
+    """``measured_sizes()`` reads a plan's ENTRIES, so a plan over no requirements
+    measures nothing whatever the root holds -- which is how the live host came to
+    report an empty root at every startup. This reads the root itself."""
+    _history_file(tmp_path, "price_target", "AAPL", payload="x" * 400)
+    _history_file(tmp_path, "grades_historical", "AAPL", payload="y" * 900)
+
+    empty_plan = planner.plan([], [str(tmp_path)], as_of_now=NOW)
+
+    assert empty_plan.measured_sizes() == []
+    assert sorted(planner.measured_root_sizes([str(tmp_path)])) == [400, 900]
+
+
+def test_an_empty_root_measures_nothing_rather_than_inventing_a_size(tmp_path):
+    assert planner.measured_root_sizes([str(tmp_path)]) == []
+
+
+def test_measuring_a_root_writes_nothing_into_it(tmp_path):
+    _history_file(tmp_path, "price_target", "AAPL")
+    before = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*"))
+
+    planner.measured_root_sizes([str(tmp_path)])
+
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == before
