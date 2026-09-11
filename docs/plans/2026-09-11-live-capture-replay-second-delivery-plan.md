@@ -138,4 +138,14 @@ hook, full budget accounting, prefix/hole coverage, DST-safe settlement (Task B 
 **Commit:** `feat(replay): pilot rollout — settings card, capture health badge and activity events, retention GC, export, paper acceptance script (spec step 7)`.
 
 ### Final gate (controller)
+
+**Byte-identical backtest check (operator requirement, 2026-09-11):** in addition to the pinned
+golden fingerprints, run the SAME real-data backtest payload twice, hermetic on the shared
+cache (`hermetic_fmp_history`, network denied): once from the pre-change checkout (dev
+3e34440a, the code prod runs) and once from the branch head; write both result sets
+(trades, equity curve, metrics, per-bar decisions) to JSON with ids/timestamps stripped and
+diff them byte for byte. Any difference blocks the merge until explained and fixed. Use
+one config per recorded expert class (FMPRating, FMPEarningsDrift, FMPInsiderClusterBuy,
+DeterministicScorer) over a short 2024 window on symbols the shared cache already covers.
+
 Goldens byte-identical; full backend (`tests/backtest`, `tests/replay`, warm tests), `packages/common|experts|providers`, root suite vs the 25-failure dev baseline; a real dev-instance paper session captured for one analysis batch and replayed end to end (`inventory`, `experts`, `gather`, `decisions`, `historical` against a pinned root) with the acceptance script.
