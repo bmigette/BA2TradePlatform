@@ -714,6 +714,34 @@ def validate_endpoint_key(endpoint: str) -> str:
     return name
 
 
+#: Fingerprints of the malformed endpoint values already warned about, so a mis-named
+#: endpoint used on every fetch warns ONCE per process, not once per request.
+_MALFORMED_WARNED: set = set()
+
+
+def _warn_malformed_endpoint_once(endpoint: object) -> None:
+    """One WARNING per distinct offending value, describing its SHAPE, never its text.
+
+    The value is refused precisely because it may be a URL carrying the API key, so
+    the log line must not quote it -- not even a prefix (the key sits at a different
+    offset on every base URL). Length and the two tell-tale markers are enough to find
+    the call site; the fingerprint lets two log lines be matched without the text.
+    """
+    import hashlib
+
+    text = endpoint if isinstance(endpoint, str) else repr(endpoint)
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+    with _PURPOSE_LOCK:
+        if digest in _MALFORMED_WARNED:
+            return
+        _MALFORMED_WARNED.add(digest)
+    logger.warning(
+        f"FMP request counter: an endpoint value is not an endpoint NAME (length {len(text)}, "
+        f"query={'?' in text}, scheme={'://' in text}, fingerprint {digest}); pass the short "
+        f"path segment, e.g. 'price-target', never a URL. The attempt is counted under "
+        f"{MALFORMED_ENDPOINT_KEY!r}; further requests with this value are not logged.")
+
+
 def _counter_key(endpoint: str) -> str:
     """``endpoint`` as a counter key, falling back to ``malformed``. Never raises."""
     try:
@@ -746,10 +774,7 @@ def record_fmp_request(endpoint: str, nbytes: Optional[int] = None) -> None:
     """
     name = _counter_key(endpoint)
     if name == MALFORMED_ENDPOINT_KEY:
-        logger.warning(
-            f"FMP request counter: {endpoint!r:.60} is not an endpoint NAME (pass the short "
-            f"path segment, e.g. 'price-target', never a URL); the attempt is counted under "
-            f"{MALFORMED_ENDPOINT_KEY!r}")
+        _warn_malformed_endpoint_once(endpoint)
     day = _utc_day()
     key = (current_fmp_purpose(), name)
     with _PURPOSE_LOCK:

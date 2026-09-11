@@ -232,6 +232,35 @@ def test_a_malformed_endpoint_is_counted_not_raised(bad):
         "credential leak the validator exists to prevent")
 
 
+def test_the_malformed_warning_never_quotes_the_value_and_fires_once(caplog, monkeypatch):
+    """The value is refused BECAUSE it may carry the api key, so the warning must not
+    print it -- not even a prefix -- and a mis-named endpoint used on every fetch must
+    not warn on every fetch."""
+    import logging as _logging
+
+    monkeypatch.setattr(fmp_common, "_MALFORMED_WARNED", set())
+    records = []
+
+    class _Sink(_logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    sink = _Sink(level=_logging.WARNING)
+    fmp_common.logger.addHandler(sink)
+    try:
+        for _ in range(3):
+            fmp_common.record_fmp_request("https://fmp.example/x?apikey=SECRET", nbytes=1)
+    finally:
+        fmp_common.logger.removeHandler(sink)
+
+    warnings = [m for m in records if "not an endpoint NAME" in m]
+    assert len(warnings) == 1, warnings
+    assert "SECRET" not in warnings[0] and "fmp.example" not in warnings[0]
+    assert "query=True" in warnings[0] and "scheme=True" in warnings[0]
+    assert fmp_common.get_purpose_stats()["live"]["endpoints"][
+        fmp_common.MALFORMED_ENDPOINT_KEY]["requests"] == 3
+
+
 def test_a_malformed_endpoint_does_not_fail_the_fetch_it_meters():
     """The whole point: the response still comes back."""
     resp = _get(b"y" * 20,
