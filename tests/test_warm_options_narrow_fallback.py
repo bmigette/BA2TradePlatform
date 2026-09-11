@@ -324,3 +324,59 @@ def test_a_symbol_with_nothing_left_to_fetch_is_not_called_a_failure(monkeypatch
 
     assert stats.units_failed == 0, logs
     assert len(store.written) == len(expiries), store.written
+
+
+def test_a_trickle_in_one_window_does_not_certify_the_silent_ones(monkeypatch):
+    """MEASURED LIVE 2026-09-11, and the reason the symbol-level guard was not enough.
+
+    CNC's walk delivered bars in ONE window and nothing in the other six. The symbol-level
+    check ("did we see any bar at all?") passed, the walk reported "recovered via narrow
+    windows", and the tail flush wrote 333 partitions as EMPTY -- the identical false record,
+    reached by a narrower path. Centene has listed options in every one of those expiries.
+    """
+    expiries = [date(2020, 6, 19), date(2021, 6, 18), date(2026, 6, 19)]
+
+    class _OnlyLastWindowSpeaks(_Provider):
+        def fetch_underlying_eod_bars(self, symbol, *, start, end):
+            self.calls.append((start, end))
+            if (end - start).days >= 365 * 3:
+                raise RuntimeError("StatusCode.INTERNAL")     # the wide call
+            if end.year < 2026:
+                return                                        # silent, and no error
+            for b in self._bars:
+                if start <= b.bar_date <= end:
+                    yield b
+
+    prov = _OnlyLastWindowSpeaks(365 * 3, [_Bar("X2", date(2026, 3, 2))])
+    stats, store, logs = _run(monkeypatch, prov, expiries=expiries, narrow_years=1.0)
+
+    assert store.written == {},         f"a silent window must not certify its expiries as empty, got {store.written}"
+    assert not any("recovered via narrow" in l for l in logs), logs
+    assert any("EMPTY stream" in l for l in logs), logs
+    # It stops at the FIRST silent window that owed expiries, so the later ones are not asked.
+    assert not [c for c in prov.calls if c[0].year >= 2022],         f"the walk must stop at the first silent window, got {prov.calls}"
+
+
+def test_a_window_with_no_expiry_due_may_be_legitimately_empty(monkeypatch):
+    """The other half of the rule, or a symbol first listed in 2023 could never be fetched.
+
+    Nothing expires in 2020-2022 here, so those windows returning nothing is the market, not
+    the vendor -- and the walk must carry on to the windows that do own expiries.
+    """
+    expiries = [date(2025, 6, 20)]
+
+    class _QuietEarlyYears(_Provider):
+        def fetch_underlying_eod_bars(self, symbol, *, start, end):
+            self.calls.append((start, end))
+            if (end - start).days >= 365 * 3:
+                raise RuntimeError("StatusCode.INTERNAL")
+            for b in self._bars:
+                if start <= b.bar_date <= end:
+                    yield b
+
+    prov = _QuietEarlyYears(365 * 3, [_Bar("X0", date(2025, 5, 21))])
+    stats, store, logs = _run(monkeypatch, prov, expiries=expiries, narrow_years=1.0)
+
+    assert stats.units_failed == 0, logs
+    assert len(store.written) == 1, store.written
+    assert any("recovered via narrow windows" in l for l in logs), logs

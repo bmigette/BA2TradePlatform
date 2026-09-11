@@ -975,10 +975,12 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                     if not pending:
                         break                      # everything owed has been written
                     for attempt in range(1, max(1, ns.max_retries) + 1):
+                        window_bars = 0
                         try:
                             for bar in provider.fetch_underlying_eod_bars(
                                     unit.underlying, start=w_start, end=w_end):
                                 narrow_bars_seen += 1
+                                window_bars += 1
                                 expiry = parse_occ_expiry(bar.occ_symbol)
                                 if expiry is None or expiry not in pending:
                                     continue
@@ -1000,7 +1002,28 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                             if attempt < max(1, ns.max_retries):
                                 sleep(ns.backoff)
                         else:
-                            break
+                            # A window that delivered NOTHING while contracts expired inside
+                            # it is the vendor being silent, not a quiet market: something
+                            # that expires on a date certainly traded near that date.
+                            #
+                            # MEASURED 2026-09-11, and the reason the symbol-level guard is
+                            # not enough: CNC's walk delivered a trickle in ONE window and
+                            # nothing in the other six, so `narrow_bars_seen` was positive,
+                            # the walk "recovered", and the tail flush wrote 333 partitions
+                            # as EMPTY -- the same false record as before, reached by a
+                            # narrower path. Per-window evidence is what closes it.
+                            #
+                            # A window with no pending expiry inside it may legitimately be
+                            # empty (a symbol first listed in 2023 has no 2020 options), so
+                            # the check is conditioned on expiries actually falling due here.
+                            due_here = [e for e in pending if w_start <= e <= w_end]
+                            if window_bars or not due_here:
+                                break
+                            log(f"  [{unit.underlying} {w_start}..{w_end}] narrow attempt "
+                                f"{attempt} returned an EMPTY stream with {len(due_here)} "
+                                f"expiry(ies) falling due inside it — treated as a failure")
+                            if attempt < max(1, ns.max_retries):
+                                sleep(ns.backoff)
                     else:
                         # EVERY attempt on this window failed. STOP THE WALK HERE — do not
                         # try the later windows.
