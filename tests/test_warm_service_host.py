@@ -61,6 +61,10 @@ def host_errors():
     # file would silently empty this list; both are lifted for the test and restored.
     from ba2_trade_platform.core import warm_service
     host_logger = warm_service.logger
+    assert isinstance(host_logger, logging.Logger), (
+        f"warm_service.logger is {type(host_logger).__name__}, not a Logger: a test "
+        f"earlier in the session left a mock in sys.modules['ba2_trade_platform.logger'] "
+        f"(tests/test_penny_*.py once did) and this module bound it at first import")
 
     handler = _CapturedErrors()
     saved_disable = logging.root.manager.disable
