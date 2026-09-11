@@ -63,24 +63,75 @@ def _rm_num(value, fmt: str) -> str:
         return str(value)
 
 
-def classic_run_detail_rows(decisions) -> list:
-    """One table row per decision, ordered the way the manager FUNDED them.
+def classic_run_detail_columns() -> list:
+    """The decision table's columns. Module-level so the screen's shape is checkable.
 
-    Rank order, not refusals-first. The classic manager funds down a ranked list until the
-    money runs out, so reading the run in rank order is reading the allocation happening:
-    the balance falls row by row and the refusals appear exactly where it ran out. A symbol
-    the permission filter dropped was never ranked at all and has no place in that sequence,
-    so those rows go last rather than being given a rank they never had.
+    ``rank`` is deliberately NOT sortable. The column holds formatted strings (and a dash for
+    the rows that were never ranked), so a click would order "10" before "2" -- and sorting
+    it at all destroys the funding sequence the rows exist to show.
     """
-    ordered = sorted(enumerate(decisions or []),
-                     key=lambda pair: (pair[1].get('rank') is None,
-                                       pair[1].get('rank') or 0, pair[0]))
+    return [
+        {'name': 'rank', 'label': '#', 'field': 'rank',
+         'align': 'right', 'style': 'width: 50px'},
+        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True,
+         'align': 'left', 'style': 'width: 90px'},
+        {'name': 'outcome', 'label': 'Outcome', 'field': 'outcome', 'sortable': True,
+         'align': 'left', 'style': 'width: 190px'},
+        {'name': 'score', 'label': 'Score', 'field': 'score', 'sortable': True,
+         'align': 'right', 'style': 'width: 110px'},
+        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity',
+         'align': 'right', 'style': 'width: 60px'},
+        {'name': 'size', 'label': 'Size', 'field': 'size', 'sortable': True,
+         'align': 'right', 'style': 'width: 90px'},
+        {'name': 'cap_available', 'label': 'Cap avail', 'field': 'cap_available',
+         'align': 'right', 'style': 'width: 90px'},
+        {'name': 'balance', 'label': 'Balance', 'field': 'balance',
+         'align': 'right', 'style': 'width: 130px'},
+        {'name': 'binding', 'label': 'Binding', 'field': 'binding', 'sortable': True,
+         'align': 'left', 'style': 'width: 120px'},
+        {'name': 'weight', 'label': 'Weight', 'field': 'weight',
+         'align': 'right', 'style': 'width: 70px'},
+        {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
+    ]
+
+
+def classic_run_detail_rows(decisions) -> list:
+    """One table row per decision, ordered the way the manager worked.
+
+    RANKED runs (the classic manager) read in FUNDING order. It funds down a ranked list
+    until the money runs out, so that sequence is the allocation happening: the balance
+    falls row by row and the refusals appear exactly where it ran out. A symbol the
+    permission filter dropped was never ranked and has no place in the sequence, so it goes
+    last rather than being given a rank it never had.
+
+    UNRANKED runs -- the OPTION manager, which weighs each candidate against standing sleeve
+    rails instead of funding a ranked list, and every classic run recorded before the rank
+    existed -- fall back to REFUSALS FIRST. Sorting those by a rank none of them has leaves
+    them in insertion order, which buries the rail refusals among the admissions; listing
+    them first is the reason that view was built (see OptionRiskManagement's own note).
+    """
+    decisions = list(decisions or [])
+    ranked = any(d.get('rank') is not None for d in decisions)
+    if ranked:
+        def _order(pair):
+            position, d = pair
+            return (d.get('rank') is None, d.get('rank') or 0, position)
+    else:
+        def _order(pair):
+            position, d = pair
+            return (d.get('outcome') == 'FUNDED', position)
+
     rows = []
-    for _position, d in ordered:
+    for position, d in sorted(enumerate(decisions), key=_order):
         before, after = d.get('balance_before'), d.get('balance_after')
+        symbol = d.get('symbol', '')
         rows.append({
+            # UNIQUE per decision, and not the symbol: two recommendations on one ticker
+            # (or two option legs) are two decisions, and on a symbol key Quasar renders
+            # them as one row -- silently hiding whichever it saw first.
+            'key': f"{position}:{symbol}",
             'rank': _rm_num(d.get('rank'), 'd'),
-            'symbol': d.get('symbol', ''),
+            'symbol': symbol,
             'outcome': d.get('outcome', ''),
             # WHAT THE RANKING DECIDED ON. The score is the sort key the funding order was
             # built from, so a refused symbol's score IS its explanation: it ranked below the
@@ -90,6 +141,10 @@ def classic_run_detail_rows(decisions) -> list:
             'score_inputs': _rm_score_inputs(d),
             # '-' not 0: a refused symbol has no quantity at all.
             'quantity': ('-' if d.get('quantity') is None else f"{d['quantity']:g}"),
+            # The ceilings and the risk budget the quantity was solved from. Recorded on
+            # every row; shown on hover rather than as four more columns, because they are
+            # what you ask for AFTER the size surprises you.
+            'qty_detail': _rm_qty_detail(d),
             # THE SIZE IN MONEY, which is what the per-instrument cap in the context above is
             # denominated in -- so a funded row can be checked against the limit it was
             # measured against without doing the multiplication.
@@ -101,6 +156,7 @@ def classic_run_detail_rows(decisions) -> list:
                         else f"{_rm_num(before, ',.0f')} → {_rm_num(after, ',.0f')}"),
             'binding': ('-' if d.get('binding') is None
                         else RM_BINDING_LABELS.get(d['binding'], str(d['binding']))),
+            'binding_detail': _rm_binding_detail(d),
             'weight': ('-' if d.get('weight') is None else f"{d['weight']:g}%"),
             'reason': d.get('reason', ''),
         })
@@ -108,19 +164,50 @@ def classic_run_detail_rows(decisions) -> list:
 
 
 def _rm_score_inputs(d) -> str:
-    """The score's inputs as one short string, or ''. Absent inputs are simply not shown."""
+    """The score's two inputs as one short string, or ''.
+
+    ONLY the score's inputs. The risk budget and the stop distance used to ride here too and
+    do not belong: they size the position, they do not rank it, and reading them under a
+    score invites the conclusion that they fed it. They are on the Qty cell instead.
+    """
     parts = []
     if d.get('profit_pct') is not None:
         parts.append(f"profit {d['profit_pct']:g}%")
     if d.get('confidence') is not None:
         parts.append(f"conf {d['confidence']:g}%")
-    if d.get('risk_dollars') is not None:
-        # risk_atr sizing: the dollar budget the share count was solved from, and the stop
-        # distance it was solved against. Only present when that mode actually ran.
-        parts.append(f"risk ${d['risk_dollars']:,.0f}")
-    if d.get('stop_distance_pct') is not None:
-        parts.append(f"stop {d['stop_distance_pct']:.1f}%")
     return ' · '.join(parts)
+
+
+def _rm_qty_detail(d) -> str:
+    """The operands the share count was solved from, or ''.
+
+    The two ceilings for a notional size; the risk budget and the count it alone bought for
+    a risk_atr one. Absent terms are simply not shown -- an old row has none of them and
+    gets no tooltip at all rather than a tooltip full of dashes.
+    """
+    parts = []
+    if d.get('max_qty_by_instrument') is not None:
+        parts.append(f"cap ceiling {d['max_qty_by_instrument']:,.2f} sh")
+    if d.get('max_qty_by_balance') is not None:
+        parts.append(f"balance ceiling {d['max_qty_by_balance']:,.2f} sh")
+    if d.get('risk_budget_pct') is not None:
+        risk = f"risk budget {d['risk_budget_pct']:g}%"
+        if d.get('risk_dollars') is not None:
+            risk += f" (${d['risk_dollars']:,.0f})"
+        if d.get('qty_by_risk') is not None:
+            risk += f" → {d['qty_by_risk']:g} sh"
+        parts.append(risk)
+    if d.get('stop_distance_pct') is not None:
+        parts.append(f"stop {d['stop_distance_pct']:.1f}% away")
+    return ' · '.join(parts)
+
+
+def _rm_binding_detail(d) -> str:
+    """What the binding limit had already been spent on, or ''."""
+    if d.get('existing_allocation') is None:
+        return ''
+    return (f"this symbol already held ${d['existing_allocation']:,.2f} against its "
+            f"per-instrument cap")
 
 
 def classic_run_context_lines(context) -> list:
@@ -1090,31 +1177,11 @@ class JobMonitoringTab:
             rows = classic_run_detail_rows(decisions)
 
             table = ui.table(
-                columns=[
-                    {'name': 'rank', 'label': '#', 'field': 'rank', 'sortable': True,
-                     'align': 'right', 'style': 'width: 50px'},
-                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True,
-                     'align': 'left', 'style': 'width: 90px'},
-                    {'name': 'outcome', 'label': 'Outcome', 'field': 'outcome', 'sortable': True,
-                     'align': 'left', 'style': 'width: 190px'},
-                    {'name': 'score', 'label': 'Score', 'field': 'score', 'sortable': True,
-                     'align': 'right', 'style': 'width: 110px'},
-                    {'name': 'quantity', 'label': 'Qty', 'field': 'quantity',
-                     'align': 'right', 'style': 'width: 60px'},
-                    {'name': 'size', 'label': 'Size', 'field': 'size', 'sortable': True,
-                     'align': 'right', 'style': 'width: 90px'},
-                    {'name': 'cap_available', 'label': 'Cap avail', 'field': 'cap_available',
-                     'align': 'right', 'style': 'width: 90px'},
-                    {'name': 'balance', 'label': 'Balance', 'field': 'balance',
-                     'align': 'right', 'style': 'width: 130px'},
-                    {'name': 'binding', 'label': 'Binding', 'field': 'binding', 'sortable': True,
-                     'align': 'left', 'style': 'width: 120px'},
-                    {'name': 'weight', 'label': 'Weight', 'field': 'weight',
-                     'align': 'right', 'style': 'width: 70px'},
-                    {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
-                ],
+                columns=classic_run_detail_columns(),
                 rows=rows,
-                row_key='symbol',
+                # The DECISION, not the ticker: two orders on one symbol are two decisions,
+                # and a symbol key renders them as one row.
+                row_key='key',
             ).classes('w-full mt-2').props('dense wrap-cells')
             # The score's two inputs under the score itself. A slot and not a tooltip: the
             # reader is comparing scores DOWN the column to see who outranked whom, and a
@@ -1125,6 +1192,24 @@ class JobMonitoringTab:
                     <div>{{ props.row.score }}</div>
                     <div v-if="props.row.score_inputs" class="text-xs text-gray-500">
                         {{ props.row.score_inputs }}</div>
+                </q-td>
+            ''')
+            # The operands, on hover. The two share ceilings, the risk budget and the stop
+            # distance are RECORDED on every row, and a number that is recorded and never
+            # shown is, to the person reading the screen, not recorded at all. They are the
+            # question you ask AFTER the size surprises you, though, so they hang off the
+            # cells they explain instead of becoming four more columns.
+            table.add_slot('body-cell-quantity', r'''
+                <q-td :props="props" class="text-right">
+                    {{ props.row.quantity }}
+                    <q-tooltip v-if="props.row.qty_detail">{{ props.row.qty_detail }}</q-tooltip>
+                </q-td>
+            ''')
+            table.add_slot('body-cell-binding', r'''
+                <q-td :props="props">
+                    {{ props.row.binding }}
+                    <q-tooltip v-if="props.row.binding_detail">
+                        {{ props.row.binding_detail }}</q-tooltip>
                 </q-td>
             ''')
 

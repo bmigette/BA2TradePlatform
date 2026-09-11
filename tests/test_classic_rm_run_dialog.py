@@ -86,12 +86,14 @@ def test_a_run_recorded_before_the_trace_renders_as_dashes():
         decision("MSFT", OUTCOME_UNFUNDED, "budget exhausted", side="BUY"),
     ])
 
-    assert [r['symbol'] for r in rows] == ['AAPL', 'MSFT']
+    # Refusals first, exactly as this screen read before the rank existed: an old run has no
+    # funding order to follow, and the refusals are what it was opened for.
+    assert [r['symbol'] for r in rows] == ['MSFT', 'AAPL']
     for row in rows:
         assert row['rank'] == '-' and row['binding'] == '-' and row['balance'] == '-'
         assert row['cap_available'] == '-' and row['score'] == '-'
-    assert rows[0]['quantity'] == '12' and rows[0]['size'] == '1,200.00'
-    assert rows[1]['quantity'] == '-', "a refused symbol was never sized"
+    assert rows[1]["quantity"] == "12" and rows[1]["size"] == "1,200.00"
+    assert rows[0]["quantity"] == "-", "a refused symbol was never sized"
 
 
 # -----------------------------------------------------------------------------------------
@@ -196,7 +198,87 @@ def test_the_dialog_renders_the_new_columns_and_the_capital_line(nicegui_client,
     assert [c['name'] for c in table.columns][:4] == ['rank', 'symbol', 'outcome', 'score']
     assert {'cap_available', 'balance', 'binding'} <= {c['name'] for c in table.columns}
     assert [r['symbol'] for r in table.rows] == ['AAA', 'BBB', 'CCC', 'DDD']
+    assert table._props['row-key'] == 'key', (
+        "on a symbol key Quasar collapses two decisions on one ticker into one row")
 
     texts = [e._text for e in nicegui_client.elements.values() if e._text]
     assert any(t.startswith('Capital: equity $10,000.00') for t in texts), texts
     assert any('Sizing notional' in t for t in texts), texts
+
+
+# =========================================================================================
+# REVIEW 2026-09-11: rank ordering must not bury the runs that have no ranks, and a table
+# whose row key is the symbol silently renders one row for two orders on the same ticker.
+# =========================================================================================
+
+def _option_rows():
+    """An OPTION manager's run: sleeve rails, no ranking anywhere.
+
+    ``OptionRiskManagement`` writes into this same table and its rows never carry a rank --
+    it weighs each candidate against standing rails rather than funding down a ranked list.
+    The refusals are the whole reason that view exists.
+    """
+    return [
+        decision("AAPL", OUTCOME_FUNDED, "within every sleeve rail", quantity=1.0),
+        decision("MSFT", "REFUSED_RAIL", "cash_secured_put on MSFT: max_deployment"),
+        decision("TSLA", OUTCOME_FUNDED, "within every sleeve rail", quantity=2.0),
+        decision("NVDA", "REFUSED_RAIL", "cash_secured_put on NVDA: drawdown breaker"),
+    ]
+
+
+def test_a_run_with_no_ranking_at_all_still_shows_its_refusals_first():
+    """Rank order is the right reading for the classic manager and meaningless for the
+    option one -- with no rank on any row, sorting by it buries the rails among the
+    admissions, which is exactly the view that was replaced."""
+    rows = ma.classic_run_detail_rows(_option_rows())
+
+    assert [r['symbol'] for r in rows] == ['MSFT', 'NVDA', 'AAPL', 'TSLA']
+    assert [r['outcome'] for r in rows][:2] == ['REFUSED_RAIL', 'REFUSED_RAIL']
+
+
+def test_a_ranked_run_still_reads_in_funding_order(run_rows):
+    """And the classic manager keeps its sequence: one ranked row is enough to mean the
+    record HAS a funding order worth following."""
+    rows = ma.classic_run_detail_rows(run_rows)
+
+    assert [r['symbol'] for r in rows] == ['AAA', 'BBB', 'CCC', 'DDD']
+
+
+def test_two_orders_on_one_ticker_render_as_two_rows():
+    """Two recommendations on the same symbol (or two option legs) are two decisions. On a
+    symbol row key Quasar treats them as one row and renders whichever it saw last."""
+    rows = ma.classic_run_detail_rows([
+        decision("AAPL", OUTCOME_FUNDED, "funded at 10", quantity=10.0, rank=1,
+                 binding="balance"),
+        decision("AAPL", OUTCOME_UNFUNDED, "sized to zero", rank=2,
+                 binding="early_skip_balance"),
+    ])
+
+    assert len(rows) == 2
+    assert len({r['key'] for r in rows}) == 2, f"row keys collide: {[r['key'] for r in rows]}"
+    assert [r['outcome'] for r in rows] == [OUTCOME_FUNDED, OUTCOME_UNFUNDED]
+
+
+def test_the_recorded_ceilings_and_risk_budget_are_surfaced_not_just_stored():
+    """They are the operands the size was solved from. Recorded and never shown is the same
+    as not recorded, for anyone reading the screen."""
+    rows = ma.classic_run_detail_rows([
+        decision("AAA", OUTCOME_FUNDED, "funded at 10", quantity=10.0, rank=1,
+                 binding="instrument_cap", max_qty_by_instrument=10.0,
+                 max_qty_by_balance=85.0, existing_allocation=400.0),
+        decision("BBB", OUTCOME_FUNDED, "funded at 12", quantity=12.0, rank=2,
+                 binding="risk_atr", risk_budget_pct=1.0, qty_by_risk=12.0,
+                 risk_dollars=1_000.0, stop_distance_pct=8.0),
+    ])
+
+    assert '10' in rows[0]['qty_detail'] and '85' in rows[0]['qty_detail']
+    assert '400.00' in rows[0]['binding_detail']
+    assert '1%' in rows[1]['qty_detail'] and '12' in rows[1]['qty_detail']
+
+
+def test_the_rank_column_cannot_be_sorted_away():
+    """The column holds formatted strings (and a dash), so sorting it orders '10' before
+    '2' -- and sorting it at all destroys the funding sequence the rows exist to show."""
+    columns = {c['name']: c for c in ma.classic_run_detail_columns()}
+
+    assert not columns['rank'].get('sortable')

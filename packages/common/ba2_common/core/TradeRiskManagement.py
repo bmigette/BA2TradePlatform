@@ -44,6 +44,15 @@ BINDING_EARLY_SKIP_CAP = "early_skip_cap"       # one share did not fit under th
 BINDING_EARLY_SKIP_BALANCE = "early_skip_balance"   # one share did not fit in the budget
 BINDING_NO_PRICE = "no_price"                   # unmeasurable: no price, so no limit can be named
 
+#: ``compute_risk_based_quantity``'s own ``capped_by`` -> the binding it means. The sizer
+#: speaks in terms of what it clamped ('notional' = the per-instrument notional ceiling,
+#: 'balance' = cash); the record speaks in terms of the limit the operator configured. One
+#: map, so the two vocabularies are joined in a single place rather than at each call.
+_RISK_CLAMP_BINDINGS = {
+    "notional": BINDING_INSTRUMENT_CAP,
+    "balance": BINDING_BALANCE,
+}
+
 SIZING_BINDINGS = (
     BINDING_INSTRUMENT_CAP, BINDING_BALANCE, BINDING_WEIGHT, BINDING_DIVERSIFICATION,
     BINDING_MIN_ONE_SHARE, BINDING_LOT_SIZE, BINDING_RISK_ATR, BINDING_EARLY_SKIP_CAP,
@@ -305,8 +314,7 @@ class TradeRiskManagement:
                 instrument_weights=self._safe_instrument_config(expert),
                 traces=run_record.get("traces"),
                 context=self._run_context_with_permissions(
-                    run_record, total_virtual_balance, max_equity_per_instrument,
-                    enable_buy=enable_buy, enable_sell=enable_sell),
+                    run_record, enable_buy=enable_buy, enable_sell=enable_sell),
             )
 
             # Log activity for risk manager execution
@@ -540,8 +548,7 @@ class TradeRiskManagement:
             symbol_prices=symbol_prices,
             traces=run_record.get("traces"),
             context=self._run_context_with_permissions(
-                run_record, available_balance, max_per_instrument,
-                enable_buy=enable_buy, enable_sell=enable_sell),
+                run_record, enable_buy=enable_buy, enable_sell=enable_sell),
         )
         return funded
 
@@ -664,19 +671,33 @@ class TradeRiskManagement:
         except Exception as e:  # noqa: BLE001 -- see _open_trace
             self.logger.warning(f"Could not record sizing operands {sorted(fields)}: {e}")
 
+    def _trace_overwrite(self, trace: Optional[Dict[str, Any]], **fields) -> None:
+        """Record operands INCLUDING the ones that are ``None``.
+
+        The one case ``_trace_note`` cannot express: putting a field back to what it was
+        when what it was is "nothing". Used by the weight revert, where the weight has
+        already been written as the binding and has to be taken back off.
+        """
+        if trace is None:
+            return
+        try:
+            trace.update(fields)
+        except Exception as e:  # noqa: BLE001 -- see _open_trace
+            self.logger.warning(f"Could not restore sizing operands {sorted(fields)}: {e}")
+
     @staticmethod
-    def _run_context_with_permissions(run_record, available_balance, max_per_instrument,
-                                      *, enable_buy, enable_sell) -> Dict[str, Any]:
+    def _run_context_with_permissions(run_record, *, enable_buy, enable_sell) -> Dict[str, Any]:
         """The sizing pass's own context, plus the two permissions the CALLER read.
 
         The permissions gate which orders even reach the sizing, so they belong in the run's
-        context; but they are read one level above the sizing core, by each entry point. The
-        two figures the caller already holds are a floor, not an override: they fill in for a
-        pass that filled no context (nothing to size), and never replace what it recorded.
+        context; but they are read one level above the sizing core, by each entry point.
+
+        No fall-back for the capital figures. ``_size_prioritized_orders`` fills the context
+        before it returns, and if it does NOT return, neither entry point reaches the
+        recorder at all -- so a "missing context" floor here could only ever have papered
+        over a sizing pass that never happened.
         """
         context = dict(run_record.get("context") or {})
-        context.setdefault("available_balance", available_balance)
-        context.setdefault("max_per_instrument", max_per_instrument)
         context["enable_buy"] = enable_buy
         context["enable_sell"] = enable_sell
         return context
@@ -709,7 +730,12 @@ class TradeRiskManagement:
             if isinstance(config, dict) and config.get("weight") is not None:
                 fields["weight"] = float(config["weight"])
             return fields
-        except Exception:  # noqa: BLE001 -- an annotation must not reach the sizing loop
+        except Exception as e:  # noqa: BLE001 -- an annotation must not reach the sizing loop
+            # SAID OUT LOUD. This costs the score column, which is the thing the record
+            # exists for; swallowed, the run would look as though the ranking simply had
+            # nothing to report. The module logger, because this is a staticmethod (the two
+            # instance helpers beside it log through self.logger for the same reason).
+            logger.warning(f"Could not read what the ranking saw for {symbol}: {e}")
             return {}
 
     @staticmethod
@@ -779,6 +805,61 @@ class TradeRiskManagement:
                 row["weight"] = float(weight)
         return row
 
+    @staticmethod
+    def _unfunded_reason(price, cap, extras) -> str:
+        """Why this symbol got nothing, in the terms the BINDING names.
+
+        The sentence and the ``binding`` column have to be the same claim. They were not:
+        the sentence was re-derived by comparing the price against the FULL per-instrument
+        cap, while the branch that actually refused had compared it against what was LEFT
+        under that cap -- the cap minus this symbol's existing position, and after the regime
+        scale. A half-invested symbol therefore showed "Binding: early_skip_cap" beside a
+        sentence quoting a ceiling it never met, or (worse) a sentence blaming the budget.
+
+        So each binding quotes ITS OWN operand, off the trace. Only a record with no trace at
+        all -- every run written before the trace existed -- keeps the old comparison, which
+        is the best that can be said when the operands were never captured.
+        """
+        if price is None:
+            # UNMEASURABLE stays unmeasurable: with no price there is no way to say which
+            # limit bound this order, and naming one would be a guess.
+            return ("sized to zero; no price was available, so the binding "
+                    "limit cannot be identified")
+        price = float(price)
+        binding = extras.get("binding")
+        room = extras.get("cap_available")
+        budget = extras.get("balance_before")
+
+        if binding == BINDING_EARLY_SKIP_CAP and room is not None:
+            return (f"one share at {price:,.2f} exceeds the {float(room):,.2f} this symbol "
+                    f"had left under its per-instrument cap")
+        if binding == BINDING_EARLY_SKIP_BALANCE and budget is not None:
+            return (f"one share at {price:,.2f} exceeds the {float(budget):,.2f} of budget "
+                    f"still unspent when this symbol's turn came")
+        if binding == BINDING_INSTRUMENT_CAP and room is not None:
+            return (f"sized to zero; the per-instrument cap left {float(room):,.2f} for this "
+                    f"symbol, not enough for a share at {price:,.2f}")
+        if binding == BINDING_BALANCE and budget is not None:
+            return (f"sized to zero; the {float(budget):,.2f} of budget still unspent did "
+                    f"not cover a share at {price:,.2f}")
+        if binding == BINDING_LOT_SIZE:
+            return ("sized below one whole round lot, so nothing was bought — a partial lot "
+                    "is unusable to the strategy that asked for the lot size")
+        if binding == BINDING_RISK_ATR:
+            return ("risk-based sizing bought no shares: the risk budget on this row does "
+                    "not cover one share at the stop distance recorded beside it")
+        if binding is not None:
+            # A binding this sentence has no wording for. Named rather than guessed at --
+            # the column and the sentence still agree, which is the property that matters.
+            return f"sized to zero; the binding constraint was {binding}"
+
+        # NO TRACE: a legacy row. Same comparison it has always carried.
+        if cap is not None and price > float(cap):
+            return (f"one share at {price:,.2f} exceeds the "
+                    f"{float(cap):,.2f} per-instrument cap")
+        return ("sized to zero; the remaining budget did not cover one "
+                f"share at {price:,.2f}")
+
     def _build_run_decisions(self, *, received, permission_keys, recommended_keys,
                              funded_by_key, unfunded_keys, prices, cap,
                              traces=None, weights=None) -> List[Dict[str, Any]]:
@@ -847,18 +928,8 @@ class TradeRiskManagement:
                     quantity=qty, side=side, price=price, cost=cost, **extras))
             elif key in unfunded_keys:
                 price = prices.get(symbol)
-                # UNMEASURABLE stays unmeasurable: with no price there is no way to say which
-                # limit bound this order, and naming one would be a guess.
-                if price is None:
-                    why = ("sized to zero; no price was available, so the binding "
-                           "limit cannot be identified")
-                elif cap is not None and float(price) > float(cap):
-                    why = (f"one share at {float(price):,.2f} exceeds the "
-                           f"{float(cap):,.2f} per-instrument cap")
-                else:
-                    why = ("sized to zero; the remaining budget did not cover one "
-                           f"share at {float(price):,.2f}")
-                decisions.append(decision(symbol, OUTCOME_UNFUNDED, why,
+                decisions.append(decision(symbol, OUTCOME_UNFUNDED,
+                                          self._unfunded_reason(price, cap, extras),
                                           side=side, price=price, **extras))
             else:
                 # Reached the sizing core and came back neither funded nor deleted --
@@ -1283,7 +1354,6 @@ class TradeRiskManagement:
                 quantity = 0
                 if sizing_mode == 'risk_atr':
                     sized_by_risk = True
-                    self._trace_note(trace, binding=BINDING_RISK_ATR)
                     quantity = self._risk_atr_quantity(
                         order, symbol, current_price, expert,
                         max_position_value=available_for_instrument,
@@ -1380,7 +1450,11 @@ class TradeRiskManagement:
                             original_quantity = quantity
                             # The limit that stood BEFORE the weight touched the size, so the
                             # revert below can put it back. A reverted weight bound nothing.
-                            binding_before_weight = trace.get("binding") if trace else None
+                            # ``is not None``, not truthiness: an empty dict is a LIVE trace
+                            # (the operands simply have not been written into it yet), and
+                            # reading it as "no trace" would drop the restore below.
+                            binding_before_weight = (
+                                trace.get("binding") if trace is not None else None)
                             weighted_quantity = quantity * (instrument_weight / 100.0)
                             self.logger.info(f"  Instrument weight {instrument_weight}%: "
                                            f"{original_quantity} shares * {instrument_weight/100:.2f} = {weighted_quantity:.2f} shares")
@@ -1403,7 +1477,10 @@ class TradeRiskManagement:
                             if weighted_cost > remaining_balance or weighted_cost > available_for_instrument:
                                 # Revert to original quantity if weighted amount exceeds limits
                                 quantity = original_quantity
-                                self._trace_note(trace, binding=binding_before_weight)
+                                # OVERWRITE, not note: _trace_note drops None, and here None
+                                # is the answer -- "nothing had bound it yet" -- which must
+                                # replace the weight rather than be discarded.
+                                self._trace_overwrite(trace, binding=binding_before_weight)
                                 self.logger.info(f"  Weight {instrument_weight}% would exceed limits "
                                               f"(cost ${weighted_cost:.2f} > remaining ${remaining_balance:.2f} or available ${available_for_instrument:.2f}), "
                                               f"keeping original quantity {quantity}")
@@ -1648,7 +1725,17 @@ class TradeRiskManagement:
         # The operands, straight off the result -- ``stop_distance_pct`` is the same
         # risk-per-share the sizer used, expressed against the price so a 7% stop is legible
         # as one; it is a rendering of that number, not a second measurement of the stop.
+        #
+        # AND WHICH LIMIT ACTUALLY BOUND IT. risk_atr sizes off the risk budget and THEN
+        # clamps to the per-instrument ceiling and to cash, so the mode is the answer only
+        # while nothing clamped: an order the cap cut from 200 shares to 10 was bound by the
+        # cap, and recording "risk_atr" there sends the reader to check a budget that was not
+        # the limit. ``capped_by`` is the sizer's own report of which clamp trimmed it, taken
+        # from the branch that ran; ``None`` (no clamp) is dropped by _trace_note and leaves
+        # the mode standing.
         risk_per_share = result["risk_per_share"]
+        self._trace_note(trace, binding=BINDING_RISK_ATR)
+        self._trace_note(trace, binding=_RISK_CLAMP_BINDINGS.get(result["capped_by"]))
         self._trace_note(
             trace,
             risk_budget_pct=risk_pct,

@@ -520,3 +520,181 @@ def test_a_broken_trace_costs_the_annotation_and_not_the_sizing():
         traces=_Hostile(), context={})
 
     assert orders_to_update == [pair[0]] and pair[0].quantity == 10
+
+
+# =========================================================================================
+# REVIEW 2026-09-11: the record must name the constraint that ACTUALLY bound
+#
+# The first cut recorded the SIZING MODE for every risk_atr order and called it the binding
+# constraint. risk_atr sizes off the risk budget and THEN clamps to the per-instrument cap
+# and to cash -- the sizer returns which clamp trimmed it (``capped_by``) and the record
+# threw that away, so an order cut in half by the cap still read "risk_atr". And the refusal
+# SENTENCE was re-derived from the full cap while the branch that refused had compared
+# against the cap MINUS what the symbol already holds, so a row could name one limit and
+# quote a different number.
+# =========================================================================================
+
+def _risk_atr_expert(**settings):
+    base = {"sizing_mode": "risk_atr", "risk_per_trade_pct": 1.0, "min_stop_loss_pct": 5.0}
+    base.update(settings)
+    return _FakeExpert(settings=base, equity=100_000.0)
+
+
+def test_a_risk_atr_order_trimmed_by_the_instrument_cap_says_instrument_cap():
+    """The budget alone buys 200 shares; the cap allows 10. Reporting "risk_atr" would
+    send the reader to check a risk budget that was not what limited this order."""
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0},
+                      expert=_risk_atr_expert())
+    t = traces["AAA"]
+
+    assert t["qty_by_risk"] == 200
+    assert t["quantity"] == 10
+    assert t["binding"] == "instrument_cap"
+
+
+def test_a_risk_atr_order_trimmed_by_cash_says_balance():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=550.0, cap=1_000_000.0, prices={"AAA": 100.0},
+                      expert=_risk_atr_expert())
+    t = traces["AAA"]
+
+    assert t["quantity"] == 5
+    assert t["binding"] == "balance"
+
+
+def test_an_unclamped_risk_atr_order_still_says_risk_atr():
+    """The budget itself bound it: no clamp ran, so the mode IS the answer."""
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000_000.0, prices={"AAA": 100.0},
+                      expert=_risk_atr_expert())
+
+    assert traces["AAA"]["binding"] == "risk_atr"
+    assert traces["AAA"]["quantity"] == 200
+
+
+def test_the_refusal_sentence_quotes_the_limit_its_binding_names(candidate_recorded):
+    """The early-skip compared the price against what was LEFT under the cap -- the cap
+    minus this symbol's existing position. A sentence re-derived from the full cap quotes a
+    number that had nothing to do with the refusal, next to a Binding column that names the
+    one that did."""
+    pair = _pair("AAA")
+    order = pair[0]
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0},
+                      allocations={"AAA": 950.0})
+    row = candidate_recorded(candidates=[pair], unfunded=[order], prices={"AAA": 100.0},
+                             traces={id(order): traces["AAA"]})["AAA"]
+
+    assert row["binding"] == "early_skip_cap"
+    assert "50.00" in row["reason"], row["reason"]
+    assert "1,000.00" not in row["reason"], (
+        "the full cap was never the limit this order hit")
+
+
+def test_a_refusal_for_want_of_budget_quotes_the_budget_it_had(candidate_recorded):
+    pair = _pair("AAA")
+    order = pair[0]
+    traces, _ = _size([pair], balance=50.0, cap=1_000_000.0, prices={"AAA": 100.0})
+    row = candidate_recorded(candidates=[pair], unfunded=[order], prices={"AAA": 100.0},
+                             traces={id(order): traces["AAA"]})["AAA"]
+
+    assert row["binding"] == "early_skip_balance"
+    assert "50.00" in row["reason"] and "100.00" in row["reason"], row["reason"]
+
+
+def test_a_traceless_refusal_keeps_the_sentence_it_always_had(candidate_recorded):
+    """Every row production has recorded so far. With no binding and no operands there is
+    nothing to branch on, so the old price-against-cap comparison stands."""
+    pair = _pair("AAA")
+    row = candidate_recorded(candidates=[pair], unfunded=[pair[0]],
+                             prices={"AAA": 5_000.0})["AAA"]
+
+    assert "exceeds the 1,000.00 per-instrument cap" in row["reason"], row["reason"]
+
+
+# -----------------------------------------------------------------------------------------
+# The bindings the first cut never exercised
+# -----------------------------------------------------------------------------------------
+
+def test_the_diversification_factor_is_named_when_it_reserved_the_rest():
+    """Two instruments still have headroom and the factor is below 1, so only a fraction of
+    the ceiling is spent on the first -- that fraction, not the ceiling, set the size."""
+    first, second = _pair("AAA"), _pair("BBB")
+    traces, _ = _size([first, second], balance=100_000.0, cap=1_000.0,
+                      prices={"AAA": 100.0, "BBB": 100.0},
+                      expert=_FakeExpert(settings={"diversification_factor": 0.5}))
+
+    assert traces["AAA"]["binding"] == "diversification"
+    assert traces["AAA"]["quantity"] == 5, "10 by the cap, halved by the factor"
+
+
+def test_the_one_share_floor_is_named_when_it_rescued_the_order():
+    """Rounding gave zero and the floor put one share back. Neither ceiling decided that."""
+    first, second = _pair("AAA"), _pair("BBB")
+    traces, _ = _size([first, second], balance=100_000.0, cap=150.0,
+                      prices={"AAA": 100.0, "BBB": 100.0},
+                      expert=_FakeExpert(settings={"diversification_factor": 0.5}))
+
+    assert traces["AAA"]["quantity"] == 1
+    assert traces["AAA"]["binding"] == "min_one_share"
+
+
+def test_the_one_share_floor_after_weighting_is_named_too():
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0},
+                      expert=_FakeExpert(instruments={"AAA": {"weight": 5.0}}))
+
+    assert traces["AAA"]["quantity"] == 1, "10 by the cap, 0.5 after the weight, floored to 1"
+    assert traces["AAA"]["binding"] == "min_one_share"
+
+
+def test_a_weight_that_was_reverted_did_not_bind_anything():
+    """A weight above 100% that would breach the cap is discarded and the original size
+    kept -- so the limit that stood before it is still the one that bound."""
+    pair = _pair("AAA")
+    traces, _ = _size([pair], balance=100_000.0, cap=1_000.0, prices={"AAA": 100.0},
+                      expert=_FakeExpert(instruments={"AAA": {"weight": 200.0}}))
+
+    assert traces["AAA"]["quantity"] == 10, "the doubled size was reverted"
+    assert traces["AAA"]["binding"] == "instrument_cap", (
+        "a reverted weight bound nothing; the cap did")
+
+
+def test_a_trace_that_breaks_MID_ORDER_still_leaves_the_quantity_alone():
+    """The hostile-store test covers the trace being opened. This one breaks every write
+    AFTER it is open -- i.e. inside the sizing branches themselves, where an escaping
+    exception would land in the per-order handler and zero the order."""
+    class _Hostile(dict):
+        def update(self, *a, **kw):
+            raise RuntimeError("trace write is on fire")
+
+    pair = _pair("AAA")
+    mgr = _manager()
+    mgr._open_trace = lambda traces, order, **fields: _Hostile()
+
+    orders_to_update, _, _ = mgr._calculate_order_quantities(
+        [pair], 100_000.0, 1_000.0, {}, _FakeAccount({"AAA": 100.0}), _FakeExpert(),
+        traces={}, context={})
+
+    assert orders_to_update == [pair[0]] and pair[0].quantity == 10
+
+
+def test_a_ranking_that_cannot_be_read_is_reported_not_swallowed(monkeypatch):
+    """It costs the score column, which is the point of the record -- so it must show up in
+    the log rather than as a silently empty column.
+
+    The module logger is captured by substitution, not with ``caplog``: the app's logger
+    does not propagate to the root, so caplog sees nothing while the line is really emitted.
+    """
+    class _Hostile:
+        @property
+        def expected_profit_percent(self):
+            raise RuntimeError("recommendation is unreadable")
+
+    warnings = []
+    monkeypatch.setattr(trm.logger, "warning", warnings.append)
+
+    fields = trm.TradeRiskManagement._ranking_fields(_Hostile(), {}, "AAA")
+
+    assert fields == {}
+    assert any("AAA" in w and "unreadable" in w for w in warnings), warnings
