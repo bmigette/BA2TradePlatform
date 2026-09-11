@@ -868,6 +868,12 @@ class WorkerQueue:
     def _execute_task(self, task: AnalysisTask, worker_name: str):
         """Execute a single analysis task."""
         logger.debug(f"Worker {worker_name} executing analysis task '{task.id}' for expert {task.expert_instance_id}, symbol {task.symbol}")
+
+        # Replay capture (spec step 2): the names are bound HERE (before the try)
+        # so the finally's clear can never fail on an unbound name; the batch id
+        # itself is set inside the try, so every path that sets it is a path the
+        # finally clears.
+        from .replay_capture import set_current_batch, clear_current_batch
         
         # Update task status
         with self._task_lock:
@@ -878,6 +884,11 @@ class WorkerQueue:
         self._update_persisted_task_status(task.id, "running", datetime.fromtimestamp(task.started_at, tz=timezone.utc))
             
         try:
+            # Tell THIS worker thread which batch it is running, so the analysis
+            # RECORD can name it. Thread-local -- nothing is written to the
+            # MarketAnalysis or any other trading row to carry it.
+            set_current_batch(getattr(task, 'batch_id', None))
+
             # Import here to avoid circular imports
             from .db import get_instance, add_instance
             from .models import ExpertInstance, MarketAnalysis
@@ -1100,6 +1111,8 @@ class WorkerQueue:
             )
         
         finally:
+            clear_current_batch()
+
             # Handle batch completion logging if this task belongs to a batch
             if hasattr(task, 'batch_id') and task.batch_id:
                 try:

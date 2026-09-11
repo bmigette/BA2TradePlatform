@@ -34,6 +34,7 @@ from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
+from ba2_common.core.replay import replay_now
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
@@ -443,7 +444,9 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         analyst_score: Optional[float] = None
         analyst_info: Dict[str, Any] = {}
         if float(settings.get("w_analyst", 0.0) or 0.0) > 0:
-            ref = as_of if as_of is not None else datetime.now(timezone.utc)
+            # replay_now(as_of): as_of when historical, the wall clock live, the
+            # recorded read when replaying -- the branch selector is untouched.
+            ref = replay_now(as_of)
             # Two dated legs: rating revisions + price-target drift. EPS-estimate
             # revisions would be the stronger signal but FMP exposes no dated
             # estimate history (only a snapshot keyed by future fiscal period),
@@ -462,7 +465,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         earnings_score: Optional[float] = None
         earnings_info: Dict[str, Any] = {}
         if float(settings.get("w_earnings", 0.0) or 0.0) > 0 and data_bundle.get("earnings_rows"):
-            ref = as_of if as_of is not None else datetime.now(timezone.utc)
+            ref = replay_now(as_of)
             pead = pead_score(data_bundle["earnings_rows"], ref, settings)
             if pead is not None:
                 earnings_score = pead["score"]
@@ -567,7 +570,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     @staticmethod
     def _statement_age_days(stmt: Dict[str, Any], as_of: Optional[datetime]) -> Optional[float]:
         """Age of a statement at as_of, measured from its FILING date."""
-        ref = as_of if as_of is not None else datetime.now(timezone.utc)
+        ref = replay_now(as_of)
         raw = next((stmt.get(k) for k in
                     ("fillingDate", "filling_date", "filingDate", "acceptedDate",
                      "accepted_date", "date") if stmt.get(k)), None)
@@ -867,8 +870,17 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             self._gather_use_model_target = bool(settings.get("use_model_target", False))
 
             providers = self._live_providers()
-            bundle = self._gather(providers, as_of=None)
-            rec = self._process(bundle, settings, as_of=None)
+            # Recorded live analysis (spec step 2): a no-op when capture is off,
+            # in which case this is exactly the gather/process pair it replaces.
+            # _gather_and_process links the outcome -- including the skip verdict
+            # the early return below acts on.
+            use_case = self._use_case_of(market_analysis)
+            with self._analysis_capture(market_analysis, settings, use_case):
+                bundle, rec = self._gather_and_process(
+                    providers, settings,
+                    market_analysis=market_analysis,
+                    use_case=use_case,
+                )
 
             if rec.skip:
                 market_analysis.state = {

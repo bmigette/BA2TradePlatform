@@ -14,7 +14,10 @@ ERROR POLICY: every broad handler calls ``absorb_if_benign`` first. Only OSError
 else -- above all ``FMPHermeticViolation`` and the cache-miss errors -- must
 propagate. Swallowing those turns "this backtest silently reached the network /
 ran on missing data" into a plausible-looking score, which is the exact failure
-mode the hermetic guard exists to make loud.
+mode the hermetic guard exists to make loud. ``ReplayMiss`` is re-raised BEFORE
+``absorb_if_benign`` for the same reason and independently of ``BA2_ERROR_MODE``:
+an offline replay whose tape lacks a response must stop and say so, never degrade
+to an empty section that then compares as a plausible bundle.
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.replay import ReplayMiss, replay_now
 from ba2_common.logger import logger
 from ba2_providers.fmp_common import TTLCache
 
@@ -98,13 +102,24 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
     # lookback) and ending at "now" covers the whole run in one fetch. Anchoring
     # it on `now` instead silently returns an empty causal slice for every
     # historical bar -- the backtest then trades nothing and looks merely idle.
-    need_from = ((as_of or _utcnow()) - timedelta(days=lookback_days)).replace(tzinfo=None)
+    # replay_now(None), not _utcnow(): BOTH ends of this window reach the OHLCV
+    # provider's REQUEST IDENTITY, and an identity key holding a raw wall-clock
+    # value can never be matched again -- the recorded request would be
+    # unreproducible by construction (see ba2_common.core.replay.observe). Passing
+    # None (never as_of) keeps the semantics exactly as they were: the window ends
+    # at "now" even in a backtest, because bars advance forward into it.
+    now = replay_now(None)
+    need_from = ((as_of or now) - timedelta(days=lookback_days)).replace(tzinfo=None)
     key = f"ohlcv|{symbol}|{lookback_days}"
     covered_from, df = _OHLCV_COVERAGE.get(key, (None, None))
     if df is None or (covered_from is not None and need_from < covered_from):
         try:
             df = providers.ohlcv().get_ohlcv_data(
-                symbol=symbol, start_date=need_from, end_date=_utcnow(), interval="1d")
+                symbol=symbol, start_date=need_from, end_date=now, interval="1d")
+        except ReplayMiss:
+            raise
+        except ReplayMiss:
+            raise
         except Exception as e:          # noqa: BLE001 - hermetic/defect errors re-raise
             absorb_if_benign(e)
             logger.warning("DeterministicScorer OHLCV fetch failed for %s: %s", symbol, e)
@@ -142,6 +157,8 @@ def fetch_statements(providers, symbol: str, as_of: Optional[datetime],
             kwargs["as_of"] = as_of  # activates the filing-date filter
         try:
             stmts = fn(**kwargs)
+        except ReplayMiss:
+            raise
         except Exception as e:          # noqa: BLE001 - hermetic/defect errors re-raise
             absorb_if_benign(e)
             logger.warning("DeterministicScorer %s fetch failed for %s: %s", key, symbol, e)
@@ -202,6 +219,8 @@ def fetch_past_earnings(providers, symbol: str, as_of: Optional[datetime],
     try:
         out = det.get_past_earnings(symbol=symbol, frequency="quarterly", end_date=ref,
                                     lookback_periods=lookback_periods, format_type="dict")
+    except ReplayMiss:
+        raise
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
         absorb_if_benign(e)
         logger.warning("DeterministicScorer past-earnings fetch failed for %s: %s", symbol, e)
@@ -216,6 +235,8 @@ def fetch_grades_history(api_key: str, symbol: str) -> list:
     from ba2_experts.FMPRating import fetch_grades_historical_cached
     try:
         return fetch_grades_historical_cached(api_key, symbol) or []
+    except ReplayMiss:
+        raise
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
         absorb_if_benign(e)
         logger.warning("DeterministicScorer grades fetch failed for %s: %s", symbol, e)
@@ -229,6 +250,8 @@ def fetch_price_targets(api_key: str, symbol: str) -> list:
     from ba2_experts.FMPRating import fetch_price_target_history_cached
     try:
         return fetch_price_target_history_cached(api_key, symbol) or []
+    except ReplayMiss:
+        raise
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
         absorb_if_benign(e)
         logger.warning("DeterministicScorer price-target fetch failed for %s: %s", symbol, e)
@@ -322,6 +345,8 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
         # its input, so the substitution is unit-safe.
         out["oas_series"] = _series("BAA10Y")
         out["spread_10y3m_series"] = _series("T10Y3M")
+    except ReplayMiss:
+        raise
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
         absorb_if_benign(e)
         logger.warning("DeterministicScorer macro series failed: %s", e)

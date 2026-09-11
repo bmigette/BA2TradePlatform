@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
+from ba2_common.core.replay.context import capture_aware_submit
+from ba2_common.core.replay.observe import observe_provider
 
 
 #: ONE window per symbol per day, wide enough for every pass a screen makes.
@@ -154,6 +156,13 @@ class StockScreener:
             except Exception:
                 pass
 
+    @observe_provider(
+        "screener", "screen",
+        identity=lambda a: {
+            "as_of": a["self"]._as_of,
+            "filters": a["self"]._settings,
+        },
+    )
     def screen(self) -> Dict[str, Any]:
         """
         Execute the full screen/enrich/rank pipeline.
@@ -387,7 +396,11 @@ class StockScreener:
             return {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(fetch_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+            # capture_aware_submit: plain executor.submit for a worker with no
+            # capture context; with one active it copies the caller's context into
+            # the task so a tap inside the fan-out still records (spec step 2).
+            futures = {capture_aware_submit(executor, fetch_chunk, i, chunk): i
+                       for i, chunk in enumerate(chunks)}
             for future in as_completed(futures):
                 items = future.result()
                 with result_lock:
@@ -523,7 +536,8 @@ class StockScreener:
             return chunk_result
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(fetch_chunk, chunk): i for i, chunk in enumerate(chunks)}
+            futures = {capture_aware_submit(executor, fetch_chunk, chunk): i
+                       for i, chunk in enumerate(chunks)}
             for future in as_completed(futures):
                 chunk_result = future.result()
                 with result_lock:

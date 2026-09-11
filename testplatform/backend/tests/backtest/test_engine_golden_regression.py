@@ -50,6 +50,13 @@ NOW = datetime(2026, 6, 13, tzinfo=timezone.utc)
 # concrete ``as_of``); the time-invariant fixtures keep the decision identical.
 # --------------------------------------------------------------------------- #
 _FROZEN_EXPERT_MODULES = (
+    # The replay clock seam (spec step 2): the live ``as_of=None`` path now reads
+    # its evaluation time through ``replay_now``, which reads the wall clock in
+    # THIS module when no capture context is active. Freezing only the expert
+    # modules would leave the live branch on the real clock and make this gate
+    # fail on every calendar day but NOW. Production semantics are unchanged --
+    # the same instant is pinned, one module further in.
+    "ba2_common.core.replay.clock",
     "ba2_experts.FMPEarningsDrift",
     "ba2_experts.FMPInsiderClusterBuy",
 )

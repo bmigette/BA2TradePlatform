@@ -338,6 +338,12 @@ Confidence: {confidence:.1f}%
         return out
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _require_current_price(bundle: Dict[str, Any]) -> None:
+        """The live price guard, run between _gather and _process (unchanged)."""
+        if not bundle.get("current_price"):
+            raise ValueError(f"Unable to get current price for {bundle['symbol']}")
+
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
         """Thin live orchestrator: resolve settings -> _gather(as_of=None) ->
         _process -> persist ExpertRecommendation + AnalysisOutput + state. Runs the
@@ -356,10 +362,19 @@ Confidence: {confidence:.1f}%
             self._gather_lookback_days = lookback_days   # gather-time fetch window
             self._gather_expected_profit_mode = settings.get("expected_profit_mode", "static")
             providers = self._live_providers()
-            bundle = self._gather(providers, as_of=None)
-            if not bundle.get("current_price"):
-                raise ValueError(f"Unable to get current price for {symbol}")
-            rec = self._process(bundle, settings, as_of=None)
+            # Recorded live analysis (spec step 2): a no-op when capture is off,
+            # in which case this is exactly the gather/guard/process sequence it
+            # replaces. This body has no early return -- _process never sets
+            # skip=True for this expert (see _build_export_metrics), so every path
+            # either reaches a recommendation or raises, and both are recorded.
+            use_case = self._use_case_of(market_analysis)
+            with self._analysis_capture(market_analysis, settings, use_case):
+                bundle, rec = self._gather_and_process(
+                    providers, settings,
+                    market_analysis=market_analysis,
+                    use_case=use_case,
+                    validate=self._require_current_price,
+                )
 
             recommendation_id = add_instance(ExpertRecommendation(
                 instance_id=self.id,

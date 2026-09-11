@@ -60,7 +60,7 @@ class BuildOptionsRequest(BaseModel):
 class PrewarmRequest(BaseModel):
     """Pre-build the per-symbol FMP-history disk cache — mirrors CLI prewarm."""
     symbols: List[str]
-    experts: Optional[List[str]] = None      # default: the 3 disk-cached history experts
+    experts: Optional[List[str]] = None      # default: the 3 core rating/signal experts
     workers: Optional[int] = 5
     end: Optional[str] = None                # ISO end date (default now)
 

@@ -16,6 +16,8 @@ from ba2_common.logger import logger
 from ba2_common import config
 from ba2_common.core.provider_utils import log_provider_call, validate_date_range
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
+from ba2_common.core.replay.observe import observe_provider
+from ba2_common.core.replay.schemas import ReplayStatus
 
 # Intraday interval spellings, SHORT and provider long form (FMP writes "5min"/"1hour").
 # Single source of truth: the cache-freshness branch in get_ohlcv_data and its
@@ -26,6 +28,57 @@ _INTRADAY_INTERVALS = (
     '1m', '5m', '15m', '30m', '1h', '4h',
     '1min', '5min', '15min', '30min', '1hour', '4hour',
 )
+
+
+# --------------------------------------------------------------------------- #
+# Replay capture (spec step 2): OHLCV provenance.
+#
+# The parquet store counts its own hits and misses, so "did this call fetch?" is
+# already measured -- reading the delta costs two integer reads and issues no
+# request of its own ("never issue a duplicate fetch just to fill metadata").
+#
+# The counters are process-global, so a CONCURRENT read in another thread can
+# move them under us. That makes the delta ambiguous, never wrong-but-confident:
+# anything other than exactly one hit or one miss is recorded as ``unknown``.
+# --------------------------------------------------------------------------- #
+def ohlcv_identity(args):
+    """What makes an OHLCV response what it is: provider, symbol, window, interval.
+
+    Named (not an inline lambda) so the offline replay tape can build the SAME
+    identity to look a recorded frame up by it; two copies of this dict would
+    drift and turn a real match into a silent miss.
+    """
+    return {
+        "provider": type(args["self"]).__name__,
+        "symbol": args["symbol"],
+        "interval": args["interval"],
+        "start_date": args["start_date"],
+        "end_date": args["end_date"],
+        "lookback_days": args["lookback_days"],
+        "use_cache": args["use_cache"],
+    }
+
+
+def _ohlcv_cache_counters():
+    from ba2_common.core import native_cache
+    return (native_cache.STATS.hits, native_cache.STATS.misses)
+
+
+def _ohlcv_provenance(args, before):
+    from ba2_common.core import native_cache
+
+    if not args["use_cache"]:
+        # Caching disabled: the frame can only have come from the source.
+        return ReplayStatus.PROVENANCE_NETWORK
+    if before is None:
+        return ReplayStatus.PROVENANCE_UNKNOWN
+    hits = native_cache.STATS.hits - before[0]
+    misses = native_cache.STATS.misses - before[1]
+    if hits == 1 and misses == 0:
+        return ReplayStatus.PROVENANCE_DISK_CACHE
+    if misses >= 1 and hits == 0:
+        return ReplayStatus.PROVENANCE_NETWORK
+    return ReplayStatus.PROVENANCE_UNKNOWN
 
 
 class MarketDataProviderInterface(DataProviderInterface):
@@ -746,6 +799,12 @@ class MarketDataProviderInterface(DataProviderInterface):
 
         return datapoints
 
+    @observe_provider(
+        "market_data", "get_ohlcv_data",
+        identity=ohlcv_identity,
+        before=lambda a: _ohlcv_cache_counters(),
+        provenance=lambda a, result, before: _ohlcv_provenance(a, before),
+    )
     def get_ohlcv_data(
         self,
         symbol: str,

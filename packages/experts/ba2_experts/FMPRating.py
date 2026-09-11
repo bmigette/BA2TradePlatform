@@ -14,11 +14,22 @@ from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
+from ba2_common.core.replay import observe_provider, record_branch_flag, replay_now
 from ba2_common.core.provider_utils import parse_provider_date
 from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 from ba2_providers.fmp_common import fmp_http_get, FMPError, TTLCache, fmp_history_disk_cached
+
+
+def symbol_identity(args):
+    """Request identity of the per-symbol FMP fetches below: the symbol, nothing else.
+
+    Named (not an inline lambda per decorator) because the offline replay tape
+    imports it to look a recorded response up by exactly the identity the tap
+    wrote -- and because five copies of one dict is five chances to drift.
+    """
+    return {"symbol": args["symbol"]}
 
 
 # Process-wide short-TTL caches so the many experts that analyze overlapping
@@ -358,6 +369,12 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # (and a hermetic backtest without the gene never requires the grades cache).
         max_age = int(getattr(self, "_gather_max_analyst_age", 0) or 0)
         analyst_grades = None
+        # Which branch ran is a RECORDED FACT: the live snapshot path and the
+        # as_of reconstruction path consume DIFFERENT endpoints, so a replay must
+        # read the branch off the record rather than guess it from the tape.
+        record_branch_flag("fmp_rating_branch",
+                           "live_snapshot" if as_of is None else "as_of_reconstruction")
+        record_branch_flag("fmp_rating_analyst_grades", max_age > 0)
         if as_of is None:
             # LIVE path — unchanged: current consensus snapshots.
             consensus_data = self._fetch_price_target_consensus(symbol)
@@ -376,8 +393,11 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
             if consensus_data is not None:
                 consensus_data = dict(consensus_data)
                 pt_history = self._fetch_price_target_history(symbol)
+                # replay_now(as_of): the wall clock live (as_of is None on this
+                # branch), the recorded read when replaying. Same instant, same
+                # semantics -- the evaluation clock is now observable (spec s4).
                 consensus_data["targetCount"] = self._count_targets_in_window(
-                    pt_history, datetime.now(timezone.utc), _QUARTER_DAYS)
+                    pt_history, replay_now(as_of), _QUARTER_DAYS)
             current_price = self._get_current_price(symbol)
         else:
             # BACKTEST path — no-lookahead reconstruction from dated history.
@@ -441,7 +461,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # long-stale ratings). The buckets still drive the signal direction/confidence below.
         max_age = int(settings.get("max_analyst_age_months", 0) or 0)
         if max_age > 0:
-            ref_date = as_of if as_of is not None else datetime.now(timezone.utc)
+            ref_date = replay_now(as_of)
             analyst_count = self._count_recent_analysts(
                 data_bundle.get("analyst_grades"), ref_date, max_age)
             count_desc = f"{analyst_count} active within {max_age}mo"
@@ -486,6 +506,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
+    @observe_provider("fmp", "price_target_consensus", identity=symbol_identity)
     def _fetch_price_target_consensus(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
         Fetch price target consensus from FMP API.
@@ -530,6 +551,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # Deduped across experts within the TTL window.
         return _CONSENSUS_CACHE.get_or_call(symbol, _do_fetch)
     
+    @observe_provider("fmp", "upgrade_downgrade_consensus", identity=symbol_identity)
     def _fetch_upgrade_downgrade(self, symbol: str) -> Optional[list]:
         """
         Fetch analyst upgrade/downgrade summary from FMP API.
@@ -588,6 +610,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         "strongSell": ("analystRatingsStrongSell", "strongSell"),
     }
 
+    @observe_provider("fmp", "grades_historical", identity=symbol_identity)
     def _fetch_grades_historical(self, symbol: str) -> list:
         """Fetch the FULL dated analyst-grade history for a symbol (backtest path).
 
@@ -604,6 +627,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # inline _do_fetch + TTLCache/disk-cache wrapping.
         return fetch_grades_historical_cached(self._api_key, symbol)
 
+    @observe_provider("fmp", "price_target_history", identity=symbol_identity)
     def _fetch_price_target_history(self, symbol: str) -> list:
         """Fetch the FULL dated individual analyst price-target history (backtest path).
 
@@ -619,6 +643,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         # Behaviour is byte-identical to the prior inline _do_fetch + cache wrapping.
         return fetch_price_target_history_cached(self._api_key, symbol)
 
+    @observe_provider("fmp", "analyst_grades", identity=symbol_identity)
     def _fetch_analyst_grades(self, symbol: str) -> list:
         """Fetch the FULL dated INDIVIDUAL analyst-grade history (rating-recency path).
 
@@ -1263,6 +1288,12 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
         finally:
             session.close()
     
+    @staticmethod
+    def _require_price_when_covered(bundle: Dict[str, Any]) -> None:
+        """The live price guard, run between _gather and _process (unchanged)."""
+        if bundle["consensus_data"] is not None and not bundle["current_price"]:
+            raise ValueError(f"Unable to get current price for {bundle['symbol']}")
+
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
         """
         Run FMPRating analysis for a symbol and create ExpertRecommendation.
@@ -1292,18 +1323,27 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
             self._gather_window_days = int(settings.get("price_target_window_days", 90))
             self._gather_max_analyst_age = int(settings.get("max_analyst_age_months", 0) or 0)
             providers = self._live_providers()
-            bundle = self._gather(providers, as_of=None)
-            current_price = bundle["current_price"]
-            consensus_data = bundle["consensus_data"]
-            upgrade_data = bundle["upgrade_data"]
-
-            # current_price is required for the calculation (live-data, no fallback).
-            # The no-coverage skip below does not need a price, but a genuine
-            # missing-price is still a hard error (preserves the live guard).
-            if consensus_data is not None and not current_price:
-                raise ValueError(f"Unable to get current price for {symbol}")
-
-            rec = self._process(bundle, settings, as_of=None)
+            # Recorded live analysis (spec step 2). The scope spans the gather, the
+            # guard and the calculation; _gather_and_process links the outcome,
+            # including the skip verdict below, so every path is captured -- not
+            # only the ones that reach a recommendation. With capture off the
+            # scope is a no-op and _gather_and_process is exactly the
+            # gather/guard/process sequence it replaces, in the same order.
+            use_case = self._use_case_of(market_analysis)
+            with self._analysis_capture(market_analysis, settings, use_case):
+                bundle, rec = self._gather_and_process(
+                    providers, settings,
+                    market_analysis=market_analysis,
+                    use_case=use_case,
+                    # current_price is required for the calculation (live-data, no
+                    # fallback). The no-coverage skip below does not need a price,
+                    # but a genuine missing-price is still a hard error BEFORE
+                    # _process runs (preserves the live guard).
+                    validate=self._require_price_when_covered,
+                )
+                current_price = bundle["current_price"]
+                consensus_data = bundle["consensus_data"]
+                upgrade_data = bundle["upgrade_data"]
 
             # Honor SKIP first-class: map _process skip -> the live SKIPPED outcomes
             # (state shape kept byte-identical to the pre-refactor skip blocks).
