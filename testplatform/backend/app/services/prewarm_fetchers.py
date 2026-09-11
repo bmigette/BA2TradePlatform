@@ -115,6 +115,68 @@ def resolve_keys() -> Dict[str, Optional[str]]:
     }
 
 
+def resolve_fred_key() -> Optional[str]:
+    """The FRED key: env first, then the app-settings DB (the order FMP/Finnhub use).
+
+    ``None`` when unconfigured -- refused by :func:`prewarm_fred`, which is the only
+    caller that needs it, rather than failing a 500-symbol FMP prewarm over a key
+    only DeterministicScorer's macro section uses.
+    """
+    key = os.getenv("FRED_API_KEY")
+    if not key:
+        try:
+            from ba2_common.config import get_app_setting
+            key = get_app_setting("fred_api_key")
+        except Exception:  # noqa: BLE001 - no DB / no settings row: the env answer stands
+            key = None
+    return key
+
+
+def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] = None
+                 ) -> Dict[str, Any]:
+    """Refresh the FRED macro series DeterministicScorer reads.
+
+    Global, not per-symbol: these are economy-wide series, so they are fetched once per
+    run rather than once per (expert, symbol) like the FMP history caches.
+
+    This exists because ``fred_series.get_series_as_of`` RAISES on a missing cache file
+    rather than reaching for the network -- a backtest must never silently run on absent
+    macro data. That contract is only safe if something populates the cache first, and
+    this is it. The files land under CACHE_FOLDER, so remote workers receive them with
+    the rest of the cache sync automatically.
+
+    LIVES HERE, not in one entry point. It was defined inside
+    ``data_build_handler``, so ``ba2-test prewarm --experts DeterministicScorer``
+    warmed every per-symbol history and NO macro series at all -- the CLI half of the
+    same "two prewarm tooling gaps" finding that moved the fetcher table here. Both
+    entry points now call this one function.
+    """
+    import time
+
+    from ba2_providers.macro import fred_series
+
+    say = log if log is not None else logger.info
+    key = resolve_fred_key()
+    if not key:
+        # Not fatal to the whole prewarm: only DeterministicScorer needs it, and saying
+        # so precisely beats failing a 500-symbol FMP prewarm over a missing macro key.
+        return {"error": "fred_api_key not configured (AppSetting or FRED_API_KEY)"}
+
+    refreshed = skipped = errors = 0
+    for sid in fred_series.SERIES_SPEC:
+        path = fred_series.cache_path(sid)
+        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) / 3600.0 < max_age_hours:
+            skipped += 1
+            continue
+        try:
+            fred_series.refresh_series(sid, key)
+            refreshed += 1
+        except Exception as e:  # noqa: BLE001 - one series must not abort the prewarm
+            errors += 1
+            say(f"!! prewarm FRED {sid} failed: {redact(str(e))}")
+    return {"refreshed": refreshed, "fresh": skipped, "errors": errors}
+
+
 class PrewarmFetchers:
     """Per-symbol history fetchers for every expert prewarm supports.
 

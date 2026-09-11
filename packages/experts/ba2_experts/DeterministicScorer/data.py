@@ -49,6 +49,13 @@ OHLCV_LOOKBACK_DAYS = 600
 
 INDEX_SYMBOL = "SPY"
 
+# The FRED series ``fetch_macro_series`` reads, in the order it reads them. Declared
+# here rather than inline in the fetcher so the replay-dependency adapter
+# (``ba2_experts.replay_dependencies``) names EXACTLY what the fetcher reads: a second
+# hand-kept copy of this tuple is how a warm plan silently stops covering a series the
+# expert still asks for. Every id must exist in ``fred_series.SERIES_SPEC``.
+MACRO_SERIES_IDS = ("VIXCLS", "UNRATE", "BAA10Y", "T10Y3M")
+
 
 def reset_caches() -> None:
     """Drop every process-wide cache (tests, and the live /api/reload path).
@@ -364,15 +371,18 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
             f"{series_id}__{_key_suffix}",
             lambda: fred_series.get_series_as_of(series_id, as_of))
 
+    # Keyed by MACRO_SERIES_IDS so the tuple the dependency adapter declares is the
+    # tuple this function reads.
+    vix_id, unrate_id, oas_id, spread_id = MACRO_SERIES_IDS
     try:
-        vix = _series("VIXCLS")
+        vix = _series(vix_id)
         out["vix"] = float(vix.iloc[-1]) if len(vix) else None
-        out["unrate_series"] = _series("UNRATE")
+        out["unrate_series"] = _series(unrate_id)
         # Credit: Moody's Baa less 10y, NOT the ICE HY OAS the key name still reflects
         # -- FRED serves ICE indices on a rolling ~3y licence. credit_score z-scores
         # its input, so the substitution is unit-safe.
-        out["oas_series"] = _series("BAA10Y")
-        out["spread_10y3m_series"] = _series("T10Y3M")
+        out["oas_series"] = _series(oas_id)
+        out["spread_10y3m_series"] = _series(spread_id)
     except ReplayMiss:
         raise
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise

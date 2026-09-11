@@ -180,7 +180,14 @@ def _record_hermetic_miss(namespace: str, symbol: str):
 @contextmanager
 def persist_empty_sentinel():
     """Within this context a genuinely-empty FMP history is cached as ``[]`` (prewarm sentinel).
-    Used by ``ba2-test prewarm`` so no-data symbols don't perpetually look 'not pre-warmed'."""
+    Used by ``ba2-test prewarm`` so no-data symbols don't perpetually look 'not pre-warmed'.
+
+    PROCESS-WIDE on purpose, and it has to stay that way: ``run_prewarm`` enters this on the
+    SUBMITTING thread and relies on the flag reaching its ``ThreadPoolExecutor`` workers (the
+    freeze flag next to it is thread-local, which is exactly why that one needs an
+    ``initializer``). Anything that must NOT reach sibling threads uses
+    :func:`thread_persist_empty_sentinel` instead.
+    """
     global _PERSIST_EMPTY_SENTINEL
     prev = _PERSIST_EMPTY_SENTINEL
     _PERSIST_EMPTY_SENTINEL = True
@@ -188,6 +195,38 @@ def persist_empty_sentinel():
         yield
     finally:
         _PERSIST_EMPTY_SENTINEL = prev
+
+
+@contextmanager
+def thread_persist_empty_sentinel(enabled: bool = True):
+    """Sentinel semantics for THIS THREAD ONLY, overriding the process-wide flag.
+
+    The warm worker runs inside the LIVE trading process, where the process-global
+    :func:`persist_empty_sentinel` would be a shared mutation: a concurrent backtest thread
+    (frozen, so it does reach the persist branch) would start writing ``[]`` sentinels it never
+    asked for, and "checked, FMP has nothing" is a claim only a deliberate warm may make. Spec
+    section 9: "process-global empty-sentinel flags must not leak into concurrent live work."
+
+    The override is consulted BEFORE the global (see ``_persist_empty_sentinel_enabled``), so a
+    warm thread can also turn the sentinel OFF inside a process that turned it on.
+    """
+    prev = getattr(_tls, "persist_empty_sentinel", None)
+    _tls.persist_empty_sentinel = bool(enabled)
+    try:
+        yield
+    finally:
+        _tls.persist_empty_sentinel = prev
+
+
+def _persist_empty_sentinel_enabled() -> bool:
+    """Whether a genuine empty is persisted as the ``[]`` sentinel right now.
+
+    This thread's explicit override wins; otherwise the process-wide prewarm flag.
+    """
+    override = getattr(_tls, "persist_empty_sentinel", None)
+    if override is not None:
+        return override
+    return _PERSIST_EMPTY_SENTINEL
 
 
 # --- live-only short-TTL cache for SETTINGS-INDEPENDENT bulk fetches --------
@@ -388,7 +427,7 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     #    file then means "checked, no data" (no signal) while an ABSENT file still means "never
     #    warmed" (fatal in a hermetic backtest), so no-data instruments stop looking like prewarm
     #    gaps. The atomic tmp+replace means a concurrent reader never sees a half-written file.
-    to_persist = data if data else ([] if _PERSIST_EMPTY_SENTINEL else None)
+    to_persist = data if data else ([] if _persist_empty_sentinel_enabled() else None)
     if to_persist is not None:
         tmp = None
         try:
@@ -577,6 +616,121 @@ def _gate_arm(delay: float) -> None:
         _GATE_UNTIL = max(_GATE_UNTIL, _now() + max(0.0, delay))
 
 
+def gate_remaining_seconds() -> float:
+    """How long the SHARED FMP cooldown still has to run (0.0 when it is not armed).
+
+    Read-only; arming stays internal. Exposed for the warm budget, which must pause
+    background work while a 429/5xx backoff is in force so the remaining allowance goes to
+    live requests first (spec section 6, "Live requests retain priority").
+    """
+    with _GATE_LOCK:
+        return max(0.0, _GATE_UNTIL - _now())
+
+
+# ---- Request / byte accounting by purpose ------------------------------------------------------
+# Spec section 6: "Track requests/bytes by endpoint and purpose: normal live, capture overhead
+# (must be zero network), and warmup." Nothing measured this before, so "capture adds zero
+# requests" and "warm stayed inside its allowance" were both unfalsifiable claims.
+#
+# The purpose is a ContextVar, not a thread-local, because the callers that need to tag their
+# work fan out through ``ThreadPoolExecutor`` (prewarm) and ``capture_aware_submit`` (gather),
+# both of which copy a ``contextvars.Context`` into the worker. A thread-local would have
+# reported every pooled warm fetch as "live".
+import contextvars as _contextvars
+from datetime import datetime as _datetime, timezone as _timezone
+
+#: The purposes a request can be made for. ``capture`` must never appear with a non-zero count:
+#: recording reads what live already fetched and issues no request of its own.
+PURPOSE_LIVE = "live"
+PURPOSE_CAPTURE = "capture"
+PURPOSE_WARM = "warm"
+PURPOSES = (PURPOSE_LIVE, PURPOSE_CAPTURE, PURPOSE_WARM)
+
+_fmp_purpose: "_contextvars.ContextVar[str]" = _contextvars.ContextVar(
+    "fmp_purpose", default=PURPOSE_LIVE)
+
+#: ``{utc_day: {(purpose, endpoint): {"requests": int, "bytes": int}}}``. Kept per UTC day so a
+#: daily allowance is measured against a day and an old day cannot silently consume today's.
+_PURPOSE_STATS: dict = {}
+_PURPOSE_LOCK = _threading.Lock()
+
+
+def current_fmp_purpose() -> str:
+    """What the requests made from this context are being made FOR."""
+    return _fmp_purpose.get()
+
+
+@contextmanager
+def fmp_purpose(purpose: str):
+    """Tag every FMP request made inside this context (and in contexts copied from it)."""
+    if purpose not in PURPOSES:
+        raise ValueError(f"unknown FMP request purpose {purpose!r}; expected one of {PURPOSES}")
+    token = _fmp_purpose.set(purpose)
+    try:
+        yield
+    finally:
+        _fmp_purpose.reset(token)
+
+
+def _utc_day() -> str:
+    return _datetime.now(_timezone.utc).date().isoformat()
+
+
+def _record_fmp_request(endpoint: str, nbytes: Optional[int]) -> None:
+    """Count one completed FMP request against (today, purpose, endpoint).
+
+    ``nbytes`` is ``None`` when the response object cannot report a size (a stubbed getter in a
+    test, a streamed body): the request is still counted and the byte total is left alone rather
+    than padded with a guess -- a budget that silently invents bytes is not a measurement.
+    """
+    day = _utc_day()
+    key = (current_fmp_purpose(), endpoint or "unknown")
+    with _PURPOSE_LOCK:
+        # One day at a time: yesterday's counters are dropped as soon as a request lands on a
+        # new day, which is the "reset per UTC day" the allowance is defined against.
+        if day not in _PURPOSE_STATS:
+            _PURPOSE_STATS.clear()
+            _PURPOSE_STATS[day] = {}
+        entry = _PURPOSE_STATS[day].setdefault(key, {"requests": 0, "bytes": 0})
+        entry["requests"] += 1
+        if nbytes:
+            entry["bytes"] += int(nbytes)
+
+
+def get_purpose_stats() -> dict:
+    """Today's request/byte counters as ``{purpose: {"requests", "bytes", "endpoints": {...}}}``.
+
+    A purpose with no requests today is absent rather than reported as zero-of-nothing; a caller
+    that wants the full shape reads ``PURPOSES``.
+    """
+    day = _utc_day()
+    out: dict = {}
+    with _PURPOSE_LOCK:
+        for (purpose, endpoint), entry in _PURPOSE_STATS.get(day, {}).items():
+            bucket = out.setdefault(purpose, {"requests": 0, "bytes": 0, "endpoints": {}})
+            bucket["requests"] += entry["requests"]
+            bucket["bytes"] += entry["bytes"]
+            bucket["endpoints"][endpoint] = dict(entry)
+    return out
+
+
+def reset_purpose_stats() -> None:
+    """Drop every counter (tests, and an explicit operator reset)."""
+    with _PURPOSE_LOCK:
+        _PURPOSE_STATS.clear()
+
+
+def _response_bytes(resp) -> Optional[int]:
+    """The size of a response body, or ``None`` when it cannot be read without consuming it."""
+    try:
+        content = getattr(resp, "content", None)
+        if content is not None:
+            return len(content)
+    except Exception:  # noqa: BLE001 - a size read must never break a data fetch
+        return None
+    return None
+
+
 def fmp_http_get(
     url: str,
     params: Optional[dict] = None,
@@ -638,6 +792,10 @@ def fmp_http_get(
 
         # Any other 4xx (401/404/...) is a non-retryable client error -> raise.
         resp.raise_for_status()
+        # Counted AFTER raise_for_status so the counters describe requests that actually
+        # returned data. Retries and rate-limited attempts are deliberately not counted as
+        # payload: they consumed a request slot, not an allowance of bytes.
+        _record_fmp_request(endpoint or url, _response_bytes(resp))
         return resp
 
     logger.error(
