@@ -6,6 +6,13 @@ managers size on it, and until the second delivery it fetched with an inline
 decided a quantity left no trace, and the request that produced it could never be
 reproduced (a wall clock in a request identity is unmatchable by construction).
 
+SCOPE. This records only while a capture scope is open around the sizing call.
+Today the scopes are per-ANALYSIS, and sizing runs after one closes, so a live ATR
+read is tapped but usually unrecorded; the decision-and-execution trace (spec step
+6, Task D) is what opens a scope around the decision path. What is pinned here is
+that the read goes through the seam and produces a reproducible request whenever a
+scope IS open -- not that today's live platform records it.
+
 Two properties, and one guard:
 
 1. a live call (no ``end_date``) records ONE clock read and ONE indicator
@@ -97,10 +104,12 @@ def test_a_live_atr_read_records_one_clock_read_and_one_indicator_observation():
     one = observed[0]
     assert (one.provider, one.method) == ("indicators", "get_indicator")
     assert one.request_identity == {
-        "symbol": "AAPL", "indicator": "atr", "period": 14,
-        "interval": "1d", "end_date": reads[0],
+        "provider": "_Indicators", "symbol": "AAPL", "indicator": "atr",
+        "period": 14, "interval": "1d", "start_date": None,
+        "end_date": reads[0], "lookback_days": 60, "format_type": "dict",
     }, ("the recorded request must be reproducible: its end_date is the RECORDED "
-        "clock read, not a wall clock nobody wrote down")
+        "clock read, not a wall clock nobody wrote down -- and every other argument "
+        "that selects a different answer is in the identity with it")
     assert context.observations[0].payload["values"] == [2.0, 2.5]
     assert context.capture_failures == {}
 

@@ -319,11 +319,16 @@ class _TapeStatementsMixin:
 class _TapeDetailsMixin(_TapeStatementsMixin):
     """The same provider, for the experts that reach it through ``cached_get``.
 
-    FMPEarningsDrift and FMPInsiderClusterBuy call ``past_earnings_get``, whose
-    own tap records the ALIAS layer's identity; a live analysis through that path
-    records both boundaries, and this one serves the alias so the replay reads the
-    same observation the live call site produced. Which shape applies is decided
-    per expert in :func:`_prepare`, never inferred from what the tape holds.
+    THE CONSTRAINT: one live ``get_past_earnings`` call through the alias layer
+    records TWO observations under two different identities -- the alias's
+    (``provider_cache.past_earnings_get``, carrying the uniform as_of/lookback
+    request) and the provider method's (``fundamentals_details.get_past_earnings``,
+    carrying the window that answered it). A tape actor has ONE
+    ``get_past_earnings``, so it can serve only one of them, and choosing by "which
+    one is on the tape" would be exactly the inference this module refuses
+    everywhere else. So the choice is made by EXPERT in :func:`_prepare`: the two
+    experts that call the alias get this class, the ones that call the provider
+    method directly get :class:`_TapeStatementsMixin`'s version.
     """
 
     def get_past_earnings(self, symbol, frequency="quarterly", end_date=None,
@@ -636,8 +641,8 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
         # empty bundle then compares as a plausible DIFFERENCE instead of the
         # missing capture it is.
         expert._get_fmp_api_key = _refuse_api_key
-        if float(expert._gather_w_analyst) > 0:
-            if bool(_branch(analysis, "ds_analyst_history")):
+        if expert._gather_w_analyst > 0:
+            if bool(_branch(analysis, "ds_analyst_key_present")):
                 stack.enter_context(_analyst_history_from_tape(tape))
                 # A sentinel, never a key: the tape answers both fetches and nothing
                 # on this path uses the value.

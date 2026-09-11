@@ -217,6 +217,8 @@ class CaptureContext:
         if not self._replay_untagged:
             for value, read_phase in zip(clock_reads, clock_read_phases):
                 self._replay_by_phase.setdefault(read_phase, []).append(value)
+        self._close_callbacks: List[Any] = []
+        self._closed = False
         self._bundle_status = ReplayStatus.CAPTURE_NOT_ATTEMPTED
         self._outcome: Optional[str] = None
         self._skip_reason: Optional[str] = None
@@ -397,6 +399,46 @@ class CaptureContext:
         except Exception as exc:
             self._note_failure(f"observation {provider}.{method} not recorded", exc)
             return None
+
+    # -- scope lifetime
+
+    def on_close(self, callback) -> None:
+        """Run ``callback`` when this analysis's capture scope ends.
+
+        For per-analysis state a caller keeps OUTSIDE the record and must not
+        leave behind: a process-wide memo keyed on ``analysis_id`` grows by one
+        entry per analysis forever unless whoever added the entry also removes it,
+        and "forever" in a live instance means until restart. Callbacks run once,
+        in registration order, inside :func:`capture_scope`'s ``finally`` -- so a
+        failing one is counted like any other recording failure and never reaches
+        the analysis.
+        """
+        with self._lock:
+            if self._closed:
+                closed = True
+            else:
+                closed = False
+                self._close_callbacks.append(callback)
+        if closed:
+            # The scope is already over: run it now rather than never.
+            self._run_callback(callback)
+
+    def close(self) -> None:
+        """End the scope: run every registered callback exactly once."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            callbacks = list(self._close_callbacks)
+            self._close_callbacks.clear()
+        for callback in callbacks:
+            self._run_callback(callback)
+
+    def _run_callback(self, callback) -> None:
+        try:
+            callback()
+        except Exception as exc:        # recording never breaks the analysis
+            self._note_failure("close callback failed", exc)
 
     @property
     def phase(self) -> str:
@@ -665,3 +707,7 @@ def capture_scope(store, analysis_meta: Mapping[str, Any]):
     finally:
         _CURRENT.reset(token)
         context.submit_to(store)
+        # After the record is submitted: a close callback drops per-analysis state
+        # the analysis left in a process-wide memo, and must not be able to
+        # interfere with what gets written.
+        context.close()

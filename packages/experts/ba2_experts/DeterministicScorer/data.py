@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from ba2_common.core.failure_modes import absorb_if_benign
-from ba2_common.core.replay import ReplayMiss, replay_now
+from ba2_common.core.replay import ReplayMiss, current_capture, replay_now
 from ba2_common.logger import logger
 from ba2_providers.fmp_common import TTLCache
 
@@ -269,6 +269,14 @@ def fetch_index_closes(providers, as_of: Optional[datetime],
     return df["Close"]
 
 
+def _drop_macro_entries(key_suffix: str) -> None:
+    """Drop one analysis's macro memo entries (see ``fetch_macro_series``)."""
+    with _MACRO_CACHE._lock:            # type: ignore[attr-defined]
+        for key in [k for k in _MACRO_CACHE._store  # type: ignore[attr-defined]
+                    if str(k).endswith(f"__{key_suffix}")]:
+            del _MACRO_CACHE._store[key]   # type: ignore[attr-defined]
+
+
 def _observation_series(rows: Any) -> Optional[pd.Series]:
     """FRED-style [{date, value}, ...] -> ascending float Series.
 
@@ -332,13 +340,24 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
     # str(): as_of may be a datetime (engine) or an ISO string (tools/tests), and
     # get_series_as_of accepts both -- the memo key must not care which.
     #
-    # The LIVE key is the recorded evaluation instant, not the constant "live": a
-    # process that captures an analysis and then replays one holds both runs' macro
-    # reads in this one memo, and a shared key would serve the replay the value the
-    # capture cached -- a hit that skips the tapped read the replay is there to
-    # reproduce. replay_now(as_of) returns as_of unchanged when it is given, so the
-    # historical key (and every backtest) is byte-identical to before.
-    _key_suffix = str(as_of) if as_of is not None else str(replay_now(None))
+    # The live key is THE ANALYSIS, not the clock. Capture has to see each recorded
+    # analysis read these series (a memo shared across analyses records the first
+    # one's reads and none of the rest, leaving every later bundle unreplayable),
+    # and keying on a clock read instead would defeat the memo entirely -- a new key
+    # per tick, an unbounded pile of Series in a cache that only evicts on read, and
+    # STILL a shared key for two analyses inside one tick. With capture off there is
+    # no analysis to key on and the constant "live" key is exactly the behaviour
+    # this memo has always had.
+    context = current_capture()
+    if as_of is not None:
+        _key_suffix = str(as_of)
+    elif context is not None:
+        _key_suffix = f"analysis:{context.analysis_id}"
+        # Whoever adds a per-analysis entry removes it: this memo is process-wide
+        # and a live instance runs analyses for weeks.
+        context.on_close(lambda: _drop_macro_entries(_key_suffix))
+    else:
+        _key_suffix = "live"
 
     def _series(series_id: str):
         return _MACRO_CACHE.get_or_call(

@@ -9,8 +9,15 @@ enters through (``ba2_common.core.position_sizing.get_latest_atr``), so it is
 recorded like every other provider return. The tap cannot sit on the abstract method
 -- an implementation OVERRIDES it, which would replace the decorator along with the
 body -- so :meth:`MarketIndicatorsInterface.__init_subclass__` applies it to each
-concrete implementation as the class is created. That is what makes the guarantee
-hold for a provider written later, instead of depending on its author remembering.
+concrete implementation as the class is created, which covers a provider written
+later without depending on its author remembering.
+
+What that does NOT cover, stated so the gap is not mistaken for a guarantee: a
+provider that does not inherit from this interface at all (the backtest's
+duck-typed ``MetricStoreATRProvider``), a mixin whose ``get_indicator`` is picked up
+from a base that is not a subclass of this one, and the INNER call of an override
+that delegates to ``super().get_indicator(...)`` -- which is recorded once, by the
+override, not twice.
 """
 
 from abc import abstractmethod
@@ -18,27 +25,39 @@ from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime
 
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
-from ba2_common.core.replay.observe import observe_provider
+from ba2_common.core.replay.observe import observe_provider, tapped_boundary
 
 
 def indicator_identity(args):
-    """What makes an indicator response what it is.
+    """What makes an indicator response what it is: EVERY argument that changes it.
 
-    Named (not an inline lambda) because the offline replay tape imports it to look
-    a recorded indicator up by exactly the identity the tap wrote; a second copy
-    would drift and turn a real match into a silent miss.
+    Named (not an inline lambda) so that whatever replays a recorded sizing
+    decision builds the identity by importing this function rather than restating
+    it -- two copies of one identity dict drift, and a drifted copy turns a real
+    match into a silent miss. No replay path consumes it yet: no expert ``_gather``
+    reads an indicator, so the gather tape has no indicator actor; the caller this
+    was tapped for is ``position_sizing.get_latest_atr``, which the decision-trace
+    replay (spec step 6) covers.
 
-    ``period`` is absent from the interface signature but present on the
-    implementations ``get_latest_atr`` drives (it selects the ATR window, i.e. a
-    different answer), so it is read when the bound call has it and recorded as
-    ``None`` when the implementation takes no such parameter -- never guessed.
+    The window is the pair (``start_date``, ``end_date``) PLUS ``lookback_days``,
+    because the implementations accept either form and a different form is a
+    different request. ``period`` is absent from the interface signature but
+    present on the implementations ``get_latest_atr`` drives (it selects the ATR
+    window, i.e. a different answer), so it is read when the bound call has it and
+    recorded as ``None`` when the implementation takes no such parameter -- never
+    guessed. ``format_type`` is in too: the same window rendered as markdown is a
+    different answer from the same window rendered as a dict.
     """
     return {
+        "provider": type(args["self"]).__name__,
         "symbol": args["symbol"],
         "indicator": args["indicator"],
         "period": args["period"] if "period" in args else None,
         "interval": args["interval"],
+        "start_date": args["start_date"],
         "end_date": args["end_date"],
+        "lookback_days": args["lookback_days"],
+        "format_type": args["format_type"],
     }
 
 
@@ -69,20 +88,19 @@ class MarketIndicatorsInterface(DataProviderInterface):
 
         Only a concrete implementation defined ON this class is wrapped: an
         abstract redeclaration has nothing to record, an inherited method is
-        already tapped on the class that defined it, and ``_replay_tapped`` stops a
+        already tapped on the class that defined it, and the tap marker stops a
         deeper subclass from wrapping a wrapper (which would record one call
-        twice). With capture off the wrapper is one ``is None`` check.
+        twice). With capture off the wrapper is one ``is None`` check. See the
+        module docstring for what this does not reach.
         """
         super().__init_subclass__(**kwargs)
         implementation = cls.__dict__.get("get_indicator")
         if implementation is None or getattr(implementation, "__isabstractmethod__", False):
             return
-        if getattr(implementation, "_replay_tapped", False):
+        if tapped_boundary(implementation) is not None:
             return
-        tapped = observe_provider("indicators", "get_indicator",
-                                  identity=indicator_identity)(implementation)
-        tapped._replay_tapped = True
-        cls.get_indicator = tapped
+        cls.get_indicator = observe_provider(
+            "indicators", "get_indicator", identity=indicator_identity)(implementation)
 
     # Centralized indicator metadata - all providers share this catalog
     ALL_INDICATORS = {

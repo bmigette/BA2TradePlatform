@@ -30,6 +30,7 @@ from ba2_common.core.replay import (
     ReplayStatus,
     ReplayStore,
     SessionRecord,
+    current_capture,
     encode,
     get_replay_store,
     observe_provider,
@@ -278,19 +279,62 @@ def _fmp_rating_case():
     return expert, settings, patches, counters, reset
 
 
-def _earnings_drift_case(earnings_rows=None):
-    mod = importlib.import_module("ba2_experts.FMPEarningsDrift")
+#: Raw FMP ``historical_earning_calendar`` rows, faked UNDER the provider's tap.
+_DRIFT_EARNINGS = [{"date": "2026-06-10", "eps": 1.2, "epsEstimated": 1.0, "time": "amc"}]
 
-    rows = earnings_rows if earnings_rows is not None else [
-        {"report_date": "2026-06-10", "reported_eps": 1.2,
-         "estimated_eps": 1.0, "surprise_percent": 20.0}]
+#: Raw FMP insider rows (v4 shape), faked under the insider provider's own fetch.
+_INSIDER_ROWS = [
+    {"transactionDate": "2026-06-02", "filingDate": "2026-06-03",
+     "reportingName": "A", "transactionType": "P-Purchase",
+     "securitiesTransacted": 1_000.0, "price": 100.0, "typeOfOwner": "officer"},
+    {"transactionDate": "2026-06-03", "filingDate": "2026-06-04",
+     "reportingName": "B", "transactionType": "P-Purchase",
+     "securitiesTransacted": 1_000.0, "price": 100.0, "typeOfOwner": "director"},
+    {"transactionDate": "2026-06-04", "filingDate": "2026-06-05",
+     "reportingName": "C", "transactionType": "P-Purchase",
+     "securitiesTransacted": 1_000.0, "price": 100.0, "typeOfOwner": "officer"},
+]
+
+
+class _PerSymbolDetails:
+    """A real FMPCompanyDetailsProvider behind a type the calendar branch skips.
+
+    ``_gather``'s live calendar shortcut is chosen by ``isinstance(provider,
+    FMPCompanyDetailsProvider)``, so this fixture cannot simply hold the real
+    provider: it would switch the expert onto the OTHER branch (the one
+    ``_calendar_expert`` already covers) and this case would stop testing the
+    per-symbol path. Delegating instead keeps the branch and still routes the
+    fetch through the real, TAPPED provider method -- which is the whole point:
+    the alias layer and the provider method are two distinct boundaries, and a
+    hand-written stub here recorded only the first of them.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def get_past_earnings(self, *args, **kwargs):
+        return self._inner.get_past_earnings(*args, **kwargs)
+
+
+def _earnings_drift_case(earnings_rows=None):
+    from unittest import mock
+
+    mod = importlib.import_module("ba2_experts.FMPEarningsDrift")
+    details_module = importlib.import_module(
+        "ba2_providers.fundamentals.details.FMPCompanyDetailsProvider")
+
+    rows = _DRIFT_EARNINGS if earnings_rows is None else earnings_rows
     counters = {"past_earnings": 0}
 
-    class _FakeDetails:
-        def get_past_earnings(self, symbol, frequency, end_date, lookback_periods,
-                              format_type, **kw):
-            counters["past_earnings"] += 1
-            return {"earnings": list(rows)}
+    def fake_history(namespace, symbol, fetch_fn, *a, **kw):
+        counters["past_earnings"] += 1
+        if not namespace.startswith("past_earnings_"):
+            raise AssertionError(f"unexpected cache namespace {namespace!r}")
+        return [dict(row) for row in rows]
+
+    inner = details_module.FMPCompanyDetailsProvider.__new__(
+        details_module.FMPCompanyDetailsProvider)
+    inner.api_key = "TEST-API-KEY"
 
     expert = mod.FMPEarningsDrift.__new__(mod.FMPEarningsDrift)
     expert.id = 12
@@ -302,33 +346,39 @@ def _earnings_drift_case(earnings_rows=None):
     settings = {"surprise_min_pct": 5.0, "max_days_since_report": 30,
                 "expected_profit_percent": 8.0}
     expert._resolve_settings = lambda keys: dict(settings)
-    providers = LiveProviderBundle(_resolver({"fundamentals_details": _FakeDetails(),
-                                              "ohlcv": FakeOHLCV()}))
+    providers = LiveProviderBundle(_resolver({
+        "fundamentals_details": _PerSymbolDetails(inner), "ohlcv": FakeOHLCV()}))
     expert._live_providers = lambda: providers
+    patches = [mock.patch.object(details_module, "fmp_history_disk_cached", fake_history)]
 
     def reset():
         counters["past_earnings"] = 0
 
-    return expert, settings, [], counters, reset
+    return expert, settings, patches, counters, reset
 
 
 def _insider_case(transactions=None):
-    mod = importlib.import_module("ba2_experts.FMPInsiderClusterBuy")
+    from unittest import mock
 
-    rows = transactions if transactions is not None else [
-        {"insider_name": "A", "transaction_type": "P-Purchase", "value": 100_000},
-        {"insider_name": "B", "transaction_type": "P-Purchase", "value": 100_000},
-        {"insider_name": "C", "transaction_type": "P-Purchase", "value": 100_000},
-    ]
+    mod = importlib.import_module("ba2_experts.FMPInsiderClusterBuy")
+    insider_module = importlib.import_module(
+        "ba2_providers.insider.FMPInsiderProvider")
+
+    rows = _INSIDER_ROWS if transactions is None else transactions
     counters = {"insider": 0}
 
-    class _FakeInsider:
-        def get_insider_transactions(self, symbol, end_date, lookback_days=None,
-                                     as_of=None, format_type="dict", **kw):
-            counters["insider"] += 1
-            return {"start_date": "2026-05-14T00:00:00",
-                    "end_date": "2026-06-13T00:00:00",
-                    "transactions": list(rows)}
+    def fake_history(namespace, symbol, fetch_fn, *a, **kw):
+        counters["insider"] += 1
+        if namespace != "insider_v2":
+            raise AssertionError(f"unexpected cache namespace {namespace!r}")
+        return [dict(row) for row in rows]
+
+    # The REAL provider, with its per-symbol history faked underneath: the window
+    # filter, the purchase/sale accounting and the row mapping the expert reads are
+    # production's, not a stub's approximation of them.
+    provider = insider_module.FMPInsiderProvider.__new__(
+        insider_module.FMPInsiderProvider)
+    provider.api_key = "TEST-API-KEY"
 
     expert = mod.FMPInsiderClusterBuy.__new__(mod.FMPInsiderClusterBuy)
     expert.id = 13
@@ -342,14 +392,15 @@ def _insider_case(transactions=None):
     settings = {"lookback_days": 30, "min_insiders": 3, "min_total_value": 200_000.0,
                 "expected_profit_percent": 10.0}
     expert._resolve_settings = lambda keys: dict(settings)
-    providers = LiveProviderBundle(_resolver({"insider": _FakeInsider(),
+    providers = LiveProviderBundle(_resolver({"insider": provider,
                                               "ohlcv": FakeOHLCV()}))
     expert._live_providers = lambda: providers
+    patches = [mock.patch.object(insider_module, "fmp_history_disk_cached", fake_history)]
 
     def reset():
         counters["insider"] = 0
 
-    return expert, settings, [], counters, reset
+    return expert, settings, patches, counters, reset
 
 
 def _ds_frame(bars=400):
@@ -534,17 +585,24 @@ CASES = {
 #: stopped firing is a failure and not a shrug.
 EXPECTED_OBSERVATIONS = {
     "FMPRating": 3,
-    "FMPEarningsDrift": 1,
+    # The alias layer AND the provider method are two distinct boundaries over one
+    # fetch: ``past_earnings_get`` records the uniform as_of/lookback request the
+    # expert made, ``get_past_earnings`` the provider-level window that answered it.
+    "FMPEarningsDrift": 2,
+    # Insider reads only the alias layer -- its provider method carries no tap.
     "FMPInsiderClusterBuy": 1,
     "DeterministicScorer": 11,
 }
 
-#: Which experts read an evaluation clock on their live path. Insider does not --
-#: its decision is a pure aggregation of the provider's own dated window.
+#: Which experts read an evaluation clock on their live path. All four do now:
+#: Insider's own decision is a pure aggregation of the provider's dated window, but
+#: the window itself ends at "now", and that end date reaches the insider request's
+#: identity -- so the alias layer derives it through ``replay_now`` rather than an
+#: un-replayable ``datetime.now()``.
 EXPECTS_CLOCK_READS = {
     "FMPRating": True,
     "FMPEarningsDrift": True,
-    "FMPInsiderClusterBuy": False,
+    "FMPInsiderClusterBuy": True,
     "DeterministicScorer": True,
 }
 
@@ -752,6 +810,96 @@ def test_the_dated_analyst_history_is_recorded_once_per_call(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# 2b. The macro memo: one recorded read per ANALYSIS, and nothing left behind
+# --------------------------------------------------------------------------- #
+@contextmanager
+def _seeded_fred():
+    """The FRED files the macro section reads, seeded into the module memo.
+
+    ``patch.dict(clear=True)``: the memo is process-wide, so a seed left behind
+    would serve these rows to any later test that reads the same series.
+    """
+    from unittest import mock
+
+    from ba2_providers.macro import fred_series
+
+    with mock.patch.dict(fred_series._MEM,
+                         {sid: [dict(row) for row in rows]
+                          for sid, rows in _DS_FRED.items()}, clear=True):
+        yield fred_series
+
+
+def _macro_meta(analysis_id):
+    return {"analysis_id": analysis_id, "attempt_id": analysis_id, "session_id": "S-TEST",
+            "expert_class": "DeterministicScorer", "expert_instance_id": 14,
+            "symbol": "AAPL", "use_case": "enter_market", "scheduled_at": None,
+            "started_at": NOW}
+
+
+def test_the_live_macro_memo_still_serves_repeated_calls_from_memory():
+    """Capture OFF: the memo behaves exactly as it always has -- one load per series.
+
+    The point of this memo is that a live instance analysing 30 symbols reads each
+    FRED series once, not 30 times. Keying it on anything that changes per call (a
+    clock read, say) disables it silently: every number stays correct and the work
+    quietly multiplies.
+    """
+    from ba2_experts.DeterministicScorer import data
+
+    loads = []
+    with _seeded_fred() as fred_series:
+        original = fred_series._load
+        try:
+            fred_series._load = lambda series_id: (loads.append(series_id),
+                                                   original(series_id))[1]
+            data.reset_caches()
+            assert current_capture() is None
+            for _ in range(5):
+                out = data.fetch_macro_series(None, None)
+        finally:
+            fred_series._load = original
+            data.reset_caches()
+
+    assert out["vix"] == 15.5
+    assert len(loads) == 4, (
+        f"5 live calls should load each of the 4 series once; loaded {loads}")
+
+
+def test_each_analysis_records_its_own_macro_reads_and_leaves_no_memo_behind(tmp_path):
+    """Capture ON: every analysis records 4 macro observations, and the memo empties.
+
+    Two failure modes, one key. A memo shared across analyses (the constant "live"
+    key) serves the second analysis from the first one's entries, so its bundle
+    holds macro values whose reads were never recorded -- unreplayable, and silently
+    so. A memo keyed per analysis that nobody clears grows by four pandas Series per
+    analysis for as long as the instance runs.
+    """
+    from ba2_common.core.replay import capture_scope
+    from ba2_experts.DeterministicScorer import data
+
+    recorded = {}
+    with capture_to(tmp_path / "macro") as store:
+        with _seeded_fred():
+            data.reset_caches()
+            for analysis_id in ("A1", "A2"):
+                with capture_scope(store, _macro_meta(analysis_id)) as context:
+                    context.set_phase(ReplayStatus.PHASE_GATHER)
+                    context.set_skip("test scope")
+                    data.fetch_macro_series(None, None)
+                    recorded[analysis_id] = [
+                        pending.observation.request_identity["series_id"]
+                        for pending in context.observations]
+
+    assert sorted(recorded["A1"]) == ["BAA10Y", "T10Y3M", "UNRATE", "VIXCLS"]
+    assert sorted(recorded["A2"]) == sorted(recorded["A1"]), (
+        "the second analysis was served from the first one's memo, so its macro "
+        "inputs entered the bundle with no observation behind them")
+    assert data._MACRO_CACHE._store == {}, (
+        f"the closed analyses left {len(data._MACRO_CACHE._store)} macro entries in a "
+        f"process-wide memo")
+
+
+# --------------------------------------------------------------------------- #
 # 3. Skip and error paths
 # --------------------------------------------------------------------------- #
 def test_fmp_rating_skip_is_recorded_with_its_reason(tmp_path):
@@ -818,6 +966,8 @@ def test_an_error_inside_process_is_recorded_and_still_propagates(tmp_path):
     market_analysis = _market_analysis("AAPL", expert.id)
 
     with ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
         stack.enter_context(freeze_now_for_live_path())
         store = stack.enter_context(capture_to(tmp_path / "error"))
         with pytest.raises(RuntimeError, match="calculator exploded"):
@@ -841,6 +991,8 @@ def test_a_price_guard_failure_is_recorded_as_an_error(tmp_path):
     market_analysis = _market_analysis("AAPL", expert.id)
 
     with ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
         stack.enter_context(freeze_now_for_live_path())
         store = stack.enter_context(capture_to(tmp_path / "guard"))
         with pytest.raises(ValueError, match="Unable to get current price"):
@@ -914,6 +1066,8 @@ def test_an_unsupported_bundle_value_is_a_gap_not_a_failed_analysis(tmp_path):
     market_analysis = _market_analysis("AAPL", expert.id)
 
     with ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
         stack.enter_context(freeze_now_for_live_path())
         store = stack.enter_context(capture_to(tmp_path / "unsupported"))
         expert.run_analysis("AAPL", market_analysis)

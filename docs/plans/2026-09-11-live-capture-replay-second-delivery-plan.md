@@ -38,6 +38,32 @@
 
 **Commit:** `feat(replay): tap statements, earnings/estimates, FRED, analyst history and ATR; clock seams for DS and estimator inputs (spec §5 gaps)`.
 
+**Amendment (review, 2026-09-11).** Two instructions above were wrong and are superseded by
+what shipped. (1) *"`_MACRO_CACHE` key derived from the same clock value"* — a clock-derived
+key disables the memo (a new key per tick, so a live instance re-reads every FRED series per
+analysis), piles `pd.Series` into a TTLCache that only evicts on read, and STILL collides for
+two analyses inside one tick, recording the second one's macro inputs nowhere. The key is the
+ANALYSIS (`analysis:<analysis_id>` from `current_capture()`, the unchanged constant `"live"`
+with capture off, `as_of` when historical), and the entries are dropped by a
+`CaptureContext.on_close` callback when the analysis's capture scope ends — new, shared
+machinery for per-analysis state a caller keeps outside the record. (2) The indicator identity
+*"symbol/indicator/period/interval/end_date"* is incomplete: it now carries every argument that
+changes the response (`provider`, `start_date`, `lookback_days`, `format_type` too), and there
+is no gather-tape actor for indicators because no expert `_gather` reads one — the consumer of
+that identity is the decision-and-execution trace (Task D), not this delivery. Also added
+beyond the plan's file list: `replay_now` in the four `cached_get` aliases (their derived
+`end_date` reaches the provider method's identity, so it was a raw wall clock there), a
+`ds_analyst_key_present` branch flag, and the `observe_provider` tap marker the routing guard
+asserts (`__wrapped__` is set by any `functools.wraps` decorator and cannot say "tapped").
+**Bundles captured before this commit report `missing_capture` for DeterministicScorer** — they
+carry neither the branch flag nor the macro/statement observations. That is expected, not a
+regression: re-capture to get a serveable scorer row. Finally, a backend worktree-isolation fix
+(`testplatform/backend/pytest.ini` + `tests/backtest/conftest.py`): the venv's editable
+installs map `ba2test_launcher`/`ba2_trade_platform` to the MAIN checkout, and importing the
+main launcher put the main `testplatform/backend` on `sys.path`, after which every `app.*`
+import came from there — which made `tests/replay` fail against a stale `gather_tape` whenever
+`tests/backtest` was collected in the same run. Those two suites now run in one invocation.
+
 ### Task B: Shared warm service — resolver, planner, budgets, pinned roots, background worker (spec step 4, §6)
 
 **Files:** new `packages/common/ba2_common/core/replay/dependencies.py` (typed `Requirement(provider, namespace, symbol, window, interval, kind: history|timeseries|series|indicator, optional: bool, reason)` and `required_replay_inputs(expert_class, settings, rules, universe, window) -> list[Requirement]` — per-expert adapters registered from `ba2_experts` (`packages/experts/ba2_experts/replay_dependencies.py`: FMPRating, EarningsDrift, Insider, DeterministicScorer incl. estimator inputs, FRED series, index symbol, statements; FactorRanker/Senate/FinnHub/ETF/Penny return `unsupported`), plus rule/RM extras (ATR interval from `sizing_mode/atr_period`, earnings conditions, cooldown state) derived from the rules the caller passes); `testplatform/backend/app/services/warm/{planner,budget,roots,worker}.py`: `plan(requirements, roots) -> WarmPlan` (read-only inspection of production + shared roots: present/stale/missing per requirement using the on-disk formats — `fmp_history` files incl. `[]` sentinels, parquet coverage via `native_cache.timeseries_row_count`/max date, FRED files; estimated bytes from measured sizes; zero network), `budget.py` (request/byte accounting: add counters to `fmp_common.fmp_http_get` keyed by endpoint + purpose `live|capture|warm` via a contextvar purpose tag; `warm_daily_allowance_mib` app setting; reservation before dispatch; pause with remaining-gap report on exhaustion or rate-limit), `roots.py` (`materialize_pinned_root(plan, dest)`: copy/hardlink the selected artifact versions into an isolated root with a `manifest.json` of hashes and provenance `legacy_history_unknown_revision` for reused files; never overwrites source roots), `worker.py` (`WarmQueue` following `SmartRiskManagerQueue`: own `queue.Queue`, 2 daemon threads, `warm_workers` setting, shares the FMP gate; consumes `WarmPlan` items; each item runs `fmp_history_disk_cached` under `frozen_ttl_cache`+`persist_empty_sentinel` set in the worker thread; second unchanged run downloads nothing); host wiring `ba2_trade_platform/core/warm_service.py` (settings `warm_enabled` default false, `warm_workers` 2, `warm_daily_allowance_mib` 100; JobManager job: after each analysis batch (hook at `WorkerQueue.py:1113-1142`) enqueue newly required dependencies for the batch's captured analyses; a bounded scheduled job after session close (CronTrigger at exchange close + settlement offset) extends price tails and pins artifacts); CLI `ba2-test replay warm-plan --bundle <dir> --cache-root <isolated>` and `replay warm --plan <json>`; fix the CLI prewarm FRED gap by routing `_prewarm_fred` through the shared module.

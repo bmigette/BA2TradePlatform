@@ -16,9 +16,9 @@ providers is a no-op (insider/statements both gate their effective-date filter b
 ``as_of is not None``). Screener is EXCLUDED (no temporal param; live-only, see its
 module docstring).
 """
-from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ba2_common.core.replay.clock import replay_now
 from ba2_common.core.replay.observe import observe_provider
 
 # Replay capture (spec step 2): the uniform alias layer is where the insider and
@@ -26,11 +26,18 @@ from ba2_common.core.replay.observe import observe_provider
 # -- at the RETURN, cache hits included, with no extra request. ``as_of`` is part
 # of the identity because it selects the point-in-time window; the api key is not
 # passed here at all, and the tap drops credential-shaped keys regardless.
+#
+# ``replay_now(as_of)`` -- not ``as_of or datetime.now()`` -- for the ``end_date``
+# each alias derives: that value is passed DOWN to the provider method, whose own
+# tap puts it in ITS request identity, and an identity key holding an un-replayed
+# wall clock can never be matched again (see ba2_common.core.replay.observe). With
+# ``as_of`` given it is returned unchanged, so the point-in-time path is untouched;
+# with no capture context it is the same wall-clock read as before.
 
 
 def ohlcv_get(provider, symbol, as_of=None, lookback=400, interval="1d", format_type="dict"):
     """OHLCV time-series up to ``as_of`` (close). ``as_of=None`` => now (live)."""
-    end = as_of or datetime.now(timezone.utc)
+    end = replay_now(as_of)
     return provider.get_ohlcv_data(symbol, end_date=end, lookback_days=lookback, interval=interval)
 
 
@@ -55,7 +62,7 @@ def insider_get(provider, symbol, as_of=None, lookback=30, format_type="dict"):
     """Insider transactions. ``as_of`` is threaded so the corrected provider enforces
     the no-lookahead filingDate anchor when set; with ``as_of=None`` the live
     transactionDate-range behaviour is byte-identical."""
-    end = as_of or datetime.now(timezone.utc)
+    end = replay_now(as_of)
     return provider.get_insider_transactions(symbol, end_date=end, lookback_days=lookback,
                                              as_of=as_of, format_type=format_type)
 
@@ -65,7 +72,7 @@ def statement_get(provider, symbol, statement, as_of=None, frequency="annual",
     """Financial statement (``balance_sheet`` | ``income_statement`` |
     ``cashflow_statement``). ``as_of`` is threaded so the corrected provider enforces
     the no-lookahead fillingDate/acceptedDate anchor when set."""
-    end = as_of or datetime.now(timezone.utc)
+    end = replay_now(as_of)
     fn = getattr(provider, f"get_{statement}")
     return fn(symbol, frequency, end, lookback_periods=lookback_periods,
               as_of=as_of, format_type=format_type)
@@ -89,6 +96,6 @@ def past_earnings_get(provider, symbol, as_of=None, frequency="quarterly",
     """Historical earnings up to ``as_of``. The provider's existing report-date
     (``date`` <= ``end_date``) filter is already point-in-time-safe, so ``as_of`` maps
     to ``end_date`` only — the provider takes no ``as_of`` param."""
-    end = as_of or datetime.now(timezone.utc)
+    end = replay_now(as_of)
     return provider.get_past_earnings(symbol, frequency=frequency, end_date=end,
                                       lookback_periods=lookback_periods, format_type=format_type)

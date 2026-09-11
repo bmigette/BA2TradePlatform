@@ -47,8 +47,16 @@ __all__ = [
     "observe_provider",
     "record_observation",
     "sanitize_identity",
+    "tapped_boundary",
     "SECRET_KEY_TOKENS",
 ]
+
+#: Attribute the decorator stamps on its wrapper, holding ``(provider, method)``.
+#: A guard test needs to assert that a SHIPPED boundary is tapped, and
+#: ``__wrapped__`` cannot say that: any ``functools.wraps`` decorator sets it
+#: (``@log_provider_call`` does), so a boundary that lost its tap but kept another
+#: wrapper would still pass. This marker is set by nothing else.
+OBSERVED_ATTRIBUTE = "_observe_provider_boundary"
 
 #: Any identity key containing one of these (case-insensitive) is DROPPED, never
 #: masked: the guarantee the tests assert is that no credential reaches the store
@@ -220,9 +228,29 @@ def observe_provider(
             )
             return result
 
+        setattr(wrapper, OBSERVED_ATTRIBUTE, (provider, method))
         return wrapper
 
     return decorator
+
+
+def tapped_boundary(fn) -> Optional[tuple]:
+    """``(provider, method)`` if ``fn`` is tapped anywhere in its wrapper chain.
+
+    Walks ``__wrapped__`` because a tap is not always the outermost decorator: a
+    subclass tap applied by ``MarketIndicatorsInterface.__init_subclass__`` wraps
+    the provider's own ``@log_provider_call`` wrapper, and a boundary could as
+    easily be decorated the other way round. Returns ``None`` when no layer of the
+    chain carries the marker -- which is the only honest reading of "not tapped".
+    """
+    seen = set()
+    while fn is not None and id(fn) not in seen:
+        seen.add(id(fn))
+        marker = getattr(fn, OBSERVED_ATTRIBUTE, None)
+        if marker is not None:
+            return marker
+        fn = getattr(fn, "__wrapped__", None)
+    return None
 
 
 def _bind(context, signature, args, kwargs, provider, method) -> Optional[dict]:

@@ -389,7 +389,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             # analyst response -- and an absent response would then quietly reroute it
             # down the no-coverage branch, whose empty bundle compares as a plausible
             # DIFFERENCE instead of the missing capture it is.
-            record_branch_flag("ds_analyst_history", bool(api_key))
+            record_branch_flag("ds_analyst_key_present", bool(api_key))
             if api_key:
                 grades_rows = data.fetch_grades_history(api_key, symbol)
                 target_rows = data.fetch_price_targets(api_key, symbol)

@@ -13,7 +13,9 @@ Plus the two things a tap can only get wrong once: quote provenance (memo vs
 network) and context propagation into a thread pool (a ContextVar does not cross
 into a worker, so a fan-out would silently record nothing).
 """
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from unittest import mock
 
 import pandas as pd
 import pytest
@@ -28,6 +30,7 @@ from ba2_common.core.replay import (
     record_observation,
     run_in_capture_context,
     sanitize_identity,
+    tapped_boundary,
     use_capture_context,
 )
 from ba2_providers.cache.cached_get import insider_get, past_earnings_get
@@ -565,8 +568,6 @@ class _FMPDetails:
         self.namespaces = []
 
     def __enter__(self):
-        from unittest import mock
-
         def fake_history(namespace, symbol, fetch_fn, *a, **kw):
             self.namespaces.append(namespace)
             if namespace not in _HISTORY_BY_NAMESPACE:
@@ -687,25 +688,27 @@ def test_no_fmp_key_reaches_a_recorded_details_identity():
 # --------------------------------------------------------------------------- #
 # 9. The FRED tap
 # --------------------------------------------------------------------------- #
+@contextmanager
 def _seed_fred(series_id="VIXCLS"):
-    """Seed the module's in-process memo so the real read runs with no disk/network."""
+    """Seed the module's in-process memo so the real read runs with no disk/network.
+
+    ``patch.dict(..., clear=True)`` rather than writing into the module global: the
+    memo is process-wide, so a seed left behind would silently serve this fixture's
+    two observations to any later test that reads the same series.
+    """
     from ba2_providers.macro import fred_series
 
-    fred_series._MEM[series_id] = [
-        {"date": "2026-06-11", "value": "14.5"},
-        {"date": "2026-06-12", "value": "15.5"},
-    ]
-    return fred_series
+    rows = [{"date": "2026-06-11", "value": "14.5"},
+            {"date": "2026-06-12", "value": "15.5"}]
+    with mock.patch.dict(fred_series._MEM, {series_id: rows}, clear=True):
+        yield fred_series
 
 
 def test_fred_tap_records_the_series_it_returned():
-    fred_series = _seed_fred()
     context = _context()
-    try:
+    with _seed_fred() as fred_series:
         with use_capture_context(context):
             out = fred_series.get_series_as_of("VIXCLS", None)
-    finally:
-        fred_series.reset_cache()
 
     one = _observations(context)[0]
     assert (one.provider, one.method) == ("macro", "get_series_as_of")
@@ -718,26 +721,20 @@ def test_fred_tap_records_the_series_it_returned():
 
 
 def test_fred_tap_records_the_as_of_cut_it_was_asked_for():
-    fred_series = _seed_fred()
     as_of = datetime(2026, 6, 11, tzinfo=timezone.utc)
     context = _context()
-    try:
+    with _seed_fred() as fred_series:
         with use_capture_context(context):
             out = fred_series.get_series_as_of("VIXCLS", as_of)
-    finally:
-        fred_series.reset_cache()
 
     assert list(out) == [14.5], "the as_of cut is the point of this provider"
     assert _observations(context)[0].request_identity["as_of"] == as_of.isoformat()
 
 
 def test_fred_tap_is_passthrough_without_a_context():
-    fred_series = _seed_fred()
     assert current_capture() is None
-    try:
+    with _seed_fred() as fred_series:
         out = fred_series.get_series_as_of("VIXCLS", None)
-    finally:
-        fred_series.reset_cache()
     assert isinstance(out, pd.Series) and list(out) == [14.5, 15.5]
 
 
@@ -793,8 +790,9 @@ def test_indicator_tap_records_identity_and_payload():
     one = _observations(context)[0]
     assert (one.provider, one.method) == ("indicators", "get_indicator")
     assert one.request_identity == {
-        "symbol": "AAPL", "indicator": "atr", "period": 14,
-        "interval": "1d", "end_date": end.isoformat(),
+        "provider": "_Indicators", "symbol": "AAPL", "indicator": "atr",
+        "period": 14, "interval": "1d", "start_date": None,
+        "end_date": end.isoformat(), "lookback_days": 60, "format_type": "dict",
     }
     assert _payloads(context)[0] == out
     assert calls == [("AAPL", "atr", 14)], "the tap must not fetch a second time"
@@ -876,8 +874,14 @@ def test_every_recorded_provider_boundary_carries_its_tap(name, attribute):
     Reading the shipped attribute is the only check that survives someone
     'simplifying' the decorator away: the behaviour tests above would still pass
     against a provider the test itself wrapped.
+
+    ``tapped_boundary``, not ``hasattr(__wrapped__)``: ANY ``functools.wraps``
+    decorator sets ``__wrapped__`` -- ``@log_provider_call`` sits on both indicator
+    providers -- so that check passes on a boundary whose tap is gone. The marker
+    is set by ``observe_provider`` and by nothing else, and the helper walks the
+    wrapper chain because the tap is not always the outermost layer.
     """
-    assert hasattr(attribute, "__wrapped__"), f"{name} is no longer tapped"
+    assert tapped_boundary(attribute) is not None, f"{name} is no longer tapped"
 
 
 def test_the_analyst_history_is_tapped_at_exactly_one_level():
@@ -893,5 +897,5 @@ def test_the_analyst_history_is_tapped_at_exactly_one_level():
 
     rating = importlib.import_module("ba2_experts.FMPRating")
     for method in ("_fetch_grades_historical", "_fetch_price_target_history"):
-        assert not hasattr(getattr(rating.FMPRating, method), "__wrapped__"), (
+        assert tapped_boundary(getattr(rating.FMPRating, method)) is None, (
             f"FMPRating.{method} carries a second tap around the module fetcher's")

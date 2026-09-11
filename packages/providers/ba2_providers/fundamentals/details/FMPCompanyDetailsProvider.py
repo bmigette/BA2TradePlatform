@@ -42,7 +42,6 @@ STATEMENT_HISTORY_DEPTH = 20
 _PAST_EARNINGS_FETCH_LIMIT = 1000
 
 
-
 # --------------------------------------------------------------------------- #
 # Replay capture (spec step 2 / second-delivery Task A): the fundamentals reads
 # DeterministicScorer and the analyst-target estimator consume are recorded HERE,

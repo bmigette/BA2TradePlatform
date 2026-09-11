@@ -60,6 +60,7 @@ from ba2_common.core.replay.observe import (
     observe_provider,
     record_observation,
     sanitize_identity,
+    tapped_boundary,
 )
 from ba2_common.core.replay.schemas import (
     SCHEMA_VERSION,
@@ -121,6 +122,7 @@ __all__ = [
     "observe_provider",
     "record_observation",
     "sanitize_identity",
+    "tapped_boundary",
     "SECRET_KEY_TOKENS",
     "replay_now",
     "ReplayMiss",
