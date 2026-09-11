@@ -242,6 +242,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "keep using tools/run_option_warmup_parallel.py's --workers "
                         "(separate processes) instead; this is for providers whose session "
                         "must be shared in-process.")
+    p.add_argument("--wide-min-pending", type=int, default=25,
+                   help="``--wide`` only. A symbol with FEWER than this many expiry "
+                        "partitions still owed is fetched one expiry at a time instead of "
+                        "with a wide request (default 25; 0 sends everything wide). "
+                        "WHY: the wide request cannot ask for a subset of expirations — it "
+                        "streams every expiration in the window and discards on arrival "
+                        "everything not owed. That is the right trade for a FIRST fill (350 "
+                        "partitions in one request) and badly wrong for a tail pass. Measured "
+                        "2026-09-11 on IBM and JPM, one straggler expiry each: 18s and 29s "
+                        "per-expiry, against 10-34 MINUTES per symbol wide, re-streaming ~6M "
+                        "rows to keep ~3,000.")
     p.add_argument("--narrow-fallback-years", type=float, default=1.0,
                    help="``--wide`` only. When a symbol's wide request fails every retry, "
                         "re-ask for it in windows of this many YEARS instead of one request "
@@ -590,6 +601,41 @@ def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str
         if budget is not None and len(plan.units) >= budget:
             break
     return plan
+
+
+def split_by_pending(plan: Plan, min_pending: int) -> Tuple[List["SymbolUnit"], Plan]:
+    """Route each symbol by HOW MUCH IT STILL OWES: wide for the bulk, per-expiry for the tail.
+
+    Returns ``(symbol_units_for_the_wide_path, plan_holding_the_per_expiry_units)``.
+
+    The two shapes ask the vendor for very different things. A wide request streams every
+    expiration in the window and the caller discards what it does not owe, so its cost is the
+    SYMBOL's whole chain no matter how little is missing; a per-expiry request costs only the
+    expiry asked for. Which one wins is therefore a function of the number of partitions still
+    pending, and nothing else:
+
+        first fill        350 pending   wide, by a distance (one request, not 350)
+        tail pass           1 pending   per-expiry, by 50-80x (measured, see --wide-min-pending)
+
+    ``min_pending <= 0`` sends everything wide, which is the behaviour this function replaced.
+    """
+    if min_pending <= 0:
+        return to_symbol_units(plan), Plan()
+    wide_units: List[WorkUnit] = []
+    narrow = Plan()
+    by_symbol: Dict[str, List[WorkUnit]] = {}
+    for unit in plan.units:
+        by_symbol.setdefault(unit.underlying, []).append(unit)
+    for symbol, units in by_symbol.items():
+        if len(units) >= min_pending:
+            wide_units.extend(units)
+        else:
+            narrow.units.extend(units)
+    narrow.units_pending = len(narrow.units)
+    narrow.contracts_pending = sum(len(u.contracts) for u in narrow.units)
+    wide_plan = Plan(units=wide_units, units_pending=len(wide_units),
+                     contracts_pending=sum(len(u.contracts) for u in wide_units))
+    return to_symbol_units(wide_plan), narrow
 
 
 def parse_occ_expiry(occ: str) -> Optional[date]:
@@ -1396,16 +1442,22 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
                 aggregate.units = chunk_plan.units[:1]
             continue
         if ns.wide:
-            # Same plan, regrouped: one wide fetch per underlying instead of one per expiry.
-            # build_plan has already dropped every COMPLETE/EMPTY partition, so a resumed run
-            # still only WRITES what is missing (it does re-fetch the symbol -- the wide call
-            # cannot ask for a subset of expirations -- which at ~6 min/symbol is cheap).
-            symbol_units = to_symbol_units(chunk_plan)
+            # Same plan, regrouped by SYMBOL for the wide shape -- but only for the symbols
+            # that still owe enough to be worth a wide request. build_plan has already dropped
+            # every COMPLETE/EMPTY partition, so what is left is exactly what is missing; the
+            # split decides HOW to ask for it (see split_by_pending).
+            symbol_units, tail_plan = split_by_pending(chunk_plan, ns.wide_min_pending)
             log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
-                f"{len(symbol_units)} symbols, {chunk_plan.units_pending} partitions pending")
-            stats.merge(run_symbol_units_concurrent(symbol_units, provider, store, start, end,
-                                                    ns, clock=clock, sleep=sleep, log=log,
-                                                    concurrency=ns.concurrency))
+                f"{len(symbol_units)} wide symbol(s), {tail_plan.units_pending} tail "
+                f"partition(s), {chunk_plan.units_pending} partitions pending")
+            if symbol_units:
+                stats.merge(run_symbol_units_concurrent(symbol_units, provider, store, start,
+                                                        end, ns, clock=clock, sleep=sleep,
+                                                        log=log, concurrency=ns.concurrency))
+            if tail_plan.units:
+                stats.merge(run_units_concurrent(tail_plan, provider, store, start, end, ns,
+                                                 clock=clock, sleep=sleep, log=log,
+                                                 concurrency=ns.concurrency))
         else:
             log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
                 f"{chunk_plan.units_pending} units pending")
