@@ -33,7 +33,13 @@ enter_market_ruleset_id/open_positions_ruleset_id at the new rulesets, and write
 via the expert's own ``save_settings`` (so value typing follows get_settings_definitions exactly,
 same as any other settings save through the app).
 
-Usage: python tools/import_deploy_payload.py <payload.json>
+The pinned risk-manager toggles (use_atr_stop, regime_overlay_enabled) are written EXPLICITLY on
+every deploy and reported either way. Off by default, which is parity with every backtest on
+record; ``--use-atr`` / ``--use-regime-overlay`` turn them on and print a loud block saying the
+instance will no longer reproduce its backtest. The OFF notice exists so that a live settings page
+showing ``atr_multiplier = 5.0`` is never mistaken for a tuned value -- see _PINNED_RM_TOGGLES.
+
+Usage: python tools/import_deploy_payload.py <payload.json> [--use-atr] [--use-regime-overlay]
 """
 import json
 import os
@@ -67,8 +73,66 @@ def _expert_class(name: str):
     raise SystemExit(f"expert {name!r} not found in the live registry")
 
 
+#: The risk-manager toggles that are currently pinned OFF everywhere -- search space, trial
+#: config and deploy -- mapped to the flag that turns each one ON for a deployed instance.
+#:
+#: They are NOT dead code and NOT a permanent state. ``use_atr_stop`` and
+#: ``regime_overlay_enabled`` never took effect in any run on record (a bool was stored as the
+#: JSON string "1" and read as False); ``coerce_bool`` fixed the encoding, and
+#: ``strategy_param_space.INERT_RM_TOGGLES`` then pinned them OFF deliberately so that enabling
+#: them could not silently make new results incomparable with the whole archive. Turning them on
+#: is planned, as its own re-optimization and its own baseline.
+#:
+#: Until that happens the genome's ``atr_multiplier`` / ``atr_period`` / ``regime_*_scale`` values
+#: are INERT -- carried, never read. A deploy therefore has to say so out loud, because a settings
+#: page showing ``atr_multiplier = 5.0`` on a live instance reads exactly like a tuned parameter.
+_PINNED_RM_TOGGLES = {
+    "use_atr_stop": "--use-atr",
+    "regime_overlay_enabled": "--use-regime-overlay",
+}
+
+
+def _apply_rm_toggles(expert_params: dict, enabled: dict) -> None:
+    """Set the currently-pinned RM toggles and SAY what was done, either way.
+
+    OFF (the default, and what every backtest on record ran): a one-line notice per toggle naming
+    the genes it renders inert, so nobody reads those numbers as live tuning.
+
+    ON: a loud block, because it is the dangerous direction -- the backtest that justified this
+    deploy did NOT exercise the feature, so live stops matching it the moment the flag is passed.
+    That is a legitimate thing to do on purpose (it is how the planned ATR baseline starts) and an
+    expensive thing to do by accident.
+    """
+    for setting, flag in _PINNED_RM_TOGGLES.items():
+        on = bool(enabled.get(setting))
+        expert_params[setting] = on
+        if not on:
+            genes = ("atr_multiplier / atr_period" if setting == "use_atr_stop"
+                     else "regime_risk_scale / regime_stop_scale / regime_tp_scale")
+            print(f"  {setting}=False (pinned; pass {flag} to enable) "
+                  f"-- {genes} in this genome are INERT, not tuned values")
+        else:
+            print("  " + "!" * 74)
+            print(f"  !! {setting}=True -- ENABLED BY {flag}")
+            print("  !! Every backtest on record, INCLUDING the one this deploy is derived from,")
+            print("  !! ran with this OFF (strategy_param_space.INERT_RM_TOGGLES). This live")
+            print("  !! instance will NOT reproduce its backtest. Only do this deliberately, as")
+            print("  !! part of a re-optimized ATR/regime baseline.")
+            print("  " + "!" * 74)
+
+
 def main() -> int:
-    payload_path = sys.argv[1]
+    argv = [a for a in sys.argv[1:]]
+    enabled = {s: False for s in _PINNED_RM_TOGGLES}
+    for setting, flag in _PINNED_RM_TOGGLES.items():
+        if flag in argv:
+            enabled[setting] = True
+            argv.remove(flag)
+    if not argv:
+        raise SystemExit(
+            "usage: import_deploy_payload.py <payload.json> "
+            + " ".join(f"[{f}]" for f in _PINNED_RM_TOGGLES.values()))
+    payload_path = argv[0]
     with open(payload_path) as f:
         payloads = json.load(f)
 
@@ -176,6 +240,11 @@ def main() -> int:
         # silently honouring that disagreement is what cost instance 13 its first trading day.
         # Applied for an EXISTING instance too -- a re-deploy onto a wrongly-configured row must
         # repair it, not inherit the fault.
+        # The pinned RM toggles, applied EXPLICITLY rather than inherited from the payload, so a
+        # deploy always states its ATR/regime posture instead of silently carrying whatever the
+        # exporting run happened to embed. Off by default = parity with the backtest.
+        _apply_rm_toggles(expert_params, enabled)
+
         required_ism = (expert.__class__.get_expert_properties() or {}).get(
             "required_instrument_selection_method")
         if required_ism:
