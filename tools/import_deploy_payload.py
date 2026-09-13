@@ -10,6 +10,13 @@ allow_automated_trade_opening is forced ON for a freshly created instance: it de
 and an instance that silently never places an order looks identical to one whose strategy simply
 found no setup -- a trap this project has already hit once.
 
+instrument_selection_method is forced to the expert class's own
+``required_instrument_selection_method`` whenever it declares one (basket experts: Senate
+Weight/Copy). It defaults to "static", and a static instance with no instrument rows makes
+JobManager skip enter_market job creation entirely -- the same silent "enabled but never trades"
+shape as the flag above. Cost the first Senate deploy (instance 13, 2026-09-13) its entry job
+until it was set by hand.
+
 OPERATOR NOTE (2026-09-03): every live O_CC / O_WHEEL ExpertInstance deployed BEFORE 2026-09-03
 must be re-exported and re-imported through this pair of tools (then POST /api/reload): the live
 option lifecycle pass no longer closes the written call at the roll window -- the ruleset's
@@ -152,6 +159,34 @@ def main() -> int:
             print(f"universe: {len(universe_params)} screener setting(s) carried into "
                   f"expert_params ({SCREENER_UNIVERSE_SETTING}="
                   f"{universe_params[SCREENER_UNIVERSE_SETTING]!r})")
+        # INSTRUMENT SELECTION, forced when the expert class declares one. Same failure mode as
+        # the two settings below, found live 2026-09-13 on the first Senate deploy (instance 13).
+        #
+        # A basket expert -- FMPSenateTraderWeight, FMPSenateTraderCopy -- picks its own symbols
+        # and declares required_instrument_selection_method="expert". JobManager only creates the
+        # single placeholder EXPERT job when the INSTANCE's instrument_selection_method says
+        # "expert"; the setting defaults to "static", and a static instance with no instrument
+        # rows yields an empty list, so `_get_enabled_instruments` returns [] and NO enter_market
+        # job is ever created. The instance comes up enabled, correctly configured, schedule
+        # attached, visible in the UI -- and never trades. Indistinguishable from a strategy that
+        # found no setup, which is exactly the trap the two lines below already exist to close.
+        #
+        # ASSIGNED, not setdefault: this is a hard requirement of the expert class, not a
+        # default. A payload (or an operator) disagreeing with it is wrong by construction, and
+        # silently honouring that disagreement is what cost instance 13 its first trading day.
+        # Applied for an EXISTING instance too -- a re-deploy onto a wrongly-configured row must
+        # repair it, not inherit the fault.
+        required_ism = (expert.__class__.get_expert_properties() or {}).get(
+            "required_instrument_selection_method")
+        if required_ism:
+            prior = expert.get_setting_with_interface_default(
+                "instrument_selection_method", log_warning=False)
+            expert_params["instrument_selection_method"] = required_ism
+            if prior != required_ism:
+                print(f"instrument_selection_method: {prior!r} -> {required_ism!r} "
+                      f"(REQUIRED by {expert.__class__.__name__}; without it JobManager creates "
+                      f"no enter_market job and the instance never trades)")
+
         if created:
             # Defaults to False; without it the instance analyses and never trades. The export
             # now carries it explicitly (deploy_parity), so this is a floor for an OLD payload.
