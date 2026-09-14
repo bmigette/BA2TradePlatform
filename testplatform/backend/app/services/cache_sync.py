@@ -109,7 +109,10 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
         # os.walk (not rglob) so a skipped directory is PRUNED from the descent: a derived cache
         # holds several .npy per signature dir over the whole provider tree, and this walk is the
         # one with history (a cold manifest over 312k files took ~140s and got a worker excluded).
-        for dirpath, dirnames, filenames in os.walk(base):
+        # followlinks=True is DELIBERATE: it keeps rglob's semantics. Path.rglob descends
+        # directory symlinks, os.walk does not — without it a subtree a worker relocated with
+        # `ln -s` would vanish from the manifest and diff_stale would prune every worker's copy.
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=True):
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRNAMES]
             rel_dir = Path(dirpath).relative_to(base)
             for fn in filenames:
@@ -121,7 +124,9 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
                     st = p.stat()
                 except OSError:
                     continue
-                if not S_ISREG(st.st_mode):  # dir symlink/junction listed as a name: not a file
+                # not a regular file (fifo/device, or a file-became-dir race); stat follows
+                # symlinks, so a symlinked file still passes
+                if not S_ISREG(st.st_mode):
                     continue
                 entry = {
                     "rel_path": rel.as_posix(),

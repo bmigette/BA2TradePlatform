@@ -323,8 +323,10 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
         # Never prune on an EMPTY local view: diff_stale would then list every file the worker
         # has, so one unreadable/misconfigured cache root on the master would wipe the worker's
         # whole cache instead of removing a rebuild leftover.
-        logger.warning(f"cache prune -> {worker['name']}: skipped, master manifest is EMPTY "
-                       f"(root {local['root']}) — refusing to prune on an empty view")
+        msg = (f"cache prune -> {worker['name']}: skipped, master manifest is EMPTY "
+               f"(root {local['root']}) — refusing to prune on an empty view")
+        log(msg)  # the injected sink is the VISIBLE job log; the module logger alone is not
+        logger.warning(msg)
         return {**res, "pruned": 0}
 
     stale = cache_sync.diff_stale(local["files"], remote)

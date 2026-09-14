@@ -115,12 +115,16 @@ def test_push_cache_never_prunes_on_an_empty_local_manifest(monkeypatch):
     calls = _fake_transport(monkeypatch, remote, local)
     warned = []
     monkeypatch.setattr(worker_client.logger, "warning", lambda m, *a, **k: warned.append(m))
+    logged = []
 
-    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, log=lambda _m: None)
+    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, log=logged.append)
 
     assert res["pruned"] == 0
     assert not any(url.endswith("/cache/prune") for _m, url in calls), calls
     assert len(warned) == 1 and "EMPTY" in warned[0], warned
+    # ...and it reaches the INJECTED sink too -- that is the visible job log, where an operator
+    # would otherwise see only "already in sync (0 files)" and no hint of a refused prune.
+    assert any("EMPTY" in m for m in logged), logged
 
 
 def test_push_cache_still_prunes_stale_files_on_a_non_empty_manifest(monkeypatch):
