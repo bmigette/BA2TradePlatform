@@ -121,6 +121,20 @@ introduced to guard (see ``ParquetOptionsProvider.__init__``): two runs whose pr
 answer differently for the same (symbol, date) get different GREEKS, they just stop paying to
 re-read the same bytes to find that out.
 
+THE RAW CACHE IS NOW A CACHE OF VIEWS, NOT OF BYTES. ``_load_raw_underlying`` sources the
+numeric half from the per-host derived array store (``ba2_common.core.shared_arrays``): the
+first process to want an underlying parses the parquet once and publishes ``.npy`` files
+beside the source tree, and every process after that memory-maps them, so the OS page cache
+holds ONE copy of an underlying per HOST instead of one per worker. What a cached
+``_RawUnderlying`` then owns privately is only the projections ``_bind`` derives. Two
+consequences worth stating here rather than discovering:
+
+  * ``clear_worker_parquet_options_cache()`` drops the VIEWS. The mapping closes when the
+    last view of it dies; the files themselves are the host's and are never touched, so the
+    next load re-opens them for free instead of re-parsing anything.
+  * a re-read is no longer the thing to fear. A cold miss on a warm host is a mmap, not
+    200 MB of parquet — which is why the LRU caps below are sized by the projections.
+
 All three are bounded LRUs (a remote worker's pool is long-lived across jobs touching
 different universes) and all three are dropped by ``clear_worker_parquet_options_cache()``,
 which ``options_provider.clear_worker_options_cache()`` also calls so existing test isolation
@@ -160,14 +174,18 @@ from .options_cache import OptionsCacheMiss
 
 logger = logging.getLogger(__name__)
 
-#: Underlyings held per worker process. Measured: GOOG's 27,974 rows cost 2.36 MB raw plus
-#: 1.09 MB per greeks overlay, so the default cap is ~700 MB worst case with both caches full
-#: and clears a 100-symbol option universe several times over. Sizing it BELOW the run's
-#: universe is the thing to avoid — that thrashes (evict-then-reload) inside a single bar,
-#: exactly as the sqlite reader's bar-cache comment warns. The penalty is far gentler here
-#: than there (a reload is ~55 ms of parquet, not thousands of sqlite round-trips), so
-#: lowering it on a memory-tight worker is a real option. The same cap bounds BOTH the raw
-#: cache and the scope-keyed overlay cache.
+#: Underlyings held per worker process. WHAT AN ENTRY COSTS THIS PROCESS is now the
+#: PROJECTIONS plus the greeks overlay, not the columns: the numeric arrays are mapped from
+#: the host-shared derived cache (see CACHING), so they are one copy per host and reclaimable
+#: page cache, while ``bar_ord_l`` (4 B/row), the per-contract lists and the ordinal/ISO
+#: dicts are private per process. On GOOG's 27,974 rows that is the 0.43 MB per-row
+#: projection plus the 0.26 MB contract list/index measured in the module docstring, against
+#: the 1.53 MB of columns that no longer count, plus 1.09 MB per greeks overlay. Sizing the
+#: cap BELOW the run's universe is still the thing to avoid — that thrashes
+#: (evict-then-reload) inside a single bar, exactly as the sqlite reader's bar-cache comment
+#: warns — but the penalty for a reload is now a mmap rather than ~55 ms of parquet, so
+#: lowering it on a memory-tight worker is a cheaper option than it was. The same cap bounds
+#: BOTH the raw cache and the scope-keyed overlay cache.
 _UNDERLYING_CACHE_MAX = int(os.getenv("BT_OPTION_PARQUET_CACHE_MAX", "200"))
 #: Same generosity (and same reasoning) as the sqlite reader's ATM-IV memo: the values are a
 #: float or None, and a GA re-asks the identical (symbol, date) pairs on every trial.
@@ -265,15 +283,26 @@ class _RawUnderlying:
     #:     with the arrays rather than the log line staying behind on the host that built them.
     #: ``bid``/``ask`` are ZERO-LENGTH when ``has_quotes`` is false; see ``_bind``.
     #:
-    #: CONSEQUENCE FOR A DERIVED STORE'S KEY, since it is not obvious from the source files: a
-    #: tree re-warmed to ADD the bid/ask columns changes what these arrays contain (and their
-    #: very lengths) without necessarily changing a partition's size or mtime, so the key must
-    #: cover the COLUMN SET -- ``has_quotes`` -- and not only a source signature.
+    #: THE COLUMN SET NEEDS NO KEY COMPONENT OF ITS OWN. A tree re-warmed to ADD the bid/ask
+    #: columns changes what these arrays contain and their very lengths -- but it can only do
+    #: that by REWRITING the partitions, and a rewritten partition is a new (path, size,
+    #: mtime) and therefore a new source signature. ``has_quotes`` travels IN the array set
+    #: rather than in the key because it is an output of the build, not an input to it.
     ARRAY_NAMES = (
         "bar_ord", "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
         "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord", "c_is_call",
         "c_occ_utf8", "has_quotes", "priceless_count",
     )
+
+    #: THE READER'S HALF OF THE DERIVED-CACHE CONTRACT, carried in the cache KEY. Bump it
+    #: whenever ``ARRAY_NAMES`` changes, an encoding changes, or the MEANING of an array
+    #: changes: a set published by an older reader then lives under a different key and can
+    #: never be opened by a newer one (nor the reverse), whatever the sources look like.
+    #: ``shared_arrays.SCHEMA_VERSION`` covers the on-disk FILE layout, which is the store's
+    #: business; this covers what the bytes inside those files mean, which is ours. It is
+    #: deliberately NOT reused for a column-set change -- see ARRAY_NAMES above, where a
+    #: rewritten partition already moves the signature.
+    ARRAYS_VERSION = 1
 
     #: The ARRAY_NAMES that bind straight onto the identically-named slots the hot paths read.
     #: (The three above are decoded into ``c_occ`` / ``has_quotes`` / a log line instead.)
@@ -670,26 +699,49 @@ def _i(v) -> Optional[int]:
 
 
 def _load_raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
+    """One underlying's arrays, through the PER-HOST derived cache.
+
+    The parquet is parsed by the first process on the host that wants this underlying at this
+    source signature; every later process (and every later cold cache in this one) memory-maps
+    what that build published. That is why the parquet read sits behind ``build_or_open``
+    rather than in front of it: at the 2020 ThetaData window the private arrays were ~15.6 GB
+    PER WORKER of byte-identical data, which is what OOM-killed a 251 GB host at 16 workers.
+
+    The SOURCES are the partition files ``read_underlying`` itself concatenates (asked of the
+    store, never re-globbed here), so any re-warm of this underlying moves the signature and
+    the stale arrays become unreachable rather than merely old. ``BA2_SHARED_ARRAYS=0``
+    restores the private path exactly, writing nothing.
+    """
+    from ba2_common.core import shared_arrays as _sa
     from ba2_providers.options.parquet_store import OptionHistoryParquetStore
 
     store = OptionHistoryParquetStore(root=root)
-    df = store.read_underlying(underlying)
-    u = _RawUnderlying(underlying, df)
+    parts = store.partition_paths(underlying)
+    if not parts:
+        # No sources means no signature, so this never reaches the derived store at all.
+        logger.warning("[backtest] parquet option store: NO partitions for %s under %s — "
+                       "every chain read for it will be empty.", underlying, root)
+        return _RawUnderlying(underlying, None)
+
+    def _build() -> Dict[str, np.ndarray]:
+        return _RawUnderlying.arrays_from_frame(store.read_underlying(underlying))
+
+    derived = _sa.DerivedArrayStore(_sa.derived_root_for(root))
+    key = f"{underlying.upper()}.v{_RawUnderlying.ARRAYS_VERSION}"
+    u = _RawUnderlying.from_arrays(underlying, derived.build_or_open(key, parts, _build))
     # COVERAGE, STATED ONCE PER UNDERLYING PER WORKER. The vendor's history FLOOR bounds what
     # COULD have been downloaded; it says nothing about what this tree actually holds, and a
     # run outside the downloaded window reads an empty store and reports the resulting
     # zero-trade result as a result. That is the failure the floor seam exists to prevent, one
     # level down, and it is not detectable from the floor. One log line per underlying is the
     # cheapest honest signal: a 2024 run against a 2023-only tree says so in the first
-    # screenful instead of at the post-mortem.
+    # screenful instead of at the post-mortem. Said per PROCESS, not per build: the arrays are
+    # mapped by workers that never ran the build and are owed the same statement.
     if u.n_rows:
         logger.info("[backtest] parquet option store: %s %d bars / %d contracts, %s..%s",
                     underlying, u.n_rows, len(u.c_occ),
                     date.fromordinal(int(u.bar_ord.min())).isoformat(),
                     date.fromordinal(int(u.bar_ord.max())).isoformat())
-    else:
-        logger.warning("[backtest] parquet option store: NO partitions for %s under %s — "
-                       "every chain read for it will be empty.", underlying, root)
     return u
 
 

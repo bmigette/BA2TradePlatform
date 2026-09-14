@@ -17,10 +17,12 @@ Run:
 from __future__ import annotations
 
 import array
+import dataclasses
 import inspect
 import logging
 import os
 from datetime import date, datetime
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -96,6 +98,15 @@ def store_root(tmp_path):
     clear_worker_parquet_options_cache()
     yield root
     clear_worker_parquet_options_cache()
+
+
+@pytest.fixture(autouse=True)
+def shared_arrays_enabled(monkeypatch):
+    """Every test here runs with the host-shared derived array cache ON — the production
+    default — so an operator's ambient ``BA2_SHARED_ARRAYS=0`` cannot quietly turn the
+    caching assertions below into a different test. The tests that are ABOUT the escape
+    hatch set "0" in their own body, which wins: it is the same monkeypatch instance."""
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
 
 
 @pytest.fixture
@@ -305,10 +316,36 @@ def test_absent_store_root_fails_loud(tmp_path):
 # 4. CACHING — the GA rebuilds the provider once per trial from the same store
 # --------------------------------------------------------------------------- #
 def _count_reads(monkeypatch):
-    """Count PARQUET READS (``_load_raw_underlying``), which is the expensive thing.
+    """Count PARQUET READS — ``OptionHistoryParquetStore.read_underlying``.
 
     Not overlay construction: the greeks overlay is cheap and scope-keyed by design, while
     re-reading and re-parsing the bytes is what a scope change used to cost.
+
+    And not ``_load_raw_underlying``, which since the host-shared derived cache runs on every
+    cold OPEN: a fresh worker still calls it and still gets a whole object, it just MAPS the
+    arrays somebody already built instead of parsing the parquet again. The parquet read is
+    the expensive thing and it is precisely what a warm derived set skips, so it is the thing
+    worth counting.
+    """
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    real = OptionHistoryParquetStore.read_underlying
+    calls = {"n": 0}
+
+    def counting(self, underlying):
+        calls["n"] += 1
+        return real(self, underlying)
+
+    monkeypatch.setattr(OptionHistoryParquetStore, "read_underlying", counting)
+    return calls
+
+
+def _count_loads(monkeypatch):
+    """Count ``_load_raw_underlying`` calls — i.e. WORKER-CACHE misses, whatever served them.
+
+    The counterpart to ``_count_reads``: for the tests that are about the process-local cache
+    being kept or dropped, a miss is the event, and the derived store deliberately makes a
+    miss cheap rather than making it disappear.
     """
     real = pq._load_raw_underlying
     calls = {"n": 0}
@@ -342,7 +379,10 @@ def test_clear_worker_options_cache_also_clears_the_parquet_backend(monkeypatch,
     everything the option readers cached"."""
     from app.services.backtest.options_provider import clear_worker_options_cache
 
-    calls = _count_reads(monkeypatch)
+    # _count_loads, not _count_reads: what is under test is that the WORKER cache was
+    # dropped, and after the drop the host-shared derived set serves the reload with no
+    # parquet read at all.
+    calls = _count_loads(monkeypatch)
     p = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
                                   spot_scope="test")
     _wide(p, date(2023, 1, 10))
@@ -484,8 +524,12 @@ def _real_root():
 
 
 @pytest.mark.skipif(_real_root() is None, reason="no local TastyTrade parquet tree")
-def test_real_store_serves_a_plausible_2023_chain():
+def test_real_store_serves_a_plausible_2023_chain(monkeypatch):
     """The window the sqlite cannot reach at all: GOOG, 2023-01-17."""
+    # The escape hatch, deliberately: this is the one test that reads the operator's REAL
+    # tree, and the shared path would publish a derived array set into their real cache as a
+    # side effect of running the suite. What is under test here is the tree's CONTENT.
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "0")
     root = _real_root()
     clear_worker_parquet_options_cache()
     try:
@@ -893,3 +937,156 @@ def test_arrays_round_trip_through_read_only_memory_maps(store_root, tmp_path):
     _assert_same_raw(pq._RawUnderlying(_UNDER, df), b)
     assert b.bar_ord.flags.writeable is False, "_bind must not privately copy a mapping"
     assert b.close.flags.writeable is False
+
+
+# --------------------------------------------------------------------------- #
+# 10. THE HOST-SHARED DERIVED ARRAY CACHE (Task 4 of
+#     docs/plans/2026-09-14-shared-arrays-across-workers.md)
+#
+# The seam above (arrays_from_frame / from_arrays) is now SOURCED from a per-host derived
+# cache of memory-mapped .npy files: the first process to want an underlying parses the
+# parquet once and publishes the arrays; every later process on that host maps them. What
+# these tests pin is that the mapping is real (so the memory is actually shared), that it is
+# invalidated by a rewritten partition, and — the whole point — that it answers IDENTICALLY
+# to the private path it replaces.
+# --------------------------------------------------------------------------- #
+def _derived_key_dir(root):
+    from ba2_common.core import shared_arrays as SA
+
+    return (Path(SA.derived_root_for(root))
+            / f"{_UNDER}.v{pq._RawUnderlying.ARRAYS_VERSION}")
+
+
+def _canon(arr):
+    """An array as a comparable value, with NaN equal to NaN.
+
+    ``[nan] == [nan]`` is False, and a no-trade row's OHLC (and a legacy tree's whole
+    bid/ask) is exactly NaN, so a plain list comparison would report every fixture as
+    "different" whatever the arrays hold. ``repr`` of the list renders NaN as the token
+    ``nan``, which compares positionally like every other value.
+    """
+    return arr.dtype.str, repr(arr.tolist())
+
+
+def _published_sigs(root):
+    from ba2_common.core import shared_arrays as SA
+
+    d = _derived_key_dir(root)
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir() if (p / SA.DONE_MARKER).is_file())
+
+
+def test_shared_store_is_built_then_opened_without_re_reading_parquet(store_root, monkeypatch):
+    """Cold: parse once and publish. Warm: MAP, do not re-parse.
+
+    The second load stands in for a second worker process — the worker caches are process
+    globals, so clearing them is exactly what a fresh process starts with. Zero parquet reads
+    there is the entire saving: on the 2020 ThetaData tree it is 177.8M rows of float64 that
+    every worker used to build, and hold, privately.
+    """
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    clear_worker_parquet_options_cache()
+
+    raw = pq._load_raw_underlying(store_root, _UNDER)
+
+    sigs = _published_sigs(store_root)
+    assert len(sigs) == 1, [p.name for p in _derived_key_dir(store_root).iterdir()]
+    assert (sigs[0] / "close.npy").is_file()
+    # A plain ndarray VIEW over the mapping, not the np.memmap subclass (33-43% slower on
+    # scalar reads) and not a private copy (which would share nothing at all).
+    assert type(raw.close) is np.ndarray
+    assert raw.close.base is not None
+    assert raw.close.flags.writeable is False
+
+    clear_worker_parquet_options_cache()
+    calls = _count_reads(monkeypatch)
+    raw2 = pq._load_raw_underlying(store_root, _UNDER)
+    assert calls["n"] == 0, "a published derived set must be opened, not re-parsed"
+    assert raw2.close.base is not None
+    _assert_same_raw(raw, raw2)
+
+
+@pytest.mark.parametrize("root_fixture", ["store_root", "quoted_store_root"])
+def test_shared_and_private_paths_are_bit_identical(root_fixture, request, monkeypatch):
+    """THE POINT. Same chain, same marks, same greeks, same bar, whichever path served the
+    arrays — on the legacy no-quote tree AND on a quoted (ThetaData-shaped) one, because the
+    two do not even store the same columns."""
+    root = request.getfixturevalue(root_fixture)
+    as_of = date(2023, 1, 5)          # a date BOTH fixtures carry a bar on
+    results = {}
+    raws = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv("BA2_SHARED_ARRAYS", flag)
+        clear_worker_parquet_options_cache()
+        p = ParquetOptionsProvider(root, spot_source=_spot_source, risk_free_rate=_RATE,
+                                   spot_scope="parity")
+        chain = sorted(p.get_chain(_UNDER, as_of, expiry_min=date(2023, 1, 1),
+                                   expiry_max=date(2023, 12, 31)),
+                       key=lambda c: c.symbol)
+        raw = pq._raw_underlying(root, _UNDER)
+        raws[flag] = raw
+        results[flag] = (
+            [dataclasses.asdict(c) for c in chain],
+            p.get_atm_iv(_UNDER, as_of),
+            p.get_bar(_C100, as_of),
+            {name: _canon(getattr(raw, name)) for name in pq._RawUnderlying._DIRECT_ARRAYS},
+            (raw.has_quotes, raw.c_occ, raw.n_rows),
+        )
+    assert results["0"] == results["1"]
+    # And every remaining slot, including the array('i') projection and the ordinal lookups.
+    _assert_same_raw(raws["0"], raws["1"])
+    assert raws["0"].close.flags.writeable is True, "the escape hatch keeps private arrays"
+    assert raws["1"].close.flags.writeable is False, "the shared path maps them read-only"
+
+
+def test_a_rewritten_partition_invalidates_the_derived_set(store_root, monkeypatch):
+    """A re-warmed underlying must not be served from the arrays built off the OLD parquet.
+
+    The signature is (path, size, mtime) per partition — deliberately not a content hash, on
+    a tree that runs to hundreds of GB — so this rewrites a partition through the store's own
+    writer AND advances its mtime, which is what a real re-warm does.
+    """
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    clear_worker_parquet_options_cache()
+    pq._load_raw_underlying(store_root, _UNDER)
+    before = {p.name for p in _published_sigs(store_root)}
+    assert len(before) == 1
+
+    store = OptionHistoryParquetStore(root=store_root)
+    store.write_partition(
+        _UNDER, _EXP2,
+        [OptionEodBar(occ_symbol=_C110, bar_date=date(2023, 1, 10), open=3.0, high=3.4,
+                      low=2.9, close=9.9, volume=55, open_interest=700, iv=0.28)],
+        start=date(2023, 1, 1), end=date(2023, 3, 31))
+    # Belt and braces: a one-row rewrite need not change the file's SIZE, and a filesystem
+    # timestamp granularity coarser than the rewrite would leave the mtime equal too.
+    path = store.bars_path(_UNDER, _EXP2)
+    stamp = os.stat(path).st_mtime + 100
+    os.utime(path, (stamp, stamp))
+
+    clear_worker_parquet_options_cache()
+    raw = pq._load_raw_underlying(store_root, _UNDER)
+    after = {p.name for p in _published_sigs(store_root)}
+    assert after - before, f"no new signature was published: {after}"
+    assert 9.9 in raw.close.tolist(), "the stale arrays were served for a rewritten partition"
+
+
+def test_escape_hatch_reads_parquet_every_cold_load_and_writes_nothing(
+        store_root, tmp_path, monkeypatch):
+    """``BA2_SHARED_ARRAYS=0`` is the pre-2026-09-14 behaviour, exactly: private writable
+    arrays, a parquet read per cold load, and NOTHING on disk to roll back."""
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "0")
+    clear_worker_parquet_options_cache()
+    calls = _count_reads(monkeypatch)
+
+    a = pq._load_raw_underlying(store_root, _UNDER)
+    clear_worker_parquet_options_cache()
+    b = pq._load_raw_underlying(store_root, _UNDER)
+
+    assert calls["n"] == 2, "the escape hatch must re-read, not open a derived set"
+    assert not (tmp_path / "_derived").exists()
+    assert a.close.flags.writeable and b.close.flags.writeable
+    _assert_same_raw(a, b)

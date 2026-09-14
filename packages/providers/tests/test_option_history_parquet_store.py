@@ -699,3 +699,35 @@ def test_writing_a_second_time_replaces_rather_than_duplicates(store):
                           empty_contracts=[])
     store.write_partition("AAPL", exp, [_bar()], *WINDOW, empty_contracts=[])
     assert len(store.read_partition("AAPL", exp)) == 1
+
+
+def test_partition_paths_is_exactly_what_read_underlying_concatenates(store):
+    """The glob is EXPOSED, not duplicated. A derived array cache (ba2_common.core.
+    shared_arrays) signs an underlying's arrays on the source files they were built from, and
+    the only honest source list is the one ``read_underlying`` actually reads -- a second copy
+    of the pattern in the caller would drift and then sign the wrong files."""
+    store.write_partition("AAPL", date(2023, 1, 27), [
+        _bar(occ="AAPL230127C00150000", d=date(2023, 1, 4)),
+        _bar(occ="AAPL230127C00150000", d=date(2023, 1, 5)),
+    ], *WINDOW, empty_contracts=[])
+    store.write_partition("AAPL", date(2023, 1, 20), [_bar(d=date(2023, 1, 3))],
+                          *WINDOW, empty_contracts=[])
+    # A killed write's leftover must not be signed as a source any more than it may be read
+    # as data (see test_a_leftover_temp_file_is_not_mistaken_for_data).
+    leftover = os.path.join(os.path.dirname(store.bars_path("AAPL", date(2023, 1, 20))),
+                            "AAPL_2023-01-20_1d.parquet.13.99.tmp")
+    with open(leftover, "wb") as f:
+        f.write(b"not a parquet")
+
+    paths = store.partition_paths("AAPL")
+    assert paths == sorted(paths), "sorted, so the signature does not depend on readdir order"
+    assert paths == [store.bars_path("AAPL", date(2023, 1, 20)),
+                     store.bars_path("AAPL", date(2023, 1, 27))]
+    assert all(os.path.isfile(p) for p in paths)
+
+    # Same set, same rows: the paths ARE the read.
+    expected = pd.concat((pd.read_parquet(p) for p in paths), ignore_index=True)
+    assert len(store.read_underlying("AAPL")) == len(expected) == 3
+
+    assert store.partition_paths("aapl") == paths, "the symbol is upper-cased like everywhere"
+    assert store.partition_paths("NOPE") == []

@@ -411,15 +411,25 @@ class OptionHistoryParquetStore:
                 out.append(exp)
         return sorted(out)
 
-    def read_underlying(self, underlying: str):
-        """Every partition for ``underlying`` concatenated, or None if there are none.
+    def partition_paths(self, underlying: str) -> List[str]:
+        """Every readable ``*_1d.parquet`` partition for ``underlying``, sorted.
+
+        Exactly the files ``read_underlying`` concatenates, exposed so that a caller can
+        IDENTIFY them without re-writing the glob. The per-host derived array cache
+        (``ba2_common.core.shared_arrays``) signs an underlying's arrays on the
+        ``(path, size, mtime)`` of their sources, and the only source list that cannot drift
+        away from what was actually read is the one the read itself uses.
 
         Globs only the exact ``*_1d.parquet`` name, so a leftover ``.tmp`` from a killed
-        write can never be read back as data.
+        write can never be read back as data — nor signed as if it were.
         """
-        import pandas as pd
         base = os.path.join(self.root, underlying.upper())
-        parts = sorted(glob.glob(os.path.join(base, "exp=*", f"*_{BARS_INTERVAL}.parquet")))
+        return sorted(glob.glob(os.path.join(base, "exp=*", f"*_{BARS_INTERVAL}.parquet")))
+
+    def read_underlying(self, underlying: str):
+        """Every partition for ``underlying`` concatenated, or None if there are none."""
+        import pandas as pd
+        parts = self.partition_paths(underlying)
         if not parts:
             return None
         return pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
