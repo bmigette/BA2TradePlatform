@@ -718,8 +718,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         if not self.instance:
             raise ValueError(f"ExpertInstance with ID {id} not found")
 
-    def _get_current_price(self, symbol: str):
-        """Get current price for the symbol from the account."""
+    def _get_current_price(self, symbol: str | List[str]):
+        """Get an account price, or a symbol-to-price map for a batch of symbols."""
         try:
             from ba2_common.core.instance_resolver import get_instance_resolver
 

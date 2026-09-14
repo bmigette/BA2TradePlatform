@@ -1208,7 +1208,8 @@ def _weight_basket_expert(senate_trades, house_trades, history_by_name, price_ma
     e._fetch_house_trades = lambda symbol=None, **kwargs: house_trades
     e._fetch_trader_history = lambda name: history_by_name.get(name)
     e._get_price_at_date = lambda sym, date: exec_price
-    e._get_current_price = lambda sym: price_map.get(str(sym).upper())
+    e._get_current_price = lambda sym: ({s: price_map.get(s) for s in sym}
+                                        if isinstance(sym, list) else price_map.get(str(sym).upper()))
     return e
 
 
@@ -1406,6 +1407,131 @@ def _two_symbol_basket_fixture():
     return senate, house, history, price_map
 
 
+@pytest.fixture
+def live_weight_batch_case(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("ba2_experts.FMPSenateTraderWeight")
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is not None else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(module, "datetime", FixedDatetime)
+    senate, house, history, prices = _two_symbol_basket_fixture()
+    expert = _weight_basket_expert(senate, house, history, prices)
+    expert._gather_settings = dict(WEIGHT_SETTINGS, skill_signal_weight=0.0,
+                                  skill_confidence_weight=0.0, min_trader_avg_hold_days=0.0)
+    return expert, prices
+
+
+def test_weight_live_basket_uses_account_batch_after_historical_prices(live_weight_batch_case, monkeypatch):
+    """Exercise the real expert/account seam, not just a fake bulk helper."""
+    import importlib
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    expert, prices = live_weight_batch_case
+    base = importlib.import_module("ba2_common.core.interfaces.MarketExpertInterface")
+    resolver = importlib.import_module("ba2_common.core.instance_resolver")
+    events = []
+
+    def historical(symbol, day):
+        events.append(("historical", symbol))
+        return 50.0
+
+    def quote_batch(symbols):
+        events.append(("quotes", symbols))
+        assert isinstance(symbols, list), "live basket must not fetch quotes one by one"
+        # Deliberately return a different key order: mapping must use symbols.
+        return {"MSFT": prices["MSFT"], "AAPL": prices["AAPL"]}
+
+    account = SimpleNamespace(get_instrument_current_price=Mock(side_effect=quote_batch))
+    monkeypatch.setattr(base, "get_instance", lambda model, id: SimpleNamespace(account_id=17))
+    monkeypatch.setattr(resolver, "get_instance_resolver", lambda: SimpleNamespace(
+        get_account_instance=lambda id: account if id == 17 else None))
+    expert._get_current_price = base.MarketExpertInterface._get_current_price.__get__(expert)
+    expert._get_price_at_date = historical
+
+    bundles = expert._gather_all(_bundle({}), as_of=None)
+
+    account.get_instrument_current_price.assert_called_once_with(["AAPL", "MSFT"])
+    assert events[-1] == ("quotes", ["AAPL", "MSFT"])
+    assert len(events) == 5  # four execution dates, then one quote batch
+    assert {sym: b["current_price"] for sym, b in bundles.items()} == prices
+
+
+def test_weight_bulk_live_matches_backtest_and_backtest_never_calls_broker(live_weight_batch_case):
+    from unittest.mock import Mock
+
+    expert, prices = live_weight_batch_case
+    broker = Mock(return_value=prices)
+    expert._get_current_price = broker
+    backtest = expert._gather_all(_bundle(prices), as_of=NOW)
+    broker.assert_not_called()
+    live = expert._gather_all(_bundle({}), as_of=None)
+    broker.assert_called_once_with(["AAPL", "MSFT"])
+    settings = expert._gather_settings
+    expected = expert._process_all(backtest, settings, as_of=NOW)
+    actual = expert._process_all(live, settings, as_of=NOW)
+    assert len(expected) == len(actual) == 2
+    for a, b in zip(actual, expected):
+        assert a.almost_equals(b)
+        assert a.details == b.details
+
+
+@pytest.mark.parametrize("unpriced", [{"MSFT": None}, {}])
+def test_weight_bulk_missing_price_skips_only_that_symbol(live_weight_batch_case, unpriced):
+    from unittest.mock import Mock
+
+    expert, prices = live_weight_batch_case
+    broker = Mock(return_value={"AAPL": prices["AAPL"], **unpriced})
+    expert._get_current_price = broker
+    result = expert._gather_all(_bundle({}), as_of=None)
+    assert set(result) == {"AAPL"}
+    broker.assert_called_once_with(["AAPL", "MSFT"])
+
+
+@pytest.mark.parametrize("bad_response", [None, 100.0])
+def test_weight_bulk_bad_response_fails_instead_of_reporting_no_candidates(live_weight_batch_case, bad_response):
+    expert, _ = live_weight_batch_case
+    expert._get_current_price = lambda symbols: bad_response
+    with pytest.raises(ValueError, match="did not return a price map"):
+        expert._gather_all(_bundle({}), as_of=None)
+
+
+def test_weight_bulk_omits_symbols_with_unavailable_execution_history(live_weight_batch_case):
+    from unittest.mock import Mock
+    from ba2_providers.fmp_common import FMPHistoryCacheMiss
+
+    expert, prices = live_weight_batch_case
+
+    def historical(symbol, day):
+        if symbol == "MSFT":
+            raise FMPHistoryCacheMiss("fixture has no MSFT execution history")
+        return 50.0
+
+    broker = Mock(return_value={"AAPL": prices["AAPL"]})
+    expert._get_price_at_date = historical
+    expert._get_current_price = broker
+    result = expert._gather_all(_bundle({}), as_of=None)
+    assert set(result) == {"AAPL"}
+    broker.assert_called_once_with(["AAPL"])
+
+
+def test_weight_empty_live_basket_does_not_request_quotes(live_weight_batch_case):
+    from unittest.mock import Mock
+
+    expert, _ = live_weight_batch_case
+    expert._fetch_senate_trades = lambda **kw: []
+    expert._fetch_house_trades = lambda **kw: []
+    broker = Mock(side_effect=AssertionError("empty basket must not request prices"))
+    expert._get_current_price = broker
+    assert expert._gather_all(_bundle({}), as_of=None) == {}
+    broker.assert_not_called()
+
+
 def test_gather_all_skips_symbol_whose_current_price_cache_misses():
     """A cache-miss EXCEPTION (not just a None/falsy return) while resolving ONE symbol's
     current_price via providers.price_at_date must not abort _gather_all for the other
@@ -1459,10 +1585,10 @@ def test_gather_all_bubbles_up_a_non_cache_miss_exception():
     e = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
     e._gather_settings = WEIGHT_SETTINGS
 
-    def _boom(sym):
-        if str(sym).upper() == "MSFT":
+    def _boom(symbols):
+        if "MSFT" in symbols:
             raise RuntimeError("some unrelated bug")
-        return price_map.get(str(sym).upper())
+        return {sym: price_map.get(sym) for sym in symbols}
 
     e._get_current_price = _boom  # as_of=None path -> exercised via analyze_as_of-style live call
     with pytest.raises(RuntimeError, match="some unrelated bug"):
