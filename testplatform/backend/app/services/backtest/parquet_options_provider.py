@@ -131,13 +131,16 @@ the keys are parallel, so they evict roughly together.
 Columnar (numpy) rather than dict-per-bar because the cap has to clear a realistic universe:
 686 underlyings x ~28k rows, and a run's ~100-symbol universe must fit in a worker alongside
 the OHLCV memo. Measured on GOOG (27,974 rows / 1,374 contracts): 2.36 MB for the raw
-(1.53 MB of numpy plus 0.43 MB of the interned python projections the hot paths index and
-0.26 MB of the contract symbol list/index) and 1.09 MB for one greeks overlay. Bars are
+(1.53 MB of numpy plus 0.43 MB of the python projections the hot paths index and
+0.26 MB of the contract symbol list/index) and 1.09 MB for one greeks overlay. The per-ROW
+projection is an ``array('i')`` rather than a list precisely because that 0.43 MB is the part
+that scales with the store — see ``_RawUnderlying._bind``. Bars are
 materialised into dicts only when a caller actually reads one, and then memoised (see
 ``bar_dict``).
 """
 from __future__ import annotations
 
+import array as _array
 import logging
 import os
 from bisect import bisect_left, bisect_right
@@ -188,6 +191,17 @@ _ATM_DTE_MAX = 45
 
 #: greeks_tuple's shape, for readers of the hot paths. (iv, delta, gamma, theta, vega).
 _NO_GREEKS: Tuple[Optional[float], ...] = (None, None, None, None, None)
+
+#: ``bar_ord_l``'s buffer type. 'i' is C ``int`` — 4 bytes on every platform BA2 runs on, and
+#: the same width as the ``bar_ord`` int32 whose bytes are copied straight into it. Checked at
+#: import rather than trusted: a 2- or 8-byte ``int`` would not raise, it would silently
+#: re-interpret the buffer and mis-clamp every as-of read.
+_BAR_ORD_TYPECODE = "i"
+if _array.array(_BAR_ORD_TYPECODE).itemsize != 4:  # pragma: no cover - not reachable on x86/ARM
+    raise RuntimeError(
+        f"array('{_BAR_ORD_TYPECODE}').itemsize is "
+        f"{_array.array(_BAR_ORD_TYPECODE).itemsize}, not 4: bar_ord_l cannot be filled from "
+        "an int32 buffer on this platform")
 
 
 def clear_worker_parquet_options_cache() -> None:
@@ -246,18 +260,28 @@ class _RawUnderlying:
     #:     They are strings (an object array, which a ``.npy`` mapping refuses) and each
     #:     process needs its own list + index dict anyway; the bytes are the cheap part.
     #:   * ``has_quotes`` -- a 1-element bool array, because a scalar is not an array.
+    #:   * ``priceless_count`` -- a 1-element int64: the invariant is COUNTED at build (it is
+    #:     a fact about the store) but has to be SAID in every process, so the count travels
+    #:     with the arrays rather than the log line staying behind on the host that built them.
+    #: ``bid``/``ask`` are ZERO-LENGTH when ``has_quotes`` is false; see ``_bind``.
+    #:
+    #: CONSEQUENCE FOR A DERIVED STORE'S KEY, since it is not obvious from the source files: a
+    #: tree re-warmed to ADD the bid/ask columns changes what these arrays contain (and their
+    #: very lengths) without necessarily changing a partition's size or mtime, so the key must
+    #: cover the COLUMN SET -- ``has_quotes`` -- and not only a source signature.
     ARRAY_NAMES = (
         "bar_ord", "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
         "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord", "c_is_call",
-        "c_occ_utf8", "has_quotes",
+        "c_occ_utf8", "has_quotes", "priceless_count",
     )
 
     #: The ARRAY_NAMES that bind straight onto the identically-named slots the hot paths read.
-    #: (The two encodings above are decoded into ``c_occ`` / ``has_quotes`` instead.)
-    _DIRECT_ARRAYS = (
-        "bar_ord", "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
-        "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord", "c_is_call",
-    )
+    #: (The three above are decoded into ``c_occ`` / ``has_quotes`` / a log line instead.)
+    _DIRECT_ARRAYS = tuple(
+        n for n in ("bar_ord", "open", "high", "low", "close", "volume", "open_interest",
+                    "vendor_iv", "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord",
+                    "c_is_call", "c_occ_utf8", "has_quotes", "priceless_count")
+        if n not in ("c_occ_utf8", "has_quotes", "priceless_count"))
 
     @staticmethod
     def arrays_from_frame(df) -> Dict[str, np.ndarray]:
@@ -285,6 +309,7 @@ class _RawUnderlying:
             arrays["c_is_call"] = np.empty(0, dtype=bool)
             arrays["c_occ_utf8"] = np.empty(0, dtype=np.uint8)
             arrays["has_quotes"] = np.array([False], dtype=bool)
+            arrays["priceless_count"] = np.array([0], dtype=np.int64)
             return arrays
 
         df = df.sort_values(["occ_symbol", "bar_date"], kind="mergesort").reset_index(drop=True)
@@ -326,8 +351,12 @@ class _RawUnderlying:
             arrays["bid"] = df["bid"].to_numpy(dtype="float64", na_value=np.nan)
             arrays["ask"] = df["ask"].to_numpy(dtype="float64", na_value=np.nan)
         else:
-            arrays["bid"] = np.full(n, np.nan)
-            arrays["ask"] = np.full(n, np.nan)
+            # NOT two all-NaN columns. On a TastyTrade-style tree they would be 16 bytes a row
+            # of recorded nothing (61 MB for TSLA's 7.6M rows) written to disk and mapped into
+            # every worker. Absence is the fact; ``_bind`` materialises the NaN arrays the read
+            # paths index, privately, at zero storage cost.
+            arrays["bid"] = np.empty(0, dtype="float64")
+            arrays["ask"] = np.empty(0, dtype="float64")
 
         # INVARIANT: every stored row has a price -- a trade close, or a quote, or both. A row
         # with neither cannot be priced, and (per option_selector.passes_liquidity) a contract
@@ -335,8 +364,9 @@ class _RawUnderlying:
         # it would survive selection unpriced. Providers drop such rows at ingest; this counts
         # them once per underlying rather than per contract, so a store that violates the
         # invariant says so loudly instead of quietly mis-selecting.
-        priceless = int(np.count_nonzero(
-            np.isnan(arrays["close"]) & np.isnan(arrays["bid"]) & np.isnan(arrays["ask"])))
+        no_quote = np.isnan(arrays["bid"]) & np.isnan(arrays["ask"]) if has_quotes else True
+        priceless = int(np.count_nonzero(np.isnan(arrays["close"]) & no_quote))
+        arrays["priceless_count"] = np.array([priceless], dtype=np.int64)
         if priceless:
             # The symbol comes from the FRAME (the store writes an ``underlying`` column,
             # already upper-cased) rather than from a constructor argument, because this
@@ -367,13 +397,21 @@ class _RawUnderlying:
     def _bind(self, underlying: str, arrays: Dict[str, np.ndarray]) -> None:
         """Bind the shared arrays, then derive the per-process projections from them.
 
-        WHY THE PROJECTIONS STAY PYTHON LISTS. They are not a convenience copy of the arrays:
-        the as-of clamp is a ``bisect``, and ``bisect_right(list, x, lo, hi)`` is 0.051 us
-        against 0.73 us for ``np.searchsorted(arr[lo:hi], x)`` (which allocates a view and
-        pays numpy's call overhead). get_chain runs that clamp ONCE PER CONTRACT -- 1,374
-        times for GOOG -- and get_atm_iv once per contract in the DTE band. Nor could they be
-        shared if one wanted to: a list of python ints is not a mappable buffer. Measured
-        1.5 ms for GOOG's 27,974 rows / 1,374 contracts, against a ~130 ms parquet read.
+        WHY THE CLAMP DOES NOT BISECT THE NUMPY ARRAY. ``bisect_right(seq, x, lo, hi)`` is
+        0.051 us against 0.73 us for ``np.searchsorted(arr[lo:hi], x)``, which allocates a
+        view and pays numpy's call overhead; get_chain runs that clamp ONCE PER CONTRACT
+        (1,374 times for GOOG) and get_atm_iv once per contract in the DTE band.
+
+        WHY ``bar_ord_l`` IS AN ``array('i')`` AND NOT A LIST. It is per-row, and it is the
+        only per-row projection, so it is the one that scales: a list of python ints costs
+        8.2 B/row PRIVATE per process -- twice the 4 B/row the MAPPED ``bar_ord`` shares -- and
+        the interned ``.tolist()`` + ``setdefault`` build spiked 243 MB of transient int
+        objects. Measured on TSLA's 7.6M rows: 62.6 MB and 668 ms as a list against 32.3 MB
+        and 13.8 ms filled from the int32 bytes, and the bisect over a contract's window (a
+        few hundred rows) pays +0.023 us, +6%. ``starts_l``/``stops_l`` stay lists: they are
+        per-CONTRACT, three orders of magnitude smaller, and indexed as scalars.
+        (None of the three can be shared either way -- neither a list nor an ``array`` is a
+        mappable buffer -- which is why they are rebuilt here rather than stored.)
         """
         self.underlying = underlying
         for name in self._DIRECT_ARRAYS:
@@ -384,12 +422,35 @@ class _RawUnderlying:
         self.c_index = {s: i for i, s in enumerate(self.c_occ)}
         self.n_rows = int(len(self.bar_ord))
 
-        # bar_ord as a LIST as well as an array, INTERNED (setdefault) because there are ~82
-        # distinct ordinals here, not 27,974: a plain ``.tolist()`` would allocate 27,974
-        # separate int objects (+0.9 MB/underlying, ~30% on top of the columnar arrays) to
-        # hold 82 distinct values.
-        seen: Dict[int, int] = {}
-        self.bar_ord_l = [seen.setdefault(v, v) for v in self.bar_ord.tolist()]
+        # The encoding is newline-joined, so a symbol containing a newline -- or a mapping
+        # paired with the wrong underlying's arrays -- shifts every contract index by one and
+        # mis-prices silently from then on. One comparison per underlying buys that back.
+        if len(self.c_occ) != len(self.starts):
+            raise ValueError(
+                f"{underlying}: c_occ_utf8 decoded to {len(self.c_occ)} symbols for "
+                f"{len(self.starts)} contracts -- a symbol contains a newline, or the mapped "
+                "arrays are inconsistent")
+
+        # SAID HERE, counted at build. With a per-host derived store the arrays are built once
+        # and opened by every later process, so a build-time-only log would report a malformed
+        # store to exactly one run and leave the rest of them silent.
+        priceless = int(arrays["priceless_count"][0])
+        if priceless:
+            logger.error(
+                "%s: %d of %d option bar rows have NO price at all (no close, no bid, no "
+                "ask). These cannot be marked or liquidity-gated. The store is malformed -- "
+                "re-warm this underlying.", underlying, priceless, self.n_rows)
+
+        # NOT PERSISTED, because absence is the fact and two all-NaN columns are not (see
+        # arrays_from_frame). Materialised privately so every read path finds a full-length
+        # array whether or not the tree carries quotes; only TastyTrade-style trees pay it.
+        if not self.has_quotes:
+            self.bid = np.full(self.n_rows, np.nan)
+            self.ask = np.full(self.n_rows, np.nan)
+
+        self.bar_ord_l = _array.array(_BAR_ORD_TYPECODE)
+        self.bar_ord_l.frombytes(
+            np.ascontiguousarray(self.bar_ord, dtype=np.int32).tobytes())
         self.starts_l = self.starts.tolist()
         self.stops_l = self.stops.tolist()
         date_of_ord = {int(o): date.fromordinal(int(o))
@@ -446,10 +507,12 @@ class _Underlying:
             setattr(self, name, np.full(n, np.nan, dtype="float64"))
 
     # -- as-of clamp ----------------------------------------------------
-    # ``bisect`` over the interned python list rather than ``np.searchsorted`` over an array
+    # ``bisect`` over the ``array('i')`` buffer rather than ``np.searchsorted`` over an array
     # SLICE: identical answers (the rows are sorted by (occ_symbol, bar_date), so contract
     # ci's bar ordinals ascend across starts_l[ci]:stops_l[ci]) at 0.05 us instead of 0.73 us,
-    # and this runs once per contract inside every get_chain / get_atm_iv.
+    # and this runs once per contract inside every get_chain / get_atm_iv. ``array('i')``
+    # yields plain python ints on indexing, so every comparison and subtraction below is
+    # exactly what it was when this was a list (see _RawUnderlying._bind for why it is not).
     def latest_row_on_or_before(self, ci: int, as_of_ord: int) -> int:
         """Row index of contract ``ci``'s latest bar dated <= ``as_of_ord``, or -1."""
         lo = self.starts_l[ci]

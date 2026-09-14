@@ -16,7 +16,9 @@ Run:
 """
 from __future__ import annotations
 
+import array
 import inspect
+import logging
 import os
 from datetime import date, datetime
 
@@ -717,41 +719,49 @@ def test_a_no_trade_day_is_marked_at_the_quote_not_at_zero(quoted_store_root):
         "get_quote and get_chain must price identically (options_provider bug B4)")
 
 
+
 # --------------------------------------------------------------------------- #
 # THE SHARED-ARRAY SEAM. A `_RawUnderlying` is two separable halves: numeric columns that
 # depend on nothing but the parquet bytes (so several worker processes can memory-map ONE
-# copy) and the python list/dict projections the hot paths index, which are per-process by
+# copy) and the python projections the hot paths index, which are per-process by
 # construction. `arrays_from_frame` produces the first half as a plain dict of 1-D numeric
 # arrays; `from_arrays` rebuilds the whole object from it. Nothing here changes what a reader
 # answers -- it is the shape a per-host derived array store can plug into.
 # --------------------------------------------------------------------------- #
-_ARRAY_ATTRS = ("bar_ord", "open", "high", "low", "close", "volume", "open_interest",
-                "vendor_iv", "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord",
-                "c_is_call")
-
-
 def _assert_same_raw(a, b):
-    for name in _ARRAY_ATTRS:
-        np.testing.assert_array_equal(getattr(a, name), getattr(b, name))
-        assert getattr(a, name).dtype == getattr(b, name).dtype, name
-    assert a.c_occ == b.c_occ and a.c_index == b.c_index and a.bar_ord_l == b.bar_ord_l
-    assert a.starts_l == b.starts_l and a.stops_l == b.stops_l
-    assert a.c_expiry_ord_l == b.c_expiry_ord_l and a.c_expiry_iso == b.c_expiry_iso
-    assert a.c_expiry_date == b.c_expiry_date and a.c_strike_f == b.c_strike_f
-    assert a.c_right == b.c_right and a.c_type_str == b.c_type_str
-    assert a.has_quotes == b.has_quotes and a.n_rows == b.n_rows
-    assert a.iso_of_ord == b.iso_of_ord and a.date_of_ord == b.date_of_ord
-    assert a.underlying == b.underlying
+    """Every slot, compared by its kind.
+
+    Driven off ``__slots__`` rather than a hand-kept name list, so a field added to
+    ``_RawUnderlying`` later cannot quietly escape the round-trip check -- which is exactly
+    how a shared store would start serving a half-built object.
+    """
+    for name in pq._RawUnderlying.__slots__:
+        va, vb = getattr(a, name), getattr(b, name)
+        if isinstance(va, np.ndarray) or isinstance(vb, np.ndarray):
+            assert isinstance(va, np.ndarray) and isinstance(vb, np.ndarray), name
+            np.testing.assert_array_equal(va, vb, err_msg=name)
+            assert va.dtype == vb.dtype, name
+        elif isinstance(va, array.array) or isinstance(vb, array.array):
+            assert isinstance(va, array.array) and isinstance(vb, array.array), name
+            assert va.typecode == vb.typecode, name
+            assert list(va) == list(vb), name
+        else:
+            assert type(va) is type(vb), name
+            assert va == vb, name
+
+
+def _arrays_for(root):
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    df = OptionHistoryParquetStore(root=root).read_underlying(_UNDER)
+    return df, pq._RawUnderlying.arrays_from_frame(df)
 
 
 def test_raw_underlying_round_trips_through_its_array_dict(store_root):
     """The numeric arrays a _RawUnderlying is built from are a plain dict of 1-D numeric arrays,
     and building from that dict gives the identical object -- the seam the shared store plugs
     into. Only what a memory-mapped .npy can hold may appear in the dict: no object arrays."""
-    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
-
-    df = OptionHistoryParquetStore(root=store_root).read_underlying(_UNDER)
-    arrays = pq._RawUnderlying.arrays_from_frame(df)
+    df, arrays = _arrays_for(store_root)
     assert set(arrays) == set(pq._RawUnderlying.ARRAY_NAMES)
     for name, arr in arrays.items():
         assert isinstance(arr, np.ndarray), name
@@ -762,8 +772,19 @@ def test_raw_underlying_round_trips_through_its_array_dict(store_root):
     b = pq._RawUnderlying.from_arrays(_UNDER, arrays)
     _assert_same_raw(a, b)
 
-    # the interning survives the rebuild: ~82 distinct ordinals, not one int object per row
-    assert len({id(v) for v in b.bar_ord_l}) == len(set(b.bar_ord_l))
+    # The as-of clamp bisects a C int buffer, not a list of boxed ints: half the private
+    # bytes per process and no transient int-object spike while building it.
+    assert isinstance(b.bar_ord_l, array.array) and b.bar_ord_l.typecode == "i"
+    assert len(b.bar_ord_l) == b.n_rows
+    assert list(b.bar_ord_l) == b.bar_ord.tolist()
+
+
+def test_direct_arrays_all_name_real_slots():
+    """`_DIRECT_ARRAYS` is set with setattr, so a name that is not a slot would raise at bind
+    time -- on the first underlying of a run, not in any test that only reads the dict."""
+    assert set(pq._RawUnderlying._DIRECT_ARRAYS) <= set(pq._RawUnderlying.__slots__)
+    assert set(pq._RawUnderlying._DIRECT_ARRAYS) == (
+        set(pq._RawUnderlying.ARRAY_NAMES) - {"c_occ_utf8", "has_quotes", "priceless_count"})
 
 
 def test_empty_frame_arrays_have_the_documented_dtypes():
@@ -778,29 +799,97 @@ def test_empty_frame_arrays_have_the_documented_dtypes():
         "volume": np.float64, "open_interest": np.float64, "vendor_iv": np.float64,
         "bid": np.float64, "ask": np.float64, "c_strike": np.float64,
         "c_is_call": np.bool_, "c_occ_utf8": np.uint8, "has_quotes": np.bool_,
+        "priceless_count": np.int64,
     }
+    sized = {"has_quotes": 1, "priceless_count": 1}
     for name, dt in expected.items():
         assert arrays[name].dtype == np.dtype(dt), f"{name}: {arrays[name].dtype}"
-        assert arrays[name].size == (1 if name == "has_quotes" else 0), name
-    assert arrays["has_quotes"][0] == False  # noqa: E712 -- it is the array's value, not truthiness
+        assert arrays[name].size == sized.get(name, 0), name
+    assert arrays["has_quotes"][0] == False  # noqa: E712 -- the value, not truthiness
+    assert arrays["priceless_count"][0] == 0
 
     empty = pq._RawUnderlying.from_arrays(_UNDER, arrays)
     _assert_same_raw(pq._RawUnderlying(_UNDER, None), empty)
     assert empty.n_rows == 0 and empty.c_occ == [] and empty.has_quotes is False
 
 
+def test_a_store_without_quotes_persists_no_nan_quote_columns(store_root):
+    """The REAL TastyTrade tree predates the bid/ask columns and does not carry them at all
+    (the fixture store writes today's column set, so the legacy frame is reproduced by
+    dropping them). Two all-NaN float64 columns would be 16 bytes a row of stored nothing --
+    61 MB for TSLA -- written to disk and mapped into every worker. Absence is the fact; the
+    binder synthesises them per process, so every read path still finds a full-length array."""
+    df, _ = _arrays_for(store_root)
+    df = df.drop(columns=["bid", "ask"])
+    arrays = pq._RawUnderlying.arrays_from_frame(df)
+    assert arrays["has_quotes"].tolist() == [False]
+    assert arrays["bid"].size == 0 and arrays["ask"].size == 0
+    assert arrays["bid"].dtype == np.float64 and arrays["ask"].dtype == np.float64
+
+    a = pq._RawUnderlying(_UNDER, df)
+    b = pq._RawUnderlying.from_arrays(_UNDER, arrays)
+    for raw in (a, b):
+        assert raw.bid.shape == (raw.n_rows,) and raw.ask.shape == (raw.n_rows,)
+        assert np.all(np.isnan(raw.bid)) and np.all(np.isnan(raw.ask))
+    _assert_same_raw(a, b)
+
+
 def test_quoted_store_round_trips_its_real_bid_ask_through_the_array_dict(quoted_store_root):
     """A ThetaData-shaped store carries real NBBO, so `has_quotes` and the bid/ask columns are
     part of what a shared store must ship -- a rebuild that lost them would silently revert the
     run to the zero-spread close proxy."""
-    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
-
-    df = OptionHistoryParquetStore(root=quoted_store_root).read_underlying(_UNDER)
-    arrays = pq._RawUnderlying.arrays_from_frame(df)
+    df, arrays = _arrays_for(quoted_store_root)
     assert arrays["has_quotes"].tolist() == [True]
 
     a = pq._RawUnderlying(_UNDER, df)
     b = pq._RawUnderlying.from_arrays(_UNDER, arrays)
+    assert arrays["bid"].size == a.n_rows and arrays["ask"].size == a.n_rows
     assert a.has_quotes is True and b.has_quotes is True
     _assert_same_raw(a, b)
     assert not np.all(np.isnan(b.bid)) and not np.all(np.isnan(b.ask))
+
+
+def test_priceless_rows_are_reported_once_per_process_not_once_per_host(store_root, caplog):
+    """The invariant is COUNTED at build (a fact about the store) but must be SAID wherever
+    the arrays are used: with a per-host cache the build happens once and every later process
+    would otherwise open a malformed store in silence."""
+    _df, arrays = _arrays_for(store_root)
+    arrays = dict(arrays)
+    arrays["priceless_count"] = np.array([3], dtype=np.int64)
+
+    with caplog.at_level(logging.ERROR, logger=pq.__name__):
+        raw = pq._RawUnderlying.from_arrays(_UNDER, arrays)
+
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any(_UNDER in m and "3" in m and "NO price" in m for m in msgs), msgs
+    assert raw.n_rows > 0, "the complaint does not stop the object being usable"
+
+
+def test_a_decoded_symbol_count_that_disagrees_with_the_contracts_is_refused(store_root):
+    """c_occ_utf8 is a newline-joined encoding, so a symbol containing a newline -- or a
+    mapping paired with the wrong underlying's arrays -- silently shifts every contract
+    index. Cheap to check once per bind, and unrecoverable if it is not."""
+    _df, arrays = _arrays_for(store_root)
+    arrays = dict(arrays)
+    arrays["c_occ_utf8"] = np.frombuffer("A\nB\nC\nEXTRA".encode("utf-8"), dtype=np.uint8)
+
+    with pytest.raises(ValueError) as e:
+        pq._RawUnderlying.from_arrays(_UNDER, arrays)
+    assert _UNDER in str(e.value) and "newline" in str(e.value)
+
+
+def test_arrays_round_trip_through_read_only_memory_maps(store_root, tmp_path):
+    """The point of the split: the arrays survive a .npy round trip and the binder reads them
+    AS MAPPED. If _bind ever copied one privately the sharing would be gone and nothing else
+    would notice, so the read-only flag is asserted on the bound object."""
+    df, arrays = _arrays_for(store_root)
+    mapped = {}
+    for name, arr in arrays.items():
+        path = tmp_path / f"{name}.npy"
+        np.save(str(path), arr)
+        mapped[name] = np.asarray(np.load(str(path), mmap_mode="r"))
+
+    b = pq._RawUnderlying.from_arrays(_UNDER, mapped)
+    _assert_same_raw(pq._RawUnderlying(_UNDER, df), b)
+    assert b.bar_ord.flags.writeable is False, "_bind must not privately copy a mapping"
+    assert b.close.flags.writeable is False
