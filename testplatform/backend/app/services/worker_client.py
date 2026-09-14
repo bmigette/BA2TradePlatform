@@ -289,6 +289,8 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     tar, THEN prune anything the worker has that the master's CURRENT manifest no longer lists
     (leftovers from a local rebuild/compaction, e.g. old screener metric_store fragments — see
     ``cache_sync.diff_stale``). Returns ``{pushed, pruned, ...}``.
+
+    The prune step is skipped outright when the master's own manifest is empty (see below).
     """
     base, headers = _base(worker), _headers(worker)
     # Manifest GET: a worker with a very large cache (remote150: 312k files / 36GB) enumerates
@@ -316,6 +318,14 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
             r.raise_for_status()
             res = {"pushed": len(missing), **r.json()}
         log(f"cache push -> {worker['name']}: {res}")
+
+    if not local["files"]:
+        # Never prune on an EMPTY local view: diff_stale would then list every file the worker
+        # has, so one unreadable/misconfigured cache root on the master would wipe the worker's
+        # whole cache instead of removing a rebuild leftover.
+        logger.warning(f"cache prune -> {worker['name']}: skipped, master manifest is EMPTY "
+                       f"(root {local['root']}) — refusing to prune on an empty view")
+        return {**res, "pruned": 0}
 
     stale = cache_sync.diff_stale(local["files"], remote)
     if stale:

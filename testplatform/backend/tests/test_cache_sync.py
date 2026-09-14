@@ -5,6 +5,7 @@ worker's manifest, streams ONLY the missing files as one tar, and the worker ext
 (traversal-guarded). A re-push after sync is a no-op.
 """
 import io
+from pathlib import Path
 
 import pytest
 
@@ -97,7 +98,7 @@ def test_prune_paths_deletes_and_guards_traversal(tmp_path):
         ],
         str(tmp_path),
     )
-    assert res == {"pruned": 1, "skipped": 1}
+    assert res == {"pruned": 1, "skipped": 1, "failed": 0}
     assert not (tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part-00001.parquet").exists()
     assert (tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part.parquet").exists()
 
@@ -189,6 +190,8 @@ def test_derived_array_cache_is_never_part_of_the_manifest(tmp_path):
     d = tmp_path / "_derived" / "FMPOHLCVProvider" / "AAPL_1d" / "abc123"
     _write(d / "close.npy", b"n")
     _write(d / "_done.json", b"{}")
+    # A provider tree that is not directly under CACHE_FOLDER derives into a NESTED _derived.
+    _write(tmp_path / "options" / "_derived" / "thetadata" / "x" / "close.npy", b"n")
 
     man = cache_sync.build_manifest(str(tmp_path))
     rels = {f["rel_path"] for f in man["files"]}
@@ -209,3 +212,70 @@ def test_derived_exclusion_is_an_exact_path_component_match(tmp_path):
         "_derived",
         "FMPOHLCVProvider/not_derived/b.parquet",
     }
+
+
+def test_manifest_ignores_a_derived_component_in_the_cache_roots_own_prefix(tmp_path):
+    """The skip is a component match on paths RELATIVE to the cache root. Were it applied to the
+    absolute path, a cache root that merely LIVES under a directory named ``_derived`` would yield
+    an empty manifest -- and an empty master manifest makes ``diff_stale`` return every worker
+    file, so the next ``/cache/prune`` would wipe that worker's whole cache."""
+    root = tmp_path / "_derived" / "cache"
+    _write(root / "FMPOHLCVProvider" / "AAPL_1d.parquet", b"x")
+
+    man = cache_sync.build_manifest(str(root))
+    assert man["count"] == 1
+    assert man["files"][0]["rel_path"] == "FMPOHLCVProvider/AAPL_1d.parquet"
+
+
+def test_skip_dirname_is_the_shared_arrays_constant():
+    """One source of truth for the directory name -- a rename in shared_arrays must not leave
+    cache_sync silently pushing the derived tree again."""
+    from ba2_common.core.shared_arrays import DERIVED_DIRNAME
+    assert cache_sync._SKIP_DIRNAMES == (DERIVED_DIRNAME,)
+
+
+def test_build_manifest_does_not_descend_into_a_derived_tree(tmp_path, monkeypatch):
+    """Not merely filtered afterwards: the walk must PRUNE the directory. A derived tree holds
+    several .npy per signature dir across the whole provider tree, and the cold manifest walk is
+    already the slow path (~140s over 312k files)."""
+    _write(tmp_path / "FMPOHLCVProvider" / "AAPL_1d.parquet", b"p")
+    _write(tmp_path / "_derived" / "FMPOHLCVProvider" / "AAPL_1d" / "sig" / "close.npy", b"n")
+
+    walked = []
+    real_walk = cache_sync.os.walk
+
+    def spy_walk(top, *a, **k):
+        for dirpath, dirnames, filenames in real_walk(top, *a, **k):
+            walked.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(cache_sync.os, "walk", spy_walk)
+    cache_sync.build_manifest(str(tmp_path))
+
+    assert not any("_derived" in Path(d).parts for d in walked), walked
+
+
+def test_prune_paths_survives_an_undeletable_file(tmp_path, monkeypatch):
+    """A locked/memory-mapped file (Windows: WinError 32 -> PermissionError) must not abort the
+    sweep -- everything AFTER it would stay un-pruned, which is the silent staleness diff_stale
+    exists to prevent. It is counted in ``failed`` and logged, not raised."""
+    for name in ("locked.parquet", "after.parquet"):
+        _write(tmp_path / name, b"x")
+
+    real_unlink = Path.unlink
+
+    def fake_unlink(self, *a, **k):
+        if self.name == "locked.parquet":
+            raise PermissionError(32, "The process cannot access the file")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
+    warned = []
+    monkeypatch.setattr(cache_sync.logger, "warning", lambda m, *a, **k: warned.append(m))
+
+    res = cache_sync.prune_paths(["locked.parquet", "after.parquet"], str(tmp_path))
+
+    assert res == {"pruned": 1, "skipped": 0, "failed": 1}
+    assert not (tmp_path / "after.parquet").exists()   # the loop continued past the failure
+    assert (tmp_path / "locked.parquet").exists()
+    assert len(warned) == 1 and "locked.parquet" in warned[0], warned
