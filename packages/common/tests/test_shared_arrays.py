@@ -266,10 +266,35 @@ def test_two_concurrent_evictors_never_half_delete(tmp_path):
         if d.exists():
             left = sorted(p.name for p in d.iterdir())
             assert left == expected, f"attempt {attempt}: half-deleted directory {left}"
-        assert results.count(True) == 1, f"attempt {attempt}: exactly one winner, got {results}"
+        # ">= 1", not "== 1": the threads are not guaranteed to overlap, and what must hold is
+        # that the directory is never left half-deleted, not that a race actually happened.
+        assert results.count(True) >= 1, f"attempt {attempt}: nobody removed it, got {results}"
         assert not d.exists(), f"attempt {attempt}: the winner must have removed it"
         claim = d.with_name(d.name + SA.EVICTING_SUFFIX)
         assert not claim.exists(), "the eviction claim must be released"
+
+
+def test_eviction_waits_for_a_held_claim_but_housekeeping_never_does(tmp_path):
+    """A probe is renames only, so a publish waits a held claim out rather than escalating it
+    to "Stop the workers"; sweep() and _remove_stale_siblings pass wait_s=0.0 and move on."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    d = _write_done_dir(store.key_dir("AAPL") / "sig")
+    claim = d.with_name(d.name + SA.EVICTING_SUFFIX)
+    claim.write_text(str(os.getpid()))
+
+    assert store._evict_dir(d, wait_s=0.0) is False, "housekeeping must not block"
+    assert d.is_dir() and (d / SA.DONE_MARKER).is_file(), "and must leave the directory alone"
+
+    def hold():
+        time.sleep(0.3)
+        claim.unlink()
+    t = threading.Thread(target=hold)
+    t.start()
+    try:
+        assert store._evict_dir(d) is True, "a publish waits the momentary overlap out"
+    finally:
+        t.join()
+    assert not d.exists()
 
 
 def test_corrupt_array_in_a_marked_dir_is_rebuilt(tmp_path):
@@ -461,6 +486,10 @@ def test_sweep_collects_old_signatures_orphans_and_dead_tmps_only(tmp_path):
     store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
     kd = store.key_dir("AAPL")
     old_done = _write_done_dir(kd / "sig_old", marker_mtime=time.time() - 10_000)
+    # Superseded but PUBLISHED SECONDS AGO: with a churning source the newest-by-mtime is often
+    # not the one a builder just published, and collecting this one raced that builder between
+    # its _publish and its _try_open.
+    fresh_superseded = _write_done_dir(kd / "sig_fresh", marker_mtime=time.time() - 5)
     new_done = _write_done_dir(kd / "sig_new", marker_mtime=time.time())
     orphan = kd / "sig_partial"                 # what a pre-_evict_dir partial delete leaves
     orphan.mkdir()
@@ -474,7 +503,8 @@ def test_sweep_collects_old_signatures_orphans_and_dead_tmps_only(tmp_path):
     removed = store.sweep()
 
     left = sorted(p.name for p in kd.iterdir() if p.is_dir())
-    assert left == sorted([new_done.name, live_tmp.name])
+    assert left == sorted([new_done.name, fresh_superseded.name, live_tmp.name])
     assert removed == 3                          # old_done, orphan, dead_tmp
     assert not old_done.exists() and not orphan.exists() and not dead_tmp.exists()
+    assert fresh_superseded.is_dir(), "a directory published seconds ago is not garbage yet"
     assert store.sweep() == 0, "sweep must be idempotent"

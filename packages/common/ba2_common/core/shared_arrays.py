@@ -65,6 +65,9 @@ EVICT_SUFFIX = ".evict"
 EVICTING_SUFFIX = ".evicting"
 SCHEMA_VERSION = 1          #: bump when layout/meaning changes; every signature moves
 LOCK_STALE_S = float(os.getenv("BA2_SHARED_ARRAYS_LOCK_STALE_S", "900"))
+#: How long a publish waits for somebody else's eviction probe to finish. A probe is renames
+#: only, so this is generous; housekeeping passes 0.0 and never waits at all.
+EVICT_CLAIM_WAIT_S = 5.0
 _WAIT_POLL_S = 0.25
 
 #: Names NTFS refuses as a path segment whatever the extension; PRN and AUX are plausible
@@ -383,20 +386,32 @@ class DerivedArrayStore:
         """Why the last eviction refused, for an error message. Never branch on this."""
         return self._last_evict_error or "cause unknown"
 
-    def _claim_eviction(self, claim: Path) -> bool:
-        """Take the O_EXCL eviction claim, breaking it if it is older than LOCK_STALE_S."""
+    def _claim_eviction(self, claim: Path, wait_s: float) -> bool:
+        """Take the O_EXCL eviction claim, waiting up to ``wait_s`` for a live one to clear.
+
+        Waiting matters on the ``_publish`` path: a probe is renames only, so a held claim
+        clears in milliseconds, and giving up instantly there turned a momentary overlap into
+        "Stop the workers and run sweep()". Housekeeping passes ``wait_s=0.0`` -- it already
+        reads False as "not mine" and must never block. A claim older than ``LOCK_STALE_S`` is
+        broken rather than waited on.
+        """
+        deadline = time.monotonic() + max(wait_s, 0.0)
         while True:
             try:
                 fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
-                if not self._lock_is_stale(claim):
+                if self._lock_is_stale(claim):
+                    try:
+                        claim.unlink()
+                    except FileNotFoundError:
+                        continue            # somebody else broke it; race for it again
+                    except OSError:
+                        return False
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return False
-                try:
-                    claim.unlink()
-                except FileNotFoundError:
-                    continue                # somebody else broke it; race for it again
-                except OSError:
-                    return False
+                time.sleep(min(_WAIT_POLL_S, remaining))
                 continue
             except OSError:
                 return False
@@ -404,7 +419,7 @@ class DerivedArrayStore:
                 f.write(str(os.getpid()))
             return True
 
-    def _evict_dir(self, d: Path) -> bool:
+    def _evict_dir(self, d: Path, wait_s: float = EVICT_CLAIM_WAIT_S) -> bool:
         """Remove ``d`` entirely, or leave it exactly as it was and return False.
 
         Every child is renamed aside first. A file another process maps refuses that rename on
@@ -422,7 +437,7 @@ class DerivedArrayStore:
         already treats as "not mine to remove".
         """
         claim = d.with_name(d.name + EVICTING_SUFFIX)
-        if not self._claim_eviction(claim):
+        if not self._claim_eviction(claim, wait_s):
             self._last_evict_error = f"another evictor holds {claim.name}"
             return False
         try:
@@ -434,14 +449,20 @@ class DerivedArrayStore:
                 pass
 
     def _evict_claimed(self, d: Path) -> bool:
-        """The rename-probe body of ``_evict_dir``; call only while holding the claim."""
+        """The rename-probe body of ``_evict_dir``; call only while holding the claim.
+
+        True means THIS call removed the directory. A directory that was already gone reports
+        False: counting it as a removal inflated ``sweep()``'s total, and let two evictors that
+        merely failed to overlap both believe they had won.
+        """
+        if not d.is_dir():
+            self._last_evict_error = f"{d.name} is already gone"
+            return False
         try:
             children = list(d.iterdir())
         except OSError as exc:
-            if d.exists():
-                self._last_evict_error = f"{type(exc).__name__}: {exc}"
-                return False
-            return True
+            self._last_evict_error = f"{type(exc).__name__}: {exc}"
+            return False
         # The marker goes LAST so that _marker_mtime keeps classifying this directory as
         # TRUSTED for the whole probe: a second evictor must not meet it half-renamed and
         # decide it is a marker-less orphan to collect. (A reader that already read the marker
@@ -499,7 +520,7 @@ class DerivedArrayStore:
             mtime = _marker_mtime(d)
             if mtime is None or now - mtime < LOCK_STALE_S:
                 continue                    # marker-less or freshly published: leave to sweep()
-            self._evict_dir(d)
+            self._evict_dir(d, wait_s=0.0)  # housekeeping never waits on another evictor
 
     def _acquire(self, lock: Path) -> bool:
         """Take the O_EXCL build lock, breaking it first if it is older than LOCK_STALE_S."""
@@ -555,8 +576,14 @@ class DerivedArrayStore:
         only here. Nothing can ever open one by name (``_try_open`` needs the marker), so it is
         pure garbage, and it is exactly what an interrupted publish or a pre-``_evict_dir``
         partial delete leaves behind.
+
+        Stale ``.lock`` and ``.evicting`` FILES are deliberately not collected here: both are
+        self-correcting, since the next claimant breaks one it finds older than
+        ``LOCK_STALE_S``, and deleting a lock somebody may still hold is how two builders end
+        up in one directory.
         """
         removed = 0
+        now = time.time()
         try:
             key_dirs = list(self.root.iterdir())
         except OSError:
@@ -582,7 +609,14 @@ class DerivedArrayStore:
                 else:
                     done.append((mtime, d))
             done.sort(key=lambda row: row[0])
-            for d in [row[1] for row in done[:-1]] + orphans + dead_tmps:
-                if self._evict_dir(d):
+            # Superseded, but only once it is OLDER than LOCK_STALE_S -- the same guard
+            # _remove_stale_siblings uses, and for the same reason. With a churning source the
+            # directory a builder has just published is very often not the newest by marker
+            # mtime, so an unguarded done[:-1] deleted it in the window between that builder's
+            # _publish and its _try_open: ~40 "left no readable set" failures per 500 opens
+            # under a 6-builder stress, and none at all with the sweeper switched off.
+            superseded = [d for mtime, d in done[:-1] if now - mtime >= LOCK_STALE_S]
+            for d in superseded + orphans + dead_tmps:
+                if self._evict_dir(d, wait_s=0.0):
                     removed += 1
         return removed
