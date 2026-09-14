@@ -273,8 +273,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"Expert driving O_ERN (default {_DEFAULT_EARNINGS_EXPERT}). It "
                          f"stamps the event date the strategy's timing gates read; no other "
                          f"expert can make those gates fire.")
-    ap.add_argument("--start", default="2023-01-01",
-                    help="Backtest start (design Section 7 window; needs the parquet store).")
+    ap.add_argument("--start", default="2020-01-01",
+                    help="Backtest start (the goal2020 window; served by the thetadata store, "
+                         "whose floor is 2018-09-14. A later start is legal but no longer the "
+                         "specified window).")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (2026 is the reserved walk-forward holdout and the "
                          "launcher refuses to search into it).")
@@ -297,9 +299,10 @@ def build_parser() -> argparse.ArgumentParser:
                          f"uses option_convex and must not be crossed with it).")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f}).")
-    ap.add_argument("--options-store", default="parquet",
-                    help="Options store serving the run (default parquet -- the only vendor "
-                         "whose history floor reaches a 2023 start).")
+    ap.add_argument("--options-store", default="thetadata",
+                    help="Options store serving the run (default thetadata -- floor 2018-09-14, "
+                         "the only vendor whose history reaches the 2020 start this grid "
+                         "targets; tastytrade floors at 2022-10-01 and alpaca at 2024-01-18).")
     ap.add_argument("--universe-file", default=_UNIVERSE_FILE,
                     help="Symbol list probed and then passed to each job.")
     ap.add_argument("--probe-out-dir", default=_TOOLS_DIR,

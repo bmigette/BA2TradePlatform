@@ -34,13 +34,32 @@ from datetime import date
 from typing import Any, Callable, Dict, Optional
 
 SQLITE = "sqlite"
-PARQUET = "parquet"
-OPTIONS_STORES = (SQLITE, PARQUET)
+TASTYTRADE = "tastytrade"
+THETADATA = "thetadata"
+OPTIONS_STORES = (SQLITE, TASTYTRADE, THETADATA)
+
+#: Superseded names, accepted on input and normalised. NOT offered in ``OPTIONS_STORES``.
+#:
+#: ``parquet`` named the FILE FORMAT, which stopped identifying anything the moment ThetaData
+#: became the second parquet-backed store. Stores are named for their VENDOR because the vendor
+#: is what the name has to answer: whose history, and therefore which floor.
+#:
+#: The alias is load-bearing, not courtesy: every options optimization_config and Backtest on
+#: record carries ``options_store: "parquet"``, and an unrecognised value RAISES here by design,
+#: so dropping it would break re-runs, deploys and warm starts across the whole existing archive.
+STORE_ALIASES = {"parquet": TASTYTRADE}
 
 #: Store -> the vendor whose history it holds. Consumed by
 #: ``daily_backtest_handler.backtest_options_provider``; the values must be keys of
 #: ``ba2_providers.options.OPTIONS_HISTORY_PROVIDERS`` or the floor lookup raises.
-STORE_VENDOR = {SQLITE: "alpaca", PARQUET: "tastytrade"}
+STORE_VENDOR = {SQLITE: "alpaca", TASTYTRADE: "tastytrade", THETADATA: "thetadata"}
+
+#: Store -> its sub-directory of CACHE_FOLDER. Each vendor writes its OWN tree and they must
+#: never resolve to one directory: the two hold different contracts over different windows, and
+#: the warmer already keeps them apart (tools/warm_options_history.py picks the directory from
+#: ``--provider``). TastyTrade's comes from the WRITER's own constant rather than being retyped,
+#: because a hand-copied directory name is how a reader drifts from its writer.
+_STORE_DIRS = {TASTYTRADE: None, THETADATA: "ThetaDataOptionsProvider"}
 
 #: Sub-directory of CACHE_FOLDER holding the parquet tree. Imported from the writer so the
 #: reader can never drift from it.
@@ -63,6 +82,7 @@ def resolve_options_store(config: Optional[Dict[str, Any]] = None) -> str:
     if raw is None:
         raw = os.environ.get("BACKTEST_OPTIONS_STORE")
     store = str(raw).strip().lower() if raw else SQLITE
+    store = STORE_ALIASES.get(store, store)      # 'parquet' -> 'tastytrade'; see STORE_ALIASES
     if store not in OPTIONS_STORES:
         raise ValueError(
             f"Unknown options store {raw!r}. Choose one of {list(OPTIONS_STORES)}. "
@@ -70,22 +90,40 @@ def resolve_options_store(config: Optional[Dict[str, Any]] = None) -> str:
     return store
 
 
-def default_options_parquet_root() -> str:
-    """Where the TastyTrade parquet tree lives.
+def default_options_parquet_root(store: str = TASTYTRADE) -> str:
+    """Where *store*'s parquet tree lives.
 
-    ``BACKTEST_OPTIONS_PARQUET_ROOT`` overrides the full path; otherwise
-    ``<CACHE_FOLDER>/TastyTradeOptionsProvider``, i.e. exactly what
-    ``OptionHistoryParquetStore`` writes to and what the chain viewer
-    (``services/option_cache_reader``) reads. The directory is NOT created on demand — unlike
-    the sqlite path, an absent parquet root means "no data", and creating an empty one would
-    turn a loud ``OptionsCacheMiss`` into a silent zero-trade run.
+    ``BACKTEST_OPTIONS_PARQUET_ROOT`` overrides the full path for whichever store is selected;
+    otherwise ``<CACHE_FOLDER>/<ProviderDir>`` — ``TastyTradeOptionsProvider`` or
+    ``ThetaDataOptionsProvider``, matching what ``OptionHistoryParquetStore`` and
+    ``tools/warm_options_history.py`` write and what the chain viewer
+    (``services/option_cache_reader``) reads.
+
+    The two trees are SEPARATE and must stay so: they hold different contracts over different
+    windows, and collapsing them would mix vendors inside one run — the same class of error as a
+    floor naming a vendor the store does not hold.
+
+    The directory is NOT created on demand — unlike the sqlite path, an absent parquet root means
+    "no data", and creating an empty one would turn a loud ``OptionsCacheMiss`` into a silent
+    zero-trade run.
+
+    The default argument keeps the old no-argument call site working: before ThetaData there was
+    only one parquet tree, and it was TastyTrade's.
     """
     explicit = os.environ.get(_PARQUET_DIR_ENV)
     if explicit:
         return explicit
-    from ba2_providers.options.parquet_store import PROVIDER_DIR
+    store = STORE_ALIASES.get(store, store)
+    if store not in _STORE_DIRS:
+        raise ValueError(
+            f"{store!r} has no parquet tree (stores with one: {sorted(_STORE_DIRS)}).")
+    provider_dir = _STORE_DIRS[store]
+    if provider_dir is None:
+        # Taken from the WRITER so the reader can never drift from it.
+        from ba2_providers.options.parquet_store import PROVIDER_DIR
+        provider_dir = PROVIDER_DIR
     import ba2_common.config as cfg
-    return str(pathlib.Path(cfg.CACHE_FOLDER) / PROVIDER_DIR)
+    return str(pathlib.Path(cfg.CACHE_FOLDER) / provider_dir)
 
 
 def default_options_risk_free_rate() -> float:
@@ -136,10 +174,14 @@ def spot_scope(config: Dict[str, Any]) -> str:
 def build_options_provider(config: Dict[str, Any], *, price_source: Any):
     """The run's option reader, or None when the run does not use options.
 
-    ``config['options_cache_db']`` remains the OPTIONS-RUN FLAG for both stores (it is what
+    ``config['options_cache_db']`` remains the OPTIONS-RUN FLAG for every store (it is what
     ``strategy_uses_options`` derives and what every launcher already forwards); for the
-    parquet store it is not otherwise read — the tree comes from
-    ``config['options_parquet_root']`` / ``default_options_parquet_root()``.
+    parquet-backed stores it is not otherwise read — the tree comes from
+    ``config['options_parquet_root']`` / ``default_options_parquet_root(store)``.
+
+    The root is resolved FOR THE SELECTED STORE. Passing the store here is what keeps a
+    ``thetadata`` run off the TastyTrade tree: both are parquet and both would load, so an
+    un-keyed default would silently serve one vendor's contracts under the other's floor.
     """
     if not config.get("options_cache_db"):
         return None
@@ -148,7 +190,7 @@ def build_options_provider(config: Dict[str, Any], *, price_source: Any):
         from .options_provider import HistoricalOptionsProvider
         return HistoricalOptionsProvider(config["options_cache_db"])
     from .parquet_options_provider import ParquetOptionsProvider
-    root = config.get("options_parquet_root") or default_options_parquet_root()
+    root = config.get("options_parquet_root") or default_options_parquet_root(store)
     rate = config.get("options_risk_free_rate")
     return ParquetOptionsProvider(
         root, spot_source=price_source_spot(price_source),

@@ -1,5 +1,12 @@
 """Autonomous driver for the OPTIONS strategy optimization matrix.
 
+Stage 1: --profile discovery selects 16 permitted singles x FMPRating/DeterministicScorer,
+population 200, generations 60 and patience 8. It requires the gate store with blanket
+--max-stock-price 0 so the strategy-specific caps apply. --dry-run prints the actual commands.
+Discovery names include a configuration digest; change --name-suffix after code/cache-content
+changes at unchanged paths. This preserves older results and checkpoints as separate experiments.
+The default matrix profile retains the existing family-search interface.
+
 OPERATOR CHECKLIST BEFORE LAUNCHING ANY OPTION GRID (2026-09-03, options-grid2 closeout):
   1. Window: retarget --start to 2020-01-01 on the ThetaData store (the TastyTrade parquet is a
      bull-only 2024-02+ window). Provider PARITY first: the parquet store layout, the per-worker
@@ -22,8 +29,8 @@ OPERATOR CHECKLIST BEFORE LAUNCHING ANY OPTION GRID (2026-09-03, options-grid2 c
 
 Runs `ba2-test optimize --strategy <OS?/O_?>` SEQUENTIALLY (one job at a time) over the
 option-strategy matrix on the top-100 large-cap universe covered by the offline options
-cache (built via `ba2-test fetch-options`; see tools/options_universe_top100.txt — the
-DISTINCT underlyings actually present in the cache, so no OptionsCacheMiss mid-run):
+cache (see tools/options_universe_top100.txt). The list does not prove time/contract coverage;
+validate that independently on the machine serving the run:
 
   per expert, in order:
     OS1   grouped: directional DEBIT  (O_LC long call, O_LP long put, O_VERT bear put
@@ -35,7 +42,7 @@ DISTINCT underlyings actually present in the cache, so no OptionsCacheMiss mid-r
     O_CC  covered call (equity entry + call overlay — different entry path, own job)
     O_STK plain equity baseline (control)
 
-Experts: FMPRating only by default. FMPEarningsDrift/FMPInsiderClusterBuy are EXCLUDED —
+Matrix experts: FMPRating only by default. FMPEarningsDrift/FMPInsiderClusterBuy are EXCLUDED —
 they have no large-cap signal/data and the options cache is large-cap only. FactorRanker
 is a bypass expert (no strategy rules), so it cannot drive option entries.
 
@@ -54,7 +61,13 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
         [--fitness <override>] [--initial-capital 20000] [--dry-run]
 """
 import argparse
+from datetime import date
+import hashlib
+import json
+import math
 import os
+from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -78,10 +91,24 @@ _DEFAULT_EXPERTS = ["FMPRating"]
 # contract dominate the book.
 _DEFAULT_CAPITAL = 20000.0
 
+# Discovery keeps every structure in its own job. Family composition is a separate
+# experiment; its larger genome cannot answer the per-structure knowledge question.
+_DISCOVERY_STRATEGIES = [
+    "O_LC", "O_LP", "O_VERT", "O_BULLCS", "O_BULLPS", "O_BEARCS", "O_BF",
+    "O_IC", "O_JL", "O_RS", "O_CSP", "O_STRD", "O_STRG",
+    "O_CC", "O_PP", "O_WHEEL",
+]
+# The 2026-08-31 risk decision supersedes the original 18-structure design.
+# Both singles are refused by the launcher; this is not a performance survival gate.
+_DISCOVERY_EXCLUDED = {"O_SSTG", "O_SSTD"}
+_DISCOVERY_EXPERTS = ["FMPRating", "DeterministicScorer"]
 
-def _universe() -> str:
-    with open(_UNIVERSE_FILE, encoding="utf-8") as f:
-        syms = [s.strip() for s in f.read().split() if s.strip()]
+
+def _universe(path=_UNIVERSE_FILE) -> str:
+    with open(path, encoding="utf-8") as f:
+        syms = list(dict.fromkeys(s.upper() for s in f.read().split()))
+    if not syms:
+        raise ValueError(f"Empty options universe: {path}")
     return ",".join(syms)
 
 
@@ -91,14 +118,16 @@ def _db_path() -> str:
 
 def _completed_names() -> set:
     import sqlite3
+    path = Path(_db_path()).resolve()
+    if not path.exists():
+        return set()  # A new instance is allowed, but a dry-run must not create its DB.
+    c = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
     try:
-        c = sqlite3.connect(_db_path())
         rows = c.execute(
             "SELECT name FROM strategy_optimizations WHERE status='completed'").fetchall()
+    finally:
         c.close()
-        return {r[0] for r in rows}
-    except Exception:  # noqa: BLE001
-        return set()
+    return {r[0] for r in rows}
 
 
 def _jobs(experts, strategies, name_suffix=""):
@@ -116,12 +145,15 @@ def _gate_passthrough(args) -> list:
             "--max-stock-price", str(args.max_stock_price)]
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--experts", default=",".join(_DEFAULT_EXPERTS),
+    ap.add_argument("--profile", choices=["matrix", "discovery"], default="matrix",
+                    help="Discovery: 16 permitted singles x Rating/DS, pop 200, gen 60, patience 8. "
+                         "Matrix retains the existing grouped defaults. Explicit knobs override.")
+    ap.add_argument("--experts", default=None,
                     help="Comma list of experts (default FMPRating; EarningsDrift/Insider "
                          "excluded — no large-cap signal on this options universe).")
-    ap.add_argument("--strategies", default=",".join(_DEFAULT_STRATEGIES),
+    ap.add_argument("--strategies", default=None,
                     help="Comma list of option strategy keys: grouped OS1-4 and/or singles "
                          "(O_LC,O_LP,O_VERT,O_BULLCS,O_BF,O_SSTG,O_SSTD,O_IC,O_CSP,O_JL,O_RS,"
                          "O_BEARCS,O_STRD,O_STRG,O_CC,O_PP,O_STK). OS1=directional debit, "
@@ -144,19 +176,27 @@ def main() -> int:
     # backtest/options_store.py, added 2026-08-28). Selecting it moves the floor to 2022-10-01
     # HONESTLY, because it also moves which store is read; do NOT instead lower the Alpaca
     # number, which would admit a window the sqlite is empty for.
-    ap.add_argument("--start", default="2023-01-01",
-                    help="Backtest start (default 2023-01-01; requires the options cache -- "
-                         "and the serving vendor's history floor -- to reach that far back).")
+    ap.add_argument("--start", default="2020-01-01",
+                    help="Backtest start (default 2020-01-01, the goal2020 window; requires the "
+                         "options cache -- and the serving vendor's history floor -- to reach "
+                         "that far back, which is why the store below defaults to thetadata).")
+    ap.add_argument("--options-store", default="thetadata",
+                    help="Options store serving the run, forwarded to the launcher per job "
+                         "(default thetadata -- floor 2018-09-14, the only vendor reaching a "
+                         "2020 start; tastytrade floors at 2022-10-01, alpaca at 2024-01-18).")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
-    ap.add_argument("--population", type=int, default=40)
-    ap.add_argument("--generations", type=int, default=8)
+    ap.add_argument("--population", type=int, default=None)
+    ap.add_argument("--generations", type=int, default=None)
     ap.add_argument("--early-stop", type=int, default=None,
                     help="Generations without improvement before a job stops (spec stage 1: 8). "
                          "Omitted -> launcher default.")
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's).")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Random seed, included in discovery job identity; vary for stability pilots.")
+    ap.add_argument("--elitism-percent", type=float, default=10.0)
     ap.add_argument("--interval", default="1d",
                     help="Analysis/fill interval (default 1d — option cache bars are daily).")
     ap.add_argument("--fitness", default=None,
@@ -169,6 +209,11 @@ def main() -> int:
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "
                          "need more headroom than the equity grid's 10k).")
+    ap.add_argument("--equity-cap", type=float, default=None,
+                    help="Optional fixed sizing ceiling; omitted preserves compounding. "
+                         "Recorded in discovery identity; different capital policies are separate runs.")
+    ap.add_argument("--universe-file", default=_UNIVERSE_FILE,
+                    help="Whitespace-separated offline-cache universe, preserving symbol order.")
     ap.add_argument("--name-suffix", default="",
                     help="Suffix appended to every job name — re-runs the whole matrix under "
                          "FRESH names without clobbering prior runs' tagged Backtests.")
@@ -218,11 +263,136 @@ def main() -> int:
     ap.add_argument("--max-stock-price", type=float, default=100.0,
                     help="Max underlying price for the gate-only entry gate (default 100 — the "
                          "$20k-account cap). 0 disables the price filter.")
-    args = ap.parse_args()
+    return ap
+
+
+def resolve_args(ap, argv=None):
+    args = ap.parse_args(argv)
+    discovery = args.profile == "discovery"
+    if args.experts is None:
+        args.experts = ",".join(_DISCOVERY_EXPERTS if discovery else _DEFAULT_EXPERTS)
+    if args.strategies is None:
+        args.strategies = ",".join(_DISCOVERY_STRATEGIES if discovery else _DEFAULT_STRATEGIES)
+    if args.population is None:
+        args.population = 200 if discovery else 40
+    if args.generations is None:
+        args.generations = 60 if discovery else 8
+    if discovery:
+        if args.early_stop is None:
+            args.early_stop = 8
+        if args.mutation_prob is None:
+            args.mutation_prob = 0.3
+        if args.fitness is None:
+            args.fitness = "option_consistent_annual_return"
+    for label in ("experts", "strategies"):
+        values = [v.strip() for v in getattr(args, label).split(",") if v.strip()]
+        if not values or len(values) != len(set(values)):
+            ap.error(f"--{label} must be a non-empty list without duplicates")
+        setattr(args, label, ",".join(values))
+    if discovery:
+        if set(args.strategies.split(",")) & _DISCOVERY_EXCLUDED:
+            ap.error("O_SSTG/O_SSTD are excluded by the existing unbounded-risk policy; "
+                     "discovery does not override that policy")
+        if set(args.strategies.split(",")) - set(_DISCOVERY_STRATEGIES):
+            ap.error("Discovery requires stage-1 single structures; groups/baselines belong in matrix mode")
+        if set(args.experts.split(",")) - set(_DISCOVERY_EXPERTS):
+            ap.error("Discovery is defined for FMPRating and DeterministicScorer")
+        if not args.screener_gate_store or args.max_stock_price != 0:
+            ap.error("Discovery requires --screener-gate-store and --max-stock-price 0 "
+                     "to retain the launcher's per-structure affordability caps")
+    try:
+        start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
+    except ValueError:
+        ap.error("--start and --end must be ISO dates (YYYY-MM-DD)")
+    if start > end:
+        ap.error("--start must not be after --end")
+    # Scope to this option-grid driver, including the equity-entry overlays/control.
+    # Do not extend the backend's pure-option rail into unrelated equity optimizations.
+    if end >= date(2026, 1, 1):
+        ap.error("Option-grid search must end before the reserved 2026 holdout")
+    for key in ("population", "generations", "parallel", "initial_capital",
+                "early_stop", "equity_cap", "fitness_trade_scale_cap", "fitness_trade_scale_target"):
+        value = getattr(args, key)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            ap.error(f"--{key.replace('_', '-')} must be finite and positive")
+    for key in ("profit_cap_pct", "profit_share_cap_pct", "max_stock_price"):
+        value = getattr(args, key)
+        if not math.isfinite(value) or value < 0:
+            ap.error(f"--{key.replace('_', '-')} must be finite and non-negative")
+    if not math.isfinite(args.elitism_percent) or not 0 <= args.elitism_percent <= 100:
+        ap.error("--elitism-percent must be in [0, 100]")
+    if args.mutation_prob is not None and (not math.isfinite(args.mutation_prob)
+                                          or not 0 <= args.mutation_prob <= 1):
+        ap.error("--mutation-prob must be in [0, 1]")
+    return args
+
+
+def build_cmd(args, launcher, name, expert, strat, universe):
+    cmd = ([sys.executable, launcher] if launcher.endswith(".py") else [launcher]) + [
+        "optimize", "--expert", expert, "--universe", universe, "--strategy", strat,
+        "--start", args.start, "--end", args.end,
+        "--interval", args.interval, "--population", str(args.population),
+        "--generations", str(args.generations), "--initial-capital", str(args.initial_capital),
+        "--run-schedule", "daily", "--name", name, "--parallel", str(args.parallel),
+        "--seed", str(args.seed), "--elitism-percent", str(args.elitism_percent),
+        # EXPLICIT per job, never left to BACKTEST_OPTIONS_STORE. A distributed trial ships only
+        # {config, fitness_metric, cache_root, inmem_trades} -- no environment goes with it -- so
+        # a store chosen via env is a decision the master made that the worker cannot see, and
+        # the worker would silently re-resolve to the sqlite default. That is how a whole grid
+        # once scored against the wrong vendor's history while every log said otherwise.
+        "--options-store", args.options_store]
+    cmd += _gate_passthrough(args)
+    for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
+                        ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
+        value = getattr(args, field)
+        if value is not None:
+            cmd += [flag, str(value)]
+    cmd += cap_passthrough(args)
+    if args.fitness_trade_scale:
+        cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap),
+                "--fitness-trade-scale-target", str(args.fitness_trade_scale_target)]
+    if args.fitness_win_rate_factor:
+        cmd += ["--fitness-win-rate-factor"]
+    if args.workers:
+        cmd += ["--workers", args.workers]
+    return cmd
+
+
+def discovery_name(args, launcher, name, expert, strat, universe):
+    """Version the experiment, not the machine's consumer count or selected job subset.
+
+    Name is also the backend checkpoint key. Changed window/seed/capital/GA knobs
+    must neither skip an older completion nor resume its incompatible experiment.
+    Cache contents/code changes at the same paths still require a fresh name suffix.
+    """
+    cmd = build_cmd(args, launcher, "", expert, strat, universe)
+    tokens = cmd[cmd.index("optimize") + 1:]
+    config = {}
+    i = 0
+    while i < len(tokens):
+        flag = tokens[i]
+        if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor"):
+            config[flag] = True
+            i += 1
+        else:
+            if flag not in ("--name", "--parallel", "--workers"):
+                config[flag] = tokens[i + 1]
+            i += 2
+    identity = {"schema": 1, "args": config, "launcher": os.path.abspath(launcher),
+                "store": {key: os.environ.get(key) for key in (
+                    "BA2_HOME", "BACKTEST_OPTIONS_STORE", "BACKTEST_OPTIONS_PARQUET_ROOT",
+                    "BACKTEST_OPTIONS_RISK_FREE_RATE", "TASTYTRADE_OPTIONS_HISTORY_FLOOR")}}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
+    return f"{name}-d{digest}"
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
+    args = resolve_args(ap, argv)
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
-    universe = _universe()
+    universe = _universe(args.universe_file)
 
     launcher = args.launcher
     if not launcher:
@@ -230,6 +400,20 @@ def main() -> int:
         if not os.path.exists(launcher):
             launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test")
     jobs = list(_jobs(experts, strategies, args.name_suffix))
+    if args.profile == "discovery":
+        jobs = [(discovery_name(args, launcher, nm, exp, strat, universe), exp, strat)
+                for nm, exp, strat in jobs]
+        print("DISCOVERY: permitted singles only; all remain eligible for composition. "
+              "Stage-1 rankings provide seeds, not a survival gate.")
+        print("Risk-policy exclusions: O_SSTG, O_SSTD (2026-08-31; not performance exclusions).")
+        print(f"Search budget: population={args.population}, generations={args.generations}, "
+              f"patience={args.early_stop}, seed={args.seed}; "
+              f"capital={args.initial_capital}, equity_cap={args.equity_cap}")
+        if args.population < 200:
+            print("PILOT BUDGET: population below the documented 200; precision equivalence is unmeasured.")
+        if args.start > "2020-01-01":
+            print("LIMITED WINDOW: this does not satisfy the later goal2020 specification. "
+                  "2020 requires ThetaData reader/vendor parity and verified cache coverage.")
     done = _completed_names()
     print(f"options matrix: {len(jobs)} jobs (experts={experts}, strategies={strategies}, "
           f"universe={len(universe.split(','))} symbols); "
@@ -237,45 +421,24 @@ def main() -> int:
     if args.dry_run:
         for nm, exp, s in jobs:
             print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s})")
+            print("    " + shlex.join(build_cmd(args, launcher, nm, exp, s, universe)))
+        print("Dry-run only: cache coverage and vendor compatibility have NOT been validated.")
         return 0
+
+    if args.screener_gate_store and not Path(args.screener_gate_store).exists():
+        ap.error(f"Screener gate store does not exist: {args.screener_gate_store}")
 
     for i, (name, expert, strat) in enumerate(jobs, 1):
         if name in _completed_names():   # re-read each loop (resumable)
             print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
             continue
-        cmd = ([sys.executable, launcher] if launcher.endswith(".py") else [launcher]) + ["optimize", "--expert", expert, "--universe", universe,
-               "--strategy", strat,
-               "--start", args.start, "--end", args.end,
-               "--interval", args.interval, "--population", str(args.population),
-               "--generations", str(args.generations),
-               "--initial-capital", str(args.initial_capital),
-               # Daily cadence: option entries want the day's signal, not a weekly scan —
-               # mirrors scripts/run_options_grid.sh.
-               "--run-schedule", "daily", "--name", name, "--parallel", str(args.parallel)]
-        cmd += _gate_passthrough(args)
-        if args.fitness:
-            # Explicit override forces this metric uniformly; omitted (default) lets
-            # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option AND
-            # the equity-entry overlays O_CC/O_PP -> option_consistent_annual_return, O_STK ->
-            # sharpe_ratio).
-            cmd += ["--fitness", args.fitness]
-        if args.early_stop is not None:
-            cmd += ["--early-stop", str(args.early_stop)]
-        if args.mutation_prob is not None:
-            cmd += ["--mutation-prob", str(args.mutation_prob)]
-        # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
-        # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
-        cmd += cap_passthrough(args)
-        if args.fitness_trade_scale:
-            cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap),
-                    "--fitness-trade-scale-target", str(args.fitness_trade_scale_target)]
-        if args.fitness_win_rate_factor:
-            cmd += ["--fitness-win-rate-factor"]
-        if args.workers:
-            cmd += ["--workers", args.workers]
+        cmd = build_cmd(args, launcher, name, expert, strat, universe)
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
+        if rc != 0:
+            print(f"options matrix stopped: {name} failed; remaining jobs were not launched.", flush=True)
+            return rc if rc > 0 else 1
     print("options matrix driver: done.")
     return 0
 

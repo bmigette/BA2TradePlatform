@@ -1,4 +1,4 @@
-"""Export/import the shared ML data (provider cache + backtest/optimize results DB) as a
+"""Export/import the shared BA2 data (provider cache + backtest/optimize results DB) as a
 single portable zip -- for moving a warmed-up cache to/from another machine, or backing it up
 off the dev box (e.g. onto Google Drive) without hand-picking dozens of cache subfolders.
 
@@ -37,15 +37,15 @@ would otherwise be a lie for whatever slipped through unfiltered. See FILTER_DRO
 what each drop reason means, and the run's own printed summary for counts.
 
 Usage:
-    python tools/ml_cache_archive.py export --dest-dir "G:\\Mon Drive\\Work\\AiTrading\\Test ML Cache"
-    python tools/ml_cache_archive.py export --dest-dir <dir> --name my_export.zip --overwrite
-    python tools/ml_cache_archive.py export --dest-dir <dir> --scope db
-    python tools/ml_cache_archive.py export --dest-dir <dir> --scope bt-ga
-    python tools/ml_cache_archive.py export --dest-dir <dir> --scope bt --label goal2020 --label sen5min
-    python tools/ml_cache_archive.py export --dest-dir <dir> --scope cache \\
+    python tools/ba2_cache_export.py export --dest-dir "G:\\Mon Drive\\Work\\AiTrading\\Test ML Cache"
+    python tools/ba2_cache_export.py export --dest-dir <dir> --name my_export.zip --overwrite
+    python tools/ba2_cache_export.py export --dest-dir <dir> --scope db
+    python tools/ba2_cache_export.py export --dest-dir <dir> --scope bt-ga
+    python tools/ba2_cache_export.py export --dest-dir <dir> --scope bt --label goal2020 --label sen5min
+    python tools/ba2_cache_export.py export --dest-dir <dir> --scope cache \\
         --date-start 2023-01-01 --date-end 2023-03-31
-    python tools/ml_cache_archive.py import --archive <path/to/export.zip>
-    python tools/ml_cache_archive.py import --archive <path> --overwrite --force
+    python tools/ba2_cache_export.py import --archive <path/to/export.zip>
+    python tools/ba2_cache_export.py import --archive <path> --overwrite --force
 """
 import argparse
 import io

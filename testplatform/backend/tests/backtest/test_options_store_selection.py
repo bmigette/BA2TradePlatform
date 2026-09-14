@@ -20,7 +20,7 @@ from app.services.backtest.daily_backtest_handler import (
 )
 from app.services.backtest.options_store import (
     OPTIONS_STORES,
-    PARQUET,
+    TASTYTRADE,
     SQLITE,
     STORE_VENDOR,
     build_options_provider,
@@ -44,12 +44,12 @@ def test_default_is_sqlite(monkeypatch):
 def test_explicit_config_key_wins_over_env(monkeypatch):
     monkeypatch.setenv("BACKTEST_OPTIONS_STORE", "parquet")
     assert resolve_options_store({"options_store": "sqlite"}) == SQLITE
-    assert resolve_options_store({}) == PARQUET
+    assert resolve_options_store({}) == TASTYTRADE
 
 
 def test_env_selects_the_store(monkeypatch):
     monkeypatch.setenv("BACKTEST_OPTIONS_STORE", "PARQUET")   # case/space tolerant
-    assert resolve_options_store({}) == PARQUET
+    assert resolve_options_store({}) == TASTYTRADE
 
 
 def test_unknown_store_raises_rather_than_falling_back(monkeypatch):
@@ -245,7 +245,11 @@ def test_optimizer_forwards_the_store_keys_per_trial():
         _backtest_cfg(options_store="parquet", options_parquet_root="/tmp/root",
                       options_risk_free_rate=0.03),
         _DECODED)
-    assert cfg["options_store"] == "parquet"
+    # NORMALISED, not echoed: the run asked for the superseded name "parquet" and the trial
+    # config carries the canonical "tastytrade". That is the point of resolving here rather than
+    # forwarding a raw string -- the worker receives a store name that names its VENDOR, which is
+    # what the floor check downstream keys on.
+    assert cfg["options_store"] == TASTYTRADE
     assert cfg["options_parquet_root"] == "/tmp/root"
     assert cfg["options_risk_free_rate"] == 0.03
 
@@ -274,11 +278,11 @@ def test_build_config_records_the_resolved_store_not_the_raw_key(monkeypatch):
 
     monkeypatch.setenv("BACKTEST_OPTIONS_STORE", "parquet")
     cfg = H._build_config(_payload())               # payload says nothing; env does
-    assert cfg["options_store"] == PARQUET, "the DECISION must be in the config, not None"
+    assert cfg["options_store"] == TASTYTRADE, "the DECISION must be in the config, not None"
 
     on_the_worker = _across_the_wire(cfg)
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)   # the env does not travel
-    assert resolve_options_store(on_the_worker) == PARQUET
+    assert resolve_options_store(on_the_worker) == TASTYTRADE
 
 
 def test_trial_config_records_the_resolved_store_not_the_raw_key(monkeypatch):
@@ -287,11 +291,11 @@ def test_trial_config_records_the_resolved_store_not_the_raw_key(monkeypatch):
 
     monkeypatch.setenv("BACKTEST_OPTIONS_STORE", "parquet")
     cfg = _build_daily_trial_config(_backtest_cfg(), _DECODED)
-    assert cfg["options_store"] == PARQUET
+    assert cfg["options_store"] == TASTYTRADE
 
     on_the_worker = _across_the_wire(cfg)
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
-    assert resolve_options_store(on_the_worker) == PARQUET
+    assert resolve_options_store(on_the_worker) == TASTYTRADE
 
 
 def test_the_worker_would_have_read_sqlite_from_the_old_verbatim_forward(monkeypatch):
