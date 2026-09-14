@@ -32,6 +32,7 @@ Verified against the installed ba2_providers OHLCV provider:
 from __future__ import annotations
 
 import bisect
+import hashlib
 import logging
 import os
 import time
@@ -530,8 +531,6 @@ def derived_key_for(symbol: str, win: Tuple[str, str, str]) -> str:
     this format there would report on directories the engine does not use -- the prewarm would
     look complete while every trial still rebuilt.
     """
-    import hashlib
-
     interval, start_iso, end_iso = win
     win_sig = hashlib.sha1("|".join(win).encode()).hexdigest()[:12]
     return (f"u_{symbol.upper()}_{interval}_{start_iso[:10]}_{end_iso[:10]}"

@@ -760,6 +760,28 @@ def _i(v) -> Optional[int]:
     return None if v is None or v != v else int(v)
 
 
+def derived_key_for_underlying(underlying: str) -> str:
+    """The derived-cache key one underlying's arrays live under.
+
+    ``u_`` PREFIX, and it is not cosmetic. A bare symbol goes through
+    ``shared_arrays._safe_key``, which REFUSES the Windows reserved device stems -- PRN and AUX
+    are real tickers, the parquet store stores them happily, and a ValueError out of here kills
+    the trial (on Linux too, since the refusal is in the key sanitiser, not in the filesystem).
+    ``u_PRN`` is an ordinary name. Prefixing at the call site is exactly what shared_arrays' own
+    docstring asks of a caller whose keys are symbols.
+
+    NOT claimed: this does not separate two symbols the sanitiser would merge (``u_BRK/B`` still
+    cleans to ``u_BRK_B``). It cannot arise through this store -- the symbol is a DIRECTORY name
+    in the parquet tree, so a symbol with a separator in it has no partitions to read at all.
+
+    MODULE-LEVEL AND PUBLIC because ``tools/build_shared_arrays.py`` reports which underlyings a
+    prewarm BUILT and which it merely opened by looking these keys up on disk. A second spelling
+    of the format there would report on directories the reader does not use, and the prewarm
+    would look complete while every trial still rebuilt.
+    """
+    return f"u_{underlying.upper()}.v{_RawUnderlying.ARRAYS_VERSION}"
+
+
 def _load_raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
     """One underlying's arrays, through the PER-HOST derived cache.
 
@@ -808,18 +830,8 @@ def _load_raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
         return _RawUnderlying.arrays_from_frame(store.read_underlying(underlying, parts))
 
     derived = _sa.DerivedArrayStore(_sa.derived_root_for(root))
-    # ``u_`` PREFIX, and it is not cosmetic. A bare symbol goes through
-    # ``shared_arrays._safe_key``, which REFUSES the Windows reserved device stems -- PRN and
-    # AUX are real tickers, the parquet store stores them happily, and a ValueError out of
-    # here kills the trial (on Linux too, since the refusal is in the key sanitiser, not in
-    # the filesystem). ``u_PRN`` is an ordinary name. Prefixing at the call site is exactly
-    # what shared_arrays' own docstring asks of a caller whose keys are symbols.
-    # NOT claimed: this does not separate two symbols the sanitiser would merge (``u_BRK/B``
-    # still cleans to ``u_BRK_B``). It cannot arise through this store -- the symbol is a
-    # DIRECTORY name in the parquet tree, so a symbol with a separator in it has no partitions
-    # to read in the first place.
-    key = f"u_{underlying.upper()}.v{_RawUnderlying.ARRAYS_VERSION}"
-    u = _RawUnderlying.from_arrays(underlying, derived.build_or_open(key, parts, _build))
+    u = _RawUnderlying.from_arrays(
+        underlying, derived.build_or_open(derived_key_for_underlying(underlying), parts, _build))
     # COVERAGE, STATED ONCE PER UNDERLYING PER WORKER. The vendor's history FLOOR bounds what
     # COULD have been downloaded; it says nothing about what this tree actually holds, and a
     # run outside the downloaded window reads an empty store and reports the resulting

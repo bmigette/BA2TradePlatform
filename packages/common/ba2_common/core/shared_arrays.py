@@ -642,8 +642,16 @@ class DerivedArrayStore:
         renamed when a LATER one refuses is renamed back, but as a DIRECTORY move: a reader that
         was mid-``_try_open`` inside it during that window sees files vanish and rebuilds. The
         rollback restores the bytes, not the continuity, so a False from a multi-signature key
-        can still have cost some process a rebuild. Harmless (a rebuild republishes the same
-        signature) and the reason this is a between-grids tool rather than a runtime sweeper.
+        can still have cost some process a rebuild.
+
+        AND THE KEY ITSELF IS NOT ATOMIC. The probe lists the key's children and then removes the
+        directory; a builder that starts in the meantime creates a ``<sig>.lock`` or a ``.tmp``
+        INSIDE it, which the listing never saw. The ``rmtree`` then either fails (reported False,
+        with renamed children rolled back) or succeeds and takes that builder's staging directory
+        with it. Both are bounded rather than corrupting -- the marker is written LAST, so the
+        loser publishes nothing and simply rebuilds -- but it is exactly why this is a
+        BETWEEN-GRIDS tool and not a runtime sweeper: run it while a grid is up and you are
+        paying rebuilds to reclaim disk.
         """
         return self._evict_dir(Path(key_dir), wait_s=0.0)
 
@@ -660,10 +668,15 @@ class DerivedArrayStore:
         partial delete leaves behind.
 
         THE MARKER MTIME THIS READS IS LAST USE, NOT BUILD TIME -- ``_try_open`` touches it on
-        every successful open (see there). Within a key that only makes the "freshly published,
-        leave it alone" guard below more conservative; it matters to the KEY-level collector in
+        every successful open (see there). It matters to the KEY-level collector in
         ``tools/build_shared_arrays.py --sweep``, which is an age policy and would otherwise
-        delete the key every trial on the host maps daily.
+        delete the key every trial on the host maps daily. Two consequences HERE, both benign:
+        the "freshly published, leave it alone" guard below now also spares a directory merely
+        freshly OPENED, and ``done`` below is therefore sorted newest-USED rather than
+        newest-BUILT. Superseded-ness is not decided by that order anyway -- a directory only
+        survives as ``done[-1]``, and the one every process is actually opening IS the most
+        recently used one, so if anything the order is now closer to the intent than the build
+        timestamps were.
 
         Stale ``.lock`` and ``.evicting`` FILES are deliberately not collected here: both are
         self-correcting, since the next claimant breaks one it finds older than

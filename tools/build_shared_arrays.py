@@ -30,6 +30,13 @@ NOTHING CALLS ``sweep()`` AT RUNTIME. This tool is the only collector in the sys
     worker accumulates one full set (~48 B/bar; 5.6 GB for a 116M-bar band) per window it has
     ever run, and nothing removes the windows that are done with.
 
+THERE ARE THREE CONSUMERS, and "only collector" is a claim about the ROOTS you name on the
+command line, not about the whole disk. ``--options-store`` and ``--ohlcv-provider`` cover the
+option reader and the bar cache; the screener metric store publishes one ``u_store.v<n>`` key
+beside its own directory and is reached with ``--metric-store <dir> --sweep`` (sweep only --
+that store is built by the first trial that reads it, and there is no universe or window to
+prewarm it from). A root you do not name is a root nothing collects.
+
 ``--sweep-max-age-days`` IS AN AGE-SINCE-LAST-USE RULE, not age-since-build. That only holds
 because ``shared_arrays._try_open`` touches the done-marker on every successful open. Without
 that the marker would carry BUILD time, and a 14-day rule would delete the option key every
@@ -67,6 +74,7 @@ import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -137,6 +145,12 @@ def _symbols(universe_file: Optional[str], symbols: Optional[str]) -> List[str]:
 
     Upper-cased and de-duplicated in order: the parquet tree keys on the upper-cased symbol, and
     a universe file that lists one symbol twice must not build it twice.
+
+    ``universe_file`` MUST ALREADY BE ABSOLUTE -- ``_parse`` makes it so, and calls this ONCE.
+    The documented invocation passes a path relative to the repo root
+    (``tools/options_universe_top100.txt``), and ``_bootstrap`` chdirs into
+    ``testplatform/backend``: a second, later read of the same relative path is a
+    FileNotFoundError after the tool has already parsed it successfully.
     """
     raw: List[str] = []
     if universe_file:
@@ -196,12 +210,12 @@ def _human(n: int) -> str:
 # Options
 # --------------------------------------------------------------------------------------------
 def _option_key(symbol: str) -> str:
-    """The derived-cache key ``_load_raw_underlying`` uses. Mirrored here for REPORTING only --
-    the build itself goes through the reader, so the two cannot disagree about what is built."""
+    """The READER's own key for ``symbol`` -- imported, never re-spelled here, so the directory
+    this tool reports on is the directory a trial will open."""
     _bootstrap()
-    from app.services.backtest.parquet_options_provider import _RawUnderlying
+    from app.services.backtest.parquet_options_provider import derived_key_for_underlying
 
-    return f"u_{symbol.upper()}.v{_RawUnderlying.ARRAYS_VERSION}"
+    return derived_key_for_underlying(symbol)
 
 
 def build_option_symbol(root: str, symbol: str, dry_run: bool = False) -> Result:
@@ -209,6 +223,13 @@ def build_option_symbol(root: str, symbol: str, dry_run: bool = False) -> Result
 
     Never raises: a corrupt partition on one of 98 underlyings must not abandon the other 97.
     The exception travels back in the result and the run exits non-zero.
+
+    "BUILT" MEANS "WAS NOT PUBLISHED WHEN WE LOOKED", NOT "THIS PROCESS PARSED THE PARQUET".
+    The marker is checked before the call and ``build_or_open`` serialises cold builders, so a
+    symbol another worker (or another ``--jobs`` sibling on a shared root) published in the gap
+    is reported as built by whoever asked first. It is a report about the TREE -- after this run
+    the set exists -- not an accounting of who paid for it, and the only way to make it the
+    latter would be a second marker read whose answer still would not be stable.
     """
     _bootstrap()
     t0 = time.monotonic()
@@ -249,8 +270,18 @@ def build_options(root: str, symbols: List[str], jobs: int, dry_run: bool) -> Li
         return [build_option_symbol(root, s, dry_run) for s in symbols]
     import multiprocessing as mp
 
-    with ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("spawn")) as pool:
-        return list(pool.map(build_option_symbol, [root] * len(symbols), symbols))
+    try:
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("spawn")) as pool:
+            return list(pool.map(build_option_symbol, [root] * len(symbols), symbols))
+    except BrokenProcessPool as exc:
+        # THE FAILURE THIS TOOL IS MOST LIKELY TO MEET. A child that the OOM killer takes does
+        # not raise inside build_option_symbol -- it dies, and the pool reports one opaque
+        # BrokenProcessPool for the whole map. Letting that escape gives an operator a
+        # traceback with no summary, no idea which underlyings are warm, and no hint that the
+        # answer is a lower --jobs (a single ThetaData build peaks at ~7-8 GB).
+        return [(s, 0, "error", 0.0,
+                 f"a build child died ({type(exc).__name__}: {exc}) -- almost certainly the OOM "
+                 f"killer; re-run with a lower --jobs (currently {jobs})") for s in symbols]
 
 
 # --------------------------------------------------------------------------------------------
@@ -489,6 +520,10 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument("--sweep", action="store_true",
                    help="Also collect superseded signatures and obsolete KEYS (stale "
                         "ARRAYS_VERSION, or unused for --sweep-max-age-days).")
+    p.add_argument("--metric-store",
+                   help="Screener metric-store directory to SWEEP (it publishes one "
+                        "'u_store.v<n>' key beside itself). Sweep-only: the store is built by "
+                        "the first trial that reads it, not by this tool.")
     p.add_argument("--sweep-max-age-days", type=float, default=14.0)
     p.add_argument("--dry-run", action="store_true", help="Print what would happen; touch nothing.")
     args = p.parse_args(argv)
@@ -496,15 +531,29 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     if args.options_store in ("sqlite",):
         p.error("--options-store sqlite has no parquet tree and therefore no derived array "
                 "cache; there is nothing to prewarm or sweep. Choose thetadata or tastytrade.")
-    if not args.options_store and not args.ohlcv_provider:
-        p.error("nothing to do: pass --options-store and/or --ohlcv-provider.")
-    building = bool(_symbols(args.universe_file, args.symbols))
-    if not building and not args.sweep:
+    if not (args.options_store or args.ohlcv_provider or args.metric_store):
+        p.error("nothing to do: pass --options-store and/or --ohlcv-provider "
+                "(or --metric-store with --sweep).")
+    # RESOLVED ONCE, TO AN ABSOLUTE PATH, BEFORE ANYTHING READS IT. The documented invocation
+    # passes a repo-relative path and ``_bootstrap`` chdirs into testplatform/backend, so a
+    # relative path that parsed fine here would be a FileNotFoundError by the time the build
+    # started. Read once too: ``args.symbol_list`` is the only copy anything downstream uses.
+    if args.universe_file:
+        args.universe_file = os.path.abspath(args.universe_file)
+    args.symbol_list = _symbols(args.universe_file, args.symbols)
+    if not args.symbol_list and not args.sweep:
         p.error("no symbols: pass --universe-file or --symbols (or --sweep to only collect).")
-    if building and args.ohlcv_provider and not (args.start and args.end):
+    if args.symbol_list and args.ohlcv_provider and not (args.start and args.end):
         p.error("--ohlcv-provider needs --start and --end (the window is part of the cache key).")
+    if args.metric_store and not args.sweep:
+        p.error("--metric-store is sweep-only; pass --sweep (the store's arrays are built by "
+                "the first trial that reads it).")
     if args.jobs < 1:
         p.error("--jobs must be >= 1")
+    if args.sweep_max_age_days < 1:
+        # Below a day the rule stops being "nothing has used this in a while" and starts
+        # deleting sets a grid that started this morning is mapping right now.
+        p.error("--sweep-max-age-days must be >= 1")
     return args
 
 
@@ -523,7 +572,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _bootstrap()
     from ba2_common.core import shared_arrays as SA
 
-    symbols = _symbols(args.universe_file, args.symbols)
+    symbols = args.symbol_list          # resolved and read ONCE, in _parse, before the chdir
     errors = 0
 
     options_root = None
@@ -563,6 +612,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             sweep_root(f"ohlcv:{args.ohlcv_provider}", _ohlcv_derived_root(args.ohlcv_provider),
                        _OHLCV_KEY_VERSION, BAR_ARRAYS_VERSION, args.sweep_max_age_days,
                        args.dry_run)
+        if args.metric_store:
+            # THE THIRD CONSUMER. The screener metric store publishes ONE key, ``u_store.v<n>``,
+            # under the derived root beside its own directory -- same ``.v<n>`` spelling as the
+            # option reader, its own version constant. It is swept and never built here: the
+            # store is built by the first trial that reads it, in whatever window that trial
+            # wants, and there is no universe/window to prewarm it from.
+            from ba2_providers.screener.metric_store import METRIC_STORE_ARRAYS_VERSION
+
+            label = "metric-store:" + Path(args.metric_store).name
+            sweep_root(label, Path(SA.derived_root_for(args.metric_store)), _OPTIONS_KEY_VERSION,
+                       METRIC_STORE_ARRAYS_VERSION, args.sweep_max_age_days, args.dry_run)
 
     return 1 if errors else 0
 

@@ -410,6 +410,90 @@ def test_symbols_and_universe_file_resolve_to_the_same_list(tmp_path):
     assert tool._symbols(None, "aapl, msft") == ["AAPL", "MSFT"]
 
 
+def test_a_relative_universe_file_is_resolved_before_the_bootstrap_chdirs(tmp_path, monkeypatch):
+    """THE DOCUMENTED INVOCATION passes ``tools/options_universe_top100.txt`` -- relative to the
+    repo root -- and ``_bootstrap`` chdirs into testplatform/backend. A path kept relative
+    parses fine and then raises FileNotFoundError from the working directory the tool moved to,
+    so it is made absolute and read ONCE, in _parse, before anything can move."""
+    tool = _tool()
+    (tmp_path / "rel.txt").write_text("AAPL\nMSFT\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    args = tool._parse(["--options-store", "tastytrade", "--universe-file", "rel.txt"])
+
+    assert os.path.isabs(args.universe_file) and Path(args.universe_file) == tmp_path / "rel.txt"
+    assert args.symbol_list == ["AAPL", "MSFT"]
+
+
+def test_a_relative_universe_file_survives_the_real_run(store_root, tmp_path, monkeypatch,
+                                                        capsys):
+    """The same thing end to end: _parse, then the bootstrap's chdir, then the build."""
+    tool = _tool()
+    (tmp_path / "rel.txt").write_text("ZZ\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert tool.main(["--options-store", "tastytrade", "--universe-file", "rel.txt",
+                      "--jobs", "1"]) == 0
+
+    assert "1 built / 0 opened / 0 empty" in capsys.readouterr().out
+
+
+def test_a_dead_pool_child_is_reported_per_symbol_not_as_a_traceback(store_root, monkeypatch,
+                                                                     capsys):
+    """An OOM-killed child -- the likeliest failure at --jobs 4-8, since one ThetaData build
+    peaks at ~7-8 GB -- surfaces as ONE opaque BrokenProcessPool for the whole map. Letting it
+    escape gives an operator a traceback, no summary, no idea which underlyings are warm and no
+    hint that the answer is a lower --jobs."""
+    tool = _tool()
+    from concurrent.futures.process import BrokenProcessPool
+
+    def dead_map(self, *a, **k):
+        raise BrokenProcessPool("A process in the process pool was terminated abruptly")
+
+    monkeypatch.setattr("concurrent.futures.process.ProcessPoolExecutor.map", dead_map)
+
+    assert tool.main(["--options-store", "tastytrade", "--symbols", "ZZ,YY", "--jobs", "2"]) != 0
+
+    out = capsys.readouterr().out
+    assert "0 built / 0 opened / 0 empty, 2 error(s)" in out
+    assert "lower --jobs" in out and "ZZ" in out and "YY" in out
+
+
+def test_sweep_max_age_days_below_one_is_refused(capsys):
+    """Under a day the rule stops meaning "nothing has used this in a while" and starts deleting
+    sets the grid that started this morning is mapping right now."""
+    tool = _tool()
+    with pytest.raises(SystemExit):
+        tool.main(["--options-store", "tastytrade", "--sweep", "--sweep-max-age-days", "0"])
+    assert "sweep-max-age-days" in capsys.readouterr().err
+
+
+def test_the_metric_store_root_is_swept_with_its_own_version(tmp_path, capsys):
+    """The THIRD consumer. It publishes one ``u_store.v<n>`` key beside its own directory and
+    has no other collector either; it is sweep-only, because the store is built by the first
+    trial that reads it and there is no universe/window to prewarm it from."""
+    tool = _tool()
+    from ba2_providers.screener.metric_store import METRIC_STORE_ARRAYS_VERSION
+
+    store_dir = tmp_path / "screener_metrics"
+    store_dir.mkdir()
+    derived = Path(SA.derived_root_for(str(store_dir)))
+    stale = _done_dir(derived / "u_store.v0" / "sig1")
+    current = _done_dir(derived / f"u_store.v{METRIC_STORE_ARRAYS_VERSION}" / "sig1")
+
+    assert tool.main(["--metric-store", str(store_dir), "--sweep"]) == 0
+
+    assert not stale.parent.exists() and current.parent.is_dir()
+    assert "1 key(s) removed" in capsys.readouterr().out
+
+
+def test_the_metric_store_is_sweep_only(tmp_path, capsys):
+    tool = _tool()
+    with pytest.raises(SystemExit):
+        tool.main(["--metric-store", str(tmp_path), "--symbols", "AAA"])
+    assert "sweep-only" in capsys.readouterr().err
+
+
 # --------------------------------------------------------------------------------------------
 # 6. The pool path. Slow (a spawned child pays the whole backend import), so it is marked and
 #    runs the real script end to end -- the one thing an in-process call cannot prove.
