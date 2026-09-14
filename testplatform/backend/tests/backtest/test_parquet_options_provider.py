@@ -1131,34 +1131,49 @@ def test_a_reserved_device_name_ticker_is_still_readable(symbol, tmp_path, monke
 
 
 # --------------------------------------------------------------------------- #
-# THE GREEKS OVERLAY IS ALLOCATED UNINITIALISED.
+# 11. THE GREEKS ARE A BOUNDED MEMO, NOT A COLUMN.
 #
-# `_Underlying.__init__` used to build its five greek columns with
-# `np.full(n, np.nan)`, which WRITES every element and so makes 40 B/row RESIDENT
-# per process the instant an underlying is opened -- ~7.1 GB on the 2020 ThetaData
-# universe (177.8M rows), private per worker, on top of the mapped columns the host
-# shares once. They are filled LAZILY, one row at a time, and `_g_done[i]` is the
-# only thing that says whether a row holds a value, so the NaN those pages were
-# filled with is never read. The tests below pin that invariant -- it, not the
-# allocator call, is what makes `np.empty` safe.
+# They were five dense `float64` arrays plus a `_g_done` bool mask: 41 B for every ROW of
+# the mapped raw, private per worker, ~7.1 GB on the 2020 ThetaData universe (177.8M rows).
+# `np.full` made all of it resident at construction; `np.empty` made the fill lazy, which
+# fixed the construction spike and nothing else -- because of PAGE GRANULARITY against the
+# store's own layout. Rows are sorted by (occ_symbol, bar_date), so one contract's rows are
+# contiguous and ~2.4 KB per column, SMALLER THAN A 4 KB PAGE; every contract passes through
+# the DTE band a strategy reads; so every page of all five columns becomes resident inside
+# ONE trial. Measured on the real tree (AAPL, 711,559 rows, 914 bar dates, a 20-60 DTE chain
+# read + get_atm_iv every bar + MTM re-reads of held lots): 24.5% of rows touched and
+# 38.8 B/row resident, against a 40 B/row nominal. The field agreed -- remote227, 30 workers,
+# 20 minutes in, 1-2 trials each: 5.4-7.2 GB anonymous per worker.
+#
+# What replaced them is `_g_memo`, row index -> the finished 5-tuple, capped at
+# `_GREEKS_MEMO_MAX`. The cap works because the reuse this memo exists for is LOCAL: a bar's
+# chain read, its get_atm_iv rescan and its held-lot get_bar calls land on the same few
+# hundred rows and the next bar moves on. On the WIDEST pattern the seam admits (1-730 DTE,
+# every contract every bar) a 20,000-entry cap gives up 0.4% of an unbounded memo's hits and
+# 98.5% of its residency.
+#
+# The tests below pin the two things that makes safe: the memo is a memo (an evicted row
+# recomputes byte-identically, because every input is immutable for the life of the overlay),
+# and it is actually bounded.
 # --------------------------------------------------------------------------- #
-_GREEK_SLOTS = ("_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega")
-
-#: A value uninitialised memory will not plausibly hold, written over the overlay's greek
-#: arrays right after construction: if any read path returns it, that read saw a cell nothing
-#: had filled. NaN could not play this role -- NaN is a LEGITIMATE greek (an uninvertible bar).
-_POISON = -1.2345678e300
+_GREEK_KEYS = ("iv", "delta", "gamma", "theta", "vega")
 
 
 def _overlay(root, rate=_RATE, scope="test", underlying=_UNDER):
     return pq._underlying(root, underlying, rate, scope)
 
 
-def _poison(ov):
-    """Overwrite the (uninitialised) greek cells with a recognisable value."""
-    for name in _GREEK_SLOTS:
-        getattr(ov, name)[:] = _POISON
-    return ov
+def _fresh_greeks(ov, i, ci):
+    """What `compute_iv_and_greeks` says about row `i` of contract `ci`, from scratch."""
+    raw = ov.raw
+    bar_ord = ov.bar_ord_l[i]
+    px = ov.close[i]
+    return compute_iv_and_greeks(
+        None if px != px else float(px),
+        _spot_source(_UNDER, raw.date_of_ord[bar_ord]),
+        raw.c_strike_f[ci],
+        (raw.c_expiry_ord_l[ci] - bar_ord) / 365.0,
+        _RATE, raw.c_right[ci])
 
 
 def _synthetic_arrays(n_contracts: int, n_bars: int, *, underlying: str = "SY"):
@@ -1193,84 +1208,111 @@ def _synthetic_arrays(n_contracts: int, n_bars: int, *, underlying: str = "SY"):
     return arrays
 
 
-def test_the_greek_overlay_starts_with_nothing_done(provider, store_root):
-    """`_g_done` is all-False on a fresh overlay -- the ONLY record of what is filled."""
+def test_the_greek_memo_starts_empty_and_costs_nothing_per_row(provider, store_root):
+    """A fresh overlay holds no greeks at all -- and, unlike the five columns it replaces,
+    holds nothing SIZED BY THE UNDERLYING either. That is the whole change: an overlay's
+    greeks cost is now the cap, not 41 B x n_rows."""
     ov = _overlay(store_root)
     assert ov.n_rows == 5
-    np.testing.assert_array_equal(ov._g_done, np.zeros(ov.n_rows, dtype=bool))
-    for name in _GREEK_SLOTS:
-        arr = getattr(ov, name)
-        assert arr.shape == (ov.n_rows,) and arr.dtype == np.dtype("float64")
-        # PRIVATE, never a view on the mapped raw: these are a function of this run's spot
-        # and rate, so sharing them across runs would be wrong, not just surprising.
-        assert arr.base is None
+    assert ov._g_memo == {}
+    for name in ("_g_done", "_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega"):
+        assert not hasattr(ov, name), (
+            f"{name} is back -- the dense columns are 41 B/row of private residency and the "
+            "whole point of the memo is that no such array exists")
 
 
-def test_no_greek_cell_is_ever_read_before_it_is_written(provider, store_root):
-    """The whole read surface, over an overlay whose greek cells hold a poison value.
-
-    This is the invariant that lets the arrays be allocated uninitialised: if any path
-    could observe a cell `_g_done` does not vouch for, the poison would come back out of
-    it. Exercised through get_chain / get_bar / get_atm_iv / delta_at_entry, i.e. every
-    caller of `greeks_tuple`.
-    """
-    ov = _poison(_overlay(store_root))
-    seen = []
-    for as_of in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10)):
-        for c in _wide(provider, as_of):
-            seen += [c.implied_volatility, c.delta, c.gamma, c.theta, c.vega]
-        provider.get_atm_iv(_UNDER, as_of)
-        for occ in (_C100, _P100, _C110):
-            bar = provider.get_bar(occ, as_of)
-            if bar is not None:
-                seen += [bar["iv"], bar["delta"], bar["gamma"], bar["theta"], bar["vega"]]
-        seen.append(provider.delta_at_entry(_UNDER, _C100, as_of))
-
-    assert seen, "the read surface produced nothing -- the test would pass vacuously"
-    assert not any(v == _POISON for v in seen if v is not None), (
-        "a greek was read out of a cell nothing had filled")
-    # And the poison SURVIVES wherever nothing was filled: `_g_done` is exact, not a
-    # conservative under-count that happens to be covered by an all-NaN prefill.
-    for name in _GREEK_SLOTS:
-        arr = getattr(ov, name)
-        assert np.all(arr[~ov._g_done] == _POISON)
-
-
-def test_every_filled_greek_equals_a_fresh_computation_and_only_touched_rows_are_done(
-        provider, store_root):
-    """Parity: the lazily filled cells hold exactly what `compute_iv_and_greeks` returns,
-    and `_g_done` is set for precisely the rows the reads touched -- no more, no less."""
-    ov = _poison(_overlay(store_root))
-    raw = ov.raw
-    expected_rows = {}
+def test_the_memo_holds_exactly_the_rows_the_reads_touched(provider, store_root):
+    """`_g_memo`'s keys ARE the record of what has been computed -- no more, no less. A memo
+    that filled rows nothing asked for would put the per-row cost straight back."""
+    expected = {}
     for as_of in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10)):
         _wide(provider, as_of)
-        for ci in range(len(raw.c_occ)):
+        ov = _overlay(store_root)
+        for ci in range(len(ov.raw.c_occ)):
             i = ov.latest_row_on_or_before(ci, as_of.toordinal())
             if i >= 0:
-                expected_rows[i] = ci
+                expected[i] = ci
 
-    assert expected_rows
-    np.testing.assert_array_equal(
-        np.flatnonzero(ov._g_done), np.array(sorted(expected_rows), dtype=np.intp))
+    assert expected
+    ov = _overlay(store_root)
+    assert sorted(ov._g_memo) == sorted(expected)
 
-    for i, ci in expected_rows.items():
-        bar_ord = ov.bar_ord_l[i]
-        px = ov.close[i]
-        out = compute_iv_and_greeks(
-            None if px != px else float(px),
-            _spot_source(_UNDER, raw.date_of_ord[bar_ord]),
-            raw.c_strike_f[ci],
-            (raw.c_expiry_ord_l[ci] - bar_ord) / 365.0,
-            _RATE, raw.c_right[ci])
-        for name, key in zip(_GREEK_SLOTS, ("iv", "delta", "gamma", "theta", "vega")):
-            got = getattr(ov, name)[i]
-            if out[key] is None:
-                assert got != got, f"{name}[{i}] should be NaN for an uninvertible bar"
-            else:
-                assert got == pytest.approx(out[key])
-        assert ov.greeks_tuple(i, ci, _spot_source) == (
-            out["iv"], out["delta"], out["gamma"], out["theta"], out["vega"])
+
+def test_every_memoised_greek_equals_a_fresh_computation(provider, store_root):
+    """Parity: what the memo hands back is exactly what `compute_iv_and_greeks` returns for
+    that row -- byte-for-byte, including the None a NaN greek is reported as."""
+    for as_of in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10)):
+        _wide(provider, as_of)
+    ov = _overlay(store_root)
+    assert ov._g_memo
+
+    for i in list(ov._g_memo):
+        ci = next(c for c in range(len(ov.raw.c_occ))
+                  if ov.starts_l[c] <= i < ov.stops_l[c])
+        out = _fresh_greeks(ov, i, ci)
+        assert ov._g_memo[i] == tuple(
+            None if out[k] is None or out[k] != out[k] else out[k] for k in _GREEK_KEYS)
+        assert ov.greeks_tuple(i, ci, _spot_source) == ov._g_memo[i]
+
+
+def test_the_greek_memo_is_capped(provider, store_root, monkeypatch):
+    """Bounded is the property that makes the memo affordable at all: unbounded it would
+    re-acquire the per-row cost the dense columns had, only in 315 B python objects instead
+    of 41 B of float64."""
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", 2)
+    ov = _overlay(store_root)
+    ci = ov.c_index[_C100]
+    for d in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10)):
+        ov.greeks_tuple(ov.exact_row(ci, d.toordinal()), ci, _spot_source)
+    assert len(ov._g_memo) == 2
+
+
+def test_the_greek_memo_evicts_the_OLDEST_row_first(provider, store_root, monkeypatch):
+    """Insertion order, not LRU: a backtest walks its window forward, so the row read longest
+    ago is the one that will not be asked for again -- and FIFO keeps the HIT path free of the
+    `move_to_end` a true LRU would put on it."""
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", 2)
+    ov = _overlay(store_root)
+    ci = ov.c_index[_C100]
+    rows = [ov.exact_row(ci, d.toordinal())
+            for d in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10))]
+    for i in rows:
+        ov.greeks_tuple(i, ci, _spot_source)
+    assert sorted(ov._g_memo) == sorted(rows[1:])
+
+
+def test_an_evicted_greek_recomputes_byte_identically(provider, store_root, monkeypatch):
+    """THE LICENCE FOR EVICTING AT ALL. Every input to a row's greeks -- the row's close, its
+    date's spot, the contract's strike/expiry/right, the run's rate -- is immutable for the
+    life of the overlay, so a recomputation cannot differ. It has to be `==`, not `approx`:
+    delta selection picks the contract nearest a target delta and `delta_at_entry` refines
+    `max_drawdown`, so a rounding here would move a persisted number."""
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", 1)
+    ov = _overlay(store_root)
+    ci = ov.c_index[_C100]
+    i3 = ov.exact_row(ci, date(2023, 1, 3).toordinal())
+    i10 = ov.exact_row(ci, date(2023, 1, 10).toordinal())
+
+    first = ov.greeks_tuple(i3, ci, _spot_source)
+    ov.greeks_tuple(i10, ci, _spot_source)          # evicts row i3
+    assert i3 not in ov._g_memo
+    assert ov.greeks_tuple(i3, ci, _spot_source) == first
+    assert any(v is not None for v in first), "an all-None tuple would pass vacuously"
+
+
+def test_the_cap_changes_no_value_anywhere_on_the_read_surface(store_root, monkeypatch):
+    """The cap is a memory knob, so it must be invisible in the answers. Two providers over
+    the same store, one memoising freely and one evicting after every single row, must agree
+    exactly across the whole seam."""
+    roomy = _read_everything(
+        ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
+                               spot_scope="roomy"))
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", 1)
+    monkeypatch.setattr(pq, "_BAR_MEMO_MAX", 1)
+    thrashing = _read_everything(
+        ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
+                               spot_scope="thrashing"))
+    assert thrashing == roomy
 
 
 @pytest.mark.slow
@@ -1279,24 +1321,21 @@ def test_every_filled_greek_equals_a_fresh_computation_and_only_touched_rows_are
     reason="resident-set accounting is only meaningful on Windows (working set) and Linux "
            "(RSS); macOS reports compressed/purgeable pages in ways that make the delta "
            "unreliable")
-def test_the_overlay_does_not_make_its_greek_columns_resident():
-    """5M rows x 5 float64 columns = 200 MB that must NOT become resident on construction.
+def test_a_full_window_walk_costs_the_cap_not_the_window():
+    """THE FIELD BUG, on 5M synthetic rows: read EVERY row of the underlying once, the shape
+    a 2020-2025 backtest produces when it reads chains for a symbol on most days.
 
-    `np.full` writes every element, so the old construction cost the full 200 MB in the
-    working set (and ~7.1 GB on the 177.8M-row 2020 ThetaData universe, per worker, on top
-    of the mapped columns the host shares once). `np.empty` leaves the pages demand-zero:
-    the allocation is committed but nothing is backed until a row is filled, and a chain
-    read fills roughly one row per contract.
-
-    Windows commits the reservation up front, so `private`/`pagefile` DOES grow by the full
-    200 MB; `rss` (the working set) is the number that must not, and it is the one that
-    decides how many trial slots fit in a worker box. On Linux neither grows.
+    The dense columns this replaces cost 41 B/row -- 195 MB here, 7.1 GB on the 177.8M-row
+    98-symbol universe -- and page granularity meant a trial reached essentially all of it.
+    The bounded memo's ceiling is `_GREEKS_MEMO_MAX x 315 B` however many rows are walked, so
+    what this asserts is that residency is flat in the ROW COUNT.
     """
     psutil = pytest.importorskip("psutil")
     proc = psutil.Process()
+    clear_worker_parquet_options_cache()
     n_contracts, n_bars = 5_000, 1_000
     n = n_contracts * n_bars
-    nominal = n * 5 * 8  # 5 float64 columns
+    dense_nominal = n * 41            # 5 float64 columns + the bool done-mask
 
     raw = pq._RawUnderlying.from_arrays("SY", _synthetic_arrays(n_contracts, n_bars))
     assert raw.n_rows == n
@@ -1304,14 +1343,266 @@ def test_the_overlay_does_not_make_its_greek_columns_resident():
     gc.collect()
     before = proc.memory_info().rss
     ov = pq._Underlying(raw, _RATE)
+    pq._WORKER_UNDERLYING_CACHE[("synthetic", "SY", _RATE, "scope")] = ov
+
+    def _spot(_sym, _on):
+        return 100.0
+
+    for ci in range(n_contracts):
+        s = ov.starts_l[ci]
+        for b in range(n_bars):
+            ov.greeks_tuple(s + b, ci, _spot)
     gc.collect()
     grew = proc.memory_info().rss - before
 
-    assert ov.n_rows == n
-    assert grew < nominal * 0.25, (
-        f"the greek overlay made {grew / 1048576:.0f} MB resident of a nominal "
-        f"{nominal / 1048576:.0f} MB -- it is being written at construction, not lazily")
+    assert len(ov._g_memo) <= pq._GREEKS_MEMO_MAX
+    assert grew < dense_nominal * 0.25, (
+        f"walking every row made {grew / 1048576:.0f} MB resident against the dense design's "
+        f"{dense_nominal / 1048576:.0f} MB -- the greeks are still scaling with the window")
 
-    # ...and it still works: filling one row makes exactly that row done.
-    ov.greeks_tuple(0, 0, lambda s, d: 100.0)
-    assert ov._g_done[0] and not ov._g_done[1:].any()
+    # ...and the reset hands even the cap back.
+    pq.reset_run_overlays()
+    gc.collect()
+    assert proc.memory_info().rss - before < grew
+    clear_worker_parquet_options_cache()
+
+
+
+# --------------------------------------------------------------------------- #
+# 12. THE RUN-SCOPED FILL IS RELEASED PER TRIAL, AND THE BAR MEMO IS CAPPED TOO
+#
+# Section 11 bounds what ONE trial can hold. This bounds what a WORKER accumulates: an
+# overlay is cached per (root, underlying, rate, spot_scope) for the worker's life (32
+# individuals, by BT_MAX_TASKS_PER_CHILD) and successive genomes read different contracts on
+# different dates, so without a release the memos hold the UNION of every trial the worker has
+# run -- measured on a 5M-row synthetic, a second genome reuses only 7.5% of the first's fill
+# and two genomes alone hold 1.93x one genome's rows.
+#
+# `reset_run_overlays()` drops everything a RUN filled (the greeks memo, the bar dicts, the
+# spot memo, the ATM-IV results) and keeps everything the STORE gave (the mapped columns and
+# the private projections `_bind` derives), so the next trial starts empty without re-opening
+# or re-parsing anything. `_bar_memo` is capped for the same reason `_g_memo` is, and at a
+# tighter number: 821 B/entry measured, 2.6x what a greeks entry costs.
+#
+# Nothing here may change a VALUE: every one of them is pure memoisation of a pure function,
+# so a dropped entry costs a recomputation and nothing else. That is what the parity tests
+# below assert, and it is the only reason this is safe to do per trial.
+# --------------------------------------------------------------------------- #
+def _read_everything(p, dates=(date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10))):
+    """Every read the seam offers, over the whole fixture, as comparable values."""
+    out = []
+    for as_of in dates:
+        for c in _wide(p, as_of):
+            out.append((c.symbol, c.implied_volatility, c.delta, c.gamma, c.theta, c.vega,
+                        c.bid, c.ask, c.last, c.open_interest, c.volume))
+        out.append(("atm", p.get_atm_iv(_UNDER, as_of)))
+        for occ in (_C100, _P100, _C110):
+            bar = p.get_bar(occ, as_of)
+            out.append((occ, None if bar is None else tuple(sorted(bar.items(), key=str))))
+            q = p.get_quote(occ, as_of)
+            out.append((occ, None if q is None else (q.bid, q.ask)))
+            out.append((occ, p.delta_at_entry(_UNDER, occ, as_of)))
+    return out
+
+
+def test_reset_run_overlays_drops_every_run_scoped_fill(provider, store_root):
+    """The greeks memo, the bar dicts, the spot memo and the ATM-IV results are all a
+    function of THIS run's reads. After a reset the overlay must look exactly as it did
+    before the run touched it."""
+    _read_everything(provider)
+    ov = _overlay(store_root)
+    assert ov._g_memo, "the reads filled nothing -- the test would pass vacuously"
+    assert ov._bar_memo and ov._spot_cache and pq._WORKER_ATM_IV_CACHE
+
+    pq.reset_run_overlays()
+
+    assert len(ov._g_memo) == 0
+    assert len(ov._bar_memo) == 0
+    assert len(ov._spot_cache) == 0
+    assert len(pq._WORKER_ATM_IV_CACHE) == 0
+
+
+def test_reset_run_overlays_keeps_the_raw_bytes_and_the_overlay_object(provider, store_root,
+                                                                      monkeypatch):
+    """The whole point of a reset that is not `clear_worker_parquet_options_cache()`: the
+    expensive half (the mapped columns and the per-row/per-contract projections `_bind`
+    derives) survives, so a per-trial reset costs a recomputation of greeks and NOT a
+    re-open, a re-parse or a rebuild of `bar_ord_l`."""
+    _read_everything(provider)
+    raw_before = pq._WORKER_RAW_CACHE[(store_root, _UNDER)]
+    ov_before = _overlay(store_root)
+    bar_ord_l_before = ov_before.bar_ord_l
+
+    loads = _count_loads(monkeypatch)
+    reads = _count_reads(monkeypatch)
+    pq.reset_run_overlays()
+    _read_everything(provider)
+
+    assert loads["n"] == 0, "a reset re-loaded the underlying -- it must keep the raw"
+    assert reads["n"] == 0, "a reset re-read the parquet"
+    assert pq._WORKER_RAW_CACHE[(store_root, _UNDER)] is raw_before
+    assert _overlay(store_root) is ov_before
+    assert _overlay(store_root).bar_ord_l is bar_ord_l_before
+
+
+def test_reset_run_overlays_hands_back_the_memo_objects(provider, store_root):
+    """FRESH dicts, not `.clear()`. A cleared dict keeps the table it grew to -- which for a
+    memo that ran at its cap all trial is the entire allocation -- so the reset would report
+    zero entries while freeing nothing."""
+    _read_everything(provider)
+    ov = _overlay(store_root)
+    g_before, b_before, s_before = ov._g_memo, ov._bar_memo, ov._spot_cache
+
+    pq.reset_run_overlays()
+
+    assert ov._g_memo is not g_before
+    assert ov._bar_memo is not b_before
+    assert ov._spot_cache is not s_before
+
+
+def test_every_read_answers_identically_after_a_reset(provider, store_root):
+    """BYTE parity, not approx: a reset drops a memo of a pure function, so the second pass
+    must reproduce the first one exactly. Anything else means the reset changed a number,
+    and a run's fitness is downstream of these (delta selection picks the contract nearest a
+    target delta; `delta_at_entry` refines `max_drawdown`)."""
+    first = _read_everything(provider)
+    pq.reset_run_overlays()
+    second = _read_everything(provider)
+    assert second == first
+
+
+def test_reset_run_overlays_is_a_no_op_on_an_untouched_worker():
+    """Called once per trial on EVERY worker, including the ones that never open an option
+    store. It must not raise and must not build anything."""
+    clear_worker_parquet_options_cache()
+    assert pq.reset_run_overlays()["overlays"] == 0
+    assert not pq._WORKER_RAW_CACHE and not pq._WORKER_UNDERLYING_CACHE
+
+
+def test_reset_run_overlays_reports_what_it_dropped(provider, store_root):
+    """The counts are the only visibility a worker has into whether the reset is doing
+    anything -- a reset that silently stopped matching the overlays would look identical."""
+    _read_everything(provider)
+    ov = _overlay(store_root)
+    filled = len(ov._g_memo)
+    memo = len(ov._bar_memo)
+    assert filled and memo
+
+    got = pq.reset_run_overlays()
+    assert got["overlays"] == len(pq._WORKER_UNDERLYING_CACHE) >= 1
+    assert got["greeks_rows"] == filled
+    assert got["bar_memo_entries"] == memo
+
+
+# -- the bar-dict memo is capped ------------------------------------------- #
+def test_bar_memo_is_capped(provider, store_root, monkeypatch):
+    """Unbounded, it is 821 B of resident memory per row the run ever read a bar for -- the
+    single biggest per-touched-row cost the overlay has, five times the greeks' 151 B."""
+    monkeypatch.setattr(pq, "_BAR_MEMO_MAX", 2)
+    ov = _overlay(store_root)
+    ci = ov.c_index[_C100]
+    for d in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10)):
+        ov.bar_dict(ov.exact_row(ci, d.toordinal()), ci, provider.spot_source)
+    assert len(ov._bar_memo) == 2
+
+
+def test_bar_memo_evicts_the_OLDEST_row_first(provider, store_root, monkeypatch):
+    """Insertion order, not random: a backtest walks the window forward, so the row least
+    likely to be read again is the one read longest ago. (The reuse window is a single bar
+    date -- all nine `_options.get_bar` call sites in backtest_account.py key on
+    `self._as_of_date()` -- so the cap is a backstop, not a working-set tuning knob.)"""
+    monkeypatch.setattr(pq, "_BAR_MEMO_MAX", 2)
+    ov = _overlay(store_root)
+    ci = ov.c_index[_C100]
+    rows = [ov.exact_row(ci, d.toordinal())
+            for d in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10))]
+    for i in rows:
+        ov.bar_dict(i, ci, provider.spot_source)
+    assert sorted(ov._bar_memo) == sorted(rows[1:]), "the oldest entry was not the one dropped"
+
+
+def test_an_evicted_bar_rebuilds_identically(provider, store_root, monkeypatch):
+    """The memo is a memo. An eviction costs 5.4 us and changes no value."""
+    monkeypatch.setattr(pq, "_BAR_MEMO_MAX", 1)
+    first = provider.get_bar(_C100, date(2023, 1, 3))
+    provider.get_bar(_C100, date(2023, 1, 10))          # evicts 01-03
+    ov = _overlay(store_root)
+    assert len(ov._bar_memo) == 1
+    assert provider.get_bar(_C100, date(2023, 1, 3)) == first
+
+
+def test_memory_stats_reports_both_bounded_memos(provider, store_root):
+    """`private_mb` counted the greeks NOMINALLY (five columns whose `nbytes` said 7.1 GB
+    whatever a trial read) and the bar memo not at all. Both are now exact: an entry count
+    times a measured per-entry constant, which is also what the caps are expressed in."""
+    clear_worker_parquet_options_cache()
+    empty = pq.memory_stats()
+    assert empty["greeks_entries"] == 0 and empty["bar_memo_entries"] == 0
+    assert empty["greeks_mb"] == 0.0 and empty["bar_memo_mb"] == 0.0
+
+    _read_everything(provider)
+    st = pq.memory_stats()
+    ov = _overlay(store_root)
+    assert st["greeks_entries"] == len(ov._g_memo) > 0
+    assert st["bar_memo_entries"] == len(ov._bar_memo) > 0
+    assert st["private_mb"] >= empty["private_mb"]
+
+    pq.reset_run_overlays()
+    after = pq.memory_stats()
+    assert after["greeks_entries"] == 0 and after["bar_memo_entries"] == 0
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not sys.platform.startswith(("win", "linux")),
+    reason="resident-set accounting is only meaningful on Windows (working set) and Linux "
+           "(RSS); macOS reports compressed/purgeable pages in ways that make the delta "
+           "unreliable")
+def test_two_genomes_with_a_reset_between_them_do_not_accumulate():
+    """Two genomes reading DIFFERENT rows of the same 5M-row underlying, with a reset between
+    them. The caps already bound each trial; this is the other half -- that a worker running
+    32 individuals does not carry 32 working sets.
+
+    Asserted against the DENSE design's nominal (41 B/row = 195 MB per genome, 7.1 GB on the
+    177.8M-row universe) rather than against genome A's own RSS, because RSS here is not a
+    clean instrument: 200k bar dicts are built and freed per genome and CPython returns an
+    arena to the OS only when it is completely empty, so the working set carries allocator
+    churn the caps have no say over. The structural assertions below are the exact ones.
+    """
+    psutil = pytest.importorskip("psutil")
+    proc = psutil.Process()
+    clear_worker_parquet_options_cache()
+    n_contracts, n_bars = 5_000, 1_000
+    raw = pq._RawUnderlying.from_arrays("SY", _synthetic_arrays(n_contracts, n_bars))
+    ov = pq._Underlying(raw, _RATE)
+    pq._WORKER_UNDERLYING_CACHE[("synthetic", "SY", _RATE, "scope")] = ov
+
+    def _spot(_sym, _on):
+        return 100.0
+
+    def _genome(contracts, bars):
+        for ci in contracts:
+            s = ov.starts_l[ci]
+            for b in bars:
+                ov.bar_dict(s + b, ci, _spot)
+
+    gc.collect()
+    base = proc.memory_info().rss
+    _genome(range(0, 1_000), range(0, 200))          # genome A: 200k rows
+    gc.collect()
+    one_trial = proc.memory_info().rss - base
+
+    pq.reset_run_overlays()
+    assert not ov._g_memo and not ov._bar_memo
+    _genome(range(700, 1_700), range(150, 350))      # genome B: 200k DIFFERENT rows
+    gc.collect()
+    both = proc.memory_info().rss - base
+
+    assert len(ov._g_memo) <= pq._GREEKS_MEMO_MAX
+    assert len(ov._bar_memo) <= pq._BAR_MEMO_MAX
+    dense_nominal_one_genome = raw.n_rows * 41
+    assert both < dense_nominal_one_genome * 0.5, (
+        f"two genomes hold {both / 1048576:.1f} MB (one alone held "
+        f"{one_trial / 1048576:.1f} MB) against the dense design's "
+        f"{dense_nominal_one_genome / 1048576:.0f} MB for ONE -- still accumulating")
+    clear_worker_parquet_options_cache()

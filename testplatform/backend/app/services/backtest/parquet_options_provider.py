@@ -105,7 +105,7 @@ so reads are cached at WORKER-PROCESS level, not per instance:
     parsed into columnar numpy: prices, volumes, the per-contract descriptors, and the
     ordinal/ISO/date lookups derived from them. NOTHING here depends on the run.
   * ``_WORKER_UNDERLYING_CACHE`` — one ``_Underlying`` overlay per (root, underlying, rate,
-    spot_scope), holding a reference to the raw plus the lazily-filled greeks arrays, the
+    spot_scope), holding a reference to the raw plus the BOUNDED greeks memo, the
     per-bar spot memo, and the materialised-bar-dict memo. These ARE a function of the run.
   * ``_WORKER_ATM_IV_CACHE`` — the get_atm_iv RESULT memo, mirroring the sqlite reader's.
 
@@ -146,7 +146,10 @@ Columnar (numpy) rather than dict-per-bar because the cap has to clear a realist
 686 underlyings x ~28k rows, and a run's ~100-symbol universe must fit in a worker alongside
 the OHLCV memo. Measured on GOOG (27,974 rows / 1,374 contracts): 2.36 MB for the raw
 (1.53 MB of numpy plus 0.43 MB of the python projections the hot paths index and
-0.26 MB of the contract symbol list/index) and 1.09 MB for one greeks overlay. The per-ROW
+0.26 MB of the contract symbol list/index). The greeks are no longer per-row at all -- they
+are a bounded row->tuple memo (``_GREEKS_MEMO_MAX``, 6.3 MB at the default cap however big
+the underlying is); see ``_Underlying._fresh_run_fill`` for why the five dense float64
+columns they replace could not be made to follow what a trial reads. The per-ROW
 projection is an ``array('i')`` rather than a list precisely because that 0.43 MB is the part
 that scales with the store — see ``_RawUnderlying._bind``. Bars are
 materialised into dicts only when a caller actually reads one, and then memoised (see
@@ -175,7 +178,7 @@ from .options_cache import OptionsCacheMiss
 logger = logging.getLogger(__name__)
 
 #: Underlyings held per worker process. WHAT AN ENTRY COSTS THIS PROCESS is now the
-#: PROJECTIONS plus the greeks overlay, not the columns: the numeric arrays are mapped from
+#: PROJECTIONS plus the two bounded overlay memos, not the columns: the numeric arrays are mapped from
 #: the host-shared derived cache (see CACHING), so they are one copy per host and reclaimable
 #: page cache, while ``bar_ord_l`` (4 B/row), the per-contract lists and the ordinal/ISO
 #: dicts are private per process. ON A LEGACY NO-QUOTE TREE ADD 16 B/ROW: ``_bind``
@@ -184,7 +187,8 @@ logger = logging.getLogger(__name__)
 #: is four times what ``bar_ord_l`` costs and makes the TastyTrade tree, not the quoted
 #: ThetaData one, the expensive case per process. On GOOG's 27,974 rows that is the 0.43 MB
 #: per-row projection plus the 0.26 MB contract list/index measured in the module docstring,
-#: against the 1.53 MB of columns that no longer count, plus 1.09 MB per greeks overlay. Sizing the
+#: against the 1.53 MB of columns that no longer count, plus at most 10.4 MB of bounded
+#: greeks + bar memo per overlay whatever the row count. Sizing the
 #: cap BELOW the run's universe is still the thing to avoid — that thrashes
 #: (evict-then-reload) inside a single bar, exactly as the sqlite reader's bar-cache comment
 #: warns — but the penalty for a reload is now a mmap rather than ~55 ms of parquet, so
@@ -194,6 +198,32 @@ _UNDERLYING_CACHE_MAX = int(os.getenv("BT_OPTION_PARQUET_CACHE_MAX", "200"))
 #: Same generosity (and same reasoning) as the sqlite reader's ATM-IV memo: the values are a
 #: float or None, and a GA re-asks the identical (symbol, date) pairs on every trial.
 _ATM_IV_CACHE_MAX = int(os.getenv("BT_OPTION_ATM_IV_CACHE_MAX", "200000"))
+#: Greeks memoised per OVERLAY, as row index -> the finished 5-tuple. THE NUMBER THAT SIZES
+#: A WORKER: at a measured 315 B/entry this is 6.3 MB per underlying, so the 98-symbol
+#: stage-1 option universe holds ~617 MB where the five dense float64 columns it replaces
+#: held 7.1 GB. The cap is chosen from the WIDEST read pattern the seam admits (1-730 DTE,
+#: every contract every bar: 751 new rows and 1,326 calls per bar on AAPL) — at 20,000 it
+#: gives up 0.4% of the hits an unbounded memo gets and 98.5% of the residency. Lower it on a
+#: memory-tight worker before touching anything else here; 5,000 still holds 41.1% of 43.6%.
+#: See ``_Underlying._fresh_run_fill``.
+_GREEKS_MEMO_MAX = int(os.getenv("BT_OPTION_GREEKS_MEMO_MAX", "20000"))
+#: Materialised bar dicts held per OVERLAY (see ``_Underlying.bar_dict``). 821 B of resident
+#: memory per entry, measured — 2.6x what a greeks entry costs, which is why its cap is
+#: tighter even though it is asked for far less often. ``bar_dict`` is reached only through
+#: ``get_bar``, i.e. only for HELD lots and order fills: the real-tree walk above produced 730
+#: entries over 914 bar dates, so 5,000 is ~7x the measured need and 4.1 MB per underlying
+#: (~400 MB across a 98-symbol universe in the worst case). Until 2026-09-15 it was unbounded
+#: and counted at zero in ``memory_stats``. Eviction is insertion-ordered (see ``bar_dict``).
+_BAR_MEMO_MAX = int(os.getenv("BT_OPTION_BAR_MEMO_MAX", "5000"))
+#: What one ``_bar_memo`` entry costs this process, for ``memory_stats``. MEASURED, not
+#: derived: 200,000 entries over a 5M-row synthetic moved the working set by 156.5 MB, i.e.
+#: 821 B — the 17-key dict object (``getsizeof`` 464 B) plus the float/int objects its values
+#: point at plus the holding dict's own slot. ``sys.getsizeof`` alone would under-report it by
+#: ~40%, which is exactly the kind of number that makes a worker look healthy while it is not.
+_BAR_MEMO_BYTES_PER_ENTRY = 821
+#: Likewise for ``_g_memo``: 500,000 real greek tuples moved the working set by 150.2 MB —
+#: 315 B for a 5-tuple, its five float objects and the dict slot holding it.
+_GREEKS_MEMO_BYTES_PER_ENTRY = 315
 
 #: SCOPE-INDEPENDENT. The parquet bytes and everything derived from them alone. See CACHING.
 _WORKER_RAW_CACHE: "OrderedDict[Tuple[str, str], _RawUnderlying]" = OrderedDict()
@@ -239,11 +269,15 @@ def memory_stats() -> Dict[str, Any]:
       * ``private_mb`` — the per-process half: any column that is a real allocation (the
         ``BA2_SHARED_ARRAYS=0`` path), ``bar_ord_l`` (the ``array('i')`` the bisects read,
         4 B/row), the ``starts_l``/``stops_l`` lists (one pointer per CONTRACT, not per row),
-        and the overlay greeks arrays — which are always private: they are computed here from
-        this run's spot/rate and depend on nothing on disk. NOMINAL, not resident, for the
-        greeks: they are allocated uninitialised and filled one row at a time (see
-        ``_Underlying.__init__``), so their ``nbytes`` is the ceiling a fully-scanned
-        underlying would reach, not the working set a trial actually holds.
+        and the two overlay memos, which are always private: they are computed here from this
+        run's spot/rate and depend on nothing on disk. Both are counted at their MEASURED
+        per-entry cost, and both were counted WRONG until 2026-09-15 — the greeks nominally
+        (five dense columns whose ``nbytes`` said 7.1 GB whatever a trial read) and the bar
+        memo not at all.
+      * ``greeks_entries`` / ``greeks_mb`` and ``bar_memo_entries`` / ``bar_memo_mb`` — what
+        the two bounded memos actually hold, so the numbers ``_GREEKS_MEMO_MAX``,
+        ``_BAR_MEMO_MAX`` and ``reset_run_overlays`` act on are visible rather than inferred.
+        These are EXACT (an entry count times a measured constant), not a ceiling.
       * ``shared_mb`` — columns backed by an ``np.memmap``. ``isinstance(arr.base, np.memmap)``
         asks the real question rather than ``arr.base is not None``, which a private fancy-index
         view would also satisfy (see price_source.memory_stats).
@@ -270,13 +304,71 @@ def memory_stats() -> Dict[str, Any]:
         for lst in (getattr(raw, "starts_l", None), getattr(raw, "stops_l", None)):
             if lst is not None:
                 private += 8 * len(lst)      # one pointer per entry; the ints themselves are small
+    greeks_entries = 0
+    memo_entries = 0
     for ov in list(_WORKER_UNDERLYING_CACHE.values()):
-        for name in ("_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega"):
-            arr = getattr(ov, name, None)
-            private += int(getattr(arr, "nbytes", 0) or 0)
+        greeks_entries += len(ov._g_memo)
+        memo_entries += len(ov._bar_memo)
+    greeks_bytes = greeks_entries * _GREEKS_MEMO_BYTES_PER_ENTRY
+    memo_bytes = memo_entries * _BAR_MEMO_BYTES_PER_ENTRY
+    private += greeks_bytes + memo_bytes
     return {"entries": len(_WORKER_RAW_CACHE),
             "private_mb": round(private / 1048576, 1),
-            "shared_mb": round(shared / 1048576, 1)}
+            "shared_mb": round(shared / 1048576, 1),
+            "greeks_entries": greeks_entries,
+            "greeks_mb": round(greeks_bytes / 1048576, 1),
+            "bar_memo_entries": memo_entries,
+            "bar_memo_mb": round(memo_bytes / 1048576, 1)}
+
+
+def reset_run_overlays() -> Dict[str, Any]:
+    """Drop everything a RUN filled into the cached overlays; keep everything the STORE gave.
+
+    THE MEMOS ARE PER-WORKER, THE RUNS ARE NOT. An overlay is cached per
+    (root, underlying, rate, spot_scope) for the LIFE of the worker — 32 individuals, by
+    ``BT_MAX_TASKS_PER_CHILD`` — and successive genomes read different contracts on different
+    dates, so without this the memos hold the UNION of every trial the worker has run. Measured
+    on a 5M-row synthetic: a second genome reuses 7.5% of the first's fill, and two genomes
+    alone hold 1.93x one genome's rows. Called once per trial, this makes the ceiling ONE
+    trial's working set — which the caps then bound in turn.
+
+    WHAT IT DROPS — and all four are pure memoisation of pure functions of this run's spot
+    source and rate, which is the only reason dropping them per trial is safe:
+      * ``_g_memo`` — the greeks, 315 B/entry;
+      * ``_bar_memo`` — the materialised bar dicts, 821 B/entry;
+      * ``_spot_cache`` — one float per bar DATE, small, but it is run-scoped like the rest;
+      * ``_WORKER_ATM_IV_CACHE`` — a run-scoped RESULT memo, and pointless to keep once the
+        greeks it summarises are gone.
+
+    SECONDARY, since the memos became bounded (see ``_Underlying._fresh_run_fill``): the caps
+    are what stop a worker converging on the window, and this is what stops it carrying one
+    genome's working set into the next. It is cheap — a few dict drops per underlying — so it
+    stays on the per-trial path rather than being folded into the caps.
+
+    WHAT IT KEEPS is the expensive half: ``_WORKER_RAW_CACHE`` and the overlay OBJECTS, so
+    the mapped ``.npy`` columns stay open and the private projections ``_bind`` derives
+    (``bar_ord_l``, the per-contract lists, the ordinal/ISO dicts) are not rebuilt. That is
+    what makes this different from ``clear_worker_parquet_options_cache()`` and from the
+    governor's ``_worker_release_memory``, both of which drop the lot: this runs on the happy
+    path after EVERY trial, so it has to cost a re-computation and never a re-open.
+
+    Returns what it dropped — the only visibility a worker has that the reset is still
+    matching the overlays rather than quietly finding none.
+    """
+    overlays = list(_WORKER_UNDERLYING_CACHE.values())
+    greeks_rows = 0
+    bar_memo_entries = 0
+    spot_entries = 0
+    for ov in overlays:
+        greeks_rows += len(ov._g_memo)
+        bar_memo_entries += len(ov._bar_memo)
+        spot_entries += len(ov._spot_cache)
+        ov._fresh_run_fill()
+    atm = len(_WORKER_ATM_IV_CACHE)
+    _WORKER_ATM_IV_CACHE.clear()
+    return {"overlays": len(overlays), "greeks_rows": greeks_rows,
+            "bar_memo_entries": bar_memo_entries, "spot_entries": spot_entries,
+            "atm_iv_entries": atm}
 
 
 def clear_worker_parquet_options_cache() -> None:
@@ -577,16 +669,13 @@ class _Underlying:
         "c_occ", "c_index", "c_strike", "c_expiry_ord", "c_is_call", "starts", "stops",
         "bar_ord", "bar_ord_l", "starts_l", "stops_l",
         "open", "high", "low", "close", "volume", "open_interest", "vendor_iv", "bid", "ask",
-        "_g_done", "_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega",
-        "_spot_cache", "_bar_memo",
+        "_g_memo", "_spot_cache", "_bar_memo",
     )
 
     def __init__(self, raw: "_RawUnderlying", rate: float):
         self.raw = raw
         self.underlying = raw.underlying
         self.rate = float(rate)
-        self._spot_cache: Dict[int, Optional[float]] = {}
-        self._bar_memo: Dict[int, Dict[str, object]] = {}
 
         n = raw.n_rows
         self.n_rows = n
@@ -596,54 +685,58 @@ class _Underlying:
                      "bid", "ask"):
             setattr(self, name, getattr(raw, name))
 
-        # UNINITIALISED, AND THE INVARIANT THAT MAKES IT SAFE: no cell of these five is ever
-        # READ before ``_g_done[i]`` is set. ``greeks_tuple`` is their only reader and it
-        # fills the row first; nothing else in the codebase indexes them (``memory_stats``
-        # asks for ``nbytes``). "NaN means not computed" is NOT the rule and never was --
-        # NaN is a legitimate greek (an uninvertible bar stores it deliberately), so
-        # ``_g_done`` has always been the sole record of what is filled.
-        #
-        # WHY IT MATTERS. ``np.full`` WRITES every element, so all 40 B/row became RESIDENT
-        # the instant an underlying was opened, PRIVATE to each worker -- against mapped
-        # columns the host shares once. On the 2020 ThetaData universe (177.8M rows) that is
-        # ~7.1 GB per worker and was the shared design's remaining dominant private cost (a
-        # live probe on 20 symbols measured ~3.6 GB private per worker). ``np.empty`` leaves
-        # the pages demand-zero and the fill is lazy, so residency follows what the run
-        # actually reads. Measured on a synthetic 5M-row / 5k-contract underlying, nominal
-        # 191 MB:
-        #
-        #   construction         190.7 MB rss (np.full)  ->    0.0 MB (np.empty)
-        #   + 5% of rows filled, densely (250 consecutive bars x 1,000 contracts, the
-        #     shape a backtest produces -- it re-reads one contract on many dates)
-        #                        190.7 MB                ->   44.0 MB
-        #   + the worst case (one scattered row per contract, 0.1% of rows)
-        #                        190.7 MB                ->  102.5 MB
-        #
-        # THE WORST CASE IS PAGE GRANULARITY, and it is the ceiling worth knowing: a 4 KB
-        # page holds 512 float64, so one touched row in a long contract makes a whole page
-        # resident in each of the five columns. It is still under the old cost, and it never
-        # exceeds it -- ``np.full``'s 191 MB is the limit this converges to, not a baseline
-        # it can pass.
-        #
-        # WINDOWS still COMMITS the reservation, so ``private``/pagefile grows by the full
-        # nominal size either way; the working set is the number that decides how many trial
-        # slots fit in a box, and that is the one measured above. On Linux an untouched page
-        # is neither committed nor resident.
-        #
-        # NOT PER-CONTRACT SLICES (the obvious next step: allocate ``stops[ci]-starts[ci]``
-        # cells the first time a contract is read). Measured, it loses: its allocation
-        # granularity is a CONTRACT, which here is 8 KB per column -- coarser than the 4 KB
-        # page this already pays -- so the dense pattern lands on the same ~40 MB and the
-        # scattered one costs ~200 MB, worse than both this and ``np.full``. It would also
-        # put a dict lookup and a subtraction on a path measured at 671 ns/call
-        # (``np.empty``-built) against 708 ns/call (``np.full``-built) -- i.e. the change
-        # here costs the hot path nothing to begin with.
-        #
-        # ``_g_done`` stays ``np.zeros``: calloc hands back demand-zero pages too, so the
-        # bool mask (1 B/row) is no more resident than the floats it guards.
-        self._g_done = np.zeros(n, dtype=bool)
-        for name in ("_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega"):
-            setattr(self, name, np.empty(n, dtype="float64"))
+        # THE GREEKS ARE A BOUNDED MEMO, NOT A COLUMN. See ``_fresh_run_fill``.
+        self._fresh_run_fill()
+
+    def _fresh_run_fill(self) -> None:
+        """(Re)build everything that is a function of the RUN rather than of the store.
+
+        Called by ``__init__`` and by ``reset_run_overlays``; the two must not diverge, which
+        is the whole reason it is one method.
+
+        WHY THE GREEKS ARE NOT FIVE COLUMNS ANY MORE (2026-09-15). They were: five
+        ``float64`` arrays plus a ``_g_done`` bool mask, 41 B for every ROW of the mapped raw,
+        private to each worker. ``np.full`` made all of it resident at construction; ``np.empty``
+        (commit c608ac05) made it lazy, which fixed the construction spike and nothing else.
+        The field then showed why that was not enough — remote227, stage-1 option grid, 98
+        underlyings = 177.8M rows, 30 workers: 5.4-7.2 GB anonymous per worker (median 6.6)
+        after ONE OR TWO trials, cgroup anon 218 GB of a 232 GB cap, swap exhausted.
+
+        LAZY DOES NOT HELP HERE, and the reason is page granularity against the store's own
+        layout. Rows are sorted by (occ_symbol, bar_date), so one contract's rows are
+        contiguous and ~2.4 KB per column — SMALLER THAN A 4 KB PAGE. Every contract passes
+        through the DTE band a strategy reads, so every contract is touched, so every page of
+        all five columns becomes resident. Measured on the real tree (AAPL, 711,559 rows, 914
+        bar dates 2023-01..2026-08, a 20-60 DTE chain read + get_atm_iv every day + MTM
+        re-reads of held lots): 24.5% of ROWS touched, and 38.8 B/row RESIDENT against a
+        40 B/row nominal. One trial, and the columns are already all there.
+
+        SO THE MEMO IS BOUNDED AND SPARSE INSTEAD: ``_g_memo`` maps row index -> the finished
+        5-tuple, capped at ``_GREEKS_MEMO_MAX``. The cap works because the REUSE IS LOCAL —
+        a bar's chain read, its ``get_atm_iv`` and its held-lot ``get_bar`` calls all land on
+        the same few hundred rows, and the next bar moves on. Measured on the same AAPL walk,
+        and on the WIDEST read pattern the seam admits (1-730 DTE, i.e. every contract every
+        day, 751 new rows and 1,326 calls per bar):
+
+            design                   hit rate   misses     resident     elapsed
+            dense columns (before)     43.6%    683,342    28 MB (41.0 B/row)   134 s
+            memo, cap 20,000           43.4%    686,097     0 MB ( 0.6 B/row)   139 s
+            memo, cap  5,000           41.1%    713,820     2 MB ( 2.2 B/row)   137 s
+
+        i.e. the cap buys back 98.5% of the residency for 0.4% of the hits. At 315 B/entry
+        (measured) the cap is 6.3 MB per underlying, so a 98-symbol universe holds ~617 MB
+        where the columns held 7.1 GB.
+
+        FIFO, NOT LRU. A backtest walks its window forward; the row read longest ago is the
+        one that will not be asked for again, and ``next(iter(memo))`` keeps the HIT path free
+        of the ``move_to_end`` a true LRU would put on it. An evicted row recomputes
+        identically — this is a memo of a pure function (see ``greeks_tuple``).
+
+        Fresh objects rather than in-place clears, so the allocator can hand the pages back.
+        """
+        self._spot_cache: Dict[int, Optional[float]] = {}
+        self._bar_memo: Dict[int, Dict[str, object]] = {}
+        self._g_memo: Dict[int, Tuple[Optional[float], ...]] = {}
 
     # -- as-of clamp ----------------------------------------------------
     # ``bisect`` over the ``array('i')`` buffer rather than ``np.searchsorted`` over an array
@@ -682,16 +775,28 @@ class _Underlying:
     def greeks_tuple(self, i: int, ci: int, spot_source) -> Tuple[Optional[float], ...]:
         """(iv, delta, gamma, theta, vega) for row ``i``, inverted from its own close.
 
-        Memoised per row for the life of the cached overlay: a GA re-reads the same
-        (contract, bar) pairs on every trial, and get_atm_iv alone re-scans a whole DTE band
-        per bar. ``compute_iv_and_greeks`` is the ONE greeks path (11.2 us/call measured), the
-        same one ``fetch_options.bar_to_row`` used to fill the sqlite store's bars.
+        Memoised per row in a BOUNDED dict (``_GREEKS_MEMO_MAX``), because the reuse this
+        memo exists for is LOCAL: a bar's chain read, its ``get_atm_iv`` DTE-band rescan and
+        its held-lot ``get_bar`` calls all land on the same few hundred rows and the next bar
+        moves on. Measured on the real tree, 52% of calls are hits on a 20-60 DTE walk and a
+        5,000-entry cap captures every one of them (174,830 misses against an unbounded
+        174,654). See ``_fresh_run_fill`` for why this is a dict and not five columns, and for
+        the numbers that decided the cap.
+
+        ``compute_iv_and_greeks`` is the ONE greeks path (11.2 us/call measured), the same one
+        ``fetch_options.bar_to_row`` used to fill the sqlite store's bars. A miss is that call;
+        an eviction therefore costs 11.2 us and CHANGES NO VALUE — the inputs (the row's close,
+        its date's spot, the contract's strike/expiry/right, the run's rate) are all immutable
+        for the life of the overlay, which is the whole licence for evicting at all.
 
         A TUPLE, not a dict, because every caller of this is per-contract-per-bar. Rebuilding
         a 5-key dict here cost 1.7 us on a MEMO HIT — 0.27 us of it per ``np.isnan`` on a
-        numpy scalar, which is why ``_f`` now tests ``v != v`` instead (0.019 us).
+        numpy scalar, which is why ``_f`` now tests ``v != v`` instead (0.019 us). The tuple is
+        stored FINISHED (``_f`` applied at fill), so a hit is a dict lookup and a return.
         """
-        if not self._g_done[i]:
+        memo = self._g_memo
+        t = memo.get(i)
+        if t is None:
             px = self.close[i]
             bar_ord = self.bar_ord_l[i]
             spot = self._spot_on(bar_ord, spot_source)
@@ -699,14 +804,17 @@ class _Underlying:
             out = compute_iv_and_greeks(
                 None if px != px else float(px), spot, self.raw.c_strike_f[ci],
                 t_days / 365.0, self.rate, self.raw.c_right[ci])
-            self._g_iv[i] = np.nan if out["iv"] is None else out["iv"]
-            self._g_delta[i] = np.nan if out["delta"] is None else out["delta"]
-            self._g_gamma[i] = np.nan if out["gamma"] is None else out["gamma"]
-            self._g_theta[i] = np.nan if out["theta"] is None else out["theta"]
-            self._g_vega[i] = np.nan if out["vega"] is None else out["vega"]
-            self._g_done[i] = True
-        return (_f(self._g_iv[i]), _f(self._g_delta[i]), _f(self._g_gamma[i]),
-                _f(self._g_theta[i]), _f(self._g_vega[i]))
+            # ``_f`` HERE, on the MISS branch, not on every return. It is what preserves the
+            # old columns' semantics exactly: they stored NaN for a None greek and `_f` mapped
+            # NaN back to None on the way out, so a greek that came back as a COMPUTED NaN
+            # (rather than None) was reported as None too. Storing the raw dict values would
+            # quietly start returning that NaN. 5 x 0.019 us against an 11.2 us compute.
+            t = (_f(out["iv"]), _f(out["delta"]), _f(out["gamma"]),
+                 _f(out["theta"]), _f(out["vega"]))
+            memo[i] = t
+            while len(memo) > _GREEKS_MEMO_MAX:
+                del memo[next(iter(memo))]
+        return t
 
     def delta_iv_of_row(self, i: int, ci: int, spot_source
                         ) -> Tuple[Optional[float], Optional[float]]:
@@ -732,6 +840,23 @@ class _Underlying:
         A COPY, not the memo itself: callers get a dict and none of them currently mutate it,
         but handing out the cached object would make that a silent cross-call corruption
         rather than a local bug, and ``dict.copy()`` on 17 keys is 0.054 us.
+
+        AND CAPPED, at ``_BAR_MEMO_MAX``. Unbounded it was 821 B of RESIDENT memory per row
+        the run ever read a bar for — five times what the same row costs in the five greek
+        columns (151 B measured), and the overlay's largest per-touched-row cost. Eviction is
+        INSERTION-ORDERED, not LRU: a backtest walks its window forward and every one of the
+        nine ``_options.get_bar`` call sites in ``backtest_account.py`` keys on
+        ``self._as_of_date()``, so a row's re-reads all fall on one bar date and the oldest
+        entry is exactly the one that will not be asked for again.
+
+        A PLAIN DICT, not an ``OrderedDict``. Both preserve insertion order on every Python
+        BA2 runs, so ``next(iter(memo))`` is the oldest key either way -- but ``OrderedDict``
+        carries a linked-list node per entry and its ``get`` is measurably slower on the HIT
+        path this method exists for: 311 ns against 245 ns, a 27% regression on a path taken
+        once per held lot per bar per MTM/fill/liquidation/settlement site. The eviction is on
+        the MISS branch, which already costs 5.4 us, so it can afford the ``next(iter(...))``
+        scan of one entry. An evicted row rebuilds identically -- this is a memo of a pure
+        function of immutable columns, so the cap costs 5.4 us and changes no value.
         """
         d = self._bar_memo.get(i)
         if d is None:
@@ -751,7 +876,10 @@ class _Underlying:
                 "open_interest": _i(self.open_interest[i]),
                 "vendor_iv": _f(self.vendor_iv[i]),
             }
-            self._bar_memo[i] = d
+            memo = self._bar_memo
+            memo[i] = d
+            while len(memo) > _BAR_MEMO_MAX:
+                del memo[next(iter(memo))]
         return d.copy()
 
     def contract(self, i: int, ci: int, spot_source) -> OptionContract:

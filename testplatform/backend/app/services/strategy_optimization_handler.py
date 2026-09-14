@@ -271,6 +271,46 @@ def _cancel_progress_cb(ctl):
     return _cb
 
 
+def _release_option_overlays() -> None:
+    """Drop the per-RUN option overlay fill. Called after EVERY trial, on every trial path.
+
+    ``parquet_options_provider``'s greek columns and materialised-bar memo are filled lazily
+    but cached for the LIFE of the worker, so across genomes the resident set is the UNION of
+    every trial the worker has run and converges on the whole option window: a second genome
+    reuses 7.5% of the first's fill (measured), and in the field (remote227, 2026-09-15,
+    stage-1 option grid, 98 underlyings = 177.8M rows, 30 workers) a worker held ~7.8 GB of
+    anonymous memory after ~2 trials, with the cgroup at 218 GB of a 232 GB cap and swap
+    exhausted. Resetting per trial makes the ceiling ONE trial's working set.
+
+    NOT ``_worker_release_memory``, which drops the mapped columns and the private projections
+    as well: that is the governor's panic button, it fires only under memory pressure — i.e.
+    after the convergence has already happened — and a per-trial call to it would re-open and
+    re-derive an underlying between every pair of genomes. This one keeps the expensive half
+    and costs a recomputation of the greeks a trial actually reads.
+
+    RESULT-NEUTRAL by construction: everything it drops is a memo of a pure function of the
+    run's spot source and rate, so a dropped entry costs 11.2 us and reproduces byte-identical
+    values (pinned by ``test_every_read_answers_identically_after_a_reset``).
+
+    Best effort, but never silent: memory hygiene must not turn a good genome into a failed
+    trial, and a release that quietly stopped working is exactly how the governor's
+    ``clear_worker_option_caches`` typo survived for months. The channel is ``_worker_log``
+    because a pool child's logging is globally disabled (see ``_worker_init``).
+    """
+    try:
+        from app.services.backtest import parquet_options_provider as _pq
+
+        _pq.reset_run_overlays()
+    except Exception as e:  # noqa: BLE001 — see the docstring: loud, but never fatal
+        try:
+            from app.services.backtest import price_source as _ps
+
+            _ps._worker_log(f"!! per-trial option overlay reset FAILED: {e!r} - this worker's "
+                            f"greeks/bar memo are accumulating across genomes")
+        except Exception:  # noqa: BLE001 — the log channel itself is gone; nothing left to do
+            pass
+
+
 def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) -> Dict[str, Any]:
     """Run ONE deterministic daily backtest in a worker PROCESS and return a tiny summary.
 
@@ -348,6 +388,13 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
             "SharedArrayFdExhausted")
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
                 "fatal": fatal, "mem": _trial_memory_snapshot()}
+    finally:
+        # FINALLY, not after the happy return: a failed or CANCELLED trial is when this
+        # matters most. The worker is handed another genome immediately and the abandoned
+        # one's greeks would otherwise stay resident with nothing left that could read them.
+        # After the `mem` snapshots above deliberately, so the telemetry reports what the
+        # trial actually held rather than what survived it.
+        _release_option_overlays()
 
 
 def _worker_release_memory() -> Dict[str, Any]:
@@ -977,6 +1024,12 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
             last_exc = e
             if attempt < _LOCAL_RETRY_ATTEMPTS - 1:
                 time.sleep(_LOCAL_RETRY_BACKOFF_S * (2 ** attempt))
+        finally:
+            # Per ATTEMPT, not per call: a retry re-runs the whole backtest, so a release
+            # sited outside the loop would let a re-run that failed five times hold five
+            # trials' worth of option overlay. This is also the most memory-expensive trial a
+            # worker runs — it is the one that builds the full results blob.
+            _release_option_overlays()
     return {"ok": False, "error": repr(last_exc)}
 
 
