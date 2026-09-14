@@ -355,6 +355,33 @@ def _render_trade_performance(client):
     return _texts(holder['root'])
 
 
+def _render_floating_pl_root(client, widget_cls):
+    """Same render, but hands back the ELEMENT TREE rather than its text.
+
+    Some questions ('how many rows did this account get?') cannot be answered from the
+    flattened text: the name cell's tooltip repeats the name, so a text count sees two
+    of everything.
+    """
+    widget = widget_cls.__new__(widget_cls)
+    from nicegui import ui
+
+    holder = {}
+
+    def _factory():
+        with ui.column() as root:
+            holder['root'] = root
+            loading = ui.label('🔄 Calculating floating P/L...')
+            content = ui.column()
+        return widget._load_data_async(loading, content)
+
+    async def _run():
+        with client:
+            await _factory()
+
+    asyncio.run(_run())
+    return holder['root']
+
+
 def test_trade_performance_shows_real_trades_for_an_account_with_no_experts(
         nicegui_client, select_account, manual_account):
     """THE BUG. Expert-id filtering turned a traded account into a row of zeros."""
@@ -779,9 +806,15 @@ def test_floating_pl_per_account_lists_each_account_exactly_once(
         [_price('AAPL', 110.0, unrealized_pl=100.0)])})
 
     select_account(manual_account)
-    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+    root = _render_floating_pl_root(nicegui_client, FloatingPLPerAccountWidget)
+    texts = _texts(root)
 
-    assert texts.count('Manual') == 1
+    # ROWS, not text fragments. The name cell carries a tooltip holding the same string
+    # (so a name too long for the card is never lost), which is a second occurrence of
+    # 'Manual' in the rendered text and says nothing about how many rows were drawn.
+    # Counting the name LABELS keeps this pinned on what it is about: the seed and the
+    # transaction must not produce two rows for one account.
+    assert len(_name_labels(root, {'Manual'})) == 1
     assert texts.count('$100.00') == 2      # the row and the total, nothing more
 
 
@@ -1656,3 +1689,91 @@ def test_position_distribution_still_charts_the_accounts_that_did_answer(
     assert any('Could not load positions' in t for t in texts)
     assert 'Total Market Value: $500.00' in texts
     assert [r['category'] for r in _table_rows(root)] == ['Value']
+
+
+# ---------------------------------------------------------------------------------------
+# The name cell: a fixed 150px made deployed instances indistinguishable from each other.
+# ---------------------------------------------------------------------------------------
+def _draw_rows(client, widget_cls, rows):
+    """Draw *rows* through the real ``_draw`` and hand back the root element."""
+    from nicegui import ui
+    widget = widget_cls.__new__(widget_cls)
+    holder = {}
+
+    with client:
+        with ui.column() as root:
+            holder['root'] = root
+            widget._draw(rows)
+    return holder['root']
+
+
+def _name_labels(root, names):
+    """The LABEL elements carrying the row names.
+
+    Type-checked, not text-checked: the tooltip repeats the same string, so matching on
+    text alone counts every row twice.
+    """
+    from nicegui import ui as nicegui_ui
+    return [el for el in root.descendants()
+            if isinstance(el, nicegui_ui.label) and getattr(el, '_text', None) in names]
+
+
+# Real shapes: 26 forward-test instances were deployed 2026-09-14 whose names share a long
+# 'goal2020-mid_ED_S' prefix and differ only after it.
+_LONG_A = 'goal2020-mid_ED_S1top1-riskatr-11'
+_LONG_B = 'goal2020-mid_ED_S7top2-notional-12'
+
+
+def test_the_expert_name_is_not_capped_at_a_fixed_width(nicegui_client):
+    """MEASURED 2026-09-14 from the dashboard: 'goal2020-mid_ED_S1t...'.
+
+    The cell was ``truncate max-w-[150px]``, and deployed instance names are long and
+    front-loaded with the parts that do NOT distinguish them -- band, expert, then the
+    strategy. Two different experts therefore rendered as the SAME string, so the card
+    could show a winner and a loser that a reader cannot tell apart.
+
+    The name now takes the row's remaining width instead of a fixed 150px.
+    """
+    rows = [fpl_mod.PLRow(name=_LONG_A, pl=3.57),
+            fpl_mod.PLRow(name=_LONG_B, pl=-13.37)]
+
+    root = _draw_rows(nicegui_client, FloatingPLPerExpertWidget, rows)
+    labels = _name_labels(root, {_LONG_A, _LONG_B})
+
+    assert len(labels) == 2, 'both rows must be drawn'
+    for el in labels:
+        classes = ' '.join(el._classes)
+        assert 'max-w-[150px]' not in classes, f'fixed cap is back: {classes}'
+        assert 'flex-1' in classes, f'the name must take the free width: {classes}'
+        # LOAD-BEARING beside flex-1: a flex child's default min-width is auto, which
+        # refuses to shrink below its content -- the numbers would be pushed off the
+        # card instead of the name eliding.
+        assert 'min-w-0' in classes, f'flex-1 without min-w-0 cannot elide: {classes}'
+
+
+def test_a_name_too_long_for_the_card_is_one_hover_away(nicegui_client):
+    """Eliding is the last resort, and it must not LOSE anything.
+
+    Same rule the dry-run tab's reason column follows: whatever the width, the full
+    text stays reachable, so a truncated name is never the only record of which expert
+    a number belongs to.
+    """
+    rows = [fpl_mod.PLRow(name=_LONG_A, pl=1.0)]
+
+    root = _draw_rows(nicegui_client, FloatingPLPerExpertWidget, rows)
+
+    tips = [d for d in root.descendants() if type(d).__name__ == 'Tooltip']
+    assert tips, 'the full name must be available on hover'
+    assert any(t._text == _LONG_A for t in tips),         f'the tooltip must carry the WHOLE name, not an elision: {[t._text for t in tips]}'
+
+
+def test_the_money_cells_keep_their_width_when_the_name_grows(nicegui_client):
+    """The name may take the free space; it may not take the numbers' space."""
+    rows = [fpl_mod.PLRow(name=_LONG_A, pl=-13.37)]
+
+    root = _draw_rows(nicegui_client, FloatingPLPerExpertWidget, rows)
+    money_rows = [el for el in root.descendants()
+                  if 'shrink-0' in ' '.join(getattr(el, '_classes', []))]
+
+    assert money_rows, 'the P/L side must be shrink-0 so it is never squeezed out'
+    assert '$-13.37' in _texts(root)

@@ -594,8 +594,19 @@ class _FloatingPLWidgetBase:
 
         for row in ordered:
             with ui.row().classes('w-full justify-between items-center mb-1'):
-                ui.label(row.name).classes('text-sm truncate max-w-[150px]')
-                with ui.row().classes('items-center gap-3'):
+                # The name takes whatever the card has left instead of a fixed 150px.
+                #
+                # Deployed instance names are long and front-loaded with the parts that do
+                # NOT distinguish them -- 'goal2020-mid_ED_S1t...' and 'goal2020-mid_ED_S7t...'
+                # truncate to the same string, so the widget could show two rows a reader
+                # cannot tell apart. flex-1 + min-w-0 lets the label grow to the full row
+                # (min-w-0 is load-bearing: a flex child's default min-width:auto refuses to
+                # shrink below its content, which would push the numbers off the card
+                # instead of eliding), and the numbers keep their natural width via
+                # shrink-0. `truncate` stays as the last resort for a name longer than the
+                # card itself -- and the tooltip means that resort never loses information.
+                ui.label(row.name).classes('text-sm truncate min-w-0 flex-1').tooltip(row.name)
+                with ui.row().classes('items-center gap-3 shrink-0'):
                     if self._show_balance:
                         ui.label(_balance_text(row.balance)).classes('text-xs text-gray-500')
                         ui.label(_bp_text(row.broker_bp)) \
