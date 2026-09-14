@@ -35,6 +35,18 @@ the same "immutable history" identity the cache-sync layer keys on. Builds happe
 and on Windows for a same-volume rename). A ``<key>/<sig>.lock`` created with O_EXCL serialises
 concurrent cold builders across processes; the losers wait for ``_done.json``.
 
+FILE DESCRIPTORS ARE THE SCARCE RESOURCE. A set of N arrays costs N DESCRIPTORS for as long as
+any view over it is alive -- numpy's memmap dups the fd and holds it for the life of the
+mapping -- so plan ``RLIMIT_NOFILE >= arrays x symbols x 1.2``. The 2020 option universe is 98
+underlyings x 18 arrays = 1764 descriptors per worker process, against a systemd default soft
+limit of 1024: on remote227 (2026-09-14) a worker sat at 1014 open fds, the next ``np.load``
+raised EMFILE, ``_try_open`` read that as "not usable" and ``build_or_open`` REBUILT a 7 GB set
+under the lock while 27 of 30 workers slept in the wait loop -- the grid stalled with nothing in
+the logs. Two guards came out of that, and both are load-bearing: ``ensure_fd_headroom()``
+raises the soft limit to the hard one on every process that constructs a store, and ``_try_open``
+now RE-RAISES resource exhaustion instead of reporting "absent", because rebuilding cannot make
+descriptors appear.
+
 ESCAPE HATCH. ``BA2_SHARED_ARRAYS=0`` -> ``build_or_open`` returns ``build_fn()`` directly
 (private arrays, nothing written): the pre-2026-09-14 behaviour, and what every parity test
 compares against.
@@ -44,6 +56,7 @@ This module is deliberately free of any ``ba2_*`` import (pure numpy + stdlib) s
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -82,6 +95,76 @@ _UNSAFE_CHARS = '/\\:*?"<>|'
 ArrayDict = Dict[str, np.ndarray]
 PathLike = Union[str, os.PathLike]
 BuildFn = Callable[[], ArrayDict]
+
+
+#: Soft ``RLIMIT_NOFILE`` ``ensure_fd_headroom`` aims for when the hard limit allows it. 1764
+#: descriptors is the 2020 option universe (98 underlyings x 18 arrays); 65536 leaves room for
+#: a bigger universe, every parquet handle, and every socket, and is well under the 524288 hard
+#: limit the systemd units on the worker hosts carry.
+_FD_TARGET = 65536
+#: ``DerivedArrayStore.__init__`` raises the limit lazily, once per process (see there).
+_FD_HEADROOM_DONE = False
+
+
+def ensure_fd_headroom(needed: int = 0) -> Tuple[int, int]:
+    """Raise this process's soft ``RLIMIT_NOFILE`` towards its hard limit; return (old, new).
+
+    WHY THIS EXISTS. Every array a worker maps costs ONE file descriptor for as long as any
+    view over it is alive. A GA worker on the option tree maps 98 underlyings x 18 arrays =
+    1764 of them, and the systemd unit that starts the remote worker service carries the
+    default soft limit of 1024 (hard 524288). Nothing in numpy or this module reports "you are
+    near the limit"; the failure surfaces as an EMFILE out of ``np.load`` 1014 descriptors in
+    (measured, remote227 2026-09-14). Raising the soft limit to the hard one is free -- no
+    privilege is needed for soft <= hard -- and it is the ONLY fix that does not shrink the
+    working set.
+
+    POSIX only. Windows has no ``RLIMIT_NOFILE`` (handles are not rationed per process this
+    way), so there it does nothing and returns ``(0, 0)``.
+
+    BEST EFFORT BY CONTRACT: a container that forbids the raise, or a platform without the
+    ``resource`` module, must not take the worker down over it -- every such case returns the
+    UNCHANGED pair. The loud failure belongs at the point of actual exhaustion (``_try_open``),
+    where there is a concrete path to name.
+    """
+    try:
+        import resource
+    except ImportError:                 # Windows, and anything else without POSIX rlimits
+        return (0, 0)
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return (0, 0)
+    want = max(int(needed), _FD_TARGET)
+    if hard == resource.RLIM_INFINITY:
+        target = want
+    elif soft == resource.RLIM_INFINITY or soft >= hard:
+        return (soft, soft)             # already at the ceiling; nothing to take
+    else:
+        target = min(max(want, soft), hard)
+    if target <= soft:
+        return (soft, soft)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        return (soft, soft)
+    return (soft, target)
+
+
+def _fd_limits() -> Tuple[object, object]:
+    """``(soft, hard)`` RLIMIT_NOFILE, or ``("n/a", "n/a")`` off POSIX. Diagnostics only."""
+    try:
+        import resource
+        return resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:                   # noqa: BLE001 - an error message must never raise
+        return ("n/a", "n/a")
+
+
+def _open_fd_count() -> object:
+    """How many descriptors this process holds, or ``"?"`` if the platform will not say."""
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return "?"
 
 
 def enabled() -> bool:
@@ -166,6 +249,16 @@ class DerivedArrayStore:
     """A derived ``.npy`` cache rooted at ``root``, keyed by ``<key>/<signature>``."""
 
     def __init__(self, root: PathLike) -> None:
+        # Raise RLIMIT_NOFILE here, lazily and once per process: EVERY consumer constructs a
+        # store before it maps anything, so this is the one chokepoint that covers the pool
+        # workers, the remote worker service, the prewarm tool and any ad-hoc script alike,
+        # without a startup hook each of them has to remember. One mapped array = one
+        # descriptor for the life of the mapping, and 18 arrays x 98 underlyings = 1764 is
+        # already past the systemd default soft limit of 1024 (see the module docstring).
+        global _FD_HEADROOM_DONE
+        if not _FD_HEADROOM_DONE:
+            _FD_HEADROOM_DONE = True
+            ensure_fd_headroom()
         self.root = Path(root)
         #: Why the last eviction refused, for the error messages. Diagnostic only -- it is
         #: written without synchronisation and may be overwritten by a concurrent eviction;
@@ -290,6 +383,14 @@ class DerivedArrayStore:
         hottest key on the host and charge the next grid a cold rebuild for it. Best-effort by
         design -- a read-only tree, or a concurrent evictor that has just renamed the marker
         aside, must not turn an open that WORKED into a rebuild.
+
+        RESOURCE EXHAUSTION IS THE ONE FAILURE THAT RAISES. EMFILE/ENFILE/ENOMEM say "this
+        process cannot map anything more", not "the set is missing", and the caller's rebuild
+        answer is actively harmful there: it takes the build lock, spends a multi-GB rebuild
+        that fails the same way, and parks every other worker in the lock-wait loop behind it
+        (remote227, 2026-09-14 -- 27 of 30 workers asleep, no error anywhere). Descriptors are
+        counted PER MAPPED ARRAY, so the cure is a bigger limit or a smaller working set, and
+        the message has to say so.
         """
         marker = final / DONE_MARKER
         try:
@@ -298,9 +399,20 @@ class DerivedArrayStore:
             return None
         out: ArrayDict = {}
         for name in names:
+            p = final / f"{name}.npy"
             try:
-                arr = np.load(final / f"{name}.npy", mmap_mode="r")
-            except (OSError, ValueError):
+                arr = np.load(p, mmap_mode="r")
+            except OSError as e:
+                if e.errno in (errno.EMFILE, errno.ENFILE, errno.ENOMEM):
+                    soft, hard = _fd_limits()
+                    raise RuntimeError(
+                        f"shared_arrays: cannot map {p}: {e} -- the process is out of file "
+                        f"descriptors/mappings (RLIMIT_NOFILE soft={soft}, hard={hard}, open "
+                        f"fds~{_open_fd_count()}); rebuilding would not help. Raise the limit "
+                        "(ensure_fd_headroom / systemd LimitNOFILE) or shrink the working set."
+                    ) from e
+                return None
+            except ValueError:
                 return None
             out[name] = np.asarray(arr)
         try:

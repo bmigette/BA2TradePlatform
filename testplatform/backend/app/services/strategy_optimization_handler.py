@@ -131,6 +131,22 @@ def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
     for k, v in (env or {}).items():
         if v is not None:
             os.environ.setdefault(k, v)
+    # Raise RLIMIT_NOFILE before anything maps a derived array set. Each mapped .npy costs ONE
+    # descriptor for the life of the mapping, and the option universe is 98 underlyings x 18
+    # arrays = 1764 per worker -- against the systemd default soft limit of 1024 (hard 524288)
+    # on the remote worker hosts. Measured on remote227 2026-09-14: a worker sat at 1014 open
+    # fds, the next np.load raised EMFILE, and the store rebuilt a 7 GB set under the lock while
+    # 27 of 30 workers slept behind it. The store raises the limit itself on construction too;
+    # doing it HERE as well means it is already up before the first import maps anything, and
+    # gives the one line of evidence a stalled host is diagnosed from.
+    try:
+        from ba2_common.core import shared_arrays as _sa
+        _old_fd, _new_fd = _sa.ensure_fd_headroom()
+        if _new_fd != _old_fd:
+            _worker_log(f"worker fd limit: soft {_old_fd} -> {_new_fd} "
+                        f"(hard {_sa._fd_limits()[1]})")
+    except Exception as e:  # noqa: BLE001 -- best effort; never fail a worker over a soft limit
+        _worker_log(f"!! worker fd limit: could not raise RLIMIT_NOFILE: {e!r}")
     # Point ba2_common's DB at the SAME test DB the master uses, so THIS pool worker's
     # get_app_setting() (FMP_API_KEY / finnhub_api_key / alpaca_*) resolves from the test DB
     # instead of ba2_common's neutral default home DB (which has no keys). The FMP/FinnHub experts

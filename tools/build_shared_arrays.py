@@ -130,6 +130,13 @@ def _bootstrap() -> None:
         import logging
 
         logging.disable(logging.WARNING)
+    # The verification pass OPENS every set it built, and each mapped array holds a descriptor
+    # until the process exits: at --jobs 4 over a 98-symbol x 18-array option universe that is
+    # far past the POSIX default soft limit of 1024. Raising it here (every pool child runs this
+    # bootstrap too) keeps the tool from reporting the same EMFILE-as-"absent" rebuild loop the
+    # GA workers hit on remote227.
+    from ba2_common.core.shared_arrays import ensure_fd_headroom
+    ensure_fd_headroom()
     launcher = os.path.join(REPO, "testplatform")
     if launcher not in sys.path:
         sys.path.insert(0, launcher)

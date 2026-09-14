@@ -1,5 +1,6 @@
 """ba2_common.core.shared_arrays -- one derived-cache mechanism for every read-only array set
 a GA worker used to hold privately. See docs/plans/2026-09-14-shared-arrays-across-workers.md."""
+import errno
 import gc
 import json
 import os
@@ -707,3 +708,189 @@ def test_a_failed_open_does_not_restamp_the_marker(tmp_path):
 
     assert store._try_open(d) is None
     assert (d / SA.DONE_MARKER).stat().st_mtime == before
+
+
+# --------------------------------------------------------------------------------------------
+# File descriptors. Every mapped array holds ONE fd for the life of the mapping, so an option
+# universe (98 underlyings x 18 arrays = 1764) blows straight through a systemd soft
+# RLIMIT_NOFILE of 1024. Measured on remote227 2026-09-14: a worker sat at 1014 open fds, the
+# next np.load raised EMFILE, _try_open read that as "not usable" and REBUILT a 7 GB set under
+# the lock while 27 of 30 workers slept in the wait loop -- a silent whole-grid stall.
+# --------------------------------------------------------------------------------------------
+class _FakeResource:
+    """Stand-in for the POSIX ``resource`` module, so the limit logic is testable on Windows."""
+
+    RLIMIT_NOFILE = 7
+    RLIM_INFINITY = -1
+
+    def __init__(self, soft, hard, fail=None):
+        self.limits = (soft, hard)
+        self.calls = []
+        self.fail = fail
+
+    def getrlimit(self, which):
+        assert which == self.RLIMIT_NOFILE
+        return self.limits
+
+    def setrlimit(self, which, pair):
+        assert which == self.RLIMIT_NOFILE
+        self.calls.append(pair)
+        if self.fail is not None:
+            raise self.fail
+        self.limits = (pair[0], self.limits[1])
+
+
+def test_ensure_fd_headroom_raises_the_soft_limit_towards_the_hard_one(monkeypatch):
+    fake = _FakeResource(1024, 4096)
+    monkeypatch.setitem(sys.modules, "resource", fake)
+
+    old, new = SA.ensure_fd_headroom()
+
+    assert (old, new) == (1024, 4096)
+    assert fake.calls == [(4096, 4096)], "the hard limit is the ceiling we may take for free"
+
+
+def test_ensure_fd_headroom_caps_at_the_target_when_the_hard_limit_is_huge(monkeypatch):
+    fake = _FakeResource(1024, 524288)            # the systemd default hard limit on remote227
+    monkeypatch.setitem(sys.modules, "resource", fake)
+
+    old, new = SA.ensure_fd_headroom()
+
+    assert (old, new) == (1024, 65536)
+    assert fake.calls == [(65536, 524288)]
+
+
+def test_ensure_fd_headroom_honours_an_explicit_need(monkeypatch):
+    fake = _FakeResource(1024, 524288)
+    monkeypatch.setitem(sys.modules, "resource", fake)
+
+    assert SA.ensure_fd_headroom(200_000) == (1024, 200_000)
+
+
+def test_ensure_fd_headroom_is_a_no_op_when_the_soft_limit_is_already_the_hard_one(monkeypatch):
+    fake = _FakeResource(524288, 524288)
+    monkeypatch.setitem(sys.modules, "resource", fake)
+
+    assert SA.ensure_fd_headroom() == (524288, 524288)
+    assert fake.calls == []
+
+
+def test_ensure_fd_headroom_never_raises_when_the_kernel_refuses(monkeypatch):
+    """Best effort by contract: a container that forbids the raise must not kill the worker."""
+    fake = _FakeResource(1024, 4096, fail=OSError(1, "Operation not permitted"))
+    monkeypatch.setitem(sys.modules, "resource", fake)
+
+    assert SA.ensure_fd_headroom() == (1024, 1024)
+
+    fake2 = _FakeResource(1024, 4096, fail=ValueError("bad limit"))
+    monkeypatch.setitem(sys.modules, "resource", fake2)
+    assert SA.ensure_fd_headroom() == (1024, 1024)
+
+
+def test_ensure_fd_headroom_on_this_host(monkeypatch):
+    """Called for real: on Windows there is no RLIMIT_NOFILE and it must report (0, 0)."""
+    old, new = SA.ensure_fd_headroom()
+    again = SA.ensure_fd_headroom()
+
+    if os.name == "nt":
+        assert (old, new) == (0, 0) and again == (0, 0)
+    else:
+        import resource as _r
+        soft, hard = _r.getrlimit(_r.RLIMIT_NOFILE)
+        assert new >= old and soft == new
+        assert again == (new, new), "idempotent: a second call changes nothing"
+
+
+def test_constructing_a_store_raises_the_limit_once_per_process(monkeypatch):
+    calls = []
+    monkeypatch.setattr(SA, "ensure_fd_headroom", lambda *a, **k: calls.append(1) or (0, 0))
+    monkeypatch.setattr(SA, "_FD_HEADROOM_DONE", False)
+
+    SA.DerivedArrayStore("x")
+    SA.DerivedArrayStore("y")
+
+    assert calls == [1], "every consumer builds a store; the raise is lazy and once"
+
+
+def test_descriptor_exhaustion_is_loud_and_never_triggers_a_rebuild(tmp_path, monkeypatch):
+    """EMFILE is NOT a missing set. Rebuilding cannot make descriptors appear -- it takes the
+    lock, spends a multi-GB build, and stalls every other worker behind it."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    calls = []
+
+    def build():
+        calls.append(1)
+        return _arrays()
+
+    got = store.build_or_open("AAPL", [src], build)
+    del got
+    gc.collect()
+    assert calls == [1]
+
+    def boom(*a, **k):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(np, "load", boom)
+
+    with pytest.raises(RuntimeError) as ei:
+        store.build_or_open("AAPL", [src], build)
+
+    assert "file descriptors" in str(ei.value)
+    assert "RLIMIT_NOFILE" in str(ei.value)
+    assert calls == [1], "exhaustion must never be read as 'absent' and rebuilt"
+    assert not (store.key_dir("AAPL") / (store.signature([src]) + ".lock")).exists(), \
+        "no lock may be taken: 27 of 30 workers sleeping behind one is the field failure"
+
+
+def test_out_of_memory_mapping_is_also_loud(tmp_path, monkeypatch):
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    store.build_or_open("AAPL", [src], _arrays)
+    gc.collect()
+
+    def boom(*a, **k):
+        raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+    monkeypatch.setattr(np, "load", boom)
+    with pytest.raises(RuntimeError, match="file descriptors"):
+        store.build_or_open("AAPL", [src], _arrays)
+
+
+def test_a_plain_oserror_still_reports_not_usable(tmp_path, monkeypatch):
+    """Everything that is not resource exhaustion keeps the old contract: None -> rebuild."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    store.build_or_open("AAPL", [src], _arrays)
+    gc.collect()
+    d = store.current_dir("AAPL", [src])
+
+    for exc in (OSError(errno.ENOENT, "No such file or directory"),
+                OSError("something else entirely"),
+                ValueError("not a .npy")):
+        monkeypatch.setattr(np, "load", lambda *a, _e=exc, **k: (_ for _ in ()).throw(_e))
+        assert store._try_open(d) is None
+    monkeypatch.undo()
+
+
+def test_a_missing_array_file_is_rebuilt(tmp_path):
+    """The end-to-end half of the above: a genuinely incomplete set is still rebuilt."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    calls = []
+
+    def build():
+        calls.append(1)
+        return _arrays()
+
+    got = store.build_or_open("AAPL", [src], build)
+    del got
+    gc.collect()
+    (store.current_dir("AAPL", [src]) / "close.npy").unlink()
+
+    again = store.build_or_open("AAPL", [src], build)
+
+    assert calls == [1, 1]
+    np.testing.assert_array_equal(again["close"], _arrays()["close"])
+    del again
+    gc.collect()

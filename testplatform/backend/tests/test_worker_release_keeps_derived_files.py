@@ -19,6 +19,7 @@ symptoms visible in the master.
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 from pathlib import Path
 
@@ -463,3 +464,79 @@ def test_release_counts_the_option_caches_it_drops(big_store_root, monkeypatch):
     assert out["shared_mb"] >= st["shared_mb"]
     assert out["freed_cache_mb"] >= st["private_mb"]
     assert not pq._WORKER_RAW_CACHE
+
+
+# --------------------------------------------------------------------------------------------
+# 8. The worker raises its own file-descriptor limit
+#
+# One mapped array = ONE descriptor for as long as a view over it lives. The option universe is
+# 98 underlyings x 18 arrays = 1764 per worker process, and the systemd unit that starts the
+# remote worker service carries the default soft RLIMIT_NOFILE of 1024 (hard 524288). On
+# remote227 (2026-09-14) a worker hit EMFILE at 1014 open fds, which the store read as "the set
+# is missing" and answered with a 7 GB rebuild under the lock -- 27 of 30 workers then slept in
+# the lock-wait loop and the grid stalled silently. The store's own guard is necessary but not
+# sufficient: it can only be raised INSIDE a process, so every pool initializer has to ask.
+# --------------------------------------------------------------------------------------------
+class _FakeResource:
+    """Stand-in for the POSIX ``resource`` module. Injected into ``sys.modules`` rather than
+    skipped off POSIX: the limit arithmetic is the thing under test and it must be exercised on
+    the machine this is developed on, not only on the Linux box it was written for."""
+
+    RLIMIT_NOFILE = 7
+    RLIM_INFINITY = -1
+
+    def __init__(self, soft, hard):
+        self.limits = (soft, hard)
+        self.calls = []
+
+    def getrlimit(self, which):
+        return self.limits
+
+    def setrlimit(self, which, pair):
+        self.calls.append(pair)
+        self.limits = (pair[0], self.limits[1])
+
+
+def test_worker_init_raises_the_fd_limit_and_reports_the_change(worker_log, monkeypatch):
+    import logging
+    import sys
+
+    import app.models.database as _dbmod
+
+    fake = _FakeResource(1024, 4096)
+    monkeypatch.setitem(sys.modules, "resource", fake)
+    # Keep the initializer's real side effects out of the session: don't let it re-point
+    # ba2_common's engine, and restore the logging kill-switch + the env keys it sets.
+    monkeypatch.setattr(_dbmod, "DATABASE_URL", "postgresql://none/none", raising=False)
+    for k in ("BA2_FILE_LOGGING", "BA2_STDOUT_LOGGING"):
+        monkeypatch.setenv(k, os.environ.get(k, ""))
+    prev_disable = logging.root.manager.disable
+    try:
+        H._worker_init(H._BACKEND_DIR, {})
+    finally:
+        logging.disable(prev_disable)
+
+    assert fake.calls == [(4096, 4096)], "raise the soft limit to the hard one"
+    assert any("fd limit" in m and "1024 -> 4096" in m for m in worker_log), worker_log
+
+
+def test_worker_init_says_nothing_when_the_limit_is_already_high(worker_log, monkeypatch):
+    """A line per worker start is noise unless it reports an actual change."""
+    import logging
+    import sys
+
+    import app.models.database as _dbmod
+
+    fake = _FakeResource(524288, 524288)
+    monkeypatch.setitem(sys.modules, "resource", fake)
+    monkeypatch.setattr(_dbmod, "DATABASE_URL", "postgresql://none/none", raising=False)
+    for k in ("BA2_FILE_LOGGING", "BA2_STDOUT_LOGGING"):
+        monkeypatch.setenv(k, os.environ.get(k, ""))
+    prev_disable = logging.root.manager.disable
+    try:
+        H._worker_init(H._BACKEND_DIR, {})
+    finally:
+        logging.disable(prev_disable)
+
+    assert fake.calls == []
+    assert not any("fd limit" in m for m in worker_log), worker_log
