@@ -357,7 +357,11 @@ class DerivedArrayStore:
         behind (see the module docstring).
         """
         if final.exists() and _marker_mtime(final) is None:
-            if not self._evict_dir(final):
+            # "Did not remove it" is not "it is still in the way": sweep() collects orphans with
+            # no age guard (correctly -- nothing can open one), so `final` can vanish between
+            # the check above and the claim, and _evict_dir then reports False for a directory
+            # that is already gone. Re-check rather than escalating that to "Stop the workers".
+            if not self._evict_dir(final) and final.exists():
                 raise RuntimeError(
                     f"shared_arrays: {final} has no {DONE_MARKER} but cannot be removed or "
                     f"moved aside ({self._evict_reason()}); a process on this host may still "
@@ -370,8 +374,8 @@ class DerivedArrayStore:
             # final would otherwise make us discard a good build and then fail forever.
             if self._try_open(final) is not None:
                 shutil.rmtree(tmp, ignore_errors=True)      # another builder really won
-            elif self._evict_dir(final):
-                os.replace(tmp, final)
+            elif self._evict_dir(final) or not final.exists():
+                os.replace(tmp, final)      # evicted, or it vanished under us; either will do
             else:
                 # The second door into the same dead end as above: marked but unreadable AND
                 # immovable. Re-raising the bare OSError here would put a raw WinError 5 in
@@ -394,6 +398,11 @@ class DerivedArrayStore:
         "Stop the workers and run sweep()". Housekeeping passes ``wait_s=0.0`` -- it already
         reads False as "not mine" and must never block. A claim older than ``LOCK_STALE_S`` is
         broken rather than waited on.
+
+        Note that the ``_publish`` wait happens while this process HOLDS the build lock, so a
+        worker can sit on that lock for up to ``EVICT_CLAIM_WAIT_S``. That is bounded and far
+        below ``LOCK_STALE_S``, so no waiter breaks the lock over it -- it is a pause, not a
+        hang, and the alternative was failing the publish outright.
         """
         deadline = time.monotonic() + max(wait_s, 0.0)
         while True:

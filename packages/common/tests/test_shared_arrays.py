@@ -3,6 +3,7 @@ a GA worker used to hold privately. See docs/plans/2026-09-14-shared-arrays-acro
 import gc
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -272,6 +273,66 @@ def test_two_concurrent_evictors_never_half_delete(tmp_path):
         assert not d.exists(), f"attempt {attempt}: the winner must have removed it"
         claim = d.with_name(d.name + SA.EVICTING_SUFFIX)
         assert not claim.exists(), "the eviction claim must be released"
+
+
+def _vanishing_claim(store, victim: Path):
+    """Wrap _claim_eviction so ``victim`` disappears the instant the claim is won.
+
+    That is what a concurrent sweep() doing its (correctly unguarded) orphan collection looks
+    like from inside _publish: the directory was there at the exists() check and is gone by the
+    time the probe runs, so _evict_dir reports False for a directory already out of the way.
+    """
+    original = store._claim_eviction
+
+    def wrapper(claim, wait_s):
+        won = original(claim, wait_s)
+        if won and victim.exists():
+            shutil.rmtree(victim)
+        return won
+    return wrapper
+
+
+def _opens_or_refuses(call, phrase):
+    """Either the rebuild opened, or it refused legibly naming ``phrase``. Never a raw OSError."""
+    try:
+        return call()
+    except Exception as exc:
+        assert isinstance(exc, RuntimeError) and phrase in str(exc), f"illegible: {exc!r}"
+        return None
+
+
+def test_publish_tolerates_a_final_that_vanishes_under_it(tmp_path, monkeypatch):
+    """Both doors must read _evict_dir's False as "did not remove it", not "still in the way"."""
+    # DOOR 1: untrusted final (no marker), collected by the "sweeper" mid-probe.
+    store = SA.DerivedArrayStore(tmp_path / "d1")
+    src = _src(tmp_path)
+    store.build_or_open("AAPL", [src], _arrays)
+    gc.collect()
+    d = store.current_dir("AAPL", [src])
+    (d / SA.DONE_MARKER).unlink()
+    monkeypatch.setattr(store, "_claim_eviction", _vanishing_claim(store, d))
+    got = store.build_or_open("AAPL", [src], _arrays)
+    np.testing.assert_array_equal(got["close"], _arrays()["close"])
+
+    # DOOR 2: marked but unreadable, likewise collected mid-probe.
+    store2 = SA.DerivedArrayStore(tmp_path / "d2")
+    src2 = _src(tmp_path, name="b.parquet")
+    store2.build_or_open("AAPL", [src2], _arrays)
+    gc.collect()
+    d2 = store2.current_dir("AAPL", [src2])
+    (d2 / "bar_ord.npy").unlink()
+    assert store2._try_open(d2) is None, "the premise: marked, but not readable"
+    monkeypatch.setattr(store2, "_claim_eviction", _vanishing_claim(store2, d2))
+    got2 = store2.build_or_open("AAPL", [src2], _arrays)
+    np.testing.assert_array_equal(got2["bar_ord"], _arrays()["bar_ord"])
+
+    # ... while a final that is genuinely immovable still refuses, legibly.
+    store3 = SA.DerivedArrayStore(tmp_path / "d3")
+    src3 = _src(tmp_path, name="c.parquet")
+    held = store3.build_or_open("AAPL", [src3], _arrays)
+    (store3.current_dir("AAPL", [src3]) / SA.DONE_MARKER).unlink()
+    _opens_or_refuses(lambda: store3.build_or_open("AAPL", [src3], _arrays), SA.DONE_MARKER)
+    assert held["close"][1] == 2.5
 
 
 def test_eviction_waits_for_a_held_claim_but_housekeeping_never_does(tmp_path):
