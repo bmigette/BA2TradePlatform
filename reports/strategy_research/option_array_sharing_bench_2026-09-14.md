@@ -300,3 +300,19 @@ The build step is idempotent and took 22 s for the 6 symbols (537 MB of `.npy`).
 any case whose projected footprint would exceed that share of available RAM, which is what keeps a
 32-worker private run from disturbing the live platforms on the Windows box. Temp trees were deleted
 after the runs.
+
+## Acceptance (2026-09-14, tools/backtest_parity.py, private child then shared child, byte-for-byte)
+
+| ref | source | trades | private-path private MB | shared-path private / mapped MB | verdict |
+|---|---|---|---|---|---|
+| 1 screener small S7 | `--bt 1681` (opt 521 rank 1), retry | 168 | bars 4374 | bars 729 / 3645 | PASS |
+| 2 Senate S6 | `--bt 1645` (opt 512 rank 1), retry | 405 | bars 2574 | bars 429 / 2145 | PASS |
+| 3 ThetaData 2020 options | `--bt 1688` (opt 522 rank 2, local probe) | 72 | options 3451 (20 syms) | options 1267 / 2184 | PASS |
+| 4 TastyTrade 2023 options | `--bt 1695` (opt 523 rank 1, local probe) | 56 | options 174 (8 syms) | options 87 / 87 | PASS |
+
+Every blob (results, trades, equity_curve, drawdown_curve) and every metric column compared
+equal after canonical JSON. The informational archived-vs-re-run diff shows only last-digit
+float noise in `results.robustness.*` / `results.fitness_*` (1e-15), the known re-run
+non-determinism of summary statistics -- unrelated to sharing. A first attempt at ref 4 on
+opt 429 (LEAP perf probe) was VACUOUS (0 trades: its stored block has no options provider
+flag) and is why the tool now refuses 0-trade pairs. Rows: PARITY-* 1686-1704 in the test DB.
