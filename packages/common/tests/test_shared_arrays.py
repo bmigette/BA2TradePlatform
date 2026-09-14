@@ -213,6 +213,65 @@ def test_rebuild_of_untrusted_dir_while_arrays_are_held(tmp_path):
     assert held["close"][1] == 2.5, "the held mapping must survive the attempt either way"
 
 
+def test_rebuild_of_marked_but_unreadable_dir_while_arrays_are_held(tmp_path):
+    """The SECOND door into the same dead end, which N1 found still raising a raw WinError 5.
+
+    The marker is present, so _publish skips the untrusted branch; but one array the marker
+    lists is gone, so _try_open refuses, os.replace cannot land on the existing directory, and
+    a held mapping blocks eviction. The only acceptable outcomes are the same two as above.
+    """
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    held = store.build_or_open("AAPL", [src], _arrays)
+    d = store.current_dir("AAPL", [src])
+    for k in [k for k in held if k != "close"]:
+        del held[k]                       # keep ONLY close.npy mapped
+    gc.collect()
+    (d / "bar_ord.npy").unlink()          # unmapped, so NTFS lets it go
+    assert store._try_open(d) is None, "the premise: marked, but no longer readable"
+    try:
+        got = store.build_or_open("AAPL", [src], _arrays)
+    except Exception as exc:
+        assert isinstance(exc, RuntimeError) and "neither opened nor removed" in str(exc), (
+            f"the mapped-directory failure must be legible, got {exc!r}"
+        )
+    else:
+        np.testing.assert_array_equal(got["close"], _arrays()["close"])
+    assert held["close"][1] == 2.5, "the held mapping must survive the attempt either way"
+
+
+def test_two_concurrent_evictors_never_half_delete(tmp_path):
+    """Two evictors renaming into the same .evict names used to roll back each other's work and
+    both report "left intact" over a directory they had destroyed between them (3/5 trials)."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    names = [f"a{i}" for i in range(5)]
+    expected = sorted([f"{n}.npy" for n in names] + [SA.DONE_MARKER])
+    for attempt in range(5):
+        d = store.key_dir("AAPL") / f"sig{attempt}"
+        d.mkdir(parents=True)
+        for n in names:
+            np.save(d / f"{n}.npy", np.arange(3.0), allow_pickle=False)
+        (d / SA.DONE_MARKER).write_text(
+            json.dumps({"arrays": names, "schema": SA.SCHEMA_VERSION}), encoding="utf-8"
+        )
+        results = []
+        guard = threading.Lock()
+        def run():
+            r = store._evict_dir(d)
+            with guard:
+                results.append(r)
+        ts = [threading.Thread(target=run) for _ in range(2)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+
+        if d.exists():
+            left = sorted(p.name for p in d.iterdir())
+            assert left == expected, f"attempt {attempt}: half-deleted directory {left}"
+        assert results.count(True) == 1, f"attempt {attempt}: exactly one winner, got {results}"
+        assert not d.exists(), f"attempt {attempt}: the winner must have removed it"
+        claim = d.with_name(d.name + SA.EVICTING_SUFFIX)
+        assert not claim.exists(), "the eviction claim must be released"
+
+
 def test_corrupt_array_in_a_marked_dir_is_rebuilt(tmp_path):
     """A marker is a claim, not proof: _publish must trust _try_open, not the marker's presence,
     or a truncated .npy makes the rebuild discard its own good build and fail forever."""
@@ -234,6 +293,9 @@ def test_build_fn_exception_leaves_nothing_behind(tmp_path):
         store.build_or_open("AAPL", [src], boom)
     key_dir = tmp_path / "_derived" / "X" / "AAPL"
     assert not key_dir.exists() or not any(p for p in key_dir.iterdir() if p.is_dir())
+    assert not store.lock_path("AAPL", [src]).exists(), (
+        "a failed build must release its lock, or every other worker waits out LOCK_STALE_S"
+    )
 
 
 def test_concurrent_builders_build_once(tmp_path):
@@ -327,6 +389,21 @@ def test_stale_lock_is_broken(tmp_path, monkeypatch):
     got = store.build_or_open("AAPL", [src], _arrays)
     np.testing.assert_array_equal(got["close"], _arrays()["close"])
     assert not lock.exists(), "the broken lock must be released, not left for the next waiter"
+
+
+def test_release_leaves_a_lock_owned_by_another_process_alone(tmp_path):
+    """A build that overran LOCK_STALE_S has had its lock broken and re-taken; unlinking that
+    one would hand a third process a lock the second still believes it holds."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    lock = store.lock_path("AAPL", [src])
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("999999")                     # a pid that is not ours
+    store._release(lock)
+    assert lock.exists(), "releasing somebody else's lock is how two builders end up at once"
+    lock.write_text(str(os.getpid()))
+    store._release(lock)
+    assert not lock.exists()
 
 
 def test_waiting_on_a_live_lock_times_out(tmp_path, monkeypatch):

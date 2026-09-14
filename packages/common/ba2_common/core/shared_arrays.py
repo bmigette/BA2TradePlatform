@@ -59,6 +59,10 @@ DONE_MARKER = "_done.json"
 DERIVED_DIRNAME = "_derived"
 TMP_SUFFIX = ".tmp"
 EVICT_SUFFIX = ".evict"
+#: O_EXCL claim taken on ``<sig>`` for the duration of an eviction probe. Deliberately NOT
+#: ``.tmp`` or ``.lock``: it is a FILE, and both scanners iterate directories only, so neither
+#: sweep() nor _remove_stale_siblings can mistake it for garbage.
+EVICTING_SUFFIX = ".evicting"
 SCHEMA_VERSION = 1          #: bump when layout/meaning changes; every signature moves
 LOCK_STALE_S = float(os.getenv("BA2_SHARED_ARRAYS_LOCK_STALE_S", "900"))
 _WAIT_POLL_S = 0.25
@@ -142,9 +146,12 @@ def _marker_mtime(d: Path) -> Optional[float]:
 def _tmp_is_live(d: Path) -> bool:
     """True if ``d`` looks like a staging directory a builder is still writing into.
 
-    A build in flight touches its tmp directory continuously, so an mtime younger than
-    ``LOCK_STALE_S`` means "someone owns this". Deleting it out from under them raised
-    FileNotFoundError from inside ``np.save`` (reproduced). Unreadable -> assume live.
+    The freshness signal is the directory's own mtime, which ``_build`` refreshes explicitly
+    after every array. It has to: on NTFS writing INTO an existing file does not advance the
+    parent directory's mtime at all -- only creating or removing an entry does -- so a long
+    multi-array build would otherwise look abandoned halfway through and get swept out from
+    under itself (that raised FileNotFoundError from inside ``np.save``). Unreadable ->
+    assume live.
     """
     try:
         return time.time() - d.stat().st_mtime < LOCK_STALE_S
@@ -157,16 +164,22 @@ class DerivedArrayStore:
 
     def __init__(self, root: PathLike) -> None:
         self.root = Path(root)
+        #: Why the last eviction refused, for the error messages. Diagnostic only -- it is
+        #: written without synchronisation and may be overwritten by a concurrent eviction;
+        #: never branch on it.
+        self._last_evict_error: Optional[str] = None
 
     # ---------------------------------------------------------------- identity
 
     def signature(self, sources: Iterable[PathLike]) -> str:
         """sha1 over ``SCHEMA_VERSION`` + the sorted ``(path, size, mtime_ns)`` of the sources.
 
-        The full RESOLVED path is hashed, not the basename: a per-symbol tree of
+        The full path is hashed, not the basename: a per-symbol tree of
         ``<symbol>/<year>.parquet`` files gives many same-named sources, and two of them with
         equal size and mtime would otherwise share a signature and serve one symbol's arrays
-        for another.
+        for another. It is normalised with ``abspath``/``normcase`` rather than ``resolve()``
+        because resolve() STATS every component -- 0.46 s -> 3.6 s per worker for a 335-symbol
+        x 100-file set, paid on every single call.
 
         Content hashing is deliberately NOT used: the option/OHLCV parquet tree is append-only
         immutable history and can run to hundreds of GB, so stat() identity is both sufficient
@@ -180,9 +193,9 @@ class DerivedArrayStore:
         for s in sources:
             p = Path(s)
             st = p.stat()
-            ident = p.resolve().as_posix()
-            if os.name == "nt":
-                ident = ident.lower()       # NTFS is case-insensitive; the identity must be too
+            # normcase lower-cases on NT, where the filesystem is case-insensitive, and is a
+            # no-op elsewhere; abspath is pure string manipulation.
+            ident = os.path.normcase(os.path.abspath(p))
             rows.append((ident, st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
         for ident, size, mtime in sorted(rows):
             h.update(f"{ident}|{size}|{mtime}\n".encode())
@@ -305,6 +318,9 @@ class DerivedArrayStore:
                         "np.ascontiguousarray inside the builder, where the cost is visible"
                     )
                 self._write_fsynced(tmp / f"{name}.npy", lambda f, a=a: np.save(f, a, allow_pickle=False))
+                # Republish the staging directory's freshness. Writing into a file does not
+                # touch its parent's mtime on NTFS, and _tmp_is_live reads exactly that.
+                os.utime(tmp, None)
             payload = json.dumps({"arrays": sorted(arrays), "schema": SCHEMA_VERSION,
                                   "written_at": time.time(), "pid": os.getpid()})
             # The marker is written and fsynced LAST: it is the only thing _try_open trusts, so
@@ -341,12 +357,12 @@ class DerivedArrayStore:
             if not self._evict_dir(final):
                 raise RuntimeError(
                     f"shared_arrays: {final} has no {DONE_MARKER} but cannot be removed or "
-                    "moved aside; a process on this host still maps a file inside it. Stop the "
-                    "workers (or let them exit) and run sweep()."
+                    f"moved aside ({self._evict_reason()}); a process on this host may still "
+                    "map a file inside it. Stop the workers (or let them exit) and run sweep()."
                 )
         try:
             os.replace(tmp, final)
-        except OSError:
+        except OSError as exc:
             # Trust READABILITY, not the mere presence of a marker: a marked-but-truncated
             # final would otherwise make us discard a good build and then fail forever.
             if self._try_open(final) is not None:
@@ -354,7 +370,39 @@ class DerivedArrayStore:
             elif self._evict_dir(final):
                 os.replace(tmp, final)
             else:
-                raise
+                # The second door into the same dead end as above: marked but unreadable AND
+                # immovable. Re-raising the bare OSError here would put a raw WinError 5 in
+                # front of every worker with nothing saying what to do about it.
+                raise RuntimeError(
+                    f"shared_arrays: {final} can be neither opened nor removed "
+                    f"({self._evict_reason()}); a process on this host may still map a file "
+                    "inside it. Stop the workers (or let them exit) and run sweep()."
+                ) from exc
+
+    def _evict_reason(self) -> str:
+        """Why the last eviction refused, for an error message. Never branch on this."""
+        return self._last_evict_error or "cause unknown"
+
+    def _claim_eviction(self, claim: Path) -> bool:
+        """Take the O_EXCL eviction claim, breaking it if it is older than LOCK_STALE_S."""
+        while True:
+            try:
+                fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if not self._lock_is_stale(claim):
+                    return False
+                try:
+                    claim.unlink()
+                except FileNotFoundError:
+                    continue                # somebody else broke it; race for it again
+                except OSError:
+                    return False
+                continue
+            except OSError:
+                return False
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+            return True
 
     def _evict_dir(self, d: Path) -> bool:
         """Remove ``d`` entirely, or leave it exactly as it was and return False.
@@ -364,14 +412,41 @@ class DerivedArrayStore:
         directory keeps its marker and stays openable by anyone mid-flight. Only once the whole
         directory has proven movable is it deleted. On POSIX every rename succeeds and this is
         an rmtree with extra steps -- which is the point: one behaviour on both platforms.
+
+        The probe is SERIALISED on an O_EXCL ``<dir>.evicting`` claim, because the rollback is
+        only safe for one evictor at a time. ``sweep()``, another signature's
+        ``_remove_stale_siblings`` and ``_publish`` can all aim at one directory at once; two of
+        them rename into the same ``.evict`` names, each then rolls back what the other moved,
+        and both report "left intact" over a directory they have destroyed between them
+        (reproduced, 3 of 5 two-thread trials). A loser simply returns False, which every caller
+        already treats as "not mine to remove".
         """
+        claim = d.with_name(d.name + EVICTING_SUFFIX)
+        if not self._claim_eviction(claim):
+            self._last_evict_error = f"another evictor holds {claim.name}"
+            return False
+        try:
+            return self._evict_claimed(d)
+        finally:
+            try:
+                claim.unlink()
+            except OSError:
+                pass
+
+    def _evict_claimed(self, d: Path) -> bool:
+        """The rename-probe body of ``_evict_dir``; call only while holding the claim."""
         try:
             children = list(d.iterdir())
-        except OSError:
-            return not d.exists()
-        # The marker goes LAST. While a data file is renamed but the marker is not, a concurrent
-        # reader must still see a TRUSTED directory, or it starts the rebuild this probe exists
-        # to prevent.
+        except OSError as exc:
+            if d.exists():
+                self._last_evict_error = f"{type(exc).__name__}: {exc}"
+                return False
+            return True
+        # The marker goes LAST so that _marker_mtime keeps classifying this directory as
+        # TRUSTED for the whole probe: a second evictor must not meet it half-renamed and
+        # decide it is a marker-less orphan to collect. (A reader that already read the marker
+        # is not protected by the ordering -- it fails on the renamed .npy and rebuilds -- but
+        # that path is safe, and a rollback puts the file straight back.)
         children.sort(key=lambda c: c.name == DONE_MARKER)
         renamed: List[Tuple[Path, Path]] = []
 
@@ -385,15 +460,18 @@ class DerivedArrayStore:
             target = child.with_name(child.name + EVICT_SUFFIX)
             try:
                 os.rename(child, target)
-            except OSError:
+            except OSError as exc:
+                self._last_evict_error = f"{child.name}: {type(exc).__name__}: {exc}"
                 _rollback()
                 return False
             renamed.append((child, target))
         try:
             shutil.rmtree(d)
-        except OSError:
+        except OSError as exc:
+            self._last_evict_error = f"{d.name}: {type(exc).__name__}: {exc}"
             _rollback()
             return False
+        self._last_evict_error = None
         return True
 
     def _remove_stale_siblings(self, final: Path) -> None:
