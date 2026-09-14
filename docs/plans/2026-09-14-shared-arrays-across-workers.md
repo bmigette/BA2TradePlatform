@@ -959,6 +959,8 @@ All four must print PASS. A FAIL is a blocker, not a tolerance discussion: the s
 
 ## Out of scope (recorded, not built here)
 
+* `price_source.py` ~:761 — the tolerated-cache-miss `logger.warning` ("Never let this be quiet") is child-blind for the same reason as Task 5's I13: `_worker_init` installs `logging.disable(ERROR)`, so in a GA worker it is quiet. Switch it to `_worker_log` in a follow-up (it also records `_dropped_symbols`, so it is not wholly silent today).
+
 * Senate scoring shards (`_WORKER_SCORING_CACHE`): read-modify-write during a job; needs a write path. Separate design.
 * `_FULL_SERIES_MEMO` (full-series DataFrames for expert indicator fetches): lazily filled per expert request; revisit after Task 8's finding on DataFrame sharing.
 * `BT_BAR_CACHE_TRIALS` is now relevant only to the private path (see Task 5); no further change.
