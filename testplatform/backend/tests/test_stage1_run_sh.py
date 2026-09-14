@@ -23,7 +23,9 @@ def test_the_script_exists():
 
 def test_population_and_generations_are_env_overridable_with_the_documented_defaults():
     text = _text()
-    assert 'POP="${POP:-140}"' in text
+    # 200 is the approved discovery budget (2026-09-12 review restored it; the 140 pilot value
+    # is an explicit override, never the default).
+    assert 'POP="${POP:-200}"' in text
     assert 'GEN="${GEN:-60}"' in text
     assert '--population "$POP"' in text
     assert '--generations "$GEN"' in text
@@ -33,12 +35,16 @@ def test_population_and_generations_are_env_overridable_with_the_documented_defa
     assert "--generations 60 --early-stop" not in text
 
 
-def test_the_header_notes_the_worker_count_and_the_provisional_pop_reduction():
+def test_the_header_states_the_slot_policy_the_prewarm_and_the_pop_pilot():
+    """The header is the operator's runbook for this host: the consumer count is tuned from
+    measured PRIVATE bytes (RSS counts shared mapped pages), the prewarm is mandatory before a
+    cold launch, and POP=140 remains an explicitly labelled pilot rather than the default."""
     text = _text()
-    assert "24 workers" in text
-    assert "2026-08-30" in text
-    assert "precision-neutral" in text
-    assert "pilot" in text
+    assert 'PARALLEL="${PARALLEL:-24}"' in text
+    assert "smaps_rollup" in text
+    assert "build_shared_arrays.py" in text
+    assert "0 built / 98 opened" in text
+    assert "POP=140" in text and "pilot" in text
 
 
 def test_the_universe_price_caps_are_wired_through_the_gate_store_not_the_blanket_cap():
