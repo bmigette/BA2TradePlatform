@@ -959,6 +959,8 @@ All four must print PASS. A FAIL is a blocker, not a tolerance discussion: the s
 
 ## Out of scope (recorded, not built here)
 
+* **One file per symbol (18 -> 1 descriptor).** Field failure 2026-09-14 on remote227: every mapped `.npy` holds one file descriptor while a view lives, so 98 symbols x 18 arrays = 1764 fds per worker exceeded the systemd soft `RLIMIT_NOFILE` of 1024; `np.load` raised EMFILE, `_try_open` returned None and the worker REBUILT the set while 27/30 workers waited on its lock -- a silent stall. The immediate fix raises the soft limit at worker/store/tool init and makes exhaustion loud (never a rebuild). The structural fix is a single container file per key (all arrays concatenated with an offset table in `_done.json`, one `np.memmap` sliced into views), which also removes the 3.6 s/22 MB-per-symbol cold cost's open() overhead. Do it before a universe larger than ~1,000 symbols x arrays is mapped per process.
+
 * `price_source.py` ~:761 — the tolerated-cache-miss `logger.warning` ("Never let this be quiet") is child-blind for the same reason as Task 5's I13: `_worker_init` installs `logging.disable(ERROR)`, so in a GA worker it is quiet. Switch it to `_worker_log` in a follow-up (it also records `_dropped_symbols`, so it is not wholly silent today).
 
 * Senate scoring shards (`_WORKER_SCORING_CACHE`): read-modify-write during a job; needs a write path. Separate design.
