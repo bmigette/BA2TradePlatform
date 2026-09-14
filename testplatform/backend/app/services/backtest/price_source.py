@@ -165,10 +165,11 @@ _MISSING_SYMBOL_MAX_FRAC = float(os.getenv("BT_MISSING_SYMBOLS_MAX_FRAC", "0.01"
 # symbols / ~5GB, while the peak hit 1423.
 #
 # PRIVATE PATH ONLY since 2026-09-14: when the OHLCV columns are mapped from the host-shared
-# derived cache (BA2_SHARED_ARRAYS on, the default) the cache persists for the whole job and
-# NEITHER the flush nor the recency sweep runs -- see _bar_cache_persists for why the peak
-# argument below stops applying once the 40 of 48 bytes/bar that were private become mapped
-# pages. This constant keeps its full meaning under BA2_SHARED_ARRAYS=0.
+# derived cache (BA2_SHARED_ARRAYS on, the default) the cache persists across individuals under
+# the _WORKER_BAR_CACHE_MAX count backstop alone, and NEITHER the flush nor the recency sweep
+# runs -- see _bar_cache_persists for why the peak argument below stops applying once the 40 of
+# 48 bytes/bar that were private become mapped pages. This constant keeps its full meaning under
+# BA2_SHARED_ARRAYS=0.
 #
 # N=1 bounds a process to ONE individual's set (~600 symbols, ~5GB), so 4 local slots ~= 20GB and
 # the remote's 6 slots ~= 30GB of its 65GB. The reuse given up costs a re-parse per individual
@@ -196,7 +197,15 @@ def clear_worker_bar_cache() -> None:
 def _bar_cache_persists() -> bool:
     """True when the OHLCV columns are MAPPED from the host-shared derived cache
     (``BA2_SHARED_ARRAYS`` on, the default) — in which case the bar cache is kept for the whole
-    job instead of being flushed/recency-swept per individual.
+    job, SUBJECT TO THE ``_WORKER_BAR_CACHE_MAX`` COUNT BACKSTOP, instead of being flushed or
+    recency-swept per individual.
+
+    "Persists" is not "never evicts". At the 1400-symbol screener bands the 1500-entry cap is only
+    1.07x one individual's working set, so an expert whose per-individual selection differs still
+    churns the tail of the LRU — just far more cheaply than a flush did, because a churned symbol
+    re-OPENS its mapped set (~2.2 ms) instead of re-parsing the parquet (~38 ms). Raise
+    ``BT_BAR_CACHE_MAX`` if that churn shows up in the telemetry, with the key cost in mind: 1500
+    entries of private keys is ~9 MB at 1d but ~1 GB at 5min.
 
     WHY the per-individual eviction existed and why it no longer applies here: it bounded the PEAK
     of PRIVATE per-symbol arrays (~48 B/bar x |A u B| while individual B loaded on top of A's
@@ -208,8 +217,8 @@ def _bar_cache_persists() -> bool:
     2026-09-14: "as data is shared, it should persist across the whole GA job").
 
     ``BT_BAR_CACHE_TRIALS`` therefore governs the PRIVATE path only (``BA2_SHARED_ARRAYS=0``).
-    The ``_WORKER_BAR_CACHE_MAX`` count backstop and the memory governor's explicit
-    ``clear_worker_bar_cache()`` stay in force in BOTH modes.
+    The count backstop above and the memory governor's explicit ``clear_worker_bar_cache()`` stay
+    in force in BOTH modes.
     """
     from ba2_common.core import shared_arrays as _sa
     return _sa.enabled()
@@ -217,9 +226,10 @@ def _bar_cache_persists() -> bool:
 
 def _flush_bar_cache_for_new_individual() -> int:
     """FLUSH-PER-INDIVIDUAL mode (BT_BAR_CACHE_TRIALS=0 — the default of the PRIVATE path only;
-    see _bar_cache_persists, which skips this entirely when the columns are host-shared). Drop
-    everything at the START of preload and collect, so the previous individual's arrays are
-    released BEFORE this one starts allocating. Peak = one working set.
+    see _bar_cache_persists, which skips this entirely when the columns are host-shared and lets
+    the cache persist across individuals under the count backstop). Drop everything at the START
+    of preload and collect, so the previous individual's arrays are released BEFORE this one
+    starts allocating. Peak = one working set.
 
     WHY THE PEAK, NOT THE RESTING SIZE. The end-of-preload recency sweep (N>=1 below) bounds what is
     RETAINED but not what is HELD WHILE LOADING: during individual B's preload the cache still holds
@@ -275,8 +285,9 @@ def memory_stats() -> Dict[str, Any]:
                             the OS under pressure. Counting them as process footprint (what the
                             single ``mb`` number did) would make the governor think a 6-worker
                             box holds 6x data it holds once.
-        ``mode`` says which eviction policy is in force: ``persistent`` (shared — the cache is
-        kept for the whole job), ``flush`` (private, BT_BAR_CACHE_TRIALS=0) or ``recency``.
+        ``mode`` says which eviction policy is in force: ``persistent`` (shared — kept across
+        individuals, bounded by the count backstop alone), ``flush`` (private,
+        BT_BAR_CACHE_TRIALS=0) or ``recency``.
       * ``series_memo``: MemoizedOHLCVProvider's full-DataFrame memo (_FULL_SERIES_MEMO) —
         entries, distinct symbols, total rows + estimated MB (shallow memory_usage;
         deep=True would rescan every frame).
@@ -300,7 +311,11 @@ def memory_stats() -> Dict[str, Any]:
         bar_bytes += getattr(keys, 'nbytes', len(keys) * 8)
         for arr in cached[1:]:
             n = getattr(arr, "nbytes", 0)
-            if getattr(arr, "base", None) is not None:
+            # SHARED == "backed by a np.memmap", not merely "is a view". A fancy-indexed private
+            # array (what the argsort/dedup produces) has base None TODAY, so `.base is not None`
+            # happens to agree -- but any private view introduced later would silently report as
+            # shared and hide real process footprint from the governor. Ask the real question.
+            if isinstance(getattr(arr, "base", None), np.memmap):
                 shared_bytes += n
             else:
                 bar_bytes += n
@@ -471,15 +486,30 @@ def _bar_from_row(row: Dict[str, Any]) -> Dict[str, float]:
 
 #: The array names the columnar store is built from — and the file names of the host-shared
 #: derived .npy set. ``keys_ns`` is int64 nanoseconds (the storage form of ``_norm``); the rest
-#: are float64 columns aligned to it.
+#: are the float64 columns aligned to it. EVERY array dict here is built from this tuple, so the
+#: set cannot drift between the empty case, the private path and what gets written to disk.
 _ARRAY_NAMES = ("keys_ns", "o", "h", "l", "c", "v")
+
+#: THE BAR STORE'S HALF OF THE DERIVED-CACHE CONTRACT, carried in the cache KEY. Bump it whenever
+#: ``_ARRAY_NAMES`` changes or the MEANING of an array changes — the ``datetime64[D]`` truncation
+#: of daily keys, the keep-the-LAST dedup, the column order, a dtype. A set published by an older
+#: build then lives under a different key and can never be opened by a newer reader (nor the
+#: reverse), whatever the sources look like. ``shared_arrays.SCHEMA_VERSION`` covers the on-disk
+#: FILE layout, which is the store's business; this covers what the bytes inside mean, which is
+#: ours.
+#:
+#: A BUMP ORPHANS DISK, so it is a maintenance action and not just an edit: the version is part of
+#: the KEY, so every ``…_v<old>_<winsig>`` directory becomes a key nothing asks for, and
+#: ``sweep()`` only keeps the newest signature WITHIN a key — it will never collect them however
+#: long they sit there. And do not re-warm a tree mid-grid on Windows: running workers keep the old
+#: set MAPPED, NTFS refuses to evict it, and both sets occupy the disk until the grid exits.
+ARRAYS_VERSION = 1
 
 
 def _empty_ohlcv_arrays() -> Dict[str, np.ndarray]:
     """The array set of a symbol whose cache exists but holds no bars in the window (a recent IPO
     before its first bar, a gap): a legitimate outcome, not an error."""
-    return {"keys_ns": np.empty(0, dtype=np.int64),
-            **{n: np.empty(0, dtype=float) for n in _ARRAY_NAMES[1:]}}
+    return {n: np.empty(0, dtype=(np.int64 if n == "keys_ns" else float)) for n in _ARRAY_NAMES}
 
 
 def _columnar_arrays(keys64: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray,
@@ -505,7 +535,9 @@ def _columnar_arrays(keys64: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.nda
     if not intraday:
         keys64 = keys64.astype("datetime64[D]")
     keys_ns = np.ascontiguousarray(keys64.astype("datetime64[ns]").astype(np.int64))
-    return {"keys_ns": keys_ns, "o": o, "h": h, "l": l, "c": c, "v": v}
+    # Zipped against _ARRAY_NAMES, never spelled out: the names are the .npy FILE names, so a
+    # mismatch between what a build writes and what a reader expects is a wrong-data bug.
+    return dict(zip(_ARRAY_NAMES, (keys_ns, o, h, l, c, v)))
 
 
 def _ohlcv_arrays_from_df(df: Any, intraday: bool) -> Dict[str, np.ndarray]:
@@ -786,11 +818,23 @@ class AsOfPriceSource:
 
         The derived set lives beside the source tree (``<CACHE_FOLDER>/_derived/<Provider>/``) and
         is signed by the parquet's (name, size, mtime), so a refreshed cache file invalidates it
-        automatically. The key carries the window because the arrays are the WINDOW's slice, and it
-        is PREFIXED (``u_``) because a bare symbol can be a Windows reserved device name (CON, AUX,
-        PRN, NUL...) that cannot be a directory. A ``BacktestCacheMiss`` raised by the build
-        propagates out untouched and leaves nothing on disk.
+        automatically. A ``BacktestCacheMiss`` raised by the build propagates out untouched and
+        leaves nothing on disk.
+
+        THE KEY MUST BE A TOTAL IDENTITY OF THE WINDOW, because the arrays are the WINDOW's slice
+        and the SIGNATURE only covers the parquet. The first version spelled the window as
+        ``<start-date>_<end-date>``, which silently dropped the time of day: preloading
+        09:30->10:00 and then 09:30->16:00 of the same day on a 5min series resolved to the same
+        ``<key>/<sig>`` and the second caller was served the FIRST one's 7 bars instead of its own
+        79 -- wrong data, no error. So the readable dates stay for the operator, and a sha1 over
+        the whole ``(interval, start_iso, end_iso)`` tuple is appended to make the identity total.
+        ``ARRAYS_VERSION`` rides along so a change in what the arrays MEAN cannot read an old set.
+
+        The key is PREFIXED (``u_``) because a bare symbol can be a Windows reserved device name
+        (CON, AUX, PRN, NUL...) that cannot be a directory — all three are real tickers.
         """
+        import hashlib
+
         from ba2_common.core import shared_arrays as _sa
 
         src_path = self._native_parquet_path(symbol)
@@ -802,7 +846,9 @@ class AsOfPriceSource:
         if src_path is None:
             return _build()
         derived = _sa.DerivedArrayStore(_sa.derived_root_for(os.path.dirname(src_path)))
-        key = f"u_{symbol.upper()}_{self._interval}_{win[1][:10]}_{win[2][:10]}"
+        win_sig = hashlib.sha1("|".join(win).encode()).hexdigest()[:12]
+        key = (f"u_{symbol.upper()}_{self._interval}_{win[1][:10]}_{win[2][:10]}"
+               f"_v{ARRAYS_VERSION}_{win_sig}")
         return derived.build_or_open(key, [src_path], _build)
 
     def _set_empty(self, symbol: str) -> None:
@@ -835,10 +881,16 @@ class AsOfPriceSource:
         them.
         """
         k = array("q")
-        # frombytes, NOT array('q', ...tolist()): tolist() materialises one Python int PER BAR into
-        # pymalloc arenas that are never returned to the OS (measured 2026-08-16: it turned the
-        # "memory saving" into a loss). ascontiguousarray+dtype: the source may be a mapped view.
-        k.frombytes(np.ascontiguousarray(a["keys_ns"], dtype=np.int64).tobytes())
+        # frombytes, NOT array('q', ns.tolist()): tolist() materialises one Python int PER BAR
+        # (~19k/symbol at 5min) into pymalloc arenas that are NOT returned to the OS -- measured
+        # 2026-08-16, it made the "memory saving" a LOSS, 8.62 MB/symbol against the object-list
+        # original's 6.79 MB/symbol, even though memory_stats' accounting showed a halving.
+        # A byte-cast memoryview of the C-contiguous int64 buffer, not .tobytes(): frombytes takes
+        # any BYTE buffer (an int64 memoryview is refused -- "a bytes-like object is required" --
+        # hence the .cast("B")), so this copies straight into the array and skips an intermediate
+        # bytes object the size of the whole key column. ascontiguousarray+dtype because the source
+        # may be a mapped view.
+        k.frombytes(memoryview(np.ascontiguousarray(a["keys_ns"], dtype=np.int64)).cast("B"))
         self._keys[symbol] = k
         self._o[symbol], self._h[symbol], self._l[symbol] = a["o"], a["h"], a["l"]
         self._c[symbol], self._v[symbol] = a["c"], a["v"]
@@ -1092,6 +1144,12 @@ def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
 # (the pool workers stay alive across trials), not once per call.
 _FULL_SERIES_MEMO: Dict[tuple, Any] = {}
 
+# Exception TYPE names already reported by MemoizedOHLCVProvider.cached_path in this process. The
+# lookup runs once per symbol per individual (thousands of times a job), so a degraded cache would
+# otherwise print the same line thousands of times; it still must print ONCE, because "sharing is
+# off" is invisible except as a shared_mb of 0.
+_CACHED_PATH_WARNED: set = set()
+
 
 def clear_ohlcv_memo() -> None:
     """Drop the process-global OHLCV memo (tests / between distinct universes)."""
@@ -1157,7 +1215,7 @@ class MemoizedOHLCVProvider:
         self._cached_only = cached_only
 
     def cached_path(self, symbol: str, interval: str) -> Optional[str]:
-        """The native on-disk parquet for (symbol, interval), or None when absent.
+        """The native on-disk parquet for (symbol, interval), or None when there is none to sign.
 
         ``CACHE_FOLDER/<ProviderClassName>/<SYM>_<interval>.parquet`` — the single native cache
         both ``MarketDataProviderInterface.get_ohlcv_data`` and ``ba2-test fetch-cache`` write.
@@ -1165,11 +1223,29 @@ class MemoizedOHLCVProvider:
         the canonical write spelling, so a legacy-spelled file ("<SYM>_5min.parquet") would read as
         a miss. Exposed because ``AsOfPriceSource`` signs this file to key the host-shared derived
         array cache — the path resolution has exactly one home, here.
+
+        FAILS LOUD, NARROWLY. Only ImportError/OSError degrade to None (no shared source, build the
+        arrays privately — result-neutral), and even those log ONCE per process: a blanket
+        ``except Exception -> None`` turned any bug in here into "sharing is silently off for the
+        whole run", visible only as a ``shared_mb`` of 0 with no cause anywhere. Anything else
+        propagates.
         """
+        if not self._cached_only:
+            # LIVE-FETCH mode: the series comes from the network through _full/get_ohlcv_data, and
+            # any parquet sitting at this path is NOT what was read. Signing it would key a derived
+            # set on a file that did not produce the arrays in it.
+            return None
         try:
             from ba2_common.core import native_cache
             return native_cache.find_timeseries_path(type(self._inner).__name__, symbol, interval)
-        except Exception:  # pragma: no cover — an unresolvable path is just "no shared source"
+        except (ImportError, OSError) as e:
+            if type(e).__name__ not in _CACHED_PATH_WARNED:
+                _CACHED_PATH_WARNED.add(type(e).__name__)
+                logger.warning(
+                    f"OHLCV cache path lookup failed for {symbol} {interval} "
+                    f"({type(e).__name__}: {e}); this process falls back to PRIVATE per-worker "
+                    f"bar arrays (shared_mb will read 0). Results are unaffected."
+                )
             return None
 
     def _read_cached_df(self, symbol: str, interval: str):

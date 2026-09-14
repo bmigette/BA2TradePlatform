@@ -77,7 +77,7 @@ def _frame(n: int, offset: float, dates) -> pd.DataFrame:
 
 
 def _native_tree(tmp_path, monkeypatch, syms=("AAA", "BBB"), n=300, interval="1d",
-                 messy=()):
+                 messy=(), dates=None):
     """A ``CACHE_FOLDER/FMPOHLCVProvider/<SYM>_<interval>.parquet`` tree, like
     ``ba2-test fetch-cache`` writes. ``messy`` names symbols whose frame is written UNSORTED and
     with a duplicated date, to exercise _store's argsort/dedup (keep the LAST of equal keys)."""
@@ -87,10 +87,10 @@ def _native_tree(tmp_path, monkeypatch, syms=("AAA", "BBB"), n=300, interval="1d
     monkeypatch.setattr(native_cache, "CACHE_FOLDER", str(tmp_path), raising=False)
     d = tmp_path / "FMPOHLCVProvider"
     d.mkdir(exist_ok=True)
-    if interval == "1d":
-        dates = pd.bdate_range("2024-01-01", periods=n)
-    else:
-        dates = pd.date_range("2024-01-02 14:30", periods=n, freq="5min")
+    if dates is None:
+        dates = (pd.bdate_range("2024-01-01", periods=n) if interval == "1d"
+                 else pd.date_range("2024-01-02 14:30", periods=n, freq="5min"))
+    n = len(dates)
     for i, s in enumerate(syms):
         df = _frame(n, float(i), dates)
         if s in messy:
@@ -121,6 +121,11 @@ def _preload(src, syms, interval="1d"):
 def _derived_root(tmp_path):
     from ba2_common.core import shared_arrays as SA
     return Path(SA.derived_root_for(str(tmp_path / "FMPOHLCVProvider")))
+
+
+def _sig_dirs(tmp_path):
+    """Every published signature directory under the derived root (any key)."""
+    return [p for p in _derived_root(tmp_path).rglob("*") if p.is_dir() and (p / "_done.json").is_file()]
 
 
 def _dump(src, syms):
@@ -252,3 +257,136 @@ def test_private_path_still_flushes_per_individual(tmp_path, monkeypatch):
     assert ps.memory_stats()["bar_cache"]["shared_mb"] == 0.0
     assert not (tmp_path / "_derived").exists(), "the escape hatch must write nothing"
     assert src2._c["CCC"].base is None and src2._c["CCC"].flags.writeable
+
+
+def test_two_windows_on_the_same_day_get_different_derived_sets(tmp_path, monkeypatch):
+    """REGRESSION (review round 1). The derived key spelled the window as <start-date>_<end-date>
+    and the signature covers only the parquet, so two windows that differ only in TIME OF DAY
+    resolved to the same <key>/<sig>: the second preload was served the first one's arrays. On a
+    one-day 5min series, 09:30->10:00 (7 bars) followed by 09:30->16:00 (79 bars) returned 7 bars
+    BOTH times with sharing on, and 7 then 79 with it off. Wrong data, no error.
+    """
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    day = pd.date_range("2024-01-02 09:30", "2024-01-02 16:00", freq="5min")
+    root = _native_tree(tmp_path, monkeypatch, syms=("AAA",), interval="5min", dates=day)
+    src1, prov = _source(root, interval="5min")
+    src1.preload(["AAA"], datetime(2024, 1, 2, 9, 30), datetime(2024, 1, 2, 10, 0), warmup_days=0)
+    src2 = ps.AsOfPriceSource(ohlcv_provider=prov, interval="5min")
+    src2.preload(["AAA"], datetime(2024, 1, 2, 9, 30), datetime(2024, 1, 2, 16, 0), warmup_days=0)
+
+    assert len(src1._keys["AAA"]) == 7
+    assert len(src2._keys["AAA"]) == 79
+    assert len([p for p in _derived_root(tmp_path).iterdir() if p.is_dir()]) == 2, \
+        "the two windows must key two derived sets, not share one"
+
+
+def test_a_refreshed_parquet_invalidates_the_derived_set(tmp_path, monkeypatch):
+    """The signature is (name, size, mtime) of the source parquet: re-fetching a symbol's bars
+    must make the next run see the new rows, not the arrays built from the old file."""
+    import os
+
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    root = _native_tree(tmp_path, monkeypatch, syms=("AAA",), n=300)
+    src1, _ = _source(root)
+    _preload(src1, ["AAA"])
+    before = {p.name for p in _sig_dirs(tmp_path)}
+    first_bars = len(src1._keys["AAA"])
+
+    # Add a bar INSIDE the preloaded window (a Saturday, so it cannot already be in the
+    # business-day series), then age the mtime forward -- the fixture writer can finish inside one
+    # filesystem timestamp tick, which would leave the signature unchanged for the wrong reason.
+    parquet = tmp_path / "FMPOHLCVProvider" / "AAA_1d.parquet"
+    df = pd.read_parquet(parquet)
+    extra = df.iloc[[-1]].copy()
+    extra["Date"] = pd.Timestamp("2024-06-01")
+    pd.concat([df, extra], ignore_index=True).to_parquet(parquet, index=False)
+    os.utime(parquet, (os.path.getatime(parquet) + 100, os.path.getmtime(parquet) + 100))
+
+    ps.clear_worker_bar_cache()
+    ps.clear_ohlcv_memo()
+    src2, _ = _source(root)
+    _preload(src2, ["AAA"])
+    after = {p.name for p in _sig_dirs(tmp_path)}
+    assert len(src2._keys["AAA"]) == first_bars + 1, "the rebuilt set must carry the new bar"
+    assert after - before, "a changed source must publish a NEW signature directory"
+
+
+def test_a_provider_without_cached_path_builds_privately_and_writes_nothing(tmp_path, monkeypatch):
+    """Fixture/in-memory providers have no parquet to sign, so there is nothing to share — they
+    must keep working exactly as before and leave no derived cache behind."""
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+
+    class _InMemory:
+        def read_window(self, symbol, start, end, interval):
+            return _frame(3, 0.0, pd.to_datetime(["2024-03-04", "2024-03-05", "2024-03-06"]))
+
+    src = ps.AsOfPriceSource(ohlcv_provider=_InMemory(), interval="1d")
+    _preload(src, ["AAA"])
+    assert len(src._keys["AAA"]) == 3
+    assert src._c["AAA"].base is None and src._c["AAA"].flags.writeable
+    assert not (tmp_path / "_derived").exists()
+
+
+def test_a_live_fetch_provider_never_signs_a_parquet_it_did_not_read(tmp_path, monkeypatch):
+    """``cached_only=False`` serves the series from the network through get_ohlcv_data; a parquet
+    sitting at the cache path is NOT what produced those arrays, so it must not key them."""
+    _native_tree(tmp_path, monkeypatch, syms=("AAA",))
+    live = ps.MemoizedOHLCVProvider(FMPOHLCVProvider(), datetime(2023, 1, 1),
+                                    datetime(2026, 12, 31), interval="1d", cached_only=False)
+    assert live.cached_path("AAA", "1d") is None
+    cached = ps.MemoizedOHLCVProvider(FMPOHLCVProvider(), datetime(2023, 1, 1),
+                                      datetime(2026, 12, 31), interval="1d", cached_only=True)
+    assert cached.cached_path("AAA", "1d") is not None      # same tree, hermetic mode
+
+
+def test_a_broken_cache_path_lookup_degrades_loudly_not_silently(tmp_path, monkeypatch, caplog):
+    """An OSError out of the path lookup means "no shared source" — the run continues on private
+    arrays — but it must SAY so once: the only other symptom is a shared_mb of 0, which is
+    indistinguishable from sharing being off on purpose."""
+    import logging
+
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    from ba2_common.core import native_cache
+    monkeypatch.setattr(ps, "_CACHED_PATH_WARNED", set())
+    real = native_cache.find_timeseries_path
+    calls = []
+
+    def _flaky(*a, **k):
+        # Fails the SIGNING lookup (the first call of a preload) and recovers for the read, so the
+        # test isolates "no shared source" from "no data at all" -- a lookup that stays broken is
+        # an ordinary hermetic cache miss, covered elsewhere.
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk gone")
+        return real(*a, **k)
+
+    monkeypatch.setattr(native_cache, "find_timeseries_path", _flaky)
+    src, _ = _source(_native_tree(tmp_path, monkeypatch, syms=("AAA",)))
+    with caplog.at_level(logging.WARNING):
+        _preload(src, ["AAA"])
+    assert len(src._keys["AAA"]) > 0                      # built privately, results unaffected
+    assert src._c["AAA"].base is None
+    assert any("falls back to PRIVATE" in r.message for r in caplog.records)
+
+
+def test_an_unexpected_cache_path_error_propagates(tmp_path, monkeypatch):
+    """Only ImportError/OSError degrade. A blanket ``except Exception -> None`` would turn any bug
+    in the lookup into "sharing is silently off for the whole run"."""
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    from ba2_common.core import native_cache
+    monkeypatch.setattr(native_cache, "find_timeseries_path",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bug")))
+    src, _ = _source(_native_tree(tmp_path, monkeypatch, syms=("AAA",)))
+    with pytest.raises(RuntimeError, match="bug"):
+        _preload(src, ["AAA"])
+
+
+def test_every_array_dict_carries_exactly_the_published_names():
+    """The dict keys ARE the .npy file names, so a name that drifts between the empty case, the
+    built case and the reader is a wrong-data bug, not a typo."""
+    empty = ps._empty_ohlcv_arrays()
+    built = ps._ohlcv_arrays_from_df(
+        _frame(3, 0.0, pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])), False)
+    assert set(empty) == set(ps._ARRAY_NAMES)
+    assert set(built) == set(ps._ARRAY_NAMES)
+    assert built["keys_ns"].dtype == np.int64
