@@ -240,7 +240,10 @@ def memory_stats() -> Dict[str, Any]:
         ``BA2_SHARED_ARRAYS=0`` path), ``bar_ord_l`` (the ``array('i')`` the bisects read,
         4 B/row), the ``starts_l``/``stops_l`` lists (one pointer per CONTRACT, not per row),
         and the overlay greeks arrays — which are always private: they are computed here from
-        this run's spot/rate and depend on nothing on disk.
+        this run's spot/rate and depend on nothing on disk. NOMINAL, not resident, for the
+        greeks: they are allocated uninitialised and filled one row at a time (see
+        ``_Underlying.__init__``), so their ``nbytes`` is the ceiling a fully-scanned
+        underlying would reach, not the working set a trial actually holds.
       * ``shared_mb`` — columns backed by an ``np.memmap``. ``isinstance(arr.base, np.memmap)``
         asks the real question rather than ``arr.base is not None``, which a private fancy-index
         view would also satisfy (see price_source.memory_stats).
@@ -593,9 +596,54 @@ class _Underlying:
                      "bid", "ask"):
             setattr(self, name, getattr(raw, name))
 
+        # UNINITIALISED, AND THE INVARIANT THAT MAKES IT SAFE: no cell of these five is ever
+        # READ before ``_g_done[i]`` is set. ``greeks_tuple`` is their only reader and it
+        # fills the row first; nothing else in the codebase indexes them (``memory_stats``
+        # asks for ``nbytes``). "NaN means not computed" is NOT the rule and never was --
+        # NaN is a legitimate greek (an uninvertible bar stores it deliberately), so
+        # ``_g_done`` has always been the sole record of what is filled.
+        #
+        # WHY IT MATTERS. ``np.full`` WRITES every element, so all 40 B/row became RESIDENT
+        # the instant an underlying was opened, PRIVATE to each worker -- against mapped
+        # columns the host shares once. On the 2020 ThetaData universe (177.8M rows) that is
+        # ~7.1 GB per worker and was the shared design's remaining dominant private cost (a
+        # live probe on 20 symbols measured ~3.6 GB private per worker). ``np.empty`` leaves
+        # the pages demand-zero and the fill is lazy, so residency follows what the run
+        # actually reads. Measured on a synthetic 5M-row / 5k-contract underlying, nominal
+        # 191 MB:
+        #
+        #   construction         190.7 MB rss (np.full)  ->    0.0 MB (np.empty)
+        #   + 5% of rows filled, densely (250 consecutive bars x 1,000 contracts, the
+        #     shape a backtest produces -- it re-reads one contract on many dates)
+        #                        190.7 MB                ->   44.0 MB
+        #   + the worst case (one scattered row per contract, 0.1% of rows)
+        #                        190.7 MB                ->  102.5 MB
+        #
+        # THE WORST CASE IS PAGE GRANULARITY, and it is the ceiling worth knowing: a 4 KB
+        # page holds 512 float64, so one touched row in a long contract makes a whole page
+        # resident in each of the five columns. It is still under the old cost, and it never
+        # exceeds it -- ``np.full``'s 191 MB is the limit this converges to, not a baseline
+        # it can pass.
+        #
+        # WINDOWS still COMMITS the reservation, so ``private``/pagefile grows by the full
+        # nominal size either way; the working set is the number that decides how many trial
+        # slots fit in a box, and that is the one measured above. On Linux an untouched page
+        # is neither committed nor resident.
+        #
+        # NOT PER-CONTRACT SLICES (the obvious next step: allocate ``stops[ci]-starts[ci]``
+        # cells the first time a contract is read). Measured, it loses: its allocation
+        # granularity is a CONTRACT, which here is 8 KB per column -- coarser than the 4 KB
+        # page this already pays -- so the dense pattern lands on the same ~40 MB and the
+        # scattered one costs ~200 MB, worse than both this and ``np.full``. It would also
+        # put a dict lookup and a subtraction on a path measured at 671 ns/call
+        # (``np.empty``-built) against 708 ns/call (``np.full``-built) -- i.e. the change
+        # here costs the hot path nothing to begin with.
+        #
+        # ``_g_done`` stays ``np.zeros``: calloc hands back demand-zero pages too, so the
+        # bool mask (1 B/row) is no more resident than the floats it guards.
         self._g_done = np.zeros(n, dtype=bool)
         for name in ("_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega"):
-            setattr(self, name, np.full(n, np.nan, dtype="float64"))
+            setattr(self, name, np.empty(n, dtype="float64"))
 
     # -- as-of clamp ----------------------------------------------------
     # ``bisect`` over the ``array('i')`` buffer rather than ``np.searchsorted`` over an array

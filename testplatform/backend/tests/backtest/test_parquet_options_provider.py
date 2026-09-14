@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import array
 import dataclasses
+import gc
 import inspect
 import logging
 import os
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
@@ -1126,3 +1128,190 @@ def test_a_reserved_device_name_ticker_is_still_readable(symbol, tmp_path, monke
     sigs = _published_sigs(root, symbol)
     assert len(sigs) == 1, "the arrays must actually be shared, not skipped for this symbol"
     assert sigs[0].parent.name == f"u_{symbol}.v{pq._RawUnderlying.ARRAYS_VERSION}"
+
+
+# --------------------------------------------------------------------------- #
+# THE GREEKS OVERLAY IS ALLOCATED UNINITIALISED.
+#
+# `_Underlying.__init__` used to build its five greek columns with
+# `np.full(n, np.nan)`, which WRITES every element and so makes 40 B/row RESIDENT
+# per process the instant an underlying is opened -- ~7.1 GB on the 2020 ThetaData
+# universe (177.8M rows), private per worker, on top of the mapped columns the host
+# shares once. They are filled LAZILY, one row at a time, and `_g_done[i]` is the
+# only thing that says whether a row holds a value, so the NaN those pages were
+# filled with is never read. The tests below pin that invariant -- it, not the
+# allocator call, is what makes `np.empty` safe.
+# --------------------------------------------------------------------------- #
+_GREEK_SLOTS = ("_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega")
+
+#: A value uninitialised memory will not plausibly hold, written over the overlay's greek
+#: arrays right after construction: if any read path returns it, that read saw a cell nothing
+#: had filled. NaN could not play this role -- NaN is a LEGITIMATE greek (an uninvertible bar).
+_POISON = -1.2345678e300
+
+
+def _overlay(root, rate=_RATE, scope="test", underlying=_UNDER):
+    return pq._underlying(root, underlying, rate, scope)
+
+
+def _poison(ov):
+    """Overwrite the (uninitialised) greek cells with a recognisable value."""
+    for name in _GREEK_SLOTS:
+        getattr(ov, name)[:] = _POISON
+    return ov
+
+
+def _synthetic_arrays(n_contracts: int, n_bars: int, *, underlying: str = "SY"):
+    """An ARRAY_NAMES dict for a synthetic underlying of ``n_contracts * n_bars`` rows.
+
+    Built directly rather than through ``arrays_from_frame`` because the point of the
+    memory test is a row count (millions) no fixture parquet tree is going to hold.
+
+    The numeric columns are ``np.zeros``, not ``np.full``, deliberately: calloc'd pages are
+    demand-zero and never become resident, so the RAW an overlay is measured against costs
+    essentially nothing itself and the measurement is about the overlay.
+    """
+    n = n_contracts * n_bars
+    base = date(2023, 1, 3).toordinal()
+    starts = (np.arange(n_contracts, dtype=np.int64) * n_bars).astype(np.int32)
+    arrays = {
+        "starts": starts,
+        "stops": (starts.astype(np.int64) + n_bars).astype(np.int32),
+        "c_occ_utf8": np.frombuffer(
+            "\n".join(f"{underlying}230120C{i:08d}" for i in range(n_contracts)).encode("utf-8"),
+            dtype=np.uint8),
+        "c_strike": np.full(n_contracts, 100.0),
+        "c_expiry_ord": np.full(n_contracts, base + n_bars + 30, dtype=np.int32),
+        "c_is_call": np.ones(n_contracts, dtype=bool),
+        "bar_ord": np.tile(np.arange(base, base + n_bars, dtype=np.int32), n_contracts),
+        "has_quotes": np.array([True], dtype=bool),
+        "priceless_count": np.array([0], dtype=np.int64),
+    }
+    for col in ("open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
+                "bid", "ask"):
+        arrays[col] = np.zeros(n, dtype="float64")
+    return arrays
+
+
+def test_the_greek_overlay_starts_with_nothing_done(provider, store_root):
+    """`_g_done` is all-False on a fresh overlay -- the ONLY record of what is filled."""
+    ov = _overlay(store_root)
+    assert ov.n_rows == 5
+    np.testing.assert_array_equal(ov._g_done, np.zeros(ov.n_rows, dtype=bool))
+    for name in _GREEK_SLOTS:
+        arr = getattr(ov, name)
+        assert arr.shape == (ov.n_rows,) and arr.dtype == np.dtype("float64")
+        # PRIVATE, never a view on the mapped raw: these are a function of this run's spot
+        # and rate, so sharing them across runs would be wrong, not just surprising.
+        assert arr.base is None
+
+
+def test_no_greek_cell_is_ever_read_before_it_is_written(provider, store_root):
+    """The whole read surface, over an overlay whose greek cells hold a poison value.
+
+    This is the invariant that lets the arrays be allocated uninitialised: if any path
+    could observe a cell `_g_done` does not vouch for, the poison would come back out of
+    it. Exercised through get_chain / get_bar / get_atm_iv / delta_at_entry, i.e. every
+    caller of `greeks_tuple`.
+    """
+    ov = _poison(_overlay(store_root))
+    seen = []
+    for as_of in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10)):
+        for c in _wide(provider, as_of):
+            seen += [c.implied_volatility, c.delta, c.gamma, c.theta, c.vega]
+        provider.get_atm_iv(_UNDER, as_of)
+        for occ in (_C100, _P100, _C110):
+            bar = provider.get_bar(occ, as_of)
+            if bar is not None:
+                seen += [bar["iv"], bar["delta"], bar["gamma"], bar["theta"], bar["vega"]]
+        seen.append(provider.delta_at_entry(_UNDER, _C100, as_of))
+
+    assert seen, "the read surface produced nothing -- the test would pass vacuously"
+    assert not any(v == _POISON for v in seen if v is not None), (
+        "a greek was read out of a cell nothing had filled")
+    # And the poison SURVIVES wherever nothing was filled: `_g_done` is exact, not a
+    # conservative under-count that happens to be covered by an all-NaN prefill.
+    for name in _GREEK_SLOTS:
+        arr = getattr(ov, name)
+        assert np.all(arr[~ov._g_done] == _POISON)
+
+
+def test_every_filled_greek_equals_a_fresh_computation_and_only_touched_rows_are_done(
+        provider, store_root):
+    """Parity: the lazily filled cells hold exactly what `compute_iv_and_greeks` returns,
+    and `_g_done` is set for precisely the rows the reads touched -- no more, no less."""
+    ov = _poison(_overlay(store_root))
+    raw = ov.raw
+    expected_rows = {}
+    for as_of in (date(2023, 1, 3), date(2023, 1, 5), date(2023, 1, 10)):
+        _wide(provider, as_of)
+        for ci in range(len(raw.c_occ)):
+            i = ov.latest_row_on_or_before(ci, as_of.toordinal())
+            if i >= 0:
+                expected_rows[i] = ci
+
+    assert expected_rows
+    np.testing.assert_array_equal(
+        np.flatnonzero(ov._g_done), np.array(sorted(expected_rows), dtype=np.intp))
+
+    for i, ci in expected_rows.items():
+        bar_ord = ov.bar_ord_l[i]
+        px = ov.close[i]
+        out = compute_iv_and_greeks(
+            None if px != px else float(px),
+            _spot_source(_UNDER, raw.date_of_ord[bar_ord]),
+            raw.c_strike_f[ci],
+            (raw.c_expiry_ord_l[ci] - bar_ord) / 365.0,
+            _RATE, raw.c_right[ci])
+        for name, key in zip(_GREEK_SLOTS, ("iv", "delta", "gamma", "theta", "vega")):
+            got = getattr(ov, name)[i]
+            if out[key] is None:
+                assert got != got, f"{name}[{i}] should be NaN for an uninvertible bar"
+            else:
+                assert got == pytest.approx(out[key])
+        assert ov.greeks_tuple(i, ci, _spot_source) == (
+            out["iv"], out["delta"], out["gamma"], out["theta"], out["vega"])
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not sys.platform.startswith(("win", "linux")),
+    reason="resident-set accounting is only meaningful on Windows (working set) and Linux "
+           "(RSS); macOS reports compressed/purgeable pages in ways that make the delta "
+           "unreliable")
+def test_the_overlay_does_not_make_its_greek_columns_resident():
+    """5M rows x 5 float64 columns = 200 MB that must NOT become resident on construction.
+
+    `np.full` writes every element, so the old construction cost the full 200 MB in the
+    working set (and ~7.1 GB on the 177.8M-row 2020 ThetaData universe, per worker, on top
+    of the mapped columns the host shares once). `np.empty` leaves the pages demand-zero:
+    the allocation is committed but nothing is backed until a row is filled, and a chain
+    read fills roughly one row per contract.
+
+    Windows commits the reservation up front, so `private`/`pagefile` DOES grow by the full
+    200 MB; `rss` (the working set) is the number that must not, and it is the one that
+    decides how many trial slots fit in a worker box. On Linux neither grows.
+    """
+    psutil = pytest.importorskip("psutil")
+    proc = psutil.Process()
+    n_contracts, n_bars = 5_000, 1_000
+    n = n_contracts * n_bars
+    nominal = n * 5 * 8  # 5 float64 columns
+
+    raw = pq._RawUnderlying.from_arrays("SY", _synthetic_arrays(n_contracts, n_bars))
+    assert raw.n_rows == n
+
+    gc.collect()
+    before = proc.memory_info().rss
+    ov = pq._Underlying(raw, _RATE)
+    gc.collect()
+    grew = proc.memory_info().rss - before
+
+    assert ov.n_rows == n
+    assert grew < nominal * 0.25, (
+        f"the greek overlay made {grew / 1048576:.0f} MB resident of a nominal "
+        f"{nominal / 1048576:.0f} MB -- it is being written at construction, not lazily")
+
+    # ...and it still works: filling one row makes exactly that row done.
+    ov.greeks_tuple(0, 0, lambda s, d: 100.0)
+    assert ov._g_done[0] and not ov._g_done[1:].any()
