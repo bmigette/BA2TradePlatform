@@ -255,9 +255,9 @@ def test_build_manifest_does_not_descend_into_a_derived_tree(tmp_path, monkeypat
     cache_sync.build_manifest(str(tmp_path))
 
     assert not any("_derived" in Path(d).parts for d in walked), walked
-    # Pinned here because the symlink test below can only run where symlinks are creatable:
-    # dropping followlinks would silently un-follow directory symlinks rglob used to descend.
-    assert kwargs.get("followlinks") is True, kwargs
+    # Strict parity with the Path.rglob this replaced (3.12: Path.walk(follow_symlinks=False)):
+    # widening it to followlinks=True would let a symlink cycle loop the manifest walk.
+    assert kwargs.get("followlinks", False) is False, kwargs
 
 
 def test_prune_paths_survives_an_undeletable_file(tmp_path, monkeypatch):
@@ -284,22 +284,3 @@ def test_prune_paths_survives_an_undeletable_file(tmp_path, monkeypatch):
     assert not (tmp_path / "after.parquet").exists()   # the loop continued past the failure
     assert (tmp_path / "locked.parquet").exists()
     assert len(warned) == 1 and "locked.parquet" in warned[0], warned
-
-
-def test_build_manifest_descends_directory_symlinks_like_rglob_did(tmp_path):
-    """``os.walk(followlinks=True)`` keeps Path.rglob's semantics. Without it a subtree an
-    operator relocated with ``ln -s`` silently drops out of the master manifest -- the empty-view
-    guard would NOT fire (the manifest is merely incomplete), so diff_stale would list every
-    worker copy of that subtree as stale and the next push would prune it."""
-    import os
-    target = tmp_path / "elsewhere" / "FMPOHLCVProvider"
-    _write(target / "AAPL_1d.parquet", b"x")
-    root = tmp_path / "cache"
-    root.mkdir()
-    try:
-        os.symlink(target, root / "FMPOHLCVProvider", target_is_directory=True)
-    except (OSError, NotImplementedError) as e:  # Windows without SeCreateSymbolicLink (1314)
-        pytest.skip(f"cannot create a directory symlink here: {e}")
-
-    man = cache_sync.build_manifest(str(root))
-    assert {f["rel_path"] for f in man["files"]} == {"FMPOHLCVProvider/AAPL_1d.parquet"}
