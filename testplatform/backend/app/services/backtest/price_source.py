@@ -39,7 +39,7 @@ from array import array
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -506,6 +506,38 @@ _ARRAY_NAMES = ("keys_ns", "o", "h", "l", "c", "v")
 ARRAYS_VERSION = 1
 
 
+def derived_key_for(symbol: str, win: Tuple[str, str, str]) -> str:
+    """The derived-cache key one symbol's bars live under for the window ``win``.
+
+    ``win`` is preload's own window tuple ``(interval, fetch_start_iso, end_iso)`` -- taken whole
+    rather than as separate interval/start/end arguments so a caller cannot pass an interval that
+    disagrees with the window it hashes.
+
+    THE KEY MUST BE A TOTAL IDENTITY OF THE WINDOW, because the arrays are the WINDOW's slice and
+    the source SIGNATURE only covers the parquet. The first version spelled the window as
+    ``<start-date>_<end-date>``, which silently dropped the time of day: preloading 09:30->10:00
+    and then 09:30->16:00 of the same day on a 5min series resolved to the same ``<key>/<sig>``
+    and the second caller was served the FIRST one's 7 bars instead of its own 79 -- wrong data,
+    no error. So the readable dates stay for the operator, and a sha1 over the WHOLE tuple is
+    appended to make the identity total. ``ARRAYS_VERSION`` rides along so a change in what the
+    arrays MEAN cannot read an old set.
+
+    The key is PREFIXED (``u_``) because a bare symbol can be a Windows reserved device name
+    (CON, AUX, PRN, NUL...) that cannot be a directory -- all three are real tickers.
+
+    MODULE-LEVEL AND PUBLIC because ``tools/build_shared_arrays.py`` reports which symbols a
+    prewarm BUILT and which it merely opened by looking the keys up on disk. A second spelling of
+    this format there would report on directories the engine does not use -- the prewarm would
+    look complete while every trial still rebuilt.
+    """
+    import hashlib
+
+    interval, start_iso, end_iso = win
+    win_sig = hashlib.sha1("|".join(win).encode()).hexdigest()[:12]
+    return (f"u_{symbol.upper()}_{interval}_{start_iso[:10]}_{end_iso[:10]}"
+            f"_v{ARRAYS_VERSION}_{win_sig}")
+
+
 def _empty_ohlcv_arrays() -> Dict[str, np.ndarray]:
     """The array set of a symbol whose cache exists but holds no bars in the window (a recent IPO
     before its first bar, a gap): a legitimate outcome, not an error."""
@@ -821,20 +853,10 @@ class AsOfPriceSource:
         automatically. A ``BacktestCacheMiss`` raised by the build propagates out untouched and
         leaves nothing on disk.
 
-        THE KEY MUST BE A TOTAL IDENTITY OF THE WINDOW, because the arrays are the WINDOW's slice
-        and the SIGNATURE only covers the parquet. The first version spelled the window as
-        ``<start-date>_<end-date>``, which silently dropped the time of day: preloading
-        09:30->10:00 and then 09:30->16:00 of the same day on a 5min series resolved to the same
-        ``<key>/<sig>`` and the second caller was served the FIRST one's 7 bars instead of its own
-        79 -- wrong data, no error. So the readable dates stay for the operator, and a sha1 over
-        the whole ``(interval, start_iso, end_iso)`` tuple is appended to make the identity total.
-        ``ARRAYS_VERSION`` rides along so a change in what the arrays MEAN cannot read an old set.
-
-        The key is PREFIXED (``u_``) because a bare symbol can be a Windows reserved device name
-        (CON, AUX, PRN, NUL...) that cannot be a directory — all three are real tickers.
+        The KEY is ``derived_key_for(symbol, win)`` — module-level and public, because
+        ``tools/build_shared_arrays.py`` has to name the same directories to report what a
+        prewarm actually built (see that function for why the window is hashed whole).
         """
-        import hashlib
-
         from ba2_common.core import shared_arrays as _sa
 
         src_path = self._native_parquet_path(symbol)
@@ -846,10 +868,7 @@ class AsOfPriceSource:
         if src_path is None:
             return _build()
         derived = _sa.DerivedArrayStore(_sa.derived_root_for(os.path.dirname(src_path)))
-        win_sig = hashlib.sha1("|".join(win).encode()).hexdigest()[:12]
-        key = (f"u_{symbol.upper()}_{self._interval}_{win[1][:10]}_{win[2][:10]}"
-               f"_v{ARRAYS_VERSION}_{win_sig}")
-        return derived.build_or_open(key, [src_path], _build)
+        return derived.build_or_open(derived_key_for(symbol, win), [src_path], _build)
 
     def _set_empty(self, symbol: str) -> None:
         self._keys[symbol] = array('q')

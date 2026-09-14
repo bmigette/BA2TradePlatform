@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -303,7 +304,32 @@ def test_sweep_removes_aged_and_stale_version_keys_and_keeps_the_current_one(
     assert not aged.parent.exists(), "a key nothing has opened in 20 days is garbage"
     assert not stale_version.parent.exists(), "a key below the reader's ARRAYS_VERSION is garbage"
     assert current.parent.is_dir(), "the CURRENT key must survive its own sweep"
-    assert "2 key(s) removed" in out and "reclaimed" in out
+    assert "2 key(s) removed" in out
+    # A reclaimed figure that is always "0.0 B" would pass a substring check while reporting
+    # nothing -- the number is the only evidence the eviction actually freed the disk.
+    reclaimed = re.search(r"([\d.]+) (B|KB|MB|GB|TB) reclaimed", out)
+    assert reclaimed and float(reclaimed.group(1)) > 0, out
+
+
+def test_sweep_does_not_remove_a_key_that_is_old_but_still_in_daily_use(store_root, capsys):
+    """The age rule is age-since-LAST-USE. ``_try_open`` restamps the marker on every successful
+    open, so a key built months ago and mapped by every trial this morning is not garbage -- a
+    build-time rule would delete the hottest key on the host and bill the next grid for it."""
+    tool = _tool()
+    derived = Path(SA.derived_root_for(store_root))
+    key_dir = derived / f"u_ZZ.v{pq._RawUnderlying.ARRAYS_VERSION}"
+    pq._load_raw_underlying(store_root, "ZZ")                 # cold: builds
+    marker = next(key_dir.rglob(SA.DONE_MARKER))
+    old = time.time() - 90 * 86400
+    os.utime(marker, (old, old))
+
+    pq._load_raw_underlying(store_root, "ZZ")                 # warm: OPENS, and restamps
+    assert time.time() - marker.stat().st_mtime < 60
+
+    assert tool.main(["--options-store", "tastytrade", "--sweep",
+                      "--sweep-max-age-days", "14"]) == 0
+    assert key_dir.is_dir(), "a key opened today must survive an age sweep"
+    assert "0 key(s) removed" in capsys.readouterr().out
 
 
 def test_sweep_of_the_ohlcv_root_uses_the_bar_stores_own_version(native_tree, capsys):
@@ -388,6 +414,30 @@ def test_symbols_and_universe_file_resolve_to_the_same_list(tmp_path):
 # 6. The pool path. Slow (a spawned child pays the whole backend import), so it is marked and
 #    runs the real script end to end -- the one thing an in-process call cannot prove.
 # --------------------------------------------------------------------------------------------
+@pytest.mark.slow
+def test_bootstrap_enters_the_backend_even_when_app_is_already_importable(store_root):
+    """THE REMOTE227 DEFECT, pinned.
+
+    The worker wrapper exports a PYTHONPATH containing ``testplatform/backend``, so ``import
+    app.models.database`` succeeds in a bare interpreter that has entered nothing. A bootstrap
+    that treats "importable" as "already bootstrapped" then skips the chdir, the .env load, the
+    ba2_common DB binding and the FMP-key mirroring -- and ``--ohlcv-provider`` dies on "FMP API
+    key not configured" as an unhandled traceback on the one host this tool exists for.
+
+    Not expressible in-process (this session IS under pytest and HAS entered the backend), so it
+    runs the script the way the wrapper does and reads back the line the bootstrap prints.
+    """
+    env = dict(os.environ, BACKTEST_OPTIONS_PARQUET_ROOT=store_root,
+               PYTHONPATH=str(_REPO / "testplatform" / "backend"))
+    env.pop("PYTEST_CURRENT_TEST", None)
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--options-store", "tastytrade", "--symbols", "ZZ",
+         "--jobs", "1", "--dry-run"],
+        cwd=str(_REPO), env=env, capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "bootstrap: backend entered" in proc.stdout, proc.stdout + proc.stderr
+
+
 @pytest.mark.slow
 def test_the_spawn_pool_path_builds_every_symbol(store_root, tmp_path):
     env = dict(os.environ, BACKTEST_OPTIONS_PARQUET_ROOT=store_root, BA2_SHARED_ARRAYS="1")

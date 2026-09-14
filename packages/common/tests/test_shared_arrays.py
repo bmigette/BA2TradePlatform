@@ -670,3 +670,40 @@ def test_evict_key_leaves_a_key_whose_arrays_are_still_mapped(tmp_path):
         np.testing.assert_array_equal(held["close"], _arrays()["close"])
     del held
     gc.collect()
+
+
+def test_opening_a_set_refreshes_its_marker_so_mtime_means_last_use(tmp_path):
+    """An age-based collector is only safe if the timestamp it reads moves when the set is USED.
+
+    Otherwise the marker keeps the timestamp of the day the set was BUILT, and
+    ``tools/build_shared_arrays.py --sweep --sweep-max-age-days 14`` deletes the very key every
+    trial on the host has been mapping daily -- charging the next grid a cold rebuild for the
+    hottest entry on the box.
+    """
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    store.build_or_open("AAPL", [src], _arrays)
+    marker = store.current_dir("AAPL", [src]) / SA.DONE_MARKER
+    _age(marker, seconds=30 * 86400)
+    assert time.time() - marker.stat().st_mtime > 29 * 86400
+
+    got = store.build_or_open("AAPL", [src], _arrays)      # an OPEN, not a build
+
+    np.testing.assert_array_equal(got["close"], _arrays()["close"])
+    assert time.time() - marker.stat().st_mtime < 60, "a successful open must restamp the marker"
+    del got
+    gc.collect()
+
+
+def test_a_failed_open_does_not_restamp_the_marker(tmp_path):
+    """Only a set that actually OPENED counts as used: a marked-but-unreadable directory is
+    about to be rebuilt, and refreshing it would hide it from the collector forever."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    kd = store.key_dir("AAPL")
+    d = _write_done_dir(kd / "sig_broken")
+    (d / "close.npy").write_bytes(b"not a npy at all")
+    _age(d / SA.DONE_MARKER, seconds=30 * 86400)
+    before = (d / SA.DONE_MARKER).stat().st_mtime
+
+    assert store._try_open(d) is None
+    assert (d / SA.DONE_MARKER).stat().st_mtime == before

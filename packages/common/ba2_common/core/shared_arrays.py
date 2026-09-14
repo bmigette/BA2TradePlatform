@@ -282,6 +282,14 @@ class DerivedArrayStore:
         A marker that cannot be parsed, or an array that cannot be loaded (missing, truncated,
         not a ``.npy`` at all), reports "not usable" rather than raising: the caller's answer to
         both is the same rebuild, and the corrupt directory is then evicted by ``_publish``.
+
+        A SUCCESSFUL OPEN TOUCHES THE MARKER, so its mtime means LAST USE and not BUILD TIME.
+        That is what makes an age-based collector safe: without it the marker of the set every
+        trial on the box maps daily keeps the timestamp of the day it was built, and
+        ``tools/build_shared_arrays.py --sweep --sweep-max-age-days 14`` would delete the
+        hottest key on the host and charge the next grid a cold rebuild for it. Best-effort by
+        design -- a read-only tree, or a concurrent evictor that has just renamed the marker
+        aside, must not turn an open that WORKED into a rebuild.
         """
         marker = final / DONE_MARKER
         try:
@@ -295,6 +303,10 @@ class DerivedArrayStore:
             except (OSError, ValueError):
                 return None
             out[name] = np.asarray(arr)
+        try:
+            os.utime(marker, None)
+        except OSError:
+            pass
         return out
 
     def _build(self, final: Path, build_fn: BuildFn, lock: Optional[Path] = None) -> None:
@@ -623,6 +635,15 @@ class DerivedArrayStore:
         True means THIS call removed it; False means it is still there (or was already gone),
         never that it was half-removed. ``wait_s=0.0`` because this is housekeeping: it must
         never block behind a live publisher's eviction claim.
+
+        THE "BYTE-FOR-BYTE INTACT" GUARANTEE IS PER SIGNATURE DIRECTORY, NOT PER KEY.
+        ``_evict_dir`` probes the key's children -- the signature directories -- by renaming each
+        one aside, and rolls back on the first refusal. A signature directory that was already
+        renamed when a LATER one refuses is renamed back, but as a DIRECTORY move: a reader that
+        was mid-``_try_open`` inside it during that window sees files vanish and rebuilds. The
+        rollback restores the bytes, not the continuity, so a False from a multi-signature key
+        can still have cost some process a rebuild. Harmless (a rebuild republishes the same
+        signature) and the reason this is a between-grids tool rather than a runtime sweeper.
         """
         return self._evict_dir(Path(key_dir), wait_s=0.0)
 
@@ -637,6 +658,12 @@ class DerivedArrayStore:
         only here. Nothing can ever open one by name (``_try_open`` needs the marker), so it is
         pure garbage, and it is exactly what an interrupted publish or a pre-``_evict_dir``
         partial delete leaves behind.
+
+        THE MARKER MTIME THIS READS IS LAST USE, NOT BUILD TIME -- ``_try_open`` touches it on
+        every successful open (see there). Within a key that only makes the "freshly published,
+        leave it alone" guard below more conservative; it matters to the KEY-level collector in
+        ``tools/build_shared_arrays.py --sweep``, which is an age policy and would otherwise
+        delete the key every trial on the host maps daily.
 
         Stale ``.lock`` and ``.evicting`` FILES are deliberately not collected here: both are
         self-correcting, since the next claimant breaks one it finds older than
