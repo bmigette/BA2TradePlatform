@@ -19,7 +19,6 @@ symptoms visible in the master.
 """
 from __future__ import annotations
 
-from array import array  # noqa: F401  (documents what a private key buffer is)
 from datetime import date, datetime
 from pathlib import Path
 
@@ -98,7 +97,10 @@ def _native_tree(tmp_path, monkeypatch, syms=("AAA", "BBB"), n=300, interval="1d
     return tmp_path
 
 
-def _source(tmp_path, interval="1d", provider=None):
+def _source(_tree, interval="1d", provider=None):
+    """``_tree`` is the ``_native_tree`` return value. Taken and ignored ON PURPOSE: it makes the
+    parquet tree an ARGUMENT, so a caller cannot build a price source before the tree (and the
+    CACHE_FOLDER monkeypatch that comes with it) exists."""
     prov = provider or _CountingMemo(FMPOHLCVProvider(), datetime(2023, 1, 1),
                                      datetime(2026, 12, 31), interval=interval, cached_only=True)
     return ps.AsOfPriceSource(ohlcv_provider=prov, interval=interval), prov
@@ -183,6 +185,18 @@ def test_shared_arrays_env_flags_reach_spawned_workers():
     the memory shape this plan removes, with the master's telemetry saying it is fixed."""
     assert "BA2_SHARED_ARRAYS" in H._WORKER_ENV_KEYS
     assert "BA2_SHARED_ARRAYS_LOCK_STALE_S" in H._WORKER_ENV_KEYS
+
+
+def test_the_release_hook_names_functions_that_exist():
+    """A rename on either side is caught HERE, at import time, not by a grid that quietly stops
+    reclaiming: the hook reaches these two by string, and for months it named two functions that
+    had never existed (`clear_worker_option_caches`, `clear_worker_5m_cache`)."""
+    import importlib
+
+    for mod, fn in (("app.services.backtest.options_provider", "clear_worker_options_cache"),
+                    ("app.services.backtest.results", "clear_worker_5m_bars_cache"),
+                    ("app.services.backtest.parquet_options_provider", "memory_stats")):
+        assert hasattr(importlib.import_module(mod), fn), f"{mod}.{fn} is gone"
 
 
 # --------------------------------------------------------------------------------------------
@@ -277,3 +291,175 @@ def test_release_reports_zero_shared_mb_on_the_private_path(tmp_path, monkeypatc
     assert out["shared_mb"] == 0.0
     assert out["freed_cache_mb"] > 0
     assert not (tmp_path / "_derived").exists(), "the escape hatch must write nothing"
+
+
+# --------------------------------------------------------------------------------------------
+# 5. A release that cannot clear something SAYS SO
+# --------------------------------------------------------------------------------------------
+@pytest.fixture
+def worker_log(monkeypatch):
+    """Capture ``price_source._worker_log`` -- the only channel that survives inside a pool
+    child, whose stdlib logging ``_worker_init`` disables globally."""
+    lines: list = []
+    monkeypatch.setattr(ps, "_worker_log", lines.append)
+    return lines
+
+
+def test_a_missing_clear_function_is_announced_not_swallowed(worker_log, monkeypatch):
+    """The whole bug this file was written after: a name that no longer resolves used to leave
+    the cache resident with the release reporting success."""
+    import importlib
+
+    results = importlib.import_module("app.services.backtest.results")
+    monkeypatch.delattr(results, "clear_worker_5m_bars_cache")
+
+    H._worker_release_memory()
+
+    assert any("clear_worker_5m_bars_cache" in m and "GONE" in m for m in worker_log), worker_log
+
+
+def test_a_failing_clear_is_announced_and_does_not_stop_the_others(worker_log, monkeypatch):
+    import importlib
+
+    options = importlib.import_module("app.services.backtest.options_provider")
+    results = importlib.import_module("app.services.backtest.results")
+    ran: list = []
+    monkeypatch.setattr(options, "clear_worker_options_cache",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(results, "clear_worker_5m_bars_cache", lambda: ran.append("5m"))
+
+    H._worker_release_memory()
+
+    assert any("clear_worker_options_cache" in m and "boom" in m for m in worker_log), worker_log
+    assert ran == ["5m"], "one failing clear must not skip the rest of the release"
+
+
+def test_failed_stats_are_announced_so_zero_is_not_read_as_empty(worker_log, monkeypatch):
+    monkeypatch.setattr(ps, "memory_stats",
+                        lambda: (_ for _ in ()).throw(RuntimeError("psutil gone")))
+
+    out = H._worker_release_memory()
+
+    assert out["freed_cache_mb"] == 0.0
+    assert any("memory stats failed" in m and "psutil gone" in m for m in worker_log), worker_log
+
+
+# --------------------------------------------------------------------------------------------
+# 6. The governor's log shows private and mapped apart
+# --------------------------------------------------------------------------------------------
+class _FakeFuture:
+    def __init__(self, value):
+        self._value = value
+
+    def result(self, timeout=None):
+        return dict(self._value)
+
+
+class _FakePool:
+    """Stands in for a ProcessPoolExecutor: every submit resolves to one worker's release dict."""
+
+    def __init__(self, value):
+        self.value = value
+        self.submits = 0
+
+    def submit(self, fn, *a):
+        self.submits += 1
+        return _FakeFuture(self.value)
+
+
+def test_the_pool_release_log_separates_private_from_mapped():
+    """Summed into one number, a release that freed almost nothing PRIVATE reads as a big win --
+    and the governor's next escalation then looks unnecessary to whoever reads the log."""
+    msgs: list = []
+    pool = _FakePool({"freed_cache_mb": 10.0, "shared_mb": 100.0})
+
+    H._release_pool_memory(pool, 2, log=msgs.append)
+
+    assert pool.submits == 6                      # oversubscribed 3x, see the docstring
+    assert "~60 MB private" in msgs[0] and "+600 MB mapped views" in msgs[0], msgs
+
+
+def test_slot_pools_release_all_returns_the_totals_and_they_reach_the_log():
+    """``release_all`` used to discard every result dict, so the per-slot path -- the LOCAL
+    path -- logged no numbers at all."""
+    pools = H._SlotPools.__new__(H._SlotPools)     # no real subprocesses in a unit test
+    pools.pools = [_FakePool({"freed_cache_mb": 7.0, "shared_mb": 70.0}) for _ in range(3)]
+
+    got = pools.release_all()
+    assert got == {"freed_cache_mb": 21.0, "shared_mb": 210.0}
+
+    msgs: list = []
+    H._release_pool_memory(pools, 3, log=msgs.append)
+    assert "~21 MB private" in msgs[0] and "+210 MB mapped views" in msgs[0], msgs
+    assert "per-slot" in msgs[0]
+
+
+# --------------------------------------------------------------------------------------------
+# 7. The option reader can say what it holds, and which half is the host's
+# --------------------------------------------------------------------------------------------
+_BIG_UNDER = "ZY"
+_BIG_EXPIRY = date(2024, 3, 15)
+
+
+@pytest.fixture
+def big_store_root(tmp_path):
+    """A store big enough that the MB figures clear the telemetry's 0.1 MB rounding:
+    200 contracts x 300 bar dates = 60,000 rows (a rounding-sized fixture would make the
+    private/shared split unreadable rather than wrong)."""
+    from ba2_common.core.interfaces.OptionsDataProviderInterface import OptionEodBar
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    root = str(tmp_path / "ThetaDataOptionsProvider")
+    dates = [d.date() for d in pd.bdate_range("2023-01-03", periods=300)]
+    bars = []
+    for i in range(200):
+        strike = 50.0 + i
+        occ = f"{_BIG_UNDER}{_BIG_EXPIRY:%y%m%d}C{int(round(strike * 1000)):08d}"
+        for j, d in enumerate(dates):
+            bars.append(OptionEodBar(occ_symbol=occ, bar_date=d, open=1.0 + j * 0.01,
+                                     high=1.2 + j * 0.01, low=0.9 + j * 0.01,
+                                     close=1.1 + j * 0.01, volume=10 + j, open_interest=100 + j,
+                                     iv=0.3))
+    OptionHistoryParquetStore(root=root).write_partition(
+        _BIG_UNDER, _BIG_EXPIRY, bars, start=dates[0], end=_BIG_EXPIRY)
+    pq.clear_worker_parquet_options_cache()
+    yield root
+    pq.clear_worker_parquet_options_cache()
+
+
+def test_option_memory_stats_splits_mapped_columns_from_private_projections(big_store_root,
+                                                                           monkeypatch):
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    pq._raw_underlying(big_store_root, _BIG_UNDER)
+
+    st = pq.memory_stats()
+
+    assert st["entries"] == 1
+    assert st["shared_mb"] > 0, "the mapped columns must be visible as the HOST's, not this one's"
+    assert st["private_mb"] > 0, "bar_ord_l + the contract lists are this process's own"
+    assert st["private_mb"] < st["shared_mb"], "4 B/row private against ~64 B/row mapped"
+
+
+def test_option_memory_stats_reports_nothing_shared_on_the_private_path(big_store_root,
+                                                                       monkeypatch):
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "0")
+    pq._raw_underlying(big_store_root, _BIG_UNDER)
+
+    st = pq.memory_stats()
+
+    assert st["shared_mb"] == 0.0, "the escape hatch maps nothing"
+    assert st["private_mb"] > 0
+
+
+def test_release_counts_the_option_caches_it_drops(big_store_root, monkeypatch):
+    """``freed_cache_mb``/``shared_mb`` used to cover the BARS only, so a release of gigabytes
+    of option arrays reported whatever the (possibly empty) bar cache happened to hold."""
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    pq._raw_underlying(big_store_root, _BIG_UNDER)
+    st = pq.memory_stats()
+
+    out = H._worker_release_memory()
+
+    assert out["shared_mb"] >= st["shared_mb"]
+    assert out["freed_cache_mb"] >= st["private_mb"]
+    assert not pq._WORKER_RAW_CACHE

@@ -354,6 +354,7 @@ def _worker_release_memory() -> Dict[str, Any]:
     different problems.
     """
     import gc
+    import importlib
 
     from app.services.backtest import price_source as _ps
     before = 0.0
@@ -365,27 +366,38 @@ def _worker_release_memory() -> Dict[str, Any]:
         # `before`: mapped pages are one copy per HOST, so folding them into a per-process figure
         # would make a 6-worker box look like it holds 6x the data it holds once.
         shared = float(st["bar_cache"]["shared_mb"])
-    except Exception:  # noqa: BLE001
-        pass
+        # The option reader is the OTHER big holder — at the 2020 ThetaData window it dwarfs the
+        # bars — and it was missing from this accounting entirely, so a release of 15 GB of
+        # option arrays reported whatever the bar cache happened to hold.
+        _opt = importlib.import_module("app.services.backtest.parquet_options_provider")
+        _ost = _opt.memory_stats()
+        before += float(_ost["private_mb"])
+        shared += float(_ost["shared_mb"])
+    except Exception as e:  # noqa: BLE001 -- telemetry must never fail a release, but must SAY so
+        _ps._worker_log(f"!! release: memory stats failed: {e!r} - the MB reported below is "
+                        f"incomplete, NOT a measurement of an empty cache")
     _ps.clear_worker_bar_cache()
     _ps.clear_ohlcv_memo()
     # The NAMES are load-bearing and were wrong until 2026-09-14: neither `clear_worker_option_
-    # caches` nor `clear_worker_5m_cache` has ever existed, so the candidate loop below fell
-    # through and the option reader's caches (the biggest single holding a worker has at the
-    # 2020 option window) survived every release the governor ever performed. The real entry
-    # points are these two; options_provider's also clears the PARQUET reader's caches behind
-    # the one seam (see its docstring).
+    # caches` nor `clear_worker_5m_cache` has ever existed, so the lookup below fell through and
+    # the option reader's caches (the biggest single holding a worker has at the 2020 option
+    # window) survived every release the governor ever performed. The real entry points are
+    # these two; options_provider's also clears the PARQUET reader's caches behind the one seam
+    # (see its docstring). There is NO fallback-name list any more: guessing at neighbouring
+    # names is what let a typo look like a working release for months. A name that no longer
+    # resolves is now a loud notice through _worker_log (the pool child's logging is globally
+    # disabled — see _worker_init — so this is the only channel that survives in there).
     for mod, fn in (("app.services.backtest.options_provider", "clear_worker_options_cache"),
                     ("app.services.backtest.results", "clear_worker_5m_bars_cache")):
         try:
-            import importlib
             m = importlib.import_module(mod)
-            for cand in (fn, "clear_worker_bar_cache", "clear_caches"):
-                if hasattr(m, cand):
-                    getattr(m, cand)()
-                    break
-        except Exception:  # noqa: BLE001 -- best effort; never fail a release
-            pass
+            clear = getattr(m, fn, None)
+            if clear is None:
+                _ps._worker_log(f"!! release: {mod}.{fn} is GONE - its caches were NOT cleared")
+                continue
+            clear()
+        except Exception as e:  # noqa: BLE001 -- best effort; never fail a release
+            _ps._worker_log(f"!! release: {mod}.{fn} failed: {e!r}")
     gc.collect()
     try:
         import os as _o
@@ -596,20 +608,34 @@ class _SlotPools:
                 self.busy[i] = None
                 return
 
-    def release_all(self) -> None:
-        """Drop data caches in every slot. Exact, unlike the shared-pool version, which has to
-        oversubscribe and hope each worker picks one up -- here each pool has exactly one worker."""
+    def release_all(self) -> Dict[str, float]:
+        """Drop data caches in every slot and RETURN what they freed, summed over the slots.
+
+        Exact, unlike the shared-pool version, which has to oversubscribe and hope each worker
+        picks one up -- here each pool has exactly one worker.
+
+        The totals are returned rather than discarded because the two halves mean different
+        things to the operator: ``freed_cache_mb`` is memory the box actually got back, while
+        ``shared_mb`` was only ever one copy per HOST (mapped .npy views) and its release frees
+        this process's mappings, not the pages. A release that reports 400 MB private is a
+        different event from one that reports 40 MB private plus 6 GB of dropped views.
+        """
         futs = []
         for pool in self.pools:
             try:
                 futs.append(pool.submit(_worker_release_memory))
             except Exception:  # noqa: BLE001 -- a dead slot must not stop the others
                 pass
+        freed = 0.0
+        shared = 0.0
         for f in futs:
             try:
-                f.result(timeout=120)
+                r = f.result(timeout=120) or {}
+                freed += float(r.get("freed_cache_mb") or 0)
+                shared += float(r.get("shared_mb") or 0)
             except Exception:  # noqa: BLE001
                 pass
+        return {"freed_cache_mb": freed, "shared_mb": shared}
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         for pool in self.pools:
@@ -645,19 +671,28 @@ def _release_pool_memory(pool: Any, n_workers: int, log=logger.warning) -> None:
     every worker gets one. Best-effort by design: a missed worker is flushed at its next preload."""
     if hasattr(pool, "release_all"):
         # Per-slot pools: one release per pool covers every worker exactly (see _SlotPools).
-        pool.release_all()
-        log("released worker caches (per-slot, exact coverage)")
+        got = pool.release_all() or {}
+        log(f"memory governor: released ~{float(got.get('freed_cache_mb') or 0):.0f} MB private "
+            f"(+{float(got.get('shared_mb') or 0):.0f} MB mapped views) of worker caches "
+            f"(per-slot, exact coverage)")
         return
     try:
         futs = [pool.submit(_worker_release_memory) for _ in range(max(1, n_workers) * 3)]
         freed = 0.0
+        shared = 0.0
         for f in futs:
             try:
-                r = f.result(timeout=60)
+                r = f.result(timeout=60) or {}
                 freed += float(r.get("freed_cache_mb") or 0)
+                # PRIVATE and MAPPED are logged apart because only the first is memory the box
+                # got back: the mapped views were one copy per host and their pages are the OS's
+                # to reclaim. Summed into one number, a release that freed almost nothing private
+                # reads as a big win and the governor's next escalation looks unnecessary.
+                shared += float(r.get("shared_mb") or 0)
             except Exception:  # noqa: BLE001
                 pass
-        log(f"memory governor: released ~{freed:.0f} MB of worker caches across the pool")
+        log(f"memory governor: released ~{freed:.0f} MB private (+{shared:.0f} MB mapped views) "
+            f"of worker caches across the pool")
     except Exception as e:  # noqa: BLE001 -- never let a release attempt kill the run
         log(f"memory governor: cache release failed ({type(e).__name__}: {e})")
 

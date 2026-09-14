@@ -226,6 +226,56 @@ if _array.array(_BAR_ORD_TYPECODE).itemsize != 4:  # pragma: no cover - not reac
         "an int32 buffer on this platform")
 
 
+def memory_stats() -> Dict[str, Any]:
+    """Cheap per-process snapshot of what THIS worker's option caches hold, PRIVATE vs MAPPED.
+
+    The counterpart to ``price_source.memory_stats``'s ``bar_cache`` split, and for the same
+    reason: with ``BA2_SHARED_ARRAYS`` on, the columns are views over ``.npy`` files the HOST
+    owns — one copy however many workers map them, and clean pages the OS reclaims under
+    pressure — while the projections every process must build for itself are real allocations.
+    Reported as one number they are indistinguishable, and at the 2020 ThetaData window that is
+    the difference between a worker holding 15.6 GB and a box holding 15.6 GB once.
+
+      * ``private_mb`` — the per-process half: any column that is a real allocation (the
+        ``BA2_SHARED_ARRAYS=0`` path), ``bar_ord_l`` (the ``array('i')`` the bisects read,
+        4 B/row), the ``starts_l``/``stops_l`` lists (one pointer per CONTRACT, not per row),
+        and the overlay greeks arrays — which are always private: they are computed here from
+        this run's spot/rate and depend on nothing on disk.
+      * ``shared_mb`` — columns backed by an ``np.memmap``. ``isinstance(arr.base, np.memmap)``
+        asks the real question rather than ``arr.base is not None``, which a private fancy-index
+        view would also satisfy (see price_source.memory_stats).
+
+    NOT counted: ``c_occ``/``c_index`` and the per-contract python objects. They are per
+    CONTRACT (thousands), not per row (millions), and pricing a python string's true footprint
+    is guesswork — a number that cannot be trusted is worse here than an absent one.
+
+    O(entries x columns) with tiny constants — safe to call per trial or per release.
+    """
+    private = 0
+    shared = 0
+    for raw in list(_WORKER_RAW_CACHE.values()):
+        for name in _RawUnderlying._DIRECT_ARRAYS:
+            arr = getattr(raw, name, None)
+            n = int(getattr(arr, "nbytes", 0) or 0)
+            if isinstance(getattr(arr, "base", None), np.memmap):
+                shared += n
+            else:
+                private += n
+        bol = getattr(raw, "bar_ord_l", None)
+        if bol is not None:
+            private += bol.itemsize * len(bol)
+        for lst in (getattr(raw, "starts_l", None), getattr(raw, "stops_l", None)):
+            if lst is not None:
+                private += 8 * len(lst)      # one pointer per entry; the ints themselves are small
+    for ov in list(_WORKER_UNDERLYING_CACHE.values()):
+        for name in ("_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega"):
+            arr = getattr(ov, name, None)
+            private += int(getattr(arr, "nbytes", 0) or 0)
+    return {"entries": len(_WORKER_RAW_CACHE),
+            "private_mb": round(private / 1048576, 1),
+            "shared_mb": round(shared / 1048576, 1)}
+
+
 def clear_worker_parquet_options_cache() -> None:
     """Drop every cached underlying + ATM-IV result (test isolation / explicit reset)."""
     _WORKER_RAW_CACHE.clear()
