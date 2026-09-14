@@ -1229,7 +1229,7 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
         _old_fd, _new_fd = _sa.ensure_fd_headroom()
         if _new_fd != _old_fd:
             logger.info("worker fd limit: soft %s -> %s (hard %s)",
-                        _old_fd, _new_fd, _sa._fd_limits()[1])
+                        _old_fd, _new_fd, _sa.fd_limits()[1])
     except Exception as e:  # noqa: BLE001 -- a soft limit must never stop the service starting
         logger.warning("worker fd limit: could not raise RLIMIT_NOFILE: %r", e)
     _sweep_orphaned_spawn_children()

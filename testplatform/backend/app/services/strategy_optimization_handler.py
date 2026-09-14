@@ -144,7 +144,7 @@ def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
         _old_fd, _new_fd = _sa.ensure_fd_headroom()
         if _new_fd != _old_fd:
             _worker_log(f"worker fd limit: soft {_old_fd} -> {_new_fd} "
-                        f"(hard {_sa._fd_limits()[1]})")
+                        f"(hard {_sa.fd_limits()[1]})")
     except Exception as e:  # noqa: BLE001 -- best effort; never fail a worker over a soft limit
         _worker_log(f"!! worker fd limit: could not raise RLIMIT_NOFILE: {e!r}")
     # Point ba2_common's DB at the SAME test DB the master uses, so THIS pool worker's
@@ -337,8 +337,15 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # data/config problem that affects EVERY trial, not a bad genome. It also has to abort
         # fast — opt 255 spent 8h with all four workers blocked in the FMP rate gate, having
         # completed zero trials, because a breach merely made each trial slow instead of failing.
+        # SharedArrayFdExhausted joins them: this worker cannot open another mapping, so every
+        # remaining trial it is handed fails identically. Scored as an ordinary failure it
+        # becomes ZERO_TRADE_SENTINEL fitness and the GA happily finishes, reporting a winner
+        # chosen among whichever genomes were not unlucky enough to land on a starved worker.
+        # Matched by NAME, like the others, so this module does not import ba2_common just to
+        # classify an error (see ba2_common.core.shared_arrays.SharedArrayFdExhausted).
         fatal = type(e).__name__ in (
-            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation")
+            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
+            "SharedArrayFdExhausted")
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
                 "fatal": fatal, "mem": _trial_memory_snapshot()}
 

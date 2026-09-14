@@ -43,9 +43,10 @@ limit of 1024: on remote227 (2026-09-14) a worker sat at 1014 open fds, the next
 raised EMFILE, ``_try_open`` read that as "not usable" and ``build_or_open`` REBUILT a 7 GB set
 under the lock while 27 of 30 workers slept in the wait loop -- the grid stalled with nothing in
 the logs. Two guards came out of that, and both are load-bearing: ``ensure_fd_headroom()``
-raises the soft limit to the hard one on every process that constructs a store, and ``_try_open``
-now RE-RAISES resource exhaustion instead of reporting "absent", because rebuilding cannot make
-descriptors appear.
+raises the soft limit to the hard one on every process that constructs a store, and every open
+path in here -- the marker read, the array mapping, the O_EXCL build lock -- re-raises resource
+exhaustion as ``SharedArrayFdExhausted`` instead of reporting "absent" or "busy", because
+rebuilding cannot make descriptors appear and waiting for a lock nobody holds is a hot spin.
 
 ESCAPE HATCH. ``BA2_SHARED_ARRAYS=0`` -> ``build_or_open`` returns ``build_fn()`` directly
 (private arrays, nothing written): the pre-2026-09-14 behaviour, and what every parity test
@@ -150,8 +151,11 @@ def ensure_fd_headroom(needed: int = 0) -> Tuple[int, int]:
     return (soft, target)
 
 
-def _fd_limits() -> Tuple[object, object]:
-    """``(soft, hard)`` RLIMIT_NOFILE, or ``("n/a", "n/a")`` off POSIX. Diagnostics only."""
+def fd_limits() -> Tuple[object, object]:
+    """``(soft, hard)`` RLIMIT_NOFILE, or ``("n/a", "n/a")`` off POSIX. Diagnostics only.
+
+    Public because the worker startup paths log it next to what ``ensure_fd_headroom`` did.
+    """
     try:
         import resource
         return resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -160,11 +164,50 @@ def _fd_limits() -> Tuple[object, object]:
 
 
 def _open_fd_count() -> object:
-    """How many descriptors this process holds, or ``"?"`` if the platform will not say."""
+    """How many descriptors this process holds, or ``"?"`` if the platform will not say.
+
+    ``"?"`` off Linux (no ``/proc/self/fd``) -- AND, ironically, sometimes in the very case
+    this exists to describe: ``listdir`` needs a descriptor of its own, so a process wedged at
+    exactly its limit can fail to count them. A missing number is not evidence of a healthy
+    process; the errno that got us here is.
+    """
     try:
         return len(os.listdir("/proc/self/fd"))
     except OSError:
         return "?"
+
+
+class SharedArrayFdExhausted(RuntimeError):
+    """This process cannot open another file/mapping (EMFILE/ENFILE/ENOMEM).
+
+    A distinct type because the ANSWER is distinct. Everything else this module refuses is a
+    per-set problem with a per-set remedy (rebuild it); this one is a process/host problem, and
+    every consumer that retries, rebuilds or falls back makes it worse. The GA's trial worker
+    keys on the class NAME to mark a run fatal, so do not rename it without looking there
+    (``strategy_optimization_handler._trial_worker``). Subclasses RuntimeError so the handlers
+    that predate it still catch it.
+    """
+
+
+def _raise_if_exhausted(exc: OSError, path: PathLike) -> None:
+    """Re-raise ``exc`` as ``SharedArrayFdExhausted`` if it is resource exhaustion; else return.
+
+    Called at EVERY point in this module where a starved process can fail a syscall: the
+    marker read, the array mapping, and the O_EXCL build lock. Missing any one of them puts
+    exhaustion back into a code path that answers it with a rebuild or a wait -- the marker
+    read read EMFILE as "no marker, rebuild it", and the lock read it as "somebody else is
+    building", which is worse: ``build_or_open`` then finds no lock to wait on and spins
+    through the outer loop with no sleep for 2 x LOCK_STALE_S.
+    """
+    if exc.errno not in (errno.EMFILE, errno.ENFILE, errno.ENOMEM):
+        return
+    soft, hard = fd_limits()
+    raise SharedArrayFdExhausted(
+        f"shared_arrays: cannot map {path}: {exc} -- the process is out of file "
+        f"descriptors/mappings (RLIMIT_NOFILE soft={soft}, hard={hard}, open "
+        f"fds~{_open_fd_count()}); rebuilding would not help. Raise the limit "
+        "(ensure_fd_headroom / systemd LimitNOFILE) or shrink the working set."
+    ) from exc
 
 
 def enabled() -> bool:
@@ -384,7 +427,8 @@ class DerivedArrayStore:
         design -- a read-only tree, or a concurrent evictor that has just renamed the marker
         aside, must not turn an open that WORKED into a rebuild.
 
-        RESOURCE EXHAUSTION IS THE ONE FAILURE THAT RAISES. EMFILE/ENFILE/ENOMEM say "this
+        RESOURCE EXHAUSTION IS THE ONE FAILURE THAT RAISES, on the marker read as much as on
+        the mapping (see ``_raise_if_exhausted``). EMFILE/ENFILE/ENOMEM say "this
         process cannot map anything more", not "the set is missing", and the caller's rebuild
         answer is actively harmful there: it takes the build lock, spends a multi-GB rebuild
         that fails the same way, and parks every other worker in the lock-wait loop behind it
@@ -395,7 +439,10 @@ class DerivedArrayStore:
         marker = final / DONE_MARKER
         try:
             names = json.loads(marker.read_text(encoding="utf-8"))["arrays"]
-        except (OSError, ValueError, KeyError, TypeError):
+        except OSError as e:
+            _raise_if_exhausted(e, marker)      # a marker we cannot OPEN is not a missing one
+            return None
+        except (ValueError, KeyError, TypeError):
             return None
         out: ArrayDict = {}
         for name in names:
@@ -403,14 +450,7 @@ class DerivedArrayStore:
             try:
                 arr = np.load(p, mmap_mode="r")
             except OSError as e:
-                if e.errno in (errno.EMFILE, errno.ENFILE, errno.ENOMEM):
-                    soft, hard = _fd_limits()
-                    raise RuntimeError(
-                        f"shared_arrays: cannot map {p}: {e} -- the process is out of file "
-                        f"descriptors/mappings (RLIMIT_NOFILE soft={soft}, hard={hard}, open "
-                        f"fds~{_open_fd_count()}); rebuilding would not help. Raise the limit "
-                        "(ensure_fd_headroom / systemd LimitNOFILE) or shrink the working set."
-                    ) from e
+                _raise_if_exhausted(e, p)
                 return None
             except ValueError:
                 return None
@@ -689,7 +729,14 @@ class DerivedArrayStore:
             self._evict_dir(d, wait_s=0.0)  # housekeeping never waits on another evictor
 
     def _acquire(self, lock: Path) -> bool:
-        """Take the O_EXCL build lock, breaking it first if it is older than LOCK_STALE_S."""
+        """Take the O_EXCL build lock, breaking it first if it is older than LOCK_STALE_S.
+
+        False means "not mine to build" and every caller waits on it -- so a process that
+        cannot open a file AT ALL must not report False. ``build_or_open`` would then look for
+        the lock it is supposedly waiting on, not find it, break out of the wait loop, and
+        re-enter the outer loop with no sleep on any branch: a hot spin until the 2 x
+        LOCK_STALE_S guard fires half an hour later. Exhaustion raises instead.
+        """
         while True:
             try:
                 fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -700,10 +747,12 @@ class DerivedArrayStore:
                     lock.unlink()
                 except FileNotFoundError:
                     continue                # somebody else broke it; race for it again
-                except OSError:
+                except OSError as e:
+                    _raise_if_exhausted(e, lock)
                     return False
                 continue
-            except OSError:
+            except OSError as e:
+                _raise_if_exhausted(e, lock)
                 return False
             with os.fdopen(fd, "w") as f:
                 f.write(str(os.getpid()))

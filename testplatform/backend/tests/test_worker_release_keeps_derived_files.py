@@ -19,6 +19,7 @@ symptoms visible in the master.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 from datetime import date, datetime
 from pathlib import Path
@@ -480,7 +481,15 @@ def test_release_counts_the_option_caches_it_drops(big_store_root, monkeypatch):
 class _FakeResource:
     """Stand-in for the POSIX ``resource`` module. Injected into ``sys.modules`` rather than
     skipped off POSIX: the limit arithmetic is the thing under test and it must be exercised on
-    the machine this is developed on, not only on the Linux box it was written for."""
+    the machine this is developed on, not only on the Linux box it was written for.
+
+    THE RISK THIS CARRIES: while it is installed it is visible to EVERY importer, so anything
+    else that does ``import resource`` during the call under test gets this object. That is
+    tolerable only because the window is one synchronous call and ``resource`` has exactly one
+    consumer in this tree (ensure_fd_headroom). On a real POSIX host it also SHADOWS the real
+    module for that window -- which is the point: the assertion is then about our arithmetic
+    and not about whatever limit the developer's shell happened to set.
+    """
 
     RLIMIT_NOFILE = 7
     RLIM_INFINITY = -1
@@ -497,8 +506,31 @@ class _FakeResource:
         self.limits = (pair[0], self.limits[1])
 
 
-def test_worker_init_raises_the_fd_limit_and_reports_the_change(worker_log, monkeypatch):
+@contextlib.contextmanager
+def _worker_init_contained():
+    """Run ``_worker_init`` without letting its PROCESS-WIDE side effects outlive the test.
+
+    It is a pool-child initializer, so it is written to reshape the whole process: it chdirs,
+    installs ``logging.disable(ERROR)`` and pins the ``ba2_*`` logger levels to WARNING. In a
+    pytest session that would silently gag every later test in the file (and any assertion that
+    reads a log), and leave the cwd wherever ``_BACKEND_DIR`` points.
+    """
     import logging
+
+    names = ("ba2_common", "ba2_providers", "ba2_experts", "app.services.backtest")
+    cwd = os.getcwd()
+    prev_disable = logging.root.manager.disable
+    levels = {n: logging.getLogger(n).level for n in names}
+    try:
+        yield
+    finally:
+        logging.disable(prev_disable)
+        for n, lvl in levels.items():
+            logging.getLogger(n).setLevel(lvl)
+        os.chdir(cwd)
+
+
+def test_worker_init_raises_the_fd_limit_and_reports_the_change(worker_log, monkeypatch):
     import sys
 
     import app.models.database as _dbmod
@@ -510,11 +542,8 @@ def test_worker_init_raises_the_fd_limit_and_reports_the_change(worker_log, monk
     monkeypatch.setattr(_dbmod, "DATABASE_URL", "postgresql://none/none", raising=False)
     for k in ("BA2_FILE_LOGGING", "BA2_STDOUT_LOGGING"):
         monkeypatch.setenv(k, os.environ.get(k, ""))
-    prev_disable = logging.root.manager.disable
-    try:
+    with _worker_init_contained():
         H._worker_init(H._BACKEND_DIR, {})
-    finally:
-        logging.disable(prev_disable)
 
     assert fake.calls == [(4096, 4096)], "raise the soft limit to the hard one"
     assert any("fd limit" in m and "1024 -> 4096" in m for m in worker_log), worker_log
@@ -532,11 +561,45 @@ def test_worker_init_says_nothing_when_the_limit_is_already_high(worker_log, mon
     monkeypatch.setattr(_dbmod, "DATABASE_URL", "postgresql://none/none", raising=False)
     for k in ("BA2_FILE_LOGGING", "BA2_STDOUT_LOGGING"):
         monkeypatch.setenv(k, os.environ.get(k, ""))
-    prev_disable = logging.root.manager.disable
-    try:
+    with _worker_init_contained():
         H._worker_init(H._BACKEND_DIR, {})
-    finally:
-        logging.disable(prev_disable)
 
     assert fake.calls == []
     assert not any("fd limit" in m for m in worker_log), worker_log
+
+
+# --------------------------------------------------------------------------------------------
+# 9. A host that cannot raise its limit must ABORT the run, not finish it
+#
+# SharedArrayFdExhausted is a data/host problem, not a bad genome: every remaining trial on that
+# worker hits it. Scored as an ordinary failure it becomes ZERO_TRADE_SENTINEL fitness, and the
+# GA then reports a confident winner chosen among the genomes that happened to dodge a starved
+# worker. `fatal` is what makes handle_strategy_optimization raise _FatalTrialError instead.
+# --------------------------------------------------------------------------------------------
+def _trial_raising(monkeypatch, exc):
+    import app.services.backtest.daily_backtest_handler as dbh
+
+    def boom(config, progress_cb=None):
+        raise exc
+
+    monkeypatch.setattr(dbh, "run_daily_backtest", boom)
+    return H._trial_worker({"symbols": ["AAA"]}, "calmar")
+
+
+def test_a_descriptor_exhausted_trial_is_fatal(monkeypatch):
+    from ba2_common.core.shared_arrays import SharedArrayFdExhausted
+
+    out = _trial_raising(monkeypatch, SharedArrayFdExhausted(
+        "shared_arrays: cannot map /x/close.npy: [Errno 24] Too many open files -- the process "
+        "is out of file descriptors/mappings"))
+
+    assert out["fatal"] is True and out["ok"] is False
+    assert "Too many open files" in out["error"]
+
+
+def test_an_ordinary_trial_failure_is_still_not_fatal(monkeypatch):
+    """The contrast that gives the assertion above its meaning: a bad genome must NOT abort a
+    run -- that is what scoring it 0 and moving on is for."""
+    out = _trial_raising(monkeypatch, ValueError("nonsense parameter combination"))
+
+    assert out["fatal"] is False and out["ok"] is False

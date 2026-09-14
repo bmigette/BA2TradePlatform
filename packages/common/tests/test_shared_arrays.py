@@ -894,3 +894,80 @@ def test_a_missing_array_file_is_rebuilt(tmp_path):
     np.testing.assert_array_equal(again["close"], _arrays()["close"])
     del again
     gc.collect()
+
+
+# --------------------------------------------------------------------------------------------
+# Exhaustion on the OTHER open paths (review round 1). ``np.load`` is not the only syscall a
+# starved process makes in here: the marker read opens a file, and taking the build lock opens
+# one with O_EXCL. Left as they were, the first turned EMFILE into "no marker -> rebuild" and
+# the second into "somebody else holds the lock" -- and that second one is worse than a rebuild,
+# because build_or_open then finds NO lock file to wait on, breaks straight out of the wait
+# loop, and re-enters the outer loop with no sleep anywhere: a hot spin for 2 x LOCK_STALE_S.
+# --------------------------------------------------------------------------------------------
+def test_emfile_reading_the_marker_is_loud_and_never_rebuilds(tmp_path, monkeypatch):
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    calls = []
+
+    def build():
+        calls.append(1)
+        return _arrays()
+
+    got = store.build_or_open("AAPL", [src], build)
+    del got
+    gc.collect()
+
+    def boom(self, *a, **k):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+
+    with pytest.raises(SA.SharedArrayFdExhausted) as ei:
+        store.build_or_open("AAPL", [src], build)
+
+    assert "file descriptors" in str(ei.value)
+    assert calls == [1], "an unreadable marker is a rebuild; an unREADABLE-AT-ALL process is not"
+    assert not (store.key_dir("AAPL") / (store.signature([src]) + ".lock")).exists()
+
+
+def test_emfile_taking_the_build_lock_raises_instead_of_spinning(tmp_path, monkeypatch):
+    """The nastiest shape of the bug: _acquire's False means "someone else is building", and
+    nothing else in the loop sleeps when the lock it is waiting for does not exist."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    calls = []
+
+    def build():
+        calls.append(1)
+        return _arrays()
+
+    def boom(*a, **k):
+        raise OSError(errno.ENFILE, "Too many open files in system")
+
+    monkeypatch.setattr(os, "open", boom)
+    # So a REGRESSION fails this test in half a second instead of hanging it for the full
+    # 2 x LOCK_STALE_S (30 min by default) that the bug spins for.
+    monkeypatch.setattr(SA, "LOCK_STALE_S", 0.2)
+
+    t0 = time.monotonic()
+    with pytest.raises(SA.SharedArrayFdExhausted):
+        store.build_or_open("AAPL", [src], build)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 1.0, f"must fail immediately, not spin: took {elapsed:.1f}s"
+    assert calls == [], "nothing may be built without the lock"
+
+
+def test_acquire_reports_busy_for_every_other_oserror(tmp_path, monkeypatch):
+    """Only exhaustion changes: a read-only tree or a vanished directory still reads as "not
+    mine to build", which is what keeps a degraded host from stampeding."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    lock = tmp_path / "nope" / "sig.lock"
+
+    monkeypatch.setattr(os, "open", lambda *a, **k: (_ for _ in ()).throw(
+        OSError(errno.EACCES, "Permission denied")))
+    assert store._acquire(lock) is False
+
+
+def test_fd_exhausted_is_a_runtimeerror_so_old_handlers_still_catch_it():
+    assert issubclass(SA.SharedArrayFdExhausted, RuntimeError)
