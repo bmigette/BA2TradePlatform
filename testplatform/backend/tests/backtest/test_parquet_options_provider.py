@@ -20,6 +20,7 @@ import inspect
 import os
 from datetime import date, datetime
 
+import numpy as np
 import pytest
 
 from ba2_common.core.interfaces.OptionsDataProviderInterface import OptionEodBar
@@ -714,3 +715,92 @@ def test_a_no_trade_day_is_marked_at_the_quote_not_at_zero(quoted_store_root):
     q = p.get_quote(_C100, date(2023, 1, 5))
     assert (q.bid, q.ask) == (pytest.approx(55.10), pytest.approx(56.20)), (
         "get_quote and get_chain must price identically (options_provider bug B4)")
+
+
+# --------------------------------------------------------------------------- #
+# THE SHARED-ARRAY SEAM. A `_RawUnderlying` is two separable halves: numeric columns that
+# depend on nothing but the parquet bytes (so several worker processes can memory-map ONE
+# copy) and the python list/dict projections the hot paths index, which are per-process by
+# construction. `arrays_from_frame` produces the first half as a plain dict of 1-D numeric
+# arrays; `from_arrays` rebuilds the whole object from it. Nothing here changes what a reader
+# answers -- it is the shape a per-host derived array store can plug into.
+# --------------------------------------------------------------------------- #
+_ARRAY_ATTRS = ("bar_ord", "open", "high", "low", "close", "volume", "open_interest",
+                "vendor_iv", "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord",
+                "c_is_call")
+
+
+def _assert_same_raw(a, b):
+    for name in _ARRAY_ATTRS:
+        np.testing.assert_array_equal(getattr(a, name), getattr(b, name))
+        assert getattr(a, name).dtype == getattr(b, name).dtype, name
+    assert a.c_occ == b.c_occ and a.c_index == b.c_index and a.bar_ord_l == b.bar_ord_l
+    assert a.starts_l == b.starts_l and a.stops_l == b.stops_l
+    assert a.c_expiry_ord_l == b.c_expiry_ord_l and a.c_expiry_iso == b.c_expiry_iso
+    assert a.c_expiry_date == b.c_expiry_date and a.c_strike_f == b.c_strike_f
+    assert a.c_right == b.c_right and a.c_type_str == b.c_type_str
+    assert a.has_quotes == b.has_quotes and a.n_rows == b.n_rows
+    assert a.iso_of_ord == b.iso_of_ord and a.date_of_ord == b.date_of_ord
+    assert a.underlying == b.underlying
+
+
+def test_raw_underlying_round_trips_through_its_array_dict(store_root):
+    """The numeric arrays a _RawUnderlying is built from are a plain dict of 1-D numeric arrays,
+    and building from that dict gives the identical object -- the seam the shared store plugs
+    into. Only what a memory-mapped .npy can hold may appear in the dict: no object arrays."""
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    df = OptionHistoryParquetStore(root=store_root).read_underlying(_UNDER)
+    arrays = pq._RawUnderlying.arrays_from_frame(df)
+    assert set(arrays) == set(pq._RawUnderlying.ARRAY_NAMES)
+    for name, arr in arrays.items():
+        assert isinstance(arr, np.ndarray), name
+        assert arr.ndim == 1 and arr.dtype != object, name
+        assert arr.flags.c_contiguous, name
+
+    a = pq._RawUnderlying(_UNDER, df)
+    b = pq._RawUnderlying.from_arrays(_UNDER, arrays)
+    _assert_same_raw(a, b)
+
+    # the interning survives the rebuild: ~82 distinct ordinals, not one int object per row
+    assert len({id(v) for v in b.bar_ord_l}) == len(set(b.bar_ord_l))
+
+
+def test_empty_frame_arrays_have_the_documented_dtypes():
+    """A store with no rows for an underlying still produces the full array set, so a derived
+    store never has to special-case it -- and the empty arrays carry the SAME dtypes as the
+    populated ones, or a memory-mapped rebuild would silently change an int column to float."""
+    arrays = pq._RawUnderlying.arrays_from_frame(None)
+    assert set(arrays) == set(pq._RawUnderlying.ARRAY_NAMES)
+    expected = {
+        "bar_ord": np.int32, "starts": np.int32, "stops": np.int32, "c_expiry_ord": np.int32,
+        "open": np.float64, "high": np.float64, "low": np.float64, "close": np.float64,
+        "volume": np.float64, "open_interest": np.float64, "vendor_iv": np.float64,
+        "bid": np.float64, "ask": np.float64, "c_strike": np.float64,
+        "c_is_call": np.bool_, "c_occ_utf8": np.uint8, "has_quotes": np.bool_,
+    }
+    for name, dt in expected.items():
+        assert arrays[name].dtype == np.dtype(dt), f"{name}: {arrays[name].dtype}"
+        assert arrays[name].size == (1 if name == "has_quotes" else 0), name
+    assert arrays["has_quotes"][0] == False  # noqa: E712 -- it is the array's value, not truthiness
+
+    empty = pq._RawUnderlying.from_arrays(_UNDER, arrays)
+    _assert_same_raw(pq._RawUnderlying(_UNDER, None), empty)
+    assert empty.n_rows == 0 and empty.c_occ == [] and empty.has_quotes is False
+
+
+def test_quoted_store_round_trips_its_real_bid_ask_through_the_array_dict(quoted_store_root):
+    """A ThetaData-shaped store carries real NBBO, so `has_quotes` and the bid/ask columns are
+    part of what a shared store must ship -- a rebuild that lost them would silently revert the
+    run to the zero-spread close proxy."""
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    df = OptionHistoryParquetStore(root=quoted_store_root).read_underlying(_UNDER)
+    arrays = pq._RawUnderlying.arrays_from_frame(df)
+    assert arrays["has_quotes"].tolist() == [True]
+
+    a = pq._RawUnderlying(_UNDER, df)
+    b = pq._RawUnderlying.from_arrays(_UNDER, arrays)
+    assert a.has_quotes is True and b.has_quotes is True
+    _assert_same_raw(a, b)
+    assert not np.all(np.isnan(b.bid)) and not np.all(np.isnan(b.ask))

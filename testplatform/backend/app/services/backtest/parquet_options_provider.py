@@ -234,71 +234,100 @@ class _RawUnderlying:
         "vendor_iv", "iso_of_ord", "date_of_ord", "bid", "ask", "has_quotes",
     )
 
-    def __init__(self, underlying: str, df):
-        self.underlying = underlying
-        self.iso_of_ord: Dict[int, str] = {}
-        self.date_of_ord: Dict[int, date] = {}
+    #: THE SHAREABLE HALF, COMPLETE. An underlying splits cleanly in two: numeric columns that
+    #: depend on nothing but the parquet bytes, and the python list/dict projections below,
+    #: which every process has to own. Only the first half can be memory-mapped, so
+    #: ``ARRAY_NAMES`` is the contract with a per-host derived array store: 1-D,
+    #: numeric-or-bool, NEVER object. ``arrays_from_frame`` produces exactly these names,
+    #: ``from_arrays`` consumes exactly these names, and the store in between knows nothing
+    #: about this class. Two entries are ENCODINGS rather than columns, because the contract
+    #: admits no others:
+    #:   * ``c_occ_utf8`` -- the contract symbols, newline-joined and UTF-8 encoded to uint8.
+    #:     They are strings (an object array, which a ``.npy`` mapping refuses) and each
+    #:     process needs its own list + index dict anyway; the bytes are the cheap part.
+    #:   * ``has_quotes`` -- a 1-element bool array, because a scalar is not an array.
+    ARRAY_NAMES = (
+        "bar_ord", "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
+        "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord", "c_is_call",
+        "c_occ_utf8", "has_quotes",
+    )
 
+    #: The ARRAY_NAMES that bind straight onto the identically-named slots the hot paths read.
+    #: (The two encodings above are decoded into ``c_occ`` / ``has_quotes`` instead.)
+    _DIRECT_ARRAYS = (
+        "bar_ord", "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
+        "bid", "ask", "starts", "stops", "c_strike", "c_expiry_ord", "c_is_call",
+    )
+
+    @staticmethod
+    def arrays_from_frame(df) -> Dict[str, np.ndarray]:
+        """The parquet frame -> the shareable numeric half, as a plain dict of 1-D arrays.
+
+        This is the expensive part of a cold load (the parquet read plus
+        ``_iso_to_ordinal_array``'s per-row ``date.fromisoformat`` loop) and it is a pure
+        function of the bytes, which is what makes the result shareable at all.
+
+        The ``priceless`` invariant is checked HERE rather than in the binder: it is a fact
+        about the STORE, so it is answered once when the arrays are built, not once per
+        process that opens them.
+        """
         if df is None or not len(df):
-            self.n_rows = 0
-            self.c_occ = []
-            self.c_index = {}
-            self.c_strike_f = []
-            self.c_expiry_date = []
-            self.c_expiry_iso = []
-            self.c_type_str = []
-            self.c_right = []
-            self.c_expiry_ord_l = []
-            self.starts_l = []
-            self.stops_l = []
-            self.bar_ord_l = []
-            self.has_quotes = False
-            for name in ("c_strike", "c_expiry_ord", "c_is_call", "starts", "stops", "bar_ord",
-                         "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
-                         "bid", "ask"):
-                setattr(self, name, np.empty(0))
-            return
+            arrays: Dict[str, np.ndarray] = {
+                name: np.empty(0, dtype="float64")
+                for name in ("open", "high", "low", "close", "volume", "open_interest",
+                             "vendor_iv", "bid", "ask", "c_strike")
+            }
+            # int32/bool deliberately, NOT np.empty(0)'s default float64: an empty underlying
+            # must present the same dtypes as a populated one, or a rebuild through the store
+            # would silently change an ordinal column's type.
+            for name in ("bar_ord", "starts", "stops", "c_expiry_ord"):
+                arrays[name] = np.empty(0, dtype=np.int32)
+            arrays["c_is_call"] = np.empty(0, dtype=bool)
+            arrays["c_occ_utf8"] = np.empty(0, dtype=np.uint8)
+            arrays["has_quotes"] = np.array([False], dtype=bool)
+            return arrays
 
         df = df.sort_values(["occ_symbol", "bar_date"], kind="mergesort").reset_index(drop=True)
         occ = df["occ_symbol"].astype(str).to_numpy(dtype=object)
         n = len(occ)
-        self.n_rows = n
 
         is_new = np.empty(n, dtype=bool)
         is_new[0] = True
         if n > 1:
             is_new[1:] = occ[1:] != occ[:-1]
         starts = np.flatnonzero(is_new).astype(np.int32)
-        self.starts = starts
-        self.stops = np.append(starts[1:], np.int32(n)).astype(np.int32)
 
-        self.c_occ = [str(s) for s in occ[starts]]
-        self.c_index = {s: i for i, s in enumerate(self.c_occ)}
-        self.c_strike = df["strike"].to_numpy(dtype="float64")[starts]
-        self.c_expiry_ord = _iso_to_ordinal_array(df["expiry"].to_numpy(dtype=object)[starts])
-        self.c_is_call = (df["option_type"].astype(str).to_numpy(dtype=object)[starts]
-                          == OptionRight.CALL.value)
-
-        self.bar_ord = _iso_to_ordinal_array(df["bar_date"].to_numpy(dtype=object))
+        c_occ = [str(s) for s in occ[starts]]
+        arrays = {
+            "starts": starts,
+            "stops": np.append(starts[1:], np.int32(n)).astype(np.int32),
+            "c_occ_utf8": np.frombuffer("\n".join(c_occ).encode("utf-8"), dtype=np.uint8),
+            "c_strike": df["strike"].to_numpy(dtype="float64")[starts],
+            "c_expiry_ord": _iso_to_ordinal_array(df["expiry"].to_numpy(dtype=object)[starts]),
+            "c_is_call": (df["option_type"].astype(str).to_numpy(dtype=object)[starts]
+                          == OptionRight.CALL.value),
+            "bar_ord": _iso_to_ordinal_array(df["bar_date"].to_numpy(dtype=object)),
+            "vendor_iv": df["iv"].to_numpy(dtype="float64", na_value=np.nan),
+            # volume/open_interest are pandas Int64 (nullable). float64 + nan keeps "absent"
+            # distinguishable from a recorded 0, which is a fact about a strike nobody trades.
+            "volume": df["volume"].to_numpy(dtype="float64", na_value=np.nan),
+            "open_interest": df["open_interest"].to_numpy(dtype="float64", na_value=np.nan),
+        }
         for col in ("open", "high", "low", "close"):
-            setattr(self, col, df[col].to_numpy(dtype="float64", na_value=np.nan))
-        self.vendor_iv = df["iv"].to_numpy(dtype="float64", na_value=np.nan)
-        # volume/open_interest are pandas Int64 (nullable). float64 + nan keeps "absent"
-        # distinguishable from a recorded 0, which is a fact about a strike nobody trades.
-        self.volume = df["volume"].to_numpy(dtype="float64", na_value=np.nan)
-        self.open_interest = df["open_interest"].to_numpy(dtype="float64", na_value=np.nan)
+            arrays[col] = df[col].to_numpy(dtype="float64", na_value=np.nan)
 
         # REAL QUOTES, when the store has them. The TastyTrade tree predates the bid/ask
         # columns entirely and its partitions do not carry them; ThetaData's do. Absent
         # columns => all-NaN => `contract()` falls back to the historical zero-spread close
         # proxy, so a TastyTrade-backed run is byte-identical to before this existed.
-        self.has_quotes = "bid" in df.columns and "ask" in df.columns
-        if self.has_quotes:
-            self.bid = df["bid"].to_numpy(dtype="float64", na_value=np.nan)
-            self.ask = df["ask"].to_numpy(dtype="float64", na_value=np.nan)
+        has_quotes = "bid" in df.columns and "ask" in df.columns
+        arrays["has_quotes"] = np.array([has_quotes], dtype=bool)
+        if has_quotes:
+            arrays["bid"] = df["bid"].to_numpy(dtype="float64", na_value=np.nan)
+            arrays["ask"] = df["ask"].to_numpy(dtype="float64", na_value=np.nan)
         else:
-            self.bid = np.full(n, np.nan)
-            self.ask = np.full(n, np.nan)
+            arrays["bid"] = np.full(n, np.nan)
+            arrays["ask"] = np.full(n, np.nan)
 
         # INVARIANT: every stored row has a price -- a trade close, or a quote, or both. A row
         # with neither cannot be priced, and (per option_selector.passes_liquidity) a contract
@@ -307,23 +336,58 @@ class _RawUnderlying:
         # them once per underlying rather than per contract, so a store that violates the
         # invariant says so loudly instead of quietly mis-selecting.
         priceless = int(np.count_nonzero(
-            np.isnan(self.close) & np.isnan(self.bid) & np.isnan(self.ask)))
+            np.isnan(arrays["close"]) & np.isnan(arrays["bid"]) & np.isnan(arrays["ask"])))
         if priceless:
+            # The symbol comes from the FRAME (the store writes an ``underlying`` column,
+            # already upper-cased) rather than from a constructor argument, because this
+            # check belongs to the build and the build takes only the frame. Guarded so a
+            # malformed store cannot turn the complaint about it into a KeyError.
+            symbol = (str(df["underlying"].iloc[0]) if "underlying" in df.columns
+                      else "<no underlying column>")
             logger.error(
                 "%s: %d of %d option bar rows have NO price at all (no close, no bid, no "
                 "ask). These cannot be marked or liquidity-gated. The store is malformed -- "
-                "re-warm this underlying.", underlying, priceless, n)
+                "re-warm this underlying.", symbol, priceless, n)
+        return arrays
 
-        # -- native-Python projections, built once (measured 1.5 ms for GOOG's 27,974 rows /
-        #    1,374 contracts, against a ~130 ms parquet read) ------------------------------
-        # bar_ord as a LIST as well as an array: the as-of clamp is a bisect, and
-        # ``bisect_right(list, x, lo, hi)`` is 0.051 us against 0.73 us for
-        # ``np.searchsorted(arr[lo:hi], x)`` (which allocates a view and pays numpy's call
-        # overhead). get_chain runs that clamp ONCE PER CONTRACT — 1,374 times for GOOG — and
-        # get_atm_iv once per contract in the DTE band, so it is not a micro-optimisation.
-        # INTERNED (setdefault) because there are ~82 distinct ordinals here, not 27,974: a
-        # plain ``.tolist()`` would allocate 27,974 separate int objects (+0.9 MB/underlying,
-        # ~30% on top of the columnar arrays) to hold 82 distinct values.
+    @classmethod
+    def from_arrays(cls, underlying: str, arrays: Dict[str, np.ndarray]) -> "_RawUnderlying":
+        """Rebuild an underlying from an ARRAY_NAMES dict the caller already holds.
+
+        The dict may be memory-mapped and shared with other worker processes; everything this
+        adds on top of it is per-process by construction (see ``_bind``).
+        """
+        self = cls.__new__(cls)
+        self._bind(underlying, arrays)
+        return self
+
+    def __init__(self, underlying: str, df):
+        self._bind(underlying, self.arrays_from_frame(df))
+
+    def _bind(self, underlying: str, arrays: Dict[str, np.ndarray]) -> None:
+        """Bind the shared arrays, then derive the per-process projections from them.
+
+        WHY THE PROJECTIONS STAY PYTHON LISTS. They are not a convenience copy of the arrays:
+        the as-of clamp is a ``bisect``, and ``bisect_right(list, x, lo, hi)`` is 0.051 us
+        against 0.73 us for ``np.searchsorted(arr[lo:hi], x)`` (which allocates a view and
+        pays numpy's call overhead). get_chain runs that clamp ONCE PER CONTRACT -- 1,374
+        times for GOOG -- and get_atm_iv once per contract in the DTE band. Nor could they be
+        shared if one wanted to: a list of python ints is not a mappable buffer. Measured
+        1.5 ms for GOOG's 27,974 rows / 1,374 contracts, against a ~130 ms parquet read.
+        """
+        self.underlying = underlying
+        for name in self._DIRECT_ARRAYS:
+            setattr(self, name, arrays[name])
+        self.has_quotes = bool(arrays["has_quotes"][0])
+        occ_utf8 = arrays["c_occ_utf8"]
+        self.c_occ = bytes(occ_utf8).decode("utf-8").split("\n") if occ_utf8.size else []
+        self.c_index = {s: i for i, s in enumerate(self.c_occ)}
+        self.n_rows = int(len(self.bar_ord))
+
+        # bar_ord as a LIST as well as an array, INTERNED (setdefault) because there are ~82
+        # distinct ordinals here, not 27,974: a plain ``.tolist()`` would allocate 27,974
+        # separate int objects (+0.9 MB/underlying, ~30% on top of the columnar arrays) to
+        # hold 82 distinct values.
         seen: Dict[int, int] = {}
         self.bar_ord_l = [seen.setdefault(v, v) for v in self.bar_ord.tolist()]
         self.starts_l = self.starts.tolist()
