@@ -368,6 +368,48 @@ def test_a_clean_pair_with_good_evidence_passes(monkeypatch, capsys):
     assert "bars 812.5 MB shared" in out      # the evidence is in the report, not just the gate
 
 
+def test_an_unreadable_option_stat_is_refused_not_reported_as_zero():
+    """A defect in the option telemetry (a renamed key, a changed signature) would fire in BOTH
+    children, give 0 MB on both sides, compare equal -- and silently PASS the option reference
+    runs, which are the runs this evidence exists for."""
+    m = _tool()
+    broken = _evidence(options_stats_error="ImportError('parquet_options_provider')")
+    assert any("option cache stats" in p
+               for p in m.evidence_problems(_private_evidence(), broken))
+    assert any("option cache stats" in p
+               for p in m.evidence_problems(_private_evidence(options_stats_error="boom"),
+                                            _evidence()))
+
+
+# --------------------------------------------------------------------------------------------
+# Child streaming: the protocol lines must survive trailing chatter, and the timeout timer must
+# not fire on a child that already finished.
+# --------------------------------------------------------------------------------------------
+def _fake_child(monkeypatch, m, body):
+    monkeypatch.setattr(m, "_child_command",
+                        lambda mode, opt_id, rank, name: [sys.executable, "-c", body])
+
+
+def test_protocol_lines_are_captured_while_streaming_not_from_the_tail(monkeypatch, capsys):
+    m = _tool()
+    body = (f"print({m.EVIDENCE_PREFIX!r} + {json.dumps(_evidence())!r})\n"
+            f"print({m.BT_ID_PREFIX!r} + '1701')\n"
+            f"[print('chatter %d' % i) for i in range({m._TAIL_LINES} + 50)]\n")
+    _fake_child(monkeypatch, m, body)
+    bt_id, ev, note = m._run_one("shared", 1, 1, "PARITY-shared-x", timeout_min=5.0)
+    assert bt_id == 1701, note
+    assert ev == _evidence()
+    assert "chatter 0" in capsys.readouterr().out      # and the stream was forwarded live
+
+
+def test_a_child_that_outlives_its_budget_is_killed(monkeypatch):
+    m = _tool()
+    _fake_child(monkeypatch, m, "import time; time.sleep(60)")
+    bt_id, ev, note = m._run_one("private", 1, 1, "PARITY-private-x", timeout_min=0.02)
+    assert bt_id is None and ev is None
+    assert "KILLED" in note
+
+
 # --------------------------------------------------------------------------------------------
 # --bt: the rank lives in the archived row's NAME and nowhere else
 # --------------------------------------------------------------------------------------------

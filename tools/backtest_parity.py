@@ -279,6 +279,11 @@ def evidence_problems(private_ev: Optional[Dict[str, Any]],
     if shared_ev is not None and not shared_ev.get("shared_enabled"):
         problems.append("the SHARED child ran with shared arrays DISABLED (BA2_SHARED_ARRAYS did "
                         "not reach it): the comparison would be private against private")
+    for label, ev in (("private", private_ev), ("shared", shared_ev)):
+        if ev is not None and ev.get("options_stats_error"):
+            problems.append(f"the {label} child could not read the option cache stats "
+                            f"({ev['options_stats_error']}): its 0 MB of options is an unknown, "
+                            f"not a measurement")
     if private_ev is not None and shared_ev is not None:
         # The private child is the witness that this run HAS bars/options at all: if it held
         # none, the shared child holding none is silence, not a failure.
@@ -520,8 +525,15 @@ def collect_evidence() -> Dict[str, Any]:
         opts = pq.memory_stats()
         ev["options_shared_mb"] = float(opts.get("shared_mb") or 0.0)
         ev["options_private_mb"] = float(opts.get("private_mb") or 0.0)
-    except Exception as e:  # noqa: BLE001 -- an equity run never loads the option reader
-        print(f"[evidence] option cache stats unavailable ({e!r}); reporting 0 MB")
+    except ImportError as e:
+        # ONLY an import error is tolerated, and even that is RECORDED rather than reported as
+        # "0 MB of options". There is no legitimate exception here: an equity run simply has an
+        # empty _WORKER_RAW_CACHE and memory_stats returns zeros without raising. A broad catch
+        # would turn a real defect (a renamed key, a changed signature) into 0 MB in BOTH
+        # children -- which compares equal, and silently PASSES the option reference runs, the
+        # exact runs this evidence exists for. evidence_problems refuses on this key.
+        ev["options_stats_error"] = repr(e)
+        print(f"[evidence] option cache stats unavailable ({e!r})")
     return ev
 
 
@@ -674,26 +686,35 @@ def _run_one(mode: str, opt_id: int, rank: Any, name: str,
     if timer is not None:
         timer.daemon = True
         timer.start()
+    # The protocol lines are captured AS THEY STREAM, not re-found in the kept tail: the tail is
+    # bounded, and a child that logs a few hundred lines after them (a shutdown message, a
+    # library's parting warning) would push them out and turn a good run into INCONCLUSIVE.
+    evidence: Optional[Dict[str, Any]] = None
+    bt_id: Optional[int] = None
     try:
         for line in proc.stdout:                      # type: ignore[union-attr]
             line = line.rstrip("\r\n")
             tail.append(line)
+            if line.strip().startswith(EVIDENCE_PREFIX):
+                evidence = parse_child_evidence(line) or evidence
+            elif line.strip().startswith(BT_ID_PREFIX):
+                bt_id = parse_child_bt_id(line) or bt_id
             print(f"    [{mode}] {line}", flush=True)
-        rc = proc.wait()
     finally:
+        # BEFORE the wait: the timer must not fire on a process that has already finished (its
+        # stdout is closed, so the loop above ended), which would report a clean run as KILLED.
         if timer is not None:
             timer.cancel()
         if proc.stdout is not None:
             proc.stdout.close()
+    rc = proc.wait()
     took = (datetime.now() - t0).total_seconds()
     text = "\n".join(tail)
-    if killed.is_set():
+    if killed.is_set() and rc != 0:
         return None, None, (f"child KILLED after {took:.0f}s (--timeout-min {timeout_min:g})\n"
                             f"--- output tail ---\n{text}")
     if rc != 0:
         return None, None, (f"child exited {rc} after {took:.0f}s\n--- output tail ---\n{text}")
-    evidence = parse_child_evidence(text)
-    bt_id = parse_child_bt_id(text)
     if bt_id is None:
         return None, evidence, (f"child exited 0 after {took:.0f}s but printed no "
                                 f"{BT_ID_PREFIX} line\n--- output tail ---\n{text}")
