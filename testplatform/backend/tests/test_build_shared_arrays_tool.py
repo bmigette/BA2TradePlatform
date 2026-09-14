@@ -487,6 +487,25 @@ def test_the_metric_store_root_is_swept_with_its_own_version(tmp_path, capsys):
     assert "1 key(s) removed" in capsys.readouterr().out
 
 
+def test_a_relative_metric_store_is_resolved_before_the_bootstrap_chdirs(tmp_path, monkeypatch,
+                                                                        capsys):
+    """The SILENT half of the same bug. A relative --universe-file raised FileNotFoundError; a
+    relative --metric-store resolved against testplatform/backend to a directory that does not
+    exist, printed "nothing at ..." and exited 0 -- so a scheduled sweep would reclaim nothing
+    for months and never say so. Every path argument is absolutized as a class, in one pass."""
+    tool = _tool()
+    store_dir = tmp_path / "screener_metrics"
+    store_dir.mkdir()
+    stale = _done_dir(Path(SA.derived_root_for(str(store_dir))) / "u_store.v0" / "sig1")
+    monkeypatch.chdir(tmp_path)
+
+    assert tool.main(["--metric-store", "screener_metrics", "--sweep"]) == 0
+
+    out = capsys.readouterr().out
+    assert "removed" in out and "nothing at" not in out
+    assert not stale.parent.exists()
+
+
 def test_the_metric_store_is_sweep_only(tmp_path, capsys):
     tool = _tool()
     with pytest.raises(SystemExit):

@@ -89,6 +89,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _OPTIONS_KEY_VERSION = re.compile(r"\.v(\d+)$")
 _OHLCV_KEY_VERSION = re.compile(r"_v(\d+)_[0-9a-f]+$")
 
+#: Every option whose value is a filesystem path. ``_parse`` absolutizes all of them in one pass
+#: because ``_bootstrap`` chdirs: a relative path typed at the repo root does not survive into
+#: the rest of the run. Add an option here the day you add the option.
+_PATH_ARGS = ("universe_file", "metric_store")
+
 #: One symbol's outcome: (symbol, rows, status, seconds, error). status is one of
 #: built / opened / empty / error.
 Result = Tuple[str, int, str, float, Optional[str]]
@@ -534,12 +539,18 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     if not (args.options_store or args.ohlcv_provider or args.metric_store):
         p.error("nothing to do: pass --options-store and/or --ohlcv-provider "
                 "(or --metric-store with --sweep).")
-    # RESOLVED ONCE, TO AN ABSOLUTE PATH, BEFORE ANYTHING READS IT. The documented invocation
-    # passes a repo-relative path and ``_bootstrap`` chdirs into testplatform/backend, so a
-    # relative path that parsed fine here would be a FileNotFoundError by the time the build
-    # started. Read once too: ``args.symbol_list`` is the only copy anything downstream uses.
-    if args.universe_file:
-        args.universe_file = os.path.abspath(args.universe_file)
+    # EVERY PATH ARGUMENT IS ABSOLUTIZED HERE, AS A CLASS. ``_bootstrap`` chdirs into
+    # testplatform/backend, so a relative path typed at the repo root -- which is what the
+    # documented invocations use -- means something different to every line that runs after it.
+    # The two failure modes are not even alike: ``--universe-file`` raised FileNotFoundError,
+    # while ``--metric-store`` resolved to a directory that simply did not exist, printed
+    # "nothing at ..." and exited 0, so a scheduled sweep could reclaim nothing for months and
+    # never say so. Any path option added later belongs in this tuple on the day it is added.
+    for _name in _PATH_ARGS:
+        _value = getattr(args, _name, None)
+        if _value:
+            setattr(args, _name, os.path.abspath(_value))
+    # Read once, here: ``args.symbol_list`` is the only copy anything downstream uses.
     args.symbol_list = _symbols(args.universe_file, args.symbols)
     if not args.symbol_list and not args.sweep:
         p.error("no symbols: pass --universe-file or --symbols (or --sweep to only collect).")
