@@ -45,12 +45,28 @@ _PROGRESS_LOG_INTERVAL_S = 15.0
 # it cleanly and re-derives any -wal/-shm.
 _SKIP_SUFFIXES = (".tmp", ".part", ".lock", "-wal", "-shm", ".journal")
 
+# Per-host DERIVED caches (memory-mapped .npy sets built from parquet already on the worker --
+# see ba2_common.core.shared_arrays). Deterministic from the source and ~3x its size, so each
+# host builds its own on first touch instead of pulling it over the wire. Excluded from the
+# manifest on BOTH ends, which also keeps diff_stale/prune_paths from mistaking a worker's own
+# derived cache for a stale leftover of a master rebuild.
+_SKIP_DIRNAMES = ("_derived",)
+
 
 def cache_root(root: Optional[str] = None) -> Path:
     return Path(root or CACHE_FOLDER)
 
 
 def _is_syncable(p: Path) -> bool:
+    """Whether *p* (a path RELATIVE to the cache root) may be synced.
+
+    Relative on purpose: the ``_SKIP_DIRNAMES`` component match would otherwise fire on a
+    directory in the cache root's own absolute prefix and silently empty the whole manifest.
+    Only an exact path COMPONENT matches, so a file literally named ``_derived`` or a sibling
+    directory like ``_derived_something`` stays ordinary cache content.
+    """
+    if any(part in _SKIP_DIRNAMES for part in p.parts[:-1]):
+        return False
     name = p.name
     if name.startswith("."):
         return False
@@ -85,14 +101,17 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
     files: List[dict] = []
     if base.is_dir():
         for p in base.rglob("*"):
-            if not p.is_file() or not _is_syncable(p):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(base)
+            if not _is_syncable(rel):
                 continue
             try:
                 st = p.stat()
             except OSError:
                 continue
             entry = {
-                "rel_path": p.relative_to(base).as_posix(),
+                "rel_path": rel.as_posix(),
                 "size": st.st_size,
                 "mtime": st.st_mtime,
             }

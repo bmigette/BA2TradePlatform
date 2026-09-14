@@ -176,3 +176,36 @@ def test_extract_tar_rejects_traversal(tmp_path):
     res = cache_sync.extract_tar(tb, str(dst))
     assert res["skipped"] == 1 and res["extracted"] == 0
     assert not (tmp_path / "evil.txt").exists()  # did NOT escape the cache root
+
+
+def test_derived_array_cache_is_never_part_of_the_manifest(tmp_path):
+    """The per-host derived .npy cache (ba2_common.core.shared_arrays) is deterministic from
+    parquet the worker already has and ~3x its size; it must never ride the pre-flight push.
+
+    Excluded on BOTH ends by construction (master push and the worker's own manifest come from
+    this one walker), so ``diff_stale``/``prune_paths`` can't mistake a worker's locally-built
+    derived cache for a stale leftover and delete it either."""
+    _write(tmp_path / "FMPOHLCVProvider" / "AAPL_1d.parquet", b"p")
+    d = tmp_path / "_derived" / "FMPOHLCVProvider" / "AAPL_1d" / "abc123"
+    _write(d / "close.npy", b"n")
+    _write(d / "_done.json", b"{}")
+
+    man = cache_sync.build_manifest(str(tmp_path))
+    rels = {f["rel_path"] for f in man["files"]}
+    assert rels == {"FMPOHLCVProvider/AAPL_1d.parquet"}
+
+
+def test_derived_exclusion_is_an_exact_path_component_match(tmp_path):
+    """Only a path COMPONENT named exactly ``_derived`` is skipped -- a regular file called
+    ``_derived`` or a directory whose name merely starts with it is ordinary cache content."""
+    _write(tmp_path / "_derived_something" / "a.parquet", b"x")
+    _write(tmp_path / "_derived", b"y")                      # a FILE named _derived
+    _write(tmp_path / "FMPOHLCVProvider" / "not_derived" / "b.parquet", b"z")
+
+    man = cache_sync.build_manifest(str(tmp_path))
+    rels = {f["rel_path"] for f in man["files"]}
+    assert rels == {
+        "_derived_something/a.parquet",
+        "_derived",
+        "FMPOHLCVProvider/not_derived/b.parquet",
+    }
