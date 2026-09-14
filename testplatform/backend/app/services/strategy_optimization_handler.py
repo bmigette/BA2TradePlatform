@@ -64,7 +64,25 @@ REQUIRED_GA_KEYS = (
 import os as _os
 _BACKEND_DIR = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 # Provider API keys mirrored into each worker's env (spawn starts a clean environment).
-_WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY")
+#
+# The last two are the host-shared array knobs (ba2_common.core.shared_arrays): the
+# BA2_SHARED_ARRAYS escape hatch and the lock-staleness override. Both must reach a spawned
+# worker EXACTLY as the process that built the pool sees them — a master running shared while
+# its children each build private copies is the worst of both worlds: the per-worker memory
+# shape this exists to remove, plus a master whose telemetry says it was removed.
+#
+# They are applied with ``os.environ.setdefault`` (see _worker_init), so an ambient value in the
+# child would WIN over the mirrored one. That cannot happen here: multiprocessing's "spawn" child
+# inherits the parent's environment on both Windows (CreateProcess with a NULL env block) and
+# Linux (execv, no env replacement), so the value being mirrored is already the child's ambient
+# value and setdefault is a no-op. The mirroring is what makes that explicit — and it is what
+# carries these keys on the REMOTE worker, whose pool is built by worker_server.run_worker_server
+# from the WORKER SERVICE's own environment: no environment ever crosses the wire (RunTrialReq
+# carries config/fitness_metric/cache_root/inmem_trades only, and _localize_paths rewrites cache
+# path STRINGS inside the config), so setting BA2_SHARED_ARRAYS on the master says nothing at all
+# about a remote box. Each host's service environment governs its own workers; set it there.
+_WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY",
+                    "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S")
 
 
 def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
@@ -318,20 +336,47 @@ def _worker_release_memory() -> Dict[str, Any]:
 
     Safe to call at any time: every cache here is a pure memoisation of on-disk parquet, so a
     later miss re-reads identical bytes. Result-neutral, costs a re-parse.
+
+    WITH THE HOST-SHARED ARRAYS ON (``BA2_SHARED_ARRAYS``, the default — see
+    ba2_common.core.shared_arrays), most of what these caches hold is not bytes this process
+    owns: the OHLCV columns and the option reader's arrays are VIEWS over memory-mapped ``.npy``
+    files in the per-host derived cache. Clearing the caches drops the views, the mapping closes
+    when the last view dies, and this process's private memory comes back — which is exactly what
+    the governor asked for. The FILES are the HOST's and are never touched: other workers on the
+    box are mapping the same bytes, and a later miss here re-OPENS them (milliseconds) instead of
+    re-parsing the parquet (tens of ms plus a build transient ~2.3x the frame). A release that
+    deleted or rebuilt them would turn one box's throttle into a stampede across every worker on
+    it. So the release is CHEAPER under sharing than it used to be, not more expensive.
+
+    ``shared_mb`` in the return says how much of what was dropped was mapped rather than private,
+    so the governor's log shows the two apart: a worker holding 5 GB of its own and one holding
+    views over 5 GB the host holds once are the same number to ``freed_cache_mb`` and completely
+    different problems.
     """
     import gc
 
     from app.services.backtest import price_source as _ps
     before = 0.0
+    shared = 0.0
     try:
         st = _ps.memory_stats()
         before = float(st["bar_cache"]["mb"]) + float(st["series_memo"]["mb"])
+        # Read BEFORE the clear (afterwards there is nothing left to measure), and kept out of
+        # `before`: mapped pages are one copy per HOST, so folding them into a per-process figure
+        # would make a 6-worker box look like it holds 6x the data it holds once.
+        shared = float(st["bar_cache"]["shared_mb"])
     except Exception:  # noqa: BLE001
         pass
     _ps.clear_worker_bar_cache()
     _ps.clear_ohlcv_memo()
-    for mod, fn in (("app.services.backtest.options_provider", "clear_worker_option_caches"),
-                    ("app.services.backtest.results", "clear_worker_5m_cache")):
+    # The NAMES are load-bearing and were wrong until 2026-09-14: neither `clear_worker_option_
+    # caches` nor `clear_worker_5m_cache` has ever existed, so the candidate loop below fell
+    # through and the option reader's caches (the biggest single holding a worker has at the
+    # 2020 option window) survived every release the governor ever performed. The real entry
+    # points are these two; options_provider's also clears the PARQUET reader's caches behind
+    # the one seam (see its docstring).
+    for mod, fn in (("app.services.backtest.options_provider", "clear_worker_options_cache"),
+                    ("app.services.backtest.results", "clear_worker_5m_bars_cache")):
         try:
             import importlib
             m = importlib.import_module(mod)
@@ -349,7 +394,8 @@ def _worker_release_memory() -> Dict[str, Any]:
         rss = psutil.Process(_o.getpid()).memory_info().rss // 1048576
     except Exception:  # noqa: BLE001
         rss = None
-    return {"freed_cache_mb": round(before, 1), "rss_mb_after": rss}
+    return {"freed_cache_mb": round(before, 1), "shared_mb": round(shared, 1),
+            "rss_mb_after": rss}
 
 
 def system_memory() -> Dict[str, Any]:
