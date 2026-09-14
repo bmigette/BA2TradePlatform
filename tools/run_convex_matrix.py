@@ -296,9 +296,9 @@ def build_parser() -> argparse.ArgumentParser:
                          f"refuses any other metric for --strategy O_CONVEX).")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f}).")
-    ap.add_argument("--options-store", default="parquet",
-                    help="Options store serving the run (default parquet -- the only vendor "
-                         "whose history floor reaches a 2023 start).")
+    ap.add_argument("--options-store", default="tastytrade",
+                    help="Options store serving the run (default tastytrade -- floor 2022-10-01, "
+                         "reaches this driver's 2023 start; 'parquet' is its accepted alias).")
     ap.add_argument("--universe-file", default=_UNIVERSE_FILE,
                     help="Symbol list probed and then passed to each job.")
     ap.add_argument("--probe-out-dir", default=_TOOLS_DIR,

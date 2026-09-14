@@ -6147,6 +6147,11 @@ def main(argv: "list | None" = None) -> int:
     # The two option READERS a run can be served by (backtest/options_store.py). Taken from the
     # seam rather than spelled out here so a third store cannot exist without the CLI offering it.
     from app.services.backtest.options_store import OPTIONS_STORES as _OPTIONS_STORES
+    from app.services.backtest.options_store import STORE_ALIASES as _STORE_ALIASES
+    # Superseded names ('parquet' -> 'tastytrade') stay ACCEPTED on the CLI: every archived
+    # optimization_config, the older drivers and the runbooks say 'parquet', and
+    # _apply_options_store resolves the alias before it reaches the run.
+    _STORE_CHOICES = list(_OPTIONS_STORES) + sorted(_STORE_ALIASES)
 
     p = argparse.ArgumentParser(prog="ba2-test", description="BA2 Test Platform CLI.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -6477,7 +6482,7 @@ def main(argv: "list | None" = None) -> int:
                          "selector hands the filler candidates it rejects, and the order just sits "
                          "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
                          "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
-    op.add_argument("--options-store", default=None, choices=list(_OPTIONS_STORES),
+    op.add_argument("--options-store", default=None, choices=_STORE_CHOICES,
                     help="WHICH option store the run reads, and therefore whose history floor "
                          "applies: 'sqlite' (default -- the Alpaca-built OptionsHistoryCache, "
                          "floor 2024-01-18, the store every recorded backtest number came from) "
@@ -6642,7 +6647,7 @@ def main(argv: "list | None" = None) -> int:
                          "selector hands the filler candidates it rejects, and the order just sits "
                          "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
                          "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
-    ob.add_argument("--options-store", default=None, choices=list(_OPTIONS_STORES),
+    ob.add_argument("--options-store", default=None, choices=_STORE_CHOICES,
                     help="WHICH option store every job in the batch reads: 'sqlite' (default, "
                          "Alpaca, floor 2024-01-18) or 'parquet' (TastyTrade/dxfeed, floor "
                          "2022-10-01, the only one holding 2023). Omitted -> "
