@@ -628,3 +628,45 @@ def test_a_vanished_lock_does_not_kill_the_build(tmp_path, monkeypatch):
     monkeypatch.setattr(np, "save", save_then_break_the_lock)
     got = store.build_or_open("AAPL", [src], _arrays)
     np.testing.assert_array_equal(got["close"], _arrays()["close"])
+
+
+def test_evict_key_removes_a_whole_key_directory_all_or_nothing(tmp_path):
+    """The public seam for the only collector an OBSOLETE KEY has.
+
+    ``sweep()`` deliberately never removes a key -- it cannot tell "nothing asks for this key any
+    more" from "nothing has asked YET on this host". ``tools/build_shared_arrays.py --sweep``
+    can (it holds the consumers' ARRAYS_VERSION and an age policy), so it needs a way in that
+    still gets ``_evict_dir``'s all-or-nothing probe rather than an rmtree.
+    """
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    kd = store.key_dir("u_AAPL.v0")
+    _write_done_dir(kd / "sig_a")
+    _write_done_dir(kd / "sig_b")
+    (kd / "sig_c.lock").write_text("123")
+
+    assert store.evict_key(kd) is True
+    assert not kd.exists()
+    # Already gone is NOT "removed by this call" -- the tool sums the return value into a count
+    # and bytes it reports as reclaimed.
+    assert store.evict_key(kd) is False
+    assert not (tmp_path / "_derived" / "X" / "u_AAPL.v0.evicting").exists()
+
+
+def test_evict_key_leaves_a_key_whose_arrays_are_still_mapped(tmp_path):
+    """The Windows contract, stated at the KEY level: a directory holding a file another process
+    maps is left byte-for-byte intact and reported False (on POSIX every rename succeeds, so the
+    claim there is only that the key is gone and the caller was told so)."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    held = store.build_or_open("AAPL", [src], _arrays)
+    kd = store.key_dir("AAPL")
+
+    removed = store.evict_key(kd)
+
+    if removed:                                  # POSIX: unlinking a mapped file is legal
+        assert not kd.exists()
+    else:                                        # NTFS: refused, and nothing was half-deleted
+        assert (store.current_dir("AAPL", [src]) / SA.DONE_MARKER).is_file()
+        np.testing.assert_array_equal(held["close"], _arrays()["close"])
+    del held
+    gc.collect()

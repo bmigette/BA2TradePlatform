@@ -607,6 +607,25 @@ class DerivedArrayStore:
         except OSError:
             return True
 
+    def evict_key(self, key_dir: PathLike) -> bool:
+        """Remove a whole KEY directory -- every signature under it -- or leave it untouched.
+
+        THE PUBLIC SEAM FOR THE ONLY COLLECTOR AN OBSOLETE KEY HAS. ``sweep()`` deliberately
+        never removes a key: from inside the store, "nothing asks for this key any more" and
+        "nothing has asked YET on this host" look identical, and getting that wrong deletes a
+        set a worker is about to open. A caller that genuinely knows -- ``tools/
+        build_shared_arrays.py --sweep``, which holds both consumers' current ``ARRAYS_VERSION``
+        and an age policy -- names the key itself, and gets ``_evict_dir``'s all-or-nothing
+        probe rather than an ``rmtree`` that could strip the marker off a directory a process
+        still maps (see the module docstring: that leaves a set nobody can read and nobody can
+        remove).
+
+        True means THIS call removed it; False means it is still there (or was already gone),
+        never that it was half-removed. ``wait_s=0.0`` because this is housekeeping: it must
+        never block behind a live publisher's eviction claim.
+        """
+        return self._evict_dir(Path(key_dir), wait_s=0.0)
+
     def sweep(self) -> int:
         """Collect superseded signatures, marker-less orphans and dead ``.tmp`` dirs.
 
