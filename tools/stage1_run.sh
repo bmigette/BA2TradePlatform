@@ -19,14 +19,24 @@
 # THIS host covers tools/options_universe_top100.txt over the window before launching
 # (local reference 2026-09-14: 98/98 symbols, expiries 2020-01-03..2026-09-11, 350 per symbol).
 #
-# PARALLELISM (2026-09-14, operator): 20 local consumers on babatest (32 cores / 251 GB).
-# Measured 2026-09-02 on the 2024+ store: ~22 MB of cached chains per symbol per consumer,
-# roughly x2-3 at a 2020 start (350 expiries per symbol vs 184) -> ~5-7 GB per consumer for
-# the ~100-symbol universe, ~100-140 GB for 20. The fleet worker on this host must be IDLE
-# (no goal2020 job) or the two will fight for RAM; check `free -g` before launching.
-# BT_MAX_TASKS_PER_CHILD is raised from the handler default of 8: every pool recycle re-pays
-# the cold chain load (~11 s/symbol at 2020), which was ~14% of job time on the 2024+ store
-# at 8 individuals per child. RAM is not the constraint on this host, so hold the cache longer.
+# PARALLELISM (2026-09-14). The FIRST attempts at 20 and 16 consumers were OOM-killed: the
+# option reader held ~15.6 GB of private numpy per consumer (177.8M rows x ~88 B at the 2020
+# window). Since commit c608ac05 the reader maps its arrays from a per-host DERIVED cache
+# (`<CACHE_FOLDER>/_derived/...`, see docs/plans/2026-09-14-shared-arrays-across-workers.md):
+# the columns are shared through the page cache once per host, and the private residue per
+# consumer is the projections + the touched greeks rows (~1-3 GB). PARALLEL therefore starts
+# at 24 and is TUNED FROM MEASUREMENT: watch the cgroup total and each child's PRIVATE bytes
+# (`/proc/<pid>/smaps_rollup` Private_Clean+Private_Dirty -- RSS counts shared mapped pages
+# and is misleading here), and raise/lower it between jobs. The fleet worker on this host must
+# be IDLE (its pool parked at 1 slot) or the two will fight for RAM; check `free -g` first.
+#
+# PREWARM IS MANDATORY BEFORE A COLD LAUNCH (build transient ~2.3x the frame, ~7-8 GB for
+# ThetaData TSLA; the store serialises builders per KEY only, so 24 cold consumers on
+# different keys can OOM the host). From the repo root, same PYTHONPATH/BA2_HOME as below:
+#   /opt/ba2worker/ba2-venvs/test/bin/python tools/build_shared_arrays.py #     --options-store thetadata --universe-file tools/options_universe_top100.txt #     --ohlcv-provider FMPOHLCVProvider --interval 1d --start 2020-01-01 --end 2025-12-31 #     --warmup-days 60 --jobs 4
+# and run it TWICE: the second run must report 0 built / 98 opened before launching.
+# BT_MAX_TASKS_PER_CHILD is raised from the handler default of 8: a recycle now costs a
+# re-OPEN of mapped files (ms), not a re-parse, but the projections are still rebuilt.
 set -euo pipefail
 cd /home/debian/ba2-grid/repo
 
@@ -47,7 +57,7 @@ export PYTHONPATH=/home/debian/ba2-grid/repo/packages/common:/home/debian/ba2-gr
 # Restore the approved search budget; reducing it requires the separate pilot evidence.
 POP="${POP:-200}"
 GEN="${GEN:-60}"
-PARALLEL="${PARALLEL:-20}"
+PARALLEL="${PARALLEL:-24}"
 
 # Universe constraints (F4(a), grid design §6): the screener metric store attached PURELY as a
 # GATE-ONLY per-bar entry gate (no universe switch, no screener:* genes -- see
