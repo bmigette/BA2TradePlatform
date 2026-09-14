@@ -154,8 +154,10 @@ def test_preload_maps_ohlcv_columns_and_keeps_keys_private(tmp_path, monkeypatch
         assert not arr.flags.writeable, "a shared mapping must never be writeable"
     d = _derived_root(tmp_path)
     assert any(d.rglob("c.npy")), f"no derived close array under {d}"
-    assert any(p.name.startswith("u_AAA_1d_") for p in d.iterdir()), \
-        "the key must be prefixed (Windows reserved device names) and name the window"
+    assert any(p.name.startswith("u_AAA_1d_") and f"_v{ps.ARRAYS_VERSION}_" in p.name
+               for p in d.iterdir()), \
+        ("the key must be prefixed (Windows reserved device names), name the window, and carry "
+         "ARRAYS_VERSION -- a change in what the arrays MEAN must not read an old set")
 
 
 def test_shared_and_private_preload_are_bit_identical(tmp_path, monkeypatch):
@@ -339,12 +341,15 @@ def test_a_live_fetch_provider_never_signs_a_parquet_it_did_not_read(tmp_path, m
     assert cached.cached_path("AAA", "1d") is not None      # same tree, hermetic mode
 
 
-def test_a_broken_cache_path_lookup_degrades_loudly_not_silently(tmp_path, monkeypatch, caplog):
+def test_a_broken_cache_path_lookup_degrades_loudly_not_silently(tmp_path, monkeypatch):
     """An OSError out of the path lookup means "no shared source" — the run continues on private
     arrays — but it must SAY so once: the only other symptom is a shared_mb of 0, which is
-    indistinguishable from sharing being off on purpose."""
-    import logging
+    indistinguishable from sharing being off on purpose.
 
+    Asserted on ``_worker_log``, not on a log record: preload runs inside a spawned trial-pool
+    child under a process-global ``logging.disable(ERROR)``, so a ``logger.warning`` there would
+    never be emitted — the report has to go through the channel that survives it.
+    """
     monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
     from ba2_common.core import native_cache
     monkeypatch.setattr(ps, "_CACHED_PATH_WARNED", set())
@@ -361,12 +366,13 @@ def test_a_broken_cache_path_lookup_degrades_loudly_not_silently(tmp_path, monke
         return real(*a, **k)
 
     monkeypatch.setattr(native_cache, "find_timeseries_path", _flaky)
+    said: list = []
+    monkeypatch.setattr(ps, "_worker_log", said.append)
     src, _ = _source(_native_tree(tmp_path, monkeypatch, syms=("AAA",)))
-    with caplog.at_level(logging.WARNING):
-        _preload(src, ["AAA"])
+    _preload(src, ["AAA"])
     assert len(src._keys["AAA"]) > 0                      # built privately, results unaffected
     assert src._c["AAA"].base is None
-    assert any("falls back to PRIVATE" in r.message for r in caplog.records)
+    assert any("falls back to PRIVATE" in m and "AAA" in m for m in said)
 
 
 def test_an_unexpected_cache_path_error_propagates(tmp_path, monkeypatch):

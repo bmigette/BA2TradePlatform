@@ -1225,10 +1225,16 @@ class MemoizedOHLCVProvider:
         array cache — the path resolution has exactly one home, here.
 
         FAILS LOUD, NARROWLY. Only ImportError/OSError degrade to None (no shared source, build the
-        arrays privately — result-neutral), and even those log ONCE per process: a blanket
+        arrays privately — result-neutral), and even those report ONCE per process: a blanket
         ``except Exception -> None`` turned any bug in here into "sharing is silently off for the
         whole run", visible only as a ``shared_mb`` of 0 with no cause anywhere. Anything else
         propagates.
+
+        Reported through ``_worker_log``, NOT ``logger.warning``: this runs inside a spawned
+        trial-pool child, where ``_worker_init`` has installed a process-global
+        ``logging.disable(logging.ERROR)`` — a WARNING there never becomes a LogRecord at all, so
+        the one line that explains a degraded run would be exactly the line that vanishes. See
+        ``_worker_log``'s own docstring.
         """
         if not self._cached_only:
             # LIVE-FETCH mode: the series comes from the network through _full/get_ohlcv_data, and
@@ -1241,7 +1247,7 @@ class MemoizedOHLCVProvider:
         except (ImportError, OSError) as e:
             if type(e).__name__ not in _CACHED_PATH_WARNED:
                 _CACHED_PATH_WARNED.add(type(e).__name__)
-                logger.warning(
+                _worker_log(
                     f"OHLCV cache path lookup failed for {symbol} {interval} "
                     f"({type(e).__name__}: {e}); this process falls back to PRIVATE per-worker "
                     f"bar arrays (shared_mb will read 0). Results are unaffected."
