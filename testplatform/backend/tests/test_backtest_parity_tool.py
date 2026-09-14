@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import json
 import math
 import sys
@@ -200,7 +201,7 @@ def test_every_metric_column_is_actually_compared():
 # --------------------------------------------------------------------------------------------
 def _fake_source():
     return {"opt_id": 487, "rank": 1, "name": "TOP1-sen-S6-goal2020-notional",
-            "expert": "SenateTrading", "ga_fitness": 5.5741,
+            "expert": "SenateTrading", "ga_fitness": 5.5741, "option_source": False,
             "start_date": "2020-01-01", "end_date": "2025-12-31", "initial_capital": 100000.0}
 
 
@@ -271,8 +272,9 @@ def test_a_child_that_printed_no_marker_is_a_failure_not_a_guess():
 # Evidence -- a PASS must prove the shared path was actually used
 # --------------------------------------------------------------------------------------------
 def _evidence(**over):
-    ev = {"shared_enabled": True, "bars_shared_mb": 812.5, "bars_private_mb": 96.0,
-          "options_shared_mb": 0.0, "options_private_mb": 0.0}
+    ev = {"shared_enabled": True, "total_trades": 214, "bars_shared_mb": 812.5,
+          "bars_private_mb": 96.0, "options_shared_mb": 0.0, "options_private_mb": 0.0,
+          "options_entries": 0, "options_provider_built": False}
     ev.update(over)
     return ev
 
@@ -381,10 +383,63 @@ def test_an_unreadable_option_stat_is_refused_not_reported_as_zero():
                                             _evidence()))
 
 
+def test_zero_trades_on_both_sides_is_vacuous_not_a_pass():
+    """Measured in the field: opt 429 (the O_LEAP perf probe) re-ran to 0 trades in BOTH children
+    -- its stored bt block builds no options provider -- and the tool printed PASS. Two runs that
+    traded nothing are identical whatever the arrays did."""
+    m = _tool()
+    problems = m.evidence_problems(_private_evidence(total_trades=0),
+                                   _evidence(total_trades=0))
+    assert any("VACUOUS" in p for p in problems)
+    # One side trading is not vacuous -- that is a real (and alarming) difference, and the row
+    # comparison is the thing that must report it.
+    assert not any("VACUOUS" in p for p in
+                   m.evidence_problems(_private_evidence(total_trades=0), _evidence()))
+
+
+def test_an_option_source_that_loaded_no_option_data_is_refused():
+    m = _tool()
+    ev = dict(_evidence(options_entries=0, options_provider_built=False))
+    problems = m.evidence_problems(_private_evidence(options_entries=0,
+                                                     options_provider_built=False),
+                                   ev, option_source=True)
+    assert any("OPTION strategy" in p for p in problems)
+    # The same evidence is fine for an equity source, and fine as soon as one child read a chain.
+    assert m.evidence_problems(_private_evidence(), _evidence(), option_source=False) == []
+    assert not any("OPTION strategy" in p for p in m.evidence_problems(
+        _private_evidence(options_entries=3, options_provider_built=True),
+        _evidence(options_entries=3, options_provider_built=True), option_source=True))
+
+
+@pytest.mark.parametrize("block,expected", [
+    # The real shapes, read off the live DB 2026-09-14: an option job is identified by its entry
+    # ACTION and its O_* label, never by options_store (every equity opt carries one).
+    ({"entry_action": {"action_type": "buy_call", "option_dte_min": 380},
+      "labels": ["perfprobe", "O_LEAP"], "options_store": "parquet"}, True),
+    ({"entry_action": None, "labels": ["goal2020-notional", "S7"],
+      "options_store": "sqlite"}, False),
+    ({"strategy": "O_PMCC"}, True),
+    ({"strategy": "OS_SOMETHING"}, True),
+    ({}, False),
+])
+def test_an_option_source_is_recognised_without_keying_on_options_store(block, expected):
+    assert _tool().is_option_source(block) is expected
+
+
 # --------------------------------------------------------------------------------------------
-# Child streaming: the protocol lines must survive trailing chatter, and the timeout timer must
-# not fire on a child that already finished.
+# Child streaming: the protocol lines must survive trailing chatter, the parent's stdout must
+# survive anything the child logs, and the timeout timer must not fire on a finished child.
 # --------------------------------------------------------------------------------------------
+def test_a_child_line_the_parents_stdout_cannot_encode_does_not_kill_the_run(monkeypatch):
+    """Measured in the field: a parent died at 40 minutes with UnicodeEncodeError forwarding a
+    child log line containing '⚡'. Under nohup the parent's stdout is cp1252, and losing an
+    hour of work to one glyph is not a trade anyone would make."""
+    m = _tool()
+    buf = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(buf, encoding="cp1252"))
+    m._emit("    [shared] ⚡ preloaded 98 symbols")
+    sys.stdout.flush()
+    assert b"preloaded 98 symbols" in buf.getvalue()
 def _fake_child(monkeypatch, m, body):
     monkeypatch.setattr(m, "_child_command",
                         lambda mode, opt_id, rank, name: [sys.executable, "-c", body])

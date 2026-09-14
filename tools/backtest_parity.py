@@ -115,6 +115,33 @@ _IDENTITY_KEYS = ("name", "id", "backtest_id", "created_at", "started_at", "comp
 _BOOTSTRAPPED = False
 
 
+def _force_utf8_stdout() -> None:
+    """Make this process's stdout/stderr able to carry ANYTHING a child logs.
+
+    MEASURED THE HARD WAY (2026-09-14): a reference run died at 40 minutes with
+    UnicodeEncodeError forwarding a child line containing '⚡'. Under ``nohup``/a redirect the
+    parent's stdout is not a console, so Python picks the locale encoding -- cp1252 on this box
+    -- and one non-ASCII character in a log line destroys an hour of work at the very end."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):       # detached / already-wrapped stream
+                pass
+
+
+def _emit(text: str) -> None:
+    """Print a line that came from a child. Second line of defence behind ``_force_utf8_stdout``:
+    if the stream still cannot encode a character (a stdout this tool does not own, a stricter
+    wrapper), the character is replaced -- a mangled glyph is a trivial loss, and losing the run
+    over it is not."""
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
+
+
 # =============================================================================================
 # Comparison -- pure, importable, unit-tested (tests/test_backtest_parity_tool.py)
 # =============================================================================================
@@ -251,6 +278,29 @@ def parse_child_evidence(stdout: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def is_option_source(bt_block: Dict[str, Any]) -> bool:
+    """Does this optimization's backtest block describe an OPTION strategy?
+
+    There is no single field for it. The launcher's option jobs are identified by the entry
+    ACTION (``buy_call``/``buy_put``/... plus the ``option_*`` gene keys) and carry an ``O_*``
+    label; ``strategy`` is honoured too for blocks that have one. ``options_store`` is NOT a
+    signal -- verified 2026-09-14 against the live DB, every equity opt carries
+    ``options_store: "sqlite"`` as a default, so keying on it would call every run an option run.
+    """
+    if str(bt_block.get("strategy") or "").startswith(("O_", "OS")):
+        return True
+    if any(str(lbl).startswith("O_") for lbl in (bt_block.get("labels") or [])):
+        return True
+    entry = bt_block.get("entry_action")
+    if isinstance(entry, dict):
+        if any(str(k).startswith("option_") for k in entry):
+            return True
+        action = str(entry.get("action_type") or "")
+        if "call" in action or "put" in action:
+            return True
+    return False
+
+
 def _mb(ev: Optional[Dict[str, Any]], key: str) -> float:
     try:
         return float((ev or {}).get(key) or 0.0)
@@ -259,7 +309,8 @@ def _mb(ev: Optional[Dict[str, Any]], key: str) -> float:
 
 
 def evidence_problems(private_ev: Optional[Dict[str, Any]],
-                      shared_ev: Optional[Dict[str, Any]]) -> List[str]:
+                      shared_ev: Optional[Dict[str, Any]],
+                      option_source: bool = False) -> List[str]:
     """Reasons a PASS from these two children would prove NOTHING.
 
     Two runs that both took the private path are byte-identical for a reason that has nothing to
@@ -297,16 +348,33 @@ def evidence_problems(private_ev: Optional[Dict[str, Any]],
                 f"the private child held {_mb(private_ev, 'options_private_mb')} MB of option "
                 f"arrays but the shared child mapped 0 MB: the option columns were NOT served "
                 f"from the derived cache")
+        # A run that traded NOTHING compares equal whatever the arrays did: two empty trade
+        # lists, two flat curves, two zeroed metric columns. Measured in the field on opt 429
+        # (the O_LEAP perf probe), whose stored bt block carries no options_cache_db, so the
+        # engine built no options provider, no chain was ever read and both children "agreed"
+        # on nothing at all -- and the tool printed PASS.
+        if private_ev.get("total_trades") == 0 and shared_ev.get("total_trades") == 0:
+            problems.append("VACUOUS: 0 trades on both sides -- the gate proves nothing. Two "
+                            "runs that traded nothing are identical whatever the arrays did. "
+                            "Pick a source whose re-run actually trades.")
+        if option_source and not (private_ev.get("options_provider_built")
+                                  or shared_ev.get("options_provider_built")):
+            problems.append("the source is an OPTION strategy but neither child loaded a single "
+                            "option underlying (0 cache entries): no chain was read, so this run "
+                            "exercises none of the option reader the shared path changed. Check "
+                            "the stored backtest block actually builds an options provider "
+                            "(options_cache_db / the option entry action).")
     return problems
 
 
 def _format_evidence(ev: Optional[Dict[str, Any]]) -> str:
     if ev is None:
         return "<none printed>"
-    return (f"shared_enabled={ev.get('shared_enabled')} "
+    return (f"shared_enabled={ev.get('shared_enabled')} trades={ev.get('total_trades')} "
             f"bars {_mb(ev, 'bars_shared_mb')} MB shared / {_mb(ev, 'bars_private_mb')} MB private; "
             f"options {_mb(ev, 'options_shared_mb')} MB shared / "
-            f"{_mb(ev, 'options_private_mb')} MB private")
+            f"{_mb(ev, 'options_private_mb')} MB private "
+            f"({ev.get('options_entries')} underlying(s))")
 
 
 def parse_child_bt_id(stdout: str) -> Optional[int]:
@@ -432,6 +500,9 @@ def resolve_source(opt_id: int, rank: Any, db: Any = None) -> Dict[str, Any]:
             "start_date": str(bt_block["start_date"]),
             "end_date": str(bt_block["end_date"]),
             "initial_capital": float(bt_block["initial_capital"]),
+            # Whether a run of this source is SUPPOSED to touch the option reader -- if it is and
+            # neither child did, the comparison says nothing about the option path.
+            "option_source": is_option_source(bt_block),
         }
     finally:
         if own:
@@ -500,31 +571,44 @@ def existing_parity_names(names: Sequence[str]) -> List[str]:
 # =============================================================================================
 # Child -- runs ONE mode in its own process and persists ONE row
 # =============================================================================================
-def collect_evidence() -> Dict[str, Any]:
-    """What the caches ACTUALLY held when the run finished -- the proof that goes with the row.
+def collect_evidence(results: Dict[str, Any]) -> Dict[str, Any]:
+    """What the caches ACTUALLY held when the run finished, and what the run actually DID --
+    the proof that goes with the row.
 
     Called after ``_persist_trial_worker`` returns and BEFORE anything is released:
     ``run_daily_backtest`` clears neither the bar cache nor the option reader cache, so the run's
     own arrays are still resident and their private/shared split is the honest answer to "which
-    path served this run"."""
+    path served this run".
+
+    ``total_trades`` is here because a run that traded nothing compares equal for free -- see
+    ``evidence_problems``."""
     from ba2_common.core import shared_arrays as SA
 
     from app.services.backtest import price_source as ps
 
     bars = ps.memory_stats()["bar_cache"]
+    trades = results["total_trades"]     # the same key _persist_results maps to bt.total_trades
     # ``mb`` is the PRIVATE half of the bar cache and ``shared_mb`` the mapped half — see
     # price_source.memory_stats (the keys are always private; only the five float columns map).
     ev = {"shared_enabled": bool(SA.enabled()),
+          "total_trades": int(trades) if trades is not None else None,
           "bars_shared_mb": float(bars.get("shared_mb") or 0.0),
           "bars_private_mb": float(bars.get("mb") or 0.0),
           "options_shared_mb": 0.0,
-          "options_private_mb": 0.0}
+          "options_private_mb": 0.0,
+          # Entries in the option reader's raw cache: one per underlying whose chain was read.
+          # Zero means no options provider was ever built (or never asked for a chain), which
+          # for an option source makes the whole comparison beside the point.
+          "options_entries": 0,
+          "options_provider_built": False}
     try:
         from app.services.backtest import parquet_options_provider as pq
 
         opts = pq.memory_stats()
         ev["options_shared_mb"] = float(opts.get("shared_mb") or 0.0)
         ev["options_private_mb"] = float(opts.get("private_mb") or 0.0)
+        ev["options_entries"] = int(opts.get("entries") or 0)
+        ev["options_provider_built"] = ev["options_entries"] > 0
     except ImportError as e:
         # ONLY an import error is tolerated, and even that is RECORDED rather than reported as
         # "0 MB of options". There is no legitimate exception here: an equity run simply has an
@@ -549,6 +633,7 @@ def run_child(mode: str, opt_id: int, rank: Any, name: str) -> int:
     NOTE ON COLD START: the shared child BUILDS the derived ``.npy`` cache if the host was never
     prewarmed, so its first run pays the build (and its transient ~2.3x the frame) on top of the
     backtest. Run ``tools/build_shared_arrays.py`` first for a timing that means anything."""
+    _force_utf8_stdout()    # the child's own logs reach the parent through this pipe
     _bootstrap()
 
     import app.models  # noqa: F401  -- registers the mappers
@@ -588,7 +673,7 @@ def run_child(mode: str, opt_id: int, rank: Any, name: str) -> int:
             return 2
         # Read the caches BEFORE persisting: nothing has been released yet, and a DB error below
         # must not cost the evidence of what the run actually mapped.
-        evidence = collect_evidence()
+        evidence = collect_evidence(out["results"])
 
         strategy_params = dict(src["genome"])
         fixed = {}
@@ -699,7 +784,7 @@ def _run_one(mode: str, opt_id: int, rank: Any, name: str,
                 evidence = parse_child_evidence(line) or evidence
             elif line.strip().startswith(BT_ID_PREFIX):
                 bt_id = parse_child_bt_id(line) or bt_id
-            print(f"    [{mode}] {line}", flush=True)
+            _emit(f"    [{mode}] {line}")
     finally:
         # BEFORE the wait: the timer must not fire on a process that has already finished (its
         # stdout is closed, so the loop above ended), which would report a clean run as KILLED.
@@ -779,6 +864,7 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _force_utf8_stdout()
     args = _parse(argv)
     if args.child:
         return run_child(args.child, args.opt, args.rank, args.name)
@@ -823,7 +909,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"evidence [private] {_format_evidence(evidence['private'])}")
     print(f"evidence [shared]  {_format_evidence(evidence['shared'])}")
-    problems = evidence_problems(evidence["private"], evidence["shared"])
+    problems = evidence_problems(evidence["private"], evidence["shared"], src["option_source"])
     if problems:
         print("INCONCLUSIVE: the two runs cannot be compared as private vs shared --")
         for p_ in problems:
