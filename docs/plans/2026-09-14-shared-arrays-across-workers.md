@@ -881,13 +881,70 @@ Stop there and report; the metric store implementation is a follow-on plan once 
 
 ---
 
+### Task 9a: ACCEPTANCE — byte-for-byte comparison of known backtests, private vs shared
+
+**Operator acceptance criterion (2026-09-14): "ensure byte comparison of known backtest with new shared cache."** Nothing ships to remote227 until this passes.
+
+**Files:**
+- Create: `tools/backtest_parity.py`
+- Test: `testplatform/backend/tests/test_backtest_parity_tool.py`
+
+**What the tool does.** `python tools/backtest_parity.py --opt <id> [--rank best|<n>] [--bt <id>]` re-runs ONE known genome twice — once with `BA2_SHARED_ARRAYS=0` (today's private path) and once with `=1` — each in its OWN subprocess (the worker caches are process globals, so two modes cannot share a process), persists each as a NEW Backtest named `PARITY-<mode>-<original name>` with labels `["parity", "<mode>"]` (the source row is never touched; refuse to run if the names already exist), then compares the two rows and prints `PASS` or the first difference and exits non-zero on `FAIL`.
+
+Base the re-run on the existing scratch pattern (it is the same machinery the OK1000/OK2000 rows were produced with):
+```python
+# child process: python tools/backtest_parity.py --_child <mode> --opt <id> --rank <r> --name <NAME>
+import logging; logging.disable(logging.WARNING)          # memory: standalone runs must silence logging
+import sys; sys.path.insert(0, "<repo>/testplatform"); import ba2test_launcher as L; L._enter_backend()
+import app.models  # noqa
+from app.models.database import SessionLocal
+from app.models.backtest import Backtest
+from app.models.strategy import Strategy
+from app.models.strategy_optimization import StrategyOptimization
+from app.services.strategy_optimization_handler import _build_daily_trial_config, _persist_trial_worker
+from app.services.strategy_param_space import decode_params
+from app.services.backtest.daily_backtest_handler import _persist_results
+
+db = SessionLocal()
+opt = db.query(StrategyOptimization).get(opt_id); strat = db.query(Strategy).get(opt.strategy_id)
+genome = opt.best_params if rank == "best" else <rank-th of opt.all_results by distinct fitness, as tools/recover_missing_topn.py does>
+bt_block = dict((opt.optimization_config or {})["backtest"])
+cfg = _build_daily_trial_config(bt_block, decode_params(strat, genome), None)
+cfg["name"] = NAME; cfg["persist_trading_db"] = True; cfg["ga_fitness"] = opt.best_fitness
+out = _persist_trial_worker(cfg)                       # runs the backtest in THIS process
+bt = Backtest(name=NAME, model_id=None, engine_type="daily_expert", expert_name=opt.expert_name,
+              optimization_id=opt.id, labels=["parity", mode], strategy_params=..., start_date=..., end_date=...,
+              initial_capital=bt_block["initial_capital"], status="running", started_at=now)
+db.add(bt); db.commit(); db.refresh(bt); _persist_results(db, bt, out["results"]); bt.status="completed"; bt.is_saved=True; db.commit()
+print(bt.id)
+```
+The parent runs the child twice with `env={**os.environ, "BA2_SHARED_ARRAYS": mode}` and the test venv python, reads the two ids, then compares.
+
+**Comparison (`compare_rows(a, b) -> list[str]` — importable, unit-tested):**
+* Blob columns `results`, `trades`, `equity_curve`, `drawdown_curve`: parse JSON, canonicalise with `json.dumps(obj, sort_keys=True, separators=(",", ":"))`, compare the canonical STRINGS byte-for-byte. Strip only keys that are run identity, not results: `name`, `id`, `backtest_id`, `created_at`, `started_at`, `completed_at`, `run_seconds`/timing fields — enumerate them explicitly in a `_IDENTITY_KEYS` tuple with a comment per key; anything else that differs is a FAIL.
+* Numeric columns: every column in `Backtest.__table__.columns` of Float/Integer type except `id`, `optimization_id`, `model_id`, `strategy_id` — compared with `==` (exact, NOT tolerance: the point is bit-identity; NaN==NaN counts as equal).
+* Report the first differing key path (e.g. `trades[17].exit_price: 12.34 != 12.35`) and the total count of differing paths.
+
+**Reference runs (record ids + verdicts in the bench report under "Acceptance"):**
+1. Equity, OHLCV-heavy with the screener gate: the opt behind bt **1681** (`TOP1-scr-small-FMPInsiderClusterBuy-S7-goal2020-notional`, small-cap screener, 2020 window) — exercises Task 5 (bars) and the metric store path. `--rank 1`.
+2. Equity, Senate: the opt behind bt **1680** / **1645** (`sen-S6-goal2020-notional`) — exercises bars + FMP history through a different expert. `--rank best`.
+3. Options on ThetaData at 2020: the TOP1 row of the GA probe from Task 9 step 4 (pop 8 / gen 2 on the 98-symbol universe, `--options-store thetadata --start 2020-01-01`) — exercises Task 4. `--rank 1`.
+4. Options on the TastyTrade store (the archive baseline): any persisted `optm-*` row from the options-grid2 era (2026-08-25..09-03) whose config carries `options_store: "parquet"` — proves the alias + the tastytrade tree still read identically. `--rank 1`.
+All four must print PASS. A FAIL is a blocker, not a tolerance discussion: the shared path must produce the SAME bytes, or the difference must be traced to a genuine bug in the private path and fixed there first.
+
+**Unit test for the tool** (`test_backtest_parity_tool.py`): build two fake row objects with identical blobs -> `[]`; change one trade's `exit_price` -> exactly one path reported naming `trades[..].exit_price`; reorder keys inside `results` -> `[]` (canonicalisation); NaN metric on both -> equal; different `created_at` -> `[]` (identity key).
+
+**Commit** — `git commit -am "feat(tools): backtest_parity re-runs a known genome private vs shared and compares byte-for-byte"`
+
+---
+
 ### Task 9: Full regression + Windows/Linux sanity on the real trees
 
 1. Backend suite: `cd testplatform/backend && ...pytest tests/backtest -q -p no:cacheprovider` — Expected: baseline 1,169 passed + the new tests, 1 skipped, 2 xfailed, zero new failures. Then `tests/test_cache_sync.py`, `tests/test_memory_governor.py`, `tests/test_option_discovery_driver.py`.
 2. packages/common suite: `cd packages/common && ...pytest tests -q` (separate invocation).
 3. Real-tree sanity (Windows, from repo root, test venv): `python tools/build_shared_arrays.py --options-store thetadata --universe-file tools/options_universe_top100.txt --jobs 4` twice — the second run must report 98 opened / 0 built, and `du -sh ~/Documents/ba2/common/cache/_derived/ThetaDataOptionsProvider` ≈ 3x the parquet (~10 GB).
 4. Measure: run the GA probe shape from memory `option-grid-thetadata-2020-and-cache-followups` (pop 8 / gen 2 / parallel 4, the 98-symbol universe, `--options-store thetadata --start 2020-01-01`) and record per-worker RSS and USS from the `mem gen` lines / `psutil` — expected: USS per worker drops from ~10-16 GB to ~1.5-2.5 GB (the `bar_ord_l` list + contract lists + trial working set); trial seconds within 10% of the 267-444 s measured on remote227.
-5. Record the numbers in `reports/strategy_research/option_array_sharing_bench_2026-09-14.md` under a "Post-implementation" heading.
+5. Record the numbers in `reports/strategy_research/option_array_sharing_bench_2026-09-14.md` under a "Post-implementation" heading, then run Task 9a's four reference parity runs (the options one uses this probe's TOP1) and record their ids and PASS lines under "Acceptance".
 
 ---
 
