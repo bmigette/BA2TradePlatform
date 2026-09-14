@@ -1,10 +1,28 @@
 # Test-account spread/cache audit — 2026-07-16
 
+> **2026-09-14 revision 4 — selection complete:** the current plan is in
+> [the account allocation plan](plans/2026-09-13-forward-test-account-allocation.md), with
+> full results in [the updated selection report](../reports/strategy_research/forward_test_selection_2026-09-13.md).
+> All **26 candidates** are labelled: two settings per retained expert/band, each at **10%**.
+> Small EarningsDrift adds **1367 + 1528**; small Insider adds **1386 + 1681**.
+> Small FactorRanker stays excluded. Account totals are **100% / 80% / 80%**, with no
+> pending slots or oversubscription. Twelve settings carry review tags for concentration,
+> drawdown, weak results or duplication. The scheduled follow-up was deleted.
+> Selection is complete; deployment and validation at actual sleeve budgets are separate.
+> The tables below are historical, not today’s inventory.
+>
+> **Current label rule, superseding the historical rule below:** `ForwardTestCandidate`
+> identifies a selected research candidate; `ForwardTestProd` identifies a source of an
+> enabled production instance; `ForwardTestReview` flags a candidate pair needing review.
+> A source can have multiple tags. The old `ForwardTest`,
+> `ForwardTestOld` and stale candidate tags were cleared on 2026-09-13; all seven enabled
+> production sources were preserved as `ForwardTestProd`. Labels do not deploy settings.
+
 Working memo for deciding what to update. Covers: current dev-account deployments, the
 per-deployment spread-robustness resim, the mid-band FMPEarningsDrift warm-start-with-spread
 results, and the cache/data-quality findings that came up along the way.
 
-## Process rule: tag every deployed backtest's source with `ForwardTest`
+## Historical process rule: tag every deployed backtest's source with `ForwardTest`
 
 **Whenever a `Backtest` row (test-platform DB) is deployed to a live `ExpertInstance`
 (either account, dev or prod), add `"ForwardTest"` to that backtest's `labels` field.**
