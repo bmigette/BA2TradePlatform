@@ -332,9 +332,9 @@ def _count_reads(monkeypatch):
     real = OptionHistoryParquetStore.read_underlying
     calls = {"n": 0}
 
-    def counting(self, underlying):
+    def counting(self, underlying, parts=None):
         calls["n"] += 1
-        return real(self, underlying)
+        return real(self, underlying, parts)
 
     monkeypatch.setattr(OptionHistoryParquetStore, "read_underlying", counting)
     return calls
@@ -950,11 +950,12 @@ def test_arrays_round_trip_through_read_only_memory_maps(store_root, tmp_path):
 # invalidated by a rewritten partition, and — the whole point — that it answers IDENTICALLY
 # to the private path it replaces.
 # --------------------------------------------------------------------------- #
-def _derived_key_dir(root):
+def _derived_key_dir(root, symbol=_UNDER):
     from ba2_common.core import shared_arrays as SA
 
+    # The ``u_`` prefix is the reader's, not the store's: see _load_raw_underlying.
     return (Path(SA.derived_root_for(root))
-            / f"{_UNDER}.v{pq._RawUnderlying.ARRAYS_VERSION}")
+            / f"u_{symbol.upper()}.v{pq._RawUnderlying.ARRAYS_VERSION}")
 
 
 def _canon(arr):
@@ -968,10 +969,10 @@ def _canon(arr):
     return arr.dtype.str, repr(arr.tolist())
 
 
-def _published_sigs(root):
+def _published_sigs(root, symbol=_UNDER):
     from ba2_common.core import shared_arrays as SA
 
-    d = _derived_key_dir(root)
+    d = _derived_key_dir(root, symbol)
     if not d.is_dir():
         return []
     return sorted(p for p in d.iterdir() if (p / SA.DONE_MARKER).is_file())
@@ -1090,3 +1091,38 @@ def test_escape_hatch_reads_parquet_every_cold_load_and_writes_nothing(
     assert not (tmp_path / "_derived").exists()
     assert a.close.flags.writeable and b.close.flags.writeable
     _assert_same_raw(a, b)
+
+
+@pytest.mark.parametrize("symbol", ["PRN", "AUX"])
+def test_a_reserved_device_name_ticker_is_still_readable(symbol, tmp_path, monkeypatch):
+    """PRN and AUX are real tickers AND Windows device names.
+
+    ``shared_arrays._safe_key`` REFUSES such a key outright (it will not silently mangle one),
+    so a bare-symbol key raised ValueError out of ``_load_raw_underlying`` -- nothing catches
+    it, so the trial dies -- and on Linux too, because the refusal is in the sanitiser rather
+    than in the filesystem. The reader prefixes, which is what the sanitiser's own message
+    asks a symbol-keyed caller to do. Reproduced before the fix; the test is the fix's
+    receipt, so it must exercise the whole load, not just the key.
+    """
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
+    root = str(tmp_path / "ThetaDataOptionsProvider")
+    occ = f"{symbol}230120C00100000"
+    OptionHistoryParquetStore(root=root).write_partition(
+        symbol, _EXP1,
+        [OptionEodBar(occ_symbol=occ, bar_date=date(2023, 1, 3), open=5.0, high=5.4, low=4.9,
+                      close=5.2, volume=110, open_interest=900, iv=0.31)],
+        start=date(2023, 1, 1), end=date(2023, 3, 31))
+    clear_worker_parquet_options_cache()
+
+    p = ParquetOptionsProvider(root, spot_source=_spot_source, risk_free_rate=_RATE,
+                               spot_scope="reserved-name")
+    chain = p.get_chain(symbol, date(2023, 1, 3), expiry_min=date(2023, 1, 1),
+                        expiry_max=date(2023, 12, 31))
+    assert [c.symbol for c in chain] == [occ]
+    assert p.get_bar(occ, date(2023, 1, 3))["close"] == pytest.approx(5.2)
+
+    sigs = _published_sigs(root, symbol)
+    assert len(sigs) == 1, "the arrays must actually be shared, not skipped for this symbol"
+    assert sigs[0].parent.name == f"u_{symbol}.v{pq._RawUnderlying.ARRAYS_VERSION}"

@@ -178,9 +178,13 @@ logger = logging.getLogger(__name__)
 #: PROJECTIONS plus the greeks overlay, not the columns: the numeric arrays are mapped from
 #: the host-shared derived cache (see CACHING), so they are one copy per host and reclaimable
 #: page cache, while ``bar_ord_l`` (4 B/row), the per-contract lists and the ordinal/ISO
-#: dicts are private per process. On GOOG's 27,974 rows that is the 0.43 MB per-row
-#: projection plus the 0.26 MB contract list/index measured in the module docstring, against
-#: the 1.53 MB of columns that no longer count, plus 1.09 MB per greeks overlay. Sizing the
+#: dicts are private per process. ON A LEGACY NO-QUOTE TREE ADD 16 B/ROW: ``_bind``
+#: materialises ``bid``/``ask`` as private ``np.full(n_rows, nan)`` there (they are stored
+#: zero-length precisely so that nothing but the reader that needs them pays for them), which
+#: is four times what ``bar_ord_l`` costs and makes the TastyTrade tree, not the quoted
+#: ThetaData one, the expensive case per process. On GOOG's 27,974 rows that is the 0.43 MB
+#: per-row projection plus the 0.26 MB contract list/index measured in the module docstring,
+#: against the 1.53 MB of columns that no longer count, plus 1.09 MB per greeks overlay. Sizing the
 #: cap BELOW the run's universe is still the thing to avoid — that thrashes
 #: (evict-then-reload) inside a single bar, exactly as the sqlite reader's bar-cache comment
 #: warns — but the penalty for a reload is now a mmap rather than ~55 ms of parquet, so
@@ -302,6 +306,14 @@ class _RawUnderlying:
     #: business; this covers what the bytes inside those files mean, which is ours. It is
     #: deliberately NOT reused for a column-set change -- see ARRAY_NAMES above, where a
     #: rewritten partition already moves the signature.
+    #:
+    #: A BUMP ORPHANS DISK, so it is a maintenance action and not just an edit. The version is
+    #: part of the KEY, so ``<derived_root>/u_<SYM>.v<old>`` becomes a key nothing asks for --
+    #: and ``sweep()`` only keeps the newest signature WITHIN a key, so it will never collect
+    #: the old version's directories however long they sit there. Bumping means deleting the
+    #: ``*.v<old>`` directories (Task 7's ``--sweep`` gains a stale-version pass). And do not
+    #: re-warm a tree mid-grid on Windows: the running workers keep the old set MAPPED, so
+    #: NTFS refuses to evict it and both sets occupy the disk until the grid exits.
     ARRAYS_VERSION = 1
 
     #: The ARRAY_NAMES that bind straight onto the identically-named slots the hot paths read.
@@ -707,10 +719,24 @@ def _load_raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
     rather than in front of it: at the 2020 ThetaData window the private arrays were ~15.6 GB
     PER WORKER of byte-identical data, which is what OOM-killed a 251 GB host at 16 workers.
 
-    The SOURCES are the partition files ``read_underlying`` itself concatenates (asked of the
-    store, never re-globbed here), so any re-warm of this underlying moves the signature and
-    the stale arrays become unreachable rather than merely old. ``BA2_SHARED_ARRAYS=0``
-    restores the private path exactly, writing nothing.
+    The SOURCES are the partition files themselves, enumerated ONCE and then both signed and
+    read: ``partition_paths`` produces the list, ``read_underlying`` is handed that same list
+    rather than globbing again. The tree is written by a warm-up that runs for hours, so two
+    globs are not the same set, and arrays built from the second while signed with the first
+    would never be invalidated. Any re-warm of this underlying therefore moves the signature
+    and the stale arrays become unreachable rather than merely old.
+
+    MEMORY, WHICH IS THE POINT AND ALSO THE TRAP. ``build_or_open`` serialises cold builders
+    per KEY, not per host: 24 workers starting cold on 24 DIFFERENT underlyings run 24
+    concurrent builds. A build's transient peak is ~2.3x the frame (~835 B/row measured:
+    TSLA's 1.48M rows peak at 1.24 GB; the ThetaData TSLA at 7.6M rows is ~7-8 GB), so a cold
+    grid can OOM a host that the steady state fits in comfortably. Prewarming the tree with
+    ``tools/build_shared_arrays.py`` at ``--jobs 3-4`` before launching a grid is a
+    precondition, not an optimisation.
+
+    ``BA2_SHARED_ARRAYS=0`` restores the private path: the same frame, parsed privately,
+    writing nothing. The one thing it does not restore is the ORDER of the two store calls —
+    the no-partition early return below now happens before any read, on both paths.
     """
     from ba2_common.core import shared_arrays as _sa
     from ba2_providers.options.parquet_store import OptionHistoryParquetStore
@@ -719,15 +745,30 @@ def _load_raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
     parts = store.partition_paths(underlying)
     if not parts:
         # No sources means no signature, so this never reaches the derived store at all.
+        # It also covers every empty case: the store writes NO parquet for a partition with
+        # no bars (write_partition removes the file and records EMPTY in the manifest), so a
+        # zero-row partition file cannot exist and "has partitions but no rows" is
+        # unreachable. That is why the coverage log below needs no `else` branch.
         logger.warning("[backtest] parquet option store: NO partitions for %s under %s — "
                        "every chain read for it will be empty.", underlying, root)
         return _RawUnderlying(underlying, None)
 
     def _build() -> Dict[str, np.ndarray]:
-        return _RawUnderlying.arrays_from_frame(store.read_underlying(underlying))
+        # `parts`, not another glob: the files that were SIGNED are the files that are read.
+        return _RawUnderlying.arrays_from_frame(store.read_underlying(underlying, parts))
 
     derived = _sa.DerivedArrayStore(_sa.derived_root_for(root))
-    key = f"{underlying.upper()}.v{_RawUnderlying.ARRAYS_VERSION}"
+    # ``u_`` PREFIX, and it is not cosmetic. A bare symbol goes through
+    # ``shared_arrays._safe_key``, which REFUSES the Windows reserved device stems -- PRN and
+    # AUX are real tickers, the parquet store stores them happily, and a ValueError out of
+    # here kills the trial (on Linux too, since the refusal is in the key sanitiser, not in
+    # the filesystem). ``u_PRN`` is an ordinary name. Prefixing at the call site is exactly
+    # what shared_arrays' own docstring asks of a caller whose keys are symbols.
+    # NOT claimed: this does not separate two symbols the sanitiser would merge (``u_BRK/B``
+    # still cleans to ``u_BRK_B``). It cannot arise through this store -- the symbol is a
+    # DIRECTORY name in the parquet tree, so a symbol with a separator in it has no partitions
+    # to read in the first place.
+    key = f"u_{underlying.upper()}.v{_RawUnderlying.ARRAYS_VERSION}"
     u = _RawUnderlying.from_arrays(underlying, derived.build_or_open(key, parts, _build))
     # COVERAGE, STATED ONCE PER UNDERLYING PER WORKER. The vendor's history FLOOR bounds what
     # COULD have been downloaded; it says nothing about what this tree actually holds, and a

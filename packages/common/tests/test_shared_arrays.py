@@ -569,3 +569,62 @@ def test_sweep_collects_old_signatures_orphans_and_dead_tmps_only(tmp_path):
     assert not old_done.exists() and not orphan.exists() and not dead_tmp.exists()
     assert fresh_superseded.is_dir(), "a directory published seconds ago is not garbage yet"
     assert store.sweep() == 0, "sweep must be idempotent"
+
+
+def test_a_long_build_heartbeats_its_own_lock(tmp_path, monkeypatch):
+    """A build that outlives LOCK_STALE_S must not have its lock broken UNDER it.
+
+    The lock's mtime is stamped once, at _acquire, and staleness is measured from that stamp,
+    so without a heartbeat a slow build hands a second process permission to start the same
+    multi-GB build beside it — precisely on the largest underlyings, where a duplicate build
+    is what this module exists to prevent.
+
+    Made deterministic by slowing the WRITE of each array (0.2 s) past a shortened
+    LOCK_STALE_S (0.3 s) and asking, at each array boundary, whether the lock has gone stale.
+    Without the heartbeat the observed ages are 0.2/0.4/0.6/0.8 s and every answer after the
+    first is "stale"; with it each age is one array long. The observation is taken INSIDE the
+    write, so it sees the state the build itself would be judged on.
+    """
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    lock = store.lock_path("AAPL", [src])
+    monkeypatch.setattr(SA, "LOCK_STALE_S", 0.3)
+
+    real_save = np.save
+    stale_at_each_array = []
+
+    def slow_save(f, a, **kw):
+        time.sleep(0.2)
+        out = real_save(f, a, **kw)
+        stale_at_each_array.append(SA.DerivedArrayStore._lock_is_stale(lock))
+        return out
+
+    monkeypatch.setattr(np, "save", slow_save)
+    got = store.build_or_open("AAPL", [src], _arrays)
+
+    assert len(stale_at_each_array) == len(_arrays()), stale_at_each_array
+    assert not any(stale_at_each_array), (
+        f"the build's own lock went stale mid-build: {stale_at_each_array}")
+    np.testing.assert_array_equal(got["close"], _arrays()["close"])
+
+
+def test_a_vanished_lock_does_not_kill_the_build(tmp_path, monkeypatch):
+    """The heartbeat is best-effort. A lock broken by a waiter that gave up is not something a
+    builder in flight can repair, and throwing the finished arrays away over it would be the
+    worse answer: the publish still either wins the rename or opens the winner's set."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    lock = store.lock_path("AAPL", [src])
+    real_save = np.save
+    killed = []
+
+    def save_then_break_the_lock(f, a, **kw):
+        out = real_save(f, a, **kw)
+        if not killed:
+            lock.unlink()
+            killed.append(1)
+        return out
+
+    monkeypatch.setattr(np, "save", save_then_break_the_lock)
+    got = store.build_or_open("AAPL", [src], _arrays)
+    np.testing.assert_array_equal(got["close"], _arrays()["close"])

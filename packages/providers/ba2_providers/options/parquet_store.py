@@ -426,10 +426,18 @@ class OptionHistoryParquetStore:
         base = os.path.join(self.root, underlying.upper())
         return sorted(glob.glob(os.path.join(base, "exp=*", f"*_{BARS_INTERVAL}.parquet")))
 
-    def read_underlying(self, underlying: str):
-        """Every partition for ``underlying`` concatenated, or None if there are none."""
+    def read_underlying(self, underlying: str, parts: Optional[List[str]] = None):
+        """Every partition for ``underlying`` concatenated, or None if there are none.
+
+        ``parts`` reads EXACTLY the given partition paths instead of globbing for them. A
+        caller that has already enumerated the partitions — to sign them, as the derived array
+        cache does — must be able to read the very files it enumerated: the tree is written
+        concurrently with a warm-up, so a second glob can return a partition the first did not
+        see, and the arrays would then be published under a signature that does not describe
+        them. Passing the list makes the read and the identity the same set by construction.
+        """
         import pandas as pd
-        parts = self.partition_paths(underlying)
+        parts = self.partition_paths(underlying) if parts is None else list(parts)
         if not parts:
             return None
         return pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)

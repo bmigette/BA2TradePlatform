@@ -731,3 +731,27 @@ def test_partition_paths_is_exactly_what_read_underlying_concatenates(store):
 
     assert store.partition_paths("aapl") == paths, "the symbol is upper-cased like everywhere"
     assert store.partition_paths("NOPE") == []
+
+
+def test_read_underlying_reads_exactly_the_partition_list_it_is_given(store):
+    """An explicit list is READ, not re-globbed.
+
+    The derived array cache signs the partitions it enumerated and then asks for them by name.
+    If this re-globbed, a partition that landed between the two calls (the tree is written by
+    a warm-up that runs for hours) would be read into arrays published under a signature that
+    does not mention it — a stale-looking set that is actually too NEW, and never invalidated
+    because its signature already matches.
+    """
+    store.write_partition("AAPL", date(2023, 1, 20), [_bar(d=date(2023, 1, 3))],
+                          *WINDOW, empty_contracts=[])
+    signed = store.partition_paths("AAPL")
+    # ... and now a concurrent warm-up finishes another expiry.
+    store.write_partition("AAPL", date(2023, 1, 27), [
+        _bar(occ="AAPL230127C00150000", d=date(2023, 1, 4)),
+        _bar(occ="AAPL230127C00150000", d=date(2023, 1, 5)),
+    ], *WINDOW, empty_contracts=[])
+
+    assert len(store.read_underlying("AAPL", signed)) == 1
+    assert set(store.read_underlying("AAPL", signed)["occ_symbol"]) == {"AAPL230120C00150000"}
+    assert len(store.read_underlying("AAPL")) == 3, "no list still means every partition"
+    assert store.read_underlying("AAPL", []) is None

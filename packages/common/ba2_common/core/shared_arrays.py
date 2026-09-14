@@ -247,7 +247,7 @@ class DerivedArrayStore:
                 try:
                     opened = self._try_open(final)
                     if opened is None:
-                        self._build(final, build_fn)
+                        self._build(final, build_fn, lock)
                         opened = self._try_open(final)
                         if opened is None:
                             raise RuntimeError(
@@ -297,8 +297,24 @@ class DerivedArrayStore:
             out[name] = np.asarray(arr)
         return out
 
-    def _build(self, final: Path, build_fn: BuildFn) -> None:
-        """Run ``build_fn`` into a private ``.tmp`` directory and publish it onto ``final``."""
+    def _build(self, final: Path, build_fn: BuildFn, lock: Optional[Path] = None) -> None:
+        """Run ``build_fn`` into a private ``.tmp`` directory and publish it onto ``final``.
+
+        ``lock`` is the build lock the caller holds, and it is HEARTBEATED here for the same
+        reason the staging directory is. Its mtime was stamped once, at ``_acquire``, and
+        staleness is measured from that stamp -- so a build that legitimately runs longer than
+        ``LOCK_STALE_S`` has its own lock broken out from under it and a second process starts
+        the identical multi-GB build beside it. That is the exact case this module exists for:
+        the largest option underlyings are the slowest builds AND the ones a duplicate build
+        cannot be afforded on. Passed rather than recomputed so a signature that moves
+        mid-build cannot make us touch a different process's lock.
+
+        WHAT IT DOES NOT COVER: ``build_fn`` itself is one opaque blocking call and cannot be
+        heartbeated from here, so ``LOCK_STALE_S`` still has to exceed the time it takes to
+        produce the arrays (a parquet parse: ~1-2 min for the largest underlying measured,
+        against a 15 min default). The heartbeat covers the WRITE phase, which is the part
+        that scales with the size of the result rather than with the source.
+        """
         arrays = build_fn()
         tmp = final.parent / _tmp_dir_name(final.name)
         if tmp.exists():
@@ -324,6 +340,7 @@ class DerivedArrayStore:
                 # Republish the staging directory's freshness. Writing into a file does not
                 # touch its parent's mtime on NTFS, and _tmp_is_live reads exactly that.
                 os.utime(tmp, None)
+                self._heartbeat(lock)
             payload = json.dumps({"arrays": sorted(arrays), "schema": SCHEMA_VERSION,
                                   "written_at": time.time(), "pid": os.getpid()})
             # The marker is written and fsynced LAST: it is the only thing _try_open trusts, so
@@ -333,6 +350,22 @@ class DerivedArrayStore:
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
+
+    @staticmethod
+    def _heartbeat(lock: Optional[Path]) -> None:
+        """Say "still building" by advancing the lock's mtime; never fail over it.
+
+        A lock that has vanished (broken by a waiter that gave up on us, or never passed) is
+        not something a builder in flight can fix, and raising here would throw away the work
+        instead. The publish is still safe: it either wins the ``os.replace`` or finds the
+        other builder's set and opens it.
+        """
+        if lock is None:
+            return
+        try:
+            os.utime(lock, None)
+        except OSError:
+            pass
 
     @staticmethod
     def _write_fsynced(path: Path, write: Callable[[object], None]) -> None:
