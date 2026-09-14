@@ -781,9 +781,11 @@ def check_frame_quality(df: "pd.DataFrame", thresholds: Optional[Dict[str, float
 #: there. Deleting the ``*.v<old>`` directory is part of the bump.
 METRIC_STORE_ARRAYS_VERSION = 1
 
-#: Object columns that become an ORDERED categorical. ``date`` must be, or the as-of resolve
-#: (``dates <= day``) raises "Unordered Categoricals can only compare equality"; the order is the
-#: sorted-ISO category order, which is exactly the string order it replaces.
+#: Object columns that become an ORDERED categorical. ``date`` must be, and it is load-bearing in
+#: TWO places: the as-of resolve (``dates <= day``) and ``.min()``/``.max()`` over the column
+#: (``tools/strategy_research/runtime.py:110``, the store-coverage guard) both raise "Unordered
+#: Categoricals can only compare equality" without it. The order is the sorted-ISO category order,
+#: which is exactly the string order it replaces.
 _ORDERED_CAT_COLUMNS = ("date",)
 
 _COLUMNS_ARRAY = "__columns_utf8"
@@ -795,6 +797,15 @@ _NCATS_SUFFIX = "__ncats"
 #: Characters that cannot appear in a column name: each array is published as ``<name>.npy``, and
 #: the name also travels inside a newline-joined blob.
 _UNSAFE_NAME_CHARS = '/\\:*?"<>|\n\r'
+
+#: Stems NTFS refuses as a path segment whatever the extension, so ``AUX.npy`` cannot be created.
+#: ``shared_arrays._safe_key`` guards the cache KEY with the same set, but array NAMES go through
+#: no sanitiser at all -- so the check has to be made here. Taken from that module so there is one
+#: definition, with the (tiny) set replicated only for the case where it is ever renamed there.
+_RESERVED_NAMES = getattr(_sa, "_WINDOWS_RESERVED", None) or (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)})
 
 
 def _utf8_join(parts: "List[str]", what: str) -> "np.ndarray":
@@ -819,7 +830,10 @@ def _utf8_split(arr: "np.ndarray", n_expected: int, what: str) -> "List[str]":
     strings or one empty one), and because a mapped set paired with the wrong sidecar must fail
     loudly rather than silently re-key every row.
     """
-    out = bytes(arr).decode("utf-8").split("\n") if arr.size else []
+    # An EMPTY blob is two different things -- zero strings, or ONE empty string -- and the byte
+    # count cannot tell them apart. ``n_expected`` is what decides, so a category column that is
+    # "" on every row round-trips instead of failing the decode that is meant to validate it.
+    out = [] if (arr.size == 0 and n_expected == 0) else bytes(arr).decode("utf-8").split("\n")
     if len(out) != n_expected:
         raise ValueError(
             f"metric store: {what} decoded to {len(out)} entries, expected {n_expected} — the "
@@ -867,15 +881,27 @@ def _store_arrays_from_frame(df: "pd.DataFrame") -> "Dict[str, np.ndarray]":
     for raw_name in df.columns:
         name = str(raw_name)
         if any(c in name for c in _UNSAFE_NAME_CHARS) or name.startswith("__") \
-                or name.endswith((_CATS_SUFFIX, _NCATS_SUFFIX)):
+                or name.endswith((_CATS_SUFFIX, _NCATS_SUFFIX)) \
+                or name.split(".")[0].upper() in _RESERVED_NAMES:
             raise ValueError(
                 f"metric store: column {name!r} cannot be a shared-array name (it is published as "
-                f"'<name>.npy' and must not collide with the '__' encodings)")
+                f"'<name>.npy', so it must not collide with the '__' encodings and must not be a "
+                f"Windows reserved device stem)")
         col = df[raw_name]
         dtype = col.dtype
         if dtype == object or isinstance(dtype, pd.CategoricalDtype):
             values = col.astype(object) if isinstance(dtype, pd.CategoricalDtype) else col
             cat = pd.Categorical(values, ordered=name in _ORDERED_CAT_COLUMNS)
+            # Refused, not stringified. ``str()`` would happily turn an int or Timestamp column
+            # into categories that compare and sort DIFFERENTLY from the values the store was
+            # built with, and the frame would come back silently re-typed instead of failing here,
+            # where the BUILD that produced the odd column can be fixed.
+            bad = next((c for c in cat.categories if not isinstance(c, str)), None)
+            if bad is not None:
+                raise TypeError(
+                    f"metric store: object column {name!r} holds a non-string value {bad!r} "
+                    f"({type(bad).__name__}); the shared-array contract carries object columns as "
+                    "STRING categories only. Write it as a numeric column, or as ISO strings.")
             cats = [str(c) for c in cat.categories]
             codes = np.ascontiguousarray(cat.codes, dtype=_code_dtype(len(cats)))
             arrays[name] = codes
@@ -1269,8 +1295,8 @@ def _latest_scan_date_le(store_df: "pd.DataFrame", day: str) -> Optional[str]:
     WHY THIS EXISTS. ``load_store`` returns ``date`` as an ORDERED categorical, and pandas refuses
     ``series <= "2023-03-05"`` when that string is not one of the categories — which is the normal
     case, since the as-of day is a BAR date and the scan grid is weekly. So the comparison is done
-    on the CODES (an int8/int16 pass, ~100x cheaper than the object comparison it replaces) and
-    only the winning code is decoded. A string-keyed frame (a test fixture, a hand-built frame)
+    on the CODES (an int8/int16 pass -- ~24x cheaper than the object comparison it replaces:
+    129 ms -> 5.4 ms on the real store, spike §1.6) and only the winning code is decoded. A string-keyed frame (a test fixture, a hand-built frame)
     still takes the original path, so both dtypes give the same answer.
 
     The codes are checked for PRESENCE rather than trusted from the category list: a caller may

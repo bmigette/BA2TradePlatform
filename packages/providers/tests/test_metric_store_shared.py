@@ -112,6 +112,31 @@ def test_newline_in_a_category_is_refused_not_silently_shifted(tmp_path):
         ms._store_arrays_from_frame(src)
 
 
+def test_an_all_empty_string_category_round_trips(tmp_path):
+    """``_utf8_join([""])`` is a ZERO-BYTE blob, exactly like zero categories; the count decides."""
+    _, src = _make_store(tmp_path, n_symbols=4)
+    src["sector"] = ""
+    out = ms._frame_from_arrays(ms._store_arrays_from_frame(src))
+    assert list(out["sector"].cat.categories) == [""]
+    assert list(out["sector"].astype(str)) == [""] * len(src)
+
+
+def test_non_string_categories_are_refused_not_stringified(tmp_path):
+    _, src = _make_store(tmp_path, n_symbols=3)
+    src["sector"] = [1, 2, 3] * 3                      # object-ish column holding ints
+    src["sector"] = src["sector"].astype(object)
+    with pytest.raises(TypeError, match="sector"):
+        ms._store_arrays_from_frame(src)
+
+
+def test_a_windows_reserved_column_name_is_refused(tmp_path):
+    """Array names are published as ``<name>.npy``; NTFS refuses ``AUX.npy`` outright."""
+    _, src = _make_store(tmp_path, n_symbols=3)
+    src["AUX"] = 1.0
+    with pytest.raises(ValueError, match="AUX"):
+        ms._store_arrays_from_frame(src)
+
+
 def test_nullable_extension_dtype_is_refused_loudly(tmp_path):
     _, src = _make_store(tmp_path, n_symbols=3)
     src["shares"] = pd.array([1, 2, None] * 3, dtype="Int64")
@@ -249,3 +274,36 @@ def test_screens_and_metrics_agree_with_the_string_keyed_frame(tmp_path, monkeyp
         ms.screened_symbol_union(raw, "2023-01-15", "2023-04-15", settings)
     assert ms.screened_symbol_union(df, "2023-02-01", "2023-02-20", settings) == \
         ms.screened_symbol_union(raw, "2023-02-01", "2023-02-20", settings)
+    # end_day BEFORE the first scan date: no window at all, on either dtype
+    assert ms.screened_symbol_union(df, "2022-11-01", "2022-12-01", settings) == \
+        ms.screened_symbol_union(raw, "2022-11-01", "2022-12-01", settings) == []
+
+
+def test_as_of_resolve_reads_the_rows_present_not_just_the_categories(tmp_path, monkeypatch):
+    """A row-filtered frame keeps the FULL category set; the naive answer would be a date that
+    the slice no longer contains."""
+    _shared_on(monkeypatch)
+    store, _ = _make_store(tmp_path)
+    df = ms.load_store(store)
+    january = df[df["date"] == "2023-01-31"]
+    assert list(january["date"].cat.categories) == ms.scan_dates(df)      # categories survive
+    assert ms._latest_scan_date_le(january, "2023-06-01") == "2023-01-31"
+    assert ms._latest_scan_date_le(january, "2022-12-31") is None
+    assert ms._latest_scan_date_le(df, "2023-06-01") == "2023-03-31"
+    # and it agrees with the string-keyed frame it replaces
+    raw = _parquet_frame(store)
+    assert ms._latest_scan_date_le(raw, "2023-03-05") == ms._latest_scan_date_le(df, "2023-03-05")
+
+
+def test_per_date_top_n_groupby_matches_the_string_keyed_frame(tmp_path, monkeypatch):
+    """The call ``screened_symbol_union`` actually changed: groupby('date', observed=True).head."""
+    _shared_on(monkeypatch)
+    store, _ = _make_store(tmp_path)
+    df = ms.load_store(store)
+    raw = _parquet_frame(store)
+    window = df[df["date"] != "2023-01-31"].sort_values("market_cap", ascending=False)
+    raw_window = raw[raw["date"] != "2023-01-31"].sort_values("market_cap", ascending=False)
+    got = window.groupby("date", sort=False, observed=True).head(3)
+    want = raw_window.groupby("date", sort=False).head(3)
+    assert list(got["symbol"].astype(str)) == list(want["symbol"])
+    assert sorted(set(got["date"].astype(str))) == ["2023-02-28", "2023-03-31"]
