@@ -5,6 +5,20 @@
 **Deliverable:** a runnable script, not a run. The target machine holds the option data; this
 repo holds the definition of what to run.
 
+**Stage-1 implementation update, 2026-09-12:** the later 2026-08-31 exclusion of
+truly unbounded structures removes `O_SSTG` and `O_SSTD` from search. The current
+discovery matrix is therefore **16 permitted singles × 2 experts = 32 jobs**.
+This is a risk-policy exclusion, not the performance survival gate rejected below.
+`tools/stage1_run.sh` now selects `run_options_matrix.py --profile discovery`, with
+population **200**, generation ceiling **60**, patience **8**, and distinct
+configuration-based job/checkpoint names. Actual joint genomes now contain
+**47–63 genes**, including expert, risk-manager and schedule parameters; the older
+~22 figure below is not the full current search space. The 2023 window remains a
+limited-history experiment; the later goal2020 requirement still needs explicit
+ThetaData reader/vendor wiring and verified coverage. See the
+[review and usage](../../../reports/strategy_research/option_stage1_driver_review_2026-09-12.md).
+Earlier counts/implementation-status passages below are retained as design history.
+
 ---
 
 ## 1. Goal

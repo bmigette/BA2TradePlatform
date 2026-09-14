@@ -1,0 +1,600 @@
+{
+  "method": "Real strategy builder + collect_param_space, merged expert/RM/schedule genes; no engine run or network",
+  "jobs": [
+    {
+      "expert": "FMPRating",
+      "strategy": "O_LC",
+      "genes": 50,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_LP",
+      "genes": 50,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_VERT",
+      "genes": 50,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_BULLCS",
+      "genes": 50,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_BULLPS",
+      "genes": 53,
+      "by_namespace": {
+        "model": 15,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_BEARCS",
+      "genes": 53,
+      "by_namespace": {
+        "model": 15,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_BF",
+      "genes": 49,
+      "by_namespace": {
+        "model": 15,
+        "entry": 5,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_IC",
+      "genes": 52,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_JL",
+      "genes": 52,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_RS",
+      "genes": 52,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_CSP",
+      "genes": 53,
+      "by_namespace": {
+        "model": 15,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_STRD",
+      "genes": 47,
+      "by_namespace": {
+        "model": 15,
+        "entry": 3,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_STRG",
+      "genes": 50,
+      "by_namespace": {
+        "model": 15,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_CC",
+      "genes": 49,
+      "by_namespace": {
+        "model": 15,
+        "cond": 14,
+        "exit": 13,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_PP",
+      "genes": 47,
+      "by_namespace": {
+        "model": 15,
+        "cond": 13,
+        "exit": 12,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_WHEEL",
+      "genes": 60,
+      "by_namespace": {
+        "model": 15,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 17,
+        "exit": 11,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": true,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_LC",
+      "genes": 53,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_LP",
+      "genes": 53,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_VERT",
+      "genes": 53,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_BULLCS",
+      "genes": 53,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_BULLPS",
+      "genes": 56,
+      "by_namespace": {
+        "model": 18,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_BEARCS",
+      "genes": 56,
+      "by_namespace": {
+        "model": 18,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_BF",
+      "genes": 52,
+      "by_namespace": {
+        "model": 18,
+        "entry": 5,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_IC",
+      "genes": 55,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_JL",
+      "genes": 55,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_RS",
+      "genes": 55,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_CSP",
+      "genes": 56,
+      "by_namespace": {
+        "model": 18,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 16,
+        "exit": 5,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_STRD",
+      "genes": 50,
+      "by_namespace": {
+        "model": 18,
+        "entry": 3,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_STRG",
+      "genes": 53,
+      "by_namespace": {
+        "model": 18,
+        "entry": 6,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_CC",
+      "genes": 52,
+      "by_namespace": {
+        "model": 18,
+        "cond": 14,
+        "exit": 13,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_PP",
+      "genes": 50,
+      "by_namespace": {
+        "model": 18,
+        "cond": 13,
+        "exit": 12,
+        "schedule": 7
+      },
+      "gate": {},
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_WHEEL",
+      "genes": 63,
+      "by_namespace": {
+        "model": 18,
+        "entry": 7,
+        "optsel": 3,
+        "cond": 17,
+        "exit": 11,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 100.0
+      },
+      "hold_assigned_stock": true,
+      "fitness": "option_consistent_annual_return"
+    }
+  ],
+  "excluded_by_search_policy": [
+    {
+      "expert": "FMPRating",
+      "strategy": "O_SSTD",
+      "genes": 48,
+      "by_namespace": {
+        "model": 15,
+        "entry": 4,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 300.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "FMPRating",
+      "strategy": "O_SSTG",
+      "genes": 49,
+      "by_namespace": {
+        "model": 15,
+        "entry": 5,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 300.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_SSTD",
+      "genes": 51,
+      "by_namespace": {
+        "model": 18,
+        "entry": 4,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 300.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    },
+    {
+      "expert": "DeterministicScorer",
+      "strategy": "O_SSTG",
+      "genes": 52,
+      "by_namespace": {
+        "model": 18,
+        "entry": 5,
+        "optsel": 3,
+        "cond": 15,
+        "exit": 4,
+        "schedule": 7
+      },
+      "gate": {
+        "price_max": 300.0
+      },
+      "hold_assigned_stock": false,
+      "fitness": "option_consistent_annual_return"
+    }
+  ],
+  "policy": "2026-08-31: O_SSTG/O_SSTD excluded from optimization; builders remain supported"
+}

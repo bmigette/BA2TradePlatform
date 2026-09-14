@@ -133,7 +133,8 @@ def test_every_driver_help_promise_that_zero_disables_is_now_true():
     import inspect
 
     for mod in (run_options_matrix, run_senate_matrix, run_screener_capband_matrix):
-        src = inspect.getsource(mod.main)
+        # Parser/command helpers may live outside main; inspect the complete driver.
+        src = inspect.getsource(mod)
         assert "Pass 0 to disable" in src, f"{mod.__name__} dropped the documented promise"
         assert "args.profit_cap_pct and" not in src, (
             f"{mod.__name__} reintroduced the falsy-zero guard")
