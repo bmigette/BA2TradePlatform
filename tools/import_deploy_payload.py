@@ -260,30 +260,50 @@ def main() -> int:
             # Defaults to False; without it the instance analyses and never trades. The export
             # now carries it explicitly (deploy_parity), so this is a floor for an OLD payload.
             expert_params.setdefault("allow_automated_trade_opening", True)
-            # THE SCHEDULE, same failure mode as the flag above and previously dropped entirely.
-            #
-            # The payload carries the backtest's own cadence as execution.run_schedule_override,
-            # but nothing here ever wrote it, so a freshly deployed instance came up enabled,
-            # correctly configured, and with NO schedule -- it loads, shows in the UI, and never
-            # fires. Indistinguishable from a strategy that simply found no setup, which is the
-            # exact trap the allow_automated_trade_opening line above exists to close. Found live
-            # 2026-09-06 on five instances whose Scheduled Jobs table was empty.
-            sched = ((entry["settings"].get("execution") or {}).get("run_schedule_override") or {})
-            if sched.get("days"):
-                days = {d: bool(v) for d, v in sched["days"].items()}
-                times = sched.get("times") or ["09:30"]
-                expert_params.setdefault("execution_schedule_enter_market",
-                                         {"days": days, "times": times, "time_basis": "market"})
-                # EXITS RUN EVERY WEEKDAY, not on the entry cadence. Entry is typically Mondays
-                # only (that is when the screener re-ranks), but an open position's stop and
-                # target have to be evaluated daily -- inheriting a Monday-only schedule here
-                # would leave live positions unmanaged from Tuesday to Friday.
-                expert_params.setdefault("execution_schedule_open_positions", {
-                    "days": {d: d not in ("saturday", "sunday") for d in days},
-                    "times": times, "time_basis": "market"})
+
+        # THE SCHEDULE -- applied on EVERY deploy, not only on creation.
+        #
+        # The payload carries the backtest's own cadence as execution.run_schedule_override.
+        # Originally nothing wrote it at all, so a freshly deployed instance came up enabled,
+        # correctly configured, and with NO schedule -- it loaded, showed in the UI and never
+        # fired (found 2026-09-06 on five instances with an empty Scheduled Jobs table). That was
+        # fixed for NEW instances only, which left the mirror-image bug:
+        #
+        # RE-DEPLOYING a DIFFERENT strategy onto an EXISTING instance kept the OLD cadence. The
+        # GA optimizes the entry WEEKDAY (see reference-ga-schedule-genes), so the instance then
+        # runs the new genome on the previous strategy's calendar -- a silent parity break, with
+        # every other setting correct. Hit live 2026-09-14 swapping prod instance 13 from
+        # sen-S5 (mon/wed/fri) to sen-S6 (mon/tue/fri): the rules and settings changed, the
+        # schedule did not, and only a post-deploy read caught it.
+        #
+        # ASSIGNED, not setdefault, for the same reason: the payload's cadence IS the strategy's,
+        # and silently keeping a stale one is the failure being closed here.
+        sched = ((entry["settings"].get("execution") or {}).get("run_schedule_override") or {})
+        if sched.get("days"):
+            days = {d: bool(v) for d, v in sched["days"].items()}
+            times = sched.get("times") or ["09:30"]
+            prior = (expert.get_setting_with_interface_default(
+                "execution_schedule_enter_market", log_warning=False) or {}).get("days") or {}
+            expert_params["execution_schedule_enter_market"] = {
+                "days": days, "times": times, "time_basis": "market"}
+            # EXITS RUN EVERY WEEKDAY, not on the entry cadence. Entry is typically one or two
+            # days a week (that is when the screener re-ranks), but an open position's stop and
+            # target have to be evaluated daily -- inheriting the entry schedule here would
+            # leave live positions unmanaged for the rest of the week.
+            expert_params["execution_schedule_open_positions"] = {
+                "days": {d: d not in ("saturday", "sunday") for d in days},
+                "times": times, "time_basis": "market"}
+            on = sorted(d for d, v in days.items() if v)
+            was = sorted(d for d, v in prior.items() if v)
+            if was and was != on:
+                print(f"  entry schedule: {was} -> {on}  (the new strategy's OWN cadence; the GA "
+                      f"optimizes the entry weekday, so keeping the old one would run this "
+                      f"genome on the previous strategy's calendar)")
             else:
-                print("  WARNING: payload carries no run_schedule_override -- the instance will "
-                      "have NO schedule and will never fire. Set one before enabling it.")
+                print(f"  entry schedule: {on} (exits every weekday)")
+        else:
+            print("  WARNING: payload carries no run_schedule_override -- the instance will "
+                  "have NO schedule and will never fire. Set one before enabling it.")
         expert.save_settings({k: (v, None) for k, v in expert_params.items()})
         print(f"expertsetting: saved {len(expert_params)} keys for instance {inst_id}"
               + ("  (incl. allow_automated_trade_opening)" if created else ""))
