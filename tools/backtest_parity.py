@@ -22,24 +22,40 @@ below, one comment per key). No tolerance on numbers: the shared path maps the S
 private path parsed, so "close enough" is a bug in the mapping, not a rounding question. A FAIL
 is a blocker -- trace it, fix the cause, re-run; never widen the comparison to make it pass.
 
+A PASS ALSO HAS TO PROVE THE SHARED PATH RAN. Two children that both silently took the private
+path produce identical rows for a reason that has nothing to do with this work. So each child
+reports what its caches actually held (``PARITY_EVIDENCE=``: ``shared_arrays.enabled()`` plus the
+private/shared MB split from ``price_source.memory_stats`` and
+``parquet_options_provider.memory_stats``) and the parent refuses to call it a PASS when the
+shared child mapped nothing the private child held privately.
+
+PREWARM FIRST. The shared child BUILDS the derived ``.npy`` cache if the host is cold, paying the
+build (transient ~2.3x the frame) inside the run. Run ``tools/build_shared_arrays.py`` before
+this tool if the timings are meant to mean anything.
+
 Usage
 -----
     python tools/backtest_parity.py --opt 487 --rank best
     python tools/backtest_parity.py --opt 512 --rank 1 --label rerun2
+    python tools/backtest_parity.py --bt 1681            # rank read off the row's TOP<n>- name
     python tools/backtest_parity.py --opt 512 --rank 1 --dry-run
 
 Exit codes: 0 = PASS, 1 = FAIL (the rows differ), 2 = the comparison could not be made (a child
-failed, or the parity rows already exist).
+failed or timed out, the parity rows already exist, or the evidence says the two modes did not
+actually differ).
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import functools
 import json
 import math
 import os
+import re
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -49,6 +65,21 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: The child's last stdout line. The parent reads the id from it, so it is a PROTOCOL, not a log
 #: line: keep it last, keep it exact.
 BT_ID_PREFIX = "PARITY_BT_ID="
+
+#: The child's other protocol line, printed just before the id: what the caches ACTUALLY held
+#: when the run finished. A PASS is only evidence if the shared child really mapped shared
+#: arrays -- two runs that both silently took the private path are identical for a reason that
+#: proves nothing. See ``evidence_problems``.
+EVIDENCE_PREFIX = "PARITY_EVIDENCE="
+
+#: How many differing leaves to spell out per column before summarising the rest. One is rarely
+#: enough to see a pattern ("every exit_price" vs "one trade"); twenty is a wall.
+_MAX_REPORTED_LEAVES = 5
+#: Values in a difference line are truncated to this many characters: a differing leaf can be a
+#: whole nested dict, and an unbounded repr turns the verdict into a dump.
+_MAX_REPR = 120
+#: Child output lines kept for the protocol parse (the stream itself is forwarded live).
+_TAIL_LINES = 200
 
 #: ``0`` restores the private path (today's behaviour); ``1`` is the shared mapped path.
 _MODE_FLAG = {"private": "0", "shared": "1"}
@@ -146,15 +177,22 @@ def _scalars_equal(x: Any, y: Any) -> bool:
     return bool(x == y)
 
 
+def _r(value: Any) -> str:
+    """A value for a difference line: its repr, truncated. A differing leaf can be a whole nested
+    dict, and an unbounded repr turns the verdict into a dump nobody reads."""
+    text = repr(value)
+    return text if len(text) <= _MAX_REPR else text[:_MAX_REPR - 1] + "…"
+
+
 def _diff_paths(a: Any, b: Any, path: str, out: List[str]) -> None:
     """Every differing LEAF, deepest-first-in-order, as ``path: a != b``."""
     if isinstance(a, dict) and isinstance(b, dict):
         for k in list(a) + [k for k in b if k not in a]:
             sub = f"{path}.{k}" if path else str(k)
             if k not in a:
-                out.append(f"{sub}: <missing> != {b[k]!r}")
+                out.append(f"{sub}: <missing> != {_r(b[k])}")
             elif k not in b:
-                out.append(f"{sub}: {a[k]!r} != <missing>")
+                out.append(f"{sub}: {_r(a[k])} != <missing>")
             else:
                 _diff_paths(a[k], b[k], sub, out)
         return
@@ -165,7 +203,7 @@ def _diff_paths(a: Any, b: Any, path: str, out: List[str]) -> None:
             _diff_paths(a[i], b[i], f"{path}[{i}]", out)
         return
     if not _scalars_equal(a, b):
-        out.append(f"{path}: {a!r} != {b!r}")
+        out.append(f"{path}: {_r(a)} != {_r(b)}")
 
 
 def compare_rows(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
@@ -187,11 +225,83 @@ def compare_rows(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
             # localise (e.g. list vs dict at the root). Report it rather than swallowing it.
             diffs.append(f"{col}: canonical JSON differs (no differing leaf localised)")
         else:
-            diffs.append(f"{col}: {len(leaves)} differing leaf/leaves; first: {leaves[0]}")
+            shown = "; ".join(leaves[:_MAX_REPORTED_LEAVES])
+            more = (f"; (+{len(leaves) - _MAX_REPORTED_LEAVES} more)"
+                    if len(leaves) > _MAX_REPORTED_LEAVES else "")
+            diffs.append(f"{col}: {len(leaves)} differing leaf/leaves; first: {shown}{more}")
     for col in numeric_columns():
         if not _scalars_equal(a.get(col), b.get(col)):
-            diffs.append(f"{col}: {a.get(col)!r} != {b.get(col)!r}")
+            diffs.append(f"{col}: {_r(a.get(col))} != {_r(b.get(col))}")
     return diffs
+
+
+def parse_child_evidence(stdout: str) -> Optional[Dict[str, Any]]:
+    """The child's cache evidence, read from the LAST ``PARITY_EVIDENCE=`` line.
+
+    ``None`` when the child never printed one or printed something unparsable -- in both cases
+    the parent has no proof of which path ran, which is a refusal, not a warning."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith(EVIDENCE_PREFIX):
+            try:
+                loaded = json.loads(line[len(EVIDENCE_PREFIX):].strip())
+            except ValueError:
+                return None
+            return loaded if isinstance(loaded, dict) else None
+    return None
+
+
+def _mb(ev: Optional[Dict[str, Any]], key: str) -> float:
+    try:
+        return float((ev or {}).get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def evidence_problems(private_ev: Optional[Dict[str, Any]],
+                      shared_ev: Optional[Dict[str, Any]]) -> List[str]:
+    """Reasons a PASS from these two children would prove NOTHING.
+
+    Two runs that both took the private path are byte-identical for a reason that has nothing to
+    do with shared arrays, and that is exactly the failure mode a green gate must not hide: an
+    unset flag, a typo in an env name, a consumer that quietly fell back. So the verdict is
+    conditional on the caches actually having held what each mode claims."""
+    problems: List[str] = []
+    if private_ev is None:
+        problems.append(f"the private child printed no {EVIDENCE_PREFIX} line: there is no proof "
+                        f"of which path it took")
+    if shared_ev is None:
+        problems.append(f"the shared child printed no {EVIDENCE_PREFIX} line: there is no proof "
+                        f"the shared path was used")
+    if private_ev is not None and private_ev.get("shared_enabled"):
+        problems.append("the PRIVATE child ran with shared arrays ENABLED (BA2_SHARED_ARRAYS did "
+                        "not reach it): the comparison would be shared against shared")
+    if shared_ev is not None and not shared_ev.get("shared_enabled"):
+        problems.append("the SHARED child ran with shared arrays DISABLED (BA2_SHARED_ARRAYS did "
+                        "not reach it): the comparison would be private against private")
+    if private_ev is not None and shared_ev is not None:
+        # The private child is the witness that this run HAS bars/options at all: if it held
+        # none, the shared child holding none is silence, not a failure.
+        if _mb(private_ev, "bars_private_mb") > 0 and _mb(shared_ev, "bars_shared_mb") <= 0:
+            problems.append(
+                f"the private child held {_mb(private_ev, 'bars_private_mb')} MB of bars but the "
+                f"shared child mapped 0 MB: the OHLCV columns were NOT served from the derived "
+                f"cache")
+        if _mb(private_ev, "options_private_mb") > 0 and _mb(shared_ev, "options_shared_mb") <= 0:
+            problems.append(
+                f"the private child held {_mb(private_ev, 'options_private_mb')} MB of option "
+                f"arrays but the shared child mapped 0 MB: the option columns were NOT served "
+                f"from the derived cache")
+    return problems
+
+
+def _format_evidence(ev: Optional[Dict[str, Any]]) -> str:
+    if ev is None:
+        return "<none printed>"
+    return (f"shared_enabled={ev.get('shared_enabled')} "
+            f"bars {_mb(ev, 'bars_shared_mb')} MB shared / {_mb(ev, 'bars_private_mb')} MB private; "
+            f"options {_mb(ev, 'options_shared_mb')} MB shared / "
+            f"{_mb(ev, 'options_private_mb')} MB private")
 
 
 def parse_child_bt_id(stdout: str) -> Optional[int]:
@@ -220,7 +330,9 @@ def _bootstrap() -> None:
     importable -- that case is pytest, where disabling the root logger would reach out of this
     tool and into the rest of the session. A standalone run is the one that needs it: a direct
     backtest call that keeps logging is 10x+ slower (memory
-    ``standalone-backtest-scripts-need-logging-disable``)."""
+    ``standalone-backtest-scripts-need-logging-disable``). The floor is INFO, matching the TOP-N
+    persist path: the per-bar ruleset/RM spam goes, and a WARNING from a failing run still
+    reaches the parent's stream."""
     global _BOOTSTRAPPED
     if _BOOTSTRAPPED:
         return
@@ -235,7 +347,7 @@ def _bootstrap() -> None:
         return
     import logging
 
-    logging.disable(logging.WARNING)
+    logging.disable(logging.INFO)
     sys.path.insert(0, os.path.join(REPO, "testplatform"))
     import ba2test_launcher as L  # noqa: E402
 
@@ -321,6 +433,49 @@ def resolve_source(opt_id: int, rank: Any, db: Any = None) -> Dict[str, Any]:
             db.close()
 
 
+#: ``TOP<n>-<opt name>`` / ``BEST-<opt name>`` -- the names ``_persist_top_backtests`` and
+#: ``recover_missing_topn`` give the rows they persist. They ARE the rank, and they are the only
+#: record of it on the row (the genome is stored, the rank is not).
+_TOP_NAME = re.compile(r"^TOP(\d+)-")
+_BEST_NAME = re.compile(r"^BEST-")
+
+
+def rank_from_backtest_name(name: str) -> Any:
+    """The rank a persisted row's NAME encodes, or ``None`` when it encodes none.
+
+    ``None`` is a refusal, not a default: guessing ``best`` for an arbitrarily-named row would
+    re-run a DIFFERENT genome than the one the operator pointed at and then compare it against
+    that row, which is worse than declining."""
+    m = _TOP_NAME.match(name or "")
+    if m:
+        return int(m.group(1))
+    return "best" if _BEST_NAME.match(name or "") else None
+
+
+def resolve_backtest_source(bt_id: int) -> Tuple[int, Any]:
+    """(optimization id, rank) for ``--bt``: which genome that archived row came from."""
+    from app.models.backtest import Backtest
+    from app.models.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        bt = db.query(Backtest).filter(Backtest.id == bt_id).first()
+        if bt is None:
+            raise SystemExit(f"no backtest with id {bt_id}")
+        if not bt.optimization_id:
+            raise SystemExit(f"backtest {bt_id} ({bt.name!r}) has no optimization_id: there is no "
+                             f"genome to re-run. Pass --opt/--rank instead.")
+        rank = rank_from_backtest_name(bt.name or "")
+        if rank is None:
+            raise SystemExit(
+                f"backtest {bt_id} is named {bt.name!r}, which encodes no rank (expected a "
+                f"'TOP<n>-' or 'BEST-' prefix). The rank is not stored on the row, so it cannot "
+                f"be recovered -- pass --opt {bt.optimization_id} --rank <best|n> explicitly.")
+        return int(bt.optimization_id), rank
+    finally:
+        db.close()
+
+
 def parity_name(source_name: str, mode: str, label: Optional[str] = None) -> str:
     return f"PARITY-{mode}-{source_name}" + (f"-{label}" if label else "")
 
@@ -340,13 +495,48 @@ def existing_parity_names(names: Sequence[str]) -> List[str]:
 # =============================================================================================
 # Child -- runs ONE mode in its own process and persists ONE row
 # =============================================================================================
+def collect_evidence() -> Dict[str, Any]:
+    """What the caches ACTUALLY held when the run finished -- the proof that goes with the row.
+
+    Called after ``_persist_trial_worker`` returns and BEFORE anything is released:
+    ``run_daily_backtest`` clears neither the bar cache nor the option reader cache, so the run's
+    own arrays are still resident and their private/shared split is the honest answer to "which
+    path served this run"."""
+    from ba2_common.core import shared_arrays as SA
+
+    from app.services.backtest import price_source as ps
+
+    bars = ps.memory_stats()["bar_cache"]
+    # ``mb`` is the PRIVATE half of the bar cache and ``shared_mb`` the mapped half — see
+    # price_source.memory_stats (the keys are always private; only the five float columns map).
+    ev = {"shared_enabled": bool(SA.enabled()),
+          "bars_shared_mb": float(bars.get("shared_mb") or 0.0),
+          "bars_private_mb": float(bars.get("mb") or 0.0),
+          "options_shared_mb": 0.0,
+          "options_private_mb": 0.0}
+    try:
+        from app.services.backtest import parquet_options_provider as pq
+
+        opts = pq.memory_stats()
+        ev["options_shared_mb"] = float(opts.get("shared_mb") or 0.0)
+        ev["options_private_mb"] = float(opts.get("private_mb") or 0.0)
+    except Exception as e:  # noqa: BLE001 -- an equity run never loads the option reader
+        print(f"[evidence] option cache stats unavailable ({e!r}); reporting 0 MB")
+    return ev
+
+
 def run_child(mode: str, opt_id: int, rank: Any, name: str) -> int:
     """Re-run the genome in THIS process under whatever ``BA2_SHARED_ARRAYS`` the parent set, and
-    persist the result as a new Backtest. Prints ``PARITY_BT_ID=<id>`` last.
+    persist the result as a new Backtest. Prints ``PARITY_EVIDENCE={...}`` then
+    ``PARITY_BT_ID=<id>`` last.
 
     Same machinery as a TOP-N persist (``_build_daily_trial_config`` -> ``_persist_trial_worker``
     -> ``_persist_results``), so a parity row is produced exactly the way the rows it is
-    validating were."""
+    validating were.
+
+    NOTE ON COLD START: the shared child BUILDS the derived ``.npy`` cache if the host was never
+    prewarmed, so its first run pays the build (and its transient ~2.3x the frame) on top of the
+    backtest. Run ``tools/build_shared_arrays.py`` first for a timing that means anything."""
     _bootstrap()
 
     import app.models  # noqa: F401  -- registers the mappers
@@ -384,6 +574,9 @@ def run_child(mode: str, opt_id: int, rank: Any, name: str) -> int:
         if not out or not out.get("ok"):
             print(f"[{mode}] re-run FAILED: {(out or {}).get('error', 'no result')}")
             return 2
+        # Read the caches BEFORE persisting: nothing has been released yet, and a DB error below
+        # must not cost the evidence of what the run actually mapped.
+        evidence = collect_evidence()
 
         strategy_params = dict(src["genome"])
         fixed = {}
@@ -417,10 +610,15 @@ def run_child(mode: str, opt_id: int, rank: Any, name: str) -> int:
         db.refresh(bt)
         # The fitness decomposition the TOP-N persist writes onto the blob, so a parity row is
         # comparable to the rows it validates. It is a pure function of `results`, so it can only
-        # differ between the two modes if the results already did.
-        from app.services.strategy_fitness import compute_fitness as _cf
+        # differ between the two modes if the results already did. Wrapped exactly as
+        # _persist_top_backtests wraps it: this is telemetry, and a raise here must not burn an
+        # hour-long run AND the PARITY name it just claimed.
+        try:
+            from app.services.strategy_fitness import compute_fitness as _cf
 
-        _cf(src["fitness_metric"], out["results"])
+            _cf(src["fitness_metric"], out["results"])
+        except Exception as e:  # noqa: BLE001 -- never lose a persisted row over telemetry
+            print(f"[{mode}] fitness annotation failed: {e!r}")
         _persist_results(db, bt, out["results"])
         if cfg.get("ga_fitness") is not None:
             bt.ga_fitness = float(cfg["ga_fitness"])
@@ -431,7 +629,9 @@ def run_child(mode: str, opt_id: int, rank: Any, name: str) -> int:
         bt_id = bt.id
     finally:
         db.close()
-    print(f"{BT_ID_PREFIX}{bt_id}", flush=True)     # PROTOCOL: last line, exact spelling
+    # PROTOCOL: evidence first, the id LAST. Both exact spellings; the parent parses them.
+    print(f"{EVIDENCE_PREFIX}{json.dumps(evidence, sort_keys=True)}", flush=True)
+    print(f"{BT_ID_PREFIX}{bt_id}", flush=True)
     return 0
 
 
@@ -443,26 +643,62 @@ def _child_command(mode: str, opt_id: int, rank: Any, name: str) -> List[str]:
             "--opt", str(opt_id), "--rank", str(rank), "--name", name]
 
 
-def _run_one(mode: str, opt_id: int, rank: Any, name: str) -> Tuple[Optional[int], str]:
-    """Start the child for one mode and return (backtest id, note). The mode is passed through
-    the ENVIRONMENT, not a flag, because that is how every consumer reads it -- a flag would test
-    a code path the GA never uses."""
+def _run_one(mode: str, opt_id: int, rank: Any, name: str,
+             timeout_min: float = 0.0) -> Tuple[Optional[int], Optional[Dict[str, Any]], str]:
+    """Start the child for one mode; return (backtest id, evidence, note).
+
+    The mode is passed through the ENVIRONMENT, not a flag, because that is how every consumer
+    reads it -- a flag would test a code path the GA never uses.
+
+    The child's output is STREAMED, line by line, prefixed with its mode: a re-run is an hour of
+    work and a silent capture makes a stuck one indistinguishable from a slow one. utf-8 is
+    forced on the pipe because Python would otherwise decode it as the console's cp1252 on
+    Windows and a single non-ASCII byte in a log line would kill the run with a UnicodeDecodeError
+    after that hour. ``timeout_min`` (0 = none) kills a child that outlives its budget, stream or
+    no stream -- the timer fires on wall clock, not on output."""
     cmd = _child_command(mode, opt_id, rank, name)
     env = {**os.environ, "BA2_SHARED_ARRAYS": _MODE_FLAG[mode]}
     print(f"  [{mode}] BA2_SHARED_ARRAYS={_MODE_FLAG[mode]} {' '.join(cmd)}", flush=True)
     t0 = datetime.now()
-    proc = subprocess.run(cmd, env=env, cwd=REPO, capture_output=True, text=True)
+    proc = subprocess.Popen(cmd, env=env, cwd=REPO, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                            errors="replace", bufsize=1)
+    tail: "collections.deque[str]" = collections.deque(maxlen=_TAIL_LINES)
+    killed = threading.Event()
+
+    def _kill():
+        killed.set()
+        proc.kill()
+
+    timer = threading.Timer(timeout_min * 60.0, _kill) if timeout_min and timeout_min > 0 else None
+    if timer is not None:
+        timer.daemon = True
+        timer.start()
+    try:
+        for line in proc.stdout:                      # type: ignore[union-attr]
+            line = line.rstrip("\r\n")
+            tail.append(line)
+            print(f"    [{mode}] {line}", flush=True)
+        rc = proc.wait()
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if proc.stdout is not None:
+            proc.stdout.close()
     took = (datetime.now() - t0).total_seconds()
-    tail = "\n".join((proc.stdout or "").splitlines()[-15:])
-    if proc.returncode != 0:
-        return None, (f"child exited {proc.returncode} after {took:.0f}s\n--- stdout tail ---\n"
-                      f"{tail}\n--- stderr tail ---\n"
-                      f"{chr(10).join((proc.stderr or '').splitlines()[-15:])}")
-    bt_id = parse_child_bt_id(proc.stdout or "")
+    text = "\n".join(tail)
+    if killed.is_set():
+        return None, None, (f"child KILLED after {took:.0f}s (--timeout-min {timeout_min:g})\n"
+                            f"--- output tail ---\n{text}")
+    if rc != 0:
+        return None, None, (f"child exited {rc} after {took:.0f}s\n--- output tail ---\n{text}")
+    evidence = parse_child_evidence(text)
+    bt_id = parse_child_bt_id(text)
     if bt_id is None:
-        return None, (f"child exited 0 after {took:.0f}s but printed no {BT_ID_PREFIX} line\n"
-                      f"--- stdout tail ---\n{tail}")
-    return bt_id, f"persisted backtest {bt_id} in {took:.0f}s"
+        return None, evidence, (f"child exited 0 after {took:.0f}s but printed no "
+                                f"{BT_ID_PREFIX} line\n--- output tail ---\n{text}")
+    return bt_id, evidence, (f"persisted backtest {bt_id} in {took:.0f}s; "
+                             f"{_format_evidence(evidence)}")
 
 
 def _load_view(bt_id: int) -> Dict[str, Any]:
@@ -483,7 +719,11 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="backtest_parity.py",
         description="Re-run one known genome private vs shared and compare the rows byte-for-byte.")
-    p.add_argument("--opt", type=int, required=True, help="StrategyOptimization id.")
+    p.add_argument("--opt", type=int, help="StrategyOptimization id.")
+    p.add_argument("--bt", type=int,
+                   help="An ARCHIVED backtest row to re-run: its optimization_id and its rank "
+                        "(from the TOP<n>-/BEST- name prefix) are read off the row, and the two "
+                        "re-runs are ALSO compared against it, informationally.")
     p.add_argument("--rank", default="best",
                    help="'best' (best_params) or a 1-based rank of the distinct-fitness ranking.")
     p.add_argument("--label", help="Appended to both row names, so a second comparison of the "
@@ -493,10 +733,18 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument("--keep-going", action="store_true",
                    help="Run the second mode even if the first child failed (the comparison is "
                         "still impossible; this only gets both failures in one pass).")
+    p.add_argument("--timeout-min", type=float, default=0.0,
+                   help="Kill a child that runs longer than this many minutes (0 = no limit).")
     p.add_argument("--_child", dest="child", choices=sorted(_MODE_FLAG),
                    help=argparse.SUPPRESS)      # hidden: the child form, spawned by the parent
     p.add_argument("--name", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if not args.opt and not args.bt:
+        p.error("pass --opt <optimization id> or --bt <archived backtest id>")
+    if args.opt and args.bt:
+        p.error("--opt and --bt name the source two different ways; pass one")
+    if args.child and not args.opt:
+        p.error("--_child requires --opt (the parent always resolves --bt first)")
     if args.rank != "best":
         try:
             args.rank = int(args.rank)
@@ -515,7 +763,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_child(args.child, args.opt, args.rank, args.name)
 
     _bootstrap()
-    src = resolve_source(args.opt, args.rank)
+    opt_id, rank = args.opt, args.rank
+    if args.bt:
+        opt_id, rank = resolve_backtest_source(args.bt)
+        print(f"--bt {args.bt} -> opt {opt_id} rank {rank}")
+    src = resolve_source(opt_id, rank)
     names = {m: parity_name(src["name"], m, args.label) for m in ("private", "shared")}
     print(f"source: opt {src['opt_id']} rank {src['rank']} -> {src['name']} "
           f"[{src['expert']}] ga_fitness={src['ga_fitness']} "
@@ -530,15 +782,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("children (private FIRST, then shared, sequentially -- they share this machine):")
     if args.dry_run:
         for mode in ("private", "shared"):
-            cmd = _child_command(mode, args.opt, args.rank, names[mode])
+            cmd = _child_command(mode, opt_id, rank, names[mode])
             print(f"  [{mode}] BA2_SHARED_ARRAYS={_MODE_FLAG[mode]} {' '.join(cmd)}")
         print("--dry-run: nothing was run.")
         return 0
 
     ids: Dict[str, Optional[int]] = {}
+    evidence: Dict[str, Optional[Dict[str, Any]]] = {}
     for mode in ("private", "shared"):
-        bt_id, note = _run_one(mode, args.opt, args.rank, names[mode])
-        ids[mode] = bt_id
+        bt_id, ev, note = _run_one(mode, opt_id, rank, names[mode], args.timeout_min)
+        ids[mode], evidence[mode] = bt_id, ev
         print(f"  [{mode}] {note}")
         if bt_id is None and not args.keep_going:
             print("FAILED TO RUN: no comparison was made.")
@@ -547,8 +800,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("FAILED TO RUN: no comparison was made.")
         return 2
 
-    diffs = compare_rows(_load_view(ids["private"]), _load_view(ids["shared"]))
+    print(f"evidence [private] {_format_evidence(evidence['private'])}")
+    print(f"evidence [shared]  {_format_evidence(evidence['shared'])}")
+    problems = evidence_problems(evidence["private"], evidence["shared"])
+    if problems:
+        print("INCONCLUSIVE: the two runs cannot be compared as private vs shared --")
+        for p_ in problems:
+            print(f"  {p_}")
+        print("Fix the setup and re-run (with --label, the rows above are kept). A matching pair "
+              "of rows proves nothing unless the shared side actually mapped shared arrays.")
+        return 2
+
+    private_view, shared_view = _load_view(ids["private"]), _load_view(ids["shared"])
+    diffs = compare_rows(private_view, shared_view)
     print(f"compared backtest {ids['private']} (private) vs {ids['shared']} (shared)")
+    if args.bt:
+        # INFORMATIONAL ONLY, never part of the verdict. The archived row was persisted by the GA
+        # from a config rebuilt differently (screener state re-derived, a later code state); a
+        # re-run is allowed to diverge from it by ~0.5% and the platform has a dedicated concept
+        # for that (rerun_fitness_divergence). The parity question is private vs shared, and
+        # folding the archive into it would fail the gate for a reason that is not about arrays.
+        archived = compare_rows(_load_view(args.bt), private_view)
+        if archived:
+            print(f"archived vs private (informational, NOT part of the verdict): "
+                  f"{len(archived)} difference(s); first: {archived[0]}")
+        else:
+            print("archived vs private (informational): identical.")
     if not diffs:
         print("PASS: the two rows are byte-identical across every blob and metric column.")
         return 0

@@ -256,6 +256,7 @@ def test_child_id_is_read_from_the_last_marker_line_despite_noise():
     m = _tool()
     stdout = ("some preload chatter\n"
               "WARNING: whatever\n"
+              f"{m.EVIDENCE_PREFIX}{json.dumps(_evidence())}\n"
               f"{m.BT_ID_PREFIX}1701\n"
               "\n")
     assert m.parse_child_bt_id(stdout) == 1701
@@ -264,3 +265,119 @@ def test_child_id_is_read_from_the_last_marker_line_despite_noise():
 def test_a_child_that_printed_no_marker_is_a_failure_not_a_guess():
     m = _tool()
     assert m.parse_child_bt_id("traceback...\nBOOM\n") is None
+
+
+# --------------------------------------------------------------------------------------------
+# Evidence -- a PASS must prove the shared path was actually used
+# --------------------------------------------------------------------------------------------
+def _evidence(**over):
+    ev = {"shared_enabled": True, "bars_shared_mb": 812.5, "bars_private_mb": 96.0,
+          "options_shared_mb": 0.0, "options_private_mb": 0.0}
+    ev.update(over)
+    return ev
+
+
+def _private_evidence(**over):
+    base = {"shared_enabled": False, "bars_shared_mb": 0.0, "bars_private_mb": 908.5}
+    base.update(over)
+    return _evidence(**base)
+
+
+def test_evidence_is_read_from_its_protocol_line():
+    m = _tool()
+    stdout = (f"preload chatter\n{m.EVIDENCE_PREFIX}{json.dumps(_evidence())}\n"
+              f"{m.BT_ID_PREFIX}1701\n")
+    assert m.parse_child_evidence(stdout) == _evidence()
+
+
+def test_absent_or_unparsable_evidence_is_none_not_a_guess():
+    m = _tool()
+    assert m.parse_child_evidence("nothing here\n") is None
+    assert m.parse_child_evidence(f"{m.EVIDENCE_PREFIX}{{not json\n") is None
+
+
+def test_matching_modes_report_no_evidence_problem():
+    m = _tool()
+    assert m.evidence_problems(_private_evidence(), _evidence()) == []
+
+
+def test_a_shared_child_that_mapped_no_bars_is_not_evidence():
+    """The failure this gate exists for: both children take the private path (an env name typo, a
+    consumer that fell back) and the rows match for a reason that says nothing about arrays."""
+    m = _tool()
+    problems = m.evidence_problems(_private_evidence(),
+                                   _evidence(bars_shared_mb=0.0, bars_private_mb=908.5))
+    assert problems and any("0 MB" in p for p in problems)
+
+
+def test_shared_arrays_disabled_in_either_child_is_refused():
+    m = _tool()
+    assert any("SHARED child" in p
+               for p in m.evidence_problems(_private_evidence(),
+                                            _evidence(shared_enabled=False)))
+    assert any("PRIVATE child" in p
+               for p in m.evidence_problems(_private_evidence(shared_enabled=True), _evidence()))
+
+
+def test_missing_option_mapping_is_only_a_problem_when_the_private_run_had_options():
+    """An equity run holds no option arrays at all; 0 vs 0 is silence, not a failure."""
+    m = _tool()
+    assert m.evidence_problems(_private_evidence(options_private_mb=0.0),
+                               _evidence(options_shared_mb=0.0)) == []
+    assert any("option" in p for p in
+               m.evidence_problems(_private_evidence(options_private_mb=1500.0),
+                                   _evidence(options_shared_mb=0.0)))
+
+
+def test_a_run_whose_shared_child_mapped_nothing_exits_2_without_comparing(monkeypatch, capsys):
+    """End to end through main: both rows persisted, and the tool still refuses to call it a
+    PASS -- and never even loads the rows, because there is nothing worth comparing."""
+    m = _tool()
+    monkeypatch.setattr(m, "resolve_source", lambda *a, **k: _fake_source())
+    monkeypatch.setattr(m, "existing_parity_names", lambda names: [])
+    evidence = {"private": _private_evidence(),
+                "shared": _evidence(bars_shared_mb=0.0, bars_private_mb=908.5)}
+    ran = []
+
+    def fake_run_one(mode, opt_id, rank, name, timeout_min=0.0):
+        ran.append(mode)
+        return (1700 + len(ran)), evidence[mode], "persisted"
+
+    monkeypatch.setattr(m, "_run_one", fake_run_one)
+    monkeypatch.setattr(m, "_load_view", lambda bt_id: pytest.fail("compared despite no evidence"))
+    rc = m.main(["--opt", "487", "--rank", "1"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert ran == ["private", "shared"]
+    assert "INCONCLUSIVE" in out
+    assert "PASS" not in out
+
+
+def test_a_clean_pair_with_good_evidence_passes(monkeypatch, capsys):
+    m = _tool()
+    monkeypatch.setattr(m, "resolve_source", lambda *a, **k: _fake_source())
+    monkeypatch.setattr(m, "existing_parity_names", lambda names: [])
+    evidence = {"private": _private_evidence(), "shared": _evidence()}
+    monkeypatch.setattr(m, "_run_one",
+                        lambda mode, o, r, n, t=0.0: (1700, evidence[mode], "persisted"))
+    monkeypatch.setattr(m, "_load_view", lambda bt_id: _view(m))
+    rc = m.main(["--opt", "487", "--rank", "1"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PASS" in out
+    assert "bars 812.5 MB shared" in out      # the evidence is in the report, not just the gate
+
+
+# --------------------------------------------------------------------------------------------
+# --bt: the rank lives in the archived row's NAME and nowhere else
+# --------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("name,expected", [
+    ("TOP1-scr-small-FMPInsiderClusterBuy-S7-goal2020-notional", 1),
+    ("TOP12-sen-S6-goal2020-notional", 12),
+    ("BEST-sen-S5-goal2020-risk_atr", "best"),
+    ("PARITY-private-TOP1-x", None),          # a parity row is not a source
+    ("my manual run", None),
+    ("", None),
+])
+def test_rank_is_read_off_the_row_name(name, expected):
+    assert _tool().rank_from_backtest_name(name) == expected
