@@ -64,12 +64,26 @@ def test_series_memo_counts_dataframe_tuples():
         ps.clear_ohlcv_memo()
 
 
-def test_memory_stats_empty_caches():
+def test_memory_stats_empty_caches(monkeypatch):
+    """The exact shape, pinned: the ``mem gen`` telemetry line formats these keys by name.
+
+    ``mb`` is the PRIVATE byte total and ``shared_mb`` the bytes mapped from the host-shared
+    derived cache (2026-09-14); ``mode`` names the eviction policy the shared/private choice puts
+    in force -- ``persistent`` with sharing on, ``flush``/``recency`` on the escape-hatch path.
+    """
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "1")
     ps.clear_worker_bar_cache()
     ps.clear_ohlcv_memo()
     stats = ps.memory_stats()
-    assert stats["bar_cache"] == {"entries": 0, "symbols": 0, "bars": 0, "mb": 0.0}
+    assert stats["bar_cache"] == {"entries": 0, "symbols": 0, "bars": 0, "mb": 0.0,
+                                  "shared_mb": 0.0, "mode": "persistent"}
     assert stats["series_memo"] == {"entries": 0, "symbols": 0, "rows": 0, "mb": 0.0}
+
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "0")
+    monkeypatch.setattr(ps, "_WORKER_BAR_CACHE_TRIALS", 0)
+    assert ps.memory_stats()["bar_cache"]["mode"] == "flush"
+    monkeypatch.setattr(ps, "_WORKER_BAR_CACHE_TRIALS", 2)
+    assert ps.memory_stats()["bar_cache"]["mode"] == "recency"
 
 
 def test_bar_cache_max_env_override(monkeypatch):

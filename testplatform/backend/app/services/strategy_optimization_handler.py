@@ -792,7 +792,11 @@ def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
         f"mem gen {gen + 1}/{n_gens} ind {done}/{total}"
         + (f" | {secs}s" if secs is not None else "")
         + f" | rss {mem.get('rss_mb')}MB"
+        # bars: PRIVATE MB (this process's own keys/arrays) then, separately, the MB mapped from
+        # the host-shared derived cache -- one copy per HOST however many workers map it, so
+        # folding it into the private figure would make a 6-worker box look 6x heavier than it is.
         f" | bars {bc.get('symbols')} sym {bc.get('bars')} bars {bc.get('mb')}MB"
+        f" (+{bc.get('shared_mb')}MB shared)"
         f" | memo {sm.get('symbols')} sym {sm.get('rows')} rows {sm.get('mb')}MB"
         + _fitness_suffix(fit_raw, fit_ranked, robustness)
     )

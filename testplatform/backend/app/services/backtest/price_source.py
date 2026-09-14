@@ -19,6 +19,12 @@ union × 3yr × 5min) — almost all of it the ~9M tiny inner dicts; dropping th
 Daily/coarser bars are keyed at midnight (the time component is dropped, mirroring ``_norm``);
 intraday keys carry the full tz-naive UTC bar timestamp.
 
+SHARED ACROSS WORKERS (2026-09-14). The five float64 columns of a preloaded symbol are memory-
+mapped from a per-host DERIVED cache of ``.npy`` files keyed on the source parquet's signature
+(``ba2_common.core.shared_arrays``), so N GA workers on a box hold ONE copy of the bars between
+them instead of N. The int64-ns KEYS stay private per process -- see ``_bind_arrays`` for the
+measurement that forbids sharing them. ``BA2_SHARED_ARRAYS=0`` restores the fully-private path.
+
 Verified against the installed ba2_providers OHLCV provider:
   * public method = ``get_ohlcv_data(symbol, start_date=, end_date=, interval=, ...)``
     -> pandas.DataFrame with columns ``Date, Open, High, Low, Close, Volume``.
@@ -158,6 +164,12 @@ _MISSING_SYMBOL_MAX_FRAC = float(os.getenv("BT_MISSING_SYMBOLS_MAX_FRAC", "0.01"
 # as before the fix. Confirmed by the per-individual telemetry: single-set workers sat at 547-613
 # symbols / ~5GB, while the peak hit 1423.
 #
+# PRIVATE PATH ONLY since 2026-09-14: when the OHLCV columns are mapped from the host-shared
+# derived cache (BA2_SHARED_ARRAYS on, the default) the cache persists for the whole job and
+# NEITHER the flush nor the recency sweep runs -- see _bar_cache_persists for why the peak
+# argument below stops applying once the 40 of 48 bytes/bar that were private become mapped
+# pages. This constant keeps its full meaning under BA2_SHARED_ARRAYS=0.
+#
 # N=1 bounds a process to ONE individual's set (~600 symbols, ~5GB), so 4 local slots ~= 20GB and
 # the remote's 6 slots ~= 30GB of its 65GB. The reuse given up costs a re-parse per individual
 # (~23s for a 600-symbol set) against trials measured at 250-2400s here -- 1-10%.
@@ -181,10 +193,33 @@ def clear_worker_bar_cache() -> None:
     _BAR_CACHE_LAST_USED.clear()
 
 
+def _bar_cache_persists() -> bool:
+    """True when the OHLCV columns are MAPPED from the host-shared derived cache
+    (``BA2_SHARED_ARRAYS`` on, the default) — in which case the bar cache is kept for the whole
+    job instead of being flushed/recency-swept per individual.
+
+    WHY the per-individual eviction existed and why it no longer applies here: it bounded the PEAK
+    of PRIVATE per-symbol arrays (~48 B/bar x |A u B| while individual B loaded on top of A's
+    set) — that peak is what OOM'd a 64 GB box. With the five float64 columns mapped, this
+    process's private part of a series is only the int64-ns key buffer (8 B/bar; ~1 GB even for
+    the largest screener band), and the mapped pages are clean file pages the OS reclaims under
+    pressure without any help from us. The bars are static for the length of a job, so re-parsing
+    them before every individual buys nothing and costs ~23 s per individual (operator decision
+    2026-09-14: "as data is shared, it should persist across the whole GA job").
+
+    ``BT_BAR_CACHE_TRIALS`` therefore governs the PRIVATE path only (``BA2_SHARED_ARRAYS=0``).
+    The ``_WORKER_BAR_CACHE_MAX`` count backstop and the memory governor's explicit
+    ``clear_worker_bar_cache()`` stay in force in BOTH modes.
+    """
+    from ba2_common.core import shared_arrays as _sa
+    return _sa.enabled()
+
+
 def _flush_bar_cache_for_new_individual() -> int:
-    """FLUSH-PER-INDIVIDUAL mode (BT_BAR_CACHE_TRIALS=0, the default). Drop everything at the START
-    of preload and collect, so the previous individual's arrays are released BEFORE this one starts
-    allocating. Peak = one working set.
+    """FLUSH-PER-INDIVIDUAL mode (BT_BAR_CACHE_TRIALS=0 — the default of the PRIVATE path only;
+    see _bar_cache_persists, which skips this entirely when the columns are host-shared). Drop
+    everything at the START of preload and collect, so the previous individual's arrays are
+    released BEFORE this one starts allocating. Peak = one working set.
 
     WHY THE PEAK, NOT THE RESTING SIZE. The end-of-preload recency sweep (N>=1 below) bounds what is
     RETAINED but not what is HELD WHILE LOADING: during individual B's preload the cache still holds
@@ -230,8 +265,18 @@ def memory_stats() -> Dict[str, Any]:
     memory telemetry (diagnosing which cache depletes a worker box):
 
       * ``bar_cache``: the LRU-bounded parsed-bar columnar store (_WORKER_BAR_CACHE) —
-        entries, distinct symbols, total bars + estimated MB (numpy nbytes + ~50B/key for
-        the Python key list).
+        entries, distinct symbols, total bars, and the byte total SPLIT in two:
+          - ``mb``        = PRIVATE bytes, i.e. this process's own footprint: the int64-ns key
+                            buffer (8 B/bar) plus any column that is a real allocation
+                            (``.base is None`` — the BA2_SHARED_ARRAYS=0 path, and fixtures).
+          - ``shared_mb`` = bytes that are VIEWS over a memory-mapped .npy in the host-shared
+                            derived cache (``.base is not None``). Those are clean file pages:
+                            one copy per HOST however many workers map them, and reclaimable by
+                            the OS under pressure. Counting them as process footprint (what the
+                            single ``mb`` number did) would make the governor think a 6-worker
+                            box holds 6x data it holds once.
+        ``mode`` says which eviction policy is in force: ``persistent`` (shared — the cache is
+        kept for the whole job), ``flush`` (private, BT_BAR_CACHE_TRIALS=0) or ``recency``.
       * ``series_memo``: MemoizedOHLCVProvider's full-DataFrame memo (_FULL_SERIES_MEMO) —
         entries, distinct symbols, total rows + estimated MB (shallow memory_usage;
         deep=True would rescan every frame).
@@ -243,15 +288,22 @@ def memory_stats() -> Dict[str, Any]:
     O(cache entries) with tiny constants (~25ms at a 500-symbol working set, against a
     90s+ trial) — safe to call once per trial.
     """
-    bar_bytes = 0
+    bar_bytes = 0            # PRIVATE: this process's own allocations
+    shared_bytes = 0         # views over the host-shared memory-mapped .npy set
     bars = 0
     bar_symbols = set()
     for key, cached in _WORKER_BAR_CACHE.items():
         keys = cached[0]
         bars += len(keys)
-        bar_bytes += getattr(keys, 'nbytes', len(keys) * 8)   # array('q') = 8B/elem
+        # The keys are ALWAYS private (array('q'), 8B/elem): the hot path reads scalars out of
+        # them ~200k times per backtest and an ndarray key buffer measured 26x slower.
+        bar_bytes += getattr(keys, 'nbytes', len(keys) * 8)
         for arr in cached[1:]:
-            bar_bytes += getattr(arr, "nbytes", 0)
+            n = getattr(arr, "nbytes", 0)
+            if getattr(arr, "base", None) is not None:
+                shared_bytes += n
+            else:
+                bar_bytes += n
         bar_symbols.add(key[0])          # key = (symbol, interval, fetch_start, end)
     memo_bytes = 0
     memo_rows = 0
@@ -270,7 +322,10 @@ def memory_stats() -> Dict[str, Any]:
         memo_symbols.add(key[0])         # key = (symbol, interval, bounds_start, bounds_end)
     return {
         "bar_cache": {"entries": len(_WORKER_BAR_CACHE), "symbols": len(bar_symbols),
-                      "bars": bars, "mb": round(bar_bytes / 1048576, 1)},
+                      "bars": bars, "mb": round(bar_bytes / 1048576, 1),
+                      "shared_mb": round(shared_bytes / 1048576, 1),
+                      "mode": ("persistent" if _bar_cache_persists()
+                               else ("flush" if _WORKER_BAR_CACHE_TRIALS <= 0 else "recency"))},
         "series_memo": {"entries": len(_FULL_SERIES_MEMO), "symbols": len(memo_symbols),
                         "rows": memo_rows, "mb": round(memo_bytes / 1048576, 1)},
     }
@@ -318,33 +373,6 @@ def _from_key64(v: Any, intraday: bool) -> Any:
     all_dates). Only used on cold paths that hand keys back out, never in a lookup."""
     dt = np.datetime64(int(v), "ns").astype("datetime64[us]").astype(datetime)
     return dt if intraday else dt.date()
-
-
-def _keys64_from_datetime64(keys64: np.ndarray, intraday: bool) -> "array":
-    """Normalise a datetime64 bar-key array to the storage form: ``array('q')`` of int64 ns,
-    truncated to calendar day for daily intervals (mirrors what ``_norm`` did for object keys).
-
-    WHY array('q') AND NOT AN ndarray -- measured, after an ndarray version regressed the 5min
-    A/B by 65% (62s -> 104s). Per scalar read on the per-lookup path (~200k+/backtest):
-        python list  k[i]        97 ns   (the original)
-        ndarray      int(k[i]) 2493 ns   (26x -- this was the regression)
-        ndarray      k.item(i)  334 ns
-        array('q')   k[i]       160 ns   <- returns a real Python int, no scalar boxing
-    array('q') is 8 bytes/element, so the ~47% memory cut over the object list is fully kept, and
-    it is buffer-compatible -> ``_keys_np`` gives a ZERO-COPY ndarray view for searchsorted. Best
-    of both: cheap scalar reads on the hot path, binary search on the cold ones.
-    """
-    if not intraday:
-        keys64 = keys64.astype("datetime64[D]")
-    ns = np.ascontiguousarray(keys64.astype("datetime64[ns]").astype(np.int64))
-    out = array("q")
-    # frombytes, NOT array('q', ns.tolist()): tolist() materialises one Python int PER BAR
-    # (~19k/symbol at 5min). Those land in pymalloc arenas that are NOT returned to the OS, and
-    # measured 2026-08-16 they made the "memory saving" a LOSS -- 8.62 MB/symbol against the
-    # object-list original's 6.79 MB/symbol, even though memory_stats' accounting showed a halving.
-    # frombytes copies the raw buffer and creates no Python objects at all.
-    out.frombytes(ns.tobytes())
-    return out
 
 
 def _keys_np(k: "array") -> np.ndarray:
@@ -439,6 +467,75 @@ def _bar_from_row(row: Dict[str, Any]) -> Dict[str, float]:
         "close": float(pick("Close", "close")),
         "volume": float(pick("Volume", "volume")) if ("Volume" in row or "volume" in row) else 0.0,
     }
+
+
+#: The array names the columnar store is built from — and the file names of the host-shared
+#: derived .npy set. ``keys_ns`` is int64 nanoseconds (the storage form of ``_norm``); the rest
+#: are float64 columns aligned to it.
+_ARRAY_NAMES = ("keys_ns", "o", "h", "l", "c", "v")
+
+
+def _empty_ohlcv_arrays() -> Dict[str, np.ndarray]:
+    """The array set of a symbol whose cache exists but holds no bars in the window (a recent IPO
+    before its first bar, a gap): a legitimate outcome, not an error."""
+    return {"keys_ns": np.empty(0, dtype=np.int64),
+            **{n: np.empty(0, dtype=float) for n in _ARRAY_NAMES[1:]}}
+
+
+def _columnar_arrays(keys64: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray,
+                     c: np.ndarray, v: np.ndarray, intraday: bool) -> Dict[str, np.ndarray]:
+    """Sort by key (ascending) + dedup keeping the LAST of each duplicate (byte-identical to the
+    old dict-of-dicts, where a later row overwrote an earlier one with the same key), then reduce
+    the datetime64 keys to the int64-ns storage form.
+
+    PURE: no ``self``, no I/O — so it can run inside a ``shared_arrays`` build_fn (whose result is
+    written to a .npy set every worker on the host then maps) as well as on the private path.
+    """
+    if not len(keys64):
+        return _empty_ohlcv_arrays()
+    order = np.argsort(keys64, kind="stable")  # stable -> equal keys keep original order
+    keys64, o, h, l, c, v = keys64[order], o[order], h[order], l[order], c[order], v[order]
+    keep = np.ones(len(keys64), dtype=bool)
+    keep[:-1] = keys64[1:] != keys64[:-1]  # keep only the LAST of each run of equal keys
+    if not keep.all():
+        keys64, o, h, l, c, v = keys64[keep], o[keep], h[keep], l[keep], c[keep], v[keep]
+    # The int64-ns storage form of the keys (daily/coarser truncated to the calendar day,
+    # mirroring _norm). The array('q') copy of this is made PER PROCESS in _bind_arrays -- the
+    # keys are the one part that must never be shared; its docstring carries the measurements.
+    if not intraday:
+        keys64 = keys64.astype("datetime64[D]")
+    keys_ns = np.ascontiguousarray(keys64.astype("datetime64[ns]").astype(np.int64))
+    return {"keys_ns": keys_ns, "o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+def _ohlcv_arrays_from_df(df: Any, intraday: bool) -> Dict[str, np.ndarray]:
+    """One symbol's OHLCV frame -> the sorted/deduped columnar arrays the bar store binds.
+
+    The vectorized date normalisation (no per-bar Python dict: the old dict-of-dicts allocated
+    ~9M small dicts for a 158-symbol 5min run, which dominated both warmup time and the ~9 GB
+    worker footprint) plus ``_columnar_arrays``. PURE — this is the build_fn behind the
+    host-shared derived cache, so its output must depend on nothing but ``df`` and ``intraday``.
+    """
+    if df is None or len(df) == 0:
+        return _empty_ohlcv_arrays()
+    import pandas as pd
+    dcol = "Date" if "Date" in df.columns else "date"
+    dates = pd.to_datetime(df[dcol])
+    if intraday:
+        # tz-naive UTC datetime keys (identical to _norm's intraday path).
+        if getattr(dates.dt, "tz", None) is not None:
+            dates = dates.dt.tz_convert("UTC").dt.tz_localize(None)
+        keys64 = dates.to_numpy(dtype="datetime64[ns]")
+    else:
+        # daily/coarser: drop the time component (midnight) — mirrors _norm's date key.
+        keys64 = dates.dt.normalize().to_numpy(dtype="datetime64[ns]")
+    o = df["Open"].to_numpy(dtype=float)
+    h = df["High"].to_numpy(dtype=float)
+    l = df["Low"].to_numpy(dtype=float)
+    c = df["Close"].to_numpy(dtype=float)
+    v = (df["Volume"].to_numpy(dtype=float) if "Volume" in df.columns
+         else np.zeros(len(df), dtype=float))
+    return _columnar_arrays(keys64, o, h, l, c, v, intraday)
 
 
 class AsOfPriceSource:
@@ -536,7 +633,8 @@ class AsOfPriceSource:
         # the last N individuals" from "carried over from older ones".
         global _TRIAL_SEQ
         _TRIAL_SEQ += 1
-        if _WORKER_BAR_CACHE_TRIALS <= 0:
+        _persists = _bar_cache_persists()
+        if not _persists and _WORKER_BAR_CACHE_TRIALS <= 0:
             _flush_bar_cache_for_new_individual()   # bound the PEAK: free A before allocating B
         # TIMING (2026-08-25), BULK/COLD ONLY -- see _PRELOAD_BULK_LOG_MIN and _worker_log's own
         # docstring for why this goes through _worker_log rather than print()/logger directly.
@@ -576,23 +674,15 @@ class AsOfPriceSource:
             # (hermetic mode); collect those and fail once, loudly, after the loop (the user asked
             # for a hard error naming what to cache — never a silent skip).
             try:
-                # Prefer a NON-memoizing read so preload doesn't also stuff every symbol's full
-                # series into _FULL_SERIES_MEMO (the columnar store below + _WORKER_BAR_CACHE already
-                # provide the per-symbol cache + cross-individual reuse). Double-caching the whole
-                # universe was the screener/FactorRanker OOM. Fixture providers lack read_window ->
-                # fall back to get_ohlcv_data.
-                _reader = getattr(self._ohlcv, "read_window", None)
-                if _reader is not None:
-                    df = _reader(sym, fetch_start, end, self._interval)
-                else:
-                    df = self._ohlcv.get_ohlcv_data(
-                        sym, start_date=fetch_start, end_date=end, interval=self._interval,
-                    )
+                arrays = self._shared_or_private_arrays(sym, win, fetch_start, end)
             except BacktestCacheMiss:
                 missing.append(sym)
                 continue
             _loaded += 1
-            self.load_bars_df(sym, df)  # vectorized columnar build (no per-bar dict)
+            if not len(arrays["keys_ns"]):
+                self._set_empty(sym)
+            else:
+                self._bind_arrays(sym, arrays)
             _WORKER_BAR_CACHE[(sym, *win)] = (
                 self._keys[sym], self._o[sym], self._h[sym],
                 self._l[sym], self._c[sym], self._v[sym],
@@ -610,9 +700,13 @@ class AsOfPriceSource:
                        f"{len(missing)} missing, {time.monotonic() - _t0:.2f}s "
                        f"(pid {os.getpid()})")
 
-        # PRIMARY bound: drop series no individual in the last N has touched. Runs after the loop
-        # so the current individual's series are all stamped and safe.
-        _evict_bar_cache_by_recency()
+        # PRIMARY bound of the PRIVATE path: drop series no individual in the last N has touched.
+        # Runs after the loop so the current individual's series are all stamped and safe. Skipped
+        # entirely when the columns are host-shared -- see _bar_cache_persists (the cache then
+        # persists for the whole job; only the _WORKER_BAR_CACHE_MAX backstop above and the
+        # governor's clear_worker_bar_cache() bound it).
+        if not _persists:
+            _evict_bar_cache_by_recency()
 
         if missing:
             # TOLERANCE: a handful of uncached symbols must not kill a 586-symbol job. Observed
@@ -656,6 +750,61 @@ class AsOfPriceSource:
                 f"(native OHLCV cache)."
             )
 
+    def _read_window_df(self, symbol: str, fetch_start: datetime, end: datetime) -> Any:
+        """One symbol's [fetch_start, end] OHLCV frame from the injected provider.
+
+        Prefers the NON-memoizing ``read_window`` so preload doesn't also stuff every symbol's full
+        series into ``_FULL_SERIES_MEMO`` (the columnar store + _WORKER_BAR_CACHE already provide
+        the per-symbol cache and the cross-individual reuse). Double-caching the whole universe was
+        the screener/FactorRanker OOM. Fixture providers lack ``read_window`` -> ``get_ohlcv_data``.
+        Raises ``BacktestCacheMiss`` for a symbol absent from every on-disk cache (hermetic mode).
+        """
+        _reader = getattr(self._ohlcv, "read_window", None)
+        if _reader is not None:
+            return _reader(symbol, fetch_start, end, self._interval)
+        return self._ohlcv.get_ohlcv_data(
+            symbol, start_date=fetch_start, end_date=end, interval=self._interval,
+        )
+
+    def _native_parquet_path(self, symbol: str) -> Optional[str]:
+        """The on-disk parquet backing ``symbol`` at this run's interval, or None.
+
+        None means "there is no file to sign" — an in-memory/fixture provider, or a symbol with
+        no cache file — and the caller then builds the arrays privately (result-neutral: the same
+        frame, parsed here instead of mapped). Looked up through the provider (``cached_path``,
+        alias-spelling aware) rather than rebuilt here, so there is exactly one definition of where
+        a symbol's bars live; probed with ``getattr`` like ``read_window`` above, because fixture
+        providers have neither.
+        """
+        finder = getattr(self._ohlcv, "cached_path", None)
+        return None if finder is None else finder(symbol, self._interval)
+
+    def _shared_or_private_arrays(self, symbol: str, win: tuple, fetch_start: datetime,
+                                  end: datetime) -> Dict[str, np.ndarray]:
+        """This symbol's columnar arrays, mapped from the HOST-shared derived cache when there is
+        a parquet to key them on, built privately otherwise.
+
+        The derived set lives beside the source tree (``<CACHE_FOLDER>/_derived/<Provider>/``) and
+        is signed by the parquet's (name, size, mtime), so a refreshed cache file invalidates it
+        automatically. The key carries the window because the arrays are the WINDOW's slice, and it
+        is PREFIXED (``u_``) because a bare symbol can be a Windows reserved device name (CON, AUX,
+        PRN, NUL...) that cannot be a directory. A ``BacktestCacheMiss`` raised by the build
+        propagates out untouched and leaves nothing on disk.
+        """
+        from ba2_common.core import shared_arrays as _sa
+
+        src_path = self._native_parquet_path(symbol)
+
+        def _build() -> Dict[str, np.ndarray]:
+            return _ohlcv_arrays_from_df(self._read_window_df(symbol, fetch_start, end),
+                                         self._intraday)
+
+        if src_path is None:
+            return _build()
+        derived = _sa.DerivedArrayStore(_sa.derived_root_for(os.path.dirname(src_path)))
+        key = f"u_{symbol.upper()}_{self._interval}_{win[1][:10]}_{win[2][:10]}"
+        return derived.build_or_open(key, [src_path], _build)
+
     def _set_empty(self, symbol: str) -> None:
         self._keys[symbol] = array('q')
         self._o[symbol] = np.array([], dtype=float)
@@ -664,27 +813,46 @@ class AsOfPriceSource:
         self._c[symbol] = np.array([], dtype=float)
         self._v[symbol] = np.array([], dtype=float)
 
+    def _bind_arrays(self, symbol: str, a: Dict[str, np.ndarray]) -> None:
+        """Bind one symbol's columnar arrays (from ``_columnar_arrays``/``_ohlcv_arrays_from_df``,
+        private or mapped from the host-shared derived cache) into the store.
+
+        THE KEYS ARE COPIED, THE COLUMNS ARE NOT. ``keys_ns`` becomes a PRIVATE ``array('q')``
+        (8 B/bar). WHY array('q') AND NOT THE ndarray ITSELF -- measured, after an ndarray version
+        regressed the 5min A/B by 65% (62s -> 104s). Per scalar read on the per-lookup path
+        (~200k+/backtest):
+            python list  k[i]        97 ns   (the original object-key list)
+            ndarray      int(k[i]) 2493 ns   (26x -- this was the regression)
+            ndarray      k.item(i)  334 ns
+            array('q')   k[i]       160 ns   <- returns a real Python int, no scalar boxing
+        array('q') is 8 bytes/element, so the ~47% memory cut over the object list is fully kept,
+        and it is buffer-compatible -> ``_keys_np`` gives a ZERO-COPY ndarray view for
+        searchsorted. Cheap scalar reads on the hot path, binary search on the cold ones -- and
+        that is why the keys are the one part NOT shared: the mapping would put the 26x back.
+
+        The five float64 columns are bound AS GIVEN, so when they are views over a memory-mapped
+        .npy set (40 of the 48 B/bar) the whole host shares one copy; nothing here ever writes to
+        them.
+        """
+        k = array("q")
+        # frombytes, NOT array('q', ...tolist()): tolist() materialises one Python int PER BAR into
+        # pymalloc arenas that are never returned to the OS (measured 2026-08-16: it turned the
+        # "memory saving" into a loss). ascontiguousarray+dtype: the source may be a mapped view.
+        k.frombytes(np.ascontiguousarray(a["keys_ns"], dtype=np.int64).tobytes())
+        self._keys[symbol] = k
+        self._o[symbol], self._h[symbol], self._l[symbol] = a["o"], a["h"], a["l"]
+        self._c[symbol], self._v[symbol] = a["c"], a["v"]
+
     def _store(self, symbol: str, keys64: np.ndarray,
                o: np.ndarray, h: np.ndarray, l: np.ndarray,
                c: np.ndarray, v: np.ndarray) -> None:
-        """Sort by key (ascending) + dedup keeping the LAST of each duplicate (byte-identical to the
-        old dict-of-dicts, where a later row overwrote an earlier one with the same key), all via
-        fast numpy on the datetime64 keys; then materialise the sorted Python key list (date for
-        daily/coarser, tz-naive datetime for intraday) used by the lookups, and keep OHLCV columnar."""
+        """Sort/dedup raw datetime64-keyed columns and bind them (the fixture/``load_bars`` entry
+        point; ``preload`` goes through ``_ohlcv_arrays_from_df`` instead, which ends in the same
+        ``_columnar_arrays`` + ``_bind_arrays`` pair)."""
         if not len(keys64):
             self._set_empty(symbol)
             return
-        order = np.argsort(keys64, kind="stable")  # stable -> equal keys keep original order
-        keys64, o, h, l, c, v = keys64[order], o[order], h[order], l[order], c[order], v[order]
-        keep = np.ones(len(keys64), dtype=bool)
-        keep[:-1] = keys64[1:] != keys64[:-1]  # keep only the LAST of each run of equal keys
-        if not keep.all():
-            keys64, o, h, l, c, v = keys64[keep], o[keep], h[keep], l[keep], c[keep], v[keep]
-        # int64-ns array, NOT a Python object list: at 5min that list was ~4.5MB/symbol against
-        # 3.6MB for all five OHLCV arrays combined (see _key64).
-        self._keys[symbol] = _keys64_from_datetime64(keys64, self._intraday)
-        self._o[symbol], self._h[symbol], self._l[symbol] = o, h, l
-        self._c[symbol], self._v[symbol] = c, v
+        self._bind_arrays(symbol, _columnar_arrays(keys64, o, h, l, c, v, self._intraday))
 
     def load_bars(self, symbol: str, rows: List[Dict[str, Any]]) -> None:
         """Index a list of OHLCV row dicts for ``symbol`` into the columnar store.
@@ -709,30 +877,14 @@ class AsOfPriceSource:
     def load_bars_df(self, symbol: str, df: Any) -> None:
         """VECTORIZED columnar build straight from a pandas OHLCV DataFrame (the hot preload path).
 
-        Builds the per-symbol datetime64[ns] key array + float64 OHLCV arrays in bulk — no per-bar
-        Python dict (the old dict-of-dicts allocated ~9M small dicts for a 158-symbol 5min run,
-        which dominated both the warmup time and the ~9 GB worker footprint)."""
-        if df is None or len(df) == 0:
+        Thin wrapper over the pure ``_ohlcv_arrays_from_df`` (the same function the shared derived
+        cache builds from, so a frame indexed here and one served from a mapped .npy set are
+        byte-identical); kept for fixtures and any caller that already holds the frame."""
+        arrays = _ohlcv_arrays_from_df(df, self._intraday)
+        if not len(arrays["keys_ns"]):
             self._set_empty(symbol)
             return
-        import pandas as pd
-        dcol = "Date" if "Date" in df.columns else "date"
-        dates = pd.to_datetime(df[dcol])
-        if self._intraday:
-            # tz-naive UTC datetime keys (identical to _norm's intraday path).
-            if getattr(dates.dt, "tz", None) is not None:
-                dates = dates.dt.tz_convert("UTC").dt.tz_localize(None)
-            keys64 = dates.to_numpy(dtype="datetime64[ns]")
-        else:
-            # daily/coarser: drop the time component (midnight) — mirrors _norm's date key.
-            keys64 = dates.dt.normalize().to_numpy(dtype="datetime64[ns]")
-        o = df["Open"].to_numpy(dtype=float)
-        h = df["High"].to_numpy(dtype=float)
-        l = df["Low"].to_numpy(dtype=float)
-        c = df["Close"].to_numpy(dtype=float)
-        v = (df["Volume"].to_numpy(dtype=float) if "Volume" in df.columns
-             else np.zeros(len(df), dtype=float))
-        self._store(symbol, keys64, o, h, l, c, v)
+        self._bind_arrays(symbol, arrays)
 
     # ---- queries -----------------------------------------------------------
     def _exact_index(self, symbol: str, key: Any) -> int:
@@ -1004,6 +1156,22 @@ class MemoizedOHLCVProvider:
         # report exactly what to cache. cached_only=False keeps the live passthrough (fetch).
         self._cached_only = cached_only
 
+    def cached_path(self, symbol: str, interval: str) -> Optional[str]:
+        """The native on-disk parquet for (symbol, interval), or None when absent.
+
+        ``CACHE_FOLDER/<ProviderClassName>/<SYM>_<interval>.parquet`` — the single native cache
+        both ``MarketDataProviderInterface.get_ohlcv_data`` and ``ba2-test fetch-cache`` write.
+        MUST go through ``find_timeseries_path`` (not ``timeseries_path``): the latter returns only
+        the canonical write spelling, so a legacy-spelled file ("<SYM>_5min.parquet") would read as
+        a miss. Exposed because ``AsOfPriceSource`` signs this file to key the host-shared derived
+        array cache — the path resolution has exactly one home, here.
+        """
+        try:
+            from ba2_common.core import native_cache
+            return native_cache.find_timeseries_path(type(self._inner).__name__, symbol, interval)
+        except Exception:  # pragma: no cover — an unresolvable path is just "no shared source"
+            return None
+
     def _read_cached_df(self, symbol: str, interval: str):
         """Read a symbol's full OHLCV series from the native on-disk cache. None on miss.
 
@@ -1015,12 +1183,10 @@ class MemoizedOHLCVProvider:
         import pandas as pd
 
         try:
-            from ba2_common.core import native_cache
-            # Resolve any interval-alias spelling on disk (canonical "5m" + legacy "5min", etc.).
-            # MUST use find_timeseries_path, not timeseries_path: the latter returns only the
-            # canonical write path, so a legacy-spelled cache file ("<SYM>_5min.parquet") would
-            # be a false miss -> a spurious BacktestCacheMiss on data that is actually cached.
-            p = native_cache.find_timeseries_path(type(self._inner).__name__, symbol, interval)
+            # Resolves any interval-alias spelling on disk (canonical "5m" + legacy "5min", etc.)
+            # -- see cached_path; a false miss here would be a spurious BacktestCacheMiss on data
+            # that is actually cached.
+            p = self.cached_path(symbol, interval)
             if p is not None:
                 return pd.read_parquet(p)
         except Exception:  # pragma: no cover
