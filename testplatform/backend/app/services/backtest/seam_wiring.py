@@ -22,7 +22,7 @@ Confirmed against the installed Phase-0 packages (NOT the plan's draft guesses):
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ba2_common.core.instance_resolver import (
     set_instance_resolver,
@@ -222,6 +222,15 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
     """
     profile = config["market_condition_profile"]
     if profile == MARKET_CONDITION_PROFILE_NONE:
+        # A run with market leaves but no profile would evaluate every gate as no_context and
+        # place ZERO entries without a word (e.g. a trial config that dropped the key after an
+        # earlier gated run installed the dispatcher in this process). Refuse it instead.
+        leaves = market_condition_leaves_in(config)
+        if leaves:
+            raise ValueError(
+                f"market_condition_profile is 'none' but the run's rules contain market-condition "
+                f"leaves {leaves!r}: every such gate would be unknown and never pass. Set the "
+                f"profile the rules were built for.")
         _market_condition_tl.resolver = None
         return None
     from ba2_common.core import TradeConditions
@@ -240,6 +249,39 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
         TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
     _market_condition_tl.resolver = resolver
     return resolver
+
+
+def market_condition_leaves_in(config: Any) -> List[str]:
+    """Ids (or config paths, for a leaf without an id) of every condition leaf anywhere in
+    ``config`` whose ``field`` is a registered market-condition field. Walks dicts and lists, and
+    JSON-encoded rule trees held as strings (expert settings store trees that way)."""
+    import json
+
+    from ba2_common.core.market_conditions import PROFILES
+
+    fields = {f.name for prof in PROFILES.values() for f in prof.fields}
+    hits: List[str] = []
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            field = node.get("field")
+            if isinstance(field, str) and field in fields:
+                hits.append(str(node["id"]) if node.get("id") else path)
+            for key, value in node.items():
+                walk(value, f"{path}.{key}")
+        elif isinstance(node, (list, tuple)):
+            for i, value in enumerate(node):
+                walk(value, f"{path}[{i}]")
+        elif isinstance(node, str) and node[:1] in ("{", "[") and any(f in node for f in fields):
+            try:
+                decoded = json.loads(node)
+            except ValueError:
+                hits.append(path)  # names a market field but is not a parseable tree: refuse too
+                return
+            walk(decoded, path)
+
+    walk(config, "config")
+    return hits
 
 
 def clear_backtest_market_conditions() -> None:

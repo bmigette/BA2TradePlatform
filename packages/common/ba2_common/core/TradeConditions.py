@@ -4112,6 +4112,18 @@ class MarketConditionCompare(CompareCondition):
                     "Market-condition leaf %s evaluated with NO context resolver installed: "
                     "every market-condition gate in this process is unknown and never passes "
                     "(%s)", self.FIELD, NO_MARKET_CONDITION_CONTEXT_REASON)
+            resolver = _market_condition_context_resolver
+            if resolver is not None:
+                # A resolver IS installed but has no context for this evaluation (live: a leaf
+                # outside the enter-market decision scope). Never raise -- exit rulesets must keep
+                # running -- but say so ONCE per field instead of a DEBUG line per evaluation.
+                reason = getattr(resolver, "no_context_reason", None) or \
+                    "the installed market-condition resolver has no context for this evaluation"
+                if self.FIELD not in _warned_no_market_condition_context_fields:
+                    _warned_no_market_condition_context_fields.add(self.FIELD)
+                    logger.warning("Market-condition leaf %s (%s): %s",
+                                   self.FIELD, self.instrument_name, reason)
+                return self._unknown(_MC_STATUS_NO_CONTEXT, reason)
             return self._unknown(_MC_STATUS_NO_CONTEXT, NO_MARKET_CONDITION_CONTEXT_REASON)
         session = ctx.prior_session
         values = ctx.reader.observe(self.instrument_name, session)
@@ -4160,6 +4172,8 @@ class MarketConditionCompare(CompareCondition):
 
 
 _warned_no_market_condition_resolver = False
+#: Fields already warned about "resolver installed, no context" (once per field per process).
+_warned_no_market_condition_context_fields: set = set()
 
 _OPERATORS_BY_KIND = {
     "numeric": frozenset({"<", ">"}),

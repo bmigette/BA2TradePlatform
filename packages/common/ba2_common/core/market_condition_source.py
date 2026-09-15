@@ -30,12 +30,13 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ba2_common.core.market_calendar import regular_sessions_ending_at
+from ba2_common.core.market_calendar import regular_sessions_ending_at_tuple
 from ba2_common.core.market_conditions import (
     STATUS_INSUFFICIENT_HISTORY,
     STATUS_MISSING_SESSION,
@@ -46,6 +47,11 @@ from ba2_common.core.market_conditions import (
 __all__ = [
     "SOURCE_PROFILE_FMP_DAILY",
     "FMP_OHLCV_PROVIDER_DIR",
+    "FMP_DAILY_COLUMNS",
+    "read_fmp_daily_cache",
+    "normalized_window_bytes",
+    "window_from_bytes",
+    "window_digest_of_bytes",
     "WindowResult",
     "assemble_window",
     "window_digest",
@@ -66,6 +72,8 @@ __all__ = [
 SOURCE_PROFILE_FMP_DAILY = "fmp-daily-split-adjusted-v1"
 #: The provider's cache directory name under ``CACHE_FOLDER`` (its class name).
 FMP_OHLCV_PROVIDER_DIR = "FMPOHLCVProvider"
+#: The provider cache's column layout. The ONE place the live reader and certification take it.
+FMP_DAILY_COLUMNS = ("Date", "Open", "High", "Low", "Close", "Volume")
 
 _DAY = "datetime64[D]"
 
@@ -102,12 +110,19 @@ def _fail(status: str, reason: str) -> WindowResult:
 
 
 def _to_day64(dates: Any) -> np.ndarray:
-    """Bar dates -> ``datetime64[D]``. Accepts datetime64 arrays (any unit, naive), ``date``
-    objects and midnight-naive ``datetime`` objects. A datetime with a time or a timezone is an
-    ambiguous bar date and is refused (design section 4)."""
+    """Bar dates -> ``datetime64[D]``. Accepts naive datetime64 arrays (any unit), ``date``
+    objects and midnight-naive ``datetime`` objects. A timestamp carrying a time of day (in
+    either form) or a timezone is an ambiguous bar date and is REFUSED, never truncated
+    (design section 4)."""
     arr = np.asarray(dates)
     if np.issubdtype(arr.dtype, np.datetime64):
-        return arr.astype(_DAY)
+        days = arr.astype(_DAY)
+        if arr.dtype != days.dtype:
+            timed = np.flatnonzero(days.astype(arr.dtype) != arr)
+            if len(timed):
+                raise ValueError(f"ambiguous bar date {arr[timed[0]]!r}: carries a time of day, "
+                                 "expected a session label (a date)")
+        return days
     out = np.empty(len(arr), dtype=_DAY)
     for i, d in enumerate(arr):
         if isinstance(d, datetime):
@@ -124,6 +139,16 @@ def _day(d64: np.datetime64) -> date:
     return d64.astype(object)
 
 
+@lru_cache(maxsize=4096)
+def _required_sessions(session: date, n: int) -> Tuple[Tuple[date, ...], np.ndarray]:
+    """The window's session dates as ``(tuple of date, read-only datetime64[D] array)``, built
+    once per (session, n): the conversions were ~60% of an ``assemble_window`` call."""
+    dates = regular_sessions_ending_at_tuple(session, n)
+    arr = np.array(dates, dtype=_DAY)
+    arr.flags.writeable = False
+    return dates, arr
+
+
 def assemble_window(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any, session: date,
                     n: int = WINDOW) -> WindowResult:
     """Assemble the ``n`` bars of the ``n`` regular sessions ending at ``session``.
@@ -136,7 +161,7 @@ def assemble_window(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any, session:
     if any(len(col) != len(d) for col in cols):
         raise ValueError(f"dates and OHLCV must have equal lengths, got {[len(d)] + [len(x) for x in cols]}")
 
-    required = np.array(regular_sessions_ending_at(session, n), dtype=_DAY)
+    required_dates, required = _required_sessions(session, n)
     last = np.datetime64(session, "D")
     if not len(d):
         return _fail(STATUS_MISSING_SESSION, f"no bars for any of the {n} sessions ending {session}")
@@ -171,7 +196,7 @@ def assemble_window(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any, session:
     if present.all():
         return WindowResult(
             status=STATUS_VALID,
-            dates=tuple(_day(x) for x in required),
+            dates=required_dates,
             o=np.ascontiguousarray(scols[0]), h=np.ascontiguousarray(scols[1]),
             l=np.ascontiguousarray(scols[2]), c=np.ascontiguousarray(scols[3]),
             v=np.ascontiguousarray(scols[4]),
@@ -197,15 +222,29 @@ def assemble_window(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any, session:
 
 
 def window_digest(o: Any, h: Any, l: Any, c: Any, v: Any) -> str:
-    """sha256 (hex) of the NORMALIZED window bytes: a C-contiguous little-endian float64 matrix
-    of shape (bars, 5) with columns open, high, low, close, volume. The same five arrays hash
-    identically on every host."""
-    return "sha256:" + _sha256(normalized_window_bytes(o, h, l, c, v))
+    """``"sha256:<hex>"`` of the NORMALIZED window bytes: a C-contiguous little-endian float64
+    matrix of shape (bars, 5) with columns open, high, low, close, volume. The same five arrays
+    hash identically on every host."""
+    return window_digest_of_bytes(normalized_window_bytes(o, h, l, c, v))
+
+
+def window_digest_of_bytes(data: bytes) -> str:
+    """``window_digest`` computed directly on normalized window bytes."""
+    return "sha256:" + _sha256(data)
 
 
 def normalized_window_bytes(o: Any, h: Any, l: Any, c: Any, v: Any) -> bytes:
+    """The window as raw little-endian float64 bytes, shape (bars, 5), columns o/h/l/c/v."""
     mat = np.stack([np.asarray(x, dtype="<f8") for x in (o, h, l, c, v)], axis=1)
     return np.ascontiguousarray(mat, dtype="<f8").tobytes()
+
+
+def window_from_bytes(data: bytes) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Inverse of ``normalized_window_bytes``: ``(o, h, l, c, v)`` float64 arrays."""
+    if len(data) % 40:
+        raise ValueError(f"window bytes must be a whole number of 5-float64 rows, got {len(data)} bytes")
+    mat = np.frombuffer(data, dtype="<f8").reshape(-1, 5)
+    return tuple(np.ascontiguousarray(mat[:, j], dtype=np.float64) for j in range(5))
 
 
 def _sha256(data: bytes) -> str:
@@ -224,7 +263,7 @@ BASIS_UNAVAILABLE = "unavailable"
 #: A ratio within this factor of its target counts as matching it (ln 1.5 ~ 0.405 keeps the
 #: "ordinary day" and "~1/factor" bands disjoint for the 4:1 and 10:1 fixtures).
 _MATCH_TOLERANCE = math.log(1.5)
-_PRICE_COLUMNS = ("Open", "High", "Low", "Close")
+_PRICE_COLUMNS = FMP_DAILY_COLUMNS[1:5]  # Open, High, Low, Close
 
 
 @dataclass(frozen=True)
@@ -348,21 +387,38 @@ def certify_split(dates: Any, o: Any, h: Any, l: Any, c: Any, fixture: SplitFixt
 def certify_source_columns(cache_root: str,
                            splits: Sequence[SplitFixture] = CERTIFICATION_SPLITS) -> CertificationReport:
     """Certify the FMP daily OHLCV cache under ``cache_root`` (a ``CACHE_FOLDER``) against the
-    split fixtures. A missing or unreadable parquet is ``unavailable`` and NOT consistent."""
-    import pandas as pd
-
+    split fixtures. A missing parquet is ``unavailable`` and NOT consistent."""
     results = []
     for fx in splits:
         path = os.path.join(cache_root, FMP_OHLCV_PROVIDER_DIR, f"{fx.symbol.upper()}_1d.parquet")
         if not os.path.exists(path):
             results.append(_unavailable(fx, f"no cache file {path}"))
             continue
-        df = pd.read_parquet(path, columns=["Date", *_PRICE_COLUMNS])
-        dates = pd.to_datetime(df["Date"])
-        if getattr(dates.dt, "tz", None) is not None:
-            # A tz-aware stamp is only a label if it is midnight in its own zone.
-            dates = dates.dt.tz_localize(None)
-        results.append(certify_split(dates.to_numpy(dtype="datetime64[ns]"),
-                                     df["Open"], df["High"], df["Low"], df["Close"], fx))
+        dates, o, h, l, c, _v = read_fmp_daily_cache(path)
+        results.append(certify_split(dates, o, h, l, c, fx))
     return CertificationReport(source_profile=SOURCE_PROFILE_FMP_DAILY, cache_root=str(cache_root),
                                symbols=tuple(results))
+
+
+def read_fmp_daily_cache(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Read one FMP daily OHLCV cache parquet -> ``(dates datetime64[D], o, h, l, c, v)`` float64.
+
+    ``Date`` must be a session LABEL: naive midnight, or tz-aware midnight in its own zone (the
+    label is then that wall date). Any time of day is REFUSED (ValueError) instead of converted:
+    converting a 00:00 New York stamp to UTC, or truncating a 20:00 UTC one, would silently move
+    a bar to another session.
+    """
+    import pandas as pd
+
+    df = pd.read_parquet(path, columns=list(FMP_DAILY_COLUMNS))
+    stamps = pd.to_datetime(df[FMP_DAILY_COLUMNS[0]])
+    if getattr(stamps.dt, "tz", None) is not None:
+        wall = stamps.dt.tz_localize(None)
+        timed = wall != wall.dt.normalize()
+        if bool(timed.any()):
+            raise ValueError(f"{path}: tz-aware bar date {stamps[timed].iloc[0]!r} is not midnight; "
+                             "refusing to guess its session")
+        stamps = wall
+    dates = _to_day64(stamps.to_numpy(dtype="datetime64[ns]"))
+    cols = tuple(df[name].to_numpy(dtype=np.float64) for name in FMP_DAILY_COLUMNS[1:])
+    return (dates, *cols)

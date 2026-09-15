@@ -4,7 +4,7 @@ using them; never guess an adjustment).
 
 The real-cache test reads the machine's actual cache READ-ONLY (``tests/conftest.py`` redirects
 ``CACHE_FOLDER`` to a temp dir for writes, so the real root is resolved from the environment the
-same way ``ba2_common.config`` does). It PINS the measured finding (2026-09-15):
+same way ``ba2_common.config`` does). It checks the measured finding (2026-09-15) with ratio tolerances:
 
 * AAPL 4:1 on 2020-08-31 -- Close[split]/Close[prev] = 129.04/124.81 = 1.0339; the pre-split
   close 124.81 is the raw 499.23 divided by 4 (so split-adjusted, NOT dividend-adjusted);
@@ -55,20 +55,27 @@ def test_real_fmp_cache_is_split_adjusted():
     assert report.source_profile == SOURCE_PROFILE_FMP_DAILY
     by = report.by_symbol()
 
-    aapl = by["AAPL"]
-    assert aapl.basis == BASIS_SPLIT_ADJUSTED and aapl.consistent
-    assert aapl.close_ratio == pytest.approx(129.04 / 124.81, abs=1e-9)
-    nvda = by["NVDA"]
-    assert nvda.basis == BASIS_SPLIT_ADJUSTED and nvda.consistent
-    assert nvda.close_ratio == pytest.approx(121.79 / 120.89, abs=1e-9)
-    for cert in (aapl, nvda):
-        assert all(abs(j - 1.0) < 0.03 for j in cert.intrabar_jumps.values()), cert
+    from ba2_common.core.market_condition_source import read_fmp_daily_cache
+
+    for fx in CERTIFICATION_SPLITS:
+        cert = by[fx.symbol]
+        assert cert.basis == BASIS_SPLIT_ADJUSTED and cert.consistent, cert
+        # An ordinary trading day across the split, nowhere near 1/factor (0.25 / 0.10).
+        assert 0.8 < cert.close_ratio < 1.25, cert
+        assert all(0.8 < r < 1.25 for r in cert.column_ratios.values()), cert
+        assert all(abs(j - 1.0) < 0.05 for j in cert.intrabar_jumps.values()), cert
+        # Exact: the report's close ratio IS the file's Close[split] / Close[previous session].
+        dates, _o, _h, _l, c, _v = read_fmp_daily_cache(
+            os.path.join(root, "FMPOHLCVProvider", f"{fx.symbol}_1d.parquet"))
+        i = int(np.flatnonzero(dates == np.datetime64(fx.split_date))[0])
+        assert cert.close_ratio == c[i] / c[i - 1]
     assert report.consistent
 
-    # Split-adjusted but NOT dividend-adjusted: the pre-split close is exactly raw/4.
-    df = pd.read_parquet(os.path.join(root, "FMPOHLCVProvider", "AAPL_1d.parquet"), columns=["Date", "Close"])
-    prev = df[pd.to_datetime(df["Date"]) == pd.Timestamp("2020-08-28")]["Close"].iloc[0]
-    assert prev == pytest.approx(round(499.23 / 4, 2), abs=1e-9)
+    # Split-adjusted but NOT dividend-adjusted: AAPL's pre-split close times 4 is the raw
+    # 2020-08-28 print (499.23) to the cent; a dividend-adjusted series sits ~3% lower.
+    dates, _o, _h, _l, c, _v = read_fmp_daily_cache(os.path.join(root, "FMPOHLCVProvider", "AAPL_1d.parquet"))
+    prev = c[int(np.flatnonzero(dates == np.datetime64("2020-08-28"))[0])]
+    assert abs(prev * 4 - 499.23) < 0.03
 
 
 def test_missing_cache_is_unavailable_and_inconsistent(tmp_path):

@@ -146,3 +146,84 @@ def test_window_digest_is_stable_and_content_sensitive():
     c = res.c.copy()
     c[0] = np.nextafter(c[0], np.inf)
     assert window_digest(res.o, res.h, res.l, c, res.v) != a
+
+
+# --------------------------------------------------------------------------- date refusals / reader
+def test_datetime64_with_a_time_of_day_is_refused_not_truncated():
+    d, o, h, l, c, v = _series(_sessions())
+    stamped = d.astype("datetime64[ns]").copy()
+    stamped[5] += np.timedelta64(20, "h")
+    with pytest.raises(ValueError, match="time of day"):
+        assemble_window(stamped, o, h, l, c, v, SESSION)
+    # midnight datetime64[ns] is a label and is accepted
+    assert assemble_window(d.astype("datetime64[ns]"), o, h, l, c, v, SESSION).ok
+
+
+def _parquet(path, stamps):
+    import pandas as pd
+
+    n = len(stamps)
+    pd.DataFrame({"Date": stamps, "Open": np.full(n, 10.0), "High": np.full(n, 11.0),
+                  "Low": np.full(n, 9.0), "Close": np.full(n, 10.5),
+                  "Volume": np.arange(n, dtype=np.int64)}).to_parquet(path, index=False)
+
+
+def test_read_fmp_daily_cache_accepts_labels(tmp_path):
+    import pandas as pd
+
+    from ba2_common.core.market_condition_source import read_fmp_daily_cache
+
+    naive = tmp_path / "naive.parquet"
+    _parquet(naive, pd.to_datetime(["2025-06-27", "2025-06-30"]))
+    dates, o, h, l, c, v = read_fmp_daily_cache(str(naive))
+    assert list(dates) == [np.datetime64("2025-06-27"), np.datetime64("2025-06-30")]
+    assert o.dtype == np.float64 and list(v) == [0.0, 1.0]
+
+    aware = tmp_path / "aware.parquet"
+    _parquet(aware, pd.to_datetime(["2025-06-27", "2025-06-30"]).tz_localize("America/New_York"))
+    dates, *_ = read_fmp_daily_cache(str(aware))
+    # tz-aware MIDNIGHT keeps its wall date (a UTC conversion would have moved it to 04:00 the same day,
+    # and a 00:00 UTC stamp in New York would land on the previous day)
+    assert list(dates) == [np.datetime64("2025-06-27"), np.datetime64("2025-06-30")]
+
+
+def test_read_fmp_daily_cache_refuses_tz_aware_non_midnight(tmp_path):
+    import pandas as pd
+
+    from ba2_common.core.market_condition_source import read_fmp_daily_cache
+
+    path = tmp_path / "timed.parquet"
+    _parquet(path, pd.to_datetime(["2025-06-27 20:00", "2025-06-30 20:00"]).tz_localize("UTC"))
+    with pytest.raises(ValueError, match="not midnight"):
+        read_fmp_daily_cache(str(path))
+
+
+def test_read_fmp_daily_cache_refuses_naive_time_of_day(tmp_path):
+    import pandas as pd
+
+    from ba2_common.core.market_condition_source import read_fmp_daily_cache
+
+    path = tmp_path / "naive_timed.parquet"
+    _parquet(path, pd.to_datetime(["2025-06-27 16:00", "2025-06-30 00:00"]))
+    with pytest.raises(ValueError, match="time of day"):
+        read_fmp_daily_cache(str(path))
+
+
+def test_valid_window_dates_are_the_memoised_tuple():
+    d, o, h, l, c, v = _series(_sessions())
+    a = assemble_window(d, o, h, l, c, v, SESSION)
+    b = assemble_window(d, o, h, l, c, v, SESSION)
+    assert isinstance(a.dates, tuple) and a.dates is b.dates
+
+
+def test_window_bytes_round_trip():
+    from ba2_common.core.market_condition_source import window_digest_of_bytes, window_from_bytes
+
+    res = assemble_window(*_series(_sessions()), SESSION)
+    raw = normalized_window_bytes(*res.arrays())
+    back = window_from_bytes(raw)
+    for x, y in zip(back, res.arrays()):
+        np.testing.assert_array_equal(x, y)
+    assert window_digest_of_bytes(raw) == window_digest(*res.arrays())
+    with pytest.raises(ValueError):
+        window_from_bytes(raw[:-1])

@@ -7,6 +7,7 @@ served by ``ReplayMarketConditionReader`` -- the same round trip every other rep
 """
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 from datetime import date, datetime, timezone
@@ -24,7 +25,11 @@ from ba2_common.core.market_condition_readers import (
     FMPCacheMarketConditionReader,
     ReplayMarketConditionReader,
 )
-from ba2_common.core.market_condition_source import window_digest
+from ba2_common.core.market_condition_source import (
+    window_digest,
+    window_digest_of_bytes,
+    window_from_bytes,
+)
 from ba2_common.core.market_conditions import STATUS_INSUFFICIENT_HISTORY, STATUS_VALID, WINDOW
 from ba2_common.core.replay import (
     CaptureContext,
@@ -130,18 +135,19 @@ def test_the_bundle_retains_the_window_bytes_and_values(recorded):
                                          for o in bundle.observations_for(ANALYSIS_ID)
                                          if o.provider == CAPTURE_PROVIDER)}
     aaa = payloads["AAA"]
-    frame = aaa["window"]
-    assert isinstance(frame, pd.DataFrame) and frame.shape == (WINDOW, 5)
-    assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
-    assert all(frame[c].dtype == np.float64 for c in frame.columns)
-    assert window_digest(*(frame[c].to_numpy() for c in frame.columns)) == aaa["window_digest"]
+    raw = base64.b64decode(aaa["window_f8_b64"])
+    assert aaa["window_shape"] == [WINDOW, 5] and len(raw) == WINDOW * 5 * 8
+    assert window_digest_of_bytes(raw) == aaa["window_digest"]
+    o, h, l, c, v = window_from_bytes(raw)
+    assert window_digest(o, h, l, c, v) == aaa["window_digest"]
+    assert c.dtype == np.float64 and c[-1] > 0
     assert aaa["window_first_session"] == regular_sessions_ending_at(PRIOR, WINDOW)[0]
     live_row = recorded["reader"].observe("AAA", PRIOR)
     assert aaa["values"] == {f: o.value for f, o in live_row.by_field().items()}
     assert set(aaa["statuses"].values()) == {STATUS_VALID}
 
     yng = payloads["YNG"]
-    assert yng["window"] is None and yng["window_digest"] is None
+    assert yng["window_f8_b64"] is None and yng["window_digest"] is None
     assert set(yng["statuses"].values()) == {STATUS_INSUFFICIENT_HISTORY}
 
 
@@ -174,7 +180,9 @@ def test_replay_refuses_a_tampered_window(recorded):
                 if o.provider == CAPTURE_PROVIDER]
     for p in payloads:
         if p["symbol"] == "AAA":
-            p["window"].loc[WINDOW - 1, "close"] += 0.01
+            raw = bytearray(base64.b64decode(p["window_f8_b64"]))
+            raw[-16] ^= 0x01   # flip one bit of the last close
+            p["window_f8_b64"] = base64.b64encode(bytes(raw)).decode("ascii")
     reader = ReplayMarketConditionReader.from_payloads(
         payloads, profile="ohlcv-v1", source_profile="fmp-daily-split-adjusted-v1",
         timing_policy="prior_session_v1")
@@ -188,7 +196,7 @@ def test_replay_refuses_a_hash_without_bytes(recorded):
     payloads = [dict(bundle.decode(o.payload_object)) for o in bundle.observations_for(ANALYSIS_ID)
                 if o.provider == CAPTURE_PROVIDER]
     for p in payloads:
-        p["window"] = None
+        p["window_f8_b64"] = None
     reader = ReplayMarketConditionReader.from_payloads(
         payloads, profile="ohlcv-v1", source_profile="fmp-daily-split-adjusted-v1",
         timing_policy="prior_session_v1")
@@ -215,3 +223,33 @@ def test_a_replayed_decision_uses_the_tape_and_never_the_cache(recorded, fixed_c
                     got[(symbol, field)] = (leaf.evaluate(), leaf.last_status, leaf.calculated_value)
     assert got == recorded["results"]
     assert inner.computed == 0
+
+
+def test_two_profiles_for_one_symbol_session_do_not_overwrite(recorded):
+    bundle = load_bundle(recorded["bundle_dir"])
+    payloads = [dict(bundle.decode(o.payload_object)) for o in bundle.observations_for(ANALYSIS_ID)
+                if o.provider == CAPTURE_PROVIDER]
+    other = [dict(p, profile="ta-structure-v1", window_digest="sha256:" + "0" * 64,
+                  window_f8_b64=None) for p in payloads]
+    reader = ReplayMarketConditionReader.from_payloads(
+        payloads + other, profile="ohlcv-v1", source_profile="fmp-daily-split-adjusted-v1",
+        timing_policy="prior_session_v1")
+    assert reader.observe("AAA", PRIOR) == recorded["reader"].observe("AAA", PRIOR)
+
+
+def test_capture_dedupes_windows_by_digest_and_failures_by_status_and_reason():
+    from ba2_common.core.market_condition_readers import (
+        CapturingMarketConditionReader,
+        ObservedWindow,
+    )
+    from ba2_common.core.market_conditions import OHLCV_V1, FeatureRow
+
+    valid = FeatureRow.uniform(OHLCV_V1, STATUS_INSUFFICIENT_HISTORY, "a")
+    key = CapturingMarketConditionReader._dedupe_key
+    with_digest = ObservedWindow(row=valid, window=None, digest="sha256:abc")
+    assert key("AAA", PRIOR, with_digest) == ("AAA", PRIOR, "sha256:abc")
+    a = key("AAA", PRIOR, ObservedWindow(row=valid, window=None, digest=None))
+    b = key("AAA", PRIOR, ObservedWindow(row=FeatureRow.uniform(OHLCV_V1, STATUS_INSUFFICIENT_HISTORY, "b"),
+                                         window=None, digest=None))
+    assert a != b, "a different reason is a different observation"
+    assert key("AAA", PRIOR, None) == ("AAA", PRIOR, None)

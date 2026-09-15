@@ -775,7 +775,11 @@ def run_daily_backtest(
         # on every non-screener run -> the engine's entry gate is a no-op (behaviour unchanged).
         "screener_runtime": config.get("screener_runtime"),
         # Market-condition entry gates (design 2026-09-15): absent on every existing config, which
-        # means "none" -- nothing is installed and no adapter is imported for the run.
+        # means "none" -- nothing is installed and no adapter is imported for the run. The
+        # ``or "none"`` default is DELIBERATE back-compat (every persisted config predates the
+        # key), not a hidden fallback: install_backtest_market_conditions refuses a "none" run
+        # whose rules contain market-condition leaves, so a config that LOST the key fails loudly
+        # instead of evaluating every gate as no_context and placing zero entries.
         "market_condition_profile": config.get("market_condition_profile") or "none",
     }
 

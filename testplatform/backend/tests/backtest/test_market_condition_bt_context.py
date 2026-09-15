@@ -235,3 +235,33 @@ def test_profile_installs_a_thread_local_run_resolver(ps):
 
     seam_wiring.clear_backtest_market_conditions()
     assert dispatch(account, "AAA", None) is None
+
+
+def test_profile_none_with_market_leaves_in_the_rules_raises(ps):
+    import json
+
+    tree = {"op": "AND", "children": [
+        {"id": "o_lc-entry-iv", "field": "iv_rank", "op": "<", "value": 30},
+        {"id": "o_lc-market-adx", "field": "underlying_adx_14", "op": "<", "value": 25},
+    ]}
+    with pytest.raises(ValueError, match="o_lc-market-adx"):
+        seam_wiring.install_backtest_market_conditions(
+            {"market_condition_profile": "none", "entry_rules": [{"conditions": tree}]}, ps)
+    # A tree held as a JSON string inside expert settings is found too.
+    cfg = {"market_condition_profile": "none",
+           "experts": [{"class": "X", "settings": {"entry_condition": json.dumps(tree)}}]}
+    with pytest.raises(ValueError, match="o_lc-market-adx"):
+        seam_wiring.install_backtest_market_conditions(cfg, ps)
+    # A leaf without an id is named by its config path.
+    no_id = {"market_condition_profile": "none",
+             "exit_rules": [{"field": "underlying_realized_vol_ratio_5_20", "op": ">", "value": 1}]}
+    with pytest.raises(ValueError, match=r"config\.exit_rules\[0\]"):
+        seam_wiring.install_backtest_market_conditions(no_id, ps)
+
+
+def test_profile_none_without_market_leaves_is_fine(ps):
+    cfg = {"market_condition_profile": "none", "enabled_instruments": ["AAA"],
+           "entry_rules": [{"conditions": {"id": "x", "field": "iv_rank", "op": "<", "value": 30}}],
+           "experts": [{"class": "X", "settings": {"note": "[not json", "tree": "{\"field\": \"iv_rank\"}"}}]}
+    assert seam_wiring.install_backtest_market_conditions(cfg, ps) is None
+    assert seam_wiring.market_condition_leaves_in(cfg) == []

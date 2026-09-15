@@ -11,8 +11,8 @@ Design: ``docs/plans/2026-09-15-option-market-condition-genes-design.md`` sectio
   ONLY, read directly (never a provider call, so never a network fetch inside a condition).
 * :class:`CapturingMarketConditionReader` -- wraps a window reader while a replay capture
   context is active: every served row is recorded ONCE per (symbol, session, window digest),
-  with the normalized 128x5 float64 window retained as a content-addressed frame (a hash without
-  retained bytes is not replayable).
+  with the normalized 128x5 float64 window bytes retained in the payload (a hash without retained
+  bytes is not replayable).
 * :class:`ReplayMarketConditionReader` -- serves exactly what was recorded, verifies the window
   digest, and raises ``ReplayMiss`` for anything not on the tape; it never touches a cache.
 
@@ -21,6 +21,7 @@ reader protocol, the memo contract and the capture payload stay.
 """
 from __future__ import annotations
 
+import base64
 import os
 import threading
 from collections import OrderedDict
@@ -34,7 +35,11 @@ from ba2_common.core.market_condition_source import (
     FMP_OHLCV_PROVIDER_DIR,
     WindowResult,
     assemble_window,
+    normalized_window_bytes,
+    read_fmp_daily_cache,
     window_digest,
+    window_digest_of_bytes,
+    window_from_bytes,
 )
 from ba2_common.core.market_conditions import (
     COMPUTE_BY_PROFILE,
@@ -66,7 +71,6 @@ MEMO_SIZE = 2000
 CAPTURE_PROVIDER = "market_conditions"
 CAPTURE_METHOD = "window"
 CAPTURE_SCHEMA = "market_condition_window/v1"
-_WINDOW_COLUMNS = ("open", "high", "low", "close", "volume")
 
 _ABSENT = object()
 
@@ -185,14 +189,18 @@ class WindowMarketConditionReader:
 class FMPCacheMarketConditionReader(WindowMarketConditionReader):
     """Live reader over the FMP daily OHLCV parquet cache ONLY.
 
-    Reads ``<cache_root>/FMPOHLCVProvider/<SYM>_1d.parquet`` directly with the provider cache's
-    column layout (``Date, Open, High, Low, Close, Volume``); with ``cache_root=None`` the path is
-    resolved by ``native_cache.find_timeseries_path`` -- the same resolution the provider's own
-    cache read uses. No provider method is called, so no network request can happen inside a
-    condition; a symbol whose file is absent observes ``None`` (``missing_session``).
+    Reads ``<cache_root>/FMPOHLCVProvider/<SYM>_1d.parquet`` through
+    ``market_condition_source.read_fmp_daily_cache`` (the single copy of the column layout and of
+    the bar-date rule); with ``cache_root=None`` the path is resolved by
+    ``native_cache.find_timeseries_path`` -- the same resolution the provider's own cache read
+    uses. No provider method is called, so no network request can happen inside a condition; a
+    symbol whose file is absent observes ``None`` (``missing_session``).
 
-    The memo key carries the file's ``(mtime_ns, size)``: a cache the warmup completes or
-    corrects later is re-read instead of being hidden behind an earlier negative row.
+    Freshness: the memo key carries the file's ``(mtime_ns, size)``, so EVERY ``observe`` re-stats
+    the file and a cache the warmup completes or corrects later is re-read instead of being hidden
+    behind an earlier negative row. The reader is therefore NOT frozen per decision -- only the
+    ``MarketConditionContext`` is. Two leaves of one decision can in principle see different rows
+    if the file is rewritten between them; the capture records each distinct window served.
     """
 
     def __init__(self, profile: str, cache_root: Optional[str] = None, *, memo_size: int = MEMO_SIZE):
@@ -217,19 +225,10 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
         return (symbol, session, path, st.st_mtime_ns, st.st_size)
 
     def _bars(self, symbol: str, session: date):
-        import pandas as pd
-
         path = self._path(symbol)
         if path is None:
             return None
-        df = pd.read_parquet(path, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
-        dates = pd.to_datetime(df["Date"])
-        if getattr(dates.dt, "tz", None) is not None:
-            dates = dates.dt.tz_convert("UTC").dt.tz_localize(None)
-        return (dates.to_numpy(dtype="datetime64[ns]").astype("datetime64[D]"),
-                df["Open"].to_numpy(np.float64), df["High"].to_numpy(np.float64),
-                df["Low"].to_numpy(np.float64), df["Close"].to_numpy(np.float64),
-                df["Volume"].to_numpy(np.float64))
+        return read_fmp_daily_cache(path)
 
 
 # ---------------------------------------------------------------------------
@@ -248,21 +247,22 @@ def capture_identity(symbol: str, session: date, *, profile: str, source_profile
     }
 
 
-def _window_frame(window: WindowResult):
-    import pandas as pd
-
-    return pd.DataFrame({name: np.asarray(arr, dtype=np.float64)
-                         for name, arr in zip(_WINDOW_COLUMNS, window.arrays())})
-
-
 class CapturingMarketConditionReader:
-    """Record every row served by ``inner`` into a capture context, once per
-    (symbol, session, window digest).
+    """Record every row served by ``inner`` into a capture context, once per distinct observation.
+
+    Dedupe key: ``(symbol, session, window digest)`` when a window was assembled, else
+    ``(symbol, session, statuses, reasons)``.
+
+    Payload (schema ``market_condition_window/v1``): the identity, ``row_present``, per-field
+    ``values``/``statuses``/``reasons``, ``window_digest`` and ``window_f8_b64`` -- the NORMALIZED
+    window bytes (little-endian float64, shape ``window_shape`` = [bars, 5], columns o/h/l/c/v)
+    base64-encoded, because the replay codec's JSON tree has no bytes type. Replay decodes them
+    with numpy alone and checks the digest on the bytes themselves.
 
     The capture context is bound at construction (on the coordinating thread) and written through
     directly, so a leaf evaluated in a pool thread -- where the capture ContextVar is not set --
     still records. ``record`` has the ``MarketConditionContext.recorder`` signature; the conditions'
-    per-valid-read recorder calls land on the same dedup set and add nothing.
+    per-valid-read recorder calls land on the same dedupe set and add nothing.
     """
 
     def __init__(self, inner: WindowMarketConditionReader, capture: Any, *,
@@ -292,9 +292,18 @@ class CapturingMarketConditionReader:
     def record(self, symbol: str, session: date, row: Any = None) -> None:
         self._record_entry(symbol, session, self.inner.observe_window(symbol, session))
 
+    @staticmethod
+    def _dedupe_key(symbol: str, session: date, entry: Optional[ObservedWindow]) -> Tuple:
+        if entry is None:
+            return (symbol, session, None)
+        if entry.digest is not None:
+            return (symbol, session, entry.digest)
+        fields = entry.row.by_field()
+        return (symbol, session, tuple((f, o.status) for f, o in fields.items()),
+                tuple((f, o.reason) for f, o in fields.items()))
+
     def _record_entry(self, symbol: str, session: date, entry: Optional[ObservedWindow]) -> None:
-        key = (symbol, session, None if entry is None else entry.digest,
-               None if entry is None else tuple(o.status for o in entry.row.by_field().values()))
+        key = self._dedupe_key(symbol, session, entry)
         with self._lock:
             if key in self._recorded:
                 return
@@ -309,7 +318,8 @@ class CapturingMarketConditionReader:
             "row_present": entry is not None,
             "window_digest": None,
             "window_first_session": None,
-            "window": None,
+            "window_shape": None,
+            "window_f8_b64": None,
             "values": {},
             "statuses": {},
             "reasons": {},
@@ -320,9 +330,11 @@ class CapturingMarketConditionReader:
             payload["statuses"] = {f: o.status for f, o in fields.items()}
             payload["reasons"] = {f: o.reason for f, o in fields.items()}
             if entry.window is not None:
+                raw = normalized_window_bytes(*entry.window.arrays())
                 payload["window_digest"] = entry.digest
                 payload["window_first_session"] = entry.window.dates[0]
-                payload["window"] = _window_frame(entry.window)
+                payload["window_shape"] = [len(entry.window.dates), 5]
+                payload["window_f8_b64"] = base64.b64encode(raw).decode("ascii")
         from ba2_common.core.replay.observe import sanitize_identity
         from ba2_common.core.replay.schemas import ReplayStatus
 
@@ -333,9 +345,13 @@ class CapturingMarketConditionReader:
 
 
 class ReplayMarketConditionReader:
-    """Serve recorded market-condition rows; anything unrecorded is a ``ReplayMiss``."""
+    """Serve recorded market-condition rows; anything unrecorded is a ``ReplayMiss``.
 
-    def __init__(self, recorded: Mapping[Tuple[str, date], Mapping[str, Any]], *, profile: str,
+    Recorded payloads are keyed on ``(profile, symbol, session)``, so two profiles recorded for
+    one symbol/session never overwrite each other; this reader serves its own profile's keys.
+    """
+
+    def __init__(self, recorded: Mapping[Tuple[str, str, date], Mapping[str, Any]], *, profile: str,
                  source_profile: str, timing_policy: str):
         if profile not in PROFILES:
             raise KeyError(f"unknown market-condition profile {profile!r}")
@@ -349,16 +365,17 @@ class ReplayMarketConditionReader:
 
     @classmethod
     def from_payloads(cls, payloads: Iterable[Mapping[str, Any]], **kwargs) -> "ReplayMarketConditionReader":
-        recorded: Dict[Tuple[str, date], Mapping[str, Any]] = {}
+        recorded: Dict[Tuple[str, str, date], Mapping[str, Any]] = {}
         for payload in payloads:
             if payload.get("schema") != CAPTURE_SCHEMA:
                 continue
-            key = (payload["symbol"], date.fromisoformat(payload["session"]))
+            key = (payload["profile"], payload["symbol"], date.fromisoformat(payload["session"]))
             previous = recorded.get(key)
             if previous is not None and previous.get("window_digest") != payload.get("window_digest"):
                 from ba2_common.core.replay.context import ReplayMiss
-                raise ReplayMiss("market_condition_window_conflict", request_identity=list(key),
-                                 detail="two different windows were recorded for one symbol/session")
+                raise ReplayMiss("market_condition_window_conflict",
+                                 request_identity=[key[0], key[1], key[2].isoformat()],
+                                 detail="two different windows were recorded for one profile/symbol/session")
             recorded[key] = payload
         return cls(recorded, **kwargs)
 
@@ -379,17 +396,31 @@ class ReplayMarketConditionReader:
             self._rows[key] = row
         return row
 
+    def _retained_bytes(self, payload: Mapping[str, Any], identity: Mapping[str, Any]) -> bytes:
+        from ba2_common.core.replay.context import ReplayMiss
+
+        encoded = payload["window_f8_b64"]
+        shape = payload["window_shape"]
+        if encoded is None or shape is None:
+            raise ReplayMiss("market_condition_window_bytes", request_identity=dict(identity),
+                             detail="the recorded window bytes are not retained")
+        raw = base64.b64decode(encoded)
+        if list(shape) != [WINDOW, 5] or len(raw) != WINDOW * 5 * 8:
+            raise ReplayMiss("market_condition_window_bytes", request_identity=dict(identity),
+                             detail=f"retained window has shape {shape} / {len(raw)} bytes")
+        return raw
+
     def _build(self, symbol: str, session: date) -> Optional[FeatureRow]:
         from ba2_common.core.replay.context import ReplayMiss
 
         identity = capture_identity(symbol, session, profile=self.profile,
                                     source_profile=self._source_profile,
                                     timing_policy=self._timing_policy, calc_version=self.calc_version)
-        payload = self._recorded.get((symbol, session))
+        payload = self._recorded.get((self.profile, symbol, session))
         if payload is None:
             raise ReplayMiss("market_condition_window", request_identity=identity,
-                             detail="no recorded market-condition window for this symbol/session")
-        for name in ("profile", "source_profile", "timing_policy", "calc_version"):
+                             detail="no recorded market-condition window for this profile/symbol/session")
+        for name in ("source_profile", "timing_policy", "calc_version"):
             if payload[name] != identity[name]:
                 if name == "calc_version":
                     raise MarketConditionVersionMismatch(
@@ -399,12 +430,9 @@ class ReplayMarketConditionReader:
                                  detail=f"recorded {name} {payload[name]!r} differs")
         if not payload["row_present"]:
             return None
-        frame = payload["window"]
         if payload["window_digest"] is not None:
-            if frame is None or len(frame) != WINDOW:
-                raise ReplayMiss("market_condition_window_bytes", request_identity=identity,
-                                 detail="the recorded window bytes are not retained")
-            digest = window_digest(*(frame[c].to_numpy(np.float64) for c in _WINDOW_COLUMNS))
+            raw = self._retained_bytes(payload, identity)
+            digest = window_digest_of_bytes(raw)
             if digest != payload["window_digest"]:
                 raise ReplayMiss("market_condition_window_digest", request_identity=identity,
                                  detail=f"retained window hashes to {digest}, recorded {payload['window_digest']}")
@@ -418,8 +446,10 @@ class ReplayMarketConditionReader:
     def recorded_window(self, symbol: str, session: date) -> Optional[Tuple[np.ndarray, ...]]:
         """The retained window arrays ``(o, h, l, c, v)`` for a recorded key (for recomputation
         comparisons), ``None`` when the recorded row had no window."""
-        payload = self._recorded.get((symbol, session))
-        if payload is None or payload["window"] is None:
+        payload = self._recorded.get((self.profile, symbol, session))
+        if payload is None or payload["window_digest"] is None:
             return None
-        frame = payload["window"]
-        return tuple(frame[c].to_numpy(np.float64) for c in _WINDOW_COLUMNS)
+        identity = capture_identity(symbol, session, profile=self.profile,
+                                    source_profile=self._source_profile,
+                                    timing_policy=self._timing_policy, calc_version=self.calc_version)
+        return window_from_bytes(self._retained_bytes(payload, identity))

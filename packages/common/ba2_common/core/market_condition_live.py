@@ -49,10 +49,30 @@ __all__ = [
     "run_in_decision_context",
     "submit_in_decision_context",
     "resolver_from_env",
+    "SourceCertificationError",
+    "NO_DECISION_SCOPE_REASON",
 ]
 
 #: Environment switch for the live profile. Unset, empty or ``none`` -> nothing is installed.
 PROFILE_ENV = "BA2_MARKET_CONDITION_PROFILE"
+
+#: Why a live leaf got no context: read by ``TradeConditions`` for its once-per-field WARNING.
+NO_DECISION_SCOPE_REASON = (
+    "market-condition leaf evaluated OUTSIDE a market_condition_decision_scope (only the "
+    "enter-market pass opens one; open-positions/exit rulesets and the ruleset test page do not): "
+    "the gate is unknown and never passes")
+
+
+class SourceCertificationError(RuntimeError):
+    """The OHLCV cache the live profile would read failed split certification."""
+
+    def __init__(self, report: Any):
+        bad = [f"{c.symbol}: basis={c.basis} close_ratio={c.close_ratio} {c.reason}".strip()
+               for c in report.symbols if not c.consistent]
+        super().__init__(f"source profile {report.source_profile} is NOT certified for cache "
+                         f"{report.cache_root}: " + "; ".join(bad))
+        self.report = report
+
 
 _DECISION: contextvars.ContextVar[Optional["DecisionState"]] = contextvars.ContextVar(
     "ba2_market_condition_decision", default=None)
@@ -100,6 +120,9 @@ class DecisionState:
 
 class LiveMarketConditionResolver:
     """The ``TradeConditions`` market-condition resolver for the live platform."""
+
+    #: Surfaced by ``TradeConditions`` when this resolver returns no context.
+    no_context_reason = NO_DECISION_SCOPE_REASON
 
     def __init__(self, profile: str, *, reader: Optional[Any] = None,
                  source_profile: str = SOURCE_PROFILE_FMP_DAILY):
@@ -154,12 +177,21 @@ def current_decision() -> Optional[DecisionState]:
 @contextmanager
 def market_condition_decision_scope(*, replay_reader: Optional[Any] = None) -> Iterator[Optional[DecisionState]]:
     """Open one decision pass. A no-op (no clock read, yields ``None``) unless a
-    ``LiveMarketConditionResolver`` is installed in ``TradeConditions``."""
+    ``LiveMarketConditionResolver`` is installed in ``TradeConditions``.
+
+    Nested scopes reuse the OUTER state (same decision time, same context, no second clock read):
+    one decision pass has one clock, however many helpers open a scope inside it."""
     from ba2_common.core.TradeConditions import get_market_condition_context_resolver
 
     resolver = get_market_condition_context_resolver()
     if not isinstance(resolver, LiveMarketConditionResolver):
         yield None
+        return
+    outer = _DECISION.get()
+    if outer is not None and outer.resolver is resolver:
+        if replay_reader is not None and outer.reader is not replay_reader:
+            raise ValueError("a nested decision scope cannot switch to a different replay reader")
+        yield outer
         return
     state = resolver.begin_decision(replay_reader=replay_reader)
     token = _DECISION.set(state)
@@ -170,8 +202,10 @@ def market_condition_decision_scope(*, replay_reader: Optional[Any] = None) -> I
 
 
 def run_in_decision_context(fn: Callable) -> Callable:
-    """Wrap ``fn`` so a pool thread running it sees the CURRENT decision state. Safe to reuse
-    concurrently (it re-installs this one ContextVar rather than sharing a Context object)."""
+    """Wrap ``fn`` so a pool thread running it sees the decision state that is current WHEN THIS
+    WRAPPER IS CREATED (captured once, at wrap time -- not when ``fn`` later runs). Create the
+    wrapper inside the scope, on the coordinating thread. Safe to reuse concurrently: it
+    re-installs this one ContextVar rather than sharing a ``contextvars.Context`` object."""
     state = _DECISION.get()
 
     @functools.wraps(fn)
@@ -194,9 +228,21 @@ def submit_in_decision_context(executor: Any, fn: Callable, *args, **kwargs):
     return executor.submit(ctx.run, functools.partial(fn, *args, **kwargs))
 
 
-def resolver_from_env(environ: Optional[Any] = None) -> Optional[LiveMarketConditionResolver]:
+def resolver_from_env(environ: Optional[Any] = None,
+                      cache_root: Optional[str] = None) -> Optional[LiveMarketConditionResolver]:
     """``LiveMarketConditionResolver`` for ``BA2_MARKET_CONDITION_PROFILE``, or ``None`` when the
-    variable is unset/empty/``none``. An unregistered profile name raises (loud misconfiguration)."""
+    variable is unset/empty/``none``.
+
+    Before installing, the cache the reader will read is CERTIFIED (``certify_source_columns``:
+    two parquet reads). ``cache_root`` defaults to ``native_cache.CACHE_FOLDER`` -- the root the
+    default ``FMPCacheMarketConditionReader`` resolves its files under, so the certified cache is
+    the served cache.
+
+    Raises:
+        ValueError: an unregistered profile name (loud misconfiguration).
+        SourceCertificationError: any certification symbol is not consistent (the report is on
+            the exception).
+    """
     env = os.environ if environ is None else environ
     raw = (env.get(PROFILE_ENV) or "").strip()
     if not raw or raw.lower() == "none":
@@ -206,4 +252,15 @@ def resolver_from_env(environ: Optional[Any] = None) -> Optional[LiveMarketCondi
     if raw not in PROFILES:
         raise ValueError(f"{PROFILE_ENV}={raw!r} is not a registered market-condition profile "
                          f"({sorted(PROFILES)!r})")
-    return LiveMarketConditionResolver(raw)
+    from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
+    from ba2_common.core.market_condition_source import certify_source_columns
+
+    if cache_root is None:
+        from ba2_common.core import native_cache
+        root = native_cache.CACHE_FOLDER
+    else:
+        root = cache_root
+    report = certify_source_columns(root)
+    if not report.consistent:
+        raise SourceCertificationError(report)
+    return LiveMarketConditionResolver(raw, reader=FMPCacheMarketConditionReader(raw, cache_root))
