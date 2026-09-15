@@ -446,3 +446,21 @@ that have actually changed conclusions in the past.
 ```bash
 powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Descending | Select-Object -First 5 @{n='MB';e={[math]::Round(\$_.Length/1MB,1)}},Name"
 ```
+
+## remote227 (babatest) traps found 2026-09-15
+
+* **logind `RemoveIPC`** deletes a non-system user's POSIX semaphores (`/dev/shm/sem.mp-*`) when
+  that user's last login session ends. A GA unit running as `debian` under `systemd-run` then
+  loses the semaphores its process pools created: children spawned later (a lazily-started
+  slot, a recycle, a generation-boundary rebuild) die in `SemLock._rebuild` with
+  `FileNotFoundError`, the executor reports "A process in the process pool was terminated
+  abruptly", the job exits 1. Already-running children are unaffected, which is why it looks
+  like a random mid-run death. Fix: `sudo loginctl enable-linger debian` and `RemoveIPC=no` in
+  `/etc/systemd/logind.conf`. The "benign `sem_unlink FileNotFoundError` noise at pool recycle"
+  seen on 2026-08-30 was this.
+* **`RLIMIT_NOFILE`**: launch GA units with `-p LimitNOFILE=524288`; every memory-mapped derived
+  array holds a descriptor (98 x 18 = 1764 > the 1024 default).
+* **Ownership of the isolated home**: `/home/debian/ba2-grid/home` must be owned by `debian`
+  (it was `ba2worker` 750, which blocked the derived cache). The fleet worker does not use it.
+* Never `pgrep -f spawn_main` from an ssh command that contains the string (self-match killed the
+  shell); use `pgrep -f multiprocessing.spawn`.
