@@ -467,7 +467,7 @@ powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Desce
 
 ## Database backups (2026-09-15)
 
-`tools/backup_dbs.py` copies the PROD trade DB and the TEST/GA DB with SQLite's online-backup
+`tools/backup_dbs.py` copies the PROD trade DB, the DEV trade DB and the TEST/GA DB with SQLite's online-backup
 API (safe while the platforms and a GA write), `quick_check`s the copy, deflates it to
 `G:\Mon Driveackup\BA2\<prod|test>_<YYYY-MM-DD>.sqlite.zip`, and keeps the newest 7 per
 database. Windows Task Scheduler task **`BA2 DB Backup`** runs it daily at 00:00 as the

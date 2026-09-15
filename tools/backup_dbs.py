@@ -1,6 +1,6 @@
 """Nightly backup of the BA2 SQLite databases to the Google Drive backup folder.
 
-WHAT.  For each database in ``DATABASES`` (the PROD trade DB and the TEST/GA DB by default):
+WHAT.  For each database in ``DATABASES`` (the PROD trade DB, the DEV trade DB and the TEST/GA DB):
   1. copy it with SQLite's ONLINE BACKUP API (``Connection.backup``) into a local temp file --
      safe while the platform / a GA is writing, unlike copying the file (a WAL-mode DB copied
      mid-write is corrupt), and it needs no lock the writers would notice;
@@ -42,6 +42,7 @@ HOME = Path.home()
 #: retention sweep matches on.
 DATABASES: Dict[str, Path] = {
     "prod": HOME / "Documents" / "ba2_trade_platform-prod" / "db.sqlite",
+    "dev": HOME / "Documents" / "ba2" / "trade" / "db.sqlite",
     "test": HOME / "Documents" / "ba2" / "test" / "dl_forecasting.db",
 }
 DEFAULT_DEST = Path(r"G:\Mon Drive\backup\BA2")
