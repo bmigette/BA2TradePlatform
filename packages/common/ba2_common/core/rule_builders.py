@@ -97,16 +97,23 @@ def register_market_condition_field_events() -> List[str]:
     ``market_conditions.register_profile``. A field without an enum member is skipped with a
     WARNING and returned. Guarded by tests/test_condition_registry_coverage.py (every
     CONDITION_MAP entry needs a mapping here) and tests/test_market_condition_conditions.py
-    (every registered field has an ExpertEventType member)."""
+    (every registered field has an ExpertEventType member). Raises if a field is already mapped
+    to a DIFFERENT event type."""
     skipped: List[str] = []
     for prof in PROFILES.values():
         for spec in prof.fields:
             try:
-                FIELD_EVENT[spec.name] = ExpertEventType(spec.name)
+                event = ExpertEventType(spec.name)
             except ValueError:
-                logger.warning(f"Market-condition field {spec.name!r} has no ExpertEventType "
-                               f"member; a rule leaf naming it is not mapped")
+                logger.warning("Market-condition field %r has no ExpertEventType member; a rule "
+                               "leaf naming it is not mapped", spec.name)
                 skipped.append(spec.name)
+                continue
+            existing = FIELD_EVENT.get(spec.name)
+            if existing is not None and existing is not event:
+                raise ValueError(f"FIELD_EVENT[{spec.name!r}] is already {existing.name}; "
+                                 f"refusing to replace it with {event.name}")
+            FIELD_EVENT[spec.name] = event
     return skipped
 
 

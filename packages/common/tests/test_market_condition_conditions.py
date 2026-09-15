@@ -15,7 +15,9 @@ runtime, so the categorical tests register a throwaway categorical profile, chec
 entry), then build its generated class directly with ``market_condition_condition_class`` and
 exercise the ``==``-on-float-code comparison through the real ``evaluate()``.
 """
+import dataclasses
 import logging
+import pickle
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
@@ -28,6 +30,7 @@ from ba2_common.core.market_condition_context import (
     TIMING_POLICY_PRIOR_SESSION_V1,
     DictMarketConditionReader,
     MarketConditionContext,
+    FeatureRowLike,
     MarketConditionReader,
 )
 from ba2_common.core.market_conditions import (
@@ -173,7 +176,7 @@ def test_create_condition_returns_the_generated_class():
 
 # --- unknown never passes -----------------------------------------------------------------
 
-@pytest.mark.parametrize("op", ["<", ">", "=="])
+@pytest.mark.parametrize("op", ["<", ">"])
 def test_no_resolver_is_no_context(no_resolver, op):
     c = _cond(op=op, value=30.0)
     assert c.evaluate() is False
@@ -229,15 +232,56 @@ def test_non_valid_observation_never_passes(resolver, status, reason, op, value)
     assert recorded == [], "the recorder must never be called on an unknown"
 
 
-def test_row_without_the_field_is_unknown(resolver):
+def test_row_without_the_field_raises(resolver):
+    """A row that does not carry the leaf's field is a launcher/reader WIRING defect (leaves are
+    placed by profile) -- never an unknown the GA could learn "mode=off wins" from."""
     class _OtherProfileValues:
         def by_field(self):
             return {"some_other_field": Observation(1.0, STATUS_VALID)}
 
     resolver(_ctx(reader=DictMarketConditionReader({(SYMBOL, PRIOR): _OtherProfileValues()})))
-    c = _cond()
-    assert c.evaluate() is False and c.calculated_value is None
-    assert c.last_status == STATUS_NO_CONTEXT and FIELD_ADX in c.last_reason
+    with pytest.raises(LookupError, match=FIELD_ADX) as ei:
+        _cond().evaluate()
+    assert "some_other_field" in str(ei.value)
+
+
+def test_reader_exception_escapes_evaluate(resolver):
+    class _Boom:
+        def observe(self, symbol, session):
+            raise RuntimeError("reader down")
+
+    resolver(_ctx(reader=_Boom()))
+    with pytest.raises(RuntimeError, match="reader down"):
+        _cond().evaluate()
+
+
+def test_recorder_exception_escapes_evaluate(resolver):
+    def _boom(*a):
+        raise RuntimeError("recorder down")
+
+    resolver(_ctx(recorder=_boom))
+    with pytest.raises(RuntimeError, match="recorder down"):
+        _cond().evaluate()
+
+
+def test_no_resolver_warns_once_per_process(no_resolver, monkeypatch):
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            if record.levelno == logging.WARNING:
+                records.append(record.getMessage())
+
+    from ba2_common import logger as _logger_mod
+    monkeypatch.setattr(T, "_warned_no_market_condition_resolver", False)
+    handler = _Capture()
+    _logger_mod.logger.addHandler(handler)
+    try:
+        for _ in range(3):
+            assert _cond().evaluate() is False
+    finally:
+        _logger_mod.logger.removeHandler(handler)
+    assert len([m for m in records if "NO context resolver" in m]) == 1
 
 
 # --- comparisons --------------------------------------------------------------------------
@@ -283,6 +327,43 @@ def test_recorder_called_exactly_once_per_successful_evaluation(resolver):
 
 def test_reader_protocol_is_satisfied_by_the_dict_reader():
     assert isinstance(DictMarketConditionReader({}), MarketConditionReader)
+    assert isinstance(_values(), FeatureRowLike)
+
+
+@pytest.mark.parametrize("op", [">=", "<=", "!=", "=="])
+def test_numeric_field_rejects_non_strict_operators_at_construction(op):
+    with pytest.raises(ValueError, match="accepts only"):
+        _cond(ExpertEventType.N_UNDERLYING_ADX, op=op, value=25.0)
+
+
+@pytest.mark.parametrize("cls", [T.UnderlyingTrendSlopeCondition, T.UnderlyingAdxCondition,
+                                 T.UnderlyingRealizedVolRatioCondition])
+def test_generated_classes_pickle_by_reference(cls):
+    assert pickle.loads(pickle.dumps(cls)) is cls
+    assert cls.KIND == "numeric" and cls.ALLOWED_OPERATORS == frozenset({"<", ">"})
+
+
+def test_condition_map_conflict_guard(monkeypatch):
+    monkeypatch.setitem(T.CONDITION_MAP, ExpertEventType.N_UNDERLYING_ADX, T.ConfidenceCondition)
+    with pytest.raises(ValueError, match="refusing to replace"):
+        T.register_market_condition_conditions()
+
+
+def test_field_event_conflict_guard(monkeypatch):
+    monkeypatch.setitem(rb.FIELD_EVENT, FIELD_ADX, ExpertEventType.N_CONFIDENCE)
+    with pytest.raises(ValueError, match="refusing to replace"):
+        rb.register_market_condition_field_events()
+
+
+def test_valid_numeric_read_does_not_touch_the_registry(resolver, monkeypatch):
+    """The display is called on every evaluation: a numeric field must not scan the registry."""
+    resolver(_ctx(rows={(SYMBOL, PRIOR): _values(adx=20.0)}))
+    monkeypatch.setattr(T, "_mc_field_codes", lambda *a: pytest.fail("registry read"))
+    monkeypatch.setattr(T, "_mc_field_spec", lambda *a: pytest.fail("registry read"))
+    c = _cond(op="<", value=25.0)
+    assert c.evaluate() is True
+    assert c.get_actual_value_display() == "20"
+    c.get_description()
 
 
 # --- categorical ------------------------------------------------------------------------
@@ -302,6 +383,14 @@ class _CatValues:
         return {_CAT.name: self._obs}
 
 
+@pytest.fixture
+def cat_classes(monkeypatch):
+    """Isolate the factory's memo and the module global it binds for the throwaway field."""
+    monkeypatch.setattr(T, "_MARKET_CONDITION_CLASSES", dict(T._MARKET_CONDITION_CLASSES))
+    yield
+    T.__dict__.pop("TestCatRegimeV0Condition", None)
+
+
 def test_categorical_field_without_event_type_is_skipped_loudly():
     with registered_profile(ProfileSpec(name="test-cat-v0", calc_version="t/1", fields=(_CAT,))):
         before = dict(T.CONDITION_MAP)
@@ -312,8 +401,7 @@ def test_categorical_field_without_event_type_is_skipped_loudly():
 
 
 @pytest.mark.parametrize("value,expected", [(2.0, True), (1.0, False), (2, True)])
-def test_categorical_equality_on_float_code(resolver, monkeypatch, value, expected):
-    monkeypatch.setattr(T, "_MARKET_CONDITION_CLASSES", dict(T._MARKET_CONDITION_CLASSES))
+def test_categorical_equality_on_float_code(resolver, cat_classes, value, expected):
     with registered_profile(ProfileSpec(name="test-cat-v0", calc_version="t/1", fields=(_CAT,))):
         cls = T.market_condition_condition_class(_CAT.name)
         assert cls.__name__ == "TestCatRegimeV0Condition"
@@ -325,16 +413,38 @@ def test_categorical_equality_on_float_code(resolver, monkeypatch, value, expect
         assert c.evaluate() is expected
         assert c.calculated_value == 2.0
         assert c.get_actual_value_display() == "bear"
+        assert ("bear" if float(value) == 2.0 else "bull") in c.get_description()
         assert len(recorded) == 1
+        assert pickle.loads(pickle.dumps(cls)) is cls
 
 
-def test_categorical_unknown_never_passes_equality(resolver, monkeypatch):
-    monkeypatch.setattr(T, "_MARKET_CONDITION_CLASSES", dict(T._MARKET_CONDITION_CLASSES))
+@pytest.mark.parametrize("op", ["<", ">", "!="])
+def test_categorical_field_rejects_non_equality_operators_at_construction(cat_classes, op):
+    with registered_profile(ProfileSpec(name="test-cat-v0", calc_version="t/1", fields=(_CAT,))):
+        cls = T.market_condition_condition_class(_CAT.name)
+        assert cls.KIND == "categorical" and cls.ALLOWED_OPERATORS == frozenset({"=="})
+        with pytest.raises(ValueError, match="accepts only"):
+            cls(_Account(), SYMBOL, _rec(), op, 2.0)
+
+
+def test_memo_is_keyed_by_spec_so_a_rekinded_field_gets_a_fresh_class(cat_classes):
+    numeric = FieldSpec(name=_CAT.name, kind="numeric", short="tcat", searched=True,
+                        value_min=0.0, value_max=1.0, value_step=0.5, anchor_op="<",
+                        anchor_value=0.5)
+    with registered_profile(ProfileSpec(name="test-cat-v0", calc_version="t/1", fields=(_CAT,))):
+        cat_cls = T.market_condition_condition_class(_CAT.name)
+    with registered_profile(ProfileSpec(name="test-num-v0", calc_version="t/1", fields=(numeric,))):
+        num_cls = T.market_condition_condition_class(_CAT.name)
+    assert cat_cls is not num_cls
+    assert (cat_cls.KIND, num_cls.KIND) == ("categorical", "numeric")
+
+
+def test_categorical_unknown_never_passes_equality(resolver, cat_classes):
     with registered_profile(ProfileSpec(name="test-cat-v0", calc_version="t/1", fields=(_CAT,))):
         cls = T.market_condition_condition_class(_CAT.name)
         resolver(_ctx(reader=DictMarketConditionReader(
             {(SYMBOL, PRIOR): _CatValues(Observation(None, STATUS_INSUFFICIENT_HISTORY, "short"))})))
-        c = cls(_Account(), SYMBOL, _rec(), "!=", 1.0)
+        c = cls(_Account(), SYMBOL, _rec(), "==", 2.0)
         assert c.evaluate() is False and c.calculated_value is None
         assert c.last_status == STATUS_INSUFFICIENT_HISTORY
 
@@ -433,5 +543,5 @@ def test_context_rejects_inconsistent_fields(kw):
 
 def test_context_is_immutable():
     ctx = _ctx()
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         ctx.prior_session = SESSION  # type: ignore[misc]

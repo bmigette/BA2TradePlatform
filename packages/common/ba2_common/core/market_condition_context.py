@@ -19,39 +19,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from types import MappingProxyType
-from typing import Callable, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import Callable, Dict, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
-from ba2_common.core.market_conditions import MarketConditionValues
+from ba2_common.core.market_conditions import Observation
 
 #: v1 timing policy: a decision made during session S reads the observation computed from the
 #: completed daily bars through the PRIOR regular session (never S's own, still-forming bar).
 TIMING_POLICY_PRIOR_SESSION_V1 = "prior_session_v1"
 TIMING_POLICIES = (TIMING_POLICY_PRIOR_SESSION_V1,)
 
-#: ``recorder(symbol, session, values)`` -- called once per successful (valid) evaluation.
-MarketConditionRecorder = Callable[[str, date, MarketConditionValues], None]
+
+@runtime_checkable
+class FeatureRowLike(Protocol):
+    """A computed feature row: ``{field name: Observation}``. ``MarketConditionValues`` (the
+    ohlcv-v1 trio) satisfies it structurally, as does a field-generic row."""
+
+    def by_field(self) -> Mapping[str, Observation]:
+        ...
+
+
+#: ``recorder(symbol, session, row)`` -- called once per successful (valid) evaluation.
+MarketConditionRecorder = Callable[[str, date, FeatureRowLike], None]
 
 
 @runtime_checkable
 class MarketConditionReader(Protocol):
     """Read-only access to computed feature rows."""
 
-    def observe(self, symbol: str, session: date) -> Optional[MarketConditionValues]:
+    def observe(self, symbol: str, session: date) -> Optional[FeatureRowLike]:
         """The feature row for ``symbol`` computed through ``session``; ``None`` when no row
         exists for that symbol/session (reported as ``missing_session``, never a default)."""
         ...
 
 
 class DictMarketConditionReader:
-    """A ``MarketConditionReader`` over an in-memory ``{(symbol, session): values}`` mapping.
-    Used by tests and as the backing store of the backtest adapter. The mapping is copied and
-    exposed read-only, so later mutation of the caller's dict cannot change a decision."""
+    """A ``MarketConditionReader`` over an in-memory ``{(symbol, session): row}`` mapping.
+    Used by tests and as the backing store of the backtest adapter.
 
-    def __init__(self, rows: Mapping[Tuple[str, date], MarketConditionValues]):
-        self._rows = MappingProxyType(dict(rows))
+    The mapping is COPIED ON CONSTRUCTION (O(rows)), so later mutation of the caller's dict
+    cannot change a decision -- and an adapter must build the reader ONCE (per run / per
+    loaded window), never per decision."""
 
-    def observe(self, symbol: str, session: date) -> Optional[MarketConditionValues]:
+    def __init__(self, rows: Mapping[Tuple[str, date], FeatureRowLike]):
+        self._rows: Dict[Tuple[str, date], FeatureRowLike] = dict(rows)
+
+    def observe(self, symbol: str, session: date) -> Optional[FeatureRowLike]:
         return self._rows.get((symbol, session))
 
     def __len__(self) -> int:

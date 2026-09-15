@@ -35,6 +35,7 @@ from ba2_common.core.market_conditions import (
     STATUS_MISSING_SESSION as _MC_STATUS_MISSING_SESSION,
     STATUS_NO_CONTEXT as _MC_STATUS_NO_CONTEXT,
     STATUS_VALID as _MC_STATUS_VALID,
+    field_codes as _mc_field_codes,
     field_spec as _mc_field_spec,
 )
 from ba2_common.core.market_condition_context import MarketConditionContext
@@ -4058,28 +4059,37 @@ class MarketConditionCompare(CompareCondition):
 
     Reads the observation for ``FIELD`` from the evaluation's ``MarketConditionContext``
     (resolved lazily through the seam above) at the context's ``prior_session``. NUMERIC
-    fields are decoded to strict ``<``/``>`` (equality passes neither); CATEGORICAL fields to
-    ``==`` against the float code.
+    fields accept only strict ``<``/``>`` (equality passes neither); CATEGORICAL fields only
+    ``==`` against the float code. Any other operator raises ``ValueError`` at construction.
 
-    UNKNOWN NEVER PASSES: no context (``no_context``), no feature row (``missing_session``), a
-    row that does not carry the field (``no_context`` -- the reader was built for a different
-    profile), or any non-``valid`` observation -> ``calculated_value`` None, ``evaluate()``
-    False for EVERY operator, and ``last_status``/``last_reason`` say why. The recorder is
-    called only on a valid read. Reader/resolver exceptions propagate: broken wiring is a
-    defect, not an "unknown".
+    UNKNOWN NEVER PASSES: no context (``no_context``), no feature row (``missing_session``) or
+    any non-``valid`` observation -> ``calculated_value`` None, ``evaluate()`` False, and
+    ``last_status``/``last_reason`` say why. The recorder is called only on a valid read.
+
+    WIRING DEFECTS RAISE (they are never an "unknown" the GA could learn "mode=off wins" from):
+    a resolver returning a non-context (``TypeError``), a feature row that does not carry
+    ``FIELD`` (``LookupError`` -- leaves are placed by profile, so this is a launcher/reader
+    bug), and any exception from the reader or recorder.
     """
 
     #: Canonical market-condition field name (== ExpertEventType value). Set by the factory.
     FIELD: str = ""
+    #: "numeric" | "categorical" -- the FieldSpec kind. Set by the factory.
+    KIND: str = ""
+    #: Operators this field's leaves may use. Set by the factory from KIND.
+    ALLOWED_OPERATORS: frozenset = frozenset()
 
     def __init__(self, account: AccountInterface, instrument_name: str,
                  expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
                  existing_order: Optional[TradingOrder] = None):
         super().__init__(account, instrument_name, expert_recommendation, operator_str, value,
                          existing_order)
-        if not self.FIELD:
-            raise TypeError(f"{type(self).__name__} has no FIELD: build it with "
-                            f"market_condition_condition_class(field)")
+        if not self.FIELD or not self.ALLOWED_OPERATORS:
+            raise TypeError(f"{type(self).__name__} has no FIELD/ALLOWED_OPERATORS: build it "
+                            f"with market_condition_condition_class(field)")
+        if operator_str not in self.ALLOWED_OPERATORS:
+            raise ValueError(f"{self.FIELD} ({self.KIND}) accepts only "
+                             f"{sorted(self.ALLOWED_OPERATORS)}, got {operator_str!r}")
         self.last_status: Optional[str] = None
         self.last_reason: str = ""
 
@@ -4087,26 +4097,34 @@ class MarketConditionCompare(CompareCondition):
         self.calculated_value = None
         self.last_status = status
         self.last_reason = reason
-        logger.debug(f"Market condition {self.FIELD} for {self.instrument_name} is unknown "
-                     f"({status}): {reason}")
+        logger.debug("Market condition %s for %s is unknown (%s): %s",
+                     self.FIELD, self.instrument_name, status, reason)
         return False
 
     def evaluate(self) -> bool:
+        global _warned_no_market_condition_resolver
         ctx = resolve_market_condition_context(self.account, self.instrument_name,
                                                self.expert_recommendation)
         if ctx is None:
+            if _market_condition_context_resolver is None and not _warned_no_market_condition_resolver:
+                _warned_no_market_condition_resolver = True
+                logger.warning(
+                    "Market-condition leaf %s evaluated with NO context resolver installed: "
+                    "every market-condition gate in this process is unknown and never passes "
+                    "(%s)", self.FIELD, NO_MARKET_CONDITION_CONTEXT_REASON)
             return self._unknown(_MC_STATUS_NO_CONTEXT, NO_MARKET_CONDITION_CONTEXT_REASON)
         session = ctx.prior_session
         values = ctx.reader.observe(self.instrument_name, session)
         if values is None:
             return self._unknown(_MC_STATUS_MISSING_SESSION,
                                  f"no feature row for {self.instrument_name} at {session}")
-        obs = values.by_field().get(self.FIELD)
+        by_field = values.by_field()
+        obs = by_field.get(self.FIELD)
         if obs is None:
-            return self._unknown(
-                _MC_STATUS_NO_CONTEXT,
-                f"feature row for {self.instrument_name} at {session} carries no {self.FIELD} "
-                f"(reader not built for this field's profile)")
+            raise LookupError(
+                f"feature row for {self.instrument_name} at {session} carries no {self.FIELD!r} "
+                f"(row fields: {sorted(by_field)!r}) -- the reader was not built for this "
+                f"field's profile")
         if obs.status != _MC_STATUS_VALID:
             return self._unknown(obs.status, obs.reason)
         self.calculated_value = obs.value
@@ -4117,19 +4135,17 @@ class MarketConditionCompare(CompareCondition):
         return self.operator_func(obs.value, self.value)
 
     def _code_name(self, code) -> Optional[str]:
-        """The categorical value name for ``code`` (None for numeric/unregistered fields)."""
-        spec = _registered_market_fields().get(self.FIELD)
-        codes = spec.codes if spec is not None else None
-        if not codes:
+        """The categorical value name for ``code``; None for numeric fields (no registry read)."""
+        if self.KIND != "categorical":
             return None
-        for name, c in codes.items():
+        for name, c in _mc_field_codes(self.FIELD).items():  # memoised; cleared on registration
             if float(c) == float(code):
                 return name
         return None
 
     def get_description(self) -> str:
         shown = self.value
-        name = self._code_name(self.value) if self.operator_str == "==" else None
+        name = self._code_name(self.value)
         if name is not None:
             shown = f"{name} ({float(self.value):g})"
         return f"Check if {self.instrument_name} {self.FIELD} is {self.operator_str} {shown}"
@@ -4143,12 +4159,16 @@ class MarketConditionCompare(CompareCondition):
         return f"{self.calculated_value:.4g}"
 
 
-def _registered_market_fields() -> Dict[str, Any]:
-    """``{field name: FieldSpec}`` across every registered market-condition profile."""
-    return {f.name: f for prof in _MC_PROFILES.values() for f in prof.fields}
+_warned_no_market_condition_resolver = False
 
+_OPERATORS_BY_KIND = {
+    "numeric": frozenset({"<", ">"}),
+    "categorical": frozenset({"=="}),
+}
 
-_MARKET_CONDITION_CLASSES: Dict[str, Type[MarketConditionCompare]] = {}
+#: Memo keyed by the FieldSpec itself, so a field re-registered with a different spec (e.g. a
+#: different kind) never gets a stale class back.
+_MARKET_CONDITION_CLASSES: Dict[Any, Type[MarketConditionCompare]] = {}
 
 
 def _class_name_for_field(field: str) -> str:
@@ -4157,17 +4177,25 @@ def _class_name_for_field(field: str) -> str:
 
 def market_condition_condition_class(field: str) -> Type[MarketConditionCompare]:
     """The (memoised) ``MarketConditionCompare`` subclass for a REGISTERED field, e.g.
-    ``underlying_adx_14`` -> ``UnderlyingAdx14Condition``. KeyError for an unknown field."""
-    cls = _MARKET_CONDITION_CLASSES.get(field)
+    ``underlying_adx_14`` -> ``UnderlyingAdx14Condition``. KeyError for an unknown field.
+
+    The class is also bound as a module global under its own name, so it pickles by
+    reference (GA workers spawn on Windows; distributed payloads pickle)."""
+    spec = _mc_field_spec(field)  # KeyError naming the known fields
+    cls = _MARKET_CONDITION_CLASSES.get(spec)
     if cls is not None:
         return cls
-    spec = _mc_field_spec(field)  # KeyError naming the known fields
-    cls = type(_class_name_for_field(field), (MarketConditionCompare,), {
+    name = _class_name_for_field(spec.name)
+    cls = type(name, (MarketConditionCompare,), {
         "FIELD": spec.name,
+        "KIND": spec.kind,
+        "ALLOWED_OPERATORS": _OPERATORS_BY_KIND[spec.kind],
         "__doc__": f"Market-condition gate on {spec.name} ({spec.kind}); see MarketConditionCompare.",
         "__module__": __name__,
+        "__qualname__": name,
     })
-    _MARKET_CONDITION_CLASSES[field] = cls
+    _MARKET_CONDITION_CLASSES[spec] = cls
+    globals().setdefault(name, cls)
     return cls
 
 
@@ -4263,12 +4291,13 @@ def register_market_condition_conditions() -> List[str]:
     fails for any registered field without a member, so a skip never survives CI. Raises if an
     event type is already mapped to a different class (a registry clash)."""
     skipped: List[str] = []
-    for field in _registered_market_fields():
+    fields = [f.name for prof in _MC_PROFILES.values() for f in prof.fields]
+    for field in fields:
         try:
             event = ExpertEventType(field)
         except ValueError:
-            logger.warning(f"Market-condition field {field!r} has no ExpertEventType member; "
-                           f"no condition registered for it")
+            logger.warning("Market-condition field %r has no ExpertEventType member; "
+                           "no condition registered for it", field)
             skipped.append(field)
             continue
         cls = market_condition_condition_class(field)
