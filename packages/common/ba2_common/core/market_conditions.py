@@ -76,7 +76,7 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from dataclasses import field as dc_field
 from types import MappingProxyType
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -403,9 +403,12 @@ class FieldSpec:
     fields carry ``codes`` (value -> distinct positive int) and no range. ``"none"`` (no
     classification) is never a code: it must not be selectable as a regime.
 
-    ``codes`` is frozen into a read-only ``MappingProxyType`` copy after validation. A
-    mappingproxy is not hashable, so ``codes`` is excluded from ``__hash__`` (``hash=False``) but
-    still part of ``==``; equal specs therefore still hash equal."""
+    ``codes`` is accepted as any Mapping but STORED as ``_code_pairs``: a tuple of
+    ``(value, code)`` pairs sorted by value -- hashable, picklable and deep-copyable (GA workers
+    spawn on Windows and distributed payloads pickle configs), and part of ``==``/``hash``
+    independent of the input dict's order. The ``codes`` property returns a fresh read-only
+    ``MappingProxyType`` view. (A mappingproxy attribute would make the spec unpicklable.)
+    Because ``codes`` is an ``InitVar``, ``dataclasses.replace`` must be passed ``codes=``."""
 
     name: str                      # canonical field name == ExpertEventType value == store column
     kind: str                      # "numeric" | "categorical"
@@ -416,10 +419,11 @@ class FieldSpec:
     value_step: Optional[float] = None
     anchor_op: Optional[str] = None      # the template's explicit fixed interpretation
     anchor_value: Optional[float] = None
-    codes: Optional[Mapping[str, int]] = dc_field(default=None, hash=False)  # categorical only; never "none"
+    codes: InitVar[Optional[Mapping[str, int]]] = None   # categorical only; never contains "none"
     ui_name: str = ""
+    _code_pairs: Optional[Tuple[Tuple[str, int], ...]] = dc_field(default=None, init=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, codes: Optional[Mapping[str, int]]) -> None:
         if not self.name or not self.short:
             raise ValueError(f"FieldSpec needs a name and a short id suffix, got {self.name!r}/{self.short!r}")
         if self.kind not in _FIELD_KINDS:
@@ -428,18 +432,18 @@ class FieldSpec:
         if self.kind == "categorical":
             if any(v is not None for v in ranges) or self.anchor_op is not None or self.anchor_value is not None:
                 raise ValueError(f"FieldSpec {self.name!r}: a categorical field carries no threshold range/anchor")
-            if not self.codes:
+            if not codes:
                 raise ValueError(f"FieldSpec {self.name!r}: a categorical field needs non-empty codes")
-            if _FORBIDDEN_CODE in self.codes:
+            if _FORBIDDEN_CODE in codes:
                 raise ValueError(f"FieldSpec {self.name!r}: {_FORBIDDEN_CODE!r} is never a code")
-            vals = list(self.codes.values())
+            vals = list(codes.values())
             if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in vals):
-                raise ValueError(f"FieldSpec {self.name!r}: codes must be positive ints, got {self.codes!r}")
+                raise ValueError(f"FieldSpec {self.name!r}: codes must be positive ints, got {codes!r}")
             if len(set(vals)) != len(vals):
-                raise ValueError(f"FieldSpec {self.name!r}: code values must be distinct, got {self.codes!r}")
-            object.__setattr__(self, "codes", MappingProxyType(dict(self.codes)))
+                raise ValueError(f"FieldSpec {self.name!r}: code values must be distinct, got {codes!r}")
+            object.__setattr__(self, "_code_pairs", tuple(sorted(dict(codes).items())))
         else:
-            if self.codes is not None:
+            if codes is not None:
                 raise ValueError(f"FieldSpec {self.name!r}: a numeric field carries no codes")
             if any(v is None for v in ranges):
                 raise ValueError(f"FieldSpec {self.name!r}: a numeric field needs value_min/value_max/value_step")
@@ -454,6 +458,16 @@ class FieldSpec:
                 raise ValueError(
                     f"FieldSpec {self.name!r}: anchor_value {self.anchor_value!r} outside "
                     f"[{self.value_min!r}, {self.value_max!r}]")
+
+
+def _field_spec_codes(self: FieldSpec) -> Optional[Mapping[str, int]]:
+    """Read-only ``value -> code`` view of a categorical field (None for numeric fields)."""
+    return None if self._code_pairs is None else MappingProxyType(dict(self._code_pairs))
+
+
+# Attached after the dataclass decorator ran: defined in the class body, the property object
+# would become the ``codes`` InitVar's default.
+FieldSpec.codes = property(_field_spec_codes)  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)

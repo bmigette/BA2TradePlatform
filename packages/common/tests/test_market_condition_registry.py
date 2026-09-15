@@ -67,6 +67,25 @@ def test_categorical_spec_is_hashable_and_its_codes_are_immutable():
     assert spec == _cat()
 
 
+def test_categorical_field_spec_pickles_and_deep_copies_equal():
+    import copy
+    import pickle
+
+    spec = _cat(codes={"bear": 2, "bull": 1})
+    prof = ProfileSpec(name="p", calc_version="p/calc-1", fields=(spec,))
+    for clone in (pickle.loads(pickle.dumps(spec)), copy.deepcopy(spec), copy.copy(spec)):
+        assert clone == spec and hash(clone) == hash(spec)
+        assert dict(clone.codes) == {"bull": 1, "bear": 2}
+        with pytest.raises(TypeError):
+            clone.codes["none"] = 0
+    assert pickle.loads(pickle.dumps(prof)) == prof and copy.deepcopy(prof) == prof
+    assert pickle.loads(pickle.dumps(OHLCV_V1)) == OHLCV_V1
+    # codes participate in equality and hashing, independent of the input dict's order
+    assert _cat(codes={"bull": 1, "bear": 2}) == _cat(codes={"bear": 2, "bull": 1})
+    assert hash(_cat(codes={"bull": 1, "bear": 2})) == hash(_cat(codes={"bear": 2, "bull": 1}))
+    assert _cat(codes={"bull": 1, "bear": 2}) != _cat(codes={"bull": 1, "bear": 3})
+
+
 def test_profile_spec_coerces_fields_to_a_tuple_and_requires_names():
     prof = ProfileSpec(name="p", calc_version="p/calc-1", fields=[_cat()])
     assert isinstance(prof.fields, tuple) and prof.fields == (_cat(),)

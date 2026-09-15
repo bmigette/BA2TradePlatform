@@ -93,7 +93,11 @@ def leaf_mode_kind(leaf: Mapping[str, Any]) -> Optional[str]:
     """Kind of a leaf given as a plain dict: ``"numeric"``, ``"categorical"``, or ``None`` when
     it carries no mode metadata. Delegates to :meth:`ConditionLeaf._mode_kind` through full
     model validation, so there is exactly ONE kind rule (alias precedence, bool coercion and all)
-    -- and an invalid leaf raises instead of being classified."""
+    -- and an invalid leaf raises instead of being classified.
+
+    LEAVES ONLY: a group node (a dict with a ``conditions`` key) or a dict without ``field``
+    raises pydantic ``ValidationError`` (a ``ValueError``). That is deliberate and must not be
+    swallowed -- callers walking a condition tree must call this on leaves only."""
     return ConditionLeaf.model_validate(dict(leaf))._mode_kind()
 
 
@@ -185,6 +189,12 @@ class ConditionLeaf(BaseModel):
                 "(the mode gene's 'off' choice already removes the leaf)"
             )
         choices = self.mode_choices
+        # Choice-list shape by kind applies whenever choices are DECLARED, optimized or not.
+        if kind == "numeric" and choices is not None and list(choices) != list(NUMERIC_MODE_CHOICES):
+            raise ValueError(
+                f"condition {self._label()}: a numeric (threshold) leaf's mode_choices must be "
+                f"exactly {list(NUMERIC_MODE_CHOICES)!r}, got {choices!r}"
+            )
         if kind == "categorical" and choices is not None:
             bad = [c for c in choices if c in _THRESHOLD_MODES]
             if bad:
@@ -196,11 +206,6 @@ class ConditionLeaf(BaseModel):
             return
         if choices is None:
             raise ValueError(f"condition {self._label()}: mode_optimize requires mode_choices")
-        if kind == "numeric" and list(choices) != list(NUMERIC_MODE_CHOICES):
-            raise ValueError(
-                f"condition {self._label()}: a numeric (threshold) leaf's mode_choices must be "
-                f"exactly {list(NUMERIC_MODE_CHOICES)!r}, got {choices!r}"
-            )
         if kind == "categorical" and len(choices) < 2:
             raise ValueError(
                 f"condition {self._label()}: a categorical leaf's mode_choices need at least one "
@@ -210,8 +215,8 @@ class ConditionLeaf(BaseModel):
     def _check_resolved_mode(self, kind: Optional[str]) -> None:
         """The resolved ``mode`` token and the categorical ``value`` rule.
 
-        NUMERIC: the token must be one of ``NUMERIC_MODE_CHOICES`` (and of ``mode_choices`` when
-        declared). CATEGORICAL: ``below``/``above`` and ``FORBIDDEN_MODE_CHOICES`` are always
+        NUMERIC: the token must be one of ``NUMERIC_MODE_CHOICES`` (declared numeric choices are
+        checked to equal that list). CATEGORICAL: ``below``/``above`` and ``FORBIDDEN_MODE_CHOICES`` are always
         rejected; with declared ``mode_choices`` the token must be one of them; WITHOUT choices
         (a deployed/exported leaf whose optimizer metadata was stripped) any other token is
         accepted here -- the check against the registry (``market_conditions.field_spec(field)
@@ -228,7 +233,7 @@ class ConditionLeaf(BaseModel):
         if mode is None or mode == MODE_OFF:
             return
         if kind == "numeric":
-            allowed = list(NUMERIC_MODE_CHOICES) if choices is None else [c for c in choices if c in NUMERIC_MODE_CHOICES]
+            allowed = list(NUMERIC_MODE_CHOICES)  # declared numeric choices are exactly these
             if mode not in allowed:
                 raise ValueError(f"condition {self._label()}: unknown mode {mode!r} for a numeric leaf; allowed {allowed!r}")
             return

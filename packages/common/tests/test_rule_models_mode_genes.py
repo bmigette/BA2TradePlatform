@@ -68,6 +68,16 @@ def test_numeric_leaf_rejections(extra):
     assert "numeric-bad-leaf" in str(ei.value)
 
 
+@pytest.mark.parametrize("choices", [["off", "below"], ["off", "above", "below"], ["off", "below", "above", "x"]],
+                         ids=["subset", "reordered", "superset"])
+def test_numeric_choice_shape_is_checked_without_mode_optimize(choices):
+    with pytest.raises(ValueError) as ei:
+        ConditionLeaf(**{**_ADX, "id": "numeric-shape-leaf"}, mode_choices=choices)
+    assert "numeric-shape-leaf" in str(ei.value)
+    # the exact numeric list is fine without mode_optimize
+    ConditionLeaf(**_ADX, mode_choices=list(NUMERIC_MODE_CHOICES))
+
+
 def test_categorical_template_declares_off_plus_values_and_no_threshold():
     ok = ConditionLeaf(id="s1-structure-state", field="structure_state", op="==",
                        mode_optimize=True, mode_choices=_CAT_CHOICES)
