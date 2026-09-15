@@ -464,3 +464,20 @@ powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Desce
   (it was `ba2worker` 750, which blocked the derived cache). The fleet worker does not use it.
 * Never `pgrep -f spawn_main` from an ssh command that contains the string (self-match killed the
   shell); use `pgrep -f multiprocessing.spawn`.
+
+## Database backups (2026-09-15)
+
+`tools/backup_dbs.py` copies the PROD trade DB, the DEV trade DB and the TEST/GA DB with SQLite's online-backup
+API (safe while the platforms and a GA write), `quick_check`s the copy, deflates it to
+`G:\Mon Driveackup\BA2\<prod|test>_<YYYY-MM-DD>.sqlite.zip`, and keeps the newest 7 per
+database. Windows Task Scheduler task **`BA2 DB Backup`** runs it daily at 00:00 as the
+interactive user (Google Drive's `G:` only exists in the logged-on session), 4 h limit, no
+overlapping instances. Log: `G:\Mon Driveackup\BA2ackup.log`. Measured 2026-09-15: prod
+411 MB -> 93 MB in 12 s. Manual run: `.venv\Scripts\python.exe toolsackup_dbs.py [--dry-run]`.
+
+**Weekly remote pull (stage-1 isolated DB).** `tools/backup_remote_db.py` runs the same online
+backup + `quick_check` + zip ON remote227 (python3 over one ssh session, `nice`d so the grid is
+not disturbed), scp's it to `G:\Mon Driveackup\BA2emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
+deletes the remote copy and keeps the newest 4. Task **`BA2 Remote DB Backup`**, Sunday 01:00,
+interactive user (needs the ssh key + G:). Stage-1 results live ONLY in that isolated DB
+(`/home/debian/ba2-grid/home/test/dl_forecasting.db`); nothing syncs them to the local test DB.
