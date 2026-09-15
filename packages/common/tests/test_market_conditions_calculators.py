@@ -2,6 +2,8 @@
 
 Expected numbers come from independent, deliberately naive loops written in
 this file straight from the design text -- never from the module under test.
+The reference reductions use ``math.fsum`` exactly as the module's
+reproducibility contract states, so values are compared with ``==``.
 """
 import math
 
@@ -9,8 +11,8 @@ import numpy as np
 import pytest
 
 from ba2_common.core.market_conditions import (
-    WINDOW, CALC_VERSION, Observation, MarketConditionValues,
-    compute_market_conditions, ema_wilder_seeded, atr14_wilder, adx14_wilder, realized_vol_ratio,
+    WINDOW, CALC_VERSION, Observation,
+    compute_market_conditions, ema_sma_seeded, atr14_wilder, adx14_wilder, realized_vol_ratio,
     STATUS_VALID, STATUS_INSUFFICIENT_HISTORY, STATUS_INVALID_PRICES, STATUSES,
     FIELD_TREND_SLOPE, FIELD_ADX, FIELD_RV_RATIO, FIELDS,
 )
@@ -27,9 +29,27 @@ def _walk(n, seed, start=100.0, step=1.0):
     return start + np.cumsum(rng.normal(0.0, step, n))
 
 
+def _random_ohlc(seed_c, seed_hl):
+    rng = np.random.default_rng(seed_hl)
+    c = _walk(WINDOW, seed=seed_c)
+    h = c + rng.uniform(0.1, 1.5, WINDOW)
+    l = c - rng.uniform(0.1, 1.5, WINDOW)
+    o = np.clip(c + rng.normal(0, 0.3, WINDOW), l, h)
+    return o, h, l, c, np.full(WINDOW, 1e6)
+
+
 # --------------------------------------------------------------------------
 # Independent reference implementation (plain Python lists, design §3.1 text)
 # --------------------------------------------------------------------------
+
+def _ref_mean(xs):
+    return math.fsum(xs) / len(xs)
+
+
+def _ref_sstd(xs):
+    m = _ref_mean(xs)
+    return math.sqrt(math.fsum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
 
 def _ref_tr(H, L, C):
     tr = [None]
@@ -41,7 +61,7 @@ def _ref_tr(H, L, C):
 def _ref_wilder14(x):
     """Seed at index 14 with mean(x[1..14]); ATR-style recurrence after."""
     out = [None] * len(x)
-    out[14] = sum(x[1:15]) / 14.0
+    out[14] = _ref_mean(x[1:15])
     for j in range(15, len(x)):
         out[j] = (13.0 * out[j - 1] + x[j]) / 14.0
     return out
@@ -50,7 +70,7 @@ def _ref_wilder14(x):
 def _ref_slope(H, L, C):
     H, L, C = list(map(float, H)), list(map(float, L)), list(map(float, C))
     ema = [None] * len(C)
-    ema[49] = sum(C[0:50]) / 50.0
+    ema[49] = _ref_mean(C[0:50])
     for j in range(50, len(C)):
         ema[j] = (2.0 / 51.0) * C[j] + (49.0 / 51.0) * ema[j - 1]
     atr = _ref_wilder14(_ref_tr(H, L, C))
@@ -75,10 +95,16 @@ def _ref_adx(H, L, C):
         s = pdi[j] + mdi[j]
         dx[j] = 0.0 if s == 0 else 100.0 * abs(pdi[j] - mdi[j]) / s
     adx = [None] * n
-    adx[27] = sum(dx[14:28]) / 14.0
+    adx[27] = _ref_mean(dx[14:28])
     for j in range(28, n):
         adx[j] = (13.0 * adx[j - 1] + dx[j]) / 14.0
     return pdi, mdi, dx, adx
+
+
+def _ref_rv(C):
+    C = list(map(float, C))
+    r = [math.log(C[j] / C[j - 1]) for j in range(1, len(C))]
+    return _ref_sstd(r[-5:]) / _ref_sstd(r[-20:])
 
 
 # --------------------------------------------------------------------------
@@ -115,33 +141,34 @@ def test_trend_slope_matches_independent_reference():
     expected = _ref_slope(h, l, c)
     res = compute_market_conditions(o, h, l, c, v)
     assert res.trend_slope.status == STATUS_VALID
+    assert res.trend_slope.value == expected
     assert res.trend_slope.value == pytest.approx(expected, abs=1e-12)
     # The EMA helper pins the seed and the recurrence too.
-    ema = ema_wilder_seeded(c, 50)
+    ema = ema_sma_seeded(c, 50)
     assert np.all(np.isnan(ema[:49]))
-    assert ema[49] == pytest.approx(sum(map(float, c[:50])) / 50.0, abs=1e-12)
-    assert ema[50] == pytest.approx((2 / 51) * c[50] + (49 / 51) * ema[49], abs=1e-12)
+    assert ema[49] == math.fsum(map(float, c[:50])) / 50.0
+    assert ema[50] == (2.0 / 51.0) * float(c[50]) + (49.0 / 51.0) * float(ema[49])
 
 
 def test_adx_intermediates_are_pinned_on_a_reference_path():
-    rng = np.random.default_rng(11)
-    c = _walk(WINDOW, seed=3)
-    h = c + rng.uniform(0.1, 1.5, WINDOW)
-    l = c - rng.uniform(0.1, 1.5, WINDOW)
-    o = np.clip(c + rng.normal(0, 0.3, WINDOW), l, h)
+    o, h, l, c, v = _random_ohlc(seed_c=3, seed_hl=11)
     pdi_r, mdi_r, dx_r, adx_r = _ref_adx(h, l, c)
     pdi, mdi, dx, adx = adx14_wilder(h, l, c)
     for j in (14, 27):
-        assert pdi[j] == pytest.approx(pdi_r[j], abs=1e-12)
-        assert mdi[j] == pytest.approx(mdi_r[j], abs=1e-12)
+        assert pdi[j] == pdi_r[j]
+        assert mdi[j] == mdi_r[j]
+        assert dx[j] == dx_r[j]
         assert dx[j] == pytest.approx(dx_r[j], abs=1e-12)
-    assert adx[27] == pytest.approx(adx_r[27], abs=1e-12)
-    assert adx[127] == pytest.approx(adx_r[127], abs=1e-12)
+    assert adx[27] == adx_r[27]
+    assert adx[127] == adx_r[127]
     assert np.all(np.isnan(pdi[:14])) and np.all(np.isnan(dx[:14]))
     assert np.all(np.isnan(adx[:27]))
-    res = compute_market_conditions(o, h, l, c, np.full(WINDOW, 1e6))
+    # a precomputed ATR gives the identical result
+    pdi2, mdi2, dx2, adx2 = adx14_wilder(h, l, c, atr=atr14_wilder(h, l, c))
+    assert adx2[127] == adx[127] and dx2[27] == dx[27]
+    res = compute_market_conditions(o, h, l, c, v)
     assert res.adx.status == STATUS_VALID
-    assert res.adx.value == pytest.approx(adx_r[127], abs=1e-12)
+    assert res.adx.value == adx_r[127]
 
 
 def test_adx_with_atr_positive_and_both_dm_zero_is_zero_not_unknown():
@@ -183,24 +210,19 @@ def test_zero_atr_inside_adx_warmup_is_unknown_not_zero():
     assert atr14_wilder(h, l, c)[14] == 0.0
     assert res.trend_slope.status == STATUS_VALID
     assert res.adx.status == STATUS_INVALID_PRICES and res.adx.value is None
+    assert res.adx.reason == "adx undefined: atr<=0 at index 14"
 
 
 def test_rv_ratio_uses_ddof1_and_no_annualization():
     c = _walk(WINDOW, seed=21)
-    r = np.log(c[1:] / c[:-1])
-    expected = np.std(r[-5:], ddof=1) / np.std(r[-20:], ddof=1)
     obs = realized_vol_ratio(c)
     assert obs.status == STATUS_VALID
-    assert obs.value == pytest.approx(expected, abs=1e-12)
-
-    def sstd(x):  # independent hand-rolled sample standard deviation
-        m = sum(x) / len(x)
-        return math.sqrt(sum((xi - m) ** 2 for xi in x) / (len(x) - 1))
-
-    rr = [math.log(float(c[j]) / float(c[j - 1])) for j in range(1, len(c))]
-    assert obs.value == pytest.approx(sstd(rr[-5:]) / sstd(rr[-20:]), abs=1e-12)
+    assert obs.value == _ref_rv(c)
+    # cross-check against numpy's ddof=1 std (different summation, so approx only)
+    r = np.log(c[1:] / c[:-1])
+    assert obs.value == pytest.approx(np.std(r[-5:], ddof=1) / np.std(r[-20:], ddof=1), abs=1e-12)
     res = compute_market_conditions(*_bars(c))
-    assert res.rv_ratio.value == pytest.approx(expected, abs=1e-12)
+    assert res.rv_ratio.value == obs.value
 
 
 def test_rv_ratio_zero_numerator_is_valid_zero_and_zero_denominator_is_unknown():
@@ -229,13 +251,15 @@ def test_nonfinite_or_nonpositive_price_is_invalid_prices_never_substituted():
     res = compute_market_conditions(o, h, l, c, v)
     for obs in (res.trend_slope, res.adx, res.rv_ratio):
         assert obs.status == STATUS_INVALID_PRICES and obs.value is None
-        assert "index 60" in obs.reason
+        assert obs.reason.startswith("invalid_prices: index 60 (")
+        assert "close non-finite" in obs.reason
     o, h, l, c, v = _bars(_walk(WINDOW, seed=2))
     c[5] = 0.0
     res = compute_market_conditions(o, h, l, c, v)
     for obs in (res.trend_slope, res.adx, res.rv_ratio):
         assert obs.status == STATUS_INVALID_PRICES and obs.value is None
-        assert "index 5" in obs.reason
+        assert obs.reason.startswith("invalid_prices: index 5 (")
+        assert "close non-positive" in obs.reason
 
 
 def test_ohlc_ordering_violation_is_invalid_prices():
@@ -244,7 +268,72 @@ def test_ohlc_ordering_violation_is_invalid_prices():
     res = compute_market_conditions(o, h, l, c, v)
     for obs in (res.trend_slope, res.adx, res.rv_ratio):
         assert obs.status == STATUS_INVALID_PRICES and obs.value is None
-        assert "index 30" in obs.reason
+        assert obs.reason.startswith("invalid_prices: index 30 (")
+        assert "high < low" in obs.reason
+
+
+def _break_high_below_open(o, h, l, c, v):
+    o[40] = h[40] + 0.1
+
+def _break_low_above_open(o, h, l, c, v):
+    o[41] = l[41] - 0.1
+
+def _nan_volume(o, h, l, c, v):
+    v[42] = np.nan
+
+def _negative_volume(o, h, l, c, v):
+    v[43] = -1.0
+
+def _nan_open(o, h, l, c, v):
+    o[44] = np.nan
+
+def _nan_high(o, h, l, c, v):
+    h[45] = np.nan
+
+def _nan_low(o, h, l, c, v):
+    l[46] = np.nan
+
+
+@pytest.mark.parametrize("mutate, index, label", [
+    (_break_high_below_open, 40, "high < max(open, close)"),
+    (_break_low_above_open, 41, "low > min(open, close)"),
+    (_nan_volume, 42, "volume non-finite"),
+    (_negative_volume, 43, "volume negative"),
+    (_nan_open, 44, "open non-finite"),
+    (_nan_high, 45, "high non-finite"),
+    (_nan_low, 46, "low non-finite"),
+])
+def test_validation_branches_report_status_and_index(mutate, index, label):
+    o, h, l, c, v = _bars(_walk(WINDOW, seed=12))
+    mutate(o, h, l, c, v)
+    res = compute_market_conditions(o, h, l, c, v)
+    for obs in (res.trend_slope, res.adx, res.rv_ratio):
+        assert obs.status == STATUS_INVALID_PRICES and obs.value is None
+        assert f"index {index} (" in obs.reason
+        assert label in obs.reason
+
+
+def test_unequal_array_lengths_raise():
+    o, h, l, c, v = _bars(_walk(WINDOW, seed=12))
+    with pytest.raises(ValueError):
+        compute_market_conditions(o, h, l, c[:-1], v)
+
+
+def test_invalid_price_reason_reports_lowest_index_with_every_problem_there():
+    o, h, l, c, v = _bars(_walk(WINDOW, seed=14))
+    c[70] = np.nan            # later index, different field
+    v[50] = -1.0              # lower index: two problems at the same bar
+    o[50] = np.nan            # NaN does not also trip the ordering checks
+    res = compute_market_conditions(o, h, l, c, v)
+    assert res.trend_slope.reason == "invalid_prices: index 50 (open non-finite, volume negative)"
+    assert res.adx.reason == res.rv_ratio.reason == res.trend_slope.reason
+    # order of discovery does not matter: swapping which field is bad first
+    o, h, l, c, v = _bars(_walk(WINDOW, seed=14))
+    o[90] = np.nan
+    h[33] = l[33] - 1.0
+    res = compute_market_conditions(o, h, l, c, v)
+    assert res.trend_slope.reason == \
+        "invalid_prices: index 33 (high < low, high < max(open, close))"
 
 
 def test_window_invariance_extra_history_does_not_change_values():
@@ -268,8 +357,37 @@ def test_split_case_is_the_source_contracts_responsibility():
     res = compute_market_conditions(o, h, l, c, v)
     assert res.trend_slope.status == STATUS_VALID
     assert res.adx.status == STATUS_VALID
-    assert res.trend_slope.value == pytest.approx(_ref_slope(h, l, c), abs=1e-12)
-    assert res.adx.value == pytest.approx(_ref_adx(h, l, c)[3][127], abs=1e-12)
+    assert res.trend_slope.value == _ref_slope(h, l, c)
+    assert res.adx.value == _ref_adx(h, l, c)[3][127]
+
+
+def _golden_window(k):
+    if k == 0:
+        return _bars(_walk(WINDOW, seed=101), spread=0.6)
+    if k == 1:
+        return _random_ohlc(seed_c=202, seed_hl=203)
+    # math.sin (not np.sin) so the golden INPUT is platform-independent too
+    return _bars([80.0 + 0.15 * t + 3.0 * math.sin(t / 6.0) for t in range(WINDOW)], spread=1.1)
+
+
+# (slope, adx, rv) as float.hex(), computed once from the reference loops above.
+_GOLDEN = [
+    ("-0x1.7f8ece5543d79p-4", "0x1.1a2945d330d16p+4", "0x1.e81888fe2fa5fp-1"),
+    ("-0x1.3d26f004274a8p-7", "0x1.627e75c6d4b4fp+3", "0x1.0dc591f02b364p+0"),
+    ("0x1.bf6c5d9ab0dfap-4", "0x1.fb5456ce2131fp+5", "0x1.c672467b6c70dp-2"),
+]
+
+
+@pytest.mark.parametrize("k", [0, 1, 2])
+def test_golden_windows_are_bit_exact(k):
+    o, h, l, c, v = _golden_window(k)
+    slope_hex, adx_hex, rv_hex = _GOLDEN[k]
+    expected = (float.fromhex(slope_hex), float.fromhex(adx_hex), float.fromhex(rv_hex))
+    # the reference loops still produce the stored values ...
+    assert (_ref_slope(h, l, c), _ref_adx(h, l, c)[3][127], _ref_rv(c)) == expected
+    # ... and so does the module, bit for bit
+    res = compute_market_conditions(o, h, l, c, v)
+    assert (res.trend_slope.value, res.adx.value, res.rv_ratio.value) == expected
 
 
 def test_as_row_and_by_field_shapes():
@@ -287,11 +405,12 @@ def test_as_row_and_by_field_shapes():
     srow = short.as_row()
     assert all(srow[f] is None for f in FIELDS)
     assert all(srow[f"{f}_status"] == STATUS_INSUFFICIENT_HISTORY for f in FIELDS)
-    assert isinstance(res, MarketConditionValues)
 
 
 def test_observation_invariants():
     assert Observation(1.5, STATUS_VALID).value == 1.5
+    coerced = Observation(np.float64(2.5), STATUS_VALID)
+    assert type(coerced.value) is float and coerced.value == 2.5
     assert Observation(None, STATUS_INVALID_PRICES, "x").value is None
     with pytest.raises(ValueError):
         Observation(None, STATUS_VALID)
@@ -299,3 +418,9 @@ def test_observation_invariants():
         Observation(1.0, STATUS_INSUFFICIENT_HISTORY)
     with pytest.raises(ValueError):
         Observation(None, "bogus")
+    with pytest.raises(ValueError):
+        Observation(True, STATUS_VALID)
+    with pytest.raises(ValueError):
+        Observation("1.0", STATUS_VALID)
+    with pytest.raises(ValueError):
+        Observation(float("nan"), STATUS_VALID)
