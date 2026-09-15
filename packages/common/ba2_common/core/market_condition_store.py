@@ -99,7 +99,9 @@ RAW_DIRNAME = "raw"
 OBJECTS_DIRNAME = "objects"
 MANIFESTS_DIRNAME = "manifests"
 #: Feature-object / manifest layout version. A change of columns or meaning gets a new number.
-SCHEMA_VERSION = 1
+#: 2 = ``sessions_digest`` is a required manifest key (reuse refuses a version-1 manifest, of
+#: which none was ever published outside a test).
+SCHEMA_VERSION = 2
 _COMPRESSION = "zstd"
 
 MANIFEST_KEYS = (
@@ -107,6 +109,9 @@ MANIFEST_KEYS = (
     "schema_version", "fields", "objects", "raw_objects", "coverage", "universe_digest",
     "sessions_digest", "window_start", "window_end", "created_at",
 )
+
+#: How long a reader waits on one notification while another thread indexes a manifest.
+_INDEX_WAIT_S = 1.0
 
 _STATUS_CODE = {s: i for i, s in enumerate(STATUSES)}
 _RAW_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -311,7 +316,11 @@ class MarketConditionStore:
         self.root = self.cache_root / MC_DIRNAME
         self._window_index: Dict[str, Tuple[str, int, int]] = {}
         self._indexed_manifests: set = set()
-        self._index_lock = threading.Lock()
+        #: Manifests being indexed RIGHT NOW by some thread. A second reader waits for them
+        #: instead of concluding the digest is absent (the index is built lazily, so "not in the
+        #: index yet" and "not in the store" are only distinguishable once indexing has finished).
+        self._indexing: set = set()
+        self._index_cv = threading.Condition()
 
     # -- paths
     def abspath(self, rel: str) -> Path:
@@ -667,12 +676,39 @@ class MarketConditionStore:
             yield frame.sessions[i].astype(object), frame.row(i)
 
     # -- retained evidence
+    def _index_hit(self, window_digest: str) -> Optional[Tuple[str, int, int]]:
+        with self._index_cv:
+            return self._window_index.get(window_digest)
+
+    @staticmethod
+    def _manifest_key(manifest: Mapping[str, Any]) -> Tuple:
+        """Identity of a manifest handed in directly (it may never have been written)."""
+        return ("explicit", manifest.get("universe_digest"), manifest.get("sessions_digest"),
+                manifest.get("created_at"), len(manifest.get("objects", ())))
+
+    def _unindexed_manifests(self, manifest: Optional[Mapping[str, Any]]) -> List[Tuple[Tuple, Mapping[str, Any]]]:
+        """``[(key, manifest)]`` this store has not indexed yet -- the explicit one, or every
+        manifest of every profile. Does its I/O without holding the index lock."""
+        with self._index_cv:
+            known = set(self._indexed_manifests) | set(self._indexing)
+        if manifest is not None:
+            key = self._manifest_key(manifest)
+            return [] if key in known else [(key, manifest)]
+        out = []
+        profiles = [p.name for p in self.root.iterdir() if p.is_dir() and p.name != RAW_DIRNAME] \
+            if self.root.exists() else []
+        for prof in sorted(profiles):
+            for dg in self.list_manifests(prof):
+                if (prof, dg) not in known:
+                    out.append(((prof, dg), self.read_manifest(dg, prof)))
+        return out
+
     def _index_manifest(self, manifest: Mapping[str, Any]) -> None:
         for o in manifest["objects"]:
             t = self.read_table(o["path"], columns=["window_digest", "raw_shard_ref", "raw_row_lo", "raw_row_hi"])
             rows = list(zip(t.column("window_digest").to_pylist(), t.column("raw_shard_ref").to_pylist(),
                             t.column("raw_row_lo").to_pylist(), t.column("raw_row_hi").to_pylist()))
-            with self._index_lock:
+            with self._index_cv:
                 for dg, ref, lo, hi in rows:
                     self._window_index.setdefault(dg, (ref, int(lo), int(hi)))
 
@@ -686,37 +722,42 @@ class MarketConditionStore:
         Only VALID rows have a retained window: a row whose window could not be assembled carries
         an ``unavailable_window_digest`` over a partial (possibly empty) span, which is evidence
         of absence, not a 128-bar window, and is not served here."""
-        with self._index_lock:
-            hit = self._window_index.get(window_digest)
-        if hit is None:
-            # Object I/O happens OUTSIDE the lock: indexing a large manifest would otherwise block
-            # every other reader of this store for the whole scan.
-            manifests = []
-            if manifest is not None:
-                key = ("explicit", manifest.get("universe_digest"), manifest.get("created_at"),
-                       len(manifest.get("objects", ())))
-                with self._index_lock:
-                    already = key in self._indexed_manifests
-                    self._indexed_manifests.add(key)
-                if not already:
-                    manifests = [manifest]
-            else:
-                profiles = [p.name for p in self.root.iterdir() if p.is_dir() and p.name != RAW_DIRNAME] \
-                    if self.root.exists() else []
-                for prof in sorted(profiles):
-                    for dg in self.list_manifests(prof):
-                        with self._index_lock:
-                            already = (prof, dg) in self._indexed_manifests
-                            self._indexed_manifests.add((prof, dg))
-                        if not already:
-                            manifests.append(self.read_manifest(dg, prof))
-            for m in manifests:
-                self._index_manifest(m)
-                with self._index_lock:
-                    if window_digest in self._window_index:
-                        break
-            with self._index_lock:
+        hit = self._index_hit(window_digest)
+        while hit is None:
+            with self._index_cv:
+                if self._indexing:
+                    # Another thread is building the index; the digest may be in the manifest it
+                    # is reading. Waiting is the only honest answer -- raising KeyError here would
+                    # make the result depend on which thread got there first.
+                    self._index_cv.wait(_INDEX_WAIT_S)
+                    hit = self._window_index.get(window_digest)
+                    if hit is not None or self._indexing:
+                        continue
+            # Reading manifests and objects happens OUTSIDE the lock: indexing a large manifest
+            # would otherwise block every other reader of this store for the whole scan.
+            pending = self._unindexed_manifests(manifest)
+            claimed = []
+            with self._index_cv:
                 hit = self._window_index.get(window_digest)
+                if hit is not None:
+                    break
+                for key, m in pending:
+                    if key in self._indexed_manifests or key in self._indexing:
+                        continue
+                    self._indexing.add(key)
+                    claimed.append((key, m))
+                if not claimed and not self._indexing:
+                    break                       # nothing left to index: the digest is not here
+            try:
+                for _key, m in claimed:
+                    self._index_manifest(m)
+            finally:
+                with self._index_cv:
+                    for key, _m in claimed:
+                        self._indexing.discard(key)
+                        self._indexed_manifests.add(key)
+                    self._index_cv.notify_all()
+            hit = self._index_hit(window_digest)
         if hit is None:
             raise KeyError(f"no retained window with digest {window_digest}")
         ref, lo, hi = hit

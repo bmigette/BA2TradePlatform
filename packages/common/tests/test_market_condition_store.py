@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date
 
 import numpy as np
@@ -307,3 +308,58 @@ def test_publishing_while_a_reader_holds_the_object_open_windows(store, monkeypa
         assert reader.read() == expected          # the reader's view never changed
     assert again == entry and reused
     assert final.read_bytes() == expected and not list(final.parent.glob("*.part"))
+
+
+def test_two_threads_asking_for_a_window_during_one_index_build(store, monkeypatch):
+    """The window index is built lazily on first ask. A second reader arriving mid-build must WAIT
+    for it, not conclude the digest is absent: which thread wins the race is not an answer."""
+    import threading
+
+    rec, raws, arrays = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    store.write_manifest(_manifest(store, [obj], raws))
+
+    reader = MarketConditionStore(store.cache_root)
+    started, indexed = threading.Event(), []
+    real_read_table = MarketConditionStore.read_table
+
+    def slow_read_table(self, rel, columns=None):
+        if columns and "window_digest" in columns:
+            indexed.append(rel)
+            started.set()
+            time.sleep(0.6)
+        return real_read_table(self, rel, columns=columns)
+
+    monkeypatch.setattr(MarketConditionStore, "read_table", slow_read_table)
+    results, errors = {}, {}
+
+    def ask(k):
+        try:
+            results[k] = reader.retained_window(rec["window_digest"])
+        except Exception as e:                      # noqa: BLE001 -- the failure IS the finding
+            errors[k] = e
+
+    t0 = threading.Thread(target=ask, args=(0,))
+    t0.start()
+    assert started.wait(5), "the first reader never started indexing"
+    t1 = threading.Thread(target=ask, args=(1,))
+    t1.start()
+    for t in (t0, t1):
+        t.join(timeout=20)
+
+    assert not errors, errors
+    assert len(indexed) == 1, "the manifest was indexed twice"
+    for k in (0, 1):
+        for got, want in zip(results[k], arrays):
+            assert np.array_equal(got, want)
+
+
+def test_an_absent_digest_still_raises_key_error(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    store.write_manifest(_manifest(store, [obj], raws))
+    reader = MarketConditionStore(store.cache_root)
+    with pytest.raises(KeyError):
+        reader.retained_window("sha256:" + "e" * 64)
+    # ... and the index it built on the way is reusable, not poisoned.
+    assert reader.retained_window(rec["window_digest"])[0].size == WINDOW

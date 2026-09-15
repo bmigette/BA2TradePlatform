@@ -519,8 +519,10 @@ class _Candidate:
 def _load_candidates(store: MarketConditionStore, index: _ManifestIndex, cache_root: str, profile: str,
                      symbol: str, *, verify_hashes: bool, fields: Sequence[str]) -> List[_Candidate]:
     entries: Dict[str, ObjectEntry] = {}
-    # Progress records FIRST, manifests second: a concurrent builder publishes its manifest BEFORE
-    # deleting its progress records, so this order can never miss an object that exists.
+    # Progress records FIRST, manifests second: the previous holder of this symbol's claim
+    # publishes its manifest BEFORE deleting its progress records, so this order can never miss an
+    # object THAT holder published. (A builder still running elsewhere may of course publish more
+    # after this read; its objects are simply not candidates yet.)
     progress = _progress_entries(cache_root, profile, symbol, index.calc_version)
     for e in progress + index.entries(symbol):
         if e.symbol == symbol:
@@ -1057,9 +1059,13 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
 
     counters.add("rows_total", len(windows))
     counters.add("symbols_built")
-    # Records for objects this build superseded are no longer resume hints: drop them.
-    _progress_entries(plan_.cache_root, profile.name, sym, index.calc_version,
-                      keep={e.sha256 for e in objects})
+    # Records for objects this build superseded are no longer resume hints: drop them -- but
+    # ONLY while the claim is still ours. A builder whose claim was broken as stale is looking at
+    # the NEW owner's records, and deleting those would throw away the resume hints of a build
+    # that is still running.
+    if claim is None or not claim.lost:
+        _progress_entries(plan_.cache_root, profile.name, sym, index.calc_version,
+                          keep={e.sha256 for e in objects})
     return _SymbolResult(sym, objects, used_raw, _coverage_from(statuses, fields, extra))
 
 

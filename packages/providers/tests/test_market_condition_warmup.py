@@ -531,14 +531,105 @@ def test_the_fmp_source_satisfies_the_warmup_source_protocol():
     import inspect
     from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
 
+    # The expectation comes from the PROTOCOL, so adding an argument there fails every
+    # implementation that has not followed -- including the fake these tests trust.
+    names = [n for n in ("split_calendar", "fetch_daily", "force_full_refetch")]
+    wanted = {n: [p for p in inspect.signature(getattr(W.WarmupSource, n)).parameters if p != "self"]
+              for n in names}
+    assert wanted["fetch_daily"] == ["symbol", "start", "end"], wanted   # the protocol is not empty
     for impl in (FMPWarmupSource, FakeSource):
-        for name, params in (("split_calendar", ["symbol"]), ("fetch_daily", ["symbol", "start", "end"]),
-                             ("force_full_refetch", ["symbol"])):
-            fn = getattr(impl, name)
-            got = [p for p in inspect.signature(fn).parameters if p != "self"]
+        for name, params in wanted.items():
+            got = [p for p in inspect.signature(getattr(impl, name)).parameters if p != "self"]
             assert got == params, f"{impl.__name__}.{name}{tuple(got)} != {name}{tuple(params)}"
     # The two counters the report's provider_calls/provider_bytes are deltas of: an int on the
     # fake, the FMP request meter on the real one.
     fake = FakeSource("", truth={})
     assert isinstance(fake.calls, int) and isinstance(fake.bytes, int)
     assert isinstance(FMPWarmupSource.calls, property) and isinstance(FMPWarmupSource.bytes, property)
+
+
+def test_a_builder_that_lost_its_claim_does_not_prune_the_new_owner_s_records(root, monkeypatch):
+    """The prune at the end of a symbol's build removes records the build superseded. A builder
+    whose claim was broken as stale is looking at the NEW owner's records instead, and deleting
+    those would strip a running build of its resume hints."""
+    src = FakeSource(root)
+    p, r1 = _warm(root, src, concurrency=1)
+    assert r1.ok
+
+    store = MarketConditionStore(root)
+    index = W._ManifestIndex(store, PROFILE, UNIVERSE)
+    inv = p.symbol("AAA")
+    cal = W._calendar_span(date.fromisoformat(p.first_row_session), date.fromisoformat(p.last_row_session),
+                           p.decision_sessions)
+    foreign = W._progress_dir(root, PROFILE, "AAA") / ("f" * 64 + ".json")
+    payload = {"path": store.object_rel(PROFILE, "f" * 64), "sha256": "f" * 64, "symbol": "AAA",
+               "month": "2025-06", "rows": 1, "calc_version": p.calc_version, "schema_version": 2}
+
+    # 1. A builder that still holds its claim prunes the record it superseded.
+    foreign.parent.mkdir(parents=True, exist_ok=True)
+    foreign.write_text(json.dumps(payload), encoding="utf-8")
+    held = W._FileClaim(W.local_build_dir(root) / "claims" / PROFILE / "AAA.lock")
+    assert held.try_acquire()
+    W._build_symbol(store, index, p, inv, cal, W._Counters(), [], lambda _m: None, claim=held)
+    held.release()
+    assert not foreign.exists()
+
+    # 2. The same build, having LOST the claim, leaves them alone.
+    foreign.write_text(json.dumps(payload), encoding="utf-8")
+    lost = W._FileClaim(W.local_build_dir(root) / "claims" / PROFILE / "AAA.lock")
+    assert lost.try_acquire()
+    lost.lost = True
+    W._build_symbol(store, index, p, inv, cal, W._Counters(), [], lambda _m: None, claim=lost)
+    lost.release()
+    assert foreign.exists()
+
+
+def test_the_fmp_source_calls_the_provider_the_way_the_provider_expects(monkeypatch, tmp_path):
+    """Bind the REAL call shapes the FMP source relies on: the provider's latest-read kwargs, its
+    full re-fetch, and the disk-cached split-calendar fetch (namespace, symbol, age, retain)."""
+    from ba2_common.core import native_cache
+    from ba2_providers import fmp_common, symbol_info
+    from ba2_providers.market_conditions.fmp_source import (
+        SPLIT_CALENDAR_MAX_AGE_DAYS, SPLIT_CALENDAR_NAMESPACE, FMPWarmupSource,
+    )
+
+    class StubProvider:
+        api_key = "test-key"
+
+        def __init__(self):
+            self.ohlcv_calls = []
+            self.refetches = []
+
+        def get_ohlcv_data(self, symbol, **kwargs):
+            self.ohlcv_calls.append((symbol, kwargs))
+
+        def force_full_refetch(self, symbol, interval):
+            self.refetches.append((symbol, interval))
+
+    provider = StubProvider()
+    source = FMPWarmupSource(native_cache.CACHE_FOLDER, provider=provider)
+
+    source.fetch_daily("aaa", date(2024, 1, 2), date(2024, 3, 1))
+    (sym, kwargs), = provider.ohlcv_calls
+    assert sym == "AAA" and kwargs["interval"] == "1d" and kwargs["end_date"] is None
+    assert kwargs["start_date"].date() == date(2024, 1, 2) and kwargs["max_cache_age_hours"] == 0
+
+    source.force_full_refetch("bbb")
+    assert provider.refetches == [("BBB", "1d")]
+
+    disk = []
+    monkeypatch.setattr(symbol_info, "fetch_splits", lambda key, symbol: {"symbol": symbol, "historical": [
+        {"date": "2024-06-10", "numerator": 10, "denominator": 1}]})
+
+    def fake_disk_cached(namespace, symbol, fetch_fn, max_age_days=None, *, retain=True):
+        disk.append({"namespace": namespace, "symbol": symbol, "max_age_days": max_age_days, "retain": retain,
+                     "frozen": fmp_common._is_ttl_frozen(), "purpose": fmp_common.current_fmp_purpose()})
+        return fetch_fn()
+
+    monkeypatch.setattr(fmp_common, "fmp_history_disk_cached", fake_disk_cached)
+    splits = source.split_calendar("ccc")
+    assert [(c.date, c.ratio) for c in splits] == [(date(2024, 6, 10), 10.0)]
+    assert disk == [{"namespace": SPLIT_CALENDAR_NAMESPACE, "symbol": "CCC",
+                     "max_age_days": SPLIT_CALENDAR_MAX_AGE_DAYS, "retain": False,
+                     "frozen": True, "purpose": fmp_common.PURPOSE_WARM}]
+    assert not fmp_common._is_ttl_frozen()          # the freeze is scoped to the call
