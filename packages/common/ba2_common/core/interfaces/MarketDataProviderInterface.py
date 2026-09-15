@@ -643,7 +643,111 @@ class MarketDataProviderInterface(DataProviderInterface):
             logger.warning(
                 f"Failed to refresh parquet cache for {symbol} ({interval}): {e}"
             )
-        return df
+        return self._repair_split_basis_drift(df, symbol, interval, provider_name)
+
+    # ---- split-basis drift (market-condition source contract, plan Task 6) ----------
+    #: Providers whose daily history is delivered split-adjusted AS OF THE FETCH set this, so a
+    #: cold full fill records a full-fetch marker (``ba2_common.core.split_basis``) and a later
+    #: split check knows the pre-split bars were fetched after the split.
+    WRITES_FULL_FETCH_MARKER = False
+
+    def _split_calendar(self, symbol: str, interval: str):
+        """The provider's split calendar for ``symbol`` as ``[CalendarSplit]``, or ``None`` when
+        this provider has none (no drift check is possible then). Overridden by providers whose
+        appended cache can drift across a split (FMP)."""
+        return None
+
+    def _repair_split_basis_drift(self, df: pd.DataFrame, symbol: str, interval: str,
+                                  provider_name: str) -> pd.DataFrame:
+        """Force a FULL re-fetch when the split calendar shows a split after the cached file's
+        first bar that the cached prices are not verifiably on one basis across.
+
+        The top-up above APPENDS bars after the last cached one, so a symbol that split after its
+        file was first fetched holds unadjusted pre-split bars next to adjusted post-split bars --
+        a fake 2x/4x/10x move every reader (the market-condition gates included) would take as
+        real. Daily-or-longer intervals only. A split-calendar failure is logged and the refresh
+        result is served unchanged (the warmup preflight refuses such a symbol loudly)."""
+        if interval in _INTRADAY_INTERVALS or df is None or df.empty:
+            return df
+        try:
+            splits = self._split_calendar(symbol, interval)
+        except Exception as e:
+            logger.warning(f"Split calendar unavailable for {symbol} ({interval}); split-basis drift "
+                           f"not checked on this refresh: {e}")
+            return df
+        if not splits:
+            return df
+        from ba2_common.core import native_cache
+        from ba2_common.core.split_basis import (
+            REFETCH_VERDICTS, check_split_basis, needs_full_refetch, read_full_fetch_marker,
+        )
+        path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        dates = pd.to_datetime(df['Date'])
+        if getattr(dates.dt, 'tz', None) is not None:
+            dates = dates.dt.tz_localize(None)
+        days = dates.dt.normalize().to_numpy(dtype='datetime64[ns]')
+        checks = check_split_basis(days, df['Open'], df['High'], df['Low'], df['Close'], splits,
+                                   symbol=symbol, marker=read_full_fetch_marker(path))
+        if not needs_full_refetch(checks):
+            return df
+        bad = [c.to_dict() for c in checks if c.verdict in REFETCH_VERDICTS]
+        logger.warning(f"{provider_name} {symbol} ({interval}): cached history is not verifiably on one "
+                       f"split basis ({bad}); forcing a full re-fetch")
+        try:
+            return self.force_full_refetch(symbol, interval, provider_name=provider_name)
+        except Exception as e:
+            logger.error(f"Full re-fetch of {symbol} ({interval}) after split-basis drift failed: {e}",
+                         exc_info=True)
+            return df
+
+    def force_full_refetch(self, symbol: str, interval: str = '1d',
+                           provider_name: Optional[str] = None) -> pd.DataFrame:
+        """REPLACE (never merge) the cached daily history of ``symbol`` with a fresh full-history
+        fetch -- the same 15-year window as the cold fill -- and record the full-fetch marker.
+
+        Merging would keep the stale pre-split bars, which is exactly what this repairs. Raises
+        when the fetch returns nothing (the existing file is left untouched then)."""
+        from ba2_common.core import native_cache
+        from ba2_common.core.split_basis import write_full_fetch_marker
+
+        provider_name = provider_name or type(self).__name__
+        now = datetime.now()
+        fresh = self._get_ohlcv_data_impl(symbol, now - timedelta(days=365 * 15), now, interval)
+        if fresh is None or fresh.empty:
+            raise RuntimeError(f"full re-fetch of {symbol} ({interval}) returned no bars")
+        out = self._clean_dataframe(fresh.copy())
+        out['Date'] = pd.to_datetime(out['Date'])
+        existing_path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        if existing_path is not None:
+            try:
+                existing_dates = pd.to_datetime(pd.read_parquet(existing_path, columns=['Date'])['Date'])
+                out['Date'] = self._match_tz(out['Date'], existing_dates)
+            except Exception as e:
+                logger.warning(f"Could not read {existing_path} to match its timezone convention: {e}")
+        out = out.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
+        out['effective_date'] = out['Date']
+        native_cache.write_timeseries(provider_name, symbol, interval, out)
+        path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        write_full_fetch_marker(path, first_bar=pd.Timestamp(out['Date'].iloc[0]).date(),
+                                last_bar=pd.Timestamp(out['Date'].iloc[-1]).date(), rows=len(out))
+        logger.info(f"{provider_name} {symbol} ({interval}): replaced the cache with {len(out)} "
+                    f"freshly fetched bars")
+        return out
+
+    def _record_cold_full_fetch(self, provider_name: str, symbol: str, interval: str) -> None:
+        """A cold daily fill of an ABSENT file is a full-history fetch: record the marker."""
+        from ba2_common.core import native_cache
+        from ba2_common.core.split_basis import write_full_fetch_marker
+        path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        if path is None:
+            return
+        try:
+            dates = pd.to_datetime(pd.read_parquet(path, columns=['Date'])['Date'])
+            if len(dates):
+                write_full_fetch_marker(path, first_bar=pd.Timestamp(dates.iloc[0]).date(),
+                                        last_bar=pd.Timestamp(dates.iloc[-1]).date(), rows=len(dates))
+        except Exception as e:
+            logger.warning(f"Could not record the full-fetch marker for {path}: {e}")
 
     @staticmethod
     def _match_tz(new_dates: 'pd.Series', existing_dates: 'pd.Series') -> 'pd.Series':
@@ -964,7 +1068,10 @@ class MarketDataProviderInterface(DataProviderInterface):
 
             # Save to the parquet as_of store (effective_date == bar Date).
             if use_cache:
+                cold_file = native_cache.find_timeseries_path(provider_name, symbol, interval) is None
                 self._write_ohlcv_parquet(df, provider_name, symbol, interval)
+                if cold_file and self.WRITES_FULL_FETCH_MARKER and interval not in _INTRADAY_INTERVALS:
+                    self._record_cold_full_fetch(provider_name, symbol, interval)
                 # Re-read the as_of slice so the returned frame is byte-equivalent
                 # to a subsequent cache-hit read (same effective_date<=end_date cut).
                 sliced = native_cache.read_timeseries(

@@ -356,6 +356,23 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
 
         return df
 
+    #: FMP delivers daily history split-adjusted as of the fetch, so a cold full fill records a
+    #: full-fetch marker (see ``ba2_common.core.split_basis``).
+    WRITES_FULL_FETCH_MARKER = True
+
+    def _split_calendar(self, symbol: str, interval: str):
+        """FMP's split calendar for ``symbol`` (daily-or-longer intervals only).
+
+        Endpoint: ``/api/v3/historical-price-full/stock_split/{symbol}`` through the existing
+        ``symbol_info.fetch_splits`` (shared rate-limit gate, 1-day live memo) and
+        ``parse_splits``. A split with an unknown ratio is dropped (it cannot be checked)."""
+        if self.TIMEFRAME_MAP.get(interval) != "daily":
+            return None
+        from ba2_common.core.split_basis import CalendarSplit
+        from ba2_providers import symbol_info
+        events = symbol_info.parse_splits(symbol_info.fetch_splits(self.api_key, symbol))
+        return [CalendarSplit(e.date, float(e.ratio)) for e in events if e.ratio]
+
     def get_provider_name(self) -> str:
         """Get the provider name."""
         return "fmp"
