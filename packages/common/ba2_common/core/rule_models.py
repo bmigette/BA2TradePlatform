@@ -27,9 +27,9 @@ DB rows are read-and-normalised, never rewritten.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from ba2_common.core.rule_builders import FIELD_EVENT, FLAG_FIELD_EVENT
 
@@ -75,6 +75,50 @@ def infer_field_type(field: Optional[str], given: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Mode genes (design 2026-09-15 §5 incl. amendment 2). A leaf with ``mode_optimize`` lets the
+# optimizer pick HOW the leaf applies: ``off`` removes it; on a NUMERIC leaf ``below``/``above``
+# mean ``< threshold`` / ``> threshold`` (threshold from the usual ``cond:<id>:value`` gene); on a
+# CATEGORICAL leaf each other choice is an allowed value and becomes ``== choice`` (no threshold
+# gene). ``none`` is never a choice: "no classification" must not be selectable as a regime.
+# ---------------------------------------------------------------------------
+MODE_OFF = "off"
+NUMERIC_MODE_CHOICES = ("off", "below", "above")
+FORBIDDEN_MODE_CHOICES = ("none",)
+
+# Keys whose presence (non-None) makes a leaf NUMERIC (it carries a threshold or its range).
+_THRESHOLD_KEYS = (
+    ("value",),
+    ("value_min", "valueMin"),
+    ("value_max", "valueMax"),
+    ("value_step", "valueStep"),
+    ("value_offset_from", "valueOffsetFrom"),
+)
+
+
+def _first_present(leaf: Mapping[str, Any], keys: tuple) -> Any:
+    """Snake-first lookup (same precedence as the models' AliasChoices)."""
+    for k in keys:
+        if leaf.get(k) is not None:
+            return leaf[k]
+    return None
+
+
+def leaf_mode_kind(leaf: Mapping[str, Any]) -> Optional[str]:
+    """Kind of a mode-carrying leaf given as a plain dict: ``"numeric"`` when it carries any
+    threshold key (``value``, ``value_min``/``valueMin``, ``value_max``/``valueMax``,
+    ``value_step``/``valueStep``, ``value_offset_from``/``valueOffsetFrom``), else
+    ``"categorical"`` -- the same rule ``ConditionLeaf`` validates. ``None`` when the leaf is
+    not a mode leaf at all (no truthy ``mode_optimize``/``modeOptimize`` and no ``mode``)."""
+    mode_opt = _first_present(leaf, ("mode_optimize", "modeOptimize"))
+    if not mode_opt and leaf.get("mode") is None:
+        return None
+    for keys in _THRESHOLD_KEYS:
+        if _first_present(leaf, keys) is not None:
+            return "numeric"
+    return "categorical"
+
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 class ConditionLeaf(BaseModel):
@@ -112,6 +156,65 @@ class ConditionLeaf(BaseModel):
     confirmation_bars_min: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars_min", "confirmationBarsMin"))
     confirmation_bars_max: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars_max", "confirmationBarsMax"))
     confirmation_bars_step: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars_step", "confirmationBarsStep"))
+    #: MODE GENE metadata (design 2026-09-15 §5): ``mode_optimize`` asks the optimizer for a
+    #: categorical ``cond:<id>:mode`` gene over ``mode_choices`` (NUMERIC leaf: exactly
+    #: ``["off","below","above"]``; CATEGORICAL leaf: ``"off"`` plus its allowed values);
+    #: ``mode`` is the RESOLVED token a decode wrote. See :func:`leaf_mode_kind` for the
+    #: numeric/categorical rule and ``_validate_mode_metadata`` for what is rejected.
+    #: MUST be DECLARED fields, for the same reason as ``value_offset_from``: extra='allow'
+    #: keeps unknown keys on the model, but to_canonical_dict rebuilds the dict from declared
+    #: fields only, so undeclared mode keys would be silently dropped by normalize_trade_rules
+    #: and the gene would vanish from every normalised template.
+    mode: Optional[str] = None
+    mode_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("mode_optimize", "modeOptimize"))
+    mode_choices: Optional[List[str]] = Field(default=None, validation_alias=AliasChoices("mode_choices", "modeChoices"))
+
+    @model_validator(mode="after")
+    def _validate_mode_metadata(self) -> "ConditionLeaf":
+        if self.mode_optimize and self.toggle_optimize:
+            raise ValueError(
+                f"condition {self.id!r}: mode_optimize and toggle_optimize cannot both be set "
+                "(the mode gene's 'off' choice already removes the leaf)"
+            )
+        choices = self.mode_choices
+        if choices is not None:
+            if not choices:
+                raise ValueError(f"condition {self.id!r}: mode_choices must not be empty")
+            if choices[0] != MODE_OFF:
+                raise ValueError(f"condition {self.id!r}: mode_choices must start with {MODE_OFF!r}, got {choices!r}")
+            if len(set(choices)) != len(choices):
+                raise ValueError(f"condition {self.id!r}: mode_choices has duplicates: {choices!r}")
+            forbidden = [c for c in choices if c in FORBIDDEN_MODE_CHOICES]
+            if forbidden:
+                raise ValueError(f"condition {self.id!r}: mode_choices may not contain {forbidden!r}")
+        numeric = any(v is not None for v in (
+            self.value, self.value_min, self.value_max, self.value_step, self.value_offset_from))
+        if self.mode_optimize:
+            if choices is None:
+                raise ValueError(f"condition {self.id!r}: mode_optimize requires mode_choices")
+            if numeric:
+                if list(choices) != list(NUMERIC_MODE_CHOICES):
+                    raise ValueError(
+                        f"condition {self.id!r}: a numeric (threshold) leaf's mode_choices must be "
+                        f"exactly {list(NUMERIC_MODE_CHOICES)!r}, got {choices!r}"
+                    )
+            else:
+                if len(choices) < 2:
+                    raise ValueError(
+                        f"condition {self.id!r}: a categorical leaf's mode_choices need at least one "
+                        f"value besides {MODE_OFF!r}"
+                    )
+                bad = [c for c in choices if c in ("below", "above")]
+                if bad:
+                    raise ValueError(
+                        f"condition {self.id!r}: a categorical leaf (no threshold) cannot offer {bad!r}; "
+                        "a threshold makes the leaf numeric"
+                    )
+        if self.mode is not None:
+            allowed = list(choices) if choices is not None else list(NUMERIC_MODE_CHOICES)
+            if self.mode != MODE_OFF and self.mode not in allowed:
+                raise ValueError(f"condition {self.id!r}: unknown mode {self.mode!r}; allowed {allowed!r}")
+        return self
 
     def to_canonical_dict(self) -> Dict[str, Any]:
         ftype = infer_field_type(self.field, self.field_type)
@@ -159,6 +262,14 @@ class ConditionLeaf(BaseModel):
             if val is not None:
                 out[camel] = val
                 out[snake] = val
+        if self.mode is not None:
+            out["mode"] = self.mode
+        if self.mode_optimize is not None:
+            out["modeOptimize"] = self.mode_optimize
+            out["mode_optimize"] = self.mode_optimize
+        if self.mode_choices is not None:
+            out["modeChoices"] = list(self.mode_choices)
+            out["mode_choices"] = list(self.mode_choices)
         if self.id is None:
             out.pop("id")
         return out

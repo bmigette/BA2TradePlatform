@@ -3,6 +3,7 @@ export interface GeneInfo { name: string; choices: number; }
 export interface GeneCount { genes: GeneInfo[]; searchSpace: number; }
 
 interface Node { id: string; optimizeEnabled?: boolean; toggleOptimize?: boolean;
+  mode?: string; modeOptimize?: boolean; modeChoices?: string[];
   valueMin?: number; valueMax?: number; valueStep?: number; conditions?: Node[]; }
 interface Rule { id: string; conditions?: Node; actionValueOptimize?: boolean;
   actionValueMin?: number; actionValueMax?: number; actionValueStep?: number; toggleOptimize?: boolean;

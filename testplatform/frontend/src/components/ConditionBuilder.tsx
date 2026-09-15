@@ -12,6 +12,12 @@ export interface ConditionNode {
   value: number | string | [number, number];
   optimizeEnabled: boolean;
   toggleOptimize?: boolean; // optimizer may enable/disable this condition (cond:<id>:enabled gene)
+  // Mode gene (cond:<id>:mode): 'off' drops the leaf; numeric leaves 'below'/'above' (< / > threshold);
+  // categorical leaves one of their values (== value). Mutually exclusive with toggleOptimize.
+  // Carried through import/export only; no editor control in v1.
+  mode?: 'off' | 'below' | 'above' | string; // resolved token written by a decode
+  modeOptimize?: boolean;
+  modeChoices?: string[]; // 'off' first; numeric leaves exactly ['off','below','above']
   valueMin?: number;
   valueMax?: number;
   valueStep?: number;
@@ -404,6 +410,10 @@ const ConditionBuilder: React.FC<ConditionBuilderProps> = ({
       delete newCondition.valueMin;
       delete newCondition.valueMax;
       delete newCondition.valueStep;
+      // ...and the mode gene (a flag has neither a threshold nor categorical values).
+      delete newCondition.mode;
+      delete newCondition.modeOptimize;
+      delete newCondition.modeChoices;
     } else if (['is_true', 'is_false'].includes(condition.comparison)) {
       // Becoming numeric from a flag: restore a numeric comparison + value.
       newCondition.comparison = numericOperators[0]?.value ?? '>';

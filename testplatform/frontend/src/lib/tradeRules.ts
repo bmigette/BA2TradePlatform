@@ -74,6 +74,8 @@ const UNDROPPABLE = new Set(['buy', 'sell']);
 interface CondNode {
   id?: string; optimizeEnabled?: boolean; toggleOptimize?: boolean;
   optimize_enabled?: boolean; toggle_optimize?: boolean; optimize?: boolean;
+  mode?: string; modeOptimize?: boolean; modeChoices?: string[];
+  mode_optimize?: boolean; mode_choices?: string[];
   valueMin?: number; valueMax?: number; valueStep?: number;
   value_min?: number; value_max?: number; value_step?: number;
   conditions?: CondNode[];

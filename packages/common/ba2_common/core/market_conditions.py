@@ -379,3 +379,128 @@ def compute_market_conditions(o, h, l, c, v) -> MarketConditionValues:
             adx = Observation(None, STATUS_INVALID_PRICES, "adx non-finite")
 
     return MarketConditionValues(trend_slope=trend, adx=adx, rv_ratio=rv)
+
+
+# ---------------------------------------------------------------------------
+# Profile registry (design §3 table, amendment 2). Pure data: every later layer (store columns,
+# engine event types, template leaves, launcher ids, reports) iterates the registered fields
+# instead of hard-coding the ohlcv-v1 trio, so a second profile (e.g. ``ta-structure-v1`` with a
+# CATEGORICAL field) is one ``register_profile`` call.
+# ---------------------------------------------------------------------------
+_FIELD_KINDS = ("numeric", "categorical")
+_ANCHOR_OPS = ("<", ">")
+_FORBIDDEN_CODE = "none"
+
+
+@dataclass(frozen=True)
+class FieldSpec:
+    """One market-condition field. ``name`` is the canonical field name, which is also the
+    ExpertEventType value and the store column. NUMERIC fields carry the GA threshold range and
+    the template's explicit fixed interpretation (``anchor_op``/``anchor_value``); CATEGORICAL
+    fields carry ``codes`` (value -> distinct positive int) and no range. ``"none"`` (no
+    classification) is never a code: it must not be selectable as a regime."""
+
+    name: str                      # canonical field name == ExpertEventType value == store column
+    kind: str                      # "numeric" | "categorical"
+    short: str                     # id suffix used by the launcher: "slope" | "adx" | "rv"
+    searched_v1: bool
+    value_min: Optional[float] = None
+    value_max: Optional[float] = None
+    value_step: Optional[float] = None
+    anchor_op: Optional[str] = None      # the template's explicit fixed interpretation
+    anchor_value: Optional[float] = None
+    codes: Optional[Dict[str, int]] = None   # categorical only; never contains "none"
+    ui_name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.short:
+            raise ValueError(f"FieldSpec needs a name and a short id suffix, got {self.name!r}/{self.short!r}")
+        if self.kind not in _FIELD_KINDS:
+            raise ValueError(f"FieldSpec {self.name!r}: kind must be one of {_FIELD_KINDS}, got {self.kind!r}")
+        ranges = (self.value_min, self.value_max, self.value_step)
+        if self.kind == "categorical":
+            if any(v is not None for v in ranges) or self.anchor_op is not None or self.anchor_value is not None:
+                raise ValueError(f"FieldSpec {self.name!r}: a categorical field carries no threshold range/anchor")
+            if not self.codes:
+                raise ValueError(f"FieldSpec {self.name!r}: a categorical field needs non-empty codes")
+            if _FORBIDDEN_CODE in self.codes:
+                raise ValueError(f"FieldSpec {self.name!r}: {_FORBIDDEN_CODE!r} is never a code")
+            vals = list(self.codes.values())
+            if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in vals):
+                raise ValueError(f"FieldSpec {self.name!r}: codes must be positive ints, got {self.codes!r}")
+            if len(set(vals)) != len(vals):
+                raise ValueError(f"FieldSpec {self.name!r}: code values must be distinct, got {self.codes!r}")
+        else:
+            if self.codes is not None:
+                raise ValueError(f"FieldSpec {self.name!r}: a numeric field carries no codes")
+            if any(v is None for v in ranges):
+                raise ValueError(f"FieldSpec {self.name!r}: a numeric field needs value_min/value_max/value_step")
+            if not (self.value_step > 0 and self.value_max > self.value_min):
+                raise ValueError(
+                    f"FieldSpec {self.name!r}: need value_step > 0 and value_max > value_min, got {ranges!r}")
+            if self.anchor_op not in _ANCHOR_OPS or self.anchor_value is None:
+                raise ValueError(
+                    f"FieldSpec {self.name!r}: a numeric field needs anchor_op in {_ANCHOR_OPS} and an "
+                    f"anchor_value, got {self.anchor_op!r}/{self.anchor_value!r}")
+
+
+@dataclass(frozen=True)
+class ProfileSpec:
+    name: str
+    calc_version: str
+    fields: Tuple[FieldSpec, ...]
+
+
+OHLCV_V1 = ProfileSpec(name="ohlcv-v1", calc_version=CALC_VERSION, fields=(
+    FieldSpec(FIELD_TREND_SLOPE, "numeric", "slope", True, -0.30, 0.30, 0.05, ">", 0.0,
+              ui_name="Underlying trend slope"),
+    FieldSpec(FIELD_ADX, "numeric", "adx", True, 10.0, 40.0, 5.0, "<", 25.0,
+              ui_name="Underlying trend strength"),
+    FieldSpec(FIELD_RV_RATIO, "numeric", "rv", True, 0.50, 2.00, 0.25, "<", 1.0,
+              ui_name="Realized volatility expansion"),
+))
+PROFILES: Dict[str, ProfileSpec] = {OHLCV_V1.name: OHLCV_V1}
+
+
+def _known_fields() -> List[str]:
+    return [f.name for prof in PROFILES.values() for f in prof.fields]
+
+
+def profile_for_field(field: str) -> ProfileSpec:
+    """The registered profile owning ``field``; KeyError naming the known fields otherwise."""
+    for prof in PROFILES.values():
+        for f in prof.fields:
+            if f.name == field:
+                return prof
+    raise KeyError(f"unknown market-condition field {field!r}; known fields: {_known_fields()!r}")
+
+
+def field_spec(field: str) -> FieldSpec:
+    """The registered FieldSpec for ``field``; KeyError naming the known fields otherwise."""
+    for f in profile_for_field(field).fields:
+        if f.name == field:
+            return f
+    raise AssertionError("unreachable")  # profile_for_field only returns a profile owning field
+
+
+def register_profile(spec: ProfileSpec) -> None:
+    """Add a profile. Refuses a duplicate profile name, a field repeated inside the profile, or a
+    field already registered by another profile (field names are global: they are event types
+    and store columns). FieldSpec consistency is validated at FieldSpec construction."""
+    if spec.name in PROFILES:
+        raise ValueError(f"market-condition profile {spec.name!r} is already registered")
+    if not spec.fields:
+        raise ValueError(f"market-condition profile {spec.name!r} has no fields")
+    names = [f.name for f in spec.fields]
+    if len(set(names)) != len(names):
+        raise ValueError(f"market-condition profile {spec.name!r} repeats a field: {names!r}")
+    taken = set(_known_fields())
+    clash = [n for n in names if n in taken]
+    if clash:
+        raise ValueError(f"market-condition fields {clash!r} are already registered by another profile")
+    # Short suffixes become launcher leaf ids (``<rule>-market-<short>``), so they are global too.
+    shorts = [f.short for f in spec.fields]
+    taken_shorts = {f.short for prof in PROFILES.values() for f in prof.fields}
+    if len(set(shorts)) != len(shorts) or any(sh in taken_shorts for sh in shorts):
+        raise ValueError(f"market-condition profile {spec.name!r}: short ids {shorts!r} repeat or are already taken")
+    PROFILES[spec.name] = spec
