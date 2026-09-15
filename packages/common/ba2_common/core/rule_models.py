@@ -85,9 +85,11 @@ MODE_OFF = "off"
 NUMERIC_MODE_CHOICES = ("off", "below", "above")
 FORBIDDEN_MODE_CHOICES = ("none",)
 
-# Keys whose presence (non-None) makes a leaf NUMERIC (it carries a threshold or its range).
+# Keys whose presence (non-None) makes a mode leaf NUMERIC: its threshold RANGE. ``value`` is
+# deliberately NOT one of them: a DECODED categorical leaf carries its registry code as
+# ``value`` (``== float(code)``, with ``mode`` = the chosen value), so ``value`` alone cannot
+# tell the kinds apart.
 _THRESHOLD_KEYS = (
-    ("value",),
     ("value_min", "valueMin"),
     ("value_max", "valueMax"),
     ("value_step", "valueStep"),
@@ -105,8 +107,9 @@ def _first_present(leaf: Mapping[str, Any], keys: tuple) -> Any:
 
 def leaf_mode_kind(leaf: Mapping[str, Any]) -> Optional[str]:
     """Kind of a mode-carrying leaf given as a plain dict: ``"numeric"`` when it carries any
-    threshold key (``value``, ``value_min``/``valueMin``, ``value_max``/``valueMax``,
-    ``value_step``/``valueStep``, ``value_offset_from``/``valueOffsetFrom``), else
+    threshold-range key (``value_min``/``valueMin``, ``value_max``/``valueMax``,
+    ``value_step``/``valueStep``, ``value_offset_from``/``valueOffsetFrom``; NOT ``value``,
+    which a decoded categorical leaf uses for its code), else
     ``"categorical"`` -- the same rule ``ConditionLeaf`` validates. ``None`` when the leaf is
     not a mode leaf at all (no truthy ``mode_optimize``/``modeOptimize`` and no ``mode``)."""
     mode_opt = _first_present(leaf, ("mode_optimize", "modeOptimize"))
@@ -187,8 +190,16 @@ class ConditionLeaf(BaseModel):
             forbidden = [c for c in choices if c in FORBIDDEN_MODE_CHOICES]
             if forbidden:
                 raise ValueError(f"condition {self.id!r}: mode_choices may not contain {forbidden!r}")
+        # KIND: numeric iff a threshold RANGE is declared. ``value`` is excluded on purpose: a
+        # decoded categorical leaf carries ``== float(code)`` in ``value`` (see _THRESHOLD_KEYS).
         numeric = any(v is not None for v in (
-            self.value, self.value_min, self.value_max, self.value_step, self.value_offset_from))
+            self.value_min, self.value_max, self.value_step, self.value_offset_from))
+        has_mode_meta = bool(self.mode_optimize) or self.mode is not None or choices is not None
+        if has_mode_meta and not numeric and self.value is not None and self.mode in (None, MODE_OFF):
+            raise ValueError(
+                f"condition {self.id!r}: a categorical leaf has no threshold (value={self.value!r}); "
+                "only a decoded leaf (mode set to a chosen value) carries its code as value"
+            )
         if self.mode_optimize:
             if choices is None:
                 raise ValueError(f"condition {self.id!r}: mode_optimize requires mode_choices")
@@ -208,7 +219,7 @@ class ConditionLeaf(BaseModel):
                 if bad:
                     raise ValueError(
                         f"condition {self.id!r}: a categorical leaf (no threshold) cannot offer {bad!r}; "
-                        "a threshold makes the leaf numeric"
+                        "a value_min/value_max/value_step range makes the leaf numeric"
                     )
         if self.mode is not None:
             allowed = list(choices) if choices is not None else list(NUMERIC_MODE_CHOICES)
