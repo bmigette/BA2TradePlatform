@@ -1414,13 +1414,38 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     @staticmethod
     def _get_actual_available_balance(account: AccountInterface) -> Optional[float]:
         """The account's REAL spendable balance, straight from the broker — not this expert's
-        virtual-equity slice. Tries ``get_account_info()``'s buying-power-style fields first (the
+        virtual-equity slice. Reads ``get_account_snapshot().buying_power`` first (the adapter's
+        REMAINING stock buying power), then ``get_account_info()``'s buying-power-style fields (the
         true "can I actually place this order" figure); different account implementations name it
         differently (Alpaca/backtest: ``buying_power``; IBKR: ``buying_power``; TastyTrade:
         ``equity_buying_power`` or ``cash_balance``), so several known names are tried in order.
         Falls back to ``get_balance()`` (equity) if none are present — a real, if less precise,
         cap; still catches an account whose overall value has genuinely dropped. None (never a
         fabricated number) if nothing is available."""
+        # The broker-agnostic snapshot FIRST: ``AccountSnapshot.buying_power`` is each
+        # adapter's REMAINING stock buying power (Alpaca: regt_buying_power; TastyTrade:
+        # equity_buying_power; backtest/IBKR: the same figure get_account_info() carries).
+        # Probing the raw ``get_account_info()`` object first read Alpaca's TradeAccount
+        # .buying_power -- the "effective" figure, larger than the Reg-T power the account
+        # can actually hold overnight -- so this clamp and the BP the UI shows disagreed.
+        # The raw probe below stays as the fallback for adapters/fakes without a snapshot.
+        snap_fn = getattr(account, "get_account_snapshot", None)
+        if callable(snap_fn):
+            try:
+                snap_bp = getattr(snap_fn(), "buying_power", None)
+            except Exception:  # noqa: BLE001 — same contract as the info probe: never block sizing
+                snap_bp = None
+            if snap_bp is not None:
+                try:
+                    snap_num = float(snap_bp)
+                except (TypeError, ValueError):
+                    snap_num = None
+                if snap_num is not None and math.isfinite(snap_num):
+                    return snap_num
+                logger.warning(
+                    f"Account {getattr(account, 'id', '?')}: unusable snapshot buying_power "
+                    f"({snap_bp!r}); falling back to get_account_info() for the clamp")
+
         try:
             info = account.get_account_info()
         except Exception:  # noqa: BLE001 — a broker hiccup here must not block the virtual figure

@@ -2038,11 +2038,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     f"run will size whole shares even if the account is fractional-capable"
                 )
 
+        # ``buying_power`` is the REMAINING stock buying power (what
+        # ``get_buying_power`` promises, and what TastyTrade publishes as
+        # equity_buying_power). On Alpaca that is ``regt_buying_power``: the Reg-T
+        # figure, 2 x (equity - initial_margin) on a 2:1 account, which is what the
+        # account can still finance overnight. Alpaca's own ``buying_power`` is the
+        # dashboard's "Effective Buying Power" -- an intraday-oriented number that sat
+        # at $2,077 on a 2:1 account whose Reg-T power was $869 (2026-09-15, operator:
+        # "real BP is the RegT one"). It is kept in ``raw`` for diagnostics only.
+        regt_bp = _f('regt_buying_power')
+        effective_bp = _f('buying_power')
+        if regt_bp is None and effective_bp is not None:
+            logger.warning(
+                f"[Account {self.id}] TradeAccount published buying_power={effective_bp} but "
+                f"no regt_buying_power -- reporting buying power as unknown rather than the "
+                f"effective figure")
         snapshot = AccountSnapshot(
             cash=_f('cash'),
             equity=equity,
             net_liquidation=equity,
-            buying_power=_f('buying_power'),
+            buying_power=regt_bp,
             non_marginable_buying_power=_f('non_marginable_buying_power'),
             option_buying_power=_f('options_buying_power'),
             margin_multiplier=multiplier,
@@ -2052,7 +2067,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             pending_transfer_in=_f('pending_transfer_in'),
             supports_fractional=supports_fractional,
             raw={'account_number': getattr(info, 'account_number', None),
-                 'status': str(getattr(info, 'status', None))},
+                 'status': str(getattr(info, 'status', None)),
+                 # Alpaca's effective / day-trading figures, for diagnostics only --
+                 # NOT the remaining buying power the platform sizes and displays with.
+                 'effective_buying_power': effective_bp,
+                 'daytrading_buying_power': _f('daytrading_buying_power')},
         )
         self._account_snapshot_cache = (time.time(), snapshot)
         return snapshot

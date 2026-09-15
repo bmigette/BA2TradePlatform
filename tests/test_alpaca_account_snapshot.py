@@ -34,7 +34,8 @@ def _trade_account(**overrides):
         status=AccountStatus.ACTIVE,
         cash="1000.50",
         equity="25000.00",
-        buying_power="50000.00",
+        buying_power="50000.00",          # Alpaca's EFFECTIVE figure -- diagnostics only
+        regt_buying_power="20000.00",     # the remaining (Reg-T) power the platform reports
         non_marginable_buying_power="1000.50",
         multiplier="2",
         long_market_value="24000.00",
@@ -55,7 +56,8 @@ def test_snapshot_coerces_alpacas_string_money_fields_to_floats():
     assert snap.cash == 1000.50
     assert snap.equity == 25000.00
     assert snap.net_liquidation == 25000.00
-    assert snap.buying_power == 50000.00
+    assert snap.buying_power == 20000.00          # regt_buying_power, never the effective one
+    assert snap.raw["effective_buying_power"] == 50000.00
     assert snap.non_marginable_buying_power == 1000.50
     assert snap.long_market_value == 24000.00
     assert snap.short_market_value == 0.0
@@ -133,7 +135,7 @@ def test_snapshot_still_returns_the_money_when_account_configurations_fails():
 
     snap = acct.get_account_snapshot()
 
-    assert snap.buying_power == 50000.00
+    assert snap.buying_power == 20000.00
     assert snap.supports_fractional is False
 
 
@@ -161,7 +163,7 @@ def test_snapshot_recovers_fractional_via_raw_fallback_when_the_typed_parse_fail
     snap = acct.get_account_snapshot()
 
     assert snap.supports_fractional is True
-    assert snap.buying_power == 50000.00
+    assert snap.buying_power == 20000.00
     acct.client.get.assert_called_once_with("/account/configurations")
 
 
@@ -185,7 +187,7 @@ def test_snapshot_raw_fallback_that_also_fails_still_reports_the_money():
     snap = acct.get_account_snapshot()
 
     assert snap.supports_fractional is False
-    assert snap.buying_power == 50000.00
+    assert snap.buying_power == 20000.00
 
 
 def test_snapshot_raw_fallback_with_no_fractional_key_at_all_reports_false():
@@ -473,3 +475,29 @@ def test_an_order_that_never_reached_the_broker_is_not_asked_about():
     acct = _bare_account()
     assert acct.get_broker_order_remaining_quantity(_local_entry(broker_order_id=None)) is None
     acct.client.get_order_by_id.assert_not_called()
+
+
+def test_snapshot_buying_power_is_regt_not_alpacas_effective_figure():
+    """2026-09-15: a 2:1 account showed effective buying_power $2,077 while its Reg-T power was
+    $869 -- the platform must report the one the account can actually hold overnight."""
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account(buying_power="2077.27",
+                                                          regt_buying_power="869.43")
+    acct.client.get_account_configurations.return_value = MagicMock(fractional_trading=True)
+
+    snap = acct.get_account_snapshot()
+
+    assert snap.buying_power == 869.43
+    assert snap.raw["effective_buying_power"] == 2077.27
+
+
+def test_snapshot_without_regt_reports_buying_power_unknown_not_effective():
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account(buying_power="2077.27",
+                                                          regt_buying_power=None)
+    acct.client.get_account_configurations.return_value = MagicMock(fractional_trading=True)
+
+    snap = acct.get_account_snapshot()
+
+    assert snap.buying_power is None
+    assert snap.raw["effective_buying_power"] == 2077.27
