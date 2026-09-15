@@ -28,8 +28,12 @@ Numerical contract (§3.1), window indexed 0..127, float64, unrounded:
 Reproducibility contract (bit-for-bit): ALL reductions -- every seed mean and
 both RV sample standard deviations -- use ``math.fsum`` (correctly rounded,
 independent of summation order): ``mean = fsum(xs)/n`` and
-``std = sqrt(fsum((x - mean)**2 for x in xs) / (n - 1))``.  Log returns use
-``math.log(C[j]/C[j-1])`` per element.  Every recurrence is an explicit
+``std = sqrt(fsum(d*d for d = x - mean) / (n - 1))`` -- squares are ``d*d``,
+never ``pow`` (``**``), because IEEE multiplication is correctly rounded
+everywhere while the C library ``pow`` is not.  Log returns use
+``math.log(C[j]/C[j-1])`` per element; ``math.log`` is the one remaining
+platform-library dependency and is not guaranteed correctly rounded between
+MSVC and glibc (``sqrt`` is exact).  Every recurrence is an explicit
 left-to-right loop over Python floats written exactly as above.  Only exact
 elementwise IEEE operations (subtraction, abs, max, comparisons) are
 vectorised.  A batch implementation must reproduce these results with ``==``;
@@ -43,7 +47,7 @@ Status rules (an invalid observation never becomes 0, a neutral regime or a pass
 * Any non-finite or non-positive o/h/l/c, ``h < l``, ``h < max(o, c)`` or
   ``l > min(o, c)`` -> all three ``invalid_prices``.  The reason is
   deterministic: the LOWEST bad index, naming every problem at that index,
-  e.g. ``"invalid_prices: index 50 (close non-finite)"``.  Volume does not
+  e.g. ``"index 50 (close non-finite)"``.  Volume does not
   enter any v1 measurement; it is only checked to be finite and non-negative
   (failure reported the same way).
 * ``ATR[127] <= 0`` -> slope and ADX ``invalid_prices`` ("atr<=0"); the RV
@@ -165,7 +169,8 @@ def _fsum_mean(xs: Sequence[float]) -> float:
 
 def _fsum_sample_std(xs: Sequence[float]) -> float:
     m = _fsum_mean(xs)
-    return math.sqrt(math.fsum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+    total = math.fsum((x - m) * (x - m) for x in xs)  # d*d, never pow
+    return math.sqrt(total / (len(xs) - 1))
 
 
 def ema_sma_seeded(c: np.ndarray, period: int = 50) -> np.ndarray:
@@ -276,19 +281,19 @@ def realized_vol_ratio(c: np.ndarray) -> Observation:
     need = _RV_LONG + 1
     if len(c) < need:
         return Observation(None, STATUS_INSUFFICIENT_HISTORY,
-                           f"rv ratio needs {need} closes, got {len(c)}")
+                           f"insufficient history: {len(c)} of {need} closes")
     tail = c[-need:]
     bad = np.flatnonzero(~np.isfinite(tail) | (tail <= 0))
     if bad.size:
         idx = len(c) - need + int(bad[0])
         return Observation(None, STATUS_INVALID_PRICES,
-                           f"invalid_prices: index {idx} (close non-finite or non-positive)")
+                           f"index {idx} (close non-finite or non-positive)")
     tl = tail.tolist()
     r = [math.log(tl[j] / tl[j - 1]) for j in range(1, len(tl))]
     std_long = _fsum_sample_std(r[-_RV_LONG:])
     std_short = _fsum_sample_std(r[-_RV_SHORT:])
     if not std_long > 0:
-        return Observation(None, STATUS_INVALID_PRICES, "zero 20-session realized volatility (denominator)")
+        return Observation(None, STATUS_INVALID_PRICES, "zero 20-session volatility")
     value = std_short / std_long
     if not math.isfinite(value):
         # Defensive: unreachable for finite positive closes (finite std / positive std).
@@ -322,7 +327,7 @@ def _invalid_bar_reason(o, h, l, c, v) -> Optional[str]:
         return None
     i = int(bad[0])
     labels = [label for label, mask in checks if mask[i]]
-    return f"invalid_prices: index {i} ({', '.join(labels)})"
+    return f"index {i} ({', '.join(labels)})"
 
 
 def compute_market_conditions(o, h, l, c, v) -> MarketConditionValues:
@@ -338,7 +343,7 @@ def compute_market_conditions(o, h, l, c, v) -> MarketConditionValues:
     if n > WINDOW:
         raise ValueError(f"expected at most {WINDOW} bars (pre-slice the window), got {n}")
     if n < WINDOW:
-        return _all_three(STATUS_INSUFFICIENT_HISTORY, f"{n} of {WINDOW} bars")
+        return _all_three(STATUS_INSUFFICIENT_HISTORY, f"insufficient history: {n} of {WINDOW} bars")
 
     problem = _invalid_bar_reason(o, h, l, c, v)
     if problem is not None:

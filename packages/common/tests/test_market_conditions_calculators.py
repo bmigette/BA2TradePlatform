@@ -48,7 +48,7 @@ def _ref_mean(xs):
 
 def _ref_sstd(xs):
     m = _ref_mean(xs)
-    return math.sqrt(math.fsum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+    return math.sqrt(math.fsum((x - m) * (x - m) for x in xs) / (len(xs) - 1))
 
 
 def _ref_tr(H, L, C):
@@ -142,7 +142,6 @@ def test_trend_slope_matches_independent_reference():
     res = compute_market_conditions(o, h, l, c, v)
     assert res.trend_slope.status == STATUS_VALID
     assert res.trend_slope.value == expected
-    assert res.trend_slope.value == pytest.approx(expected, abs=1e-12)
     # The EMA helper pins the seed and the recurrence too.
     ema = ema_sma_seeded(c, 50)
     assert np.all(np.isnan(ema[:49]))
@@ -158,7 +157,6 @@ def test_adx_intermediates_are_pinned_on_a_reference_path():
         assert pdi[j] == pdi_r[j]
         assert mdi[j] == mdi_r[j]
         assert dx[j] == dx_r[j]
-        assert dx[j] == pytest.approx(dx_r[j], abs=1e-12)
     assert adx[27] == adx_r[27]
     assert adx[127] == adx_r[127]
     assert np.all(np.isnan(pdi[:14])) and np.all(np.isnan(dx[:14]))
@@ -242,7 +240,7 @@ def test_short_window_is_insufficient_history_for_all_three():
     for obs in (res.trend_slope, res.adx, res.rv_ratio):
         assert obs.status == STATUS_INSUFFICIENT_HISTORY
         assert obs.value is None
-        assert "100" in obs.reason
+        assert obs.reason == "insufficient history: 100 of 128 bars"
 
 
 def test_nonfinite_or_nonpositive_price_is_invalid_prices_never_substituted():
@@ -251,14 +249,14 @@ def test_nonfinite_or_nonpositive_price_is_invalid_prices_never_substituted():
     res = compute_market_conditions(o, h, l, c, v)
     for obs in (res.trend_slope, res.adx, res.rv_ratio):
         assert obs.status == STATUS_INVALID_PRICES and obs.value is None
-        assert obs.reason.startswith("invalid_prices: index 60 (")
+        assert obs.reason.startswith("index 60 (")
         assert "close non-finite" in obs.reason
     o, h, l, c, v = _bars(_walk(WINDOW, seed=2))
     c[5] = 0.0
     res = compute_market_conditions(o, h, l, c, v)
     for obs in (res.trend_slope, res.adx, res.rv_ratio):
         assert obs.status == STATUS_INVALID_PRICES and obs.value is None
-        assert obs.reason.startswith("invalid_prices: index 5 (")
+        assert obs.reason.startswith("index 5 (")
         assert "close non-positive" in obs.reason
 
 
@@ -268,7 +266,7 @@ def test_ohlc_ordering_violation_is_invalid_prices():
     res = compute_market_conditions(o, h, l, c, v)
     for obs in (res.trend_slope, res.adx, res.rv_ratio):
         assert obs.status == STATUS_INVALID_PRICES and obs.value is None
-        assert obs.reason.startswith("invalid_prices: index 30 (")
+        assert obs.reason.startswith("index 30 (")
         assert "high < low" in obs.reason
 
 
@@ -325,7 +323,7 @@ def test_invalid_price_reason_reports_lowest_index_with_every_problem_there():
     v[50] = -1.0              # lower index: two problems at the same bar
     o[50] = np.nan            # NaN does not also trip the ordering checks
     res = compute_market_conditions(o, h, l, c, v)
-    assert res.trend_slope.reason == "invalid_prices: index 50 (open non-finite, volume negative)"
+    assert res.trend_slope.reason == "index 50 (open non-finite, volume negative)"
     assert res.adx.reason == res.rv_ratio.reason == res.trend_slope.reason
     # order of discovery does not matter: swapping which field is bad first
     o, h, l, c, v = _bars(_walk(WINDOW, seed=14))
@@ -333,7 +331,7 @@ def test_invalid_price_reason_reports_lowest_index_with_every_problem_there():
     h[33] = l[33] - 1.0
     res = compute_market_conditions(o, h, l, c, v)
     assert res.trend_slope.reason == \
-        "invalid_prices: index 33 (high < low, high < max(open, close))"
+        "index 33 (high < low, high < max(open, close))"
 
 
 def test_window_invariance_extra_history_does_not_change_values():
