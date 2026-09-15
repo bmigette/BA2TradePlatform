@@ -6,7 +6,7 @@ EventAction shape the TradeActionEvaluator parses (event_type/operator/value, ac
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ba2_common.logger import logger
 from ba2_common.core.types import (
@@ -15,6 +15,7 @@ from ba2_common.core.types import (
     ReferenceValue,
     is_option_action,
 )
+from ba2_common.core.market_conditions import PROFILES
 
 # Strategy condition-tree field -> ExpertEventType for value (N_*) gates. These are the
 # numeric fields an entry/exit condition tree tunes on; an unknown field is skipped (it
@@ -87,6 +88,29 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "rec_days_to_earnings": ExpertEventType.N_REC_DAYS_TO_EARNINGS,
     "days_after_event": ExpertEventType.N_DAYS_AFTER_EVENT,
 }
+
+
+def register_market_condition_field_events() -> List[str]:
+    """Market-condition entry gates (design 2026-09-15): ``FIELD_EVENT[field] =
+    ExpertEventType(field)`` for every field of every registered profile -- GENERATED from the
+    registry, not listed above. Idempotent; runs at import and is re-callable after
+    ``market_conditions.register_profile``. A field without an enum member is skipped with a
+    WARNING and returned. Guarded by tests/test_condition_registry_coverage.py (every
+    CONDITION_MAP entry needs a mapping here) and tests/test_market_condition_conditions.py
+    (every registered field has an ExpertEventType member)."""
+    skipped: List[str] = []
+    for prof in PROFILES.values():
+        for spec in prof.fields:
+            try:
+                FIELD_EVENT[spec.name] = ExpertEventType(spec.name)
+            except ValueError:
+                logger.warning(f"Market-condition field {spec.name!r} has no ExpertEventType "
+                               f"member; a rule leaf naming it is not mapped")
+                skipped.append(spec.name)
+    return skipped
+
+
+register_market_condition_field_events()
 
 # Flag (boolean) condition fields -> ExpertEventType (no operator/value). Used by exit
 # (open_positions) rules whose triggers include sentiment / term / risk / rating-change /

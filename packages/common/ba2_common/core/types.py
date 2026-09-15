@@ -509,6 +509,16 @@ class ExpertEventType(str, Enum):
     # underlying is no longer the position that was opened. Unevaluable when no quote carries
     # a delta, which is every account whose data source publishes none.
     N_LONG_LEG_DELTA = "long_leg_delta"
+    # MARKET-CONDITION ENTRY GATES (design 2026-09-15 option-market-condition-genes). ONE
+    # member per field registered in ``market_conditions.PROFILES``, VALUE == the canonical
+    # field name. Enum members cannot be added after class creation, so a newly registered
+    # profile must add its members here explicitly -- tests/test_market_condition_conditions.py
+    # fails until it does. The condition classes and rule_builders mappings are GENERATED from
+    # the registry. UNEVALUABLE (never fires, in either direction) without a wired
+    # MarketConditionContext or on any non-valid observation. Profile ``ohlcv-v1``:
+    N_UNDERLYING_TREND_SLOPE = "underlying_trend_slope_50_atr14"
+    N_UNDERLYING_ADX = "underlying_adx_14"
+    N_UNDERLYING_RV_RATIO = "underlying_realized_vol_ratio_5_20"
 
 
 class ExpertActionType(str, Enum):
@@ -659,6 +669,9 @@ def get_numeric_event_values():
         ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY.value,
         ExpertEventType.N_CREDIT_DECAYED_PCT.value,
         ExpertEventType.N_LONG_LEG_DELTA.value,
+        ExpertEventType.N_UNDERLYING_TREND_SLOPE.value,
+        ExpertEventType.N_UNDERLYING_ADX.value,
+        ExpertEventType.N_UNDERLYING_RV_RATIO.value,
     ]
 
 

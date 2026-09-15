@@ -6,7 +6,7 @@ that can be used in rulesets and automated trading decisions.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Callable, Type
 from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
 
@@ -28,6 +28,16 @@ from ba2_common.core.earnings_stamp import (
     order_event_date,
     stamped_days_to_earnings,
 )
+# Market-condition entry gates (design 2026-09-15 option-market-condition-genes): the profile
+# registry the condition classes are GENERATED from, and the evaluation-scoped context type.
+from ba2_common.core.market_conditions import (
+    PROFILES as _MC_PROFILES,
+    STATUS_MISSING_SESSION as _MC_STATUS_MISSING_SESSION,
+    STATUS_NO_CONTEXT as _MC_STATUS_NO_CONTEXT,
+    STATUS_VALID as _MC_STATUS_VALID,
+    field_spec as _mc_field_spec,
+)
+from ba2_common.core.market_condition_context import MarketConditionContext
 
 
 # --- Provider-injection seam -------------------------------------------------
@@ -59,6 +69,52 @@ def set_provider_resolver(fn):
 def get_provider_resolver():
     """Return the injected provider resolver (or None if not configured)."""
     return _provider_resolver
+
+
+# --- Market-condition context seam --------------------------------------------
+# The market-condition gates need an evaluation-scoped MarketConditionContext (decision time,
+# session, reader, ...). Neither create_condition nor TradeActionEvaluator threads anything but
+# ``account``, so -- exactly like the provider seam above -- the host installs a resolver:
+#   fn(account, instrument_name, expert_recommendation) -> Optional[MarketConditionContext]
+# It is called LAZILY, only from MarketConditionCompare.evaluate(): a ruleset with no market
+# leaves never reaches it, so the gates being off costs no clock or market-data read. With no
+# resolver (or a resolver returning None) the gate is UNKNOWN (status ``no_context``) and never
+# passes -- there is deliberately no fallback to an end-of-day helper.
+_market_condition_context_resolver: Optional[Callable[..., Optional[MarketConditionContext]]] = None
+
+#: Reason recorded when no context could be resolved for a market-condition gate.
+NO_MARKET_CONDITION_CONTEXT_REASON = "market-condition profile not wired for this process"
+
+
+def set_market_condition_context_resolver(fn) -> None:
+    """Install (or, with None, remove) the market-condition context resolver.
+
+    fn(account, instrument_name, expert_recommendation) -> Optional[MarketConditionContext].
+    Injected by the backtest / live host; the previous resolver is replaced.
+    """
+    global _market_condition_context_resolver
+    _market_condition_context_resolver = fn
+
+
+def get_market_condition_context_resolver():
+    """Return the installed market-condition context resolver (or None)."""
+    return _market_condition_context_resolver
+
+
+def resolve_market_condition_context(account, instrument_name: str,
+                                     expert_recommendation) -> Optional[MarketConditionContext]:
+    """Resolve the context for one evaluation; None when no resolver is installed or the
+    resolver has no context for it. A resolver returning anything else is a wiring defect and
+    raises (it must never be mistaken for a usable context)."""
+    fn = _market_condition_context_resolver
+    if fn is None:
+        return None
+    ctx = fn(account, instrument_name, expert_recommendation)
+    if ctx is not None and not isinstance(ctx, MarketConditionContext):
+        raise TypeError(
+            f"market-condition context resolver returned {type(ctx).__name__}, "
+            f"expected MarketConditionContext or None")
+    return ctx
 
 
 def _is_missing(value) -> bool:
@@ -3996,6 +4052,125 @@ class HasAssignedSharesCondition(FlagCondition):
         return f"Assigned shares found: {'Yes' if has else 'No'}"
 
 
+class MarketConditionCompare(CompareCondition):
+    """Base of the GENERATED market-condition gates (one subclass per registered field; see
+    ``market_condition_condition_class``). Design 2026-09-15 §4.1/§5/§7.
+
+    Reads the observation for ``FIELD`` from the evaluation's ``MarketConditionContext``
+    (resolved lazily through the seam above) at the context's ``prior_session``. NUMERIC
+    fields are decoded to strict ``<``/``>`` (equality passes neither); CATEGORICAL fields to
+    ``==`` against the float code.
+
+    UNKNOWN NEVER PASSES: no context (``no_context``), no feature row (``missing_session``), a
+    row that does not carry the field (``no_context`` -- the reader was built for a different
+    profile), or any non-``valid`` observation -> ``calculated_value`` None, ``evaluate()``
+    False for EVERY operator, and ``last_status``/``last_reason`` say why. The recorder is
+    called only on a valid read. Reader/resolver exceptions propagate: broken wiring is a
+    defect, not an "unknown".
+    """
+
+    #: Canonical market-condition field name (== ExpertEventType value). Set by the factory.
+    FIELD: str = ""
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, operator_str, value,
+                         existing_order)
+        if not self.FIELD:
+            raise TypeError(f"{type(self).__name__} has no FIELD: build it with "
+                            f"market_condition_condition_class(field)")
+        self.last_status: Optional[str] = None
+        self.last_reason: str = ""
+
+    def _unknown(self, status: str, reason: str) -> bool:
+        self.calculated_value = None
+        self.last_status = status
+        self.last_reason = reason
+        logger.debug(f"Market condition {self.FIELD} for {self.instrument_name} is unknown "
+                     f"({status}): {reason}")
+        return False
+
+    def evaluate(self) -> bool:
+        ctx = resolve_market_condition_context(self.account, self.instrument_name,
+                                               self.expert_recommendation)
+        if ctx is None:
+            return self._unknown(_MC_STATUS_NO_CONTEXT, NO_MARKET_CONDITION_CONTEXT_REASON)
+        session = ctx.prior_session
+        values = ctx.reader.observe(self.instrument_name, session)
+        if values is None:
+            return self._unknown(_MC_STATUS_MISSING_SESSION,
+                                 f"no feature row for {self.instrument_name} at {session}")
+        obs = values.by_field().get(self.FIELD)
+        if obs is None:
+            return self._unknown(
+                _MC_STATUS_NO_CONTEXT,
+                f"feature row for {self.instrument_name} at {session} carries no {self.FIELD} "
+                f"(reader not built for this field's profile)")
+        if obs.status != _MC_STATUS_VALID:
+            return self._unknown(obs.status, obs.reason)
+        self.calculated_value = obs.value
+        self.last_status = obs.status
+        self.last_reason = obs.reason
+        if ctx.recorder is not None:
+            ctx.recorder(self.instrument_name, session, values)
+        return self.operator_func(obs.value, self.value)
+
+    def _code_name(self, code) -> Optional[str]:
+        """The categorical value name for ``code`` (None for numeric/unregistered fields)."""
+        spec = _registered_market_fields().get(self.FIELD)
+        codes = spec.codes if spec is not None else None
+        if not codes:
+            return None
+        for name, c in codes.items():
+            if float(c) == float(code):
+                return name
+        return None
+
+    def get_description(self) -> str:
+        shown = self.value
+        name = self._code_name(self.value) if self.operator_str == "==" else None
+        if name is not None:
+            shown = f"{name} ({float(self.value):g})"
+        return f"Check if {self.instrument_name} {self.FIELD} is {self.operator_str} {shown}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return f"unknown ({self.last_status})" if self.last_status else None
+        name = self._code_name(self.calculated_value)
+        if name is not None:
+            return name
+        return f"{self.calculated_value:.4g}"
+
+
+def _registered_market_fields() -> Dict[str, Any]:
+    """``{field name: FieldSpec}`` across every registered market-condition profile."""
+    return {f.name: f for prof in _MC_PROFILES.values() for f in prof.fields}
+
+
+_MARKET_CONDITION_CLASSES: Dict[str, Type[MarketConditionCompare]] = {}
+
+
+def _class_name_for_field(field: str) -> str:
+    return "".join(p[:1].upper() + p[1:] for p in field.split("_") if p) + "Condition"
+
+
+def market_condition_condition_class(field: str) -> Type[MarketConditionCompare]:
+    """The (memoised) ``MarketConditionCompare`` subclass for a REGISTERED field, e.g.
+    ``underlying_adx_14`` -> ``UnderlyingAdx14Condition``. KeyError for an unknown field."""
+    cls = _MARKET_CONDITION_CLASSES.get(field)
+    if cls is not None:
+        return cls
+    spec = _mc_field_spec(field)  # KeyError naming the known fields
+    cls = type(_class_name_for_field(field), (MarketConditionCompare,), {
+        "FIELD": spec.name,
+        "__doc__": f"Market-condition gate on {spec.name} ({spec.kind}); see MarketConditionCompare.",
+        "__module__": __name__,
+    })
+    _MARKET_CONDITION_CLASSES[field] = cls
+    return cls
+
+
 # Factory function to create conditions based on event type
 
 # (from_rating, to_rating) for the six 3-bucket rating TRANSITION events, all served by
@@ -4076,6 +4251,41 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
     ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
 }
+
+
+def register_market_condition_conditions() -> List[str]:
+    """Map every field of every registered market-condition profile into ``CONDITION_MAP``
+    (``ExpertEventType(field)`` -> its generated class). Idempotent; called at import for the
+    profiles registered then, and re-callable after ``market_conditions.register_profile``.
+
+    A field with no ``ExpertEventType`` member (enum members cannot be added at runtime) is
+    SKIPPED with a WARNING and its name returned -- tests/test_market_condition_conditions.py
+    fails for any registered field without a member, so a skip never survives CI. Raises if an
+    event type is already mapped to a different class (a registry clash)."""
+    skipped: List[str] = []
+    for field in _registered_market_fields():
+        try:
+            event = ExpertEventType(field)
+        except ValueError:
+            logger.warning(f"Market-condition field {field!r} has no ExpertEventType member; "
+                           f"no condition registered for it")
+            skipped.append(field)
+            continue
+        cls = market_condition_condition_class(field)
+        existing = CONDITION_MAP.get(event)
+        if existing is not None and existing is not cls:
+            raise ValueError(f"CONDITION_MAP[{event.name}] is already {existing.__name__}; "
+                             f"refusing to replace it with {cls.__name__}")
+        CONDITION_MAP[event] = cls
+    return skipped
+
+
+register_market_condition_conditions()
+
+#: Explicit names for the ohlcv-v1 gates (the generated classes, not hand-written ones).
+UnderlyingTrendSlopeCondition = market_condition_condition_class(ExpertEventType.N_UNDERLYING_TREND_SLOPE.value)
+UnderlyingAdxCondition = market_condition_condition_class(ExpertEventType.N_UNDERLYING_ADX.value)
+UnderlyingRealizedVolRatioCondition = market_condition_condition_class(ExpertEventType.N_UNDERLYING_RV_RATIO.value)
 
 
 def create_condition(event_type: ExpertEventType, account: AccountInterface,
