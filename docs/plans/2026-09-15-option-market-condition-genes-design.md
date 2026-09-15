@@ -9,6 +9,14 @@ the first delivery, including preparation of distributed workers before trials.
 Follow-up scope: the same opt-in conditions also cover Options Grid 2 and the
 separate convex-harvest grid, with per-arm genes and preserved trade lifecycles.
 
+Amendment 2 (2026-09-15, chart structure): section 3.2 adds a second feature
+profile, `ta-structure-v1` — support/resistance distance, regression channel,
+prior-range breakout and swing structure (BOS/CHoCH) — computed in the same
+store, window and timing contract. All conditions in this document, old and
+new, are available to **both option structures and the equity strategies
+S1–S7**. A new equity grid using them follows; existing equity results and
+the running goal2020 outputs are not re-run or re-labelled.
+
 ## 1. Intended result
 
 Each option structure can learn whether to require a rising/falling underlying,
@@ -116,6 +124,155 @@ nonpositive close or nonfinite input is unknown. Never substitute 1 or infinity.
 differences caused by live and BT supplying different amounts of prehistory.
 The calculation version records this finite-window convention. A faster batch
 implementation must reproduce the reference results and condition decisions.
+
+### 3.2 Chart-structure measurements — second profile `ta-structure-v1`
+
+**Rule that governs everything in this section: every field is precomputed in
+warmup, once per (symbol, session), and stored as a float in the feature store
+of section 4.3. A trial never detects a pattern. A condition never touches a
+DataFrame or a bar series. At evaluation time the work is one array lookup by
+(symbol index, session index) followed by one numeric comparison.**
+
+This is not an optimisation choice; it is what makes chart structure feasible
+in the GA at all. Today's bar-derived conditions
+(`PercentBelowRecentHighCondition` and its siblings) fetch a DataFrame and
+slice it inside `evaluate()`, once per symbol, per bar, per individual, per
+generation. Pivot detection, regression fitting and swing sequencing are each
+O(window) per session; doing them where those conditions do their work would
+be one to two orders of magnitude slower than the slowest condition we have.
+Precomputed, the whole profile costs one vectorised pass per symbol at warmup
+(pivots by shifted comparisons, regression by cumulative sums) and nothing per
+trial. None of these fields is recursive, so — unlike EMA/ADX — a batch
+implementation over full history and the 128-bar reference implementation
+agree exactly, and window invariance (section 8, item 2) holds by construction.
+
+Chart patterns are drawings; a searchable condition needs a scalar. Each
+pattern below is therefore reduced to its **components**, and no composite
+detector ("flag", "channel breakout") is shipped. A flag, for instance, is
+what the GA can compose from an existing positive trend slope, a negative
+20-session channel slope and a close beyond the prior 20-session high. Keeping
+the parts separate keeps every number meaningful in a report and leaves the
+pattern definition to the search rather than to us.
+
+Same input as section 3: one validated window of 128 regular-session daily
+OHLCV bars, the same provider, adjustment basis and `prior_session_v1` cutoff
+(section 4), the same ATR14 series as section 3.1. Fixed conventions of this
+profile: pivot span **K = 3**, channel lookback **20 sessions**, level
+tolerance **0.25 ATR14**. They are part of the calculator version, not genes.
+
+| UI name | Canonical field | Measurement | Searched in v1 | Initial threshold search |
+|---|---|---|---|---|
+| Distance to support | `structure_dist_support_atr` | (close − nearest confirmed pivot low below close) / ATR14 | yes | 0.0 to 5.0, step 0.5 |
+| Distance to resistance | `structure_dist_resistance_atr` | (nearest confirmed pivot high above close − close) / ATR14 | yes | 0.0 to 5.0, step 0.5 |
+| Support strength | `structure_support_touches` | confirmed pivot lows within ±0.25 ATR of that support level | no | 1 to 5, step 1 |
+| Resistance strength | `structure_resistance_touches` | confirmed pivot highs within ±0.25 ATR of that resistance level | no | 1 to 5, step 1 |
+| Channel slope | `channel_slope_20_atr` | OLS slope of close over the last 20 sessions / ATR14, per session | no | −0.30 to +0.30, step 0.05 |
+| Channel width | `channel_width_20_atr` | 4 × residual standard deviation / ATR14 | no | 1.0 to 8.0, step 0.5 |
+| Position in channel | `channel_pos_20` | where the close sits between the −2σ and +2σ regression bands, 0 = lower, 1 = upper, unclamped | yes | 0.0 to 1.0, step 0.1 |
+| Close vs prior 20-session high | `close_vs_prior_high_20_atr` | (close − highest high of the 20 sessions before it) / ATR14, signed | yes | −3.0 to +2.0, step 0.25 |
+| Close vs prior 20-session low | `close_vs_prior_low_20_atr` | (close − lowest low of the 20 sessions before it) / ATR14, signed | no | −2.0 to +3.0, step 0.25 |
+| Swing structure | `structure_state` | categorical: `bull` (higher high and higher low), `bear` (lower high and lower low), `none` | yes | mode gene only: `off`, `bull`, `bear` |
+| Sessions since break of structure | `structure_bars_since_bos` | sessions since the close last broke the previous swing in the direction of structure | no | 0 to 60, step 5 |
+| Sessions since change of character | `structure_bars_since_choch` | sessions since the close last broke the previous swing against structure | no | 0 to 60, step 5 |
+
+**Searched in v1** marks the five leaves the first `ta-structure-v1` launcher
+profile appends to an entry arm: four numeric and one categorical, **nine
+genes per arm** on top of the six from section 3. Every field in the table is
+computed and stored regardless — storage is a float32 per field per row and
+the marginal warmup cost of the unsearched fields is nil — so a later profile
+can search the rest without re-warming. The subset is a search-space decision
+(section 5 warns against widening a space silently), not a data decision, and
+it can be revised before the first launch.
+
+As in section 3, the ranges are starting bounds, not estimates of good values.
+Report winners at a boundary.
+
+### 3.3 Exact numerical contract for chart-structure fields
+
+Index the window 0..127; C, H, L are close, high, low; ATR is the section 3.1
+ATR14 series and every division below is by `ATR[127]`. ATR <= 0 makes every
+field of this profile unknown. Comparisons use unrounded values.
+
+**Confirmed pivots (the lookahead guard for the whole profile)**
+
+A pivot high at index p (K <= p <= 127 − K) requires `H[p] > H[p−i]` and
+`H[p] > H[p+i]` for every i in 1..K, strictly. A pivot low is the mirror on L
+with `<`. Ties are not pivots. A pivot at p is **confirmed at index p + K**
+and does not exist before that: for the row ending at session 127, the usable
+pivots are exactly those with p <= 127 − K. This is how a trader sees a level
+appear — three sessions after the extreme — and it is what makes these fields
+free of lookahead. A full-history batch implementation must therefore compute
+the row for session t from pivots with p + K <= t, never from pivots the
+future confirms.
+
+**Support and resistance**
+
+- Resistance level R = the smallest confirmed pivot-high price strictly above
+  `C[127]`; support level S = the largest confirmed pivot-low price strictly
+  below `C[127]`. Ties between equal pivot prices are one level.
+- `structure_dist_resistance_atr = (R − C[127]) / ATR[127]`;
+  `structure_dist_support_atr = (C[127] − S) / ATR[127]`. Both are >= 0 by
+  construction.
+- No qualifying pivot in the window makes the corresponding field **unknown**.
+  Never 0 (which would say "sitting on the level"), never a sentinel, never
+  the window's extreme price: a window with no pivot above the close does not
+  have a resistance at its highest bar.
+- `structure_resistance_touches` = the number of confirmed pivot highs whose
+  price lies within `R ± 0.25 × ATR[127]`, including the one that defined R;
+  support mirrors it. Minimum 1 when the level exists; unknown when it does not.
+
+**Regression channel over 20 sessions**
+
+Over indices 108..127 let x = 0..19 and y = C. Fit ordinary least squares
+`y = a + b·x`. Residuals `e[x] = y[x] − (a + b·x)`; σ is their sample standard
+deviation with `ddof = 2` (two fitted parameters).
+
+- `channel_slope_20_atr = b / ATR[127]` — per session, on the same scale as
+  the section 3 trend slope.
+- `channel_width_20_atr = 4σ / ATR[127]`.
+- `channel_pos_20 = (C[127] − (a + 19b − 2σ)) / (4σ)`. 0 is the lower band,
+  1 the upper band; values outside 0..1 are real and mean the close is outside
+  the channel, which is information, so the value is **not clamped**.
+- σ = 0 (twenty identical closes) makes the width and position unknown; the
+  slope is still valid (0).
+
+**Prior-range breakout**
+
+- `close_vs_prior_high_20_atr = (C[127] − max(H[107..126])) / ATR[127]`.
+- `close_vs_prior_low_20_atr = (C[127] − min(L[107..126])) / ATR[127]`.
+
+Both are signed and always defined when ATR is valid. The range deliberately
+excludes session 127 itself, so a close above the prior high is a genuine
+breakout of the range that existed before it.
+
+**Swing structure**
+
+1. Take the confirmed pivots of the window in chronological order and reduce
+   them to alternating swings: between two consecutive pivot lows keep only
+   the highest pivot high, between two consecutive pivot highs keep only the
+   lowest pivot low. The result alternates high, low, high, low.
+2. Let SH1 < SH2 be the last two swing highs by time and SL1 < SL2 the last two
+   swing lows. Fewer than two of either makes `structure_state = none` and both
+   `bars_since` fields unknown.
+3. `structure_state` is `bull` when `SH2 > SH1` and `SL2 > SL1`; `bear` when
+   `SH2 < SH1` and `SL2 < SL1`; otherwise `none`. Equality is neither.
+4. Walking sessions from index 127 backwards while structure is `bull`: a
+   break of structure is a session whose close exceeds the swing high that was
+   the most recent confirmed one at that session; a change of character is a
+   session whose close falls below the most recent confirmed swing low. `bear`
+   mirrors both. `structure_bars_since_bos` / `_choch` are `127 − index` of the
+   most recent such session, using only pivots confirmed by that session.
+   None in the window is unknown, not 0 and not 128.
+
+**Precomputation, batch form.** For each symbol, over its full cached history
+in one pass: pivots from K-shifted comparisons; the pivot-confirmation index
+from `p + K`; nearest-level queries against the sorted confirmed levels;
+regression via cumulative sums of x, y, x², xy over the rolling 20; prior
+range via rolling max/min shifted by one. Then keep each session's row only
+if its 128-session input window is valid under section 4. The expected cold
+cost is on the order of ten milliseconds per symbol; a thousand-symbol
+universe warms in seconds and the per-trial cost is a lookup. Report the
+measured figures with the section 4.6 counters before the first launch.
 
 ## 4. Daily information and replay contract
 
@@ -433,6 +590,16 @@ Decode behavior:
 | off | Remove the leaf. Do not evaluate it, even when data is missing. |
 | below | Ordinary numeric leaf with `< threshold`. |
 | above | Ordinary numeric leaf with `> threshold`. |
+| `<choice>` (categorical fields only) | Leaf with `== choice`; no threshold gene. |
+
+A categorical field such as `structure_state` (section 3.2) declares
+`mode_choices` as `off` plus its allowed values (`["off", "bull", "bear"]`)
+and **no** `value_min`/`value_max`/`value_step`; the collector emits the mode
+gene only. A numeric field must not list a value choice, and a categorical
+field must not carry a threshold — reject either at template load, the same
+way conflicting toggle metadata is rejected below. `none` is never a choice:
+a leaf that required "no structure" would pass on missing pivots, which is
+exactly the unknown-passes-a-gate failure this design refuses.
 
 Equality passes neither strict comparison. Unknown never passes an active
 comparison. In OR contexts an unknown leaf is false for its branch, not a
@@ -488,6 +655,38 @@ ADX gate. Report eligible recommendations separately from condition rejections.
 The three metrics do not encode all regimes. A weak ADX is an observation, not a
 forecast of a quiet future; one threshold cannot encode an arbitrary interval.
 Keep those limitations in report labels and the resulting expert description.
+
+### 6.0 Equity strategies S1–S7 and the follow-on stock grid
+
+Every condition in this document — the section 3 trio and the section 3.2
+chart-structure fields — is also available to the classic equity strategies.
+Placement: the leaves are appended to the **initial-entry AND tree of each
+equity strategy's entry rule** (the trees `ba2test_launcher.py` builds for
+S1–S7), never to the open-positions or exit rules, so no gate can prevent an
+exit or a protective-order adjustment. Per-strategy IDs as in section 5, e.g.
+`s1-structure-dist-support`.
+
+The profile flag is the same one, on the equity drivers:
+`--market-condition-profile none|ohlcv-v1|ta-structure-v1|ohlcv-v1,ta-structure-v1`.
+`none` stays the default and emits exactly today's rules and genes, so the
+goal2020 grid, its 135 completed optimizations, their labels and the 26
+forward-test deployments of 2026-09-14 are untouched: **a new equity grid
+under a new name runs with the profile on, after the option work lands.** It
+starts from the same frozen all-off control and matched seeds as the option
+launches, and its results are compared against the goal2020 cells of the same
+expert/band/strategy, not merged into them.
+
+Feature rows are shared: an equity grid and an option grid on the same
+universe and dates read the same manifest, and a symbol warmed for one is
+warmed for the other. The equity universe is larger (the small band alone is
+several hundred symbols), so the union warmup of section 4.4 is planned for
+the equity universe first; the option universe is a subset.
+
+Gene count per equity strategy with both profiles on: 6 + 9 = 15 additional
+genes on top of the strategy's existing space. That is a real widening —
+report population size and generation count against the wider space in the
+run configuration, and keep the section 3.2 "searched in v1" subset unless a
+smaller space is shown to be insufficient.
 
 ### 6.1 Follow-up grids: explicit coverage
 
@@ -678,6 +877,31 @@ new claim that different fills or changing account equity produce identical P&L.
     and O_CAL remains refused. Test manifest/profile/seed forwarding, selected
     option-root parity between probe and trial, fitness separation, fresh
     checkpoint identities and feature reuse across all three drivers.
+14. **Chart-structure calculators (section 3.3):** fixtures for a pivot that
+    is not yet confirmed (must be absent from the row K−1 sessions after the
+    extreme and present K sessions after), equal-price ties (not a pivot), a
+    window with no pivot above the close (unknown, not the window high),
+    touch counting at the tolerance boundary, σ = 0 channel (width/position
+    unknown, slope 0), a close outside the channel (position outside 0..1,
+    unclamped), breakout measured against the range that excludes the
+    session itself, alternating-swing reduction with two highs between lows,
+    each of bull/bear/none, and BOS/CHoCH walked with pivots as confirmed at
+    each session. Pin the intermediate pivot lists and swing sequences, not
+    only the final fields.
+15. **Chart-structure precomputation:** the batch-over-full-history
+    implementation equals the 128-bar reference for every session and every
+    field; adding a future bar changes no earlier row (the confirmation lag
+    makes this the sharpest test in the profile — a batch that uses pivots
+    the future confirms fails it). Measure and record cold build per symbol
+    and per-trial lookup cost; a trial that constructs a DataFrame or calls
+    a calculator for any of these fields fails.
+16. **Categorical mode genes:** `structure_state` emits one gene with the
+    declared choices, decodes to an equality leaf, and is rejected at
+    template load when it carries a threshold or lists `none`.
+17. **Equity placement:** on each of S1–S7 the leaves land on the initial
+    entry tree only; `none` reproduces the goal2020 rules and genes exactly;
+    an equity job and an option job over the same universe and dates resolve
+    the same manifest and read identical feature rows.
 
 ## 9. Implementation order
 
@@ -691,6 +915,11 @@ new claim that different fills or changing account equity produce identical P&L.
 | 6 | Mode-gene metadata, collection/decoding, Python/TS round trips and concrete deployment export | Six-gene and serialization tests; unsupported-field rejection |
 | 7 | Opt-in profile across the stage-1, grid-2 and convex drivers; union preflight, correct option-probe root, per-arm placement, run/deploy metadata and separate identities | Prepared-worker dispatch, all three dry-run matrices and old-profile/all-off compatibility checks |
 | 8 | Coverage/performance report, entry-state attribution and a small paper/offline parity pilot | Measured cache reuse and unchanged existing golden results |
+| 9 | `ta-structure-v1` calculators (section 3.3) in the same `market_conditions.py`, their batch form, the twelve stored fields, the five v1 condition classes and the categorical mode gene | Section 8 items 14–16; batch equals reference on a real symbol set; measured cold-build and lookup cost |
+| 10 | Equity placement on S1–S7 and the profile flag on the equity drivers; the new-name equity grid definition | Section 8 item 17; `none` reproduces a goal2020 cell's rules and genes byte for byte |
+
+Steps 9 and 10 build on steps 1–4 and reuse them unchanged: a second profile
+in the same store, not a second store.
 
 Do not move DS calculators out of their package or change their initialization
 as incidental cleanup. The new shared implementation has its own pinned contract.
@@ -728,6 +957,19 @@ also be a separately identified search-space change.
   mapped arrays; no per-trial indicator rebuilds.
 - New search profile and concrete resolved rules on deployment.
 - Preserve existing runs and defaults; do not alter production or running grids.
+- Chart structure (support/resistance, channel, breakout, swing structure) as a
+  second profile in the same store: **every field precomputed at warmup, a
+  trial does a lookup and a compare, never a detection**. Components, not
+  composite pattern detectors. Confirmed pivots (K = 3) as the lookahead guard.
+- Twelve fields stored, five searched in v1 (nine genes per arm); the rest are
+  a search-space decision for a later profile, not a data change.
+- Not included: Wolfe waves, harmonics and other multi-point geometric fits.
+  Their reproducibility between implementations is poor and their inputs
+  (pivots, converging channels) are already in the profile; the GA can find
+  that shape from the components if it exists without a declared detector.
+- All conditions apply to both option structures and equity strategies S1–S7;
+  a new equity grid under a new name runs with the profile on. goal2020 and
+  the 2026-09-14 forward-test deployments are not re-run or re-labelled.
 
 This document completes the design request. Implementation, new GA launches and
 production deployment have not occurred.
