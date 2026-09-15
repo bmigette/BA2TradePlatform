@@ -33,8 +33,12 @@ def state_field():
         FieldSpec(name=_STATE_FIELD, kind="categorical", short="state", searched=True,
                   codes=_STATE_CODES, ui_name="Test market state"),
     ))
+    # The decode path memoises field -> codes; registered_profile mutates the registry, so
+    # clear the memo on both edges of the temporary registration.
+    sps._field_codes.cache_clear()
     with registered_profile(spec):
         yield spec
+    sps._field_codes.cache_clear()
 
 
 def _numeric_leaf(**over):
@@ -108,6 +112,11 @@ def test_categorical_choices_must_match_the_registry_and_unknown_field_raises(st
         collect_param_space(_strategy(_cat_leaf(field="no_such_market_field")))
 
 
+def test_categorical_mode_leaf_with_optimize_but_no_range_raises_naming_the_leaf(state_field):
+    with pytest.raises(ValueError, match=r"o_ic-market-state.*no threshold gene"):
+        collect_param_space(_strategy(_cat_leaf(optimize=True)))
+
+
 def test_mode_and_toggle_together_raise_at_collection():
     with pytest.raises(ValueError, match="o_ic-market-adx"):
         collect_param_space(_strategy(_numeric_leaf(toggle_optimize=True)))
@@ -151,6 +160,37 @@ def test_decode_categorical_choice_sets_equality_and_the_code_as_value(state_fie
     leaf = _by_id(decode_params(s, {"cond:o_ic-market-state:mode": "bear"}))["o_ic-market-state"]
     assert (leaf["op"], leaf["comparison"], leaf["mode"]) == ("==", "==", "bear")
     assert leaf["value"] == 2.0 and isinstance(leaf["value"], float)
+
+
+def test_categorical_mode_not_in_registry_raises_at_decode(state_field):
+    """The template offers a value the (e.g. remote worker's) registry does not know."""
+    s = _strategy(_cat_leaf(mode_choices=["off", *_STATE_ORDER, "sideways"]))
+    with pytest.raises(ValueError, match="o_ic-market-state"):
+        decode_params(s, {"cond:o_ic-market-state:mode": "sideways"})
+
+
+def test_decode_off_on_a_root_leaf_raises_but_below_works():
+    rules = [{"id": "o_ic-entry", "continue_processing": False,
+              "actions": [{"action_type": "buy"}], "conditions": _numeric_leaf()}]
+    s = types.SimpleNamespace(entry_rules=rules, exit_rules=[])
+    with pytest.raises(ValueError, match=r"o_ic-market-adx.*ROOT|ROOT.*o_ic-market-adx"):
+        decode_params(s, {"cond:o_ic-market-adx:mode": "off"})
+    out = decode_params(s, {"cond:o_ic-market-adx:mode": "below",
+                            "cond:o_ic-market-adx:value": 15.0})
+    root = out["entry_rules"][0]["conditions"]
+    assert (root["op"], root["comparison"], root["mode"], root["value"]) == (
+        "<", "<", "below", 15.0)
+
+
+@pytest.mark.parametrize("raw, expected", [(2.0, "above"), (True, None)])
+def test_mode_index_resolution_edge_cases(raw, expected):
+    s = _strategy(_numeric_leaf())
+    flat = {"cond:o_ic-market-adx:mode": raw, "cond:o_ic-market-adx:value": 30.0}
+    if expected is None:
+        with pytest.raises(ValueError, match="o_ic-market-adx"):
+            decode_params(s, flat)
+    else:
+        assert _by_id(decode_params(s, flat))["o_ic-market-adx"]["mode"] == expected
 
 
 def test_decode_categorical_choice_not_in_the_leaf_choices_raises(state_field):
@@ -246,14 +286,11 @@ def test_encode_decode_roundtrip_keeps_mode_index_and_value(state_field):
         "==", 2.0)
 
 
-def test_anchor_canonicalisation_or_where_dedup_lives():
-    """Phenotype dedup is NOT in this module: the trial memo key is built in
-    ``strategy_optimization_handler`` (``trial_key({... "params": decoded_flat})`` -- the RAW
-    decoded genome), so the inactive-threshold anchor canonicalisation belongs there (Task 8).
-    This module must not grow a half-implemented canonicaliser, and decode must not rewrite
-    the raw genome it was handed."""
-    assert not [n for n in dir(sps)
-                if any(w in n.lower() for w in ("canonical", "phenotype", "dedup"))]
+def test_decode_does_not_mutate_the_flat_genome():
+    # Phenotype dedup is not in this module: the trial memo key is built in
+    # strategy_optimization_handler (trial_key({... "params": decoded_flat}), the RAW genome),
+    # so the inactive-threshold anchor canonicalisation belongs there (Task 8). Decode must
+    # leave the raw genome it was handed untouched (it is the provenance).
     s = _strategy(_numeric_leaf())
     flat = {"cond:o_ic-market-adx:mode": "off", "cond:o_ic-market-adx:value": 35.0}
     before = dict(flat)

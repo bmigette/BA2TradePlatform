@@ -64,6 +64,7 @@ nowhere here anymore — saved rows carrying them are reconstructed by the
 quick-load path, not by this module.
 """
 import copy
+import functools
 import logging
 from typing import Any, Dict, Optional
 
@@ -165,6 +166,11 @@ def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -
     if not cid:
         return
     if cond.get("optimize") or cond.get("optimize_enabled"):
+        if cond.get("mode_optimize") and all(
+                cond.get(k) is None for k in ("value_min", "value_max", "value_step")):
+            raise ValueError(
+                f"condition {cid!r}: optimize is set on a mode leaf with no value_min/value_max/"
+                f"value_step -- a categorical leaf has no threshold gene")
         out[f"cond:{cid}:value"] = _range_entry(
             cond.get("value_min"), cond.get("value_max"), cond.get("value_step"),
             is_int=False,
@@ -215,9 +221,6 @@ def _collect_mode_gene(cond: Dict[str, Any], cid: str, out: Dict[str, Any]) -> N
         raise ValueError(
             f"condition {cid!r}: a {kind} leaf's mode_choices must be exactly {expected!r}, "
             f"got {declared!r}")
-    if kind == "categorical" and f"cond:{cid}:value" in out:
-        # A categorical leaf has no threshold range, so nothing may have emitted one.
-        raise ValueError(f"condition {cid!r}: a categorical leaf carries no :value gene")
     out[f"cond:{cid}:mode"] = {
         "type": "choice", "choices": expected, "min": 0, "max": len(expected) - 1, "step": 1,
     }
@@ -610,6 +613,8 @@ def _resolve_modes(tree: Any, by_id: Dict[str, Dict[str, Any]]) -> Dict[str, str
     an index and mapped back); a raw int index (a hand-built flat dict) is resolved through
     the TEMPLATE leaf's own ``mode_choices``. Anything unresolvable raises naming the leaf --
     a mode gene the tree cannot interpret is a broken genome, not "leave it as authored"."""
+    if not any("mode" in sub for sub in by_id.values()):
+        return {}  # no mode genes at all: legacy trees pay nothing
     found: Dict[str, str] = {}
 
     def _walk(node):
@@ -644,6 +649,18 @@ def _resolve_modes(tree: Any, by_id: Dict[str, Dict[str, Any]]) -> Dict[str, str
     return found
 
 
+_THRESHOLD_OPS = {"below": "<", "above": ">"}
+
+
+@functools.lru_cache(maxsize=None)
+def _field_codes(field: str) -> Dict[str, int]:
+    """Memoised ``field -> {value: code}`` so the per-trial decode pays one dict hit instead of
+    a scan over every registered profile. Production registers profiles at import only;
+    ``registered_profile`` (a test hook) mutates the registry, so tests using it call
+    ``_field_codes.cache_clear()``."""
+    return dict(field_spec(field).codes)
+
+
 def _apply_mode(node: Dict[str, Any], cid: str, token: str) -> None:
     """Write a decoded non-off mode onto its (deep-copied) leaf.
 
@@ -652,11 +669,15 @@ def _apply_mode(node: Dict[str, Any], cid: str, token: str) -> None:
     ``operator`` spelling, when present on the leaf, is synchronised for the same reason."""
     if token == MODE_OFF:  # dropped by the parent's child loop; nothing to write
         return
-    kind = leaf_mode_kind(node)
-    if kind == "numeric":
-        op = {"below": "<", "above": ">"}[token]
+    # PER-TRIAL path: the kind is derived structurally, never by model validation. below/above
+    # <=> numeric (ConditionLeaf forbids those tokens on a categorical leaf, and collection
+    # already validated the template); any other non-off token <=> categorical.
+    if token in _THRESHOLD_OPS:
+        op = _THRESHOLD_OPS[token]
     else:
-        codes = field_spec(node["field"]).codes
+        codes = _field_codes(node["field"])
+        # Kept at decode on purpose: catches a remote worker whose ba2_common registry dropped
+        # a value the master's template still offers.
         if token not in codes:
             raise ValueError(
                 f"condition {cid!r}: categorical mode {token!r} is not a registered value of "
