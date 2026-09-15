@@ -463,7 +463,12 @@ class PerformanceTab:
         table = PerformanceTable(
             title="",
             columns=columns,
-            rows=rows
+            rows=rows,
+            # Eleven columns do not fit a phone. What survives is the identity and the
+            # four figures the table is opened for; the rest are a tap away on desktop
+            # and are still in the row data, just not painted.
+            mobile_hide=['Avg Duration (days)', 'Avg P&L', 'Profit Factor',
+                         'Largest Win', 'Largest Loss', 'Sharpe Ratio'],
         )
         table.render()
     

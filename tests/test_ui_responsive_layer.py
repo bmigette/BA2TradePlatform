@@ -123,3 +123,66 @@ def test_plotly_height_is_left_alone(css):
     """It sizes its own SVG inline from the figure layout; overriding the container
     underneath it CLIPS the plot instead of shrinking it."""
     assert 'js-plotly-plot' not in css
+
+
+# ---------------------------------------------------------------------------
+# Hiding a column needs a TAG, because Quasar gives a stylesheet nothing to aim at
+# ---------------------------------------------------------------------------
+
+def test_the_phone_layer_hides_tagged_columns(phone_block):
+    assert '.mobile-hide' in phone_block
+    assert 'display: none' in phone_block
+
+
+def test_a_lazytable_column_can_ask_to_be_hidden():
+    """`classes`/`headerClasses` is Quasar's documented per-column hook, and the only
+    handle a stylesheet has: QTable adds no class of its own naming the column."""
+    from ba2_trade_platform.ui.components.LazyTable import ColumnDef
+
+    col = ColumnDef(name='account', label='Account', field='account',
+                    mobile_hide=True).to_quasar_column()
+
+    assert col['classes'] == 'mobile-hide'
+    assert col['headerClasses'] == 'mobile-hide'
+
+
+def test_a_lazytable_column_shows_by_default():
+    """Nothing disappears without being asked for."""
+    from ba2_trade_platform.ui.components.LazyTable import ColumnDef
+
+    col = ColumnDef(name='symbol', label='Symbol', field='symbol').to_quasar_column()
+
+    assert 'classes' not in col
+    assert 'headerClasses' not in col
+
+
+def test_the_performance_table_hides_only_what_it_was_told_to():
+    from ba2_trade_platform.ui.components.performance_charts import PerformanceTable
+
+    table = PerformanceTable(title='', columns=['Symbol', 'Sharpe Ratio'], rows=[],
+                             mobile_hide=['Sharpe Ratio'])
+
+    assert table.mobile_hide == {'Sharpe Ratio'}
+    assert PerformanceTable(title='', columns=['Symbol'], rows=[]).mobile_hide == set()
+
+
+def test_the_identity_column_is_never_hidden_on_the_priority_tables():
+    """The sticky first column is what keeps a scrolled row identifiable. Hiding the
+    symbol would leave a phone user scrolling anonymous numbers -- and it is the one
+    column every one of these tables is read BY."""
+    import pathlib
+    for page in ('overview.py', 'marketanalysis.py'):
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'ba2_trade_platform' / 'ui' / 'pages' / page).read_text()
+        for line in src.splitlines():
+            if 'mobile-hide' in line:
+                assert "'label': 'Symbol'" not in line, f"{page}: {line.strip()}"
+
+
+def test_kpi_tiles_stay_two_up_rather_than_one_per_screen(phone_block):
+    """The blanket 1-column collapse is right for a chart and wrong for four small
+    metric cards, which would otherwise be four screens of scrolling to read four
+    numbers."""
+    assert '.metric-grid' in phone_block
+    block = phone_block[phone_block.index('.metric-grid'):]
+    assert 'repeat(2' in block[:block.index('}')]

@@ -283,7 +283,7 @@ class ActivityMonitorPage:
         
         # Filters
         with ui.expansion("🔍 Filters", icon="filter_list").classes("w-full"):
-            with ui.grid(columns=4).classes("w-full gap-4 p-4"):
+            with ui.grid(columns=4).classes("w-full gap-4 p-4 metric-grid"):
                 # Type filter (multi-select)
                 with ui.column():
                     ui.label("Activity Type(s)")
@@ -350,9 +350,9 @@ class ActivityMonitorPage:
                             />
                         </q-td>
                       '''),
-            ColumnDef(name='type', label='Type', field='type', sortable=True, align='left'),
-            ColumnDef(name='expert', label='Expert', field='expert', sortable=True, align='left'),
-            ColumnDef(name='account', label='Account', field='account', sortable=True, align='left'),
+            ColumnDef(name='type', label='Type', field='type', sortable=True, align='left', mobile_hide=True),
+            ColumnDef(name='expert', label='Expert', field='expert', sortable=True, align='left', mobile_hide=True),
+            ColumnDef(name='account', label='Account', field='account', sortable=True, align='left', mobile_hide=True),
             ColumnDef(name='description', label='Description', field='description', align='left', filterable=True,
                       slot_template='''
                         <q-td :props="props" style="white-space: pre-wrap; word-break: break-word; max-width: 600px; vertical-align: top;">

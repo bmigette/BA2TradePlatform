@@ -74,7 +74,11 @@ class ColumnDef:
     
     # Width override
     width: Optional[str] = None
-    
+
+    #: Drop this column on a phone (<640px). Default False, so an existing column keeps
+    #: showing and nothing disappears without being asked for.
+    mobile_hide: bool = False
+
     def to_quasar_column(self) -> dict:
         """Convert to Quasar table column format."""
         col = {
@@ -86,6 +90,14 @@ class ColumnDef:
         }
         if self.width:
             col['style'] = f'width: {self.width}'
+        if self.mobile_hide:
+            # Quasar adds no per-column class of its own, so `classes`/`headerClasses`
+            # -- its documented hook -- is the only handle a stylesheet has on one. The
+            # responsive layer hides `.mobile-hide` below 640px. Tagged rather than
+            # positional: an `nth-child` rule hides the WRONG column the first time one
+            # is inserted.
+            col['classes'] = 'mobile-hide'
+            col['headerClasses'] = 'mobile-hide'
         return col
 
 

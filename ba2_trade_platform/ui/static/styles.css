@@ -1010,6 +1010,51 @@ div[class*="disconnect"] * {
         padding: 0.5rem !important;
     }
 
+    /* KPI TILES STAY TWO-UP. The blanket 1-column collapse above is right for a chart
+     * or a table, and wrong for a row of small metric cards: four of them one per row
+     * is four screens of scrolling to read four numbers. `nicegui-card-tight` is not
+     * what these use, so they are identified by the dashboard's own wrapper class --
+     * see `MultiMetricDashboard.render`, which tags its grid. */
+    .metric-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        gap: 0.5rem !important;
+    }
+
+    .metric-grid .nicegui-card {
+        padding: 0.5rem !important;
+    }
+
+    /* Metric values shrink with their tiles: `text-3xl` is 1.875rem, which overflows a
+     * half-width card on a 390px screen the moment the number has a currency symbol
+     * and two decimals. */
+    .metric-grid .text-3xl {
+        font-size: 1.25rem !important;
+    }
+
+    /* COLUMNS A PHONE DOES NOT NEED are tagged and hidden. Quasar adds no per-column
+     * class of its own, so a stylesheet cannot target one -- the tag comes from the
+     * column definition's `classes`/`headerClasses`, which is the documented QTable
+     * hook for exactly this.
+     *
+     * Tagged rather than positional (`nth-child`): a positional rule silently hides
+     * the WRONG column the first time one is inserted, and does it on a table of
+     * money. A tag moves with its column.
+     *
+     * If a Quasar version ever stopped honouring those keys the column simply stays
+     * visible, which is the safe direction to fail in. */
+    .q-table th.mobile-hide,
+    .q-table td.mobile-hide {
+        display: none !important;
+    }
+
+    /* Header labels WRAP rather than setting the column width. A single long label
+     * ("Today Change %") otherwise makes its column wider than the numbers under it,
+     * pushing the ones that matter off-screen. */
+    .q-table thead th {
+        white-space: normal !important;
+        word-break: break-word;
+    }
+
     /* Long labels break instead of forcing the page wider. `anywhere` rather than
      * `break-all` so ordinary words still break at their boundaries and only a long
      * unbroken token (an OCC option symbol, a URL) is split mid-string. */

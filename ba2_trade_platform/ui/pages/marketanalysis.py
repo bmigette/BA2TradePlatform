@@ -600,13 +600,13 @@ class JobMonitoringTab:
         """Create the analysis jobs table."""
         columns = [
             {'name': 'id', 'label': 'ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
-            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'recommendation', 'label': 'Recommendation', 'field': 'recommendation', 'sortable': True, 'style': 'width: 130px'},
             {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'sortable': True, 'style': 'width: 100px'},
-            {'name': 'expected_profit', 'label': 'Expected Profit', 'field': 'expected_profit', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'expected_profit', 'label': 'Expected Profit', 'field': 'expected_profit', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'created_at', 'label': 'Created', 'field': 'created_at_local', 'sortable': True, 'style': 'width: 160px'},
             {'name': 'subtype', 'label': 'Type', 'field': 'subtype', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False, 'style': 'width: 100px'}
@@ -696,16 +696,16 @@ class JobMonitoringTab:
         """Create the Smart Risk Manager jobs table."""
         columns = [
             {'name': 'id', 'label': 'Job ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
-            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
             {'name': 'type', 'label': 'Type', 'field': 'type_label', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'run_date', 'label': 'Run Date', 'field': 'run_date_local', 'sortable': True, 'style': 'width: 160px'},
-            {'name': 'duration', 'label': 'Duration', 'field': 'duration_display', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'duration', 'label': 'Duration', 'field': 'duration_display', 'sortable': True, 'style': 'width: 100px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             # SMART runs iterate an agent loop; the classic/option managers do not, so
             # this column reads "-" for them rather than 0 -- they did not iterate zero
             # times, the concept does not apply.
-            {'name': 'iterations', 'label': 'Iterations', 'field': 'iteration_count', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'iterations', 'label': 'Iterations', 'field': 'iteration_count', 'sortable': True, 'style': 'width: 100px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             # Smart: actions executed. Classic/options: symbols funded out of received,
             # which is the same question ("what did it actually do?") asked of a manager
             # that sizes rather than acts.
@@ -1557,13 +1557,13 @@ class JobMonitoringTab:
                     columns = [
                         {'name': 'task_id', 'label': 'Task ID', 'field': 'task_id', 'sortable': True, 'style': 'width: 200px'},
                         {'name': 'type', 'label': 'Type', 'field': 'type', 'sortable': True, 'style': 'width: 100px'},
-                        {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
+                        {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
                         {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'priority', 'label': 'Priority', 'field': 'priority', 'sortable': True, 'style': 'width: 80px'},
                         {'name': 'created_at', 'label': 'Created', 'field': 'created_at_display', 'sortable': True, 'style': 'width: 160px'},
-                        {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 220px'},
+                        {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 220px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                     ]
                     
                     self.queued_tasks_table = ui.table(
@@ -3651,13 +3651,13 @@ class ScheduledJobsTab:
     def _create_scheduled_jobs_table(self, scheduled_data=None, total_records=None):
         """Create the scheduled jobs table."""
         columns = [
-            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True},
-            {'name': 'instance_id', 'label': 'Instance ID', 'field': 'expert_instance_id', 'sortable': True},
-            {'name': 'job_type', 'label': 'Job Type', 'field': 'job_type', 'sortable': True},
-            {'name': 'weekdays', 'label': 'Days', 'field': 'weekdays', 'sortable': True},
-            {'name': 'times', 'label': 'Times', 'field': 'times', 'sortable': True},
+            {'name': 'instance_id', 'label': 'Instance ID', 'field': 'expert_instance_id', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'job_type', 'label': 'Job Type', 'field': 'job_type', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'weekdays', 'label': 'Days', 'field': 'weekdays', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'times', 'label': 'Times', 'field': 'times', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False}
         ]
         

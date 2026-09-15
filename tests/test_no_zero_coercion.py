@@ -371,10 +371,10 @@ ALLOWLIST: dict = {
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
         "continuation line 3795, one past the outer .get(...)'s opening line 3794)",
-    "ba2_trade_platform/ui/components/performance_charts.py:458":
+    "ba2_trade_platform/ui/components/performance_charts.py:475":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
-        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl was added above it)",
-    "ba2_trade_platform/ui/components/performance_charts.py:459":
+        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging)",
+    "ba2_trade_platform/ui/components/performance_charts.py:476":
         "loss half of the same win-rate count; 0 is excluded from both tallies rather than "
         "scored as either",
     "testplatform/backend/app/services/data_build_handler.py:126":

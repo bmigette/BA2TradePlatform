@@ -1716,7 +1716,7 @@ class LiveTradesTab:
                 with ui.card().classes('w-full mb-4'):
                     ui.label('📊 Transaction Overview').classes('text-h6 mb-3')
                     
-                    with ui.grid(columns=4).classes('w-full gap-4'):
+                    with ui.grid(columns=4).classes('w-full gap-4 metric-grid'):
                         # Symbol
                         with ui.card().classes('bg-primary/5'):
                             ui.label('Symbol').classes('text-caption text-grey-7')
