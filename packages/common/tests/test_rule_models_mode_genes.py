@@ -8,21 +8,14 @@ import pytest
 
 from ba2_common.core.rule_models import (
     ConditionLeaf,
-    FORBIDDEN_MODE_CHOICES,
-    MODE_OFF,
     NUMERIC_MODE_CHOICES,
     leaf_mode_kind,
     normalize_trade_rules,
 )
 
-_ADX = dict(id="o_ic-market-adx", field="underlying_adx_14", op="<", value=25, optimize=True,
-            value_min=10, value_max=40, value_step=5)
-
-
-def test_constants():
-    assert MODE_OFF == "off"
-    assert NUMERIC_MODE_CHOICES == ("off", "below", "above")
-    assert FORBIDDEN_MODE_CHOICES == ("none",)
+_RANGE = dict(value_min=10, value_max=40, value_step=5)
+_ADX = dict(id="o_ic-market-adx", field="underlying_adx_14", op="<", value=25, optimize=True, **_RANGE)
+_CAT_CHOICES = ["off", "bull", "bear"]
 
 
 def test_mode_metadata_round_trips_through_canonical_dict_in_both_spellings():
@@ -33,7 +26,8 @@ def test_mode_metadata_round_trips_through_canonical_dict_in_both_spellings():
     assert "mode" not in out
     assert ConditionLeaf(**out).to_canonical_dict() == out
     camel = ConditionLeaf(**{"id": "x", "field": "underlying_adx_14", "op": "<", "value": 20,
-                             "valueMin": 10, "valueMax": 40, "valueStep": 5, "modeOptimize": True, "modeChoices": ["off", "below", "above"]})
+                             "valueMin": 10, "valueMax": 40, "valueStep": 5, "modeOptimize": True,
+                             "modeChoices": ["off", "below", "above"]})
     assert camel.mode_optimize is True and camel.mode_choices == ["off", "below", "above"]
 
 
@@ -41,7 +35,7 @@ def test_mode_and_toggle_optimize_together_is_rejected():
     with pytest.raises(ValueError) as ei:
         ConditionLeaf(**_ADX, mode_optimize=True, mode_choices=["off", "below", "above"], toggle_optimize=True)
     msg = str(ei.value)
-    assert "mode_optimize" in msg and "toggle_optimize" in msg
+    assert "mode_optimize" in msg and "toggle_optimize" in msg and "o_ic-market-adx" in msg
     # camelCase spellings are rejected the same way
     with pytest.raises(ValueError):
         ConditionLeaf(**{**_ADX, "modeOptimize": True, "modeChoices": ["off", "below", "above"],
@@ -51,89 +45,136 @@ def test_mode_and_toggle_optimize_together_is_rejected():
     ConditionLeaf(**_ADX, mode_optimize=True, mode_choices=["off", "below", "above"], toggle_optimize=False)
 
 
-def test_unknown_mode_value_and_unsupported_choice_list_are_rejected():
-    with pytest.raises(ValueError):
-        ConditionLeaf(**_ADX, mode="sideways")
-    with pytest.raises(ValueError):
-        ConditionLeaf(**_ADX, mode_optimize=True, mode_choices=["off", "above"])
-    with pytest.raises(ValueError):
-        ConditionLeaf(**_ADX, mode_optimize=True, mode_choices=["off", "above", "below"])
-    with pytest.raises(ValueError):
-        ConditionLeaf(**_ADX, mode_optimize=True)
-    with pytest.raises(ValueError):
-        ConditionLeaf(**_ADX, mode_optimize=True, mode_choices=[])
-    with pytest.raises(ValueError):   # declared choices but a resolved mode outside them
-        ConditionLeaf(**_ADX, mode_optimize=True, mode_choices=["off", "below", "above"], mode="bull")
+def test_error_message_falls_back_to_field_without_id():
+    with pytest.raises(ValueError, match="underlying_adx_14"):
+        ConditionLeaf(field="underlying_adx_14", op="<", value=1, mode="sideways", **_RANGE)
 
 
-def test_categorical_leaf_declares_off_plus_values_and_no_threshold():
+@pytest.mark.parametrize("extra", [
+    dict(mode="sideways"),
+    dict(mode_optimize=True, mode_choices=["off", "above"]),
+    dict(mode_optimize=True, mode_choices=["off", "above", "below"]),
+    dict(mode_optimize=True),
+    dict(mode_optimize=True, mode_choices=[]),
+    dict(mode_optimize=True, mode_choices=["off", "below", "above"], mode="bull"),
+    dict(mode_optimize=True, mode_choices=_CAT_CHOICES),
+    dict(mode="bull"),
+    dict(mode="none"),
+], ids=["unknown-mode", "missing-below", "wrong-order", "no-choices", "empty-choices",
+        "mode-outside-choices", "categorical-choices", "categorical-token", "none-token"])
+def test_numeric_leaf_rejections(extra):
+    with pytest.raises(ValueError) as ei:
+        ConditionLeaf(**{**_ADX, "id": "numeric-bad-leaf"}, **extra)
+    assert "numeric-bad-leaf" in str(ei.value)
+
+
+def test_categorical_template_declares_off_plus_values_and_no_threshold():
     ok = ConditionLeaf(id="s1-structure-state", field="structure_state", op="==",
-                       mode_optimize=True, mode_choices=["off", "bull", "bear"])
-    assert ok.to_canonical_dict()["mode_choices"] == ["off", "bull", "bear"]
-    for bad in (dict(value=1, mode_optimize=True, mode_choices=["off", "bull", "bear"]),    # threshold
-                dict(value_min=1, mode_optimize=True, mode_choices=["off", "bull", "bear"]),
-                dict(value_offset_from="y", mode_optimize=True, mode_choices=["off", "bull", "bear"]),
-                dict(mode_optimize=True, mode_choices=["off", "bull", "bear", "none"]),       # none
-                dict(mode_optimize=True, mode_choices=["bull", "off", "bear"]),               # first off
-                dict(mode_optimize=True, mode_choices=["off", "bull", "bull"]),               # duplicates
-                dict(mode_optimize=True, mode_choices=["off", "below", "bull"]),              # below on cat
-                dict(mode_optimize=True, mode_choices=["off", "bull", "above"]),              # above on cat
-                dict(mode_optimize=True, mode_choices=["off"])):                              # no value
-        with pytest.raises(ValueError):
-            ConditionLeaf(id="x", field="structure_state", op="==", **bad)
-    with pytest.raises(ValueError):   # numeric leaf with categorical choices
-        ConditionLeaf(id="x", field="underlying_adx_14", op="<", value=1, value_min=0, value_max=2,
-                      value_step=1, mode_optimize=True, mode_choices=["off", "bull", "bear"])
-    with pytest.raises(ValueError):   # "none" is forbidden even without mode_optimize
-        ConditionLeaf(id="x", field="structure_state", op="==", mode_choices=["off", "none"])
+                       mode_optimize=True, mode_choices=_CAT_CHOICES)
+    assert ok.to_canonical_dict()["mode_choices"] == _CAT_CHOICES
+
+
+@pytest.mark.parametrize("bad", [
+    dict(value=1, mode_optimize=True, mode_choices=_CAT_CHOICES),
+    dict(mode_optimize=True, mode_choices=["off", "bull", "bear", "none"]),
+    dict(mode_optimize=True, mode_choices=["bull", "off", "bear"]),
+    dict(mode_optimize=True, mode_choices=["off", "bull", "bull"]),
+    dict(mode_optimize=True, mode_choices=["off", "below", "bull"]),
+    dict(mode_optimize=True, mode_choices=["off", "bull", "above"]),
+    dict(mode_optimize=True, mode_choices=["off"]),
+    dict(mode_choices=["off", "none"]),
+], ids=["template-with-threshold", "none-choice", "off-not-first", "duplicates", "below-choice",
+        "above-choice", "no-value-choice", "none-without-optimize"])
+def test_categorical_template_rejections(bad):
+    with pytest.raises(ValueError) as ei:
+        ConditionLeaf(id="cat-bad-leaf", field="structure_state", op="==", **bad)
+    assert "cat-bad-leaf" in str(ei.value)
+
+
+def test_categorical_template_value_message_says_no_threshold():
+    with pytest.raises(ValueError, match="no threshold"):
+        ConditionLeaf(id="s", field="structure_state", op="==", value=1, mode_optimize=True,
+                      mode_choices=_CAT_CHOICES)
 
 
 def test_decoded_categorical_leaf_carries_its_code_as_value():
     kw = dict(id="s1-structure-state", field="structure_state", op="==", value=1.0,
-              mode_optimize=True, mode_choices=["off", "bull", "bear"])
+              mode_optimize=True, mode_choices=_CAT_CHOICES)
     out = ConditionLeaf(**kw, mode="bull").to_canonical_dict()
     assert out["value"] == 1.0 and out["mode"] == "bull"
     assert out["op"] == "==" and out["comparison"] == "=="
     assert ConditionLeaf(**out).to_canonical_dict() == out
-    # without metadata choices too (a decode may strip the optimize metadata)
-    assert ConditionLeaf(id="s", field="structure_state", op="==", value=2.0, mode="bear",
-                         mode_choices=["off", "bull", "bear"]).mode == "bear"
     for mode in ("off", None):
         with pytest.raises(ValueError, match="no threshold"):
             ConditionLeaf(**kw, mode=mode)
 
 
+def test_deployed_categorical_leaf_with_stripped_metadata_is_accepted():
+    # An exported/deployed leaf: the optimizer metadata is gone, only the resolved token and code
+    # remain. The token is checked against the registry codes at collection/launch, not here.
+    leaf = ConditionLeaf(**{"field": "s", "op": "==", "value": 1.0, "mode": "bull"})
+    assert leaf.mode == "bull" and leaf._mode_kind() == "categorical"
+    assert leaf.to_canonical_dict()["mode"] == "bull"
+
+
+@pytest.mark.parametrize("choices", [None, _CAT_CHOICES], ids=["no-choices", "with-choices"])
+@pytest.mark.parametrize("token", ["below", "above", "none"])
+def test_categorical_leaf_rejects_numeric_and_forbidden_tokens(choices, token):
+    with pytest.raises(ValueError) as ei:
+        ConditionLeaf(id="cat-token-leaf", field="structure_state", op="==", value=1.0, mode=token,
+                      mode_choices=choices)
+    assert "cat-token-leaf" in str(ei.value)
+
+
+def test_categorical_leaf_with_choices_rejects_token_outside_them():
+    with pytest.raises(ValueError, match="cat-leaf"):
+        ConditionLeaf(id="cat-leaf", field="structure_state", op="==", value=3.0, mode="range",
+                      mode_choices=_CAT_CHOICES)
+
+
 def test_resolved_mode_token_is_preserved_but_never_invented():
-    rng = dict(value_min=10, value_max=40, value_step=5)
-    below = ConditionLeaf(id="x", field="underlying_adx_14", op="<", value=20, mode="below", **rng)
+    below = ConditionLeaf(id="x", field="underlying_adx_14", op="<", value=20, mode="below", **_RANGE)
     assert below.to_canonical_dict()["mode"] == "below"
     assert ConditionLeaf(**below.to_canonical_dict()).mode == "below"
-    assert ConditionLeaf(id="x", field="underlying_adx_14", op="<", value=20, mode="off", **rng).mode == "off"
+    assert ConditionLeaf(id="x", field="underlying_adx_14", op="<", value=20, mode="off", **_RANGE).mode == "off"
     plain = ConditionLeaf(id="c", field="confidence", op=">=", value=70).to_canonical_dict()
     for k in ("mode", "mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
         assert k not in plain
-    cat = ConditionLeaf(id="s", field="structure_state", op="==", mode="bull",
-                        mode_optimize=True, mode_choices=["off", "bull", "bear"])
+    cat = ConditionLeaf(id="s", field="structure_state", op="==", mode="bull", value=1.0,
+                        mode_optimize=True, mode_choices=_CAT_CHOICES)
     assert cat.to_canonical_dict()["mode"] == "bull"
-    with pytest.raises(ValueError):
-        ConditionLeaf(id="x", field="underlying_adx_14", op="<", value=20, mode="bull", **rng)
-    with pytest.raises(ValueError):
-        ConditionLeaf(id="x", field="underlying_adx_14", op="<", value=20, mode="none", **rng)
 
 
-def test_leaf_mode_kind_helper():
-    assert leaf_mode_kind({**_ADX, "mode_optimize": True, "mode_choices": list(NUMERIC_MODE_CHOICES)}) == "numeric"
-    assert leaf_mode_kind({"id": "s", "field": "structure_state", "op": "==", "modeOptimize": True,
-                           "modeChoices": ["off", "bull", "bear"]}) == "categorical"
-    assert leaf_mode_kind({"id": "x", "field": "f", "modeOptimize": True, "valueMin": 1}) == "numeric"
-    assert leaf_mode_kind({"id": "x", "field": "f", "modeOptimize": True, "valueOffsetFrom": "y"}) == "numeric"
-    assert leaf_mode_kind({"id": "x", "field": "f", "mode": "bull"}) == "categorical"
-    assert leaf_mode_kind({"id": "x", "field": "f", "mode": "below", "value": 3, "valueStep": 1}) == "numeric"
-    assert leaf_mode_kind({"id": "x", "field": "f", "mode": "below", "value": 3, "value_max": 5}) == "numeric"
-    # a decoded categorical leaf carries its code as value: value alone does not make it numeric
-    assert leaf_mode_kind({"mode": "bull", "value": 1.0, "mode_choices": ["off", "bull", "bear"]}) == "categorical"
-    assert leaf_mode_kind({"id": "c", "field": "confidence", "op": ">=", "value": 70}) is None
-    assert leaf_mode_kind({"id": "c", "field": "confidence", "value": 70, "mode_optimize": False}) is None
+@pytest.mark.parametrize("leaf,expected", [
+    ({**_ADX, "mode_optimize": True, "mode_choices": list(NUMERIC_MODE_CHOICES)}, "numeric"),
+    ({"id": "s", "field": "structure_state", "op": "==", "modeOptimize": True, "modeChoices": _CAT_CHOICES},
+     "categorical"),
+    ({"field": "f", "modeOptimize": True, "modeChoices": list(NUMERIC_MODE_CHOICES), "valueMin": 1}, "numeric"),
+    ({"field": "f", "modeOptimize": True, "modeChoices": list(NUMERIC_MODE_CHOICES), "valueOffsetFrom": "y"},
+     "numeric"),
+    ({"field": "f", "mode": "bull"}, "categorical"),
+    ({"field": "f", "mode": "below", "value": 3, "valueStep": 1}, "numeric"),
+    ({"field": "f", "mode": "below", "value": 3, "value_max": 5}, "numeric"),
+    ({"field": "f", "mode": "bull", "value": 1.0, "mode_choices": _CAT_CHOICES}, "categorical"),
+    ({"id": "c", "field": "confidence", "op": ">=", "value": 70}, None),
+    ({"id": "c", "field": "confidence", "value": 70, "mode_optimize": False}, None),
+    # (a) AliasChoices takes the FIRST PRESENT key even when it is None -> no range -> categorical
+    ({"field": "f", "value_min": None, "valueMin": 10, "mode_choices": ["off", "bull"]}, "categorical"),
+    # (b) "0" coerces to False -> not a mode leaf
+    ({"field": "f", "modeOptimize": "0"}, None),
+    # (c) declared choices alone make it a mode leaf
+    ({"field": "f", "mode_choices": ["off", "bull"]}, "categorical"),
+], ids=["numeric-template", "categorical-template", "camel-valueMin", "camel-offset", "mode-only",
+        "camel-step", "snake-max", "decoded-categorical", "plain", "optimize-false",
+        "alias-first-present-none", "string-zero", "choices-only"])
+def test_leaf_mode_kind_agrees_with_the_model(leaf, expected):
+    assert ConditionLeaf.model_validate(dict(leaf))._mode_kind() == expected
+    assert leaf_mode_kind(leaf) == expected
+
+
+def test_leaf_mode_kind_fails_loud_on_an_invalid_leaf():
+    with pytest.raises(ValueError):
+        leaf_mode_kind({"field": "f", "mode": "sideways", "value_min": 1})
 
 
 def test_legacy_leaf_canonical_output_is_unchanged():

@@ -75,8 +75,11 @@ callers that assemble the window, not by these calculators.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import field as dc_field
+from types import MappingProxyType
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -398,18 +401,22 @@ class FieldSpec:
     ExpertEventType value and the store column. NUMERIC fields carry the GA threshold range and
     the template's explicit fixed interpretation (``anchor_op``/``anchor_value``); CATEGORICAL
     fields carry ``codes`` (value -> distinct positive int) and no range. ``"none"`` (no
-    classification) is never a code: it must not be selectable as a regime."""
+    classification) is never a code: it must not be selectable as a regime.
+
+    ``codes`` is frozen into a read-only ``MappingProxyType`` copy after validation. A
+    mappingproxy is not hashable, so ``codes`` is excluded from ``__hash__`` (``hash=False``) but
+    still part of ``==``; equal specs therefore still hash equal."""
 
     name: str                      # canonical field name == ExpertEventType value == store column
     kind: str                      # "numeric" | "categorical"
     short: str                     # id suffix used by the launcher: "slope" | "adx" | "rv"
-    searched_v1: bool
+    searched: bool                 # searched by the GA in this profile's grids
     value_min: Optional[float] = None
     value_max: Optional[float] = None
     value_step: Optional[float] = None
     anchor_op: Optional[str] = None      # the template's explicit fixed interpretation
     anchor_value: Optional[float] = None
-    codes: Optional[Dict[str, int]] = None   # categorical only; never contains "none"
+    codes: Optional[Mapping[str, int]] = dc_field(default=None, hash=False)  # categorical only; never "none"
     ui_name: str = ""
 
     def __post_init__(self) -> None:
@@ -430,6 +437,7 @@ class FieldSpec:
                 raise ValueError(f"FieldSpec {self.name!r}: codes must be positive ints, got {self.codes!r}")
             if len(set(vals)) != len(vals):
                 raise ValueError(f"FieldSpec {self.name!r}: code values must be distinct, got {self.codes!r}")
+            object.__setattr__(self, "codes", MappingProxyType(dict(self.codes)))
         else:
             if self.codes is not None:
                 raise ValueError(f"FieldSpec {self.name!r}: a numeric field carries no codes")
@@ -442,6 +450,10 @@ class FieldSpec:
                 raise ValueError(
                     f"FieldSpec {self.name!r}: a numeric field needs anchor_op in {_ANCHOR_OPS} and an "
                     f"anchor_value, got {self.anchor_op!r}/{self.anchor_value!r}")
+            if not (self.value_min <= self.anchor_value <= self.value_max):
+                raise ValueError(
+                    f"FieldSpec {self.name!r}: anchor_value {self.anchor_value!r} outside "
+                    f"[{self.value_min!r}, {self.value_max!r}]")
 
 
 @dataclass(frozen=True)
@@ -450,13 +462,21 @@ class ProfileSpec:
     calc_version: str
     fields: Tuple[FieldSpec, ...]
 
+    def __post_init__(self) -> None:
+        if not self.name or not self.calc_version:
+            raise ValueError(f"ProfileSpec needs a name and a calc_version, got {self.name!r}/{self.calc_version!r}")
+        object.__setattr__(self, "fields", tuple(self.fields))
+
 
 OHLCV_V1 = ProfileSpec(name="ohlcv-v1", calc_version=CALC_VERSION, fields=(
-    FieldSpec(FIELD_TREND_SLOPE, "numeric", "slope", True, -0.30, 0.30, 0.05, ">", 0.0,
+    FieldSpec(name=FIELD_TREND_SLOPE, kind="numeric", short="slope", searched=True,
+              value_min=-0.30, value_max=0.30, value_step=0.05, anchor_op=">", anchor_value=0.0,
               ui_name="Underlying trend slope"),
-    FieldSpec(FIELD_ADX, "numeric", "adx", True, 10.0, 40.0, 5.0, "<", 25.0,
+    FieldSpec(name=FIELD_ADX, kind="numeric", short="adx", searched=True,
+              value_min=10.0, value_max=40.0, value_step=5.0, anchor_op="<", anchor_value=25.0,
               ui_name="Underlying trend strength"),
-    FieldSpec(FIELD_RV_RATIO, "numeric", "rv", True, 0.50, 2.00, 0.25, "<", 1.0,
+    FieldSpec(name=FIELD_RV_RATIO, kind="numeric", short="rv", searched=True,
+              value_min=0.50, value_max=2.00, value_step=0.25, anchor_op="<", anchor_value=1.0,
               ui_name="Realized volatility expansion"),
 ))
 PROFILES: Dict[str, ProfileSpec] = {OHLCV_V1.name: OHLCV_V1}
@@ -466,21 +486,25 @@ def _known_fields() -> List[str]:
     return [f.name for prof in PROFILES.values() for f in prof.fields]
 
 
+def _unknown_field(field: str) -> KeyError:
+    return KeyError(f"unknown market-condition field {field!r}; known fields: {_known_fields()!r}")
+
+
 def profile_for_field(field: str) -> ProfileSpec:
     """The registered profile owning ``field``; KeyError naming the known fields otherwise."""
     for prof in PROFILES.values():
-        for f in prof.fields:
-            if f.name == field:
-                return prof
-    raise KeyError(f"unknown market-condition field {field!r}; known fields: {_known_fields()!r}")
+        if any(f.name == field for f in prof.fields):
+            return prof
+    raise _unknown_field(field)
 
 
 def field_spec(field: str) -> FieldSpec:
     """The registered FieldSpec for ``field``; KeyError naming the known fields otherwise."""
-    for f in profile_for_field(field).fields:
-        if f.name == field:
-            return f
-    raise AssertionError("unreachable")  # profile_for_field only returns a profile owning field
+    for prof in PROFILES.values():
+        for f in prof.fields:
+            if f.name == field:
+                return f
+    raise _unknown_field(field)
 
 
 def register_profile(spec: ProfileSpec) -> None:
@@ -504,3 +528,17 @@ def register_profile(spec: ProfileSpec) -> None:
     if len(set(shorts)) != len(shorts) or any(sh in taken_shorts for sh in shorts):
         raise ValueError(f"market-condition profile {spec.name!r}: short ids {shorts!r} repeat or are already taken")
     PROFILES[spec.name] = spec
+
+
+@contextmanager
+def registered_profile(spec: ProfileSpec) -> Iterator[ProfileSpec]:
+    """TEST HOOK: register ``spec`` for the duration of the ``with`` block, then restore the
+    previous registry contents (also on an exception). Mutates ``PROFILES`` in place, so modules
+    that imported the dict see the temporary profile too. Not for production registration."""
+    saved = dict(PROFILES)
+    try:
+        register_profile(spec)
+        yield spec
+    finally:
+        PROFILES.clear()
+        PROFILES.update(saved)

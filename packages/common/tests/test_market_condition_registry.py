@@ -6,6 +6,7 @@ import pytest
 from ba2_common.core import market_conditions as mc
 from ba2_common.core.market_conditions import (
     FIELDS, OHLCV_V1, PROFILES, FieldSpec, ProfileSpec, field_spec, profile_for_field, register_profile,
+    registered_profile,
 )
 
 
@@ -22,7 +23,7 @@ def test_ohlcv_v1_fields_match_calculator_fields_in_order():
 ])
 def test_design_table_ranges_and_anchors(name, short, lo, hi, step, op, anchor):
     s = field_spec(name)
-    assert (s.kind, s.short, s.searched_v1) == ("numeric", short, True)
+    assert (s.kind, s.short, s.searched) == ("numeric", short, True)
     assert (s.value_min, s.value_max, s.value_step) == (lo, hi, step)
     assert (s.anchor_op, s.anchor_value) == (op, anchor)
     assert s.codes is None and s.ui_name
@@ -49,30 +50,73 @@ def test_specs_are_frozen():
         OHLCV_V1.fields[0].short = "x"
 
 
-def _cat(name="t_structure_state", codes=None):
-    return FieldSpec(name, "categorical", "struct", True, codes=codes or {"bull": 1, "bear": 2})
+def _cat(name="t_structure_state", short="struct", codes=None):
+    return FieldSpec(name=name, kind="categorical", short=short, searched=True,
+                     codes=codes or {"bull": 1, "bear": 2})
 
 
-def test_register_profile_rejects_duplicates(monkeypatch):
-    monkeypatch.setattr(mc, "PROFILES", dict(mc.PROFILES))
+def test_categorical_spec_is_hashable_and_its_codes_are_immutable():
+    raw = {"bull": 1, "bear": 2}
+    spec = _cat(codes=raw)
+    assert isinstance(hash(spec), int)
+    assert hash(OHLCV_V1) == hash(OHLCV_V1)
+    with pytest.raises(TypeError):
+        spec.codes["none"] = 0
+    raw["range"] = 3                      # the caller's dict is copied, not aliased
+    assert dict(spec.codes) == {"bull": 1, "bear": 2}
+    assert spec == _cat()
+
+
+def test_profile_spec_coerces_fields_to_a_tuple_and_requires_names():
+    prof = ProfileSpec(name="p", calc_version="p/calc-1", fields=[_cat()])
+    assert isinstance(prof.fields, tuple) and prof.fields == (_cat(),)
+    with pytest.raises(ValueError):
+        ProfileSpec(name="", calc_version="x", fields=(_cat(),))
+    with pytest.raises(ValueError):
+        ProfileSpec(name="p", calc_version="", fields=(_cat(),))
+
+
+def test_register_profile_rejects_duplicates():
     with pytest.raises(ValueError):
         register_profile(ProfileSpec(name="ohlcv-v1", calc_version="x", fields=(_cat(),)))
     with pytest.raises(ValueError):   # field already registered by ohlcv-v1
         register_profile(ProfileSpec(name="other", calc_version="x", fields=(
-            FieldSpec("underlying_adx_14", "numeric", "adx", True, 10.0, 40.0, 5.0, "<", 25.0),)))
+            FieldSpec(name="underlying_adx_14", kind="numeric", short="adx2", searched=True, value_min=10.0,
+                      value_max=40.0, value_step=5.0, anchor_op="<", anchor_value=25.0),)))
     with pytest.raises(ValueError):   # duplicate field inside one profile
         register_profile(ProfileSpec(name="dup", calc_version="x", fields=(_cat(), _cat())))
     with pytest.raises(ValueError):   # short id already used by ohlcv-v1 (launcher ids collide)
-        register_profile(ProfileSpec(name="short", calc_version="x", fields=(
-            FieldSpec("t_other", "categorical", "adx", True, codes={"a": 1}),)))
+        register_profile(ProfileSpec(name="short", calc_version="x", fields=(_cat("t_other", short="adx"),)))
     with pytest.raises(ValueError):   # empty profile
         register_profile(ProfileSpec(name="empty", calc_version="x", fields=()))
+    assert set(PROFILES) == {"ohlcv-v1"}
+
+
+def test_registered_profile_hook_registers_then_restores():
+    before = dict(PROFILES)
     spec = ProfileSpec(name="t-v1", calc_version="t/calc-1", fields=(_cat(),))
-    register_profile(spec)
-    assert mc.PROFILES["t-v1"] is spec
-    assert profile_for_field("t_structure_state") is spec
-    assert field_spec("t_structure_state").codes == {"bull": 1, "bear": 2}
-    assert "t-v1" not in PROFILES   # the monkeypatched copy is the one mutated
+    with registered_profile(spec) as got:
+        assert got is spec
+        assert mc.PROFILES["t-v1"] is spec
+        assert profile_for_field("t_structure_state") is spec
+        assert field_spec("t_structure_state").codes == {"bull": 1, "bear": 2}
+        with pytest.raises(ValueError):   # re-registering inside the context is still refused
+            register_profile(spec)
+    assert "t-v1" not in PROFILES and PROFILES == before   # original dict unchanged
+    assert mc.PROFILES is PROFILES
+    with pytest.raises(KeyError):
+        field_spec("t_structure_state")
+
+
+def test_registered_profile_restores_after_an_exception_inside():
+    before = dict(PROFILES)
+    with pytest.raises(RuntimeError):
+        with registered_profile(ProfileSpec(name="t-v2", calc_version="x", fields=(_cat(),))):
+            raise RuntimeError("boom")
+    assert PROFILES == before
+
+
+_NUM = dict(value_min=1.0, value_max=2.0, value_step=0.5, anchor_op="<", anchor_value=1.0)
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -86,13 +130,21 @@ def test_register_profile_rejects_duplicates(monkeypatch):
     dict(kind="categorical", codes={"bull": 1, "bear": 2}, value_min=1.0),
     dict(kind="numeric"),
     dict(kind="numeric", value_min=1.0, value_max=2.0),
-    dict(kind="numeric", value_min=1.0, value_max=2.0, value_step=0.5, anchor_op="<=", anchor_value=1.0),
-    dict(kind="numeric", value_min=1.0, value_max=2.0, value_step=0.5, anchor_op="<", anchor_value=1.0,
-         codes={"a": 1}),
-    dict(kind="numeric", value_min=2.0, value_max=1.0, value_step=0.5, anchor_op="<", anchor_value=1.0),
-    dict(kind="numeric", value_min=1.0, value_max=2.0, value_step=0.0, anchor_op="<", anchor_value=1.0),
-    dict(kind="ordinal", value_min=1.0, value_max=2.0, value_step=0.5, anchor_op="<", anchor_value=1.0),
-])
+    dict(kind="numeric", **{**_NUM, "anchor_op": "<="}),
+    dict(kind="numeric", **_NUM, codes={"a": 1}),
+    dict(kind="numeric", **{**_NUM, "value_min": 2.0, "value_max": 1.0}),
+    dict(kind="numeric", **{**_NUM, "value_step": 0.0}),
+    dict(kind="numeric", **{**_NUM, "anchor_value": 0.5}),
+    dict(kind="numeric", **{**_NUM, "anchor_value": 2.5}),
+    dict(kind="ordinal", **_NUM),
+], ids=["none-code-0", "none-code", "empty-codes", "no-codes", "dup-codes", "zero-code", "bool-code",
+        "cat-with-range", "num-no-range", "num-no-step", "bad-anchor-op", "num-with-codes",
+        "min-above-max", "zero-step", "anchor-below-min", "anchor-above-max", "bad-kind"])
 def test_field_spec_consistency_is_validated(kwargs):
     with pytest.raises(ValueError):
-        FieldSpec(name="x", short="x", searched_v1=True, **kwargs)
+        FieldSpec(name="x", short="x", searched=True, **kwargs)
+
+
+def test_anchor_on_range_bounds_is_allowed():
+    FieldSpec(name="x", short="x", searched=True, kind="numeric", **{**_NUM, "anchor_value": 1.0})
+    FieldSpec(name="x", short="x", searched=True, kind="numeric", **{**_NUM, "anchor_value": 2.0})
