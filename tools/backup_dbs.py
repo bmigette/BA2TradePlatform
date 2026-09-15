@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import os
 import sqlite3
@@ -67,26 +68,45 @@ def archive_name(name: str, day: _dt.date) -> str:
     return f"{name}_{day:%Y-%m-%d}{ARCHIVE_SUFFIX}"
 
 
+def _sidecars(db: Path) -> List[Path]:
+    """The DB file plus the WAL/SHM siblings SQLite creates next to a WAL-mode database."""
+    return [db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")]
+
+
+def remove_copy(db: Path) -> None:
+    """Delete a temp copy and its sidecars. Raises on failure: a 14 GB leftover per night in the
+    temp dir is exactly the kind of silent failure this script must not have."""
+    for p in _sidecars(db):
+        if p.exists():
+            p.unlink()
+
+
 def online_copy(src: Path, dst: Path) -> None:
-    """SQLite online backup of ``src`` into a fresh file ``dst``."""
-    if dst.exists():
-        dst.unlink()
-    with sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True) as s, sqlite3.connect(dst) as d:
+    """SQLite online backup of ``src`` into a fresh file ``dst``.
+
+    Connections are closed explicitly: ``with sqlite3.connect(...)`` only commits/rolls back,
+    it does NOT close, and an open handle makes the later unlink fail on Windows."""
+    remove_copy(dst)
+    with contextlib.closing(sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True)) as s,             contextlib.closing(sqlite3.connect(dst)) as d:
         s.backup(d, pages=_PAGES_PER_STEP, sleep=_SLEEP_BETWEEN_STEPS_S)
+        # The header copied from a WAL-mode source leaves the copy in WAL mode; switch it back so
+        # the archived file is a single self-contained file with nothing pending in a -wal.
+        d.execute("PRAGMA journal_mode=DELETE")
 
 
 def quick_check(path: Path) -> str:
-    with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True) as c:
+    with contextlib.closing(sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)) as c:
         return str(c.execute("PRAGMA quick_check").fetchone()[0])
 
 
-def deflate(src: Path, final: Path) -> int:
-    """Zip ``src`` into ``final`` via a ``.part`` sibling; returns the archive size in bytes."""
+def deflate(src: Path, final: Path, arcname: str) -> int:
+    """Zip ``src`` into ``final`` (stored inside as ``arcname``) via a ``.part`` sibling;
+    returns the archive size in bytes."""
     part = final.with_name(final.name + ".part")
     if part.exists():
         part.unlink()
     with zipfile.ZipFile(part, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        z.write(src, arcname=src.name)
+        z.write(src, arcname=arcname)
     os.replace(part, final)
     return final.stat().st_size
 
@@ -127,7 +147,7 @@ def backup_one(name: str, src: Path, dest: Path, tmp_dir: Path, keep: int, day: 
             log(f"[{name}] FAILED quick_check on the copy: {verdict}", dest)
             return False
         t2 = time.monotonic()
-        archived = deflate(tmp_copy, final)
+        archived = deflate(tmp_copy, final, arcname=src.name)
         t3 = time.monotonic()
         log(f"[{name}] ok: copy {t1 - t0:.0f}s, check {t2 - t1:.0f}s, zip {t3 - t2:.0f}s -> "
             f"{archived / 1048576:.0f} MB ({archived / max(src.stat().st_size, 1) * 100:.0f}% of source)",
@@ -137,10 +157,14 @@ def backup_one(name: str, src: Path, dest: Path, tmp_dir: Path, keep: int, day: 
         return False
     finally:
         try:
-            if tmp_copy.exists():
-                tmp_copy.unlink()
-        except OSError:
-            pass
+            remove_copy(tmp_copy)
+        except OSError as e:
+            log(f"[{name}] WARNING: temp copy left behind at {tmp_copy}: {e}", dest)
+            ok_cleanup = False
+        else:
+            ok_cleanup = True
+    if not ok_cleanup:
+        return False
     victims = prune(dest, name, keep)
     if victims:
         log(f"[{name}] pruned {[v.name for v in victims]} (keep {keep})", dest)
