@@ -120,3 +120,66 @@ def test_sessions_ending_at_rejects_bad_input():
         regular_sessions_ending_at(date(2025, 6, 30), 0)
     with pytest.raises(TypeError):
         regular_sessions_ending_at(datetime(2025, 6, 30, tzinfo=timezone.utc), 5)
+
+
+# --------------------------------------------------------------------------- table performance
+def _cold_pass(n_sessions=1508):
+    from ba2_common.core.market_calendar import clear_nyse_calendar_cache
+
+    clear_nyse_calendar_cache()
+    sessions = regular_sessions_ending_at(date(2025, 12, 31), n_sessions)
+    out = []
+    for d in sessions:
+        out.append((d, prior_regular_session(d), regular_sessions_ending_at(d, 128)[0],
+                    regular_session_close_utc(d)))
+    return out
+
+
+def test_cold_1508_session_pass_is_fast():
+    import time
+
+    start = time.perf_counter()
+    out = _cold_pass()
+    elapsed = time.perf_counter() - start
+    assert len(out) == 1508
+    # The range-memo version measured 101.8 s for this pass (4525 schedule() misses).
+    assert elapsed < 2.0, f"cold 1508-session pass took {elapsed:.2f}s"
+
+
+def test_table_matches_the_previous_implementation_2019_2025():
+    """Pinned from the range-memo implementation (commit 2d18f778) before the table rewrite."""
+    import hashlib
+
+    sessions = [o.astimezone(NY_TZ).date() for o, _ in nyse_regular_sessions(date(2019, 1, 1), date(2025, 12, 31))]
+    assert (len(sessions), sessions[0], sessions[-1]) == (1760, date(2019, 1, 2), date(2025, 12, 31))
+    assert regular_sessions_ending_at(date(2025, 12, 31), 1760) == sessions
+    utc = timezone.utc
+    pinned = {
+        date(2025, 1, 9): (False, date(2025, 1, 8), datetime(2025, 1, 8, 21, 0, tzinfo=utc)),     # Carter mourning day
+        date(2025, 4, 18): (False, date(2025, 4, 17), datetime(2025, 4, 17, 20, 0, tzinfo=utc)),  # Good Friday
+        date(2025, 7, 3): (True, date(2025, 7, 2), datetime(2025, 7, 2, 20, 0, tzinfo=utc)),
+        date(2025, 7, 4): (False, date(2025, 7, 3), datetime(2025, 7, 3, 17, 0, tzinfo=utc)),     # 07-03 half day
+        date(2025, 11, 27): (False, date(2025, 11, 26), datetime(2025, 11, 26, 21, 0, tzinfo=utc)),
+        date(2025, 11, 28): (True, date(2025, 11, 26), datetime(2025, 11, 26, 21, 0, tzinfo=utc)),
+        date(2025, 12, 24): (True, date(2025, 12, 23), datetime(2025, 12, 23, 21, 0, tzinfo=utc)),
+        date(2025, 12, 25): (False, date(2025, 12, 24), datetime(2025, 12, 24, 18, 0, tzinfo=utc)),  # 12-24 half day
+    }
+    for d, (is_session, prior, prior_close) in pinned.items():
+        assert (d in sessions, prior_regular_session(d), regular_session_close_utc(prior)) == \
+            (is_session, prior, prior_close), d
+    assert regular_sessions_ending_at(date(2019, 1, 2), 3) == [date(2018, 12, 28), date(2018, 12, 31), date(2019, 1, 2)]
+    digest = hashlib.sha256(repr([
+        (str(d), prior_regular_session(d), regular_sessions_ending_at(d, 128)[0],
+         regular_session_close_utc(d).isoformat()) for d in sessions]).encode()).hexdigest()
+    assert digest == "0b76f7cb5dfa631fb480574e8cd52b669ce8249b75f9ce3d32cb200a566a853c"
+
+
+def test_table_grows_backwards_and_forwards():
+    from ba2_common.core import market_calendar as mcal
+
+    mcal.clear_nyse_calendar_cache()
+    assert prior_regular_session(date(1985, 1, 3)) == date(1985, 1, 2)
+    assert regular_sessions_ending_at(date(1985, 1, 2), 3)[-1] == date(1985, 1, 2)
+    far = date.today().replace(month=1, day=1) + timedelta(days=366 * 5)
+    assert prior_regular_session(far) < far
+    assert mcal._TABLE.first_day <= date(1984, 1, 3) and mcal._TABLE.last_day >= far

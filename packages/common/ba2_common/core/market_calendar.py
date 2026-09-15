@@ -21,10 +21,13 @@ around it.
 Offline: ``pandas_market_calendars`` ships the NYSE holiday and half-day rules as
 DATA, so no network call is ever made here.
 """
+import threading
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+
+import numpy as np
 
 from ba2_common.core.account_types import (
     MARKET_HOURS_SOURCE_FALLBACK,
@@ -96,7 +99,7 @@ def clear_nyse_calendar_cache() -> None:
     _CALENDAR = None
     _nyse_sessions_memo.cache_clear()
     _sessions_ending_at_memo.cache_clear()
-    _prior_session_memo.cache_clear()
+    _clear_session_table()
 
 
 def _require_aware(moment: datetime) -> datetime:
@@ -215,21 +218,75 @@ def nyse_market_hours(now: Optional[datetime] = None) -> MarketHours:
 # ---------------------------------------------------------------------------
 # Session-label arithmetic for the market-condition gates (design
 # ``docs/plans/2026-09-15-option-market-condition-genes-design.md`` section 4,
-# ``prior_session_v1``). Built on the same memoised schedule as
-# ``nyse_regular_sessions``, so holidays and half days come from the same data.
+# ``prior_session_v1``).
+#
+# ONE wide session table, built with a single ``schedule()`` call and answered by binary search.
+# The first version derived every answer from a fresh ``nyse_regular_sessions`` range: each
+# (session, n) and each prior-session lookup was a distinct range key, so a backtest walking
+# 1508 sessions missed the 512-entry range memo 4525 times -- measured 101.8 s cold, ~20 s per
+# trial ongoing. The table costs one schedule call per process, then O(log n) lookups. The same
+# pandas_market_calendars data answers both, so holidays and half days are unchanged.
 # ---------------------------------------------------------------------------
 
-#: Calendar days per regular session is ~1.45 (252 sessions / 365 days); 1.6 plus a fixed
-#: margin covers any holiday cluster, and the look-back doubles if it ever comes up short.
-_SESSION_SPAN_FACTOR = 1.6
-_SESSION_SPAN_MARGIN_DAYS = 10
-#: Hard stop for the doubling loops: no caller legitimately asks for more than a century.
-_MAX_LOOKBACK_DAYS = 366 * 100
+#: Default span of the session table; grown automatically when a query falls outside it.
+_TABLE_FIRST_DAY = date(1990, 1, 1)
+_TABLE_FUTURE_DAYS = 2 * 366
+#: Floor for backward growth.
+_TABLE_MIN_DAY = date(1885, 1, 1)
+
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_TABLE_LOCK = threading.Lock()
 
 
-def _session_dates(first_day: date, last_day: date) -> List[date]:
-    """Exchange-local session DATES over an inclusive calendar-day range, ascending."""
-    return [o.astimezone(NY_TZ).date() for o, _ in _nyse_sessions_memo(first_day, last_day)]
+class _SessionTable:
+    """Sorted session dates (``datetime64[D]``) with their UTC close instants (int64 ns) over
+    the inclusive calendar-day span ``[first_day, last_day]``. Immutable once built."""
+
+    __slots__ = ("first_day", "last_day", "days", "closes_ns")
+
+    def __init__(self, first_day: date, last_day: date):
+        schedule = _nyse_calendar().schedule(start_date=first_day, end_date=last_day)
+        self.first_day = first_day
+        self.last_day = last_day
+        self.days = np.asarray(schedule.index.values).astype("datetime64[D]")
+        closes = schedule["market_close"]
+        if getattr(closes.dt, "tz", None) is not None:
+            closes = closes.dt.tz_convert("UTC").dt.tz_localize(None)
+        self.closes_ns = closes.to_numpy(dtype="datetime64[ns]").astype(np.int64)
+
+
+_TABLE: Optional[_SessionTable] = None
+
+
+def _session_table(covering: date, history_from: Optional[date] = None) -> _SessionTable:
+    """The session table, (re)built so its span contains ``covering`` (and, when given, starts on
+    or before ``history_from``). Rebuilding widens the span; it never narrows it."""
+    global _TABLE
+    table = _TABLE
+    want_first = covering if history_from is None else min(covering, history_from)
+    if table is not None and table.first_day <= max(want_first, _TABLE_MIN_DAY) \
+            and covering <= table.last_day:
+        return table
+    with _TABLE_LOCK:
+        table = _TABLE
+        if table is not None and table.first_day <= max(want_first, _TABLE_MIN_DAY) \
+                and covering <= table.last_day:
+            return table
+        if table is None:
+            first, last = _TABLE_FIRST_DAY, date.today() + timedelta(days=_TABLE_FUTURE_DAYS)
+        else:
+            first, last = table.first_day, table.last_day
+        first = max(_TABLE_MIN_DAY, min(first, want_first - timedelta(days=366)))
+        last = max(last, covering + timedelta(days=_TABLE_FUTURE_DAYS))
+        _TABLE = _SessionTable(first, last)
+        _sessions_ending_at_memo.cache_clear()
+        return _TABLE
+
+
+def _clear_session_table() -> None:
+    global _TABLE
+    with _TABLE_LOCK:
+        _TABLE = None
 
 
 def _decision_local_date(decision: Any) -> date:
@@ -249,16 +306,18 @@ def _decision_local_date(decision: Any) -> date:
     raise TypeError(f"decision must be a datetime or a date, got {type(decision).__name__}")
 
 
-@lru_cache(maxsize=4096)
-def _prior_session_memo(local_day: date) -> date:
-    span = LOOKAHEAD_DAYS
-    while True:
-        dates = _session_dates(local_day - timedelta(days=span), local_day - timedelta(days=1))
-        if dates:
-            return dates[-1]
-        if span >= _MAX_LOOKBACK_DAYS:
-            raise ValueError(f"no regular NYSE session in the {span} days before {local_day}")
-        span = min(span * 2, _MAX_LOOKBACK_DAYS)
+def _require_session_date(session: Any) -> date:
+    if isinstance(session, datetime) or not isinstance(session, date):
+        raise TypeError(f"session must be a date, got {type(session).__name__}")
+    return session
+
+
+def _session_index(table: _SessionTable, session: date) -> int:
+    d64 = np.datetime64(session, "D")
+    i = int(np.searchsorted(table.days, d64, side="left"))
+    if i >= len(table.days) or table.days[i] != d64:
+        raise ValueError(f"{session} is not a regular NYSE session")
+    return i
 
 
 def prior_regular_session(decision: Any) -> date:
@@ -273,25 +332,41 @@ def prior_regular_session(decision: Any) -> date:
             (a daily backtest's session label, used as-is).
 
     Raises:
-        ValueError: a naive datetime.
+        ValueError: a naive datetime, or no session before the calendar's first day.
         TypeError: anything that is not a date/datetime.
         MarketCalendarUnavailable: see ``_nyse_calendar``.
     """
-    return _prior_session_memo(_decision_local_date(decision))
+    local_day = _decision_local_date(decision)
+    table = _session_table(local_day)
+    d64 = np.datetime64(local_day, "D")
+    i = int(np.searchsorted(table.days, d64, side="left")) - 1
+    if i < 0:
+        table = _session_table(local_day, local_day - timedelta(days=4 * LOOKAHEAD_DAYS))
+        i = int(np.searchsorted(table.days, d64, side="left")) - 1
+        if i < 0:
+            raise ValueError(f"no regular NYSE session before {local_day}")
+    return table.days[i].astype(object)
 
 
 @lru_cache(maxsize=4096)
 def _sessions_ending_at_memo(session: date, n: int) -> Tuple[date, ...]:
-    if not _session_dates(session, session):
-        raise ValueError(f"{session} is not a regular NYSE session")
-    span = int(n * _SESSION_SPAN_FACTOR) + _SESSION_SPAN_MARGIN_DAYS
-    while True:
-        dates = _session_dates(session - timedelta(days=span), session)
-        if len(dates) >= n:
-            return tuple(dates[-n:])
-        if span >= _MAX_LOOKBACK_DAYS:
+    table = _session_table(session)
+    i = _session_index(table, session)
+    if i + 1 < n:
+        # ~1.45 calendar days per session: 3x plus a margin reaches far enough in one regrowth.
+        table = _session_table(session, session - timedelta(days=3 * n + 30))
+        i = _session_index(table, session)
+        if i + 1 < n:
             raise ValueError(f"fewer than {n} regular NYSE sessions end at {session}")
-        span = min(span * 2, _MAX_LOOKBACK_DAYS)
+    return tuple(table.days[i - n + 1:i + 1].astype(object).tolist())
+
+
+def regular_sessions_ending_at_tuple(session: date, n: int) -> Tuple[date, ...]:
+    """``regular_sessions_ending_at`` as the memoised immutable tuple (no copy)."""
+    _require_session_date(session)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"n must be a positive int, got {n!r}")
+    return _sessions_ending_at_memo(session, n)
 
 
 def regular_sessions_ending_at(session: date, n: int) -> List[date]:
@@ -304,11 +379,7 @@ def regular_sessions_ending_at(session: date, n: int) -> List[date]:
             than ``n`` sessions ending there.
         TypeError: ``session`` is a datetime or not a date (a session label is a calendar day).
     """
-    if isinstance(session, datetime) or not isinstance(session, date):
-        raise TypeError(f"session must be a date, got {type(session).__name__}")
-    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-        raise ValueError(f"n must be a positive int, got {n!r}")
-    return list(_sessions_ending_at_memo(session, n))
+    return list(regular_sessions_ending_at_tuple(session, n))
 
 
 def regular_session_close_utc(session: date) -> datetime:
@@ -317,9 +388,7 @@ def regular_session_close_utc(session: date) -> datetime:
     Raises:
         ValueError: ``session`` is not a regular session.
     """
-    if isinstance(session, datetime) or not isinstance(session, date):
-        raise TypeError(f"session must be a date, got {type(session).__name__}")
-    pairs = _nyse_sessions_memo(session, session)
-    if not pairs:
-        raise ValueError(f"{session} is not a regular NYSE session")
-    return pairs[-1][1]
+    _require_session_date(session)
+    table = _session_table(session)
+    ns = int(table.closes_ns[_session_index(table, session)])
+    return _EPOCH_UTC + timedelta(microseconds=ns // 1000)
