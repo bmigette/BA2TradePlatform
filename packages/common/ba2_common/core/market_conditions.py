@@ -80,7 +80,7 @@ from contextlib import contextmanager
 from dataclasses import InitVar, dataclass
 from dataclasses import field as dc_field
 from types import MappingProxyType
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -161,6 +161,60 @@ class MarketConditionValues:
             row[f"{field}_status"] = obs.status
         row["calc_version"] = self.calc_version
         return row
+
+    def to_feature_row(self) -> "FeatureRow":
+        """The field-generic row the store, readers and conditions share (one calc version
+        per field; for this trio all three carry ``self.calc_version``)."""
+        values = self.by_field()
+        return FeatureRow(values=values, calc_versions={f: self.calc_version for f in values})
+
+
+@dataclass(frozen=True)
+class FeatureRow:
+    """A computed row for ANY registered profile: ``{field: Observation}`` plus the calculator
+    version that produced each field. Satisfies ``FeatureRowLike``.
+
+    Both mappings are copied ONCE at construction into read-only ``MappingProxyType`` views, so
+    ``by_field()`` returns the stored mapping (no per-read allocation on the decision path) and
+    no caller can edit a memoised row in place.
+    """
+
+    values: Mapping[str, Observation]
+    calc_versions: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        values = dict(self.values)
+        versions = dict(self.calc_versions)
+        if not values:
+            raise ValueError("a FeatureRow needs at least one field")
+        for field, obs in values.items():
+            if not isinstance(field, str) or not field:
+                raise ValueError(f"field names must be non-empty strings, got {field!r}")
+            if not isinstance(obs, Observation):
+                raise ValueError(f"field {field!r} must hold an Observation, got {type(obs).__name__}")
+        if set(versions) != set(values):
+            raise ValueError(
+                f"calc_versions keys {sorted(versions)!r} must equal the fields {sorted(values)!r}")
+        for field, version in versions.items():
+            if not isinstance(version, str) or not version:
+                raise ValueError(f"calc version of {field!r} must be a non-empty string, got {version!r}")
+        object.__setattr__(self, "values", MappingProxyType(values))
+        object.__setattr__(self, "calc_versions", MappingProxyType(versions))
+
+    __hash__ = None  # type: ignore[assignment]  # mapping fields: equality only
+
+    def by_field(self) -> Mapping[str, Observation]:
+        return self.values
+
+    @classmethod
+    def uniform(cls, profile: "ProfileSpec", status: str, reason: str) -> "FeatureRow":
+        """Every field of ``profile`` with the same non-valid ``status`` (a window that could
+        not be assembled fails all fields together)."""
+        if status == STATUS_VALID:
+            raise ValueError("a uniform row carries no values, so it cannot be valid")
+        obs = Observation(None, status, reason)
+        return cls(values={f.name: obs for f in profile.fields},
+                   calc_versions={f.name: profile.calc_version for f in profile.fields})
 
 
 def _f64(x) -> np.ndarray:
@@ -595,3 +649,13 @@ def registered_profile(spec: ProfileSpec) -> Iterator[ProfileSpec]:
         PROFILES.clear()
         PROFILES.update(saved)
         field_codes.cache_clear()
+
+
+def _compute_ohlcv_v1(o, h, l, c, v) -> FeatureRow:
+    return compute_market_conditions(o, h, l, c, v).to_feature_row()
+
+
+#: profile name -> ``fn(o, h, l, c, v) -> FeatureRow`` over exactly ``WINDOW`` bars. Readers look
+#: the compute function up here by profile, so a second profile (Task 10's ``ta-structure-v1``)
+#: registers its calculator next to its ``ProfileSpec`` and no reader changes.
+COMPUTE_BY_PROFILE: Dict[str, Callable[..., FeatureRow]] = {OHLCV_V1.name: _compute_ohlcv_v1}

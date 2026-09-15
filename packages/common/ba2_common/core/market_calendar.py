@@ -95,6 +95,8 @@ def clear_nyse_calendar_cache() -> None:
     global _CALENDAR
     _CALENDAR = None
     _nyse_sessions_memo.cache_clear()
+    _sessions_ending_at_memo.cache_clear()
+    _prior_session_memo.cache_clear()
 
 
 def _require_aware(moment: datetime) -> datetime:
@@ -208,3 +210,116 @@ def nyse_market_hours(now: Optional[datetime] = None) -> MarketHours:
         source=MARKET_HOURS_SOURCE_FALLBACK,
         as_of=now_utc,
     )
+
+
+# ---------------------------------------------------------------------------
+# Session-label arithmetic for the market-condition gates (design
+# ``docs/plans/2026-09-15-option-market-condition-genes-design.md`` section 4,
+# ``prior_session_v1``). Built on the same memoised schedule as
+# ``nyse_regular_sessions``, so holidays and half days come from the same data.
+# ---------------------------------------------------------------------------
+
+#: Calendar days per regular session is ~1.45 (252 sessions / 365 days); 1.6 plus a fixed
+#: margin covers any holiday cluster, and the look-back doubles if it ever comes up short.
+_SESSION_SPAN_FACTOR = 1.6
+_SESSION_SPAN_MARGIN_DAYS = 10
+#: Hard stop for the doubling loops: no caller legitimately asks for more than a century.
+_MAX_LOOKBACK_DAYS = 366 * 100
+
+
+def _session_dates(first_day: date, last_day: date) -> List[date]:
+    """Exchange-local session DATES over an inclusive calendar-day range, ascending."""
+    return [o.astimezone(NY_TZ).date() for o, _ in _nyse_sessions_memo(first_day, last_day)]
+
+
+def _decision_local_date(decision: Any) -> date:
+    """The exchange-local calendar date a decision belongs to.
+
+    A tz-aware datetime is converted to America/New_York; a NAIVE datetime is refused (no
+    timezone is guessed, design section 4); a plain ``date`` is the session label itself.
+    """
+    if isinstance(decision, datetime):
+        if decision.tzinfo is None or decision.tzinfo.utcoffset(decision) is None:
+            raise ValueError(
+                f"decision time must be timezone-aware, got naive {decision!r}; "
+                "a guessed timezone would move the session boundary")
+        return decision.astimezone(NY_TZ).date()
+    if isinstance(decision, date):
+        return decision
+    raise TypeError(f"decision must be a datetime or a date, got {type(decision).__name__}")
+
+
+@lru_cache(maxsize=4096)
+def _prior_session_memo(local_day: date) -> date:
+    span = LOOKAHEAD_DAYS
+    while True:
+        dates = _session_dates(local_day - timedelta(days=span), local_day - timedelta(days=1))
+        if dates:
+            return dates[-1]
+        if span >= _MAX_LOOKBACK_DAYS:
+            raise ValueError(f"no regular NYSE session in the {span} days before {local_day}")
+        span = min(span * 2, _MAX_LOOKBACK_DAYS)
+
+
+def prior_regular_session(decision: Any) -> date:
+    """The last regular NYSE session STRICTLY BEFORE the decision's exchange-local date.
+
+    ``prior_session_v1``: a decision on local date D reads the completed bar of the session
+    before D -- also after D's close (the policy is stable for the whole local date), and also
+    when D itself is not a session (a Saturday decision reads Friday).
+
+    Args:
+        decision: a tz-aware ``datetime`` (converted to America/New_York first) or a ``date``
+            (a daily backtest's session label, used as-is).
+
+    Raises:
+        ValueError: a naive datetime.
+        TypeError: anything that is not a date/datetime.
+        MarketCalendarUnavailable: see ``_nyse_calendar``.
+    """
+    return _prior_session_memo(_decision_local_date(decision))
+
+
+@lru_cache(maxsize=4096)
+def _sessions_ending_at_memo(session: date, n: int) -> Tuple[date, ...]:
+    if not _session_dates(session, session):
+        raise ValueError(f"{session} is not a regular NYSE session")
+    span = int(n * _SESSION_SPAN_FACTOR) + _SESSION_SPAN_MARGIN_DAYS
+    while True:
+        dates = _session_dates(session - timedelta(days=span), session)
+        if len(dates) >= n:
+            return tuple(dates[-n:])
+        if span >= _MAX_LOOKBACK_DAYS:
+            raise ValueError(f"fewer than {n} regular NYSE sessions end at {session}")
+        span = min(span * 2, _MAX_LOOKBACK_DAYS)
+
+
+def regular_sessions_ending_at(session: date, n: int) -> List[date]:
+    """The ``n`` regular-session dates ending at ``session`` INCLUSIVE, ascending.
+
+    Returns a fresh list (the memo holds a tuple, so no caller can edit another's answer).
+
+    Raises:
+        ValueError: ``session`` is not a regular session, ``n < 1``, or the calendar holds fewer
+            than ``n`` sessions ending there.
+        TypeError: ``session`` is a datetime or not a date (a session label is a calendar day).
+    """
+    if isinstance(session, datetime) or not isinstance(session, date):
+        raise TypeError(f"session must be a date, got {type(session).__name__}")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"n must be a positive int, got {n!r}")
+    return list(_sessions_ending_at_memo(session, n))
+
+
+def regular_session_close_utc(session: date) -> datetime:
+    """The regular close (tz-aware UTC) of ``session``: 16:00 ET, 13:00 ET on a half day.
+
+    Raises:
+        ValueError: ``session`` is not a regular session.
+    """
+    if isinstance(session, datetime) or not isinstance(session, date):
+        raise TypeError(f"session must be a date, got {type(session).__name__}")
+    pairs = _nyse_sessions_memo(session, session)
+    if not pairs:
+        raise ValueError(f"{session} is not a regular NYSE session")
+    return pairs[-1][1]
