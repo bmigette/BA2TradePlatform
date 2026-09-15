@@ -29,6 +29,8 @@ class ExpertInstance(SQLModel, table=True):
     account_id: int = Field(foreign_key="accountdefinition.id", nullable=False, ondelete="CASCADE")
     expert: str     
     enabled: bool = Field(default=True)
+    priority: int = Field(default=1, sa_column=Column(Integer, nullable=False, server_default="1"),
+                          description="Scheduled expert priority; higher runs trade processing first")
     alias: str | None = Field(default=None, max_length=100, description="Short display name for the expert (max 100 chars)")
     user_description: str | None = Field(default=None, description="Detailed notes about this expert instance")
     virtual_equity_pct: float = Field(default=100.0)

@@ -1561,7 +1561,7 @@ class JobMonitoringTab:
                         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
                         {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 100px'},
-                        {'name': 'priority', 'label': 'Priority', 'field': 'priority', 'sortable': True, 'style': 'width: 80px'},
+                        {'name': 'priority', 'label': 'Expert priority', 'field': 'priority', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'created_at', 'label': 'Created', 'field': 'created_at_display', 'sortable': True, 'style': 'width: 160px'},
                         {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 220px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                     ]
@@ -1598,6 +1598,7 @@ class JobMonitoringTab:
             worker_queue = self._get_worker_queue()
             all_tasks_dict = worker_queue.get_all_tasks()
             all_tasks = list(all_tasks_dict.values()) if isinstance(all_tasks_dict, dict) else all_tasks_dict
+            priority_waiting = worker_queue._expert_priority.waiting_batches()
             
             # Build a cache of expert IDs to shortnames and account names for efficient lookup
             expert_shortnames = {}
@@ -1629,7 +1630,9 @@ class JobMonitoringTab:
                 task_status = getattr(task, 'status', None) or getattr(task, 'state', None)
                 
                 # Only show pending and running tasks
-                if task_status not in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING, 'pending', 'running']:
+                waiting = (getattr(task, 'batch_id', None) in priority_waiting
+                           and task_status in (WorkerTaskStatus.COMPLETED, WorkerTaskStatus.PENDING))
+                if not waiting and task_status not in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING, 'pending', 'running']:
                     continue
                 
                 # Determine task type
@@ -1656,7 +1659,10 @@ class JobMonitoringTab:
                     created_at_display = 'Unknown'
                 
                 # Get status display and color
-                if task_status == WorkerTaskStatus.PENDING or task_status == 'pending':
+                if waiting:
+                    status_display = 'Waiting for priority'
+                    status_color = 'orange'
+                elif task_status == WorkerTaskStatus.PENDING or task_status == 'pending':
                     status_display = 'Pending'
                     status_color = 'orange'
                 elif task_status == WorkerTaskStatus.RUNNING or task_status == 'running':
@@ -1685,13 +1691,13 @@ class JobMonitoringTab:
                     'expert_name': expert_name,
                     'status_display': status_display,
                     'status_color': status_color,
-                    'priority': getattr(task, 'priority', 0),
+                    'priority': getattr(task, 'expert_priority', 1),
                     'created_at_display': created_at_display,
                     'batch_id': task_batch_id,
                 })
             
-            # Sort by priority (lower = higher priority), then by created time
-            formatted_tasks.sort(key=lambda x: (x['priority'], x['created_at_display']))
+            # Higher expert priority first, then creation time.
+            formatted_tasks.sort(key=lambda x: (-x['priority'], x['created_at_display']))
             
             return formatted_tasks
             

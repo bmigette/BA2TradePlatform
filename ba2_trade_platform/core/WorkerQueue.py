@@ -19,6 +19,7 @@ from .db import get_setting, add_instance, update_instance, get_db
 from .models import AppSetting, PersistedQueueTask
 from .types import WorkerTaskStatus, AnalysisUseCase
 from .SmartPriorityQueue import SmartPriorityQueue
+from .ExpertPriority import ExpertPriority
 
 
 
@@ -41,6 +42,8 @@ class AnalysisTask:
     bypass_balance_check: bool = False  # If True, skip balance verification for this task
     bypass_transaction_check: bool = False  # If True, skip existing transaction checks for this task
     batch_id: Optional[str] = None  # Batch ID for grouping related analysis jobs (e.g., "expertid_HHmm_YYYYMMDD" for scheduled, timestamp-based for manual)
+    expert_priority: int = 1
+    priority_group: Optional[tuple[str, int]] = None
     
     def __post_init__(self):
         if self.created_at is None:
@@ -65,6 +68,9 @@ class SmartRiskManagerTask:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     job_id: Optional[int] = None  # Reference to SmartRiskManagerJob record
+    batch_id: Optional[str] = None
+    expert_priority: int = 1
+    priority_group: Optional[tuple[str, int]] = None
     
     def __post_init__(self):
         if self.created_at is None:
@@ -90,6 +96,8 @@ class InstrumentExpansionTask:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     batch_id: Optional[str] = None  # Batch ID for grouping related expansion tasks
+    expert_priority: int = 1
+    priority_group: Optional[tuple[str, int]] = None
     
     def __post_init__(self):
         if self.created_at is None:
@@ -109,6 +117,8 @@ class WorkerQueue:
     
     def __init__(self):
         """Initialize the WorkerQueue system."""
+        self._expert_priority = ExpertPriority(self._priority_run_completed,
+            lambda run: self.release_deferred_open_positions(run.expert_id, "scheduled batch finishing"))
         self._queue = SmartPriorityQueue()  # Custom queue with expert-based round-robin
         self._workers: Dict[int, threading.Thread] = {}  # Maps thread id to thread object
         self._worker_count = 0
@@ -269,16 +279,17 @@ class WorkerQueue:
             self._queue_counter += 1
             queue_entry = (priority, self._queue_counter, task)
         
-        self._queue.put(queue_entry)
-        
-        # Persist task for recovery after restart
+        # Register before making work visible to any worker. Persist before enqueue
+        # so a fast completion cannot race the insertion of its recovery record.
         self._persist_task(task, self._queue_counter)
+        self._expert_priority.submit(batch_id, task, lambda: self._queue.put(queue_entry))
         
         logger.debug(f"Analysis task '{task_id}' submitted for expert {expert_instance_id}, symbol {symbol}, priority {priority}, batch_id={batch_id}")
         return task_id
     
     def submit_smart_risk_manager_task(self, expert_instance_id: int, account_id: int, 
-                                      priority: int = -10, task_id: Optional[str] = None) -> str:
+                                      priority: int = -10, task_id: Optional[str] = None,
+                                      batch_id: Optional[str] = None) -> str:
         """
         Submit a Smart Risk Manager task to be processed by the worker queue.
         Smart Risk Manager tasks have higher priority than regular analysis tasks (default priority = -10).
@@ -318,6 +329,7 @@ class WorkerQueue:
                 id=task_id,
                 expert_instance_id=expert_instance_id,
                 account_id=account_id,
+                batch_id=batch_id,
                 priority=priority
             )
             
@@ -330,10 +342,10 @@ class WorkerQueue:
             self._queue_counter += 1
             queue_entry = (priority, self._queue_counter, task)
         
-        self._queue.put(queue_entry)
-        
-        # Persist task for recovery after restart
+        # Register before making work visible to any worker. Persist before enqueue
+        # so a fast completion cannot race the insertion of its recovery record.
         self._persist_task(task, self._queue_counter)
+        self._expert_priority.submit(batch_id, task, lambda: self._queue.put(queue_entry), wait_for_turn=True)
         
         logger.info(f"Smart Risk Manager task '{task_id}' submitted for expert {expert_instance_id}, priority {priority}")
         return task_id
@@ -395,10 +407,10 @@ class WorkerQueue:
             self._queue_counter += 1
             queue_entry = (priority, self._queue_counter, task)
         
-        self._queue.put(queue_entry)
-        
-        # Persist task for recovery after restart
+        # Register before making work visible to any worker. Persist before enqueue
+        # so a fast completion cannot race the insertion of its recovery record.
         self._persist_task(task, self._queue_counter)
+        self._expert_priority.submit(batch_id, task, lambda: self._queue.put(queue_entry))
         
         logger.info(f"Instrument expansion task '{task_id}' ({expansion_type}) submitted for expert {expert_instance_id}, priority {priority}, batch_id={batch_id}")
         return task_id
@@ -556,7 +568,9 @@ class WorkerQueue:
             task.completed_at = time.time()
             
             logger.info(f"Task '{task_id}' cancelled")
-            return True
+        self._remove_persisted_task(task.id)
+        self._expert_priority.finished(task.batch_id, task.id)
+        return True
     
     def cancel_analysis_task(self, expert_instance_id: int, symbol: str) -> tuple[bool, str]:
         """
@@ -570,32 +584,12 @@ class WorkerQueue:
             Tuple of (success: bool, message: str) - success indicates if cancelled, message explains why
         """
         with self._task_lock:
-            # Find task by expert instance and symbol
-            for task_id, task in self._tasks.items():
-                if (task.expert_instance_id == expert_instance_id and 
-                    task.symbol == symbol):
-                    
-                    # Check if task is already running
-                    if task.status == WorkerTaskStatus.RUNNING:
-                        return False, "Task is currently running and cannot be cancelled"
-                    
-                    # Check if task is not pending
-                    if task.status != WorkerTaskStatus.PENDING:
-                        return False, f"Task is in '{task.status.value}' status and cannot be cancelled"
-                    
-                    # Remove from task key mapping
-                    task_key = task.get_task_key()
-                    if task_key in self._task_keys and self._task_keys[task_key] == task_id:
-                        del self._task_keys[task_key]
-                        
-                    # Update task status
-                    task.status = WorkerTaskStatus.FAILED
-                    task.error = Exception("Analysis task cancelled by user")
-                    task.completed_at = time.time()
-                    
-                    logger.info(f"Analysis task for expert {expert_instance_id}, symbol {symbol} cancelled")
-                    return True, "Task cancelled successfully"
-        
+            matching_id = next((task_id for task_id, task in self._tasks.items()
+                                if isinstance(task, AnalysisTask) and task.expert_instance_id == expert_instance_id and task.symbol == symbol and task.status in (WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING)), None)
+        if matching_id is not None:
+            cancelled = self.cancel_task(matching_id)
+            return cancelled, "Task cancelled successfully" if cancelled else "Task already started"
+
         # Task not found - update MarketAnalysis to FAILED if it exists
         try:
             from .db import get_instance, update_instance
@@ -640,31 +634,12 @@ class WorkerQueue:
             Tuple of (success: bool, message: str) - success indicates if cancelled, message explains why
         """
         with self._task_lock:
-            # Find task by market_analysis_id
-            for task_id, task in self._tasks.items():
-                if task.market_analysis_id == market_analysis_id:
-                    
-                    # Check if task is already running
-                    if task.status == WorkerTaskStatus.RUNNING:
-                        return False, "Task is currently running and cannot be cancelled"
-                    
-                    # Check if task is not pending
-                    if task.status != WorkerTaskStatus.PENDING:
-                        return False, f"Task is in '{task.status.value}' status and cannot be cancelled"
-                    
-                    # Remove from task key mapping
-                    task_key = task.get_task_key()
-                    if task_key in self._task_keys and self._task_keys[task_key] == task_id:
-                        del self._task_keys[task_key]
-                        
-                    # Update task status
-                    task.status = WorkerTaskStatus.FAILED
-                    task.error = Exception("Analysis task cancelled by user")
-                    task.completed_at = time.time()
-                    
-                    logger.info(f"Analysis task with market_analysis_id {market_analysis_id} cancelled")
-                    return True, "Task cancelled successfully"
-        
+            matching_id = next((task_id for task_id, task in self._tasks.items()
+                                if isinstance(task, AnalysisTask) and task.market_analysis_id == market_analysis_id and task.status in (WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING)), None)
+        if matching_id is not None:
+            cancelled = self.cancel_task(matching_id)
+            return cancelled, "Task cancelled successfully" if cancelled else "Task already started"
+
         # Task not found - update MarketAnalysis to FAILED if it exists
         try:
             from .db import get_instance, update_instance
@@ -735,6 +710,10 @@ class WorkerQueue:
                     self._queue.task_done()  # Mark sentinel task as done
                     break
                 
+                if task.status != WorkerTaskStatus.PENDING:
+                    self._queue.task_done()
+                    continue
+
                 # Track current task for round-robin fairness
                 current_thread.current_task = task
                 
@@ -842,6 +821,10 @@ class WorkerQueue:
                         if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                             del self._task_keys[task_key]
                     
+                    self._remove_finished_task(task)
+                    self._check_and_process_expert_recommendations(
+                        task.expert_instance_id, task.subtype, task.batch_id)
+                    self._expert_priority.finished(task.batch_id, task.id)
                     current_thread.current_task = None
                     self._queue.task_done()
                     continue
@@ -877,6 +860,8 @@ class WorkerQueue:
         
         # Update task status
         with self._task_lock:
+            if task.status != WorkerTaskStatus.PENDING:
+                return
             task.status = WorkerTaskStatus.RUNNING
             task.started_at = time.time()
         
@@ -1044,10 +1029,10 @@ class WorkerQueue:
             logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype}) completed. Checking for SmartRiskManager trigger...")
             if task.subtype == AnalysisUseCase.ENTER_MARKET:
                 logger.debug(f"[RISK_MGR_TRIGGER] Calling _check_and_process_expert_recommendations for ENTER_MARKET")
-                self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET)
+                self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET, task.batch_id)
             elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
                 logger.debug(f"[RISK_MGR_TRIGGER] Calling _check_and_process_expert_recommendations for OPEN_POSITIONS")
-                self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.OPEN_POSITIONS)
+                self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.OPEN_POSITIONS, task.batch_id)
             
         except Exception as e:
             # Update task with failure
@@ -1165,7 +1150,7 @@ class WorkerQueue:
             
             # Remove from persistence when task completes or fails
             if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
-                self._remove_persisted_task(task.id)
+                self._remove_finished_task(task)
 
             # Check if all analysis tasks are completed/failed for this expert
             # This must run on both success AND failure so the SmartRiskManager triggers
@@ -1175,9 +1160,11 @@ class WorkerQueue:
             if task.status == WorkerTaskStatus.FAILED or is_skipped_task:
                 logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype}) {'failed' if task.status == WorkerTaskStatus.FAILED else 'skipped'}. Checking for SmartRiskManager trigger...")
                 if task.subtype == AnalysisUseCase.ENTER_MARKET:
-                    self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET)
+                    self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET, task.batch_id)
                 elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
-                    self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.OPEN_POSITIONS)
+                    self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.OPEN_POSITIONS, task.batch_id)
+
+            self._expert_priority.finished(task.batch_id, task.id)
 
     def _execute_smart_risk_manager_task(self, task: SmartRiskManagerTask, worker_name: str):
         """Execute a Smart Risk Manager task."""
@@ -1185,6 +1172,8 @@ class WorkerQueue:
         
         # Update task status
         with self._task_lock:
+            if task.status != WorkerTaskStatus.PENDING:
+                return
             task.status = WorkerTaskStatus.RUNNING
             task.started_at = time.time()
         
@@ -1349,7 +1338,9 @@ class WorkerQueue:
             
             # Remove from persistence when task completes or fails
             if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
-                self._remove_persisted_task(task.id)
+                self._remove_finished_task(task)
+            self.release_deferred_open_positions(task.expert_instance_id, "Smart RM finished")
+            self._expert_priority.finished(task.batch_id, task.id)
     
     def _execute_instrument_expansion_task(self, task: InstrumentExpansionTask, worker_name: str):
         """Execute an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS)."""
@@ -1357,6 +1348,8 @@ class WorkerQueue:
         
         # Update task status
         with self._task_lock:
+            if task.status != WorkerTaskStatus.PENDING:
+                return
             task.status = WorkerTaskStatus.RUNNING
             task.started_at = time.time()
         
@@ -1420,7 +1413,8 @@ class WorkerQueue:
             
             # Remove from persistence when task completes or fails
             if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
-                self._remove_persisted_task(task.id)
+                self._remove_finished_task(task)
+            self._expert_priority.finished(task.batch_id, task.id)
     
     # ------------------------------------------------------------------------------------
     # ENTRY BEFORE MANAGE -- the backtest's order, made deterministic in live.
@@ -1455,7 +1449,9 @@ class WorkerQueue:
                     for task in self._tasks.values():
                         if (getattr(task, "expert_instance_id", None) == expert_instance_id
                                 and getattr(task, "subtype", None) == AnalysisUseCase.ENTER_MARKET
-                                and task.status in (WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING)):
+                                and (task.status in (WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING)
+                                     or (getattr(task, "batch_id", None) == batch_id
+                                         and self._expert_priority.contains(batch_id)))):
                             in_flight = True
                             break
             if not in_flight:
@@ -1489,7 +1485,27 @@ class WorkerQueue:
                     f"({reason}) as task {task_id}")
         return task_id
 
-    def _check_and_process_expert_recommendations(self, expert_instance_id: int, use_case: AnalysisUseCase = AnalysisUseCase.ENTER_MARKET) -> None:
+    def _remove_finished_task(self, task):
+        if not self._expert_priority.contains(task.batch_id):
+            self._remove_persisted_task(task.id)
+
+    def _priority_run_completed(self, run):
+        logger.info("Expert %s priority %s: scheduled batch %s finished including order processing",
+                    run.expert_id, run.priority, run.batch_id)
+        # No analyses (empty/failed expansion) must also release a parked exit pass.
+        for task_id in run.all_tasks:
+            self._remove_persisted_task(task_id)
+
+    def _check_and_process_expert_recommendations(self, expert_instance_id: int,
+            use_case: AnalysisUseCase = AnalysisUseCase.ENTER_MARKET, batch_id=None) -> None:
+        if self._expert_priority.contains(batch_id):
+            self._expert_priority.ready(batch_id, use_case,
+                lambda: self._process_expert_recommendations(expert_instance_id, use_case, batch_id))
+            return
+        self._process_expert_recommendations(expert_instance_id, use_case, batch_id)
+
+    def _process_expert_recommendations(self, expert_instance_id: int,
+            use_case: AnalysisUseCase = AnalysisUseCase.ENTER_MARKET, batch_id=None) -> None:
         """
         Check if there are any pending analysis tasks for an expert.
         If not, trigger automated order processing based on expert's risk_manager_mode setting:
@@ -1649,7 +1665,7 @@ class WorkerQueue:
                             # Add Smart Risk Manager task to queue
                             try:
                                 logger.debug(f"[RISK_MGR_TRIGGER] Submitting SmartRiskManager task for expert {expert_instance_id}, account {account_id}")
-                                task_id = self.submit_smart_risk_manager_task(expert_instance_id, account_id)
+                                task_id = self.submit_smart_risk_manager_task(expert_instance_id, account_id, batch_id=batch_id)
                                 logger.info(f"[RISK_MGR_TRIGGER] ✓ Queued Smart Risk Manager task {task_id} for expert {expert_instance_id}")
                                 logger.debug(f"[RISK_MGR_TRIGGER] ===== END (SmartRiskManager queued successfully) =====")
                             except Exception as e:
@@ -1891,6 +1907,7 @@ class WorkerQueue:
                     priority=task.priority,
                     expert_instance_id=task.expert_instance_id,
                     account_id=task.account_id,
+                    batch_id=task.batch_id,
                     queue_counter=queue_counter
                 )
             elif isinstance(task, InstrumentExpansionTask):
@@ -2125,6 +2142,7 @@ class WorkerQueue:
         """
         restored_count = 0
         failed_count = 0
+        recovery_runs = []
         
         try:
             persisted_tasks = self.get_persisted_tasks()
@@ -2137,11 +2155,36 @@ class WorkerQueue:
             saved_count = self.save_queue_state()
             logger.info(f"Saved {saved_count} current tasks before restoring persisted queue")
             
-            # Clear the old persisted tasks (they'll be restored below)
+            logger.info(f"Restoring {len(persisted_tasks)} persisted tasks...")
+
+            # Keep completed-but-unprocessed analyses in recovery until their run
+            # finishes. Reconstruct all scheduled cohorts BEFORE restoring work;
+            # restoring rows one by one would let a fast low-priority run escape.
+            from .ExpertPriority import ExpertRun, validate_expert_priority
+            from .db import get_instance
+            from .models import ExpertInstance
+            from .utils import get_expert_instance_from_id, expert_uses_risk_manager
+            batches = {pt.batch_id: pt.expert_instance_id for pt in persisted_tasks if pt.batch_id}
+            for batch_id, expert_id in batches.items():
+                if self._expert_priority.contains(batch_id):
+                    continue
+                try:
+                    prefix, slot = batch_id.split("_", 1)
+                    datetime.strptime(slot, "%H%M_%Y%m%d")
+                    if int(prefix) != expert_id:
+                        continue
+                except ValueError:
+                    continue  # manual jobs have no shared scheduled cohort
+                record = get_instance(ExpertInstance, expert_id)
+                expert = get_expert_instance_from_id(expert_id)
+                recovery_runs.append(ExpertRun(batch_id, "recovered:" + slot,
+                    expert_id, record.account_id, validate_expert_priority(record.priority),
+                    not expert_uses_risk_manager(type(expert))))
+            self._expert_priority.register(recovery_runs)
+
+            # Validate every recovered cohort before replacing recovery rows.
             cleared_count = self.clear_persisted_tasks()
             logger.info(f"Cleared {cleared_count} old persisted tasks")
-            
-            logger.info(f"Restoring {len(persisted_tasks)} persisted tasks...")
             
             for pt in persisted_tasks:
                 try:
@@ -2168,7 +2211,8 @@ class WorkerQueue:
                         task_id = self.submit_smart_risk_manager_task(
                             expert_instance_id=pt.expert_instance_id,
                             account_id=pt.account_id,
-                            priority=pt.priority
+                            priority=pt.priority,
+                            batch_id=pt.batch_id
                         )
                         restored_count += 1
                         logger.debug(f"Restored smart risk manager task {pt.task_id} as {task_id}")
@@ -2198,6 +2242,11 @@ class WorkerQueue:
         except Exception as e:
             logger.error(f"Failed to restore persisted tasks: {e}", exc_info=True)
             return {'restored': restored_count, 'failed': failed_count}
+        finally:
+            registered = [run.batch_id for run in recovery_runs
+                          if self._expert_priority.contains(run.batch_id)]
+            if registered:
+                self._expert_priority.seal(registered)
     
     def clear_persisted_tasks(self) -> int:
         """
