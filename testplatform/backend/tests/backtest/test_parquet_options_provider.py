@@ -1360,10 +1360,17 @@ def test_a_full_window_walk_costs_the_cap_not_the_window():
         f"walking every row made {grew / 1048576:.0f} MB resident against the dense design's "
         f"{dense_nominal / 1048576:.0f} MB -- the greeks are still scaling with the window")
 
-    # ...and the reset hands even the cap back.
+    # ...and the reset hands even the cap back. Asserted STRUCTURALLY (the memos and their
+    # eviction orders are empty), not as an RSS drop: glibc keeps freed small-object arenas
+    # mapped, so on Linux the RSS after the reset sat exactly at `before + grew` (147 KB of
+    # growth, 36 pages) and `rss - before < grew` failed the CI gate on allocator behaviour the
+    # design does not control. The residency claim above is the one that measures the cap.
     pq.reset_run_overlays()
     gc.collect()
-    assert proc.memory_info().rss - before < grew
+    assert not ov._g_memo and not ov._g_order, "reset left greeks memo entries behind"
+    assert not ov._bar_memo and not ov._bar_order, "reset left bar memo entries behind"
+    # No NEW residency beyond page noise either -- the reset must not allocate.
+    assert proc.memory_info().rss - before <= grew + 4 * 1048576
     clear_worker_parquet_options_cache()
 
 
