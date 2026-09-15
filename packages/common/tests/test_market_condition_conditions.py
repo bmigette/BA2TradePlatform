@@ -327,6 +327,9 @@ def test_recorder_called_exactly_once_per_successful_evaluation(resolver):
 
 def test_reader_protocol_is_satisfied_by_the_dict_reader():
     assert isinstance(DictMarketConditionReader({}), MarketConditionReader)
+
+
+def test_market_condition_values_satisfy_the_feature_row_protocol():
     assert isinstance(_values(), FeatureRowLike)
 
 
@@ -425,6 +428,31 @@ def test_categorical_field_rejects_non_equality_operators_at_construction(cat_cl
         assert cls.KIND == "categorical" and cls.ALLOWED_OPERATORS == frozenset({"=="})
         with pytest.raises(ValueError, match="accepts only"):
             cls(_Account(), SYMBOL, _rec(), op, 2.0)
+
+
+def test_generated_name_clash_with_a_foreign_global_raises(cat_classes):
+    class _HandWritten:
+        pass
+
+    T.TestCatRegimeV0Condition = _HandWritten  # removed by the cat_classes fixture
+    with registered_profile(ProfileSpec(name="test-cat-v0", calc_version="t/1", fields=(_CAT,))):
+        with pytest.raises(ValueError, match="already bound"):
+            T.market_condition_condition_class(_CAT.name)
+    assert T.TestCatRegimeV0Condition is _HandWritten
+
+
+def test_regenerating_for_the_same_field_rebinds_the_global(cat_classes):
+    numeric = FieldSpec(name=_CAT.name, kind="numeric", short="tcat", searched=True,
+                        value_min=0.0, value_max=1.0, value_step=0.5, anchor_op="<",
+                        anchor_value=0.5)
+    with registered_profile(ProfileSpec(name="test-cat-v0", calc_version="t/1", fields=(_CAT,))):
+        first = T.market_condition_condition_class(_CAT.name)
+        assert T.TestCatRegimeV0Condition is first
+    with registered_profile(ProfileSpec(name="test-num-v0", calc_version="t/1", fields=(numeric,))):
+        second = T.market_condition_condition_class(_CAT.name)
+    assert second is not first
+    assert T.TestCatRegimeV0Condition is second
+    assert pickle.loads(pickle.dumps(second)) is second
 
 
 def test_memo_is_keyed_by_spec_so_a_rekinded_field_gets_a_fresh_class(cat_classes):

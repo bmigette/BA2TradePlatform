@@ -4179,13 +4179,26 @@ def market_condition_condition_class(field: str) -> Type[MarketConditionCompare]
     """The (memoised) ``MarketConditionCompare`` subclass for a REGISTERED field, e.g.
     ``underlying_adx_14`` -> ``UnderlyingAdx14Condition``. KeyError for an unknown field.
 
+    The memo is keyed by the FieldSpec, not the field name: ANY spec change on re-registration
+    yields a NEW class, and a second ``register_market_condition_conditions()`` then hits the
+    CONDITION_MAP conflict guard on purpose (a changed field must not silently keep serving
+    rules built against the old spec).
+
     The class is also bound as a module global under its own name, so it pickles by
-    reference (GA workers spawn on Windows; distributed payloads pickle)."""
+    reference (GA workers spawn on Windows; distributed payloads pickle). If that name is
+    unbound, or bound to a generated class for the SAME field, it is (re)bound so the latest
+    class pickles; bound to anything else (e.g. a hand-written condition class whose name a
+    field happens to generate) raises ``ValueError`` rather than silently keeping the wrong one."""
     spec = _mc_field_spec(field)  # KeyError naming the known fields
     cls = _MARKET_CONDITION_CLASSES.get(spec)
     if cls is not None:
         return cls
     name = _class_name_for_field(spec.name)
+    bound = globals().get(name)
+    if bound is not None and not (isinstance(bound, type) and issubclass(bound, MarketConditionCompare)
+                                  and bound.FIELD == spec.name):
+        raise ValueError(f"market-condition field {spec.name!r} generates class name {name!r}, which "
+                         f"is already bound in {__name__} to {bound!r}")
     cls = type(name, (MarketConditionCompare,), {
         "FIELD": spec.name,
         "KIND": spec.kind,
@@ -4195,7 +4208,7 @@ def market_condition_condition_class(field: str) -> Type[MarketConditionCompare]
         "__qualname__": name,
     })
     _MARKET_CONDITION_CLASSES[spec] = cls
-    globals().setdefault(name, cls)
+    globals()[name] = cls
     return cls
 
 
