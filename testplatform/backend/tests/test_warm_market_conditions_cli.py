@@ -169,3 +169,35 @@ def test_configuration_errors_exit_two(tool, root, universe_file, tmp_path, caps
 def test_unknown_manifest_verification_exits_one(tool, root, capsys):
     assert tool.main(["--quiet", "verify", "--manifest", "0" * 64, "--cache-root", root]) == 1
     capsys.readouterr()
+
+
+class _BrokenCalendarSource(_NoFetchSource):
+    """The split calendar cannot be read: the warmup must refuse, not warm an unproven basis."""
+
+    def split_calendar(self, symbol):
+        if symbol == "BBB":
+            raise RuntimeError("FMP split calendar unreachable")
+        return []
+
+
+def test_unreadable_split_calendar_exits_one_until_exclusions_are_allowed(tool, root, universe_file,
+                                                                          tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tool, "make_source", lambda cache_root: _BrokenCalendarSource())
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out)) == 1
+    printed = json.loads(capsys.readouterr().out)
+    assert [i["kind"] for i in printed["inventory"]] == ["split_calendar_unavailable"]
+    assert printed["inventory"][0]["symbol"] == "BBB"
+    assert any(e.startswith("BBB:") for e in printed["preflight_errors"])
+
+    assert tool.main(["--quiet", "build", "--plan", out, "--cache-only"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert not report["ok"] and report["manifest_digest"] is None and "BBB" in report["errors"][0]
+
+    assert tool.main(["--quiet", "build", "--plan", out, "--cache-only", "--allow-exclusions"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] and report["manifest_digest"]
+    assert list(report["excluded"]) == ["BBB"]
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    m = MarketConditionStore(root).read_manifest(report["manifest_digest"])
+    assert m["coverage"]["BBB"]["exceptions"][0]["kind"] == "split_calendar_unavailable"

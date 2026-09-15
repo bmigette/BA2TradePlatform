@@ -280,8 +280,13 @@ def test_two_concurrent_builders_coalesce_on_one_manifest(root):
     a, b = reports
     assert a.ok and b.ok and a.manifest_digest == b.manifest_digest
     total = p.decision_sessions * len(UNIVERSE)
-    assert a.counters["rows_computed"] + b.counters["rows_computed"] == total
-    assert a.waited_symbols or b.waited_symbols
+    # EXACTLY one builder does the work: the other waits on every symbol's claim and then finds
+    # each row already published (through the winner's progress records), computing nothing.
+    winner, waiter = (a, b) if a.counters["rows_computed"] else (b, a)
+    assert winner.counters["rows_computed"] == total
+    assert waiter.counters["rows_computed"] == 0 and waiter.counters["rows_reused"] == total
+    assert waiter.waited_symbols == sorted(UNIVERSE)
+    assert winner.counters["objects_written"] > 0 and waiter.counters["objects_written"] == 0
     assert src.fetches == []
 
 
@@ -392,3 +397,59 @@ def test_unknown_profile_and_bad_window_are_configuration_errors(root):
         W.plan(PROFILE, UNIVERSE, END, START, cache_root=root, source=src)
     with pytest.raises(W.WarmupConfigError):
         W.plan(PROFILE, UNIVERSE, START, END, source_profile="yahoo", cache_root=root, source=src)
+
+
+class BrokenCalendarSource(FakeSource):
+    """A source whose split calendar cannot be read for one symbol (FMP down, key revoked)."""
+
+    def __init__(self, root, broken, **kw):
+        super().__init__(root, **kw)
+        self.broken = broken
+
+    def split_calendar(self, symbol):
+        if symbol == self.broken:
+            raise RuntimeError("FMP split calendar unreachable")
+        return super().split_calendar(symbol)
+
+
+def test_unreadable_split_calendar_fails_loudly_and_is_only_waived_explicitly(root):
+    src = BrokenCalendarSource(root, broken="BBB")
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+
+    # The plan says it out loud: a preflight error AND an actionable inventory item naming BBB.
+    assert p.symbol("BBB").split_calendar_error.startswith("RuntimeError")
+    assert [e for e in p.preflight_errors if e.startswith("BBB:")]
+    assert p.waivable_preflight_errors() == p.preflight_errors and p.fatal_preflight_errors() == []
+    item = [i for i in p.blocking_inventory() if i["symbol"] == "BBB"]
+    assert item and item[0]["kind"] == "split_calendar_unavailable" and not item[0]["fetchable"]
+
+    # Neither mode publishes: the basis of BBB's cached history cannot be proven either way.
+    for fetch_missing in (False, True):
+        rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=fetch_missing, source=src)
+        assert not rep.ok and rep.exit_code == 1 and rep.manifest_digest is None
+        assert [i["symbol"] for i in rep.inventory] == ["BBB"] and "BBB" in rep.errors[0]
+        assert src.fetches == [] and src.full_refetches == []
+        assert MarketConditionStore(root).list_manifests(PROFILE) == []
+
+    # Waived explicitly: published, with BBB excluded and the reason recorded in the manifest.
+    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src,
+                  allow_exclusions=True)
+    assert rep.ok and rep.exit_code == 0 and rep.manifest_digest
+    assert list(rep.excluded) == ["BBB"] and rep.excluded["BBB"][0]["kind"] == "split_calendar_unavailable"
+    m = MarketConditionStore(root).read_manifest(rep.manifest_digest)
+    assert m["coverage"]["BBB"]["rows"] == 0
+    assert m["coverage"]["BBB"]["exceptions"][0]["kind"] == "split_calendar_unavailable"
+    assert m["coverage"]["AAA"]["rows"] == p.decision_sessions
+    assert not list(MarketConditionStore(root).iter_rows(m, "BBB"))
+
+
+def test_a_symbol_without_source_data_also_blocks_publication(root):
+    os.remove(_path(root, "CCC"))
+    src = FakeSource(root, truth={"AAA": TRUTH["AAA"], "BBB": TRUTH["BBB"]})
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
+    assert not rep.ok and rep.exit_code == 1 and rep.manifest_digest is None
+    assert list(rep.excluded) == ["CCC"] and rep.excluded["CCC"][0]["kind"] in ("no_source_data", "fetch_failed")
+    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src,
+                  allow_exclusions=True)
+    assert rep.ok and list(rep.excluded) == ["CCC"]

@@ -15,6 +15,9 @@ ONE preparation for a whole search (design section 4.4). Typical use:
     # 2b. Or let it fetch the missing coverage through the existing provider cache path.
     python tools/warm_market_conditions.py build --plan plan.json --fetch-missing --concurrency 4
 
+    # 2c. Publish anyway, recording the symbols that cannot be warmed (never the default).
+    python tools/warm_market_conditions.py build --plan plan.json --cache-only --allow-exclusions
+
     # 3. Prove a published snapshot (re-hashes every referenced object).
     python tools/warm_market_conditions.py verify --manifest <digest>
 
@@ -114,7 +117,7 @@ def cmd_build(args) -> int:
             return EXIT_CONFIG
     try:
         report = W.build(plan, fetch_missing=bool(args.fetch_missing), concurrency=args.concurrency,
-                         log=_logger(args), source=source)
+                         log=_logger(args), source=source, allow_exclusions=bool(args.allow_exclusions))
     except W.WarmupConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return EXIT_CONFIG
@@ -175,6 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--cache-only", action="store_true", help="never fetch; stop with the inventory")
     mode.add_argument("--fetch-missing", action="store_true", help="fetch the missing coverage first")
     b.add_argument("--concurrency", type=int, default=4)
+    b.add_argument("--allow-exclusions", action="store_true",
+                   help="publish even though some symbols cannot be warmed (an unreadable split "
+                        "calendar, an unverifiable basis, no source data); each is recorded in the "
+                        "manifest coverage exceptions and in the report. Without it such a symbol is "
+                        "an actionable inventory item and NOTHING is published.")
     b.set_defaults(func=cmd_build)
 
     v = sub.add_parser("verify", parents=[common], help="re-hash every object a manifest references")

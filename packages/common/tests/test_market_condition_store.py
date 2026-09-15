@@ -120,10 +120,15 @@ def test_objects_are_immutable_and_content_addressed(store):
 def test_manifest_identity_ignores_created_at_and_dict_order(store):
     rec, raws, _ = _valid_setup(store)
     obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
-    m1 = _manifest(store, [obj], raws)
+    other, _ = store.write_feature_object(PROFILE, "BBB", [_invalid_row(date(2024, 3, 27))])
+    assert len(raws) > 1 and other.sha256 != obj.sha256
+    m1 = _manifest(store, [obj, other], raws, symbols=("AAA", "BBB"))
+    # Reversed key order AND reversed object/raw lists: neither carries meaning.
     m2 = dict(reversed(list(m1.items())))
+    m2["objects"] = list(reversed(m1["objects"]))
+    m2["raw_objects"] = list(reversed(m1["raw_objects"]))
     m2["created_at"] = "1999-01-01T00:00:00+00:00"
-    m2["coverage"] = {"AAA": {"rows": 1}}
+    m2["coverage"] = {"BBB": {"rows": 1}, "AAA": {"rows": 1}}
     assert manifest_identity(m1) == manifest_identity(m2)
     d1 = store.write_manifest(m1)
     d2 = store.write_manifest(m2)
@@ -131,6 +136,7 @@ def test_manifest_identity_ignores_created_at_and_dict_order(store):
     loaded = store.read_manifest(d1)
     assert loaded["created_at"] == m1["created_at"]  # the first publication is kept
     assert store.list_manifests("ohlcv-v1") == [d1]
+    assert json.loads(store.manifest_path("ohlcv-v1", d1).read_text())["objects"][0]["symbol"] == "AAA"
     m3 = dict(m1, window_end="2024-03-30")
     assert manifest_identity(m3) != d1
     # A tampered manifest file no longer matches its name.
@@ -160,7 +166,17 @@ def test_verify_catches_same_size_corruption_and_missing(store):
     rep = store.verify(m, digest)
     assert not rep.ok and rep.corrupt == [obj.path] and not rep.missing
 
-    os.remove(store.abspath(raws[0].path))
+    # A RAW shard corrupted in place (same size) is caught too -- the evidence must re-hash.
+    raw_path = store.abspath(raws[0].path)
+    raw_size = raw_path.stat().st_size
+    raw_data = bytearray(raw_path.read_bytes())
+    raw_data[len(raw_data) // 2] ^= 0x7F
+    raw_path.write_bytes(bytes(raw_data))
+    assert raw_path.stat().st_size == raw_size
+    rep = store.verify(m, digest)
+    assert sorted(rep.corrupt) == sorted([obj.path, raws[0].path]) and not rep.missing
+
+    os.remove(raw_path)
     rep = store.verify(m, digest)
     assert raws[0].path in rep.missing
 

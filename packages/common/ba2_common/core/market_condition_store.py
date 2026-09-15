@@ -15,6 +15,11 @@ LAYOUT under ``<cache_root>/market_conditions/`` (ordinary syncable cache data -
   registry order (a categorical field holds its integer code), one int8 ``<field>_status`` per field
   (index into ``STATUSES``), one ``<field>_reason`` string per field, ``window_digest``
   (``sha256:<hex>``), ``raw_shard_ref``, ``raw_row_lo``, ``raw_row_hi``.
+  The ``<field>_reason`` columns are an ADDITION to the column list in the design (section 4.3):
+  an ``Observation`` carries ``(value, status, reason)``, so without them a stored row could not
+  be rebuilt into the row the calculators produce, and "why is this symbol unknown today" would
+  survive only in the manifest's aggregate coverage exceptions. They are dictionary-encoded and
+  empty for every valid row, so they cost almost nothing.
   A (symbol, month) may be covered by several objects (an extension publishes a delta object and
   reuses the old one by hash); a (symbol, session) appears in exactly one object of a manifest.
 * ``<profile>/manifests/<sha256>.json`` -- the exact object list plus the pinned definition

@@ -17,7 +17,15 @@ PHASES
      preflight error and nothing is built);
    * the split calendar is consulted for every universe symbol; any split dated after the cached
      file's first bar is checked AT THAT DATE (``ba2_common.core.split_basis``) and a file not
-     verifiably on one basis is ``refetch_required`` -- never silently kept.
+     verifiably on one basis is ``refetch_required`` -- never silently kept. A split calendar that
+     cannot be READ is a preflight error for that symbol: without it nothing can tell an appended
+     mixed basis from a clean one, so the symbol is refused rather than warmed on an unproven
+     basis.
+
+EXCLUSIONS ARE NEVER SILENT. A symbol that ends up unusable (no split calendar, a basis still
+unverifiable after a full re-fetch, no source data at all) blocks the publication: ``build``
+refuses with the inventory unless the operator passes ``allow_exclusions``, and only then is the
+manifest published with that symbol recorded in its coverage exceptions and in the report.
 
 2. :func:`build` -- ``fetch_missing=False`` stops with the actionable inventory when raw coverage
    is missing or a symbol needs a re-fetch, and fetches NOTHING. ``fetch_missing=True`` fetches
@@ -176,8 +184,18 @@ class SymbolInventory:
     def fetch_needed(self) -> bool:
         return self.raw_state in (RAW_MISSING_FILE, RAW_STALE_TAIL)
 
+    def split_calendar_preflight_message(self) -> Optional[str]:
+        """The preflight error text for an unreadable split calendar (None when it was read)."""
+        if not self.split_calendar_error:
+            return None
+        return (f"{self.symbol}: split calendar unavailable ({self.split_calendar_error}); the cached "
+                "history cannot be proven to be on one split basis")
+
     def blocking_items(self) -> List[Dict[str, Any]]:
         items = []
+        if self.split_calendar_error:
+            items.append({"symbol": self.symbol, "kind": "split_calendar_unavailable",
+                          "error": self.split_calendar_error, "fetchable": False})
         if self.raw_state == RAW_MISSING_FILE:
             items.append({"symbol": self.symbol, "kind": RAW_MISSING_FILE,
                           "missing_from": self.missing_from, "missing_to": self.missing_to,
@@ -226,6 +244,16 @@ class WarmPlan:
     def blocking_inventory(self) -> List[Dict[str, Any]]:
         return [item for s in self.symbols for item in s.blocking_items()]
 
+    def waivable_preflight_errors(self) -> List[str]:
+        """Preflight errors an operator may waive with ``allow_exclusions`` (the symbol is then
+        excluded from the manifest and recorded): an unreadable split calendar."""
+        return [m for m in (s.split_calendar_preflight_message() for s in self.symbols) if m]
+
+    def fatal_preflight_errors(self) -> List[str]:
+        """Preflight errors nothing can waive: the source certification itself failed."""
+        waivable = set(self.waivable_preflight_errors())
+        return [e for e in self.preflight_errors if e not in waivable]
+
     def row_sessions(self) -> List[date]:
         """The feature-row (prior) sessions the plan requires, ascending."""
         return regular_sessions_ending_at(date.fromisoformat(self.last_row_session), self.decision_sessions)
@@ -238,6 +266,7 @@ class WarmPlan:
             "rows_missing": sum(s.rows_missing for s in self.symbols),
             "earliest_raw_bar": self.earliest_raw_bar, "preflight_ok": not self.preflight_errors,
             "blocking": len(self.blocking_inventory()),
+            "fatal_preflight_errors": len(self.fatal_preflight_errors()),
             "refetch_required": [s.symbol for s in self.symbols if s.refetch_required],
             "split_calendar_errors": [s.symbol for s in self.symbols if s.split_calendar_error],
             "provider_calls": self.provider_calls, "provider_bytes": self.provider_bytes,
@@ -559,8 +588,9 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
             checks = _split_checks_for(snap, events, sym)
             inv.split_checks = [c.to_dict() for c in checks]
             inv.refetch_required = any(c.verdict in REFETCH_VERDICTS for c in checks)
-        except Exception as e:  # noqa: BLE001 -- reported per symbol, never swallowed
+        except Exception as e:  # noqa: BLE001 -- a preflight error for this symbol, never a note
             inv.split_calendar_error = f"{type(e).__name__}: {e}"
+            preflight.append(inv.split_calendar_preflight_message())
         inventories.append(inv)
         log(f"plan {sym}: raw={inv.raw_state} rows={inv.rows_required} reusable={inv.rows_reusable} "
             f"refetch_required={inv.refetch_required}"
@@ -698,6 +728,8 @@ class BuildReport:
     counters: Dict[str, int] = dc_field(default_factory=dict)
     elapsed_s: Dict[str, float] = dc_field(default_factory=dict)
     inventory: List[Dict[str, Any]] = dc_field(default_factory=list)
+    #: Symbols left OUT of the manifest and why (empty unless ``allow_exclusions`` was passed).
+    excluded: Dict[str, List[Dict[str, Any]]] = dc_field(default_factory=dict)
     exceptions: Dict[str, List[Dict[str, Any]]] = dc_field(default_factory=dict)
     errors: List[str] = dc_field(default_factory=list)
     waited_symbols: List[str] = dc_field(default_factory=list)
@@ -957,8 +989,13 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: War
 
 
 def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
-          log: Callable[[str], None] = _log_noop, source: Optional[WarmupSource] = None) -> BuildReport:
+          log: Callable[[str], None] = _log_noop, source: Optional[WarmupSource] = None,
+          allow_exclusions: bool = False) -> BuildReport:
     """Fetch (optionally), build and publish the manifest for ``plan_``. See the module docstring.
+
+    ``allow_exclusions`` authorises publishing a manifest that leaves symbols OUT (an unreadable
+    split calendar, a basis still unverifiable after a full re-fetch, no source data): without it
+    such a symbol is an actionable inventory item and nothing is published.
 
     Exit codes in the report: 0 published; 1 actionable inventory / preflight / build failure."""
     t_total = time.monotonic()
@@ -967,12 +1004,22 @@ def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
     if plan_.profile not in PROFILES or PROFILES[plan_.profile].calc_version != plan_.calc_version:
         raise WarmupConfigError(f"plan profile {plan_.profile!r} at {plan_.calc_version!r} is not registered "
                                 f"(registered: {[(p, s.calc_version) for p, s in PROFILES.items()]})")
-    if plan_.preflight_errors:
-        report.errors = list(plan_.preflight_errors)
+    fatal = plan_.fatal_preflight_errors()
+    if fatal:
+        report.errors = fatal
         report.elapsed_s = {"total": round(time.monotonic() - t_total, 4)}
-        log(f"build refused: preflight failed: {plan_.preflight_errors}")
+        log(f"build refused: preflight failed: {fatal}")
         return report
     blocking = plan_.blocking_inventory()
+    unwaived = [i for i in blocking if not i.get("fetchable", True)]
+    if unwaived and not allow_exclusions:
+        report.inventory = unwaived
+        report.errors = plan_.waivable_preflight_errors()
+        report.elapsed_s = {"total": round(time.monotonic() - t_total, 4)}
+        log(f"build refused: {len(unwaived)} symbol(s) cannot be warmed and exclusions were not "
+            f"authorised (pass allow_exclusions): {unwaived}")
+        return report
+    blocking = [i for i in blocking if i.get("fetchable", True)]
     if blocking and not fetch_missing:
         report.inventory = blocking
         report.counters = dict(counters.values)
@@ -1058,6 +1105,19 @@ def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
         report.counters["provider_bytes"] = int(source.bytes - bytes0)
     report.waited_symbols = sorted(waited)
     report.exceptions = {s: r.coverage["exceptions"] for s, r in sorted(results.items()) if r.coverage["exceptions"]}
+    # A symbol that produced NO rows is an exclusion: publishing a manifest that silently leaves it
+    # out is exactly the "generic success for partial work" design section 4.4 forbids.
+    report.excluded = {s: r.coverage["exceptions"] for s, r in sorted(results.items()) if not r.coverage["rows"]}
+    if report.excluded and not allow_exclusions:
+        report.inventory = [{"symbol": s, "kind": exc[0]["kind"] if exc else "no_rows", "detail": exc}
+                            for s, exc in report.excluded.items()]
+        report.errors = errors + [f"{item['symbol']}: {item['kind']} -- no rows could be built"
+                                  for item in report.inventory]
+        report.elapsed_s = {"fetch": round(fetch_elapsed, 4), "build": round(build_elapsed, 4),
+                            "total": round(time.monotonic() - t_total, 4)}
+        log(f"build refused: {sorted(report.excluded)} produced no rows and exclusions were not "
+            f"authorised (pass allow_exclusions)")
+        return report
     if errors:
         report.errors = errors
         report.elapsed_s = {"fetch": round(fetch_elapsed, 4), "build": round(build_elapsed, 4),
