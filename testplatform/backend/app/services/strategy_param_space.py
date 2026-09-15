@@ -64,11 +64,10 @@ nowhere here anymore — saved rows carrying them are reconstructed by the
 quick-load path, not by this module.
 """
 import copy
-import functools
 import logging
 from typing import Any, Dict, Optional
 
-from ba2_common.core.market_conditions import field_spec
+from ba2_common.core.market_conditions import field_codes, field_spec
 from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES, leaf_mode_kind
 
 logger = logging.getLogger(__name__)
@@ -652,15 +651,6 @@ def _resolve_modes(tree: Any, by_id: Dict[str, Dict[str, Any]]) -> Dict[str, str
 _THRESHOLD_OPS = {"below": "<", "above": ">"}
 
 
-@functools.lru_cache(maxsize=None)
-def _field_codes(field: str) -> Dict[str, int]:
-    """Memoised ``field -> {value: code}`` so the per-trial decode pays one dict hit instead of
-    a scan over every registered profile. Production registers profiles at import only;
-    ``registered_profile`` (a test hook) mutates the registry, so tests using it call
-    ``_field_codes.cache_clear()``."""
-    return dict(field_spec(field).codes)
-
-
 def _apply_mode(node: Dict[str, Any], cid: str, token: str) -> None:
     """Write a decoded non-off mode onto its (deep-copied) leaf.
 
@@ -675,7 +665,7 @@ def _apply_mode(node: Dict[str, Any], cid: str, token: str) -> None:
     if token in _THRESHOLD_OPS:
         op = _THRESHOLD_OPS[token]
     else:
-        codes = _field_codes(node["field"])
+        codes = field_codes(node["field"])  # memoised in the registry: one dict hit per trial
         # Kept at decode on purpose: catches a remote worker whose ba2_common registry dropped
         # a value the master's template still offers.
         if token not in codes:

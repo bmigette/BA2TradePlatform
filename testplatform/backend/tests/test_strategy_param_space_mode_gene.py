@@ -18,7 +18,6 @@ import types
 import pytest
 
 from ba2_common.core.market_conditions import FieldSpec, ProfileSpec, registered_profile
-import app.services.strategy_param_space as sps
 from app.services.genetic import GeneticOptimizer
 from app.services.strategy_param_space import collect_param_space, decode_params
 
@@ -33,12 +32,8 @@ def state_field():
         FieldSpec(name=_STATE_FIELD, kind="categorical", short="state", searched=True,
                   codes=_STATE_CODES, ui_name="Test market state"),
     ))
-    # The decode path memoises field -> codes; registered_profile mutates the registry, so
-    # clear the memo on both edges of the temporary registration.
-    sps._field_codes.cache_clear()
     with registered_profile(spec):
         yield spec
-    sps._field_codes.cache_clear()
 
 
 def _numeric_leaf(**over):

@@ -74,6 +74,7 @@ callers that assemble the window, not by these calculators.
 """
 from __future__ import annotations
 
+import functools
 import math
 from contextlib import contextmanager
 from dataclasses import InitVar, dataclass
@@ -544,6 +545,19 @@ def field_spec(field: str) -> FieldSpec:
     raise _unknown_field(field)
 
 
+@functools.lru_cache(maxsize=None)
+def field_codes(field: str) -> Mapping[str, int]:
+    """Memoised read-only ``value -> code`` mapping of a registered CATEGORICAL field, in code
+    order -- one dict hit for per-trial callers (the GA decode) instead of a scan over every
+    profile. KeyError (naming the known fields) for an unknown field, ValueError for a numeric
+    one. The memo is cleared wherever the registry changes (``register_profile`` and
+    ``registered_profile``'s restore)."""
+    codes = field_spec(field).codes
+    if codes is None:
+        raise ValueError(f"market-condition field {field!r} is numeric: it has no codes")
+    return MappingProxyType(dict(codes))
+
+
 def register_profile(spec: ProfileSpec) -> None:
     """Add a profile. Refuses a duplicate profile name, a field repeated inside the profile, or a
     field already registered by another profile (field names are global: they are event types
@@ -565,6 +579,7 @@ def register_profile(spec: ProfileSpec) -> None:
     if len(set(shorts)) != len(shorts) or any(sh in taken_shorts for sh in shorts):
         raise ValueError(f"market-condition profile {spec.name!r}: short ids {shorts!r} repeat or are already taken")
     PROFILES[spec.name] = spec
+    field_codes.cache_clear()
 
 
 @contextmanager
@@ -579,3 +594,4 @@ def registered_profile(spec: ProfileSpec) -> Iterator[ProfileSpec]:
     finally:
         PROFILES.clear()
         PROFILES.update(saved)
+        field_codes.cache_clear()

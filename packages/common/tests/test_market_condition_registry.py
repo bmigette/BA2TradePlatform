@@ -5,8 +5,8 @@ import pytest
 
 from ba2_common.core import market_conditions as mc
 from ba2_common.core.market_conditions import (
-    FIELDS, OHLCV_V1, PROFILES, FieldSpec, ProfileSpec, field_spec, profile_for_field, register_profile,
-    registered_profile,
+    FIELDS, OHLCV_V1, PROFILES, FieldSpec, ProfileSpec, field_codes, field_spec, profile_for_field,
+    register_profile, registered_profile,
 )
 
 
@@ -158,6 +158,47 @@ def test_registered_profile_hook_registers_then_restores():
     assert mc.PROFILES is PROFILES
     with pytest.raises(KeyError):
         field_spec("t_structure_state")
+
+
+def test_field_codes_memo_returns_the_same_read_only_mapping():
+    with registered_profile(ProfileSpec(name="t-memo", calc_version="x", fields=(_cat(),))):
+        first = field_codes("t_structure_state")
+        assert first is field_codes("t_structure_state")
+        assert dict(first) == {"bull": 1, "bear": 2}
+        with pytest.raises(TypeError):
+            first["sideways"] = 3
+
+
+def test_field_codes_memo_is_invalidated_where_the_registry_changes():
+    with registered_profile(ProfileSpec(name="t-memo1", calc_version="x", fields=(_cat(),))):
+        assert dict(field_codes("t_structure_state")) == {"bull": 1, "bear": 2}
+    with pytest.raises(KeyError):
+        field_codes("t_structure_state")
+    other = _cat(codes={"bull": 1, "bear": 2, "chop": 3})
+    with registered_profile(ProfileSpec(name="t-memo2", calc_version="x", fields=(other,))):
+        assert dict(field_codes("t_structure_state")) == {"bull": 1, "bear": 2, "chop": 3}
+
+
+def test_field_codes_memo_is_cleared_by_register_profile():
+    # A KeyError is not memoised, but a stale mapping would be: register_profile must clear.
+    saved = dict(PROFILES)
+    try:
+        register_profile(ProfileSpec(name="t-memo3", calc_version="x", fields=(_cat(),)))
+        assert dict(field_codes("t_structure_state")) == {"bull": 1, "bear": 2}
+        PROFILES.clear()
+        PROFILES.update(saved)
+        register_profile(ProfileSpec(name="t-memo4", calc_version="x",
+                                     fields=(_cat(codes={"up": 5}),)))
+        assert dict(field_codes("t_structure_state")) == {"up": 5}
+    finally:
+        PROFILES.clear()
+        PROFILES.update(saved)
+        field_codes.cache_clear()
+
+
+def test_field_codes_on_a_numeric_field_raises_value_error_naming_it():
+    with pytest.raises(ValueError, match="underlying_adx_14"):
+        field_codes("underlying_adx_14")
 
 
 def test_registered_profile_restores_after_an_exception_inside():
