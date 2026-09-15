@@ -24,6 +24,7 @@ deadlock. The fitness calls the synchronous runner in-process (confirmed in Repl
 import logging
 import math as _math
 import random
+import sys as _sys
 import time as _time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -271,7 +272,7 @@ def _cancel_progress_cb(ctl):
     return _cb
 
 
-def _release_option_overlays() -> None:
+def _release_option_overlays() -> Dict[str, Any]:
     """Drop the per-RUN option overlay fill. Called after EVERY trial, on every trial path.
 
     ``parquet_options_provider``'s greek columns and materialised-bar memo are filled lazily
@@ -292,15 +293,26 @@ def _release_option_overlays() -> None:
     run's spot source and rate, so a dropped entry costs 11.2 us and reproduces byte-identical
     values (pinned by ``test_every_read_answers_identically_after_a_reset``).
 
+    AN EQUITY TRIAL PAYS NOTHING. The reader is looked up in ``sys.modules`` rather than
+    imported: the question this asks is "has anything in this process already opened an option
+    store?", and on an equity-only grid — the majority of runs — the answer is no on every
+    trial. Importing the module to call a function that then finds no overlays would be a real
+    cost (the module pulls numpy, the greeks solver and the OCC parser) charged to runs that
+    can never benefit from it.
+
+    Returns what was dropped, for ``_trial_worker`` to fold into the trial's ``mem``
+    telemetry; ``{}`` when there was nothing to do.
+
     Best effort, but never silent: memory hygiene must not turn a good genome into a failed
     trial, and a release that quietly stopped working is exactly how the governor's
     ``clear_worker_option_caches`` typo survived for months. The channel is ``_worker_log``
     because a pool child's logging is globally disabled (see ``_worker_init``).
     """
+    _pq = _sys.modules.get("app.services.backtest.parquet_options_provider")
+    if _pq is None:
+        return {}
     try:
-        from app.services.backtest import parquet_options_provider as _pq
-
-        _pq.reset_run_overlays()
+        return _pq.reset_run_overlays()
     except Exception as e:  # noqa: BLE001 — see the docstring: loud, but never fatal
         try:
             from app.services.backtest import price_source as _ps
@@ -309,6 +321,7 @@ def _release_option_overlays() -> None:
                             f"greeks/bar memo are accumulating across genomes")
         except Exception:  # noqa: BLE001 — the log channel itself is gone; nothing left to do
             pass
+        return {}
 
 
 def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) -> Dict[str, Any]:
@@ -328,6 +341,14 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
     workers here AND the master's in-process top-N persist / parallel=1 runs uniformly.
     """
     want_full = config.pop("_want_full_results", False)
+    # EMBEDDED BY REFERENCE, FILLED BY THE ``finally``. The option-overlay release has to run
+    # AFTER the trial (including after a failure), but its counts have to travel back INSIDE
+    # the result -- and by then the result dict is already built. Putting this empty dict into
+    # the `mem` payload and populating it in the `finally` gets both: the `finally` runs before
+    # the value is handed to the pool, so what is pickled carries the counts. The alternative
+    # -- releasing early to have the numbers in hand -- would move the release off the one
+    # path that covers cancellations.
+    released: Dict[str, Any] = {}
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
         from app.services.strategy_fitness import compute_fitness
@@ -361,6 +382,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
                # was depleting the machine.
                "mem": _trial_memory_snapshot()}
+        out["mem"]["option_overlays"] = released
         if want_full:
             out["full_results"] = results
         return out
@@ -386,15 +408,18 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         fatal = type(e).__name__ in (
             "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
             "SharedArrayFdExhausted")
+        snap = _trial_memory_snapshot()
+        snap["option_overlays"] = released
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal, "mem": _trial_memory_snapshot()}
+                "fatal": fatal, "mem": snap}
     finally:
         # FINALLY, not after the happy return: a failed or CANCELLED trial is when this
         # matters most. The worker is handed another genome immediately and the abandoned
         # one's greeks would otherwise stay resident with nothing left that could read them.
         # After the `mem` snapshots above deliberately, so the telemetry reports what the
-        # trial actually held rather than what survived it.
-        _release_option_overlays()
+        # trial actually held rather than what survived it. The counts go into `released`,
+        # which both result shapes above already carry by reference.
+        released.update(_release_option_overlays())
 
 
 def _worker_release_memory() -> Dict[str, Any]:

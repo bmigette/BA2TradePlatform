@@ -1201,3 +1201,70 @@ def test_the_overlay_release_never_fails_a_trial(monkeypatch):
     out = H._trial_worker({"backtest_id": 1}, "sharpe")
     assert out["ok"] is True and out["fitness"] == 1.5
     assert any("overlay reset exploded" in m for m in said), said
+
+
+def test_the_release_costs_an_equity_trial_nothing(monkeypatch):
+    """An equity-only grid never opens an option store, so the option reader must not be
+    IMPORTED on its behalf -- an import per trial to call a function that finds no overlays is
+    a cost the majority of runs would pay for nothing. `sys.modules` is the exact question:
+    has anything in this process already loaded the reader?"""
+    import sys
+
+    from app.services import strategy_optimization_handler as H
+
+    name = "app.services.backtest.parquet_options_provider"
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest",
+        lambda cfg, **kw: {"total_trades": 3, "sharpe_ratio": 1.5})
+
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+
+    assert out["ok"] is True
+    assert name not in sys.modules, "the release imported the option reader on an equity trial"
+    assert out["mem"]["option_overlays"] == {}
+
+
+def test_the_release_counts_ride_along_in_the_trials_mem_telemetry(monkeypatch):
+    """`reset_run_overlays` returns what it dropped and that is the only visibility a worker
+    has that it is still matching the overlays rather than quietly finding none -- so it has to
+    reach the master, not die in the worker. It rides in the `mem` payload the trial already
+    carries."""
+    import app.services.backtest.parquet_options_provider as pq
+
+    from app.services import strategy_optimization_handler as H
+
+    counts = {"overlays": 4, "greeks_rows": 61_000, "bar_memo_entries": 700,
+              "spot_entries": 900, "atm_iv_entries": 120}
+    monkeypatch.setattr(pq, "reset_run_overlays", lambda: counts)
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest",
+        lambda cfg, **kw: {"total_trades": 3, "sharpe_ratio": 1.5})
+
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+
+    assert out["ok"] is True
+    assert out["mem"]["option_overlays"] == counts
+
+
+def test_the_release_counts_ride_along_on_a_FAILED_trial_too(monkeypatch):
+    """The failure path builds its own `mem` snapshot, and it is the path where a worker's
+    accumulated overlay is most worth seeing."""
+    import app.services.backtest.parquet_options_provider as pq
+
+    from app.services import strategy_optimization_handler as H
+
+    counts = {"overlays": 2, "greeks_rows": 5, "bar_memo_entries": 1,
+              "spot_entries": 1, "atm_iv_entries": 0}
+    monkeypatch.setattr(pq, "reset_run_overlays", lambda: counts)
+
+    def _boom(cfg, **kw):
+        raise RuntimeError("bad genome")
+
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest", _boom)
+
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+
+    assert out["ok"] is False
+    assert out["mem"]["option_overlays"] == counts

@@ -161,7 +161,7 @@ import array as _array
 import logging
 import os
 from bisect import bisect_left, bisect_right
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -198,6 +198,18 @@ _UNDERLYING_CACHE_MAX = int(os.getenv("BT_OPTION_PARQUET_CACHE_MAX", "200"))
 #: Same generosity (and same reasoning) as the sqlite reader's ATM-IV memo: the values are a
 #: float or None, and a GA re-asks the identical (symbol, date) pairs on every trial.
 _ATM_IV_CACHE_MAX = int(os.getenv("BT_OPTION_ATM_IV_CACHE_MAX", "200000"))
+def _cap_from_env(name: str, default: int) -> int:
+    """A memo cap from the environment, CLAMPED AT ZERO.
+
+    An operator turning a memo off reaches for ``-1`` as often as ``0``, and a negative cap is
+    not a smaller memo — it is a broken one: ``while len(memo) > -1`` drains the dict and then
+    pops an empty order deque, so the first read of the run dies on an ``IndexError`` rather
+    than the memo simply being disabled. Zero is the real OFF switch (insert, then immediately
+    evict what was inserted) and every negative value means the same thing, so it says so.
+    """
+    return max(0, int(os.getenv(name, str(default))))
+
+
 #: Greeks memoised per OVERLAY, as row index -> the finished 5-tuple. THE NUMBER THAT SIZES
 #: A WORKER: at a measured 315 B/entry this is 6.3 MB per underlying, so the 98-symbol
 #: stage-1 option universe holds ~617 MB where the five dense float64 columns it replaces
@@ -206,7 +218,7 @@ _ATM_IV_CACHE_MAX = int(os.getenv("BT_OPTION_ATM_IV_CACHE_MAX", "200000"))
 #: gives up 0.4% of the hits an unbounded memo gets and 98.5% of the residency. Lower it on a
 #: memory-tight worker before touching anything else here; 5,000 still holds 41.1% of 43.6%.
 #: See ``_Underlying._fresh_run_fill``.
-_GREEKS_MEMO_MAX = int(os.getenv("BT_OPTION_GREEKS_MEMO_MAX", "20000"))
+_GREEKS_MEMO_MAX = _cap_from_env("BT_OPTION_GREEKS_MEMO_MAX", 20000)
 #: Materialised bar dicts held per OVERLAY (see ``_Underlying.bar_dict``). 821 B of resident
 #: memory per entry, measured — 2.6x what a greeks entry costs, which is why its cap is
 #: tighter even though it is asked for far less often. ``bar_dict`` is reached only through
@@ -214,7 +226,7 @@ _GREEKS_MEMO_MAX = int(os.getenv("BT_OPTION_GREEKS_MEMO_MAX", "20000"))
 #: entries over 914 bar dates, so 5,000 is ~7x the measured need and 4.1 MB per underlying
 #: (~400 MB across a 98-symbol universe in the worst case). Until 2026-09-15 it was unbounded
 #: and counted at zero in ``memory_stats``. Eviction is insertion-ordered (see ``bar_dict``).
-_BAR_MEMO_MAX = int(os.getenv("BT_OPTION_BAR_MEMO_MAX", "5000"))
+_BAR_MEMO_MAX = _cap_from_env("BT_OPTION_BAR_MEMO_MAX", 5000)
 #: What one ``_bar_memo`` entry costs this process, for ``memory_stats``. MEASURED, not
 #: derived: 200,000 entries over a 5M-row synthetic moved the working set by 156.5 MB, i.e.
 #: 821 B — the 17-key dict object (``getsizeof`` 464 B) plus the float/int objects its values
@@ -222,7 +234,10 @@ _BAR_MEMO_MAX = int(os.getenv("BT_OPTION_BAR_MEMO_MAX", "5000"))
 #: ~40%, which is exactly the kind of number that makes a worker look healthy while it is not.
 _BAR_MEMO_BYTES_PER_ENTRY = 821
 #: Likewise for ``_g_memo``: 500,000 real greek tuples moved the working set by 150.2 MB —
-#: 315 B for a 5-tuple, its five float objects and the dict slot holding it.
+#: 315 B for a 5-tuple, its five float objects and the dict slot holding it. Neither constant
+#: counts the 8 B/entry the eviction-order deque adds (a pointer to the int the dict already
+#: holds as its key); it is 2.5% of a greeks entry and 1% of a bar entry, inside the noise of
+#: the RSS deltas these were measured from.
 _GREEKS_MEMO_BYTES_PER_ENTRY = 315
 
 #: SCOPE-INDEPENDENT. The parquet bytes and everything derived from them alone. See CACHING.
@@ -352,8 +367,11 @@ def reset_run_overlays() -> Dict[str, Any]:
     governor's ``_worker_release_memory``, both of which drop the lot: this runs on the happy
     path after EVERY trial, so it has to cost a re-computation and never a re-open.
 
-    Returns what it dropped — the only visibility a worker has that the reset is still
-    matching the overlays rather than quietly finding none.
+    Returns what it dropped. That is the only visibility a worker has that the reset is still
+    matching the overlays rather than quietly finding none, so it must not stop here:
+    ``strategy_optimization_handler._trial_worker`` folds the counts into the ``mem`` payload
+    every trial already carries back to the master. (The top-N persist path returns no such
+    payload and discards them.)
     """
     overlays = list(_WORKER_UNDERLYING_CACHE.values())
     greeks_rows = 0
@@ -669,7 +687,7 @@ class _Underlying:
         "c_occ", "c_index", "c_strike", "c_expiry_ord", "c_is_call", "starts", "stops",
         "bar_ord", "bar_ord_l", "starts_l", "stops_l",
         "open", "high", "low", "close", "volume", "open_interest", "vendor_iv", "bid", "ask",
-        "_g_memo", "_spot_cache", "_bar_memo",
+        "_g_memo", "_g_order", "_bar_memo", "_bar_order", "_spot_cache",
     )
 
     def __init__(self, raw: "_RawUnderlying", rate: float):
@@ -728,15 +746,34 @@ class _Underlying:
         where the columns held 7.1 GB.
 
         FIFO, NOT LRU. A backtest walks its window forward; the row read longest ago is the
-        one that will not be asked for again, and ``next(iter(memo))`` keeps the HIT path free
-        of the ``move_to_end`` a true LRU would put on it. An evicted row recomputes
-        identically — this is a memo of a pure function (see ``greeks_tuple``).
+        one that will not be asked for again, and a FIFO order keeps the HIT path free of the
+        ``move_to_end`` a true LRU would put on it. Which key is oldest comes from the deque
+        sidecar below, not from the dict. An evicted row recomputes identically — this is a
+        memo of a pure function (see ``greeks_tuple``).
 
         Fresh objects rather than in-place clears, so the allocator can hand the pages back.
         """
         self._spot_cache: Dict[int, Optional[float]] = {}
         self._bar_memo: Dict[int, Dict[str, object]] = {}
         self._g_memo: Dict[int, Tuple[Optional[float], ...]] = {}
+        # THE EVICTION ORDER, AS A SIDECAR. Both memos are FIFO and a plain dict already
+        # remembers insertion order, so the oldest key was read with ``next(iter(memo))``.
+        # That reads as O(1) and is not: a dict's iterator walks its entry TABLE from the
+        # front, and every delete leaves a tombstone that stays until the dict resizes, so the
+        # scan crosses the whole dead prefix before reaching the first live entry. Measured on
+        # the primitive alone (insert + evict, no compute): 3.5 us at cap 20,000, 3.3 us at
+        # 22,000, 2.9 us at 30,000, against 163 ns for the deque -- 18-22x. End to end through
+        # ``greeks_tuple`` the eviction path lost 4.5-8.2 us per call. A review measured 23 us
+        # just above the 21,846-entry table-growth boundary; whichever figure a given cap and
+        # allocator state produces, it is microseconds spent on bookkeeping against an 11.2 us
+        # compute, and at 751 evictions per bar (the widest read pattern) it is milliseconds a
+        # bar.
+        #
+        # A deque of keys is exact BY CONSTRUCTION: a key enters it exactly when it enters the
+        # dict and the two leave together, so its head is always the oldest LIVE key. Nothing
+        # reads it on the hit path. ~8 B/entry on top of the 315/821 the entries cost.
+        self._g_order: "deque[int]" = deque()
+        self._bar_order: "deque[int]" = deque()
 
     # -- as-of clamp ----------------------------------------------------
     # ``bisect`` over the ``array('i')`` buffer rather than ``np.searchsorted`` over an array
@@ -812,8 +849,10 @@ class _Underlying:
             t = (_f(out["iv"]), _f(out["delta"]), _f(out["gamma"]),
                  _f(out["theta"]), _f(out["vega"]))
             memo[i] = t
+            order = self._g_order
+            order.append(i)
             while len(memo) > _GREEKS_MEMO_MAX:
-                del memo[next(iter(memo))]
+                del memo[order.popleft()]
         return t
 
     def delta_iv_of_row(self, i: int, ci: int, spot_source
@@ -849,14 +888,14 @@ class _Underlying:
         ``self._as_of_date()``, so a row's re-reads all fall on one bar date and the oldest
         entry is exactly the one that will not be asked for again.
 
-        A PLAIN DICT, not an ``OrderedDict``. Both preserve insertion order on every Python
-        BA2 runs, so ``next(iter(memo))`` is the oldest key either way -- but ``OrderedDict``
-        carries a linked-list node per entry and its ``get`` is measurably slower on the HIT
-        path this method exists for: 311 ns against 245 ns, a 27% regression on a path taken
-        once per held lot per bar per MTM/fill/liquidation/settlement site. The eviction is on
-        the MISS branch, which already costs 5.4 us, so it can afford the ``next(iter(...))``
-        scan of one entry. An evicted row rebuilds identically -- this is a memo of a pure
-        function of immutable columns, so the cap costs 5.4 us and changes no value.
+        A PLAIN DICT plus a ``deque`` of keys, not an ``OrderedDict``: the latter carries a
+        linked-list node per entry and its ``get`` is measurably slower on the HIT path this
+        method exists for (311 ns against 245 ns, a 27% regression on a path taken once per
+        held lot per bar per MTM/fill/liquidation/settlement site). The deque is read only on
+        the MISS branch and says which key is oldest in ~180 ns -- see ``_fresh_run_fill`` for
+        why the dict cannot be asked that itself. An evicted row rebuilds identically -- this
+        is a memo of a pure function of immutable columns, so the cap costs 5.4 us and changes
+        no value.
         """
         d = self._bar_memo.get(i)
         if d is None:
@@ -878,8 +917,10 @@ class _Underlying:
             }
             memo = self._bar_memo
             memo[i] = d
+            order = self._bar_order
+            order.append(i)
             while len(memo) > _BAR_MEMO_MAX:
-                del memo[next(iter(memo))]
+                del memo[order.popleft()]
         return d.copy()
 
     def contract(self, i: int, ci: int, spot_source) -> OptionContract:

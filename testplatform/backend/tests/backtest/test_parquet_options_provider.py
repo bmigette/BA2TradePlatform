@@ -1606,3 +1606,128 @@ def test_two_genomes_with_a_reset_between_them_do_not_accumulate():
         f"{one_trial / 1048576:.1f} MB) against the dense design's "
         f"{dense_nominal_one_genome / 1048576:.0f} MB for ONE -- still accumulating")
     clear_worker_parquet_options_cache()
+
+
+# --------------------------------------------------------------------------- #
+# 13. THE EVICTION ORDER IS A SIDECAR, NOT A SCAN
+#
+# Both memos evicted with `del memo[next(iter(memo))]`. That reads as O(1) and is not: a
+# dict's iterator walks its entry TABLE from the front, and the slots a delete leaves behind
+# stay as tombstones until the dict resizes, so the scan crosses the whole dead prefix before
+# reaching the first live entry. Measured on the primitive alone: 3.5 us per eviction at cap
+# 20,000 against 163 ns for a deque, 18-22x across the caps tried; end to end through
+# `greeks_tuple` the eviction path lost 4.5-8.2 us per call. A review measured 23 us just
+# above the 21,846-entry table-growth boundary. At 751 evictions per bar (the widest read
+# pattern) it is milliseconds a bar, on an 11.2 us compute.
+#
+# A deque of keys in insertion order is exact BY CONSTRUCTION: the memo is FIFO, a key enters
+# the deque exactly when it enters the dict and the two leave together, so the deque's head is
+# always the oldest live key. The HIT path is untouched -- it never looks at the sidecar.
+#
+# These tests pin the CORRECTNESS of that sidecar, not its speed: a benchmark in the suite
+# would be a flake, but a sidecar that drifts out of step with the dict is a KeyError on the
+# next eviction or a live row dropped while a dead key waits at the head.
+# --------------------------------------------------------------------------- #
+def _fill_greeks(ov, spot, rows):
+    ci = 0
+    for i in rows:
+        ov.greeks_tuple(i, ci, spot)
+
+
+def test_the_greek_memo_holds_the_cap_and_drops_the_oldest_keys(monkeypatch):
+    """Insert cap + 1000 rows: the memo holds exactly the cap, and what is gone is the first
+    1000 inserted -- not an arbitrary 1000."""
+    cap = 2_000
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", cap)
+    raw = pq._RawUnderlying.from_arrays("SY", _synthetic_arrays(1, cap + 1_000))
+    ov = pq._Underlying(raw, _RATE)
+
+    _fill_greeks(ov, lambda s, d: 100.0, range(cap + 1_000))
+
+    assert len(ov._g_memo) == cap
+    assert sorted(ov._g_memo) == list(range(1_000, cap + 1_000))
+    assert list(ov._g_order) == list(range(1_000, cap + 1_000)), (
+        "the key sidecar must track the dict exactly, or the NEXT eviction drops a live row "
+        "while a dead key sits at its head")
+
+
+def test_the_bar_memo_holds_the_cap_and_drops_the_oldest_keys(monkeypatch):
+    """The same, for the materialised-bar memo."""
+    cap = 2_000
+    monkeypatch.setattr(pq, "_BAR_MEMO_MAX", cap)
+    raw = pq._RawUnderlying.from_arrays("SY", _synthetic_arrays(1, cap + 1_000))
+    ov = pq._Underlying(raw, _RATE)
+
+    for i in range(cap + 1_000):
+        ov.bar_dict(i, 0, lambda s, d: 100.0)
+
+    assert len(ov._bar_memo) == cap
+    assert sorted(ov._bar_memo) == list(range(1_000, cap + 1_000))
+    assert list(ov._bar_order) == list(range(1_000, cap + 1_000))
+
+
+def test_a_re_read_of_an_evicted_row_re_enters_the_order_once(monkeypatch):
+    """A key that is evicted and later read again is inserted afresh, so it must appear in the
+    sidecar ONCE, at the back. Two entries for one key would make the next eviction delete a
+    key that is no longer there (a KeyError) or drop the row while a stale key waits."""
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", 2)
+    raw = pq._RawUnderlying.from_arrays("SY", _synthetic_arrays(1, 10))
+    ov = pq._Underlying(raw, _RATE)
+    spot = lambda s, d: 100.0        # noqa: E731
+
+    _fill_greeks(ov, spot, [0, 1, 2])          # evicts 0
+    assert sorted(ov._g_memo) == [1, 2]
+    _fill_greeks(ov, spot, [0])                # 0 comes back, evicts 1
+    assert sorted(ov._g_memo) == [0, 2]
+    assert list(ov._g_order).count(0) == 1
+    _fill_greeks(ov, spot, [3])                # evicts 2, the oldest LIVE key
+    assert sorted(ov._g_memo) == [0, 3]
+
+
+def test_the_reset_drops_the_eviction_order_too(provider, store_root):
+    """A sidecar that survived a reset would name keys the memo no longer has, and the first
+    eviction of the next trial would raise."""
+    _read_everything(provider)
+    ov = _overlay(store_root)
+    assert ov._g_order and ov._bar_order
+
+    pq.reset_run_overlays()
+
+    assert len(ov._g_order) == 0 and len(ov._bar_order) == 0
+    assert len(ov._g_memo) == 0 and len(ov._bar_memo) == 0
+    # ...and the overlay still works, with eviction intact.
+    _read_everything(provider)
+    assert len(ov._g_order) == len(ov._g_memo)
+    assert len(ov._bar_order) == len(ov._bar_memo)
+
+
+@pytest.mark.parametrize("raw_value,expected", [
+    ("-1", 0), ("-20000", 0), ("0", 0), ("1", 1), ("20000", 20000),
+])
+def test_a_negative_cap_is_clamped_to_zero(raw_value, expected, monkeypatch):
+    """An operator lowering a cap to turn a memo OFF reaches for -1 as often as 0. Unclamped,
+    `while len(memo) > -1` drains the dict and then pops an empty deque, so the first read of
+    the run would die with an IndexError instead of the memo simply being disabled."""
+    monkeypatch.setenv("BT_PROBE_CAP", raw_value)
+    assert pq._cap_from_env("BT_PROBE_CAP", 99) == expected
+
+
+def test_a_cap_of_zero_memoises_nothing_and_still_answers(store_root, monkeypatch):
+    """Cap 0 is the OFF switch, and off must mean "recompute every time", not "fail". It is
+    also the boundary the eviction loop is most likely to get wrong: the entry it has to drop
+    is the one it just inserted."""
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", 0)
+    monkeypatch.setattr(pq, "_BAR_MEMO_MAX", 0)
+    p = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
+                               spot_scope="cap-zero")
+    got = _read_everything(p)
+    ov = _overlay(store_root, scope="cap-zero")
+    assert len(ov._g_memo) == 0 and len(ov._bar_memo) == 0
+    assert len(ov._g_order) == 0 and len(ov._bar_order) == 0
+
+    # ...and it answers exactly what a roomy memo answers.
+    monkeypatch.setattr(pq, "_GREEKS_MEMO_MAX", 20_000)
+    monkeypatch.setattr(pq, "_BAR_MEMO_MAX", 5_000)
+    assert _read_everything(
+        ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
+                               spot_scope="cap-roomy")) == got
