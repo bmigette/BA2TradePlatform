@@ -1216,6 +1216,22 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
         )
 
     _install_orchestration_file_logging()
+    # Raise the service's own RLIMIT_NOFILE before the pool is built. Spawned children inherit
+    # the SOFT limit of this process, so raising it here covers every worker even if one of them
+    # somehow never constructs a DerivedArrayStore. It matters because a mapped derived array
+    # costs one descriptor for the life of the mapping: 98 option underlyings x 18 arrays = 1764
+    # per worker, against the systemd default soft limit of 1024 (remote227, 2026-09-14 -- EMFILE
+    # at 1014 fds was silently answered with a 7 GB rebuild and stalled the whole grid). Systemd's
+    # LimitNOFILE= is the other half of this and is still worth setting; this makes the unit file
+    # optional rather than load-bearing.
+    try:
+        from ba2_common.core import shared_arrays as _sa
+        _old_fd, _new_fd = _sa.ensure_fd_headroom()
+        if _new_fd != _old_fd:
+            logger.info("worker fd limit: soft %s -> %s (hard %s)",
+                        _old_fd, _new_fd, _sa.fd_limits()[1])
+    except Exception as e:  # noqa: BLE001 -- a soft limit must never stop the service starting
+        logger.warning("worker fd limit: could not raise RLIMIT_NOFILE: %r", e)
     _sweep_orphaned_spawn_children()
     # Pre-warm the manifest cache in the background: the first /cache/manifest call after a
     # restart would otherwise pay the full ~140s disk enumeration (remote150, 312k files) and

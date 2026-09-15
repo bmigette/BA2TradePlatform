@@ -2289,7 +2289,7 @@ class InstrumentAccountShareCondition(CompareCondition):
         """
         Get expert's total virtual equity (allocated capital, not just free cash).
 
-        Uses get_virtual_balance() = account_balance × virtual_equity_pct so that
+        Uses get_virtual_balance() = tradable balance × virtual_equity_pct so that
         a fully-invested expert still has a sensible denominator.
         """
         try:

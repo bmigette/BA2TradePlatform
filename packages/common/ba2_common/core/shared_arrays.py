@@ -1,0 +1,884 @@
+"""Read-only numpy array sets shared across worker processes through memory-mapped ``.npy``
+files in a DERIVED cache beside the source tree.
+
+WHY. A GA runs N worker processes that each parse the same parquet into the same numpy arrays
+and hold them privately: N copies of identical bytes. On the 2020 ThetaData option tree that
+was ~15.6 GB PER WORKER (177.8M rows x ~88 B), which OOM-killed a 251 GB host at 16 workers.
+Mapping the arrays from files lets the OS page cache hold ONE copy per host; measured
+2026-09-14 (reports/strategy_research/option_array_sharing_bench_2026-09-14.md): -1..-6%
+throughput at 32 workers, 5x less committed memory, on Windows and Linux.
+
+RULES THAT CAME OUT OF THE MEASUREMENT (do not "simplify" them away):
+  * Every opened array is ``np.asarray(np.load(path, mmap_mode='r'))``. The ``np.memmap``
+    SUBCLASS costs 33-43% on scalar indexing; the plain ndarray view over the same mapping
+    does not. The view keeps the mapping alive through ``.base``.
+  * A mapped array is NEVER pickled or sent to a child (it materialises); every process opens
+    its own through ``build_or_open``.
+  * A published directory is NEVER edited in place. A changed source gets a NEW signature
+    directory, and an obsolete one is removed only by ``_evict_dir``.
+
+WINDOWS, AND WHY EVICTION IS ALL-OR-NOTHING. While any process maps ``<sig>/x.npy``, NTFS
+refuses to delete it (WinError 32), refuses to rename it (WinError 32), AND refuses to rename
+its PARENT directory (WinError 5) -- all three measured on this host. So a partial delete is a
+trap, not an inconvenience: ``shutil.rmtree(..., ignore_errors=True)`` happily removes
+``_done.json`` and leaves the mapped ``.npy``, producing a directory that is untrusted (so every
+worker tries to rebuild) and immovable (so no worker can). ``_evict_dir`` therefore PROBES
+first: it renames every child aside, rolls every rename back on the first refusal and reports
+False, leaving the directory byte-for-byte intact and still trusted. Nothing in this module
+deletes a published directory any other way.
+
+LAYOUT.  ``<derived_root>/<key>/<sig>/<name>.npy`` + ``<derived_root>/<key>/<sig>/_done.json``
+(written LAST -- a directory without it is not trusted and is rebuilt). ``sig`` is a sha1 over
+the sorted ``(resolved path, size, mtime_ns)`` of the SOURCE files plus ``SCHEMA_VERSION`` --
+the same "immutable history" identity the cache-sync layer keys on. Builds happen in
+``<key>/<sig>.<pid>.<tid>.tmp/`` and are published with one ``os.replace`` (atomic on POSIX
+and on Windows for a same-volume rename). A ``<key>/<sig>.lock`` created with O_EXCL serialises
+concurrent cold builders across processes; the losers wait for ``_done.json``.
+
+FILE DESCRIPTORS ARE THE SCARCE RESOURCE. A set of N arrays costs N DESCRIPTORS for as long as
+any view over it is alive -- numpy's memmap dups the fd and holds it for the life of the
+mapping -- so plan ``RLIMIT_NOFILE >= arrays x symbols x 1.2``. The 2020 option universe is 98
+underlyings x 18 arrays = 1764 descriptors per worker process, against a systemd default soft
+limit of 1024: on remote227 (2026-09-14) a worker sat at 1014 open fds, the next ``np.load``
+raised EMFILE, ``_try_open`` read that as "not usable" and ``build_or_open`` REBUILT a 7 GB set
+under the lock while 27 of 30 workers slept in the wait loop -- the grid stalled with nothing in
+the logs. Two guards came out of that, and both are load-bearing: ``ensure_fd_headroom()``
+raises the soft limit to the hard one on every process that constructs a store, and every open
+path in here -- the marker read, the array mapping, the O_EXCL build lock -- re-raises resource
+exhaustion as ``SharedArrayFdExhausted`` instead of reporting "absent" or "busy", because
+rebuilding cannot make descriptors appear and waiting for a lock nobody holds is a hot spin.
+
+ESCAPE HATCH. ``BA2_SHARED_ARRAYS=0`` -> ``build_or_open`` returns ``build_fn()`` directly
+(private arrays, nothing written): the pre-2026-09-14 behaviour, and what every parity test
+compares against.
+
+This module is deliberately free of any ``ba2_*`` import (pure numpy + stdlib) so that
+``ba2_providers`` and the backtest engine can depend on it without a cycle.
+"""
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import os
+import shutil
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+import numpy as np
+
+DONE_MARKER = "_done.json"
+DERIVED_DIRNAME = "_derived"
+TMP_SUFFIX = ".tmp"
+EVICT_SUFFIX = ".evict"
+#: O_EXCL claim taken on ``<sig>`` for the duration of an eviction probe. Deliberately NOT
+#: ``.tmp`` or ``.lock``: it is a FILE, and both scanners iterate directories only, so neither
+#: sweep() nor _remove_stale_siblings can mistake it for garbage.
+EVICTING_SUFFIX = ".evicting"
+SCHEMA_VERSION = 1          #: bump when layout/meaning changes; every signature moves
+LOCK_STALE_S = float(os.getenv("BA2_SHARED_ARRAYS_LOCK_STALE_S", "900"))
+#: How long a publish waits for somebody else's eviction probe to finish. A probe is renames
+#: only, so this is generous; housekeeping passes 0.0 and never waits at all.
+EVICT_CLAIM_WAIT_S = 5.0
+_WAIT_POLL_S = 0.25
+
+#: Names NTFS refuses as a path segment whatever the extension; PRN and AUX are plausible
+#: tickers, so a symbol key must be refused rather than silently mangled.
+_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+_UNSAFE_CHARS = '/\\:*?"<>|'
+
+ArrayDict = Dict[str, np.ndarray]
+PathLike = Union[str, os.PathLike]
+BuildFn = Callable[[], ArrayDict]
+
+
+#: Soft ``RLIMIT_NOFILE`` ``ensure_fd_headroom`` aims for when the hard limit allows it. 1764
+#: descriptors is the 2020 option universe (98 underlyings x 18 arrays); 65536 leaves room for
+#: a bigger universe, every parquet handle, and every socket, and is well under the 524288 hard
+#: limit the systemd units on the worker hosts carry.
+_FD_TARGET = 65536
+#: ``DerivedArrayStore.__init__`` raises the limit lazily, once per process (see there).
+_FD_HEADROOM_DONE = False
+
+
+def ensure_fd_headroom(needed: int = 0) -> Tuple[int, int]:
+    """Raise this process's soft ``RLIMIT_NOFILE`` towards its hard limit; return (old, new).
+
+    WHY THIS EXISTS. Every array a worker maps costs ONE file descriptor for as long as any
+    view over it is alive. A GA worker on the option tree maps 98 underlyings x 18 arrays =
+    1764 of them, and the systemd unit that starts the remote worker service carries the
+    default soft limit of 1024 (hard 524288). Nothing in numpy or this module reports "you are
+    near the limit"; the failure surfaces as an EMFILE out of ``np.load`` 1014 descriptors in
+    (measured, remote227 2026-09-14). Raising the soft limit to the hard one is free -- no
+    privilege is needed for soft <= hard -- and it is the ONLY fix that does not shrink the
+    working set.
+
+    POSIX only. Windows has no ``RLIMIT_NOFILE`` (handles are not rationed per process this
+    way), so there it does nothing and returns ``(0, 0)``.
+
+    BEST EFFORT BY CONTRACT: a container that forbids the raise, or a platform without the
+    ``resource`` module, must not take the worker down over it -- every such case returns the
+    UNCHANGED pair. The loud failure belongs at the point of actual exhaustion (``_try_open``),
+    where there is a concrete path to name.
+    """
+    try:
+        import resource
+    except ImportError:                 # Windows, and anything else without POSIX rlimits
+        return (0, 0)
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return (0, 0)
+    want = max(int(needed), _FD_TARGET)
+    if hard == resource.RLIM_INFINITY:
+        target = want
+    elif soft == resource.RLIM_INFINITY or soft >= hard:
+        return (soft, soft)             # already at the ceiling; nothing to take
+    else:
+        target = min(max(want, soft), hard)
+    if target <= soft:
+        return (soft, soft)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        return (soft, soft)
+    return (soft, target)
+
+
+def fd_limits() -> Tuple[object, object]:
+    """``(soft, hard)`` RLIMIT_NOFILE, or ``("n/a", "n/a")`` off POSIX. Diagnostics only.
+
+    Public because the worker startup paths log it next to what ``ensure_fd_headroom`` did.
+    """
+    try:
+        import resource
+        return resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:                   # noqa: BLE001 - an error message must never raise
+        return ("n/a", "n/a")
+
+
+def _open_fd_count() -> object:
+    """How many descriptors this process holds, or ``"?"`` if the platform will not say.
+
+    ``"?"`` off Linux (no ``/proc/self/fd``) -- AND, ironically, sometimes in the very case
+    this exists to describe: ``listdir`` needs a descriptor of its own, so a process wedged at
+    exactly its limit can fail to count them. A missing number is not evidence of a healthy
+    process; the errno that got us here is.
+    """
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return "?"
+
+
+class SharedArrayFdExhausted(RuntimeError):
+    """This process cannot open another file/mapping (EMFILE/ENFILE/ENOMEM).
+
+    A distinct type because the ANSWER is distinct. Everything else this module refuses is a
+    per-set problem with a per-set remedy (rebuild it); this one is a process/host problem, and
+    every consumer that retries, rebuilds or falls back makes it worse. The GA's trial worker
+    keys on the class NAME to mark a run fatal, so do not rename it without looking there
+    (``strategy_optimization_handler._trial_worker``). Subclasses RuntimeError so the handlers
+    that predate it still catch it.
+    """
+
+
+def _raise_if_exhausted(exc: OSError, path: PathLike) -> None:
+    """Re-raise ``exc`` as ``SharedArrayFdExhausted`` if it is resource exhaustion; else return.
+
+    Called at EVERY point in this module where a starved process can fail a syscall: the
+    marker read, the array mapping, and the O_EXCL build lock. Missing any one of them puts
+    exhaustion back into a code path that answers it with a rebuild or a wait -- the marker
+    read read EMFILE as "no marker, rebuild it", and the lock read it as "somebody else is
+    building", which is worse: ``build_or_open`` then finds no lock to wait on and spins
+    through the outer loop with no sleep for 2 x LOCK_STALE_S.
+    """
+    if exc.errno not in (errno.EMFILE, errno.ENFILE, errno.ENOMEM):
+        return
+    soft, hard = fd_limits()
+    raise SharedArrayFdExhausted(
+        f"shared_arrays: cannot map {path}: {exc} -- the process is out of file "
+        f"descriptors/mappings (RLIMIT_NOFILE soft={soft}, hard={hard}, open "
+        f"fds~{_open_fd_count()}); rebuilding would not help. Raise the limit "
+        "(ensure_fd_headroom / systemd LimitNOFILE) or shrink the working set."
+    ) from exc
+
+
+def enabled() -> bool:
+    """True unless ``BA2_SHARED_ARRAYS`` is set to a falsey value (the escape hatch)."""
+    return os.getenv("BA2_SHARED_ARRAYS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def derived_root_for(source_root: PathLike) -> str:
+    """``.../cache/<Provider>`` -> ``.../cache/_derived/<Provider>``.
+
+    The derived tree is a SIBLING of the source tree, never inside it: the cache-sync layer
+    mirrors the source tree wholesale and must not carry machine-local mappings with it.
+
+    Raises ValueError for a bare filesystem or drive root, which has no provider name to
+    mirror and would otherwise yield a relative path.
+    """
+    s = os.fspath(source_root)
+    drive, rest = os.path.splitdrive(str(s))
+    rest = rest.rstrip("/\\")
+    if not rest:
+        raise ValueError(
+            f"shared_arrays: {source_root!r} is a bare root, not a provider cache directory"
+        )
+    s = drive + rest
+    return os.path.join(os.path.dirname(s), DERIVED_DIRNAME, os.path.basename(s))
+
+
+def _tmp_dir_name(sig: str) -> str:
+    """Name of a private staging directory for ``sig``; unique per process AND per thread."""
+    return f"{sig}.{os.getpid()}.{threading.get_ident()}{TMP_SUFFIX}"
+
+
+def _safe_key(key: str) -> str:
+    """Return ``key`` as a single safe path segment, or raise ValueError if it cannot be one.
+
+    Refusing is the point. Sanitising ``""`` or ``"."`` down to something empty would collapse
+    ``key_dir`` onto the store ROOT, and the next ``_remove_stale_siblings`` would then treat
+    every OTHER key as an obsolete sibling and evict the whole cache (reproduced).
+    """
+    cleaned = "".join(
+        "_" if (c in _UNSAFE_CHARS or ord(c) < 32) else c for c in str(key)
+    ).strip().rstrip(".")
+    if cleaned in ("", ".", ".."):
+        raise ValueError(f"shared_arrays: {key!r} is not usable as a cache key")
+    if cleaned.split(".")[0].upper() in _WINDOWS_RESERVED:
+        raise ValueError(
+            f"shared_arrays: {key!r} is a reserved device name on Windows and cannot be a "
+            "cache key; prefix it (e.g. 'sym_PRN') at the call site"
+        )
+    return cleaned
+
+
+def _marker_mtime(d: Path) -> Optional[float]:
+    """mtime of the done-marker in ``d``, or None if ``d`` is not a trusted directory.
+
+    Read through in ONE stat: an ``is_file()`` followed by a ``stat()`` is a TOCTOU that
+    raised FileNotFoundError out of ``sweep()`` when a sibling vanished mid-scan.
+    """
+    try:
+        return (d / DONE_MARKER).stat().st_mtime
+    except OSError:
+        return None
+
+
+def _tmp_is_live(d: Path) -> bool:
+    """True if ``d`` looks like a staging directory a builder is still writing into.
+
+    The freshness signal is the directory's own mtime, which ``_build`` refreshes explicitly
+    after every array. It has to: on NTFS writing INTO an existing file does not advance the
+    parent directory's mtime at all -- only creating or removing an entry does -- so a long
+    multi-array build would otherwise look abandoned halfway through and get swept out from
+    under itself (that raised FileNotFoundError from inside ``np.save``). Unreadable ->
+    assume live.
+    """
+    try:
+        return time.time() - d.stat().st_mtime < LOCK_STALE_S
+    except OSError:
+        return True
+
+
+class DerivedArrayStore:
+    """A derived ``.npy`` cache rooted at ``root``, keyed by ``<key>/<signature>``."""
+
+    def __init__(self, root: PathLike) -> None:
+        # Raise RLIMIT_NOFILE here, lazily and once per process: EVERY consumer constructs a
+        # store before it maps anything, so this is the one chokepoint that covers the pool
+        # workers, the remote worker service, the prewarm tool and any ad-hoc script alike,
+        # without a startup hook each of them has to remember. One mapped array = one
+        # descriptor for the life of the mapping, and 18 arrays x 98 underlyings = 1764 is
+        # already past the systemd default soft limit of 1024 (see the module docstring).
+        global _FD_HEADROOM_DONE
+        if not _FD_HEADROOM_DONE:
+            _FD_HEADROOM_DONE = True
+            ensure_fd_headroom()
+        self.root = Path(root)
+        #: Why the last eviction refused, for the error messages. Diagnostic only -- it is
+        #: written without synchronisation and may be overwritten by a concurrent eviction;
+        #: never branch on it.
+        self._last_evict_error: Optional[str] = None
+
+    # ---------------------------------------------------------------- identity
+
+    def signature(self, sources: Iterable[PathLike]) -> str:
+        """sha1 over ``SCHEMA_VERSION`` + the sorted ``(path, size, mtime_ns)`` of the sources.
+
+        The full path is hashed, not the basename: a per-symbol tree of
+        ``<symbol>/<year>.parquet`` files gives many same-named sources, and two of them with
+        equal size and mtime would otherwise share a signature and serve one symbol's arrays
+        for another. It is normalised with ``abspath``/``normcase`` rather than ``resolve()``
+        because resolve() STATS every component -- 0.46 s -> 3.6 s per worker for a 335-symbol
+        x 100-file set, paid on every single call.
+
+        Content hashing is deliberately NOT used: the option/OHLCV parquet tree is append-only
+        immutable history and can run to hundreds of GB, so stat() identity is both sufficient
+        and the only affordable check.
+        """
+        sources = list(sources)
+        if not sources:
+            raise ValueError("shared_arrays: signature() needs at least one source file")
+        h = hashlib.sha1(f"schema={SCHEMA_VERSION}\n".encode())
+        rows: List[Tuple[str, int, int]] = []
+        for s in sources:
+            p = Path(s)
+            st = p.stat()
+            # normcase lower-cases on NT, where the filesystem is case-insensitive, and is a
+            # no-op elsewhere; abspath is pure string manipulation.
+            ident = os.path.normcase(os.path.abspath(p))
+            rows.append((ident, st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+        for ident, size, mtime in sorted(rows):
+            h.update(f"{ident}|{size}|{mtime}\n".encode())
+        return h.hexdigest()[:20]
+
+    def key_dir(self, key: str) -> Path:
+        """Directory holding every signature built for ``key``."""
+        return self.root / _safe_key(key)
+
+    def current_dir(self, key: str, sources: Iterable[PathLike]) -> Path:
+        """Directory the arrays for ``key`` live in given the CURRENT state of ``sources``."""
+        return self.key_dir(key) / self.signature(sources)
+
+    def lock_path(self, key: str, sources: Iterable[PathLike]) -> Path:
+        """The O_EXCL build lock guarding ``current_dir(key, sources)``."""
+        return self.key_dir(key) / (self.signature(sources) + ".lock")
+
+    # ------------------------------------------------------------ the entry point
+
+    def build_or_open(self, key: str, sources: Iterable[PathLike], build_fn: BuildFn) -> ArrayDict:
+        """Open the mapped arrays for ``key``, building them from ``build_fn`` if absent.
+
+        ``build_fn`` takes no arguments and returns ``{name: ndarray}`` of C-contiguous
+        numeric/bool arrays. It runs at most once per (key, signature) per host; concurrent
+        callers wait on the lock and then open what the winner published. The returned arrays
+        are plain read-only ``np.ndarray`` VIEWS over the mapping -- never ``np.memmap``, which
+        is 33-43% slower on scalar reads -- except under the ``BA2_SHARED_ARRAYS=0`` escape
+        hatch, which returns the private writable arrays of ``build_fn()`` and writes nothing.
+        """
+        if not enabled():
+            return build_fn()
+        sources = [Path(s) for s in sources]
+        # Resolve the signature ONCE: recomputing it for the directory and then for the lock
+        # would let a source that changes mid-call guard one path with the other's lock.
+        sig = self.signature(sources)
+        key_dir = self.key_dir(key)
+        final = key_dir / sig
+        lock = key_dir / (sig + ".lock")
+        t_start = time.monotonic()
+        while True:
+            opened = self._try_open(final)
+            if opened is not None:
+                return opened
+            key_dir.mkdir(parents=True, exist_ok=True)
+            if self._acquire(lock):
+                try:
+                    opened = self._try_open(final)
+                    if opened is None:
+                        self._build(final, build_fn, lock)
+                        opened = self._try_open(final)
+                        if opened is None:
+                            raise RuntimeError(
+                                f"shared_arrays: build of {final} left no readable set"
+                            )
+                    self._remove_stale_siblings(final)
+                    return opened
+                finally:
+                    self._release(lock)
+            # Somebody else holds the lock: wait for what they publish, and take over if they
+            # die. A loop, not recursion -- a long-lived worker must not grow a stack per retry.
+            t_wait = time.monotonic()
+            while True:
+                opened = self._try_open(final)
+                if opened is not None:
+                    return opened
+                if not lock.exists() or self._lock_is_stale(lock):
+                    break                       # the builder vanished; re-enter and take over
+                if time.monotonic() - t_wait > LOCK_STALE_S:
+                    raise TimeoutError(f"shared_arrays: waited {LOCK_STALE_S:.0f}s on {lock}")
+                time.sleep(_WAIT_POLL_S)
+            if time.monotonic() - t_start > 2 * LOCK_STALE_S:
+                raise TimeoutError(
+                    f"shared_arrays: {final} never settled after {2 * LOCK_STALE_S:.0f}s"
+                )
+
+    # ------------------------------------------------------------------- internals
+
+    def _try_open(self, final: Path) -> Optional[ArrayDict]:
+        """Map every array named by the done-marker of ``final``, or None if it is not usable.
+
+        A marker that cannot be parsed, or an array that cannot be loaded (missing, truncated,
+        not a ``.npy`` at all), reports "not usable" rather than raising: the caller's answer to
+        both is the same rebuild, and the corrupt directory is then evicted by ``_publish``.
+
+        A SUCCESSFUL OPEN TOUCHES THE MARKER, so its mtime means LAST USE and not BUILD TIME.
+        That is what makes an age-based collector safe: without it the marker of the set every
+        trial on the box maps daily keeps the timestamp of the day it was built, and
+        ``tools/build_shared_arrays.py --sweep --sweep-max-age-days 14`` would delete the
+        hottest key on the host and charge the next grid a cold rebuild for it. Best-effort by
+        design -- a read-only tree, or a concurrent evictor that has just renamed the marker
+        aside, must not turn an open that WORKED into a rebuild.
+
+        RESOURCE EXHAUSTION IS THE ONE FAILURE THAT RAISES, on the marker read as much as on
+        the mapping (see ``_raise_if_exhausted``). EMFILE/ENFILE/ENOMEM say "this
+        process cannot map anything more", not "the set is missing", and the caller's rebuild
+        answer is actively harmful there: it takes the build lock, spends a multi-GB rebuild
+        that fails the same way, and parks every other worker in the lock-wait loop behind it
+        (remote227, 2026-09-14 -- 27 of 30 workers asleep, no error anywhere). Descriptors are
+        counted PER MAPPED ARRAY, so the cure is a bigger limit or a smaller working set, and
+        the message has to say so.
+        """
+        marker = final / DONE_MARKER
+        try:
+            names = json.loads(marker.read_text(encoding="utf-8"))["arrays"]
+        except OSError as e:
+            _raise_if_exhausted(e, marker)      # a marker we cannot OPEN is not a missing one
+            return None
+        except (ValueError, KeyError, TypeError):
+            return None
+        out: ArrayDict = {}
+        for name in names:
+            p = final / f"{name}.npy"
+            try:
+                arr = np.load(p, mmap_mode="r")
+            except OSError as e:
+                _raise_if_exhausted(e, p)
+                return None
+            except ValueError:
+                return None
+            out[name] = np.asarray(arr)
+        try:
+            os.utime(marker, None)
+        except OSError:
+            pass
+        return out
+
+    def _build(self, final: Path, build_fn: BuildFn, lock: Optional[Path] = None) -> None:
+        """Run ``build_fn`` into a private ``.tmp`` directory and publish it onto ``final``.
+
+        ``lock`` is the build lock the caller holds, and it is HEARTBEATED here for the same
+        reason the staging directory is. Its mtime was stamped once, at ``_acquire``, and
+        staleness is measured from that stamp -- so a build that legitimately runs longer than
+        ``LOCK_STALE_S`` has its own lock broken out from under it and a second process starts
+        the identical multi-GB build beside it. That is the exact case this module exists for:
+        the largest option underlyings are the slowest builds AND the ones a duplicate build
+        cannot be afforded on. Passed rather than recomputed so a signature that moves
+        mid-build cannot make us touch a different process's lock.
+
+        WHAT IT DOES NOT COVER: ``build_fn`` itself is one opaque blocking call and cannot be
+        heartbeated from here, so ``LOCK_STALE_S`` still has to exceed the time it takes to
+        produce the arrays (a parquet parse: ~1-2 min for the largest underlying measured,
+        against a 15 min default). The heartbeat covers the WRITE phase, which is the part
+        that scales with the size of the result rather than with the source.
+        """
+        arrays = build_fn()
+        tmp = final.parent / _tmp_dir_name(final.name)
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        try:
+            for name, arr in arrays.items():
+                a = np.asarray(arr)
+                if a.dtype == object:
+                    raise TypeError(
+                        f"shared_arrays: {name!r} is an object array; only numeric/bool arrays "
+                        "can be shared"
+                    )
+                if a.ndim and not a.flags.c_contiguous:
+                    # np.ascontiguousarray here would silently double peak RSS -- 15 GB of it
+                    # for the option set this module exists for. Make the copy the caller's,
+                    # where it is visible in the builder that produced the odd layout.
+                    raise ValueError(
+                        f"shared_arrays: {name!r} is not C-contiguous; copy it with "
+                        "np.ascontiguousarray inside the builder, where the cost is visible"
+                    )
+                self._write_fsynced(tmp / f"{name}.npy", lambda f, a=a: np.save(f, a, allow_pickle=False))
+                # Republish the staging directory's freshness. Writing into a file does not
+                # touch its parent's mtime on NTFS, and _tmp_is_live reads exactly that.
+                os.utime(tmp, None)
+                self._heartbeat(lock)
+            payload = json.dumps({"arrays": sorted(arrays), "schema": SCHEMA_VERSION,
+                                  "written_at": time.time(), "pid": os.getpid()})
+            # The marker is written and fsynced LAST: it is the only thing _try_open trusts, so
+            # a crash anywhere above leaves a directory nobody will read.
+            self._write_fsynced(tmp / DONE_MARKER, lambda f: f.write(payload.encode("utf-8")))
+            self._publish(tmp, final)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _heartbeat(lock: Optional[Path]) -> None:
+        """Say "still building" by advancing the lock's mtime; never fail over it.
+
+        A lock that has vanished (broken by a waiter that gave up on us, or never passed) is
+        not something a builder in flight can fix, and raising here would throw away the work
+        instead. The publish is still safe: it either wins the ``os.replace`` or finds the
+        other builder's set and opens it.
+        """
+        if lock is None:
+            return
+        try:
+            os.utime(lock, None)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _write_fsynced(path: Path, write: Callable[[object], None]) -> None:
+        """Write ``path`` through ``write(fileobj)`` and fsync it before returning.
+
+        Without the fsync a crash can leave a fully published, marker-carrying directory whose
+        ``.npy`` bodies are still in the OS write cache -- NTFS would then serve a correctly
+        sized extent of zeros, which is wrong data rather than a detectable failure. The
+        directory ENTRY is not fsynced: losing the publish itself only costs a rebuild.
+        """
+        with open(path, "wb") as f:
+            write(f)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _publish(self, tmp: Path, final: Path) -> None:
+        """Move ``tmp`` onto ``final`` with a single rename, clearing whatever is in the way.
+
+        ``os.replace`` cannot rename a directory onto an existing one (ENOTEMPTY on POSIX, a
+        plain refusal on Windows), so anything already at ``final`` has to go first, and going
+        means ``_evict_dir`` -- the only removal that cannot leave a half-deleted directory
+        behind (see the module docstring).
+        """
+        if final.exists() and _marker_mtime(final) is None:
+            # "Did not remove it" is not "it is still in the way": sweep() collects orphans with
+            # no age guard (correctly -- nothing can open one), so `final` can vanish between
+            # the check above and the claim, and _evict_dir then reports False for a directory
+            # that is already gone. Re-check rather than escalating that to "Stop the workers".
+            if not self._evict_dir(final) and final.exists():
+                raise RuntimeError(
+                    f"shared_arrays: {final} has no {DONE_MARKER} but cannot be removed or "
+                    f"moved aside ({self._evict_reason()}); a process on this host may still "
+                    "map a file inside it. Stop the workers (or let them exit) and run sweep()."
+                )
+        try:
+            os.replace(tmp, final)
+        except OSError as exc:
+            # Trust READABILITY, not the mere presence of a marker: a marked-but-truncated
+            # final would otherwise make us discard a good build and then fail forever.
+            if self._try_open(final) is not None:
+                shutil.rmtree(tmp, ignore_errors=True)      # another builder really won
+            elif self._evict_dir(final) or not final.exists():
+                os.replace(tmp, final)      # evicted, or it vanished under us; either will do
+            else:
+                # The second door into the same dead end as above: marked but unreadable AND
+                # immovable. Re-raising the bare OSError here would put a raw WinError 5 in
+                # front of every worker with nothing saying what to do about it.
+                raise RuntimeError(
+                    f"shared_arrays: {final} can be neither opened nor removed "
+                    f"({self._evict_reason()}); a process on this host may still map a file "
+                    "inside it. Stop the workers (or let them exit) and run sweep()."
+                ) from exc
+
+    def _evict_reason(self) -> str:
+        """Why the last eviction refused, for an error message. Never branch on this."""
+        return self._last_evict_error or "cause unknown"
+
+    def _claim_eviction(self, claim: Path, wait_s: float) -> bool:
+        """Take the O_EXCL eviction claim, waiting up to ``wait_s`` for a live one to clear.
+
+        Waiting matters on the ``_publish`` path: a probe is renames only, so a held claim
+        clears in milliseconds, and giving up instantly there turned a momentary overlap into
+        "Stop the workers and run sweep()". Housekeeping passes ``wait_s=0.0`` -- it already
+        reads False as "not mine" and must never block. A claim older than ``LOCK_STALE_S`` is
+        broken rather than waited on.
+
+        Note that the ``_publish`` wait happens while this process HOLDS the build lock, so a
+        worker can sit on that lock for up to ``EVICT_CLAIM_WAIT_S``. That is bounded and far
+        below ``LOCK_STALE_S``, so no waiter breaks the lock over it -- it is a pause, not a
+        hang, and the alternative was failing the publish outright.
+        """
+        deadline = time.monotonic() + max(wait_s, 0.0)
+        while True:
+            try:
+                fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if self._lock_is_stale(claim):
+                    try:
+                        claim.unlink()
+                    except FileNotFoundError:
+                        continue            # somebody else broke it; race for it again
+                    except OSError:
+                        return False
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(_WAIT_POLL_S, remaining))
+                continue
+            except OSError:
+                return False
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+            return True
+
+    def _evict_dir(self, d: Path, wait_s: float = EVICT_CLAIM_WAIT_S) -> bool:
+        """Remove ``d`` entirely, or leave it exactly as it was and return False.
+
+        Every child is renamed aside first. A file another process maps refuses that rename on
+        NTFS, and the refusal is the probe: every rename already made is undone, so the
+        directory keeps its marker and stays openable by anyone mid-flight. Only once the whole
+        directory has proven movable is it deleted. On POSIX every rename succeeds and this is
+        an rmtree with extra steps -- which is the point: one behaviour on both platforms.
+
+        The probe is SERIALISED on an O_EXCL ``<dir>.evicting`` claim, because the rollback is
+        only safe for one evictor at a time. ``sweep()``, another signature's
+        ``_remove_stale_siblings`` and ``_publish`` can all aim at one directory at once; two of
+        them rename into the same ``.evict`` names, each then rolls back what the other moved,
+        and both report "left intact" over a directory they have destroyed between them
+        (reproduced, 3 of 5 two-thread trials). A loser simply returns False, which every caller
+        already treats as "not mine to remove".
+        """
+        claim = d.with_name(d.name + EVICTING_SUFFIX)
+        if not self._claim_eviction(claim, wait_s):
+            self._last_evict_error = f"another evictor holds {claim.name}"
+            return False
+        try:
+            return self._evict_claimed(d)
+        finally:
+            try:
+                claim.unlink()
+            except OSError:
+                pass
+
+    def _evict_claimed(self, d: Path) -> bool:
+        """The rename-probe body of ``_evict_dir``; call only while holding the claim.
+
+        True means THIS call removed the directory. A directory that was already gone reports
+        False: counting it as a removal inflated ``sweep()``'s total, and let two evictors that
+        merely failed to overlap both believe they had won.
+        """
+        if not d.is_dir():
+            self._last_evict_error = f"{d.name} is already gone"
+            return False
+        try:
+            children = list(d.iterdir())
+        except OSError as exc:
+            self._last_evict_error = f"{type(exc).__name__}: {exc}"
+            return False
+        # The marker goes LAST so that _marker_mtime keeps classifying this directory as
+        # TRUSTED for the whole probe: a second evictor must not meet it half-renamed and
+        # decide it is a marker-less orphan to collect. (A reader that already read the marker
+        # is not protected by the ordering -- it fails on the renamed .npy and rebuilds -- but
+        # that path is safe, and a rollback puts the file straight back.)
+        children.sort(key=lambda c: c.name == DONE_MARKER)
+        renamed: List[Tuple[Path, Path]] = []
+
+        def _rollback() -> None:
+            for original, moved in reversed(renamed):
+                try:
+                    os.rename(moved, original)
+                except OSError:
+                    pass                    # best effort; sweep() collects whatever is left
+        for child in children:
+            target = child.with_name(child.name + EVICT_SUFFIX)
+            try:
+                os.rename(child, target)
+            except OSError as exc:
+                self._last_evict_error = f"{child.name}: {type(exc).__name__}: {exc}"
+                _rollback()
+                return False
+            renamed.append((child, target))
+        try:
+            shutil.rmtree(d)
+        except OSError as exc:
+            self._last_evict_error = f"{d.name}: {type(exc).__name__}: {exc}"
+            _rollback()
+            return False
+        self._last_evict_error = None
+        return True
+
+    def _remove_stale_siblings(self, final: Path) -> None:
+        """Best-effort eviction of OBSOLETE signature directories for the same key.
+
+        Two guards, both for concurrency rather than tidiness. Only DIRECTORIES are considered,
+        so a sibling ``<sig>.lock`` held by a process building a different signature is never
+        touched. And a sibling whose marker is younger than ``LOCK_STALE_S`` is left alone: it
+        may have been published seconds ago by another worker that has not opened it yet, and
+        this call has no way to tell that from genuine garbage.
+        """
+        now = time.time()
+        try:
+            children = list(final.parent.iterdir())
+        except OSError:
+            return
+        for d in children:
+            if d == final or d.name.endswith(TMP_SUFFIX):
+                continue
+            try:
+                if not d.is_dir():
+                    continue
+            except OSError:
+                continue
+            mtime = _marker_mtime(d)
+            if mtime is None or now - mtime < LOCK_STALE_S:
+                continue                    # marker-less or freshly published: leave to sweep()
+            self._evict_dir(d, wait_s=0.0)  # housekeeping never waits on another evictor
+
+    def _acquire(self, lock: Path) -> bool:
+        """Take the O_EXCL build lock, breaking it first if it is older than LOCK_STALE_S.
+
+        False means "not mine to build" and every caller waits on it -- so a process that
+        cannot open a file AT ALL must not report False. ``build_or_open`` would then look for
+        the lock it is supposedly waiting on, not find it, break out of the wait loop, and
+        re-enter the outer loop with no sleep on any branch: a hot spin until the 2 x
+        LOCK_STALE_S guard fires half an hour later. Exhaustion raises instead.
+        """
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if not self._lock_is_stale(lock):
+                    return False
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    continue                # somebody else broke it; race for it again
+                except OSError as e:
+                    _raise_if_exhausted(e, lock)
+                    return False
+                continue
+            except OSError as e:
+                _raise_if_exhausted(e, lock)
+                return False
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+            return True
+
+    def _release(self, lock: Path) -> None:
+        """Drop the build lock, but only if it is still OURS.
+
+        A build that overran ``LOCK_STALE_S`` has had its lock broken and re-taken by another
+        process; unlinking that one would hand a third process a lock the second still thinks
+        it holds.
+        """
+        try:
+            if lock.read_text(encoding="utf-8").strip() != str(os.getpid()):
+                return
+            lock.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _lock_is_stale(lock: Path) -> bool:
+        """True when the mtime of ``lock`` is older than ``LOCK_STALE_S`` (or it vanished)."""
+        try:
+            return time.time() - lock.stat().st_mtime > LOCK_STALE_S
+        except OSError:
+            return True
+
+    def evict_key(self, key_dir: PathLike) -> bool:
+        """Remove a whole KEY directory -- every signature under it -- or leave it untouched.
+
+        THE PUBLIC SEAM FOR THE ONLY COLLECTOR AN OBSOLETE KEY HAS. ``sweep()`` deliberately
+        never removes a key: from inside the store, "nothing asks for this key any more" and
+        "nothing has asked YET on this host" look identical, and getting that wrong deletes a
+        set a worker is about to open. A caller that genuinely knows -- ``tools/
+        build_shared_arrays.py --sweep``, which holds both consumers' current ``ARRAYS_VERSION``
+        and an age policy -- names the key itself, and gets ``_evict_dir``'s all-or-nothing
+        probe rather than an ``rmtree`` that could strip the marker off a directory a process
+        still maps (see the module docstring: that leaves a set nobody can read and nobody can
+        remove).
+
+        True means THIS call removed it; False means it is still there (or was already gone),
+        never that it was half-removed. ``wait_s=0.0`` because this is housekeeping: it must
+        never block behind a live publisher's eviction claim.
+
+        THE "BYTE-FOR-BYTE INTACT" GUARANTEE IS PER SIGNATURE DIRECTORY, NOT PER KEY.
+        ``_evict_dir`` probes the key's children -- the signature directories -- by renaming each
+        one aside, and rolls back on the first refusal. A signature directory that was already
+        renamed when a LATER one refuses is renamed back, but as a DIRECTORY move: a reader that
+        was mid-``_try_open`` inside it during that window sees files vanish and rebuilds. The
+        rollback restores the bytes, not the continuity, so a False from a multi-signature key
+        can still have cost some process a rebuild.
+
+        AND THE KEY ITSELF IS NOT ATOMIC. The probe lists the key's children and then removes the
+        directory; a builder that starts in the meantime creates a ``<sig>.lock`` or a ``.tmp``
+        INSIDE it, which the listing never saw. The ``rmtree`` then either fails (reported False,
+        with renamed children rolled back) or succeeds and takes that builder's staging directory
+        with it. Both are bounded rather than corrupting -- the marker is written LAST, so the
+        loser publishes nothing and simply rebuilds -- but it is exactly why this is a
+        BETWEEN-GRIDS tool and not a runtime sweeper: run it while a grid is up and you are
+        paying rebuilds to reclaim disk.
+        """
+        return self._evict_dir(Path(key_dir), wait_s=0.0)
+
+    def sweep(self) -> int:
+        """Collect superseded signatures, marker-less orphans and dead ``.tmp`` dirs.
+
+        Returns how many directories were removed. Idempotent and total: every scan step
+        tolerates a sibling vanishing underneath it, and a directory another process still maps
+        is simply left for the next sweep by ``_evict_dir``.
+
+        Orphans -- a directory with no marker and no ``.tmp`` suffix -- are collected here and
+        only here. Nothing can ever open one by name (``_try_open`` needs the marker), so it is
+        pure garbage, and it is exactly what an interrupted publish or a pre-``_evict_dir``
+        partial delete leaves behind.
+
+        THE MARKER MTIME THIS READS IS LAST USE, NOT BUILD TIME -- ``_try_open`` touches it on
+        every successful open (see there). It matters to the KEY-level collector in
+        ``tools/build_shared_arrays.py --sweep``, which is an age policy and would otherwise
+        delete the key every trial on the host maps daily. Two consequences HERE, both benign:
+        the "freshly published, leave it alone" guard below now also spares a directory merely
+        freshly OPENED, and ``done`` below is therefore sorted newest-USED rather than
+        newest-BUILT. Superseded-ness is not decided by that order anyway -- a directory only
+        survives as ``done[-1]``, and the one every process is actually opening IS the most
+        recently used one, so if anything the order is now closer to the intent than the build
+        timestamps were.
+
+        Stale ``.lock`` and ``.evicting`` FILES are deliberately not collected here: both are
+        self-correcting, since the next claimant breaks one it finds older than
+        ``LOCK_STALE_S``, and deleting a lock somebody may still hold is how two builders end
+        up in one directory.
+        """
+        removed = 0
+        now = time.time()
+        try:
+            key_dirs = list(self.root.iterdir())
+        except OSError:
+            return 0
+        for key_dir in key_dirs:
+            try:
+                if not key_dir.is_dir():
+                    continue
+                children = [d for d in key_dir.iterdir() if d.is_dir()]
+            except OSError:
+                continue
+            done: List[Tuple[float, Path]] = []
+            orphans: List[Path] = []
+            dead_tmps: List[Path] = []
+            for d in children:
+                if d.name.endswith(TMP_SUFFIX):
+                    if not _tmp_is_live(d):
+                        dead_tmps.append(d)
+                    continue
+                mtime = _marker_mtime(d)
+                if mtime is None:
+                    orphans.append(d)
+                else:
+                    done.append((mtime, d))
+            done.sort(key=lambda row: row[0])
+            # Superseded, but only once it is OLDER than LOCK_STALE_S -- the same guard
+            # _remove_stale_siblings uses, and for the same reason. With a churning source the
+            # directory a builder has just published is very often not the newest by marker
+            # mtime, so an unguarded done[:-1] deleted it in the window between that builder's
+            # _publish and its _try_open: ~40 "left no readable set" failures per 500 opens
+            # under a 6-builder stress, and none at all with the sweeper switched off.
+            superseded = [d for mtime, d in done[:-1] if now - mtime >= LOCK_STALE_S]
+            for d in superseded + orphans + dead_tmps:
+                if self._evict_dir(d, wait_s=0.0):
+                    removed += 1
+        return removed

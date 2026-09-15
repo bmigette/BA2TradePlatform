@@ -24,9 +24,10 @@ deadlock. The fitness calls the synchronous runner in-process (confirmed in Repl
 import logging
 import math as _math
 import random
+import sys as _sys
 import time as _time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -64,7 +65,25 @@ REQUIRED_GA_KEYS = (
 import os as _os
 _BACKEND_DIR = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 # Provider API keys mirrored into each worker's env (spawn starts a clean environment).
-_WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY")
+#
+# The last two are the host-shared array knobs (ba2_common.core.shared_arrays): the
+# BA2_SHARED_ARRAYS escape hatch and the lock-staleness override. Both must reach a spawned
+# worker EXACTLY as the process that built the pool sees them — a master running shared while
+# its children each build private copies is the worst of both worlds: the per-worker memory
+# shape this exists to remove, plus a master whose telemetry says it was removed.
+#
+# They are applied with ``os.environ.setdefault`` (see _worker_init), so an ambient value in the
+# child would WIN over the mirrored one. That cannot happen here: multiprocessing's "spawn" child
+# inherits the parent's environment on both Windows (CreateProcess with a NULL env block) and
+# Linux (execv, no env replacement), so the value being mirrored is already the child's ambient
+# value and setdefault is a no-op. The mirroring is what makes that explicit — and it is what
+# carries these keys on the REMOTE worker, whose pool is built by worker_server.run_worker_server
+# from the WORKER SERVICE's own environment: no environment ever crosses the wire (RunTrialReq
+# carries config/fitness_metric/cache_root/inmem_trades only, and _localize_paths rewrites cache
+# path STRINGS inside the config), so setting BA2_SHARED_ARRAYS on the master says nothing at all
+# about a remote box. Each host's service environment governs its own workers; set it there.
+_WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY",
+                    "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S")
 
 
 def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
@@ -113,6 +132,22 @@ def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
     for k, v in (env or {}).items():
         if v is not None:
             os.environ.setdefault(k, v)
+    # Raise RLIMIT_NOFILE before anything maps a derived array set. Each mapped .npy costs ONE
+    # descriptor for the life of the mapping, and the option universe is 98 underlyings x 18
+    # arrays = 1764 per worker -- against the systemd default soft limit of 1024 (hard 524288)
+    # on the remote worker hosts. Measured on remote227 2026-09-14: a worker sat at 1014 open
+    # fds, the next np.load raised EMFILE, and the store rebuilt a 7 GB set under the lock while
+    # 27 of 30 workers slept behind it. The store raises the limit itself on construction too;
+    # doing it HERE as well means it is already up before the first import maps anything, and
+    # gives the one line of evidence a stalled host is diagnosed from.
+    try:
+        from ba2_common.core import shared_arrays as _sa
+        _old_fd, _new_fd = _sa.ensure_fd_headroom()
+        if _new_fd != _old_fd:
+            _worker_log(f"worker fd limit: soft {_old_fd} -> {_new_fd} "
+                        f"(hard {_sa.fd_limits()[1]})")
+    except Exception as e:  # noqa: BLE001 -- best effort; never fail a worker over a soft limit
+        _worker_log(f"!! worker fd limit: could not raise RLIMIT_NOFILE: {e!r}")
     # Point ba2_common's DB at the SAME test DB the master uses, so THIS pool worker's
     # get_app_setting() (FMP_API_KEY / finnhub_api_key / alpaca_*) resolves from the test DB
     # instead of ba2_common's neutral default home DB (which has no keys). The FMP/FinnHub experts
@@ -237,6 +272,58 @@ def _cancel_progress_cb(ctl):
     return _cb
 
 
+def _release_option_overlays() -> Dict[str, Any]:
+    """Drop the per-RUN option overlay fill. Called after EVERY trial, on every trial path.
+
+    ``parquet_options_provider``'s greek columns and materialised-bar memo are filled lazily
+    but cached for the LIFE of the worker, so across genomes the resident set is the UNION of
+    every trial the worker has run and converges on the whole option window: a second genome
+    reuses 7.5% of the first's fill (measured), and in the field (remote227, 2026-09-15,
+    stage-1 option grid, 98 underlyings = 177.8M rows, 30 workers) a worker held ~7.8 GB of
+    anonymous memory after ~2 trials, with the cgroup at 218 GB of a 232 GB cap and swap
+    exhausted. Resetting per trial makes the ceiling ONE trial's working set.
+
+    NOT ``_worker_release_memory``, which drops the mapped columns and the private projections
+    as well: that is the governor's panic button, it fires only under memory pressure — i.e.
+    after the convergence has already happened — and a per-trial call to it would re-open and
+    re-derive an underlying between every pair of genomes. This one keeps the expensive half
+    and costs a recomputation of the greeks a trial actually reads.
+
+    RESULT-NEUTRAL by construction: everything it drops is a memo of a pure function of the
+    run's spot source and rate, so a dropped entry costs 11.2 us and reproduces byte-identical
+    values (pinned by ``test_every_read_answers_identically_after_a_reset``).
+
+    AN EQUITY TRIAL PAYS NOTHING. The reader is looked up in ``sys.modules`` rather than
+    imported: the question this asks is "has anything in this process already opened an option
+    store?", and on an equity-only grid — the majority of runs — the answer is no on every
+    trial. Importing the module to call a function that then finds no overlays would be a real
+    cost (the module pulls numpy, the greeks solver and the OCC parser) charged to runs that
+    can never benefit from it.
+
+    Returns what was dropped, for ``_trial_worker`` to fold into the trial's ``mem``
+    telemetry; ``{}`` when there was nothing to do.
+
+    Best effort, but never silent: memory hygiene must not turn a good genome into a failed
+    trial, and a release that quietly stopped working is exactly how the governor's
+    ``clear_worker_option_caches`` typo survived for months. The channel is ``_worker_log``
+    because a pool child's logging is globally disabled (see ``_worker_init``).
+    """
+    _pq = _sys.modules.get("app.services.backtest.parquet_options_provider")
+    if _pq is None:
+        return {}
+    try:
+        return _pq.reset_run_overlays()
+    except Exception as e:  # noqa: BLE001 — see the docstring: loud, but never fatal
+        try:
+            from app.services.backtest import price_source as _ps
+
+            _ps._worker_log(f"!! per-trial option overlay reset FAILED: {e!r} - this worker's "
+                            f"greeks/bar memo are accumulating across genomes")
+        except Exception:  # noqa: BLE001 — the log channel itself is gone; nothing left to do
+            pass
+        return {}
+
+
 def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) -> Dict[str, Any]:
     """Run ONE deterministic daily backtest in a worker PROCESS and return a tiny summary.
 
@@ -254,6 +341,14 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
     workers here AND the master's in-process top-N persist / parallel=1 runs uniformly.
     """
     want_full = config.pop("_want_full_results", False)
+    # EMBEDDED BY REFERENCE, FILLED BY THE ``finally``. The option-overlay release has to run
+    # AFTER the trial (including after a failure), but its counts have to travel back INSIDE
+    # the result -- and by then the result dict is already built. Putting this empty dict into
+    # the `mem` payload and populating it in the `finally` gets both: the `finally` runs before
+    # the value is handed to the pool, so what is pickled carries the counts. The alternative
+    # -- releasing early to have the numbers in hand -- would move the release off the one
+    # path that covers cancellations.
+    released: Dict[str, Any] = {}
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
         from app.services.strategy_fitness import compute_fitness
@@ -287,6 +382,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
                # was depleting the machine.
                "mem": _trial_memory_snapshot()}
+        out["mem"]["option_overlays"] = released
         if want_full:
             out["full_results"] = results
         return out
@@ -303,10 +399,27 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # data/config problem that affects EVERY trial, not a bad genome. It also has to abort
         # fast — opt 255 spent 8h with all four workers blocked in the FMP rate gate, having
         # completed zero trials, because a breach merely made each trial slow instead of failing.
+        # SharedArrayFdExhausted joins them: this worker cannot open another mapping, so every
+        # remaining trial it is handed fails identically. Scored as an ordinary failure it
+        # becomes ZERO_TRADE_SENTINEL fitness and the GA happily finishes, reporting a winner
+        # chosen among whichever genomes were not unlucky enough to land on a starved worker.
+        # Matched by NAME, like the others, so this module does not import ba2_common just to
+        # classify an error (see ba2_common.core.shared_arrays.SharedArrayFdExhausted).
         fatal = type(e).__name__ in (
-            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation")
+            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
+            "SharedArrayFdExhausted")
+        snap = _trial_memory_snapshot()
+        snap["option_overlays"] = released
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal, "mem": _trial_memory_snapshot()}
+                "fatal": fatal, "mem": snap}
+    finally:
+        # FINALLY, not after the happy return: a failed or CANCELLED trial is when this
+        # matters most. The worker is handed another genome immediately and the abandoned
+        # one's greeks would otherwise stay resident with nothing left that could read them.
+        # After the `mem` snapshots above deliberately, so the telemetry reports what the
+        # trial actually held rather than what survived it. The counts go into `released`,
+        # which both result shapes above already carry by reference.
+        released.update(_release_option_overlays())
 
 
 def _worker_release_memory() -> Dict[str, Any]:
@@ -318,29 +431,68 @@ def _worker_release_memory() -> Dict[str, Any]:
 
     Safe to call at any time: every cache here is a pure memoisation of on-disk parquet, so a
     later miss re-reads identical bytes. Result-neutral, costs a re-parse.
+
+    WITH THE HOST-SHARED ARRAYS ON (``BA2_SHARED_ARRAYS``, the default — see
+    ba2_common.core.shared_arrays), most of what these caches hold is not bytes this process
+    owns: the OHLCV columns and the option reader's arrays are VIEWS over memory-mapped ``.npy``
+    files in the per-host derived cache. Clearing the caches drops the views, the mapping closes
+    when the last view dies, and this process's private memory comes back — which is exactly what
+    the governor asked for. The FILES are the HOST's and are never touched: other workers on the
+    box are mapping the same bytes, and a later miss here re-OPENS them (milliseconds) instead of
+    re-parsing the parquet (tens of ms plus a build transient ~2.3x the frame). A release that
+    deleted or rebuilt them would turn one box's throttle into a stampede across every worker on
+    it. So the release is CHEAPER under sharing than it used to be, not more expensive.
+
+    ``shared_mb`` in the return says how much of what was dropped was mapped rather than private,
+    so the governor's log shows the two apart: a worker holding 5 GB of its own and one holding
+    views over 5 GB the host holds once are the same number to ``freed_cache_mb`` and completely
+    different problems.
     """
     import gc
+    import importlib
 
     from app.services.backtest import price_source as _ps
     before = 0.0
+    shared = 0.0
     try:
         st = _ps.memory_stats()
         before = float(st["bar_cache"]["mb"]) + float(st["series_memo"]["mb"])
-    except Exception:  # noqa: BLE001
-        pass
+        # Read BEFORE the clear (afterwards there is nothing left to measure), and kept out of
+        # `before`: mapped pages are one copy per HOST, so folding them into a per-process figure
+        # would make a 6-worker box look like it holds 6x the data it holds once.
+        shared = float(st["bar_cache"]["shared_mb"])
+        # The option reader is the OTHER big holder — at the 2020 ThetaData window it dwarfs the
+        # bars — and it was missing from this accounting entirely, so a release of 15 GB of
+        # option arrays reported whatever the bar cache happened to hold.
+        _opt = importlib.import_module("app.services.backtest.parquet_options_provider")
+        _ost = _opt.memory_stats()
+        before += float(_ost["private_mb"])
+        shared += float(_ost["shared_mb"])
+    except Exception as e:  # noqa: BLE001 -- telemetry must never fail a release, but must SAY so
+        _ps._worker_log(f"!! release: memory stats failed: {e!r} - the MB reported below is "
+                        f"incomplete, NOT a measurement of an empty cache")
     _ps.clear_worker_bar_cache()
     _ps.clear_ohlcv_memo()
-    for mod, fn in (("app.services.backtest.options_provider", "clear_worker_option_caches"),
-                    ("app.services.backtest.results", "clear_worker_5m_cache")):
+    # The NAMES are load-bearing and were wrong until 2026-09-14: neither `clear_worker_option_
+    # caches` nor `clear_worker_5m_cache` has ever existed, so the lookup below fell through and
+    # the option reader's caches (the biggest single holding a worker has at the 2020 option
+    # window) survived every release the governor ever performed. The real entry points are
+    # these two; options_provider's also clears the PARQUET reader's caches behind the one seam
+    # (see its docstring). There is NO fallback-name list any more: guessing at neighbouring
+    # names is what let a typo look like a working release for months. A name that no longer
+    # resolves is now a loud notice through _worker_log (the pool child's logging is globally
+    # disabled — see _worker_init — so this is the only channel that survives in there).
+    for mod, fn in (("app.services.backtest.options_provider", "clear_worker_options_cache"),
+                    ("app.services.backtest.results", "clear_worker_5m_bars_cache")):
         try:
-            import importlib
             m = importlib.import_module(mod)
-            for cand in (fn, "clear_worker_bar_cache", "clear_caches"):
-                if hasattr(m, cand):
-                    getattr(m, cand)()
-                    break
-        except Exception:  # noqa: BLE001 -- best effort; never fail a release
-            pass
+            clear = getattr(m, fn, None)
+            if clear is None:
+                _ps._worker_log(f"!! release: {mod}.{fn} is GONE - its caches were NOT cleared")
+                continue
+            clear()
+        except Exception as e:  # noqa: BLE001 -- best effort; never fail a release
+            _ps._worker_log(f"!! release: {mod}.{fn} failed: {e!r}")
     gc.collect()
     try:
         import os as _o
@@ -349,7 +501,8 @@ def _worker_release_memory() -> Dict[str, Any]:
         rss = psutil.Process(_o.getpid()).memory_info().rss // 1048576
     except Exception:  # noqa: BLE001
         rss = None
-    return {"freed_cache_mb": round(before, 1), "rss_mb_after": rss}
+    return {"freed_cache_mb": round(before, 1), "shared_mb": round(shared, 1),
+            "rss_mb_after": rss}
 
 
 def system_memory() -> Dict[str, Any]:
@@ -550,20 +703,34 @@ class _SlotPools:
                 self.busy[i] = None
                 return
 
-    def release_all(self) -> None:
-        """Drop data caches in every slot. Exact, unlike the shared-pool version, which has to
-        oversubscribe and hope each worker picks one up -- here each pool has exactly one worker."""
+    def release_all(self) -> Dict[str, float]:
+        """Drop data caches in every slot and RETURN what they freed, summed over the slots.
+
+        Exact, unlike the shared-pool version, which has to oversubscribe and hope each worker
+        picks one up -- here each pool has exactly one worker.
+
+        The totals are returned rather than discarded because the two halves mean different
+        things to the operator: ``freed_cache_mb`` is memory the box actually got back, while
+        ``shared_mb`` was only ever one copy per HOST (mapped .npy views) and its release frees
+        this process's mappings, not the pages. A release that reports 400 MB private is a
+        different event from one that reports 40 MB private plus 6 GB of dropped views.
+        """
         futs = []
         for pool in self.pools:
             try:
                 futs.append(pool.submit(_worker_release_memory))
             except Exception:  # noqa: BLE001 -- a dead slot must not stop the others
                 pass
+        freed = 0.0
+        shared = 0.0
         for f in futs:
             try:
-                f.result(timeout=120)
+                r = f.result(timeout=120) or {}
+                freed += float(r.get("freed_cache_mb") or 0)
+                shared += float(r.get("shared_mb") or 0)
             except Exception:  # noqa: BLE001
                 pass
+        return {"freed_cache_mb": freed, "shared_mb": shared}
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         for pool in self.pools:
@@ -599,19 +766,28 @@ def _release_pool_memory(pool: Any, n_workers: int, log=logger.warning) -> None:
     every worker gets one. Best-effort by design: a missed worker is flushed at its next preload."""
     if hasattr(pool, "release_all"):
         # Per-slot pools: one release per pool covers every worker exactly (see _SlotPools).
-        pool.release_all()
-        log("released worker caches (per-slot, exact coverage)")
+        got = pool.release_all() or {}
+        log(f"memory governor: released ~{float(got.get('freed_cache_mb') or 0):.0f} MB private "
+            f"(+{float(got.get('shared_mb') or 0):.0f} MB mapped views) of worker caches "
+            f"(per-slot, exact coverage)")
         return
     try:
         futs = [pool.submit(_worker_release_memory) for _ in range(max(1, n_workers) * 3)]
         freed = 0.0
+        shared = 0.0
         for f in futs:
             try:
-                r = f.result(timeout=60)
+                r = f.result(timeout=60) or {}
                 freed += float(r.get("freed_cache_mb") or 0)
+                # PRIVATE and MAPPED are logged apart because only the first is memory the box
+                # got back: the mapped views were one copy per host and their pages are the OS's
+                # to reclaim. Summed into one number, a release that freed almost nothing private
+                # reads as a big win and the governor's next escalation looks unnecessary.
+                shared += float(r.get("shared_mb") or 0)
             except Exception:  # noqa: BLE001
                 pass
-        log(f"memory governor: released ~{freed:.0f} MB of worker caches across the pool")
+        log(f"memory governor: released ~{freed:.0f} MB private (+{shared:.0f} MB mapped views) "
+            f"of worker caches across the pool")
     except Exception as e:  # noqa: BLE001 -- never let a release attempt kill the run
         log(f"memory governor: cache release failed ({type(e).__name__}: {e})")
 
@@ -792,7 +968,11 @@ def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
         f"mem gen {gen + 1}/{n_gens} ind {done}/{total}"
         + (f" | {secs}s" if secs is not None else "")
         + f" | rss {mem.get('rss_mb')}MB"
+        # bars: PRIVATE MB (this process's own keys/arrays) then, separately, the MB mapped from
+        # the host-shared derived cache -- one copy per HOST however many workers map it, so
+        # folding it into the private figure would make a 6-worker box look 6x heavier than it is.
         f" | bars {bc.get('symbols')} sym {bc.get('bars')} bars {bc.get('mb')}MB"
+        f" (+{bc.get('shared_mb')}MB shared)"
         f" | memo {sm.get('symbols')} sym {sm.get('rows')} rows {sm.get('mb')}MB"
         + _fitness_suffix(fit_raw, fit_ranked, robustness)
     )
@@ -869,6 +1049,12 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
             last_exc = e
             if attempt < _LOCAL_RETRY_ATTEMPTS - 1:
                 time.sleep(_LOCAL_RETRY_BACKOFF_S * (2 ** attempt))
+        finally:
+            # Per ATTEMPT, not per call: a retry re-runs the whole backtest, so a release
+            # sited outside the loop would let a re-run that failed five times hold five
+            # trials' worth of option overlay. This is also the most memory-expensive trial a
+            # worker runs — it is the one that builds the full results blob.
+            _release_option_overlays()
     return {"ok": False, "error": repr(last_exc)}
 
 
@@ -1158,6 +1344,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             data = optimizer.get_checkpoint_data(generation, population)
             data["fingerprint"] = ckpt_fingerprint   # refuse to resume into a changed gene space
             data["partial"] = partial               # resume INTO this generation, not after it
+            # The best entries SO FAR, so a resumed run's top-N persist can still see the
+            # winners found before the interruption. See _elite_slice for why this is cheap
+            # (and why the older "it would embed every trial's trades JSON" reading was wrong).
+            data["top_results"] = _elite_slice(all_results, CHECKPOINT_ELITE_COUNT)
             _save_checkpoint(ckpt_task_id, data)
 
         def _trial_key_for(decoded_flat: Dict[str, Any]) -> str:
@@ -1442,16 +1632,24 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             logger.warning(
                 f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
                 f"{start_gen}/{ga['generations']} from checkpoint {ckpt_task_id}")
-            # KNOWN LIMITATION: ``all_results`` restarts empty, so this row records only the
-            # trials evaluated AFTER the resume -- the earlier ones stay on the interrupted run's
-            # own row. The SEARCH is unaffected (population, elites, best_individual and both RNG
-            # states are all restored -- true only since the Python RNG state was made to survive
-            # the JSON checkpoint column; before that its setstate() raised "state vector must be
-            # a tuple", was swallowed as a warning, and a resumed run silently diverged. See
-            # genetic._jsonable_to_py_state and tests/test_determinism_helpers.py), and elites
-            # re-appear in later generations, so best_params is intact; only the top-N candidate
-            # POOL is thinner than an uninterrupted run's.
-            # Carrying all_results in the checkpoint would embed every trial's trades JSON in it.
+            # The SEARCH was already safe across a resume (population, elites, best_individual
+            # and all three RNG states are restored -- true only since the Python RNG state was
+            # made to survive the JSON checkpoint column; before that its setstate() raised
+            # "state vector must be a tuple", was swallowed as a warning, and a resumed run
+            # silently diverged. See genetic._jsonable_to_py_state and
+            # tests/test_determinism_helpers.py). What was NOT safe is the top-N PERSIST, which
+            # ranks off ``all_results`` -- and that restarted empty here, so the winners found
+            # before the interruption could never be saved as Backtests.
+            #
+            # matrix3, 2026-09-09: the box rebooted mid-job; sen-S5-goal2020-risk_atr resumed and
+            # finished with best_fitness 5.5741 (bit-identical to the interrupted run), but its
+            # row carried 16 entries instead of ~190, its best PERSISTED row scored 5.2598, and
+            # the 5.5741 genome sitting in best_params was never written as a Backtest. Every
+            # saved S5 row understated the cell.
+            #
+            # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
+            # the note this replaces -- see _elite_slice.
+            _seed_all_results_from_checkpoint(ckpt, all_results)
         else:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
             # optimization's individuals, but run this job's OWN fresh --generations budget from
@@ -1828,6 +2026,8 @@ def _build_daily_trial_config(
     below gates the screener-settings wiring further down — it has no tp/sl implications since
     entry TP/SL rides on ``entry_rules`` (Strategy.entry_actions), not a bespoke gene.
     """
+    from app.services.strategy_param_space import INERT_RM_TOGGLES
+
     bypass = _is_bypass_expert(backtest_cfg)
     overrides = dict(decoded.get("expert_overrides") or {})
 
@@ -1896,6 +2096,21 @@ def _build_daily_trial_config(
     # Merge the per-trial overrides into each expert spec's settings (do NOT mutate the
     # run-level backtest_cfg — build fresh spec dicts). The bypass screener settings are layered
     # UNDER the model:* overrides so an explicitly-optimized expert param still wins.
+    #
+    # THE INERT TOGGLES ARE PINNED LAST, above even the genes. use_atr_stop and
+    # regime_overlay_enabled never took effect in any run on record -- the GA passes genes as
+    # integers and the old settings writer stored a bool as the JSON string "1", which the
+    # reader did not read as true. coerce_bool fixed that, which means a STORED genome carrying
+    # `model:use_atr_stop: 1` would now switch the feature on the moment it is decoded.
+    #
+    # Removing the genes from the search space (ba2test_launcher._RM_OPT) covers fresh runs, but
+    # NOT this path: a re-run, a warm start or a deploy decodes the genome that is already on
+    # disk, and `overrides` wins over the run-level settings two lines up. Four of the six live
+    # deployed genomes carry use_atr_stop=1. Without this pin, re-running a saved backtest would
+    # silently produce a DIFFERENT strategy from the one whose results are recorded on the row.
+    #
+    # Applied here because this is the one place every trial config is assembled -- GA, re-run,
+    # robustness variant and deploy alike.
     experts_in = backtest_cfg["experts"]
     experts_out = []
     for spec in experts_in:
@@ -1903,10 +2118,12 @@ def _build_daily_trial_config(
             merged_settings = dict(spec.get("settings") or {})
             merged_settings.update(bypass_screener_settings)
             merged_settings.update(overrides)
+            merged_settings.update(INERT_RM_TOGGLES)
             experts_out.append({"class": spec["class"], "settings": merged_settings})
         else:
             merged_settings = dict(bypass_screener_settings)
             merged_settings.update(overrides)
+            merged_settings.update(INERT_RM_TOGGLES)
             experts_out.append({"class": spec, "settings": merged_settings})
 
     # SCREENER runtime: when the run hoisted a metric store, this individual's EFFECTIVE screener
@@ -2236,6 +2453,115 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> s
     }
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+# Relative gap between a top-N re-run's own fitness and the GA score it was chosen for, beyond
+# which the two are treated as DIFFERENT STRATEGIES rather than the same one measured twice.
+#
+# RELATIVE, because this code ranks metrics on very different scales. 0.1% is far above the
+# float-summation noise a re-run can legitimately show (pool ordering moves the last bits) and far
+# below any gap a real config difference produces -- the documented screener-hoisted-state case
+# moved fitness by tens of percent.
+RERUN_FITNESS_TOL_REL = 1e-3
+
+# Absolute floor so a ga_fitness of exactly 0 still compares (a relative tolerance of 0 would
+# make every non-zero re-run infinitely divergent, and every zero one a division by zero).
+_RERUN_FITNESS_TOL_ABS = 1e-9
+
+
+def _numeric(v: Any) -> Optional[float]:
+    """*v* as a float if it is a real number, else None. ``bool`` is not a number here."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def rerun_fitness_divergence(
+    ga_fitness: Any, rerun_fitness: Any, *, tol_rel: float = RERUN_FITNESS_TOL_REL
+) -> Optional[Dict[str, Any]]:
+    """None when a re-run reproduces the score its genome was ranked on; else the discrepancy.
+
+    A top-N genome from the GA's FINAL generation is persisted from the results the GA itself
+    computed, so it agrees by construction. Any EARLIER genome is RE-RUN from a config rebuilt
+    out of the STORED ``optimization_config`` with the screener hoisted state RE-DERIVED at
+    re-run time -- either of which can have moved since the run. When it has, the persisted row
+    carries plausible metrics for a strategy that is no longer the one that earned the fitness,
+    and nothing on the row says so. (The handler already documents one such case: without
+    re-applying the hoisted state "the persisted top-N silently diverge from their fitness".)
+
+    Comparing the two numbers cannot say WHICH field drifted, but it says that one did -- which
+    is the difference between a silent wrong answer and a loud one worth investigating.
+
+    Returns ``{ga_fitness, rerun_fitness, delta, pct, tol}``. ``pct`` is None against a zero
+    base. Unknown inputs (no ``ga_fitness`` on a pre-migration-030 row, a non-numeric) yield
+    None: unknown is not the same as divergent, and this check must never cost a persisted row.
+    """
+    ga = _numeric(ga_fitness)
+    rerun = _numeric(rerun_fitness)
+    if ga is None or rerun is None:
+        return None
+    delta = rerun - ga
+    tol = max(abs(ga) * float(tol_rel), _RERUN_FITNESS_TOL_ABS)
+    if abs(delta) <= tol:
+        return None
+    return {
+        "ga_fitness": ga,
+        "rerun_fitness": rerun,
+        "delta": delta,
+        "pct": (100.0 * delta / ga) if ga else None,
+        "tol": tol,
+    }
+
+
+# How many of the best ``all_results`` entries ride along in a checkpoint. Bounded so the
+# checkpoint column cannot grow with the run: it is rewritten once per generation (and every
+# ``partial_checkpoint_every`` trials on top of that), so an unbounded copy of a 40x8 search
+# would mean rewriting hundreds of entries dozens of times.
+#
+# 20 comfortably covers the ``--save-top N`` the grids actually use (5). MEASURED on opt 489
+# (186 trials): one entry is 1,949 bytes, a top-10 slice is 19 KB and the WHOLE all_results is
+# 359 KB, against a checkpoint column already carrying 64 KB of population + RNG state. The
+# note this replaced -- "carrying all_results would embed every trial's trades JSON" -- misread
+# the schema: an entry's ``trades`` is an int COUNT, not the trade list.
+CHECKPOINT_ELITE_COUNT = 20
+
+
+def _elite_slice(all_results: Optional[List[Dict[str, Any]]], n: int) -> List[Dict[str, Any]]:
+    """The ``n`` best entries of *all_results* by fitness, highest first.
+
+    Never raises: a failed trial records ``fitness: None`` and must sort as worst rather than
+    blowing up a checkpoint write, because a checkpoint failure costs hours of compute.
+    """
+    if not all_results:
+        return []
+    ranked = sorted(
+        all_results,
+        key=lambda r: (r.get("fitness") if isinstance(r.get("fitness"), (int, float)) else -1e18),
+        reverse=True,
+    )
+    return ranked[:n]
+
+
+def _seed_all_results_from_checkpoint(
+    ckpt: Optional[Dict[str, Any]], all_results: List[Dict[str, Any]]
+) -> None:
+    """APPEND a resumed checkpoint's carried elites onto this run's ``all_results``, in place.
+
+    Appends rather than replaces so it composes with whatever the resumed run has already
+    recorded. Duplicates are harmless: ``_persist_top_backtests`` de-duplicates on rounded
+    fitness, and an elite that survives into a later generation is re-recorded there anyway.
+
+    Tolerates a missing or malformed ``top_results``: every checkpoint written before this
+    change lacks the key (including the ones on disk for jobs still queued), and the worst
+    acceptable outcome for a resume is the old thinner candidate pool -- never a crashed job
+    that throws away the generations it was resuming.
+    """
+    if not isinstance(ckpt, dict):
+        return
+    carried = ckpt.get("top_results")
+    if not isinstance(carried, list):
+        return
+    all_results.extend(r for r in carried if isinstance(r, dict))
 
 
 def _save_checkpoint(task_id: str, checkpoint_data: Dict[str, Any]) -> None:

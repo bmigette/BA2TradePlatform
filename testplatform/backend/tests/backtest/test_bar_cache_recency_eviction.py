@@ -31,6 +31,21 @@ class _FakeOHLCV:
 
 
 @pytest.fixture(autouse=True)
+def _private_bar_arrays(monkeypatch):
+    """Pin the PRIVATE path for every test in this file (``BA2_SHARED_ARRAYS=0``).
+
+    Since 2026-09-14 the OHLCV columns are memory-mapped from a host-shared derived cache, and in
+    that mode the bar cache deliberately PERSISTS for the whole job: neither the per-individual
+    flush nor the recency sweep runs (see price_source._bar_cache_persists — the private part of a
+    series drops from 48 to 8 B/bar, so the peak argument that justified flushing no longer
+    applies). These tests exist to guard the flush/recency semantics themselves, which are now the
+    escape-hatch path's behaviour, so they must ask for it explicitly rather than inherit whatever
+    the ambient default happens to be.
+    """
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "0")
+
+
+@pytest.fixture(autouse=True)
 def _clean():
     ps.clear_worker_bar_cache()
     ps._TRIAL_SEQ = 0

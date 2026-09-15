@@ -53,6 +53,15 @@ class _Acct(OptionsAccountInterface):
     def get_balance(self):
         return 1_000_000.0
 
+    def get_option_tradable_balance(self):
+        """``OptionsAccountInterface`` is a MIXIN -- it does not inherit the real
+        accessor from ``ReadOnlyAccountInterface``, so a double must publish it or
+        ``_OptionEntryAction._virtual_equity`` cannot size anything. Unlevered, matching
+        this double's balance: every supported broker's option multiplier is 1.0 today.
+        (Before the tradable-balance handlers were narrowed to benign errors, the missing
+        method raised an ``AttributeError`` that the broad catch silently absorbed.)"""
+        return self.get_balance()
+
     def get_account_snapshot(self):
         """The double's balance IS its CASH — the intent this file has always tested.
 

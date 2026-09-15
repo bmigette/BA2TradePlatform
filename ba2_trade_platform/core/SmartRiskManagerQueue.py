@@ -57,8 +57,9 @@ def _read_expert_virtual_equity(account_id: int, expert_record, phase: str) -> O
     ``float(account_info.equity)`` therefore raised ``AttributeError`` -- literally
     ``'dict' object has no attribute 'equity'`` -- for EVERY dict-shaped broker; the
     enclosing ``except Exception`` downgraded it to a warning and the job recorded
-    ``None`` equity for both ends of the run. ``get_account_snapshot()`` is the
-    broker-agnostic seam that exists for exactly this (same fix as
+    ``None`` equity for both ends of the run. ``get_tradable_balance()`` -- which
+    reads the broker-agnostic ``get_account_snapshot()`` seam once, and only when
+    margin is on -- is the typed answer that exists for exactly this (same fix as
     ``AccountInterface._validate_position_size_limits`` and TradeActions Task 34).
 
     ``is None``, NEVER TRUTHINESS. The old gate was ``if account_info and
@@ -83,12 +84,25 @@ def _read_expert_virtual_equity(account_id: int, expert_record, phase: str) -> O
             )
             return None
 
-        account_equity = account.get_account_snapshot().equity
+        # THE SAME BASE as the graph's ``account_virtual_equity``
+        # (``expert.get_virtual_balance()``): the tradable balance x pct, so initial and
+        # final are one definition; this records the run, it does not size it (margin
+        # design 2026-09-08). It used to read ``get_account_snapshot().equity``, which is
+        # the UNLEVERED figure, while ``SmartRiskManagerGraph`` writes these very columns
+        # from the levered one -- on a margin account the job card showed a phantom ~-44%
+        # change across a run that moved nothing. With margin off the two are identical
+        # (``get_balance()``), so nothing about a backtest or a cash account changes.
+        #
+        # ``get_tradable_balance()`` RAISES rather than guessing when the broker published
+        # no balance, multiplier or buying power; the except below turns that into exactly
+        # the "unknown" this function already records for an unpublished figure. Never a
+        # number.
+        account_equity = account.get_tradable_balance()
         if account_equity is None:
             logger.error(
                 f"{phase.capitalize()} portfolio equity unavailable: account "
-                f"{account_id} ({account.__class__.__name__}) published no equity "
-                f"(get_account_snapshot().equity is None). Recording it as unknown "
+                f"{account_id} ({account.__class__.__name__}) published no tradable "
+                f"balance (get_tradable_balance() is None). Recording it as unknown "
                 f"rather than as zero -- a risk manager reasoning about an unknown "
                 f"portfolio is not the same as one reasoning about an empty portfolio."
             )
@@ -102,13 +116,15 @@ def _read_expert_virtual_equity(account_id: int, expert_record, phase: str) -> O
         virtual_equity_pct = expert_record.virtual_equity_pct
         virtual_equity = account_equity * (virtual_equity_pct / 100.0)
         logger.debug(
-            f"{phase.capitalize()} portfolio equity: Account=${account_equity:,.2f} "
+            f"{phase.capitalize()} portfolio equity: Account tradable "
+            f"balance=${account_equity:,.2f} "
             f"x {virtual_equity_pct}% = ${virtual_equity:,.2f}"
         )
         return virtual_equity
     except Exception as e:
         logger.error(
-            f"Could not read {phase} portfolio equity for account {account_id}: {e}. "
+            f"{phase.capitalize()} portfolio equity unavailable: Could not read it "
+            f"for account {account_id}: {e}. "
             f"Recording it as unknown rather than as zero.",
             exc_info=True,
         )

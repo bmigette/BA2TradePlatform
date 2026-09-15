@@ -446,3 +446,38 @@ that have actually changed conclusions in the past.
 ```bash
 powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Descending | Select-Object -First 5 @{n='MB';e={[math]::Round(\$_.Length/1MB,1)}},Name"
 ```
+
+## remote227 (babatest) traps found 2026-09-15
+
+* **logind `RemoveIPC`** deletes a non-system user's POSIX semaphores (`/dev/shm/sem.mp-*`) when
+  that user's last login session ends. A GA unit running as `debian` under `systemd-run` then
+  loses the semaphores its process pools created: children spawned later (a lazily-started
+  slot, a recycle, a generation-boundary rebuild) die in `SemLock._rebuild` with
+  `FileNotFoundError`, the executor reports "A process in the process pool was terminated
+  abruptly", the job exits 1. Already-running children are unaffected, which is why it looks
+  like a random mid-run death. Fix: `sudo loginctl enable-linger debian` and `RemoveIPC=no` in
+  `/etc/systemd/logind.conf`. The "benign `sem_unlink FileNotFoundError` noise at pool recycle"
+  seen on 2026-08-30 was this.
+* **`RLIMIT_NOFILE`**: launch GA units with `-p LimitNOFILE=524288`; every memory-mapped derived
+  array holds a descriptor (98 x 18 = 1764 > the 1024 default).
+* **Ownership of the isolated home**: `/home/debian/ba2-grid/home` must be owned by `debian`
+  (it was `ba2worker` 750, which blocked the derived cache). The fleet worker does not use it.
+* Never `pgrep -f spawn_main` from an ssh command that contains the string (self-match killed the
+  shell); use `pgrep -f multiprocessing.spawn`.
+
+## Database backups (2026-09-15)
+
+`tools/backup_dbs.py` copies the PROD trade DB, the DEV trade DB and the TEST/GA DB with SQLite's online-backup
+API (safe while the platforms and a GA write), `quick_check`s the copy, deflates it to
+`G:\Mon Driveackup\BA2\<prod|test>_<YYYY-MM-DD>.sqlite.zip`, and keeps the newest 7 per
+database. Windows Task Scheduler task **`BA2 DB Backup`** runs it daily at 00:00 as the
+interactive user (Google Drive's `G:` only exists in the logged-on session), 4 h limit, no
+overlapping instances. Log: `G:\Mon Driveackup\BA2ackup.log`. Measured 2026-09-15: prod
+411 MB -> 93 MB in 12 s. Manual run: `.venv\Scripts\python.exe toolsackup_dbs.py [--dry-run]`.
+
+**Weekly remote pull (stage-1 isolated DB).** `tools/backup_remote_db.py` runs the same online
+backup + `quick_check` + zip ON remote227 (python3 over one ssh session, `nice`d so the grid is
+not disturbed), scp's it to `G:\Mon Driveackup\BA2emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
+deletes the remote copy and keeps the newest 4. Task **`BA2 Remote DB Backup`**, Sunday 01:00,
+interactive user (needs the ssh key + G:). Stage-1 results live ONLY in that isolated DB
+(`/home/debian/ba2-grid/home/test/dl_forecasting.db`); nothing syncs them to the local test DB.

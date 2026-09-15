@@ -1,0 +1,63 @@
+{
+  "dev_shared": {
+    "root": "C:\\Users\\basti\\Documents\\ba2\\common\\cache",
+    "parquet_files": 26373,
+    "parquet_bytes": 17012130567,
+    "csv_files": 986,
+    "historical_price_full_json_files": 4002,
+    "historical_price_full_json_bytes": 4681825059,
+    "history_json_mtime_counts": {
+      "2026-07-18": 10,
+      "2026-07-27": 3991,
+      "2026-08-01": 1
+    },
+    "intraday_alias_conflicts": [
+      "AMC",
+      "APWC",
+      "BBBY",
+      "BFLY",
+      "CAMP",
+      "CD",
+      "CNVS",
+      "DGNX",
+      "GALT",
+      "GANX",
+      "HELP",
+      "HIVE",
+      "IFRX",
+      "KNDI",
+      "MODD",
+      "MTEK",
+      "NBP",
+      "NEOV",
+      "NNBR",
+      "NNOX",
+      "OBIO",
+      "PLUG",
+      "PRQR",
+      "QNC",
+      "ROC",
+      "RPAY",
+      "RTB",
+      "SMRT",
+      "SOUN",
+      "SRFM",
+      "STTK",
+      "TGE",
+      "TYGO",
+      "WPRT",
+      "WSHP",
+      "YOOV"
+    ]
+  },
+  "prod": {
+    "root": "C:\\Users\\basti\\Documents\\ba2_trade_platform-prod\\cache",
+    "parquet_files": 49,
+    "parquet_bytes": 4006684,
+    "csv_files": 338,
+    "historical_price_full_json_files": 0,
+    "historical_price_full_json_bytes": 0,
+    "history_json_mtime_counts": {},
+    "intraday_alias_conflicts": []
+  }
+}

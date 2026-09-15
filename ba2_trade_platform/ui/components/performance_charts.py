@@ -8,7 +8,7 @@ All components use Plotly for consistent, interactive visualizations.
 from nicegui import ui
 import plotly.graph_objects as go
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Sequence, Tuple
 import pandas as pd
 import numpy as np
 
@@ -359,7 +359,8 @@ class PieChartComponent:
 class PerformanceTable:
     """Table component for displaying detailed performance metrics."""
     
-    def __init__(self, title: str, columns: List[str], rows: List[Dict[str, Any]]):
+    def __init__(self, title: str, columns: List[str], rows: List[Dict[str, Any]],
+                 mobile_hide: Optional[Sequence[str]] = None):
         """
         Args:
             title: Table title
@@ -368,6 +369,9 @@ class PerformanceTable:
         """
         self.title = title
         self.columns = columns
+        #: Column LABELS to drop on a phone. Empty by default, so an existing
+        #: caller keeps every column and nothing disappears without being asked for.
+        self.mobile_hide = set(mobile_hide or ())
         self.rows = rows
     
     def render(self):
@@ -380,9 +384,19 @@ class PerformanceTable:
             return
         
         # Create table with sortable columns
+        #
+        # ``mobile_hide`` tags a column so the responsive layer can drop it on a phone.
+        # Quasar adds no per-column class of its own, so ``classes``/``headerClasses``
+        # -- its documented hook -- is the only way a stylesheet can reach one. A
+        # positional `nth-child` rule would hide the WRONG column the first time one is
+        # inserted, on a table of money.
         table_data = {
-            'columns': [{'name': col, 'label': col, 'field': col, 'align': 'left', 'sortable': True} 
-                       for col in self.columns],
+            'columns': [
+                {'name': col, 'label': col, 'field': col, 'align': 'left',
+                 'sortable': True,
+                 **({'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'}
+                    if col in self.mobile_hide else {})}
+                for col in self.columns],
             'rows': self.rows
         }
         
@@ -403,7 +417,10 @@ class MultiMetricDashboard:
     
     def render(self):
         """Render the metrics dashboard."""
-        with ui.grid(columns=self.columns).classes('w-full gap-4'):
+        # ``metric-grid`` is the mobile layer's hook: the blanket 1-column collapse
+        # is right for a chart and wrong for a row of small tiles, so this grid asks
+        # to stay two-up on a phone rather than becoming four screens of scrolling.
+        with ui.grid(columns=self.columns).classes('w-full gap-4 metric-grid'):
             for metric in self.metrics:
                 card = MetricCard(
                     title=metric.get('title', ''),

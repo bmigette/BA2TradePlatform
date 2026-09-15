@@ -56,7 +56,7 @@ import copy
 import math
 from dataclasses import dataclass, field
 from datetime import datetime as DateTime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ba2_common.core.account_types import (  # noqa: F401 (re-exported)
     MARGIN_SOURCE_ASSET, MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
@@ -106,11 +106,13 @@ __all__ = [
     # what a plan's target_notional MEANS, and the residual loop's bound (D2)
     "ALLOCATION_BASIS_POSITION", "ALLOCATION_BASIS_BUDGET", "REDISTRIBUTION_MAX_PASSES",
     # reason / warning / error strings
+    "is_untracked_holding", "REASON_UNTRACKED_NO_SELL", "ACTION_SELL_UNTRACKED",
     "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
     "REASON_WHOLE_SHARE_FLOOR", "REASON_FRACTIONAL_UNKNOWN",
     "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
     "REASON_BUMPED_TO_ONE_SHARE_FMT", "REASON_BELOW_ONE_SHARE_FMT",
     "REASON_BUMP_BLOCKED_MIN_ORDER_FMT", "REASON_ROUNDS_TO_ZERO_FMT",
+    "REASON_SELL_ROUNDED_UP_FMT",
     "REASON_REDISTRIBUTED_FMT", "REASON_REDISTRIBUTED_PREFIX",
     "WARNING_RESIDUAL_LEFT_FMT", "WARNING_RESIDUAL_UNCONVERGED_FMT",
     "REASON_FRACTIONAL_FLOOR_BUMPED_FMT", "REASON_FRACTIONAL_FLOOR_SKIPPED_FMT",
@@ -125,6 +127,7 @@ __all__ = [
     "ERROR_SYMBOL_NEGATIVE_FMT", "ERROR_SYMBOL_DUPLICATE_FMT",
     # engine
     "current_value", "UnrealisedPnL", "unrealised_pnl", "format_unrealised_pnl",
+    "split_unrealised_pnl",
     "PNL_UNMEASURABLE_MARK", "PNL_NO_PRICE_MARK", "PNL_PCT_FMT", "PNL_NO_COST_NOTE",
     "PNL_UNPRICED_FMT", "PNL_FMT", "PNL_WITH_DIV_FMT",
     "round_quantity", "round_delta_quantity", "even_split_pct",
@@ -142,6 +145,7 @@ __all__ = [
     "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
     "redistribute_label_residuals",
     # per-row leverage, for the dry-run table (W6/W7)
+    "cash_dividends_by_symbol",
     "bp_leverage", "LEVERAGE_VERDICTS", "LEVERAGE_NONE", "LEVERAGE_LEVERAGED",
     "LEVERAGE_PENALISED", "LEVERAGE_UNKNOWN", "LEVERAGE_NOT_APPLICABLE",
     "LEVERAGE_RATIO_TOLERANCE",
@@ -196,6 +200,19 @@ QUANTITY_EPSILON = 1e-9
 #: ledger write, whereas 1e-9 of a share can matter on a fractional grid.
 MONEY_EPSILON = 1e-6
 
+#: The bp_factor a symbol gets when NOTHING is known about its margin treatment.
+#:
+#: 1.0 is neutral on every account shape -- an ordinary marginable stock at Reg-T is
+#: 0.5 x 2 and a cash account is 1.0 x 1, and both land here -- so it holds the
+#: invariant that a buy never consumes MORE buying power than its notional.
+#:
+#: It used to be the ACCOUNT MULTIPLIER (2.0 on a margin account), which by this
+#: module's own table means NON-MARGINABLE: a buying-power penalty of double the
+#: notional, applied to every symbol nobody had measured. On a live TastyTrade
+#: account that was every symbol not already held -- so every first-time buy -- and
+#: the plan then scaled itself down to fit a budget twice its real size.
+NEUTRAL_BP_FACTOR = 1.0
+
 #: The five verdicts ``bp_leverage`` can return, and the ONLY five the dry-run
 #: table knows how to draw. See ``bp_leverage`` for the predicate and the live
 #: numbers behind it; the short version is that the neutral point is 1.0 on every
@@ -214,10 +231,27 @@ LEVERAGE_NOT_APPLICABLE = "n/a"
 LEVERAGE_VERDICTS = (LEVERAGE_NONE, LEVERAGE_LEVERAGED, LEVERAGE_PENALISED,
                      LEVERAGE_UNKNOWN, LEVERAGE_NOT_APPLICABLE)
 
-#: How far a BP ratio may sit from 1.0 and still be called neutral. Its own
-#: constant and NOT MONEY_EPSILON: this is a dimensionless ratio, and a broker that
-#: publishes a rate to 4dp lands a hair off 1.0 through float division alone.
-LEVERAGE_RATIO_TOLERANCE = 1e-6
+#: How far a BP ratio may sit from 1.0 and still be called neutral. Its own constant
+#: and NOT MONEY_EPSILON: this is a dimensionless ratio, and a broker that publishes
+#: a rate to 4dp lands a hair off 1.0 through float division alone.
+#:
+#: HALF THE DISPLAY STEP, because a badge that contradicts the number beside it is
+#: worse than no badge. The cell renders the ratio as ``x{ratio:.2f}``, so anything
+#: within 0.005 of 1.0 PRINTS as "x1.00"; at the old 1e-6 the colour was decided on
+#: digits the user cannot see. Observed live 2026-09-07: NASA at 0.99953 drew GREEN
+#: "leveraged" and CHPY at 1.00343 drew ORANGE "penalised", both showing x1.00 --
+#: two identical numbers, opposite verdicts, no way to tell why from the screen.
+#:
+#: 0.005 also lands above the FEE DUST that produces most of these. A prechecked row
+#: takes ``bp_factor = impact.bp_cost / estimated_value``, and the broker folds a
+#: fixed fee into that cost (``apply_order_impacts`` says so where it spreads it), so
+#: a perfectly ordinary marginable name comes back a few tenths of a percent over
+#: 1.0. That is a fee, not a margin penalty, and it must not be painted as one.
+#:
+#: It stays far below every real distinction the badge exists for: a leveraged ETF is
+#: 1.5, hard-to-borrow LAZR measured 1.978, non-marginable is 2.0. Nothing the colour
+#: is FOR sits anywhere near half a percent.
+LEVERAGE_RATIO_TOLERANCE = 0.005
 
 # Reason strings attached to AllocationRow.reasons / AllocationPlan.warnings.
 # Pinned here so the UI and the tests agree on the exact text.
@@ -235,6 +269,20 @@ REASON_WHOLE_SHARE_FLOOR = "rounded down to whole shares"
 REASON_FRACTIONAL_UNKNOWN = "fractionable unknown - whole shares"
 REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
+
+#: A reduction this planner cannot submit, because the shares at the broker have
+#: no local transaction behind them at all (review PA-05, 2026-09-07).
+#:
+#: The engine used to size such a sale normally, credit its proceeds as
+#: ``bp_released`` and let dependent buys spend them -- then submission refused
+#: the sale (there is no transaction to close) and sent the buys anyway. The
+#: refusal is CORRECT and stays; predicting the sale and spending money it was
+#: never going to produce is the defect. Prod account 2 makes this the common
+#: case rather than a corner: 25 broker holdings, zero local orders, so its first
+#: rebalance would have funded its entire buy side from sales that cannot happen.
+REASON_UNTRACKED_NO_SELL = (
+    "held at the broker with no local transaction - cannot be sold, no funding credit"
+)
 
 #: How far ONE tradeable unit may overshoot a target before the bump is refused.
 #: 2.0 == "one share may cost at most 200% of what this symbol was allocated".
@@ -317,6 +365,11 @@ REASON_BUMP_BLOCKED_MIN_ORDER_FMT = (
 #: away. Never bumped: the position already exists, and turning a -0.4 trim into a
 #: whole-share sale is a trade nobody asked for.
 REASON_ROUNDS_TO_ZERO_FMT = "{raw:+.4f} shares rounds to 0 on the tradeable grid - no order"
+#: A whole-share SELL that was rounded UP to the nearest share. Says the size
+#: asked for and the size sent, because the row now trades MORE than the weights
+#: requested and that must never be silent.
+REASON_SELL_ROUNDED_UP_FMT = (
+    "{raw:.4f} shares wanted, sold {sent:g} - nearest whole share")
 
 #: How many redistribution passes a label gets before the engine gives up and
 #: reports what is left. The loop is finite on its own arithmetic -- every step is
@@ -720,6 +773,13 @@ class AllocationRow:
     margin_source: str = MARGIN_SOURCE_DEFAULT
     fractional: bool = False
     skipped: bool = False
+    #: A reduction was wanted here and the planner has NO route to it: the shares
+    #: are at the broker with no local transaction behind them. Distinct from
+    #: ``skipped`` (nothing to do) on purpose -- the operator asked to exit and
+    #: cannot, which is a different sentence and a different run severity. The
+    #: delta is zeroed and the size lands in ``unmet_notional``; see
+    #: ``is_untracked_holding`` and review PA-05.
+    untracked_unsellable: bool = False
     #: The broker precheck's own fee estimate, when one was run and accepted
     #: (``OrderImpact.estimated_fees``). ``None`` means "not prechecked", never
     #: "free" -- no fallback value for a number the broker did not supply.
@@ -847,6 +907,16 @@ class AllocationPlan:
     rows: List[AllocationRow] = field(default_factory=list)
     base_notional: float = 0.0
     available_buying_power: float = 0.0
+    #: The account's Reg-T multiplier (2.0 margin, 1.0 cash), carried as a
+    #: DESCRIPTION of the account -- the same number that seeds ``default_bp_factor``.
+    #:
+    #: NOT a way to recover a row's initial margin rate. It was used exactly that
+    #: way (``rate = bp_factor / margin_multiplier``) until 2026-09-07, and the
+    #: algebra is sound only when ``bp_factor`` came from a real per-symbol rate:
+    #: applied to the neutral 1.0 placeholder it manufactured a confident 0.5 for
+    #: every symbol the broker had never rated, which is every first-time buy on
+    #: TastyTrade. A rate is a broker fact or it is 1.0 -- see ``_row_margin_rate``.
+    margin_multiplier: float = 1.0
     #: What this plan's own SELLS free, summed from ``AllocationRow.bp_released``.
     #: Added to ``available_buying_power`` to make the budget the buys are sized
     #: against. Recomputed by ``filter_plan_rows``, so un-ticking the sell that
@@ -1186,6 +1256,38 @@ def format_unrealised_pnl(pnl: UnrealisedPnL) -> str:
     return PNL_FMT.format(amount=pnl.amount, notes=', '.join(notes))
 
 
+def split_unrealised_pnl(pnl: UnrealisedPnL) -> Tuple[str, Optional[str], str]:
+    """``format_unrealised_pnl`` cut into three, so the caller can colour the middle.
+
+    THE TWO NUMBERS HAVE DIFFERENT SIGNS, and one colour cannot say so. A holding
+    down 4.27% on price that is up 4.28% once its dividends are counted is a real and
+    common shape for an income sleeve -- it is the whole point of holding one -- and
+    painting the entire caption red because the FIRST number is negative reports the
+    opposite of what the second one says. Operator, 2026-09-07: "keep the raw red,
+    and div green".
+
+    Returns ``(head, dividend_note, tail)`` where ``head + (dividend_note or "") +
+    tail`` is EXACTLY ``format_unrealised_pnl(pnl)``. That invariant is the point of
+    doing the split here rather than with a regex in the view: the caption keeps one
+    definition, and a caller that ignores the split still renders the same string.
+
+    ``dividend_note`` is ``None`` when there is no dividend-adjusted figure to show,
+    which is also every "nothing measurable" case -- there is nothing to colour
+    separately and the head carries the whole caption.
+    """
+    full = format_unrealised_pnl(pnl)
+    if pnl is None or pnl.amount is None or pnl.total_pct is None:
+        return full, None, ''
+    note = PNL_WITH_DIV_FMT.format(pct=pnl.total_pct)
+    # Built from the SAME constant format_unrealised_pnl used, so it is present.
+    # find(), not index(), because a caption that somehow lost the note must degrade
+    # to "one colour" rather than raise inside a render loop.
+    at = full.find(note)
+    if at < 0:
+        return full, None, ''
+    return full[:at], note, full[at + len(note):]
+
+
 def _round_shares(raw: float, margin: Optional[MarginInfo], *,
                   allow_fractional: bool) -> float:
     """Round a POSITIVE share count DOWN onto the broker's tradeable grid.
@@ -1221,12 +1323,41 @@ def _round_delta_shares(delta: float, margin: Optional[MarginInfo], *,
     holding, and against a SHORT position it is clamped to zero rather than to the
     negative quantity, so the engine can only ever buy a short back (targets are
     long-only).
+
+    A WHOLE-SHARE SELL ROUNDS TO THE NEAREST SHARE, not down. Flooring is right for a
+    buy -- overshooting spends money nobody authorised -- but on a sell it leaves the
+    position FURTHER from target than the alternative: IYRI wanted -0.8773 shares and
+    got 0, when selling 1 misses by 0.12 instead of 0.88. Both rows sat about twice
+    their target weight and no run could ever correct them, because every run recomputed
+    the same sub-share trim and floored it away again (live 2026-09-07, IYRI and NIHI).
+    Reported by the operator: "we should have similar logic, sell down to rounded int".
+
+    SYMMETRIC WITH THE BUY BUMP, and that is what makes it safe rather than churning.
+    ``size_sub_unit_target`` bumps a sub-unit BUY up to one share when the raw target is
+    at least half a share; rounding a sell half-up applies the same threshold from the
+    other side, so the two cannot fight: a 0.6-share target rounds to one share whether
+    the position is being opened or trimmed to it, and a 0.3-share target rounds to none
+    from either direction. (Flooring the TARGET, as an earlier version of the caller
+    warned, is a different and genuinely broken thing: it would sell a whole 1-share
+    holding down to a 0.33-share target, then buy it straight back next run.)
+
+    THE HOLDING'S OWN FRACTION IS NOT SELLABLE, so the clamp is ``floor(held)``. A
+    non-fractionable symbol can still be HELD in fractions -- DRIP pays them -- but
+    ``validate_plan_rows`` treats any fractional quantity on such a symbol as a broker
+    refusal, sells included. Clamping to the whole part means the residue stays put
+    rather than the row being planned and then rejected; nothing on the whole-share grid
+    can clear it.
     """
     magnitude = _round_shares(abs(float(delta or 0.0)), margin,
                               allow_fractional=allow_fractional)
     if delta >= 0:
         return magnitude
-    return -min(magnitude, max(0.0, float(current_quantity or 0.0)))
+    held = max(0.0, float(current_quantity or 0.0))
+    if not (allow_fractional and margin is not None and margin.fractionable):
+        # Round HALF UP, then clamp to the sellable (whole) part of the holding.
+        magnitude = math.floor(abs(float(delta or 0.0)) + 0.5)
+        return -min(float(magnitude), math.floor(held))
+    return -min(magnitude, held)
 
 
 def tradeable_unit(margin: Optional[MarginInfo], *, allow_fractional: bool) -> float:
@@ -1415,6 +1546,27 @@ def _is_fractional_quantity(quantity: float) -> bool:
     """
     part = abs(float(quantity)) % 1.0
     return min(part, 1.0 - part) > QUANTITY_EPSILON
+
+
+def is_untracked_holding(state: Optional["PositionState"]) -> bool:
+    """The broker holds shares here and we have NO transaction behind any of them.
+
+    A THIRD meaning for an empty ``transaction_ids``, alongside the two
+    ``PositionState`` already documents. "We hold nothing of ours here" and
+    "everything we hold here is invisible to this planner" are both states the
+    engine can act on; this one is not. There is no transaction to close or trim,
+    so ``decide_symbol_action`` has nowhere to route a sale -- which is correct
+    and deliberate -- and the planner must therefore not PROMISE that sale, nor
+    spend the buying power it would have released.
+
+    Distinguished from the option case by the absence of
+    ``unactionable_transaction_ids``: there, real transactions exist and are
+    merely held back, and the operator is told which ones.
+    """
+    return (state is not None
+            and (state.quantity or 0.0) > 0
+            and not state.transaction_ids
+            and not state.unactionable_transaction_ids)
 
 
 def _suppress_below_min_order(delta: float, margin: Optional[MarginInfo],
@@ -2096,8 +2248,24 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
                        default_bp_factor: float,
                        valuation_mode: str,
-                       unallocated_pct: float = 0.0) -> AllocationPlan:
+                       unallocated_pct: float = 0.0,
+                       unsellable_symbols: Optional[Set[str]] = None) -> AllocationPlan:
     """Solve a full REBALANCE: every managed label, buys and sells.
+
+    ``unsellable_symbols`` are symbols whose REDUCTION this caller already knows
+    it cannot submit -- live, a broker holding with no local transaction behind it
+    (see ``is_untracked_holding``). Their sells are still sized and shown, because
+    the operator asked for them and the size is the useful part, but they release
+    NO buying power: predicting proceeds from a sale that is known to be
+    unsubmittable is what let a $1,000 phantom sale fund a $1,000 real buy (review
+    PA-05, 2026-09-07).
+
+    PASSED IN rather than inferred from ``current``, deliberately. An empty
+    ``PositionState.transaction_ids`` means "untracked" only when the caller
+    populates ids at all; the live service always does, a hand-built state does
+    not. Inferring it here would have made every ordinary held position in the
+    shared engine's own vocabulary unsellable. Default ``None`` == today's
+    behaviour exactly.
 
     ``valuation_mode`` is REQUIRED on all three entry points
     (``compute_base_notional``, this, and ``compute_label_investment``) and NONE of
@@ -2203,6 +2371,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                           available_buying_power=float(available_buying_power),
                           allow_fractional=bool(allow_fractional),
                           valuation_mode=valuation_mode,
+                          margin_multiplier=float(default_bp_factor or 1.0),
                           labels=list(labels or []))
     # THE SINGLE SCALING POINT. The reserve is applied ONCE, here, to produce the
     # money the labels divide; every target below is a share of ``investable``
@@ -2245,11 +2414,12 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             per_label[st.symbol] = (per_label.get(st.symbol, 0.0)
                                     + investable * share / 100.0)
 
+    unsellable = set(unsellable_symbols or ())
     for symbol, target_notional in targets.items():
         ps = current.get(symbol)
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=list(sym_labels[symbol]))
-        row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
         _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
         row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
@@ -2335,11 +2505,24 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             # ``_round_delta_shares``, so a trim that cannot be sent on the grid
             # leaves the position where it is instead of closing it -- matching
             # ``grid_zeroed`` below, which is what "leave it alone" means.
+            #
+            # NOT contradicted by the half-up rounding _round_delta_shares now applies
+            # to a whole-share sell: that rounds the DELTA to the nearest share, which
+            # is bounded by the trim that was asked for. Flooring the TARGET is
+            # unbounded -- it discards the whole fractional part of the target, however
+            # large the holding -- which is why one is safe and the other sells a
+            # position out from under a sub-share target.
             delta = _round_delta_shares(raw_delta, m,
                                         allow_fractional=allow_fractional,
                                         current_quantity=row.current_quantity)
         if abs(delta) < QUANTITY_EPSILON:
             delta = 0.0
+        # A whole-share SELL rounded UP to the nearest share trades MORE than the
+        # weights asked for, and an over-sale the user cannot see is exactly the kind
+        # of quiet overshoot the bump rule is made to announce on the buy side.
+        if delta < 0 and abs(delta) > abs(raw_delta) + QUANTITY_EPSILON:
+            row.reasons.append(REASON_SELL_ROUNDED_UP_FMT.format(
+                raw=abs(raw_delta), sent=abs(delta)))
         # D1, and it runs BEFORE _suppress_below_min_order on purpose (L8b): the
         # suppression zeroes the row, and a bump that runs afterwards finds nothing
         # left to decide about.
@@ -2383,6 +2566,14 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         # buying it consumed.
         row.bp_cost = row.estimated_value * row.bp_factor if delta > 0 else 0.0
         row.bp_released = row.estimated_value * row.bp_factor if delta < 0 else 0.0
+        # A reduction the CALLER has told us cannot be submitted frees nothing.
+        # Kept for a genuinely unroutable sale; an UNTRACKED broker holding is no
+        # longer one of those -- it is sold directly (ACTION_SELL_UNTRACKED), so
+        # its proceeds are real and must keep funding the plan.
+        if delta < 0 and row.symbol in unsellable:
+            row.untracked_unsellable = True
+            row.reasons.append(REASON_UNTRACKED_NO_SELL)
+            row.bp_released = 0.0
         plan.rows.append(row)
 
     # D2, BEFORE the buying-power pass: the label's own arithmetic first, the
@@ -2485,7 +2676,7 @@ def compute_label_investment(label: LabelTarget, amount: float,
         ps = current.get(symbol)
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=[label.label])
-        row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
         _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
         row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
@@ -2635,9 +2826,48 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
             # -- but the source was left saying "default", so every TastyTrade dry run
             # reported a genuinely measured buying-power cost as unknown (2026-09-05).
             row.margin_source = MARGIN_SOURCE_PRECHECK
+            # THE CAPITAL REQUIREMENT, MEASURED. ``OrderImpact.margin_requirement``
+            # is the broker's own isolated margin requirement for exactly this
+            # order (TastyTrade's ``isolated_order_margin_requirement``), i.e. the
+            # dollars the resulting holding ties up -- the precise number
+            # ``capital_required`` otherwise has to assume. It was collected by the
+            # adapter and then dropped on the floor here until 2026-09-07, so a
+            # first-time buy showed an assumed full-value requirement even on a run
+            # where the broker had just priced it.
+            #
+            # Stored as a RATE, not as the dollar figure, because the row is still
+            # subject to ``_apply_bp_scaling`` below and to later re-sizing: a rate
+            # survives a quantity change, a total does not. The impact was priced
+            # on the pre-scaling quantity, which is what ``estimated_value`` still
+            # holds at this point.
+            #
+            # A non-positive or absent requirement is NOT a measurement of zero:
+            # it leaves the rate None so the row keeps saying "assumed".
+            requirement = getattr(impact, "margin_requirement", None)
+            if requirement is not None and row.estimated_value > MONEY_EPSILON:
+                measured = abs(float(requirement)) / row.estimated_value
+                if measured > 0.0:
+                    row.initial_margin_rate = min(1.0, measured)
             if abs(impact.bp_cost - row.bp_cost) > 0.005:
                 out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
                 row.bp_cost = impact.bp_cost
+                # RECALIBRATE THE RATE, not just this one total (review PA-02).
+                # bp_cost is a derived number: every later sizing pass recomputes
+                # it as value x bp_factor -- _apply_bp_scaling, the per-row resize
+                # at the end of this function, and _reclaim_rounding_slack. Leaving
+                # bp_factor at the pre-broker estimate meant the broker's answer
+                # survived only until the next pass touched the row, and rounding
+                # recovery then restored an order at HALF its prechecked cost while
+                # reporting the plan as fitting. Two $200-prechecked orders came
+                # back as "$200 required" against $200 available.
+                #
+                # LINEAR, and only as linear as the broker is: a fixed fee inside
+                # the impact is spread across the quantity here. That is still
+                # strictly better than a rate the broker never quoted, and any row
+                # whose FINAL quantity differs from the prechecked one should be
+                # re-previewed rather than trusted to this arithmetic.
+                if row.estimated_value > MONEY_EPSILON:
+                    row.bp_factor = impact.bp_cost / row.estimated_value
     factor = _apply_bp_scaling(out.rows, out.available_buying_power,
                                allow_fractional=out.allow_fractional, margin=margin)
     out.scale_factor = float(plan.scale_factor) * factor
@@ -3104,6 +3334,89 @@ def validate_plan_budget(plan: "AllocationPlan") -> Optional[str]:
     return REFUSAL_OVER_BUDGET_FMT.format(required=required, budget=budget)
 
 
+def cash_dividends_by_symbol(dividends: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
+    """``{SYMBOL: CASH dividend received}`` from the broker's dividend feed. Pure.
+
+    CASH ONLY, and that is the whole point. A REINVESTED (DRIP) dividend never left
+    the position: it became shares. Those shares are already in the position's market
+    value and in its cost basis, so adding the payment to a P&L figure counts the same
+    money twice -- once as the stock it bought and once as income. The growth charts
+    made exactly that mistake until 2026-09-07, drawing total dividends beside a value
+    line that already contained the reinvested ones.
+
+    ``drip_quantity`` is the discriminator, per the ``get_dividends`` contract
+    (``ReadOnlyAccountInterface.get_dividends``): ``None`` on a cash dividend, the
+    share count on a reinvested one.
+
+    ``amount`` is the NET dividend the broker reports -- gross minus tax withheld --
+    which is the money actually kept, and therefore the only figure a P&L column may
+    use. ``gross_amount`` is deliberately not summed here.
+
+    THE OTHER SOURCE, and why this is not it. ``get_dividends_by_symbol`` reads the
+    ``portfolio_income_event`` ledger, which exists to answer "what cash is waiting to
+    be deployed" and is synced over a rolling ``INCOME_WINDOW_DAYS`` window. It is
+    correct for consumption and WRONG for lifetime P&L: on 2026-09-07 it held six
+    weeks of a six-month position and reported a fifth of what the holding had paid.
+    This function takes the broker's full history instead.
+
+    Args:
+        dividends: rows as ``get_dividends()`` returns them. ``None``/empty is an
+            empty result, never an error -- that seam returns ``[]`` on failure.
+
+    Returns:
+        Dict[str, float]: totals keyed by UPPERCASE symbol. A symbol that paid only
+        reinvested dividends is ABSENT rather than 0.0, exactly like one that never
+        paid: neither has cash to show in a P&L column.
+    """
+    out: Dict[str, float] = {}
+    for row in dividends or []:
+        if row.get("drip_quantity"):
+            continue
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            # A payment attributable to nothing would land on whichever holding
+            # sorted first -- the same rule get_dividends_by_symbol applies.
+            continue
+        amount = float(row.get("amount") or 0.0)
+        if amount:
+            out[symbol] = out.get(symbol, 0.0) + amount
+    return out
+
+
+def _row_margin_rate(row: "AllocationRow", plan: "AllocationPlan") -> float:
+    """The INITIAL MARGIN RATE behind a row's CAPITAL REQUIREMENT. Pure.
+
+    MEASURED, OR 1.0 -- there is no third answer. A rate is a broker fact: it
+    arrives on the ``MarginInfo`` of a symbol the account holds, out of this
+    account's own measured-rate cache, or from the order precheck's isolated
+    margin requirement. When none of those spoke, the requirement is the FULL
+    projected market value. Assuming anything cheaper is inventing leverage the
+    broker never granted, which is the one direction that under-states what a
+    position costs to hold.
+
+    IT USED TO BE DERIVED as ``bp_factor / margin_multiplier``, and that is what
+    made every unrated symbol print a 0.5 rate: the neutral factor is 1.0 and the
+    multiplier is 2.0 on a margin account, so the arithmetic manufactured an
+    ordinary-marginable rate for symbols nobody had rated. The derivation is
+    correct algebra (``bp_factor = rate x multiplier``) applied to a factor that
+    was itself a placeholder, so it turned "unknown" into a confident 50%.
+    ``plan`` is kept in the signature because the capital requirement is a
+    property of the row IN a plan and callers read better for it, not because a
+    plan-level number is allowed back into this answer.
+
+    Clamped to (0, 1]: a rate above 1 would claim a position ties up more capital
+    than it is worth, and a non-positive one is not a rate at all -- both fall
+    back to the full requirement rather than to a quieter wrong number.
+    """
+    rate = row.initial_margin_rate
+    if rate is None:
+        return 1.0
+    rate = float(rate)
+    if rate <= 0.0:
+        return 1.0
+    return min(1.0, rate)
+
+
 def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     """One display dict per row the user must look at, in plan order.
 
@@ -3217,6 +3530,29 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             # Already reflects whole-share rounding, the bump and the redistribution:
             # what is displayed is what will be owned.
             "projected_notional": None if projected is None else round(projected, 2),
+            # CAPITAL REQUIRED BY THE RESULTING HOLDING -- a LEVEL, not the trade's
+            # delta. ``projected market value x initial margin rate``: what the
+            # position ties up once this row executes.
+            #
+            # Distinct from ``bp_effect`` beside it, which is what the ORDER consumes
+            # or releases. Both are useful and they answer different questions -- "how
+            # much capital does this position cost me to hold" vs "what does this
+            # trade do to my buying power right now" -- and the two were conflated
+            # under one heading until 2026-09-07.
+            #
+            # The rate is read off ``initial_margin_rate`` and nowhere else: an
+            # unrated symbol requires its FULL projected value, because the only
+            # honest default is no leverage. See ``_row_margin_rate``.
+            "capital_required": (round(projected * _row_margin_rate(row, plan), 2)
+                                 if projected is not None else None),
+            # IS THAT RATE MEASURED, OR ASSUMED? Keyed on the RATE, not on
+            # ``margin_source``: the precheck sets the source to "precheck" for
+            # every accepted buy, including one whose impact carried no isolated
+            # margin requirement, so a source-keyed flag called those measured.
+            # An assumed row is showing 1.0 -- the conservative end, not a
+            # fabricated discount -- and the UI still marks it, because a capital
+            # requirement printed to the cent reads as a measurement either way.
+            "capital_required_estimated": row.initial_margin_rate is None,
             # The SAME projection measured both ways, so cost and value sit side by
             # side instead of the table silently showing whichever one the global
             # toggle happens to select. Equal to each other in an INVEST_LABEL run,
@@ -3243,6 +3579,16 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             "weight_pct": round(row.target_notional / base * 100.0, 3) if base > 0 else 0.0,
             "projected_weight_pct": (round(projected / base * 100.0, 3)
                                      if base > 0 and projected is not None else 0.0),
+            # WHAT THE ACCOUNT ACTUALLY HOLDS TODAY, as a share of the same base.
+            #
+            # Added 2026-09-07 because the pair above has no "now" in it: BOTH are
+            # forward-looking, so a symbol holding zero shares still showed a
+            # non-zero Weight and read as a holding it did not have. Same
+            # denominator as the other two, deliberately -- three numbers that
+            # divide different things cannot be compared by eye.
+            "current_weight_pct": (round(row.current_quantity * float(row.price or 0.0)
+                                         / base * 100.0, 3)
+                                   if base > 0 and row.price else 0.0),
             "unmet_notional": round(float(row.unmet_notional or 0.0), 2),
             "reasons": ", ".join(row.reasons),
             "fractional": _is_fractional_quantity(row.delta_quantity),
@@ -3748,6 +4094,11 @@ ACTION_SKIP = "skip"       # nothing to do (or nothing we are willing to do)
 #: does not act on -- so the SELL cannot be routed at all. NOT a skip: see
 #: ``decide_symbol_action``.
 ACTION_UNACTIONABLE = "unactionable"
+#: Held at the broker with no transaction of ours behind it, and being REDUCED.
+#: Submitted as a plain closing order against the broker position -- no transaction
+#: is created for it, because a Transaction links quantity to an expert and a manual
+#: holding has none. See ``decide_symbol_action``.
+ACTION_SELL_UNTRACKED = "sell_untracked"
 
 
 def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"]) -> str:
@@ -3795,6 +4146,25 @@ def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"])
     if (row.side == OrderDirection.SELL and at_the_broker
             and bool(state.unactionable_transaction_ids)):
         return ACTION_UNACTIONABLE
+
+    # A caller-declared unsellable row stays loud: it asked to exit and this run has
+    # no route. Keyed on the row's FLAG, never inferred from ``state`` -- an empty
+    # ``transaction_ids`` means "untracked" only when the caller populates ids at
+    # all, which the live service does and a hand-built state does not.
+    if row.side == OrderDirection.SELL and row.untracked_unsellable:
+        return ACTION_UNACTIONABLE
+
+    # THE UNTRACKED BROKER HOLDING. Shares the broker reports with no transaction
+    # of ours behind them. A Transaction exists to link quantity to an EXPERT, and a
+    # manually-traded account has none -- so requiring one in order to sell was the
+    # wrong shape for this account type, and it is why such a holding could only ever
+    # be bought into and never trimmed.
+    #
+    # The plan is the INTENT and the broker position is the TRUTH: sell it directly,
+    # as a plain closing order against the shares that are actually there. No
+    # transaction is invented for it (that would record a SHORT), and none is needed.
+    if row.side == OrderDirection.SELL and is_untracked_holding(state):
+        return ACTION_SELL_UNTRACKED
 
     return ACTION_NEW if row.side == OrderDirection.BUY else ACTION_SKIP
 

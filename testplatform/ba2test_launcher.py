@@ -30,6 +30,17 @@ import os
 import sys
 from datetime import date as _date, datetime, timedelta, timedelta as _timedelta
 
+# ``backend/`` on the path at IMPORT time (``_enter_backend`` repeats this, plus the chdir and
+# the .env/DB wiring, when a command actually runs). Needed this early because the senate grid
+# entry in ``_EXPERT_OPT`` below reads its scalper bounds from the shared prewarm module: those
+# two numbers are ONE source read by both the GA grid and both prewarm entry points, and the
+# dependency only points one way (the launcher may import the backend; the backend must never
+# import the launcher).
+_BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend")
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+from app.services.prewarm_fetchers import EXPERT_NAMES, SENATE_SCALPER_BOUNDS  # noqa: E402
+
 
 def _parse_symbols_arg(raw: str) -> list:
     """Comma list or ``@file`` — the idiom ``fetch-options`` already uses for its
@@ -50,8 +61,21 @@ def _parse_symbols_arg(raw: str) -> list:
     return [s.strip().upper() for s in raw.replace(",", " ").split() if s.strip()]
 
 
+#: The directory the user actually ran the command from. ``_enter_backend`` chdirs
+#: into ``backend/``, so a relative path typed on the command line has to be
+#: resolved against this instead of against the process cwd.
+_CALLER_CWD = os.getcwd()
+
+
+def _caller_path(raw: str) -> str:
+    """A command-line path, resolved against the directory the user ran from."""
+    return os.path.abspath(os.path.join(_CALLER_CWD, os.path.expanduser(raw)))
+
+
 def _enter_backend() -> str:
     """Put ``backend/`` on the path and chdir into it (the app's import + cwd root)."""
+    global _CALLER_CWD
+    _CALLER_CWD = os.getcwd()
     repo_root = os.path.dirname(os.path.abspath(__file__))
     backend = os.path.join(repo_root, "backend")
     if not os.path.isdir(backend):
@@ -228,37 +252,26 @@ def _cmd_prewarm(args) -> int:
     BEFORE the GA process pool spawns, so the first individuals read it from disk instead
     of each paying a cold network fetch.
 
-    Mirrors how fetch-cache / the providers resolve the FMP key (env FMP_API_KEY, mirrored
-    in from the trade app-settings DB by _enter_backend). Runs each expert's per-symbol
-    history fetch in a ThreadPoolExecutor, INSIDE frozen_ttl_cache() so the BACKTEST-ONLY
-    disk cache layer is engaged (the freeze gate is what enables disk writes; live passes
-    through to the API). FactorRanker is skipped — its factor data is not disk-cached.
+    Argument parsing and reporting only: the fetchers AND the run that drives them (freeze
+    gate, worker-thread initializer, empty-result sentinel, per-symbol error handling) live in
+    app.services.prewarm_fetchers, shared with the API/queue handler
+    (app.services.data_build_handler.handle_prewarm) so both entry points warm the same
+    surface the same way. Keys resolve as they do everywhere else: env FMP_API_KEY first (also
+    mirrored in from the trade app-settings DB by _enter_backend), then the app-settings DB.
+
+    The one step that stays here is the GA-grid-specific trader-SKILL score prewarm
+    (_do_senate_scores, --start), which the API handler has no use for.
     """
     import time
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     from ba2_providers.fmp_common import (
-        frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel, set_ttl_frozen,
+        frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel,
+    )
+    from app.services.prewarm_fetchers import (
+        PrewarmConfigError, PrewarmFetchers, prewarm_fred, resolve_keys, run_prewarm,
     )
 
-    # Resolve the FMP key the same way the providers / fetch-cache do.
-    key = os.getenv("FMP_API_KEY")
-    if not key:
-        try:
-            from ba2_common.config import get_app_setting
-            key = get_app_setting("FMP_API_KEY")
-        except Exception:  # noqa: BLE001
-            key = None
-    if not key:
-        sys.exit("ba2-test prewarm: FMP_API_KEY not configured (set it in .env or the app-settings DB).")
-
-    # FinnHub key (only required when warming FinnHubRating) — resolved like the expert does
-    # (get_setting('finnhub_api_key')), with an env fallback.
-    try:
-        from ba2_common.core.db import get_setting as _get_setting
-        finnhub_key = os.getenv("FINNHUB_API_KEY") or _get_setting("finnhub_api_key")
-    except Exception:  # noqa: BLE001
-        finnhub_key = os.getenv("FINNHUB_API_KEY")
+    # ONE key resolver, shared with the API handler (env first, then the app-settings DB).
+    keys = resolve_keys()
 
     symbols = _parse_symbols_arg(args.symbols)
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
@@ -288,179 +301,13 @@ def _cmd_prewarm(args) -> int:
         if start_date.tzinfo is None:
             start_date = start_date.replace(tzinfo=_tz.utc)
 
-    # Build the (expert, symbol) work items. Each item is a callable doing the cached fetch.
-    from ba2_experts.FMPRating import (
-        fetch_grades_historical_cached, fetch_price_target_history_cached,
-        fetch_analyst_grades_cached,
-    )
-    from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
-    from ba2_providers.insider.FMPInsiderProvider import FMPInsiderProvider
-
-    # Lazily construct the providers once (thread-safe enough: they only hold the API key
-    # + do stateless reads through the shared disk cache).
-    _details_provider = None
-    _insider_provider = None
-
-    def _do_fmprating(sym: str) -> None:
-        fetch_grades_historical_cached(key, sym)
-        fetch_price_target_history_cached(key, sym)
-        fetch_analyst_grades_cached(key, sym)   # dated individual grades (rating-recency filter)
-
-    def _do_earnings_drift(sym: str) -> None:
-        nonlocal _details_provider
-        if _details_provider is None:
-            _details_provider = FMPCompanyDetailsProvider()
-        _details_provider.get_past_earnings(
-            sym, frequency="quarterly", end_date=end_date,
-            lookback_periods=8, format_type="dict")
-
-    def _do_insider(sym: str) -> None:
-        nonlocal _insider_provider
-        if _insider_provider is None:
-            _insider_provider = FMPInsiderProvider()
-        _insider_provider.get_insider_transactions(
-            sym, end_date=end_date, lookback_days=400, as_of=end_date,
-            format_type="dict")
-
-    # DeterministicScorer: warm the SAME fmp_history namespaces its _gather reads --
-    # annual income/balance/cashflow statements (point-in-time F-Score / Altman Z /
-    # quality / value / growth inputs; the backtest filters them by filing date in
-    # Python) + the dated analyst-grade history for the OPTIONAL analyst section
-    # (weight default 0, but the grid may switch it on). OHLCV comes from the
-    # fetch-cache parquet (same reminder as FactorRanker below).
-    def _do_deterministic_scorer(sym: str) -> None:
-        nonlocal _details_provider
-        if _details_provider is None:
-            _details_provider = FMPCompanyDetailsProvider()
-        for fn in (_details_provider.get_income_statement,
-                   _details_provider.get_balance_sheet,
-                   _details_provider.get_cashflow_statement):
-            fn(symbol=sym, frequency="annual", end_date=end_date,
-               lookback_periods=6, as_of=end_date, format_type="dict")
-        fetch_grades_historical_cached(key, sym)
-        # EARNINGS/PEAD + the ANALYST price-target leg read these two namespaces.
-        # They MUST be warmed here or a hermetic trial with w_earnings>0 /
-        # w_analyst>0 aborts on a cache miss -- loudly now that the fetchers no
-        # longer swallow it, but still an aborted trial.
-        _details_provider.get_past_earnings(symbol=sym, frequency="quarterly",
-                                            end_date=end_date, lookback_periods=16,
-                                            format_type="dict")
-        fetch_price_target_history_cached(key, sym)
-
-    # FactorRanker (bypass/rebalance expert): warm ALL of its factor inputs by calling the SAME
-    # data-layer fetchers the rebalance path uses (so coverage auto-tracks the real fetch surface
-    # and can't drift). Per symbol this writes the fmp_history namespaces income_statement_annual /
-    # balance_sheet_annual / cashflow_statement_annual (value+quality), past_earnings_quarterly +
-    # earnings_estimates_quarterly (pead), AND the 1d OHLCV parquet (momentum + value as_of price).
-    # All factor inputs are fetched regardless of weight because the GA varies factor_weight_* per
-    # individual — any factor can be active. ohlcv_provider is intentionally omitted so the fetchers
-    # construct an FMPOHLCVProvider() and the parquet path engages.
-    # NOTE: this warms the FACTOR stage of the default static universe. It does NOT warm the
-    # min_price universe price-guard or the live screener path — neither is reachable from the
-    # static NDQ30 grid (FactorRanker pins universe_source=static; min_price/screener are not in its
-    # optimize params). OHLCV is warmed only for ~400d ending at end_date; for a multi-bar backtest
-    # span run `ba2-test fetch-cache --timeframes 1d` over [start-warmup, end] (reminder printed below).
-    from ba2_experts.FactorRanker import data as _fr_data
-
-    def _do_factorranker(sym: str) -> None:
-        _fr_data.fetch_value_inputs([sym], as_of=end_date)    # income/balance/cashflow annual + OHLCV as_of price
-        _fr_data.fetch_quality_inputs([sym], as_of=end_date)  # income/balance/cashflow annual (disk hits)
-        _fr_data.fetch_pead_inputs([sym], as_of=end_date)     # past_earnings + earnings_estimates quarterly
-        _fr_data.fetch_close_prices([sym], as_of=end_date)    # momentum: 1d OHLCV parquet
-
-    # FMPSenateTraderWeight: warm the SAME fmp_history namespaces _gather reads — per-symbol
-    # senate/house trades (congress_{chamber}_trades) + the symbol's full daily price history
-    # (historical_price_full), plus each DISCLOSED trader's full history (congress_trader_history,
-    # keyed by trader name, discovered from the trades). A bare instance (no DB row) carries just
-    # the FMP key + a logger — all the fetch methods need. (The OHLCV current-price leg of _gather
-    # is served by the fetch-cache parquet, not fmp_history, so it's out of prewarm's scope.)
-    #
-    # Dedup state is SHARED across every universe symbol's _do_senate call (not per-call locals):
-    # the same prolific trader (e.g. one member of Congress with 10k+ disclosed trades) is
-    # discovered from dozens of different universe symbols, and re-iterating their whole history
-    # + re-warming their buy-symbols each time was pure wasted CPU (the disk/memory price cache
-    # already prevented redundant NETWORK fetches, but not the redundant Python-side work of
-    # getting there). Lock-guarded since the ThreadPoolExecutor runs _do_senate concurrently.
-    _senate_expert = None
-    _senate_seen_traders: set = set()
-    _senate_warmed_skill_syms: set = set()
-    _senate_lock = threading.Lock()
-    # Scalper-skip floor: the GENTLEST scalper filter any GA trial for this expert will ever
-    # use (the grid's min_trader_avg_hold_days floor + the fixed min_trader_hold_roundtrips).
-    # A trader who fails EVEN this gentlest setting fails every stricter setting in the grid
-    # too, so their skill-symbols are unreachable by any trial — safe to skip warming them.
-    # Read from _EXPERT_OPT (not hardcoded) so a future grid change can't silently desync
-    # prewarm from what the GA actually searches.
-    _senate_opt = _EXPERT_OPT["FMPSenateTraderWeight"]
-    _senate_hold_floor_days = float(_senate_opt["expert_params"]["min_trader_avg_hold_days"]["min"])
-    _senate_hold_min_roundtrips = int(_senate_opt["fixed_settings"]["min_trader_hold_roundtrips"])
-
-    def _ensure_senate_expert():
-        nonlocal _senate_expert
-        if _senate_expert is None:
-            import logging as _lg
-            from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
-            with _senate_lock:
-                if _senate_expert is None:
-                    s = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
-                    s._api_key = key
-                    s.logger = _lg.getLogger("senate-prewarm")
-                    _senate_expert = s
-        return _senate_expert
-
-    def _warm_new_traders(s, trades) -> None:
-        """Discover new (not-yet-seen) traders from ``trades`` and warm their full disclosure
-        history + skill-relevant buy-symbol price history. Shared by ``_do_senate`` (traders
-        discovered via the per-symbol ``-trades`` endpoint) and ``_do_senate_latest`` (traders
-        discovered via the unscoped ``-latest`` endpoint) -- a trader who only shows up in the
-        unscoped feed (e.g. one whose per-symbol history was never queried because none of
-        THIS run's universe symbols happen to trigger it) still needs their
-        ``congress_trader_history`` cache entry warmed, or ``_gather_all``'s Stage 2 hits a
-        hermetic ``FMPHistoryCacheMiss`` for them mid-backtest (found empirically running
-        senate_profile_basket_verify.py after the ``_do_senate_latest`` fix alone: the unscoped
-        feed surfaces traders like "Debbie Wasserman Schultz" that the per-symbol loop over a
-        498-symbol universe never happened to discover)."""
-        new_traders = []
-        with _senate_lock:
-            for trade in trades:
-                name = s._trader_name(trade)
-                if name and name not in _senate_seen_traders:
-                    _senate_seen_traders.add(name)
-                    new_traders.append(name)
-        # Skill scoring (2026-07 upgrade) reads the price history of every symbol in each
-        # trader's scored past BUYS. Warm ALL unique buy symbols — not just the most-recent-N
-        # as of today — because at an early backtest as_of (e.g. 2022) the scorer's "most
-        # recent completed buys" are OLDER trades whose symbols a today-anchored cap would
-        # miss, hard-failing the hermetic run (FMPHistoryCacheMiss). Symbols FMP has no data
-        # for (delisted/bonds) persist as the [] sentinel, which the scorer skips cleanly.
-        for name in new_traders:
-            history = s._fetch_trader_history(name) or []  # warms congress_trader_history (once)
-            # Scalper skip: a trader excluded by even the grid's gentlest filter setting
-            # contributes to NO GA trial's signal, so their (potentially thousands of)
-            # buy-symbols are dead weight — skip the price-history warm entirely for them.
-            hold_info = s._calculate_trader_avg_hold_days(history)
-            if (hold_info["avg_hold_days"] is not None
-                    and hold_info["roundtrips"] >= _senate_hold_min_roundtrips
-                    and hold_info["avg_hold_days"] < _senate_hold_floor_days):
-                continue
-            new_skill_syms = []
-            with _senate_lock:
-                for t in history:
-                    ttype = str(t.get('type', '')).lower()
-                    if 'purchase' not in ttype and 'buy' not in ttype:
-                        continue
-                    ssym = str(t.get('symbol', '')).upper()
-                    if ssym and ssym not in _senate_warmed_skill_syms:
-                        _senate_warmed_skill_syms.add(ssym)
-                        new_skill_syms.append(ssym)
-            for ssym in new_skill_syms:
-                s._get_price_at_date(ssym, end_date)  # warms historical_price_full (once, ever)
-
-    def _do_senate(sym: str) -> None:
-        s = _ensure_senate_expert()
-        trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
-        s._get_price_at_date(sym, end_date)  # warms historical_price_full (full history, once)
-        _warm_new_traders(s, trades)
+    try:
+        fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
+                                   finnhub_key=keys["finnhub"],
+                                   log=lambda msg: print(msg, flush=True))
+    except PrewarmConfigError as e:
+        print(f"ba2-test prewarm: {e}")
+        return 1
 
     def _do_senate_scores(start: datetime, end: datetime) -> None:
         """Proactively compute FMPSenateTraderWeight's trader-SKILL cache
@@ -486,9 +333,9 @@ def _cmd_prewarm(args) -> int:
         reachable through real trade-qualification logic in ``_calculate_recommendation`` — a
         far bigger, non-grid-shaped key space that doesn't fit this same day x combo loop.
         """
-        if _senate_expert is None or not _senate_seen_traders:
+        if fetchers.senate_expert is None or not fetchers.senate_seen_traders:
             return
-        s = _senate_expert
+        s = fetchers.senate_expert
         from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
         min_past = int(FMPSenateTraderWeight._setting_or_default(None, "skill_min_past_trades"))
         max_past = int(FMPSenateTraderWeight._setting_or_default(None, "skill_max_past_trades"))
@@ -524,14 +371,15 @@ def _cmd_prewarm(args) -> int:
         from ba2_experts.FMPSenateTraderWeight import set_scoring_cache_max
         set_scoring_cache_max(len(horizon_values) * len(lookback_values))
 
-        total = len(days) * len(horizon_values) * len(lookback_values) * len(_senate_seen_traders)
+        total = (len(days) * len(horizon_values) * len(lookback_values)
+                 * len(fetchers.senate_seen_traders))
         print(f">> senate skill prewarm: {len(days)} trading days x {len(horizon_values)} horizons "
-              f"x {len(lookback_values)} lookbacks x {len(_senate_seen_traders)} traders "
+              f"x {len(lookback_values)} lookbacks x {len(fetchers.senate_seen_traders)} traders "
               f"({total} score computations)", flush=True)
         done_scores = 0
         t_scores = time.time()
         from ba2_experts.FMPSenateTraderWeight import _parse_ymd_utc as _parse_disc_date
-        for trader_idx, name in enumerate(_senate_seen_traders, start=1):
+        for trader_idx, name in enumerate(fetchers.senate_seen_traders, start=1):
             history = s._fetch_trader_history(name) or []
             # CRITICAL: slice the history to disclosures known as-of EACH day, exactly like
             # _gather does (FMPSenateTraderWeight.py, "Stage 2": ``[h for h in history if
@@ -560,7 +408,7 @@ def _cmd_prewarm(args) -> int:
                             lookback_months=lookback, is_live=False)
                         done_scores += 1
             if trader_idx % 25 == 0:
-                print(f"   senate skill prewarm: {trader_idx}/{len(_senate_seen_traders)} traders, "
+                print(f"   senate skill prewarm: {trader_idx}/{len(fetchers.senate_seen_traders)} traders, "
                       f"{done_scores}/{total} scores ({time.time() - t_scores:.0f}s elapsed)", flush=True)
         # Flush EVERY shard this loop touched, each to its OWN path. The loops above walk
         # len(horizon_values) x len(lookback_values) skill shards, and scoring runs with
@@ -581,158 +429,57 @@ def _cmd_prewarm(args) -> int:
                   f"{expected_shards}. Shards were evicted before the flush and their scores are "
                   f"LOST. Re-run with BA2_SCORING_LRU_MAX={expected_shards} or higher.", flush=True)
 
-    def _do_senate_latest() -> None:
-        """Warm the UNSCOPED 'latest disclosures' cache entries (``congress_senate_latest/
-        ALL_FULL_HISTORY``, ``congress_house_latest/ALL_FULL_HISTORY``) that
-        FMPSenateTraderWeight's basket-mode ``_gather_all`` (``analyzes_as_basket = True``,
-        senate-basket-dispatch plan Task 5) reads via ``_fetch_senate_trades(symbol=None,
-        full_history=True)``/``_fetch_house_trades(symbol=None, full_history=True)`` -- a
-        DIFFERENT disk-cache namespace from the per-symbol ``congress_senate_trades__<SYM>``/
-        ``congress_house_trades__<SYM>`` entries ``_do_senate`` above warms (those are keyed per
-        symbol; this is keyed by the fixed name ``"ALL_FULL_HISTORY"``, see
-        ``_fetch_congress_trades`` in ``expert_mixins.py``).
+    # The freeze gate, the worker-thread initializer, the empty-result sentinel, the per-symbol
+    # error handling and the one-shot senate warm all live in run_prewarm, shared with the API
+    # handler — the handler had a subtly different (broken) copy of exactly that block until
+    # 2026-09-11. This command contributes argument parsing and the printout below, nothing else.
+    # DeterministicScorer's macro series are economy-wide, so they are refreshed ONCE here
+    # rather than entering the per-symbol work list. Through the shared module, not a local
+    # copy: this command warmed no macro series at all while the only implementation lived
+    # inside the API handler, so `ba2-test prewarm --experts DeterministicScorer` produced a
+    # cache a hermetic DS trial still aborted on (fred_series.get_series_as_of RAISES on a
+    # missing file).
+    fred_summary = None
+    if "DeterministicScorer" in experts:
+        fred_summary = prewarm_fred(args.fred_max_age_hours,
+                                    log=lambda msg: print(msg, flush=True))
+        print(f">> FRED macro series: {fred_summary}", flush=True)
 
-        Nothing warmed this before Task 5 added the basket dispatch path: the per-symbol prewarm
-        loop above only ever calls ``_fetch_senate_trades(sym)``/``_fetch_house_trades(sym)`` with
-        a real symbol, never ``symbol=None``. A real hermetic backtest of basket-mode
-        FMPSenateTraderWeight therefore failed immediately with ``FMPHistoryCacheMiss`` on every
-        bar ("congress_senate_latest/ALL_FULL_HISTORY not pre-warmed") until this was added.
+    try:
+        summary = run_prewarm(fetchers, experts, symbols, args.workers, end=end_date)
+    except PrewarmConfigError as e:
+        # A configuration gap, not a data gap: it would repeat for every remaining symbol.
+        print(f"!! ba2-test prewarm aborted: {e}")
+        return 1
 
-        DEEP PAGINATION (not the original page-0-only fetch): confirmed empirically 2026-07-18
-        that the original single-page fetch (``full_history=False``, ~4 months of disclosures)
-        left basket-mode FMPSenateTraderWeight scoring ``trades=0, fitness=-1e9`` for EVERY
-        individual across a full 2023-2026 GA matrix grid -- the unscoped fetch simply didn't
-        reach back far enough for the backtest to ever see a trade. ``full_history=True`` here
-        paginates the ``{chamber}-latest`` feed to its end (verified in
-        ``build_senate_universe.py`` to reach back to ~2012/2019 for senate/house respectively)
-        instead of a single page, and writes to the SEPARATE ``"ALL_FULL_HISTORY"`` cache key so
-        a shallow-cached "ALL" entry from before this fix (or from some other still-shallow
-        caller, e.g. FMPSenateTraderCopy's live path) can never silently satisfy this deep read
-        -- see ``_fetch_congress_trades``'s "Pagination-depth design" docstring for the full
-        reasoning. One (slower, multi-page) fetch each -- still independent of any universe
-        symbol, so it runs once regardless of how many symbols are being pre-warmed.
-
-        Also warms every trader DISCOVERED via this unscoped feed through the same
-        ``_warm_new_traders`` path ``_do_senate`` uses -- the unscoped feed's trader set does
-        NOT equal the per-symbol loop's trader set (a trader can appear in the disclosures
-        without ever being surfaced by any of THIS run's universe symbols' own per-symbol
-        ``-trades`` history), so skipping this would leave ``_gather_all``'s Stage 2 hitting a
-        hermetic miss on those traders mid-backtest.
-        """
-        s = _ensure_senate_expert()
-        print(">> senate: warming unscoped 'latest disclosures' feed (congress_senate_latest/"
-              "congress_house_latest, ALL_FULL_HISTORY, full pagination)...", flush=True)
-        senate_latest = s._fetch_senate_trades(symbol=None, full_history=True) or []
-        house_latest = s._fetch_house_trades(symbol=None, full_history=True) or []
-        print(f"   senate: {len(senate_latest)} senate + {len(house_latest)} house rows "
-              f"fetched (full pagination)", flush=True)
-        _warm_new_traders(s, senate_latest + house_latest)
-
-    # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the
-    # Finnhub key + a logger (all _fetch_recommendation_trends needs).
-    _finnhub_expert = None
-
-    def _do_finnhub(sym: str) -> None:
-        nonlocal _finnhub_expert
-        if _finnhub_expert is None:
-            if not finnhub_key:
-                sys.exit("ba2-test prewarm: finnhub_api_key not configured (set FINNHUB_API_KEY or "
-                         "the app-setting) — required to warm FinnHubRating.")
-            import logging as _lg
-            from ba2_experts.FinnHubRating import FinnHubRating
-            e = FinnHubRating.__new__(FinnHubRating)
-            e._api_key = finnhub_key
-            e.logger = _lg.getLogger("finnhub-prewarm")
-            _finnhub_expert = e
-        _finnhub_expert._fetch_recommendation_trends(sym)
-
-    _EXPERT_FETCHERS = {
-        "FMPRating": _do_fmprating,
-        "FMPEarningsDrift": _do_earnings_drift,
-        "FMPInsiderClusterBuy": _do_insider,
-        "FactorRanker": _do_factorranker,
-        "FMPSenateTraderWeight": _do_senate,
-        "FinnHubRating": _do_finnhub,
-        "DeterministicScorer": _do_deterministic_scorer,
-    }
-
-    work = []  # list of (expert, symbol, fetch_callable)
-    for expert in experts:
-        fetcher = _EXPERT_FETCHERS.get(expert)
-        if fetcher is None:
-            print(f">> skipping unknown expert '{expert}' (no disk-cached history fetcher)")
-            continue
-        for sym in symbols:
-            work.append((expert, sym, fetcher))
-
-    if not work:
-        print("ba2-test prewarm: no disk-cached experts to pre-warm; nothing to do.")
-        return 0
-
-    counts = {}  # expert -> number of symbols successfully cached
-    errors = 0
-    t0 = time.time()
-    # The freeze gate engages the BACKTEST-ONLY disk cache (live would pass through).
-    # persist_empty_sentinel(): a symbol FMP genuinely has no data for is cached as ``[]`` so it
-    # reads back as "checked, no data" (not the fatal "not pre-warmed" of an absent file).
-    #
-    # CRITICAL: frozen_ttl_cache()/set_ttl_frozen() set a THREAD-LOCAL flag (by design — a live
-    # backtest thread must never see a sibling thread's freeze state). threading.local() does
-    # NOT propagate into a ThreadPoolExecutor's worker threads, so entering frozen_ttl_cache()
-    # only in this (main) thread left every submitted fn() running UN-frozen: real network
-    # fetches happened but fmp_history_disk_cached() took the "live: never persist" branch on
-    # every call — a prewarm run could burn the full FMP rate-limit budget and write ZERO cache
-    # files. The initializer runs ONCE per worker thread (before it processes any task) and sets
-    # the SAME thread-local flag from inside that thread, so every task the pool ever runs on it
-    # sees frozen=True. persist_empty_sentinel's flag is a plain module global (not thread-local)
-    # so it already applied to worker threads correctly — only ttl_frozen needed this.
-    with frozen_ttl_cache(), persist_empty_sentinel():
-        with ThreadPoolExecutor(max_workers=max(1, args.workers),
-                                initializer=set_ttl_frozen, initargs=(True,)) as ex:
-            futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
-            for fut in as_completed(futures):
-                expert, sym = futures[fut]
-                try:
-                    fut.result()
-                    counts[expert] = counts.get(expert, 0) + 1
-                except Exception as e:  # noqa: BLE001 — one bad symbol must not abort
-                    errors += 1
-                    print(f"!! prewarm {expert}/{sym} failed: {e}")
-
-        # Unscoped "latest disclosures" warm (basket-mode _gather_all's congress_senate_latest/
-        # congress_house_latest, "ALL_FULL_HISTORY" key, deep-paginated) -- independent of any
-        # universe symbol, so it runs once regardless of order relative to the per-symbol loop
-        # above; placed here (serially, still inside the freeze gate) alongside the other
-        # one-shot senate prewarm steps below.
-        #
-        # FMPSenateTraderCopy also needs this now (review 2026-07-18, finding H2):
-        # basket-mode Copy's _gather was fixed to fetch full_history=True too (same
-        # ALL_FULL_HISTORY cache key Weight reads), so a hermetic backtest/GA run including
-        # Copy without Weight in the same run must warm it too, or it hits a cache miss on
-        # the first bar.
-        if "FMPSenateTraderWeight" in experts or "FMPSenateTraderCopy" in experts:
-            _do_senate_latest()
-
-        # Skill-score prewarm runs AFTER the per-symbol loop above (needs its fully-populated
-        # _senate_seen_traders), and serially (not thread-pooled — it's CPU-bound in-memory work
-        # over already-warmed price history, not network fetches). Still inside the freeze gate:
-        # a trader-history/price cache miss here would otherwise fall through to the "live: never
-        # persist" branch same as the per-symbol fetchers above.
-        if "FMPSenateTraderWeight" in experts:
-            if start_date is not None:
+    # Skill-score prewarm runs AFTER run_prewarm (it needs the fully-populated
+    # fetchers.senate_seen_traders), and serially — it is CPU-bound in-memory work over
+    # already-warmed price history, not network fetches. Its OWN freeze gate: a trader-history /
+    # price cache miss here would otherwise fall through to the "live: never persist" branch.
+    # Weight-only (not SENATE_EXPERTS): FMPSenateTraderCopy has no trader-skill scoring.
+    if "FMPSenateTraderWeight" in experts:
+        if start_date is not None:
+            with frozen_ttl_cache(), persist_empty_sentinel():
                 _do_senate_scores(start_date, end_date)
-            else:
-                print("!! senate skill prewarm skipped: pass --start to prewarm trader-skill scores "
-                      "for the full backtest date range (otherwise they're computed lazily per-trial, "
-                      "which under-covers a multi-year grid — see _do_senate_scores docstring).")
-    elapsed = time.time() - t0
+            summary["senate_skill_scores"] = True
+            summary["notes"] = [n for n in summary["notes"] if "trader-skill" not in n]
+        else:
+            print("!! senate skill prewarm skipped: pass --start to prewarm trader-skill scores "
+                  "for the full backtest date range (otherwise they're computed lazily per-trial, "
+                  "which under-covers a multi-year grid — see _do_senate_scores docstring).")
+
+    summary["fred"] = fred_summary
 
     print("\n>> pre-warm summary")
     for expert in experts:
-        print(f"   {expert}: {counts.get(expert, 0)}/{len(symbols)} symbols cached")
-    print(f"   errors: {errors}")
-    print(f"   elapsed: {elapsed:.1f}s")
+        print(f"   {expert}: {summary['cached'].get(expert, 0)}/{len(symbols)} symbols cached")
+    print(f"   errors: {summary['errors']}")
+    print(f"   elapsed: {summary['elapsed_seconds']:.1f}s")
     print(f"   cache dir: {_fmp_history_cache_dir()}")
+    if fred_summary is not None:
+        print(f"   fred: {fred_summary}")
+    for note in summary["notes"]:
+        print(f"   note: {note}")
     # FactorRanker's momentum/value factors read the 1d OHLCV PARQUET cache (separate from the
     # fmp_history JSON cache warmed above). This prewarm only warmed ~400d of 1d bars ending at
     # end_date; a multi-bar backtest rebalances across [start, end] and needs ~400d ending at EACH
@@ -920,6 +667,222 @@ def _cmd_cache_clear(args) -> int:
     return 0
 
 
+#: How much history ``replay warm-plan`` asks for beyond an adapter's own lookback.
+#: Mirrors the live host's ``warm_service.WARM_WINDOW_DAYS`` so a CLI plan and a host
+#: plan over the same session agree on what is required.
+_WARM_PLAN_WINDOW_DAYS = 730
+#: Marks the child process ``replay warm`` re-executes with CACHE_FOLDER set.
+_WARM_CHILD_ENV = "BA2_WARM_CHILD"
+#: Longest a CLI warm waits for its queue to drain before reporting and stopping.
+_WARM_JOIN_TIMEOUT_S = 3600.0
+
+
+# --- replay (offline replay of a recorded live session) --------------------------------
+def _cmd_replay(args) -> int:
+    """``inventory`` / ``experts`` / ``gather`` / ``historical`` over one bundle.
+
+    Everything runs offline: the services enter the replay isolation (hermetic
+    FMP, a closed socket layer, refusing instance/provider resolvers) and read
+    only the bundle. Nothing here opens the trading database.
+
+    ``historical`` additionally reads a PINNED cache root, and does so in a child
+    process with ``CACHE_FOLDER`` set before import -- the only way every cache
+    reader points at the same root (see ``app.services.replay.historical``).
+    """
+    if args.replay_cmd == "warm":
+        return _cmd_replay_warm(args)
+
+    from app.services.replay import expert_replay, gather_tape, inventory
+
+    bundle = _caller_path(args.bundle)
+    if not os.path.isdir(bundle):
+        sys.exit(f"ba2-test: {bundle} is not a directory")
+    out = _caller_path(args.out) if getattr(args, "out", None) else None
+
+    if args.replay_cmd == "warm-plan":
+        return _cmd_replay_warm_plan(args, bundle, out)
+
+    if args.replay_cmd == "inventory":
+        counted = inventory.run(bundle, out)
+        print(inventory.to_markdown(counted))
+        if out:
+            print(f"-- wrote {os.path.join(out, inventory.INVENTORY_NAME)}")
+        return 0
+
+    from ba2_common.core.replay import ReplayStatus
+
+    if args.replay_cmd == "historical":
+        from app.services.replay import historical
+
+        cache_root = _caller_path(args.cache_root)
+        if not os.path.isdir(cache_root):
+            sys.exit(f"ba2-test: {cache_root} is not a directory")
+        report = historical.run(bundle, cache_root, out, timeout=args.timeout)
+    else:
+        module = expert_replay if args.replay_cmd == "experts" else gather_tape
+        report = module.run(bundle, out)
+    print(report.to_markdown())
+    if out:
+        print(f"-- wrote {os.path.join(out, report.capability + '.md')}")
+    # A DIFFERENCE is a finding: something reproduced differently, which is what
+    # this command exists to surface, so it exits non-zero and a CI step can gate
+    # on it. A missing_capture / missing_history / revision_unknown is not a
+    # finding about the calculation -- it says the session or the cache root
+    # cannot answer for that analysis -- so it does not fail the run; the report
+    # and `replay inventory` are where coverage is read.
+    #
+    # For `historical` a non-zero exit means "read the diffs", NOT "this is a
+    # defect": spec section 8 is explicit that a historical comparison "does not
+    # assume zero difference is always attainable", and an endpoint/vintage
+    # difference is expected evidence. Gate a CI step on it only where the pinned
+    # root is meant to reproduce the session exactly.
+    return 0 if report.counts()[ReplayStatus.COVERAGE_DIFFERENCE] == 0 else 1
+
+
+def _cmd_replay_warm_plan(args, bundle: str, out) -> int:
+    """What the analyses in a bundle need that ``--cache-root`` does not already hold.
+
+    NO NETWORK, by construction: the resolver maps settings to typed requirements and
+    the planner only stats and reads files. This is lifecycle step 1 ("plan without
+    network") and the thing an operator reviews before any bandwidth is spent.
+
+    The roots are inspected READ-ONLY, so pointing this at the production cache is
+    safe; ``replay warm`` is the only command that writes, and only into the plan's
+    first root.
+    """
+    from datetime import timezone as _tz
+
+    from ba2_common.core.replay import load_bundle
+    from ba2_common.core.replay.dependencies import (
+        MissingDependencySetting, Window, required_replay_inputs,
+    )
+    import ba2_experts.replay_dependencies  # noqa: F401 - registers the per-expert adapters
+    from ba2_providers.warm import planner
+
+    roots = [_caller_path(r) for r in args.cache_root]
+    if args.as_of_now:
+        as_of_now = datetime.fromisoformat(args.as_of_now)
+        if as_of_now.tzinfo is None:
+            as_of_now = as_of_now.replace(tzinfo=_tz.utc)
+    else:
+        as_of_now = datetime.now(_tz.utc)
+
+    session = load_bundle(bundle)
+    window = Window(start=as_of_now - timedelta(days=_WARM_PLAN_WINDOW_DAYS), end=as_of_now)
+    groups = {}
+    for record in session.analyses:
+        if record.settings_object is None:
+            print(f"!! {record.analysis_id} ({record.expert_class}) recorded no settings; "
+                  f"its dependencies cannot be resolved")
+            continue
+        key = (record.expert_class, record.settings_object)
+        group = groups.setdefault(
+            key, {"settings": session.decode(record.settings_object), "symbols": set()})
+        if record.symbol:
+            group["symbols"].add(record.symbol)
+
+    requirements = []
+    for (expert_class, _hash), group in sorted(groups.items()):
+        try:
+            # The RULES are not in the bundle (they are not an expert input), so a CLI plan
+            # covers the expert's own declarations only. The rule/RM extras (ATR, earnings,
+            # cooldown) come from the live host, which can read the instance's ruleset.
+            requirements.extend(required_replay_inputs(
+                expert_class, group["settings"], None, sorted(group["symbols"]), window))
+        except MissingDependencySetting as e:
+            print(f"!! cannot resolve {expert_class}: {e}")
+
+    plan = planner.plan(requirements, roots, as_of_now=as_of_now)
+    print(plan.to_markdown())
+    if out:
+        os.makedirs(out, exist_ok=True)
+        path = os.path.join(out, "warm_plan.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(plan.to_json())
+        print(f"-- wrote {path}")
+    else:
+        print(plan.to_json())
+    return 0
+
+
+def _cmd_replay_warm(args) -> int:
+    """Execute a warm plan: download only what it lists as missing or stale.
+
+    THE CACHE ROOT IS SET BEFORE IMPORT, IN A CHILD PROCESS. ``ba2_common.config``,
+    ``native_cache`` and ``fred_series`` all read ``CACHE_FOLDER`` at IMPORT time, so a
+    warm into an isolated root cannot be arranged by assigning to a module attribute
+    afterwards -- half the writers would still target the ambient cache. The child is
+    this same launcher with ``CACHE_FOLDER`` in its environment (the pattern
+    ``ba2_common.core.replay._spawn_child`` documents), and it verifies on entry that
+    the root it imported with is the one the plan names.
+    """
+    import subprocess
+
+    from ba2_providers.warm import planner
+
+    plan_path = _caller_path(args.plan)
+    with open(plan_path, "r", encoding="utf-8") as fh:
+        plan = planner.WarmPlan.from_json(fh.read())
+    if not plan.roots:
+        sys.exit("ba2-test replay warm: the plan names no cache root to write into")
+    root = os.path.abspath(plan.roots[0])
+
+    if os.environ.get(_WARM_CHILD_ENV) != "1":
+        env = dict(os.environ)
+        env["CACHE_FOLDER"] = root
+        env[_WARM_CHILD_ENV] = "1"
+        print(f">> warming into {root} (child process; CACHE_FOLDER set before import)")
+        # IN THE DIRECTORY THE USER RAN FROM, not this process's cwd. ``_enter_backend``
+        # has chdir'd into backend/ by now, and the child re-reads the SAME argv: its own
+        # ``_CALLER_CWD`` is whatever it starts in, so spawning it here made
+        # ``--plan plan.json`` resolve against the backend -- a file the user never named.
+        return subprocess.call([sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                               env=env, cwd=_CALLER_CWD)
+
+    import ba2_common.config as _cfg
+    if os.path.abspath(_cfg.CACHE_FOLDER) != root:
+        sys.exit(f"ba2-test replay warm: this process imported CACHE_FOLDER="
+                 f"{_cfg.CACHE_FOLDER}, but the plan writes into {root}; refusing to warm a "
+                 f"root half the cache readers do not point at")
+
+    from ba2_common.core.warm.budget import unknown_reserve_for
+    from ba2_experts.warm_fetchers import DefaultWarmFetcher
+    from ba2_providers.warm.seams import new_warm_budget, new_warm_queue
+    from app.services.prewarm_fetchers import resolve_fred_key, resolve_keys
+    import ba2_experts.replay_dependencies  # noqa: F401 - registers the per-expert adapters
+
+    keys = resolve_keys()
+    budget = new_warm_budget(allowance_bytes=int(args.allowance_mib * 1024 * 1024),
+                             unknown_reserve_bytes=unknown_reserve_for(plan))
+    queue = new_warm_queue(
+        workers=args.workers, budget=budget,
+        fetcher=DefaultWarmFetcher(
+            # A timeseries requirement names its OWN provider; this is only the
+            # indicator stack's, for an ATR whose underlying series has no provider of
+            # its own in the requirement.
+            indicator_ohlcv_provider=args.indicator_ohlcv_provider,
+            # The PLAN's instant, deliberately fixed: this command executes one
+            # reviewed plan, and a window that moved while it ran would ask for
+            # something the plan did not price. (The live host passes "now" instead.)
+            end_date_provider=lambda: datetime.fromisoformat(plan.created_at),
+            fmp_key=keys["fmp"], fred_key=resolve_fred_key()))
+    queue.start()
+    try:
+        enqueued = queue.submit_plan(plan)
+        print(f">> {len(enqueued)} requirement(s) enqueued; "
+              f"{len(plan.entries) - len(enqueued)} already satisfied")
+        if not queue.join(timeout=_WARM_JOIN_TIMEOUT_S):
+            print(f"!! warm still running after {_WARM_JOIN_TIMEOUT_S}s; stopping. "
+                  f"Re-plan and re-run to continue.")
+    finally:
+        queue.stop(timeout=10.0)
+    stats = queue.stats()
+    print(json.dumps(stats, indent=2, default=str))
+    # A pause is a FINDING (the allowance ran out, or the provider rate-limited), so it
+    # exits non-zero and a script can react; a per-symbol data gap is not.
+    return 1 if stats["paused"] else 0
+
+
 # --- backtest run tracking (the shared `backtests` results table) ----------------------
 def _runs_db():
     # Ensure the results schema exists so `runs`/`--track` work even before the API's
@@ -1056,6 +1019,27 @@ def _daily_manage_schedule() -> dict:
     return {"days": days, "times": ["09:30"]}
 
 
+#: Two toggles that NEVER took effect in any run to date, pinned OFF so they still don't.
+#:
+#: Both are bool-declared, and the GA hands its genes over as integers -- which save_settings
+#: stored as the JSON string "1", which the reader did not recognise as true (see
+#: ba2_common.core.interfaces.ExtendableSettingsInterface.coerce_bool). So every historical run,
+#: whatever its genome said, ran with the ATR stop-leg disabled and the regime overlay off.
+#:
+#: Fixing the encoding means these genes would START working -- silently turning the whole grid
+#: into a different experiment, and making new results incomparable with every result on record.
+#: Pinning them here keeps the change to what it should be: a bug fix, not a redesign.
+#:
+#: ``use_atr_stop`` MUST be pinned rather than merely dropped from the search: it DECLARES
+#: default True, so removing it from the space alone would flip it on -- the exact opposite of
+#: the historical behaviour being preserved.
+#:
+#: To test them deliberately, pass them through ``overrides`` (they win over this floor) in a
+#: run named so it cannot be confused with the pinned-off baseline. That is the experiment; this
+#: is the control.
+_INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
+
+
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
@@ -1083,6 +1067,8 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
     """
     settings = dict(spec["fixed_settings"])
+    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY. See _INERT_RM_TOGGLES.
+    settings.update(_INERT_RM_TOGGLES)
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
     if spec.get("risk_manager_mode"):
@@ -1379,17 +1365,22 @@ _EXPERT_OPT = {
             # the live-discovered case of a member of Congress with 12,958 disclosed trades,
             # functionally a day-trader rather than a conviction-position insider signal.
             # DELIBERATELY floored > 0 (never "disabled") — the senate prewarm skips
-            # skill-symbol warming for any trader who fails the GRID'S OWN MINIMUM here
-            # (see _SENATE_SCALPER_FLOOR_DAYS below): a 0-floor would make that prewarm
-            # optimization unsound, since a trial with the filter off would need symbols
-            # prewarm never fetched -> FMPHistoryCacheMiss mid-run.
-            "min_trader_avg_hold_days": {"optimize": True, "min": 1.0, "max": 15.0, "step": 2.0, "type": "float"},
+            # skill-symbol warming for any trader who fails the GRID'S OWN MINIMUM here: a
+            # 0-floor would make that prewarm optimization unsound, since a trial with the
+            # filter off would need symbols prewarm never fetched -> FMPHistoryCacheMiss
+            # mid-run. The floor is SENATE_SCALPER_BOUNDS in the shared prewarm module — ONE
+            # source, so the grid bound and the prewarm skip cannot desync.
+            "min_trader_avg_hold_days": {"optimize": True,
+                                         "min": SENATE_SCALPER_BOUNDS["hold_floor_days"],
+                                         "max": 15.0, "step": 2.0, "type": "float"},
         },
         # min_trader_hold_roundtrips is intentionally FIXED (not GA-optimized): letting it vary
-        # too would require reconciling two grid bounds for the prewarm-skip safety check below
+        # too would require reconciling two grid bounds for the prewarm-skip safety check
         # instead of one. 3 round-trips is enough to distinguish "genuine scalper" from "a
-        # trader who happened to flip one position quickly."
-        "fixed_settings": {"sizing_mode": "risk_atr", "min_trader_hold_roundtrips": 3},
+        # trader who happened to flip one position quickly." Same single source as the floor.
+        "fixed_settings": {"sizing_mode": "risk_atr",
+                           "min_trader_hold_roundtrips":
+                               SENATE_SCALPER_BOUNDS["hold_min_roundtrips"]},
     },
     # FactorRanker is a BYPASS expert: it ignores enter/exit rulesets and the classic RM, and
     # rebalances a portfolio by factor score. So its optimization searches ONLY the factor-model
@@ -1440,7 +1431,11 @@ _EXPERT_OPT = {
 # and the GA can otherwise only pick one compromise TP%. See
 # docs/plans/2026-08-04-regime-overlay-and-car-drawdown-design.md.
 _REGIME_OPT = {
-    "regime_overlay_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    # PINNED OFF, not searched -- see _INERT_RM_TOGGLES. Leaving it in the space would let a
+    # decoded gene overwrite the pin, which is the whole thing being prevented. The three
+    # scales below stay in the space: with the overlay off they are inert and drift exactly as
+    # they did in every run on record, so the search space keeps its historical shape.
+    "regime_overlay_enabled": {"optimize": False, "min": 0, "max": 1, "step": 1, "type": "int"},
     "regime_risk_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
     "regime_stop_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
     "regime_tp_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
@@ -1458,7 +1453,8 @@ _RM_OPT = {
     "atr_multiplier": {"optimize": True, "min": 3.0, "max": 6.0, "step": 0.5, "type": "float"},
     "atr_period": {"optimize": True, "min": 7, "max": 28, "step": 7, "type": "int"},
     "min_stop_loss_pct": {"optimize": True, "min": 3.0, "max": 15.0, "step": 1.0, "type": "float"},
-    "use_atr_stop": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    # PINNED OFF, not searched -- see _INERT_RM_TOGGLES.
+    "use_atr_stop": {"optimize": False, "min": 0, "max": 1, "step": 1, "type": "int"},
     "max_virtual_equity_per_instrument_percent": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
     **_REGIME_OPT,
 }
@@ -5865,7 +5861,26 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             # /run-trial-full path and the no-re-run (final-generation) rows identically.
             try:
                 from app.services.strategy_fitness import compute_fitness as _cf
-                _cf(opt.fitness_metric, out["results"])
+                from app.services.strategy_optimization_handler import rerun_fitness_divergence
+                _rerun_fit = _cf(opt.fitness_metric, out["results"])
+                # FIDELITY GATE. This row was chosen for `ga_fitness`; it is being saved with the
+                # metrics of a run performed LATER, from a config rebuilt out of the stored
+                # optimization_config with the screener hoisted state re-derived. If those two
+                # scores disagree, the row is not the strategy that earned its rank -- and a row
+                # that reads as finished, with plausible numbers, is exactly what somebody
+                # deploys. Say so on the row and in the log rather than persisting it silently.
+                _div = rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit)
+                if _div is not None:
+                    _pct = "n/a" if _div["pct"] is None else f"{_div['pct']:+.1f}%"
+                    print(f"    !! TOP{rank} RE-RUN DIVERGED from its GA score: "
+                          f"ga={_div['ga_fitness']:.6g} rerun={_div['rerun_fitness']:.6g} "
+                          f"({_pct}). This row is NOT the strategy that earned that rank -- "
+                          f"the stored optimization_config or the re-derived screener state has "
+                          f"moved since the run. Re-verify before deploying it.")
+                    # Onto the row: _persist_results copies non-curve keys into bt.results, so
+                    # the warning survives the log and travels with the Backtest.
+                    out["results"]["rerun_fitness"] = _div["rerun_fitness"]
+                    out["results"]["ga_fitness_divergence"] = _div["delta"]
             except Exception as _e:  # noqa: BLE001 -- never lose a persisted row over telemetry
                 print(f"    TOP{rank} fitness annotation failed: {_e!r}")
             _persist_results(db, bt, out["results"])
@@ -6132,6 +6147,11 @@ def main(argv: "list | None" = None) -> int:
     # The two option READERS a run can be served by (backtest/options_store.py). Taken from the
     # seam rather than spelled out here so a third store cannot exist without the CLI offering it.
     from app.services.backtest.options_store import OPTIONS_STORES as _OPTIONS_STORES
+    from app.services.backtest.options_store import STORE_ALIASES as _STORE_ALIASES
+    # Superseded names ('parquet' -> 'tastytrade') stay ACCEPTED on the CLI: every archived
+    # optimization_config, the older drivers and the runbooks say 'parquet', and
+    # _apply_options_store resolves the alias before it reaches the run.
+    _STORE_CHOICES = list(_OPTIONS_STORES) + sorted(_STORE_ALIASES)
 
     p = argparse.ArgumentParser(prog="ba2-test", description="BA2 Test Platform CLI.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -6161,10 +6181,9 @@ def main(argv: "list | None" = None) -> int:
                              "(ratings/earnings/insider) before the GA pool spawns.")
     pw.add_argument("--symbols", required=True, help="Comma-separated symbols, or @file.")
     pw.add_argument("--experts", default="FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy",
-                    help="Comma-separated experts to pre-warm. Supported: FMPRating, "
-                         "FMPEarningsDrift, FMPInsiderClusterBuy, FactorRanker, "
-                         "FMPSenateTraderWeight, FinnHubRating. Default: the 3 core rating/signal "
-                         "experts (pass the others explicitly).")
+                    help="Comma-separated experts to pre-warm. Supported (from the shared "
+                         f"fetcher table): {', '.join(EXPERT_NAMES)}. Default: the 3 core "
+                         "rating/signal experts (pass the others explicitly).")
     pw.add_argument("--workers", type=int, default=5, help="Parallel fetch threads (default 5).")
     pw.add_argument("--end", default=None,
                     help="ISO end date for the earnings/insider in-Python filter (default today).")
@@ -6173,6 +6192,10 @@ def main(argv: "list | None" = None) -> int:
                          "compute trader-skill scores for every trading day in [start, end] instead "
                          "of leaving them to lazy per-trial computation (see _do_senate_scores). "
                          "Ignored by the other experts.")
+    pw.add_argument("--fred-max-age-hours", type=float, default=24.0,
+                    help="Refresh a FRED macro series only when its cache file is older than "
+                         "this (default 24h, matching the API handler). Only consumed when "
+                         "DeterministicScorer is being warmed.")
 
     bm = sub.add_parser("build-screener-metrics", help="Build/extend the screener METRIC store (parquet).")
     bm.add_argument("--store", default=_DEFAULT_SCREENER_STORE_DIR,
@@ -6231,6 +6254,59 @@ def main(argv: "list | None" = None) -> int:
     cc.add_argument("--before", default=None, help="Only clear entries older than this ISO date.")
 
     sub.add_parser("cache-usage", help="Show cache disk usage per type.")
+
+    # replay: offline replay of an exported live-capture session (spec step 3).
+    rpl = sub.add_parser("replay", help="Offline replay of a recorded live session bundle.")
+    rplsub = rpl.add_subparsers(dest="replay_cmd", required=True)
+    rpi = rplsub.add_parser("inventory",
+                            help="What the session contains (counts, coverage, gaps).")
+    rpi.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpi.add_argument("--out", default=None, help="Write inventory.json/.md here.")
+    rpe = rplsub.add_parser("experts",
+                            help="Re-run _process on each recorded bundle and diff the result.")
+    rpe.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpe.add_argument("--out", default=None, help="Write the report here.")
+    rpg = rplsub.add_parser("gather",
+                            help="Re-run the live _gather against the recorded provider tape.")
+    rpg.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpg.add_argument("--out", default=None, help="Write the report here.")
+    rph = rplsub.add_parser(
+        "historical",
+        help="Re-run each recorded analysis through analyze_as_of against a PINNED cache "
+             "root and diff the inputs and the recommendation. Offline.")
+    rph.add_argument("--bundle", required=True, help="Exported session directory.")
+    rph.add_argument("--cache-root", required=True,
+                     help="The pinned cache root to reconstruct from (what `replay warm` "
+                          "filled). Read-only; a root with no pin manifest answers "
+                          "revision_unknown, because nothing recorded its revisions.")
+    rph.add_argument("--out", default=None, help="Write the report here.")
+    rph.add_argument("--timeout", type=float, default=None,
+                     help="Seconds the reconstruction child may take (default: scales with "
+                          "the number of analyses). A child that runs out of time still "
+                          "reports everything it committed; the rest name the timeout.")
+    rpw = rplsub.add_parser(
+        "warm-plan",
+        help="What a bundle's analyses need that a cache root does not hold. NO network.")
+    rpw.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpw.add_argument("--cache-root", required=True, action="append", dest="cache_root",
+                     help="Cache root to inspect READ-ONLY. Repeatable; the FIRST is the "
+                          "writable root a warm would fill, the rest are shared roots that "
+                          "can satisfy a requirement but are never written to.")
+    rpw.add_argument("--as-of-now", default=None,
+                     help="ISO instant to measure staleness against (default: now, UTC). Pass "
+                          "the session's own time to reproduce an earlier plan exactly.")
+    rpw.add_argument("--out", default=None, help="Write the plan JSON here.")
+    rpm = rplsub.add_parser(
+        "warm", help="Execute a warm plan: download only what it lists as missing or stale.")
+    rpm.add_argument("--plan", required=True, help="A plan JSON written by `replay warm-plan`.")
+    rpm.add_argument("--workers", type=int, default=2,
+                     help="Warm worker threads (default 2, the pilot value).")
+    rpm.add_argument("--allowance-mib", type=float, default=100.0,
+                     help="Daily download allowance in MiB (default 100, the pilot value).")
+    rpm.add_argument("--indicator-ohlcv-provider", default="yfinance",
+                     help="Registry name of the OHLCV provider the INDICATOR stack reads "
+                          "(default yfinance, the live host's wiring). Price-series "
+                          "requirements name their own provider and ignore this.")
 
     # runs: manage tracked backtest runs (the shared `backtests` results table).
     rp = sub.add_parser("runs", help="List / save / delete tracked backtest runs.")
@@ -6406,7 +6482,7 @@ def main(argv: "list | None" = None) -> int:
                          "selector hands the filler candidates it rejects, and the order just sits "
                          "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
                          "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
-    op.add_argument("--options-store", default=None, choices=list(_OPTIONS_STORES),
+    op.add_argument("--options-store", default=None, choices=_STORE_CHOICES,
                     help="WHICH option store the run reads, and therefore whose history floor "
                          "applies: 'sqlite' (default -- the Alpaca-built OptionsHistoryCache, "
                          "floor 2024-01-18, the store every recorded backtest number came from) "
@@ -6571,7 +6647,7 @@ def main(argv: "list | None" = None) -> int:
                          "selector hands the filler candidates it rejects, and the order just sits "
                          "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
                          "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
-    ob.add_argument("--options-store", default=None, choices=list(_OPTIONS_STORES),
+    ob.add_argument("--options-store", default=None, choices=_STORE_CHOICES,
                     help="WHICH option store every job in the batch reads: 'sqlite' (default, "
                          "Alpaca, floor 2024-01-18) or 'parquet' (TastyTrade/dxfeed, floor "
                          "2022-10-01, the only one holding 2023). Omitted -> "
@@ -6621,6 +6697,7 @@ def main(argv: "list | None" = None) -> int:
         "cache-usage": lambda: _cmd_cache_usage(args),
         "cache-clear": lambda: _cmd_cache_clear(args),
         "runs": lambda: _cmd_runs(args),
+        "replay": lambda: _cmd_replay(args),
         "report": lambda: _cmd_report(args),
         "optimize": lambda: _cmd_optimize(args),
         "optimize-batch": lambda: _cmd_optimize_batch(args),

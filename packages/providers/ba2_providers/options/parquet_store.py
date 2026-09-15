@@ -411,15 +411,33 @@ class OptionHistoryParquetStore:
                 out.append(exp)
         return sorted(out)
 
-    def read_underlying(self, underlying: str):
-        """Every partition for ``underlying`` concatenated, or None if there are none.
+    def partition_paths(self, underlying: str) -> List[str]:
+        """Every readable ``*_1d.parquet`` partition for ``underlying``, sorted.
+
+        Exactly the files ``read_underlying`` concatenates, exposed so that a caller can
+        IDENTIFY them without re-writing the glob. The per-host derived array cache
+        (``ba2_common.core.shared_arrays``) signs an underlying's arrays on the
+        ``(path, size, mtime)`` of their sources, and the only source list that cannot drift
+        away from what was actually read is the one the read itself uses.
 
         Globs only the exact ``*_1d.parquet`` name, so a leftover ``.tmp`` from a killed
-        write can never be read back as data.
+        write can never be read back as data — nor signed as if it were.
+        """
+        base = os.path.join(self.root, underlying.upper())
+        return sorted(glob.glob(os.path.join(base, "exp=*", f"*_{BARS_INTERVAL}.parquet")))
+
+    def read_underlying(self, underlying: str, parts: Optional[List[str]] = None):
+        """Every partition for ``underlying`` concatenated, or None if there are none.
+
+        ``parts`` reads EXACTLY the given partition paths instead of globbing for them. A
+        caller that has already enumerated the partitions — to sign them, as the derived array
+        cache does — must be able to read the very files it enumerated: the tree is written
+        concurrently with a warm-up, so a second glob can return a partition the first did not
+        see, and the arrays would then be published under a signature that does not describe
+        them. Passing the list makes the read and the identity the same set by construction.
         """
         import pandas as pd
-        base = os.path.join(self.root, underlying.upper())
-        parts = sorted(glob.glob(os.path.join(base, "exp=*", f"*_{BARS_INTERVAL}.parquet")))
+        parts = self.partition_paths(underlying) if parts is None else list(parts)
         if not parts:
             return None
         return pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)

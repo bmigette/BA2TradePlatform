@@ -45,20 +45,36 @@ def _read_source(filename: str) -> str:
 
 
 def _load_prompts_module():
-    """Load prompts.py directly without triggering full package init."""
+    """Load prompts.py directly without triggering full package init.
+
+    The logger mock is installed ONLY for the duration of the load and the previous
+    ``sys.modules`` bindings are put back. Left in place, the mock poisoned every
+    host module first imported later in the same pytest session (its
+    ``from ..logger import logger`` bound a MagicMock), which is how
+    ``tests/test_warm_service_host.py`` lost its ERROR records in full runs.
+    """
     mock_logger = MagicMock()
+    _MISSING = object()
+    saved = {name: sys.modules.get(name, _MISSING)
+             for name in ("ba2_trade_platform", "ba2_trade_platform.logger")}
     for mod_name in ["ba2_trade_platform", "ba2_trade_platform.logger"]:
         if mod_name not in sys.modules:
             sys.modules[mod_name] = MagicMock()
     sys.modules["ba2_trade_platform.logger"] = MagicMock(logger=mock_logger)
-
-    spec = importlib.util.spec_from_file_location(
-        "penny_prompts", os.path.join(_BASE, "prompts.py")
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["penny_prompts"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "penny_prompts", os.path.join(_BASE, "prompts.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["penny_prompts"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for name, previous in saved.items():
+            if previous is _MISSING:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
 
 
 _prompts = _load_prompts_module()

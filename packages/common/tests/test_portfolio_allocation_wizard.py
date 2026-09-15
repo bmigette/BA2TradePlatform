@@ -1028,7 +1028,7 @@ def test_can_fill_remaining_symbol_weights_is_the_buttons_enabled_state():
 
 
 def test_can_fill_remaining_symbol_weights_ignores_float_dust_in_the_manual_total():
-    """7.64 + 83.57 + 8.79 is exactly 100 in decimal and 99.99999999999999 in binary,
+    """5.00 + 63.01 + 31.99 is exactly 100 in decimal and 99.99999999999999 in binary,
     so the raw remainder is 1.4e-14 -- positive, and therefore "something left to
     fill" to anything that does not round first.
 
@@ -1036,12 +1036,16 @@ def test_can_fill_remaining_symbol_weights_ignores_float_dust_in_the_manual_tota
     label offers an enabled Fill rest that can only write 0.00 into the empty box:
     a button that does nothing when pressed, which is the exact failure the
     disabled-not-hidden rule exists to avoid. Pinned with a set that genuinely
-    drifts -- 33.33 x 2 + 33.34 sums to 100.0 on the nose and proves nothing.
+    drifts UNDER ``sum`` -- 33.33 x 2 + 33.34 lands on 100.0 on the nose and proves
+    nothing, and so did the original 7.64 / 83.57 / 8.79, which drifts only under a
+    left-to-right add. That one failed on its own premise line rather than on the
+    behaviour it guards: the worst way for a pin to rot, because the guard stops
+    running and says nothing about the thing it was watching.
     """
-    assert sum([7.64, 83.57, 8.79]) != 100.0                       # the premise
+    assert sum([5.0, 63.01, 31.99]) != 100.0                       # the premise
     label = LabelTarget("A", 100.0, [
-        SymbolTarget("AAA", 7.64), SymbolTarget("BBB", 83.57),
-        SymbolTarget("CCC", 8.79), SymbolTarget("DDD", 0.0)])
+        SymbolTarget("AAA", 5.0), SymbolTarget("BBB", 63.01),
+        SymbolTarget("CCC", 31.99), SymbolTarget("DDD", 0.0)])
 
     assert pa.can_fill_remaining_symbol_weights(label) is False
     # And the raw, unrounded remainder really would have said otherwise.
@@ -1342,19 +1346,6 @@ def test_decide_symbol_action_topping_up_a_held_symbol_is_an_adjustment():
     assert decide_symbol_action(row, state) == ACTION_ADJUST
 
 
-def test_decide_symbol_action_a_broker_position_we_do_not_track_is_not_adjustable():
-    """Held at the broker but with no open Transaction of ours: there is nothing
-    to adjust, so a BUY opens a fresh transaction and a SELL is refused rather
-    than trimming a position this platform does not own."""
-    buy = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=5.0,
-                        side=OrderDirection.BUY, target_quantity=15.0)
-    sell = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-5.0,
-                         side=OrderDirection.SELL, target_quantity=5.0)
-    untracked = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[])
-    assert decide_symbol_action(buy, untracked) == ACTION_NEW
-    assert decide_symbol_action(sell, untracked) == ACTION_SKIP
-
-
 def test_decide_symbol_action_a_suppressed_row_is_skipped_not_closed():
     """The $5 fractional floor zeroes the DELTA and leaves target_quantity at the
     CURRENT holding. A close is decided on the TARGET, so an unsendable trim of a
@@ -1393,18 +1384,6 @@ def test_decide_symbol_action_a_TRIM_of_an_option_only_holding_is_unactionable_t
     state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
                           unactionable_transaction_ids=[41])
     assert decide_symbol_action(row, state) == ACTION_UNACTIONABLE
-
-
-def test_decide_symbol_action_an_untracked_broker_position_is_still_a_plain_skip():
-    """DISCRIMINATOR for the ``unactionable_transaction_ids`` condition. Shares at
-    the broker with no transactions of ours AT ALL is the pre-existing long-only
-    refusal, not a filtered holding: there is nothing to name and nothing to look
-    at, so it keeps the words it had."""
-    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-100.0,
-                        side=OrderDirection.SELL, target_quantity=0.0)
-    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
-                          unactionable_transaction_ids=[])
-    assert decide_symbol_action(row, state) == ACTION_SKIP
 
 
 def test_decide_symbol_action_a_filtered_transaction_with_no_shares_held_is_a_skip():

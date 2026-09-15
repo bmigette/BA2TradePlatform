@@ -13,10 +13,12 @@ safeguard stop are still in memory; a stranded row cannot be re-sized afterwards
 import pytest
 
 from ba2_trade_platform.core.TradeManager import TradeManager
+from ba2_trade_platform.core.types import OrderDirection
 
 
 class _Order:
     id, symbol, quantity = 460, "CVS", 1.0
+    transaction_id, side = None, OrderDirection.BUY
 
 
 def _tm(monkeypatch):

@@ -49,9 +49,9 @@ import sys
 import threading
 import time as _time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -242,6 +242,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "keep using tools/run_option_warmup_parallel.py's --workers "
                         "(separate processes) instead; this is for providers whose session "
                         "must be shared in-process.")
+    p.add_argument("--wide-min-pending", type=int, default=25,
+                   help="``--wide`` only. A symbol with FEWER than this many expiry "
+                        "partitions still owed is fetched one expiry at a time instead of "
+                        "with a wide request (default 25; 0 sends everything wide). "
+                        "WHY: the wide request cannot ask for a subset of expirations — it "
+                        "streams every expiration in the window and discards on arrival "
+                        "everything not owed. That is the right trade for a FIRST fill (350 "
+                        "partitions in one request) and badly wrong for a tail pass. Measured "
+                        "2026-09-11 on IBM and JPM, one straggler expiry each: 18s and 29s "
+                        "per-expiry, against 10-34 MINUTES per symbol wide, re-streaming ~6M "
+                        "rows to keep ~3,000.")
+    p.add_argument("--narrow-fallback-years", type=float, default=1.0,
+                   help="``--wide`` only. When a symbol's wide request fails every retry, "
+                        "re-ask for it in windows of this many YEARS instead of one request "
+                        "for the whole span (default 1.0; 0 disables the fallback).\n"
+                        "WHY: the wide shape asks for every expiration at once, and for the "
+                        "largest chains that stream dies mid-flight every time -- measured "
+                        "2026-09-10/11, 16 symbols (COST, CVX, CRWD, DAL, VRT ...) each gave "
+                        "up with their ENTIRE ladder unfetched, on the first request, four "
+                        "attempts running. Retrying an over-large request just fails four "
+                        "times instead of once; making it smaller is the only thing that "
+                        "changes the outcome.")
     p.add_argument("--wide", action="store_true",
                    help="ThetaData only. Fetch each underlying's WHOLE chain per request "
                         "(expiration='*') instead of looping expiry by expiry, then fan the "
@@ -581,6 +603,41 @@ def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str
     return plan
 
 
+def split_by_pending(plan: Plan, min_pending: int) -> Tuple[List["SymbolUnit"], Plan]:
+    """Route each symbol by HOW MUCH IT STILL OWES: wide for the bulk, per-expiry for the tail.
+
+    Returns ``(symbol_units_for_the_wide_path, plan_holding_the_per_expiry_units)``.
+
+    The two shapes ask the vendor for very different things. A wide request streams every
+    expiration in the window and the caller discards what it does not owe, so its cost is the
+    SYMBOL's whole chain no matter how little is missing; a per-expiry request costs only the
+    expiry asked for. Which one wins is therefore a function of the number of partitions still
+    pending, and nothing else:
+
+        first fill        350 pending   wide, by a distance (one request, not 350)
+        tail pass           1 pending   per-expiry, by 50-80x (measured, see --wide-min-pending)
+
+    ``min_pending <= 0`` sends everything wide, which is the behaviour this function replaced.
+    """
+    if min_pending <= 0:
+        return to_symbol_units(plan), Plan()
+    wide_units: List[WorkUnit] = []
+    narrow = Plan()
+    by_symbol: Dict[str, List[WorkUnit]] = {}
+    for unit in plan.units:
+        by_symbol.setdefault(unit.underlying, []).append(unit)
+    for symbol, units in by_symbol.items():
+        if len(units) >= min_pending:
+            wide_units.extend(units)
+        else:
+            narrow.units.extend(units)
+    narrow.units_pending = len(narrow.units)
+    narrow.contracts_pending = sum(len(u.contracts) for u in narrow.units)
+    wide_plan = Plan(units=wide_units, units_pending=len(wide_units),
+                     contracts_pending=sum(len(u.contracts) for u in wide_units))
+    return to_symbol_units(wide_plan), narrow
+
+
 def parse_occ_expiry(occ: str) -> Optional[date]:
     """The expiry encoded in an OCC id (ROOT + YYMMDD + C/P + strike x 1000), or ``None``.
 
@@ -798,6 +855,29 @@ class _SharedProgress:
             return self.done, self.total
 
 
+def window_slices(start: date, end: date, years: float) -> List[Tuple[date, date]]:
+    """``[start, end]`` cut into consecutive windows of ``years``, oldest first. Pure.
+
+    OLDEST FIRST, and contiguous, because the caller's incremental flush closes an expiry
+    the moment a bar dated after it arrives. That is only sound while bar dates never go
+    backwards, so the slices must be walked in order -- the same guarantee
+    ``fetch_underlying_eod_bars`` makes within one window, extended across several.
+
+    ``years <= 0`` (or a span already inside one slice) returns a single window, which makes
+    the fallback a no-op rather than a special case at the call site.
+    """
+    if years <= 0:
+        return [(start, end)]
+    step = max(1, int(round(years * 365)))
+    out: List[Tuple[date, date]] = []
+    cur = start
+    while cur <= end:
+        stop = min(end, cur + timedelta(days=step - 1))
+        out.append((cur, stop))
+        cur = stop + timedelta(days=1)
+    return out or [(start, end)]
+
+
 def run_symbol_units(units: Sequence[SymbolUnit], provider,
                      store: OptionHistoryParquetStore, start: date, end: date,
                      ns: argparse.Namespace, *, clock: Callable[[], datetime],
@@ -868,9 +948,11 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
         for attempt in range(1, max(1, ns.max_retries) + 1):
             by_expiry = {}
             high_water: Optional[date] = None
+            bars_seen = 0
             try:
                 for bar in provider.fetch_underlying_eod_bars(unit.underlying,
                                                               start=start, end=end):
+                    bars_seen += 1
                     expiry = parse_occ_expiry(bar.occ_symbol)
                     if expiry is None or expiry not in pending:
                         # Not a partition this run owes: unparseable, already COMPLETE/EMPTY
@@ -893,11 +975,138 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                 log(f"  [{unit.underlying}] attempt {attempt} failed: "
                     f"{type(e).__name__}: {e}")
             else:
-                completed = True
-                break
+                if bars_seen or not pending:
+                    completed = True
+                    break
+                # AN EMPTY STREAM IS NOT AN ANSWER. The request succeeded and delivered
+                # nothing, which is treated as a failed attempt and never as "this symbol has
+                # no options data".
+                #
+                # MEASURED 2026-09-11: the vendor answered COP, COST, COTY, CPB, CRWD, CSX,
+                # CTSH, CVE, CVNA, CVS, CVX and DAL with a stream that closed cleanly and
+                # yielded nothing, in about a second each. The tail flush below then wrote
+                # every one of their ~338 partitions as EMPTY — 4,700 manifests asserting
+                # that ConocoPhillips and Costco had no listed options for six years. Nothing
+                # ever re-reads a partition once it is marked empty, so the vendor's silence
+                # had become a permanent fact about the market.
+                #
+                # The cost is that a symbol which genuinely has nothing is retried and then
+                # reported failed on every pass. That is the right way round: a loud repeated
+                # failure is cheap to notice; a silent false "empty" is not noticeable at all.
+                log(f"  [{unit.underlying}] attempt {attempt} returned an EMPTY stream with "
+                    f"{len(pending)} partition(s) pending — treated as a failure, not as "
+                    f"'no data'")
             if attempt < max(1, ns.max_retries):
                 sleep(backoff)
                 backoff *= 2
+
+        if not completed and pending and getattr(ns, "narrow_fallback_years", 0) > 0:
+            # NARROW FALLBACK. The wide request is exhausted; ask for the same symbol in
+            # smaller windows before giving up on it. Everything the flush already wrote is
+            # durable and `pending` holds only what is still owed, so this re-buffers the
+            # remainder and nothing is written twice.
+            #
+            # ``high_water`` restarts at None because we re-walk from the beginning of the
+            # span; the slices are contiguous and oldest-first, so bar dates still never go
+            # backwards and the flush stays sound.
+            slices = window_slices(start, end, ns.narrow_fallback_years)
+            if len(slices) > 1:
+                log(f"  [{unit.underlying}] wide request exhausted with {len(pending)} "
+                    f"partition(s) owed; retrying in {len(slices)} narrower window(s)")
+                by_expiry = {}
+                high_water = None
+                salvaged = True
+                narrow_bars_seen = 0
+                for w_start, w_end in slices:
+                    if not pending:
+                        break                      # everything owed has been written
+                    for attempt in range(1, max(1, ns.max_retries) + 1):
+                        window_bars = 0
+                        try:
+                            for bar in provider.fetch_underlying_eod_bars(
+                                    unit.underlying, start=w_start, end=w_end):
+                                narrow_bars_seen += 1
+                                window_bars += 1
+                                expiry = parse_occ_expiry(bar.occ_symbol)
+                                if expiry is None or expiry not in pending:
+                                    continue
+                                by_expiry.setdefault(expiry, []).append(bar)
+                                if high_water is None or bar.bar_date > high_water:
+                                    high_water = bar.bar_date
+                                    for done in [e for e in by_expiry if e < high_water]:
+                                        _flush(done)
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:  # noqa: BLE001 — classified, never swallowed
+                            if not _is_transient(e):
+                                log(f"  [{unit.underlying} {w_start}..{w_end}] narrow "
+                                    f"attempt {attempt} failed (permanent, not retrying): "
+                                    f"{type(e).__name__}: {e}")
+                                break
+                            log(f"  [{unit.underlying} {w_start}..{w_end}] narrow attempt "
+                                f"{attempt} failed: {type(e).__name__}: {e}")
+                            if attempt < max(1, ns.max_retries):
+                                sleep(ns.backoff)
+                        else:
+                            # A window that delivered NOTHING while contracts expired inside
+                            # it is the vendor being silent, not a quiet market: something
+                            # that expires on a date certainly traded near that date.
+                            #
+                            # MEASURED 2026-09-11, and the reason the symbol-level guard is
+                            # not enough: CNC's walk delivered a trickle in ONE window and
+                            # nothing in the other six, so `narrow_bars_seen` was positive,
+                            # the walk "recovered", and the tail flush wrote 333 partitions
+                            # as EMPTY -- the same false record as before, reached by a
+                            # narrower path. Per-window evidence is what closes it.
+                            #
+                            # A window with no pending expiry inside it may legitimately be
+                            # empty (a symbol first listed in 2023 has no 2020 options), so
+                            # the check is conditioned on expiries actually falling due here.
+                            due_here = [e for e in pending if w_start <= e <= w_end]
+                            if window_bars or not due_here:
+                                break
+                            log(f"  [{unit.underlying} {w_start}..{w_end}] narrow attempt "
+                                f"{attempt} returned an EMPTY stream with {len(due_here)} "
+                                f"expiry(ies) falling due inside it — treated as a failure")
+                            if attempt < max(1, ns.max_retries):
+                                sleep(ns.backoff)
+                    else:
+                        # EVERY attempt on this window failed. STOP THE WALK HERE — do not
+                        # try the later windows.
+                        #
+                        # MEASURED 2026-09-11, and the reason this is a `break` and not a
+                        # `continue`: CNC's 2020 window died, the walk carried on, and the
+                        # 2021+ windows flushed 355 partitions. A contract expiring 2021-05-28
+                        # trades from 2020, so its partition was written WITHOUT its 2020 bars
+                        # and with a manifest saying COMPLETE — invisible, and never revisited.
+                        # Continuing past a failed window manufactures exactly the truncation
+                        # the incremental flush is otherwise safe from.
+                        #
+                        # What was already flushed BEFORE this window is kept, and that is
+                        # sound rather than a compromise: an expiry is flushed only once a bar
+                        # dated after it arrives, so it closed inside an EARLIER window, and
+                        # the windows are walked oldest-first — its whole life therefore lies
+                        # in windows that succeeded. Everything still owed stays in `pending`
+                        # for the next run.
+                        salvaged = False
+                        break
+                # SALVAGED, not "nothing left owed". Expiries still buffered here are the
+                # TAIL -- nothing dated later than them was ever seen -- and the block below
+                # writes exactly those, the same way it does after a successful wide fetch.
+                # Requiring an empty `pending` here would fail every symbol on its last
+                # expiry and re-fetch the whole ladder next run.
+                # A SINGLE window may legitimately be empty -- a symbol listed in 2023 has
+                # nothing in 2020 -- but a walk that saw no bar in ANY window is the vendor
+                # being silent, not the market being empty, and must not flush the tail as
+                # EMPTY. Same rule as the wide path above, applied to the whole walk.
+                if salvaged and narrow_bars_seen == 0 and pending:
+                    log(f"  [{unit.underlying}] every narrow window returned an EMPTY stream "
+                        f"with {len(pending)} partition(s) pending — treated as a failure, "
+                        f"not as 'no data'")
+                    salvaged = False
+                completed = salvaged
+                if completed:
+                    log(f"  [{unit.underlying}] recovered via narrow windows")
 
         if not completed:
             # Whatever the flush already wrote is durable and is NOT counted as failed --
@@ -1233,16 +1442,22 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
                 aggregate.units = chunk_plan.units[:1]
             continue
         if ns.wide:
-            # Same plan, regrouped: one wide fetch per underlying instead of one per expiry.
-            # build_plan has already dropped every COMPLETE/EMPTY partition, so a resumed run
-            # still only WRITES what is missing (it does re-fetch the symbol -- the wide call
-            # cannot ask for a subset of expirations -- which at ~6 min/symbol is cheap).
-            symbol_units = to_symbol_units(chunk_plan)
+            # Same plan, regrouped by SYMBOL for the wide shape -- but only for the symbols
+            # that still owe enough to be worth a wide request. build_plan has already dropped
+            # every COMPLETE/EMPTY partition, so what is left is exactly what is missing; the
+            # split decides HOW to ask for it (see split_by_pending).
+            symbol_units, tail_plan = split_by_pending(chunk_plan, ns.wide_min_pending)
             log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
-                f"{len(symbol_units)} symbols, {chunk_plan.units_pending} partitions pending")
-            stats.merge(run_symbol_units_concurrent(symbol_units, provider, store, start, end,
-                                                    ns, clock=clock, sleep=sleep, log=log,
-                                                    concurrency=ns.concurrency))
+                f"{len(symbol_units)} wide symbol(s), {tail_plan.units_pending} tail "
+                f"partition(s), {chunk_plan.units_pending} partitions pending")
+            if symbol_units:
+                stats.merge(run_symbol_units_concurrent(symbol_units, provider, store, start,
+                                                        end, ns, clock=clock, sleep=sleep,
+                                                        log=log, concurrency=ns.concurrency))
+            if tail_plan.units:
+                stats.merge(run_units_concurrent(tail_plan, provider, store, start, end, ns,
+                                                 clock=clock, sleep=sleep, log=log,
+                                                 concurrency=ns.concurrency))
         else:
             log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
                 f"{chunk_plan.units_pending} units pending")

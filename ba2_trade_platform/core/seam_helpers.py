@@ -67,6 +67,13 @@ def auto_add_instruments_hook(symbols: List[str]) -> None:
         logger.warning(f"auto_add_instruments_hook failed for {symbols}: {e}")
 
 
+#: The OHLCV provider the default indicator stack is built on. Named here because
+#: TWO places need to agree on it: this factory, and the warm service -- which has to
+#: warm the parquet the ATR is actually computed from. A second spelling of
+#: "yfinance" elsewhere would warm a directory nothing reads.
+DEFAULT_INDICATOR_OHLCV_PROVIDER = "yfinance"
+
+
 def get_default_indicator_provider() -> Any:
     """Return a ``ba2_providers`` indicator provider for ATR fetches.
 
@@ -82,5 +89,5 @@ def get_default_indicator_provider() -> Any:
     """
     from ba2_providers import get_provider
 
-    ohlcv_provider = get_provider("ohlcv", "yfinance")
+    ohlcv_provider = get_provider("ohlcv", DEFAULT_INDICATOR_OHLCV_PROVIDER)
     return get_provider("indicators", "pandas", ohlcv_provider=ohlcv_provider)

@@ -74,7 +74,11 @@ class ColumnDef:
     
     # Width override
     width: Optional[str] = None
-    
+
+    #: Drop this column on a phone (<640px). Default False, so an existing column keeps
+    #: showing and nothing disappears without being asked for.
+    mobile_hide: bool = False
+
     def to_quasar_column(self) -> dict:
         """Convert to Quasar table column format."""
         col = {
@@ -86,6 +90,14 @@ class ColumnDef:
         }
         if self.width:
             col['style'] = f'width: {self.width}'
+        if self.mobile_hide:
+            # Quasar adds no per-column class of its own, so `classes`/`headerClasses`
+            # -- its documented hook -- is the only handle a stylesheet has on one. The
+            # responsive layer hides `.mobile-hide` below 640px. Tagged rather than
+            # positional: an `nth-child` rule hides the WRONG column the first time one
+            # is inserted.
+            col['classes'] = 'mobile-hide'
+            col['headerClasses'] = 'mobile-hide'
         return col
 
 
@@ -478,11 +490,15 @@ class LazyTable:
             # Left side: page size selector
             with ui.row().classes('items-center gap-2'):
                 ui.label('Rows per page:').classes('text-sm')
+                # `outlined dense` is what makes the value legible. A bare ui.select renders
+                # Quasar's standard field -- which reserves vertical space for a floating label
+                # this control does not have -- so inside a w-24 box the selected number was
+                # clipped to a sliver. `options-dense` keeps the popup tight to match.
                 ui.select(
                     options=self.config.page_size_options,
                     value=self._page_size,
                     on_change=lambda e: asyncio.create_task(self._on_page_size_change(e.value))
-                ).classes('w-24')
+                ).props('outlined dense options-dense').classes('w-28')
             
             # Center: pagination info
             self._pagination_label = ui.label('Loading...').classes('text-sm text-gray-600')

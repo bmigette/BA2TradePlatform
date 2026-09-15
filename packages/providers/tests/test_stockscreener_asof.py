@@ -13,7 +13,7 @@ Cover the THREE behaviours Task 4 adds, plus the live-path no-regression guards:
 
 All fetches are mocked/monkeypatched — no FMP key or network is required.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import ba2_providers
 import ba2_providers.StockScreener as S
@@ -100,8 +100,19 @@ def test_fetch_history_bulk_anchors_on_as_of(monkeypatch):
     sc._fetch_history_bulk(["AAA"], lookback_days=5)
 
     assert captured["to"] == "2020-06-30"   # anchored on as_of, not today
-    # from_date = as_of - (lookback_days + 5) = 2020-06-30 - 10 days
-    assert captured["from"] == "2020-06-20"
+
+    # THE SUBJECT OF THIS TEST is the ANCHOR -- that both ends of the window are struck
+    # from as_of rather than from today. The WIDTH stopped being the caller's lookback on
+    # 2026-09-08: the screener now fetches one wide window per symbol
+    # (SCREENER_HISTORY_WINDOW_DAYS) and slices each caller back to what it asked for, so
+    # three passes over one universe stop fetching it three times. What must still hold
+    # is that the wide window ENDS at as_of and starts before it, never that it starts at
+    # a particular narrow offset.
+    from ba2_providers.StockScreener import SCREENER_HISTORY_WINDOW_DAYS
+    expected_from = (datetime(2020, 6, 30, tzinfo=timezone.utc)
+                     - timedelta(days=SCREENER_HISTORY_WINDOW_DAYS + 5)).strftime("%Y-%m-%d")
+    assert captured["from"] == expected_from
+    assert captured["from"] < captured["to"]
 
 
 def test_fetch_history_bulk_live_window_is_today(monkeypatch):

@@ -168,7 +168,9 @@ def _args(d, **over):
 def test_the_launched_command_is_exactly_this():
     """THE ARGV GOLDEN.
 
-      --options-store parquet   same reasoning as grid 2's driver (2024-01-18 history floor).
+      --options-store tastytrade  the store 4d246e16 renamed `parquet` to; `parquet` stays an
+                                accepted CLI alias, so a runbook that spells the old name still
+                                resolves here. Same reasoning as grid 2's driver (history floor).
       --fitness option_convex   design §3/§8: the ONLY fitness this driver may pass.
       --run-schedule daily      matches grid 2's driver.
       --universe <kept>         the PREFLIGHT's kept list for O_CONVEX's DTE>=270 depth.
@@ -183,7 +185,7 @@ def test_the_launched_command_is_exactly_this():
         "--start", "2023-01-01", "--end", "2025-12-31",
         "--interval", "1d", "--population", "40", "--generations", "6",
         "--initial-capital", "20000.0",
-        "--options-store", "parquet",
+        "--options-store", "tastytrade",
         "--fitness", "option_convex",
         "--run-schedule", "daily", "--name", "convex-FMPRating-O_CONVEX",
         "--parallel", "4",

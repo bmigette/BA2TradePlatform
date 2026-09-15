@@ -119,14 +119,28 @@ def test_labels_totalling_ninety_percent_leave_ten_percent_undeployed():
     assert plan.total_buy_value == 9_000.0
 
 
-def test_unknown_margin_uses_default_bp_factor():
+def test_unknown_margin_is_NEUTRAL_not_the_account_multiplier():
+    """An unmeasured symbol gets bp_factor 1.0, and the account multiplier is kept
+    only to recover a RATE from a factor.
+
+    CHANGED 2026-09-07. This asserted 2.0 -- the multiplier -- which by this module's
+    own table means NON-MARGINABLE: a buying-power penalty of double the notional,
+    applied to every symbol nobody had measured. Live that was every symbol not
+    already held, so every first-time buy, and the plan then scaled itself down to
+    fit a budget twice its real size (observed: ``scaled x0.66``, orders landing at
+    two-thirds of their target value).
+
+    1.0 is neutral on every account shape and holds the invariant that a buy never
+    consumes MORE buying power than its notional."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"AAA": _pos("AAA", 100.0)}, {},
                                  allow_fractional=False, default_bp_factor=2.0,
                                  valuation_mode=pa.VALUATION_MODE_MARKET)
-    assert plan.rows[0].bp_factor == 2.0
-    assert plan.rows[0].bp_cost == 20_000.0
+    assert plan.rows[0].bp_factor == pa.NEUTRAL_BP_FACTOR == 1.0
+    assert plan.rows[0].bp_cost == 10_000.0
+    # The multiplier is still carried -- it is what turns a factor back into a rate.
+    assert plan.margin_multiplier == 2.0
 
 
 def test_held_symbol_with_no_managed_label_is_absent_from_the_plan():
@@ -878,17 +892,31 @@ def test_cost_mode_sizes_a_trim_off_the_average_cost_not_the_market_price():
         assert row.target_quantity * (10_000.0 / 100.0) == pytest.approx(5_000.0)
 
 
-def test_cost_mode_trims_towards_the_target_basis_rounding_down():
-    """Basis 20000 on 10 shares (average 2000) with a 5000 target: 7.5 shares of
-    basis must go, and a whole-share account rounds the SELL down to 7 -- never up,
-    so the trim under-shoots the target rather than overshooting it."""
+def test_cost_mode_trims_towards_the_target_basis_rounding_to_the_nearest_share():
+    """Basis 20000 on 10 shares (average 2000) with a 5000 target: 7.5 shares of basis
+    must go, and a whole-share account rounds the SELL to the NEAREST share.
+
+    THIS TEST USED TO PIN THE OPPOSITE -- "rounds down to 7, never up, so the trim
+    under-shoots rather than overshooting". That policy was changed on 2026-09-07 after
+    it stranded live positions: IYRI and NIHI each wanted a sub-share trim, floored to
+    zero, and no run could ever correct them because every run recomputed the same trim
+    and floored it away again. Under-shooting is not automatically the safe direction on
+    a SELL -- it leaves the position further from target than the alternative.
+
+    7.5 is the tie, and it goes UP, matching the buy-side bump's own inclusive bound
+    (``raw >= 0.5`` bumps, documented at BUMP_MAX_TARGET_MULTIPLE) so the two directions
+    break ties the same way.
+    """
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=20_000.0)}
     plan = pa.compute_allocation(5_000.0, 0.0, labels, current, {},
                                  allow_fractional=False, default_bp_factor=1.0,
                                  valuation_mode=pa.VALUATION_MODE_COST)
-    assert plan.rows[0].delta_quantity == -7.0
-    assert plan.rows[0].target_quantity == 3.0
+    assert plan.rows[0].delta_quantity == -8.0
+    assert plan.rows[0].target_quantity == 2.0
+    # And it SAYS it sold more than the weights asked for.
+    assert any("nearest whole share" in r for r in plan.rows[0].reasons), \
+        plan.rows[0].reasons
 
 
 def test_round_delta_quantity_clamps_a_sell_to_the_holding():

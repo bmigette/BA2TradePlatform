@@ -115,13 +115,12 @@ from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, blocking_messages, build_base_snapshot,
     compute_allocation,
-    compute_base_notional, compute_label_investment, current_value,
-    format_unrealised_pnl, is_blocking_message, unconsumed_income_notice,
-    validate_symbol_weights,
+    cash_dividends_by_symbol, compute_base_notional, compute_label_investment,
+    current_value, format_unrealised_pnl, is_blocking_message,
+    unconsumed_income_notice, validate_symbol_weights,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
-    get_dividends_by_symbol,
     get_previous_symbol_weights, get_symbol_rows, get_symbol_weights,
     remove_symbols_from_label, replace_managed_labels, save_allocation_targets,
     set_allocation_config, set_managed_label, set_symbol_weight,
@@ -165,7 +164,10 @@ from ..utils.portfolio_allocation_view import (
     label_total_readout,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     important_color_style,
-    missing_quote_symbols, picker_options, pnl_classes, pnl_color,
+    SUBMIT_FAILED_FMT, format_pnl_caption_parts, missing_quote_symbols,
+    picker_options, pnl_classes,
+    pnl_color, pnl_div_classes, pnl_div_color, submit_result_cell,
+    submit_summary_line,
     positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
     sort_label_views, store_color_value,
@@ -279,7 +281,12 @@ def _load_view_payload(account_id: int, valuation_mode: str,
 
     prices: Dict[str, Optional[float]] = {}
     if symbols:
-        fetched = account.get_instrument_current_price(symbols)
+        # THE MARK, EXPLICITLY -- see build_position_states for the full reasoning. This is
+        # the SECOND price fetch on this page: the wizard prices through
+        # build_position_states, the label table prices here, and fixing only the first left
+        # MAGY still reading 16.86 on the very screen the discrepancy was reported from.
+        # Both are valuations and both must ask for the same thing.
+        fetched = account.get_instrument_current_price(symbols, price_type='mark')
         if isinstance(fetched, dict):
             prices = dict(fetched)
         else:
@@ -406,13 +413,33 @@ def _load_view_payload(account_id: int, valuation_mode: str,
                                    # row: the ⓘ tooltip is the only consumer and it is
                                    # not worth a lookup per cell.
                                    company_names=get_company_names(symbols),
-                                   # ONE query over the account's income ledger, for
-                                   # the "w/ div" half of the P&L column. A local
-                                   # read, so unlike the yield and 1Y/3Y stats it
-                                   # costs no REST call and needs no background
-                                   # top-up.
-                                   dividends_by_symbol=get_dividends_by_symbol(
-                                       account_id),
+                                   # The "w/ div" half of the P&L column: the
+                                   # broker's FULL dividend history, cash only.
+                                   #
+                                   # NOT the income ledger. get_dividends_by_symbol
+                                   # answers "what cash is waiting to be deployed"
+                                   # and is synced over a rolling
+                                   # INCOME_WINDOW_DAYS=30 window, so it held six
+                                   # weeks of a six-month position and reported a
+                                   # fifth of what the holding had paid
+                                   # (WHEEL_L1_HR, 2026-09-07: 46.98 against ~189).
+                                   # It stays the source for CONSUMPTION, which is
+                                   # the question it is right for.
+                                   #
+                                   # Cash only, via the same helper the growth
+                                   # charts use: a reinvested dividend is already
+                                   # in market value and cost basis, so counting it
+                                   # here would book the money twice.
+                                   #
+                                   # This one costs a REST call, unlike the ledger
+                                   # read it replaces. It is on the same background
+                                   # thread as the rest of this payload, and a
+                                   # broker that will not answer costs the "w/ div"
+                                   # figure, not the page: get_dividends returns []
+                                   # on failure and every row simply has no
+                                   # dividend-adjusted number.
+                                   dividends_by_symbol=cash_dividends_by_symbol(
+                                       account.get_dividends()),
                                    unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
@@ -575,7 +602,7 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
 def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
                 allow_fractional: bool, valuation_mode: str,
                 unallocated_pct: float = 0.0,
-                force_market_refresh: bool = False):
+                force_market_refresh: bool = False, on_progress=None):
     """Solve one dry run against FRESH positions, prices and margin info. Blocking.
 
     Re-reads everything rather than reusing the open dialog's snapshot: Refresh
@@ -621,6 +648,10 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             allow_fractional=allow_fractional, default_bp_factor=base.default_bp_factor,
             valuation_mode=valuation_mode)
     else:
+        # ``unsellable_symbols`` is deliberately NOT populated from untracked broker
+        # holdings: those are sold directly as closing orders (ACTION_SELL_UNTRACKED),
+        # so their proceeds are real and must keep funding the plan. The parameter
+        # remains for a sale that genuinely has no route.
         plan = compute_allocation(
             base.base_notional, base.available_buying_power, labels, current, margin,
             allow_fractional=allow_fractional,
@@ -632,11 +663,12 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
     # min_trade_increment / min_order_size / min_fractional_notional.
     plan = svc.precheck_plan(account, plan,
                              available_buying_power=base.available_buying_power,
-                             margin=margin)
+                             margin=margin, on_progress=on_progress)
     return base, plan, current, svc.fetch_market_hours(account)
 
 
-def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label):
+def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label,
+                 on_outcome=None):
     """Submit a reviewed plan. Blocking. The service re-checks the market gate."""
     from ...core.utils import get_account_instance_from_id
 
@@ -644,7 +676,7 @@ def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
     return svc.run_allocation(account, plan, current, base, mode=mode,
-                              scope_label=scope_label)
+                              scope_label=scope_label, on_outcome=on_outcome)
 
 
 def _load_income_panel(account_id: int):
@@ -814,7 +846,25 @@ MARKER_BAR_ROW = 'pf-bar-row'
 #: only figure on the line whose sign carries a verdict -- so it is the only one
 #: that can be coloured, and NiceGUI colours whole elements.
 MARKER_LABEL_LAST = 'pf-label-last'
+#: The toolbar's own CSS scope, and the height every control in it is pinned to.
+#: 40px because that is what a `dense outlined` Quasar field wants once its
+#: bottom-space reservation is gone -- pinning to the BUTTON's smaller natural height
+#: instead would clip the select's floating label.
+TOOLBAR_CLASS = 'pf-alloc-toolbar'
+TOOLBAR_CONTROL_PX = 40
+
+#: The Review button's own progress bar. Marked so a test can assert it exists, is
+#: hidden at rest, and is the SAME element the latch drives.
+MARKER_REVIEW_PROGRESS = 'pf-review-progress'
 MARKER_LABEL_PNL = 'pf-label-pnl'
+#: The fixed-width CELL holding the P&L caption. The caption is two elements now
+#: -- the money with its price return, then the dividend-adjusted return -- because
+#: the two carry OPPOSITE signs on exactly the rows worth reading (an income sleeve
+#: down on price and up on total return) and one colour cannot say so.
+#: MARKER_LABEL_PNL stays on the first, which is what every reader of "the P&L
+#: text" means, and the cell keeps the width.
+MARKER_LABEL_PNL_CELL = 'pf-label-pnl-cell'
+MARKER_LABEL_PNL_DIV = 'pf-label-pnl-div'
 #: The tag icon LEFT OF THE LABEL NAME. Marked because it is one ``ui.icon`` among
 #: several on the row and its whole content is an inline colour -- and because the
 #: user's complaint was precisely that it disagreed with the bar beside it.
@@ -1129,11 +1179,19 @@ class ClickLatch:
     never works again. Deliberately NOT one-shot, unlike the dry run's own submit
     latch -- that one guards orders already sent, this one guards a solve that
     ordered nothing, and the user must be able to press it again.
+
+    ``progress`` is an optional bar shown for the run's duration. It is
+    INDETERMINATE and that is not a shortcut: the solve is a broker round trip whose
+    length is set by how many buys need prechecking, and a bar that invented a
+    percentage would be a lie told smoothly. What the user asked for is the answer to
+    "is it doing something" -- the spinner inside the button says that but sits where
+    the label was, so it reads as the button having gone blank.
     """
 
-    def __init__(self, busy_notice: str, button=None):
+    def __init__(self, busy_notice: str, button=None, progress=None):
         self.busy_notice = busy_notice
         self.button = button
+        self.progress = progress
         self.busy = False
 
     async def run(self, factory) -> bool:
@@ -1146,13 +1204,33 @@ class ClickLatch:
         self.busy = True
         if self.button is not None:
             self.button.set_enabled(False)
-            self.button.props('loading')
+            # `loading` REPLACES the button's content with a spinner -- label, icon and
+            # any child it holds. With a progress bar living inside the button that
+            # swallowed the bar whole, which is why the button showed a spinner and no
+            # progress at all. Where there IS a bar the bar is the better affordance
+            # anyway: it keeps the label readable and says how far along the work is,
+            # which a spinner cannot. The spinner stays for a latch with no bar.
+            if self.progress is None:
+                self.button.props('loading')
+        if self.progress is not None:
+            # Back to empty AND back to sweeping: a bar that opens at the last run's
+            # 100% reads as "already finished", and one left determinate at 0 draws
+            # nothing at all until the first symbol lands.
+            self.progress.set_value(0.0)
+            self.progress.props('indeterminate')
+            self.progress.set_visibility(True)
         try:
             await factory()
         finally:
+            # Both restored in the finally, for the same reason the latch is: a bar
+            # left running after a failed solve says the page is still working on
+            # something it abandoned.
             self.busy = False
+            if self.progress is not None:
+                self.progress.set_visibility(False)
             if self.button is not None:
-                self.button.props(remove='loading')
+                if self.progress is None:
+                    self.button.props(remove='loading')
                 self.button.set_enabled(True)
         return True
 
@@ -1286,11 +1364,25 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         # this render opened with. They are rewritten in the same loop anyway, so
         # nothing has to remember which of the row's figures are live.
         widgets['last'].set_text(bar.last_text)
-        widgets['pnl'].set_text(bar.pnl_text)
-        widgets['pnl'].classes(replace=PNL_CELL_CLASSES + pnl_classes(bar.pnl))
+        # head + dividend + tail is EXACTLY ``bar.pnl_text``; the engine's
+        # ``split_unrealised_pnl`` guarantees it, so only the COLOURING is split.
+        head, dividend, tail = format_pnl_caption_parts(bar.pnl)
+        widgets['pnl'].set_text(head)
+        # 'truncate', not PNL_CELL_CLASSES: the w-72 now lives on the CELL around
+        # both halves. Left on this label it would fill the cell by itself and
+        # push the dividend half out of sight -- which is the whole point of the
+        # split, silently undone.
+        widgets['pnl'].classes(replace='truncate ' + pnl_classes(bar.pnl))
         # Green up, red down, neutral inside the epsilon band -- and painted, not
         # merely classed, for the reason above.
         widgets['pnl'].style(replace=important_color_style(pnl_color(bar.pnl)))
+        # The dividend half by ITS OWN sign. Blank and unstyled when there is none, so
+        # a row with no dividend figure draws exactly what it drew before.
+        widgets['pnl_div'].set_text('' if dividend is None else dividend + tail)
+        widgets['pnl_div'].classes(
+            replace='truncate ' + ('' if dividend is None else pnl_div_classes(bar.pnl)))
+        widgets['pnl_div'].style(
+            replace='' if dividend is None else important_color_style(pnl_div_color(bar.pnl)))
         widgets['tooltip'].set_text(format_label_target_tooltip(
             target_pct=bar.target_pct, base_notional=live['base_notional'],
             unallocated_pct=live['unallocated_pct']))
@@ -3092,8 +3184,15 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets['last'] = ui.label('') \
                 .classes('w-28 shrink-0 truncate text-xs text-secondary-custom') \
                 .mark(MARKER_LABEL_LAST)
-            widgets['pnl'] = ui.label('').classes(PNL_CELL_CLASSES) \
-                .mark(MARKER_LABEL_PNL)
+            # TWO spans in ONE fixed-width cell. ``gap-0`` because the split is
+            # invisible: the halves must read as the one sentence they were before,
+            # and the engine guarantees head + dividend + tail is that sentence.
+            with ui.row().classes(PNL_CELL_CLASSES + 'gap-0 flex-nowrap items-baseline') \
+                    .mark(MARKER_LABEL_PNL_CELL):
+                widgets['pnl'] = ui.label('').classes('truncate') \
+                    .mark(MARKER_LABEL_PNL)
+                widgets['pnl_div'] = ui.label('').classes('truncate') \
+                    .mark(MARKER_LABEL_PNL_DIV)
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
             ui.icon('edit').classes('cursor-pointer text-secondary-custom') \
@@ -3333,7 +3432,8 @@ def _market_gate_for(hours):
 
 async def _open_allocation_flow(account_id: int, valuation_mode: str,
                                 refresh, *, mode: str = ALLOCATION_MODE_REBALANCE,
-                                invest_amount: float = 0.0) -> None:
+                                invest_amount: float = 0.0,
+                                on_progress=None) -> None:
     """The Review-and-Submit button: the dry run, then Submit. NO target step any more.
 
     A REBALANCE goes STRAIGHT to the dry run. The three-step dialog it used to open
@@ -3430,7 +3530,8 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                             state['unallocated_pct'])
         try:
             new_base, plan, current, hours = await asyncio.to_thread(
-                _solve_plan, account_id, mode=state['mode'], labels=state['labels'],
+                _solve_plan, account_id, on_progress=on_progress,
+                mode=state['mode'], labels=state['labels'],
                 scope_label=state['scope_label'], amount=state['amount'],
                 allow_fractional=state['allow_fractional'],
                 valuation_mode=valuation_mode,
@@ -3487,23 +3588,60 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             return svc.validate_plan(get_account_instance_from_id(account_id),
                                      selected_plan)
 
-        open_allocation_wizard(new_base, plan, market=_market_gate_for(hours),
-                               on_refresh=_on_refresh, on_submit=_on_submit,
-                               on_validate=_on_validate)
+        # HELD, because the dialog no longer closes on Submit: the run reports each
+        # row's outcome back into this table while it is still on screen.
+        state['wizard'] = open_allocation_wizard(
+            new_base, plan, market=_market_gate_for(hours),
+            on_refresh=_on_refresh, on_submit=_on_submit, on_validate=_on_validate)
 
     async def _do_submit(selected_plan) -> None:
+        # THE WORKER RECORDS, THE TIMER PAINTS -- the same split the Review bar uses,
+        # and for the same reason: run_allocation executes in asyncio.to_thread, where
+        # a NiceGUI element has no client context.
+        wizard = state.get('wizard')
+        landed: List[Any] = []
+        painted = 0
+
+        def _record(outcome) -> None:
+            landed.append(outcome)
+
+        def _paint() -> None:
+            nonlocal painted
+            if wizard is None:
+                return
+            while painted < len(landed):
+                outcome = landed[painted]
+                painted += 1
+                text, classes = submit_result_cell(outcome)
+                wizard.set_row_result(outcome.symbol, text, classes)
+
+        # Only when there is somewhere to paint. A caller without a wizard -- the
+        # invest-scope path, and every test that drives _do_submit directly -- has no
+        # rows to mark, and a timer serving nothing is a timer to leak.
+        painter = ui.timer(0.2, _paint) if wizard is not None else None
         try:
             result = await asyncio.to_thread(
                 _submit_plan, account_id, selected_plan, state['current'],
-                state['base'], mode=state['mode'], scope_label=state['scope_label'])
+                state['base'], mode=state['mode'], scope_label=state['scope_label'],
+                on_outcome=_record)
         except Exception as e:
             logger.error(f"Allocation submission failed: {e}", exc_info=True)
             ui.notify(f'Submission failed: {e}', type='negative')
+            if wizard is not None:
+                wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e))
             return
+        finally:
+            # One last pass BEFORE the timer stops, or the rows that landed in the
+            # final 200ms never get painted at all.
+            _paint()
+            if painter is not None:
+                painter.deactivate()
         if result['blocked']:
             # The service re-checked the gate on its own, freshly: this dialog can
             # sit open across 16:00 and the banner it was built with is now stale.
             ui.notify(result['blocked_reason'], type='warning')
+            if wizard is not None:
+                wizard.finish_submit(result['blocked_reason'])
             return
         def _on_retry(symbols) -> None:
             """"Retry the N that failed": re-solve and open a FRESH dry run.
@@ -3519,6 +3657,9 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                         f"row(s) on account {account_id}: {', '.join(symbols)}")
             ui.timer(0.1, _run_dry_run, once=True)
 
+        if wizard is not None:
+            wizard.finish_submit(submit_summary_line(result['outcomes'],
+                                                     run_id=result['run_id']))
         render_outcomes(result['outcomes'], run_id=result['run_id'],
                         on_retry=_on_retry)
         note = working_orders_notice(settled=result['settled'],
@@ -3586,7 +3727,51 @@ async def content() -> None:
             _render_gate_blocked(gate)
             return
 
-        toolbar = ui.row().classes('w-full items-center gap-2')
+        # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
+        # there. A Quasar field and a Quasar button are different components with
+        # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
+        # leave the select a few pixels taller than the buttons, which is exactly the
+        # misalignment that keeps being reported. `items-center` then centres two boxes
+        # of different heights -- correctly, and still looking wrong.
+        #
+        # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
+        # elsewhere on the page sit in forms where their natural height is right.
+        # `!important` throughout, and that is not laziness. Quasar sets these heights
+        # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
+        # anything scoped to this toolbar by one class -- so the winner is decided by
+        # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
+        # attempt at this had no effect whatsoever for that reason.
+        #
+        # The field's own top padding is what makes the box taller than a button even
+        # once the control is pinned, so it is zeroed here too.
+        ui.add_css(f'''
+            .{TOOLBAR_CLASS} .q-field__control {{
+                min-height: {TOOLBAR_CONTROL_PX}px !important;
+                height: {TOOLBAR_CONTROL_PX}px !important; }}
+            .{TOOLBAR_CLASS} .q-field__marginal {{
+                height: {TOOLBAR_CONTROL_PX}px !important; }}
+            .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
+                padding-top: 0 !important; padding-bottom: 0 !important; }}
+            .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
+                padding-top: 0 !important; padding-bottom: 0 !important; }}
+            .{TOOLBAR_CLASS} .q-btn {{
+                min-height: {TOOLBAR_CONTROL_PX}px !important;
+                height: {TOOLBAR_CONTROL_PX}px !important; }}
+
+            /* The Review button's own bar: WHITE on the button's green.
+               Not `color=white track-color=green-8`, which is what it was: Quasar's
+               palette props resolve to its theme colours and land a dark green track
+               under a white sweep on a mid-green button -- three greens, and the bar
+               reads as a shadow. The moving part and the track are addressed directly
+               so the contrast is a decision rather than whatever the palette gives.
+               `__model` covers BOTH renderings: determinate uses one, indeterminate
+               two, and both carry that class. */
+            .{TOOLBAR_CLASS} .q-linear-progress__model {{
+                background: #ffffff !important; opacity: 1 !important; }}
+            .{TOOLBAR_CLASS} .q-linear-progress__track {{
+                background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
+        ''')
+        toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS}')
         body = ui.column().classes('w-full gap-3')
         try:
             mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
@@ -3684,9 +3869,36 @@ async def content() -> None:
                 ui.notify(SIM_REVIEW_BLOCKED, type='warning', multi_line=True,
                           close_button=True, classes='break-words')
                 return
-            await review_latch.run(
-                lambda: _open_allocation_flow(account_id, mode_state['value'],
-                                              _refresh))
+            # The worker thread only RECORDS; this timer paints. A NiceGUI element
+            # touched from inside asyncio.to_thread has no client context, so the
+            # solve hands over plain numbers and the UI reads them at its own pace.
+            sink = {'done': 0, 'total': 0, 'determinate': False}
+
+            def _record(done, total, symbol):
+                sink['done'], sink['total'] = done, total
+
+            def _paint():
+                # TWO PHASES, and the switch between them is the honest part. Until the
+                # precheck reports there is no denominator -- the bulk positions/quotes/
+                # margin calls are one round trip each and cannot be counted -- so the
+                # bar sweeps. From the first report on it shows the real fraction.
+                bar = review_latch.progress
+                if bar is None:
+                    return
+                if not sink['total']:
+                    return
+                if not sink['determinate']:
+                    sink['determinate'] = True
+                    bar.props(remove='indeterminate')
+                bar.set_value(min(1.0, sink['done'] / sink['total']))
+
+            painter = ui.timer(0.2, _paint)
+            try:
+                await review_latch.run(
+                    lambda: _open_allocation_flow(account_id, mode_state['value'],
+                                                  _refresh, on_progress=_record))
+            finally:
+                painter.deactivate()
 
         async def _apply_simulation() -> None:
             """Re-render on the simulated base, and lock Review while it is on."""
@@ -3717,13 +3929,35 @@ async def content() -> None:
         with toolbar:
             review_latch.button = ui.button(
                 REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review) \
-                .props('color=primary') \
+                .props('color=primary').classes('relative overflow-hidden') \
                 .tooltip('Solve the plan against the broker and show it for review. '
                          'Nothing is ordered until you press Submit in the dry run.')
+            # INSIDE the button, absolutely positioned along its bottom edge. It was a
+            # sibling in a column, which made the button+bar unit taller than every
+            # other control and left `items-center` centring THAT -- so the fix for the
+            # misaligned dropdown was itself misaligning the row. Absolute positioning
+            # takes the bar out of the flow entirely: the button's box is exactly the
+            # size it was, and the toolbar cannot move whether the bar shows or not.
+            with review_latch.button:
+                # The TRACK is visible on purpose: it is what makes the bar readable
+                # at 0% and it is where the indeterminate sweep is seen. `transparent`
+                # here meant the control drew nothing until it was already half full.
+                review_latch.progress = ui.linear_progress(
+                    value=0.0, show_value=False, size='5px') \
+                    .props('rounded indeterminate') \
+                    .classes('absolute bottom-0 left-0 w-full z-10') \
+                    .mark(MARKER_REVIEW_PROGRESS)
+                review_latch.progress.set_visibility(False)
+            # ``hide-bottom-space`` is what LINES THESE UP. A Quasar field reserves a
+            # row under itself for the error/hint text it may one day show, so a
+            # labelled select is ~20px taller than a button and the toolbar's
+            # ``items-center`` centres that extra space instead of the box the user
+            # sees. Removing the reservation makes the control as tall as it looks.
             ui.select({VALUATION_MODE_COST: 'Cost basis',
                        VALUATION_MODE_MARKET: 'Market value'},
                       value=mode_state['value'], label='Valuation',
-                      on_change=_set_mode).props('dense outlined').classes('w-44')
+                      on_change=_set_mode) \
+                .props('dense outlined hide-bottom-space').classes('w-44')
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
             ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
@@ -3731,6 +3965,8 @@ async def content() -> None:
             # how every number below is computed, and neither is a number itself.
             ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
             ui.number(label='Simulated base', format='%.2f', min=0,
-                      on_change=_set_simulated_base)                 .props('dense outlined prefix=$').classes('w-40').mark(MARKER_SIM_INPUT)
+                      on_change=_set_simulated_base) \
+                .props('dense outlined hide-bottom-space prefix=$') \
+                .classes('w-40').mark(MARKER_SIM_INPUT)
 
         await _refresh()

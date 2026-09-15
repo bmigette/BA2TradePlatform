@@ -1089,3 +1089,182 @@ def test_failure_path_pushes_failed_status(monkeypatch):
 
     assert out["status"] == "failed"
     assert calls == ["failed"]  # exactly one push, from _fail
+
+
+# --------------------------------------------------------------------------- #
+# THE OPTION OVERLAY IS RELEASED PER TRIAL
+#
+# `parquet_options_provider`'s greek columns and bar-dict memo are filled lazily but cached
+# for the LIFE of the worker, so across genomes the resident set is a UNION that converges on
+# the whole option window (remote227, 2026-09-15: ~7.8 GB anonymous per worker after ~2
+# trials, 218 GB of a 232 GB cgroup cap, swap exhausted). The reset is per TRIAL, which means
+# it belongs on the two functions every trial goes through -- `_trial_worker` (the GA's
+# fitness evaluation, used by the local pool, by `distributed_eval`'s local fallback, and by
+# the remote box via `worker_server` /submit-trial) and `_persist_trial_worker` (the top-N
+# re-runs, and /submit-trial-full on the remote box).
+#
+# NOT in `_worker_release_memory`: that is the governor's panic button, it drops the mapped
+# columns and the projections too, and it only fires under memory pressure -- i.e. after the
+# convergence has already happened.
+# --------------------------------------------------------------------------- #
+def _count_overlay_resets(monkeypatch):
+    import app.services.backtest.parquet_options_provider as pq
+
+    calls = {"n": 0}
+
+    def _counting():
+        calls["n"] += 1
+        return {"overlays": 0, "greeks_rows": 0, "bar_memo_entries": 0,
+                "spot_entries": 0, "atm_iv_entries": 0}
+
+    monkeypatch.setattr(pq, "reset_run_overlays", _counting)
+    return calls
+
+
+def test_trial_worker_releases_the_option_overlay_after_every_trial(monkeypatch):
+    """One trial, one release. Without it the worker carries this genome's greeks into the
+    next one, and the next 31 (BT_MAX_TASKS_PER_CHILD) after that."""
+    from app.services import strategy_optimization_handler as H
+
+    calls = _count_overlay_resets(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest",
+        lambda cfg, **kw: {"total_trades": 3, "sharpe_ratio": 1.5})
+
+    assert H._trial_worker({"backtest_id": 1}, "sharpe")["ok"] is True
+    assert calls["n"] == 1
+
+
+def test_trial_worker_releases_the_option_overlay_when_the_trial_FAILS(monkeypatch):
+    """A failed or cancelled trial is exactly when the release matters most: the worker is
+    handed another one immediately, and the abandoned genome's fill would otherwise stay
+    resident with nothing left that could ever read it."""
+    from app.services import strategy_optimization_handler as H
+
+    calls = _count_overlay_resets(monkeypatch)
+
+    def _boom(cfg, **kw):
+        raise RuntimeError("bad genome")
+
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest", _boom)
+
+    assert H._trial_worker({"backtest_id": 1}, "sharpe")["ok"] is False
+    assert calls["n"] == 1
+
+
+def test_persist_trial_worker_releases_the_option_overlay_on_every_attempt(monkeypatch):
+    """The top-N re-run path, which is where the FULL results blob is built -- the most
+    memory-expensive trial a worker runs. Per ATTEMPT, not per call: a retry re-runs the
+    whole backtest, so a release that only fired on the way out would let a run that failed
+    six times hold six trials' worth."""
+    from app.services import strategy_optimization_handler as H
+
+    calls = _count_overlay_resets(monkeypatch)
+    monkeypatch.setattr(H, "_LOCAL_RETRY_ATTEMPTS", 3)
+    monkeypatch.setattr(H, "_LOCAL_RETRY_BACKOFF_S", 0.0)
+
+    attempts = {"n": 0}
+
+    def _flaky(cfg, **kw):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("disk I/O error")
+        return {"total_trades": 1}
+
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest", _flaky)
+
+    out = H._persist_trial_worker({"backtest_id": 1})
+    assert out["ok"] is True
+    assert attempts["n"] == 3 and calls["n"] == 3
+
+
+def test_the_overlay_release_never_fails_a_trial(monkeypatch):
+    """Memory hygiene is not a result. It is still said out loud (a release that silently
+    stopped working is how `clear_worker_option_caches` stayed a typo for months) -- but
+    through the worker log, never by turning a good genome into a failed trial."""
+    from app.services import strategy_optimization_handler as H
+    import app.services.backtest.parquet_options_provider as pq
+
+    def _broken():
+        raise RuntimeError("overlay reset exploded")
+
+    monkeypatch.setattr(pq, "reset_run_overlays", _broken)
+    said = []
+    monkeypatch.setattr("app.services.backtest.price_source._worker_log",
+                        lambda msg: said.append(msg))
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest",
+        lambda cfg, **kw: {"total_trades": 3, "sharpe_ratio": 1.5})
+
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+    assert out["ok"] is True and out["fitness"] == 1.5
+    assert any("overlay reset exploded" in m for m in said), said
+
+
+def test_the_release_costs_an_equity_trial_nothing(monkeypatch):
+    """An equity-only grid never opens an option store, so the option reader must not be
+    IMPORTED on its behalf -- an import per trial to call a function that finds no overlays is
+    a cost the majority of runs would pay for nothing. `sys.modules` is the exact question:
+    has anything in this process already loaded the reader?"""
+    import sys
+
+    from app.services import strategy_optimization_handler as H
+
+    name = "app.services.backtest.parquet_options_provider"
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest",
+        lambda cfg, **kw: {"total_trades": 3, "sharpe_ratio": 1.5})
+
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+
+    assert out["ok"] is True
+    assert name not in sys.modules, "the release imported the option reader on an equity trial"
+    assert out["mem"]["option_overlays"] == {}
+
+
+def test_the_release_counts_ride_along_in_the_trials_mem_telemetry(monkeypatch):
+    """`reset_run_overlays` returns what it dropped and that is the only visibility a worker
+    has that it is still matching the overlays rather than quietly finding none -- so it has to
+    reach the master, not die in the worker. It rides in the `mem` payload the trial already
+    carries."""
+    import app.services.backtest.parquet_options_provider as pq
+
+    from app.services import strategy_optimization_handler as H
+
+    counts = {"overlays": 4, "greeks_rows": 61_000, "bar_memo_entries": 700,
+              "spot_entries": 900, "atm_iv_entries": 120}
+    monkeypatch.setattr(pq, "reset_run_overlays", lambda: counts)
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest",
+        lambda cfg, **kw: {"total_trades": 3, "sharpe_ratio": 1.5})
+
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+
+    assert out["ok"] is True
+    assert out["mem"]["option_overlays"] == counts
+
+
+def test_the_release_counts_ride_along_on_a_FAILED_trial_too(monkeypatch):
+    """The failure path builds its own `mem` snapshot, and it is the path where a worker's
+    accumulated overlay is most worth seeing."""
+    import app.services.backtest.parquet_options_provider as pq
+
+    from app.services import strategy_optimization_handler as H
+
+    counts = {"overlays": 2, "greeks_rows": 5, "bar_memo_entries": 1,
+              "spot_entries": 1, "atm_iv_entries": 0}
+    monkeypatch.setattr(pq, "reset_run_overlays", lambda: counts)
+
+    def _boom(cfg, **kw):
+        raise RuntimeError("bad genome")
+
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest", _boom)
+
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+
+    assert out["ok"] is False
+    assert out["mem"]["option_overlays"] == counts

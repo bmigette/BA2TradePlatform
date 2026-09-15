@@ -1,0 +1,322 @@
+[
+  {
+    "family": "large_ds",
+    "status": "passed",
+    "evidence": {
+      "symbols": 667,
+      "sample": 150,
+      "coverage": {
+        "1d": {
+          "covered": 134,
+          "eligible": 134,
+          "late_listing": 16,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 132,
+          "eligible": 140,
+          "late_listing": 10,
+          "failures": [
+            "CBUS",
+            "ABTC",
+            "TT",
+            "WBD",
+            "MAAS",
+            "WDS",
+            "BALL",
+            "SHEL"
+          ],
+          "covered_pct": 94.28571428571429
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "ee3e5ed0c6d2d680a0c19bf788564ac969a6fb21c1e19da50500b83c086aa5dd"
+    }
+  },
+  {
+    "family": "mid_insider",
+    "status": "passed",
+    "evidence": {
+      "symbols": 901,
+      "sample": 150,
+      "coverage": {
+        "1d": {
+          "covered": 117,
+          "eligible": 117,
+          "late_listing": 33,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 109,
+          "eligible": 118,
+          "late_listing": 32,
+          "failures": [
+            "AGNT",
+            "SGI",
+            "PR",
+            "DKNG",
+            "TRLV",
+            "WTRG",
+            "WDS",
+            "PSKY",
+            "OPTU"
+          ],
+          "covered_pct": 92.37288135593221
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "5049dbfc262564779fd5a8d740372f7d25902172d7bf4f00390e4f8f6a6fb7d1"
+    }
+  },
+  {
+    "family": "small_earnings",
+    "status": "failed",
+    "error": "1 missing OHLCV files; no symbols silently removed: ['C:\\\\Users\\\\basti\\\\Documents\\\\ba2\\\\common\\\\cache\\\\FMPOHLCVProvider\\\\BID_5min.parquet']"
+  },
+  {
+    "family": "mid_ds",
+    "status": "passed",
+    "evidence": {
+      "symbols": 1676,
+      "sample": 150,
+      "coverage": {
+        "1d": {
+          "covered": 114,
+          "eligible": 114,
+          "late_listing": 36,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 106,
+          "eligible": 122,
+          "late_listing": 28,
+          "failures": [
+            "FHI",
+            "CTOS",
+            "PSKY",
+            "CGAU",
+            "HWM",
+            "XPRO",
+            "BTE",
+            "DRS",
+            "ATS",
+            "CLVT",
+            "SBET",
+            "DKNG",
+            "TNL",
+            "PRKS",
+            "RTO",
+            "WLYB"
+          ],
+          "covered_pct": 86.88524590163935
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "4b03fd90469800cd601a41ffb4d2ec79195c029dde764223e5d9691f32a47a40"
+    }
+  },
+  {
+    "family": "mid_earnings",
+    "status": "passed",
+    "evidence": {
+      "symbols": 793,
+      "sample": 150,
+      "coverage": {
+        "1d": {
+          "covered": 114,
+          "eligible": 114,
+          "late_listing": 36,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 101,
+          "eligible": 115,
+          "late_listing": 35,
+          "failures": [
+            "FLG",
+            "DRS",
+            "NWG",
+            "CHPT",
+            "IBRX",
+            "WTRG",
+            "CIG-C",
+            "HWM",
+            "DINO",
+            "TFII",
+            "ZD",
+            "DKNG",
+            "CBUS",
+            "WFG"
+          ],
+          "covered_pct": 87.82608695652173
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "15022f2725f1fde3962ef19f110587879e9f29c241503bb0dd4acfc1e128c546"
+    }
+  },
+  {
+    "family": "small_rating",
+    "status": "passed",
+    "evidence": {
+      "symbols": 1227,
+      "sample": 150,
+      "coverage": {
+        "1d": {
+          "covered": 138,
+          "eligible": 138,
+          "late_listing": 12,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 128,
+          "eligible": 140,
+          "late_listing": 10,
+          "failures": [
+            "GETY",
+            "RYZ",
+            "GLOP-PA",
+            "BFH",
+            "LUCK",
+            "DMC",
+            "OGC",
+            "NHPBP",
+            "LKFT",
+            "GYRE",
+            "BTDR",
+            "DRS"
+          ],
+          "covered_pct": 91.42857142857143
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "dde7263babedecd2b35d37233232554cfac4870d7d9a3114e2840013a7368c15"
+    }
+  },
+  {
+    "family": "quality_momentum",
+    "status": "passed",
+    "evidence": {
+      "symbols": 103,
+      "sample": 103,
+      "coverage": {
+        "1d": {
+          "covered": 97,
+          "eligible": 97,
+          "late_listing": 6,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 94,
+          "eligible": 99,
+          "late_listing": 4,
+          "failures": [
+            "FUBO",
+            "TTE",
+            "BRK-B",
+            "SHEL",
+            "RTX"
+          ],
+          "covered_pct": 94.94949494949495
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "dba1be9e668bbd6698d0658f989d8fc8d6c932af518d6623079b3197a6d90d63"
+    }
+  },
+  {
+    "family": "pullback",
+    "status": "passed",
+    "evidence": {
+      "symbols": 103,
+      "sample": 103,
+      "coverage": {
+        "1d": {
+          "covered": 97,
+          "eligible": 97,
+          "late_listing": 6,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 94,
+          "eligible": 99,
+          "late_listing": 4,
+          "failures": [
+            "FUBO",
+            "TTE",
+            "BRK-B",
+            "SHEL",
+            "RTX"
+          ],
+          "covered_pct": 94.94949494949495
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "dba1be9e668bbd6698d0658f989d8fc8d6c932af518d6623079b3197a6d90d63"
+    }
+  },
+  {
+    "family": "analyst_targets",
+    "status": "passed",
+    "evidence": {
+      "symbols": 92,
+      "sample": 92,
+      "coverage": {
+        "1d": {
+          "covered": 88,
+          "eligible": 88,
+          "late_listing": 4,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 88,
+          "eligible": 90,
+          "late_listing": 2,
+          "failures": [
+            "SHEL",
+            "BRK-B"
+          ],
+          "covered_pct": 97.77777777777777
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "48ea54ea0d38f3caf814034ac74fe99f7cb7333c27eafeab4e50d5c8608a1c66"
+    }
+  },
+  {
+    "family": "etf_trend",
+    "status": "passed",
+    "evidence": {
+      "symbols": 4,
+      "sample": 4,
+      "coverage": {
+        "1d": {
+          "covered": 4,
+          "eligible": 4,
+          "late_listing": 0,
+          "failures": [],
+          "covered_pct": 100.0
+        },
+        "5min": {
+          "covered": 3,
+          "eligible": 4,
+          "late_listing": 0,
+          "failures": [
+            "GLD"
+          ],
+          "covered_pct": 75.0
+        }
+      },
+      "code_signature": "6b32c7b25fa781c2b853d332cf19a3fd4aabb46fe4e7e26acce37678d89571ab",
+      "cache_signature": "892af675526c7573107f6557918be317de7f161ff28a0eab2437b5f8ea0038ac"
+    }
+  }
+]

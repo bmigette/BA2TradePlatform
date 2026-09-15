@@ -211,7 +211,7 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
     def get_orders(self, status=None):
         return []
 
-    def get_instrument_current_price(self, symbol):
+    def get_instrument_current_price(self, symbol, price_type=None):
         return self._prices.get(symbol)
 
     def submit_order(self, order, is_closing_order=False):

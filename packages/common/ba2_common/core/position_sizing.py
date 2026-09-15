@@ -21,11 +21,28 @@ function has no DB/IO so it is unit-testable; ``get_latest_atr`` is the thin
 data-fetch wrapper.
 """
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime
+from typing import Any, Callable, Optional
 
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.replay import replay_now
+
+
+def resolve_sizing_risk_budget_pct(get_setting: Callable[[str], Any]) -> float:
+    """The %-of-equity DOLLAR-RISK budget for risk-based sizing, for BOTH risk managers.
+
+    get_setting(key) -> the expert's setting value (typically
+    ``functools.partial(expert.get_setting_with_interface_default, log_warning=False)``).
+    Prefers ``atr_risk_budget_pct``; when that is None falls back to ``risk_per_trade_pct``
+    (which ALSO sets the stop DISTANCE in the classic RM -- one gene doing two jobs was the
+    2026-08-16 defect). ``float(x or 1.0)`` semantics are kept on purpose: it is the classic
+    RM's historical behaviour and every backtest result depends on it.
+    """
+    budget = get_setting("atr_risk_budget_pct")
+    if budget is None:
+        budget = get_setting("risk_per_trade_pct")
+    return float(budget or 1.0)
 
 
 def compute_risk_based_quantity(
@@ -67,8 +84,10 @@ def compute_risk_based_quantity(
         lot_size: round-lot constraint (e.g. 100); quantity is floored to a multiple.
 
     Returns:
-        dict with: quantity (int), risk_per_share, risk_dollars, reason (str when
-        quantity is 0 explaining why), capped_by (None | 'notional' | 'balance').
+        dict with: quantity (int), risk_per_share, risk_dollars, qty_by_risk (the
+        pre-clamp count the risk budget alone bought, absent when sizing refused
+        before reaching it), reason (str when quantity is 0 explaining why),
+        capped_by (None | 'notional' | 'balance').
     """
     out = {"quantity": 0, "risk_per_share": None, "risk_dollars": None,
            "reason": "", "capped_by": None}
@@ -117,6 +136,11 @@ def compute_risk_based_quantity(
     out["risk_per_share"] = risk_per_share
 
     qty = int(risk_dollars // risk_per_share)
+    # The share count the RISK BUDGET alone buys, before the notional/cash/lot clamps below.
+    # Reported, not recomputed by the caller: the run record needs to show whether the budget
+    # or a clamp produced the final size, and a caller re-deriving this from risk_dollars and
+    # risk_per_share would be a second copy of the formula, free to drift from this one.
+    out["qty_by_risk"] = qty
     if qty < 1:
         out["reason"] = (f"risk budget ${risk_dollars:.2f} too small for risk/share "
                          f"${risk_per_share:.2f} (need a wider risk % or tighter stop)")
@@ -281,9 +305,9 @@ def reconcile_protective_stop(ruleset_sl: Optional[float], safeguard_sl: Optiona
                      nothing tighter to add.
     Neither        -> None.
 
-    Pure function. Shared by the backtest submit tails (daily_engine) so the tighter-wins policy is
-    defined once. (Live currently attaches only the safeguard and does NOT call this — that policy
-    change is intentionally out of scope until separately approved + paper-validated.)
+    Pure function. Shared by the backtest submit tails (daily_engine) and live TradeManager
+    entry/retry submissions so the tighter-wins policy is defined once. Reconciliation changes
+    the attached protection, not the safeguard used to size the position.
     """
     if ruleset_sl and safeguard_sl:
         return max(ruleset_sl, safeguard_sl) if is_long else min(ruleset_sl, safeguard_sl)
@@ -314,11 +338,18 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
     if indicator_provider is None:
         logger.warning(f"get_latest_atr: no indicator_provider injected for {symbol}")
         return None
+    # replay_now(end_date) reads that wall clock THROUGH the evaluation-clock seam:
+    # ``end_date`` is part of the indicator request's identity, and an identity key
+    # holding an un-replayed datetime.now() can never be matched again, so the
+    # recorded ATR read would be unreproducible by construction (see
+    # ba2_common.core.replay.observe). A caller that PASSES end_date -- every
+    # backtest does -- gets it back unchanged: as-of semantics are untouched.
+    end_date = replay_now(end_date)
     try:
         # Pull a window comfortably longer than the ATR period for a stable value.
         lookback = max(period * 4, 60)
         result = indicator_provider.get_indicator(
-            symbol, "atr", end_date=end_date or datetime.now(timezone.utc),
+            symbol, "atr", end_date=end_date,
             lookback_days=lookback, interval=interval, format_type="dict", period=period,
         )
         # The indicator dict format exposes a flat float list under "values".

@@ -193,3 +193,64 @@ def test_watchdog_rearms_a_missing_account_refresh_job():
         assert immediate, "watchdog should also kick an immediate catch-up refresh"
     finally:
         jm._scheduler.shutdown(wait=False)
+
+
+# ----------------------------------------------------------------------------
+# The warm jobs, on the same remove_all_jobs() path
+# ----------------------------------------------------------------------------
+def _warm_jobs_on(monkeypatch, queue=object()):
+    """Make the warm look ON, with a close time nothing has to ask a broker for."""
+    from ba2_trade_platform.core import warm_service
+
+    monkeypatch.setattr(warm_service, "get_warm_queue", lambda: queue)
+    monkeypatch.setattr(warm_service, "resolve_market_close",
+                        lambda: (16, 0, "America/New_York"))
+    return warm_service
+
+
+def test_full_schedule_refresh_re_establishes_the_warm_jobs(monkeypatch):
+    """Same 2026-07-23 trap, second occupant.
+
+    ``remove_all_jobs()`` deletes EVERY non-expert job, and the all-experts branch
+    re-added only the account refresh. The post-close warm and its daily re-resolve
+    were therefore dropped by the first ``/api/reload`` and stayed dropped until the
+    process restarted -- which for this application is measured in weeks. Nothing said
+    so: the warm queue was still running, still accepting batch work, and simply never
+    extended a price tail or pinned a session again.
+    """
+    warm_service = _warm_jobs_on(monkeypatch)
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    try:
+        warm_service.schedule_settlement_job(jm)  # startup state
+        assert jm._scheduler.get_job(warm_service.WARM_SETTLEMENT_JOB_ID) is not None
+
+        jm._refresh_expert_schedules_sync(None)
+
+        assert jm._scheduler.get_job(warm_service.WARM_SETTLEMENT_JOB_ID) is not None, (
+            "the post-close warm job was destroyed by a full expert-schedule refresh")
+        assert jm._scheduler.get_job(warm_service.WARM_RERESOLVE_JOB_ID) is not None, (
+            "the daily close re-resolve went with it, so even a restart-free recovery "
+            "was impossible")
+    finally:
+        jm._scheduler.shutdown(wait=False)
+
+
+def test_no_warm_job_is_scheduled_when_the_warm_is_off(monkeypatch):
+    """Off is off: a refresh must not bring the warm to life on an installation that
+    never turned it on."""
+    from ba2_trade_platform.core import warm_service
+
+    monkeypatch.setattr(warm_service, "get_warm_queue", lambda: None)
+    scheduled = []
+    monkeypatch.setattr(warm_service, "schedule_settlement_job",
+                        lambda *a, **k: scheduled.append(1))
+    jm = _make_jobmanager()
+    _install_account_refresh_stub(jm, [])
+    try:
+        jm._refresh_expert_schedules_sync(None)
+
+        assert scheduled == []
+        assert jm._scheduler.get_job(warm_service.WARM_SETTLEMENT_JOB_ID) is None
+    finally:
+        jm._scheduler.shutdown(wait=False)

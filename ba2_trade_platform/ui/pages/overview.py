@@ -1027,7 +1027,7 @@ class OverviewTab:
                     
                     # Create compact table with columns
                     columns = [
-                        {'name': 'provider', 'label': 'Provider', 'field': 'provider', 'align': 'left'},
+                        {'name': 'provider', 'label': 'Provider', 'field': 'provider', 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                         {'name': 'balance', 'label': 'Balance', 'field': 'balance', 'align': 'right'},
                         {'name': 'week', 'label': 'Week', 'field': 'week', 'align': 'right'},
                         {'name': 'month', 'label': 'Month', 'field': 'month', 'align': 'right'},
@@ -1468,19 +1468,19 @@ class AccountOverviewTab:
                 p['labels'] = ', '.join(lbls)         # for filtering / fallback display
 
             columns = [
-                {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left'},
+                {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                 {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
-                {'name': 'labels', 'label': 'Labels', 'field': 'labels', 'sortable': True, 'align': 'left'},
-                {'name': 'exchange', 'label': 'Exchange', 'field': 'exchange', 'sortable': True, 'align': 'left'},
-                {'name': 'asset_class', 'label': 'Asset Class', 'field': 'asset_class', 'sortable': True, 'align': 'left'},
+                {'name': 'labels', 'label': 'Labels', 'field': 'labels', 'sortable': True, 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+                {'name': 'exchange', 'label': 'Exchange', 'field': 'exchange', 'sortable': True, 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+                {'name': 'asset_class', 'label': 'Asset Class', 'field': 'asset_class', 'sortable': True, 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                 {'name': 'side', 'label': 'Side', 'field': 'side', 'sortable': True, 'align': 'center'},
                 {'name': 'qty', 'label': 'Quantity', 'field': 'qty', 'sortable': True, 'align': 'right'},
                 {'name': 'current_price', 'label': 'Current Price', 'field': 'current_price', 'sortable': True, 'align': 'right'},
-                {'name': 'avg_entry_price', 'label': 'Entry Price', 'field': 'avg_entry_price', 'sortable': True, 'align': 'right'},
+                {'name': 'avg_entry_price', 'label': 'Entry Price', 'field': 'avg_entry_price', 'sortable': True, 'align': 'right', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                 {'name': 'market_value', 'label': 'Market Value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
                 {'name': 'unrealized_pl', 'label': 'Unrealized P/L', 'field': 'unrealized_pl', 'sortable': True, 'align': 'right'},
                 {'name': 'unrealized_plpc', 'label': 'P/L %', 'field': 'unrealized_plpc', 'sortable': True, 'align': 'right'},
-                {'name': 'change_today', 'label': 'Today Change %', 'field': 'change_today', 'sortable': True, 'align': 'right'}
+                {'name': 'change_today', 'label': 'Today Change %', 'field': 'change_today', 'sortable': True, 'align': 'right', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'}
             ]
             # Open Positions Table
             with ui.card():
@@ -1576,16 +1576,35 @@ class AccountOverviewTab:
                 
                 # Calculate totals from all positions
                 def calculate_totals():
-                    total_qty = sum(float(pos['qty']) if isinstance(pos['qty'], (int, float)) else 0 for pos in all_positions)
-                    total_pl = sum(float(pos['unrealized_pl']) if isinstance(pos['unrealized_pl'], (int, float)) else 0 for pos in all_positions)
-                    total_mv = sum(float(pos['market_value']) if isinstance(pos['market_value'], (int, float)) else 0 for pos in all_positions)
-                    return total_qty, total_pl, total_mv
-                
-                total_qty, total_pl, total_mv = calculate_totals()
-                
+                    """Cost basis, unrealised P/L and market value across every position.
+
+                    COST, not quantity: summing share counts across different instruments adds
+                    apples to oranges -- 1 share at $410 and 44 at $3 total "45" of nothing. Cost
+                    basis is the money actually committed, so it pairs with market value to show
+                    the whole picture (committed -> worth now -> the difference).
+                    """
+                    def _num(v):
+                        return float(v) if isinstance(v, (int, float)) else 0.0
+
+                    total_cost = 0.0
+                    for pos in all_positions:
+                        cb = pos.get('cost_basis')
+                        if isinstance(cb, (int, float)):
+                            total_cost += float(cb)
+                        else:
+                            # Providers that do not report cost_basis (see TastyTradeAccount,
+                            # which derives it) -- reconstruct it rather than silently
+                            # under-reporting the total.
+                            total_cost += abs(_num(pos.get('qty'))) * _num(pos.get('avg_entry_price'))
+                    total_pl = sum(_num(pos.get('unrealized_pl')) for pos in all_positions)
+                    total_mv = sum(_num(pos.get('market_value')) for pos in all_positions)
+                    return total_cost, total_pl, total_mv
+
+                total_cost, total_pl, total_mv = calculate_totals()
+
                 with ui.row().classes('w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-t border-white/10'):
                     ui.label('TOTAL:').classes('text-sm font-bold text-secondary-custom')
-                    ui.label(f'Qty: {total_qty:.2f}').classes('text-sm font-semibold')
+                    ui.label(f'Cost: ${total_cost:,.2f}').classes('text-sm font-semibold')
                     pl_color = 'number-positive' if total_pl >= 0 else 'number-negative'
                     ui.label(f'Unrealized P/L: ${total_pl:,.2f}').classes(f'text-sm font-bold {pl_color}')
                     ui.label(f'Market Value: ${total_mv:,.2f}').classes('text-sm font-semibold')
@@ -1752,17 +1771,17 @@ class AccountOverviewTab:
         order_columns = [
             {'name': 'order_id', 'label': 'Order ID', 'field': 'order_id', 'align': 'left'},
             {'name': 'created_at', 'label': 'Date', 'field': 'created_at', 'align': 'left'},
-            {'name': 'account', 'label': 'Account', 'field': 'account', 'align': 'left'},
-            {'name': 'provider', 'label': 'Provider', 'field': 'provider', 'align': 'left'},
+            {'name': 'account', 'label': 'Account', 'field': 'account', 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'provider', 'label': 'Provider', 'field': 'provider', 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
             {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'center'},
             {'name': 'qty', 'label': 'Quantity', 'field': 'qty', 'align': 'right'},
-            {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type', 'align': 'center'},
+            {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type', 'align': 'center', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center'},
-            {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price', 'align': 'right'},
-            {'name': 'filled_qty', 'label': 'Filled Qty', 'field': 'filled_qty', 'align': 'right'},
+            {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price', 'align': 'right', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'filled_qty', 'label': 'Filled Qty', 'field': 'filled_qty', 'align': 'right', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left'},
-            {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'}
+            {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'}
         ]
         
         if all_orders:
@@ -1852,17 +1871,17 @@ class AccountOverviewTab:
             columns = [
                 {'name': 'order_id', 'label': 'Order ID', 'field': 'order_id'},
                 {'name': 'created_at', 'label': 'Date', 'field': 'created_at'},
-                {'name': 'account', 'label': 'Account', 'field': 'account'},
+                {'name': 'account', 'label': 'Account', 'field': 'account', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                 {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol'},
                 {'name': 'side', 'label': 'Side', 'field': 'side'},
                 {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity'},
-                {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type'},
+                {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                 {'name': 'status', 'label': 'Status', 'field': 'status'},
-                {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price'},
-                {'name': 'stop_price', 'label': 'Stop Price', 'field': 'stop_price'},
+                {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+                {'name': 'stop_price', 'label': 'Stop Price', 'field': 'stop_price', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                 {'name': 'expert', 'label': 'Expert', 'field': 'expert'},
-                {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status'},
-                {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
+                {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+                {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                 {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
             ]
             
@@ -6689,7 +6708,7 @@ class AccountGrowthTab:
             {'name': 'net', 'label': 'Net ($)', 'field': 'net', 'sortable': True, 'align': 'right'},
             {'name': 'drip_shares', 'label': 'DRIP Shares', 'field': 'drip_shares', 'sortable': False, 'align': 'right'},
             {'name': 'drip_price', 'label': 'DRIP Price', 'field': 'drip_price', 'sortable': False, 'align': 'right'},
-            {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left'},
+            {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
         ]
 
         total_gross = sum(r['amount'] for r in rows)

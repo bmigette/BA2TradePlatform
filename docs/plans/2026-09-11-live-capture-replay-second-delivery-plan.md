@@ -1,0 +1,165 @@
+# Live capture + replay: second delivery plan (steps 4-7 and remaining taps)
+
+> **For Claude:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development, one task at a time, in the worktree `C:\Users\basti\Documents\dev\BA2-margin` on branch `feat/live-capture-replay-2` (from dev 3e34440a). Never run two pytest invocations at once. Never touch `C:\Users\basti\Documents\dev\BA2TradePlatform` (prod runs from it, with capture ON since 2026-09-11 08:28).
+
+**Goal:** finish `docs/plans/2026-09-10-live-capture-prewarm-backtest-replay-spec.md`: close the capture gaps the first delivery documented (DeterministicScorer statements/macro/index/analyst reads, ATR, estimator-input clock seams), then steps 4 (shared warm service), 5 (historical comparison), 6 (decision and execution trace), 7 (pilot rollout). First delivery status: spec §12; its plan `2026-09-10-live-capture-replay-implementation-plan.md` (rules, run commands, trailers apply unchanged).
+
+**Invariants (unchanged):** expert calculations, live freshness, historical reconstruction, backtest semantics and golden fingerprints unchanged (`equity_golden_run.json` sha256 `b32b8de5bb42c1355f7e873cb6c738ff57df42b0f167bf3dcf35dfc3766f264b`); capture and warm add zero unplanned external requests; recording never changes a trade or analysis; replay/historical runs are offline or budgeted and isolated; warm never holds a trading lock; no `.get(key, default)` on settings; no fallback numbers; no silent failure; `exc_info=True` only in except. Every new app setting follows the get-or-create convention (no AppSetting migrations exist) and is created OFF/at its documented pilot value.
+
+**Verified code map (dev 3e34440a):**
+
+| Seam | Where |
+|---|---|
+| DS data reads | `packages/experts/ba2_experts/DeterministicScorer/data.py`: `fetch_ohlcv`:91 (tapped via `get_ohlcv_data`, `replay_now` at :111), `fetch_statements`:138 (`_utcnow()` at :148 → `end_date`; calls `FMPCompanyDetailsProvider.get_balance_sheet/get_income_statement/get_cashflow_statement`, un-taped), `fetch_past_earnings`:208 (same pattern, `get_past_earnings`), `fetch_grades_history`/`fetch_price_targets`:231-258 (call MODULE-level `FMPRating.fetch_grades_historical_cached`/`fetch_price_target_history_cached` :83-137, which bypass the tapped instance methods `_fetch_grades_historical`/`_fetch_price_target_history` :613/:630), `fetch_macro_series`:301 (`fred_series.get_series_as_of`, file-only, un-taped; `_MACRO_CACHE` keyed `live`/as_of), `fetch_index_closes`:261 (→ `fetch_ohlcv`) |
+| `FMPCompanyDetailsProvider` | `packages/providers/ba2_providers/fundamentals/details/FMPCompanyDetailsProvider.py` statements :97/:208/:309, `get_past_earnings`:575, `get_earnings_estimates`:~855 (fiscal-period filter, no revision selection) — no `observe_provider` anywhere |
+| FRED | `packages/providers/ba2_providers/macro/fred_series.py`: `get_series_as_of`:186 (raises FileNotFoundError if not warmed), `cache_path`:92 (import-time `CACHE_FOLDER`) |
+| Estimator inputs | `packages/experts/ba2_experts/analyst_target_model.py:fetch_estimator_inputs`:86 (`_utcnow` :96; broad `absorb_if_benign` without `except ReplayMiss: raise` :103-123) |
+| ATR | `packages/common/ba2_common/core/position_sizing.py:get_latest_atr`:311 (`datetime.now` inline :329 when `end_date` None; `indicator_provider.get_indicator` un-taped, `MarketIndicatorsInterface.py:124`, `PandasIndicatorCalc.py:186`) |
+| Cache roots | `ba2_common.config.CACHE_FOLDER` (import-time); `fmp_common._fmp_history_cache_dir` reads `ba2_common.config.CACHE_FOLDER` at CALL time (:302-305), files `<root>/fmp_history/<ns>__<SYM>.json`, empty sentinel = `[]` file, `_FMP_HISTORY_DISK_MAX_AGE_DAYS=7` (:299), `hermetic_fmp_history` thread-local, `persist_empty_sentinel` module global; `native_cache._CACHE_ROOT` import-time (`<root>/datasets/cache`), `fred_series` import-time → an isolated root needs a subprocess with `CACHE_FOLDER` env set before import (pattern `ba2_common/core/replay/_spawn_child.py`) |
+| FMP gate | `fmp_common._gate_wait/_gate_arm` :554-577; `fmp_http_get`:580 returns `requests.Response`; NO request/byte counters exist |
+| Warm tooling | `testplatform/backend/app/services/prewarm_fetchers.py` (`FETCHER_METHODS`:46, `run_prewarm`:402, `validate`:166, `SENATE_SCALPER_BOUNDS`:74, `_warm_estimator_inputs`:200); `data_build_handler.handle_prewarm`:220 (+ `_prewarm_fred`:52, handler-only — CLI `_cmd_prewarm` never warms FRED: GAP); launcher `_cmd_prewarm`:250 |
+| Historical path | `daily_engine.py` `_provider_bundle`:1732 (`LiveProviderBundle` over `TradeConditions._get_provider`), `analyze_as_of` call sites :881, :1077, :1200, :1397; `BacktestContext(providers, settings, as_of)` |
+| JobManager/queues | `JobManager._schedule_account_refresh_job`:606 (IntervalTrigger), `_schedule_iv_snapshot_job`:650 (CronTrigger); `WorkerQueue` single priority heap (analysis 10/5/0, SRM −10, expansion 5); batch end hook `WorkerQueue.py:1113-1142` (`log_analysis_batch_end`); independent second queue template `SmartRiskManagerQueue` (:134, own `queue.Queue` + daemon threads, `get_smart_risk_manager_queue`) |
+| Dependency declarations | none exist (`required_*` grep = 0); `TradeConditions` conditions read providers via `_get_provider` (:80) — a second provider path; `_warm_estimator_inputs` is the only declared dependency today |
+| Decision path | `TradeActionEvaluator.evaluate`:243/`execute`:374 (Phase 2 TP/SL :558-691); `TradeManager` funded loop :2202-2372 (`size_candidate_orders`:2213, `_persist_funded_entry`:2251, `_submit_funded_entry_with_retry`:1186/:2309, `_entry_submit_stop`:1168 → `reconcile_protective_stop`, refresh :2353), wash-trade retry :836-927, post-fill rebase :1325-1358; `TradeRiskManagement._size_prioritized_orders`:332 (`_available_balance_breakdown` :355, `log_capital_mapping` :373, `_get_existing_allocations` :384, `_calculate_order_quantities` :388), `_risk_atr_quantity`:1338; `AccountInterface.submit_order`:261 (RLock :101-111/:319, validators `_validate_account_exposure`:1071, `_validate_expert_available_balance`:1374, `_validate_position_size_limits`:1510); `ReadOnlyAccountInterface` `StockExposure`:142, `get_account_snapshot`:311, `_pending_stock_entry_notional`:808, `get_stock_exposure_headroom`:993, `describe_capital`:1012, `get_positions`:1345; `MarketExpertInterface._available_balance_breakdown`:1187, `describe_capital_mapping`:1312 |
+| Execution evidence | `AlpacaAccount.refresh_orders`:2836 (filled_qty/avg :2939-2967), OCO legs :540-758; activity helpers `ba2_common/core/utils.py` `log_close_order_activity`:622, `log_transaction_created_activity`:701, `log_trade_action_activity`:768 |
+| Replay account adapter pattern | `testplatform/backend/tests/backtest/test_margin_live_backtest_parity.py::_LiveAccount`:112 (canned snapshot/positions/orders; `_submit_order_impl` records) — `BacktestAccount` is NOT suitable (ledger from fills) |
+| UI/settings | `ui/pages/settings.py` System Settings card :624-639 (`ui.number` bound to AppSetting rows, save :785-800); header badge `ui/layout.py:529,727-734`; activity page `ui/pages/activity_monitor.py`; `PerfLogger` is UI-only (`ui/utils/perf_logger.py`) |
+| Capture host | `ba2_trade_platform/core/replay_capture.py` (`capture_enabled`:102, `get_capture_health`:205, session rollover, `set_current_batch`) |
+| Paper | `AccountDefinition` setting `paper_account` → `TradingClient(paper=…)` (`AlpacaAccount.py:324-328`); dev instance = `main.py --db-file <dev db> --port 8080` |
+
+---
+
+### Task A: Close the capture gaps (spec §5 rows for DS, rules and RM)
+
+**Files:** `packages/providers/ba2_providers/fundamentals/details/FMPCompanyDetailsProvider.py` (tap statements ×3, `get_past_earnings`, `get_earnings_estimates` with identities symbol/frequency/end_date/lookback/as_of; sanitized), `packages/providers/ba2_providers/macro/fred_series.py` (tap `get_series_as_of` identity series_id/as_of; provenance `disk_cache`), `packages/experts/ba2_experts/FMPRating.py` (move the grades-history and price-target taps to the MODULE-level cached fetchers so DS and FMPRating record through one boundary; the instance methods keep calling them — no double recording: the tap must record once per outermost call), `DeterministicScorer/data.py` (`_utcnow` → `replay_now(as_of)` in `fetch_statements`/`fetch_past_earnings`; `_MACRO_CACHE` key derived from the same clock value), `analyst_target_model.py` (`_utcnow` → `replay_now(as_of)`; `except ReplayMiss: raise` before each `absorb_if_benign`), `packages/common/ba2_common/core/position_sizing.py:get_latest_atr` (`end_date = replay_now(end_date)`), `MarketIndicatorsInterface.get_indicator` tap (identity symbol/indicator/period/interval/end_date; frame payload), gather-tape provider objects for the new observations (`testplatform/backend/app/services/replay/gather_tape.py`), Task-2 routing guard extended to these boundaries.
+
+**Tests:** `packages/providers/tests/test_replay_provider_taps.py` (+statements, past earnings, estimates, FRED, indicator: identity, passthrough, no key leak), `packages/experts/tests/test_replay_capture_experts.py` (DS live run under capture records statements/macro/index/analyst observations; `scorer_case` no longer stubs `data.*`; a DS run with `w_analyst>0` and a fake api key records grades/targets once — not twice — when FMPRating's instance methods are used in the same session), `testplatform/backend/tests/replay/test_gather_tape.py` (DS gather-tape → `match`; the `missing_capture` diagnosis test updated: DS is now fully serveable), root `tests/` a test that `get_latest_atr` records one clock read and one indicator observation under capture. Goldens unchanged.
+
+**Commit:** `feat(replay): tap statements, earnings/estimates, FRED, analyst history and ATR; clock seams for DS and estimator inputs (spec §5 gaps)`.
+
+**Amendment (review, 2026-09-11).** Two instructions above were wrong and are superseded by
+what shipped. (1) *"`_MACRO_CACHE` key derived from the same clock value"* — a clock-derived
+key disables the memo (a new key per tick, so a live instance re-reads every FRED series per
+analysis), piles `pd.Series` into a TTLCache that only evicts on read, and STILL collides for
+two analyses inside one tick, recording the second one's macro inputs nowhere. The key is the
+ANALYSIS (`analysis:<analysis_id>` from `current_capture()`, the unchanged constant `"live"`
+with capture off, `as_of` when historical), and the entries are dropped by a
+`CaptureContext.on_close` callback when the analysis's capture scope ends — new, shared
+machinery for per-analysis state a caller keeps outside the record. (2) The indicator identity
+*"symbol/indicator/period/interval/end_date"* is incomplete: it now carries every argument that
+changes the response (`provider`, `start_date`, `lookback_days`, `format_type` too), and there
+is no gather-tape actor for indicators because no expert `_gather` reads one — the consumer of
+that identity is the decision-and-execution trace (Task D), not this delivery. Also added
+beyond the plan's file list: `replay_now` in the four `cached_get` aliases (their derived
+`end_date` reaches the provider method's identity, so it was a raw wall clock there), a
+`ds_analyst_key_present` branch flag, and the `observe_provider` tap marker the routing guard
+asserts (`__wrapped__` is set by any `functools.wraps` decorator and cannot say "tapped").
+**Bundles captured before this commit report `missing_capture` for DeterministicScorer** — they
+carry neither the branch flag nor the macro/statement observations. That is expected, not a
+regression: re-capture to get a serveable scorer row. Finally, a backend worktree-isolation fix
+(`testplatform/backend/pytest.ini` + `tests/backtest/conftest.py`): the venv's editable
+installs map `ba2test_launcher`/`ba2_trade_platform` to the MAIN checkout, and importing the
+main launcher put the main `testplatform/backend` on `sys.path`, after which every `app.*`
+import came from there — which made `tests/replay` fail against a stale `gather_tape` whenever
+`tests/backtest` was collected in the same run. Those two suites now run in one invocation.
+
+### Task B: Shared warm service — resolver, planner, budgets, pinned roots, background worker (spec step 4, §6)
+
+**Files:** new `packages/common/ba2_common/core/replay/dependencies.py` (typed `Requirement(provider, namespace, symbol, window, interval, kind: history|timeseries|series|indicator, optional: bool, reason)` and `required_replay_inputs(expert_class, settings, rules, universe, window) -> list[Requirement]` — per-expert adapters registered from `ba2_experts` (`packages/experts/ba2_experts/replay_dependencies.py`: FMPRating, EarningsDrift, Insider, DeterministicScorer incl. estimator inputs, FRED series, index symbol, statements; FactorRanker/Senate/FinnHub/ETF/Penny return `unsupported`), plus rule/RM extras (ATR interval from `sizing_mode/atr_period`, earnings conditions, cooldown state) derived from the rules the caller passes); `testplatform/backend/app/services/warm/{planner,budget,roots,worker}.py`: `plan(requirements, roots) -> WarmPlan` (read-only inspection of production + shared roots: present/stale/missing per requirement using the on-disk formats — `fmp_history` files incl. `[]` sentinels, parquet coverage via `native_cache.timeseries_row_count`/max date, FRED files; estimated bytes from measured sizes; zero network), `budget.py` (request/byte accounting: add counters to `fmp_common.fmp_http_get` keyed by endpoint + purpose `live|capture|warm` via a contextvar purpose tag; `warm_daily_allowance_mib` app setting; reservation before dispatch; pause with remaining-gap report on exhaustion or rate-limit), `roots.py` (`materialize_pinned_root(plan, dest)`: copy/hardlink the selected artifact versions into an isolated root with a `manifest.json` of hashes and provenance `legacy_history_unknown_revision` for reused files; never overwrites source roots), `worker.py` (`WarmQueue` following `SmartRiskManagerQueue`: own `queue.Queue`, 2 daemon threads, `warm_workers` setting, shares the FMP gate; consumes `WarmPlan` items; each item runs `fmp_history_disk_cached` under `frozen_ttl_cache`+`persist_empty_sentinel` set in the worker thread; second unchanged run downloads nothing); host wiring `ba2_trade_platform/core/warm_service.py` (settings `warm_enabled` default false, `warm_workers` 2, `warm_daily_allowance_mib` 100; JobManager job: after each analysis batch (hook at `WorkerQueue.py:1113-1142`) enqueue newly required dependencies for the batch's captured analyses; a bounded scheduled job after session close (CronTrigger at exchange close + settlement offset) extends price tails and pins artifacts); CLI `ba2-test replay warm-plan --bundle <dir> --cache-root <isolated>` and `replay warm --plan <json>`; fix the CLI prewarm FRED gap by routing `_prewarm_fred` through the shared module.
+
+**Tests:** resolver per expert/settings (model mode adds estimator namespaces; `w_analyst=0` removes analyst history; rules with ATR add the indicator requirement; unsupported experts → `unsupported`); planner on a temp root with a mix of present/stale/empty-sentinel/missing files reports exactly the gaps and zero network (patched connect); budget: reservation, exhaustion pause, rate-limit backoff, counters by purpose; pinned root materialization is reproducible and never writes to the source; worker: two workers share one fetch for a shared requirement (dedupe), sentinel written for checked-empty, second run downloads nothing, worker never touches an account lock (assert `_submit_locks` untouched); host: settings created off, job registered only when enabled.
+
+**Commit:** `feat(warm): dependency resolver, network-free planner, budgets, pinned roots and a low-priority warm queue (spec step 4)`.
+
+**Amendment (review, 2026-09-11).** The FILE LIST above put the warm service in
+`testplatform/backend/app/services/warm/`, and that was wrong: the live trading app runs the
+same warm, so reaching it meant appending the backend directory to `sys.path` from inside
+`ba2_trade_platform` — an edge the spec's §8 layering does not allow, and one that would make a
+trade-only deployment silently unable to warm. What shipped is a three-way split, with the two
+entry points reduced to hosts:
+
+| Piece | Where | Why there |
+|---|---|---|
+| `WarmQueue`, `WarmBudget`, `RemainingGap`, `BudgetExhausted`, `unknown_reserve_for` | `packages/common/ba2_common/core/warm/` | pure mechanism; the meter, the rate-limit gate, the per-thread setup and the per-item context are INJECTED, so it imports no provider |
+| `planner`, `roots`, `seams` | `packages/providers/ba2_providers/warm/` | cache-layout knowledge (`fmp_history/`, `fred/`, `<ProviderClass>/<SYM>_<interval>.parquet`) plus the FMP-backed meter/gate/freeze/sentinel/purpose seams |
+| `DefaultWarmFetcher` + the one namespace→fetch table (`NamespaceFetchers`) | `packages/experts/ba2_experts/warm_fetchers.py` | the declaration and the fetch that satisfies it move together; `prewarm_fetchers` now COMPOSES this table instead of carrying a second copy of the calls |
+| settings, hooks, CronTrigger, CLI arg parsing | `ba2_trade_platform/core/warm_service.py`, `ba2test_launcher`, `app/services/warm/__init__.py` (re-export shim) | policy: whether, with what budget, when, on whose behalf |
+
+Eight behavioural corrections landed with it. (1) `DefaultWarmFetcher` fetches a **timeseries
+requirement through the provider it names** and uses the injected indicator-stack provider only
+for `kind="indicator"` — the first version wrote `YFinanceDataProvider`'s directory for a `fmp`
+price requirement the planner resolves against `FMPOHLCVProvider`'s, so every re-plan reported it
+`missing` and re-downloaded it forever. (2) A budget **pause is recoverable and counted**: it
+lifts when the allowance can cover the item that blocked it (in practice the UTC day rollover),
+logs ONE warning per episode, and reports `paused_dropped`; the batch hook logs what was enqueued
+AND that the warm is paused. (3) The **batch-end hook is enqueue-only** — it submits one "plan
+this batch" job and returns, because it runs in a trading worker's `finally` and resolving a batch
+walks the capture index, the database and the cache directories; `_SizeIndex` also lists
+`fmp_history` once and buckets it by namespace instead of re-scanning per namespace. (4) The
+purpose counters cover **`fmp_list_call` and FRED**, which carry the dominant warm traffic (the
+statements and the earnings calendar go through fmpsdk), and count **every attempt** including
+rate-limited ones, with bytes only on success; `fmp_list_call`'s bytes are the decoded payload
+size, documented as an over-estimate of the wire. (5) Parquet coverage checks the window **START
+and holes** (against `market_calendar` sessions, tolerating at least one missing session for halts)
+as well as the tail. (6) A daily tail is measured against the **last completed session**, not the
+wall-clock date, so daily requirements are not stale on every batch before the bar exists.
+(7) The settlement job resolves the close in **`market_calendar.NY_TZ`** rather than the instant's
+own tzinfo (Alpaca normalises to UTC → an hour of silent DST drift) and re-resolves itself daily;
+holidays and early closes are explicitly not modelled. (8) A **failed fetch is forgotten** so a
+later plan retries it, and its key is exposed in `stats()["failed_keys"]`.
+
+**Commit:** `refactor(warm): warm mechanism in ba2_common, planner/roots in ba2_providers,
+fetchers beside the experts; provider-correct timeseries warm, recoverable pause, enqueue-only
+hook, full budget accounting, prefix/hole coverage, DST-safe settlement (Task B review)`.
+
+### Task C: Historical comparison (spec step 5)
+
+**Files:** `testplatform/backend/app/services/replay/historical.py`: `run(bundle_dir, cache_root, out_dir)`: for each captured analysis, run in a **subprocess** (CACHE_FOLDER=pinned root set before import; `hermetic_fmp_history`; network denied) `expert.analyze_as_of(recorded_evaluation_time, BacktestContext(providers=LiveProviderBundle(get_provider), settings=recorded settings, as_of=...))` with the capture machinery recording the historical bundle (a `historical` capture scope in the same store under a derived session id), then diff: input fields (targets/rating buckets, report/EPS, insider rows, estimates + revision provenance, OHLCV/statement periods/values) and recommendation; statuses `match|difference|missing_history|revision_unknown|unsupported|not_run`; `revision_unknown` when the requirement's artifact provenance is `legacy_history_unknown_revision` or the estimate snapshot postdates the live consumption; coverage capability `historical`; report stage "Expert inputs" and "Recommendation" populated; CLI `replay historical --bundle <dir> --cache-root <pinned>`. The recorded evaluation time is the analysis's first `process`-phase clock read (or `started_at` when none).
+
+**Tests:** hermetic providers (`fixtures/hermetic_providers.py`) seeded into a temp pinned root so the historical run equals the live capture → `match`; alter the pinned history for one symbol → `difference` naming the input field and the decision change; remove a required file → `missing_history` naming the requirement; a legacy-provenance file → `revision_unknown`; subprocess isolation (parent `CACHE_FOLDER` unchanged; connect never called); ordinary backtest golden unchanged.
+
+**Commit:** `feat(replay): historical comparison against a pinned cache root (spec step 5)`.
+
+### Task D: Decision and execution trace (spec step 6, §7)
+
+**Files:** `packages/common/ba2_common/core/replay/decision.py` (schema `DecisionEvent`: links (analysis_id, recommendation id, expert, symbol), ordered `state_reads` each with source+timestamp (snapshot, positions, pending orders + local pending-state version, exposure breakdown, capital mapping, existing allocations, prices, ATR, commission, regime scale), rule results, sizing operands and result (quantity, side, capped_by), protection intents (ruleset stop/target, safeguard, reconciled, post-fill rebase), submit attempts (lock acquisition seq, validator outcomes, broker ack/reject, exception class), subsequent broker updates (fills/partials/cancels) — a per-analysis `decision_id`; typed codec via existing `$dataclass`); recording hooks (host and shared, capture-off = no-op): `TradeRiskManagement._size_prioritized_orders` (operands + per-order result), `_risk_atr_quantity`, `AccountInterface.submit_order` (lock seq counter, validator errors, `_submit_order_impl` outcome), `TradeManager` funded loop (`_entry_submit_stop` inputs/output, retry, wash-trade retry), post-fill rebase, `AlpacaAccount.refresh_orders` fill updates linked by broker id; `ReadOnlyAccountInterface` state reads recorded through a `record_state_read(kind, payload, source_ts)` helper; replay `testplatform/backend/app/services/replay/decisions.py`: (1) recompute `StockExposure`/headroom and capital mapping from the RAW recorded operands and compare to the recorded budget (exposes duplicate reservations); (2) `RecordedAccount(AccountInterface)` adapter built from the recorded state reads (pattern `_LiveAccount`; `_submit_order_impl` RAISES `ReplayMiss("submit")`), a `RecordedExpert` exposing the recorded settings and `_available_balance_breakdown` computed from the adapter, then `TradeRiskManagement.size_candidate_orders` + `reconcile_protective_stop` + validators re-run; compare quantity, side, rule branch, TP/SL at documented rounding; (3) execution outcome comparison labelled trace replay; statuses incl. `unavailable` when required state is missing (never a flat account); coverage capability `decision`; report stages "Rules and sizing"/"Execution" populated; CLI `replay decisions --bundle <dir>`.
+
+**Tests:** capture a funded-entry cycle under the recording hooks with the Task-2 fixtures + `_LiveAccount`-style fake (existing holdings, two competing entries on one account, a partial fill visible at the broker but locally pending, a reduction, a protection change) → replay `match`; drop a state read → `unavailable`; mutate recorded pending state → the recompute reports the discrepancy; concurrent submits recorded with distinct lock seq; `_submit_order_impl` refusal in replay; backtests (which run the same RM) byte-identical with capture off — golden unchanged; hook cost with capture off is one contextvar read.
+
+**Commit:** `feat(replay): decision and execution trace capture and replay (spec step 6)`.
+
+### Task E: Pilot rollout (spec step 7, §10 tests 7, 9, 10)
+
+**Files:** settings UI (`ui/pages/settings.py`): a "Replay & warm" card with switches/numbers bound to `replay_capture_enabled`, `warm_enabled`, `warm_workers`, `warm_daily_allowance_mib`, `replay_retention_days` (90), `replay_store_quota_mib` (explicit, default from measured size: create with the current store size ×4, documented), each get-or-create; capture health: `get_capture_health()` + capture overhead timing (lightweight monotonic timer in `ba2_common.core.replay.context` recording per-analysis capture ms; p50/p95 exposed in health) shown in a header badge (`ui/layout.py` pattern) turning amber on any degradation; an `ActivityLog` event (`log_activity`) on first degradation per session and on quota/retention actions; retention GC (`service.gc(retention_days, quota_bytes)`: deletes only unreferenced objects and unpinned finalized sessions older than retention, never pinned/exported/open sessions, quota exhaustion marks capture incomplete rather than deleting evidence; `pin_session/unpin_session` API + CLI `replay pin|unpin|gc`); export CLI `replay export --instance-cache <root> --session <id> --out <dir>` (finalized only; incomplete flagged); acceptance script `tools/replay_paper_acceptance.py` (runs inventory/experts/gather/decisions on an export and checks: every analysis represented, zero network attempts, p95 capture overhead below 10 ms after bundle creation, coverage thresholds; prints a pass/fail table); docs: spec §12 updated to "all steps", how to run a paper session on the dev instance (`main.py --db-file <dev db> --port 8080`, `paper_account=true`), operational policy table with the created settings; versions APP +1, TEST +1.
+
+**Tests:** settings card creates rows off/at pilot values and saves; health badge renders amber on degradation (NiceGUI test pattern in `tests/test_ui_colour_classes_paint.py`/`test_header_*`); GC respects pins/open sessions/quota and deletes only orphans; timer records and percentiles compute; acceptance script passes on a synthetic complete export and fails loudly on an incomplete one; existing UI tests green.
+
+**Commit:** `feat(replay): pilot rollout — settings card, capture health badge and activity events, retention GC, export, paper acceptance script (spec step 7)`.
+
+### Final gate (controller)
+
+**Byte-identical backtest check (operator requirement, 2026-09-11):** in addition to the pinned
+golden fingerprints, run the SAME real-data backtest payload twice, hermetic on the shared
+cache (`hermetic_fmp_history`, network denied): once from the pre-change checkout (dev
+3e34440a, the code prod runs) and once from the branch head; write both result sets
+(trades, equity curve, metrics, per-bar decisions) to JSON with ids/timestamps stripped and
+diff them byte for byte. Any difference blocks the merge until explained and fixed. Use
+one config per recorded expert class (FMPRating, FMPEarningsDrift, FMPInsiderClusterBuy,
+DeterministicScorer) over a short 2024 window on symbols the shared cache already covers.
+
+Goldens byte-identical; full backend (`tests/backtest`, `tests/replay`, warm tests), `packages/common|experts|providers`, root suite vs the 25-failure dev baseline; a real dev-instance paper session captured for one analysis batch and replayed end to end (`inventory`, `experts`, `gather`, `decisions`, `historical` against a pinned root) with the acceptance script.
+
+---
+
+## Status (2026-09-11)
+
+| Task | State | Commits |
+|---|---|---|
+| A Remaining taps | done, reviewed | 93fb9725, 8761e861 |
+| B Warm service | done, reviewed | b6b62b39, b38322ce |
+| C Historical comparison | done, two review rounds | 6cc7e1bb, 5e11ce14, 1bc2fcd8 |
+| D Decision/execution trace | DROPPED by operator decision (2026-09-11): the DB's `RiskManagerRun`, orders and fills already answer the question; the extra stream served order-path debugging only. Ranking/allocation operands are added to `RiskManagerRun` on `feat/classic-rm-run-trace` instead. | (partial work discarded) |
+| E Pilot rollout | reduced to the close-out: spec §12 status, version bumps at push, final gate | this section |
+
+Final gate results are recorded in `reports/trading/replay_final_gate_2026-09-11b.txt`.

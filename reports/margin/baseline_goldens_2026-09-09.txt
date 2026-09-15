@@ -1,0 +1,84 @@
+Baseline freeze at 512345311d06a3c26aa7c6784ec3b6c98433865a 2026-09-09T09:37:57Z
+python: Python 3.11.8
+=== backend goldens
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition description: Check if this expert has no open position for AAPL (based on transactions)
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition no_position result: False
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition no_position not met
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Stopping evaluation (evaluate_all_conditions=False)
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Conditions not met for event action: backtest-enter-_ConfigWiredStubExpert-1-enter-long
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - INFO - ✅ Evaluation complete: 0 action(s) created, 0 stored for execution
+2026-09-09 11:41:28,184 - ba2_common - ExtendableSettingsInterface - WARNING - Setting 'execution_schedule_enter_market' not configured for _ConfigWiredStubExpert (ID: 1), using interface default: {'days': {'monday': True, 'tuesday': True, 'wednesday': True, 'thursday': True, 'friday': True, 'saturday': False, 'sunday': False}, 'times': ['09:30']}
+2026-09-09 11:41:28,184 - ba2_common - ExtendableSettingsInterface - WARNING - Setting 'execution_schedule_open_positions' not configured for _ConfigWiredStubExpert (ID: 1), using interface default: {'days': {'monday': True, 'tuesday': True, 'wednesday': True, 'thursday': True, 'friday': True, 'saturday': False, 'sunday': False}, 'times': ['15:30']}
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - INFO - Evaluating ruleset 'backtest-enter-_ConfigWiredStubExpert-1' for AAPL
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Processing event action: backtest-enter-_ConfigWiredStubExpert-1-enter-long
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Evaluating trigger: bullish
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition description: Check if current recommendation is bullish (BUY) for AAPL
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition bullish result: True
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Evaluating trigger: no_position
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition description: Check if this expert has no open position for AAPL (based on transactions)
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition no_position result: False
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Condition no_position not met
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Stopping evaluation (evaluate_all_conditions=False)
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - DEBUG - Conditions not met for event action: backtest-enter-_ConfigWiredStubExpert-1-enter-long
+2026-09-09 11:41:28,184 - ba2_common - TradeActionEvaluator - INFO - ✅ Evaluation complete: 0 action(s) created, 0 stored for execution
+.2026-09-09 11:41:28,200 - ba2_common - db - DEBUG - Importing models for table creation
+2026-09-09 11:41:28,200 - ba2_common - db - DEBUG - Models imported successfully
+2026-09-09 11:41:28,200 - ba2_common - db - DEBUG - Database file path: :memory:
+2026-09-09 11:41:28,226 - ba2_common - db - INFO - Database initialized with WAL mode enabled
+2026-09-09 11:41:28,232 - ba2_common - db - INFO - Added instance: AppSetting (id=1)
+2026-09-09 11:41:28,232 - ba2_common - db - INFO - Added instance: AppSetting (id=2)
+2026-09-09 11:41:28,237 - ba2_common - db - INFO - Added instance: Ruleset (id=1)
+2026-09-09 11:41:28,238 - ba2_common - db - INFO - Added instance: ExpertSetting (id=1)
+2026-09-09 11:41:28,238 - ba2_common - db - INFO - Added instance: ExpertSetting (id=2)
+2026-09-09 11:41:28,244 - ba2_common - db - INFO - Added instance: ExpertSetting (id=3)
+2026-09-09 11:41:28,245 - ba2_common - db - INFO - Added instance: ExpertSetting (id=4)
+2026-09-09 11:41:28,247 - ba2_common - db - INFO - Added instance: ExpertSetting (id=5)
+2026-09-09 11:41:28,247 - ba2_common - db - INFO - Added instance: ExpertSetting (id=6)
+2026-09-09 11:41:28,247 - ba2_common - ExtendableSettingsInterface - INFO - Saved settings for instance_id=1: {'use_atr_stop': (False, 'bool'), 'regime_overlay_enabled': (False, 'bool'), 'allow_automated_trade_opening': (True, 'bool'), 'enable_buy': (True, 'bool'), 'allow_automated_trade_modification': (True, 'bool'), 'enable_sell': (False, 'bool')}
+2026-09-09 11:41:28,247 - ba2_common - ExtendableSettingsInterface - DEBUG - Cleared settings cache for _ConfigWiredStubExpert id=1
+.2026-09-09 11:41:28,257 - ba2_common - db - DEBUG - Importing models for table creation
+2026-09-09 11:41:28,257 - ba2_common - db - DEBUG - Models imported successfully
+2026-09-09 11:41:28,257 - ba2_common - db - DEBUG - Database file path: :memory:
+2026-09-09 11:41:28,288 - ba2_common - db - INFO - Database initialized with WAL mode enabled
+2026-09-09 11:41:28,288 - ba2_common - db - INFO - Added instance: AppSetting (id=1)
+2026-09-09 11:41:28,295 - ba2_common - db - INFO - Added instance: AppSetting (id=2)
+2026-09-09 11:41:28,295 - ba2_common - db - INFO - Added instance: Ruleset (id=1)
+2026-09-09 11:41:28,295 - ba2_common - db - INFO - Added instance: ExpertSetting (id=1)
+2026-09-09 11:41:28,303 - ba2_common - db - INFO - Added instance: ExpertSetting (id=2)
+2026-09-09 11:41:28,303 - ba2_common - db - INFO - Added instance: ExpertSetting (id=3)
+2026-09-09 11:41:28,305 - ba2_common - db - INFO - Added instance: ExpertSetting (id=4)
+2026-09-09 11:41:28,308 - ba2_common - db - INFO - Added instance: ExpertSetting (id=5)
+2026-09-09 11:41:28,308 - ba2_common - db - INFO - Added instance: ExpertSetting (id=6)
+2026-09-09 11:41:28,308 - ba2_common - ExtendableSettingsInterface - INFO - Saved settings for instance_id=1: {'use_atr_stop': (False, 'bool'), 'regime_overlay_enabled': (False, 'bool'), 'allow_automated_trade_opening': (True, 'bool'), 'enable_buy': (True, 'bool'), 'allow_automated_trade_modification': (True, 'bool'), 'enable_sell': (False, 'bool')}
+2026-09-09 11:41:28,308 - ba2_common - ExtendableSettingsInterface - DEBUG - Cleared settings cache for _ConfigWiredStubExpert id=1
+.
+============================== warnings summary ===============================
+app\models\database.py:65
+  C:\Users\basti\Documents\dev\BA2-margin\testplatform\backend\app\models\database.py:65: MovedIn20Warning: The ``declarative_base()`` function is now available as sqlalchemy.orm.declarative_base(). (deprecated since: 2.0) (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
+    Base = declarative_base()
+tests/backtest/test_equity_golden_run.py::test_equity_golden_run_matches_pinned_fingerprint
+  C:\Users\basti\Documents\dev\BA2TradePlatform\.venv\Lib\site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+118 passed, 2 warnings in 209.37s (0:03:29)
+=== golden fingerprints
+b32b8de5bb42c1355f7e873cb6c738ff57df42b0f167bf3dcf35dfc3766f264b *tests/backtest/golden/equity_golden_run.json
+f2efadeb179ee6fda85208b3f7bbb3560911ab799118035905bbbb37d0299c21 *tests/backtest/golden/option_leap_golden_run.json
+76cdb6840a84e282f8bc8b670be815c6baa54509c9c5e15a88369df92ec5b342 *tests/backtest/fixtures/equity_cap_golden.json
+=== packages/common margin+sizing tests
+packages\common\tests\test_recalculate_transaction_quantity_no_clobber.py . [ 97%]
+                                                                         [ 97%]
+packages\common\tests\test_trade_risk_management_inmem.py ..             [100%]
+
+============================= 95 passed in 2.16s ==============================
+=== root margin tests
+  C:\Users\basti\Documents\dev\BA2TradePlatform\.venv\Lib\site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 58 passed, 1 warning in 7.54s ========================
+=== probe
+    ]
+  }
+}
+DONE

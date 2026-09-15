@@ -14,6 +14,7 @@ import requests
 
 from ba2_common.core.interfaces import CompanyFundamentalsDetailsInterface
 from ba2_common.core.provider_utils import validate_date_range, statement_effective_date
+from ba2_common.core.replay.observe import observe_provider
 from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 from ba2_providers.fmp_common import fmp_list_call, fmp_http_get, fmp_history_disk_cached, FMPError
@@ -39,6 +40,61 @@ STATEMENT_HISTORY_DEPTH = 20
 # Large enough to cover full per-symbol history (e.g. AAPL = 164 rows back to 1985) so the as-of /
 # lookback_periods filtering in get_past_earnings works for arbitrarily old backtest windows.
 _PAST_EARNINGS_FETCH_LIMIT = 1000
+
+
+# --------------------------------------------------------------------------- #
+# Replay capture (spec step 2 / second-delivery Task A): the fundamentals reads
+# DeterministicScorer and the analyst-target estimator consume are recorded HERE,
+# at the return boundary of the provider methods themselves -- not at the
+# ``cached_get`` alias layer, which those two callers do not go through.
+#
+# The identity functions are NAMED (not inline lambdas) because the offline
+# replay tape imports them to look a recorded response up by exactly the identity
+# the tap wrote; a second, hand-written copy would drift and turn a real match
+# into a silent miss. Every argument that can change the RESPONSE is in the
+# identity -- ``format_type`` included: the same window rendered as markdown is a
+# different answer from the same window rendered as a dict.
+# --------------------------------------------------------------------------- #
+def statement_identity(args):
+    """What makes one financial-statement response what it is.
+
+    The METHOD (balance/income/cashflow) is recorded alongside this dict, so the
+    statement kind is not repeated here.
+    """
+    return {
+        "provider": type(args["self"]).__name__,
+        "symbol": args["symbol"],
+        "frequency": args["frequency"],
+        "start_date": args["start_date"],
+        "end_date": args["end_date"],
+        "lookback_periods": args["lookback_periods"],
+        "as_of": args["as_of"],
+        "format_type": args["format_type"],
+    }
+
+
+def past_earnings_identity(args):
+    """What makes a ``get_past_earnings`` response what it is (see above)."""
+    return {
+        "provider": type(args["self"]).__name__,
+        "symbol": args["symbol"],
+        "frequency": args["frequency"],
+        "end_date": args["end_date"],
+        "lookback_periods": args["lookback_periods"],
+        "format_type": args["format_type"],
+    }
+
+
+def earnings_estimates_identity(args):
+    """What makes a ``get_earnings_estimates`` response what it is (see above)."""
+    return {
+        "provider": type(args["self"]).__name__,
+        "symbol": args["symbol"],
+        "frequency": args["frequency"],
+        "as_of_date": args["as_of_date"],
+        "lookback_periods": args["lookback_periods"],
+        "format_type": args["format_type"],
+    }
 
 
 class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
@@ -94,6 +150,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             return data["markdown"]
         return str(data)
     
+    @observe_provider("fundamentals_details", "get_balance_sheet",
+                      identity=statement_identity)
     def get_balance_sheet(
         self,
         symbol: str,
@@ -205,6 +263,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             logger.error(f"Error fetching FMP balance sheet for {symbol}: {e}")
             return f"Error fetching balance sheet: {str(e)}"
     
+    @observe_provider("fundamentals_details", "get_income_statement",
+                      identity=statement_identity)
     def get_income_statement(
         self,
         symbol: str,
@@ -306,6 +366,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             logger.error(f"Error fetching FMP income statement for {symbol}: {e}")
             return f"Error fetching income statement: {str(e)}"
     
+    @observe_provider("fundamentals_details", "get_cashflow_statement",
+                      identity=statement_identity)
     def get_cashflow_statement(
         self,
         symbol: str,
@@ -572,6 +634,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             statement_label = statement_type.replace("_", " ").title()
             return f"# {statement_label} for {symbol}\n\nNo statements found.\n"
     
+    @observe_provider("fundamentals_details", "get_past_earnings",
+                      identity=past_earnings_identity)
     def get_past_earnings(
         self,
         symbol: str,
@@ -735,6 +799,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 return {"error": str(e), "symbol": symbol}
             return f"Error retrieving past earnings for {symbol}: {str(e)}"
 
+    @observe_provider("fundamentals_details", "get_earnings_estimates",
+                      identity=earnings_estimates_identity)
     def get_earnings_estimates(
         self,
         symbol: str,

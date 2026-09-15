@@ -22,7 +22,7 @@ from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
     UnrealisedPnL,
     clamp_unallocated_pct, current_value, effective_target_pct,
-    format_unrealised_pnl, investable_notional,
+    format_unrealised_pnl, investable_notional, split_unrealised_pnl,
     position_sign, reserved_notional_for, scale_pct_to_total, signed_position_values,
     split_pct_across, unrealised_pnl, validate_unallocated_pct,
 )
@@ -2748,10 +2748,57 @@ def format_last_target(previous: Optional[float]) -> str:
     return LAST_TARGET_FMT.format(previous=format_last_pct(previous))
 
 
+#: Below this, a dividend-adjusted percentage is drawn NEUTRAL rather than green or
+#: red. Half of the last digit the caption prints (``{pct:+.2f}%``), so the colour can
+#: never disagree with the number beside it -- the same rule
+#: ``LEVERAGE_RATIO_TOLERANCE`` follows for the same reason. ``pnl_color``'s band is
+#: MONEY_EPSILON because it keys off an amount; this half is a percentage.
+PNL_PCT_EPSILON = 0.005
+
+
 def format_pnl_caption(pnl: UnrealisedPnL) -> str:
     """``P&L +1,500.00 (+150.00%)``. Pure; the arithmetic and the wording are the
     engine's ``format_unrealised_pnl``, so this adds a name and nothing else."""
     return PNL_CAPTION_FMT.format(pnl=format_unrealised_pnl(pnl))
+
+
+def format_pnl_caption_parts(pnl: UnrealisedPnL) -> Tuple[str, Optional[str], str]:
+    """The caption in three pieces, so the dividend half can carry its own colour.
+
+    Pure. ``head + (dividend or "") + tail`` is EXACTLY ``format_pnl_caption(pnl)``
+    -- the engine's ``split_unrealised_pnl`` guarantees it and a test pins it, so
+    the row cannot drift from the single-string form the tooltips and tests use.
+
+    ``dividend`` is ``None`` when there is nothing dividend-adjusted to show; the
+    caller then draws the head alone and the row looks exactly as it did.
+    """
+    head, dividend, tail = split_unrealised_pnl(pnl)
+    return PNL_CAPTION_FMT.format(pnl=head), dividend, tail
+
+
+def pnl_div_color(pnl: UnrealisedPnL) -> str:
+    """The colour for the ``w/ div`` half, driven by ITS OWN sign. Pure.
+
+    Deliberately NOT ``pnl_color``: the two numbers disagree on exactly the rows
+    worth looking at (an income sleeve down on price and up on total return), and
+    that disagreement is the information. Same neutral band as ``pnl_color`` for the
+    same reason -- a flat 0.00% is not a verdict.
+
+    The BAND IS ON THE PERCENTAGE, not on ``pnl.amount``: this half is a percentage,
+    and keying its colour off the money would paint the dividend figure by the sign
+    of the number it is there to contradict.
+    """
+    if pnl is None or pnl.total_pct is None or abs(pnl.total_pct) <= PNL_PCT_EPSILON:
+        return NEUTRAL_TEXT_COLOR
+    return PNL_POSITIVE_COLOR if pnl.total_pct > 0 else PNL_NEGATIVE_COLOR
+
+
+def pnl_div_classes(pnl: UnrealisedPnL) -> str:
+    """CSS for the ``w/ div`` half. Pure; the colour twin of ``pnl_div_color``."""
+    if pnl is None or pnl.total_pct is None or abs(pnl.total_pct) <= PNL_PCT_EPSILON:
+        return 'text-xs text-secondary-custom'
+    return 'text-xs font-medium ' + ('text-green-500' if pnl.total_pct > 0
+                                     else 'text-red-500')
 
 
 def pnl_classes(pnl: UnrealisedPnL) -> str:
@@ -4376,3 +4423,99 @@ def working_orders_notice(*, settled: bool,
         return None
     return (WORKING_ORDERS_NOTICE_FMT.format(count=len(working_order_ids or [])),
             "warning")
+
+
+# THE OUTCOME VOCABULARY, spelled out rather than imported. It is defined in
+# ``core.portfolio_allocation_service``, and importing it here drags the DB in
+# (sqlalchemy) -- which this module is deliberately free of, so that the pure suite
+# stays cheap and order-independent
+# (``test_the_view_module_imports_without_nicegui_the_db_or_the_expert_stack``).
+#
+# Two spellings of one vocabulary is exactly the drift this comment should worry
+# about, so it is pinned instead of trusted: ``test_the_result_vocabulary_matches
+# _the_service`` asserts these keys ARE the service's constants, from a test that
+# is free to import both.
+_OUTCOME_SUBMITTED = 'submitted'
+_OUTCOME_PARTIAL = 'partially_filled'
+_OUTCOME_SKIPPED = 'skipped'
+_OUTCOME_FAILED = 'failed'
+_OUTCOME_WASHTRADE_LOCKED = 'washtrade_locked'
+_OUTCOME_UNACTIONABLE = 'unactionable'
+
+# ---------------------------------------------------------------------------
+# SUBMIT RESULTS, shown on the dry-run row itself. The dialog used to close on
+# Submit and hand over to a separate results table, which took away the very
+# table the user had just read -- the quantities, the reasons, the row they were
+# unsure about -- and replaced it with a list of symbols and no context.
+# ---------------------------------------------------------------------------
+
+#: What each outcome status says in the Result cell, and how it is painted.
+#: Short, because the column is w-36 and the row already carries the detail: the
+#: MESSAGE goes in the tooltip, not the cell, so a long broker rejection cannot
+#: push the table sideways.
+SUBMIT_RESULT_TEXT = {
+    _OUTCOME_SUBMITTED: 'sent',
+    _OUTCOME_PARTIAL: 'partial fill',
+    _OUTCOME_FAILED: 'FAILED',
+    _OUTCOME_SKIPPED: 'skipped',
+    _OUTCOME_WASHTRADE_LOCKED: 'wash-trade block',
+    _OUTCOME_UNACTIONABLE: 'needs a human',
+}
+
+#: Green for what went, RED for what did not, grey for what was never going to.
+#: A skipped row is NOT painted red: it is a row that had nothing to do, and
+#: colouring it as a failure would put half a healthy plan in red.
+SUBMIT_RESULT_CLASSES = {
+    _OUTCOME_SUBMITTED: 'text-green-500 font-medium',
+    _OUTCOME_PARTIAL: 'text-orange-400 font-medium',
+    _OUTCOME_FAILED: 'text-red-500 font-medium',
+    _OUTCOME_SKIPPED: 'text-gray-500',
+    _OUTCOME_WASHTRADE_LOCKED: 'text-orange-400 font-medium',
+    _OUTCOME_UNACTIONABLE: 'text-orange-400 font-medium',
+}
+
+#: A status this table has never heard of. Named rather than blanked: an unknown
+#: status is a real outcome the engine produced, and an empty cell beside a row
+#: whose order has gone reads as "nothing happened to it".
+SUBMIT_RESULT_UNKNOWN_CLASSES = 'text-orange-400 font-medium'
+
+SUBMIT_SUMMARY_FMT = 'Run {run_id}: {parts}.'
+SUBMIT_SUMMARY_NOTHING = 'Run {run_id}: nothing was sent.'
+SUBMIT_FAILED_FMT = 'Submission failed: {error}'
+
+
+def submit_result_cell(outcome) -> Tuple[str, str]:
+    """``(text, css)`` for one row's Result cell. Pure.
+
+    Keyed on ``status`` alone. The ACTION (new/close/adjust/sell_untracked) is
+    already visible in the row's Side and Qty, and repeating it here would spend a
+    narrow column restating what is beside it.
+    """
+    status = getattr(outcome, 'status', '') or ''
+    text = SUBMIT_RESULT_TEXT.get(status)
+    if text is None:
+        return status or 'unknown', SUBMIT_RESULT_UNKNOWN_CLASSES
+    return text, SUBMIT_RESULT_CLASSES[status]
+
+
+def submit_summary_line(outcomes, *, run_id) -> str:
+    """One sentence for the whole run: how many of each thing happened. Pure.
+
+    Counted from the outcomes rather than from the plan, because the two can
+    legitimately differ -- a row the broker refused is in both, a row that was
+    never sent is only in the plan.
+
+    Ordered by SEVERITY, not by count: what failed is the first thing the reader
+    needs, even when one row failed and sixty were sent.
+    """
+    counts: Dict[str, int] = {}
+    for outcome in outcomes or []:
+        status = getattr(outcome, 'status', '') or 'unknown'
+        counts[status] = counts.get(status, 0) + 1
+    order = (_OUTCOME_FAILED, _OUTCOME_UNACTIONABLE, _OUTCOME_WASHTRADE_LOCKED,
+             _OUTCOME_PARTIAL, _OUTCOME_SUBMITTED, _OUTCOME_SKIPPED)
+    parts = [f"{counts[s]} {SUBMIT_RESULT_TEXT.get(s, s)}" for s in order if counts.get(s)]
+    parts += [f"{n} {s}" for s, n in sorted(counts.items()) if s not in order]
+    if not parts:
+        return SUBMIT_SUMMARY_NOTHING.format(run_id=run_id)
+    return SUBMIT_SUMMARY_FMT.format(run_id=run_id, parts=', '.join(parts))

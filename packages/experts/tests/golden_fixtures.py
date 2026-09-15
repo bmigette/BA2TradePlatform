@@ -91,6 +91,13 @@ class _FrozenDateTime(datetime):
 # future). Patching the module-level ``datetime`` name they each bound via
 # ``from datetime import datetime`` is enough; missing/edge modules are skipped.
 _CLOCK_BOUND_MODULES = (
+    # The replay clock seam (spec step 2): experts that used to read
+    # ``datetime.now()`` in their own module now call ``replay_now(as_of)``,
+    # which reads the wall clock HERE when no capture context is active. Freezing
+    # only the expert modules would leave the live path on the real clock again
+    # and make this gate date-DEPENDENT once more. Production semantics are
+    # unchanged either way -- this pins the same instant, one module further in.
+    "ba2_common.core.replay.clock",
     "ba2_experts.FMPEarningsDrift",
     "ba2_experts.FMPInsiderClusterBuy",
     "ba2_experts.FinnHubRating",

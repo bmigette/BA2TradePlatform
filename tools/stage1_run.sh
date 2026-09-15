@@ -4,14 +4,40 @@
 # Isolation vs the running fleet (worker --port 8100, checkout /opt/ba2worker/BA2TradePlatform):
 #   own BA2_HOME, own DB, own worktree code via --launcher, cgroup RAM+CPU caps.
 #
-# F4 (option-program-review-findings.md, 2026-08-30): next run uses 24 workers (operator,
-# 2026-08-30). POP defaults to 140 (down from the design's spec'd 200, see docs/superpowers/
-# specs/2026-08-27-option-ga-grid-design.md §8) -- that reduction is PROVISIONAL: pop may be
-# reduced only if precision-neutral, and that has NOT been measured yet. Decision deferred to a
-# pilot run that compares top-N stability at 140 vs 200 before trusting a 140-pop stage-1
-# verdict. Override with POP=200 (or any value) to run the original spec while the pilot is
-# pending.
-set -u
+# Discovery policy lives in run_options_matrix.py --profile discovery: 16 permitted
+# structures x two experts, population 200, generations 60, patience 8. POP=140 remains
+# available for an explicitly labelled stability pilot; equivalence is not established.
+# Changed economic/search settings get a new job/checkpoint name. Old -st1 jobs are preserved.
+#
+# WINDOW + STORE (2026-09-14): the goal2020 window, 2020-01-01..2025-12-31, on the THETADATA
+# store -- the only vendor whose history floor (2018-09-14) reaches 2020; tastytrade floors at
+# 2022-10-01 and the alpaca sqlite at 2024-01-18 (backtest/options_store.py). The driver
+# forwards --options-store to EVERY job explicitly (never left to the env), because a
+# distributed trial carries no environment; BACKTEST_OPTIONS_STORE is still exported here
+# because it is part of the discovery identity digest -- keep it equal to STAGE1_STORE.
+# The store ACCEPTING the date does not prove the bars are there: check the ThetaData tree on
+# THIS host covers tools/options_universe_top100.txt over the window before launching
+# (local reference 2026-09-14: 98/98 symbols, expiries 2020-01-03..2026-09-11, 350 per symbol).
+#
+# PARALLELISM (2026-09-14). The FIRST attempts at 20 and 16 consumers were OOM-killed: the
+# option reader held ~15.6 GB of private numpy per consumer (177.8M rows x ~88 B at the 2020
+# window). Since commit c608ac05 the reader maps its arrays from a per-host DERIVED cache
+# (`<CACHE_FOLDER>/_derived/...`, see docs/plans/2026-09-14-shared-arrays-across-workers.md):
+# the columns are shared through the page cache once per host, and the private residue per
+# consumer is the projections + the touched greeks rows (~1-3 GB). PARALLEL therefore starts
+# at 24 and is TUNED FROM MEASUREMENT: watch the cgroup total and each child's PRIVATE bytes
+# (`/proc/<pid>/smaps_rollup` Private_Clean+Private_Dirty -- RSS counts shared mapped pages
+# and is misleading here), and raise/lower it between jobs. The fleet worker on this host must
+# be IDLE (its pool parked at 1 slot) or the two will fight for RAM; check `free -g` first.
+#
+# PREWARM IS MANDATORY BEFORE A COLD LAUNCH (build transient ~2.3x the frame, ~7-8 GB for
+# ThetaData TSLA; the store serialises builders per KEY only, so 24 cold consumers on
+# different keys can OOM the host). From the repo root, same PYTHONPATH/BA2_HOME as below:
+#   /opt/ba2worker/ba2-venvs/test/bin/python tools/build_shared_arrays.py #     --options-store thetadata --universe-file tools/options_universe_top100.txt #     --ohlcv-provider FMPOHLCVProvider --interval 1d --start 2020-01-01 --end 2025-12-31 #     --warmup-days 60 --jobs 4
+# and run it TWICE: the second run must report 0 built / 98 opened before launching.
+# BT_MAX_TASKS_PER_CHILD is raised from the handler default of 8: a recycle now costs a
+# re-OPEN of mapped files (ms), not a re-parse, but the projections are still rebuilt.
+set -euo pipefail
 cd /home/debian/ba2-grid/repo
 
 FMP_KEY=$(/opt/ba2worker/ba2-venvs/test/bin/python -c "
@@ -23,29 +49,28 @@ export BA2_HOME=/home/debian/ba2-grid/home
 export DB_FILE=/home/debian/ba2-grid/home/test/dl_forecasting.db
 export DATABASE_URL="sqlite:////home/debian/ba2-grid/home/test/dl_forecasting.db"
 export FMP_API_KEY="$FMP_KEY"
-export BACKTEST_OPTIONS_STORE=parquet
+STAGE1_STORE="${STAGE1_STORE:-thetadata}"
+export BACKTEST_OPTIONS_STORE="$STAGE1_STORE"
+export BT_MAX_TASKS_PER_CHILD="${BT_MAX_TASKS_PER_CHILD:-32}"
 export PYTHONPATH=/home/debian/ba2-grid/repo/packages/common:/home/debian/ba2-grid/repo/packages/providers:/home/debian/ba2-grid/repo/packages/experts:/home/debian/ba2-grid/repo/testplatform/backend
 
-# POP/GEN env overrides (F4, 2026-08-30). Defaults: POP 140 (provisional, see header note
-# above), GEN 60 (unchanged from the design spec).
-POP="${POP:-140}"
+# Restore the approved search budget; reducing it requires the separate pilot evidence.
+POP="${POP:-200}"
 GEN="${GEN:-60}"
+PARALLEL="${PARALLEL:-24}"
 
 # Universe constraints (F4(a), grid design §6): the screener metric store attached PURELY as a
 # GATE-ONLY per-bar entry gate (no universe switch, no screener:* genes -- see
 # ba2test_launcher._screener_gate_opt_block). --max-stock-price is a SINGLE blanket cap and,
-# passed alone, would cap EVERY structure at one price -- the review's "inert without the
-# store" finding is really "the blanket cap is the wrong knob": the actual per-strategy caps
-# the design calls for (O_CSP/O_JL/O_RS at $100, O_SSTD/O_SSTG at $300, everything else
-# uncapped) are real `screener_gate_base` entries on those five `_OPTION_STRATS` members
-# (ba2test_launcher.py, F4 2026-08-30) that WIN over the blanket default by design precedence.
-# --max-stock-price 0 here disables that blanket default so every OTHER structure (all
-# defined-risk: reserve is a function of wing width, not spot) stays uncapped, exactly as §6
-# specifies.
+# passed alone, would cap EVERY structure at one price. Retain the current per-strategy
+# caps: O_CSP/O_JL/O_RS and the inheriting O_WHEEL at $100; the other permitted singles
+# have no extra spot cap here. O_SSTD/O_SSTG retain $300 caps in their builders but are
+# excluded from search by the later risk decision. Actual sizing/assignment/volume rails
+# still apply to every structure -- no spot cap does not mean every contract is affordable.
 #
 # Prerequisite: the store must cover the options universe over the run window
-# (tools/options_universe_top100.txt over 2023-01-01..2025-12-31). Build/extend it with:
-#   ba2-test build-screener-metrics --start 2023-01-01 --end 2025-12-31 \
+# (tools/options_universe_top100.txt over 2020-01-01..2025-12-31). Build/extend it with:
+#   ba2-test build-screener-metrics --start 2020-01-01 --end 2025-12-31 \
 #     --market-cap-min 10000000000 --cadence-days 7
 # (large-cap floor, weekly cadence -- matches the daily run-schedule's staleness tolerance
 # noted in docs/superpowers/specs/2026-07-29-option-grid-max-stock-price-design.md).
@@ -58,15 +83,15 @@ if [ ! -e "$SCREENER_STORE" ]; then
   exit 1
 fi
 
-# 18 structures x 2 experts = 36 jobs; spec: gen 60, early-stop patience 8 (see POP above for
-# population). Parquet (TastyTrade) store -> full spec window 2023-01-01..2025-12-31.
+# STAGE1_START/END allow explicit shorter pilots (a 2023 start prints LIMITED WINDOW and gets
+# its own discovery identity). A dry-run (pass --dry-run) prints every resolved command.
 exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
+  --profile discovery \
   --launcher /home/debian/ba2-grid/repo/testplatform/ba2test_launcher.py \
-  --experts FMPRating,DeterministicScorer \
-  --strategies O_LC,O_LP,O_VERT,O_BULLCS,O_BULLPS,O_BEARCS,O_BF,O_IC,O_JL,O_RS,O_SSTD,O_SSTG,O_CSP,O_STRD,O_STRG,O_CC,O_PP,O_WHEEL \
-  --start 2023-01-01 --end 2025-12-31 \
+  --start "${STAGE1_START:-2020-01-01}" --end "${STAGE1_END:-2025-12-31}" \
+  --options-store "$STAGE1_STORE" \
   --population "$POP" --generations "$GEN" --early-stop 8 \
-  --parallel 2 \
+  --parallel "$PARALLEL" \
   --screener-gate-store "$SCREENER_STORE" --max-stock-price 0 \
   --name-suffix=-st1 \
   "$@"

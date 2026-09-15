@@ -1,3 +1,5 @@
+import pytest
+
 from ba2_common.core import trade_store as ts
 from ba2_trade_platform.core.interfaces.OptionsAccountInterface import OptionsAccountInterface as OAI
 from ba2_trade_platform.core.db import add_instance
@@ -90,3 +92,54 @@ def test_reserved_option_buying_power_sees_inmem_orders(mock_account):
         assert mock_account.reserved_option_buying_power() == 30000.0
         assert mock_account.available_option_buying_power() == 70000.0
         assert mock_account.check_option_buying_power(80000.0) is False
+
+
+def test_available_option_buying_power_uses_the_option_tradable_balance(mock_account, monkeypatch):
+    """Base is get_option_tradable_balance(), not get_balance(): a levered option sleeve
+    gets the levered figure; with margin off the two are equal and nothing changes."""
+    # A hypothetical 2x option sleeve. No orders are seeded, so the reserve pool is
+    # measurable and empty and the whole levered base is available.
+    monkeypatch.setattr(mock_account, "get_option_tradable_balance",
+                        lambda: 2 * mock_account.get_balance())
+    assert mock_account.available_option_buying_power() == 2 * mock_account.get_balance()
+
+    # The reserve still comes off the LEVERED base, not the plain balance.
+    add_instance(TradingOrder(account_id=mock_account.id, symbol="AAPL", quantity=2,
+        side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT, status=OrderStatus.FILLED,
+        asset_class=AssetClass.OPTION, option_strategy="cash_secured_put",
+        data={"option_reserve": 30000.0}))
+    assert mock_account.available_option_buying_power() == 170000.0
+
+
+def test_available_option_buying_power_is_none_when_the_option_tradable_balance_raises(
+        mock_account, monkeypatch):
+    """An unreadable tradable balance is UNKNOWN, not zero and not the plain balance:
+    None (which every gate refuses on), plus a logged error so it is not silent."""
+    def _boom():
+        raise ValueError("balance unavailable")
+    monkeypatch.setattr(mock_account, "get_option_tradable_balance", _boom)
+
+    from ba2_common import logger as logger_module
+    errors = []
+    monkeypatch.setattr(logger_module.logger, "error",
+                        lambda msg, *a, **k: errors.append(str(msg)))
+
+    assert mock_account.available_option_buying_power() is None
+    assert mock_account.check_option_buying_power(1.0) is False
+    assert any("balance unavailable" in m for m in errors), errors
+    # WHICH account could not be read: a log line that does not name it cannot be acted on.
+    assert any(f"Account {mock_account.id}" in m for m in errors), errors
+
+
+def test_a_NON_benign_tradable_balance_error_propagates(mock_account, monkeypatch):
+    """ValueError is the NAMED "unknown balance" signal and yields None. A TypeError is a
+    DEFECT: absorbing it would disable the option sleeve for ever while every gate reported
+    a tidy "unavailable". Under enforce it must come straight back out."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+
+    def _defect():
+        raise TypeError("defect")
+    monkeypatch.setattr(mock_account, "get_option_tradable_balance", _defect)
+
+    with pytest.raises(TypeError, match="defect"):
+        mock_account.available_option_buying_power()

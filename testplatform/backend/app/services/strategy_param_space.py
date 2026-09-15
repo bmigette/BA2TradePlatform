@@ -775,3 +775,72 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         "entry_rules": entry_rules,
         "exit_rules": exit_rules,
     }
+
+
+def schedule_override_from_genes(
+    strategy_params: Optional[Dict[str, Any]],
+    base_override: Optional[Dict[str, Any]] = None,
+    weekdays_only: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """The run_schedule_override a stored genome ACTUALLY ran with, or None if it has no
+    schedule genes.
+
+    ``_build_daily_trial_config`` lets a decoded ``schedule_days`` REPLACE the run-level
+    cadence for that individual, keeping only the run-level ``times``. Anything that
+    reconstructs a genome's config after the fact -- a re-run, an export, a deploy -- has to
+    reproduce that same replacement, or it silently reports/deploys the run-level cadence
+    instead of the days the GA selected. That is exactly how five live instances came to fire
+    on Mondays when their genomes had chosen Thursday, or Tue/Thu/Fri (2026-09-07).
+
+    Mirrors ``decode_params``' repair rule: an all-days-OFF genome gets the first weekday
+    forced back ON, because a config that never scans for entries is dead rather than merely
+    unlucky.
+
+    ``weekdays_only`` translates the genome into the cadence it EFFECTIVELY ran, for callers
+    that drive a real scheduler rather than a bar loop. On a daily clock there are no weekend
+    bars, so a saturday/sunday gene is noise the GA was never able to evaluate -- it stays ON
+    in perfectly good genomes purely because nothing selected against it. A live deploy that
+    copies those bits arms a real Saturday cron and runs an entry pass into a closed market,
+    which is behaviour no backtest ever scored. Deploy paths pass True; anything reproducing a
+    backtest leaves it False so the reconstruction stays bit-for-bit.
+
+    Returns None when the genome predates the schedule genes, so the caller keeps whatever
+    run-level override it already had.
+    """
+    if not isinstance(strategy_params, dict):
+        return None
+    by_day = {
+        k[len("schedule:"):]: bool(v)
+        for k, v in strategy_params.items()
+        if isinstance(k, str) and k.startswith("schedule:")
+    }
+    if not by_day:
+        return None
+    days = {day: by_day.get(day, False) for day in SCHEDULE_DAYS}
+    if weekdays_only:
+        days = {day: (value and day in SCHEDULE_DAYS[:5]) for day, value in days.items()}
+    # Same repair as decode_params, applied after the weekday filter so an all-weekend genome
+    # deploys as Monday rather than as an instance that never scans at all.
+    if not any(days.values()):
+        days[SCHEDULE_DAYS[0]] = True
+    return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}
+
+
+#: Settings that never took effect in any run on record, pinned OFF so they still don't.
+#:
+#: Both are bool-declared, and the GA passes genes as integers. The old settings writer stored a
+#: bool as ``json.dumps(value)``, so ON became the JSON string ``"1"`` -- which the reader tested
+#: against ``'true'`` and read as False. Every historical run therefore executed with the ATR
+#: stop-leg disabled and the regime overlay off, whatever its genome said.
+#:
+#: ``coerce_bool`` fixed the encoding, which means those stored genes would START working. That
+#: is right long-term and wrong as a side effect: it would silently make every new result
+#: incomparable with every result on record, and would change what a SAVED backtest reproduces.
+#:
+#: ``use_atr_stop`` must be pinned rather than merely dropped from the search: it declares
+#: ``default: True``, so absence alone would enable it.
+#:
+#: Mirrored by ``ba2test_launcher._INERT_RM_TOGGLES`` (the run-level half, for settings assembled
+#: before any decoding); the two are pinned equal by
+#: testplatform/backend/tests/backtest/test_inert_rm_toggles_stay_off.py.
+INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}

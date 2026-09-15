@@ -1,7 +1,7 @@
 import asyncio
 
 from nicegui import ui
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 from sqlmodel import select
 
 
@@ -29,6 +29,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ...core.rules_export_import import RulesExportImportUI
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
+
+
+def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
+    """Why this account settings form must not be saved; None when it may. Pure.
+
+    Shares margin_factor_error with the account's own read path, so the dialog can
+    never accept a value the account will later refuse.
+    """
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import margin_factor_error
+    if "margin_factor" in dynamic_settings:
+        return margin_factor_error(dynamic_settings["margin_factor"])
+    return None
+
 
 def _render_reset_default_button(inp, default_value, meta):
     """
@@ -855,6 +868,18 @@ class AccountDefinitionsTab:
             if hasattr(self, 'settings_inputs') and self.settings_inputs:
                 for key, inp in self.settings_inputs.items():
                     dynamic_settings[key] = inp.value
+            # Refused HERE, before a single setting is written: save_account writes the
+            # settings one by one and only then validates, so a value that got past this
+            # point would already be stored. ``ui.number`` hands back None when the field
+            # is cleared, and margin_factor_error(None) is an error message -- so a
+            # cleared factor is refused with a clear message rather than stored as None.
+            # That is intended: the 1.8 default applies only where the key was NEVER
+            # saved, and a stored None is not that.
+            problem = account_settings_error(dynamic_settings)
+            if problem:
+                ui.notify(problem, type='negative')
+                logger.warning(f"Refused to save account settings: {problem}")
+                return
             logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, dynamic_settings_keys: {list(dynamic_settings.keys())}')
             if account:
                 account.provider = provider
@@ -968,17 +993,28 @@ class AccountDefinitionsTab:
         with self.dialog:
             self.dialog.clear()
             provider_names = list(providers.keys())
-            with ui.card() as card:
-                self.type_select = ui.select(provider_names, label='Account Provider').classes('w-full')
-                self.name_input = ui.input(label='Account Name')
-                self.desc_input = ui.input(label='Description')
+            # WIDE AND COMPACT on purpose. Quasar caps a non-maximized dialog's card at
+            # 560px, and one stacked, full-height field per setting made a dozen settings
+            # a scrolling column. Dense outlined fields in a two-column grid fit the whole
+            # form on one screen; `!max-w-[95vw]` is what lifts Quasar's cap.
+            with ui.card().classes('w-[840px] !max-w-[95vw] gap-2 p-4') as card:
+                ui.label('New account' if account is None else f'Account: {account.name}') \
+                    .classes('text-base font-semibold')
+                with ui.grid(columns=3).classes('w-full gap-x-4 gap-y-1'):
+                    self.type_select = ui.select(provider_names, label='Account Provider') \
+                        .props('dense outlined').classes('w-full')
+                    self.name_input = ui.input(label='Account Name').props('dense outlined').classes('w-full')
+                    self.desc_input = ui.input(label='Description').props('dense outlined').classes('w-full')
                 self.type_select.value = account.provider if account else provider_names[0]
                 self.name_input.value = account.name if account else ''
                 self.desc_input.value = account.description if account else ''
-                self.dynamic_settings_container = ui.column().classes('w-full')
+                ui.separator().classes('my-1')
+                self.dynamic_settings_container = ui.grid(columns=2).classes('w-full gap-x-6 gap-y-1 items-center')
                 self._render_dynamic_settings(self.type_select.value, account)
                 self.type_select.on('update:model-value', lambda e: self._on_provider_change(e, account))
-                ui.button('Save', on_click=lambda: self.save_account(account))
+                with ui.row().classes('w-full justify-end gap-2 pt-2'):
+                    ui.button('Cancel', on_click=self.dialog.close).props('flat')
+                    ui.button('Save', on_click=lambda: self.save_account(account))
         self.dialog.open()
 
     def _on_provider_change(self, event, account):
@@ -1044,37 +1080,35 @@ class AccountDefinitionsTab:
             settings_values = self._get_account_settings_from_db(account.id)
 
         self.settings_inputs = {}
+
+        def _help(tooltip_text):
+            # The help icon sits INLINE after the field, in the same grid cell, so a
+            # setting is one row of the two-column grid rather than a title block plus a
+            # full-height field. The tooltip is styled as a tooltip, not the icon.
+            if not tooltip_text:
+                return
+            with ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help shrink-0'):
+                ui.tooltip(tooltip_text).classes('text-sm max-w-[350px] leading-snug')
+
         with self.dynamic_settings_container:
             if settings_def and len(settings_def.keys()) > 0:
                 for key, meta in settings_def.items():
                     label = meta.get("description", key)
                     value = settings_values.get(key, None) if settings_values else None
                     tooltip_text = meta.get("tooltip")
+                    valid_values = meta.get("valid_values")
 
-                    # Create a container for this setting (title + input)
-                    with ui.column().classes('w-full mb-4'):
-                        # Create label with tooltip inline
-                        if tooltip_text:
-                            with ui.row().classes('items-center gap-1 mb-2'):
-                                ui.label(label).classes('text-sm font-medium')
-                                ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help').tooltip(tooltip_text).style('font-size: 18px !important; padding: 12px !important; max-width: 350px !important; line-height: 1.4 !important;')
-
-                            # Use empty label for input since we show it above
-                            display_label = ""
-                        else:
-                            display_label = label
-
-                        valid_values = meta.get("valid_values")
-
-                        # Create the input field directly in the same container
+                    # One grid cell per setting: the field (label INSIDE it, Quasar
+                    # floating label) grows, the help icon trails it.
+                    with ui.row().classes('w-full items-center gap-1 no-wrap min-h-10'):
                         if meta["type"] == "str" and valid_values:
                             inp = ui.select(
-                                label=display_label,
+                                label=label,
                                 options=list(valid_values),
                                 value=value if value in valid_values else (valid_values[0] if valid_values else "")
-                            ).classes('w-full')
+                            ).props('dense outlined').classes('flex-grow')
                         elif meta["type"] == "str":
-                            inp = ui.input(label=display_label, value=value or "").classes('w-full')
+                            inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         elif meta["type"] == "bool":
                             # Proper boolean conversion - handle string "false"/"true" and boolean values
                             bool_value = False
@@ -1085,16 +1119,17 @@ class AccountDefinitionsTab:
                                     bool_value = value.lower() in ('true', '1', 'yes')
                                 else:
                                     bool_value = bool(value)
-                            inp = ui.checkbox(text=display_label, value=bool_value)
+                            inp = ui.checkbox(text=label, value=bool_value).props('dense').classes('flex-grow')
                         elif meta["type"] == "float":
                             float_value = value if value is not None else meta.get("default", "")
-                            inp = ui.number(label=display_label, value=float_value).classes('w-full')
+                            inp = ui.number(label=label, value=float_value).props('dense outlined').classes('flex-grow')
                         else:
-                            inp = ui.input(label=display_label, value=value or "").classes('w-full')
+                            inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
+                        _help(tooltip_text)
 
                     self.settings_inputs[key] = inp
             else:
-                ui.label("No provider-specific settings available.")
+                ui.label("No provider-specific settings available.").classes('col-span-2 text-sm text-gray-500')
 
     def _on_table_edit_click(self, msg) -> None:
         logger.debug('Handling edit account from table, data %s', msg)

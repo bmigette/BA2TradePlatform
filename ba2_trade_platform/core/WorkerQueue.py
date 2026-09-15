@@ -868,6 +868,12 @@ class WorkerQueue:
     def _execute_task(self, task: AnalysisTask, worker_name: str):
         """Execute a single analysis task."""
         logger.debug(f"Worker {worker_name} executing analysis task '{task.id}' for expert {task.expert_instance_id}, symbol {task.symbol}")
+
+        # Replay capture (spec step 2): the names are bound HERE (before the try)
+        # so the finally's clear can never fail on an unbound name; the batch id
+        # itself is set inside the try, so every path that sets it is a path the
+        # finally clears.
+        from .replay_capture import set_current_batch, clear_current_batch
         
         # Update task status
         with self._task_lock:
@@ -878,6 +884,11 @@ class WorkerQueue:
         self._update_persisted_task_status(task.id, "running", datetime.fromtimestamp(task.started_at, tz=timezone.utc))
             
         try:
+            # Tell THIS worker thread which batch it is running, so the analysis
+            # RECORD can name it. Thread-local -- nothing is written to the
+            # MarketAnalysis or any other trading row to carry it.
+            set_current_batch(getattr(task, 'batch_id', None))
+
             # Import here to avoid circular imports
             from .db import get_instance, add_instance
             from .models import ExpertInstance, MarketAnalysis
@@ -1100,6 +1111,8 @@ class WorkerQueue:
             )
         
         finally:
+            clear_current_batch()
+
             # Handle batch completion logging if this task belongs to a batch
             if hasattr(task, 'batch_id') and task.batch_id:
                 try:
@@ -1129,6 +1142,17 @@ class WorkerQueue:
                             )
                         except Exception as e:
                             logger.warning(f"Failed to log batch end for {task.batch_id}: {e}")
+
+                        # Lifecycle step 3 (spec section 6): as each batch finishes,
+                        # queue only the historical dependencies its analyses newly
+                        # require. A no-op call when warming is off, and wrapped
+                        # anyway -- a warm may never delay or fail a trading path.
+                        try:
+                            from .warm_service import on_analysis_batch_end
+                            on_analysis_batch_end(task.batch_id)
+                        except Exception as e:
+                            logger.warning(
+                                f"Warm batch-end hook failed for {task.batch_id}: {e}")
                 except Exception as e:
                     logger.warning(f"Error tracking batch completion for {task.batch_id}: {e}")
             
@@ -1478,7 +1502,11 @@ class WorkerQueue:
         """
         try:
             logger.debug(f"[RISK_MGR_TRIGGER] ===== START _check_and_process_expert_recommendations for expert {expert_instance_id}, use_case={use_case.value} =====")
-            
+
+            # Set INSIDE the lock, acted on OUTSIDE it -- see the release below the
+            # ``with`` block for why that ordering is the whole point.
+            release_parked_exit_pass = False
+
             # Check if there are any pending tasks for this expert
             # Use lock to prevent race condition when multiple jobs complete simultaneously
             with self._risk_manager_lock:
@@ -1657,10 +1685,19 @@ class WorkerQueue:
                                 logger.debug(f"[RISK_MGR_TRIGGER] No orders created by automated processing for expert {expert_instance_id}")
                             if use_case == AnalysisUseCase.ENTER_MARKET:
                                 # Entry orders exist now: this is the backtest's
-                                # `_manage_open_positions`-after-`_run_expert_bar` point. Release
-                                # any OPEN_POSITIONS pass parked behind this entry pass.
-                                self.release_deferred_open_positions(
-                                    expert_instance_id, "entry pass processed")
+                                # `_manage_open_positions`-after-`_run_expert_bar` point. The
+                                # parked OPEN_POSITIONS pass is released AFTER this block drops
+                                # ``_risk_manager_lock`` -- NOT here. ``release_deferred_open_positions``
+                                # takes that same lock, and it is a plain ``threading.Lock``: calling
+                                # it from inside this block is the thread waiting on itself, forever.
+                                # That is exactly what happened on 2026-09-07 15:32:51 (PROD): expert
+                                # 12's pass created 2 orders, called the release, and never logged
+                                # another line; expert 7 and then all 8 of expert 10's completions
+                                # queued behind the held lock, expert 10's 4 actionable
+                                # recommendations were never evaluated, and nothing moved until the
+                                # 21:54 restart. First enter-market pass after e5e37c6a introduced
+                                # the call.
+                                release_parked_exit_pass = True
                             # THE OPTION RUN RECORD. Everything the option risk manager
                             # decided this pass -- every admission and every refused rail --
                             # is written as ONE ``RiskManagerRun`` row with mode="options",
@@ -1692,7 +1729,14 @@ class WorkerQueue:
                 else:
                     logger.debug(f"[RISK_MGR_TRIGGER] Still has pending {use_case.value} tasks for expert {expert_instance_id}, skipping automated processing")
                     logger.debug(f"[RISK_MGR_TRIGGER] ===== END (has pending tasks) =====")
-                
+
+            # OUTSIDE ``_risk_manager_lock`` -- the block above has released it and its
+            # ``finally`` has already dropped this expert from ``_processing_experts``, so the
+            # parking predicate now correctly reads "no entry pass in flight". Releasing while
+            # still holding the lock was a self-deadlock (see the flag's assignment above).
+            if release_parked_exit_pass:
+                self.release_deferred_open_positions(expert_instance_id, "entry pass processed")
+
         except Exception as e:
             logger.error(f"[RISK_MGR_TRIGGER] ✗ Error checking and processing recommendations for expert {expert_instance_id} ({use_case.value}): {e}", exc_info=True)
             logger.debug(f"[RISK_MGR_TRIGGER] ===== END (exception) =====")

@@ -34,7 +34,7 @@ import ba2test_launcher as L  # noqa: E402
 
 from app.services.backtest.options_store import (  # noqa: E402
     OPTIONS_STORES,
-    PARQUET,
+    TASTYTRADE,
     SQLITE,
     resolve_options_store,
 )
@@ -182,7 +182,7 @@ def test_the_batch_driver_accepts_the_same_flag():
 def test_the_flag_reaches_the_backtest_block(monkeypatch):
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
     cfg = _run_optimize(_parse(_BASE_ARGV + ["--options-store", "parquet"]), monkeypatch)
-    assert cfg["backtest"]["options_store"] == PARQUET
+    assert cfg["backtest"]["options_store"] == TASTYTRADE
 
 
 def test_the_flag_reaches_the_batch_driver_config(monkeypatch):
@@ -192,7 +192,7 @@ def test_the_flag_reaches_the_batch_driver_config(monkeypatch):
     cfg = _run_optimize_batch(
         _parse(_BATCH_ARGV + ["--options-store", "parquet"], cmd_attr="_cmd_optimize_batch"),
         monkeypatch)
-    assert cfg["backtest"]["options_store"] == PARQUET
+    assert cfg["backtest"]["options_store"] == TASTYTRADE
 
 
 def test_the_env_var_is_RESOLVED_into_the_block_rather_than_left_implicit(monkeypatch):
@@ -201,21 +201,21 @@ def test_the_env_var_is_RESOLVED_into_the_block_rather_than_left_implicit(monkey
     one."""
     monkeypatch.setenv("BACKTEST_OPTIONS_STORE", "parquet")
     cfg = _run_optimize(_parse(_BASE_ARGV), monkeypatch)
-    assert cfg["backtest"]["options_store"] == PARQUET
+    assert cfg["backtest"]["options_store"] == TASTYTRADE
 
     on_the_worker = _across_the_wire(cfg["backtest"])
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
-    assert resolve_options_store(on_the_worker) == PARQUET
+    assert resolve_options_store(on_the_worker) == TASTYTRADE
 
 
 def test_the_env_var_is_resolved_into_the_batch_block_too(monkeypatch):
     monkeypatch.setenv("BACKTEST_OPTIONS_STORE", "parquet")
     cfg = _run_optimize_batch(_parse(_BATCH_ARGV, cmd_attr="_cmd_optimize_batch"), monkeypatch)
-    assert cfg["backtest"]["options_store"] == PARQUET
+    assert cfg["backtest"]["options_store"] == TASTYTRADE
 
     on_the_worker = _across_the_wire(cfg["backtest"])
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
-    assert resolve_options_store(on_the_worker) == PARQUET
+    assert resolve_options_store(on_the_worker) == TASTYTRADE
 
 
 def test_the_flag_beats_the_env_var(monkeypatch):
@@ -246,10 +246,10 @@ def test_the_store_survives_into_the_per_trial_config(monkeypatch):
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
     argv = [a for a in _BASE_ARGV] + ["--strategy", "O_LC", "--options-store", "parquet"]
     block = _run_optimize(_parse(argv), monkeypatch)["backtest"]
-    assert block["options_store"] == PARQUET
+    assert block["options_store"] == TASTYTRADE
 
     decoded = {"tp": 8.0, "sl": 3.0, "expert_overrides": {}, "buy_tree": None,
                "sell_tree": None, "exit_rules": []}
     trial = _build_daily_trial_config(_across_the_wire(block), decoded)
-    assert trial["options_store"] == PARQUET
-    assert resolve_options_store(_across_the_wire(trial)) == PARQUET
+    assert trial["options_store"] == TASTYTRADE
+    assert resolve_options_store(_across_the_wire(trial)) == TASTYTRADE

@@ -126,7 +126,7 @@ RAW    ~/Documents/ba2/common/news_raw/<SYM>.parquet          master-only
        url_hash, published_at, provider, source, title, summary, text
        - OUTSIDE CACHE_FOLDER -> never enters build_manifest, never syncs
        - never opened by an expert or a backtest
-       - exported to GDrive as a 3rd source in tools/ml_cache_archive.py
+       - exported to GDrive as a 3rd source in tools/ba2_cache_export.py
 
 SCORED ~/Documents/ba2/common/cache/news/<SYM>.parquet        synced
        url_hash, published_at, provider, model, score, pos, neu, neg
@@ -150,7 +150,7 @@ Export and sync consume the cache tree and, for the first time, need to **disagr
 wants the raw text, sync must not have it. Putting raw outside `CACHE_FOLDER` preserves
 `cache_sync`'s strongest invariant — *everything under the cache root syncs, no exceptions* —
 which the code comment explicitly relies on to stop allowlists drifting.
-`tools/ml_cache_archive.py` already has a named-source list (`cache`, `db`), so `news_raw`
+`tools/ba2_cache_export.py` already has a named-source list (`cache`, `db`), so `news_raw`
 joins it there and hangs off `--scope`.
 
 ### Not in scope: the ProviderCache DB event store

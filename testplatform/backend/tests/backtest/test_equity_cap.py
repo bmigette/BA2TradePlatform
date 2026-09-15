@@ -351,8 +351,12 @@ def test_EVERY_money_field_on_the_account_info_dict_is_capped(capped_account):
     any reader that looks at a different name -- and the mutation run confirmed nothing caught
     it."""
     info = capped_account(cash=40_000.0, cap=20_000.0).get_account_info()
+    # Exact-dict on purpose, so a money field added later cannot slip past the cap.
+    # "multiplier" is the one NON-money entry: the simulator publishing its unlevered
+    # 1.0 for the margin accessors, a ratio the cap has nothing to say about.
     assert dict(info) == {"balance": 20_000.0, "cash": 20_000.0,
-                          "equity": 20_000.0, "buying_power": 20_000.0}
+                          "equity": 20_000.0, "buying_power": 20_000.0,
+                          "multiplier": 1.0}
 
 
 def test_an_uncapped_account_has_the_cap_attribute_set_to_None(capped_account):

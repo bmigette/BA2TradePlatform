@@ -1,0 +1,113 @@
+{
+  "reviewed_head": "512345311d06a3c26aa7c6784ec3b6c98433865a",
+  "timestamp_utc": "2026-09-09T09:42:30.622191+00:00",
+  "network_calls": 0,
+  "production_writes": 0,
+  "observations": {
+    "tp_sl_and_classic_risk_sizing": [
+      {
+        "margin": false,
+        "side": "BUY",
+        "virtual": 10000.0,
+        "quantity": 20,
+        "tp": 110.0,
+        "sl": 95.0,
+        "dollar_loss_at_stop": 100.0
+      },
+      {
+        "margin": false,
+        "side": "SELL",
+        "virtual": 10000.0,
+        "quantity": 20,
+        "tp": 90.0,
+        "sl": 105.0,
+        "dollar_loss_at_stop": 100.0
+      },
+      {
+        "margin": true,
+        "side": "BUY",
+        "virtual": 18000.0,
+        "quantity": 36,
+        "tp": 110.0,
+        "sl": 95.0,
+        "dollar_loss_at_stop": 180.0
+      },
+      {
+        "margin": true,
+        "side": "SELL",
+        "virtual": 18000.0,
+        "quantity": 36,
+        "tp": 90.0,
+        "sl": 105.0,
+        "dollar_loss_at_stop": 180.0
+      }
+    ],
+    "smart_classic_budget_divergence": {
+      "virtual": 18000.0,
+      "risk_budget_pct": 0.5,
+      "stop_gene_pct": 5.0,
+      "classic_quantity": 18,
+      "smart_quantity": 180,
+      "classic_loss_at_stop": 90.0,
+      "smart_loss_at_stop": 900.0
+    },
+    "classic_instrument_cap_uses_remaining_funds": {
+      "virtual": 18000.0,
+      "available": 9000.0,
+      "configured_cap_pct": 10.0,
+      "actual_cap": 900.0,
+      "virtual_based_cap": 1800.0,
+      "actual_new_shares": 9
+    },
+    "profitable_position_overstates_headroom": {
+      "equity": 11800.0,
+      "virtual": 21240.0,
+      "existing_marked_exposure": 19800.0,
+      "reported_available": 3240.0,
+      "ceiling_headroom": 1440.0,
+      "overstatement": 1800.0
+    },
+    "account_ceiling_is_not_an_entry_gate": {
+      "equity": 10000.0,
+      "account_ceiling": 18000.0,
+      "other_positions_notional": 18000.0,
+      "broker_remaining_bp": 2000.0,
+      "expert_reported_available": 2000.0,
+      "ceiling_headroom": 0.0
+    },
+    "nonfinite_broker_multiplier_not_rejected": {
+      "supplied_multiplier": "NaN",
+      "returned_tradable_balance": 18000.0,
+      "should_refuse": true
+    },
+    "backtest_cash_equity_contract_mismatch": {
+      "real_equity": 4000.0,
+      "cash": 3000.0,
+      "existing_position": 1000.0,
+      "live_virtual": 4000.0,
+      "live_available": 3000.0,
+      "backtest_virtual": 3000.0,
+      "backtest_available": 2000.0
+    },
+    "accepted_current_equity_equivalence": [
+      {
+        "leveraged_equity": 2000.0,
+        "leverage": 2.0,
+        "matching_unlevered_equity": 4000.0,
+        "shared_virtual_balance": 4000.0
+      },
+      {
+        "leveraged_equity": 1900.0,
+        "leverage": 2.0,
+        "matching_unlevered_equity": 3800.0,
+        "shared_virtual_balance": 3800.0
+      },
+      {
+        "leveraged_equity": 2100.0,
+        "leverage": 2.0,
+        "matching_unlevered_equity": 4200.0,
+        "shared_virtual_balance": 4200.0
+      }
+    ]
+  }
+}

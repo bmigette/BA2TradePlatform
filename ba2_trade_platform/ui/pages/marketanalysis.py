@@ -23,6 +23,297 @@ from ..utils.protective_stop import resolve_protective_legs
 from sqlmodel import select, func, distinct
 
 
+# =============================================================================================
+# The classic / option risk-manager run detail: rows and capital line
+#
+# Module-level and PURE, not methods on the tab: what the dialog says is the whole product of
+# this record, and a renderer that can only be exercised by building a page is a renderer
+# nobody checks. The dialog below is then a thin call into these two.
+# =============================================================================================
+
+#: How each binding constraint reads to an operator. The KEYS are
+#: ``TradeRiskManagement.SIZING_BINDINGS`` -- a binding this map does not know is shown as the
+#: raw token rather than as a dash, because "the sizing named a limit we do not render" must
+#: not look identical to "the sizing named nothing".
+RM_BINDING_LABELS = {
+    'instrument_cap': 'instrument cap',
+    'balance': 'balance',
+    'weight': 'weight',
+    'diversification': 'diversification',
+    'min_one_share': '1-share floor',
+    'lot_size': 'lot size',
+    'risk_atr': 'risk (ATR)',
+    'early_skip_cap': 'cap: < 1 share',
+    'early_skip_balance': 'balance: < 1 share',
+    'no_price': 'no price',
+}
+
+
+def _rm_num(value, fmt: str) -> str:
+    """A recorded number, or a dash.
+
+    ABSENT means "not recorded", which is the record's own convention: a 0 would read as a
+    measurement -- "scored zero", "no weight left" -- and those are real, different outcomes.
+    """
+    if value is None:
+        return '-'
+    try:
+        return format(value, fmt)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def classic_run_detail_columns() -> list:
+    """The decision table's columns. Module-level so the screen's shape is checkable.
+
+    ``rank`` is deliberately NOT sortable. The column holds formatted strings (and a dash for
+    the rows that were never ranked), so a click would order "10" before "2" -- and sorting
+    it at all destroys the funding sequence the rows exist to show.
+    """
+    return [
+        {'name': 'rank', 'label': '#', 'field': 'rank',
+         'align': 'right', 'style': 'width: 50px'},
+        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True,
+         'align': 'left', 'style': 'width: 90px'},
+        {'name': 'outcome', 'label': 'Outcome', 'field': 'outcome', 'sortable': True,
+         'align': 'left', 'style': 'width: 190px'},
+        {'name': 'score', 'label': 'Score', 'field': 'score', 'sortable': True,
+         'align': 'right', 'style': 'width: 110px'},
+        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity',
+         'align': 'right', 'style': 'width: 60px'},
+        {'name': 'size', 'label': 'Size', 'field': 'size', 'sortable': True,
+         'align': 'right', 'style': 'width: 90px'},
+        {'name': 'cap_available', 'label': 'Cap avail', 'field': 'cap_available',
+         'align': 'right', 'style': 'width: 90px'},
+        {'name': 'balance', 'label': 'Balance', 'field': 'balance',
+         'align': 'right', 'style': 'width: 130px'},
+        {'name': 'binding', 'label': 'Binding', 'field': 'binding', 'sortable': True,
+         'align': 'left', 'style': 'width: 120px'},
+        {'name': 'weight', 'label': 'Weight', 'field': 'weight',
+         'align': 'right', 'style': 'width: 70px'},
+        {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
+    ]
+
+
+def classic_run_detail_rows(decisions) -> list:
+    """One table row per decision, ordered the way the manager worked.
+
+    RANKED runs (the classic manager) read in FUNDING order. It funds down a ranked list
+    until the money runs out, so that sequence is the allocation happening: the balance
+    falls row by row and the refusals appear exactly where it ran out. A symbol the
+    permission filter dropped was never ranked and has no place in the sequence, so it goes
+    last rather than being given a rank it never had.
+
+    UNRANKED runs -- the OPTION manager, which weighs each candidate against standing sleeve
+    rails instead of funding a ranked list, and every classic run recorded before the rank
+    existed -- fall back to REFUSALS FIRST. Sorting those by a rank none of them has leaves
+    them in insertion order, which buries the rail refusals among the admissions; listing
+    them first is the reason that view was built (see OptionRiskManagement's own note).
+    """
+    decisions = list(decisions or [])
+    ranked = any(d.get('rank') is not None for d in decisions)
+    if ranked:
+        def _order(pair):
+            position, d = pair
+            return (d.get('rank') is None, d.get('rank') or 0, position)
+    else:
+        def _order(pair):
+            position, d = pair
+            return (d.get('outcome') == 'FUNDED', position)
+
+    rows = []
+    for position, d in sorted(enumerate(decisions), key=_order):
+        before, after = d.get('balance_before'), d.get('balance_after')
+        symbol = d.get('symbol', '')
+        rows.append({
+            # UNIQUE per decision, and not the symbol: two recommendations on one ticker
+            # (or two option legs) are two decisions, and on a symbol key Quasar renders
+            # them as one row -- silently hiding whichever it saw first.
+            'key': f"{position}:{symbol}",
+            'rank': _rm_num(d.get('rank'), 'd'),
+            'symbol': symbol,
+            'outcome': d.get('outcome', ''),
+            # WHAT THE RANKING DECIDED ON. The score is the sort key the funding order was
+            # built from, so a refused symbol's score IS its explanation: it ranked below the
+            # ones that took the budget. Its two inputs ride along in the sub-line so the
+            # number can be re-derived rather than trusted.
+            'score': _rm_num(d.get('score'), '.3f'),
+            'score_inputs': _rm_score_inputs(d),
+            # '-' not 0: a refused symbol has no quantity at all.
+            'quantity': ('-' if d.get('quantity') is None else f"{d['quantity']:g}"),
+            # The ceilings and the risk budget the quantity was solved from. Recorded on
+            # every row; shown on hover rather than as four more columns, because they are
+            # what you ask for AFTER the size surprises you.
+            'qty_detail': _rm_qty_detail(d),
+            # THE SIZE IN MONEY, which is what the per-instrument cap in the context above is
+            # denominated in -- so a funded row can be checked against the limit it was
+            # measured against without doing the multiplication.
+            'size': _rm_num(d.get('cost'), ',.2f'),
+            # What this symbol was still allowed to hold when its turn came: the cap minus
+            # whatever it already holds. The number the size was actually measured against.
+            'cap_available': _rm_num(d.get('cap_available'), ',.2f'),
+            'balance': ('-' if before is None and after is None
+                        else f"{_rm_num(before, ',.0f')} → {_rm_num(after, ',.0f')}"),
+            'binding': ('-' if d.get('binding') is None
+                        else RM_BINDING_LABELS.get(d['binding'], str(d['binding']))),
+            'binding_detail': _rm_binding_detail(d),
+            'weight': ('-' if d.get('weight') is None else f"{d['weight']:g}%"),
+            'reason': d.get('reason', ''),
+        })
+    return rows
+
+
+def _rm_score_inputs(d) -> str:
+    """The score's two inputs as one short string, or ''.
+
+    ONLY the score's inputs. The risk budget and the stop distance used to ride here too and
+    do not belong: they size the position, they do not rank it, and reading them under a
+    score invites the conclusion that they fed it. They are on the Qty cell instead.
+    """
+    parts = []
+    if d.get('profit_pct') is not None:
+        parts.append(f"profit {d['profit_pct']:g}%")
+    if d.get('confidence') is not None:
+        parts.append(f"conf {d['confidence']:g}%")
+    return ' · '.join(parts)
+
+
+def _rm_qty_detail(d) -> str:
+    """The operands the share count was solved from, or ''.
+
+    The two ceilings for a notional size; the risk budget, the count it alone bought and the
+    stop it was solved against for a risk_atr one. Absent terms are simply not shown -- an
+    old row has none of them and gets no tooltip at all rather than one full of dashes.
+
+    Every number goes through ``_rm_num``. These come out of a JSON column, and a value that
+    is not a number would otherwise raise INSIDE the dialog and take down the whole run --
+    including the rows that were fine.
+    """
+    parts = []
+    if d.get('max_qty_by_instrument') is not None:
+        parts.append(f"cap ceiling {_rm_num(d['max_qty_by_instrument'], ',.2f')} sh")
+    if d.get('max_qty_by_balance') is not None:
+        parts.append(f"balance ceiling {_rm_num(d['max_qty_by_balance'], ',.2f')} sh")
+    if d.get('risk_budget_pct') is not None:
+        risk = f"risk budget {_rm_num(d['risk_budget_pct'], 'g')}%"
+        if d.get('risk_dollars') is not None:
+            risk += f" (${_rm_num(d['risk_dollars'], ',.0f')})"
+        if d.get('qty_by_risk') is not None:
+            risk += f" → {_rm_num(d['qty_by_risk'], 'g')} sh"
+        parts.append(risk)
+    stop_price, stop_pct = d.get('stop_price'), d.get('stop_distance_pct')
+    if stop_price is not None:
+        stop = f"stop {_rm_num(stop_price, ',.2f')}"
+        if stop_pct is not None:
+            stop += f" ({_rm_num(stop_pct, '.1f')}% away)"
+        parts.append(stop)
+    elif stop_pct is not None:
+        # The distance without a price: risk sizing can imply a stop distance from the
+        # min-stop floor without a stop price ever being written to the order.
+        parts.append(f"stop {_rm_num(stop_pct, '.1f')}% away")
+    return ' · '.join(parts)
+
+
+def _rm_binding_detail(d) -> str:
+    """What the binding limit had already been spent on, or ''.
+
+    Nothing at all when the symbol held nothing: "already held $0.00" is noise on every
+    first entry, and reads as a measurement the reader then has to go and check.
+    """
+    held = d.get('existing_allocation')
+    if held is None or held == 0:
+        return ''
+    return (f"this symbol already held ${_rm_num(held, ',.2f')} against its "
+            f"per-instrument cap")
+
+
+def classic_run_detail_legend(decisions) -> str:
+    """The paragraph under the table, or '' when it would describe the wrong thing.
+
+    Gated on the RANK -- the same predicate ``classic_run_detail_rows`` orders by -- and not
+    on the score. An old classic run carries scores but no ranks, so a score gate printed a
+    legend explaining a funding sequence those rows were not in.
+    """
+    if not any(d.get('rank') is not None for d in (decisions or [])):
+        return ''
+    return ('Rows are in FUNDING order: the manager funds down the score ranking until the '
+            'budget runs out, so a refusal is explained by where it sits in this list. '
+            'Score is expected profit % weighted by confidence '
+            '(compute_order_priority_score). Cap avail is what the per-instrument limit '
+            'still allowed this symbol; Balance is the budget before → after the order; '
+            'Binding is the constraint that set the final quantity. Hover Qty for the '
+            'ceilings it was solved from.')
+
+
+def classic_run_context_lines(context) -> list:
+    """The run's capital mapping as lines a reader can follow, in the order it happened.
+
+    equity -> tradable -> this expert's allocation -> virtual -> what it already holds ->
+    what was left to spend. Every term is optional: a run recorded before these were
+    captured, or an account that publishes no capital description, simply shows the terms it
+    has. Nothing is filled in -- an absent figure was never read, and a 0 would be a lie
+    about a broker balance.
+    """
+    context = dict(context or {})
+    lines, consumed = [], set()
+
+    def _take(key):
+        consumed.add(key)
+        return context.get(key)
+
+    chain = []
+    for key, label, kind in (('equity', 'equity', 'money'),
+                             ('tradable_balance', 'tradable', 'money'),
+                             ('allocation_pct', 'allocation', 'pct'),
+                             ('virtual_balance', 'virtual', 'money'),
+                             ('used_balance', 'used', 'money'),
+                             ('available_balance', 'available', 'money')):
+        value = _take(key)
+        if value is None:
+            continue
+        term = f"{label} ${value:,.2f}" if kind == 'money' else f"{label} {value:g}%"
+        if key == 'tradable_balance' and context.get('margin_factor') is not None:
+            consumed.add('margin_factor')
+            term += f" (x{context['margin_factor']:g})"
+        chain.append(term)
+    if chain:
+        lines.append('Capital: ' + ' → '.join(chain))
+
+    cap, ratio = _take('max_per_instrument'), _take('max_per_instrument_ratio')
+    if cap is not None:
+        line = f"Max per instrument: ${cap:,.2f}"
+        if ratio is not None:
+            line += f" ({ratio * 100:g}% of available)"
+        scaled = _take('max_per_instrument_scaled')
+        if scaled is not None:
+            line += f" → ${scaled:,.2f} after the regime scale"
+        lines.append(line)
+
+    knobs = []
+    for key, label in (('regime_risk_scale', 'Regime scale'), ('sizing_mode', 'Sizing'),
+                       ('diversification_factor', 'Diversification'),
+                       ('commission_per_trade', 'Commission')):
+        value = _take(key)
+        if value is None:
+            continue
+        if key == 'commission_per_trade':
+            knobs.append(f"{label} ${value:,.2f}")
+        elif isinstance(value, float):
+            knobs.append(f"{label} {value:g}")
+        else:
+            knobs.append(f"{label} {value}")
+    if knobs:
+        lines.append(' · '.join(knobs))
+
+    # Whatever else the run recorded (the buy/sell permissions, and anything a later version
+    # adds): shown rather than dropped, so a new context key is visible the day it is written.
+    rest = [f"{key.replace('_', ' ')}: {value}"
+            for key, value in context.items() if key not in consumed]
+    if rest:
+        lines.append(' · '.join(rest))
+    return lines
+
+
 # ========== Module-level cache for expert options ==========
 # Shared across all tabs to avoid redundant database queries
 _expert_options_cache: Dict[str, Any] = {
@@ -309,13 +600,13 @@ class JobMonitoringTab:
         """Create the analysis jobs table."""
         columns = [
             {'name': 'id', 'label': 'ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
-            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'recommendation', 'label': 'Recommendation', 'field': 'recommendation', 'sortable': True, 'style': 'width: 130px'},
             {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'sortable': True, 'style': 'width: 100px'},
-            {'name': 'expected_profit', 'label': 'Expected Profit', 'field': 'expected_profit', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'expected_profit', 'label': 'Expected Profit', 'field': 'expected_profit', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'created_at', 'label': 'Created', 'field': 'created_at_local', 'sortable': True, 'style': 'width: 160px'},
             {'name': 'subtype', 'label': 'Type', 'field': 'subtype', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False, 'style': 'width: 100px'}
@@ -405,16 +696,16 @@ class JobMonitoringTab:
         """Create the Smart Risk Manager jobs table."""
         columns = [
             {'name': 'id', 'label': 'Job ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
-            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
             {'name': 'type', 'label': 'Type', 'field': 'type_label', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'run_date', 'label': 'Run Date', 'field': 'run_date_local', 'sortable': True, 'style': 'width: 160px'},
-            {'name': 'duration', 'label': 'Duration', 'field': 'duration_display', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'duration', 'label': 'Duration', 'field': 'duration_display', 'sortable': True, 'style': 'width: 100px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             # SMART runs iterate an agent loop; the classic/option managers do not, so
             # this column reads "-" for them rather than 0 -- they did not iterate zero
             # times, the concept does not apply.
-            {'name': 'iterations', 'label': 'Iterations', 'field': 'iteration_count', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'iterations', 'label': 'Iterations', 'field': 'iteration_count', 'sortable': True, 'style': 'width: 100px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             # Smart: actions executed. Classic/options: symbols funded out of received,
             # which is the same question ("what did it actually do?") asked of a manager
             # that sizes rather than acts.
@@ -886,9 +1177,18 @@ class JobMonitoringTab:
         """The classic/option manager's per-symbol reasoning for one run.
 
         Every symbol the manager RECEIVED is listed, funded or not, because the point of
-        the record is the ones that were not. Refusals are shown FIRST: a reader who
-        opens this is asking why something did not trade, and making them scroll past the
-        successes to find out is the same as not answering.
+        the record is the ones that were not.
+
+        A RANKED run (the classic manager) reads in FUNDING order, which answers the question
+        a reader actually opens this with -- "why did THIS one not trade?" -- with the
+        sequence itself: the ranking, the budget falling row by row, and the constraint that
+        bound each size. Its refusals sit where they happened rather than at the top, which
+        is what makes them legible.
+
+        A run with no ranking anywhere -- the OPTION manager, and every classic run recorded
+        before the rank existed -- keeps REFUSALS FIRST, because there is no funding sequence
+        to follow and the refusals are what the screen was opened for. Both orderings live in
+        ``classic_run_detail_rows``.
         """
         from ba2_common.core.db import get_instance
         from ba2_common.core.models import RiskManagerRun
@@ -910,39 +1210,52 @@ class JobMonitoringTab:
             if run.error_message:
                 ui.label(run.error_message).classes('text-sm text-red-500')
 
-            if run.context:
-                with ui.row().classes('w-full gap-4 mt-2'):
-                    for key, value in run.context.items():
-                        pretty = key.replace('_', ' ')
-                        shown = f'{value:,.2f}' if isinstance(value, float) else str(value)
-                        ui.label(f'{pretty}: {shown}').classes('text-xs text-gray-500')
+            for line in classic_run_context_lines(run.context):
+                ui.label(line).classes('text-xs text-gray-500')
 
             decisions = list(run.decisions or [])
-            # Refusals first, then the funded ones; each group keeps the order the manager
-            # worked in, so the ranking it applied is still legible.
-            refused = [d for d in decisions if d.get('outcome') != 'FUNDED']
-            funded = [d for d in decisions if d.get('outcome') == 'FUNDED']
-            rows = [{
-                'symbol': d.get('symbol', ''),
-                'outcome': d.get('outcome', ''),
-                # '-' not 0: a refused symbol has no quantity at all.
-                'quantity': ('-' if d.get('quantity') is None else f"{d['quantity']:g}"),
-                'reason': d.get('reason', ''),
-            } for d in refused + funded]
+            rows = classic_run_detail_rows(decisions)
 
-            ui.table(
-                columns=[
-                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True,
-                     'align': 'left', 'style': 'width: 90px'},
-                    {'name': 'outcome', 'label': 'Outcome', 'field': 'outcome', 'sortable': True,
-                     'align': 'left', 'style': 'width: 200px'},
-                    {'name': 'quantity', 'label': 'Qty', 'field': 'quantity',
-                     'align': 'right', 'style': 'width: 80px'},
-                    {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
-                ],
+            table = ui.table(
+                columns=classic_run_detail_columns(),
                 rows=rows,
-                row_key='symbol',
+                # The DECISION, not the ticker: two orders on one symbol are two decisions,
+                # and a symbol key renders them as one row.
+                row_key='key',
             ).classes('w-full mt-2').props('dense wrap-cells')
+            # The score's two inputs under the score itself. A slot and not a tooltip: the
+            # reader is comparing scores DOWN the column to see who outranked whom, and a
+            # number they have to hover one at a time to explain is a number they will not
+            # check. Empty when the run recorded no inputs, so old rows are unchanged.
+            table.add_slot('body-cell-score', r'''
+                <q-td :props="props" class="text-right">
+                    <div>{{ props.row.score }}</div>
+                    <div v-if="props.row.score_inputs" class="text-xs text-gray-500">
+                        {{ props.row.score_inputs }}</div>
+                </q-td>
+            ''')
+            # The operands, on hover. The two share ceilings, the risk budget and the stop
+            # distance are RECORDED on every row, and a number that is recorded and never
+            # shown is, to the person reading the screen, not recorded at all. They are the
+            # question you ask AFTER the size surprises you, though, so they hang off the
+            # cells they explain instead of becoming four more columns.
+            table.add_slot('body-cell-quantity', r'''
+                <q-td :props="props" class="text-right">
+                    {{ props.row.quantity }}
+                    <q-tooltip v-if="props.row.qty_detail">{{ props.row.qty_detail }}</q-tooltip>
+                </q-td>
+            ''')
+            table.add_slot('body-cell-binding', r'''
+                <q-td :props="props">
+                    {{ props.row.binding }}
+                    <q-tooltip v-if="props.row.binding_detail">
+                        {{ props.row.binding_detail }}</q-tooltip>
+                </q-td>
+            ''')
+
+            legend = classic_run_detail_legend(decisions)
+            if legend:
+                ui.label(legend).classes('text-xs text-gray-500 mt-1')
 
             if not rows:
                 ui.label('This run received no symbols.').classes('text-sm text-gray-500 mt-2')
@@ -1244,13 +1557,13 @@ class JobMonitoringTab:
                     columns = [
                         {'name': 'task_id', 'label': 'Task ID', 'field': 'task_id', 'sortable': True, 'style': 'width: 200px'},
                         {'name': 'type', 'label': 'Type', 'field': 'type', 'sortable': True, 'style': 'width: 100px'},
-                        {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
+                        {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
                         {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'priority', 'label': 'Priority', 'field': 'priority', 'sortable': True, 'style': 'width: 80px'},
                         {'name': 'created_at', 'label': 'Created', 'field': 'created_at_display', 'sortable': True, 'style': 'width: 160px'},
-                        {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 220px'},
+                        {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 220px', 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
                     ]
                     
                     self.queued_tasks_table = ui.table(
@@ -3338,13 +3651,13 @@ class ScheduledJobsTab:
     def _create_scheduled_jobs_table(self, scheduled_data=None, total_records=None):
         """Create the scheduled jobs table."""
         columns = [
-            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True},
-            {'name': 'instance_id', 'label': 'Instance ID', 'field': 'expert_instance_id', 'sortable': True},
-            {'name': 'job_type', 'label': 'Job Type', 'field': 'job_type', 'sortable': True},
-            {'name': 'weekdays', 'label': 'Days', 'field': 'weekdays', 'sortable': True},
-            {'name': 'times', 'label': 'Times', 'field': 'times', 'sortable': True},
+            {'name': 'instance_id', 'label': 'Instance ID', 'field': 'expert_instance_id', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'job_type', 'label': 'Job Type', 'field': 'job_type', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'weekdays', 'label': 'Days', 'field': 'weekdays', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
+            {'name': 'times', 'label': 'Times', 'field': 'times', 'sortable': True, 'classes': 'mobile-hide', 'headerClasses': 'mobile-hide'},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False}
         ]
         

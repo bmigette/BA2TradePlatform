@@ -1,0 +1,80 @@
+Final gate (second delivery) at d7e88345455be138f13e233c7ce0d4a1c7f467ac 2026-09-11T14:45:28Z
+
+=== pre/post byte-identical real-data backtests (operator requirement)
+pre = detached worktree at dev 3e34440a; post = branch head; window 2024-04-01..2024-05-31, 5min bars, hermetic (socket closed)
+harness: bytecheck_backtest.py (rebuild_config_for_backtest -> run_daily_backtest, ids/timestamps stripped, canonical JSON)
+FMPRating bt=1591 trades=10 equity_points=3292 result_sha256=84e33ea7f8fc17b46dc05724d555895c14e3d81c417fe59a1068d0015161edb8 config=62d80836b214 head=d7e8834545
+FMPEarningsDrift bt=1601 trades=7 equity_points=1957 result_sha256=060fea15a64515eea1422b52dc50c32a95525470e47a669054e3adaa2c99e2a3 config=291ccb604415 head=d7e8834545
+FMPInsiderClusterBuy bt=1563 trades=3 equity_points=2888 result_sha256=6880e5ac99d36c962636f5a96c30d3ae693438aca2895733c37c00fd73de6233 config=18b4db9c0e5a head=d7e8834545
+DeterministicScorer bt=1381 trades=12 equity_points=3277 result_sha256=5a78345d1150210d148385bda1d2d769daaca645606404b52669f4b879e9d06b config=66308728797f head=d7e8834545
+=== pre vs post (replay branch head)
+FMPRating IDENTICAL
+FMPEarningsDrift IDENTICAL
+FMPInsiderClusterBuy IDENTICAL
+DeterministicScorer IDENTICAL
+DONE
+
+harness determinism: pre_FMPRating_a.json == pre_FMPRating_b.json (cmp identical)
+
+Replay final gate (packages) at b644122f6c92a27b72d5411b101e72323d89af51 2026-09-11T14:01:57Z
+=== packages/common
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=============== 3704 passed, 297 warnings in 177.73s (0:02:57) ================
+=== packages/experts
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 967 passed, 1 warning in 44.42s =======================
+=== packages/providers
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================= 608 passed, 1 warning in 142.97s (0:02:22) ==================
+PACKAGES_DONE
+
+=== root (minus portfolio allocation) at b644122f
+exit=1
+tests\test_accounts\test_broker_error_handling.py ...........            [  4%]
+2026-09-11 16:18:03,448 - ba2_trade_platform - TastyTradeAccount - WARNING - [Account 1] Quantity precision fetch failed: 'types.SimpleNamespace' object has no attribute '_get'
+2026-09-11 16:18:03,968 - ba2_trade_platform - TastyTradeAccount - WARNING - [Account 1] Quantity precision fetch failed: 'types.SimpleNamespace' object has no attribute '_get'
+========== 28 failed, 3367 passed, 15 warnings in 316.85s (0:05:16) ===========
+========== 28 failed, 3367 passed, 15 warnings in 316.85s (0:05:16) ===========
+================= 1680 passed, 1 warning in 187.71s (0:03:07) =================
+root failures (all pre-existing on dev; the 24-failure baseline files):
+      2 FAILED tests/test_broker_sdk_pins.py
+      3 FAILED tests/test_no_zero_coercion.py
+      1 FAILED tests/test_option_actions.py
+     16 FAILED tests/test_option_intent_migration.py
+      1 FAILED tests/test_per_leg_expiry_no_migration.py
+      2 FAILED tests/test_tastytrade_account.py
+      1 FAILED tests/test_ui_colour_classes_paint.py
+      2 FAILED tests/test_warm_service_host.py
+(after d7e88345: warm host tests robust to leaked logging state; data_build_handler allowlist re-pointed 157->121; the 2 remaining test_no_zero_coercion failures are the dev baseline ones: TradeActions.py:1549 stale entry, portfolio_allocation.py coercions)
+
+=== backend tests/backtest tests/replay tests/warm at d7e88345
+1278 passed, 1 skipped, 2 xfailed, 4 warnings in 448.52s (0:07:28)
+=== goldens
+b32b8de5bb42c1355f7e873cb6c738ff57df42b0f167bf3dcf35dfc3766f264b *tests/backtest/golden/equity_golden_run.json
+f2efadeb179ee6fda85208b3f7bbb3560911ab799118035905bbbb37d0299c21 *tests/backtest/golden/option_leap_golden_run.json
+76cdb6840a84e282f8bc8b670be815c6baa54509c9c5e15a88369df92ec5b342 *tests/backtest/fixtures/equity_cap_golden.json
+BACKEND_DONE
+
+=== root suite, clean full runs
+=== root (minus portfolio allocation) at d7e88345 [clean re-run]
+===== 25 failed, 3368 passed, 15 warnings, 2 errors in 305.31s (0:05:05) ======
+(2 setup errors in tests/test_warm_service_host.py at d7e88345 = MagicMock logger leaked by tests/test_penny_gainers_fix.py -> fixed in 1821adc9)
+=== root (minus portfolio allocation) at 1821adc9 [clean re-run 2]
+========== 26 failed, 3369 passed, 15 warnings in 283.08s (0:04:43) ===========
+failed/error files:
+      1 FAILED tests/test_accounts/test_account_interface.py
+      2 FAILED tests/test_broker_sdk_pins.py
+      2 FAILED tests/test_no_zero_coercion.py
+      1 FAILED tests/test_option_actions.py
+     16 FAILED tests/test_option_intent_migration.py
+      1 FAILED tests/test_per_leg_expiry_no_migration.py
+      2 FAILED tests/test_tastytrade_account.py
+      1 FAILED tests/test_ui_colour_classes_paint.py
+ROOT3_DONE
+root portfolio allocation glob (unchanged files): 1680 passed
+Baseline on dev (first-delivery gate 2026-09-11): 25 failures in the same 7 files. The single extra failure at 1821adc9, tests/test_accounts/test_account_interface.py::TestTheExitGuardNetsSalesAlreadyInFlight::test_a_RESTING_PROTECTIVE_LEG_is_not_netted__a_recorded_gap, passes alone (112 passed), was absent from the previous full run at d7e88345, and touches files this branch does not change: order-dependent, not attributable to the branch.
+
+Verdict: goldens byte-identical; four real-data backtests byte-identical pre/post; packages, backend fully green; root at the dev baseline.

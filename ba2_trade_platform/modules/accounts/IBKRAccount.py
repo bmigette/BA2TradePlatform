@@ -20,6 +20,8 @@ from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType
 from ...core.interfaces import AccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import quote_identity
+from ba2_common.core.replay import ReplayStatus, observe_provider
 from sqlmodel import Session, select
 
 
@@ -244,24 +246,6 @@ class IBKRAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error getting IBKR account info: {e}", exc_info=True)
             raise
-    
-    def get_cash_balance(self) -> float:
-        """Get available cash balance"""
-        try:
-            account_info = self.get_account_info()
-            return account_info.get("cash", 0.0)
-        except Exception as e:
-            logger.error(f"Error getting cash balance: {e}", exc_info=True)
-            return 0.0
-    
-    def get_buying_power(self) -> float:
-        """Get buying power (available for trading)"""
-        try:
-            account_info = self.get_account_info()
-            return account_info.get("buying_power", 0.0)
-        except Exception as e:
-            logger.error(f"Error getting buying power: {e}", exc_info=True)
-            return 0.0
     
     def get_positions(self, with_orders: bool = False) -> Optional[List[Position]]:
         """
@@ -611,6 +595,15 @@ class IBKRAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error refreshing IBKR orders: {e}", exc_info=True)
     
+    # Replay capture (spec step 2): this OVERRIDE replaces the base method, and
+    # with it the base method's tap -- an untapped override is a live quote that
+    # silently never reaches a record. It keeps no TTL memo of its own (every call
+    # goes to the broker), so its provenance is simply ``network``.
+    @observe_provider(
+        "broker", "get_instrument_current_price",
+        identity=quote_identity,
+        provenance=ReplayStatus.PROVENANCE_NETWORK,
+    )
     def get_instrument_current_price(self, symbol: str) -> Optional[float]:
         """
         Get current market price for an instrument.

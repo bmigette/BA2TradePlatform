@@ -1,0 +1,68 @@
+Entry protective-stop parity correction — 2026-09-09
+Initial dev: d6345511 (APP 1146 / TEST 0025)
+Concurrent commission-reader merge retained: 74b9086a (APP 1146 / TEST 0026)
+Release: APP 1147 / TEST 0027
+
+Runtime: Python 3.12.14, pytest 9.1.0; canonical source paths from this monorepo.
+Existing trade/test site-packages loaded without installing or upgrading dependencies.
+Tests use temporary BA2_HOME, DB_FILE, LOG_FOLDER and backend DATABASE_URL.
+The production database was opened with SQLite mode=ro for investigation only.
+No broker orders, production database rows or account settings were changed.
+
+New regression file, before code correction:
+  tests/test_live_entry_stop_reconciliation.py: 6 failed, 7 passed in 2.16s.
+  Failing cases: tighter ruleset for long/short, ENOV's real stop values,
+    DB-lock retry, wash-trade retry, real Alpaca bracket overwrite.
+  Integrated Alpaca path reproduced initial_setup replacing 96 with 90.
+
+Live gate:
+  python -m pytest tests/test_live_entry_stop_reconciliation.py
+    tests/test_funded_entry_loop.py tests/test_washtrade_lock.py
+    tests/test_entry_submit_lock_retry.py tests/test_tpsl_rebase_to_fill.py
+    tests/test_margin_submit_idempotency.py tests/test_reductions_survive_the_ceiling.py
+    -q -p no:cacheprovider
+  93 passed, 1 warning in 15.92s.
+  The integrated Alpaca case was then strengthened to keep real order validation,
+    and rerun individually: 1 passed in 1.35s.
+  It retains the 96 ruleset stop at initial_setup, rebases to 96.96 on a 101 fill,
+    preserves TP and 14-share quantity, and performs no broker network IO.
+  Both long/short tighter rulesets and tighter safeguards are pinned; ED safeguard-only,
+    ruleset-only, no-stop, close retries and stop-entry trigger cases are covered.
+
+Shared stop helpers:
+  python -m pytest packages/common/tests/test_reconcile_protective_stop.py
+    packages/common/tests/test_ensure_safeguard_stop.py -q -p no:cacheprovider
+  8 passed in 1.87s.
+
+Frozen backtest and parity gate (backend working directory):
+  python -m pytest tests/backtest/test_equity_golden_run.py
+    tests/backtest/test_option_golden_run.py tests/backtest/test_equity_cap_e2e.py
+    tests/backtest/test_parity_golden.py tests/backtest/test_margin_live_backtest_parity.py
+    -q -p no:cacheprovider
+  45 passed, 2 xfailed, 2 warnings in 61.28s.
+  Strict xfails are the existing cash/equity and classic instrument-cap exceptions;
+    neither was changed or suppressed by this correction.
+  After noticing the concurrent commission-reader merge, the same frozen gate
+    was rerun on the combined tree: 45 passed, 2 xfailed, 2 warnings in 54.67s.
+  Commission-reader regression tests: 4 passed in 1.67s.
+
+Compatibility checks:
+  reconcile_protective_stop executable AST (excluding its docstring) equals d6345511.
+  No backtest engine, fill, sizing calculation, strategy rule or baseline fixture edit.
+  The only testplatform edit is its version string.
+  All three frozen JSON files are byte-identical to d6345511 and pre-margin dev 51234531.
+  SHA-256:
+    equity_golden_run.json
+      b32b8de5bb42c1355f7e873cb6c738ff57df42b0f167bf3dcf35dfc3766f264b
+    option_leap_golden_run.json
+      f2efadeb179ee6fda85208b3f7bbb3560911ab799118035905bbbb37d0299c21
+    equity_cap_golden.json
+      76cdb6840a84e282f8bc8b670be815c6baa54509c9c5e15a88369df92ec5b342
+  git diff --check: clean.
+
+Scope limits:
+  Tests simulate broker responses; no actual paper/live trade was submitted.
+  Existing open RAT orders require separate manual correction; this is prospective code.
+  Full live/backtest identity beyond entry-stop selection is not asserted.
+  The full backend/live suites were not repeated for this live-only change;
+    their previous known failures are recorded in reports/margin/pre_push_validation_2026-09-09.txt.

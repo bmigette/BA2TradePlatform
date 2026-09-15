@@ -7,11 +7,16 @@ expert settings, rulesets, and trading permissions.
 
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
+import math
 import threading
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
+# ONE constant, TWO readers: the OCO stop leg places its limit this far through the stop,
+# and _force_close_breached_stops below decides a stop was jumped by the same number. See
+# the constant's own comment in AlpacaAccount for why they can never be allowed to drift.
+from ..modules.accounts.AlpacaAccount import OCO_STOP_LIMIT_CUSHION
 
 
 # Serializes account refreshes across all entry points (scheduled job, immediate job,
@@ -324,6 +329,19 @@ class TradeManager:
                     # broker (no-op for non-options accounts). Idempotent.
                     self._reconcile_account_option_activities(account)
 
+                    # SAFETY NET: a stop-LIMIT exit leg that a gap jumped can never fill,
+                    # leaving an open position with no stop under it. Force-close those at
+                    # market. Runs LAST, on the freshly-refreshed order/position/transaction
+                    # state above. Idempotent, and isolated so a price/DB failure here
+                    # cannot cost the rest of the refresh.
+                    try:
+                        self._force_close_breached_stops(account)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error force-closing breached stops for {account_def.name}: {e}",
+                            exc_info=True,
+                        )
+
                 except Exception as e:
                     self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
                     continue
@@ -346,6 +364,210 @@ class TradeManager:
         finally:
             _REFRESH_LOCK.release()
     
+    # Reason stamped on a transaction the safety net closes, and the string an operator
+    # greps for. Distinct from "tp_sl_filled": nothing filled — that is the whole problem.
+    STOP_BREACH_CLOSE_REASON = "stop_breached_forced_close"
+
+    def _force_close_breached_stops(self, account):
+        """Force-close, at market, any position whose stop the market has passed without
+        the broker's stop leg filling.
+
+        LIVE-ONLY BY CONSTRUCTION. ``TradeManager`` runs only in the live platform; the
+        backtest engine never calls this refresh path. It exists precisely to make live
+        agree with the backtest:
+
+        WHY. Alpaca exits go out as an OCO whose stop leg is a stop-LIMIT, with the limit
+        placed ``OCO_STOP_LIMIT_CUSHION`` through the stop so an ordinary trigger still
+        fills (``AlpacaAccount._submit_order_impl``). When a gap clears BOTH the stop and
+        that cushion in one print, the triggered leg becomes a limit order on the wrong
+        side of the market: it rests unfilled, the OCO stays working, and the position is
+        open with no stop beneath it. Prod saw exactly this on 2026-09-10 (RARE, ENOV).
+        The backtest, by contrast, models every stop as a MARKET stop that fills at the
+        stop or at the gap open (``backtest_account._gap_stop_fill``), so the two diverge
+        on the days that hurt most. This closes that gap rather than widening the cushion,
+        which would only move the cliff.
+
+        THE RULE. For each OPENED **equity** transaction of ``account`` carrying a
+        ``stop_loss``, breached means the price is past the stop by more than the cushion:
+        a long below ``stop * (1 - cushion)``, a short above ``stop * (1 + cushion)``.
+        Inside the cushion the triggered limit can still fill normally, so we leave it to
+        the broker. Options are skipped: an option transaction's ``symbol`` is the
+        UNDERLYING and its stop is not a share price.
+
+        WHAT IT REFUSES TO DO. Nothing is closed on an assumption. A price that is
+        missing, non-finite or non-positive is UNKNOWN, and unknown is not "safe" — the
+        symbol is skipped with a WARNING, never closed and never presumed healthy. A
+        position book that cannot be read is likewise a skip, not a close. Each
+        transaction is handled independently: one failure logs and the loop continues.
+
+        Runs ONLY while the broker reports the regular session open (step 0 below); an after-hours quote is not trusted.
+        """
+        from sqlmodel import Session, select
+        from .db import get_db
+        from .types import AssetClass, TransactionStatus
+
+        # 0) ONLY WHILE THE MARKET IS OPEN (operator decision 2026-09-10). Outside regular
+        # hours the latest quote can be a stale or one-sided after-hours print on a thin
+        # name, and acting on it would queue a market sell for the open that no real trade
+        # justified. Nothing is lost by waiting: the first refresh after the bell (at most
+        # one interval later) still catches an overnight gap, and the open is exactly where
+        # the backtest fills a gapped stop. ``is_market_open`` FAILS CLOSED (an unreadable
+        # clock reads as not open), so a broken clock pauses the sweep, never the reverse.
+        if not account.is_market_open():
+            self.logger.debug(
+                f"Breached-stop sweep for account {account.id}: market not open, skipped")
+            return
+
+        # 1) The watch list: OPENED equity transactions of THIS account (transactions link
+        #    to an account only through their orders) that actually have a stop to breach.
+        watched = []
+        with Session(get_db().bind) as session:
+            open_txns = session.exec(
+                select(Transaction).join(TradingOrder).where(
+                    TradingOrder.account_id == account.id,
+                    Transaction.status == TransactionStatus.OPENED,
+                ).distinct()
+            ).all()
+            for txn in open_txns:
+                if txn.asset_class == AssetClass.OPTION or txn.multiplier not in (None, 1):
+                    continue
+                if txn.stop_loss is None or not txn.symbol:
+                    continue
+                # Plain tuples, so nothing below depends on a live ORM session.
+                watched.append((txn.id, txn.symbol, txn.side, float(txn.stop_loss)))
+
+        if not watched:
+            return
+
+        # 2) One bulk price call for every watched symbol.
+        symbols = sorted({symbol for _, symbol, _, _ in watched})
+        prices = account.get_instrument_current_price(symbols)
+        if not isinstance(prices, dict):
+            self.logger.error(
+                f"[Account {account.id}] breached-stop check: bulk price fetch for "
+                f"{len(symbols)} symbol(s) returned {type(prices).__name__}, not a mapping; "
+                f"no position can be checked this pass"
+            )
+            return
+
+        for txn_id, symbol, side, stop in watched:
+            try:
+                if symbol not in prices:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: no price returned for "
+                        f"{symbol} (transaction {txn_id}); skipping — an unknown price is not "
+                        f"a healthy position, it is an unchecked one"
+                    )
+                    continue
+                raw_price = prices[symbol]
+                if raw_price is None:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: price unavailable for "
+                        f"{symbol} (transaction {txn_id}); skipping this pass"
+                    )
+                    continue
+                price = float(raw_price)
+                if not math.isfinite(price) or price <= 0:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: unusable price "
+                        f"{raw_price!r} for {symbol} (transaction {txn_id}); skipping"
+                    )
+                    continue
+
+                if side == OrderDirection.BUY:
+                    threshold = stop * (1.0 - OCO_STOP_LIMIT_CUSHION)
+                    breached = price < threshold
+                elif side == OrderDirection.SELL:
+                    threshold = stop * (1.0 + OCO_STOP_LIMIT_CUSHION)
+                    breached = price > threshold
+                else:
+                    self.logger.warning(
+                        f"[Account {account.id}] breached-stop check: transaction {txn_id} "
+                        f"({symbol}) has an unrecognised side {side!r}; skipping"
+                    )
+                    continue
+
+                if not breached:
+                    continue
+
+                # 3) NEVER close on a guess: the position must still be at the broker, on
+                #    the side we think we hold. None means the book could not be read.
+                held_qty = account.get_signed_position_quantity(symbol)
+                if held_qty is None:
+                    self.logger.warning(
+                        f"[Account {account.id}] {symbol} stop {stop} appears breached at "
+                        f"{price}, but the broker position book is UNREADABLE; not closing "
+                        f"transaction {txn_id} on a guess"
+                    )
+                    continue
+                still_held = (held_qty > 0) if side == OrderDirection.BUY else (held_qty < 0)
+                if not still_held:
+                    self.logger.warning(
+                        f"[Account {account.id}] {symbol} stop {stop} appears breached at "
+                        f"{price}, but the broker reports qty={held_qty} for a "
+                        f"{side.value if hasattr(side, 'value') else side} position; nothing "
+                        f"to close for transaction {txn_id} (the reconciler owns this case)"
+                    )
+                    continue
+
+                # 4) Idempotency: close_transaction moves the row to CLOSING, so a later
+                #    refresh finds it out of OPENED. Re-read anyway — the watch list was
+                #    built before the price and position round-trips above.
+                txn = get_instance(Transaction, txn_id)
+                if txn.status != TransactionStatus.OPENED:
+                    continue
+
+                self.logger.warning(
+                    f"[Account {account.id}] STOP BREACHED WITHOUT FILLING: {symbol} "
+                    f"{side.value if hasattr(side, 'value') else side} transaction {txn_id}, "
+                    f"stop={stop}, price={price}, cushion={OCO_STOP_LIMIT_CUSHION:.3%}. The "
+                    f"stop-limit exit leg cannot fill from here — force-closing at market."
+                )
+
+                result = account.close_transaction(txn_id)
+                if not isinstance(result, dict):
+                    raise ValueError(
+                        f"close_transaction({txn_id}) returned {type(result).__name__}, "
+                        f"not a result dict"
+                    )
+                success = bool(result['success'])
+
+                txn = get_instance(Transaction, txn_id)
+                if success:
+                    # Stamp WHY, so the closure is attributable once the market close fills.
+                    txn.close_reason = self.STOP_BREACH_CLOSE_REASON
+                    update_instance(txn)
+                else:
+                    self.logger.error(
+                        f"[Account {account.id}] force-close of breached-stop transaction "
+                        f"{txn_id} ({symbol}) FAILED: {result['message']}. The position is "
+                        f"still open and unprotected — it will be retried next refresh."
+                    )
+
+                # Same activity-log helper every other close path uses.
+                from ba2_common.core.utils import log_close_order_activity
+                log_close_order_activity(
+                    transaction=txn,
+                    account_id=account.id,
+                    success=success,
+                    error_message=None if success else result['message'],
+                    close_order_id=result['close_order_id'],
+                    quantity=txn.quantity,
+                    side=(OrderDirection.SELL if side == OrderDirection.BUY
+                          else OrderDirection.BUY),
+                    canceled_count=result['canceled_count'],
+                    deleted_count=result['deleted_count'],
+                )
+
+            except Exception as e:
+                # One bad transaction must never cost the others their safety net.
+                self.logger.error(
+                    f"[Account {account.id}] breached-stop check failed for transaction "
+                    f"{txn_id} ({symbol}): {e}",
+                    exc_info=True,
+                )
+                continue
+
     def _reconcile_account_option_activities(self, account):
         """Reconcile broker option lifecycle events (assignment / exercise / expiry)
         against the local Transaction ledger for one account.
@@ -683,12 +905,7 @@ class TradeManager:
                         self.logger.debug(msg)
                     continue
 
-                # Infer whether this is a closing order (side opposite to its position).
-                is_closing = False
-                if order.transaction_id:
-                    txn = get_instance(Transaction, order.transaction_id)
-                    if txn and txn.side != order.side:
-                        is_closing = True
+                is_closing = self._is_closing_order(order)
 
                 self.logger.info(
                     f"Symbol {order.symbol} clear — re-submitting WASHTRADE_LOCKED order {order_id} "
@@ -706,10 +923,63 @@ class TradeManager:
                 sl_price = None
                 if (order.order_type == OrderType.MARKET and not is_closing
                         and not order.depends_on_order):
-                    sl_price = order.stop_price or None
+                    sl_price = self._entry_submit_stop(order, order.stop_price or None)
                 account.submit_order(order, sl_price=sl_price, is_closing_order=is_closing)
             except Exception as e:
                 self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
+
+    @staticmethod
+    def _is_closing_order(order) -> bool:
+        """Does this order REDUCE a position? One answer, every re-submit path.
+
+        ``is_closing_order`` is what tells ``AccountInterface`` to skip the budget checks
+        that only make sense for spending capital -- the expert's available balance and
+        the account's stock-exposure ceiling. Getting it wrong on a REDUCTION is not a
+        missed optimisation: a fully invested expert (or, with margin on, an account past
+        ``balance x margin_factor``, whose headroom is negative) refuses every quantity,
+        so the order that would have de-risked the book is the one that cannot be placed.
+
+        Two derivations used to live inline and disagreed:
+          * the wash-trade retry read only the transaction, so a transaction-LESS close
+            (``portfolio_allocation_service._sell_untracked_symbol``) came back False;
+          * the dependent-order path read only ``MARKET`` + ``'closing' in comment``,
+            which does not match ``TransactionHelper``'s "Partial close order (triggered
+            by TP/SL cancel)" -- a trim that shrinks a position was validated as an open.
+
+        This is the union; both ``'close'`` and ``'closing'`` must be checked:
+
+          1. the order has a transaction whose side is OPPOSITE to its own -> closing.
+             ``Transaction.side`` is the direction the POSITION points, the same field
+             ``_validate_account_exposure`` and ``_pending_stock_entry_notional`` read;
+             a same-side order adds exposure regardless of its comment;
+          2. else a MARKET order whose comment says ``close`` or ``closing`` (the platform's own close
+             paths write it) -> closing;
+          3. else not closing. An order that opens is the default, because mislabelling
+             an OPEN as a close would skip the risk checks entirely.
+
+        A transaction-less closing MARKET order still passes the account exposure gate
+        without this: the gate reads the broker's position book for such orders. This
+        flag is what keeps the EXPERT's available-balance check off it as well.
+        """
+        comment = (order.comment or '').lower()
+        if order.transaction_id:
+            txn = get_instance(Transaction, order.transaction_id)
+            if txn and txn.side != order.side:
+                logger.debug(
+                    f"Order {order.id} ({order.symbol} {order.side}) is CLOSING: "
+                    f"transaction {txn.id} side {txn.side} is the opposite side.")
+                return True
+            if txn:
+                return False  # A comment cannot override a known exposure increase.
+        if order.order_type == OrderType.MARKET and ('close' in comment or 'closing' in comment):
+            logger.debug(
+                f"Order {order.id} ({order.symbol} {order.side}) is CLOSING: MARKET order "
+                f"whose comment says close ({order.comment!r}).")
+            return True
+        logger.debug(
+            f"Order {order.id} ({order.symbol} {order.side}) is NOT closing: no "
+            f"opposite-side transaction and no close comment on a MARKET order.")
+        return False
 
     @staticmethod
     def _washtrade_lock_age_hours(order) -> Optional[float]:
@@ -895,6 +1165,24 @@ class TradeManager:
     _ENTRY_SUBMIT_RETRIES = 3
     _ENTRY_SUBMIT_BACKOFF_S = 2.0
 
+    @staticmethod
+    def _entry_submit_stop(order, safeguard_sl):
+        """Use the backtest's stop policy without changing the RM sizing input.
+
+        The evaluator has already attached the ruleset stop to the transaction.
+        Sending just the safeguard here would overwrite a tighter ruleset leg in
+        AccountInterface's initial_setup block. Read the current transaction on
+        each attempt so a delayed retry also preserves subsequent tightening.
+        """
+        from ba2_common.core.position_sizing import reconcile_protective_stop
+
+        transaction = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+        return reconcile_protective_stop(
+            ruleset_sl=transaction.stop_loss if transaction else None,
+            safeguard_sl=safeguard_sl,
+            is_long=order.side == OrderDirection.BUY,
+        )
+
     def _submit_funded_entry_with_retry(self, account, order, sl_price=None):
         """Submit a funded entry, retrying when the DB (not the broker) is what failed.
 
@@ -921,7 +1209,8 @@ class TradeManager:
         last_err = None
         for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
             try:
-                return account.submit_order(order, sl_price=sl_price)
+                submit_sl = self._entry_submit_stop(order, sl_price)
+                return account.submit_order(order, sl_price=submit_sl)
             except Exception as e:  # noqa: BLE001 — classified immediately below
                 if "database is locked" not in str(e).lower():
                     raise  # a real answer from the broker/validator: never re-send
@@ -1361,13 +1650,8 @@ class TradeManager:
                     # path, so it must carry the same is_closing_order=True its immediate
                     # sibling call gets — otherwise the position-size validation wrongly
                     # blocks a close just because the position grew past the entry cap
-                    # (the position is shrinking, not growing). Same MARKET+"closing"
-                    # comment heuristic close_transaction() already uses elsewhere.
-                    is_closing = (
-                        dependent_order.order_type == OrderType.MARKET and
-                        dependent_order.comment and
-                        'closing' in dependent_order.comment.lower()
-                    )
+                    # (the position is shrinking, not growing).
+                    is_closing = self._is_closing_order(dependent_order)
                     self.logger.info(
                         f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
                         f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
@@ -2019,9 +2303,8 @@ class TradeManager:
                                         f"Failed to stamp protective-leg quantity for order {order.id}: "
                                         f"{leg_err}", exc_info=True)
 
-                                # Live parity: submit with the RM safeguard SL (fo.stop_price) — the
-                                # live path does NOT apply the backtest's tighter-wins merge (that is a
-                                # separate, not-yet-approved live change), so behavior is preserved.
+                                # The submit wrapper reconciles this RM safeguard with the
+                                # transaction's ruleset stop using the same helper as backtests.
                                 self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
                                 submitted_order = self._submit_funded_entry_with_retry(
                                     account, order, sl_price=fo.stop_price or None)

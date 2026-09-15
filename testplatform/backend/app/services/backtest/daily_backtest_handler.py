@@ -258,6 +258,7 @@ _SUPPORTED_EXPERTS = {
     # (provider filing-date filter) + causal OHLCV slicing. Macro degrades to the
     # index-trend input when FRED is not wired into the backtest bundle.
     "DeterministicScorer": "ba2_experts.DeterministicScorer",
+    "ETFTrend": "ba2_experts.ETFTrend",
     # Earnings-EVENT ranker (grid 2's O_ERN chain, design 2026-08-31 §9). Ranks upcoming
     # earnings events from the FMP disk cache (past_earnings_quarterly x OHLCV) and stamps
     # the event date + days-to-earnings onto its recommendations, which is what the strategy's
@@ -278,6 +279,7 @@ _EXPERT_WARMUP_BARS = {
     "FMPSenateTraderWeight": 10,  # recent congressional trades; ATR floor governs warmup
     "FMPSenateTraderCopy": 10,
     "DeterministicScorer": 260,   # 12-1 momentum (252) + SMA200 trend inputs
+    "ETFTrend": 274,              # 252-bar momentum + previous-month anchor buffer
     # 620 = the class's own BACKTEST_WARMUP_BARS. Its features are computed over PAST earnings
     # events (min_hist_events of them), and events are quarterly: 4+ quarters of history plus
     # the earnings-day move measured off OHLCV needs ~2.5 years of bars. The table and the

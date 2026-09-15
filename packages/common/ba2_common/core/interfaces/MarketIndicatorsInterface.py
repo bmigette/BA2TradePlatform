@@ -3,6 +3,21 @@ Interface for technical market indicators providers.
 
 This interface defines methods for retrieving technical indicators like RSI, MACD,
 SMA, EMA, etc. from various data providers.
+
+REPLAY CAPTURE. ``get_indicator`` is the boundary the ATR that sizes a live position
+enters through (``ba2_common.core.position_sizing.get_latest_atr``), so it is
+recorded like every other provider return. The tap cannot sit on the abstract method
+-- an implementation OVERRIDES it, which would replace the decorator along with the
+body -- so :meth:`MarketIndicatorsInterface.__init_subclass__` applies it to each
+concrete implementation as the class is created, which covers a provider written
+later without depending on its author remembering.
+
+What that does NOT cover, stated so the gap is not mistaken for a guarantee: a
+provider that does not inherit from this interface at all (the backtest's
+duck-typed ``MetricStoreATRProvider``), a mixin whose ``get_indicator`` is picked up
+from a base that is not a subclass of this one, and the INNER call of an override
+that delegates to ``super().get_indicator(...)`` -- which is recorded once, by the
+override, not twice.
 """
 
 from abc import abstractmethod
@@ -10,6 +25,41 @@ from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime
 
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
+from ba2_common.core.replay.observe import observe_provider, tapped_boundary
+from ba2_common.logger import logger
+
+
+def indicator_identity(args):
+    """What makes an indicator response what it is: EVERY argument that changes it.
+
+    Named (not an inline lambda) so that whatever replays a recorded sizing
+    decision builds the identity by importing this function rather than restating
+    it -- two copies of one identity dict drift, and a drifted copy turns a real
+    match into a silent miss. No replay path consumes it yet: no expert ``_gather``
+    reads an indicator, so the gather tape has no indicator actor; the caller this
+    was tapped for is ``position_sizing.get_latest_atr``, which the decision-trace
+    replay (spec step 6) covers.
+
+    The window is the pair (``start_date``, ``end_date``) PLUS ``lookback_days``,
+    because the implementations accept either form and a different form is a
+    different request. ``period`` is absent from the interface signature but
+    present on the implementations ``get_latest_atr`` drives (it selects the ATR
+    window, i.e. a different answer), so it is read when the bound call has it and
+    recorded as ``None`` when the implementation takes no such parameter -- never
+    guessed. ``format_type`` is in too: the same window rendered as markdown is a
+    different answer from the same window rendered as a dict.
+    """
+    return {
+        "provider": type(args["self"]).__name__,
+        "symbol": args["symbol"],
+        "indicator": args["indicator"],
+        "period": args["period"] if "period" in args else None,
+        "interval": args["interval"],
+        "start_date": args["start_date"],
+        "end_date": args["end_date"],
+        "lookback_days": args["lookback_days"],
+        "format_type": args["format_type"],
+    }
 
 
 class MarketIndicatorsInterface(DataProviderInterface):
@@ -34,6 +84,39 @@ class MarketIndicatorsInterface(DataProviderInterface):
         """
         pass
     
+    def __init_subclass__(cls, **kwargs):
+        """Tap this subclass's own ``get_indicator`` for replay capture.
+
+        Only a concrete implementation defined ON this class is wrapped: an
+        abstract redeclaration has nothing to record, an inherited method is
+        already tapped on the class that defined it, and the tap marker stops a
+        deeper subclass from wrapping a wrapper (which would record one call
+        twice). With capture off the wrapper is one ``is None`` check. See the
+        module docstring for what this does not reach.
+
+        THIS RUNS AT IMPORT TIME, for every indicator provider in the platform, so
+        anything that raises here propagates out of the ``class`` statement and out
+        of ``main.initialize_system()`` -- the application would fail to BOOT because
+        an observability wrapper could not be attached. Capture is instrumentation:
+        it may lose an observation, it may not take the platform down. A tap that
+        cannot be built therefore leaves that one method untapped and says which one,
+        instead of raising.
+        """
+        super().__init_subclass__(**kwargs)
+        implementation = cls.__dict__.get("get_indicator")
+        if implementation is None or getattr(implementation, "__isabstractmethod__", False):
+            return
+        try:
+            if tapped_boundary(implementation) is not None:
+                return
+            cls.get_indicator = observe_provider(
+                "indicators", "get_indicator", identity=indicator_identity)(implementation)
+        except Exception as e:  # noqa: BLE001 - a tap must never stop the app from booting
+            logger.error(
+                f"replay capture could not tap {cls.__module__}.{cls.__name__}."
+                f"get_indicator ({type(e).__name__}: {e}); the provider works but its "
+                f"indicator reads are NOT recorded", exc_info=True)
+
     # Centralized indicator metadata - all providers share this catalog
     ALL_INDICATORS = {
         # Moving Averages

@@ -13,8 +13,10 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
+from ba2_common.core import shared_arrays as _sa
 from ba2_providers.fmp_common import fmp_http_get
 from ba2_common.logger import logger
 
@@ -763,9 +765,210 @@ def check_frame_quality(df: "pd.DataFrame", thresholds: Optional[Dict[str, float
     return bad
 
 
+#: THE READER'S HALF OF THE DERIVED-CACHE CONTRACT, carried in the cache KEY. Bump it whenever
+#: the array set below changes shape or MEANING: the encodings (``__columns_utf8``/``__kinds``/
+#: ``<col>__cats_utf8``/``<col>__ncats``), the code-dtype rule, which columns become categoricals,
+#: or which of them are ordered. A set published by an older reader then lives under a different
+#: key and can never be opened by a newer one (nor the reverse), whatever the sources look like.
+#: ``shared_arrays.SCHEMA_VERSION`` covers the on-disk FILE layout, which is the store's business;
+#: this covers what the bytes inside those files mean, which is ours. A column ADDED to the store
+#: needs no bump — that rewrites partitions, and a rewritten partition is a new (path, size, mtime)
+#: and therefore a new signature.
+#:
+#: A BUMP ORPHANS DISK, so it is a maintenance action and not just an edit: the version is part of
+#: the KEY, so ``<derived_root>/u_store.v<old>`` becomes a key nothing asks for, and ``sweep()``
+#: only keeps the newest signature WITHIN a key — it will never collect it however long it sits
+#: there. Deleting the ``*.v<old>`` directory is part of the bump.
+METRIC_STORE_ARRAYS_VERSION = 1
+
+#: Object columns that become an ORDERED categorical. ``date`` must be, and it is load-bearing in
+#: TWO places: the as-of resolve (``dates <= day``) and ``.min()``/``.max()`` over the column
+#: (``tools/strategy_research/runtime.py:110``, the store-coverage guard) both raise "Unordered
+#: Categoricals can only compare equality" without it. The order is the sorted-ISO category order,
+#: which is exactly the string order it replaces.
+_ORDERED_CAT_COLUMNS = ("date",)
+
+_COLUMNS_ARRAY = "__columns_utf8"
+_KINDS_ARRAY = "__kinds"
+_KIND_NUMERIC = 0
+_KIND_CATEGORICAL = 1
+_CATS_SUFFIX = "__cats_utf8"
+_NCATS_SUFFIX = "__ncats"
+#: Characters that cannot appear in a column name: each array is published as ``<name>.npy``, and
+#: the name also travels inside a newline-joined blob.
+_UNSAFE_NAME_CHARS = '/\\:*?"<>|\n\r'
+
+#: Stems NTFS refuses as a path segment whatever the extension, so ``AUX.npy`` cannot be created.
+#: ``shared_arrays._safe_key`` guards the cache KEY with the same set, but array NAMES go through
+#: no sanitiser at all -- so the check has to be made here. Taken from that module so there is one
+#: definition, with the (tiny) set replicated only for the case where it is ever renamed there.
+_RESERVED_NAMES = getattr(_sa, "_WINDOWS_RESERVED", None) or (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)})
+
+
+def _utf8_join(parts: "List[str]", what: str) -> "np.ndarray":
+    """``parts`` as a uint8 array of the newline-joined UTF-8 bytes.
+
+    Strings inside a numeric-only array contract, exactly as the option reader ships
+    ``c_occ_utf8``. A member containing a newline would shift every later element by one and
+    mis-key silently from then on, so it is refused here rather than decoded wrongly there.
+    """
+    for s in parts:
+        if "\n" in s or "\r" in s:
+            raise ValueError(
+                f"metric store: {what} contains a newline ({s!r}); the shared-array encoding is "
+                "newline-joined and cannot represent it")
+    return np.frombuffer("\n".join(parts).encode("utf-8"), dtype=np.uint8)
+
+
+def _utf8_split(arr: "np.ndarray", n_expected: int, what: str) -> "List[str]":
+    """Decode ``_utf8_join`` back to exactly ``n_expected`` strings, or raise.
+
+    The count is carried alongside the bytes because ``"".split("\\n")`` is ambiguous (zero
+    strings or one empty one), and because a mapped set paired with the wrong sidecar must fail
+    loudly rather than silently re-key every row.
+    """
+    # An EMPTY blob is two different things -- zero strings, or ONE empty string -- and the byte
+    # count cannot tell them apart. ``n_expected`` is what decides, so a category column that is
+    # "" on every row round-trips instead of failing the decode that is meant to validate it.
+    out = [] if (arr.size == 0 and n_expected == 0) else bytes(arr).decode("utf-8").split("\n")
+    if len(out) != n_expected:
+        raise ValueError(
+            f"metric store: {what} decoded to {len(out)} entries, expected {n_expected} — the "
+            "mapped arrays are inconsistent")
+    return out
+
+
+def _code_dtype(n_categories: int) -> "np.dtype":
+    """The code dtype pandas ITSELF would choose for this cardinality.
+
+    Load-bearing, not tidiness: ``Categorical.from_codes`` runs the incoming codes through
+    ``coerce_indexer_dtype``, which returns the same buffer only when the dtype already matches —
+    an int32 code file for 4 734 symbols is silently COPIED into int16 and the whole point of
+    mapping it is lost (measured, spike §3.4). Mirrors pandas' thresholds exactly.
+    """
+    if n_categories < np.iinfo(np.int8).max:
+        return np.dtype(np.int8)
+    if n_categories < np.iinfo(np.int16).max:
+        return np.dtype(np.int16)
+    if n_categories < np.iinfo(np.int32).max:
+        return np.dtype(np.int32)
+    return np.dtype(np.int64)
+
+
+def _store_arrays_from_frame(df: "pd.DataFrame") -> "Dict[str, np.ndarray]":
+    """The concatenated store frame -> the shareable numeric half, as 1-D arrays.
+
+    Numeric/bool columns travel AS THEY ARE (no dtype rewriting — a float64 column that became
+    float32 here would change every screen's arithmetic). Object columns travel as integer
+    category codes plus their sorted category strings; on the real store that is 223 MB of python
+    strings per worker collapsed to 6.8 MB of shared codes, 80 MB of which is a ``sector`` column
+    no consumer reads. The original column ORDER and the per-column kind ride along
+    (``__columns_utf8`` / ``__kinds``) so the frame is rebuilt exactly as the parquet concat
+    produced it.
+
+    Anything that is neither a numpy numeric/bool dtype nor object is REFUSED rather than coerced:
+    a pandas nullable ``Int64`` has a mask this encoding does not carry, and silently turning it
+    into float64 would change what ``isna()`` means downstream. The real store is 42 float64 + 3
+    object (spike §1.2), so this is a guard against a future build writing something new, and it
+    should fail the build rather than the trial.
+    """
+    arrays: "Dict[str, np.ndarray]" = {}
+    names: "List[str]" = []
+    kinds: "List[int]" = []
+    for raw_name in df.columns:
+        name = str(raw_name)
+        if any(c in name for c in _UNSAFE_NAME_CHARS) or name.startswith("__") \
+                or name.endswith((_CATS_SUFFIX, _NCATS_SUFFIX)) \
+                or name.split(".")[0].upper() in _RESERVED_NAMES:
+            raise ValueError(
+                f"metric store: column {name!r} cannot be a shared-array name (it is published as "
+                f"'<name>.npy', so it must not collide with the '__' encodings and must not be a "
+                f"Windows reserved device stem)")
+        col = df[raw_name]
+        dtype = col.dtype
+        if dtype == object or isinstance(dtype, pd.CategoricalDtype):
+            values = col.astype(object) if isinstance(dtype, pd.CategoricalDtype) else col
+            cat = pd.Categorical(values, ordered=name in _ORDERED_CAT_COLUMNS)
+            # Refused, not stringified. ``str()`` would happily turn an int or Timestamp column
+            # into categories that compare and sort DIFFERENTLY from the values the store was
+            # built with, and the frame would come back silently re-typed instead of failing here,
+            # where the BUILD that produced the odd column can be fixed.
+            bad = next((c for c in cat.categories if not isinstance(c, str)), None)
+            if bad is not None:
+                raise TypeError(
+                    f"metric store: object column {name!r} holds a non-string value {bad!r} "
+                    f"({type(bad).__name__}); the shared-array contract carries object columns as "
+                    "STRING categories only. Write it as a numeric column, or as ISO strings.")
+            cats = [str(c) for c in cat.categories]
+            codes = np.ascontiguousarray(cat.codes, dtype=_code_dtype(len(cats)))
+            arrays[name] = codes
+            arrays[name + _CATS_SUFFIX] = _utf8_join(cats, f"{name} categories")
+            arrays[name + _NCATS_SUFFIX] = np.array([len(cats)], dtype=np.int64)
+            kinds.append(_KIND_CATEGORICAL)
+        elif isinstance(dtype, np.dtype) and dtype.kind in "fiub":
+            arrays[name] = np.ascontiguousarray(col.to_numpy())
+            kinds.append(_KIND_NUMERIC)
+        else:
+            raise TypeError(
+                f"metric store: column {name!r} has dtype {dtype!r}, which the shared-array "
+                "contract cannot carry (numeric/bool or object strings only). Write it as float64 "
+                "(NaN for missing) in the build, or bump METRIC_STORE_ARRAYS_VERSION and teach "
+                "this encoder about it.")
+        names.append(name)
+    arrays[_COLUMNS_ARRAY] = _utf8_join(names, "column names")
+    arrays[_KINDS_ARRAY] = np.array(kinds, dtype=np.int8)
+    return arrays
+
+
+def _frame_from_arrays(arrays: "Dict[str, np.ndarray]") -> "pd.DataFrame":
+    """Rebuild the store frame over ``arrays`` WITHOUT copying a single column.
+
+    ``pd.DataFrame(mapping, copy=False)`` is the one construction that keeps the mapping: the
+    block manager holds one (1, N) block per column and never consolidates on its own —
+    ``_from_arrays``, ``concat(axis=1)`` and per-column assignment all copy, verified on pandas
+    2.3.3 (spike §3.1/§3.2). Do not "tidy" it into any of those.
+
+    Applied on BOTH paths, mapped and ``BA2_SHARED_ARRAYS=0``, so the escape hatch differs only in
+    where the bytes live — never in the dtypes a consumer sees.
+    """
+    kinds = arrays[_KINDS_ARRAY]
+    names = _utf8_split(arrays[_COLUMNS_ARRAY], len(kinds), "column names")
+    mapping: "Dict[str, Any]" = {}
+    for name, kind in zip(names, kinds):
+        if int(kind) == _KIND_NUMERIC:
+            mapping[name] = arrays[name]
+        elif int(kind) == _KIND_CATEGORICAL:
+            n_cats = int(arrays[name + _NCATS_SUFFIX][0])
+            cats = _utf8_split(arrays[name + _CATS_SUFFIX], n_cats, f"{name} categories")
+            mapping[name] = pd.Categorical.from_codes(
+                arrays[name], pd.Index(cats, dtype=object),
+                ordered=name in _ORDERED_CAT_COLUMNS)
+        else:
+            raise ValueError(f"metric store: column {name!r} has unknown kind {int(kind)}")
+    return pd.DataFrame(mapping, copy=False)
+
+
 def load_store(store_dir: str) -> "pd.DataFrame":
-    """Load all month partitions into one DataFrame, memoised by store path (per process —
-    GA workers stay alive across trials, so the store loads ~once per worker)."""
+    """All month partitions as ONE DataFrame, memoised by store path (per process — GA workers
+    stay alive across trials, so the store loads ~once per worker).
+
+    The parquet is parsed by the first process on the HOST that asks for this store at this
+    signature; every later process memory-maps what that build published and rebuilds the frame
+    over the maps. Measured on the real store (1.28M rows x 45 cols): ~1.0 GB of private RAM saved
+    per worker (4 workers: 4 087 MB -> 242 MB) and 6.3 s -> 0.35 s per worker
+    (reports/strategy_research/metric_store_sharing_spike_2026-09-14.md).
+
+    ``symbol``/``date``/``sector`` come back as ``category`` dtype — in BOTH modes, so the
+    ``BA2_SHARED_ARRAYS=0`` escape hatch stays a memory switch and never a behaviour switch. Every
+    consumer path (mask chains, ``sort_values``, ``groupby().head()``, ``set_index('symbol')``,
+    ``list(d['symbol'])``) is unchanged by that, with ONE exception that is handled here rather
+    than at the call sites: an ordered categorical refuses ``<=`` against a scalar that is not one
+    of its categories, and every as-of resolve compares against a BAR date that is usually between
+    scans — see ``_latest_scan_date_le``.
+    """
     import glob
     hit = _STORE_MEMO.get(store_dir)
     if hit is not None:
@@ -775,7 +978,18 @@ def load_store(store_dir: str) -> "pd.DataFrame":
     parts = sorted(glob.glob(os.path.join(store_dir, "ym=*", "*.parquet")))
     if not parts:
         raise FileNotFoundError(f"empty screener metric store: {store_dir}")
-    df = pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
+
+    def _build() -> "Dict[str, np.ndarray]":
+        # `parts`, not another glob: the files that were SIGNED are the files that are read.
+        return _store_arrays_from_frame(
+            pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True))
+
+    derived = _sa.DerivedArrayStore(_sa.derived_root_for(store_dir))
+    # ONE key per store dir: the derived root already mirrors the store's own directory name, so
+    # two stores never share a key. ``u_`` prefix per the store's contract for caller-built keys
+    # (a bare name could collide with a Windows reserved device stem).
+    key = f"u_store.v{METRIC_STORE_ARRAYS_VERSION}"
+    df = _frame_from_arrays(derived.build_or_open(key, parts, _build))
     _STORE_MEMO[store_dir] = df
     return df
 
@@ -1075,6 +1289,32 @@ def _drop_excluded(d: "pd.DataFrame") -> "pd.DataFrame":
     return d[~d["symbol"].isin(EXCLUDED_SYMBOLS)]
 
 
+def _latest_scan_date_le(store_df: "pd.DataFrame", day: str) -> Optional[str]:
+    """The latest scan date in ``store_df`` on or before ``day``, or None if there is none.
+
+    WHY THIS EXISTS. ``load_store`` returns ``date`` as an ORDERED categorical, and pandas refuses
+    ``series <= "2023-03-05"`` when that string is not one of the categories — which is the normal
+    case, since the as-of day is a BAR date and the scan grid is weekly. So the comparison is done
+    on the CODES (an int8/int16 pass -- ~24x cheaper than the object comparison it replaces:
+    129 ms -> 5.4 ms on the real store, spike §1.6) and only the winning code is decoded. A string-keyed frame (a test fixture, a hand-built frame)
+    still takes the original path, so both dtypes give the same answer.
+
+    The codes are checked for PRESENCE rather than trusted from the category list: a caller may
+    hand in a row-filtered frame, which keeps the full category set but not the rows.
+    """
+    s = store_df["date"]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        cats = s.cat.categories
+        i = int(cats.searchsorted(str(day), side="right")) - 1
+        if i < 0:
+            return None
+        codes = s.cat.codes.to_numpy()
+        present = codes[(codes >= 0) & (codes <= i)]
+        return None if not present.size else str(cats[int(present.max())])
+    prior = s[s <= day]
+    return None if prior.empty else str(prior.max())
+
+
 def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
                             settings: Dict[str, Any]) -> List[str]:
     """The dynamic per-day universe for one individual's screener thresholds.
@@ -1155,11 +1395,10 @@ def screen_universe_as_of(store_df: "pd.DataFrame", as_of_day: str,
     """Same as ``screen_universe_for_day`` but resolves to the LATEST scan date <= as_of_day,
     so a bar between scan dates gets the held universe (the cadence is weekly by default). Empty
     if no scan date is on/before as_of_day."""
-    dates = store_df["date"]
-    prior = dates[dates <= as_of_day]
-    if prior.empty:
+    day = _latest_scan_date_le(store_df, as_of_day)
+    if day is None:
         return []
-    return screen_universe_for_day(store_df, prior.max(), settings)
+    return screen_universe_for_day(store_df, day, settings)
 
 
 def metrics_as_of(store_df: "pd.DataFrame", as_of_day: str,
@@ -1171,11 +1410,10 @@ def metrics_as_of(store_df: "pd.DataFrame", as_of_day: str,
     across symbols, so the latest scan <= the day is one shared date). Lets a consumer read a
     precomputed factor (e.g. ``momentum_12_1``) or the point-in-time ``close`` point-in-time
     instead of re-fetching/re-deriving it from OHLCV. Empty if no scan date is on/before the day."""
-    dates = store_df["date"]
-    prior = dates[dates <= as_of_day]
-    if prior.empty:
+    day = _latest_scan_date_le(store_df, as_of_day)
+    if day is None:
         return {}
-    d = store_df[store_df["date"] == prior.max()]
+    d = store_df[store_df["date"] == day]
     cols = [c for c in columns if c in d.columns]
     if not cols:
         return {}
@@ -1210,7 +1448,14 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
         return []
     prior = [d for d in dates if d <= start_day]
     lo = prior[-1] if prior else dates[0]
-    d = _drop_excluded(store_df[(store_df["date"] >= lo) & (store_df["date"] <= end_day)])
+    # The UPPER bound is resolved to a real scan date too. Nothing changes for a string-keyed
+    # frame (no scan date lies strictly between the last one <= end_day and end_day), but an
+    # ordered categorical refuses `<=` against a day that is not one of its categories, and
+    # end_day is an arbitrary backtest end.
+    hi = _latest_scan_date_le(store_df, end_day)
+    if hi is None:
+        return []
+    d = _drop_excluded(store_df[(store_df["date"] >= lo) & (store_df["date"] <= hi)])
     if d.empty:
         return []
 
@@ -1261,5 +1506,9 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
     d = d.sort_values(sort_col, ascending=False)
     n = int(settings.get("max_stocks") or 0)
     if n > 0:
-        d = d.groupby("date", sort=False).head(n)
+        # observed=True: a categorical `date` (what load_store returns) otherwise enumerates
+        # EVERY category as a group, including the ones this windowed slice does not contain.
+        # head() itself is row-selecting so the RESULT is the same either way -- this pins the
+        # intent and drops the pandas deprecation warning that comes with the default.
+        d = d.groupby("date", sort=False, observed=True).head(n)
     return sorted(set(d["symbol"]))

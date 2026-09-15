@@ -1254,15 +1254,37 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
         return self.account.adjust_tp(transaction, self.target_price, source="ruleset")
 
     def _post_broker_hook(self, transaction) -> None:
-        # Store current target price in transaction meta_data for TradeConditions comparison
-        if not transaction.meta_data:
-            transaction.meta_data = {}
-        if "TradeConditionsData" not in transaction.meta_data:
-            transaction.meta_data["TradeConditionsData"] = {}
-        transaction.meta_data["TradeConditionsData"]["current_target_price"] = round(self.target_price, 2)
-        from ba2_common.core.db import update_instance
-        update_instance(transaction)
-        logger.info(f"Stored current_target_price=${self.target_price:.2f} in transaction {transaction.id} metadata for TradeConditions")
+        """Store the current target price in the transaction's meta_data for TradeConditions.
+
+        RE-READS the transaction instead of writing back the object ``execute`` loaded
+        BEFORE the broker call. ``_call_broker`` above is ``account.adjust_tp``, and the
+        live adapters persist the new take-profit through their OWN session
+        (``AlpacaAccount.adjust_tp_sl`` re-fetches the row and commits it), so by the time
+        this hook runs every column on the caller's copy is stale -- ``take_profit`` in
+        particular is still the PRE-broker value, i.e. None on a fresh entry.
+        ``db.update_instance`` copies every loaded column onto the row, so saving that
+        stale copy overwrote the TP the broker had just written with NULL; the later
+        ``initial_setup`` stop attachment then read that NULL, rebuilt the exit as
+        stop-only and cancelled the TP leg (2026-09-10 production review, finding 1:
+        transactions 203/204/205 lost their take-profits exactly this way).
+
+        Only the freshly read object is mutated and saved, so this hook can never carry a
+        pre-broker value back into the database.
+
+        BACKTEST: the sql-less trade store returns the SAME object by identity, so
+        ``fresh is transaction`` there and the re-read is a no-op -- no backtest decision,
+        order or result changes.
+        """
+        from ba2_common.core.db import get_instance, update_instance
+        from ba2_common.core.models import Transaction
+        fresh = get_instance(Transaction, transaction.id)
+        if not fresh.meta_data:
+            fresh.meta_data = {}
+        if "TradeConditionsData" not in fresh.meta_data:
+            fresh.meta_data["TradeConditionsData"] = {}
+        fresh.meta_data["TradeConditionsData"]["current_target_price"] = round(self.target_price, 2)
+        update_instance(fresh)
+        logger.info(f"Stored current_target_price=${self.target_price:.2f} in transaction {fresh.id} metadata for TradeConditions")
 
     def _resolve_min_take_profit_pct(self) -> float:
         """min_take_profit_percent snapshotted on the triggering ExpertRecommendation at
@@ -1397,7 +1419,12 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
         return self.account.adjust_sl(transaction, self.target_price, source="ruleset")
 
     def _post_broker_hook(self, transaction) -> None:
-        pass  # SL does not store metadata
+        # SL stores no metadata, so there is nothing to persist and -- unlike the TP hook
+        # above -- no opportunity to write the pre-broker copy of the transaction back over
+        # what ``account.adjust_sl`` just committed through its own session. If this ever
+        # grows a write, it must re-read the transaction first for the reason documented on
+        # AdjustTakeProfitAction._post_broker_hook.
+        pass
 
     def _enforce_minimum_distance(self) -> None:
         """Enforce a minimum SL distance from CURRENT price, not open/entry price.
@@ -1534,7 +1561,8 @@ class IncreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get total virtual equity (allocated capital, not just free cash)
+            # Get total virtual equity from the tradable balance (allocated
+            # capital, not just free cash)
             virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
@@ -1744,7 +1772,8 @@ class DecreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get total virtual equity (allocated capital, not just free cash)
+            # Get total virtual equity from the tradable balance (allocated
+            # capital, not just free cash)
             virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
@@ -2313,8 +2342,21 @@ class _OptionEntryAction(TradeAction):
         return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
-        """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
-        balance = self.account.get_balance()
+        """OPTION tradable balance * virtual_equity_pct/100 (the whole option tradable
+        balance when the pct is unknown). Option entries are sized from the option
+        leverage, which is 1.0 at every supported broker today, so with the stock factor
+        at 1.8 this stays at the plain balance -- long options cannot be bought on
+        margin. None when the account cannot answer, never a guess."""
+        try:
+            balance = self.account.get_option_tradable_balance()
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
+            # signal the tradable-balance path raises. Anything else is a defect, and
+            # absorbing it here would size every option entry off a silent None.
+            absorb_if_benign(e, ValueError)
+            logger.error(f"_virtual_equity: option tradable balance unavailable for "
+                         f"account {self.account.id}: {e}", exc_info=True)
+            return None
         if balance is None:
             return None
         pct = 100.0

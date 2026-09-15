@@ -59,3 +59,83 @@ def test_iter_with_progress_handles_zero_total_bytes_without_dividing_by_zero(mo
     list(worker_client._iter_with_progress([b""], total_bytes=0,
                                            worker_name="w1", log=logged.append))
     assert logged == ["cache push -> w1: 0.0 kB/0.0 kB (100.0%)"]
+
+
+# --------------------------------------------------------------------------------------------
+# push_cache prune guard (no live worker: httpx.Client and the local manifest are faked)
+# --------------------------------------------------------------------------------------------
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """Records every call and answers GET /cache/manifest with *remote*."""
+
+    def __init__(self, calls, remote, **_kw):
+        self._calls = calls
+        self._remote = remote
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def get(self, url, **_kw):
+        self._calls.append(("GET", url))
+        return _FakeResp(self._remote)
+
+    def post(self, url, **_kw):
+        self._calls.append(("POST", url))
+        return _FakeResp({"pruned": 1, "skipped": 0, "failed": 0})
+
+
+def _fake_transport(monkeypatch, remote, local):
+    calls = []
+    monkeypatch.setattr(worker_client.httpx, "Client",
+                        lambda **kw: _FakeClient(calls, remote, **kw))
+    monkeypatch.setattr(worker_client.cache_sync, "build_manifest",
+                        lambda *a, **k: local)
+    return calls
+
+
+def test_push_cache_never_prunes_on_an_empty_local_manifest(monkeypatch):
+    """diff_stale against an EMPTY master manifest lists every file the worker has — pruning on
+    that view would wipe the worker's whole cache over one unreadable/misconfigured cache root
+    on the master. The guard skips the prune and says so at WARNING."""
+    remote = {"files": [{"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10}]}
+    local = {"root": "/nonexistent/cache", "count": 0, "total_bytes": 0, "files": []}
+    calls = _fake_transport(monkeypatch, remote, local)
+    warned = []
+    monkeypatch.setattr(worker_client.logger, "warning", lambda m, *a, **k: warned.append(m))
+    logged = []
+
+    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, log=logged.append)
+
+    assert res["pruned"] == 0
+    assert not any(url.endswith("/cache/prune") for _m, url in calls), calls
+    assert len(warned) == 1 and "EMPTY" in warned[0], warned
+    # ...and it reaches the INJECTED sink too -- that is the visible job log, where an operator
+    # would otherwise see only "already in sync (0 files)" and no hint of a refused prune.
+    assert any("EMPTY" in m for m in logged), logged
+
+
+def test_push_cache_still_prunes_stale_files_on_a_non_empty_manifest(monkeypatch):
+    """The guard is about the EMPTY case only — a real manifest still prunes leftovers."""
+    local = {"root": "/cache", "count": 1, "total_bytes": 10,
+             "files": [{"rel_path": "a.parquet", "size": 10}]}
+    remote = {"files": [{"rel_path": "a.parquet", "size": 10},          # in sync -> no push
+                        {"rel_path": "old-fragment.parquet", "size": 4}]}  # stale -> prune
+    calls = _fake_transport(monkeypatch, remote, local)
+
+    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, log=lambda _m: None)
+
+    assert res["pruned"] == 1
+    assert ("POST", "http://w1/cache/prune") in calls, calls

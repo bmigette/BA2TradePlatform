@@ -917,8 +917,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
            caller always pinned an already-vetted universe symbol.
         4. Group the surviving trades by symbol.
         5. Resolve each symbol's per-trade ``exec_price_by_trade`` (``_get_price_at_date``) and
-           ``current_price`` (same ``providers.price_at_date``/``_get_current_price`` call
-           ``_gather`` already makes, just looped), and build the per-trader history/skill/
+           ``current_price`` (backtest: ``providers.price_at_date``; live: one account batch
+           after historical preparation), and build the per-trader history/skill/
            hold-info maps EXACTLY ONCE for the whole bar — shared across every qualifying symbol
            (Stages 2-4 in ``_gather`` are symbol-independent except for which traders/trades a
            given symbol's list touches; recomputing them per symbol, as the per-symbol
@@ -1056,10 +1056,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                         continue
                     exec_price_by_trade[key] = self._get_price_at_date(symbol, exec_date)
 
-                # Live (as_of=None) reads the account/broker quote (the original live source);
-                # backtest (as_of set) reads the OHLCV close-at-as_of -- identical to _gather.
-                current_price = (self._get_current_price(symbol) if as_of is None
-                                 else providers.price_at_date(symbol, as_of))
+                # Preserve backtest price resolution and exception isolation. Live quotes
+                # are resolved in one account batch AFTER all historical preparation below.
+                current_price = (providers.price_at_date(symbol, as_of)
+                                 if as_of is not None else None)
             except cache_miss_excs as e:
                 # UNPREWARMED symbol discovered dynamically from the live disclosure feed --
                 # expected/routine for basket mode (confirmed 2026-07-18: 560 of ~2,057
@@ -1073,7 +1073,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                     f"hit an un-prewarmed OHLCV/price-history cache miss: {e}")
                 continue
 
-            if not current_price:
+            if as_of is not None and not current_price:
                 # No resolvable price for this symbol -- can't score it (would blow up
                 # _filter_trades' price-delta arithmetic downstream). Mirrors
                 # FMPSenateTraderCopy._gather's supported_symbols filter.
@@ -1097,6 +1097,28 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "trader_hold_info_by_name": trader_hold_info_by_name,
                 "symbol": symbol,
             }
+
+        if as_of is None and bundle_by_symbol:
+            symbols = list(bundle_by_symbol)
+            self.logger.info(f"Fetching current prices for {len(symbols)} Senate basket symbols in bulk")
+            # The existing account list API preserves its cache, price type, broker
+            # resolution and replay observation. Fetch late so historical work cannot
+            # age the quotes, and consume this returned snapshot without per-symbol reads.
+            prices = self._get_current_price(symbols)
+            if not isinstance(prices, dict):
+                raise ValueError("Senate basket current-price batch did not return a price map")
+            unavailable = []
+            for symbol in symbols:
+                price = prices.get(symbol)
+                if not price:
+                    unavailable.append(symbol)
+                    del bundle_by_symbol[symbol]
+                else:
+                    bundle_by_symbol[symbol]["current_price"] = price
+            self.logger.info(
+                f"Senate basket prices resolved: {len(bundle_by_symbol)}/{len(symbols)} symbols")
+            if unavailable:
+                self.logger.warning(f"Senate basket skipping symbols without a current price: {unavailable}")
         return bundle_by_symbol
 
     @staticmethod

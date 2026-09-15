@@ -6,7 +6,9 @@ a worker mirrors the master's cache and then runs the hermetic backtest with zer
 calls (the backtest contract raises ``BacktestCacheMiss`` rather than fetching). The screener
 metric_store is the one exception: it DOES get rebuilt/compacted in place (e.g. replacing many
 ``part-NNNNN.parquet`` fragments with one ``part.parquet`` per month), so a worker's copy can go
-stale even though nothing looks "missing" — see ``diff_stale``/``prune_paths``.
+stale even though nothing looks "missing" — see ``diff_stale``/``prune_paths``. The per-host
+DERIVED array caches (``_derived/``, ``ba2_common.core.shared_arrays``) are the second exception,
+in the opposite direction: they are never synced EITHER way (see ``_SKIP_DIRNAMES``).
 
 PUSH model: the MASTER builds the list of files a worker is missing (``diff_missing`` against the
 worker's manifest) and streams them as ONE tar (``iter_tar``); the WORKER extracts that stream
@@ -27,10 +29,12 @@ import tarfile
 import threading
 import time
 from pathlib import Path
+from stat import S_ISREG
 from typing import Callable, Iterable, Iterator, List, Optional
 
 from ba2_common.config import CACHE_FOLDER
 from ba2_common.core.db_maintenance import format_bytes
+from ba2_common.core.shared_arrays import DERIVED_DIRNAME
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +49,28 @@ _PROGRESS_LOG_INTERVAL_S = 15.0
 # it cleanly and re-derives any -wal/-shm.
 _SKIP_SUFFIXES = (".tmp", ".part", ".lock", "-wal", "-shm", ".journal")
 
+# Per-host DERIVED caches (memory-mapped .npy sets built from parquet already on the worker --
+# see ba2_common.core.shared_arrays). Deterministic from the source and ~3x its size, so each
+# host builds its own on first touch instead of pulling it over the wire. Excluded from the
+# manifest on BOTH ends, which also keeps diff_stale/prune_paths from mistaking a worker's own
+# derived cache for a stale leftover of a master rebuild.
+_SKIP_DIRNAMES = (DERIVED_DIRNAME,)
+
 
 def cache_root(root: Optional[str] = None) -> Path:
     return Path(root or CACHE_FOLDER)
 
 
 def _is_syncable(p: Path) -> bool:
+    """Whether *p* (a path RELATIVE to the cache root) may be synced.
+
+    Relative on purpose: the ``_SKIP_DIRNAMES`` component match would otherwise fire on a
+    directory in the cache root's own absolute prefix and silently empty the whole manifest.
+    Only an exact path COMPONENT matches, so a file literally named ``_derived`` or a sibling
+    directory like ``_derived_something`` stays ordinary cache content.
+    """
+    if any(part in _SKIP_DIRNAMES for part in p.parts[:-1]):
+        return False
     name = p.name
     if name.startswith("."):
         return False
@@ -71,7 +91,9 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
 
     Returns ``{root, count, total_bytes, files:[{rel_path, size, mtime[, crc32]}]}`` with
     POSIX-style relative paths (stable across OSes). Recurses the whole cache tree so newly-added
-    buckets are covered automatically (no allowlist to drift).
+    buckets are covered automatically (no allowlist to drift) — with one DENYlist: any directory
+    named ``_derived`` (``_SKIP_DIRNAMES``) is not even descended into, since a per-host derived
+    array cache is rebuilt locally rather than synced.
 
     ``with_hash=True`` adds a ``crc32`` per file (read LOCALLY, so no extra network transfer —
     only the checksum crosses the wire). CRC32 (not sha256): this is corruption/staleness
@@ -84,24 +106,41 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
     base = cache_root(root)
     files: List[dict] = []
     if base.is_dir():
-        for p in base.rglob("*"):
-            if not p.is_file() or not _is_syncable(p):
-                continue
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            entry = {
-                "rel_path": p.relative_to(base).as_posix(),
-                "size": st.st_size,
-                "mtime": st.st_mtime,
-            }
-            if with_hash:
+        # os.walk (not rglob) so a skipped directory is PRUNED from the descent: a derived cache
+        # holds several .npy per signature dir over the whole provider tree, and this walk is the
+        # one with history (a cold manifest over 312k files took ~140s and got a worker excluded).
+        # os.walk defaults to followlinks=False, which is exactly Path.rglob's behaviour on 3.12
+        # (Path.walk(follow_symlinks=False)); junctions are not symlinks to Python and are
+        # descended by both. Deliberately NOT following symlinks: a cycle would loop this walk,
+        # and a symlinked-in subtree is symmetric on master and worker so it never reaches
+        # diff_stale.
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRNAMES]
+            rel_dir = Path(dirpath).relative_to(base)
+            for fn in filenames:
+                rel = rel_dir / fn
+                if not _is_syncable(rel):
+                    continue
+                p = Path(dirpath) / fn
                 try:
-                    entry["crc32"] = _crc32_file(p)
+                    st = p.stat()
                 except OSError:
                     continue
-            files.append(entry)
+                # not a regular file (fifo/device, or a file-became-dir race); stat follows
+                # symlinks, so a symlinked file still passes
+                if not S_ISREG(st.st_mode):
+                    continue
+                entry = {
+                    "rel_path": rel.as_posix(),
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                }
+                if with_hash:
+                    try:
+                        entry["crc32"] = _crc32_file(p)
+                    except OSError:
+                        continue
+                files.append(entry)
     return {
         "root": str(base),
         "count": len(files),
@@ -255,10 +294,17 @@ def extract_tar(fileobj, dest: Optional[str] = None,
 def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:
     """Delete *rel_paths* under *root* (default ``CACHE_FOLDER``). Traversal-guarded via
     ``safe_resolve``; a path outside the root is skipped, not deleted. Missing files are a
-    no-op (already gone). Returns ``{pruned, skipped}``."""
+    no-op (already gone). Returns ``{pruned, skipped, failed}``.
+
+    One undeletable path never aborts the sweep: on Windows a file another process still has
+    open/memory-mapped refuses to unlink (WinError 32 -> PermissionError), and letting that
+    escape mid-loop would leave every genuinely-stale file AFTER it un-pruned — exactly the
+    silent-corruption case ``diff_stale`` exists to prevent. Each failure is counted and logged.
+    """
     base = str(cache_root(root))
     pruned = 0
     skipped = 0
+    failed = 0
     for rel in rel_paths:
         try:
             target = safe_resolve(rel, base)
@@ -270,4 +316,7 @@ def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:
             pruned += 1
         except FileNotFoundError:
             pass
-    return {"pruned": pruned, "skipped": skipped}
+        except OSError as e:  # PermissionError (locked/mapped file) and friends
+            failed += 1
+            logger.warning(f"cache prune: could not delete {rel}: {e}")
+    return {"pruned": pruned, "skipped": skipped, "failed": failed}

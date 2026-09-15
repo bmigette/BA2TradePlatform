@@ -1,0 +1,8 @@
+{
+  "network_calls": 0,
+  "provider_fetch": "fake lambda",
+  "api_pattern_returned_data": true,
+  "api_pattern_wrote_file": false,
+  "cli_pattern_returned_data": true,
+  "cli_pattern_wrote_file": true
+}

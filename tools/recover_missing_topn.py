@@ -2,6 +2,11 @@
 
 usage: python recover_missing_topn.py <worker_name> <opt_id>:<rank>[,<rank>...] [<opt_id>:<ranks> ...]
 
+A <rank> is 1-based, or the literal ``best`` to recover the genome the search actually chose
+(``best_params``) rather than the Nth of ``all_results``. Those differ on a CHECKPOINT-RESUMED
+run, whose all_results holds only the generations that ran after the resume -- e.g.
+``recover_missing_topn.py remote150 487:best`` for the S5 winner the 2026-09-09 reboot cost us.
+
 Mirrors ba2test_launcher._persist_top_backtests per rank: same distinct-fitness ranking, same
 decode/_build_daily_trial_config/hoisted state, same /submit-trial-full payload, same master-side
 persist (_persist_results + ga_fitness + push_backtest). Differences, on purpose:
@@ -25,7 +30,9 @@ WORKER_NAME = sys.argv[1]
 QUEUE = []
 for spec in sys.argv[2:]:
     oid, ranks = spec.split(":")
-    QUEUE += [(int(oid), int(r)) for r in ranks.split(",")]
+    # "best" is a pseudo-rank: recover the genome from best_params instead of ranking out of
+    # all_results. Needed for a CHECKPOINT-RESUMED row, where the two disagree -- see build_spec.
+    QUEUE += [(int(oid), r.strip() if r.strip() == "best" else int(r)) for r in ranks.split(",")]
 
 sys.path.insert(0, r"C:\Users\basti\Documents\dev\BA2TradePlatform\testplatform")
 import ba2test_launcher as L  # noqa: E402
@@ -64,25 +71,41 @@ def build_spec(db, opt_id, rank):
     bt_block = dict(cfg["backtest"])
     expert = next((s["class"] for s in (bt_block.get("experts") or []) if isinstance(s, dict) and s.get("class")), None)
     assert expert, f"opt {opt_id}: no expert in optimization_config"
-    name = f"TOP{rank}-{opt.name or expert}"
+    name = (f"BEST-{opt.name or expert}" if rank == "best"
+            else f"TOP{rank}-{opt.name or expert}")
     hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
     fixed = {}
     for s in (bt_block.get("experts") or []):
         if isinstance(s, dict) and s.get("class") == expert:
             fixed = dict(s.get("settings") or {})
             break
-    seen, ranked = set(), []
-    for r in sorted(opt.all_results or [], key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9), reverse=True):
-        fit = r.get("fitness")
-        key = round(fit, 6) if isinstance(fit, (int, float)) else json.dumps(r.get("params"), sort_keys=True, default=str)
-        if key in seen:
-            continue
-        seen.add(key)
-        ranked.append((r["params"], r.get("key"), fit))
-        if len(ranked) >= rank:
-            break
-    assert len(ranked) == rank, f"opt {opt_id}: only {len(ranked)} distinct-fitness individuals, no rank {rank}"
-    params, _key, ga_fitness = ranked[rank - 1]
+    if rank == "best":
+        # The genome the SEARCH actually chose, taken from best_params rather than ranked out
+        # of all_results -- because on a CHECKPOINT-RESUMED run the two disagree. all_results
+        # restarted empty on resume (fixed going forward: the checkpoint now carries a bounded
+        # elite slice, see strategy_optimization_handler._elite_slice), so a resumed row lists
+        # only the generations that ran AFTER the resume while best_params/best_fitness carry
+        # the winner from before it.
+        #
+        # sen-S5-goal2020-risk_atr (opt 487, 2026-09-09) is exactly this: 16 entries in
+        # all_results against ~190 for an uninterrupted run, best persisted rank scoring 5.2598,
+        # and the 5.5741 genome that won the search never written as a Backtest at all. This
+        # pseudo-rank is how such a row is recovered after the fact.
+        assert opt.best_params, f"opt {opt_id}: no best_params to recover"
+        params, ga_fitness = opt.best_params, opt.best_fitness
+    else:
+        seen, ranked = set(), []
+        for r in sorted(opt.all_results or [], key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9), reverse=True):
+            fit = r.get("fitness")
+            key = round(fit, 6) if isinstance(fit, (int, float)) else json.dumps(r.get("params"), sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            ranked.append((r["params"], r.get("key"), fit))
+            if len(ranked) >= rank:
+                break
+        assert len(ranked) == rank, f"opt {opt_id}: only {len(ranked)} distinct-fitness individuals, no rank {rank}"
+        params, _key, ga_fitness = ranked[rank - 1]
     decoded = decode_params(strat, params)
     trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
     trial_cfg["name"] = name

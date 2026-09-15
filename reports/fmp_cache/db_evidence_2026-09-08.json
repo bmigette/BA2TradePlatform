@@ -1,0 +1,4719 @@
+{
+  "dev": {
+    "database": "C:\\Users\\basti\\Documents\\ba2\\trade\\db.sqlite",
+    "experts": [],
+    "analysis_counts": []
+  },
+  "dev_before_reset": {
+    "database": "C:\\Users\\basti\\Documents\\ba2\\trade\\db.sqlite.bak-pre-testreset-20260904-111605",
+    "experts": [
+      {
+        "id": 4,
+        "account_id": 3,
+        "expert": "PennyMomentumTrader",
+        "enabled": 0,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:34\"]}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\", \"10:30\", \"11:30\", \"12:30\", \"13:30\", \"14:30\", \"15:30\"]}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_provider": {
+            "value_str": "fmp",
+            "value_float": null,
+            "value_json": "{}"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 140000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 15.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 10.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.1,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 6,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 70000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 50.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 11.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 11.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.2000000000000002,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 7,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 90000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 11.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 9,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 4000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 10.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 15.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 25.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.5,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 10,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 2000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 10.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 11.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 15.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.1,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 11,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 5000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 17.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 11.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.1,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 12,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 1500000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 26.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 21.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.1,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 13,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 200000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 20.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 27.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 23.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.2000000000000002,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 14,
+        "account_id": 1,
+        "expert": "FactorRanker",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 50000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 10.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 29.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 6.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.9000000000000001,
+            "value_json": "{}"
+          },
+          "screener_store": {
+            "value_str": "C:\\Users\\basti\\Documents\\ba2\\common\\cache\\screener\\metric_store",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 15,
+        "account_id": 1,
+        "expert": "FactorRanker",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 50000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 20.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 22.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 6.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.9000000000000001,
+            "value_json": "{}"
+          },
+          "screener_store": {
+            "value_str": "C:\\Users\\basti\\Documents\\ba2\\common\\cache\\screener\\metric_store",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 16,
+        "account_id": 2,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 10000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 6000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 28.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 1.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.9000000000000001,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 19,
+        "account_id": 2,
+        "expert": "FMPInsiderClusterBuy",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 10000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 5000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 15.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 2.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.6,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 20,
+        "account_id": 2,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 2000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 26.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 6.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.7,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 21,
+        "account_id": 2,
+        "expert": "FMPInsiderClusterBuy",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 100000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 50.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 16.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 9.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.7000000000000002,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 22,
+        "account_id": 2,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 100000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 15.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 7.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.6,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"1\""
+          }
+        }
+      },
+      {
+        "id": 23,
+        "account_id": 2,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 1100000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 20.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 24.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 4.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.5,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"1\""
+          }
+        }
+      },
+      {
+        "id": 24,
+        "account_id": 2,
+        "expert": "FMPInsiderClusterBuy",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 300000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 13.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 16.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 0.7000000000000001,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 25,
+        "account_id": 2,
+        "expert": "FMPInsiderClusterBuy",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 3000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 28.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.2000000000000002,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 26,
+        "account_id": 1,
+        "expert": "FactorRanker",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 6000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 3.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 4.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.6,
+            "value_json": "{}"
+          },
+          "screener_store": {
+            "value_str": "C:\\Users\\basti\\Documents\\ba2\\common\\cache\\screener\\metric_store",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"1\""
+          }
+        }
+      },
+      {
+        "id": 27,
+        "account_id": 1,
+        "expert": "FactorRanker",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 9000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 2.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 4.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.6,
+            "value_json": "{}"
+          },
+          "screener_store": {
+            "value_str": "C:\\Users\\basti\\Documents\\ba2\\common\\cache\\screener\\metric_store",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"1\""
+          }
+        }
+      },
+      {
+        "id": 28,
+        "account_id": 3,
+        "expert": "FMPSenateTraderWeight",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "max_disclose_date_days": {
+            "value_str": null,
+            "value_float": 270.0,
+            "value_json": "{}"
+          },
+          "max_trade_exec_days": {
+            "value_str": null,
+            "value_float": 300.0,
+            "value_json": "{}"
+          },
+          "min_trader_avg_hold_days": {
+            "value_str": null,
+            "value_float": 12.0,
+            "value_json": "{}"
+          },
+          "skill_horizon_days": {
+            "value_str": null,
+            "value_float": 60.0,
+            "value_json": "{}"
+          },
+          "skill_lookback_months": {
+            "value_str": null,
+            "value_float": 6.0,
+            "value_json": "{}"
+          }
+        }
+      },
+      {
+        "id": 29,
+        "account_id": 3,
+        "expert": "FMPSenateTraderWeight",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"15:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "max_disclose_date_days": {
+            "value_str": null,
+            "value_float": 270.0,
+            "value_json": "{}"
+          },
+          "max_trade_exec_days": {
+            "value_str": null,
+            "value_float": 300.0,
+            "value_json": "{}"
+          },
+          "min_trader_avg_hold_days": {
+            "value_str": null,
+            "value_float": 12.0,
+            "value_json": "{}"
+          },
+          "skill_horizon_days": {
+            "value_str": null,
+            "value_float": 60.0,
+            "value_json": "{}"
+          },
+          "skill_lookback_months": {
+            "value_str": null,
+            "value_float": 6.0,
+            "value_json": "{}"
+          }
+        }
+      },
+      {
+        "id": 30,
+        "account_id": 1,
+        "expert": "FactorRanker",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 600000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 10.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 13.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.0,
+            "value_json": "{}"
+          },
+          "screener_store": {
+            "value_str": "C:\\Users\\basti\\Documents\\ba2\\common\\cache\\screener\\metric_store",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      },
+      {
+        "id": 31,
+        "account_id": 1,
+        "expert": "FactorRanker",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "expert",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 900000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 27.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 17.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.4000000000000004,
+            "value_json": "{}"
+          },
+          "screener_store": {
+            "value_str": "C:\\Users\\basti\\Documents\\ba2\\common\\cache\\screener\\metric_store",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"1\""
+          }
+        }
+      },
+      {
+        "id": 32,
+        "account_id": 3,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"]}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"]}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 10000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 3000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 14.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 4.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.1,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"0\""
+          }
+        }
+      }
+    ],
+    "analysis_counts": [
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 7,
+        "subtype": "ENTER_MARKET",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 11,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 12
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 14,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 15,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 16,
+        "subtype": "ENTER_MARKET",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 19,
+        "subtype": "ENTER_MARKET",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 20,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 21,
+        "subtype": "ENTER_MARKET",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 22,
+        "subtype": "ENTER_MARKET",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 23,
+        "subtype": "ENTER_MARKET",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 24,
+        "subtype": "ENTER_MARKET",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 25,
+        "subtype": "ENTER_MARKET",
+        "analyses": 19
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 26,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 27,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 28,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 29,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 30,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 31,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 12
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 12
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 12
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 12
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 5,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 7,
+        "subtype": "ENTER_MARKET",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 10,
+        "subtype": "ENTER_MARKET",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 13,
+        "subtype": "ENTER_MARKET",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 14,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 15,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 16,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 19,
+        "subtype": "ENTER_MARKET",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 20,
+        "subtype": "ENTER_MARKET",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 21,
+        "subtype": "ENTER_MARKET",
+        "analyses": 20
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 22,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 23,
+        "subtype": "ENTER_MARKET",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 25,
+        "subtype": "ENTER_MARKET",
+        "analyses": 10
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 26,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 27,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 28,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 29,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 30,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 31,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 5,
+        "subtype": "ENTER_MARKET",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 6,
+        "subtype": "ENTER_MARKET",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 7,
+        "subtype": "ENTER_MARKET",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 10,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 11,
+        "subtype": "ENTER_MARKET",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 12,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 13,
+        "subtype": "ENTER_MARKET",
+        "analyses": 12
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 14,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 15,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 16,
+        "subtype": "ENTER_MARKET",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 19,
+        "subtype": "ENTER_MARKET",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 20,
+        "subtype": "ENTER_MARKET",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 21,
+        "subtype": "ENTER_MARKET",
+        "analyses": 17
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 21,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 22,
+        "subtype": "ENTER_MARKET",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 23,
+        "subtype": "ENTER_MARKET",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 24,
+        "subtype": "ENTER_MARKET",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 25,
+        "subtype": "ENTER_MARKET",
+        "analyses": 13
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 26,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 27,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 28,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 29,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 30,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 31,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 21,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 21,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 21,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 15
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 21,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 5,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 6,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 7,
+        "subtype": "ENTER_MARKET",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 10,
+        "subtype": "ENTER_MARKET",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 11,
+        "subtype": "ENTER_MARKET",
+        "analyses": 11
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 12,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 13,
+        "subtype": "ENTER_MARKET",
+        "analyses": 9
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 18
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 14,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 15,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 16,
+        "subtype": "ENTER_MARKET",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 19,
+        "subtype": "ENTER_MARKET",
+        "analyses": 10
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 20,
+        "subtype": "ENTER_MARKET",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 21,
+        "subtype": "ENTER_MARKET",
+        "analyses": 26
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 21,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 22,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 23,
+        "subtype": "ENTER_MARKET",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 24,
+        "subtype": "ENTER_MARKET",
+        "analyses": 8
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 25,
+        "subtype": "ENTER_MARKET",
+        "analyses": 18
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 26,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 27,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 28,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 29,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 30,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 31,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 32,
+        "subtype": "ENTER_MARKET",
+        "analyses": 40
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 17
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 32,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 32,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 5,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 9
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 7,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 9,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 11,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 8
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 6
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 13,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 16
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 16,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 19,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 20,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 22,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 23,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 25,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 28,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 7
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 29,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 5
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 32,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-04",
+        "expert_instance_id": 32,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      }
+    ]
+  },
+  "prod": {
+    "database": "C:\\Users\\basti\\Documents\\ba2_trade_platform-prod\\db.sqlite",
+    "experts": [
+      {
+        "id": 1,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 0,
+        "settings": {
+          "enabled_instruments": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"INTU\": {\"enabled\": true, \"weight\": 100.0}, \"COST\": {\"enabled\": true, \"weight\": 100.0}, \"IRM\": {\"enabled\": true, \"weight\": 100.0}, \"ADBE\": {\"enabled\": true, \"weight\": 100.0}, \"QCOM\": {\"enabled\": true, \"weight\": 100.0}, \"AMD\": {\"enabled\": true, \"weight\": 100.0}, \"GOOGL\": {\"enabled\": true, \"weight\": 100.0}, \"GOOG\": {\"enabled\": true, \"weight\": 100.0}, \"KMI\": {\"enabled\": true, \"weight\": 100.0}, \"AMZN\": {\"enabled\": true, \"weight\": 100.0}, \"LRCX\": {\"enabled\": true, \"weight\": 100.0}, \"AMGN\": {\"enabled\": true, \"weight\": 100.0}, \"LIN\": {\"enabled\": true, \"weight\": 100.0}, \"SBUX\": {\"enabled\": true, \"weight\": 100.0}, \"AAPL\": {\"enabled\": true, \"weight\": 100.0}, \"T\": {\"enabled\": true, \"weight\": 100.0}, \"TMUS\": {\"enabled\": true, \"weight\": 100.0}, \"ADP\": {\"enabled\": true, \"weight\": 100.0}, \"META\": {\"enabled\": true, \"weight\": 100.0}, \"TSLA\": {\"enabled\": true, \"weight\": 100.0}, \"TXN\": {\"enabled\": true, \"weight\": 100.0}, \"MSFT\": {\"enabled\": true, \"weight\": 100.0}, \"AVGO\": {\"enabled\": true, \"weight\": 100.0}, \"NFLX\": {\"enabled\": true, \"weight\": 100.0}, \"VZ\": {\"enabled\": true, \"weight\": 100.0}, \"VRTX\": {\"enabled\": true, \"weight\": 100.0}, \"NVDA\": {\"enabled\": true, \"weight\": 100.0}, \"CHTR\": {\"enabled\": true, \"weight\": 100.0}, \"OKE\": {\"enabled\": true, \"weight\": 100.0}, \"HON\": {\"enabled\": true, \"weight\": 100.0}, \"CSCO\": {\"enabled\": true, \"weight\": 100.0}, \"PEP\": {\"enabled\": true, \"weight\": 100.0}, \"ASML\": {\"enabled\": true, \"weight\": 100.0}, \"APP\": {\"enabled\": true, \"weight\": 100.0}, \"INTC\": {\"enabled\": true, \"weight\": 100.0}}"
+          },
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": false, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"9:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_float_max": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 10000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 70000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 50.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 11.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 11.0,
+            "value_json": "{}"
+          },
+          "screener_price_max": {
+            "value_str": null,
+            "value_float": 200.0,
+            "value_json": "{}"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 10.0,
+            "value_json": "{}"
+          },
+          "screener_provider": {
+            "value_str": "fmp",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.2000000000000002,
+            "value_json": "{}"
+          },
+          "screener_sort_metric": {
+            "value_str": "price_drop_pct",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_volume_max": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 50000.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "false"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "account_id": 1,
+        "expert": "FMPEarningsDrift",
+        "enabled": 0,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": false, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"9:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "null"
+          },
+          "screener_float_max": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "null"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 10000000.0,
+            "value_json": "null"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "null"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 100000000.0,
+            "value_json": "null"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "null"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 15.0,
+            "value_json": "null"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 7.0,
+            "value_json": "null"
+          },
+          "screener_price_max": {
+            "value_str": null,
+            "value_float": 120.0,
+            "value_json": "null"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 20.0,
+            "value_json": "null"
+          },
+          "screener_provider": {
+            "value_str": "fmp",
+            "value_float": null,
+            "value_json": "null"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.6,
+            "value_json": "null"
+          },
+          "screener_sort_metric": {
+            "value_str": "price_drop_pct",
+            "value_float": null,
+            "value_json": "null"
+          },
+          "screener_volume_max": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "null"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 300000.0,
+            "value_json": "null"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "false"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "account_id": 1,
+        "expert": "DeterministicScorer",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 20000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 8.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 5.0,
+            "value_json": "{}"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 0.1,
+            "value_json": "{}"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"true\""
+          }
+        }
+      },
+      {
+        "id": 8,
+        "account_id": 1,
+        "expert": "FMPInsiderClusterBuy",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": false, \"tuesday\": false, \"wednesday\": false, \"thursday\": true, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 10000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 5000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 40.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 18.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 16.0,
+            "value_json": "{}"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 0.6000000000000001,
+            "value_json": "{}"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "false"
+          }
+        }
+      },
+      {
+        "id": 9,
+        "account_id": 1,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": false, \"tuesday\": false, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 2000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 800000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 30.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 7.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.6,
+            "value_json": "{}"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "\"true\""
+          }
+        }
+      },
+      {
+        "id": 10,
+        "account_id": 1,
+        "expert": "DeterministicScorer",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": false, \"thursday\": false, \"friday\": false, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 10000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 2000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 50.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 10.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 8.0,
+            "value_json": "{}"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.3,
+            "value_json": "{}"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "false"
+          }
+        }
+      },
+      {
+        "id": 11,
+        "account_id": 1,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": false, \"tuesday\": true, \"wednesday\": false, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 10000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 5000000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 20.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 22.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 13.0,
+            "value_json": "{}"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 1.5,
+            "value_json": "{}"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "false"
+          }
+        }
+      },
+      {
+        "id": 12,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "settings": {
+          "execution_schedule_enter_market": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": false, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "execution_schedule_open_positions": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "{\"days\": {\"monday\": true, \"tuesday\": true, \"wednesday\": true, \"thursday\": true, \"friday\": true, \"saturday\": false, \"sunday\": false}, \"times\": [\"09:30\"], \"time_basis\": \"market\"}"
+          },
+          "instrument_selection_method": {
+            "value_str": "screener",
+            "value_float": null,
+            "value_json": "{}"
+          },
+          "screener_float_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_max": {
+            "value_str": null,
+            "value_float": 2000000000.0,
+            "value_json": "{}"
+          },
+          "screener_market_cap_min": {
+            "value_str": null,
+            "value_float": 600000000.0,
+            "value_json": "{}"
+          },
+          "screener_max_stocks": {
+            "value_str": null,
+            "value_float": 20.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_days": {
+            "value_str": null,
+            "value_float": 22.0,
+            "value_json": "{}"
+          },
+          "screener_price_drop_pct": {
+            "value_str": null,
+            "value_float": 4.0,
+            "value_json": "{}"
+          },
+          "screener_price_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_relative_volume_min": {
+            "value_str": null,
+            "value_float": 2.2,
+            "value_json": "{}"
+          },
+          "screener_volume_min": {
+            "value_str": null,
+            "value_float": 0.0,
+            "value_json": "{}"
+          },
+          "screener_weinstein_stage2_only": {
+            "value_str": null,
+            "value_float": null,
+            "value_json": "false"
+          }
+        }
+      }
+    ],
+    "analysis_counts": [
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 1,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 6,
+        "subtype": "ENTER_MARKET",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-10",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-11",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-12",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-13",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-14",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 6,
+        "subtype": "ENTER_MARKET",
+        "analyses": 5
+      },
+      {
+        "day": "2026-08-17",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-18",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-19",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-20",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-21",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 1,
+        "subtype": "ENTER_MARKET",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 6,
+        "subtype": "ENTER_MARKET",
+        "analyses": 6
+      },
+      {
+        "day": "2026-08-24",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-25",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 3
+      },
+      {
+        "day": "2026-08-26",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 4
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-27",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-28",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 6,
+        "subtype": "ENTER_MARKET",
+        "analyses": 10
+      },
+      {
+        "day": "2026-08-31",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-01",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-02",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-03",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-04",
+        "expert_instance_id": 1,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-04",
+        "expert_instance_id": 6,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      },
+      {
+        "day": "2026-09-07",
+        "expert_instance_id": 7,
+        "subtype": "ENTER_MARKET",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-07",
+        "expert_instance_id": 10,
+        "subtype": "ENTER_MARKET",
+        "analyses": 8
+      },
+      {
+        "day": "2026-09-07",
+        "expert_instance_id": 12,
+        "subtype": "ENTER_MARKET",
+        "analyses": 9
+      },
+      {
+        "day": "2026-09-08",
+        "expert_instance_id": 10,
+        "subtype": "ENTER_MARKET",
+        "analyses": 27
+      },
+      {
+        "day": "2026-09-08",
+        "expert_instance_id": 10,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 1
+      },
+      {
+        "day": "2026-09-08",
+        "expert_instance_id": 11,
+        "subtype": "ENTER_MARKET",
+        "analyses": 4
+      },
+      {
+        "day": "2026-09-08",
+        "expert_instance_id": 12,
+        "subtype": "OPEN_POSITIONS",
+        "analyses": 2
+      }
+    ]
+  }
+}

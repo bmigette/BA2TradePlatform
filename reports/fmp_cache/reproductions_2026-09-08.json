@@ -1,0 +1,122 @@
+{
+  "fresh_daily_cache": {
+    "reads": 3,
+    "http_calls": 0
+  },
+  "weekend_empty_topup": {
+    "reads": 3,
+    "http_calls": 9,
+    "windows": [
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      },
+      {
+        "from": "2026-08-29",
+        "to": "2026-08-31"
+      }
+    ]
+  },
+  "partial_daily_never_revisited": {
+    "http_fetches": [
+      {
+        "start": "2026-08-29 00:00:00",
+        "end": "2026-09-01 10:00:00"
+      },
+      {
+        "start": "2026-09-01 00:00:00",
+        "end": "2026-09-02 17:00:00"
+      }
+    ],
+    "evening_cached_close": 101.0,
+    "prior_day_close_after_next_refresh": 101.0,
+    "observation": "Refresh starts the following day, so morning partial remains in history."
+  },
+  "legacy_get_data_ignores_warm_parquet": {
+    "fetch_spans_days": [
+      1125
+    ]
+  },
+  "deterministic_scorer_live_memo_never_refreshes": {
+    "requests_two_days_apart": 2,
+    "provider_calls": 1,
+    "latest_returned_bar": "2026-08-31 00:00:00+00:00"
+  },
+  "senate_live_bypasses_disk_and_pins_map": {
+    "warmed_json_and_parquet": true,
+    "network_requests": [
+      {
+        "from": "1990-01-01"
+      }
+    ],
+    "later_published_date_returned": null
+  },
+  "senate_before_sep5": {
+    "fresh_instances": 2,
+    "full_history_calls": 2,
+    "source": "eb4d4c71^",
+    "disk_cache_ignored_in_live": true
+  },
+  "screener_exact_batch_only": {
+    "logical_calls": 4,
+    "http_calls": [
+      {
+        "symbols": [
+          "AAA",
+          "BBB"
+        ],
+        "from": "2026-07-28",
+        "to": "2026-09-01"
+      },
+      {
+        "symbols": [
+          "BBB",
+          "AAA"
+        ],
+        "from": "2026-07-28",
+        "to": "2026-09-01"
+      },
+      {
+        "symbols": [
+          "AAA",
+          "BBB"
+        ],
+        "from": "2026-07-29",
+        "to": "2026-09-01"
+      }
+    ],
+    "warmed_parquet_ignored": true
+  },
+  "live_ttl_concurrent_miss": {
+    "simultaneous_readers": 6,
+    "identical_fetches": 6
+  }
+}

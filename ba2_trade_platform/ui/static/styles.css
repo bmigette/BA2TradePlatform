@@ -864,3 +864,202 @@ div[class*="disconnect"] * {
 .q-banner--error * {
     color: #ffffff !important;
 }
+
+/* ==========================================================================
+   RESPONSIVE / MOBILE
+   ==========================================================================
+   Reported: "many widget / page are not readable on mobile". Before this block
+   the app had NO responsive handling at all -- not one breakpoint class in the
+   Python and not one media query in this file -- against 16 pages, ~30 tables
+   (two of them 15+ columns), 30 fixed multi-column grids and ~180 fixed-width
+   utility classes. On a 390px phone every one of those overflowed.
+
+   WHY THIS IS CSS AND NOT PYTHON. The alternative is adding `sm:`/`md:` variants
+   to hundreds of `.classes(...)` calls across 16 pages, which is the same rule
+   written 180 times and impossible to keep consistent. One layer here reaches
+   every page, including the ones nobody has opened on a phone yet, and it is the
+   only approach under which a NEW page is responsive by default rather than by
+   its author remembering.
+
+   The viewport meta is already correct (NiceGUI's default
+   `width=device-width, initial-scale=1`), so the browser is genuinely laying out
+   at device width -- these queries take effect rather than being scaled away.
+
+   TWO BREAKPOINTS, matching Quasar's own:
+     <1024px  tablet and below -- the drawer already overlays here, so the content
+              column becomes full width and multi-column grids stop making sense.
+     <640px   phone -- fixed pixel widths have to go entirely.
+   ========================================================================== */
+
+@media (max-width: 1023px) {
+
+    /* MULTI-COLUMN GRIDS COLLAPSE. `ui.grid(columns=N)` emits an inline
+     * `grid-template-columns` style, so this needs `!important` to win -- there is
+     * no class to override. Two 50%-wide charts side by side on a 700px tablet are
+     * two unreadable charts; one at a time is one readable one. */
+    .nicegui-grid {
+        grid-template-columns: 1fr !important;
+        gap: 0.75rem !important;
+    }
+
+    /* Cards give back their padding: at this width the frame costs more than the
+     * content it frames. */
+    .nicegui-card,
+    .q-card {
+        padding: 0.75rem !important;
+    }
+
+    /* A `ui.row` is `flex-nowrap` by default, which is what pushes controls off the
+     * right edge instead of onto a second line. Rows that must NOT wrap (a chart's
+     * bar+label pair) opt out with `no-wrap`, which Quasar sets with !important, so
+     * they are unaffected by this. */
+    .nicegui-row {
+        flex-wrap: wrap !important;
+    }
+}
+
+@media (max-width: 639px) {
+
+    /* FIXED WIDTHS GO. These are the Tailwind `w-24` ... `w-96` utilities on form
+     * controls -- a `w-64` select is 16rem, wider than a 390px phone's content
+     * column once padding is counted. Listed explicitly rather than with a wildcard
+     * because `w-full`, `w-px` and the fractional widths must all survive. */
+    .w-16, .w-20, .w-24, .w-28, .w-32, .w-36, .w-40, .w-44,
+    .w-48, .w-56, .w-64, .w-72, .w-80, .w-96 {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+
+    /* Dialogs stop being a fixed box. `min-w-[420px]` on a 390px screen produces a
+     * horizontal scrollbar on the DIALOG, which is the one element a user cannot
+     * scroll sideways without losing the page behind it. */
+    .q-dialog__inner > .q-card,
+    .q-dialog__inner > div {
+        min-width: 0 !important;
+        max-width: 100vw !important;
+    }
+
+    /* TABLES SCROLL SIDEWAYS, and the symbol column stays put.
+     *
+     * Deliberately NOT reflowed into stacked cards. A 15-column allocation table
+     * becomes 15 stacked rows per symbol, so six symbols is 90 rows of scrolling and
+     * the comparison down a column -- which is the entire reason the table exists --
+     * is gone. A sticky first column keeps the row identifiable while the numbers
+     * scroll under it, which preserves that comparison on a phone.
+     *
+     * `-webkit-overflow-scrolling` for momentum on iOS, where the default is a
+     * lurching scroll that makes a wide table feel broken. */
+    .q-table__container,
+    .q-table__middle {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .q-table thead tr th:first-child,
+    .q-table tbody tr td:first-child {
+        position: sticky;
+        left: 0;
+        z-index: 2;
+        /* OPAQUE, not the theme's translucent card colour: a transparent sticky cell
+         * lets the scrolling columns show through it and the text becomes illegible
+         * exactly when it is most needed. */
+        background: #252b3b;
+    }
+
+    /* The header row's own cells need a higher stack order than the body's sticky
+     * column, or the first header cell scrolls under the rows. */
+    .q-table thead tr th:first-child {
+        z-index: 3;
+    }
+
+    /* Denser table text: the default 14px with default padding fits about four
+     * numeric columns on a phone. */
+    .q-table th,
+    .q-table td {
+        font-size: 0.78rem !important;
+        padding: 4px 8px !important;
+    }
+
+    /* ECHARTS PANELS get shorter. The height comes from a Tailwind `h-80` or an
+     * inline `style('height: 320px')`, and a 320-400px chart on a phone is most of
+     * the screen for one panel. Safe to force because NiceGUI's echart component
+     * carries a ResizeObserver, so the canvas re-lays-out into whatever box it is
+     * given rather than being clipped by it.
+     *
+     * PLOTLY IS DELIBERATELY NOT TOUCHED HERE. It sizes its own SVG inline from the
+     * `height` in the figure layout, and overriding the container underneath it
+     * clips the plot instead of shrinking it. Its width already reflows on its own
+     * -- NiceGUI defaults plotly's `responsive` config to true -- so the readability
+     * problem there is height only, and that belongs in the figure layout, not in a
+     * stylesheet fighting the library. */
+    .nicegui-echart {
+        height: 260px !important;
+        min-height: 260px !important;
+    }
+
+    /* The header bar wraps rather than pushing the account balance and the account
+     * selector off the right edge. */
+    .q-header .q-toolbar,
+    .q-header > .nicegui-row {
+        flex-wrap: wrap !important;
+        row-gap: 0.25rem;
+    }
+
+    /* Page padding: 1rem each side of a 390px screen is 8% of it. */
+    .nicegui-content {
+        padding: 0.5rem !important;
+    }
+
+    /* KPI TILES STAY TWO-UP. The blanket 1-column collapse above is right for a chart
+     * or a table, and wrong for a row of small metric cards: four of them one per row
+     * is four screens of scrolling to read four numbers. `nicegui-card-tight` is not
+     * what these use, so they are identified by the dashboard's own wrapper class --
+     * see `MultiMetricDashboard.render`, which tags its grid. */
+    .metric-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        gap: 0.5rem !important;
+    }
+
+    .metric-grid .nicegui-card {
+        padding: 0.5rem !important;
+    }
+
+    /* Metric values shrink with their tiles: `text-3xl` is 1.875rem, which overflows a
+     * half-width card on a 390px screen the moment the number has a currency symbol
+     * and two decimals. */
+    .metric-grid .text-3xl {
+        font-size: 1.25rem !important;
+    }
+
+    /* COLUMNS A PHONE DOES NOT NEED are tagged and hidden. Quasar adds no per-column
+     * class of its own, so a stylesheet cannot target one -- the tag comes from the
+     * column definition's `classes`/`headerClasses`, which is the documented QTable
+     * hook for exactly this.
+     *
+     * Tagged rather than positional (`nth-child`): a positional rule silently hides
+     * the WRONG column the first time one is inserted, and does it on a table of
+     * money. A tag moves with its column.
+     *
+     * If a Quasar version ever stopped honouring those keys the column simply stays
+     * visible, which is the safe direction to fail in. */
+    .q-table th.mobile-hide,
+    .q-table td.mobile-hide {
+        display: none !important;
+    }
+
+    /* Header labels WRAP rather than setting the column width. A single long label
+     * ("Today Change %") otherwise makes its column wider than the numbers under it,
+     * pushing the ones that matter off-screen. */
+    .q-table thead th {
+        white-space: normal !important;
+        word-break: break-word;
+    }
+
+    /* Long labels break instead of forcing the page wider. `anywhere` rather than
+     * `break-all` so ordinary words still break at their boundaries and only a long
+     * unbroken token (an OCC option symbol, a URL) is split mid-string. */
+    .nicegui-card label,
+    .nicegui-card .text-caption {
+        overflow-wrap: anywhere;
+    }
+}

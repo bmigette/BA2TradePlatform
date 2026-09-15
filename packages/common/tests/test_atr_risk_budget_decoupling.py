@@ -90,24 +90,64 @@ def test_budget_wins_when_set():
 def test_notional_mode_is_structurally_untouched():
     """The new gene must not be able to affect notional sizing.
 
-    Guarded structurally rather than behaviourally: `atr_risk_budget_pct` has exactly ONE reader
-    (_risk_atr_quantity) and that function has exactly ONE caller, inside `if sizing_mode ==
-    'risk_atr':`. If either fact stops being true, the gene has leaked into the notional path and
-    every notional result silently changes meaning.
+    Guarded structurally rather than behaviourally, in three links that together leave the budget
+    no route into the notional path:
+      1. the KEY has exactly one reader in ba2_common -- ``resolve_sizing_risk_budget_pct``
+         (``MarketExpertInterface`` only DECLARES the setting);
+      2. ``TradeRiskManagement`` calls that resolver exactly once, inside ``_risk_atr_quantity``;
+      3. ``_risk_atr_quantity`` has exactly one caller, under ``if sizing_mode == 'risk_atr':``.
+    If any link stops holding, the gene has leaked into notional sizing and every notional result
+    silently changes meaning.
+
+    Link 1 replaced a grep for a ``get_setting(...'atr_risk_budget_pct'...)`` line in
+    TradeRiskManagement: the read MOVED into position_sizing when both risk managers were put on
+    the shared resolver (review finding 1, 2026-09-09), which is a strengthening of this very
+    invariant -- one reader for the whole platform instead of one per manager -- but it left the
+    old grep matching nothing, i.e. passing vacuously in the direction that matters.
     """
-    import pathlib, re
-    src = pathlib.Path(__file__).resolve().parents[1] / "ba2_common" / "core" / "TradeRiskManagement.py"
+    import inspect, pathlib
+
+    from ba2_common.core.position_sizing import resolve_sizing_risk_budget_pct
+    from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+
+    pkg = pathlib.Path(__file__).resolve().parents[1] / "ba2_common"
+
+    # 1. Exactly one module READS the key (quoted literal on a non-comment line). The interface
+    #    module is the one legitimate other mention: it DECLARES the setting.
+    readers = {}
+    for path in pkg.rglob("*.py"):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.strip().startswith("#"):
+                continue
+            if '"atr_risk_budget_pct"' in line or "'atr_risk_budget_pct'" in line:
+                readers.setdefault(path.name, []).append((n, line.strip()))
+    assert set(readers) == {"position_sizing.py", "MarketExpertInterface.py"}, (
+        f"the budget key must be read ONLY by position_sizing (and declared by "
+        f"MarketExpertInterface); found it in {sorted(readers)}")
+    assert len(readers["position_sizing.py"]) == 1, (
+        f"expected exactly one read of the key, found {readers['position_sizing.py']}")
+    assert '"atr_risk_budget_pct"' in inspect.getsource(resolve_sizing_risk_budget_pct), (
+        "the single read must live in resolve_sizing_risk_budget_pct, the shared resolver both "
+        "risk managers call")
+
+    src = pkg / "core" / "TradeRiskManagement.py"
     text = src.read_text(encoding="utf-8")
 
-    readers = [l for l in text.splitlines() if "atr_risk_budget_pct" in l and "get_setting" in l]
-    assert len(readers) == 1, f"expected exactly one reader, found {len(readers)}: {readers}"
+    # 2. The classic RM reaches the budget ONLY through that resolver, and only from the
+    #    risk_atr sizing function.
+    calls = [l for l in text.splitlines() if "resolve_sizing_risk_budget_pct(" in l]
+    assert len(calls) == 1, f"expected exactly one resolver call, found {len(calls)}: {calls}"
+    assert "resolve_sizing_risk_budget_pct(" in inspect.getsource(
+        TradeRiskManagement._risk_atr_quantity), (
+        "the budget resolver is called from somewhere other than _risk_atr_quantity -- the gene "
+        "may now affect notional runs")
 
-    callers = [i for i, l in enumerate(text.splitlines()) if "_risk_atr_quantity(" in l
+    # 3. ...and that function is only reachable from the risk_atr branch.
+    lines = text.splitlines()
+    callers = [i for i, l in enumerate(lines) if "_risk_atr_quantity(" in l
                and "def _risk_atr_quantity" not in l]
     assert len(callers) == 1, f"expected exactly one caller, found {len(callers)}"
 
-    # the caller must sit under the risk_atr branch
-    lines = text.splitlines()
     window = "\n".join(lines[max(0, callers[0] - 6):callers[0] + 1])
     assert "sizing_mode == 'risk_atr'" in window, (
         "the risk_atr sizing call is no longer guarded by the sizing_mode branch -- the budget "

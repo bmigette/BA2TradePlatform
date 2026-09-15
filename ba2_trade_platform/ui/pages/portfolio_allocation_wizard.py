@@ -237,6 +237,17 @@ BP_OVER_BUDGET_NOTE = (
 
 #: Marker on the dry-run table's ``BP effect`` cell.
 MARKER_BP_EFFECT = 'dry-run-bp-effect'
+MARKER_CAPITAL_REQUIRED = 'dry-run-capital-required'
+
+CAP_REQ_TOOLTIP_MEASURED = (
+    "Capital this holding ties up: projected market value x the broker's own initial "
+    "margin rate for this symbol.")
+CAP_REQ_TOOLTIP_ESTIMATED = (
+    "ASSUMED, at NO LEVERAGE: the full projected value. The broker has published no "
+    "margin rate for this symbol -- it only rates one the account already HOLDS, and "
+    "out of hours it will not price an order either. Run this dry run while the market "
+    "is OPEN and the order precheck fills in the real rate, which is lower for an "
+    "ordinary marginable stock.")
 
 #: The ``BP effect`` cell's tooltips. SIGNED is the whole point of the column:
 #: negative is buying power consumed, positive is buying power handed back. The
@@ -294,6 +305,14 @@ FOOTER_TOOLTIP = ('Column totals over the TICKED rows only - exactly what Submit
 #: The free-text Reasons cell, on the order table and on the 'Not traded' table.
 #: By marker: every word in it also appears in a notice above, so a text search
 #: cannot tell which of the two drew it.
+MARKER_ROW_RESULT = 'dry-run-row-result'
+MARKER_SUBMIT_SUMMARY = 'dry-run-submit-summary'
+
+#: What a Result cell says between "Submit pressed" and "this row's order came back".
+#: Every row gets it at once, so the table shows the whole plan queued rather than
+#: appearing to do nothing until the first order lands.
+SUBMIT_PENDING_TEXT = 'sending...'
+SUBMIT_PENDING_CLASSES = 'text-gray-400'
 MARKER_ROW_REASONS = 'dry-run-row-reasons'
 
 #: Marker on the income panel's working-orders line, for the same reason.
@@ -535,16 +554,28 @@ DRY_RUN_COLUMNS = (
     # gone: an abnormal sizing outcome is a REASON, and now appears in that column
     # in red beside the reason it caused (2026-09-05).
     ('order', 'Order', 'w-32', False),
-    ('estimated_value', 'Est. value', 'w-24', True),
-    ('target', 'Target', 'w-24', True),
+    # ORDER VALUE, not "Est. value": it is the notional this row TRADES. It was
+    # read as the symbol's price more than once, and it sits next to a TARGET that
+    # is also money, so both now say which money they are.
+    ('estimated_value', 'Order value', 'w-24', True),
+    ('target', 'Target value', 'w-24', True),
     ('projected', 'Projected ({mode})', 'w-32', True),
     ('weight', 'Weight', 'w-32', False),
-    # SIGNED, and no longer called a cost: a sale FREES buying power, and a sell
-    # row reading "BP cost 0.00" said the opposite -- that a sale does nothing to
-    # your buying power at all.
+    # CAPITAL REQUIRED BY THE RESULTING HOLDING: projected market value x initial
+    # margin rate. A LEVEL -- what the position ties up once this row executes.
+    ('capital_required', 'Cap req', 'w-28', True),
+    # WHAT THE TRADE DOES TO BUYING POWER, which is a different question and was
+    # briefly conflated with the one above. SIGNED, and not called a cost: a sale
+    # FREES buying power, and a sell row reading "BP cost 0.00" said the opposite.
     ('bp_effect', 'BP effect', 'w-28', True),
     ('bp_ratio', 'BP ×', 'w-20', True),
     ('bp_pct', 'BP %', 'w-16', True),
+    # WHAT HAPPENED TO THIS ROW once Submit was pressed. Empty until then -- an
+    # unsubmitted plan has no results, and a column of dashes would read as "nothing
+    # happened" rather than "nothing has been asked for yet". Before Reasons rather
+    # than after, because Reasons is the flex-1 column and swallows the rest of the
+    # width; a fixed column after it would be pushed off screen.
+    ('result', 'Result', 'w-36', False),
     ('reasons', 'Reasons', 'flex-1 min-w-64', False),
 )
 
@@ -858,6 +889,10 @@ class AllocationWizard:
         self._footer_container = None
         self._submit_button = None
         self._submit_tooltip = None
+        self._refresh_button = None
+        #: The one-line verdict shown IN the dialog once a submit finishes. Hidden
+        #: until then: a summary of a run that has not happened is noise.
+        self._submit_summary = None
         self._validate_button = None
         #: True while a validation is in flight. The broker work now runs in a
         #: thread, so the dialog stays responsive -- which means the button is
@@ -868,8 +903,58 @@ class AllocationWizard:
         #: directly on the event loop, so the dialog stays on screen -- and
         #: clickable -- for the whole of a blocking submit.
         self._submitted = False
+        #: symbol -> the Result cell on its row, filled in by ``set_row_result`` as
+        #: each order comes back. Rebuilt on every render, so a Refresh between a
+        #: submit and its results would drop them -- which is why Refresh is disabled
+        #: for the duration (see ``begin_submit``).
+        self._result_cells: Dict[str, Any] = {}
 
     # -- public -----------------------------------------------------------
+    def begin_submit(self) -> None:
+        """Lock the dialog down for the duration of a submit and clear the results.
+
+        Everything that could change the plan under a run in flight is disabled, not
+        merely ignored: Submit (one-shot anyway), Refresh (it re-renders the rows and
+        would throw away the result cells the run is writing into) and the tick boxes
+        (un-ticking a row whose order has already gone would be a lie about what was
+        sent). Cancel stays live -- closing the window does not recall an order, and
+        a user who wants the dialog gone is entitled to it.
+        """
+        for element, flag in ((self._submit_button, False),
+                              (self._refresh_button, False)):
+            if element is not None:
+                element.set_enabled(flag)
+        for cell in self._result_cells.values():
+            cell.set_text(SUBMIT_PENDING_TEXT)
+            cell.classes(replace='text-xs ' + SUBMIT_PENDING_CLASSES)
+
+    def set_row_result(self, symbol: str, text: str, classes: str) -> None:
+        """Report ONE row's outcome on its own line. Safe for an unknown symbol.
+
+        Unknown is not an error: the run reports on every row of the plan it was
+        given, and the table only holds the rows worth showing (see ``dry_run_rows``
+        -- a row already on target is not drawn). Raising here would abandon the
+        painting of the rows that ARE on screen.
+        """
+        cell = self._result_cells.get(symbol)
+        if cell is None:
+            return
+        cell.set_text(text)
+        cell.classes(replace='text-xs ' + classes)
+
+    def finish_submit(self, summary: str) -> None:
+        """The run is over: say so, and let the user out.
+
+        Submit stays disabled -- this plan has been sent and there is nothing left to
+        send -- while Refresh comes back, because re-solving is exactly what a user
+        does next after a partial run.
+        """
+        if self._refresh_button is not None:
+            self._refresh_button.set_enabled(True)
+        if self._submit_summary is not None:
+            self._submit_summary.set_text(summary)
+            self._submit_summary.set_visibility(True)
+
     def open(self):
         with ui.dialog().props('maximized') as dialog, \
                 ui.card().classes(DIALOG_CARD_CLASSES):
@@ -937,8 +1022,19 @@ class AllocationWizard:
             # The validation verdict, ABOVE the buttons and inside the card so it
             # cannot be lost behind a tab. Empty until Validate is pressed.
             self._validation_container = ui.column().classes('w-full shrink-0')
+            # The submit verdict sits ABOVE the buttons and left of nothing: it is the
+            # answer to the button the user just pressed, and it must not be looked
+            # for elsewhere on a maximised dialog.
+            self._submit_summary = ui.label('') \
+                .classes('w-full text-sm shrink-0').mark(MARKER_SUBMIT_SUMMARY)
+            self._submit_summary.set_visibility(False)
             with ui.row().classes('w-full justify-end gap-2 shrink-0'):
-                ui.button('Refresh', on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
+                # Held, because a submit in flight must be able to disable it: a
+                # refresh re-renders every row and would throw away the Result cells
+                # the run is writing into.
+                self._refresh_button = ui.button(
+                    'Refresh',
+                    on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
                 # TEST THE PLAN BEFORE SENDING IT. See ``_validate``: the broker's
                 # own dry run where it has one, the locally knowable rejections
                 # everywhere else. Never sends an order.
@@ -1512,7 +1608,19 @@ class AllocationWizard:
             order_kind, order_class = _order_kind(row)
             _label(order_kind, _col('order', 'text-xs ' + order_class)) \
                 .mark(MARKER_ORDER_KIND)
-            ui.label(f"{row['estimated_value']:,.2f}").classes(_col('estimated_value'))
+            # SIGNED BY DIRECTION: a buy adds that much stock, a sell removes it. The
+            # magnitude alone made a 41.85 SELL and a 41.85 BUY render identically, so
+            # the only thing distinguishing them on a money column was the Side cell
+            # three columns to the left.
+            #
+            # DISPLAY ONLY. ``estimated_value`` stays a magnitude in the row dict: the
+            # buy/sell totals below sum the two sides separately, and the BP-effect
+            # tooltip divides by it to show the ratio -- both would break on a signed
+            # value, and neither is asking "which way did this trade go".
+            _order_value = (-row['estimated_value'] if row['side'] == 'SELL'
+                            else row['estimated_value'])
+            ui.label(f"{_order_value:,.2f}").classes(
+                _col('estimated_value', 'text-green-500' if _order_value < 0 else ''))
             ui.label(f"{row['target_notional']:,.2f}").classes(_col('target'))
             projected = row['projected_notional']
             # The header names the mode this figure is in; the tooltip carries the
@@ -1526,13 +1634,38 @@ class AllocationWizard:
             if row[other] is not None:
                 with projected_label:
                     ui.tooltip(f"{other.replace('_', ' ')}: {row[other]:,.2f}")
-            # ASKED -> ACTUAL. They differ whenever the grid, a bump or the label
-            # redistribution moved this row, and hiding that would be rewriting the
-            # user's weights behind their back.
-            _label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%",
-                   _col('weight', 'text-xs '
-                        + ('text-orange-400' if row['redistributed']
-                           else 'text-gray-400')))
+            # NOW -> ASKED. Reads the way a rebalance is actually thought about:
+            # where this symbol sits today, where it is going. It used to read
+            # ASKED -> PROJECTED, which had no "now" in it at all -- so a symbol
+            # holding nothing still opened with a non-zero weight and looked like a
+            # position (reported 2026-09-07).
+            #
+            # The projected share is not lost, it moves to the tooltip: it is the
+            # answer to "did the plan achieve the ask", which is a second question
+            # and not the one the column is for.
+            weight_label = _label(
+                f"{row['current_weight_pct']:.2f}% → {row['weight_pct']:.2f}%",
+                _col('weight', 'text-xs '
+                     + ('text-orange-400' if row['redistributed']
+                        else 'text-gray-400')))
+            with weight_label:
+                ui.tooltip(f"now {row['current_weight_pct']:.2f}% → asked "
+                           f"{row['weight_pct']:.2f}% → this plan achieves "
+                           f"{row['projected_weight_pct']:.2f}%")
+            capital = row['capital_required']
+            # "~" AND DIMMED when the margin rate behind it was assumed rather than
+            # measured. The number is computed to the cent either way, which is
+            # exactly why an unmeasured one needs to say so.
+            estimated = row['capital_required_estimated']
+            capital_cell = _label(
+                '-' if capital is None
+                else (f"~{capital:,.2f}" if estimated else f"{capital:,.2f}"),
+                _col('capital_required', 'text-gray-500' if estimated else '')
+            ).mark(MARKER_CAPITAL_REQUIRED)
+            if capital is not None:
+                with capital_cell:
+                    ui.tooltip(CAP_REQ_TOOLTIP_ESTIMATED if estimated
+                               else CAP_REQ_TOOLTIP_MEASURED)
             self._render_bp_effect(row)
             # Immediately beside BP effect ON PURPOSE: the x IS the explanation of
             # why that figure is not the Est. value, which is the misreading
@@ -1542,6 +1675,11 @@ class AllocationWizard:
                     .mark(MARKER_LEVERAGE):
                 ui.tooltip(tip)
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes(_col('bp_pct'))
+            # Filled in by ``set_row_result`` as each order comes back, so the row
+            # the user is looking at is the row that reports.
+            self._result_cells[row['symbol']] = ui.label('') \
+                .classes(_col('result', 'text-xs')) \
+                .mark(MARKER_ROW_RESULT)
             # An abnormal sizing outcome is a REASON and is drawn RED at the front
             # of that column; the rest of the reasons keep their own colour.
             _reasons_cell(row['reasons'], _col(
@@ -1867,9 +2005,13 @@ class AllocationWizard:
         sequentially, so a flag cleared in a ``finally`` would already be back to
         False by the time the queued second click ran; and it is set BEFORE
         ``on_submit``, so a submit that dies half way -- with orders already at
-        the broker -- cannot be re-run on top of itself either. There is nothing
-        left to submit once the plan has gone: the dialog is closed and the
-        results table takes over.
+        the broker -- cannot be re-run on top of itself either.
+
+        THE DIALOG NO LONGER CLOSES. It used to shut the instant Submit was pressed
+        and hand over to a separate results table, which meant the user lost the very
+        table they had just read -- the quantities, the reasons, the row they were
+        unsure about -- and got a list of symbols with no context. Now the plan stays
+        on screen and each row reports on itself as its order comes back.
 
         An EMPTY submit does not latch: nothing was sent, and the user still has
         to be able to tick a row and press Submit for real. Neither does a submit
@@ -1910,10 +2052,7 @@ class AllocationWizard:
             ui.notify('Nothing selected to submit', type='warning')
             return
         self._submitted = True
-        if self._submit_button is not None:
-            self._submit_button.set_enabled(False)
-        if self.dialog is not None:
-            self.dialog.close()
+        self.begin_submit()
         self.on_submit(selected_plan)
 
 

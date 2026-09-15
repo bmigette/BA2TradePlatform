@@ -1,14 +1,120 @@
+import math
 from abc import abstractmethod
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, runtime_checkable
 from sqlmodel import Session, select
 from ba2_common.logger import logger
 from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance
 from ba2_common.core.types import TransactionStatus, OrderDirection, Recommendation
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.db import get_instance, get_db
+from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
+from ba2_common.core.replay.context import MissingSkipReason
+
+
+#: The mapping terms that are DOLLARS, so the log line can render them as money
+#: ($1,234.50) and leave the factors, percentages and ids alone. A ratio printed with a
+#: currency sign (or an amount printed as 4000.0) is how a reader mistakes one for the
+#: other in the one line that exists to stop exactly that confusion.
+CAPITAL_MAPPING_DOLLAR_KEYS = frozenset({
+    "balance", "tradable_balance", "broker_buying_power", "gross_exposure",
+    "pending_entries", "headroom", "virtual_balance", "used_balance",
+    "available_balance", "equivalent_unlevered_balance",
+})
+
+
+class _Unset:
+    """The "caller passed nothing" sentinel for the capital-mapping ``balances`` argument.
+
+    ``None`` cannot serve: it is the REAL answer a balance pass gives when it could not
+    read the account ("cannot size"), and both risk managers hand their pass's result
+    straight through. With ``None`` as the default, a caller reporting a FAILED pass was
+    indistinguishable from a caller that never took one, so the mapping quietly ran a
+    SECOND pass -- an extra broker round trip in the live margin path, describing a
+    different instant than the order was sized from, and hiding the very refusal the
+    caller was reporting.
+    """
+
+    def __repr__(self) -> str:          # pragma: no cover - diagnostics only
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
+@contextmanager
+def _null_capture_scope():
+    """The "capture is off" scope: no context, no recording, no cost."""
+    yield None
+
+
+_CAPTURE_BATCH_PROVIDER = None
+
+
+def set_capture_batch_provider(provider) -> None:
+    """Install (or clear with ``None``) the host's current-batch-id callable."""
+    global _CAPTURE_BATCH_PROVIDER
+    _CAPTURE_BATCH_PROVIDER = provider
+
+
+def _current_capture_batch():
+    """The live host's current analysis batch id, when the host installed one.
+
+    Host-injected through :func:`set_capture_batch_provider` so this package keeps
+    knowing nothing about the live worker queue. The batch id is recorded on the
+    analysis RECORD only -- never written to a trading row.
+    """
+    provider = _CAPTURE_BATCH_PROVIDER
+    if provider is None:
+        return None
+    try:
+        return provider()
+    except Exception as e:
+        logger.error(f"replay capture: batch id unavailable: {e}", exc_info=True)
+        return None
+
+
+def _add_mapping_error(mapping: Dict[str, Any], message: str) -> None:
+    """Record a refusal on the mapping WITHOUT dropping one already there.
+
+    Two things can refuse in one pass (an account that publishes no description AND an
+    expert whose balance is unavailable); a plain assignment would keep only the second
+    and the operator would chase the wrong one.
+    """
+    existing = mapping["error"] if "error" in mapping else None
+    mapping["error"] = f"{existing}; {message}" if existing else message
+
+
+def format_capital_mapping(mapping: Dict[str, Any]) -> str:
+    """The mapping as a compact ``k=v`` line, dollars at 2 dp.
+
+    Not ``repr(dict)``: that prints ``4000.0`` and ``1839.4000000000003`` side by side and
+    reads as debug spew in the one line an operator is meant to check an order against.
+    The DICT itself stays unrounded -- rounding is a presentation choice, and the tests
+    assert on the numbers, not on their rendering.
+    """
+    parts = []
+    for key, value in mapping.items():
+        if (key in CAPITAL_MAPPING_DOLLAR_KEYS and isinstance(value, (int, float))
+                and not isinstance(value, bool)):
+            parts.append(f"{key}=${value:,.2f}")
+        else:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
+class ExpertBalance(NamedTuple):
+    """One expert's virtual-equity bookkeeping at one instant, from ONE pass.
+
+    A named tuple and not a bare 3-tuple for the same reason as ``StockCapital``: at a
+    call site, ``[1]`` is how "used" and "available" quietly trade places.
+    """
+    virtual: float      # tradable balance x virtual_equity_pct
+    used: float         # what this expert's own open transactions have committed
+    available: float    # virtual - used, then clamped to broker BP and account headroom
 
 
 class MarketExpertInterface(ExtendableSettingsInterface):
@@ -612,8 +718,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         if not self.instance:
             raise ValueError(f"ExpertInstance with ID {id} not found")
 
-    def _get_current_price(self, symbol: str):
-        """Get current price for the symbol from the account."""
+    def _get_current_price(self, symbol: str | List[str]):
+        """Get an account price, or a symbol-to-price map for a batch of symbols."""
         try:
             from ba2_common.core.instance_resolver import get_instance_resolver
 
@@ -656,6 +762,174 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """The single BacktestInterface method. Runs the SAME _gather+_process as live."""
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
+
+    # ---- Live capture (spec step 2) ----------------------------------
+    #
+    # "At the actual live call site, resolve settings, gather inputs, snapshot the
+    # normalized bundle, run the existing calculation and link its actual output.
+    # Capture skip/error paths as well as successful BUY/SELL/HOLD results."
+    #
+    # Both helpers are no-ops when no replay store is installed (the default), so
+    # a live run with capture OFF executes byte-identically to the two bare calls
+    # they replace: same gather, same process, same provider call counts.
+
+    def _analysis_capture(self, market_analysis: Optional["MarketAnalysis"],
+                          settings: Optional[Dict[str, Any]], use_case: str):
+        """RETURNS a context manager recording ONE live analysis (no-op when off).
+
+        Wrap the whole live body (gather, process AND the skip/error branches that
+        follow) so every outcome is recorded, not only the ones that reach a
+        recommendation. The manager yields the CaptureContext, or ``None`` when
+        capture is off -- a caller that binds it with ``as`` must therefore test
+        it before use.
+        """
+        from ba2_common.core.replay import capture_scope, get_replay_store
+
+        store = get_replay_store()
+        if store is None:
+            return _null_capture_scope()
+        try:
+            meta = self._build_analysis_meta(store, market_analysis, settings, use_case)
+        except Exception as e:
+            # Never let a recording problem stop an analysis from running.
+            logger.error(f"replay capture: could not describe the analysis: {e}", exc_info=True)
+            return _null_capture_scope()
+        if meta is None:
+            return _null_capture_scope()
+        return capture_scope(store, meta)
+
+    def _build_analysis_meta(self, store, market_analysis, settings, use_case):
+        """The identity of one analysis attempt, or ``None`` when it cannot be built."""
+        import uuid
+        from datetime import timezone as _tz
+
+        session_id = store.current_session_id()
+        if session_id is None:
+            logger.error(
+                "replay capture is enabled but no session is open; this analysis is "
+                "not recorded and coverage is incomplete"
+            )
+            return None
+        analysis_id = getattr(market_analysis, "id", None)
+        analysis_id = str(analysis_id) if analysis_id is not None else f"anon-{uuid.uuid4().hex}"
+        symbol = getattr(market_analysis, "symbol", None)
+        created_at = getattr(market_analysis, "created_at", None)
+        if created_at is not None and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=_tz.utc)
+        meta = {
+            "analysis_id": analysis_id,
+            # One row per ATTEMPT: a re-run of the same MarketAnalysis is a second
+            # attempt, not an overwrite of the first.
+            "attempt_id": uuid.uuid4().hex,
+            "session_id": session_id,
+            "expert_class": type(self).__name__,
+            "expert_instance_id": getattr(self, "id", None),
+            "symbol": str(symbol) if symbol is not None else "",
+            "use_case": str(use_case),
+            "scheduled_at": created_at,
+            "started_at": datetime.now(_tz.utc),
+        }
+        if settings is not None:
+            meta["settings"] = settings
+        batch_id = _current_capture_batch()
+        if batch_id is not None:
+            meta["branch_flags"] = {"batch_id": batch_id}
+        return meta
+
+    @staticmethod
+    def _use_case_of(market_analysis: Optional["MarketAnalysis"]) -> str:
+        """The analysis's use case as the plain string the record stores."""
+        subtype = getattr(market_analysis, "subtype", None)
+        if subtype is None:
+            return ""
+        return getattr(subtype, "value", str(subtype))
+
+    def _gather_and_process(self, providers: "ProviderBundle", settings: Dict[str, Any], *,
+                            market_analysis: Optional["MarketAnalysis"] = None,
+                            use_case: str = "", validate=None) -> tuple:
+        """The live pair, recorded: ``_gather(as_of=None)`` then ``_process(as_of=None)``.
+
+        With no capture scope active this is EXACTLY the two calls it replaces --
+        same order, same arguments, same return values, nothing else executed.
+        With one active it additionally snapshots the normalized bundle before
+        ``_process`` runs and links the actual outcome afterwards. ``as_of`` stays
+        ``None`` on both calls: capture must never switch a live analysis onto the
+        historical branch (spec section 4).
+
+        ``validate`` is the live guard some experts run BETWEEN the two calls (a
+        missing quote is a hard error before the calculation runs, not after it):
+        it is called with the bundle and may raise, and its exception is recorded
+        and re-raised exactly like one from ``_process``. Keeping it here rather
+        than at the call site is what lets every expert share one recorded pair.
+
+        Returns ``(bundle, recommendation)``. An exception from ``_process`` (or
+        from ``validate``) is recorded as the outcome and re-raised UNCHANGED.
+        """
+        from ba2_common.core.replay import ReplayStatus, current_capture
+
+        context = current_capture()
+        if context is not None:
+            # Tag every clock read taken inside _gather as a GATHER read. An expert
+            # that reads a clock in BOTH halves (FMPRating times its price-target
+            # window here and its rating-recency window in _process) would otherwise
+            # record one flat list that no replay can split back apart.
+            context.set_phase(ReplayStatus.PHASE_GATHER)
+        bundle = self._gather(providers, as_of=None)
+        if context is not None:
+            context.set_branch_flag("as_of_is_none", True)
+            context.set_branch_flag("use_case", str(use_case))
+            analysis_id = getattr(market_analysis, "id", None)
+            if analysis_id is not None:
+                context.set_branch_flag("market_analysis_id", analysis_id)
+            # freeze() lives inside set_bundle: the snapshot is taken here, BEFORE
+            # _process can mutate anything the gather returned.
+            context.set_bundle(bundle)
+        try:
+            if context is not None:
+                context.set_phase(ReplayStatus.PHASE_PROCESS)
+            if validate is not None:
+                validate(bundle)
+            recommendation = self._process(bundle, settings, as_of=None)
+        except BaseException as exc:
+            if context is not None:
+                context.set_outcome(error=exc)
+            raise
+        if context is not None:
+            self._record_outcome(context, recommendation)
+        return bundle, recommendation
+
+    @staticmethod
+    def _record_outcome(context, recommendation) -> None:
+        """Link what the analysis actually produced: a skip, or a recommendation.
+
+        ONE place decides this for every expert, because the two live call sites
+        that used to decide it themselves could (and did) disagree about whether a
+        skip also leaves a recommendation on the row. ``_process`` returns the
+        skip verdict inside the Recommendation, so this is the only place that
+        needs to know.
+
+        A skip with no reason is a defect in the expert's Recommendation, not a
+        recording failure: it is recorded as the analysis's ERROR, naming the
+        contract it broke, rather than as a reasonless skip nobody can act on or
+        an invented reason.
+
+        A skip carries the whole ``Recommendation`` into the record, not only its
+        reason: ``outcome`` already says the platform skipped, and the object is
+        what lets a replay compare the current_price, details and confidence a
+        skip still carries.
+        """
+        # getattr, not attribute access: the basket experts return a LIST of
+        # recommendations from their own orchestrators. None of them routes
+        # through here today, and if one ever does, recording must not be the
+        # thing that raises an AttributeError into a live analysis.
+        if not getattr(recommendation, "skip", False):
+            context.set_outcome(recommendation=recommendation)
+            return
+        try:
+            context.set_skip(getattr(recommendation, "skip_reason", None), recommendation)
+        except MissingSkipReason as exc:
+            context.set_outcome(error=exc)
+
 
     def _resolve_settings(self, keys) -> Dict[str, Any]:
         """Resolve the given setting keys to a plain dict via the live default-resolver.
@@ -822,36 +1096,45 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
     def get_virtual_balance(self) -> Optional[float]:
         """
-        Get the virtual balance for this expert based on account balance and virtual_equity_pct.
-        
-        For example, if account balance is $10,000 and virtual_equity_pct is 10,
-        the virtual balance would be $1,000 (10% of account balance).
+        Get the virtual balance for this expert based on the account's tradable balance
+        and virtual_equity_pct.
+
+        For example, if the account's tradable balance is $10,000 and virtual_equity_pct
+        is 10, the virtual balance would be $1,000 (10% of the tradable balance).
         
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
         """
+        # Named before the try so the except branch can always name the account the
+        # failure belongs to. Stays None only while the expert instance itself is
+        # still unread -- the one window in which there is no account id to report.
+        account_id = None
         try:
             # Lazy import to avoid circular dependency
             from ba2_common.core.instance_resolver import get_instance_resolver
-            
+
             # Get the expert instance to access virtual_equity_pct
             expert_instance = get_instance(ExpertInstance, self.id)
             if not expert_instance:
                 logger.error(f"Expert instance {self.id} not found")
                 return None
-            
+
+            account_id = expert_instance.account_id
             # Get the account instance for this expert
             account = get_instance_resolver().get_account_instance(expert_instance.account_id)
             if not account:
                 logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
                 return None
             
-            # Get account balance
-            account_balance = account.get_balance()
-            if account_balance is None:
-                logger.error(f"Could not get balance for account {expert_instance.account_id}")
-                return None
-            
+            # The TRADABLE balance, not the balance: with margin on this is
+            # balance x min(margin_factor, broker multiplier), so every expert-side
+            # figure downstream (available balance, risk sizing, per-instrument cap)
+            # scales with the account's leverage setting. Raises when the broker
+            # published nothing usable; the except below turns that into None,
+            # which every caller already treats as "cannot size". With margin off
+            # (every backtest) it is get_balance() unchanged.
+            account_balance = account.get_tradable_balance()
+
             # Calculate virtual balance based on virtual_equity_pct.
             #
             # NO ``or 100.0``. The column is ``float = Field(default=100.0)`` -- NOT NULL,
@@ -862,13 +1145,23 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_balance = account_balance * (virtual_equity_pct / 100.0)
             
-            logger.debug(f"Expert {self.id}: Account balance=${account_balance}, "
+            logger.debug(f"Expert {self.id}: Account tradable balance=${account_balance}, "
                         f"Virtual equity %={virtual_equity_pct}, Virtual balance=${virtual_balance}")
             
             return virtual_balance
             
-        except Exception as e:
-            logger.error(f"Error calculating virtual balance for expert {self.id}: {e}", exc_info=True)
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
+            # signal ``get_tradable_balance`` raises (``_plain_balance`` / ``_margin_factor``
+            # / the multiplier and buying-power readers). Anything else -- a resolver that
+            # was never wired (``InstanceResolverNotConfigured``), a deleted expert row
+            # (``InstanceNotFound``), a tz/type defect -- is a bug, and absorbing it here
+            # would size every entry this expert makes off a silent None instead of
+            # surfacing it.
+            absorb_if_benign(e, ValueError)
+            logger.error(
+                f"Error calculating virtual balance for expert {self.id} "
+                f"(account {account_id}): {e}", exc_info=True)
             return None
     
     def get_available_balance(self, exclude_transaction_id: Optional[int] = None) -> Optional[float]:
@@ -887,6 +1180,23 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
         Returns:
             Optional[float]: The available balance amount, None if error occurred
+        """
+        breakdown = self._available_balance_breakdown(exclude_transaction_id)
+        return None if breakdown is None else breakdown.available
+
+    def _available_balance_breakdown(self, exclude_transaction_id: Optional[int] = None
+                                     ) -> Optional["ExpertBalance"]:
+        """``get_available_balance``'s body, keeping the two intermediates it computes.
+
+        Split out for ``describe_capital_mapping``, which must report virtual, used AND
+        available: asking for them one by one re-ran this whole pass (a transactions
+        query plus a bulk price fetch) three times per sizing decision, and measurably
+        slowed every backtest to log a line about an account that is not even levered.
+        One pass, three figures, and by construction the reported virtual/used are the
+        ones the reported available was actually derived from.
+
+        ``None`` (never a partial record) on any failure, exactly as before: the caller
+        that only wants the available balance must not be able to tell the difference.
         """
         try:
             # Get virtual balance first
@@ -930,14 +1240,176 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                             f"a manual trade) — clamping to the actual figure")
                 available_balance = actual_available
 
+            # Clamp to the ACCOUNT's remaining stock-exposure headroom (2026-09-09 review,
+            # findings 2 and 3). The clamp above caps this expert at what the account can
+            # still SPEND; this one caps it at what the account may still HOLD.
+            #
+            # They are different numbers, and the review found both directions of the gap:
+            #   * a fully deployed levered account still publishes broker buying power (the
+            #     broker's ceiling is higher than the platform's factor), so an empty expert
+            #     was told it could open a position that took the account past
+            #     balance x margin_factor; and
+            #   * a PROFITABLE position is charged to the expert at entry COST while the
+            #     broker marks it to market, so the expert's own arithmetic overstated its
+            #     room by exactly the unrealised gain ($3,240 reported, $1,440 real).
+            # Neither is visible from inside one expert's virtual bookkeeping, which is why
+            # the ceiling is asked of the ACCOUNT.
+            #
+            # ``None`` means margin is off -- the account answers without reading its
+            # snapshot, so nothing here is reachable in a backtest. A ValueError (unknown
+            # exposure) deliberately falls through to the handler below, which returns None:
+            # "cannot size", the loud refusal, not a fabricated number.
+            #
+            # getattr, not a bare call: every REAL account is a ReadOnlyAccountInterface and
+            # has this method, but the resolver is a seam and a host that wires a narrower
+            # object must be told the ceiling is not being enforced rather than have this
+            # expert silently size without it.
+            #
+            # LATCHED to once per account object, the _non_marginable_warned pattern: this is
+            # a STANDING property of how the seam was wired, not an event, and this method
+            # runs per sizing decision -- unlatched it would emit the same line thousands of
+            # times a run and bury everything else. getattr with a default rather than an
+            # __init__ attribute, for the same reason as there (bare-constructed subclasses).
+            headroom_reader = getattr(account, "get_stock_exposure_headroom", None)
+            if headroom_reader is None:
+                message = (
+                    f"Expert {self.id}: account {expert_instance.account_id} "
+                    f"({type(account).__name__}) publishes no stock-exposure ceiling; the "
+                    f"account-wide margin ceiling is NOT enforced for this expert")
+                if getattr(account, "_no_exposure_ceiling_warned", False):
+                    logger.debug(message)
+                else:
+                    try:
+                        account._no_exposure_ceiling_warned = True
+                    except AttributeError:
+                        pass    # __slots__ or a frozen double: warn every time rather than crash
+                    logger.warning(message)
+            else:
+                headroom = headroom_reader()
+                if headroom is not None and headroom < available_balance:
+                    # DEBUG, not INFO (2026-09-10 review, finding 4): this fires on EVERY
+                    # balance read -- 353 times in one production session -- and the clamp
+                    # is the normal, healthy operation of the ceiling, not an event. The
+                    # account itself reports the abnormal case (past the ceiling) once per
+                    # state change, in ReadOnlyAccountInterface._report_over_exposure.
+                    logger.debug(
+                        f"Expert {self.id}: available ${available_balance:,.2f} exceeds the "
+                        f"account's remaining stock exposure headroom ${headroom:,.2f} — "
+                        f"clamping. The account is at its ceiling (balance x margin_factor), "
+                        f"whatever this expert's own virtual books say.")
+                    available_balance = headroom
+
             logger.debug(f"Expert {self.id}: Virtual balance=${virtual_balance}, "
                         f"Used balance=${used_balance}, Available balance=${available_balance}")
 
-            return available_balance
+            return ExpertBalance(virtual=virtual_balance, used=used_balance,
+                                 available=available_balance)
 
         except Exception as e:
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
             return None
+
+    def describe_capital_mapping(self, balances: Any = _UNSET
+                                 ) -> Optional[Dict[str, Any]]:
+        """This sizing decision's raw-equity -> deployable-capital mapping, as a dict.
+
+        The account's ``describe_capital()`` (balance, factor, ceiling, exposure) plus
+        this expert's slice of it::
+
+            expert_id, virtual_equity_pct, virtual_balance, used_balance,
+            available_balance, equivalent_unlevered_balance
+
+        ``equivalent_unlevered_balance`` IS the account's tradable balance, restated
+        under the name the 2026-09-09 review's parity table uses: a live account with
+        equity E, margin on and effective factor f behaves exactly like an UNLEVERED
+        account funded with E x f, and that equivalence is the whole leverage design.
+        Logging it on every live sizing decision is what makes a levered live run
+        checkable against the unlevered backtest it is supposed to reproduce.
+
+        NEVER RAISES. A ``ValueError`` from the account (unpublished or non-finite
+        broker figure, invalid stored factor -- the loud refusals every reader in the
+        margin path makes) becomes an ``"error"`` key alongside whatever was already
+        computed, so the caller can log the refusal at ERROR instead of losing the whole
+        line. Returns ``None`` only when there is nothing to describe: the expert row or
+        its account is gone, which the reads below already log as an error.
+
+        PASS THE ``balances`` THE ORDER WAS SIZED FROM. Both risk managers take one
+        ``_available_balance_breakdown()`` (the body of the real
+        ``get_available_balance``) and hand that record here, so the mapping explains the
+        SAME pass the quantity came from -- not a second one taken microseconds later
+        against a moved book. OMITTING it is allowed for other callers and then the
+        breakdown is taken here; no RM path may run the pass twice. Passing ``None`` is
+        NOT omitting it: ``None`` is what a FAILED pass returns, and a caller reporting
+        one gets the "expert balance unavailable" error rather than a silent retry. The
+        two cases are told apart by the ``_UNSET`` sentinel, not by ``is None``.
+
+        COST, exactly, on top of the breakdown's own reads (which are unchanged by this
+        method): margin OFF, NOTHING -- ``describe_capital()`` reads no snapshot and no
+        order store. Margin ON, ONE more ``get_account_snapshot()`` and ONE more working-
+        order scan, because ``describe_capital`` measures gross/pending exposure and the
+        breakdown's headroom clamp measured its own; the two readings are separate broker
+        instants by construction. Sharing them would mean threading the account's
+        ``StockExposure`` out through ``get_available_balance``, past the getattr seam
+        guard that lets a narrower account be wired at all -- the per-submit round-trip
+        count is a tracked follow-up (docs/plans/2026-09-08-margin-trading-design.md),
+        and it is not paid for by making this function lie about which instant it read.
+        """
+        mapping: Dict[str, Any] = {"expert_id": self.id}
+        try:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if not expert_instance:
+                logger.error(f"Expert instance {self.id} not found")
+                return None
+            account = get_instance_resolver().get_account_instance(expert_instance.account_id)
+            if not account:
+                logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
+                return None
+
+            # Before the account's own view: if a seam ever wired an account whose id
+            # disagrees with the expert's, the reader needs to see WHICH account the
+            # figures below were actually read from, so the account's answer wins.
+            mapping["account_id"] = expert_instance.account_id
+            mapping["virtual_equity_pct"] = expert_instance.virtual_equity_pct
+            # getattr, not a bare call, for the same reason as the exposure clamp above:
+            # the resolver is a seam, and a host that wires a narrower object must be
+            # told the mapping is unavailable rather than crash the sizing pass it is
+            # only describing.
+            describer = getattr(account, "describe_capital", None)
+            if describer is None:
+                _add_mapping_error(mapping, (
+                    f"account {expert_instance.account_id} ({type(account).__name__}) "
+                    f"publishes no capital description"))
+            else:
+                capital = describer()
+                mapping.update(capital)
+                mapping["equivalent_unlevered_balance"] = capital["tradable_balance"]
+
+            if balances is _UNSET:
+                balances = self._available_balance_breakdown()
+            if balances is None:
+                # Not three quiet Nones on an otherwise ordinary-looking INFO line: the
+                # expert could not say what it may deploy, and the level policy has to
+                # see that (log_capital_mapping keys off "error").
+                _add_mapping_error(mapping, "expert balance unavailable")
+            mapping["virtual_balance"] = None if balances is None else balances.virtual
+            mapping["used_balance"] = None if balances is None else balances.used
+            mapping["available_balance"] = None if balances is None else balances.available
+        except (ValueError, KeyError) as e:
+            # The NAMED refusals this diagnostic is allowed to absorb:
+            #   * ValueError -- "unknown broker figure / bad margin factor";
+            #   * KeyError   -- the instance resolver's "no account registered for this
+            #     id" (BacktestInstanceResolver raises it; the live registry can too
+            #     after an account is unregistered mid-run).
+            # Anything else is a defect and must not be absorbed by a log line's helper
+            # -- it propagates to the sizing caller, which is where it belongs.
+            #
+            # ``{type}: {e}`` and not bare ``str(e)``: KeyError stringifies to the repr
+            # of its key, so an unmapped account read as ``error='142'`` -- a number with
+            # no sentence around it, in the one line meant to explain a refusal.
+            _add_mapping_error(mapping, f"{type(e).__name__}: {e}")
+        return mapping
 
     @staticmethod
     def _get_actual_available_balance(account: AccountInterface) -> Optional[float]:
@@ -959,9 +1431,19 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             if val is None:
                 return None
             try:
-                return float(val)
+                num = float(val)
             except (TypeError, ValueError):
                 return None
+            # 2026-09-09 review, finding 5 follow-up: a non-finite figure fails the clamp
+            # OPEN -- ``actual < available`` is False for NaN, so the expert keeps its larger
+            # virtual number and the broker's real cap silently stops applying. Unusable, the
+            # same as a non-numeric value: say so and fall through to the next candidate name.
+            if not math.isfinite(num):
+                logger.warning(
+                    f"Account {getattr(account, 'id', '?')}: non-finite {name} ({val!r}) in "
+                    f"get_account_info(); ignoring it for the available-balance clamp")
+                return None
+            return num
 
         if info is not None:
             for name in ("buying_power", "cash", "cash_balance", "equity_buying_power"):
@@ -1346,6 +1828,57 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             ]
         """
         return []
+
+
+def log_capital_mapping(expert: "MarketExpertInterface", log,
+                        balances: Any = _UNSET
+                        ) -> Optional[Dict[str, Any]]:
+    """Log ``expert.describe_capital_mapping()`` at the level the mapping deserves.
+
+    ONE function, two callers (the classic risk manager and the Smart RM toolkit), so
+    the two live sizing paths can never explain their capital differently -- the same
+    rule the sizing-budget resolver follows. ``log`` is the CALLER's logger, so the line
+    lands under the module an operator is already reading, and so a test can pin the
+    level by patching that module's logger.
+
+    ``balances``: the ``_available_balance_breakdown()`` the caller SIZED FROM. Both risk
+    managers take exactly one and pass it here, so the explanation and the quantity come
+    from one pass over one book. Passing ``None`` (a pass that FAILED) is a real answer
+    and is forwarded as one -- the mapping then carries "expert balance unavailable" and
+    this function logs at ERROR; only OMITTING the argument lets the mapping take its own
+    pass. Same ``_UNSET`` sentinel as ``describe_capital_mapping``.
+
+    Levels: ERROR when the mapping carries an ``"error"`` (a broker figure was
+    unknown -- the sizing decision that follows is being made on refused inputs, which
+    must never be quiet) OR when it carries no ``effective_factor`` at all; INFO when
+    leverage is actually in play (``effective_factor != 1.0``), because then the order
+    quantities do NOT correspond to the account's own equity and an operator needs the
+    mapping to read them; DEBUG otherwise -- margin off is every backtest, where this
+    line would otherwise be emitted once per sizing pass for the whole run and say
+    nothing new.
+
+    Returns the mapping (or None when there was nothing to describe) so a caller may
+    also record it. It does not raise for the mapping's own known refusals -- an
+    unpublished or non-finite broker figure arrives as that ``"error"`` entry -- but a
+    DEFECT (an object that is not an expert at all) propagates on purpose: a diagnostic
+    that swallowed it would leave the sizing path below running on a lie. Callers keep it
+    OUT of any handler that turns an exception into a quantity of zero.
+    """
+    mapping = expert.describe_capital_mapping(balances)
+    if mapping is None:
+        return None
+    line = f"Capital mapping: {format_capital_mapping(mapping)}"
+    # The shape is NOT guaranteed: the account is reached through a getattr-guarded seam,
+    # so a host may wire something that publishes no description, and then there is no
+    # factor to judge the line by. A missing factor is therefore the ERROR branch and
+    # never a KeyError -- a diagnostic that crashes on its own payload explains nothing.
+    if "error" in mapping or "effective_factor" not in mapping:
+        log.error(line)
+    elif mapping["effective_factor"] != 1.0:
+        log.info(line)
+    else:
+        log.debug(line)
+    return mapping
 
 
 @runtime_checkable

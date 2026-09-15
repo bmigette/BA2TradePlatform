@@ -7,8 +7,8 @@ tasks on the task queue so the React UI can drive them without blocking the requ
     (CLI ``_cmd_build_screener_metrics``).
   * ``build_options``         — wraps ``app.services.backtest.fetch_options.build_cache``
     (CLI ``_cmd_fetch_options``).
-  * ``prewarm``               — wraps the per-symbol FMP-history disk-cache pre-warm
-    (CLI ``_cmd_prewarm``).
+  * ``prewarm``               — wraps ``app.services.prewarm_fetchers.run_prewarm``, the
+    SAME per-symbol FMP-history disk-cache pre-warm the CLI ``_cmd_prewarm`` runs.
 
 Contract matches the other handlers (``handle_daily_backtest`` etc.):
 ``handler(task_id: str, payload: dict) -> result dict``; a returned ``{'status':'failed',...}``
@@ -40,53 +40,22 @@ def _resolve_fmp_key() -> str:
 
 
 def _resolve_fred_key() -> str:
-    """Same resolution order as FMP. The FRED key lives in AppSetting, not .env."""
-    key = os.getenv("FRED_API_KEY")
-    if not key:
-        try:
-            from ba2_common.config import get_app_setting
-
-            key = get_app_setting("fred_api_key")
-        except Exception:  # noqa: BLE001
-            key = None
-    return key
+    """Re-export: the ONE resolver now lives in ``prewarm_fetchers`` beside the run it
+    serves, so the CLI reaches it too (it never warmed FRED at all while this was here).
+    Kept as a name because existing callers/tests import it from this module."""
+    from app.services.prewarm_fetchers import resolve_fred_key
+    return resolve_fred_key()
 
 
 def _prewarm_fred(max_age_hours: float = 24.0) -> Dict[str, Any]:
-    """Refresh the FRED macro series DeterministicScorer reads.
+    """Re-export of ``prewarm_fetchers.prewarm_fred`` (see :func:`_resolve_fred_key`).
 
-    Global, not per-symbol: these are 9 economy-wide series, so they are fetched once per
-    run rather than once per (expert, symbol) like the FMP history caches.
-
-    This exists because ``fred_series.get_series_as_of`` RAISES on a missing cache file
-    rather than reaching for the network -- a backtest must never silently run on absent
-    macro data. That contract is only safe if something populates the cache first, and
-    this is it. The files land under CACHE_FOLDER, so remote workers receive them with
-    the rest of the cache sync automatically.
+    The two sinks are SPLIT here. Passing ``logger.info`` for both reported a series
+    that could not be refreshed below the level this service logs at, so the only
+    surviving trace was an ``errors`` count in the returned summary.
     """
-    import time
-
-    from ba2_providers.macro import fred_series
-
-    key = _resolve_fred_key()
-    if not key:
-        # Not fatal to the whole prewarm: only DeterministicScorer needs it, and saying
-        # so precisely beats failing a 500-symbol FMP prewarm over a missing macro key.
-        return {"error": "fred_api_key not configured (AppSetting or FRED_API_KEY)"}
-
-    refreshed = skipped = errors = 0
-    for sid in fred_series.SERIES_SPEC:
-        path = fred_series.cache_path(sid)
-        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) / 3600.0 < max_age_hours:
-            skipped += 1
-            continue
-        try:
-            fred_series.refresh_series(sid, key)
-            refreshed += 1
-        except Exception as e:  # noqa: BLE001 — one series must not abort the prewarm
-            errors += 1
-            logger.warning(f"prewarm FRED {sid} failed: {e}")
-    return {"refreshed": refreshed, "fresh": skipped, "errors": errors}
+    from app.services.prewarm_fetchers import prewarm_fred
+    return prewarm_fred(max_age_hours, log=logger.info, warn=logger.warning)
 
 
 def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -220,22 +189,27 @@ def handle_build_options(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any
 def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Pre-build the per-symbol FMP-history disk cache for the grid experts.
 
-    Mirrors ``ba2test_launcher._cmd_prewarm``: runs each (expert, symbol) cached fetch inside
-    ``frozen_ttl_cache()`` (which engages the backtest-only disk cache) across a thread pool.
-    Required payload keys: symbols (list). Optional: experts (list; default the 3 disk-cached
-    history experts), workers (default 5), end (ISO; default now).
+    Argument parsing and reporting only: the run itself is
+    ``app.services.prewarm_fetchers.run_prewarm``, the same call ``ba2-test prewarm`` makes, so
+    the two entry points cannot drift. They had drifted badly. This handler knew 3 of the 7
+    experts, warmed no per-symbol data at all for DeterministicScorer (only FRED), and -- worst
+    -- entered ``frozen_ttl_cache()`` on the SUBMITTING thread only. That flag is thread-local,
+    so every pool worker ran un-frozen: ``fmp_history_disk_cached`` took its live passthrough
+    branch, the fetches went out over the network, and NOT ONE cache file was written, while the
+    task reported success (2026-09-10 live-replay readiness audit, "Two prewarm tooling gaps").
+
+    Required payload keys: symbols (list). Optional: experts (list; default the 3 core
+    rating/signal experts), workers (default 5), end (ISO; default now).
     """
     if payload.get("symbols") is None:
         return {"status": "failed", "error": "payload.symbols is required"}
 
     try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         from datetime import timezone as _tz
-        from ba2_providers.fmp_common import frozen_ttl_cache
 
-        key = _resolve_fmp_key()
-        if not key:
-            return {"status": "failed", "error": "FMP_API_KEY not configured"}
+        from app.services.prewarm_fetchers import (
+            PrewarmConfigError, PrewarmFetchers, resolve_keys, run_prewarm,
+        )
 
         symbols = payload["symbols"]
         if isinstance(symbols, str):
@@ -244,7 +218,8 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not symbols:
             return {"status": "failed", "error": "payload.symbols must be non-empty"}
 
-        experts = payload.get("experts") or ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy"]
+        experts = payload.get("experts") or ["FMPRating", "FMPEarningsDrift",
+                                             "FMPInsiderClusterBuy"]
         if isinstance(experts, str):
             experts = [e.strip() for e in experts.split(",") if e.strip()]
         workers = int(payload.get("workers", 5))
@@ -257,89 +232,26 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             end_date = datetime.now(_tz.utc)
 
-        from ba2_experts.FMPRating import (
-            fetch_grades_historical_cached,
-            fetch_price_target_history_cached,
-            fetch_analyst_grades_cached,
-        )
-        from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
-            FMPCompanyDetailsProvider,
-        )
-        from ba2_providers.insider.FMPInsiderProvider import FMPInsiderProvider
-
-        _details_provider = {"p": None}
-        _insider_provider = {"p": None}
-
-        def _do_fmprating(sym: str) -> None:
-            fetch_grades_historical_cached(key, sym)
-            fetch_price_target_history_cached(key, sym)
-            fetch_analyst_grades_cached(key, sym)   # dated individual grades (rating-recency)
-
-        def _do_earnings_drift(sym: str) -> None:
-            if _details_provider["p"] is None:
-                _details_provider["p"] = FMPCompanyDetailsProvider()
-            _details_provider["p"].get_past_earnings(
-                sym, frequency="quarterly", end_date=end_date,
-                lookback_periods=8, format_type="dict",
-            )
-
-        def _do_insider(sym: str) -> None:
-            if _insider_provider["p"] is None:
-                _insider_provider["p"] = FMPInsiderProvider()
-            _insider_provider["p"].get_insider_transactions(
-                sym, end_date=end_date, lookback_days=400, as_of=end_date,
-                format_type="dict",
-            )
-
-        fetchers = {
-            "FMPRating": _do_fmprating,
-            "FMPEarningsDrift": _do_earnings_drift,
-            "FMPInsiderClusterBuy": _do_insider,
-        }
-
-        # DeterministicScorer's macro series are economy-wide, so they are refreshed once
-        # here rather than entering the per-symbol work list.
+        # DeterministicScorer's macro series are economy-wide, so they are refreshed once here
+        # rather than entering the per-symbol work list (its per-symbol financial histories DO
+        # enter it, through the shared fetcher table, same as the CLI).
         fred_summary = None
         if "DeterministicScorer" in experts:
             fred_summary = _prewarm_fred(float(payload.get("fred_max_age_hours", 24.0)))
             logger.info(f"prewarm task {task_id}: FRED {fred_summary}")
 
-        work = []
-        skipped = []
-        for expert in experts:
-            if expert == "DeterministicScorer":
-                continue          # handled above; nothing per-symbol to fetch
-            fetcher = fetchers.get(expert)
-            if fetcher is None:
-                skipped.append(expert)
-                continue
-            for sym in symbols:
-                work.append((expert, sym, fetcher))
+        keys = resolve_keys()
+        try:
+            fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
+                                       finnhub_key=keys["finnhub"], log=logger.info)
+            summary = run_prewarm(fetchers, experts, symbols, workers, end=end_date)
+        except PrewarmConfigError as e:
+            # A configuration gap, not a data gap: it would repeat for every remaining symbol,
+            # so the whole task fails instead of reporting a partial warm as success.
+            logger.error(f"prewarm task {task_id} refused: {e}", exc_info=True)
+            return {"status": "failed", "error": str(e)}
 
-        if not work:
-            return {
-                "status": "completed",
-                "summary": {"cached": {}, "errors": 0, "skipped": skipped,
-                            "fred": fred_summary,
-                            "note": "no per-symbol disk-cached experts to pre-warm"},
-            }
-
-        counts: Dict[str, int] = {}
-        errors = 0
-        with frozen_ttl_cache():
-            with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-                futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
-                for fut in as_completed(futures):
-                    expert, sym = futures[fut]
-                    try:
-                        fut.result()
-                        counts[expert] = counts.get(expert, 0) + 1
-                    except Exception as e:  # noqa: BLE001 — one bad symbol must not abort
-                        errors += 1
-                        logger.warning(f"prewarm {expert}/{sym} failed: {e}")
-
-        summary = {"cached": counts, "errors": errors, "skipped": skipped,
-                   "symbols": len(symbols)}
+        summary["fred"] = fred_summary
         logger.info(f"prewarm task {task_id}: {summary}")
         return {"status": "completed", "summary": summary}
     except Exception as e:  # noqa: BLE001

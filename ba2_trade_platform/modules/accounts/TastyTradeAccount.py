@@ -1,3 +1,4 @@
+import json
 import asyncio
 import threading
 from typing import Any, Dict, List, Optional
@@ -22,7 +23,8 @@ from ...core.types import OrderType as CoreOrderType
 from ...core.account_types import (
     AccountSnapshot, CashTransfer, MarginInfo, MarketHours, OrderImpact,
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
-    MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION, MARKET_HOURS_SOURCE_BROKER,
+    MARGIN_SOURCE_CACHED, MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
+    MARKET_HOURS_SOURCE_BROKER,
 )
 from ...core.interfaces import AccountInterface
 
@@ -249,6 +251,16 @@ class TastyTradeAccount(AccountInterface):
         "read-only token 403s every write endpoint."
     )
 
+    #: TastyTrade's refusal code for an opening MARKET order outside session hours.
+    #: It applies to a DRY RUN too -- the SDK routes preview_order_impact through
+    #: place_order(dry_run=True), so an out-of-hours preview raises exactly as a
+    #: submission would. That is expected, not a fault: it is why a capital
+    #: requirement cannot be measured out of hours.
+    #:
+    #: Matched as a SUBSTRING of the broker's own message, which is returned verbatim
+    #: by _describe_broker_error.
+    _CLOSED_MARKET_PREVIEW_CODE = "tif_no_after_hours_opening_market_orders"
+
     @classmethod
     def _describe_broker_error(cls, exc: Exception, operation: str) -> str:
         """A human-actionable rendering of a broker exception, for logs and comments.
@@ -448,27 +460,44 @@ class TastyTradeAccount(AccountInterface):
             except (TypeError, ValueError):
                 return None
 
+        def _marked_total(equity_field, derivative_field):
+            """One side's TOTAL marked value: equities PLUS derivatives.
+
+            ``long_market_value``/``short_market_value`` mean TOTAL marked exposure of the
+            one pot of equity (see ReadOnlyAccountInterface._gross_stock_exposure_from) --
+            Alpaca's own figures already include option positions. Reporting only
+            ``*_equity_value`` here would make an account holding nothing but options read
+            as flat, and the account-wide margin ceiling would let it lever without limit.
+
+            ``None`` when EITHER component is missing: the sum of a known and an unknown is
+            unknown, and a partial total silently UNDERSTATES exposure, which is the
+            direction that admits orders. (Both fields are required on tastytrade's
+            AccountBalance, so in practice this is the failed-fetch case.)
+            """
+            equity_part, derivative_part = _num(equity_field), _num(derivative_field)
+            if equity_part is None or derivative_part is None:
+                return None
+            return equity_part + derivative_part
+
         is_margin = self._is_margin_account()
         net_liquidation = _num("net_liquidating_value")
+        short_marked = _marked_total("short_equity_value", "short_derivative_value")
         return AccountSnapshot(
             cash=_num("cash_balance"),
             equity=net_liquidation,
             net_liquidation=net_liquidation,
             buying_power=_num("equity_buying_power"),
             non_marginable_buying_power=_num("cash_available_to_withdraw"),
+            option_buying_power=_num("derivative_buying_power"),
             margin_multiplier=2.0 if is_margin else 1.0,
             is_margin_account=is_margin,
-            long_market_value=_num("long_equity_value"),
+            long_market_value=_marked_total("long_equity_value", "long_derivative_value"),
             # NEGATED ON PURPOSE. AccountSnapshot pins short_market_value as NEGATIVE
             # while shorts are held (the Alpaca convention), but TastyTrade's
-            # short-equity-value is a POSITIVE MAGNITUDE. Passing it through unchanged
+            # short-*-value fields are POSITIVE MAGNITUDES. Passing them through unchanged
             # makes gross exposure broker-dependent: long + abs(short) and long - short
             # disagree, and no fixture with a zero short can tell the difference.
-            short_market_value=(
-                -_num("short_equity_value")
-                if _num("short_equity_value") is not None
-                else None
-            ),
+            short_market_value=(-short_marked if short_marked is not None else None),
             # TastyTrade's pending_cash is SIGNED (positive = incoming); it is reported
             # as-is rather than clamped, so the caller sees what the broker said.
             pending_transfer_in=_num("pending_cash"),
@@ -1279,10 +1308,24 @@ class TastyTradeAccount(AccountInterface):
             response = self._run_async(
                 self._account.place_order(self._session, new_order, dry_run=True))
         except Exception as e:
+            described = self._describe_broker_error(e, 'the order preview (dry run)')
+            # NOT AN ERROR, and it must not read like one. The broker declines to price
+            # an opening market order while the market is closed -- including the dry
+            # run -- so every out-of-hours allocation preview raised here once per
+            # symbol, at ERROR, with a stack trace naming ``place_order``. 940 such
+            # lines in one prod log read as "the platform is trying to submit orders
+            # with the market shut", which is the opposite of what happened: nothing
+            # was ever sent. One INFO line, no traceback, and it says what it means.
+            if self._CLOSED_MARKET_PREVIEW_CODE in described:
+                logger.info(
+                    f"[Account {self.id}] No preview for {trading_order.symbol}: the "
+                    f"market is closed and the broker will not price an opening market "
+                    f"order out of hours. Nothing was submitted; the row simply has no "
+                    f"broker-measured buying power or margin requirement.")
+                return None
             logger.error(
                 f"[Account {self.id}] Order preview failed for {trading_order.symbol}: "
-                f"{self._describe_broker_error(e, 'the order preview (dry run)')}",
-                exc_info=True)
+                f"{described}", exc_info=True)
             return None
 
         effect = response.buying_power_effect
@@ -2016,6 +2059,9 @@ class TastyTradeAccount(AccountInterface):
                 f"[Account {self.id}] Margin requirement fetch failed: "
                 f"{self._describe_broker_error(e, 'the margin-requirement fetch')}")
 
+        cached_rates = self._load_margin_rate_cache()
+        learned: Dict[str, float] = {}
+
         result = {}
         for symbol in wanted:
             equity = equities.get(symbol)
@@ -2026,6 +2072,17 @@ class TastyTradeAccount(AccountInterface):
             if symbol in requirement and notional.get(symbol):
                 rate = min(1.0, requirement[symbol] / notional[symbol])
                 source = MARGIN_SOURCE_POSITION
+                learned[symbol] = rate
+            elif symbol in cached_rates:
+                # MEASURED EARLIER, on a day this symbol was held or the broker
+                # answered. TastyTrade publishes a per-symbol requirement only for a
+                # symbol the account HOLDS, so a first-time buy is unmeasurable BY
+                # DEFINITION -- and out of hours even the order preview refuses
+                # ("Opening market orders not allowed when market closed"), which is
+                # when a dry run needs the number most. A rate this account has seen
+                # for this very symbol beats assuming one.
+                rate = float(cached_rates[symbol])
+                source = MARGIN_SOURCE_CACHED
             # TRI-STATE. `is_fractional_quantity_eligible` is `bool | None`
             # (instruments.py:262) and `MarginInfo.fractionable` is Optional[bool] for
             # exactly that reason: None is NOT False. Never coerce, and never report
@@ -2064,7 +2121,24 @@ class TastyTradeAccount(AccountInterface):
                 increment = 1.0
             result[symbol] = MarginInfo(
                 symbol=symbol,
-                bp_factor=(rate * multiplier) if rate is not None else multiplier,
+                # NEUTRAL, not penalised, when nothing is known.
+                #
+                # This used to emit ``multiplier`` (2.0 on a margin account), which by
+                # the engine's own table means "non-marginable" -- a buying-power
+                # PENALTY of double the notional. Every symbol the account does not
+                # already hold got it, so a first-time buy of an ordinary ETF was
+                # charged twice its cost and the whole plan scaled down to fit. On the
+                # live account the two measurable symbols (GRID, URA) both came back at
+                # 0.5 x 2 = 1.0, so 2.0 was contradicted by every observation we had.
+                #
+                # 1.0 is the neutral point on every account shape -- an ordinary
+                # marginable stock at Reg-T (0.5 x 2) and a cash account (1.0 x 1) both
+                # land there -- and it keeps the invariant that a buy never consumes
+                # MORE buying power than its notional. A genuinely non-marginable name
+                # still reports whatever the broker measures once it is held or
+                # prechecked; what is gone is inventing the penalty for a symbol nobody
+                # has measured.
+                bp_factor=(rate * multiplier) if rate is not None else 1.0,
                 # TastyTrade publishes no PER-SYMBOL marginability flag, so this
                 # reports whether the ACCOUNT is a margin account.
                 marginable=is_margin,
@@ -2093,7 +2167,66 @@ class TastyTradeAccount(AccountInterface):
                 maintenance_margin_rate=None,
                 source=source,
             )
+        self._store_margin_rate_cache(learned)
         return result
+
+    #: Where the measured per-symbol initial-margin rates live between runs. An
+    #: account SETTING rather than a new table: it is a handful of floats, it is
+    #: per-account by construction, and it needs no migration to exist.
+    MARGIN_RATE_CACHE_SETTING = "_margin_rate_cache"
+
+    def _load_margin_rate_cache(self) -> Dict[str, float]:
+        """Per-symbol initial-margin rates this account has MEASURED before.
+
+        Read defensively: a corrupt or hand-edited value must degrade to "no cache"
+        rather than take the account's sizing down with it.
+        """
+        try:
+            raw = self.settings.get(self.MARGIN_RATE_CACHE_SETTING)
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if not isinstance(raw, dict):
+                return {}
+            out = {}
+            for symbol, value in raw.items():
+                try:
+                    rate = float(value)
+                except (TypeError, ValueError):
+                    continue
+                # A rate outside (0, 1] is not a margin rate. Dropping it is safer than
+                # sizing on it, and it cannot be repaired from here.
+                if 0.0 < rate <= 1.0:
+                    out[str(symbol).strip().upper()] = rate
+            return out
+        except Exception as e:  # noqa: BLE001 - a cache must never break the fetch
+            logger.warning(f"[Account {self.id}] margin-rate cache unreadable ({e}); "
+                           f"continuing without it")
+            return {}
+
+    def _store_margin_rate_cache(self, learned: Dict[str, float]) -> None:
+        """Merge newly MEASURED rates into the cache. Only writes when something changed.
+
+        Measured rates only -- never a fallback or a cached value read back, or the
+        cache would slowly fill with its own assumptions and look like evidence.
+        """
+        if not learned:
+            return
+        try:
+            current = self._load_margin_rate_cache()
+            merged = dict(current)
+            changed = False
+            for symbol, rate in learned.items():
+                symbol = symbol.strip().upper()
+                if abs(current.get(symbol, -1.0) - float(rate)) > 1e-6:
+                    merged[symbol] = float(rate)
+                    changed = True
+            if not changed:
+                return
+            self.save_settings({self.MARGIN_RATE_CACHE_SETTING: (json.dumps(merged), "str")})
+            logger.info(f"[Account {self.id}] margin-rate cache updated for "
+                        f"{len(learned)} symbol(s); {len(merged)} cached in total")
+        except Exception as e:  # noqa: BLE001 - never fail a fetch over a cache write
+            logger.warning(f"[Account {self.id}] could not persist the margin-rate cache: {e}")
 
     # ------------------------------------------------------------------
     # Market hours

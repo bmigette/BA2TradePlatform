@@ -32,7 +32,8 @@ CASH_TRANSFER_DIVIDEND = "DIVIDEND"
 MARGIN_SOURCE_PRECHECK = "precheck"    # broker order dry-run (preview_order_impact)
 MARGIN_SOURCE_ASSET = "asset"          # per-asset metadata (Alpaca Asset + multiplier)
 MARGIN_SOURCE_POSITION = "position"    # derived from a held position's requirement
-MARGIN_SOURCE_DEFAULT = "default"      # conservative fallback = account multiplier
+MARGIN_SOURCE_CACHED = "cached"        # a rate this account MEASURED earlier for this symbol
+MARGIN_SOURCE_DEFAULT = "default"      # fallback: assume an ordinary marginable stock (1.0)
 
 # Provenance of a MarketHours answer. PLAIN str (same reasoning as the
 # CASH_TRANSFER_* constants); always use the constant, never a bare literal.
@@ -66,16 +67,32 @@ class AccountSnapshot:
     ``build_base_snapshot``) -- so report ``net_liquidation`` as the account's
     headline total value.
 
+    ``long_market_value`` / ``short_market_value`` are TOTAL MARKED EXPOSURE --
+    every position the account holds against its one pot of equity, OPTIONS
+    INCLUDED, not equities only. Alpaca's own figures already work that way; an
+    adapter whose broker reports the two separately MUST sum them (TastyTrade:
+    ``long_equity_value + long_derivative_value``). This is what the account-wide
+    margin ceiling measures (``ReadOnlyAccountInterface.get_stock_exposure_headroom``),
+    so an equity-only figure would let an option book lever without limit. Options
+    still SIZE from their own sleeve (``get_option_tradable_balance``, with the
+    option multiplier); they simply consume the same capital.
+
     ``short_market_value`` is NEGATIVE while shorts are held (the Alpaca
     convention). A broker that publishes a positive magnitude instead
     (TastyTrade's ``short-equity-value``) MUST be negated by its adapter, so
     that gross exposure is one formula for every broker.
+
+    ``option_buying_power`` is the broker's derivative buying power; ``None``
+    when the broker publishes none.
     """
     cash: Optional[float] = None
     equity: Optional[float] = None
     net_liquidation: Optional[float] = None
     buying_power: Optional[float] = None
     non_marginable_buying_power: Optional[float] = None
+    #: The broker's OPTION (derivative) buying power. Alpaca `options_buying_power`,
+    #: TastyTrade `derivative_buying_power`. None = not published, never zero.
+    option_buying_power: Optional[float] = None
     margin_multiplier: Optional[float] = None
     is_margin_account: bool = False
     long_market_value: Optional[float] = None

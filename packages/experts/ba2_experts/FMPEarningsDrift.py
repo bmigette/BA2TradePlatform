@@ -37,6 +37,10 @@ from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
+from ba2_common.core.replay import (
+    ReplayMiss, ReplayStatus, observe_provider, record_branch_flag, record_observation,
+    replay_now,
+)
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
 from ba2_experts.earnings_surprise import surprise_percent as _surprise_percent
@@ -53,6 +57,17 @@ _CALENDAR_CACHE_TTL_SECONDS = 4 * 3600
 _CALENDAR_CACHE = TTLCache(_CALENDAR_CACHE_TTL_SECONDS)
 
 
+def earning_calendar_identity(args):
+    """What makes a bulk earnings-calendar response what it is: its date range.
+
+    Named (not an inline lambda) so the offline replay tape can build the SAME
+    identity to look the recorded calendar up by it. The api key is deliberately
+    absent -- it is not part of what makes the response what it is.
+    """
+    return {"from": args["from_date"], "to": args["to_date"]}
+
+
+@observe_provider("fmp", "earning_calendar", identity=earning_calendar_identity)
 def _fetch_earnings_calendar_by_symbol(api_key: str, from_date: str, to_date: str) -> Dict[str, dict]:
     """Market-wide earnings calendar for [from_date, to_date], deduped to the LATEST row per
     symbol, keyed upper-case. ONE API call regardless of universe size — no symbol list, so
@@ -279,15 +294,34 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         skip_detail_fetch = False
         # LIVE-ONLY calendar shortcut (see module docstring). Backtest (as_of set) never enters
         # this branch, so grid/backtest results are byte-identical to before this change.
-        if as_of is None and isinstance(details_provider, FMPCompanyDetailsProvider):
+        calendar_branch = as_of is None and isinstance(details_provider, FMPCompanyDetailsProvider)
+        # Which branch ran is a RECORDED FACT, not something a replay may infer
+        # from which observations happen to be on the tape: inferring it would let
+        # a missing calendar response silently reroute the replay down the
+        # per-symbol branch and call the resulting bundle a match.
+        record_branch_flag("earnings_calendar_branch", calendar_branch)
+        if calendar_branch:
             try:
                 api_key = details_provider.api_key
                 max_days = int(self._gather_max_days_since_report)
-                now = datetime.now(timezone.utc)
+                # replay_now(as_of): the wall clock live (this branch is live-only,
+                # as_of is None), the recorded read when replaying (spec s4).
+                now = replay_now(as_of)
                 from_date = (now - timedelta(days=max_days)).date().isoformat()
                 to_date = now.date().isoformat()
                 calendar = _fetch_earnings_calendar_by_symbol(api_key, from_date, to_date)
                 row = calendar.get(symbol.upper())
+                # The chosen row is what this symbol's decision actually consumed --
+                # recorded in its own right (None included: "this symbol did not
+                # report in the window" is a fact, not a missing value). It is read
+                # out of the already-fetched calendar, so no request is made for it.
+                record_observation(
+                    provider="fmp", method="earnings_calendar_row",
+                    identity={"symbol": symbol.upper(), "from": from_date, "to": to_date},
+                    payload=row,
+                    # Read out of the in-memory calendar this analysis just
+                    # received -- not a fetch of its own.
+                    provenance=ReplayStatus.PROVENANCE_MEMO_CACHE)
                 if row is None:
                     # No report in the lookback window at all -> definitively no signal;
                     # evaluate_earnings_drift(None, ...) -> "no earnings data" -> HOLD.
@@ -299,11 +333,17 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
                         skip_detail_fetch = True
                     # else: report exists but the calendar is missing the analyst estimate ->
                     # fall through to the per-symbol detail fetch below.
+            except ReplayMiss:
+                # A replay that cannot serve this branch must STOP, not fall back:
+                # falling back would run the other branch and report its bundle as
+                # if the calendar branch had produced it.
+                raise
             except Exception as e:  # noqa: BLE001 -- best-effort optimization; never break the run
                 self.logger.debug(
                     f"Earnings calendar shortcut failed for {symbol}, falling back to "
                     f"per-symbol fetch: {e}")
 
+        record_branch_flag("earnings_detail_fetch", not skip_detail_fetch)
         if not skip_detail_fetch:
             data = past_earnings_get(
                 details_provider, symbol, as_of=as_of,
@@ -326,7 +366,7 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
                  as_of: Optional[datetime] = None) -> Recommendation:
-        now = as_of or datetime.now(timezone.utc)
+        now = replay_now(as_of)
         surprise_min = float(settings["surprise_min_pct"])
         max_days = int(settings["max_days_since_report"])
         expected_profit_base = float(settings["expected_profit_percent"])
@@ -495,6 +535,12 @@ Confidence: {confidence:.1f}%
         return base
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _require_current_price(bundle: Dict[str, Any]) -> None:
+        """The live price guard, run between _gather and _process (unchanged)."""
+        if not bundle.get("current_price"):
+            raise ValueError(f"Unable to get current price for {bundle['symbol']}")
+
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
         """Thin live orchestrator: resolve settings -> _gather(as_of=None) ->
         _process -> persist ExpertRecommendation + AnalysisOutput + state. Runs the
@@ -509,10 +555,18 @@ Confidence: {confidence:.1f}%
             self._gather_max_days_since_report = settings["max_days_since_report"]
             self._gather_expected_profit_mode = settings.get("expected_profit_mode", "static")
             providers = self._live_providers()
-            bundle = self._gather(providers, as_of=None)
-            if not bundle.get("current_price"):
-                raise ValueError(f"Unable to get current price for {symbol}")
-            rec = self._process(bundle, settings, as_of=None)
+            # Recorded live analysis (spec step 2): a no-op when capture is off,
+            # in which case this is exactly the gather/guard/process sequence it
+            # replaces. This body has no early return -- every path either reaches
+            # a recommendation or raises, and both are recorded.
+            use_case = self._use_case_of(market_analysis)
+            with self._analysis_capture(market_analysis, settings, use_case):
+                bundle, rec = self._gather_and_process(
+                    providers, settings,
+                    market_analysis=market_analysis,
+                    use_case=use_case,
+                    validate=self._require_current_price,
+                )
 
             recommendation_id = add_instance(ExpertRecommendation(
                 instance_id=self.id,
