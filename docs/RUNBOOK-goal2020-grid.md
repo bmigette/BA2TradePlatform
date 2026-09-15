@@ -474,3 +474,10 @@ database. Windows Task Scheduler task **`BA2 DB Backup`** runs it daily at 00:00
 interactive user (Google Drive's `G:` only exists in the logged-on session), 4 h limit, no
 overlapping instances. Log: `G:\Mon Driveackup\BA2ackup.log`. Measured 2026-09-15: prod
 411 MB -> 93 MB in 12 s. Manual run: `.venv\Scripts\python.exe toolsackup_dbs.py [--dry-run]`.
+
+**Weekly remote pull (stage-1 isolated DB).** `tools/backup_remote_db.py` runs the same online
+backup + `quick_check` + zip ON remote227 (python3 over one ssh session, `nice`d so the grid is
+not disturbed), scp's it to `G:\Mon Driveackup\BA2emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
+deletes the remote copy and keeps the newest 4. Task **`BA2 Remote DB Backup`**, Sunday 01:00,
+interactive user (needs the ssh key + G:). Stage-1 results live ONLY in that isolated DB
+(`/home/debian/ba2-grid/home/test/dl_forecasting.db`); nothing syncs them to the local test DB.
