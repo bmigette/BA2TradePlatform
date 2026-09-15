@@ -2309,3 +2309,302 @@ def test_a_changed_feed_invalidates_the_holdings_index():
     assert set(e._holdings_index_cached(t1)) == {"AAPL"}
     t2 = t1 + [_weight_trade("Bob", "Bb", "MSFT", "purchase", "2026-06-01", "2026-05-20")]
     assert set(e._holdings_index_cached(t2)) == {"AAPL", "MSFT"}
+
+
+# ====================================================================
+# Per-symbol breakdown on the BASKET analysis (2026-09-15).
+#
+# Requested: "add more details in the analysis output for senate trader -- for each symbol
+# the traders, their scores, money invested". The basket cycle computed all of it --
+# _calculate_recommendation builds one row per trade with the trader, their skill, symbol
+# focus, disclosed amount, still-held flag and per-trade confidence -- and then persisted
+# ~400 bytes of summary: a count and a comma-joined symbol list. Measured 2026-09-15: no
+# AnalysisOutput rows at all, and the per-trader detail survived only as a 4-10k-char text
+# blob on each ExpertRecommendation, which the analysis page never rendered.
+# ====================================================================
+
+def _trade_row(trader, *, side="purchase", amount="$15,001 - $50,000", skill=0.4,
+               skill_trades=20, hit_rate=0.65, focus=4.2, still_held=True,
+               exec_price=90.0, delta=5.0, confidence=72.5, weight=1.2):
+    """One row shaped exactly like _calculate_recommendation's trade_info."""
+    return {
+        "trader": trader, "type": side, "amount": amount,
+        "exec_date": "2026-08-01", "disclose_date": "2026-08-20",
+        "exec_price": exec_price, "current_price": 94.5, "price_delta_pct": delta,
+        "still_held": still_held, "symbol_focus_pct": focus,
+        "trader_skill": skill, "trader_skill_trades": skill_trades,
+        "trader_skill_hit_rate": hit_rate, "signal_weight": weight, "size_boost": 3.0,
+        "confidence": confidence, "days_since_exec": 45, "days_since_disclose": 26,
+        "trader_confidence_modifier": 2.0,
+        "trader_recent_buys": "3 ($120,000)", "trader_recent_sells": "0 ($0)",
+        "trader_yearly_buys": "14 ($900,000)", "trader_yearly_sells": "2 ($40,000)",
+        "yearly_symbol_buys": "$65,000", "yearly_symbol_sells": "$0",
+    }
+
+
+def _basket_rec(symbol, signal, confidence, trades, *, details="report", price=94.5,
+                skip=False):
+    rec_data = {
+        "signal": signal, "confidence": confidence,
+        "expected_profit_percent": confidence * 0.15,
+        "details": details, "trades": trades, "trade_count": len(trades),
+        "buy_count": sum(1 for t in trades if "purchase" in t["type"]),
+        "sell_count": sum(1 for t in trades if "sale" in t["type"]),
+        "total_buy_amount": 32500.5 * sum(1 for t in trades if "purchase" in t["type"]),
+        "total_sell_amount": 0.0,
+        "winning_traders": len({t["trader"] for t in trades}),
+        "avg_trader_skill": 0.4, "consensus_bonus": 2.0, "avg_size_boost": 3.0,
+    }
+    return Recommendation(signal=signal, confidence=confidence, current_price=price, skip=skip,
+                          raw_outputs={"symbol": symbol, "recommendation": rec_data})
+
+
+def _run_basket(monkeypatch, recs, instance_id):
+    from ba2_common.core.models import MarketAnalysis
+    from ba2_common.core.types import MarketAnalysisStatus
+    from ba2_common.core.db import add_instance, get_instance
+
+    e = _weight_live_basket_expert([], [], {}, {}, instance_id=instance_id)
+    monkeypatch.setattr(e, "_gather_all",
+                        lambda providers, as_of: {r.raw_outputs["symbol"]: {} for r in recs})
+    monkeypatch.setattr(e, "_process_all", lambda bundle, settings, as_of: recs)
+    ma = MarketAnalysis(symbol="EXPERT", expert_instance_id=instance_id,
+                        status=MarketAnalysisStatus.PENDING,
+                        subtype=AnalysisUseCase.ENTER_MARKET)
+    ma_id = add_instance(ma)
+    e.run_analysis("EXPERT", get_instance(MarketAnalysis, ma_id))
+    # Re-read from the DB: proves the breakdown survives JSON persistence, not just that it
+    # was assigned in memory.
+    return get_instance(MarketAnalysis, ma_id).state["senate_trade_basket"]
+
+
+def test_basket_state_keeps_each_symbols_traders_scores_and_money(monkeypatch):
+    """THE REQUEST. Every recommended symbol keeps who traded it, their scores, and how much."""
+    trades = [_trade_row("Nancy Pelosi", skill=0.45, skill_trades=22, hit_rate=0.64, focus=4.2),
+              _trade_row("Dan Crenshaw", amount="$1,001 - $15,000", skill=-0.1, focus=1.1,
+                         still_held=False)]
+    state = _run_basket(monkeypatch,
+                        [_basket_rec("GS", OrderRecommendation.BUY, 94.6, trades)], 881)
+
+    gs = state["symbols"]["GS"]
+    assert gs["signal"] == "BUY"
+    assert gs["confidence"] == pytest.approx(94.6)
+    assert [t["trader"] for t in gs["traders"]] == ["Nancy Pelosi", "Dan Crenshaw"]
+
+    pelosi = gs["traders"][0]
+    # SCORES -- the inputs the ranking was built from, not a re-derived summary.
+    assert pelosi["trader_skill"] == pytest.approx(0.45)
+    assert pelosi["trader_skill_trades"] == 22
+    assert pelosi["trader_skill_hit_rate"] == pytest.approx(0.64)
+    assert pelosi["symbol_focus_pct"] == pytest.approx(4.2)
+    assert pelosi["signal_weight"] == pytest.approx(1.2)
+    assert pelosi["confidence"] == pytest.approx(72.5)
+    # MONEY -- the disclosed RANGE is the fact; the midpoint is an estimate, labelled as one.
+    assert pelosi["amount"] == "$15,001 - $50,000"
+    assert pelosi["amount_mid_usd"] == pytest.approx(32500.5)
+    assert gs["traders"][1]["amount_mid_usd"] == pytest.approx(8000.5)
+    assert gs["traders"][1]["still_held"] is False
+
+
+def test_basket_state_links_each_symbol_to_its_recommendation_row(monkeypatch):
+    """So the page can reach the full text report without re-deriving anything."""
+    state = _run_basket(monkeypatch,
+                        [_basket_rec("GS", OrderRecommendation.BUY, 90.0, [_trade_row("A")])], 882)
+    rid = state["symbols"]["GS"]["recommendation_id"]
+    assert rid in state["expert_recommendation_ids"]
+
+
+def test_basket_state_says_why_a_symbol_was_held_back(monkeypatch):
+    """The natural next question after 'why GS' is 'why not MSFT'. HOLD symbols are NOT
+    persisted as recommendations (review L2), so without this the answer is simply gone."""
+    buy = _basket_rec("GS", OrderRecommendation.BUY, 90.0, [_trade_row("A")])
+    below = _basket_rec(
+        "MSFT", OrderRecommendation.HOLD, 0.0, [_trade_row("B")],
+        details="Below minimum thresholds: 1 unique trader(s) (min 2), 1 trade(s) (min 2).")
+    state = _run_basket(monkeypatch, [buy, below], 883)
+
+    held = {h["symbol"]: h for h in state["held_back"]}
+    assert "MSFT" in held and "GS" not in held
+    assert held["MSFT"]["trade_count"] == 1
+    assert held["MSFT"]["unique_traders"] == 1
+    assert held["MSFT"]["reason"].startswith("Below minimum thresholds")
+
+
+def test_a_hold_reason_is_never_fabricated_from_a_full_report(monkeypatch):
+    """A HOLD that came out of the full calculation (buys and sells cancelled) carries a
+    multi-page report, not a reason. Its first line is a HEADING -- storing it as the reason
+    would state something the code never decided."""
+    net_zero = _basket_rec(
+        "KO", OrderRecommendation.HOLD, 50.0, [_trade_row("A")],
+        details="FMP Senate/House Trading Analysis\n\nCurrent Price: $60.00\n...")
+    state = _run_basket(monkeypatch, [net_zero], 884)
+    assert state["held_back"][0]["reason"] is None
+
+
+def test_symbols_with_no_qualifying_trade_are_not_listed_as_held_back(monkeypatch):
+    """Prod scans up to ~250 symbols a cycle and holds back up to 241. A symbol with no trade
+    left after filtering carries no information, and listing it buries the ones that do."""
+    empty = _basket_rec("ZZZ", OrderRecommendation.HOLD, 0.0, [],
+                        details="No relevant senate/house trades found")
+    state = _run_basket(monkeypatch, [empty], 885)
+    assert state["held_back"] == []
+
+
+def test_the_held_back_list_is_bounded_and_says_how_much_it_left_out(monkeypatch):
+    """A cycle can hold back ~240 symbols; the state row must not grow without limit, and a
+    cut list must say it was cut rather than look complete."""
+    from ba2_experts.FMPSenateTraderWeight import BASKET_HELD_BACK_MAX
+
+    recs = [_basket_rec(f"S{i:03d}", OrderRecommendation.HOLD, 0.0,
+                        [_trade_row(f"T{j}") for j in range(1 + i % 4)],
+                        details="Below minimum thresholds")
+            for i in range(BASKET_HELD_BACK_MAX + 20)]
+    state = _run_basket(monkeypatch, recs, 886)
+
+    assert len(state["held_back"]) == BASKET_HELD_BACK_MAX
+    assert state["held_back_omitted"] == 20
+    # The most active symbols are the ones kept.
+    counts = [h["trade_count"] for h in state["held_back"]]
+    assert counts == sorted(counts, reverse=True)
+
+
+# --------------------------------------------------------------------
+# The page: what the basket analysis now SHOWS.
+# --------------------------------------------------------------------
+
+def test_the_trader_table_shows_score_money_and_focus():
+    """The formatting half, pure: one row per trade, with the scores the ranking used."""
+    rows = FMPSenateTraderWeight._basket_trader_table_rows(
+        FMPSenateTraderWeight._basket_trader_rows(
+            [_trade_row("Nancy Pelosi", skill=0.45, skill_trades=22, hit_rate=0.64, focus=4.2)]))
+
+    row = rows[0]
+    assert row["trader"] == "Nancy Pelosi"
+    assert row["side"] == "BUY"
+    assert row["amount"] == "$15,001 - $50,000"
+    # Labelled as an estimate: Congress discloses ranges, never the amount.
+    assert row["amount_mid"] == "≈ $32,500"
+    assert row["skill"] == "+0.45 (22 scored, 64% hit)"
+    assert row["focus"] == "4.2%"
+    assert row["held"] == "yes"
+
+
+def test_a_trader_with_no_scored_history_reads_neutral_not_zero():
+    """skill_score is 0.0 BOTH for a coin-flip trader and for one never scored. Only the
+    first is a measurement; printing '+0.00' for the second states a score nobody computed."""
+    rows = FMPSenateTraderWeight._basket_trader_table_rows(
+        FMPSenateTraderWeight._basket_trader_rows(
+            [_trade_row("New Member", skill=0.0, skill_trades=0, hit_rate=None)]))
+    assert rows[0]["skill"] == "neutral (no scored history)"
+
+
+def test_a_sale_reads_as_a_sell_and_a_sold_position_says_so():
+    rows = FMPSenateTraderWeight._basket_trader_table_rows(
+        FMPSenateTraderWeight._basket_trader_rows(
+            [_trade_row("Seller", side="sale (full)", still_held=False)]))
+    assert rows[0]["side"] == "SELL"
+    assert rows[0]["held"] == "sold"
+
+
+def _render_basket_page(state):
+    """Draw the real basket page into a bare client and return (root, texts, table rows)."""
+    from nicegui import Client, ui
+
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    ma = type("MA", (), {"state": {"senate_trade_basket": state}, "id": 1})()
+
+    client = Client(lambda: None, request=None)
+    with client:
+        with ui.column() as root:
+            e._render_basket_completed(ma)
+    texts = [el._text for el in root.descendants(include_self=True) if getattr(el, "_text", None)]
+    # An expansion's header is a PROP, not element text -- without this every per-symbol
+    # header is invisible to the assertions.
+    texts += [el._props["label"] for el in root.descendants()
+              if isinstance(el, ui.expansion) and el._props.get("label")]
+    tables = [el.rows for el in root.descendants() if isinstance(el, ui.table)]
+    return root, texts, tables
+
+
+def _basket_state_with(symbols=None, held_back=None, omitted=0, rec_ids=None):
+    return {
+        "total_symbols": 124, "skipped_hold_count": 120,
+        "symbols_analyzed": sorted((symbols or {}).keys()),
+        "expert_recommendation_ids": rec_ids or [],
+        "symbols": symbols, "held_back": held_back or [], "held_back_omitted": omitted,
+        "settings": {"max_disclose_date_days": 30, "max_trade_exec_days": 60,
+                     "max_trade_price_delta_pct": 10.0},
+    }
+
+
+def test_the_basket_page_shows_each_symbol_with_its_traders():
+    """THE REQUEST, on the page: per symbol, the traders, their scores, the money."""
+    gs = FMPSenateTraderWeight._basket_symbol_breakdown(
+        _basket_rec("GS", OrderRecommendation.BUY, 94.6,
+                    [_trade_row("Nancy Pelosi", skill=0.45, skill_trades=22, hit_rate=0.64),
+                     _trade_row("Dan Crenshaw", amount="$1,001 - $15,000")]),
+        recommendation_id=7)
+
+    _root, texts, tables = _render_basket_page(_basket_state_with({"GS": gs}))
+
+    blob = "\n".join(texts)
+    assert "GS" in blob and "BUY" in blob
+    trader_rows = [r for rows in tables for r in rows]
+    assert {r["trader"] for r in trader_rows} >= {"Nancy Pelosi", "Dan Crenshaw"}
+    assert any(r["skill"] == "+0.45 (22 scored, 64% hit)" for r in trader_rows)
+    assert any(r["amount"] == "$1,001 - $15,000" for r in trader_rows)
+
+
+def test_the_most_confident_symbol_is_listed_first():
+    """A cycle can recommend several symbols; the page reads top-down in conviction order."""
+    lo = FMPSenateTraderWeight._basket_symbol_breakdown(
+        _basket_rec("LOW", OrderRecommendation.BUY, 61.0, [_trade_row("A")]), 1)
+    hi = FMPSenateTraderWeight._basket_symbol_breakdown(
+        _basket_rec("HIGH", OrderRecommendation.BUY, 93.0, [_trade_row("B")]), 2)
+
+    _root, texts, _tables = _render_basket_page(_basket_state_with({"LOW": lo, "HIGH": hi}))
+
+    # The per-symbol HEADERS only ('SYMBOL — SIGNAL ...'). Matching any text starting with a
+    # ticker passed against the OLD page, whose comma-joined 'HIGH, LOW' happens to sort HIGH
+    # first alphabetically -- right answer, wrong reason.
+    headers = [t for t in texts if t.startswith(("LOW — ", "HIGH — "))]
+    assert len(headers) == 2, headers
+    assert headers[0].startswith("HIGH — "), headers
+
+
+def test_the_basket_page_lists_held_back_symbols_and_says_when_it_was_cut():
+    held = [{"symbol": "MSFT", "signal": "HOLD", "skipped": False, "trade_count": 3,
+             "unique_traders": 1, "total_buy_amount": 40000.0, "total_sell_amount": 0.0,
+             "reason": "Below minimum thresholds: 1 unique trader(s) (min 2)"}]
+
+    _root, texts, tables = _render_basket_page(_basket_state_with({}, held_back=held, omitted=17))
+
+    blob = "\n".join(texts)
+    assert any(r.get("symbol") == "MSFT" for rows in tables for r in rows)
+    assert "Below minimum thresholds" in blob or any(
+        "Below minimum thresholds" in str(r.get("reason")) for rows in tables for r in rows)
+    assert "17" in blob, "a cut list must say how many it left out"
+
+
+def test_an_older_analysis_without_a_breakdown_shows_the_recommendation_reports():
+    """Analyses written before 2026-09-15 have no 'symbols' key -- but each recommended
+    symbol's ExpertRecommendation already holds the full text report. Show that rather than
+    leave every past cycle as a bare list of tickers."""
+    from ba2_common.core.models import ExpertRecommendation
+    from ba2_common.core.types import RiskLevel, TimeHorizon
+    from ba2_common.core.db import add_instance
+
+    rid = add_instance(ExpertRecommendation(
+        instance_id=1, symbol="CHRW", recommended_action=OrderRecommendation.BUY,
+        expected_profit_percent=13.5, price_at_date=90.0, confidence=90.0,
+        details="FMP Senate/House Trading Analysis\nTrade #1:\n- Trader: Jane Legacy",
+        risk_level=RiskLevel.MEDIUM, time_horizon=TimeHorizon.MEDIUM_TERM,
+        market_analysis_id=1))
+
+    state = _basket_state_with(None, rec_ids=[rid])
+    state["symbols_analyzed"] = ["CHRW"]
+    _root, texts, _tables = _render_basket_page(state)
+
+    assert any("Jane Legacy" in t for t in texts), "the stored report must be shown"
