@@ -130,6 +130,20 @@ def wire_all_seams() -> None:
         except Exception as e:  # pragma: no cover - defensive; ATR sizing degrades gracefully
             logger.warning(f"ATR indicator-provider injection skipped: {e}")
 
+        # 7) Market-condition entry gates (opt-in): installed ONLY when
+        #    BA2_MARKET_CONDITION_PROFILE names a registered profile. Unset -> nothing is
+        #    installed and the gates report ``no_context``; an unknown name raises here.
+        from ba2_common.core.market_condition_live import PROFILE_ENV, resolver_from_env
+
+        market_condition_resolver = resolver_from_env()
+        if market_condition_resolver is not None:
+            TradeConditions.set_market_condition_context_resolver(market_condition_resolver)
+            logger.info(
+                f"Market-condition context resolver installed ({PROFILE_ENV}="
+                f"{market_condition_resolver.profile}, source "
+                f"{market_condition_resolver.source_profile})"
+            )
+
         _wired = True
         logger.info(
             "All ba2_common/providers/experts seams wired to live implementations"

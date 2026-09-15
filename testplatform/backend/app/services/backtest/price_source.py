@@ -1070,6 +1070,48 @@ class AsOfPriceSource:
                 "low": float(self._l[symbol][i]), "close": float(self._c[symbol][i]),
                 "volume": float(self._v[symbol][i])}
 
+    def window_before(self, symbol: str, session: Any, n: int
+                      ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """The LAST ``n`` stored bars dated on or before ``session``, straight from the columnar
+        store (no DataFrame, no per-bar dict): ``(dates, o, h, l, c, v)`` with ``dates`` as
+        ``datetime64[D]`` and the five float64 columns as read-only views. ``None`` when fewer
+        than ``n`` such bars exist (or the symbol has none).
+
+        It does NOT check the calendar: the last bar may predate ``session`` and a session may be
+        missing inside the span. ``market_condition_source.assemble_window`` judges that
+        (``missing_session``) -- this only slices. Daily-keyed stores only: an intraday store has
+        many bars per session, and a window of sessions is not a window of its bars.
+        """
+        if self._intraday:
+            raise ValueError(f"window_before needs a daily bar store, this one is {self._interval!r}")
+        if isinstance(n, bool) or not isinstance(n, (int, np.integer)) or n < 1:
+            raise ValueError(f"n must be a positive int, got {n!r}")
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        end = bisect.bisect_right(k, _key64(session, self._interval))
+        if end < n:
+            return None
+        lo = end - n
+        dates = _keys_np(k)[lo:end].astype("datetime64[ns]").astype("datetime64[D]")
+        cols = []
+        for store in (self._o, self._h, self._l, self._c, self._v):
+            view = store[symbol][lo:end].view()
+            view.flags.writeable = False
+            cols.append(view)
+        return (dates, *cols)
+
+    def count_through(self, symbol: str, session: Any) -> int:
+        """How many stored bars are dated on or before ``session`` (0 for an unknown symbol).
+        Lets a caller hand ``window_before`` a short series to classify (young listing vs hole)
+        when a full window is not available. Daily-keyed stores only."""
+        if self._intraday:
+            raise ValueError(f"count_through needs a daily bar store, this one is {self._interval!r}")
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return 0
+        return bisect.bisect_right(k, _key64(session, self._interval))
+
     def next_bar_date(self, symbol: str, after: datetime) -> Optional[Any]:
         """The key of the next trading bar strictly after ``after`` (date or datetime), or None.
 

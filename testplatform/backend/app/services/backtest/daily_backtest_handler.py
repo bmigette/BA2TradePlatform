@@ -752,6 +752,8 @@ def run_daily_backtest(
     )
     from app.services.backtest.results import build_results
     from app.services.backtest.seam_wiring import (
+        clear_backtest_market_conditions,
+        install_backtest_market_conditions,
         make_indicator_provider,
         set_backtest_ohlcv_override,
         wire_backtest_seams,
@@ -772,6 +774,9 @@ def run_daily_backtest(
         # universe. Forwarded explicitly here so the engine constructor receives it; absent/None
         # on every non-screener run -> the engine's entry gate is a no-op (behaviour unchanged).
         "screener_runtime": config.get("screener_runtime"),
+        # Market-condition entry gates (design 2026-09-15): absent on every existing config, which
+        # means "none" -- nothing is installed and no adapter is imported for the run.
+        "market_condition_profile": config.get("market_condition_profile") or "none",
     }
 
     # Free the PREVIOUS run's OHLCV memo if this run's working set (universe + window + interval)
@@ -873,6 +878,7 @@ def run_daily_backtest(
         # in-memory slice is as_of-correct without an extra wrapper.
         set_backtest_ohlcv_override(ohlcv)
         try:
+            install_backtest_market_conditions(config, ps)
             # Clamp the indicator/ATR OHLCV fetches to the backtest clock: PandasIndicatorCalc
             # and get_latest_atr fetch with end_date=now(), which would leak future bars into the
             # ATR/indicators used for sizing + rule conditions. The clamp follows ps.set_clock();
@@ -904,6 +910,7 @@ def run_daily_backtest(
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
+            clear_backtest_market_conditions()
 
 
 def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float]:

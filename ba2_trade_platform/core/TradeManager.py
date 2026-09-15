@@ -1941,6 +1941,19 @@ class TradeManager:
         return None
         
     def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
+        """Process enter_market recommendations inside ONE market-condition decision scope.
+
+        The scope reads the evaluation clock once, on this (coordinating) thread, and only when a
+        market-condition profile is wired (``BA2_MARKET_CONDITION_PROFILE``); otherwise it is a
+        no-op. Every market-condition leaf of this pass then resolves the same frozen context.
+        See ``_process_expert_recommendations_after_analysis`` for the processing itself.
+        """
+        from ba2_common.core.market_condition_live import market_condition_decision_scope
+
+        with market_condition_decision_scope():
+            return self._process_expert_recommendations_after_analysis(expert_instance_id, lookback_days)
+
+    def _process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations after all market analysis jobs for enter_market are completed.
         

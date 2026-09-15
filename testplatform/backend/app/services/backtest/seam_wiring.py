@@ -190,6 +190,64 @@ def set_backtest_ohlcv_override(provider: Optional[Any]) -> None:
     _ohlcv_override_tl.provider = provider
 
 
+# Market-condition entry gates (design 2026-09-15 section 4.1). OPT-IN per run: only a config
+# whose ``market_condition_profile`` is not ``"none"`` installs anything, and only then is the
+# adapter module imported. The TradeConditions seam is process-global while backtests run
+# CONCURRENTLY in worker threads (see the OHLCV override above), so the process gets ONE
+# dispatching resolver and each run's resolver lives in THIS thread's slot; a thread without a
+# run resolver resolves None (the gate reports ``no_context``).
+MARKET_CONDITION_PROFILE_NONE = "none"
+_market_condition_tl = threading.local()
+
+
+def _current_market_condition_resolver() -> Optional[Any]:
+    return getattr(_market_condition_tl, "resolver", None)
+
+
+def _dispatch_market_condition_context(account: Any, instrument_name: str,
+                                       expert_recommendation: Any) -> Optional[Any]:
+    resolver = _current_market_condition_resolver()
+    if resolver is None:
+        return None
+    return resolver(account, instrument_name, expert_recommendation)
+
+
+def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any) -> Optional[Any]:
+    """Install this thread's market-condition resolver for one run, or nothing.
+
+    ``config["market_condition_profile"]`` is required (``run_daily_backtest`` defaults it to
+    ``"none"``). ``"none"`` returns None without importing the adapter or touching the seam; a
+    registered profile builds the run's reader over ``price_source`` and returns the resolver;
+    anything else raises.
+    """
+    profile = config["market_condition_profile"]
+    if profile == MARKET_CONDITION_PROFILE_NONE:
+        _market_condition_tl.resolver = None
+        return None
+    from ba2_common.core import TradeConditions
+    from ba2_common.core.market_conditions import PROFILES
+
+    if profile not in PROFILES:
+        raise ValueError(f"market_condition_profile {profile!r} is not registered "
+                         f"(known: {sorted(PROFILES)!r} or {MARKET_CONDITION_PROFILE_NONE!r})")
+    from app.services.backtest.market_condition_bt import (
+        BacktestMarketConditionReader,
+        BacktestMarketConditionResolver,
+    )
+
+    resolver = BacktestMarketConditionResolver(BacktestMarketConditionReader(price_source, profile))
+    if TradeConditions.get_market_condition_context_resolver() is not _dispatch_market_condition_context:
+        TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
+    _market_condition_tl.resolver = resolver
+    return resolver
+
+
+def clear_backtest_market_conditions() -> None:
+    """Drop this thread's run resolver (idempotent). The dispatcher stays installed: another
+    thread's run may still be using it, and with no slot set it resolves None."""
+    _market_condition_tl.resolver = None
+
+
 def _wire_provider_resolver() -> None:
     """Route ``TradeConditions`` data fetches through ba2_providers.get_provider.
 
