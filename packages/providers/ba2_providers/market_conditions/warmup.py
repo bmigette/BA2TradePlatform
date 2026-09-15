@@ -75,6 +75,7 @@ from ba2_common.core.market_condition_source import (
     window_digest,
 )
 from ba2_common.core.market_condition_store import (
+    SCHEMA_VERSION,
     MarketConditionStore,
     ObjectEntry,
     RawEntry,
@@ -99,10 +100,10 @@ from ba2_common.core.split_basis import (
 )
 
 __all__ = [
-    "PLAN_VERSION",
+    "MC_PLAN_VERSION",
     "WarmupSource",
     "SymbolInventory",
-    "WarmPlan",
+    "MarketConditionWarmPlan",
     "BuildReport",
     "WarmupConfigError",
     "plan",
@@ -111,7 +112,7 @@ __all__ = [
     "local_build_dir",
 ]
 
-PLAN_VERSION = 1
+MC_PLAN_VERSION = 1
 
 RAW_PRESENT = "present"
 RAW_MISSING_FILE = "missing_file"
@@ -121,6 +122,8 @@ RAW_STALE_TAIL = "stale_tail"
 MAX_SEGMENTS_PER_MONTH = 8
 #: Re-reads of a cache file that keeps changing while being read before the symbol fails.
 SNAPSHOT_RETRIES = 3
+#: How long a local progress record (a resume hint for an interrupted build) is kept.
+PROGRESS_MAX_AGE_S = 24 * 3600.0
 #: Claim / host-slot lock staleness (heartbeated while held) and wait poll.
 CLAIM_STALE_S = float(os.getenv("BA2_MC_CLAIM_STALE_S", "900"))
 CLAIM_POLL_S = 0.2
@@ -211,7 +214,7 @@ class SymbolInventory:
 
 
 @dataclass
-class WarmPlan:
+class MarketConditionWarmPlan:
     profile: str
     calc_version: str
     source_profile: str
@@ -232,7 +235,7 @@ class WarmPlan:
     #: Provider requests / bytes the PLAN itself spent (the split calendar).
     provider_calls: int = 0
     provider_bytes: int = 0
-    plan_version: int = PLAN_VERSION
+    plan_version: int = MC_PLAN_VERSION
 
     # -- views
     def symbol(self, sym: str) -> SymbolInventory:
@@ -253,10 +256,6 @@ class WarmPlan:
         """Preflight errors nothing can waive: the source certification itself failed."""
         waivable = set(self.waivable_preflight_errors())
         return [e for e in self.preflight_errors if e not in waivable]
-
-    def row_sessions(self) -> List[date]:
-        """The feature-row (prior) sessions the plan requires, ascending."""
-        return regular_sessions_ending_at(date.fromisoformat(self.last_row_session), self.decision_sessions)
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -281,10 +280,10 @@ class WarmPlan:
         return json.dumps(self.to_dict(), indent=1, sort_keys=True)
 
     @classmethod
-    def from_dict(cls, d: Mapping[str, Any]) -> "WarmPlan":
+    def from_dict(cls, d: Mapping[str, Any]) -> "MarketConditionWarmPlan":
         d = dict(d)
-        if d.get("plan_version") != PLAN_VERSION:
-            raise WarmupConfigError(f"plan version {d.get('plan_version')!r} is not {PLAN_VERSION}")
+        if d.get("plan_version") != MC_PLAN_VERSION:
+            raise WarmupConfigError(f"plan version {d.get('plan_version')!r} is not {MC_PLAN_VERSION}")
         d["symbols"] = [SymbolInventory(**s) for s in d["symbols"]]
         return cls(**d)
 
@@ -295,7 +294,7 @@ class WarmPlan:
         os.replace(tmp, path)
 
     @classmethod
-    def load(cls, path: os.PathLike) -> "WarmPlan":
+    def load(cls, path: os.PathLike) -> "MarketConditionWarmPlan":
         with open(path, "r", encoding="utf-8") as f:
             return cls.from_dict(json.load(f))
 
@@ -319,6 +318,10 @@ class _Snapshot:
 
 class SourceChangedError(RuntimeError):
     """A cache file kept changing while it was read."""
+
+
+class ClaimLostError(RuntimeError):
+    """This builder's claim was broken as stale and taken over by another builder mid-build."""
 
 
 def _normalize_bars(dates: np.ndarray, cols: Sequence[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, List[date]]:
@@ -404,48 +407,104 @@ def _calendar_span(first_row: date, last_row: date, n_rows: int) -> np.ndarray:
 
 
 class _ManifestIndex:
-    """Per-build cache of the profile's (immutable) manifests' object entries by symbol."""
+    """The profile's published objects for THIS build's universe, read once.
 
-    def __init__(self, store: MarketConditionStore, profile: str):
+    TWO THINGS IT MUST GET RIGHT.
+
+    *Compatibility.* A window digest is over BARS, so it says nothing about the calculator that
+    turned them into values. Reusing a row across a ``calc_version`` bump would publish a manifest
+    declaring the new version over values computed by the old one -- the exact silent corruption
+    ``market_condition_readers._check_row`` refuses at read time. A manifest is therefore a reuse
+    candidate only when its ``calc_version``, ``schema_version`` AND field list match the profile
+    being built.
+
+    *Cost.* Each manifest JSON is parsed ONCE per build (a 3 MB manifest costs ~9 ms) and only the
+    entries of the plan's own symbols are kept, instead of re-reading every manifest for every
+    symbol and retaining an ``ObjectEntry`` for every object of every manifest ever published."""
+
+    def __init__(self, store: MarketConditionStore, profile: str, universe: Iterable[str]):
         self.store, self.profile = store, profile
-        self._by_digest: Dict[str, Dict[str, List[ObjectEntry]]] = {}
+        self.universe = {s.upper() for s in universe}
+        spec = PROFILES[profile]
+        self.calc_version = spec.calc_version
+        self.fields = [f.name for f in spec.fields]
+        self._by_symbol: Optional[Dict[str, Dict[str, ObjectEntry]]] = None
         self._lock = threading.Lock()
 
-    def entries(self, symbol: str) -> List[ObjectEntry]:
-        out: Dict[str, ObjectEntry] = {}
+    def compatible(self, manifest: Mapping[str, Any]) -> bool:
+        return (manifest.get("calc_version") == self.calc_version
+                and manifest.get("schema_version") == SCHEMA_VERSION
+                and list(manifest.get("fields", ())) == self.fields)
+
+    def _load(self) -> Dict[str, Dict[str, ObjectEntry]]:
+        by_symbol: Dict[str, Dict[str, ObjectEntry]] = {}
         for dg in self.store.list_manifests(self.profile):
-            with self._lock:
-                by_sym = self._by_digest.get(dg)
-            if by_sym is None:
-                try:
-                    m = self.store.read_manifest(dg, self.profile)
-                except Exception:
-                    continue  # an unreadable/tampered manifest offers nothing to reuse
-                by_sym = {}
-                for o in m["objects"]:
-                    by_sym.setdefault(o["symbol"], []).append(ObjectEntry.from_dict(o))
-                with self._lock:
-                    self._by_digest[dg] = by_sym
-            for e in by_sym.get(symbol, []):
-                out[e.sha256] = e
-        return list(out.values())
+            try:
+                m = self.store.read_manifest(dg, self.profile)
+            except Exception:
+                continue  # an unreadable/tampered manifest offers nothing to reuse
+            if not self.compatible(m):
+                continue
+            for o in m["objects"]:
+                if o["symbol"] in self.universe:
+                    by_symbol.setdefault(o["symbol"], {})[o["sha256"]] = ObjectEntry.from_dict(o)
+        return by_symbol
+
+    def entries(self, symbol: str) -> List[ObjectEntry]:
+        with self._lock:
+            if self._by_symbol is None:
+                self._by_symbol = self._load()
+            return list(self._by_symbol.get(symbol, {}).values())
 
 
 def _progress_dir(cache_root: str, profile: str, symbol: str) -> Path:
     return local_build_dir(cache_root) / "progress" / profile / symbol.upper()
 
 
-def _progress_entries(cache_root: str, profile: str, symbol: str) -> List[ObjectEntry]:
+def _write_progress(cache_root: str, profile: str, entry: ObjectEntry, calc_version: str) -> None:
+    """Record a published object so a resume (or a builder that waited on our claim) finds it
+    before any manifest names it. Stamped with the versions it was built at."""
+    d = _progress_dir(cache_root, profile, entry.symbol)
+    d.mkdir(parents=True, exist_ok=True)
+    payload = dict(entry.to_dict(), calc_version=calc_version, schema_version=SCHEMA_VERSION)
+    tmp = d / f"{entry.sha256}.json.{os.getpid()}.{threading.get_ident()}.part"
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, d / f"{entry.sha256}.json")
+
+
+def _progress_entries(cache_root: str, profile: str, symbol: str, calc_version: str,
+                      keep: Optional[set] = None) -> List[ObjectEntry]:
+    """Progress records for ``symbol`` built at ``calc_version``/``SCHEMA_VERSION``.
+
+    A record from another calculator version, one older than ``PROGRESS_MAX_AGE_S`` (a build that
+    died and was never resumed) or one this build has superseded (``keep`` names the objects that
+    are still current) is DELETED here: a record is a local resume hint, never evidence, and an
+    unbounded pile of them would slow every later build's candidate scan."""
     d = _progress_dir(cache_root, profile, symbol)
     out = []
     if not d.exists():
         return out
+    now = time.time()
     for p in d.glob("*.json"):
+        drop = False
         try:
             with open(p, "r", encoding="utf-8") as f:
-                out.append(ObjectEntry.from_dict(json.load(f)))
+                payload = json.load(f)
+            entry = ObjectEntry.from_dict(payload)
+            drop = (payload.get("calc_version") != calc_version
+                    or payload.get("schema_version") != SCHEMA_VERSION
+                    or now - p.stat().st_mtime > PROGRESS_MAX_AGE_S
+                    or (keep is not None and entry.sha256 not in keep))
         except (OSError, ValueError, KeyError):
+            drop = True
+            entry = None
+        if drop:
+            try:
+                p.unlink()
+            except OSError:
+                pass
             continue
+        out.append(entry)
     return out
 
 
@@ -462,7 +521,7 @@ def _load_candidates(store: MarketConditionStore, index: _ManifestIndex, cache_r
     entries: Dict[str, ObjectEntry] = {}
     # Progress records FIRST, manifests second: a concurrent builder publishes its manifest BEFORE
     # deleting its progress records, so this order can never miss an object that exists.
-    progress = _progress_entries(cache_root, profile, symbol)
+    progress = _progress_entries(cache_root, profile, symbol, index.calc_version)
     for e in progress + index.entries(symbol):
         if e.symbol == symbol:
             entries.setdefault(e.sha256, e)
@@ -535,7 +594,7 @@ def _inventory_symbol(inv: SymbolInventory, snap: Optional[_Snapshot], cal: np.n
 
 def plan(profile: str, universe: Sequence[str], start: date, end: date,
          source_profile: str = SOURCE_PROFILE_FMP_DAILY, cache_root: Optional[os.PathLike] = None, *,
-         source: Optional[WarmupSource] = None, log: Callable[[str], None] = _log_noop) -> WarmPlan:
+         source: Optional[WarmupSource] = None, log: Callable[[str], None] = _log_noop) -> MarketConditionWarmPlan:
     """Inventory + preflight for warming ``profile`` over ``universe`` and decisions in ``[start, end]``.
 
     ``source`` supplies the split calendar (default: the FMP source for ``cache_root``)."""
@@ -574,7 +633,7 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
         preflight.append(f"source certification failed for {source_profile}: {bad}")
 
     store = MarketConditionStore(cache_root)
-    index = _ManifestIndex(store, profile)
+    index = _ManifestIndex(store, profile, symbols)
     fields = [f.name for f in PROFILES[profile].fields]
     inventories = []
     for sym in symbols:
@@ -595,7 +654,7 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
         log(f"plan {sym}: raw={inv.raw_state} rows={inv.rows_required} reusable={inv.rows_reusable} "
             f"refetch_required={inv.refetch_required}"
             + (f" split_calendar_error={inv.split_calendar_error}" if inv.split_calendar_error else ""))
-    return WarmPlan(
+    return MarketConditionWarmPlan(
         profile=profile, calc_version=PROFILES[profile].calc_version, source_profile=source_profile,
         timing_policy=TIMING_POLICY_PRIOR_SESSION_V1, cache_root=cache_root, universe=symbols,
         start=start.isoformat(), end=end.isoformat(), decision_sessions=n_rows,
@@ -619,12 +678,18 @@ class _FileClaim:
         self.token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        #: Set when the heartbeat finds the lock is no longer ours (a waiter broke it as stale and
+        #: took over). Whatever we were doing must not count as done.
+        self.lost = False
 
     def _stale(self) -> bool:
+        """True when the lock is older than ``CLAIM_STALE_S`` OR has vanished -- the same rule as
+        ``shared_arrays.DerivedArrayStore._lock_is_stale``. A vanished lock read as "held" would
+        park every waiter on a lock nobody owns."""
         try:
             return time.time() - self.path.stat().st_mtime > CLAIM_STALE_S
         except OSError:
-            return False
+            return True
 
     def try_acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -664,8 +729,18 @@ class _FileClaim:
 
         def beat():
             while not self._stop.wait(interval):
+                # Refresh ONLY while the lock is still ours. A builder that overran
+                # CLAIM_STALE_S has had its lock broken and re-taken; touching that file would
+                # keep the NEW owner's lock alive (and, if the new owner dies, keep a dead lock
+                # fresh forever) while we went on believing we held it.
                 try:
+                    if self.path.read_text(encoding="utf-8") != self.token:
+                        self.lost = True
+                        return
                     os.utime(self.path, None)
+                except FileNotFoundError:
+                    self.lost = True
+                    return
                 except OSError:
                     pass
 
@@ -753,7 +828,7 @@ class _Counters:
             self.values[key] += int(n)
 
 
-def _fetch_phase(plan_: WarmPlan, source: WarmupSource, concurrency: int, counters: _Counters,
+def _fetch_phase(plan_: MarketConditionWarmPlan, source: WarmupSource, concurrency: int, counters: _Counters,
                  log: Callable[[str], None]) -> Dict[str, str]:
     """Fetch missing coverage / full re-fetches. Returns {symbol: error} for failed fetches."""
     jobs: Dict[str, Tuple[str, Optional[str], Optional[str]]] = {}
@@ -764,8 +839,6 @@ def _fetch_phase(plan_: WarmPlan, source: WarmupSource, concurrency: int, counte
             jobs[inv.symbol] = ("range", plan_.earliest_raw_bar if inv.raw_state == RAW_MISSING_FILE
                                 else inv.missing_from, inv.missing_to)
     errors: Dict[str, str] = {}
-    inflight: Dict[str, Any] = {}
-    lock = threading.Lock()
 
     def run(sym: str) -> None:
         kind, frm, to = jobs[sym]
@@ -783,13 +856,10 @@ def _fetch_phase(plan_: WarmPlan, source: WarmupSource, concurrency: int, counte
 
     if not jobs:
         return errors
+    # ``jobs`` is keyed by symbol, so a symbol is submitted exactly once: one in-flight request
+    # per symbol, at most ``concurrency`` at a time.
     with ThreadPoolExecutor(max_workers=max(1, int(concurrency))) as ex:
-        for sym in sorted(jobs):
-            with lock:
-                if sym in inflight:      # one in-flight request per symbol
-                    continue
-                inflight[sym] = ex.submit(run, sym)
-        for fut in inflight.values():
+        for fut in [ex.submit(run, sym) for sym in sorted(jobs)]:
             fut.result()
     return errors
 
@@ -880,9 +950,10 @@ def _coverage_from(statuses: List[Tuple[date, List[str]]], fields: Sequence[str]
             "rows": len(statuses), "exceptions": exceptions}
 
 
-def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: WarmPlan, inv: SymbolInventory,
-                  cal: np.ndarray, counters: _Counters, extra_exceptions: List[Dict[str, Any]],
-                  log: Callable[[str], None]) -> _SymbolResult:
+def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: MarketConditionWarmPlan,
+                  inv: SymbolInventory, cal: np.ndarray, counters: _Counters,
+                  extra_exceptions: List[Dict[str, Any]], log: Callable[[str], None],
+                  claim: Optional["_FileClaim"] = None) -> _SymbolResult:
     profile = PROFILES[plan_.profile]
     fields = [f.name for f in profile.fields]
     compute = COMPUTE_BY_PROFILE[plan_.profile]
@@ -921,7 +992,15 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: War
 
     objects: List[ObjectEntry] = []
     statuses: List[Tuple[date, List[str]]] = []
-    progress = _progress_dir(plan_.cache_root, profile.name, sym)
+    used_raw: Dict[str, RawEntry] = {}
+
+    def _note_raw(refs: Iterable[str]) -> None:
+        for ref in refs:
+            for sha in filter(None, ref.split(";")):
+                if sha not in raw_by_sha:
+                    raw_by_sha[sha] = RawEntry(store.raw_rel(sha), sha,
+                                               _parquet_rows(store.abspath(store.raw_rel(sha))))
+                used_raw[sha] = raw_by_sha[sha]
     for month in sorted(by_month):
         ws = by_month[month]
         wanted = {w.session for w in ws}
@@ -945,10 +1024,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: War
             st_cols = [t.column(f"{f}_status").to_pylist() for f in fields]
             for i, s in enumerate(c.sessions):
                 statuses.append((s, [STATUSES[col[i]] for col in st_cols]))
-            for ref in set(t.column("raw_shard_ref").to_pylist()):
-                for sha in filter(None, ref.split(";")):
-                    if sha not in raw_by_sha:
-                        raw_by_sha[sha] = RawEntry(store.raw_rel(sha), sha, _parquet_rows(store.abspath(store.raw_rel(sha))))
+            _note_raw(set(t.column("raw_shard_ref").to_pylist()))
         if not remaining:
             continue
         records = []
@@ -968,27 +1044,26 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: War
                 counters.add("rows_computed")
             records.append(rec)
             statuses.append((w.session, list(rec["status"])))
+        if claim is not None and claim.lost:
+            raise ClaimLostError(f"{sym}: the build claim was taken over mid-build; not publishing "
+                                 "this symbol's progress")
         entry, reused = store.write_feature_object(profile, sym, records)
         counters.add("objects_reused" if reused else "objects_written")
         objects.append(entry)
+        _note_raw({rec["raw_shard_ref"] for rec in records})
         # Progress at the shard boundary: a later build (a resume, or a builder that waited on our
         # claim) finds this object before any manifest names it -- after re-hashing it.
-        progress.mkdir(parents=True, exist_ok=True)
-        tmp = progress / f"{entry.sha256}.json.{os.getpid()}.{threading.get_ident()}.part"
-        tmp.write_text(json.dumps(entry.to_dict()), encoding="utf-8")
-        os.replace(tmp, progress / f"{entry.sha256}.json")
+        _write_progress(plan_.cache_root, profile.name, entry, index.calc_version)
 
     counters.add("rows_total", len(windows))
     counters.add("symbols_built")
-    used_raw: Dict[str, RawEntry] = {}
-    for e in objects:
-        for ref in set(store.read_table(e.path, columns=["raw_shard_ref"]).column("raw_shard_ref").to_pylist()):
-            for sha in filter(None, ref.split(";")):
-                used_raw[sha] = raw_by_sha[sha]
+    # Records for objects this build superseded are no longer resume hints: drop them.
+    _progress_entries(plan_.cache_root, profile.name, sym, index.calc_version,
+                      keep={e.sha256 for e in objects})
     return _SymbolResult(sym, objects, used_raw, _coverage_from(statuses, fields, extra))
 
 
-def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
+def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: int = 4,
           log: Callable[[str], None] = _log_noop, source: Optional[WarmupSource] = None,
           allow_exclusions: bool = False) -> BuildReport:
     """Fetch (optionally), build and publish the manifest for ``plan_``. See the module docstring.
@@ -1059,7 +1134,7 @@ def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
     # -- build
     t_build = time.monotonic()
     store = MarketConditionStore(plan_.cache_root)
-    index = _ManifestIndex(store, plan_.profile)
+    index = _ManifestIndex(store, plan_.profile, plan_.universe)
     results: Dict[str, _SymbolResult] = {}
     errors: List[str] = []
     waited: List[str] = []
@@ -1078,7 +1153,13 @@ def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
         was_waiting = claim.acquire(on_wait=lambda: log(f"build {sym}: waiting for another builder"))
         try:
             with _HostSlot(plan_.cache_root):
-                res = _build_symbol(store, index, plan_, inv, cal, counters, extra, log)
+                res = _build_symbol(store, index, plan_, inv, cal, counters, extra, log, claim=claim)
+            if claim.lost:
+                # Another builder broke our claim as stale and owns this symbol now; whatever we
+                # produced is not ours to publish. Re-take the claim and rebuild from what the new
+                # owner published (which is what waiting for it would have done).
+                log(f"build {sym}: claim lost mid-build; rebuilding behind the new owner")
+                raise ClaimLostError(sym)
             res.waited = was_waiting
             results[sym] = res
             if was_waiting:
@@ -1089,7 +1170,13 @@ def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
 
     def guarded(inv: SymbolInventory) -> None:
         try:
-            one(inv)
+            try:
+                one(inv)
+            except ClaimLostError:
+                # One retry: the takeover means somebody else built this symbol, so the retry is
+                # a reuse pass, and it counts as having waited.
+                waited.append(inv.symbol)
+                one(inv)
         except Exception as e:  # noqa: BLE001 -- the symbol fails the build, loudly
             errors.append(f"{inv.symbol}: {type(e).__name__}: {e}")
             log(f"build {inv.symbol}: FAILED {type(e).__name__}: {e}")
@@ -1103,7 +1190,7 @@ def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
     if source is not None:
         report.counters["provider_calls"] = int(source.calls - calls0)
         report.counters["provider_bytes"] = int(source.bytes - bytes0)
-    report.waited_symbols = sorted(waited)
+    report.waited_symbols = sorted(set(waited))
     report.exceptions = {s: r.coverage["exceptions"] for s, r in sorted(results.items()) if r.coverage["exceptions"]}
     # A symbol that produced NO rows is an exclusion: publishing a manifest that silently leaves it
     # out is exactly the "generic success for partial work" design section 4.4 forbids.
@@ -1133,7 +1220,8 @@ def build(plan_: WarmPlan, *, fetch_missing: bool, concurrency: int = 4,
     manifest = store.make_manifest(
         PROFILES[plan_.profile], source_profile=plan_.source_profile, timing_policy=plan_.timing_policy,
         objects=objects, raw_objects=raw.values(), coverage={s: r.coverage for s, r in results.items()},
-        universe=plan_.universe, window_start=date.fromisoformat(plan_.start), window_end=date.fromisoformat(plan_.end))
+        universe=plan_.universe, sessions=[c.astype(object) for c in cal[WINDOW - 1:]],
+        window_start=date.fromisoformat(plan_.start), window_end=date.fromisoformat(plan_.end))
     digest = store.write_manifest(manifest)
     for r in results.values():
         d = _progress_dir(plan_.cache_root, plan_.profile, r.symbol)

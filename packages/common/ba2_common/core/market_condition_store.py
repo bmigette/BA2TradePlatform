@@ -86,6 +86,7 @@ __all__ = [
     "manifest_identity",
     "canonical_manifest_json",
     "universe_digest",
+    "sessions_digest",
     "calendar_version",
     "unavailable_window_digest",
     "month_of",
@@ -104,7 +105,7 @@ _COMPRESSION = "zstd"
 MANIFEST_KEYS = (
     "profile", "source_profile", "timing_policy", "calc_version", "calendar_version",
     "schema_version", "fields", "objects", "raw_objects", "coverage", "universe_digest",
-    "window_start", "window_end", "created_at",
+    "sessions_digest", "window_start", "window_end", "created_at",
 )
 
 _STATUS_CODE = {s: i for i, s in enumerate(STATUSES)}
@@ -167,10 +168,24 @@ def universe_digest(symbols: Iterable[str]) -> str:
     return "sha256:" + hashlib.sha256("\n".join(uniq).encode("utf-8")).hexdigest()
 
 
+def sessions_digest(sessions: Iterable[date]) -> str:
+    """Identity of the exact set of feature-row sessions a manifest was built for. Provenance:
+    two manifests over the same universe and window but a different calendar answer (a holiday
+    rule change) differ here, and it is part of the manifest identity."""
+    iso = sorted({s.isoformat() for s in sessions})
+    return "sha256:" + hashlib.sha256("\n".join(iso).encode("utf-8")).hexdigest()
+
+
 def unavailable_window_digest(days: np.ndarray, o: Any, h: Any, l: Any, c: Any, v: Any) -> str:
     """Identity of the bars present in an UNASSEMBLABLE window's span: dates and values, so a
     bar appearing, disappearing or changing gives a different identity. A separate domain from
-    ``window_digest`` (a prefix), so it can never collide with a valid window's key."""
+    ``window_digest`` (a prefix), so it can never collide with a valid window's key.
+
+    NOTE: over an EMPTY span (no bars at all) this is the same constant for every symbol and
+    session -- an empty span has no content to tell them apart. That is safe because a row is
+    only ever reused for the (symbol, session) it is stored under, and any bar arriving changes
+    the digest; but it means the digest alone is not a row identity, and ``retained_window`` is
+    meaningful only for VALID rows (a window that was never assembled has nothing to retain)."""
     d = np.asarray(days).astype("datetime64[D]").astype("<i8")
     payload = b"mc-unavailable-window/v1\x00" + d.tobytes() + normalized_window_bytes(o, h, l, c, v)
     return window_digest_of_bytes(payload)
@@ -326,19 +341,28 @@ class MarketConditionStore:
                 pass
         final.parent.mkdir(parents=True, exist_ok=True)
         tmp = final.with_name(f"{final.name}.{os.getpid()}.{threading.get_ident()}.part")
+        reused = False
         try:
             with open(tmp, "wb") as f:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, final)
+            try:
+                os.replace(tmp, final)
+            except OSError:
+                # Windows refuses to replace a file another process has open, and a concurrent
+                # publisher may have put the SAME bytes there between our check and this call.
+                # The name is the content, so an existing file that hashes right IS our object.
+                if not (final.exists() and sha256_file(final) == sha):
+                    raise
+                reused = True
         finally:
             if tmp.exists():
                 try:
                     tmp.unlink()
                 except OSError:
                     pass
-        return False
+        return reused
 
     @staticmethod
     def _serialize(table) -> bytes:
@@ -424,8 +448,9 @@ class MarketConditionStore:
     # -- manifests
     def make_manifest(self, profile: ProfileSpec, *, source_profile: str, timing_policy: str,
                       objects: Iterable[ObjectEntry], raw_objects: Iterable[RawEntry],
-                      coverage: Mapping[str, Any], universe: Iterable[str], window_start: date,
-                      window_end: date, created_at: Optional[str] = None) -> Dict[str, Any]:
+                      coverage: Mapping[str, Any], universe: Iterable[str], sessions: Iterable[date],
+                      window_start: date, window_end: date,
+                      created_at: Optional[str] = None) -> Dict[str, Any]:
         return {
             "profile": profile.name,
             "source_profile": source_profile,
@@ -438,6 +463,7 @@ class MarketConditionStore:
             "raw_objects": [r.to_dict() for r in raw_objects],
             "coverage": {k: coverage[k] for k in sorted(coverage)},
             "universe_digest": universe_digest(universe),
+            "sessions_digest": sessions_digest(sessions),
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
             "created_at": created_at or datetime.now(timezone.utc).isoformat(),
@@ -472,7 +498,10 @@ class MarketConditionStore:
             if sha256_file(p) != r["sha256"] or r["path"] != self.raw_rel(r["sha256"]):
                 raise ManifestError(f"raw object {r['path']} does not hash to its name")
             raw_shas.add(r["sha256"])
-        seen: Dict[Tuple[str, Any], Tuple[str, Tuple]] = {}
+        # (symbol, session) -> (object path, 16-byte row fingerprint). A fingerprint, not the
+        # row's values: the tuple-of-strings this used to keep measured ~470 MB at 100 symbols x
+        # 1500 sessions (~1.9 GB at 400), for a check that only needs equality.
+        seen: Dict[Tuple[str, Any], Tuple[str, bytes]] = {}
         for o in m["objects"]:
             if o["path"] != self.object_rel(profile, o["sha256"]):
                 raise ManifestError(f"object path {o['path']} is not {profile}/objects/<sha256>.parquet")
@@ -500,7 +529,7 @@ class MarketConditionStore:
             records = t.select(payload_cols).to_pylist()
             for s, rec in zip(sessions, records):
                 key = (o["symbol"], s)
-                sig = tuple(sorted((k, repr(v)) for k, v in rec.items()))
+                sig = hashlib.blake2b(repr(sorted(rec.items())).encode("utf-8"), digest_size=16).digest()
                 if key in seen:
                     other_path, other_sig = seen[key]
                     kind = "identical" if other_sig == sig else "conflicting"
@@ -518,10 +547,20 @@ class MarketConditionStore:
             f.flush()
             os.fsync(f.fileno())
         try:
-            os.replace(tmp, final)
+            try:
+                os.replace(tmp, final)
+            except OSError:
+                # Same race as an object: another publisher wrote this identity first, or a
+                # reader holds it open on Windows. The name is the content.
+                if not (final.exists() and manifest_identity(json.loads(final.read_text(encoding="utf-8")))
+                        == digest):
+                    raise
         finally:
-            if tmp.exists():
-                tmp.unlink()
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
         return digest
 
     def _find_manifest(self, digest: str, profile: Optional[str]) -> Path:
@@ -571,8 +610,13 @@ class MarketConditionStore:
         report = VerifyReport(manifest_digest=digest or ident, identity_ok=(digest is None or digest == ident))
         if not report.identity_ok:
             report.errors.append(f"manifest content hashes to {ident}, not {digest}")
-        entries = [(o["path"], o["sha256"]) for o in manifest.get("objects", [])]
-        raws = [(r["path"], r["sha256"]) for r in manifest.get("raw_objects", [])]
+        try:
+            entries = [(o["path"], o["sha256"]) for o in manifest["objects"]]
+            raws = [(r["path"], r["sha256"]) for r in manifest["raw_objects"]]
+        except (KeyError, TypeError) as e:
+            # A manifest without its object lists is not "nothing to check": it is malformed.
+            report.errors.append(f"manifest is missing its object lists: {e}")
+            return report
         for kind, items in (("objects", entries), ("raw", raws)):
             for rel, sha in items:
                 p = self.abspath(rel)
@@ -626,34 +670,52 @@ class MarketConditionStore:
     def _index_manifest(self, manifest: Mapping[str, Any]) -> None:
         for o in manifest["objects"]:
             t = self.read_table(o["path"], columns=["window_digest", "raw_shard_ref", "raw_row_lo", "raw_row_hi"])
-            for dg, ref, lo, hi in zip(t.column("window_digest").to_pylist(), t.column("raw_shard_ref").to_pylist(),
-                                       t.column("raw_row_lo").to_pylist(), t.column("raw_row_hi").to_pylist()):
-                self._window_index.setdefault(dg, (ref, int(lo), int(hi)))
+            rows = list(zip(t.column("window_digest").to_pylist(), t.column("raw_shard_ref").to_pylist(),
+                            t.column("raw_row_lo").to_pylist(), t.column("raw_row_hi").to_pylist()))
+            with self._index_lock:
+                for dg, ref, lo, hi in rows:
+                    self._window_index.setdefault(dg, (ref, int(lo), int(hi)))
 
     def retained_window(self, window_digest: str, manifest: Optional[Mapping[str, Any]] = None
                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """The exact ``(o, h, l, c, v)`` window whose digest is ``window_digest``, rebuilt from the
         retained raw shards (no provider access). Searches ``manifest`` when given, else every
         manifest of every profile. KeyError when no row carries the digest; ManifestError when
-        the retained bytes do not hash back to it."""
+        the retained bytes do not hash back to it.
+
+        Only VALID rows have a retained window: a row whose window could not be assembled carries
+        an ``unavailable_window_digest`` over a partial (possibly empty) span, which is evidence
+        of absence, not a 128-bar window, and is not served here."""
         with self._index_lock:
             hit = self._window_index.get(window_digest)
-            if hit is None:
-                if manifest is not None:
+        if hit is None:
+            # Object I/O happens OUTSIDE the lock: indexing a large manifest would otherwise block
+            # every other reader of this store for the whole scan.
+            manifests = []
+            if manifest is not None:
+                key = ("explicit", manifest.get("universe_digest"), manifest.get("created_at"),
+                       len(manifest.get("objects", ())))
+                with self._index_lock:
+                    already = key in self._indexed_manifests
+                    self._indexed_manifests.add(key)
+                if not already:
                     manifests = [manifest]
-                else:
-                    manifests = []
-                    profiles = [p.name for p in self.root.iterdir() if p.is_dir() and p.name != RAW_DIRNAME] \
-                        if self.root.exists() else []
-                    for prof in sorted(profiles):
-                        for dg in self.list_manifests(prof):
-                            if (prof, dg) not in self._indexed_manifests:
-                                self._indexed_manifests.add((prof, dg))
-                                manifests.append(self.read_manifest(dg, prof))
-                for m in manifests:
-                    self._index_manifest(m)
+            else:
+                profiles = [p.name for p in self.root.iterdir() if p.is_dir() and p.name != RAW_DIRNAME] \
+                    if self.root.exists() else []
+                for prof in sorted(profiles):
+                    for dg in self.list_manifests(prof):
+                        with self._index_lock:
+                            already = (prof, dg) in self._indexed_manifests
+                            self._indexed_manifests.add((prof, dg))
+                        if not already:
+                            manifests.append(self.read_manifest(dg, prof))
+            for m in manifests:
+                self._index_manifest(m)
+                with self._index_lock:
                     if window_digest in self._window_index:
                         break
+            with self._index_lock:
                 hit = self._window_index.get(window_digest)
         if hit is None:
             raise KeyError(f"no retained window with digest {window_digest}")

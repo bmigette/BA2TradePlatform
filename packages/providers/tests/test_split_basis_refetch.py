@@ -7,7 +7,7 @@ Run from ``packages/providers``:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -103,8 +103,13 @@ def test_pre_split_file_is_fully_refetched_once(tmp_path, monkeypatch):
     assert np.allclose(merged["Close_c"], merged["Close_t"])
     assert len(df) == len(truth)
     marker = read_full_fetch_marker(path)
-    assert marker and marker["fetched_on_utc"] == datetime.utcnow().date().isoformat()
+    assert marker and marker["fetched_on_utc"] == marker["fetched_at_utc"][:10]
+    assert marker["fetched_at_utc"].endswith("+00:00")
+    written_at = datetime.fromisoformat(marker["fetched_at_utc"])
+    assert 0 <= (datetime.now(timezone.utc) - written_at).total_seconds() < 300
     assert marker["rows"] == len(truth)
+    assert marker["first_bar"] == truth["Date"].iloc[0].date().isoformat()
+    assert marker["last_bar"] == truth["Date"].iloc[-1].date().isoformat()
 
     # Second refresh: the marker proves the basis, so no SECOND full re-fetch happens (an
     # ordinary tail top-up still may, and returns nothing new).
@@ -122,10 +127,13 @@ def test_consistent_file_is_not_refetched(tmp_path):
     path = _write_cache(symbol, truth)
     provider = _Provider(truth, [CalendarSplit(SPLIT_DAY, 2.0)])
     df = pd.read_parquet(path)
+    before = pd.read_parquet(path)
     provider._refresh_parquet_if_stale(df.copy(), symbol, "1d", "FMPOHLCVProvider")
-    assert provider.impl_calls == [] or all(c[3] == "1d" for c in provider.impl_calls)
-    assert not [c for c in provider.impl_calls if (datetime.now().date() - c[1]).days > 365 * 14]
+    assert all(c[3] == "1d" and (datetime.now().date() - c[1]).days < 30 for c in provider.impl_calls), \
+        provider.impl_calls
     assert read_full_fetch_marker(path) is None
+    after = pd.read_parquet(path)
+    assert len(after) == len(before) and np.allclose(after["Close"], before["Close"])
 
 
 def test_split_calendar_failure_does_not_break_the_refresh(tmp_path):
@@ -148,3 +156,35 @@ def test_marker_path_is_out_of_the_parquet_glob(tmp_path):
     p = str(tmp_path / "FMPOHLCVProvider" / "AAPL_1d.parquet")
     marker = full_fetch_marker_path(p)
     assert marker.endswith("_split_basis" + "\\" + "AAPL_1d.json") or marker.endswith("_split_basis/AAPL_1d.json")
+
+
+def test_fmp_split_calendar_parses_the_real_payload(monkeypatch):
+    """``FMPOHLCVProvider._split_calendar`` over FMP's ``historical-price-full/stock_split``
+    payload: dates and numerator/denominator ratios, an unknown ratio dropped, and no call at all
+    for an interval this provider does not serve daily bars for."""
+    from ba2_providers import symbol_info
+    from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
+
+    payload = {"symbol": "XYZ", "historical": [
+        {"date": "2024-06-10", "label": "June 10, 24", "numerator": 10.0, "denominator": 1.0},
+        {"date": "2020-08-31", "numerator": 4, "denominator": 1},
+        {"date": "2022-07-18", "numerator": 1, "denominator": 20},      # reverse split
+        {"date": "2021-01-04", "numerator": None, "denominator": 1},    # unknown: dropped
+    ]}
+    seen = []
+
+    def fake_fetch_splits(api_key, symbol):
+        seen.append((api_key, symbol))
+        return payload
+
+    monkeypatch.setattr(symbol_info, "fetch_splits", fake_fetch_splits)
+    provider = FMPOHLCVProvider(api_key="test-key")
+
+    splits = provider._split_calendar("XYZ", "1d")
+    assert seen == [("test-key", "XYZ")]
+    assert [(c.date, c.ratio) for c in splits] == [
+        (date(2020, 8, 31), 4.0), (date(2022, 7, 18), 0.05), (date(2024, 6, 10), 10.0)]
+
+    assert provider._split_calendar("XYZ", "5min") is None
+    assert provider._split_calendar("XYZ", "1wk") is None    # not in TIMEFRAME_MAP at all
+    assert len(seen) == 1                                    # neither asked FMP

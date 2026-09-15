@@ -76,10 +76,11 @@ def _valid_setup(store, session=date(2024, 3, 28), seed=3):
     return rec, raws, (o, h, l, c, v)
 
 
-def _manifest(store, objects, raws, symbols=("AAA",)):
+def _manifest(store, objects, raws, symbols=("AAA",), sessions=(date(2024, 3, 27), date(2024, 3, 28))):
     return store.make_manifest(PROFILE, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
                                objects=objects, raw_objects=raws, coverage={s: {"rows": 1} for s in symbols},
-                               universe=symbols, window_start=date(2024, 3, 1), window_end=date(2024, 3, 29))
+                               universe=symbols, sessions=sessions, window_start=date(2024, 3, 1),
+                               window_end=date(2024, 3, 29))
 
 
 def test_schema_is_declared_even_when_every_value_is_invalid(store):
@@ -224,3 +225,85 @@ def test_manifest_refuses_missing_raw_reference(store):
     obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
     with pytest.raises(ManifestError, match="raw shards not in raw_objects"):
         store.write_manifest(_manifest(store, [obj], raws[1:]))
+
+
+def test_a_lost_replace_race_over_the_same_content_is_not_an_error(store, monkeypatch):
+    """Windows refuses ``os.replace`` over a file another process holds open, and a concurrent
+    publisher may have written the SAME bytes there a moment earlier. The name IS the content, so
+    finding the right bytes in place is success, not failure -- but only then."""
+    import os as _os
+
+    rows = [_invalid_row(date(2024, 3, 4))]
+    entry, _ = store.write_feature_object(PROFILE, "AAA", rows)
+    final = store.abspath(entry.path)
+    good = final.read_bytes()
+
+    calls = {"n": 0}
+    real_hash = MarketConditionStore._publish_bytes.__globals__["sha256_file"]
+
+    def blind_first(path, *a, **kw):
+        calls["n"] += 1
+        return "0" * 64 if calls["n"] == 1 else real_hash(path, *a, **kw)
+
+    def refusing_replace(src, dst):
+        raise PermissionError(13, "the file is in use by another process")
+
+    monkeypatch.setitem(MarketConditionStore._publish_bytes.__globals__, "sha256_file", blind_first)
+    monkeypatch.setattr(_os, "replace", refusing_replace)
+    again, reused = store.write_feature_object(PROFILE, "AAA", rows)
+    assert again == entry and reused                      # the object in place is ours
+    assert final.read_bytes() == good and not list(final.parent.glob("*.part"))
+
+    # A refused replace over the WRONG bytes is a real failure and must surface.
+    final.write_bytes(good + b"tail")
+    calls["n"] = 0
+    with pytest.raises(PermissionError):
+        store.write_feature_object(PROFILE, "AAA", rows)
+
+
+def test_verify_refuses_a_manifest_without_its_object_lists(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    m = _manifest(store, [obj], raws)
+    digest = store.write_manifest(m)
+    broken = {k: v for k, v in store.read_manifest(digest).items() if k != "objects"}
+    rep = store.verify(broken)
+    assert not rep.ok and rep.errors and "object lists" in rep.errors[0]
+    assert rep.objects_checked == 0 and rep.raw_checked == 0
+    # And the untouched published manifest still verifies.
+    assert store.verify(store.read_manifest(digest), digest).ok
+
+
+def test_sessions_digest_is_part_of_the_identity(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    m1 = _manifest(store, [obj], raws)
+    m2 = _manifest(store, [obj], raws, sessions=(date(2024, 3, 26), date(2024, 3, 27), date(2024, 3, 28)))
+    assert m1["sessions_digest"] != m2["sessions_digest"]
+    assert manifest_identity(m1) != manifest_identity(m2)
+    assert _manifest(store, [obj], raws, sessions=(date(2024, 3, 28), date(2024, 3, 27)))["sessions_digest"] \
+        == m1["sessions_digest"]                       # a set of sessions, not their order
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows refuses a replace over an open file")
+def test_publishing_while_a_reader_holds_the_object_open_windows(store, monkeypatch):
+    """The real Windows behaviour, not a simulated one: a reader (another worker mapping the
+    store) holds the object open while a second publisher writes the same bytes."""
+    rows = [_invalid_row(date(2024, 3, 5))]
+    entry, _ = store.write_feature_object(PROFILE, "AAA", rows)
+    final = store.abspath(entry.path)
+    expected = final.read_bytes()
+
+    calls = {"n": 0}
+    real_hash = MarketConditionStore._publish_bytes.__globals__["sha256_file"]
+
+    def blind_first(path, *a, **kw):    # force the write path, as a concurrent publisher would hit
+        calls["n"] += 1
+        return "0" * 64 if calls["n"] == 1 else real_hash(path, *a, **kw)
+
+    monkeypatch.setitem(MarketConditionStore._publish_bytes.__globals__, "sha256_file", blind_first)
+    with open(final, "rb") as reader:
+        again, reused = store.write_feature_object(PROFILE, "AAA", rows)
+        assert reader.read() == expected          # the reader's view never changed
+    assert again == entry and reused
+    assert final.read_bytes() == expected and not list(final.parent.glob("*.part"))

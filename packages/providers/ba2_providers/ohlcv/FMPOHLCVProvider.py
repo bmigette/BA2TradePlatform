@@ -366,8 +366,8 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
         Endpoint: ``/api/v3/historical-price-full/stock_split/{symbol}`` through the existing
         ``symbol_info.fetch_splits`` (shared rate-limit gate, 1-day live memo) and
         ``parse_splits``. A split with an unknown ratio is dropped (it cannot be checked)."""
-        if self.TIMEFRAME_MAP.get(interval) != "daily":
-            return None
+        if interval not in self.TIMEFRAME_MAP or self.TIMEFRAME_MAP[interval] != "daily":
+            return None   # an interval this provider does not serve daily bars for
         from ba2_common.core.split_basis import CalendarSplit
         from ba2_providers import symbol_info
         events = symbol_info.parse_splits(symbol_info.fetch_splits(self.api_key, symbol))

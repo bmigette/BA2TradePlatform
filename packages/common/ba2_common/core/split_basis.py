@@ -35,7 +35,7 @@ import math
 import os
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -55,7 +55,6 @@ __all__ = [
     "full_fetch_marker_path",
     "read_full_fetch_marker",
     "write_full_fetch_marker",
-    "splits_from_pairs",
 ]
 
 VERDICT_CONSISTENT = "consistent"
@@ -204,13 +203,3 @@ def write_full_fetch_marker(parquet_path: str, *, first_bar: Optional[date], las
         json.dump(payload, f, sort_keys=True)
     os.replace(tmp, path)
     return path
-
-
-def splits_from_pairs(pairs: Iterable[Tuple[Any, Any]]) -> List[CalendarSplit]:
-    """``[(date | iso string, ratio), ...]`` -> ``CalendarSplit`` list; a None ratio is dropped."""
-    out = []
-    for d, r in pairs:
-        if r is None:
-            continue
-        out.append(CalendarSplit(d if isinstance(d, date) else date.fromisoformat(str(d)[:10]), float(r)))
-    return out

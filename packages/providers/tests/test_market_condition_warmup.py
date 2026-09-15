@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -141,7 +142,7 @@ def fast_claims(monkeypatch):
 
 def _warm(root, source, *, start=START, end=END, fetch_missing=False, universe=UNIVERSE, concurrency=2):
     p = W.plan(PROFILE, universe, start, end, cache_root=root, source=source)
-    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=fetch_missing,
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=fetch_missing,
                   concurrency=concurrency, source=source)
     return p, rep
 
@@ -269,7 +270,7 @@ def test_two_concurrent_builders_coalesce_on_one_manifest(root):
     reports = [None, None]
 
     def run(k):
-        reports[k] = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False,
+        reports[k] = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False,
                              concurrency=1, source=src)
 
     threads = [threading.Thread(target=run, args=(k,)) for k in (0, 1)]
@@ -326,7 +327,7 @@ def test_cache_only_with_missing_raw_stops_with_inventory_and_fetches_nothing(ro
     assert src.calls == calls and src.fetches == [] and rep.counters["rows_computed"] == 0
     assert MarketConditionStore(root).list_manifests(PROFILE) == []
 
-    rep2 = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
+    rep2 = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
     assert rep2.ok, rep2
     assert sorted(s for s, _a, _b in src.fetches) == ["BBB", "CCC"]
     assert rep2.counters["provider_calls"] == 2 and rep2.counters["provider_bytes"] > 0
@@ -355,11 +356,11 @@ def test_split_after_first_cached_bar_requires_full_refetch(root):
     # AAA's file carries no discontinuity at its calendar split: consistent, kept.
     assert not aaa.refetch_required and [c["verdict"] for c in aaa.split_checks] == ["consistent"]
 
-    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src)
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src)
     assert rep.exit_code == 1 and [i["kind"] for i in rep.inventory] == ["refetch_required"]
     assert src.full_refetches == []
 
-    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
     assert rep.ok, rep
     assert src.full_refetches == ["SPL"] and src.fetches == []
     assert rep.counters["full_refetches"] == 1 and rep.counters["provider_calls"] == 1
@@ -425,14 +426,14 @@ def test_unreadable_split_calendar_fails_loudly_and_is_only_waived_explicitly(ro
 
     # Neither mode publishes: the basis of BBB's cached history cannot be proven either way.
     for fetch_missing in (False, True):
-        rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=fetch_missing, source=src)
+        rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=fetch_missing, source=src)
         assert not rep.ok and rep.exit_code == 1 and rep.manifest_digest is None
         assert [i["symbol"] for i in rep.inventory] == ["BBB"] and "BBB" in rep.errors[0]
         assert src.fetches == [] and src.full_refetches == []
         assert MarketConditionStore(root).list_manifests(PROFILE) == []
 
     # Waived explicitly: published, with BBB excluded and the reason recorded in the manifest.
-    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src,
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src,
                   allow_exclusions=True)
     assert rep.ok and rep.exit_code == 0 and rep.manifest_digest
     assert list(rep.excluded) == ["BBB"] and rep.excluded["BBB"][0]["kind"] == "split_calendar_unavailable"
@@ -447,9 +448,97 @@ def test_a_symbol_without_source_data_also_blocks_publication(root):
     os.remove(_path(root, "CCC"))
     src = FakeSource(root, truth={"AAA": TRUTH["AAA"], "BBB": TRUTH["BBB"]})
     p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
-    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
     assert not rep.ok and rep.exit_code == 1 and rep.manifest_digest is None
     assert list(rep.excluded) == ["CCC"] and rep.excluded["CCC"][0]["kind"] in ("no_source_data", "fetch_failed")
-    rep = W.build(W.WarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src,
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src,
                   allow_exclusions=True)
     assert rep.ok and list(rep.excluded) == ["CCC"]
+
+
+def test_a_calc_version_bump_recomputes_every_row(root, monkeypatch):
+    """A window digest is over BARS only, so nothing in it changes when the CALCULATOR does.
+    Reuse must therefore be blind neither to calc_version nor to schema_version: publishing a
+    manifest that declares the new version over values the old one produced is silent corruption.
+    (The registry helper ``registered_profile`` only ADDS a profile; a version bump of an existing
+    one is what a real fix looks like, so the registered spec is replaced here instead.)"""
+    from dataclasses import replace as dc_replace
+    from ba2_common.core import market_conditions as MC
+
+    src = FakeSource(root)
+    p1, r1 = _warm(root, src)
+    total = p1.decision_sessions * len(UNIVERSE)
+    assert r1.counters["rows_computed"] == total
+
+    bumped = dc_replace(MC.PROFILES[PROFILE], calc_version="ohlcv-v1/calc-2")
+    monkeypatch.setitem(MC.PROFILES, PROFILE, bumped)
+
+    p2, r2 = _warm(root, src)
+    assert p2.calc_version == "ohlcv-v1/calc-2"
+    assert r2.counters["rows_computed"] == total and r2.counters["rows_reused"] == 0
+    assert r2.manifest_digest != r1.manifest_digest
+    # Objects are addressed by CONTENT, so this fixture's unchanged calculator re-derives the same
+    # bytes and the store rightly keeps one copy: what must not happen is a row being carried over
+    # WITHOUT being recomputed, which the counters above pin.
+    assert r2.counters["objects_written"] == 0 and r2.counters["objects_reused"] == 36
+    store = MarketConditionStore(root)
+    assert store.read_manifest(r2.manifest_digest)["calc_version"] == "ohlcv-v1/calc-2"
+    # The old manifest is untouched and still readable at its own version.
+    old = store.read_manifest(r1.manifest_digest)
+    assert old["calc_version"] == "ohlcv-v1/calc-1" and store.verify(old, r1.manifest_digest).ok
+    assert len(list(store.iter_rows(old, "AAA"))) == p1.decision_sessions
+
+    # Back at the original version (the bump undone), the original rows are reused again and the
+    # original manifest is re-opened: nothing was destroyed or rewritten.
+    monkeypatch.undo()
+    _p3, r3 = _warm(root, src)
+    assert r3.counters["rows_computed"] == 0 and r3.manifest_digest == r1.manifest_digest
+
+
+def test_a_claim_taken_over_as_stale_stops_its_heartbeat(root, monkeypatch, tmp_path):
+    """A builder whose claim was broken as stale must NOT keep refreshing the new owner's lock:
+    it would hold a lock it does not own alive (forever, if the new owner dies) while believing
+    it still owns the symbol."""
+    monkeypatch.setattr(W, "CLAIM_STALE_S", 1.2)      # heartbeat every 0.3 s
+    path = tmp_path / "AAA.lock"
+    loser = W._FileClaim(path)
+    assert loser.try_acquire() and not loser.lost
+    time.sleep(0.05)                                  # Windows time.time() granularity is ~16 ms
+    monkeypatch.setattr(W, "CLAIM_STALE_S", 0.001)    # the loser's build has overrun: it is stale now
+    winner = W._FileClaim(path)
+    assert winner.try_acquire()                       # breaks the stale lock and takes it
+    assert path.read_text(encoding="utf-8") == winner.token
+
+    deadline = time.time() + 5
+    while not loser.lost and time.time() < deadline:
+        time.sleep(0.02)
+    assert loser.lost, "the loser never noticed the takeover"
+    winner._stop.set()                                # freeze the winner's own heartbeat to measure
+    winner._thread.join(timeout=5)
+    mtime = path.stat().st_mtime_ns
+    time.sleep(0.5)                                   # > the loser's heartbeat interval
+    assert path.stat().st_mtime_ns == mtime, "the loser is still heartbeating the winner's lock"
+    loser.release()                                   # must not remove the winner's lock
+    assert path.exists() and path.read_text(encoding="utf-8") == winner.token
+    winner.release()
+    assert not path.exists()
+
+
+def test_the_fmp_source_satisfies_the_warmup_source_protocol():
+    """The fake in these tests is only as good as its resemblance to the real thing: bind the
+    REAL call shapes (names, parameter names and order) of FMPWarmupSource and FakeSource against
+    the protocol the warmup calls."""
+    import inspect
+    from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
+
+    for impl in (FMPWarmupSource, FakeSource):
+        for name, params in (("split_calendar", ["symbol"]), ("fetch_daily", ["symbol", "start", "end"]),
+                             ("force_full_refetch", ["symbol"])):
+            fn = getattr(impl, name)
+            got = [p for p in inspect.signature(fn).parameters if p != "self"]
+            assert got == params, f"{impl.__name__}.{name}{tuple(got)} != {name}{tuple(params)}"
+    # The two counters the report's provider_calls/provider_bytes are deltas of: an int on the
+    # fake, the FMP request meter on the real one.
+    fake = FakeSource("", truth={})
+    assert isinstance(fake.calls, int) and isinstance(fake.bytes, int)
+    assert isinstance(FMPWarmupSource.calls, property) and isinstance(FMPWarmupSource.bytes, property)

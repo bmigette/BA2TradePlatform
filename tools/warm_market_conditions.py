@@ -104,7 +104,7 @@ def cmd_build(args) -> int:
         print(f"plan file not found: {args.plan}", file=sys.stderr)
         return EXIT_CONFIG
     try:
-        plan = W.WarmPlan.load(args.plan)
+        plan = W.MarketConditionWarmPlan.load(args.plan)
     except (ValueError, KeyError, TypeError) as e:
         print(f"configuration error: {args.plan} is not a usable plan: {e}", file=sys.stderr)
         return EXIT_CONFIG
