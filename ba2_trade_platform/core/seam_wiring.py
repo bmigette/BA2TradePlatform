@@ -53,6 +53,14 @@ Call order (locked by the Phase 6 re-plan):
    only when the singleton has not already been built avoids clobbering a host that
    built it earlier.
 
+7. **Market-condition gates (opt-in, ``BA2_MARKET_CONDITION_PROFILE``).** Unset -> nothing is
+   installed. Set -> the FMP daily cache is split-certified first. DECISION (2026-09-16): a
+   certification failure does NOT stop startup -- exits and protective-order handling must keep
+   running. An ``UncertifiedSourceResolver`` is installed instead: every market-condition gate
+   resolves no context with the certification summary as its reason (one ERROR at install, one
+   WARNING per field on evaluation), so gated entries are refused loudly while the platform runs.
+   An unregistered profile name still raises.
+
 After ``wire_all_seams()`` returns, ``init_db()`` runs and hits the engine the
 DB seam configured.
 """
@@ -132,7 +140,9 @@ def wire_all_seams() -> None:
 
         # 7) Market-condition entry gates (opt-in): installed ONLY when
         #    BA2_MARKET_CONDITION_PROFILE names a registered profile. Unset -> nothing is
-        #    installed and the gates report ``no_context``; an unknown name raises here.
+        #    installed and the gates report ``no_context``; an unknown name raises here. A cache
+        #    failing certification installs a refusing resolver instead of stopping startup
+        #    (see step 7 in the module docstring).
         from ba2_common.core.market_condition_live import PROFILE_ENV, resolver_from_env
 
         market_condition_resolver = resolver_from_env()

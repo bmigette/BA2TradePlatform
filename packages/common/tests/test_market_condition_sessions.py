@@ -135,15 +135,30 @@ def _cold_pass(n_sessions=1508):
     return out
 
 
-def test_cold_1508_session_pass_is_fast():
+def test_cold_1508_session_pass_builds_the_schedule_exactly_once(monkeypatch):
     import time
 
+    from ba2_common.core import market_calendar as mcal
+
+    real = mcal._nyse_calendar
+    calls = []
+
+    class _Counting:
+        def __init__(self, cal):
+            self._cal = cal
+
+        def schedule(self, *args, **kwargs):
+            calls.append(kwargs or args)
+            return self._cal.schedule(*args, **kwargs)
+
+    monkeypatch.setattr(mcal, "_nyse_calendar", lambda: _Counting(real()))
     start = time.perf_counter()
     out = _cold_pass()
     elapsed = time.perf_counter() - start
     assert len(out) == 1508
-    # The range-memo version measured 101.8 s for this pass (4525 schedule() misses).
-    assert elapsed < 2.0, f"cold 1508-session pass took {elapsed:.2f}s"
+    # The range-memo version made 4525 schedule() calls for this pass (101.8 s).
+    assert len(calls) == 1, calls
+    print(f"cold 1508-session pass: {elapsed:.3f}s, schedule() calls: {len(calls)}")
 
 
 def test_table_matches_the_previous_implementation_2019_2025():

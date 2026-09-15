@@ -107,25 +107,103 @@ def test_resolver_from_env(tmp_path):
         live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v9"}, cache_root=root)
 
 
-def test_resolver_from_env_refuses_an_uncertified_cache(tmp_path):
+class _LogSpy:
+    def __init__(self):
+        self.errors, self.warnings = [], []
+
+    def error(self, msg, *args, **kwargs):
+        self.errors.append(msg % args if args else msg)
+
+    def warning(self, msg, *args, **kwargs):
+        self.warnings.append(msg % args if args else msg)
+
+    def info(self, *a, **k):
+        pass
+
+    def debug(self, *a, **k):
+        pass
+
+
+def test_uncertified_cache_degrades_to_a_refusing_resolver(tmp_path, monkeypatch):
+    import ba2_common.logger as bl
+
+    spy = _LogSpy()
+    monkeypatch.setattr(bl, "logger", spy)
     bad = _write_certifiable(str(tmp_path / "bad"), unadjusted=True)
-    with pytest.raises(live.SourceCertificationError) as err:
-        live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"}, cache_root=bad)
-    assert not err.value.report.consistent
-    assert {c.basis for c in err.value.report.symbols} == {"unadjusted"}
-    assert "AAPL" in str(err.value) and "NVDA" in str(err.value)
-    with pytest.raises(live.SourceCertificationError):
-        live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"}, cache_root=str(tmp_path / "empty"))
+    resolver = live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"}, cache_root=bad)
+    assert isinstance(resolver, live.UncertifiedSourceResolver)
+    assert resolver.failing_symbols == ("AAPL", "NVDA")
+    assert {c.basis for c in resolver.report.symbols} == {"unadjusted"}
+    assert "DISABLED" in resolver.no_context_reason and "AAPL" in resolver.no_context_reason
+    assert len(spy.errors) == 1 and "AAPL" in spy.errors[0] and "NVDA" in spy.errors[0]
+    assert resolver(object(), "AAA", None) is None
+
+    empty = live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"}, cache_root=str(tmp_path / "empty"))
+    assert isinstance(empty, live.UncertifiedSourceResolver)
+    assert {c.basis for c in empty.report.symbols} == {"unavailable"}
+
+
+def test_gated_leaf_refuses_with_the_certification_reason_and_exits_are_unaffected(tmp_path, monkeypatch, clock):
+    from types import SimpleNamespace
+
+    import ba2_common.logger as bl
+
+    monkeypatch.setattr(bl, "logger", _LogSpy())
+    spy = _LogSpy()
+    monkeypatch.setattr(TC, "logger", spy)
+    monkeypatch.setattr(TC, "_warned_no_market_condition_context_fields", set())
+    resolver = live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"},
+                                      cache_root=_write_certifiable(str(tmp_path), unadjusted=True))
+    saved = TC.get_market_condition_context_resolver()
+    TC.set_market_condition_context_resolver(resolver)
+    try:
+        with live.market_condition_decision_scope() as state:
+            assert state is None          # no live resolver: no clock read, no state
+            for _ in range(2):
+                leaf = _leaf()
+                assert leaf.evaluate() is False
+                assert leaf.last_status == STATUS_NO_CONTEXT
+                assert leaf.last_reason == resolver.no_context_reason
+        assert len(spy.warnings) == 1 and "certif" in spy.warnings[0].lower()
+        # A non-market condition (what exit / protective rulesets use) evaluates normally.
+        rec = SimpleNamespace(confidence=80.0, symbol="AAA", data={}, instance_id=1)
+        conf = TC.create_condition(ExpertEventType.N_CONFIDENCE, object(), "AAA", rec,
+                                   operator_str=">", value=50.0)
+        assert conf.evaluate() is True
+    finally:
+        TC.set_market_condition_context_resolver(saved)
+    assert clock == []
 
 
 def test_resolver_from_env_certifies_the_native_cache_root_by_default(tmp_path, monkeypatch):
+    import ba2_common.logger as bl
     from ba2_common.core import native_cache
 
+    monkeypatch.setattr(bl, "logger", _LogSpy())
     monkeypatch.setattr(native_cache, "CACHE_FOLDER", str(tmp_path / "missing"))
-    with pytest.raises(live.SourceCertificationError):
-        live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"})
+    assert isinstance(live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"}), live.UncertifiedSourceResolver)
     monkeypatch.setattr(native_cache, "CACHE_FOLDER", _write_certifiable(str(tmp_path / "ok")))
-    assert live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"}) is not None
+    assert isinstance(live.resolver_from_env({live.PROFILE_ENV: "ohlcv-v1"}), live.LiveMarketConditionResolver)
+
+
+def test_startup_completes_with_an_uncertified_cache(monkeypatch, tmp_path):
+    from ba2_common.core import native_cache
+    from tests.test_seam_wiring import _isolated_seam_state
+
+    monkeypatch.setattr(native_cache, "CACHE_FOLDER", _write_certifiable(str(tmp_path), unadjusted=True))
+    monkeypatch.setenv(live.PROFILE_ENV, "ohlcv-v1")
+    saved = TC.get_market_condition_context_resolver()
+    try:
+        TC.set_market_condition_context_resolver(None)
+        with _isolated_seam_state() as seam_wiring:
+            seam_wiring._wired = False
+            seam_wiring.wire_all_seams()
+            assert seam_wiring._wired is True
+            got = TC.get_market_condition_context_resolver()
+            assert isinstance(got, live.UncertifiedSourceResolver)
+            assert got(object(), "AAA", None) is None
+    finally:
+        TC.set_market_condition_context_resolver(saved)
 
 
 @pytest.mark.parametrize("env_value,expect_installed", [(None, False), ("ohlcv-v1", True)])

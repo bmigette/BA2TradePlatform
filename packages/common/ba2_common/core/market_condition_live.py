@@ -16,6 +16,13 @@ any worker fan-out. Different analyses cannot share a mutable global clock."
 * A ContextVar does not follow work into ``ThreadPoolExecutor`` threads on its own: submit
   through :func:`submit_in_decision_context` / wrap with :func:`run_in_decision_context`.
 
+Certification failure (DECISION 2026-09-16): a cache that fails split certification must NOT stop
+the platform -- exits and protective-order handling have to keep running. ``resolver_from_env``
+then returns an :class:`UncertifiedSourceResolver`: it resolves NO context for every leaf, its
+``no_context_reason`` is the certification summary (carried by ``TradeConditions``' once-per-field
+WARNING), and one ERROR naming the failing symbols is logged at install. Every gated entry is
+refused loudly; nothing else changes.
+
 Capture/replay: if a replay capture context is active when the scope opens, the reader records
 every served window (``CapturingMarketConditionReader``); in replay mode the scope must be given
 the recorded ``replay_reader`` and otherwise raises ``ReplayMiss`` -- a replay never reads the
@@ -50,6 +57,7 @@ __all__ = [
     "submit_in_decision_context",
     "resolver_from_env",
     "SourceCertificationError",
+    "UncertifiedSourceResolver",
     "NO_DECISION_SCOPE_REASON",
 ]
 
@@ -72,6 +80,22 @@ class SourceCertificationError(RuntimeError):
         super().__init__(f"source profile {report.source_profile} is NOT certified for cache "
                          f"{report.cache_root}: " + "; ".join(bad))
         self.report = report
+
+
+class UncertifiedSourceResolver:
+    """Installed instead of a live resolver when the served cache failed certification: resolves
+    no context, ever, and says why. Opening a decision scope with it is a no-op (no clock read)."""
+
+    def __init__(self, profile: str, report: Any, *, source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+        self.profile = profile
+        self.source_profile = source_profile
+        self.report = report
+        self.failing_symbols = tuple(c.symbol for c in report.symbols if not c.consistent)
+        self.no_context_reason = (
+            f"market-condition gates DISABLED: {SourceCertificationError(report)}")
+
+    def __call__(self, account: Any, instrument_name: str, expert_recommendation: Any) -> None:
+        return None
 
 
 _DECISION: contextvars.ContextVar[Optional["DecisionState"]] = contextvars.ContextVar(
@@ -229,7 +253,7 @@ def submit_in_decision_context(executor: Any, fn: Callable, *args, **kwargs):
 
 
 def resolver_from_env(environ: Optional[Any] = None,
-                      cache_root: Optional[str] = None) -> Optional[LiveMarketConditionResolver]:
+                      cache_root: Optional[str] = None) -> Optional[Any]:
     """``LiveMarketConditionResolver`` for ``BA2_MARKET_CONDITION_PROFILE``, or ``None`` when the
     variable is unset/empty/``none``.
 
@@ -238,10 +262,12 @@ def resolver_from_env(environ: Optional[Any] = None,
     default ``FMPCacheMarketConditionReader`` resolves its files under, so the certified cache is
     the served cache.
 
+    A cache that fails certification does NOT raise: it returns an
+    ``UncertifiedSourceResolver`` (gates refuse with the certification reason) and logs ONE
+    ERROR naming the failing symbols -- see the module docstring's DECISION.
+
     Raises:
         ValueError: an unregistered profile name (loud misconfiguration).
-        SourceCertificationError: any certification symbol is not consistent (the report is on
-            the exception).
     """
     env = os.environ if environ is None else environ
     raw = (env.get(PROFILE_ENV) or "").strip()
@@ -262,5 +288,12 @@ def resolver_from_env(environ: Optional[Any] = None,
         root = cache_root
     report = certify_source_columns(root)
     if not report.consistent:
-        raise SourceCertificationError(report)
+        from ba2_common.logger import logger
+
+        degraded = UncertifiedSourceResolver(raw, report)
+        logger.error(
+            f"{PROFILE_ENV}={raw}: source {report.source_profile} FAILED certification for "
+            f"{', '.join(degraded.failing_symbols)} under {report.cache_root}; market-condition "
+            f"gates will refuse every entry. {SourceCertificationError(report)}")
+        return degraded
     return LiveMarketConditionResolver(raw, reader=FMPCacheMarketConditionReader(raw, cache_root))

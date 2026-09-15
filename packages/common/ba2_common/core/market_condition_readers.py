@@ -32,9 +32,9 @@ from typing import Any, Dict, Hashable, Iterable, Mapping, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.market_condition_source import (
-    FMP_OHLCV_PROVIDER_DIR,
     WindowResult,
     assemble_window,
+    fmp_daily_cache_path,
     normalized_window_bytes,
     read_fmp_daily_cache,
     window_digest,
@@ -208,11 +208,8 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
         self._cache_root = cache_root
 
     def _path(self, symbol: str) -> Optional[str]:
-        if self._cache_root is None:
-            from ba2_common.core import native_cache
-            return native_cache.find_timeseries_path(FMP_OHLCV_PROVIDER_DIR, symbol, "1d")
-        path = os.path.join(self._cache_root, FMP_OHLCV_PROVIDER_DIR, f"{symbol.upper()}_1d.parquet")
-        return path if os.path.exists(path) else None
+        # The SAME lookup certification uses (legacy interval spellings included).
+        return fmp_daily_cache_path(symbol, self._cache_root)
 
     def _memo_key(self, symbol: str, session: date) -> Hashable:
         path = self._path(symbol)

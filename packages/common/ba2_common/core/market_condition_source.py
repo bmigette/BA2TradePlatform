@@ -36,7 +36,10 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ba2_common.core.market_calendar import regular_sessions_ending_at_tuple
+from ba2_common.core.market_calendar import (
+    register_calendar_cache_clear_hook,
+    regular_sessions_ending_at_tuple,
+)
 from ba2_common.core.market_conditions import (
     STATUS_INSUFFICIENT_HISTORY,
     STATUS_MISSING_SESSION,
@@ -49,6 +52,7 @@ __all__ = [
     "FMP_OHLCV_PROVIDER_DIR",
     "FMP_DAILY_COLUMNS",
     "read_fmp_daily_cache",
+    "fmp_daily_cache_path",
     "normalized_window_bytes",
     "window_from_bytes",
     "window_digest_of_bytes",
@@ -147,6 +151,9 @@ def _required_sessions(session: date, n: int) -> Tuple[Tuple[date, ...], np.ndar
     arr = np.array(dates, dtype=_DAY)
     arr.flags.writeable = False
     return dates, arr
+
+
+register_calendar_cache_clear_hook(_required_sessions.cache_clear)
 
 
 def assemble_window(dates: Any, o: Any, h: Any, l: Any, c: Any, v: Any, session: date,
@@ -390,9 +397,10 @@ def certify_source_columns(cache_root: str,
     split fixtures. A missing parquet is ``unavailable`` and NOT consistent."""
     results = []
     for fx in splits:
-        path = os.path.join(cache_root, FMP_OHLCV_PROVIDER_DIR, f"{fx.symbol.upper()}_1d.parquet")
-        if not os.path.exists(path):
-            results.append(_unavailable(fx, f"no cache file {path}"))
+        path = fmp_daily_cache_path(fx.symbol, cache_root)
+        if path is None:
+            results.append(_unavailable(
+                fx, f"no {fx.symbol} daily cache file under {os.path.join(cache_root, FMP_OHLCV_PROVIDER_DIR)}"))
             continue
         dates, o, h, l, c, _v = read_fmp_daily_cache(path)
         results.append(certify_split(dates, o, h, l, c, fx))
@@ -422,3 +430,26 @@ def read_fmp_daily_cache(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
     dates = _to_day64(stamps.to_numpy(dtype="datetime64[ns]"))
     cols = tuple(df[name].to_numpy(dtype=np.float64) for name in FMP_DAILY_COLUMNS[1:])
     return (dates, *cols)
+
+
+def fmp_daily_cache_path(symbol: str, cache_root: Optional[str] = None) -> Optional[str]:
+    """The existing FMP daily cache parquet for ``symbol``, or ``None``.
+
+    With ``cache_root`` None or equal to the live ``native_cache.CACHE_FOLDER`` the lookup IS
+    ``native_cache.find_timeseries_path`` -- the provider's own resolution, legacy interval
+    spellings (``_1day``/``_daily``) included -- so the file certified is the file served. Any
+    other root is searched with the same alias spellings, in the same order.
+    """
+    from ba2_common.core import native_cache
+
+    live_root = native_cache.CACHE_FOLDER
+    if cache_root is None or os.path.normcase(os.path.abspath(cache_root)) == \
+            os.path.normcase(os.path.abspath(live_root)):
+        return native_cache.find_timeseries_path(FMP_OHLCV_PROVIDER_DIR, symbol, "1d")
+    folder = os.path.join(cache_root, FMP_OHLCV_PROVIDER_DIR)
+    canon = native_cache.normalize_interval("1d")
+    for spelling in native_cache._INTERVAL_ALIASES.get(canon, [canon]):
+        path = os.path.join(folder, f"{symbol.upper()}_{spelling}.parquet")
+        if os.path.exists(path):
+            return path
+    return None

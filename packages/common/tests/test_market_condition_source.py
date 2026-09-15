@@ -227,3 +227,13 @@ def test_window_bytes_round_trip():
     assert window_digest_of_bytes(raw) == window_digest(*res.arrays())
     with pytest.raises(ValueError):
         window_from_bytes(raw[:-1])
+
+
+def test_clearing_the_calendar_cache_clears_the_required_sessions_memo():
+    from ba2_common.core import market_condition_source as src
+    from ba2_common.core.market_calendar import clear_nyse_calendar_cache
+
+    assemble_window(*_series(_sessions()), SESSION)
+    assert src._required_sessions.cache_info().currsize > 0
+    clear_nyse_calendar_cache()
+    assert src._required_sessions.cache_info().currsize == 0

@@ -100,6 +100,20 @@ def clear_nyse_calendar_cache() -> None:
     _nyse_sessions_memo.cache_clear()
     _sessions_ending_at_memo.cache_clear()
     _clear_session_table()
+    for hook in list(_CACHE_CLEAR_HOOKS):
+        hook()
+
+
+#: Callables run by ``clear_nyse_calendar_cache``: memos in modules that import this one (and so
+#: cannot be imported from here) register their ``cache_clear`` so no derived answer outlives the
+#: calendar it was computed from.
+_CACHE_CLEAR_HOOKS: List[Any] = []
+
+
+def register_calendar_cache_clear_hook(fn: Any) -> None:
+    """Run ``fn()`` whenever ``clear_nyse_calendar_cache`` runs (idempotent per callable)."""
+    if fn not in _CACHE_CLEAR_HOOKS:
+        _CACHE_CLEAR_HOOKS.append(fn)
 
 
 def _require_aware(moment: datetime) -> datetime:

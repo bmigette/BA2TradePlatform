@@ -137,3 +137,33 @@ def test_detector_reports_a_missing_split_bar():
     keep = d != np.datetime64(FX.split_date)
     cert = certify_split(d[keep], o[keep], h[keep], l[keep], c[keep], FX)
     assert cert.basis == BASIS_UNAVAILABLE and not cert.consistent
+
+
+def _write_split_series(folder, filename, fx):
+    days = regular_sessions_ending_at(fx.split_date + pd.Timedelta(days=30).to_pytimedelta(), 60)
+    c = np.linspace(100.0, 110.0, len(days))
+    os.makedirs(folder, exist_ok=True)
+    pd.DataFrame({"Date": pd.to_datetime([d.isoformat() for d in days]), "Open": c, "High": c * 1.01,
+                  "Low": c * 0.99, "Close": c, "Volume": np.ones(len(days), dtype=np.int64)}).to_parquet(
+        os.path.join(folder, filename), index=False)
+
+
+@pytest.mark.parametrize("live_root", [True, False])
+def test_certification_finds_legacy_interval_spellings(tmp_path, monkeypatch, live_root):
+    from ba2_common.core import native_cache
+    from ba2_common.core.market_condition_source import fmp_daily_cache_path
+
+    root = str(tmp_path / "cache")
+    folder = os.path.join(root, "FMPOHLCVProvider")
+    aapl, nvda = CERTIFICATION_SPLITS
+    _write_split_series(folder, "AAPL_1day.parquet", aapl)   # legacy spellings, no *_1d.parquet
+    _write_split_series(folder, "NVDA_daily.parquet", nvda)
+    if live_root:
+        monkeypatch.setattr(native_cache, "CACHE_FOLDER", root)
+    report = certify_source_columns(root)
+    assert report.consistent, report
+    assert fmp_daily_cache_path("AAPL", root).endswith("AAPL_1day.parquet")
+    if live_root:
+        # The live root resolves through the provider's own lookup: certified file == served file.
+        assert fmp_daily_cache_path("NVDA", root) == native_cache.find_timeseries_path("FMPOHLCVProvider", "NVDA", "1d")
+        assert fmp_daily_cache_path("NVDA", None) == fmp_daily_cache_path("NVDA", root)
