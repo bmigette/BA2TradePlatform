@@ -404,11 +404,17 @@ class FieldSpec:
     classification) is never a code: it must not be selectable as a regime.
 
     ``codes`` is accepted as any Mapping but STORED as ``_code_pairs``: a tuple of
-    ``(value, code)`` pairs sorted by value -- hashable, picklable and deep-copyable (GA workers
+    ``(value, code)`` pairs ordered by CODE -- hashable, picklable and deep-copyable (GA workers
     spawn on Windows and distributed payloads pickle configs), and part of ``==``/``hash``
     independent of the input dict's order. The ``codes`` property returns a fresh read-only
-    ``MappingProxyType`` view. (A mappingproxy attribute would make the spec unpicklable.)
-    Because ``codes`` is an ``InitVar``, ``dataclasses.replace`` must be passed ``codes=``."""
+    ``MappingProxyType`` view iterating in code order, e.g. ``{"bull": 1, "bear": 2}`` -> bull,
+    bear (the design table order). That order is a PERSISTED contract: templates build
+    ``mode_choices=["off", *codes]`` from it and the choice-gene index follows it. (A
+    mappingproxy attribute would make the spec unpicklable.)
+
+    ``dataclasses.replace`` keeps ``codes`` (it reads the property); pass ``codes=None`` when
+    changing a categorical spec to numeric. Use :meth:`to_dict` for serialisation --
+    ``dataclasses.asdict`` exposes the private ``_code_pairs`` and omits ``codes``."""
 
     name: str                      # canonical field name == ExpertEventType value == store column
     kind: str                      # "numeric" | "categorical"
@@ -441,7 +447,7 @@ class FieldSpec:
                 raise ValueError(f"FieldSpec {self.name!r}: codes must be positive ints, got {codes!r}")
             if len(set(vals)) != len(vals):
                 raise ValueError(f"FieldSpec {self.name!r}: code values must be distinct, got {codes!r}")
-            object.__setattr__(self, "_code_pairs", tuple(sorted(dict(codes).items())))
+            object.__setattr__(self, "_code_pairs", tuple(sorted(dict(codes).items(), key=lambda kv: kv[1])))
         else:
             if codes is not None:
                 raise ValueError(f"FieldSpec {self.name!r}: a numeric field carries no codes")
@@ -458,6 +464,23 @@ class FieldSpec:
                 raise ValueError(
                     f"FieldSpec {self.name!r}: anchor_value {self.anchor_value!r} outside "
                     f"[{self.value_min!r}, {self.value_max!r}]")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """The public constructor fields in declaration order, ``codes`` as a plain dict in code
+        order (never ``_code_pairs``); ``FieldSpec(**spec.to_dict()) == spec``."""
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "short": self.short,
+            "searched": self.searched,
+            "value_min": self.value_min,
+            "value_max": self.value_max,
+            "value_step": self.value_step,
+            "anchor_op": self.anchor_op,
+            "anchor_value": self.anchor_value,
+            "codes": None if self._code_pairs is None else dict(self._code_pairs),
+            "ui_name": self.ui_name,
+        }
 
 
 def _field_spec_codes(self: FieldSpec) -> Optional[Mapping[str, int]]:

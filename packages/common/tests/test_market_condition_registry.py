@@ -86,6 +86,39 @@ def test_categorical_field_spec_pickles_and_deep_copies_equal():
     assert _cat(codes={"bull": 1, "bear": 2}) != _cat(codes={"bull": 1, "bear": 3})
 
 
+def test_codes_iterate_in_code_order_not_name_order():
+    # Task 8 builds mode_choices=["off", *codes] from this order; the choice-gene index follows it.
+    spec = _cat(codes={"bear": 2, "bull": 1})
+    assert list(spec.codes) == ["bull", "bear"]
+    assert list(_cat(codes={"a": 3, "z": 1, "m": 2}).codes) == ["z", "m", "a"]
+
+
+@pytest.mark.parametrize("spec", [
+    FieldSpec(name="t_num", kind="numeric", short="tn", searched=False, value_min=-1.0, value_max=1.0,
+              value_step=0.5, anchor_op=">", anchor_value=0.0, ui_name="Num"),
+    FieldSpec(name="t_cat", kind="categorical", short="tc", searched=True, codes={"bear": 2, "bull": 1},
+              ui_name="Cat"),
+], ids=["numeric", "categorical"])
+def test_field_spec_to_dict_round_trips(spec):
+    d = spec.to_dict()
+    assert "_code_pairs" not in d
+    assert list(d) == ["name", "kind", "short", "searched", "value_min", "value_max", "value_step",
+                       "anchor_op", "anchor_value", "codes", "ui_name"]
+    assert d["codes"] is None or type(d["codes"]) is dict
+    assert FieldSpec(**d) == spec
+    if spec.kind == "categorical":
+        assert list(d["codes"].items()) == [("bull", 1), ("bear", 2)]
+
+
+def test_dataclasses_replace_keeps_codes_and_needs_codes_none_to_turn_numeric():
+    spec = _cat()
+    assert dataclasses.replace(spec, ui_name="x").codes == spec.codes
+    num = dict(kind="numeric", value_min=0.0, value_max=1.0, value_step=0.5, anchor_op="<", anchor_value=0.5)
+    with pytest.raises(ValueError):
+        dataclasses.replace(spec, **num)
+    assert dataclasses.replace(spec, codes=None, **num).codes is None
+
+
 def test_profile_spec_coerces_fields_to_a_tuple_and_requires_names():
     prof = ProfileSpec(name="p", calc_version="p/calc-1", fields=[_cat()])
     assert isinstance(prof.fields, tuple) and prof.fields == (_cat(),)
