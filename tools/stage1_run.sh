@@ -126,8 +126,13 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
       echo "re-run. Refusing to launch a gated grid on an incomplete snapshot." >&2
       exit 1; }
     if [ -z "$MARKET_CONDITION_MANIFEST" ]; then
+      # --print-digest puts the digest on stdout and the JSON report on stderr; `tail -n 1` is
+      # belt and braces against a library that logs to stdout anyway. A mangled capture cannot
+      # reach a job silently: the launcher opens the manifest before dispatch and refuses the run
+      # naming the digest it could not read.
       MARKET_CONDITION_MANIFEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN" --cache-only \
-        --print-digest)" || { echo "stage1_run.sh: market-condition BUILD failed" >&2; exit 1; }
+        --print-digest | tail -n 1)" || {
+        echo "stage1_run.sh: market-condition BUILD failed" >&2; exit 1; }
     fi
     if [ -z "$MARKET_CONDITION_MANIFEST" ]; then
       echo "stage1_run.sh: market-condition build published no manifest" >&2

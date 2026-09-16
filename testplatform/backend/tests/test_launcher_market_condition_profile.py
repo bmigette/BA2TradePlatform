@@ -183,6 +183,151 @@ PROFILE_NONE_O_LC = json.loads(r"""
 }
 """)
 
+#: ``_build_strategy("O_CC", ...).entry_rules`` as the code before this change produced it --
+#: the OVERLAY half of the byte-identity contract (the gates go on the S2 STOCK entry there,
+#: spliced into the returned strategy, so `none` has to leave that splice invisible). Same
+#: provenance as PROFILE_NONE_O_LC; a PIN, never regenerated to make a test pass.
+PROFILE_NONE_O_CC_ENTRY = json.loads(r"""
+[
+    {
+        "id": "buy",
+        "name": "enter-buy",
+        "conditions": {
+            "id": "root",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+                {
+                    "id": "buy-bullish",
+                    "field": "bullish",
+                    "fieldType": "flag",
+                    "field_type": "flag",
+                    "comparison": "is_true",
+                    "op": "is_true",
+                    "optimizeEnabled": false,
+                    "optimize": false
+                },
+                {
+                    "id": "buy-flat",
+                    "field": "has_no_position",
+                    "fieldType": "flag",
+                    "field_type": "flag",
+                    "comparison": "is_true",
+                    "op": "is_true",
+                    "optimizeEnabled": false,
+                    "optimize": false
+                },
+                {
+                    "id": "gate_confidence",
+                    "field": "confidence",
+                    "fieldType": "numeric",
+                    "field_type": "numeric",
+                    "comparison": ">",
+                    "op": ">",
+                    "optimizeEnabled": true,
+                    "optimize": true,
+                    "value": 50.0,
+                    "valueMin": 40.0,
+                    "value_min": 40.0,
+                    "valueMax": 80.0,
+                    "value_max": 80.0,
+                    "valueStep": 5.0,
+                    "value_step": 5.0,
+                    "toggleOptimize": true,
+                    "toggle_optimize": true
+                },
+                {
+                    "id": "gate_expected_profit",
+                    "field": "expected_profit",
+                    "fieldType": "numeric",
+                    "field_type": "numeric",
+                    "comparison": ">",
+                    "op": ">",
+                    "optimizeEnabled": true,
+                    "optimize": true,
+                    "value": 3.0,
+                    "valueMin": 0.0,
+                    "value_min": 0.0,
+                    "valueMax": 15.0,
+                    "value_max": 15.0,
+                    "valueStep": 1.0,
+                    "value_step": 1.0,
+                    "toggleOptimize": true,
+                    "toggle_optimize": true
+                },
+                {
+                    "id": "gate_days_since_close",
+                    "field": "days_since_last_close",
+                    "fieldType": "numeric",
+                    "field_type": "numeric",
+                    "comparison": ">",
+                    "op": ">",
+                    "optimizeEnabled": true,
+                    "optimize": true,
+                    "value": 0.0,
+                    "valueMin": 0.0,
+                    "value_min": 0.0,
+                    "valueMax": 30.0,
+                    "value_max": 30.0,
+                    "valueStep": 5.0,
+                    "value_step": 5.0,
+                    "toggleOptimize": true,
+                    "toggle_optimize": true
+                },
+                {
+                    "id": "gate_days_since_profit",
+                    "field": "days_since_last_profitable_close",
+                    "fieldType": "numeric",
+                    "field_type": "numeric",
+                    "comparison": ">",
+                    "op": ">",
+                    "optimizeEnabled": true,
+                    "optimize": true,
+                    "value": 0.0,
+                    "valueMin": 0.0,
+                    "value_min": 0.0,
+                    "valueMax": 30.0,
+                    "value_max": 30.0,
+                    "valueStep": 5.0,
+                    "value_step": 5.0,
+                    "toggleOptimize": true,
+                    "toggle_optimize": true
+                },
+                {
+                    "id": "gate_days_since_loss",
+                    "field": "days_since_last_losing_close",
+                    "fieldType": "numeric",
+                    "field_type": "numeric",
+                    "comparison": ">",
+                    "op": ">",
+                    "optimizeEnabled": true,
+                    "optimize": true,
+                    "value": 0.0,
+                    "valueMin": 0.0,
+                    "value_min": 0.0,
+                    "valueMax": 60.0,
+                    "value_max": 60.0,
+                    "valueStep": 10.0,
+                    "value_step": 10.0,
+                    "toggleOptimize": true,
+                    "toggle_optimize": true
+                }
+            ]
+        },
+        "actions": [
+            {
+                "action": "buy",
+                "action_type": "buy",
+                "lot_size": 100
+            }
+        ],
+        "continueProcessing": false,
+        "continue_processing": false
+    }
+]
+""")
+
+
 #: A throwaway CATEGORICAL profile: the only way to exercise the categorical branch before Task 10
 #: registers ``ta-structure-v1``. Codes are deliberately NOT in alphabetical order, so the
 #: "ascending CODE order" contract is actually tested.
@@ -236,6 +381,13 @@ def _market_ids(node) -> list:
 def test_profile_none_reproduces_the_pre_change_option_entry_rule_byte_for_byte():
     assert mod._MARKET_CONDITION_PROFILES == (), "the default must be OFF"
     assert mod._option_entry_rule("O_LC") == PROFILE_NONE_O_LC
+
+
+def test_profile_none_reproduces_the_pre_change_overlay_entry_rules_byte_for_byte():
+    """O_CC is the other shape: its entry comes from the shared S2 builder and the gates are
+    SPLICED into the returned strategy, so `none` must leave no trace of that splice."""
+    assert mod._MARKET_CONDITION_PROFILES == ()
+    assert mod._build_strategy("O_CC", "mc-O_CC", "FMPRating").entry_rules == PROFILE_NONE_O_CC_ENTRY
 
 
 def test_profile_none_adds_no_leaf_and_no_gene_to_any_permitted_structure():
@@ -369,16 +521,20 @@ def _build_without_profile(kind: str):
 
 
 # --------------------------------------------------------------------------- the all-off control
-def test_the_all_off_control_decodes_to_the_profile_none_tree(profile_on):
-    """Three explicit ``mode=off`` genes must leave the SAME tree profile ``none`` builds."""
-    gated = _built("O_LC")
+@pytest.mark.parametrize("kind", PERMITTED)
+def test_the_all_off_control_decodes_to_the_profile_none_tree(kind, profile_on):
+    """Explicit ``mode=off`` on every market gene must leave the SAME tree profile ``none``
+    builds -- for every permitted structure, since Task 9's compatibility gate compares a whole
+    frozen run and one structure's stray leaf would move its orders."""
+    gated = _built(kind)
     space = collect_param_space(gated)
     genome = {g: (MODE_OFF if g.endswith(":mode") else _authored(gated, g))
               for g in space if g.startswith("cond:") or g.startswith("entry:")}
     decoded = decode_params(gated, {k: v for k, v in genome.items() if v is not None})
-    plain = decode_params(_build_without_profile("O_LC"), {})
+    plain = decode_params(_build_without_profile(kind), {})
     assert _market_ids(decoded["entry_rules"]) == []
     assert decoded["entry_rules"] == plain["entry_rules"]
+    assert decoded["exit_rules"] == plain["exit_rules"]
 
 
 def _authored(strategy, gene):
@@ -409,6 +565,19 @@ def test_gates_off_removes_the_market_leaves_too(profile_on):
     rule = mod._option_entry_rule("O_LC", gates_off=True)
     ids = [c["id"] for c in rule["conditions"]["conditions"]]
     assert ids == ["o_lc-flat"], ids
+
+
+@pytest.mark.parametrize("kind", PERMITTED)
+def test_gates_off_leaves_no_market_gate_and_no_market_gene_anywhere(kind, profile_on,
+                                                                     monkeypatch):
+    """EVERY permitted structure, because the two overlays do not share the pure-option path:
+    their entry comes from the S2 builder, so the smoke filter inside ``_option_entry_rule``
+    never sees their leaves and ``--gates-off`` left 6 market genes searching on O_CC/O_PP."""
+    monkeypatch.setattr(mod, "_OPTION_GATES_OFF", True)
+    strat = _built(kind)
+    assert _market_ids(strat.entry_rules) == [], kind
+    assert _market_ids(strat.exit_rules) == [], kind
+    assert [g for g in collect_param_space(strat) if "-market-" in g] == [], kind
 
 
 # --------------------------------------------------------------------------- CLI validation
@@ -445,8 +614,16 @@ def test_the_optimize_flags_exist_with_the_documented_defaults():
 def test_an_optimize_with_a_profile_and_no_manifest_is_refused(profile_on, monkeypatch):
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", None)
     with pytest.raises(SystemExit, match="needs --market-condition-manifest"):
-        mod._apply_market_conditions("optimize", None,
-                                     {"enabled_instruments": ["AAA"]}, _built("O_LC"))
+        mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
+
+
+def test_a_manifest_without_a_profile_is_refused_rather_than_ignored(monkeypatch):
+    """Ignoring it would run an UNGATED grid from a command line that says otherwise -- and the
+    driver folds the manifest into the job-name digest, so it would read as gated afterwards."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ())
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", "abc123")
+    with pytest.raises(SystemExit, match="without --market-condition-profile"):
+        mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
 
 
 # --------------------------------------------------------------------------- the pinned snapshot
@@ -491,10 +668,44 @@ def test_a_manifest_that_does_not_cover_the_universe_is_refused_naming_the_symbo
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
     with pytest.raises(SystemExit) as e:
         mod._apply_market_conditions(
-            "optimize", None, {"enabled_instruments": ["AAA", "ZZZ", "QQQ"]}, _built("O_LC"))
+            "optimize", {"enabled_instruments": ["AAA", "ZZZ", "QQQ"]}, _built("O_LC"))
     message = str(e.value)
     assert "ZZZ" in message and "QQQ" in message and "AAA" not in message.split("instruments:")[1]
     assert snapshot in message
+
+
+def test_the_coverage_check_sees_the_SCREENED_universe_not_the_static_one(
+        profile_on, snapshot, monkeypatch):
+    """A --screener run REPLACES ``enabled_instruments`` with the screened candidate union.
+
+    That union is the universe the gates are actually asked about, so it is the one coverage must
+    be checked against. Checked against the pre-screener list (which for a screener run is the
+    static --universe, often just a seed), a run whose real universe the snapshot does not cover
+    passes -- and every uncovered symbol then reads ``missing_session`` for the whole run and
+    never enters, which is precisely the silent miss the check exists to prevent.
+    """
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
+    block = {"enabled_instruments": ["AAA"]}          # the static universe: fully covered
+    block["enabled_instruments"] = ["AAA", "ZZZ"]     # what the screener block writes
+    with pytest.raises(SystemExit, match="ZZZ"):
+        mod._apply_market_conditions("optimize", block, _built("O_LC"))
+
+
+def test_the_optimize_command_records_the_profile_after_every_universe_rewrite():
+    """The ORDER inside ``_cmd_optimize``, read from the source.
+
+    The check above can only fail if the call happens before the rewrite, and that ordering is
+    not observable from any unit call -- so it is pinned where it lives. Both screener blocks
+    (``--screener`` and ``--screener-gate-store``) run between the block's construction and this
+    call; the SCREENER one assigns ``enabled_instruments``.
+    """
+    src = open(_LAUNCHER, encoding="utf-8").read()
+    start = src.index("def _cmd_optimize(args)")
+    body = src[start:src.index("def _cmd_optimize_batch(args)")]
+    rewrite = body.index('backtest_block["enabled_instruments"] = enabled')
+    call = body.index('_apply_market_conditions("optimize"')
+    assert rewrite < call, ("the market-condition coverage check must run AFTER the screener "
+                            "rewrites the universe")
 
 
 def test_the_run_config_records_the_profile_the_manifest_and_the_calc_versions(
@@ -502,7 +713,7 @@ def test_the_run_config_records_the_profile_the_manifest_and_the_calc_versions(
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
     strat = _built("O_LC")
     block = {"enabled_instruments": ["AAA", "BBB"]}
-    recorded = mod._apply_market_conditions("optimize", None, block, strat)
+    recorded = mod._apply_market_conditions("optimize", block, strat)
 
     assert block["market_condition_profile"] == "ohlcv-v1"
     assert block["market_condition_manifest"] == snapshot
@@ -517,15 +728,33 @@ def test_the_run_config_records_the_profile_the_manifest_and_the_calc_versions(
     assert recorded["genes"] == sorted(g for g in collect_param_space(strat) if "-market-" in g)
 
 
-def test_the_profile_does_not_scale_population_or_generations(profile_on, snapshot, monkeypatch):
-    """Operator decision 2026-09-15: add genes, keep the population as it is."""
-    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
-    block = {"enabled_instruments": ["AAA", "BBB"]}
-    cfg = {"populationSize": 200, "generations": 60, "earlyStoppingGenerations": 8,
-           "backtest": block}
-    mod._apply_market_conditions("optimize", None, block, _built("O_LC"))
-    assert (cfg["populationSize"], cfg["generations"], cfg["earlyStoppingGenerations"]) == (
-        200, 60, 8)
+def test_the_profile_does_not_scale_population_or_generations():
+    """Operator decision 2026-09-15: "add genes but keep pop size as is, is already big".
+
+    Asserted where the numbers are actually decided -- the driver's resolved argv -- rather than
+    on a dict the code under test never touches.
+    """
+    import importlib.util as _ilu
+
+    driver_path = os.path.normpath(os.path.join(_ROOT, "..", "..", "tools",
+                                                "run_options_matrix.py"))
+    spec = _ilu.spec_from_file_location("run_options_matrix_pop", driver_path)
+    driver = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(driver)
+    argv = ["--profile", "discovery", "--strategies", "O_LC", "--experts", "FMPRating",
+            "--launcher", _LAUNCHER, "--start", "2020-01-01", "--end", "2025-12-31",
+            "--screener-gate-store", "store.parquet", "--max-stock-price", "0"]
+    gated = argv + ["--market-condition-profile", "ohlcv-v1",
+                    "--market-condition-manifest", "abc123"]
+
+    def budget(a):
+        args = driver.resolve_args(driver.build_parser(), a)
+        cmd = driver.build_cmd(args, _LAUNCHER, "n", "FMPRating", "O_LC", "AAPL")
+        return {flag: cmd[cmd.index(flag) + 1]
+                for flag in ("--population", "--generations", "--early-stop")}
+
+    assert budget(argv) == budget(gated) == {"--population": "200", "--generations": "60",
+                                             "--early-stop": "8"}
 
 
 def test_the_persisted_digest_round_trips_into_a_trial_config(profile_on, snapshot, monkeypatch):
@@ -542,7 +771,7 @@ def test_the_persisted_digest_round_trips_into_a_trial_config(profile_on, snapsh
         "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
         "entry_action": getattr(strat, "entry_action", None),
     }
-    mod._apply_market_conditions("optimize", None, backtest_cfg, strat)
+    mod._apply_market_conditions("optimize", backtest_cfg, strat)
     # Round-trip through JSON: the persisted optimization_config is a JSON column.
     backtest_cfg = json.loads(json.dumps(backtest_cfg, default=str))
     trial = _build_daily_trial_config(backtest_cfg, decode_params(strat, {}), None)

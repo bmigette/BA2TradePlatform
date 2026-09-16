@@ -130,6 +130,55 @@ def test_an_uninterpretable_mode_gene_raises_rather_than_being_ignored(gated):
                                          "cond:o_lc-market-adx:value": 40.0})
 
 
+def test_a_mode_leaf_used_as_an_offset_base_is_refused_at_index_build():
+    """A leaf the optimizer can switch OFF must not be another leaf's ruler.
+
+    ``_apply_to_tree`` resolves a ``value_offset_from`` base from the GENE MAP on purpose, so a
+    dropped base still anchors its dependant -- which means the base's threshold is still live
+    when its own mode decoded to ``off``. Canonicalising it to the anchor would fold two
+    genuinely different phenotypes onto one key and hand the second one the first one's fitness,
+    so the template is refused once, at index build, naming both leaves.
+    """
+    from types import SimpleNamespace
+
+    base = {"id": "o_lc-market-adx", "field": "underlying_adx_14", "op": "<", "value": 25.0,
+            "optimize": True, "value_min": 10.0, "value_max": 40.0, "value_step": 5.0,
+            "mode_optimize": True, "mode_choices": ["off", "below", "above"]}
+    dependant = {"id": "o_lc-adx-band", "field": "underlying_adx_14", "op": "<", "value": 30.0,
+                 "optimize": True, "value_offset_from": "o_lc-market-adx",
+                 "value_min": 1.0, "value_max": 10.0, "value_step": 1.0}
+    strategy = SimpleNamespace(
+        entry_rules=[{"id": "e", "conditions": {"id": "root", "operator": "AND",
+                                                "conditions": [base, dependant]},
+                      "actions": [{"action_type": "buy"}]}],
+        exit_rules=[])
+    with pytest.raises(ValueError, match="value_offset_from base"):
+        mode_anchor_index(strategy)
+    # The message has to name BOTH leaves: the base is where the mode gene is, the dependant is
+    # what has to change.
+    try:
+        mode_anchor_index(strategy)
+    except ValueError as e:
+        assert "o_lc-market-adx" in str(e) and "o_lc-adx-band" in str(e)
+
+
+def test_an_offset_base_without_a_mode_gene_is_still_fine(gated):
+    """The refusal is about MODE leaves only: ordinary offset chains are untouched."""
+    from types import SimpleNamespace
+
+    base = {"id": "plain-base", "field": "iv_rank", "op": "<", "value": 30.0, "optimize": True,
+            "value_min": 10.0, "value_max": 60.0, "value_step": 5.0}
+    dependant = {"id": "plain-band", "field": "iv_rank", "op": "<", "value": 35.0,
+                 "optimize": True, "value_offset_from": "plain-base",
+                 "value_min": 1.0, "value_max": 10.0, "value_step": 1.0}
+    strategy = SimpleNamespace(
+        entry_rules=[{"id": "e", "conditions": {"id": "root", "operator": "AND",
+                                                "conditions": [base, dependant]},
+                      "actions": [{"action_type": "buy"}]}],
+        exit_rules=[])
+    assert mode_anchor_index(strategy) == {}
+
+
 def test_a_leaf_with_no_value_gene_is_left_alone(gated):
     """A categorical leaf has a mode gene and NO threshold: there is nothing to canonicalise."""
     anchors = dict(mode_anchor_index(gated))

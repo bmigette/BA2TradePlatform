@@ -1115,8 +1115,18 @@ def mode_anchor_index(strategy) -> Dict[str, Any]:
     the FieldSpec's declared anchor for a market-condition leaf), so the per-trial work is a dict
     lookup. Empty for every run with no mode genes -- which is every run that existed before the
     market-condition profiles, and what keeps their trial keys bit-identical.
+
+    REFUSES a template in which a mode leaf is the BASE of another leaf's ``value_offset_from``.
+    Such a base is read for its decoded gene even when its own mode is ``off`` and the leaf is
+    dropped (``_apply_to_tree._resolved`` resolves from the gene map, deliberately, so a
+    toggled-off base still anchors its dependant), so that inactive threshold is NOT an inactive
+    dimension: canonicalising it to the anchor would fold two genuinely different phenotypes onto
+    one key and hand the second one the first one's fitness. The template is the wrong place for
+    that dependency -- a gate the optimizer can switch off cannot also be somebody's ruler -- so
+    this raises at index build, once per run, naming both leaves.
     """
     out: Dict[str, Any] = {}
+    offset_bases: Dict[str, list] = {}
 
     def walk(node):
         if isinstance(node, list):
@@ -1126,6 +1136,9 @@ def mode_anchor_index(strategy) -> Dict[str, Any]:
         if not isinstance(node, dict):
             return
         cid = node.get("id")
+        base = node.get("value_offset_from") or node.get("valueOffsetFrom")
+        if base:
+            offset_bases.setdefault(str(base), []).append(str(cid or "<unnamed>"))
         if cid and (node.get("mode_optimize") or node.get("modeOptimize")):
             choices = node.get("mode_choices") or node.get("modeChoices")
             out[str(cid)] = (list(choices or []), node.get("value"))
@@ -1134,6 +1147,16 @@ def mode_anchor_index(strategy) -> Dict[str, Any]:
 
     for attr in ("entry_rules", "exit_rules"):
         walk(getattr(strategy, attr, None))
+    clash = sorted(cid for cid in out if cid in offset_bases)
+    if clash:
+        detail = "; ".join(f"{cid!r} is the offset base of {sorted(set(offset_bases[cid]))!r}"
+                           for cid in clash)
+        raise ValueError(
+            f"mode leaf/leaves used as a value_offset_from base: {detail}. A leaf the optimizer "
+            f"can switch off cannot also be another leaf's ruler: the dependant reads the base's "
+            f"decoded threshold even when the base is dropped, so that threshold stays live and "
+            f"must not be canonicalised away for deduplication. Give the dependant an absolute "
+            f"range, or anchor it on a leaf without a mode gene.")
     return out
 
 
