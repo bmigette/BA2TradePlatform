@@ -579,3 +579,82 @@ def test_a_manifestless_setting_still_fails_an_optimizer_trial(ps):
     with pytest.raises(ValueError, match="pins no manifest"):
         seam_wiring.install_backtest_market_conditions(
             {"experts": [_spec("ohlcv-v1")], "_ga_trial": True}, ps)
+
+
+# ----------------------------------------- every expert's gates are served by its OWN setting
+def _gated_rules(field="underlying_adx_14", leaf_id="o_lc-market-adx"):
+    return [{"id": "o_lc-entry", "conditions": {"all": [
+        {"id": "o_lc-flat", "field": "has_no_position", "op": "=="},
+        {"id": leaf_id, "field": field, "op": "<", "value": 25.0},
+    ]}}]
+
+
+def test_a_leaf_only_the_OTHER_experts_profile_serves_is_refused(ps):
+    """THE BT/LIVE ASYMMETRY. The run's rules are run-level, so BOTH experts evaluate them; the
+    union of their settings would install a ta-structure reader and let the ohlcv-v1 expert read
+    that field in the backtest. Live there is no union -- that expert's resolver is built from
+    its own setting alone -- so the same leaf finds no reader and the sleeve never enters.
+    """
+    config = {
+        "experts": [_spec("ohlcv-v1"), _spec("ta-structure-v1", "FMPRatingB")],
+        "entry_rules": _gated_rules("structure_state", "o_lc-market-state"),
+    }
+    # The union resolves happily -- which is exactly why the union cannot be the semantic.
+    assert seam_wiring.market_condition_pins(config)[0] == ["ohlcv-v1", "ta-structure-v1"]
+    with pytest.raises(ValueError) as e:
+        seam_wiring.install_backtest_market_conditions(config, ps)
+    msg = str(e.value)
+    assert "FMPRating" in msg and "o_lc-market-state" in msg and "structure_state" in msg
+    assert "ohlcv-v1" in msg
+
+
+def test_two_experts_that_each_serve_the_runs_leaves_install_normally(ps):
+    """The same two profiles, both named by BOTH experts: the union is then an optimisation (one
+    reader set instead of two) rather than a claim about who can read what."""
+    config = {
+        "experts": [_spec("ohlcv-v1,ta-structure-v1"),
+                    _spec("ta-structure-v1,ohlcv-v1", "FMPRatingB")],
+        "entry_rules": _gated_rules("structure_state", "o_lc-market-state"),
+    }
+    resolver = seam_wiring.install_backtest_market_conditions(config, ps)
+    assert sorted(r.profile for r in resolver.reader.readers) == ["ohlcv-v1", "ta-structure-v1"]
+    seam_wiring.clear_backtest_market_conditions()
+
+
+def test_a_leaf_inside_ONE_specs_own_settings_counts_only_against_that_spec(ps):
+    """Expert settings can carry JSON-encoded rule trees, which is why the walk decodes strings.
+    Such a leaf belongs to its spec alone -- the other expert never evaluates it."""
+    import json
+
+    a = _spec("ohlcv-v1")
+    b = _spec("ta-structure-v1", "FMPRatingB")
+    b["settings"]["own_rules"] = json.dumps(_gated_rules("structure_state", "b-market-state"))
+    # B serves its own leaf, A never sees it -> installs.
+    resolver = seam_wiring.install_backtest_market_conditions(
+        {"experts": [a, b]}, ps)
+    assert resolver is not None
+    seam_wiring.clear_backtest_market_conditions()
+
+    # Move the same leaf onto A, whose setting does not serve it -> refused, naming A.
+    a2 = _spec("ohlcv-v1")
+    a2["settings"]["own_rules"] = b["settings"].pop("own_rules")
+    with pytest.raises(ValueError, match="b-market-state"):
+        seam_wiring.install_backtest_market_conditions({"experts": [a2, b]}, ps)
+
+
+def test_an_ungated_run_is_untouched_by_the_per_expert_check(ps):
+    """NO IMPACT: no market leaf anywhere means the loop finds nothing to serve, whatever the
+    settings say -- which is every existing backtest."""
+    plain = {"experts": [{"class": "FMPRating", "settings": {}}],
+             "entry_rules": [{"id": "r", "conditions": {"all": [
+                 {"field": "confidence", "op": ">", "value": 70}]}}]}
+    assert seam_wiring.assert_each_expert_serves_its_gates(plain) is None
+    with pytest.raises(KeyError):
+        seam_wiring.market_condition_pins(plain)
+
+
+def test_the_check_is_skipped_when_a_run_carries_no_expert_spec_dicts():
+    """A spec given as a bare class name carries no settings, so there is nothing to check it
+    against; the empty-union refusal in the installer remains the backstop for that shape."""
+    assert seam_wiring.assert_each_expert_serves_its_gates(
+        {"experts": ["FMPRating"], "entry_rules": _gated_rules()}) is None

@@ -491,13 +491,21 @@ def test_the_import_tool_runs_that_refusal_before_it_writes_anything():
 def live_db(tmp_path):
     """A throwaway sqlite the import tool writes into, plus the tool module bound to it.
 
-    The tool configures ``ba2_common.core.db``'s GLOBAL engine at import time, so the previous
-    configuration is snapshotted and restored: this file runs inside the shared backend suite.
+    THREE process-wide things the tool's import mutates, all snapshotted and restored, because
+    this file runs inside the shared backend suite:
+
+    * ``ba2_common.core.db``'s GLOBAL engine (the tool calls ``configure_db`` at import time) --
+      and the engine built against the temp file is DISPOSED before the restore, or Windows keeps
+      the sqlite open and ``tmp_path`` cannot be cleaned up;
+    * ``BA2_LIVE_DB`` / ``BA2_REPO``;
+    * ``sys.path``, which the tool PREPENDS its repo root and packages/experts to. Leaving those
+      in place would put the worktree root at ``sys.path[0]`` for every test that runs afterwards.
     """
     import ba2_common.core.db as ba2db
     from sqlmodel import SQLModel
 
     saved_file, saved_engine = ba2db._db_file, ba2db._engine
+    saved_path = list(sys.path)
     db_path = str(tmp_path / "live.sqlite")
     tools = os.path.normpath(os.path.join(_ROOT, "..", ".."))
     saved_env = {k: os.environ.get(k) for k in ("BA2_LIVE_DB", "BA2_REPO")}
@@ -512,12 +520,17 @@ def live_db(tmp_path):
         SQLModel.metadata.create_all(ba2db.get_engine())
         yield tool
     finally:
+        try:
+            ba2db.get_engine().dispose()    # close the temp sqlite before tmp_path is removed
+        except Exception:                   # noqa: BLE001 -- teardown must not mask a failure
+            pass
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
         ba2db._db_file, ba2db._engine = saved_file, saved_engine
+        sys.path[:] = saved_path
 
 
 def _db_counts():

@@ -31,6 +31,7 @@ from ba2_common.core.market_condition_rules import (
     PROFILE_SETTING as MARKET_CONDITION_PROFILE_SETTING,
     PROFILE_SETTING_OFF as MARKET_CONDITION_PROFILE_OFF,
     assert_fields_served,
+    assert_no_market_fields,
     parse_profile_setting,
 )
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
@@ -1943,6 +1944,10 @@ class ExpertSettingsTab:
                                 label='Market-Condition Profile',
                                 value=MARKET_CONDITION_PROFILE_OFF,
                             ).classes('w-full')
+                            # A NEW instance has no stored value to read, so the widget IS the
+                            # operator's input and is saveable from the start. The edit branch
+                            # below clears this if it cannot read what is stored.
+                            self._market_condition_profile_loaded = True
                             ui.label('Market-condition profile(s) the enter-market ruleset may gate on. '
                                      'Empty serves no market-condition data: a ruleset with a market '
                                      'gate then cannot enter, and saving that combination is refused.'
@@ -2004,11 +2009,31 @@ class ExpertSettingsTab:
                         if expert:
                             instrument_method = expert.settings.get('instrument_selection_method', 'static')
                             self.instrument_selection_method_select.value = instrument_method
-                            self._fill_market_condition_profile(
-                                expert.settings.get(MARKET_CONDITION_PROFILE_SETTING))
                     except Exception as e:
                         logger.debug(f'Could not load instrument selection method: {e}')
                         self.instrument_selection_method_select.value = 'static'
+
+                    # THE PROFILE IS READ IN ITS OWN TRY, and failing to read it is recorded.
+                    # Sharing the handler above meant a failure left the select on its
+                    # constructor default ('') while _save_expert_settings wrote that default
+                    # back unconditionally -- silently CLEARING a gated expert's profile (or
+                    # making it unsaveable with a refusal about leaves the operator never
+                    # touched), with one DEBUG line naming the wrong setting as the only trace.
+                    self._market_condition_profile_loaded = False
+                    try:
+                        from ...core.utils import get_expert_instance_from_id
+                        expert = get_expert_instance_from_id(expert_instance.id)
+                        if expert is None:
+                            raise ValueError(f'no live expert instance for id {expert_instance.id}')
+                        self._fill_market_condition_profile(
+                            expert.settings.get(MARKET_CONDITION_PROFILE_SETTING))
+                        self._market_condition_profile_loaded = True
+                    except Exception as e:
+                        logger.error(
+                            f'Could not read {MARKET_CONDITION_PROFILE_SETTING} for expert '
+                            f'instance {expert_instance.id}: {e}. The field is shown empty and '
+                            f'will NOT be saved by this dialog, so the stored value stands.',
+                            exc_info=True)
                 else:
                     if expert_types:
                         self.expert_select.value = expert_types[0]
@@ -4002,31 +4027,75 @@ class ExpertSettingsTab:
         self.market_condition_profile_select.value = shown
 
     def _market_condition_profile_value(self) -> str:
-        """The profile setting the dialog is about to save (``''`` when the widget is absent)."""
+        """The profile setting shown in the dialog (``''`` when the widget is absent)."""
         if not hasattr(self, 'market_condition_profile_select'):
             return MARKET_CONDITION_PROFILE_OFF
         return str(self.market_condition_profile_select.value or MARKET_CONDITION_PROFILE_OFF)
 
-    def _refuse_unserved_market_gates(self, enter_market_ruleset_id) -> None:
-        """Refuse a (ruleset, profile setting) combination that leaves a market gate unserved.
+    def _market_condition_profile_savable(self) -> bool:
+        """Whether this dialog may WRITE the profile setting.
+
+        False when the widget is absent, and when editing an instance whose stored value could
+        not be read: the select then shows its constructor default, and saving that would clear
+        a gated expert's profile because of an unrelated read failure.
+        """
+        return (hasattr(self, 'market_condition_profile_select')
+                and getattr(self, '_market_condition_profile_loaded', False))
+
+    def _effective_market_condition_profile(self, expert_instance_id) -> str:
+        """The profile setting the SAVED instance will end up with.
+
+        The widget's value when this dialog is going to write it; otherwise the value already
+        stored, because the save is about to skip that write and leave the stored one standing.
+        If neither can be established the combination cannot be judged at all -- and a save that
+        repoints a ruleset must not proceed unjudged -- so this raises.
+        """
+        if self._market_condition_profile_savable():
+            return self._market_condition_profile_value()
+        try:
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if expert is None:
+                raise ValueError(f'no live expert instance for id {expert_instance_id}')
+            return str(expert.settings.get(MARKET_CONDITION_PROFILE_SETTING) or
+                       MARKET_CONDITION_PROFILE_OFF)
+        except Exception as e:
+            raise ValueError(
+                f'cannot verify the market-condition gates: '
+                f'{MARKET_CONDITION_PROFILE_SETTING} for expert instance '
+                f'{expert_instance_id} could not be read ({e}), and this save changes the '
+                f'ruleset assignment. Fix the instance (or reopen the dialog) before saving.') from e
+
+    def _refuse_unserved_market_gates(self, enter_market_ruleset_id, open_positions_ruleset_id,
+                                      expert_instance_id=None) -> None:
+        """Refuse a (ruleset, profile setting) combination the live platform cannot run.
 
         THE FAILURE THIS PREVENTS. The gates and the data that feeds them are two halves of one
         strategy held in two places: the enter-market RULESET carries the leaves, the expert
         SETTING says which profile is served. Saved apart -- a gated ruleset assigned while the
         profile is still empty, or a profile cleared under a gated ruleset -- the instance comes
         up enabled, scheduled and correct-looking, and every gated entry is refused for ever:
-        indistinguishable from a strategy that found no setup. The same refusal runs at deploy
-        import (tools/import_deploy_payload.py), so neither door is the unguarded one.
+        indistinguishable from a strategy that found no setup.
 
-        Raises ValueError, which ``_save_expert``'s handler turns into a red notification with
-        the leaf, the field and the setting named.
+        BOTH DOORS, and they refuse different things. The open-positions slot may carry NO market
+        leaf at all, whatever the profile says: outside the entry decision pass the live resolver
+        has no context, so such a leaf reads ``no_context`` and its rule never fires -- an exit or
+        protective-order adjustment that silently stops happening. The deploy importer gets that
+        refusal from ``trade_rules_to_live_export``; this dialog can attach an EXISTING gated
+        ruleset to that slot without converting anything, so it needs its own.
+
+        Raises ValueError, which ``_save_expert``'s handler turns into a red notification naming
+        the leaf, the field and the setting.
         """
         from ba2_common.core.market_condition_live import market_condition_fields_in_ruleset
+
+        on_exit = market_condition_fields_in_ruleset(open_positions_ruleset_id)
+        assert_no_market_fields(on_exit, f"open-positions ruleset {open_positions_ruleset_id}")
 
         used = market_condition_fields_in_ruleset(enter_market_ruleset_id)
         if not used:
             return          # no market leaf: any profile setting is fine, including empty
-        profiles = parse_profile_setting(self._market_condition_profile_value())
+        profiles = parse_profile_setting(
+            self._effective_market_condition_profile(expert_instance_id))
         assert_fields_served(used, profiles,
                              where=f"enter-market ruleset {enter_market_ruleset_id}")
 
@@ -4080,9 +4149,12 @@ class ExpertSettingsTab:
                     expert_instance.open_positions_ruleset_id = self.open_positions_ruleset_map.get(selected_display_name)
                 
                 # BEFORE the first write: a gated enter-market ruleset needs a profile setting
-                # that serves its leaves. Nothing has been persisted yet (the assignments above
-                # are on a detached row), so a refusal here leaves the instance untouched.
-                self._refuse_unserved_market_gates(expert_instance.enter_market_ruleset_id)
+                # that serves its leaves, and the open-positions slot may carry none at all.
+                # Nothing has been persisted yet (the assignments above are on a detached row),
+                # so a refusal here leaves the instance untouched.
+                self._refuse_unserved_market_gates(expert_instance.enter_market_ruleset_id,
+                                                   expert_instance.open_positions_ruleset_id,
+                                                   expert_instance.id)
 
                 update_instance(expert_instance)
                 logger.info(f"Updated expert instance: {expert_instance.id}")
@@ -4116,8 +4188,9 @@ class ExpertSettingsTab:
                     selected_display_name = self.open_positions_ruleset_select.value
                     open_positions_id = self.open_positions_ruleset_map.get(selected_display_name)
                 
-                # Same refusal as the edit branch, before the row exists.
-                self._refuse_unserved_market_gates(enter_market_id)
+                # Same refusal as the edit branch, before the row exists. No instance id: there
+                # is nothing stored to fall back to, and the widget is what will be written.
+                self._refuse_unserved_market_gates(enter_market_id, open_positions_id)
 
                 new_instance = ExpertInstance(
                     expert=self.expert_select.value,
@@ -4309,8 +4382,12 @@ class ExpertSettingsTab:
 
         # Save the market-condition profile (a BUILTIN setting with its own widget next to the
         # ruleset assignment; _refuse_unserved_market_gates has already checked this value
-        # against the enter-market ruleset's leaves, so nothing unserved reaches the DB).
-        if hasattr(self, 'market_condition_profile_select'):
+        # against the ruleset's leaves, so nothing unserved reaches the DB).
+        #
+        # SKIPPED when the dialog could not READ the stored value: the widget then shows its
+        # constructor default (''), and writing that back would clear a gated expert's profile
+        # because of an unrelated read failure. Never write a default you did not read.
+        if self._market_condition_profile_savable():
             profile_value = self._market_condition_profile_value()
             expert.save_setting(MARKET_CONDITION_PROFILE_SETTING, profile_value, setting_type="str")
             logger.debug(f'Saved {MARKET_CONDITION_PROFILE_SETTING}: {profile_value!r}')

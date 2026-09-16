@@ -100,9 +100,14 @@ def iter_market_condition_leaves(node: Any, path: str = "rules") -> Iterator[Tup
     yield from walk(node, path)
 
 
-def assert_no_market_conditions(rules: Any, where: str) -> None:
-    """Refuse a market-condition leaf anywhere in an exit / open-positions ruleset."""
-    hits = [label for label, _ in iter_market_condition_leaves(rules, where)]
+def assert_no_market_fields(used: Iterable[Tuple[str, str]], where: str) -> None:
+    """Refuse ``(label, field)`` pairs on an exit / open-positions ruleset.
+
+    The pairs form, for the same reason :func:`assert_fields_served` has one: a payload carries
+    condition TREES keyed on ``field`` while a live ruleset is persisted as ``EventAction``
+    triggers keyed on ``event_type``. One message for both doors.
+    """
+    hits = [label for label, _ in used]
     if hits:
         raise ValueError(
             f"{where}: market-condition leaves {hits!r} are not allowed in an open-positions / "
@@ -110,6 +115,12 @@ def assert_no_market_conditions(rules: Any, where: str) -> None:
             f"resolver has no decision context, so the condition reads 'no_context', the rule "
             f"never fires, and the position's exit or protective-order adjustment silently stops "
             f"happening. Put the gate on the entry ruleset instead.")
+
+
+def assert_no_market_conditions(rules: Any, where: str) -> None:
+    """Refuse a market-condition leaf anywhere in an exit / open-positions ruleset (tree form)."""
+    assert_no_market_fields(((label, str(leaf.get("field")))
+                             for label, leaf in iter_market_condition_leaves(rules, where)), where)
 
 
 def _unresolved_reason(leaf: Mapping) -> str:

@@ -21,7 +21,10 @@ any worker fan-out. Different analyses cannot share a mutable global clock."
 
 Certification failure (DECISION 2026-09-16): a cache that fails split certification must NOT stop
 the platform -- exits and protective-order handling have to keep running. The dispatcher
-then serves an :class:`UncertifiedSourceResolver`: it resolves NO context for every leaf, its
+then serves an :class:`UncertifiedSourceResolver` (a failed VERDICT) or an
+:class:`UnreadableSourceResolver` (certification that could not run at all -- a corrupt parquet,
+a non-midnight ``Date`` label: those RAISE rather than reporting ``unavailable``): it resolves
+NO context for every leaf, its
 ``no_context_reason`` is the certification summary (carried by ``TradeConditions``' once-per-field
 WARNING), and one ERROR naming the failing symbols is logged when that expert's resolver is first
 built (certification is paid lazily, on the first expert whose setting names a profile, so a
@@ -50,6 +53,8 @@ from ba2_common.core.market_condition_context import (
     MarketConditionContext,
     MarketConditionReader,
 )
+from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.instance_resolver import InstanceResolverNotConfigured
 from ba2_common.core.market_condition_reader import coverage_detail, missing_coverage
 from ba2_common.core.market_condition_source import SOURCE_PROFILE_FMP_DAILY
 
@@ -69,6 +74,7 @@ __all__ = [
     "resolver_for_expert_instance",
     "SourceCertificationError",
     "UncertifiedSourceResolver",
+    "UnreadableSourceResolver",
     "NO_DECISION_SCOPE_REASON",
     "UNIVERSE_SENTINELS",
     "gated_expert_instances",
@@ -244,6 +250,41 @@ class UncertifiedSourceResolver:
         """No per-SYMBOL reason: certification is a property of the whole cache, so every symbol
         gets the same class-level :attr:`no_context_reason`. Defined rather than left absent so
         the dispatcher can ask any resolver it holds the same question."""
+        return None
+
+
+class UnreadableSourceResolver:
+    """Installed when split certification could not RUN at all: resolves no context, ever.
+
+    ``certify_source_columns`` returns an ``unavailable`` verdict for a cache file that is merely
+    MISSING, but it RAISES for one it cannot make sense of -- an unreadable/corrupt parquet, a
+    ``Date`` column that is not midnight-aligned (``market_condition_source.read_fmp_daily_cache``).
+    Before this class that exception escaped :meth:`PerInstanceMarketConditionResolver._build`,
+    and since Task 12 moved certification out of startup and into the live entry pass, it would
+    have aborted ``process_expert_recommendations_after_analysis`` for that expert on EVERY pass,
+    with nothing cached and no one line saying why.
+
+    So a certification that cannot run degrades exactly like one that fails: every gated entry is
+    refused with the reason, exits and protective-order handling are untouched, and the answer is
+    cached so the fault is reported once rather than re-raised per leaf.
+    """
+
+    def __init__(self, profile: Any, error: BaseException, *, cache_root: Any = None,
+                 source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+        self.profiles = _profile_tuple(profile)
+        self.profile = ",".join(self.profiles)
+        self.source_profile = source_profile
+        self.error = error
+        self.cache_root = cache_root
+        self.no_context_reason = (
+            f"market-condition gates DISABLED: the OHLCV cache under {cache_root!r} could not be "
+            f"certified for source profile {source_profile} -- {type(error).__name__}: {error}")
+
+    def __call__(self, account: Any, instrument_name: str, expert_recommendation: Any) -> None:
+        return None
+
+    def no_context_reason_for(self, symbol: Any) -> Optional[str]:
+        """No per-SYMBOL reason: an unreadable cache is a property of the cache, not of a symbol."""
         return None
 
 
@@ -495,12 +536,13 @@ class LiveMarketConditionResolver:
         ``universe=None`` derives it; a caller that already has the list (a test, or a host that
         knows its own universe) passes it.
 
-        ``at_install`` exists because ``wire_all_seams`` runs BEFORE ``init_db``, so the install
-        call normally cannot read the universe at all. That one failure is expected and is
-        reported once. A failure at DECISION time is a different event -- the DB has gone away,
-        or one expert instance raises while being built -- and it means coverage is no longer
-        being checked at all, so it is reported once per distinct cause rather than swallowed
-        into the install flag's budget.
+        ``at_install`` downgrades the "universe unreadable" report from ERROR to a single
+        WARNING. It existed for the startup install, which ran before ``init_db`` and so could
+        not read the universe at all; since Task 12 the resolver is built lazily on the first
+        decision pass, when the DB is open, and NO PRODUCTION CALLER passes it -- only the test
+        harness does. It is kept because the distinction it encodes is real (an expected
+        can't-read-yet versus coverage silently no longer being checked), and because a future
+        eager-warm path would want it back; nothing in the live flow reaches that branch today.
         """
         mapped_by_profile = [(profile, mapped)
                              for profile, mapped in zip(self.profiles, self.mapped_readers)
@@ -729,7 +771,14 @@ def certify_cache_root(cache_root: Optional[str] = None) -> Tuple[str, Any]:
 
 
 def clear_certification_cache() -> None:
-    """Forget every memoised certification (a test writing a new cache; an ops re-check)."""
+    """Forget every memoised certification, so the next gated expert re-reads the cache.
+
+    Wired into the whole-process ``/api/reload`` branch
+    (``ba2_trade_platform.core.instance_registry.drop_market_condition_resolver``): a failed or
+    unreadable cache is answered ONCE and then cached with the refusing resolver, so without this
+    an operator who repaired the cache would have to restart the platform to have it re-read.
+    Also used by tests that write a new cache under the same root.
+    """
     with _CERTIFICATION_LOCK:
         _CERTIFICATIONS.clear()
 
@@ -771,10 +820,6 @@ def resolver_for_profiles(profiles: Sequence[str], *,
         names, reader=market_condition_reader_for(readers), source_profile=source_profile,
         manifest_digest=digests.get(names[0]) if len(names) == 1 else None)
 
-
-#: Sentinel for "not in the resolver cache" -- a cached ``None`` (an expert with an empty
-#: setting) is a real answer and must not send every leaf back to the settings.
-_UNBUILT = object()
 
 #: ``cache root -> certification report``, with its lock. Certification is two parquet reads and
 #: its answer is a property of the cache, not of the expert asking.
@@ -837,9 +882,17 @@ class PerInstanceMarketConditionResolver:
         try:
             expert = get_instance_resolver().get_expert_instance(int(expert_instance_id))
             return parse_profile_setting(expert.settings.get(PROFILE_SETTING))
-        except Exception as e:  # noqa: BLE001 -- a settings fault never stops the pass
+        except Exception as e:  # noqa: BLE001 -- named below; a settings fault never stops the pass
             from ba2_common.logger import logger
 
+            # The house convention (failure_modes: deny by default under BA2_ERROR_MODE=enforce).
+            # What this path LEGITIMATELY sees: ValueError from parse_profile_setting (an
+            # unregistered or repeated profile name -- the whole point of reporting and refusing
+            # here), InstanceNotFound/LookupError for an instance deleted between the
+            # recommendation and the pass, and InstanceResolverNotConfigured (a RuntimeError) in a
+            # package-only process with no host wired. A TypeError or AttributeError is a defect
+            # in the resolver seam and must NOT be downgraded to "this expert has no profile".
+            absorb_if_benign(e, ValueError, LookupError, InstanceResolverNotConfigured)
             key = (expert_instance_id, str(e))
             if key not in self._settings_errors:
                 self._settings_errors.add(key)
@@ -853,9 +906,12 @@ class PerInstanceMarketConditionResolver:
     def resolver_for(self, expert_instance_id: Any) -> Optional[Any]:
         """This expert's resolver, built and cached on first use; ``None`` for an empty setting.
 
-        May return an :class:`UncertifiedSourceResolver` (cached like any other): the served
-        cache failed split certification, so every gated entry is refused with the certification
-        summary as its reason while exits keep running (module DECISION 2026-09-16).
+        May return an :class:`UncertifiedSourceResolver` (the cache failed split certification)
+        or an :class:`UnreadableSourceResolver` (certification could not run -- a corrupt parquet
+        or a non-midnight ``Date`` label raises instead of reporting a verdict). Both are cached
+        like any other answer, so the fault is one ERROR rather than one per leaf, and both
+        refuse every gated entry with their reason while exits keep running (module DECISION
+        2026-09-16).
 
         RAISES on a malformed :data:`MANIFEST_ENV` -- deliberately, and unlike a settings fault.
         A manifest is the host's ops configuration, not a strategy's preference, and the quiet
@@ -869,8 +925,11 @@ class PerInstanceMarketConditionResolver:
             return None
         key = (int(expert_instance_id), profiles)
         with self._lock:
-            hit = self._resolvers.get(key, _UNBUILT)
-        if hit is not _UNBUILT:
+            hit = self._resolvers.get(key)
+        # ``_build`` never returns None, so a plain ``.get`` is unambiguous. The empty-setting
+        # answer is not cached at all: ``profiles_for`` returned above, and re-reading a settings
+        # dict the host already caches is cheaper than a second cache to invalidate.
+        if hit is not None:
             return hit
         resolver = self._build(profiles)
         with self._lock:
@@ -882,7 +941,24 @@ class PerInstanceMarketConditionResolver:
     def _build(self, profiles: Tuple[str, ...]) -> Any:
         from ba2_common.logger import logger
 
-        root, report = certify_cache_root(self.cache_root)
+        try:
+            root, report = certify_cache_root(self.cache_root)
+        except Exception as e:  # noqa: BLE001 -- see UnreadableSourceResolver
+            # CERTIFICATION COULD NOT RUN (a corrupt parquet, a Date column that is not
+            # midnight-aligned). An ``unavailable`` VERDICT comes back as a report; these RAISE.
+            # Letting that escape would abort the whole enter-market pass for this expert on
+            # every schedule, uncached and unsummarised -- so it degrades exactly like a failed
+            # verdict, and the cached answer means one ERROR rather than one per leaf.
+            absorb_if_benign(e, ValueError, LookupError)
+            degraded = UnreadableSourceResolver(profiles, e, cache_root=self.cache_root,
+                                                source_profile=self.source_profile)
+            logger.error(
+                f"market-condition profile(s) {list(profiles)}: the OHLCV cache could not be "
+                f"certified at all ({type(e).__name__}: {e}). Every gated entry for this expert "
+                f"is refused with that reason; exits and protective-order handling are "
+                f"unaffected. Repair the cache and restart (or POST /api/reload) to re-certify.",
+                exc_info=True)
+            return degraded
         if not report.consistent:
             degraded = UncertifiedSourceResolver(profiles, report,
                                                  source_profile=self.source_profile)

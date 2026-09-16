@@ -84,12 +84,14 @@ _BACKEND_DIR = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspa
 # about a remote box. Each host's service environment governs its own workers; set it there.
 #
 # NOT MIRRORED (retired with Task 12): BA2_MARKET_CONDITION_PROFILE and
-# BA2_MARKET_CONDITION_MANIFEST. The profile is now an EXPERT SETTING, carried inside the trial
-# config's expert settings and read by live and backtests alike; the variable is read nowhere and
-# a set value now FAILS live startup, so mirroring it into a worker would have propagated a
-# refusal. The manifest goes with it: it only ever rode along for "environment-resolved
-# diagnostics" of a resolver that no longer resolves from the environment, and the trial config's
-# ``market_condition_manifests`` has always been the authority a backtest actually reads.
+# BA2_MARKET_CONDITION_MANIFEST. Mirroring them into a worker is now a pure no-op -- nothing
+# under testplatform/ reads either variable (the refusal lives in the LIVE ``wire_all_seams``,
+# which a backtest worker never calls), and the only justification the pair ever had was
+# "environment-resolved diagnostics" of a live-flavoured resolver that no longer resolves from
+# the environment at all. The trial config remains, and has always been, the authority a
+# backtest actually reads: the profile inside its expert settings, the snapshot in
+# ``market_condition_manifests``. Carrying dead names in this tuple invites the next reader to
+# believe the environment still decides something here.
 _WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY",
                     "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S")
 

@@ -98,13 +98,25 @@ def drop_market_condition_resolver(instance_id: "int | None" = None) -> None:
     A no-op when the installed resolver is not the per-instance dispatcher (nothing wired, a test
     resolver), and never raises -- the cache is an optimisation, and failing a settings write
     over it would be worse than serving one stale read.
+
+    ``instance_id=None`` (the whole-process form, which only ``/api/reload`` without a scope
+    uses) ALSO forgets the memoised split certifications. A failed or unreadable OHLCV cache is
+    answered once per process and then cached like any other answer, so without this an operator
+    who repaired the cache would have to restart the platform to have it re-read; with it,
+    ``POST /api/reload`` is enough. A SCOPED drop deliberately leaves them: certification is a
+    property of the cache, not of the expert being reloaded.
     """
     try:
         from ba2_common.core.TradeConditions import get_market_condition_context_resolver
-        from ba2_common.core.market_condition_live import PerInstanceMarketConditionResolver
+        from ba2_common.core.market_condition_live import (
+            PerInstanceMarketConditionResolver,
+            clear_certification_cache,
+        )
 
         resolver = get_market_condition_context_resolver()
         if isinstance(resolver, PerInstanceMarketConditionResolver):
             resolver.clear_cache(instance_id)
+        if instance_id is None:
+            clear_certification_cache()
     except Exception as e:  # pragma: no cover - defensive, never break a write
         logger.warning(f"market-condition resolver cache drop failed for id={instance_id}: {e}")

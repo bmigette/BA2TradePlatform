@@ -4930,7 +4930,13 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat) -> dict:
                  f"moment its genome is deployed.")
     setting_value = _market_condition_setting_value()
     for spec in specs:
-        spec.setdefault("settings", {})[PROFILE_SETTING] = setting_value
+        # ``"settings": None`` is a real shape -- it is exactly what the READER at
+        # seam_wiring.market_condition_profile_setting guards with its isinstance check -- and
+        # ``setdefault`` would hand it back and raise TypeError on the assignment. Both sides
+        # treat a non-dict settings value as "no settings yet".
+        if not isinstance(spec.get("settings"), dict):
+            spec["settings"] = {}
+        spec["settings"][PROFILE_SETTING] = setting_value
     # The RESOLVED list is recorded too. It is redundant with the setting BY CONSTRUCTION -- the
     # seam refuses a config where the two disagree -- and it is what every stored-config consumer
     # (re-runs, robustness variants, top-N persist, tools/backtest_parity.py) already reads.

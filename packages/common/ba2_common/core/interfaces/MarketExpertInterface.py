@@ -232,9 +232,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 # market_condition_rules.assert_market_fields_served rather than deployed unable
                 # to enter. (At EVALUATION time nothing raises: a leaf with no profile behind it
                 # reads ``no_context`` and returns False -- unknown never passes. The refusals
-                # are at save and import, which is where a human can still act on them.) ``valid_values`` renders as a select in both UIs; a COMMA LIST (two
-                # profiles at once) is accepted by the parser but has to be typed/imported rather
-                # than picked, which is deliberate -- picking one is the ordinary case.
+                # are at save and import, which is where a human can still act on them.)
+                # ``valid_values`` renders as a select in both UIs; a COMMA LIST (two profiles
+                # at once) is accepted by the parser but has to be typed or imported rather than
+                # picked, which is deliberate -- picking one is the ordinary case.
                 "market_condition_profile": {
                     "type": "str", "required": False, "default": cls._market_condition_profile_off(),
                     "valid_values": cls._market_condition_profile_choices(),

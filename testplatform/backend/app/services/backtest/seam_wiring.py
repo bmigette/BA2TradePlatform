@@ -399,6 +399,10 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
     warns once -- unless the config is an optimizer trial, which is refused (see below).
     """
     profiles, manifests = market_condition_pins(config)
+    # PER EXPERT, before the union is used for anything: a leaf only one expert's profile serves
+    # would otherwise ride the shared reader set here and find nothing live. No-op for a run with
+    # no market leaves, which is every existing backtest.
+    assert_each_expert_serves_its_gates(config)
     if not profiles:
         # A run with market leaves but no profile would evaluate every gate as no_context and
         # place ZERO entries without a word (e.g. a trial config that dropped the key after an
@@ -507,22 +511,28 @@ def check_market_condition_coverage(config: Dict[str, Any], reader: Any) -> List
     return missing
 
 
-def market_condition_leaves_in(config: Any) -> List[str]:
-    """Ids (or config paths, for a leaf without an id) of every condition leaf anywhere in
-    ``config`` whose ``field`` is a registered market-condition field. Walks dicts and lists, and
-    JSON-encoded rule trees held as strings (expert settings store trees that way)."""
+def market_condition_leaf_fields_in(config: Any, path: str = "config"
+                                   ) -> List[Tuple[str, str]]:
+    """``(label, field)`` for every condition leaf anywhere in ``config`` whose ``field`` is a
+    registered market-condition field. The label is the leaf's id, or its config path when it
+    has none. Walks dicts and lists, and JSON-encoded rule trees held as strings (expert
+    settings store trees that way).
+
+    A string that NAMES a market field but does not parse as a tree yields ``(path, "")`` -- an
+    unservable field name, so every caller refuses it rather than walking past something it
+    could not read."""
     import json
 
     from ba2_common.core.market_conditions import PROFILES
 
     fields = {f.name for prof in PROFILES.values() for f in prof.fields}
-    hits: List[str] = []
+    hits: List[Tuple[str, str]] = []
 
     def walk(node: Any, path: str) -> None:
         if isinstance(node, dict):
             field = node.get("field")
             if isinstance(field, str) and field in fields:
-                hits.append(str(node["id"]) if node.get("id") else path)
+                hits.append(((str(node["id"]) if node.get("id") else path), field))
             for key, value in node.items():
                 walk(value, f"{path}.{key}")
         elif isinstance(node, (list, tuple)):
@@ -532,12 +542,56 @@ def market_condition_leaves_in(config: Any) -> List[str]:
             try:
                 decoded = json.loads(node)
             except ValueError:
-                hits.append(path)  # names a market field but is not a parseable tree: refuse too
+                hits.append((path, ""))  # names a market field, unparseable: refuse it too
                 return
             walk(decoded, path)
 
-    walk(config, "config")
+    walk(config, path)
     return hits
+
+
+def market_condition_leaves_in(config: Any) -> List[str]:
+    """Ids (or config paths) of every market-condition leaf in ``config``; the labels of
+    :func:`market_condition_leaf_fields_in`."""
+    return [label for label, _ in market_condition_leaf_fields_in(config)]
+
+
+def assert_each_expert_serves_its_gates(config: Dict[str, Any]) -> None:
+    """Every expert's OWN ``market_condition_profile`` must serve every market leaf it evaluates.
+
+    THE BT/LIVE ASYMMETRY THIS CLOSES. A run installs ONE reader set, built from the UNION of
+    its experts' settings (``market_condition_profile_setting``), and a condition only knows its
+    own field name -- so in a backtest an ``ohlcv-v1`` expert happily reads a ``ta-structure-v1``
+    field that some OTHER expert's setting brought into the union. Live there is no union: each
+    expert gets a resolver built from its own setting alone, so the same leaf finds no reader for
+    its profile and the sleeve never enters. Identical inputs, different trades -- which this
+    repo treats as a code bug, not a documented limitation.
+
+    Checking per expert makes the union an OPTIMISATION (one reader set instead of N) rather than
+    a semantic. Unreachable today -- the launcher writes the same setting onto every spec and the
+    option jobs are single-expert -- so this is the rail, not a repair.
+
+    A backtest's rules are RUN-LEVEL (``entry_rules``/``exit_rules``, seeded into every expert's
+    ruleset by ``daily_backtest_handler._build_experts``), so every expert evaluates them all;
+    a leaf inside one spec's own settings counts only against that spec. Both are covered.
+    """
+    from ba2_common.core.market_condition_rules import (
+        PROFILE_SETTING, assert_fields_served, parse_profile_setting,
+    )
+
+    specs = [spec for spec in (config.get("experts") or ()) if isinstance(spec, dict)]
+    if not specs:
+        return
+    shared = market_condition_leaf_fields_in(
+        {k: v for k, v in config.items() if k != "experts"})
+    for i, spec in enumerate(specs):
+        settings = spec.get("settings")
+        settings = settings if isinstance(settings, dict) else {}
+        used = shared + market_condition_leaf_fields_in(spec, f"config.experts[{i}]")
+        if not used:
+            continue
+        assert_fields_served(used, parse_profile_setting(settings.get(PROFILE_SETTING)),
+                             where=f"expert {spec.get('class')!r} rules")
 
 
 def clear_backtest_market_conditions() -> None:
