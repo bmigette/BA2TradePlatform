@@ -250,6 +250,33 @@ def tree_leaves(node: Any) -> Iterable[dict]:
         yield node
 
 
+def assert_market_fields_mappable(tree: Any, where: str) -> None:
+    """Refuse a MARKET-CONDITION leaf this server cannot map to an event type.
+
+    ``triggers_from_condition_tree`` DROPS an unknown field (with a warning) so a partially-edited
+    tree still seeds a working rule. That is the right default for a hand-edited condition and
+    exactly the wrong one for a deploy: importing a gated ruleset onto a server whose
+    ``FIELD_EVENT`` predates these fields would drop every gate and run the strategy UNGATED --
+    not a degraded version of it, a different strategy with the same name and the same label.
+
+    So for the names in ``STRICT_FIELD_NAMES`` (permanent, registry-independent -- see
+    ``market_condition_rules``) the drop becomes a refusal. Callers on the DEPLOY path
+    (``rules_convert.trade_rules_to_live_export``) invoke it; the editing paths keep the warning.
+    """
+    from ba2_common.core.market_condition_rules import iter_market_condition_leaves
+
+    unmapped = [f"{label} ({leaf.get('field')})"
+                for label, leaf in iter_market_condition_leaves(tree, where)
+                if leaf.get("field") not in FIELD_EVENT and leaf.get("field") not in FLAG_FIELD_EVENT]
+    if unmapped:
+        raise ValueError(
+            f"{where}: market-condition leaf/leaves {unmapped!r} name a field this server has no "
+            f"event type for. It is NEWER than this installation's condition vocabulary: importing "
+            f"would drop the gate and trade the strategy ungated. Update the target platform "
+            f"(ba2_common market_conditions + TradeConditions registration) before deploying this "
+            f"ruleset.")
+
+
 def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     """Build an EventAction 'triggers' dict (ANDed) from a condition tree. Flag leaves ->
     value-less {event_type}; numeric leaves -> {event_type, operator, value}. Unknown fields

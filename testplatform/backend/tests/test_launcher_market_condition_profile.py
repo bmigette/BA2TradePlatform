@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import logging
 import os
 import sys
 from datetime import date
@@ -338,14 +337,23 @@ def test_the_wheel_gets_wheel_specific_ids_even_though_its_entry_is_the_csps(pro
 
 # --------------------------------------------------------------------------- reaching the engine
 @pytest.mark.parametrize("kind", ["O_LC", "O_IC", "O_CC", "O_WHEEL"])
-def test_every_new_leaf_reaches_the_engine(kind, profile_on, caplog):
+def test_every_new_leaf_reaches_the_engine(kind, profile_on, monkeypatch):
+    """A leaf the engine DROPS is a gate the GA keeps scoring and the run never applies.
+
+    The warnings are recorded through the module's own logger object: the ba2_common logger does
+    not propagate to the root logger, so a caplog assertion here would pass on an empty string
+    whatever happened.
+    """
+    from ba2_common.core import rule_builders
     from ba2_common.core.rule_builders import triggers_from_condition_tree
 
+    warnings: list = []
+    monkeypatch.setattr(rule_builders.logger, "warning",
+                        lambda msg, *a: warnings.append(msg % a if a else msg))
     before = triggers_from_condition_tree(_entry_tree(_build_without_profile(kind)))
-    with caplog.at_level(logging.WARNING):
-        after = triggers_from_condition_tree(_entry_tree(_built(kind)))
+    after = triggers_from_condition_tree(_entry_tree(_built(kind)))
     assert len(after) == len(before) + 3, (kind, sorted(before), sorted(after))
-    assert "DROPPED" not in caplog.text
+    assert warnings == []
     events = {t["event_type"] for t in after.values()}
     for spec in PROFILES["ohlcv-v1"].fields:
         assert spec.name in events, (kind, spec.name)

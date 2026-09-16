@@ -173,7 +173,15 @@ def main() -> int:
 
         entry_rules = entry["ruleset"]["entry_rules"]
         exit_rules = entry["ruleset"]["exit_rules"]
-        live_export = trade_rules_to_live_export(entry_rules, exit_rules, name=label)
+        # The converter REFUSES a payload this platform must not run: an unresolved optimizer
+        # mode gene, a market-condition gate on an open-positions ruleset, or a market field this
+        # installation has no event type for (older than the payload -- importing would drop the
+        # gate and trade the strategy ungated). Nothing is written for this entry.
+        try:
+            live_export = trade_rules_to_live_export(entry_rules, exit_rules, name=label)
+        except ValueError as e:
+            print(f"FATAL: {label}: {e}")
+            return 1
         n_rulesets = len(live_export["rulesets"])
         print(f"live_export: {n_rulesets} ruleset(s) "
               f"({[r['subtype'] for r in live_export['rulesets']]})")

@@ -20,10 +20,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from ba2_common.core.market_condition_rules import (
+    assert_market_conditions_resolved,
+    assert_no_market_conditions,
+)
 from ba2_common.core.rule_builders import (
     FIELD_EVENT,
     FLAG_FIELD_EVENT,
     action_from_rule,
+    assert_market_fields_mappable,
     triggers_from_condition_tree,
 )
 from ba2_common.core.types import (
@@ -489,6 +494,14 @@ def trade_rules_to_live_export(
     actions all fail to convert are dropped (counted nowhere — same convention as the legacy
     exporter's silent skip).
     """
+    # DEPLOY-PATH REFUSALS for market-condition gates (design sections 5/6, plan Task 8). This is
+    # the ONE converter both the deploy importer and the live-export path go through, so it is
+    # where a payload that must not reach a live instance is stopped: an unresolved optimizer
+    # template, a gate on an exit ruleset (it could only ever block an exit), and a field this
+    # server cannot map (importing would drop the gate and trade the strategy ungated).
+    assert_no_market_conditions(exit_rules or [], "open_positions ruleset")
+    assert_market_conditions_resolved(entry_rules or [], "enter_market ruleset")
+
     def _rules_for(rules: Optional[List[dict]], subtype: str) -> List[dict]:
         out: List[dict] = []
         for i, rule in enumerate(rules or []):
@@ -498,6 +511,8 @@ def trade_rules_to_live_export(
             if not actions:
                 continue
             conds = rule.get("conditions")
+            if conds:
+                assert_market_fields_mappable(conds, f"{subtype} rule {rule.get('id') or i!r}")
             triggers = triggers_from_condition_tree(conds) if conds else {}
             out.append({
                 "name": rule.get("name") or f"{name}-{subtype}-{i}",
