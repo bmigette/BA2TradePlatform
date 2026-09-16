@@ -81,16 +81,38 @@ interface CondNode {
   conditions?: CondNode[];
 }
 
+// MODE GENES (design 2026-09-15 section 5). A leaf with `modeOptimize` lets the optimizer pick
+// HOW it applies: `off` removes it, `below`/`above` mean `< value` / `> value` on a NUMERIC leaf,
+// and each other choice of a CATEGORICAL leaf is an allowed value (`== choice`). A categorical
+// leaf declares no threshold range, so it contributes the mode gene ALONE -- mirroring
+// strategy_param_space, which refuses `optimize` on such a leaf outright.
+const NUMERIC_MODE_CHOICES = 3;  // off / below / above
+
+function modeChoicesOf(n: CondNode): string[] | undefined {
+  return n.modeChoices ?? n.mode_choices;
+}
+
+function hasThresholdRange(n: CondNode): boolean {
+  return (n.valueMin ?? n.value_min) != null || (n.valueMax ?? n.value_max) != null
+    || (n.valueStep ?? n.value_step) != null;
+}
+
 function walkCond(n: CondNode | null | undefined, out: GeneInfo[]): void {
   if (!n) return;
   for (const c of (n.conditions ?? [])) walkCond(c, out);
   if (!n.id) return;
-  if (n.optimizeEnabled ?? n.optimize_enabled ?? n.optimize) {
+  const modeOptimize = n.modeOptimize ?? n.mode_optimize;
+  const categorical = !!modeOptimize && !hasThresholdRange(n);
+  if ((n.optimizeEnabled ?? n.optimize_enabled ?? n.optimize) && !categorical) {
     out.push({
       name: `cond:${n.id}:value`,
       choices: span(n.valueMin ?? n.value_min, n.valueMax ?? n.value_max,
                     n.valueStep ?? n.value_step),
     });
+  }
+  if (modeOptimize) {
+    out.push({ name: `cond:${n.id}:mode`,
+               choices: modeChoicesOf(n)?.length ?? NUMERIC_MODE_CHOICES });
   }
   if (n.toggleOptimize ?? n.toggle_optimize) out.push({ name: `cond:${n.id}:enabled`, choices: 2 });
 }

@@ -14,10 +14,23 @@ const span = (mn?: number, mx?: number, st?: number): number => {
   if (mn == null || mx == null || !st || st <= 0 || mx < mn) return 1;
   return Math.floor((mx - mn) / st) + 1;
 };
+// MODE GENES (design 2026-09-15 section 5), mirroring strategy_param_space: a `modeOptimize` leaf
+// contributes `cond:<id>:mode` over its choices, and a CATEGORICAL one (a mode leaf with no
+// threshold range) contributes NO `:value` gene -- the backend refuses `optimize` on such a leaf,
+// so counting one here would show a search space no run can have.
+const NUMERIC_MODE_CHOICES = 3;  // off / below / above
+
 function walkNode(n: Node | undefined, out: GeneInfo[]): void {
   if (!n) return;
   for (const c of (n.conditions ?? [])) walkNode(c, out);
-  if (n.optimizeEnabled) out.push({ name: `cond:${n.id}:value`, choices: span(n.valueMin, n.valueMax, n.valueStep) });
+  const categorical = !!n.modeOptimize
+    && n.valueMin == null && n.valueMax == null && n.valueStep == null;
+  if (n.optimizeEnabled && !categorical) {
+    out.push({ name: `cond:${n.id}:value`, choices: span(n.valueMin, n.valueMax, n.valueStep) });
+  }
+  if (n.modeOptimize) {
+    out.push({ name: `cond:${n.id}:mode`, choices: n.modeChoices?.length ?? NUMERIC_MODE_CHOICES });
+  }
   if (n.toggleOptimize) out.push({ name: `cond:${n.id}:enabled`, choices: 2 });
 }
 export function countGenes(buyTree: Node | undefined, sellTree: Node | undefined, exitRules: Rule[]): GeneCount {

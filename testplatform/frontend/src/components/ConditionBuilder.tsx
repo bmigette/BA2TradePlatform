@@ -554,13 +554,24 @@ const ConditionBuilder: React.FC<ConditionBuilderProps> = ({
               <Settings2 className="w-4 h-4" />
             </button>
           )}
+          {/* On/off opt is DISABLED for a mode leaf: its own `off` choice already removes the
+              condition, and the backend rejects the two disable controls together (rule_models
+              ConditionLeaf + strategy_param_space), so offering the tick here would only let the
+              editor save a ruleset no run can load. */}
           <label
-            className="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400"
-            title="Let the optimizer enable/disable this condition"
+            className={`flex items-center gap-1 text-xs ${
+              condition.modeOptimize
+                ? 'text-gray-400 dark:text-gray-600 cursor-not-allowed'
+                : 'text-gray-500 dark:text-gray-400'
+            }`}
+            title={condition.modeOptimize
+              ? "This condition is optimized by MODE: its 'off' choice already removes it"
+              : 'Let the optimizer enable/disable this condition'}
           >
             <input
               type="checkbox"
               checked={condition.toggleOptimize ?? false}
+              disabled={!!condition.modeOptimize}
               onChange={(e) => onChange({ ...condition, toggleOptimize: e.target.checked })}
               className="rounded"
             />
