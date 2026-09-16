@@ -4573,41 +4573,9 @@ def _market_condition_gates(m: str) -> list:
     selected_profiles = _market_condition_setting_profiles()
     if not selected_profiles:
         return []
-    from ba2_common.core.TradeConditions import market_condition_condition_class
-    from ba2_common.core.market_conditions import PROFILES, field_codes
-    from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES
+    from ba2_common.core.market_condition_templates import market_condition_leaves
 
-    selected = set(selected_profiles)
-    leaves: list = []
-    for prof_name, prof in PROFILES.items():
-        if prof_name not in selected:
-            continue
-        for spec in prof.fields:
-            if not spec.searched:
-                continue
-            allowed = market_condition_condition_class(spec.name).ALLOWED_OPERATORS
-            leaf = {"id": f"{m}-market-{spec.short}", "field": spec.name,
-                    "field_type": "numeric", "mode_optimize": True}
-            if spec.kind == "numeric":
-                if spec.anchor_op not in allowed:
-                    raise ValueError(
-                        f"market-condition field {spec.name!r} declares anchor_op "
-                        f"{spec.anchor_op!r}, which its condition class does not accept "
-                        f"({sorted(allowed)!r})")
-                leaf.update({
-                    "op": spec.anchor_op, "value": float(spec.anchor_value), "optimize": True,
-                    "value_min": float(spec.value_min), "value_max": float(spec.value_max),
-                    "value_step": float(spec.value_step),
-                    "mode_choices": list(NUMERIC_MODE_CHOICES),
-                })
-            else:
-                if "==" not in allowed:
-                    raise ValueError(
-                        f"market-condition field {spec.name!r} is categorical but its condition "
-                        f"class does not accept '==' ({sorted(allowed)!r})")
-                leaf.update({"op": "==", "mode_choices": [MODE_OFF, *field_codes(spec.name)]})
-            leaves.append(leaf)
-    return leaves
+    return market_condition_leaves(m, selected_profiles)
 
 
 def _append_market_condition_gates(strategy, kind: str):
@@ -4868,6 +4836,12 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
       have traded it scores as if its strategy simply did not fire there. A feature-cache miss
       must not become a property of the fitness landscape, so the run is refused NAMING the
       missing symbols (the same message and the same check the per-trial seam applies).
+    * A MANIFEST FOR ANOTHER WINDOW. The same failure, invisible to the symbol check: a snapshot
+      warmed over 2024-03 carries every symbol of a 2025 universe and not one row it will read
+      (review 2026-09-16, F1 -- reproduced against this preflight, which accepted the pin and
+      wrote it onto the run). So the run's decision window is checked against the snapshot's too,
+      with the unexplained holes inside it -- and NOT against the observations that are
+      legitimately undefined (the warm-up prefix, a mid-window listing, an unconfirmed pivot).
 
     With a profile on it ALSO writes the ``market_condition_profile`` EXPERT SETTING onto every
     expert spec of the job: that setting is what LIVE reads and what the backtest seam resolves
@@ -4901,10 +4875,23 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
         return {}
     from types import SimpleNamespace
 
-    from app.services.backtest.seam_wiring import check_market_condition_coverage
+    from app.services.backtest.seam_wiring import (
+        check_market_condition_coverage,
+        check_market_condition_window,
+    )
     from ba2_common.core.market_conditions import PROFILES
 
     universe = list(backtest_block.get("enabled_instruments") or [])
+    # THE RUN'S DECISION WINDOW, carried into the coverage check. Symbol presence does not say
+    # whether the snapshot holds the ROWS this run will read: one warmed over another window
+    # carries every symbol and serves missing_session on every decision date of this one (review
+    # 2026-09-16, F1). A block with no window cannot be checked at all, and an unvalidated pin is
+    # exactly the failure this refusal exists for, so it is refused here rather than dispatched.
+    start, end = backtest_block.get("start_date"), backtest_block.get("end_date")
+    if start in (None, "") or end in (None, ""):
+        sys.exit(f"{command}: --market-condition-profile needs the run's backtest window to "
+                 f"validate the pinned snapshot against; this backtest block carries no "
+                 f"start_date/end_date ({sorted(backtest_block)!r}).")
     manifests: dict = {}
     facts_by_profile: dict = {}
     warmed: dict = {}
@@ -4924,11 +4911,14 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
         facts = dict(facts)          # the cached dict is shared across a batch's jobs
         reader = facts.pop("reader")
         try:
-            # PER PROFILE: two snapshots were warmed separately and can cover different symbols.
-            check_market_condition_coverage(
-                {"enabled_instruments": universe, "_ga_trial": True},
-                SimpleNamespace(mapped_reader=reader),
-            )
+            # PER PROFILE: two snapshots were warmed separately and can cover different symbols
+            # and different windows. Both halves run here, ONCE per (digest, universe, window) --
+            # the session check memoises on exactly that key, so a batch of jobs sharing a pin
+            # pays for it once and no trial repeats it.
+            check_config = {"enabled_instruments": universe, "start_date": str(start),
+                            "end_date": str(end), "_ga_trial": True}
+            check_market_condition_coverage(check_config, SimpleNamespace(mapped_reader=reader))
+            check_market_condition_window(check_config, SimpleNamespace(mapped_reader=reader))
         except ValueError as e:
             sys.exit(f"{command}: {e}")
         manifests[profile] = digest

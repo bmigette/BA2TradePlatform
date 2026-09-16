@@ -378,6 +378,72 @@ def test_a_ga_trial_whose_universe_the_snapshot_does_not_cover_is_refused(ps, tm
     assert digest in message
 
 
+def test_a_ga_trial_whose_window_the_snapshot_does_not_cover_is_refused(ps, tmp_path,
+                                                                        monkeypatch):
+    """Review 2026-09-16, F1. Symbol presence is not coverage: a snapshot warmed for another
+    window carries every symbol and NOT ONE ROW the run will read, so every gate reports
+    missing_session and the GA scores the suppression as strategy behaviour. The trial is refused
+    (its job fails, the way an environment fault should) rather than scored.
+
+    The pin's own window is 2025-06-27..2025-06-30 here; the trial decides through 2025-12-31.
+    """
+    import ba2_common.config as bc
+    from ba2_common.core.market_condition_reader import clear_window_coverage_cache
+
+    clear_window_coverage_cache()
+    store, digest = _publish_manifest(tmp_path / "cache", symbol="AAA")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    cfg = {"market_condition_profile": "ohlcv-v1", "market_condition_manifest": digest,
+           "_ga_trial": True, "enabled_instruments": ["AAA"],
+           "start_date": "2025-07-01", "end_date": "2025-12-31"}
+
+    with pytest.raises(ValueError) as exc:
+        seam_wiring.install_backtest_market_conditions(cfg, ps)
+    message = str(exc.value)
+    assert "does not serve the feature rows" in message and digest in message
+    assert "2025-07-01..2025-12-31" in message
+    # ... and the window the snapshot WAS warmed for still installs.
+    assert seam_wiring.install_backtest_market_conditions(
+        {**cfg, "start_date": "2025-06-27", "end_date": "2025-06-30"}, ps) is not None
+    clear_window_coverage_cache()
+
+
+def test_a_research_run_with_a_wrong_window_pin_is_reported_and_proceeds(ps, tmp_path,
+                                                                        monkeypatch, caplog):
+    """Same policy as the symbol check: a GA trial raises, a one-off research run is told."""
+    import logging
+
+    import ba2_common.config as bc
+    from ba2_common.core.market_condition_reader import clear_window_coverage_cache
+
+    clear_window_coverage_cache()
+    store, digest = _publish_manifest(tmp_path / "cache", symbol="AAA")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    cfg = {"market_condition_profile": "ohlcv-v1", "market_condition_manifest": digest,
+           "enabled_instruments": ["AAA"], "start_date": "2025-07-01", "end_date": "2025-12-31"}
+    with caplog.at_level(logging.ERROR, logger="app.services.backtest.seam_wiring"):
+        assert seam_wiring.install_backtest_market_conditions(cfg, ps) is not None
+    assert any("does not serve the feature rows" in r.message for r in caplog.records)
+    clear_window_coverage_cache()
+
+
+def test_a_config_with_no_window_says_the_sessions_were_not_checked(ps, tmp_path, monkeypatch,
+                                                                    caplog):
+    """The shape a backtest cannot actually have (the engine requires both dates) -- reported, so
+    "not checked" never reads as "checked and fine". The LAUNCHER refuses it before dispatch."""
+    import logging
+
+    import ba2_common.config as bc
+
+    store, digest = _publish_manifest(tmp_path / "cache", symbol="AAA")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    cfg = {"market_condition_profile": "ohlcv-v1", "market_condition_manifest": digest,
+           "_ga_trial": True, "enabled_instruments": ["AAA"]}
+    with caplog.at_level(logging.WARNING, logger="app.services.backtest.seam_wiring"):
+        assert seam_wiring.install_backtest_market_conditions(cfg, ps) is not None
+    assert any("no start_date/end_date" in r.message for r in caplog.records)
+
+
 def test_research_mode_reports_the_gap_and_proceeds(ps, tmp_path, monkeypatch, caplog):
     import logging
 

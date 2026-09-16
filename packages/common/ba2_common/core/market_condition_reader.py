@@ -92,7 +92,7 @@ import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field as dc_field
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -108,6 +108,7 @@ from ba2_common.core.market_condition_store import (
 )
 from ba2_common.core.market_conditions import (
     PROFILES,
+    STATUS_INSUFFICIENT_HISTORY,
     STATUS_VALID,
     STATUSES,
     WINDOW,
@@ -138,6 +139,10 @@ __all__ = [
     "COVERAGE_NAMES",
     "missing_coverage",
     "coverage_detail",
+    "LEGITIMATE_UNKNOWN_STATUSES",
+    "WINDOW_COVERAGE_CACHE",
+    "clear_window_coverage_cache",
+    "window_coverage_problems",
 ]
 
 #: Local mapped-array layout version. A change of arrays or meaning gets a new number, which moves
@@ -447,6 +452,25 @@ class MappedMarketConditionReader:
                 while len(self._memo) > self._memo_size:
                     self._memo.popitem(last=False)
         return row
+
+    def statuses_for_sessions(self, symbol: str, sessions: Sequence[date]):
+        """Bulk preflight lookup: (present mask, status codes in ``self.fields`` order).
+
+        Missing rows carry -1, never a valid observation. This reads the same mapped arrays
+        as observe(), without constructing thousands of FeatureRows or filling its LRU.
+        Returned arrays are copies; callers cannot change the published snapshot.
+        """
+        self._recheck_registry()
+        wanted = np.asarray(sessions, dtype="datetime64[D]").astype("int64")
+        present = np.zeros(len(wanted), dtype=bool)
+        statuses = np.full((len(wanted), len(self.fields)), -1, dtype=np.int8)
+        index = self._symbol_index(symbol)
+        if index is not None:
+            at = np.searchsorted(index.sessions, wanted)
+            bounded = at < len(index.sessions)
+            present[bounded] = index.sessions[at[bounded]] == wanted[bounded]
+            statuses[present] = self.arrays()["status"][index.lo + at[present]]
+        return present, statuses
 
     def _recheck_registry(self) -> None:
         """One dict lookup and one string compare per read; the full check only when it moved.
@@ -879,3 +903,261 @@ def coverage_detail(mapped: Any, missing: Any) -> str:
         return ""
     return (f" ({len(recorded)} of them ARE in the manifest's coverage record, so they were "
             f"warmed and then excluded -- check its exceptions)")
+
+
+# --------------------------------------------------------------------------------------------
+# DOES THIS SNAPSHOT COVER THIS EXPERIMENT'S SESSIONS?
+#
+# ``missing_coverage`` above answers "is the symbol in this snapshot at all". That is not the
+# same question as "does it serve the rows this run will ask for": a snapshot warmed over
+# 2024-03 carries every symbol of a 2025 run and NO row it will ever read, so every gate on
+# every decision date reports ``missing_session``, every gated entry is refused, and the GA
+# scores that suppression as strategy behaviour (review 2026-09-16 finding F1, reproduced).
+#
+# So the pin is validated against the run's DECISION WINDOW before dispatch. For a decision on
+# session D the reader asks for ``prior_regular_session(D)`` (timing policy ``prior_session_v1``),
+# so a window ``[start, end]`` requires the feature sessions from ``prior(first session >= start)``
+# to ``prior(last session <= end)`` inclusive -- a contiguous run of regular sessions.
+#
+# WHAT IS A FAULT AND WHAT IS A LEGITIMATE UNKNOWN. The warmup writes a row for EVERY session of
+# the window it was built for, carrying a status; a row it could not compute is an explicit
+# negative observation, not an absence. The two are different answers:
+#
+#   * NO ROW for a required session -- the snapshot was built for another window, or its months
+#     have a hole. Nothing in the manifest explains it, and no strategy meaning can be read off
+#     it. A JOB CONFIGURATION ERROR.
+#   * A ROW that says ``insufficient_history`` -- the 127 warm-up sessions before a symbol's
+#     window is long enough, and (in ``ta-structure-v1``) a swing state or pivot level that is
+#     genuinely undefined yet. LEGITIMATE: the gate is unknown and refuses, which is the
+#     designed meaning.
+#   * A ROW that says ``missing_session`` as a LEADING run -- the symbol listed part-way through
+#     the window (APP, ARM, GEV, PLTR, SNDK in the published snapshots). LEGITIMATE for the same
+#     reason: there is no price history to have computed anything from, and the strategy could
+#     not have traded the symbol then either.
+#   * The same status ELSEWHERE -- an interior gap, a trailing run (a delisting, or a source that
+#     stops before the window does), or an entire window with no usable row at all (SPCX, whose
+#     daily cache starts in 2026). None of those is explained by the symbol's listing date, and
+#     each one silently removes real decision dates from the search. A JOB CONFIGURATION ERROR.
+#
+# The per-symbol ``coverage`` record is what makes the distinction cheap: its ``exceptions``
+# carry ``{kind, field, status, rows, first_session, last_session}`` per (field, status), so a
+# run is contiguous exactly when its ``rows`` equals the number of regular sessions between its
+# first and last. No object is read and no array is mapped -- this is manifest JSON arithmetic.
+# --------------------------------------------------------------------------------------------
+
+#: Statuses that describe a legitimately UNDEFINED observation rather than absent input data:
+#: the warm-up prefix and the undefined structure states. They never refuse a run.
+LEGITIMATE_UNKNOWN_STATUSES = (STATUS_INSUFFICIENT_HISTORY,)
+
+#: How many per-symbol problems one message names before it says "and N more".
+WINDOW_PROBLEM_NAMES = 12
+
+#: Distinct (digest, universe, window) validations kept. A batch launches many jobs over the
+#: same pin and universe, and a GA trial repeats the identical question per trial.
+WINDOW_COVERAGE_CACHE = 32
+
+_window_cache: "OrderedDict[Tuple[Any, ...], Tuple[str, ...]]" = OrderedDict()
+_window_cache_lock = threading.Lock()
+
+
+def _as_date(value: Any) -> date:
+    """A ``date`` from a date/datetime/ISO string (the shapes a stored config carries)."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def _opt_date(value: Any) -> Optional[date]:
+    if value in (None, ""):
+        return None
+    try:
+        return _as_date(value)
+    except ValueError:
+        return None
+
+
+def clear_window_coverage_cache() -> None:
+    """Drop the memoised validations (tests that republish a digest under one path)."""
+    with _window_cache_lock:
+        _window_cache.clear()
+
+
+def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -> List[str]:
+    """Why this snapshot does not serve the rows a run over ``[start, end]`` will ask for.
+
+    Empty list = it does. Each string is one symbol's (or the pin's) fault, phrased for an
+    operator reading a launch refusal. ``mapped`` is a :class:`MappedMarketConditionReader`
+    (``None`` -> research mode with no pin, nothing to compare to); ``universe`` the run's
+    instruments; ``start``/``end`` its DECISION dates (date/datetime/ISO string).
+
+    Symbols the snapshot has no rows for at all are NOT reported here -- that is
+    :func:`missing_coverage`'s answer, and reporting it twice would name the same symbol in two
+    different refusals. Memoised by (cache root, profile, digest, universe, window): a batch asks
+    the identical question once per job and a GA once per trial.
+    """
+    if mapped is None:
+        return []
+    wanted = tuple(sorted({str(s).upper() for s in (universe or ())}))
+    if not wanted:
+        return []
+    first, last = _as_date(start), _as_date(end)
+    key = (str(getattr(mapped, "cache_root", "")), str(getattr(mapped, "profile", "")),
+           _bare(str(getattr(mapped, "manifest_digest", ""))), wanted, first, last)
+    with _window_cache_lock:
+        hit = _window_cache.get(key)
+        if hit is not None:
+            _window_cache.move_to_end(key)
+            return list(hit)
+    problems = tuple(_window_coverage_problems(mapped, wanted, first, last))
+    with _window_cache_lock:
+        _window_cache[key] = problems
+        _window_cache.move_to_end(key)
+        while len(_window_cache) > WINDOW_COVERAGE_CACHE:
+            _window_cache.popitem(last=False)
+    return list(problems)
+
+
+def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
+                              first: date, last: date) -> List[str]:
+    from ba2_common.core.market_calendar import prior_regular_session, regular_session_dates
+
+    digest = _bare(str(getattr(mapped, "manifest_digest", "?")))
+    manifest = getattr(mapped, "manifest", None)
+    if not isinstance(manifest, Mapping):
+        # Every snapshot this check is asked about is read from a manifest; an object that cannot
+        # produce one cannot be validated, and "cannot validate" is not "valid".
+        return [f"market-condition snapshot {digest} cannot report the sessions it covers "
+                f"({type(mapped).__name__} carries no manifest), so the pin cannot be checked "
+                f"against this run's window."]
+    decisions = regular_session_dates(first, last)
+    if not decisions:
+        return [f"the run's window {first}..{last} contains no regular NYSE session, so no "
+                f"market-condition observation is defined anywhere in it."]
+    want_first = prior_regular_session(decisions[0])
+    want_last = prior_regular_session(decisions[-1])
+    required = regular_session_dates(want_first, want_last)
+
+    problems: List[str] = []
+    pin_first = _opt_date(manifest.get("window_start"))
+    pin_last = _opt_date(manifest.get("window_end"))
+    if pin_first is not None and pin_last is not None \
+            and (decisions[0] < pin_first or decisions[-1] > pin_last):
+        # ONE message, and no per-symbol noise after it: the pin is for another experiment.
+        return [f"market-condition snapshot {digest} was built for decision dates "
+                f"{pin_first}..{pin_last}; this run decides on {decisions[0]}..{decisions[-1]}, "
+                f"which it does not cover. Every gate outside the snapshot's window reads "
+                f"missing_session, so every gated entry would be refused for a cache reason and "
+                f"the search would score that as strategy behaviour. Pin (or warm) a snapshot "
+                f"for this window: tools/warm_market_conditions.py plan/build."]
+
+    rows_by_month: Dict[Tuple[str, str], int] = {}
+    for obj in manifest.get("objects") or ():
+        obj_key = (str(obj["symbol"]), str(obj["month"]))
+        rows_by_month[obj_key] = rows_by_month.get(obj_key, 0) + int(obj["rows"])
+    need_by_month: Dict[str, int] = {}
+    for session in required:
+        month = f"{session.year:04d}-{session.month:02d}"
+        need_by_month[month] = need_by_month.get(month, 0) + 1
+    span_months: Dict[Tuple[Optional[date], Optional[date]], Dict[str, int]] = {}
+
+    covered = set(mapped.symbols())
+    coverage = mapped.coverage() or {}
+    for symbol in wanted:
+        if symbol not in covered:
+            continue                     # missing_coverage names these; one refusal each is enough
+        record = coverage.get(symbol) or {}
+        cov_first = _opt_date(record.get("first_session"))
+        cov_last = _opt_date(record.get("last_session"))
+        if (cov_first is not None and cov_first > want_first) \
+                or (cov_last is not None and cov_last < want_last):
+            problems.append(
+                f"{symbol}: the snapshot holds rows for {cov_first}..{cov_last}, which does not "
+                f"reach the {want_first}..{want_last} feature sessions this window needs")
+            continue
+        # The rows the objects actually carry, month by month. Expected counts are taken over the
+        # symbol's OWN span (a month at either end of it is legitimately partial).
+        expected = span_months.get((cov_first, cov_last))
+        if expected is None:
+            # The symbol's own span, which the check above has already proved reaches the
+            # required sessions: a month at either end of it is legitimately partial.
+            lo = want_first if cov_first is None else cov_first
+            hi = want_last if cov_last is None else cov_last
+            expected = {}
+            for session in regular_session_dates(lo, hi):
+                month = f"{session.year:04d}-{session.month:02d}"
+                if month in need_by_month:
+                    expected[month] = expected.get(month, 0) + 1
+            span_months[(cov_first, cov_last)] = expected
+        holes = [f"{month} has {rows_by_month.get((symbol, month), 0)} of {want} row(s)"
+                 for month, want in sorted(expected.items())
+                 if rows_by_month.get((symbol, month), 0) < want]
+        if holes:
+            shown = "; ".join(holes[:6])
+            more = f", and {len(holes) - 6} more month(s)" if len(holes) > 6 else ""
+            problems.append(
+                f"{symbol}: the snapshot has no row at all for part of this run's window "
+                f"({shown}{more}) -- those decision dates would read missing_session")
+            continue
+        problems.extend(_status_problems(symbol, record, want_first, want_last))
+    if len(problems) > WINDOW_PROBLEM_NAMES:
+        extra = len(problems) - WINDOW_PROBLEM_NAMES
+        problems = problems[:WINDOW_PROBLEM_NAMES] + [f"... and {extra} more symbol(s)"]
+    return problems
+
+
+def _status_problems(symbol: str, record: Mapping[str, Any],
+                     want_first: date, want_last: date) -> List[str]:
+    """The symbol's recorded status exceptions that this window cannot explain.
+
+    A run of unusable rows is EXPLAINED when it is the symbol's leading prefix and contiguous:
+    the symbol had not listed yet (or its source history starts later), which no re-download
+    repairs and no strategy could have traded through. Anything else -- an interior gap, a
+    trailing run, a whole window with no usable row -- removes real decision dates from the
+    search for a reason the snapshot does not record.
+
+    The exceptions are recorded PER FIELD, and a symbol with no source data has the identical
+    run on all twelve of them, so identical runs are reported ONCE naming their fields: twelve
+    copies of one sentence is not twelve faults.
+    """
+    from ba2_common.core.market_calendar import regular_session_dates
+
+    grouped: "OrderedDict[Tuple[Any, ...], List[str]]" = OrderedDict()
+    for exc in record.get("exceptions") or ():
+        if not isinstance(exc, Mapping) or str(exc.get("kind")) != "status":
+            continue                     # build-time annotations, not per-session observations
+        status = str(exc.get("status"))
+        if status in LEGITIMATE_UNKNOWN_STATUSES:
+            continue
+        exc_first = _opt_date(exc.get("first_session"))
+        exc_last = _opt_date(exc.get("last_session"))
+        if exc_first is None or exc_last is None:
+            continue
+        if exc_last < want_first or exc_first > want_last:
+            continue                     # outside the sessions this run reads
+        rows = int(exc.get("rows") or 0)
+        contiguous = rows == len(regular_session_dates(exc_first, exc_last))
+        leading = exc_first <= want_first
+        if leading and contiguous and exc_last < want_last:
+            continue                     # the listing date explains it: legitimate pre-listing
+        whole = leading and contiguous
+        grouped.setdefault((whole, status, exc_first, exc_last, rows), []).append(
+            str(exc.get("field") or "?"))
+
+    out: List[str] = []
+    for (whole, status, exc_first, exc_last, rows), fields in grouped.items():
+        named = ", ".join(sorted(fields))
+        if whole:
+            out.append(
+                f"{symbol}: {named} is {status} for EVERY session of this window "
+                f"({exc_first}..{exc_last}, {rows} rows) -- the snapshot serves it no usable "
+                f"observation anywhere, so it can never enter on a gated rule. Remove it from "
+                f"the universe, or repair its source history and re-warm")
+        else:
+            where = "after" if exc_first > want_first else "within"
+            out.append(
+                f"{symbol}: {named} is {status} for {rows} session(s) {exc_first}..{exc_last}, "
+                f"{where} this run's window and not the leading run a listing date explains -- "
+                f"an unexplained hole in the feature data")
+    return out

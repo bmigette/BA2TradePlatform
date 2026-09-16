@@ -353,6 +353,11 @@ def _entry_tree(strategy):
     return trees[0]["conditions"]
 
 
+#: The decision window the published test snapshot serves (its two feature rows are
+#: 2025-06-27 and 2025-06-30, the prior sessions of these two decision dates).
+MC_START, MC_END = "2025-06-30", "2025-07-01"
+
+
 def _built(kind: str):
     return mod._build_strategy(kind, f"mc-{kind}", "FMPRating")
 
@@ -642,7 +647,9 @@ def test_the_optimize_flags_exist_with_the_documented_defaults():
 def test_an_optimize_with_a_profile_and_no_manifest_is_refused(profile_on, monkeypatch):
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {})
     with pytest.raises(SystemExit, match="needs a --market-condition-manifest digest OF ITS OWN"):
-        mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
+        mod._apply_market_conditions(
+            "optimize", {"enabled_instruments": ["AAA"], "start_date": MC_START,
+                         "end_date": MC_END}, _built("O_LC"))
 
 
 def test_a_manifest_without_a_profile_is_refused_rather_than_ignored(monkeypatch):
@@ -651,7 +658,9 @@ def test_a_manifest_without_a_profile_is_refused_rather_than_ignored(monkeypatch
     monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ())
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"": "abc123"})
     with pytest.raises(SystemExit, match="without --market-condition-profile"):
-        mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
+        mod._apply_market_conditions(
+            "optimize", {"enabled_instruments": ["AAA"], "start_date": MC_START,
+                         "end_date": MC_END}, _built("O_LC"))
 
 
 # --------------------------------------------------------------------------- the pinned snapshot
@@ -663,6 +672,10 @@ def _publish_manifest(root, symbols=("AAA", "BBB")):
 
     profile = PROFILES["ohlcv-v1"]
     fields = [f.name for f in profile.fields]
+    # FEATURE sessions. The manifest's window is the DECISION window they serve: a decision on
+    # session D reads the row of the session before D (``prior_session_v1``), so these two rows
+    # serve exactly the decisions MC_START..MC_END below -- which is the window every test here
+    # launches over, because a pin is now validated against the run's sessions too (F1).
     sessions = [date(2025, 6, 27), date(2025, 6, 30)]
     store = MarketConditionStore(root)
     objects = []
@@ -678,7 +691,8 @@ def _publish_manifest(root, symbols=("AAA", "BBB")):
         profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
         objects=objects, raw_objects=[],
         coverage={s: {"rows": len(sessions)} for s in symbols}, universe=list(symbols),
-        sessions=sessions, window_start=sessions[0], window_end=sessions[-1])
+        sessions=sessions, window_start=date.fromisoformat(MC_START),
+        window_end=date.fromisoformat(MC_END))
     return store, store.write_manifest(manifest)
 
 
@@ -696,10 +710,55 @@ def test_a_manifest_that_does_not_cover_the_universe_is_refused_naming_the_symbo
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     with pytest.raises(SystemExit) as e:
         mod._apply_market_conditions(
-            "optimize", {"enabled_instruments": ["AAA", "ZZZ", "QQQ"]}, _built("O_LC"))
+            "optimize", {"enabled_instruments": ["AAA", "ZZZ", "QQQ"], "start_date": MC_START,
+                         "end_date": MC_END}, _built("O_LC"))
     message = str(e.value)
     assert "ZZZ" in message and "QQQ" in message and "AAA" not in message.split("instruments:")[1]
     assert snapshot in message
+
+
+def test_a_snapshot_warmed_for_another_window_is_refused_before_dispatch(
+        profile_on, snapshot, monkeypatch):
+    """Review 2026-09-16, F1 -- reproduced against THIS preflight and fixed here.
+
+    The reviewer pinned a 2024-03 snapshot on a 2025 run: every symbol was present, the check
+    passed, the launcher wrote the pin, and ``observe()`` then returned None for every decision
+    date. Every gate read ``missing_session``, every gated entry was refused, and the GA would
+    have scored that suppression as strategy behaviour. The refusal has to happen HERE, at launch,
+    as a job configuration error -- a zero-trade fitness is not an answer to it.
+    """
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    block = {"enabled_instruments": ["AAA", "BBB"], "start_date": "2025-01-02",
+             "end_date": "2025-12-31",
+             "experts": [{"class": "FMPRating", "settings": {}}]}
+    with pytest.raises(SystemExit) as e:
+        mod._apply_market_conditions("optimize", block, _built("O_LC"))
+    message = str(e.value)
+    assert "does not serve the feature rows" in message and snapshot in message
+    assert "2025-01-02..2025-12-31" in message
+    # ... and nothing was written onto the run: a refused launch leaves no half-gated config.
+    assert "market_condition_profiles" not in block
+    assert "market_condition_profile" not in block["experts"][0]["settings"]
+
+
+def test_the_window_the_snapshot_was_warmed_for_passes(profile_on, snapshot, monkeypatch):
+    """The other half of the same guard: the right window is not refused, so the check cannot be
+    "passing" by refusing everything."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    block = _gated_block()
+    assert mod._apply_market_conditions("optimize", block, _built("O_LC"))["manifests"] == {
+        "ohlcv-v1": snapshot}
+
+
+def test_a_block_with_no_window_cannot_be_validated_and_is_refused(profile_on, snapshot,
+                                                                   monkeypatch):
+    """An unvalidated pin is exactly the failure the refusal exists for, so "I could not check"
+    is not allowed to read as "it is fine"."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    with pytest.raises(SystemExit, match="no start_date/end_date"):
+        mod._apply_market_conditions(
+            "optimize", {"enabled_instruments": ["AAA"],
+                         "experts": [{"class": "FMPRating", "settings": {}}]}, _built("O_LC"))
 
 
 def test_the_coverage_check_reads_the_universe_on_the_block_it_is_given(
@@ -712,7 +771,8 @@ def test_the_coverage_check_reads_the_universe_on_the_block_it_is_given(
     from a unit call.)
     """
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
-    screened = {"enabled_instruments": ["AAA", "ZZZ"]}   # what the screener block writes
+    screened = {"enabled_instruments": ["AAA", "ZZZ"],   # what the screener block writes
+                "start_date": MC_START, "end_date": MC_END}
     with pytest.raises(SystemExit, match="ZZZ"):
         mod._apply_market_conditions("optimize", screened, _built("O_LC"))
 
@@ -763,7 +823,7 @@ def test_the_run_config_records_the_profile_the_manifest_and_the_calc_versions(
         profile_on, snapshot, monkeypatch):
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     strat = _built("O_LC")
-    block = {"enabled_instruments": ["AAA", "BBB"],
+    block = {"enabled_instruments": ["AAA", "BBB"], "start_date": MC_START, "end_date": MC_END,
              "experts": [{"class": "FMPRating", "settings": {}}]}
     recorded = mod._apply_market_conditions("optimize", block, strat)
 
@@ -823,7 +883,7 @@ def test_the_persisted_digest_round_trips_into_a_trial_config(profile_on, snapsh
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     strat = _built("O_LC")
     backtest_cfg = {
-        "backtest_id": "mc", "start_date": "2024-02-01", "end_date": "2024-06-01",
+        "backtest_id": "mc", "start_date": MC_START, "end_date": MC_END,
         "enabled_instruments": ["AAA", "BBB"], "experts": [{"class": "FMPRating", "settings": {}}],
         "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
         "entry_action": getattr(strat, "entry_action", None),
@@ -921,7 +981,7 @@ def test_both_profiles_gate_only_the_initial_entry_tree(monkeypatch):
 
 # ------------------------------------------------- the flag writes the EXPERT SETTING (Task 12)
 def _gated_block():
-    return {"enabled_instruments": ["AAA", "BBB"],
+    return {"enabled_instruments": ["AAA", "BBB"], "start_date": MC_START, "end_date": MC_END,
             "experts": [{"class": "FMPRating", "settings": {"sizing_mode": "risk_atr"}}]}
 
 
@@ -991,7 +1051,9 @@ def test_a_job_with_no_expert_spec_to_carry_the_setting_is_refused(profile_on, s
     deployed (a payload carries settings, not that key)."""
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     with pytest.raises(SystemExit) as e:
-        mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
+        mod._apply_market_conditions(
+            "optimize", {"enabled_instruments": ["AAA"], "start_date": MC_START,
+                         "end_date": MC_END}, _built("O_LC"))
     assert "market_condition_profile" in str(e.value)
 
 

@@ -457,8 +457,10 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
             warn_research_mode(profile, "backtest reader")
         reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest)
         # PER PROFILE: each snapshot was warmed separately and can cover a different set of
-        # symbols, so "is this run covered" is a question with one answer per profile.
+        # symbols (and a different window), so "is this run served" is a question with one answer
+        # per profile -- both halves of it.
         check_market_condition_coverage(config, reader)
+        check_market_condition_window(config, reader)
         readers.append(reader)
     resolver = BacktestMarketConditionResolver(market_condition_reader_for(readers))
     if TradeConditions.get_market_condition_context_resolver() is not _dispatch_market_condition_context:
@@ -494,6 +496,12 @@ def check_market_condition_coverage(config: Dict[str, Any], reader: Any) -> List
     A GA trial RAISES (the job fails, which is what an environment fault deserves); research mode
     logs one ERROR naming the symbols and continues, because a one-off run over a wider universe
     than the snapshot is a legitimate thing to do deliberately. Returns the missing symbols.
+
+    THE SECOND QUESTION (review 2026-09-16, finding F1). A snapshot that carries every symbol can
+    still carry none of the ROWS this run will ask for -- one warmed over 2024-03 is "complete"
+    for a 2025 universe and serves ``missing_session`` on every decision date of it. So when the
+    symbols are all present, the pin is also checked against the run's decision window; see
+    :func:`check_market_condition_window`.
     """
     from ba2_common.core.market_condition_reader import coverage_detail, missing_coverage
 
@@ -518,6 +526,53 @@ def check_market_condition_coverage(config: Dict[str, Any], reader: Any) -> List
         raise ValueError(message)
     _log.error(message)
     return missing
+
+
+def check_market_condition_window(config: Dict[str, Any], reader: Any) -> List[str]:
+    """Refuse (or, in research mode, report) a pin that does not serve this run's SESSIONS.
+
+    THE FAILURE THIS PREVENTS is the one symbol presence cannot see. A snapshot warmed over
+    2024-03-01..2024-03-29 contains every symbol of a 2025 universe and not one row the run will
+    read: ``observe()`` returns None for every decision date, every gate evaluates
+    ``missing_session``, every gated entry is refused, and the GA scores that suppression as
+    strategy behaviour. Reproduced against the real preflight on 2026-09-16.
+
+    The work is in :func:`ba2_common.core.market_condition_reader.window_coverage_problems`
+    (memoised per digest/universe/window, manifest JSON only -- no object is read and no array is
+    mapped). It refuses an out-of-range pin and an unexplained hole, and deliberately does NOT
+    refuse a legitimately undefined observation: the warm-up prefix, a symbol that listed
+    part-way through the window, or a structure field with no confirmed pivot yet.
+
+    A config with no ``start_date``/``end_date`` cannot be checked. That config shape does not
+    reach a backtest (the engine requires both), and the LAUNCHER refuses to dispatch a run whose
+    block carries no window, so this reports one WARNING rather than inventing a window.
+    """
+    from ba2_common.core.market_condition_reader import window_coverage_problems
+
+    mapped = getattr(reader, "mapped_reader", None)
+    if mapped is None:
+        return []                      # research mode without a manifest: nothing to compare to
+    start, end = config.get("start_date"), config.get("end_date")
+    if start in (None, "") or end in (None, ""):
+        _log.warning(
+            f"market-condition manifest {mapped.manifest_digest} could not be checked against "
+            f"this run's decision window: the config carries no start_date/end_date. Symbol "
+            f"coverage was checked; the sessions were not.")
+        return []
+    universe = market_condition_universe(config)
+    problems = window_coverage_problems(mapped, universe, start, end)
+    if not problems:
+        return []
+    message = (
+        f"market-condition manifest {mapped.manifest_digest} does not serve the feature rows "
+        f"this run's {start}..{end} decision window needs: " + "; ".join(problems) + ". "
+        f"Each of those decision dates would read missing_session, so the gated entries would "
+        f"be refused for a cache reason and the search would score that as strategy behaviour. "
+        f"This is a job configuration fault, not a result.")
+    if config.get("_ga_trial"):
+        raise ValueError(message)
+    _log.error(message)
+    return problems
 
 
 def market_condition_leaf_fields_in(config: Any, path: str = "config"

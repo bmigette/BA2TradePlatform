@@ -406,3 +406,20 @@ def regular_session_close_utc(session: date) -> datetime:
     table = _session_table(session)
     ns = int(table.closes_ns[_session_index(table, session)])
     return _EPOCH_UTC + timedelta(microseconds=ns // 1000)
+
+
+def regular_session_dates(first_day: date, last_day: date) -> List[date]:
+    """Every regular NYSE session DATE in the inclusive range ``[first_day, last_day]``, ascending.
+
+    The date-shaped sibling of :func:`nyse_regular_sessions` (same memoised schedule, so asking
+    for the dates costs nothing extra once the pairs are built). A snapshot-coverage check needs
+    "which sessions does this window contain", not their open/close instants.
+
+    Returns an empty list when the range contains no session, INCLUDING when ``last_day`` is
+    before ``first_day`` -- an empty range is a legitimate question with an empty answer, and the
+    calendar would otherwise raise on the inverted span.
+    """
+    if last_day < first_day:
+        return []
+    return [open_utc.astimezone(NY_TZ).date()
+            for open_utc, _close in _nyse_sessions_memo(first_day, last_day)]
