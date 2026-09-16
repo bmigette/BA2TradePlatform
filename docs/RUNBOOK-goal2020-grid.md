@@ -456,7 +456,7 @@ computed in a trial.** With no profile selected (the default) none of this exist
 emits no leaves, the seam installs nothing, and the run is byte-for-byte the one it has always
 been (pinned by `tests/backtest/test_market_condition_all_off_matches_baseline.py`).
 
-### Before the first gated grid: the 13 uncovered symbols — DECISION OWED
+### The 13 uncovered symbols — RESOLVED 2026-09-16: re-fetched, full coverage
 
 The 2026-09-16 snapshot (`1136d489…f5cb3`, window 2020-01-01..2025-12-31) covers **85 of the 98**
 symbols in `tools/options_universe_top100.txt`. The other 13 —
@@ -476,7 +476,28 @@ refusal is deliberate. An uncovered symbol reads `missing_session` at every gate
 run, so the genome that would have traded it scores as though its strategy simply did not fire
 there — a feature-cache miss silently becoming a property of the fitness landscape.
 
-Record which was chosen here when it is.
+**Decision (operator, 2026-09-16): re-fetch.** `build --fetch-missing --concurrency 3` replaced
+the cache file of each of the 13 symbols wholesale — which is what clears a stale split basis; a
+patched file keeps it — in ~6 s and 13 provider calls (DELL 2534 bars, the other twelve 3769 each).
+Both profiles were then published over the repaired cache and verified (`identity_ok`, 7154 feature
+objects + 7358 raw shards re-hashed, none corrupt or missing):
+
+| profile | digest | symbols | coverage exceptions |
+|---|---|---|---|
+| `ohlcv-v1` | `c9ba981fbae8726ec749eca4201c98399a4285046733d16cca6b112b8c8371df` | **98 / 98** | 0 |
+| `ta-structure-v1` | `3c3020d05f9e24ded59272050e1f06193abc74e6c00e41e3168a1750bcc44385` | **98 / 98** | 0 |
+
+Both cover 2020-01-02..2025-12-31. The `ta-structure-v1` build needed **no provider calls** (it
+reads the same repaired raw shards). The 85/98 digest `1136d489…` is superseded: do not pin it.
+The universe file needs no trimming and the launcher's coverage refusal passes for all 98.
+
+**Running the warm tools from a WORKTREE on Windows — two traps.** `PYTHONPATH` does not work: the
+test venv's editable install puts a *meta-path finder* for `ba2_common` ahead of it, pointing at the
+MAIN checkout, so the tool dies on `No module named ba2_common.core.market_condition_source`. Only a
+`sys.path.insert` of the three `packages/*` dirs **before the first import** wins. And the tools read
+the FMP key from the TEST database, so `DB_FILE` and `DATABASE_URL` must point at
+`~/Documents/ba2/test/dl_forecasting.db` — without them every symbol fails preflight with
+"FMP API key not configured", which reads like a data problem and is not.
 
 ### Warm the snapshot (once, on the master, before any job)
 
@@ -626,7 +647,8 @@ overlapping instances. Log: `G:\Mon Driveackup\BA2ackup.log`. Measured 2026-09
 
 **Weekly remote pull (stage-1 isolated DB).** `tools/backup_remote_db.py` runs the same online
 backup + `quick_check` + zip ON remote227 (python3 over one ssh session, `nice`d so the grid is
-not disturbed), scp's it to `G:\Mon Driveackup\BA2emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
+not disturbed), scp's it to `G:\Mon Driveackup\BA2
+emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
 deletes the remote copy and keeps the newest 4. Task **`BA2 Remote DB Backup`**, Sunday 01:00,
 interactive user (needs the ssh key + G:). Stage-1 results live ONLY in that isolated DB
 (`/home/debian/ba2-grid/home/test/dl_forecasting.db`); nothing syncs them to the local test DB.
