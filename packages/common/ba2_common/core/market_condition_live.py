@@ -194,9 +194,17 @@ def gated_live_universe() -> Tuple[Tuple[str, ...], Tuple[Tuple[int, str], ...]]
     """``(symbols, deferred)`` for every gated instance: the union of their enabled instruments,
     and the ``(instance_id, sentinel)`` pairs whose universe is only known at analysis time.
 
-    Built the way ``JobManager._schedule_expert_jobs`` builds its analysis jobs -- through the
-    expert's own ``get_enabled_instruments()`` -- so the checked universe is the one the platform
-    will actually analyse, not a second reading of the same settings that could drift from it.
+    Built from the same accessor ``JobManager._schedule_expert_jobs`` schedules from -- the
+    expert's own ``get_enabled_instruments()`` -- not a second reading of the settings rows.
+
+    ONE KNOWN DIVERGENCE from ``JobManager._get_enabled_instruments``, recorded rather than
+    silently carried: JobManager resolves ``instrument_selection_method`` through
+    ``get_setting_with_interface_default`` while the interface method reads
+    ``settings.get(..., "static")``. An instance whose setting row is ABSENT but whose expert
+    class defaults to ``screener`` therefore looks static here, and its stale
+    ``enabled_instruments`` get coverage-checked instead of being reported as deferred. The
+    effect is spurious per-symbol ERRORs, never a missed refusal. The right fix lives in
+    ba2_common's own accessor (which JobManager should then use); it is not a coverage change.
     """
     from ba2_common.core.instance_resolver import get_instance_resolver
 
@@ -242,7 +250,9 @@ class LiveMarketConditionResolver:
         self._checked_universe: Optional[tuple] = None
         self._coverage_reported: set = set()
         self._coverage_universe_warned = False
+        self._coverage_universe_errors: set = set()
         self._coverage_deferred_warned = False
+        self._coverage_lock = threading.Lock()
 
     def begin_decision(self, *, replay_reader: Optional[Any] = None) -> DecisionState:
         """Read the evaluation clock ONCE (call on the coordinating thread) and bind the reader."""
@@ -287,7 +297,8 @@ class LiveMarketConditionResolver:
         """
         return self.uncovered.get(str(symbol).upper())
 
-    def refresh_coverage(self, universe: Optional[Any] = None, *, force: bool = False) -> list:
+    def refresh_coverage(self, universe: Optional[Any] = None, *, force: bool = False,
+                         at_install: bool = False) -> list:
         """Check the pinned snapshot against the LIVE universe; return the missing symbols.
 
         THE FAILURE THIS PREVENTS is the live twin of the backtest seam's: a symbol the warmup
@@ -297,10 +308,20 @@ class LiveMarketConditionResolver:
         ERROR naming the digest, and its gates then report ``no_context`` with that reason
         instead of the generic one, so the refusal names its own cause.
 
-        Called at install and at every decision-scope open; a repeat call with the SAME universe
-        does nothing (one set difference, no log), so the per-pass cost is the universe read.
-        ``universe=None`` derives it from the gated expert instances; a caller that already has
-        the list (a test, or a host that knows its own universe) passes it.
+        Called at install (``at_install=True``) and at every decision-scope open. THE PER-PASS
+        COST IS THE UNIVERSE READ ITSELF -- one ``get_all_instances`` scan plus the rulesets and
+        enabled instruments of the gated instances; the unchanged-universe short-circuit saves
+        only the set difference and the logging after it. That is per decision PASS, not per
+        evaluation, and it is the price of noticing an instance enabled since the last pass.
+        ``universe=None`` derives it; a caller that already has the list (a test, or a host that
+        knows its own universe) passes it.
+
+        ``at_install`` exists because ``wire_all_seams`` runs BEFORE ``init_db``, so the install
+        call normally cannot read the universe at all. That one failure is expected and is
+        reported once. A failure at DECISION time is a different event -- the DB has gone away,
+        or one expert instance raises while being built -- and it means coverage is no longer
+        being checked at all, so it is reported once per distinct cause rather than swallowed
+        into the install flag's budget.
         """
         mapped = self.mapped_reader
         if mapped is None:
@@ -312,12 +333,21 @@ class LiveMarketConditionResolver:
             except Exception as e:  # noqa: BLE001 -- at install the DB may not be open yet
                 from ba2_common.logger import logger
 
-                if not self._coverage_universe_warned:
-                    self._coverage_universe_warned = True
-                    logger.warning(
-                        f"market-condition coverage not checked yet: the live universe could "
-                        f"not be read ({e}). It is re-checked when the first decision scope "
-                        f"opens.")
+                if at_install:
+                    if not self._coverage_universe_warned:
+                        self._coverage_universe_warned = True
+                        logger.warning(
+                            f"market-condition coverage not checked at install: the live "
+                            f"universe could not be read ({e}). This is expected when the "
+                            f"database is opened after the seams are wired; it is re-checked "
+                            f"when the first decision scope opens.")
+                elif str(e) not in self._coverage_universe_errors:
+                    self._coverage_universe_errors.add(str(e))
+                    logger.error(
+                        f"market-condition coverage is NOT being checked: the live universe "
+                        f"could not be read during a decision pass ({e}). Until this clears, an "
+                        f"uncovered symbol's gates report the generic no-context reason and "
+                        f"nothing names the snapshot that is missing it.")
                 return []
         key = tuple(str(s).upper() for s in universe)
         if deferred and not self._coverage_deferred_warned:
@@ -330,15 +360,21 @@ class LiveMarketConditionResolver:
                 f"({sorted({s for _, s in deferred})}), so their symbols cannot be checked "
                 f"against manifest {mapped.manifest_digest} in advance; an uncovered one reads "
                 f"missing_session at the gate.")
-        if key == self._checked_universe and not force:
-            return sorted(self.uncovered)
-        self._checked_universe = key
-        missing = missing_coverage(mapped, key)
-        self.uncovered = {
-            symbol: (f"market-condition manifest {mapped.manifest_digest} has no rows for "
-                     f"{symbol}: its gates are unknown and refuse the entry rather than "
-                     f"passing unmeasured")
-            for symbol in missing}
+        # ONE recompute at a time, and the cache key is published LAST. Two analyses can open a
+        # decision scope concurrently (the UI route and the worker queue both call the entry
+        # pass); setting the key first would let the second pass see "already checked" and read
+        # the PREVIOUS ``uncovered`` -- usually empty -- so its uncovered symbols would report
+        # the generic reason instead of the coverage one, intermittently.
+        with self._coverage_lock:
+            if key == self._checked_universe and not force:
+                return [s for s in key if s in self.uncovered]
+            missing = missing_coverage(mapped, key)
+            self.uncovered = {
+                symbol: (f"market-condition manifest {mapped.manifest_digest} has no rows for "
+                         f"{symbol}: its gates are unknown and refuse the entry rather than "
+                         f"passing unmeasured")
+                for symbol in missing}
+            self._checked_universe = key
         if missing:
             from ba2_common.logger import logger
 
@@ -486,5 +522,5 @@ def resolver_from_env(environ: Optional[Any] = None,
     # read can legitimately fail here. It is not skipped in that case -- ``begin_decision``
     # re-checks on every pass -- but an operator who HAS a readable DB finds the uncovered
     # symbols in the startup log rather than after a week of a sleeve not entering.
-    resolver.refresh_coverage()
+    resolver.refresh_coverage(at_install=True)
     return resolver

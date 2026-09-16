@@ -156,14 +156,23 @@ def test_the_check_is_skipped_when_no_manifest_is_pinned(tmp_path, logs):
     assert resolver.uncovered == {}
 
 
-def test_a_repeated_universe_does_not_re_check(pinned):
-    pinned.refresh_coverage(["AAA", "BBB"])
-    before = pinned._checked_universe
-    pinned.refresh_coverage(["AAA", "BBB"])
-    assert pinned._checked_universe is not None and pinned._checked_universe == before
-    # ...and a CHANGED universe is re-checked, which is the point of doing it per pass.
+def test_a_repeated_universe_does_not_re_check(pinned, monkeypatch):
+    """Spied, not inferred: asserting the cached key is unchanged cannot fail if the re-check
+    ran anyway."""
+    calls = []
+    real = live.missing_coverage
+    monkeypatch.setattr(live, "missing_coverage",
+                        lambda mapped, universe: calls.append(tuple(universe)) or real(mapped, universe))
+    assert pinned.refresh_coverage(["AAA", "BBB"]) == ["BBB"]
+    assert pinned.refresh_coverage(["AAA", "BBB"]) == ["BBB"]      # same answer, no work
+    assert calls == [("AAA", "BBB")]
+    # ...and a CHANGED universe IS re-checked, which is the point of doing it per pass.
     assert pinned.refresh_coverage(["AAA"]) == []
+    assert calls == [("AAA", "BBB"), ("AAA",)]
     assert pinned.uncovered == {}
+    # force re-runs it even on the cached key.
+    pinned.refresh_coverage(["AAA"], force=True)
+    assert len(calls) == 3
 
 
 def test_an_uncovered_symbols_gate_reads_no_context_naming_the_digest(pinned, seam, fixed_clock,
@@ -237,11 +246,32 @@ def test_an_unreadable_universe_at_install_warns_and_re_checks_later(pinned, log
         raise RuntimeError("no such table: expertinstance")
 
     monkeypatch.setattr(live, "gated_live_universe", boom)
-    assert pinned.refresh_coverage() == []
-    assert pinned.refresh_coverage() == []
+    assert pinned.refresh_coverage(at_install=True) == []
+    assert pinned.refresh_coverage(at_install=True) == []
     warnings = [m for m in logs.messages(logging.WARNING) if "could not be read" in m]
     assert len(warnings) == 1
+    assert logs.messages(logging.ERROR) == []    # expected at install; not an error there
     assert pinned._checked_universe is None      # nothing was checked, so nothing is cached
+
+
+def test_an_unreadable_universe_at_DECISION_time_is_an_error_per_cause(pinned, logs, monkeypatch):
+    """A DIFFERENT EVENT from the install one, and it must not be swallowed by the install
+    flag's once-per-process budget: it means coverage has stopped being checked at all."""
+    causes = iter(["database is locked",            # the install attempt
+                   "database is locked", "database is locked",   # twice at decision time
+                   "no such table: ruleset"])       # a DIFFERENT cause
+
+    def boom():
+        raise RuntimeError(next(causes))
+
+    monkeypatch.setattr(live, "gated_live_universe", boom)
+    pinned.refresh_coverage(at_install=True)     # spend the install budget first
+    for _ in range(3):
+        assert pinned.refresh_coverage() == []
+    errors = [m for m in logs.messages(logging.ERROR) if "NOT being checked" in m]
+    assert len(errors) == 2                      # one per distinct cause, not one per process
+    assert any("database is locked" in m for m in errors)
+    assert any("no such table: ruleset" in m for m in errors)
 
 
 def test_a_deferred_universe_is_reported_once(pinned, logs, monkeypatch):

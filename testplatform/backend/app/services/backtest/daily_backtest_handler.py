@@ -918,13 +918,10 @@ def run_daily_backtest(
             if market_condition_record is not None:
                 # RESEARCH METADATA, added after the metrics are computed so it cannot reach
                 # any of them: the per-run counters, and the entry state attached to the trades
-                # it explains (design section 7's attribution input). With the profile off this
-                # whole block is skipped and ``results`` is what it has always been.
-                from app.services.backtest.market_condition_bt import attach_entry_states
-                block = market_condition_record.as_dict()
-                block["stats"]["trades_with_entry_state"] = attach_entry_states(
-                    results.get("trades"), market_condition_record.entry_states())
-                results["market_condition"] = block
+                # it explains (design section 7's attribution input). With the profile off the
+                # record is None, no key is added, and ``results`` is what it has always been.
+                from app.services.backtest.market_condition_bt import apply_market_condition_block
+                apply_market_condition_block(results, market_condition_record)
             # Stamp this run's trade-frequency objective so compute_fitness scores the expert on
             # ITS cadence, not the platform default. Done here because run_daily_backtest is the
             # single chokepoint every path goes through (trial worker, master top-N persist,

@@ -146,6 +146,13 @@ def bin_of(value: float, edges: Sequence[float]) -> Optional[int]:
     """
     if not edges:
         return 0
+    # NaN FIRST. Every comparison with NaN is False, so without this test it falls through the
+    # range check AND every bin test and lands in the final bin via the ``i == len - 2``
+    # fallback -- the top bucket, silently, which is the one thing this function's own
+    # docstring says must not happen. A valid Observation cannot be NaN, but this reads a
+    # persisted JSON blob and ``json.loads`` accepts the literal ``NaN``.
+    if value != value:
+        return None
     if value < edges[0] or value > edges[-1]:
         return None
     for i in range(len(edges) - 1):
@@ -249,21 +256,28 @@ def market_gene_rows(params: Dict[str, Any], block: Dict[str, Any]) -> List[Tupl
 
 
 def _mode_token(value: Any, short: str, shorts: Dict[str, Dict[str, Any]]) -> str:
-    """A persisted mode gene as its TOKEN. ``decode_individual`` stores the token; a raw index
-    (a checkpoint, a hand-built flat dict) is resolved against the choices the PERSISTED
-    FieldSpec declares -- not against this process's registry."""
-    if isinstance(value, str):
-        return value
+    """A persisted mode gene as its TOKEN, VALIDATED against the choices the PERSISTED FieldSpec
+    declares -- not against this process's registry, which may have moved on since the run.
+
+    NOT ``strategy_param_space.mode_token``, which is the one reader for the DECODE path and
+    raises on anything it cannot interpret. A report walks many jobs, some of them old; one
+    unreadable gene must render as an obvious ``INVALID`` cell rather than abort the report on
+    the other twenty. It applies the same rule and the same choice order, and it refuses the
+    same things -- it just says so in a column instead of an exception.
+    """
     spec = shorts.get(short) or {}
     if spec.get("kind") == "categorical":
         choices = ["off", *list((spec.get("codes") or {}).keys())]
     else:
         choices = ["off", "below", "above"]
-    try:
-        index = int(value)
-    except (TypeError, ValueError):
-        return f"?{value!r}"
-    return choices[index] if 0 <= index < len(choices) else f"?{value!r}"
+    if isinstance(value, str):
+        return value if value in choices else f"INVALID({value!r} not in {choices!r})"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"INVALID({value!r})"
+    if float(value) != int(value):
+        return f"INVALID({value!r})"
+    index = int(value)
+    return choices[index] if 0 <= index < len(choices) else f"INVALID(index {index})"
 
 
 # --------------------------------------------------------------------------- trades
@@ -501,6 +515,12 @@ def render(opt: Dict[str, Any], runs: Sequence[Dict[str, Any]], top: int,
         if not digest:
             _line(out, "  No manifest is pinned on this job, so there is no published snapshot")
             _line(out, "  to diagnose. Pass --manifest/--profile to check a snapshot anyway.")
+        elif not universe:
+            # REFUSE rather than print an all-clear. "Every instrument has rows" about a list of
+            # zero instruments is a reassuring sentence describing a check that examined nothing.
+            _line(out, "  REFUSED: this job's stored config records no enabled_instruments, so")
+            _line(out, "  there is no universe to check the snapshot against. Nothing here says")
+            _line(out, "  the coverage is good; it says the question was not asked.")
         else:
             _render_coverage(out, coverage_report(digest, profile, universe, cache_root))
         _line(out)
@@ -529,12 +549,19 @@ def _render_run(out: List[str], run: Dict[str, Any], block: Dict[str, Any]) -> N
                 _line(out, f"  {key:<30} {stats[key]}")
         unknown = stats.get("market_unknown_input_by_reason") or {}
         _line(out, f"  {'unknown input by reason':<30} {unknown if unknown else '(none)'}")
+        _line(out, "  (passed + rejected + unknown does NOT sum to evaluated: one recommendation")
+        _line(out, "   whose gates both rejected on a value AND read an unknown counts in both.)")
     _line(out)
 
     groups = structures(run["trades"])
     _line(out, "### structures")
-    _line(out, f"  submitted (entry rules that fired) {stats.get('entries_staged', 'n/a')}")
-    _line(out, f"  filled (closed round-trip units)   {len(groups)}")
+    # NEITHER NUMBER IS WHAT ITS ONE-WORD NAME SUGGESTS, so both are labelled with what they
+    # actually count. entries_staged is incremented when the entry RULE fires -- before the
+    # dup-position and equity gates -- so it is an upper bound on submissions; the second is
+    # CLOSED round trips, so a position still open at the end of the run is in neither.
+    _line(out, f"  entry rules that fired (before the dup/equity gates) "
+               f"{stats.get('entries_staged', 'n/a')}")
+    _line(out, f"  closed round-trip units in the trade blob                {len(groups)}")
     net, top1, top5 = concentration([math.fsum(_pnl(t) for t in g) for g in groups])
     _line(out, f"  net P&L {_money(net)}, top-1 {_pct(top1)} of it, top-5 {_pct(top5)}")
     _line(out)
@@ -558,6 +585,10 @@ def _render_run(out: List[str], run: Dict[str, Any], block: Dict[str, Any]) -> N
     data = attribution(run["trades"], block)
     _line(out, f"  units {data['units']}, without a recorded entry state {data['unattributed']}, "
                f"legs disagreeing on their state {data['inconsistent']}")
+    if data["units"] and data["unattributed"] == data["units"]:
+        _line(out, "  NOTHING TO ATTRIBUTE: no trade of this run carries an entry state. Either")
+        _line(out, "  the run predates the entry-state capture, or it ran with the profile off.")
+        _line(out, "  Its P&L is not evidence about any regime -- use --coverage instead.")
     for field, info in data["fields"].items():
         _line(out)
         _line(out, f"  {field}  edges {[_fmt_edge(e) for e in info['edges']] or 'none declared'}")

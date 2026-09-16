@@ -1959,10 +1959,20 @@ class TradeManager:
         from contextlib import nullcontext
         from datetime import timezone as _tz
 
+        from ba2_common.core.TradeConditions import get_market_condition_context_resolver
+        from ba2_common.core.market_condition_live import LiveMarketConditionResolver
         from ba2_common.core.replay import capture_scope, get_replay_store
 
         from .types import AnalysisUseCase
 
+        # ONLY when a market-condition resolver is installed. The scope exists to record the
+        # feature windows those gates read; with no profile wired there is nothing to record,
+        # and opening it anyway would submit a synthetic "TradeManager" AnalysisRecord per
+        # decision pass into every capture session -- which replay inventory counts as an
+        # analysis and expert_replay then reports as COVERAGE_UNSUPPORTED. That silently moves
+        # the replay-coverage percentage of deployments that never enable this feature.
+        if not isinstance(get_market_condition_context_resolver(), LiveMarketConditionResolver):
+            return nullcontext()
         store = get_replay_store()
         if store is None:
             return nullcontext()

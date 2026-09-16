@@ -147,10 +147,24 @@ def test_a_value_lands_in_the_bin_its_edges_declare(value, index):
     assert R.bin_of(value, R.BIN_EDGES[ADX]) == index
 
 
-@pytest.mark.parametrize("value", [-0.001, 100.001, 140.0])
+@pytest.mark.parametrize("value", [-0.001, 100.001, 140.0, float("nan")])
 def test_a_value_outside_the_edges_is_not_silently_binned(value):
-    """An ADX of 140 is a data problem. Folded into "[40, 100]" it becomes a finding."""
+    """An ADX of 140 is a data problem. Folded into "[40, 100]" it becomes a finding.
+
+    NaN is in this list because every comparison with it is False: it slips past the range
+    check AND every bin test, and lands in the TOP bin through the last-bin fallback. A valid
+    Observation cannot be NaN, but this function reads a persisted JSON blob and ``json.loads``
+    accepts the literal ``NaN``."""
     assert R.bin_of(value, R.BIN_EDGES[ADX]) is None
+
+
+def test_NaN_is_outside_even_edges_that_run_to_infinity():
+    """The slope scheme's outer edges ARE +/-inf, so the range test cannot catch anything --
+    NaN there would land in the top bin on the last-bin fallback alone."""
+    assert R.bin_of(float("nan"), R.BIN_EDGES[SLOPE]) is None
+    assert R.bin_of(float("nan"), R.BIN_EDGES[RV]) is None
+    # ...and a real value at the open end still bins, so the guard did not close the tail.
+    assert R.bin_of(140.0, R.BIN_EDGES[SLOPE]) == len(R.BIN_EDGES[SLOPE]) - 2
 
 
 def test_an_unlisted_field_gets_bins_from_the_PERSISTED_spec_not_this_registry():
@@ -174,6 +188,14 @@ def test_the_winning_modes_read_tokens_and_raw_indexes_alike():
     # number would read as "this genome gates RV at 1.25", which is the opposite of the truth.
     assert ("o_lc", "rv", "off", "-") in rows
     assert len(rows) == 3
+
+
+@pytest.mark.parametrize("value", ["sideways", 9, 1.5, True, None])
+def test_a_mode_gene_the_persisted_spec_cannot_explain_is_marked_INVALID(value):
+    """Not rendered as a plausible mode, and not an exception either: a report walks many jobs
+    and one unreadable gene must be visible in its own row rather than abort the other twenty."""
+    rows = R.market_gene_rows({"cond:o_lc-market-adx:mode": value}, _BLOCK)
+    assert rows[0][2].startswith("INVALID"), rows
 
 
 # --------------------------------------------------------------------------- attribution
@@ -272,6 +294,22 @@ def test_the_per_year_block_is_the_whole_account(db):
 def test_the_cli_reports_a_missing_job_rather_than_printing_nothing(db):
     with pytest.raises(SystemExit):
         R.main(["--opt", "999", "--db", db])
+
+
+def test_the_coverage_section_refuses_a_universe_it_cannot_read(db, tmp_path):
+    """An all-clear about zero symbols is a reassuring sentence describing a check that
+    examined nothing."""
+    con = sqlite3.connect(db)
+    block = dict(_BLOCK)
+    con.execute("UPDATE strategy_optimizations SET optimization_config = ? WHERE id = 7",
+                (json.dumps({"backtest": {"market_condition": block}}),))
+    con.commit()
+    con.close()
+    con = R.open_db(db)
+    opt = R.optimizations(con, opt_id=7)[0]
+    text = R.render(opt, [], top=1, want_coverage=True)
+    assert "REFUSED" in text
+    assert "every instrument" not in text
 
 
 def test_the_cli_writes_the_file_it_was_asked_for(db, tmp_path):

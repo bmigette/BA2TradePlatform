@@ -26,7 +26,7 @@ from ba2_common.core.market_conditions import (  # noqa: E402
 )
 
 from app.services.backtest.market_condition_bt import (  # noqa: E402
-    MarketConditionRunRecord, attach_entry_states,
+    MarketConditionRunRecord, apply_market_condition_block, attach_entry_states,
 )
 
 SPEC = PROFILES["ohlcv-v1"]
@@ -138,11 +138,14 @@ def test_a_second_entry_in_the_same_session_does_not_re_read_or_duplicate(record
     assert record.stats()["entries_staged"] == 2
 
 
-def test_a_symbol_with_no_row_records_an_EMPTY_state_rather_than_none_at_all(record):
-    """A gate that could not measure is still a fact about the entry; dropping the record
-    would make the trade look like one the profile never saw."""
+def test_a_symbol_with_no_row_records_the_STATUS_the_gate_would_have_reported(record):
+    """A gate that could not measure is still a fact about the entry, and WHICH failure it was
+    is the fact that matters: an uncovered symbol produces exactly this for a whole run. An
+    empty dict would be indistinguishable in the report from a run that predates the capture."""
     record.note_entry(object(), "ZZZ", object())
-    assert record.entry_states()[0]["values"] == {}
+    values = record.entry_states()[0]["values"]
+    assert set(values) == set(FIELDS)
+    assert all(v == {"value": None, "status": "missing_session"} for v in values.values())
 
 
 def test_a_resolver_that_raises_is_recorded_as_a_failure_not_a_silent_gap(record, caplog):
@@ -174,7 +177,7 @@ def _states(*pairs):
 
 def test_a_fill_after_the_decision_bar_still_gets_the_decision_s_state():
     states = _states(("AAA", "2024-03-05"))
-    trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-11T14:30:00"}]
+    trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-08T14:30:00"}]
     assert attach_entry_states(trades, states) == 1
     assert trades[0]["entry_state"]["session"] == "2024-03-05"
 
@@ -182,10 +185,39 @@ def test_a_fill_after_the_decision_bar_still_gets_the_decision_s_state():
 def test_each_entry_gets_ITS_OWN_state_not_the_first_or_the_last():
     states = _states(("AAA", "2024-01-05"), ("AAA", "2024-06-05"))
     trades = [{"underlying_symbol": "AAA", "entry_time": "2024-01-08T00:00:00"},
-              {"underlying_symbol": "AAA", "entry_time": "2024-07-01T00:00:00"}]
+              {"underlying_symbol": "AAA", "entry_time": "2024-06-07T00:00:00"}]
     attach_entry_states(trades, states)
     assert trades[0]["entry_state"]["session"] == "2024-01-05"
     assert trades[1]["entry_state"]["session"] == "2024-06-05"
+
+
+def test_a_position_opened_LONG_after_the_last_decision_inherits_NOTHING():
+    """THE FABRICATION THIS PREVENTS. The match is by date, not identity, so without a bound
+    an assignment or a lifecycle roll months later would inherit the last rule-fired state and
+    the attribution table would report a measured regime for a trade no measurement produced."""
+    states = _states(("AAA", "2024-01-05"))
+    trades = [{"underlying_symbol": "AAA", "entry_time": "2024-06-01T00:00:00"}]
+    assert attach_entry_states(trades, states) == 0
+    assert "entry_state" not in trades[0]
+
+
+@pytest.mark.parametrize("entry,attached", [
+    ("2024-01-05", 1),      # the decision bar itself
+    ("2024-01-12", 1),      # exactly the bound
+    ("2024-01-13", 0),      # one day past it
+])
+def test_the_gap_bound_is_inclusive_and_is_the_documented_constant(entry, attached):
+    from app.services.backtest.market_condition_bt import ENTRY_STATE_MAX_GAP_DAYS
+
+    assert ENTRY_STATE_MAX_GAP_DAYS == 7
+    trades = [{"underlying_symbol": "AAA", "entry_time": f"{entry}T00:00:00"}]
+    assert attach_entry_states(trades, _states(("AAA", "2024-01-05"))) == attached
+
+
+def test_an_unparseable_entry_date_is_not_a_match():
+    trades = [{"underlying_symbol": "AAA", "entry_time": "not-a-date"}]
+    assert attach_entry_states(trades, _states(("AAA", "2024-01-05"))) == 0
+    assert "entry_state" not in trades[0]
 
 
 def test_a_trade_with_no_record_before_it_is_left_UNTOUCHED():
@@ -207,3 +239,28 @@ def test_an_equity_row_matches_on_its_own_symbol_and_an_option_leg_on_its_underl
 def test_attaching_nothing_to_nothing_is_not_an_error():
     assert attach_entry_states([], []) == 0
     assert attach_entry_states(None, None) == 0
+
+
+# --------------------------------------------------------------------------- the blob
+def test_a_profile_less_run_gets_NO_key_at_all(record):
+    """Not an empty block, not a null: the key must be ABSENT, or the byte-identical
+    comparison in the all-off gate fails on the payload SHAPE rather than on any number."""
+    results = {"trades": [], "total_return": 1.0}
+    assert apply_market_condition_block(results, None) is results
+    assert "market_condition" not in results
+    assert results == {"trades": [], "total_return": 1.0}
+
+
+def test_the_block_lands_on_the_results_and_the_states_land_on_the_trades(record):
+    record.note_eligible()
+    record.note_entry(object(), "AAA", object())
+    results = {"trades": [{"symbol": "AAA", "entry_time": f"{SESSION.isoformat()}T15:00:00"},
+                          {"symbol": "ZZZ", "entry_time": f"{SESSION.isoformat()}T15:00:00"}]}
+    apply_market_condition_block(results, record)
+    block = results["market_condition"]
+    assert block["stats"]["trades_with_entry_state"] == 1
+    assert results["trades"][0]["entry_state"]["values"]["underlying_adx_14"]["value"] == 20.0
+    assert "entry_state" not in results["trades"][1]
+    # The metadata is added AFTER the metrics; it must not have grown a metric of its own.
+    assert set(block) == {"profile", "manifest", "calc_version", "source_profile",
+                          "timing_policy", "stats"}

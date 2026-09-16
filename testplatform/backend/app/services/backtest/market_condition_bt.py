@@ -36,12 +36,15 @@ from ba2_common.core.market_condition_context import (
 )
 from ba2_common.core.market_condition_readers import MEMO_SIZE, WindowMarketConditionReader
 from ba2_common.core.market_condition_source import SOURCE_PROFILE_FMP_DAILY
-from ba2_common.core.market_conditions import STATUS_VALID, WINDOW
+from ba2_common.core.market_conditions import (
+    PROFILES, STATUS_MISSING_SESSION, STATUS_VALID, WINDOW,
+)
 
 _log = logging.getLogger(__name__)
 
 __all__ = ["BacktestMarketConditionReader", "BacktestMarketConditionResolver",
-           "MarketConditionRunRecord", "attach_entry_states"]
+           "MarketConditionRunRecord", "apply_market_condition_block",
+           "attach_entry_states"]
 
 
 class BacktestMarketConditionReader(WindowMarketConditionReader):
@@ -179,6 +182,14 @@ class MarketConditionRunRecord:
         ``TradeActionEvaluator._evaluate_conditions`` for conditions that define
         ``last_status``), so a ruleset with no market leaf is counted nowhere here and the run's
         other rejections stay the run's other rejections.
+
+        SCOPE: ``evaluator.condition_evaluations`` spans EVERY rule the evaluator walked, not
+        only the one that fired (the evaluator is first-match over the ruleset's ordered
+        rules). With more than one entry rule carrying market leaves, a recommendation a later
+        rule admitted would still be counted as rejected by the earlier rule's leaf. The
+        launcher emits the market gates onto ONE entry rule per structure, so that case does
+        not arise today; if it ever does, the classification has to move inside the winning
+        rule's ``rule_evaluations`` entry instead of reading the flat list.
         """
         seen = rejected = unknown = False
         for record in condition_evaluations or ():
@@ -220,6 +231,14 @@ class MarketConditionRunRecord:
             if row is not None:
                 for name, obs in row.by_field().items():
                     values[name] = {"value": obs.value, "status": obs.status}
+            else:
+                # NO ROW IS ITSELF A MEASUREMENT OUTCOME, and it is the one an operator most
+                # needs to see: it is what an uncovered symbol produces for a whole run. Record
+                # it as the status the gate would have reported (``missing_session``) rather
+                # than an empty dict, which the report cannot tell from "this run predates the
+                # entry-state capture".
+                for field in PROFILES[self.profile].fields:
+                    values[field.name] = {"value": None, "status": STATUS_MISSING_SESSION}
             self._entry_states[key] = {
                 "symbol": symbol,
                 "session": ctx.session_label.isoformat(),
@@ -269,18 +288,36 @@ class MarketConditionRunRecord:
         }
 
 
-def attach_entry_states(trades: Any, entry_states: Any) -> int:
+#: How far after a recorded decision a fill may still be attributed to it, in CALENDAR days.
+#:
+#: WHY A BOUND AT ALL. The match is by date, not by identity: the trade blob carries no
+#: recommendation id, so the only link between "the entry rule fired for AAA on the 5th" and
+#: "an AAA position opened on the 11th" is their order in time. Without a bound, ANY later
+#: position on that underlying inherits the last rule-fired state -- an assignment, a lifecycle
+#: roll, a position opened months afterwards -- and the attribution table would report a
+#: measured regime for a trade that no measurement produced.
+#:
+#: WHY SEVEN. An entry order in this engine is DAY time-in-force (``backtest_account``
+#: re-submits or expires it; live forces the same), so a fill lands on the decision bar or the
+#: next one, and a re-submission on a later bar fires the rule again and records its own state.
+#: A week is generous for a long holiday weekend and still far short of the interval at which
+#: a stale attribution could look plausible.
+ENTRY_STATE_MAX_GAP_DAYS = 7
+
+
+def attach_entry_states(trades: Any, entry_states: Any,
+                        max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS) -> int:
     """Attach ``entry_state`` to every trade an entry-state record covers; return how many.
 
     A trade is matched on its UNDERLYING (an option leg's ``underlying_symbol``, else
-    ``symbol``) and on the LATEST recorded session at or before its entry date: a resting entry
-    that fills days after the decision still carries the state the decision was made on, and a
-    symbol entered repeatedly gets each entry's own state rather than the first or the last. A
-    trade with no record at or before it (a position opened by something other than a gated
-    entry rule -- an assignment, say) is left untouched: an absent key is honest, an empty one
-    would let the report bin it as though it had been measured.
+    ``symbol``) and on the LATEST recorded session at or before its entry date, provided that
+    session is within ``max_gap_days`` of it -- see ``ENTRY_STATE_MAX_GAP_DAYS``. A resting
+    entry that fills a day or two after the decision still carries the state the decision was
+    made on; a position opened by something other than a gated entry rule is left UNTOUCHED.
+    An absent key is honest; an inherited one would be a fabricated observation.
     """
     from bisect import bisect_right
+    from datetime import date as _date
 
     by_symbol: Dict[str, Any] = {}
     for record in entry_states or ():
@@ -302,8 +339,31 @@ def attach_entry_states(trades: Any, entry_states: Any) -> int:
         if pos == 0:
             continue
         chosen = records[pos - 1]
+        try:
+            gap = (_date.fromisoformat(entry) - _date.fromisoformat(chosen["session"])).days
+        except ValueError:
+            continue                       # an unparseable date is not a match, and not a guess
+        if gap > max_gap_days:
+            continue
         trade["entry_state"] = {"session": chosen["session"],
                                 "prior_session": chosen["prior_session"],
                                 "values": chosen["values"]}
         attached += 1
     return attached
+
+
+def apply_market_condition_block(results: Dict[str, Any], record: Any) -> Dict[str, Any]:
+    """Add the run's research metadata to a finished ``build_results`` blob, in place.
+
+    Called by ``run_daily_backtest`` AFTER every metric has been computed, so nothing here can
+    reach one: the counters and the per-trade entry state are evidence about a run, never an
+    input to scoring it. ``record is None`` (every profile-less run) returns the blob untouched
+    and adds no key -- which is what the all-off compatibility gate compares.
+    """
+    if record is None:
+        return results
+    block = record.as_dict()
+    block["stats"]["trades_with_entry_state"] = attach_entry_states(
+        results.get("trades"), record.entry_states())
+    results["market_condition"] = block
+    return results

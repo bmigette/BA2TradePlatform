@@ -370,11 +370,14 @@ def evidence_problems(private_ev: Optional[Dict[str, Any]],
 def _format_evidence(ev: Optional[Dict[str, Any]]) -> str:
     if ev is None:
         return "<none printed>"
+    calls = ev.get("market_condition_resolver_calls")
     return (f"shared_enabled={ev.get('shared_enabled')} trades={ev.get('total_trades')} "
             f"bars {_mb(ev, 'bars_shared_mb')} MB shared / {_mb(ev, 'bars_private_mb')} MB private; "
             f"options {_mb(ev, 'options_shared_mb')} MB shared / "
             f"{_mb(ev, 'options_private_mb')} MB private "
-            f"({ev.get('options_entries')} underlying(s))")
+            f"({ev.get('options_entries')} underlying(s)); "
+            f"market-condition resolver calls "
+            f"{'unknown (old build)' if calls is None else calls}")
 
 
 def parse_child_bt_id(stdout: str) -> Optional[int]:
@@ -571,6 +574,17 @@ def existing_parity_names(names: Sequence[str]) -> List[str]:
 # =============================================================================================
 # Child -- runs ONE mode in its own process and persists ONE row
 # =============================================================================================
+def _market_condition_calls() -> Optional[int]:
+    """This process's market-condition resolver-call count, or None on a build that predates
+    the counter (an old package pinned by a worker, say -- reported, never assumed zero)."""
+    try:
+        from ba2_common.core.TradeConditions import market_condition_resolver_calls
+
+        return int(market_condition_resolver_calls())
+    except ImportError:
+        return None
+
+
 def collect_evidence(results: Dict[str, Any]) -> Dict[str, Any]:
     """What the caches ACTUALLY held when the run finished, and what the run actually DID --
     the proof that goes with the row.
@@ -600,7 +614,14 @@ def collect_evidence(results: Dict[str, Any]) -> Dict[str, Any]:
           # Zero means no options provider was ever built (or never asked for a chain), which
           # for an option source makes the whole comparison beside the point.
           "options_entries": 0,
-          "options_provider_built": False}
+          "options_provider_built": False,
+          # MARKET-CONDITION NO-IMPACT EVIDENCE (plan Task 9). With the profile off the gates
+          # must not merely produce the same numbers -- they must never be reached. Identical
+          # results with the resolver quietly answering every leaf would be a worse outcome
+          # than a diff, because nothing about it would look wrong. This counts every entry
+          # into ``TradeConditions.resolve_market_condition_context`` in the child process, so
+          # "the resolver was never called" is a measurement rather than a belief.
+          "market_condition_resolver_calls": _market_condition_calls()}
     try:
         from app.services.backtest import parquet_options_provider as pq
 
