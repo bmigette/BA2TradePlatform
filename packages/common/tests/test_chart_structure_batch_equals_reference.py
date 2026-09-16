@@ -16,11 +16,13 @@ import numpy as np
 import pytest
 
 from ba2_common.core.market_conditions import (
+    CHANNEL_LOOKBACK,
     PIVOT_K,
     STATUS_INVALID_PRICES,
     STRUCTURE_FIELDS,
     WINDOW,
     compute_chart_structure,
+    fit_channel,
 )
 from ba2_common.core.market_conditions_batch import (
     chart_structure_rows,
@@ -213,3 +215,82 @@ def test_a_sub_span_batch_equals_the_full_history_batch_for_the_rows_it_covers()
     part = chart_structure_rows(*span)
     for e in range(WINDOW - 1, len(part)):
         assert part[e] == full[e + lo]
+
+
+# --------------------------------------------------------------------------------------------
+# the one deliberate deviation from design 3.3's "batch form" recipe, as EVIDENCE
+# --------------------------------------------------------------------------------------------
+def _cumulative_sum_channel_fit(closes: np.ndarray):
+    """Design 3.3's prescribed channel: "regression via cumulative sums of x, y, x^2, xy over
+    the rolling 20". One pass of running sums over the whole history, then each window's fit by
+    subtraction, with sigma from the normal-equation identity
+    ``Sum e^2 = Syy - a*Sy - b*Sxy``.
+
+    Lives in the test, not in the module: it is the thing being ruled OUT."""
+    c = np.asarray(closes, dtype=float)
+    n = len(c)
+    js = np.arange(n, dtype=np.float64)
+    sy = np.concatenate(([0.0], np.cumsum(c)))
+    sjy = np.concatenate(([0.0], np.cumsum(js * c)))
+    syy = np.concatenate(([0.0], np.cumsum(c * c)))
+    m = float(CHANNEL_LOOKBACK)
+    sx = m * (m - 1) / 2.0
+    sxx = (m - 1) * m * (2 * m - 1) / 6.0
+    out = []
+    for e in range(CHANNEL_LOOKBACK - 1, n):
+        s = e - CHANNEL_LOOKBACK + 1
+        y = sy[e + 1] - sy[s]
+        jy = sjy[e + 1] - sjy[s]
+        yy = syy[e + 1] - syy[s]
+        xy = jy - s * y
+        b = (m * xy - sx * y) / (m * sxx - sx * sx)
+        a = (y - b * sx) / m
+        out.append((a, b, math.sqrt(max(yy - a * y - b * xy, 0.0) / (CHANNEL_LOOKBACK - 2))))
+    return out
+
+
+def test_cumulative_sum_ols_is_not_bit_exact_so_the_batch_fits_per_session():
+    """WHY the batch deviates from design 3.3 on this one structure.
+
+    "Agree exactly" is the requirement, and the cumulative-sum form does not: every row differs,
+    and the error is not in the last bit. sigma falls out of a cancellation
+    (``Syy - a*Sy - b*Sxy``) between quantities of order price^2 while the residuals are of order
+    a few ticks, and the running sums span the whole history rather than twenty points. A drift
+    of ~1e-7 relative in a value the GA compares against a threshold is a different decision, not
+    a rounding detail -- so the batch re-fits per session with the same ``math.fsum`` reductions
+    the reference uses, and this test is the evidence rather than an omission.
+    """
+    histories = {name: build()[3] for name, build in sorted(_HISTORIES.items())}
+    if os.path.exists(_AAPL):
+        import pandas as pd
+
+        histories["AAPL"] = pd.read_parquet(_AAPL).sort_values("Date")["Close"].to_numpy(float)
+
+    worst = 0.0
+    for name, closes in histories.items():
+        got = _cumulative_sum_channel_fit(closes)
+        differing = 0
+        for k, e in enumerate(range(CHANNEL_LOOKBACK - 1, len(closes))):
+            want = fit_channel(closes[e - CHANNEL_LOOKBACK + 1:e + 1].tolist())
+            if got[k] != want:
+                differing += 1
+                for g, w in zip(got[k], want):
+                    worst = max(worst, abs(g - w) / (abs(w) or 1.0))
+        assert differing, f"{name}: the cumulative-sum fit was bit-exact here -- re-open the choice"
+    assert worst > 1e-9, f"the drift is only {worst:.3e}; re-open the choice if it is this small"
+
+
+def test_the_rolling_level_lists_survive_a_row_the_batch_declines_to_compute():
+    """The sorted level lists slide with the window even for rows that are skipped (an invalid
+    bar, a non-positive ATR). Leaving the state behind on a skip would silently mis-level every
+    later row -- and 'later' is where the trades are."""
+    o, h, l, c, v = _random_walk(n=600)
+    c = c.copy()
+    c[300] = float("nan")                  # every window containing bar 300 is skipped
+    got = chart_structure_rows(o, h, l, c, v)
+    want = _reference_rows(o, h, l, c, v)
+    assert got == want
+    after = got[300 + WINDOW]
+    assert after.dist_support.status != STATUS_INVALID_PRICES or after.dist_resistance.value is None
+    assert any(r is not None and r.dist_resistance.value is not None
+               for r in got[300 + WINDOW:]), "no level resolved after the skipped run"

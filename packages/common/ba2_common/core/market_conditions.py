@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import functools
 import math
+from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from dataclasses import InitVar, dataclass
 from dataclasses import field as dc_field
@@ -896,29 +897,67 @@ _NO_RESISTANCE = "no confirmed pivot high above the close in the window"
 _NO_SUPPORT = "no confirmed pivot low below the close in the window"
 
 
-def _level_fields(pivots: Sequence[Pivot], close: float, atr_last: float
-                  ) -> Tuple[Observation, Observation, Observation, Observation]:
-    """(dist_support, dist_resistance, support_touches, resistance_touches)."""
+def _touch_run(prices: Sequence[float], at: int, level: float, tol: float) -> int:
+    """How many entries of the SORTED ``prices`` lie within ``level +/- tol``, counted by walking
+    outward from ``at`` (an index holding ``level``).
+
+    ``abs(p - level) <= tol`` describes an interval, and the slice of a sorted list inside an
+    interval is contiguous, so the walk stops at the first failure in each direction and is
+    complete. The PREDICATE is evaluated verbatim rather than replaced by two bisects on
+    ``level +/- tol``: those bounds are rounded once each, and a price exactly on the boundary
+    can fall on the other side of the rounded bound from the side ``abs(p - level) <= tol`` puts
+    it. Bit-exactness is the whole contract here (design 3.3), so the comparison stays the one
+    the contract names and the sorted order is used only to bound the work."""
+    n = 0
+    i = at
+    while i >= 0 and abs(prices[i] - level) <= tol:
+        n += 1
+        i -= 1
+    i = at + 1
+    while i < len(prices) and abs(prices[i] - level) <= tol:
+        n += 1
+        i += 1
+    return n
+
+
+def levels_from_sorted(highs: Sequence[float], lows: Sequence[float], close: float,
+                       atr_last: float) -> Tuple[Observation, Observation, Observation, Observation]:
+    """(dist_support, dist_resistance, support_touches, resistance_touches) from the SORTED
+    confirmed pivot-high and pivot-low prices of one window (design 3.3, "nearest-level queries
+    against the sorted confirmed levels").
+
+    Resistance is the first sorted high STRICTLY above the close and support the last sorted low
+    strictly below it -- two bisects, no arithmetic, so the answer is the same element
+    ``min``/``max`` over the unsorted prices would select. The batch form keeps these two lists
+    incrementally as its window slides and calls exactly this function, which is what makes
+    "batch == reference" a property of the code rather than of a coincidence."""
     tol = LEVEL_TOL_ATR * atr_last
-    highs = [p.price for p in pivots if p.kind == PIVOT_HIGH and p.price > close]
-    lows = [p.price for p in pivots if p.kind == PIVOT_LOW and p.price < close]
-    if highs:
-        r = min(highs)
-        touches = sum(1 for p in pivots if p.kind == PIVOT_HIGH and abs(p.price - r) <= tol)
+    i = bisect_right(highs, close)
+    if i < len(highs):
+        r = highs[i]
         res = Observation((r - close) / atr_last, STATUS_VALID)
-        res_touch = Observation(float(touches), STATUS_VALID)
+        res_touch = Observation(float(_touch_run(highs, i, r, tol)), STATUS_VALID)
     else:
         res = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_RESISTANCE)
         res_touch = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_RESISTANCE)
-    if lows:
-        s = max(lows)
-        touches = sum(1 for p in pivots if p.kind == PIVOT_LOW and abs(p.price - s) <= tol)
-        sup = Observation((close - s) / atr_last, STATUS_VALID)
-        sup_touch = Observation(float(touches), STATUS_VALID)
+    j = bisect_left(lows, close)
+    if j > 0:
+        sup_level = lows[j - 1]
+        sup = Observation((close - sup_level) / atr_last, STATUS_VALID)
+        sup_touch = Observation(float(_touch_run(lows, j - 1, sup_level, tol)), STATUS_VALID)
     else:
         sup = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_SUPPORT)
         sup_touch = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_SUPPORT)
     return sup, res, sup_touch, res_touch
+
+
+def _level_fields(pivots: Sequence[Pivot], close: float, atr_last: float
+                  ) -> Tuple[Observation, Observation, Observation, Observation]:
+    """(dist_support, dist_resistance, support_touches, resistance_touches) for one window."""
+    return levels_from_sorted(
+        sorted(p.price for p in pivots if p.kind == PIVOT_HIGH),
+        sorted(p.price for p in pivots if p.kind == PIVOT_LOW),
+        close, atr_last)
 
 
 def _channel_fields(closes: Sequence[float], atr_last: float
@@ -993,18 +1032,31 @@ def _break_fields(pivots: Sequence[Pivot], closes: Sequence[float], state: str
 
 
 def _chart_structure_core(h: List[float], l: List[float], c: List[float],
-                          pivots: List[Pivot], atr_last: float) -> ChartStructureValues:
+                          pivots: List[Pivot], atr_last: float, *,
+                          levels: Optional[Tuple[Observation, ...]] = None,
+                          prior_range: Optional[Tuple[float, float]] = None
+                          ) -> ChartStructureValues:
     """The measurements themselves, on already-validated window-local lists and pivots.
 
     Shared verbatim by :func:`compute_chart_structure` and the batch form, which is how
     "batch == reference" is a property of the code rather than of a test that happened to pass.
+
+    ``levels`` and ``prior_range`` let the batch supply what it already holds in a rolling form
+    (the incrementally maintained sorted level lists, the rolling 20-session max/min shifted by
+    one). Both are SELECTIONS -- a bisect and a max/min -- never arithmetic, so a caller can only
+    hand over the same values this function would compute; the batch==reference tests pin it.
+    The swing and break fields have no rolling form and are always computed here.
     """
     last = len(c) - 1
     close = c[last]
-    sup, res, sup_touch, res_touch = _level_fields(pivots, close, atr_last)
+    sup, res, sup_touch, res_touch = (levels if levels is not None
+                                      else _level_fields(pivots, close, atr_last))
     slope, width, pos = _channel_fields(c, atr_last)
-    prior_hi = max(h[last - CHANNEL_LOOKBACK:last])     # excludes session ``last`` itself
-    prior_lo = min(l[last - CHANNEL_LOOKBACK:last])
+    if prior_range is None:
+        prior_hi = max(h[last - CHANNEL_LOOKBACK:last])     # excludes session ``last`` itself
+        prior_lo = min(l[last - CHANNEL_LOOKBACK:last])
+    else:
+        prior_hi, prior_lo = prior_range
     vs_high = Observation((close - prior_hi) / atr_last, STATUS_VALID)
     vs_low = Observation((close - prior_lo) / atr_last, STATUS_VALID)
     state = swing_state(pivots)

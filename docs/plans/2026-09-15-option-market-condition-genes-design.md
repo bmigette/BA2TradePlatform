@@ -274,6 +274,13 @@ cost is on the order of ten milliseconds per symbol; a thousand-symbol
 universe warms in seconds and the per-trial cost is a lookup. Report the
 measured figures with the section 4.6 counters before the first launch.
 
+**Measured (2026-09-16, `reports/strategy_research/market_conditions_bench_2026-09-16.md`
+section 6b): 75 us per ROW -- 276 ms for AAPL's full 3,675-session history, 109 ms for a
+6-year span -- not ~10 ms per symbol.** The estimate assumed the whole profile is
+non-recursive; the twelve measurements are, but ATR14, which every one of them divides
+by, is a Wilder recursion seeded inside each window (section 3.1), so it is re-run per
+row and dominates the cost. The per-trial cost is still a lookup (0.37 us).
+
 ## 4. Daily information and replay contract
 
 Version 1 uses **`prior_session_v1`**: a decision uses the immediately preceding

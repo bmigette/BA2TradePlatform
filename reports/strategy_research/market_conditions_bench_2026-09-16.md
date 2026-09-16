@@ -231,6 +231,66 @@ flatter every latency figure here.
 the runbook's "Market-condition feature store" section. The launcher refuses to dispatch a run
 whose pinned manifest does not cover its universe, so it cannot be skipped by accident.
 
+## 6b. `ta-structure-v1` warmup cost (Task 10, measured 2026-09-16)
+
+The second profile computes twelve chart-structure fields per (symbol, session) instead of three
+indicator fields. All figures below are on this box, AAPL out of the local FMP daily cache, taken
+as the median of five runs.
+
+| measurement | before item 1 | **after** (rolling range, sorted-level bisect) |
+|---|---|---|
+| cold batch build, FULL AAPL history (3,802 bars -> 3,675 rows) | 370 ms | **276 ms** |
+| per row | 101 us | **75 us** |
+| cold batch build, a realistic 6-year warm span (1,512 rows) | 143 ms | **109 ms** (72 us/row) |
+| per-window reference over the same 3,675 rows | 893 ms | 906 ms |
+| **batch vs reference** | 2.86x | **3.28x** |
+| `by_field()[field].value` on a stored row | 0.43 us | **0.37 us** |
+
+A 100-symbol option universe over the 6-year grid window is therefore about **11 seconds** of
+chart-structure compute, against roughly 36 seconds for the per-window path.
+
+### Why this is ~0.1 ms per ROW and not section 3.3's "~10 ms per SYMBOL"
+
+Section 3.3 reasons that "none of these fields is recursive, so a batch implementation over full
+history and the 128-bar reference implementation agree exactly", and prices the batch at about
+ten milliseconds per symbol. The first half is true of the twelve STRUCTURE measurements. It is
+not true of **ATR14, which every one of them is divided by**: ATR is a Wilder recursion *seeded
+inside each window* (section 3.1, "stable initialization" -- a session's output comes from
+exactly its last 128 eligible bars, which is what makes live and BT agree whatever prehistory
+each holds). A single global ATR pass would produce different numbers and would destroy window
+invariance, so the batch re-runs the 114-step recursion per row. That recursion is the dominant
+cost: it is ~85 % of the 75 us, and it is the entire gap against the design's estimate. The
+estimate should be read as ~0.1 ms per row, i.e. ~0.3 s per fully-warmed symbol, not as a bug.
+
+The three structures section 3.3 prescribes are implemented as prescribed, with one exception:
+
+* **pivots from K-shifted comparisons, confirmed at `p + K`** -- found once over the history and
+  sliced per window (a pivot is a local property of bars `p±K`, so a window's pivots are exactly
+  the global ones with `s + K <= p <= e - K`; a future-confirmed pivot is structurally
+  unreachable, pinned by `test_adding_a_future_bar_changes_no_earlier_row`).
+* **nearest-level queries against the sorted confirmed levels** -- two sorted price lists carried
+  across the sliding window, queried with `bisect`. Bisect is a selection, so it returns the same
+  element `min`/`max` would.
+* **prior range via rolling max/min shifted by one** -- one vectorised pass per array, read at
+  `win[e - 20]`. Also a selection.
+* **regression via cumulative sums of x, y, x^2, xy** -- **NOT used.** It was implemented and
+  measured against the `math.fsum` reference over the three synthetic histories and AAPL:
+  **every row differs**, by up to **4.3e-07 relative**. sigma comes out of the
+  `Syy - a*Sy - b*Sxy` cancellation between quantities of order price^2 while the residuals are a
+  few ticks, and the running sums span the whole history rather than twenty points. The plan is
+  explicit that correctness beats the shortcut, and a 1e-7 drift in a value the GA compares
+  against a threshold is a different decision rather than a rounding detail, so the channel is
+  re-fitted per session. `test_cumulative_sum_ols_is_not_bit_exact_so_the_batch_fits_per_session`
+  keeps that deviation as evidence rather than an omission, and fails if the drift ever becomes
+  small enough to re-open the choice.
+
+Reproduce with `packages/common/tests/test_chart_structure_batch_equals_reference.py`, whose
+`test_cold_build_and_lookup_cost_are_reported` prints the cold-build and lookup figures on every
+run (and refuses a per-row cost that has become absurd), and whose
+`test_batch_equals_reference_for_every_session_and_field` pins the equality that makes the whole
+batch legitimate -- exact `==` on every field of every session of three 600-bar synthetic
+histories and 1,200 real AAPL sessions.
+
 ## 7. Reproducing
 
 ```bash
