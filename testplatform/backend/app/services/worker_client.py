@@ -343,6 +343,38 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     return res
 
 
+def prepare_market_conditions(worker: dict, manifest_digest: str, profile: Optional[str] = None,
+                              log: Callable[[str], None] = logger.info,
+                              timeout: float = 1800.0) -> dict:
+    """Ask *worker* to verify a market-condition manifest locally and build its mapped arrays.
+
+    Called AFTER ``push_cache`` (the objects have to be there to be verified) and BEFORE any trial
+    is submitted: a worker that has not prepared the digest refuses trials pinned to it, and a
+    refusal must never look like a genome that simply did not trade (design section 4.5).
+
+    Only logical identity crosses the wire -- the digest and the profile name. The worker resolves
+    them against ITS OWN cache root; the master's absolute paths mean nothing there, and roots
+    legitimately differ between Windows and Linux.
+
+    Returns the worker's report. ``{"ok": False, ...}`` is a normal answer (an unready worker);
+    a transport/HTTP failure raises and the caller treats it the same way. Generous timeout: a
+    cold host verifies every object by sha256 and then builds the mapping.
+    """
+    body = {"manifest": manifest_digest}
+    if profile:
+        body["profile"] = profile
+    with httpx.Client(timeout=timeout) as c:
+        r = c.post(f"{_base(worker)}/market-conditions/prepare", headers=_headers(worker), json=body)
+        if r.status_code == 404:
+            raise RuntimeError(
+                f"worker {worker.get('name')} has no /market-conditions/prepare endpoint (build "
+                f"predates the market-condition feature store); it cannot serve a pinned manifest")
+        r.raise_for_status()
+        out = r.json()
+    log(f"market-conditions -> {worker['name']}: {out}")
+    return out
+
+
 def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
     """Deep, content-hash-based comparison of the master's cache against *worker*'s.
 

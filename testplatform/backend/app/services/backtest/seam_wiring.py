@@ -219,6 +219,10 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
     ``"none"``). ``"none"`` returns None without importing the adapter or touching the seam; a
     registered profile builds the run's reader over ``price_source`` and returns the resolver;
     anything else raises.
+
+    ``config["market_condition_manifest"]`` pins the published snapshot: present, the reader is a
+    mapped-store reader (no calculation anywhere in the run); absent, it computes on a miss and
+    warns once -- unless the config is an optimizer trial, which is refused (see below).
     """
     profile = config["market_condition_profile"]
     if profile == MARKET_CONDITION_PROFILE_NONE:
@@ -234,6 +238,7 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
         _market_condition_tl.resolver = None
         return None
     from ba2_common.core import TradeConditions
+    from ba2_common.core.market_condition_readers import warn_research_mode
     from ba2_common.core.market_conditions import PROFILES
 
     if profile not in PROFILES:
@@ -244,7 +249,26 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
         BacktestMarketConditionResolver,
     )
 
-    resolver = BacktestMarketConditionResolver(BacktestMarketConditionReader(price_source, profile))
+    # THE PINNED SNAPSHOT (design section 4.5). A search prepares ONE manifest before dispatch and
+    # carries its digest in every trial config; the reader then serves that snapshot's published
+    # rows and calculates nothing. A config WITHOUT the digest can only compute on a miss, which
+    # is fine for a one-off research run and is not fine inside an optimization: the numbers would
+    # come from whatever each worker's own cache happened to hold, no two hosts provably agreeing,
+    # and nothing anywhere would say so. So an optimizer-assembled config (``_ga_trial``: GA trial,
+    # re-run, robustness variant and top-N persist alike -- see
+    # strategy_optimization_handler._build_daily_trial_config) is REFUSED here instead.
+    digest = config.get("market_condition_manifest")
+    if not digest:
+        if config.get("_ga_trial"):
+            raise ValueError(
+                f"market_condition_profile {profile!r} is on but the trial config pins no "
+                f"market_condition_manifest. An optimization must prepare one snapshot "
+                f"(tools/warm_market_conditions.py plan/build/verify/prepare-host) and carry its "
+                f"digest into every trial; computing 128-session indicators per trial is not a "
+                f"fallback this path takes.")
+        warn_research_mode(profile, "backtest reader")
+    resolver = BacktestMarketConditionResolver(
+        BacktestMarketConditionReader(price_source, profile, manifest_digest=digest))
     if TradeConditions.get_market_condition_context_resolver() is not _dispatch_market_condition_context:
         TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
     _market_condition_tl.resolver = resolver

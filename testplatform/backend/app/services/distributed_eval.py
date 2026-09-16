@@ -11,8 +11,10 @@ up) and backs off; after repeated failures it gives up on that worker — gracef
 local-only.
 
 Pre-flight per selected worker: ``ensure_synced`` (auto-update+wait so it runs a compatible build,
-matched on app version) then ``push_cache`` (stream the missing cache as one tar). Workers
-that can't be reached/synced are dropped with a warning.
+matched on app version), then ``push_cache`` (stream the missing cache as one tar), then -- when
+the run pins a market-condition manifest -- ``prepare_market_conditions`` (the worker re-hashes
+every referenced object and builds its mapped arrays). Workers that can't be reached/synced, or
+that cannot prepare the pinned snapshot, are dropped with a warning.
 
 Re-admission: a worker that failed pre-flight (or gave up mid-run) is not excluded for the rest
 of the job. Every ``n_consumers`` individuals completed, one background re-check re-runs the same
@@ -157,7 +159,9 @@ class DistributedEvaluator:
                  requeue_timeout: float = 12600.0,
                  pool_factory: Optional[Callable[[], Any]] = None,
                  max_remote_slots_per_worker: Optional[int] = None,
-                 governor: Optional[Any] = None):
+                 governor: Optional[Any] = None,
+                 market_condition_manifest: Optional[str] = None,
+                 market_condition_profile: Optional[str] = None):
         self.pool = submit_pool
         self._pool_factory = pool_factory
         # Dynamic worker allocation. When set, consumers above governor.current PARK
@@ -224,6 +228,12 @@ class DistributedEvaluator:
         self._remote_peak_child: dict = {}
         self._remote_settle_until: dict = {}
         self._secrets: dict = {}
+        # The run's pinned market-condition snapshot (design section 4.5). When set, pre-flight
+        # makes each worker VERIFY that digest and build its mapped arrays before it is allowed
+        # a single trial; a worker that cannot is excluded, loudly, rather than silently
+        # returning zero-trade results for every gated genome it is handed.
+        self.market_condition_manifest = market_condition_manifest
+        self.market_condition_profile = market_condition_profile
 
     # -- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
@@ -336,6 +346,8 @@ class DistributedEvaluator:
                 return False
             worker_client.push_cache(w, log=self.log)
             worker_client.push_secrets(w, secrets, log=self.log)
+            if self.market_condition_manifest and not self._prepare_market_conditions(w):
+                return False
             _health = self._health_with_retry(w)
             if _health is not None:
                 w["capacity"] = max(1, int(_health.get("capacity") or 1))
@@ -366,6 +378,33 @@ class DistributedEvaluator:
         except Exception as e:  # noqa: BLE001 — a bad worker must never abort the run
             self.log(f"worker {w.get('name')} pre-flight failed: {e}; excluding")
             return False
+
+    def _prepare_market_conditions(self, w: dict) -> bool:
+        """Verify + map this run's pinned manifest on *w*. False = the worker is UNREADY.
+
+        Loud on purpose. The failure this prevents is invisible by construction: a worker without
+        the snapshot observes no feature row, every gate is unknown, nothing enters, and the trial
+        returns an ordinary zero-trade fitness the GA happily ranks. Excluding the worker costs
+        capacity; including it costs the search its meaning.
+        """
+        digest = self.market_condition_manifest
+        try:
+            out = worker_client.prepare_market_conditions(
+                w, digest, self.market_condition_profile, log=self.log)
+        except Exception as e:  # noqa: BLE001 -- unreachable/too old/transport error = unready
+            self.log(f"worker {w.get('name')}: market-condition manifest {digest} could NOT be "
+                     f"prepared ({e!r}); EXCLUDING it from this run")
+            logger.error(f"worker {w.get('name')}: market-condition prepare failed: {e!r}")
+            return False
+        if not out.get("ok"):
+            self.log(f"worker {w.get('name')}: market-condition manifest {digest} is NOT usable "
+                     f"there ({out.get('errors')}); EXCLUDING it from this run")
+            logger.error(f"worker {w.get('name')}: market-condition prepare reported {out}")
+            return False
+        self.log(f"worker {w.get('name')}: market-condition manifest {digest} verified "
+                 f"({out.get('objects_checked')} object(s)) and mapped "
+                 f"({'built' if out.get('built') else 'already warm'}, {out.get('symbols')} symbol(s))")
+        return True
 
     def _health_with_retry(self, w: dict) -> Optional[dict]:
         """``worker_client.health(w)``, retried ``_HEALTH_PREFLIGHT_RETRIES`` times before giving

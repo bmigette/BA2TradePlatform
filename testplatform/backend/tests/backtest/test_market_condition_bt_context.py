@@ -4,6 +4,10 @@
 assembles/computes/memoises; ``BacktestMarketConditionResolver`` builds one frozen context per
 simulated session; ``seam_wiring.install_backtest_market_conditions`` installs nothing for
 profile ``none``.
+
+Task 7 added the pinned snapshot: with ``market_condition_manifest`` in the config the reader
+serves the published rows and calls no calculator at all; without it an OPTIMIZER config
+(``_ga_trial``) is refused outright, and a research config computes on a miss after one warning.
 """
 from __future__ import annotations
 
@@ -265,3 +269,82 @@ def test_profile_none_without_market_leaves_is_fine(ps):
            "experts": [{"class": "X", "settings": {"note": "[not json", "tree": "{\"field\": \"iv_rank\"}"}}]}
     assert seam_wiring.install_backtest_market_conditions(cfg, ps) is None
     assert seam_wiring.market_condition_leaves_in(cfg) == []
+
+
+# --------------------------------------------------------------------- pinned manifest (Task 7)
+def _publish_manifest(root, symbol="AAA", sessions=(date(2025, 6, 27), SESSION)):
+    """A tiny published snapshot: negative rows only (their VALUES do not matter here -- what is
+    being pinned is that they come from the store and not from a calculator)."""
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    from ba2_common.core.market_conditions import PROFILES
+
+    profile = PROFILES["ohlcv-v1"]
+    fields = [f.name for f in profile.fields]
+    store = MarketConditionStore(root)
+    rows = [{"session": s, "values": [None] * len(fields),
+             "status": [STATUS_INSUFFICIENT_HISTORY] * len(fields),
+             "reasons": ["published row"] * len(fields),
+             "window_digest": "sha256:" + "0" * 64, "raw_shard_ref": "",
+             "raw_row_lo": 0, "raw_row_hi": 0} for s in sessions]
+    entry, _ = store.write_feature_object(profile, symbol, rows)
+    manifest = store.make_manifest(
+        profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
+        objects=[entry], raw_objects=[], coverage={symbol: {"rows": len(rows)}},
+        universe=[symbol], sessions=list(sessions), window_start=sessions[0],
+        window_end=sessions[-1])
+    return store, store.write_manifest(manifest)
+
+
+def test_a_pinned_manifest_serves_published_rows_and_never_computes(ps, tmp_path, monkeypatch):
+    import ba2_common.config as bc
+
+    store, digest = _publish_manifest(tmp_path / "cache")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+
+    def boom(*a, **kw):
+        raise AssertionError("a pinned run must not call the calculator")
+
+    monkeypatch.setattr(mc, "compute_market_conditions", boom)
+    monkeypatch.setitem(mc.COMPUTE_BY_PROFILE, "ohlcv-v1", boom)
+
+    resolver = seam_wiring.install_backtest_market_conditions(
+        {"market_condition_profile": "ohlcv-v1", "market_condition_manifest": digest,
+         "_ga_trial": True}, ps)
+    row = resolver.reader.observe("AAA", SESSION)
+    assert row is not None
+    assert {o.status for o in row.by_field().values()} == {STATUS_INSUFFICIENT_HISTORY}
+    assert {o.reason for o in row.by_field().values()} == {"published row"}
+    assert resolver.reader.computed == 0 and resolver.reader.mapped_rows == 1
+    # A symbol the snapshot does not carry is a miss, never a fallback computation.
+    assert resolver.reader.observe("BBB", SESSION) is None
+    assert resolver.reader.computed == 0
+
+
+def test_a_ga_trial_without_a_pinned_manifest_is_refused(ps):
+    with pytest.raises(ValueError, match="market_condition_manifest"):
+        seam_wiring.install_backtest_market_conditions(
+            {"market_condition_profile": "ohlcv-v1", "_ga_trial": True}, ps)
+
+
+def test_research_mode_computes_but_says_so_once(ps, monkeypatch):
+    from ba2_common.core import market_condition_readers as readers
+
+    monkeypatch.setattr(readers, "_RESEARCH_WARNED", set())
+    warned = []
+    # seam_wiring imports the helper INSIDE the function, so patching it on the module it lives
+    # in is what the call actually resolves.
+    monkeypatch.setattr(readers, "warn_research_mode",
+                        lambda profile, where: warned.append((profile, where)) or True)
+    resolver = seam_wiring.install_backtest_market_conditions(
+        {"market_condition_profile": "ohlcv-v1"}, ps)
+    assert resolver.reader.observe("AAA", SESSION) is not None
+    assert resolver.reader.computed == 1
+    assert warned == [("ohlcv-v1", "backtest reader")]
+
+
+def test_the_once_per_process_warning_is_actually_once(monkeypatch):
+    from ba2_common.core import market_condition_readers as readers
+
+    monkeypatch.setattr(readers, "_RESEARCH_WARNED", set())
+    assert readers.warn_research_mode("ohlcv-v1", "backtest reader") is True
+    assert readers.warn_research_mode("ohlcv-v1", "backtest reader") is False

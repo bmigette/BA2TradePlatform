@@ -737,6 +737,9 @@ def health(request: Request, authorization: str = Header(default=None)):
         busy = sum(1 for f in _JOBS.values() if not f.done())
     return {"ok": True, "capacity": _CAPACITY, "capacity_max": _CAPACITY_MAX,
             "busy": busy, "free": max(0, _CAPACITY - busy),
+            # Which market-condition snapshots this worker may accept trials for. The master
+            # reads it at pre-flight; a digest absent here means "unready", never "run it anyway".
+            "market_conditions": {"prepared": _mc_prepared_digests()},
             "version": self_update.get_version_info(), **_hardware()}
 
 
@@ -866,6 +869,113 @@ def _invalidate_manifest_cache() -> None:
         _MANIFEST_CACHE.clear()
 
 
+# ---------------------------------------------------------------------------------------------
+# Market-condition feature store readiness (design 2026-09-15 section 4.5)
+# ---------------------------------------------------------------------------------------------
+# A trial whose config pins a ``market_condition_manifest`` may only run on a worker that has
+# VERIFIED that digest here (every object and raw shard re-hashed) and built its mapped arrays.
+# The alternative is the failure this refusal exists to prevent: a worker missing the snapshot
+# would observe no row for every symbol, every gate would be unknown, and the trial would come
+# back as a perfectly ordinary ZERO-TRADE result that the GA scores and ranks. A missing snapshot
+# is an environment fault, and it is reported as one.
+_PREPARED_MC: dict = {}          # digest -> the prepare report that admitted it
+_PREPARED_MC_LOCK = threading.Lock()
+_PREPARED_MC_LOADED = False
+
+
+def _mc_prepared_digests() -> list:
+    """Digests this worker may accept trials for: what this process prepared, plus the host-local
+    ``_derived`` markers a previous process left (a self-update restart must not cost the box its
+    readiness and force a re-verification of the whole bucket)."""
+    global _PREPARED_MC_LOADED
+    with _PREPARED_MC_LOCK:
+        if not _PREPARED_MC_LOADED:
+            _PREPARED_MC_LOADED = True
+            try:
+                from ba2_common.config import CACHE_FOLDER
+                from ba2_common.core.market_condition_reader import prepared_digests
+
+                for digest in prepared_digests(CACHE_FOLDER):
+                    _PREPARED_MC.setdefault(digest, {"manifest": digest, "source": "marker"})
+            except Exception as e:  # noqa: BLE001 -- readiness is reported, never fatal to /health
+                logger.warning("market-conditions: could not read prepared markers: %r", e)
+        return sorted(_PREPARED_MC)
+
+
+def _mc_forget_prepared(why: str) -> None:
+    with _PREPARED_MC_LOCK:
+        had = sorted(_PREPARED_MC)
+        _PREPARED_MC.clear()
+    if had:
+        logger.error("market-conditions: dropping prepared digests %s (%s)", had, why)
+
+
+def _mc_required_digest(config: dict) -> Optional[str]:
+    digest = (config or {}).get("market_condition_manifest")
+    return str(digest) if digest else None
+
+
+def _mc_guard(config: dict) -> None:
+    """Refuse a trial pinning a manifest this worker has not prepared (HTTP 409, a distinct
+    error the master routes to "worker unready" rather than to a fitness value)."""
+    digest = _mc_required_digest(config)
+    if not digest:
+        return
+    if digest in _mc_prepared_digests():
+        return
+    logger.error("market-conditions: refusing a trial pinned to unprepared manifest %s", digest)
+    raise HTTPException(
+        status_code=409,
+        detail=(f"market_condition_manifest {digest} is not prepared on this worker: call "
+                f"POST /market-conditions/prepare first. A trial is refused rather than run "
+                f"without its feature snapshot (it would score as a zero-trade genome)."))
+
+
+class PrepareMarketConditionsReq(BaseModel):
+    """Logical identity only -- a digest and (optionally) a profile name. Never the master's
+    absolute cache path: the worker prepares from ITS OWN cache root, which is the only root it
+    has (design section 4.5: "requests carry logical identities and relative paths")."""
+
+    manifest: str
+    profile: Optional[str] = None
+    jobs: Optional[int] = None
+
+
+@worker_app.post("/market-conditions/prepare")
+def market_conditions_prepare(req: PrepareMarketConditionsReq, request: Request,
+                              authorization: str = Header(default=None)):
+    """Verify a market-condition manifest against THIS worker's cache and build its mapped arrays.
+
+    Runs the same ``prepare_host`` routine as ``tools/warm_market_conditions.py prepare-host``:
+    re-hash every object and raw shard, then publish the per-host mapped array set. Answers with
+    the report; ``ok: false`` (not an exception) is the normal "this worker cannot serve that
+    digest" answer, and the master excludes the worker on it.
+    """
+    _verify(authorization, request)
+    from ba2_common.config import CACHE_FOLDER
+    from ba2_common.core.market_condition_reader import prepare_host
+
+    try:
+        report = prepare_host(CACHE_FOLDER, req.manifest, req.profile,
+                              jobs=int(req.jobs or 4), log=lambda m: logger.info("market-conditions: %s", m))
+    except FileNotFoundError as e:
+        logger.error("market-conditions: manifest %s is not on this worker: %s", req.manifest, e)
+        return {"ok": False, "manifest": req.manifest, "errors": [str(e)]}
+    except Exception as e:  # noqa: BLE001 -- an unready worker is an answer, not a 500
+        logger.error("market-conditions: prepare of %s failed: %r", req.manifest, e)
+        return {"ok": False, "manifest": req.manifest, "errors": [repr(e)]}
+    out = report.to_dict()
+    if report.ok:
+        with _PREPARED_MC_LOCK:
+            _PREPARED_MC[report.manifest_digest] = out
+        logger.info("market-conditions: prepared %s (%s)", report.manifest_digest, out)
+    else:
+        with _PREPARED_MC_LOCK:
+            _PREPARED_MC.pop(report.manifest_digest, None)
+        logger.error("market-conditions: %s NOT prepared: %s", report.manifest_digest, report.errors)
+    return out
+
+
 @worker_app.get("/cache/manifest")
 def cache_manifest(request: Request, with_hash: bool = False,
                    authorization: str = Header(default=None)):
@@ -889,6 +999,16 @@ async def cache_push(request: Request, authorization: str = Header(default=None)
         with open(tmp.name, "rb") as fh:
             result = cache_sync.extract_tar(fh)
         _invalidate_manifest_cache()  # the tree changed -- the cached manifest is now wrong
+        if result.get("market_conditions"):
+            # Feature objects arrived: re-hash what the local manifests reference (size equality
+            # is not integrity, and this bucket decides what a gated genome trades). A failure
+            # also revokes every prepared digest -- a mapping built here from a bad object is the
+            # exact thing the verification exists to prevent from being used.
+            verdict = cache_sync.verify_market_conditions()
+            result["market_conditions_verified"] = verdict
+            if not verdict["ok"]:
+                _mc_forget_prepared("market-condition objects failed sha256 verification after a push")
+                logger.error("cache push: market-condition verification FAILED: %s", verdict)
         logger.info("cache push: %s", result)
         return result
     finally:
@@ -910,6 +1030,7 @@ def submit_trial(req: RunTrialReq, request: Request, authorization: str = Header
     if req.cache_root:
         from ba2_common.config import CACHE_FOLDER
         config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
+    _mc_guard(config)
     job_id = _submit_job(_trial_worker, config, req.fitness_metric)
     return {"job_id": job_id}
 
@@ -929,6 +1050,7 @@ def submit_trial_full(req: RunTrialReq, request: Request,
     if req.cache_root:
         from ba2_common.config import CACHE_FOLDER
         config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
+    _mc_guard(config)
     job_id = _submit_job(_persist_trial_worker, config)
     return {"job_id": job_id}
 

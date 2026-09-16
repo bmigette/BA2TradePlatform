@@ -83,7 +83,13 @@ _BACKEND_DIR = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspa
 # path STRINGS inside the config), so setting BA2_SHARED_ARRAYS on the master says nothing at all
 # about a remote box. Each host's service environment governs its own workers; set it there.
 _WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY",
-                    "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S")
+                    "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S",
+                    # Market-condition feature store (design 2026-09-15 section 4.5). The TRIAL
+                    # CONFIG is what actually pins the snapshot for a backtest; these two are
+                    # mirrored into the spawned children so anything in a worker that resolves
+                    # the profile/manifest from the environment (the live-flavoured reader, a
+                    # diagnostic) agrees with the run instead of falling back to its own default.
+                    "BA2_MARKET_CONDITION_PROFILE", "BA2_MARKET_CONDITION_MANIFEST")
 
 
 def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
@@ -1776,6 +1782,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     pool_factory=_make_pool if parallel >= 1 else None,
                     max_remote_slots_per_worker=_max_remote_slots,
                     governor=_governor,
+                    # Pre-flight makes every worker verify + map this snapshot before it receives
+                    # a trial; one that cannot is excluded rather than left to return zero-trade
+                    # results for every gated genome.
+                    market_condition_manifest=backtest_cfg.get("market_condition_manifest"),
+                    market_condition_profile=backtest_cfg.get("market_condition_profile"),
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 logger.warning(f"strategy_optimization {opt_id}: DISTRIBUTED across "
@@ -2263,6 +2274,24 @@ def _build_daily_trial_config(
         # SCREENER seam: the per-individual effective screener settings + store path the engine
         # uses to gate entries to the per-day screened universe. None for non-screener runs.
         "screener_runtime": screener_runtime,
+        # MARKET-CONDITION entry gates (design 2026-09-15 sections 4.1/4.5). Same whitelist reason
+        # as stress_spread_bps and robust_fitness above -- this dict rebuilds the trial config key
+        # by key, so a knob missing HERE is inert however correctly it was parsed upstream. Both
+        # keys are load-bearing and neither can stand without the other:
+        #   * ``market_condition_profile`` decides whether the resolver is installed at all. Absent,
+        #     run_daily_backtest defaults it to "none" and install_backtest_market_conditions then
+        #     REFUSES a run whose rules carry market leaves (rather than letting every gate read
+        #     no_context and place zero entries).
+        #   * ``market_condition_manifest`` pins the ONE prepared snapshot every trial of the run
+        #     reads. Absent from an optimizer trial, the seam raises: computing 128-session
+        #     indicators per trial, per worker, off whatever each host's cache holds is not a
+        #     fallback (section 4.5), and a feature-cache miss must never become a fitness value.
+        "market_condition_profile": backtest_cfg.get("market_condition_profile") or "none",
+        "market_condition_manifest": backtest_cfg.get("market_condition_manifest"),
+        # This config was assembled by the OPTIMIZER (GA trial, re-run, robustness variant or
+        # top-N persist), not by the single-backtest path. The market-condition seam reads it to
+        # tell "a research run may compute on a miss" from "a search may not".
+        "_ga_trial": True,
     }
 
 

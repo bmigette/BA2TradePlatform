@@ -13,7 +13,13 @@ Design: ``docs/plans/2026-09-15-option-market-condition-genes-design.md`` sectio
 
 Imported only when a run's config carries a profile other than ``none`` (see
 ``seam_wiring.install_backtest_market_conditions``); a profile-less run never loads this module.
-Task 7 swaps the reader's compute path for the host-shared mapped feature store.
+
+Task 7: with ``manifest_digest`` set (the run config's ``market_condition_manifest``, pinned by
+the launcher and carried into every trial), the reader is a thin wrapper over the host-shared
+``MappedMarketConditionReader``: rows come from the published snapshot, ``window_before`` is never
+called and no indicator is calculated in a trial. Without a digest it keeps computing on a miss --
+research/dev only; a GA trial in that state is REFUSED by ``install_backtest_market_conditions``
+rather than run on per-process numbers.
 """
 from __future__ import annotations
 
@@ -40,8 +46,19 @@ __all__ = ["BacktestMarketConditionReader", "BacktestMarketConditionResolver"]
 class BacktestMarketConditionReader(WindowMarketConditionReader):
     """``MarketConditionReader`` over one run's ``AsOfPriceSource``."""
 
-    def __init__(self, price_source: Any, profile: str, *, memo_size: int = MEMO_SIZE):
-        super().__init__(profile, memo_size=memo_size, retain_windows=False)
+    def __init__(self, price_source: Any, profile: str, *, memo_size: int = MEMO_SIZE,
+                 manifest_digest: Optional[str] = None, cache_root: Optional[str] = None):
+        mapped = None
+        if manifest_digest:
+            from ba2_common.core.market_condition_reader import MappedMarketConditionReader
+
+            root = cache_root
+            if root is None:
+                from ba2_common.config import CACHE_FOLDER
+                root = CACHE_FOLDER
+            mapped = MappedMarketConditionReader(root, manifest_digest, profile)
+        super().__init__(profile, memo_size=memo_size, retain_windows=False, mapped=mapped)
+        self.manifest_digest = manifest_digest
         self._ps = price_source
 
     def _bars(self, symbol: str, session: date):
