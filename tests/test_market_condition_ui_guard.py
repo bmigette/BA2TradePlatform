@@ -297,3 +297,102 @@ def test_the_refusal_runs_before_any_write_in_save_ruleset():
     guard = src.index("_refuse_market_gates_on_exit_ruleset(")
     writes = [src.index(c) for c in ("update_instance(ruleset)", "add_instance(new_ruleset)")]
     assert guard < min(writes)
+
+
+# ------------------------- a DEPLOYED gate must stay viewable in the rules editor (re-review N1)
+def test_a_deployed_gated_trigger_can_still_be_opened_in_the_rules_editor():
+    """THE FAILURE THIS PREVENTS. NiceGUI refuses a select value outside its options
+    (``choice_element``: ``ValueError: Invalid value: underlying_adx_14``) and
+    ``show_rule_dialog`` wraps nothing, so filtering the market fields out of the menu made
+    Edit Rule on a DEPLOYED gated rule raise mid-build and leave a half-rendered dialog: the
+    gate became impossible even to LOOK at, on the live platform this feature exists to run on.
+
+    Constructed through the REAL ``ui.select``, because the bug lived in the widget's own
+    validation -- asserting on the options list alone is exactly the gap that let this through.
+    """
+    from nicegui import ui
+
+    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
+
+    value, options = _trigger_type_options({"event_type": ADX})
+    assert value == ADX and ADX in options
+    select = ui.select(options=options, label="Trigger Type", value=value)
+    assert select.value == ADX
+
+
+def test_the_extra_option_appears_only_on_the_row_that_holds_it():
+    """Adding the value back is not a hole in the filter: a NEW trigger, and any trigger whose
+    persisted type is ordinary, is still offered no market field at all."""
+    from ba2_common.core.market_condition_rules import market_condition_fields
+    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
+
+    fields = market_condition_fields()
+    for config in (None, {}, {"event_type": "confidence"}, {"type": "has_position"}):
+        _value, options = _trigger_type_options(config)
+        assert not (set(options) & fields), config
+
+    # ... and the gated row gets exactly ONE extra option, its own.
+    _value, gated = _trigger_type_options({"event_type": ADX})
+    _value, plain = _trigger_type_options(None)
+    assert set(gated) - set(plain) == {ADX}
+
+
+@pytest.mark.parametrize("config,expected", [
+    (None, "has_position"),
+    ({}, "has_position"),
+    ({"event_type": "confidence"}, "confidence"),
+    ({"type": "days_opened"}, "days_opened"),          # the legacy spelling
+    # A malformed row (event_type present but null) displayed an EMPTY select before this fix
+    # and still does -- the fix is about the options, not about which value is shown.
+    ({"event_type": None, "type": "confidence"}, None),
+])
+def test_the_persisted_trigger_value_survives_every_shape(config, expected):
+    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
+
+    value, options = _trigger_type_options(config)
+    assert value == expected
+    assert value is None or value in options
+
+
+def test_the_value_expression_is_the_one_the_editor_always_had():
+    """Pinned against the pre-fix behaviour: only the OPTIONS changed. A value fallback that
+    quietly turned a null event_type into has_position would relabel a broken rule as a
+    position check -- a second change wearing this one's justification."""
+    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
+
+    def before(trigger_config):
+        from ba2_trade_platform.core.types import ExpertEventType as E
+        return (trigger_config.get('event_type',
+                                   trigger_config.get('type', E.F_HAS_POSITION.value))
+                if trigger_config else E.F_HAS_POSITION.value)
+
+    for config in (None, {}, {"event_type": "confidence"}, {"type": "days_opened"},
+                   {"event_type": None, "type": "confidence"}, {"event_type": ADX}):
+        assert _trigger_type_options(config)[0] == before(config), config
+
+
+def test_a_new_trigger_still_defaults_to_has_position():
+    from ba2_trade_platform.core.types import ExpertEventType
+    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
+
+    value, _options = _trigger_type_options(None)
+    assert value == ExpertEventType.F_HAS_POSITION.value
+
+
+def test_the_editor_builds_its_select_through_that_helper():
+    """Read from the source: the fix is worth nothing if the dialog re-derives the options."""
+    import inspect
+
+    from ba2_trade_platform.ui.pages.settings import TradeSettingsTab
+
+    src = inspect.getsource(TradeSettingsTab)
+    assert "_trigger_type_options(trigger_config)" in src
+    assert "options=[t.value for t in ExpertEventType]" not in src
+
+
+def test_both_halves_of_the_exit_refusal_still_hold(rules_tab):
+    """N1 relaxed the MENU only. The exit-slot refusal is what actually stops a gate reaching an
+    open-positions ruleset, and it is unchanged."""
+    rules_tab[2] = _rule(2, "gated", ADX)
+    with pytest.raises(ValueError, match="open-positions / exit ruleset"):
+        _RulesTab(rules_tab)._refuse("open_positions", [2])

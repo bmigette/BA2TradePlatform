@@ -53,6 +53,35 @@ def _authorable_trigger_types() -> list:
     """
     fields = market_condition_fields()
     return [t.value for t in ExpertEventType if t.value not in fields]
+
+
+def _trigger_type_options(trigger_config) -> tuple:
+    """``(value, options)`` for one trigger row's Trigger Type select.
+
+    The value is the persisted ``event_type`` (legacy rows spell it ``type``), defaulting to
+    ``F_HAS_POSITION`` for a new row. The options are :func:`_authorable_trigger_types` PLUS that
+    value when the menu does not already carry it.
+
+    THE FAILURE THIS PREVENTS. NiceGUI refuses a select value outside its options
+    (``choice_element.py``: ``ValueError: Invalid value: ...``) and ``show_rule_dialog`` wraps
+    nothing, so an option list that dropped the market-condition fields made a DEPLOYED gated
+    rule raise mid-build and leave a half-rendered dialog -- the gate became impossible even to
+    LOOK at, on the live platform this feature exists to run on. Adding the one value back is not
+    a hole in the filter: the extra option appears only on the row that already holds it, so a
+    NEW trigger still cannot be given a market field, and the exit-slot refusal
+    (``_refuse_market_gates_on_exit_ruleset``) is untouched either way.
+    """
+    options = _authorable_trigger_types()
+    # The value expression is the ORIGINAL one, character for character: this fix is about the
+    # OPTIONS, and quietly changing which value a malformed row displays (an explicit
+    # ``event_type: None`` showed an empty select, and still does) would be a second change
+    # wearing the first one's justification.
+    value = (trigger_config.get('event_type',
+                                trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value))
+             if trigger_config else ExpertEventType.F_HAS_POSITION.value)
+    if value is not None and value not in options:
+        options = [*options, value]
+    return value, options
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
 
@@ -5055,11 +5084,20 @@ class TradeSettingsTab:
         with self.triggers_container:
             with ui.card().classes('w-full p-2') as trigger_card:
                 with ui.row().classes('w-full items-center gap-2'):
-                    # Trigger type selection
+                    # Trigger type selection. A PERSISTED value that the menu no longer offers
+                    # is ADDED to the options rather than dropped -- same reasoning as
+                    # ``_fill_market_condition_profile``: NiceGUI raises ValueError on a value
+                    # outside its options, and ``show_rule_dialog`` has no handler, so filtering
+                    # the market-condition fields out of the menu made a DEPLOYED gated rule
+                    # impossible to open at all. Uninspectable and uneditable is worse than
+                    # un-authorable; the filter's job is only to stop a NEW gate being authored
+                    # here (they are searched by the optimizer and arrive by deploy import), and
+                    # that still holds because the extra option exists solely for this trigger.
+                    trigger_value, trigger_options = _trigger_type_options(trigger_config)
                     trigger_select = ui.select(
-                        options=_authorable_trigger_types(),
+                        options=trigger_options,
                         label='Trigger Type',
-                        value=trigger_config.get('event_type', trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value)) if trigger_config else ExpertEventType.F_HAS_POSITION.value
+                        value=trigger_value
                     ).classes('flex-1').props('dense')
 
                     # Inline container for operator/value inputs

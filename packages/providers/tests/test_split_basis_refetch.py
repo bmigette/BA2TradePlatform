@@ -227,8 +227,12 @@ def test_a_refetch_that_returns_LESS_history_is_refused_and_changes_nothing(tmp_
 
     msg = str(e.value)
     assert symbol in msg and "1d" in msg and "LESS history" in msg
-    assert f"cached {len(truth)} rows" in msg                  # both row counts
-    assert truth["Date"].iloc[0].date().isoformat() in msg     # and both first bars
+    # BOTH sides, so the message says what was offered as well as what would be lost.
+    short = provider._get_ohlcv_data_impl(symbol, datetime.now() - timedelta(days=365 * 15),
+                                          datetime.now(), "1d")
+    assert f"{len(short)} rows from {short['Date'].iloc[0].date().isoformat()}" in msg
+    assert (f"cached {len(truth)} rows from "
+            f"{truth['Date'].iloc[0].date().isoformat()}") in msg
     assert open(path, "rb").read() == before, why              # byte-identical
     assert read_full_fetch_marker(path) is None                # and NO marker
 

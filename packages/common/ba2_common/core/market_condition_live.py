@@ -739,13 +739,15 @@ def market_condition_decision_scope(*, expert_instance_id: Optional[Any] = None,
     if resolver is None:
         yield None
         return
-    _report_unpinned_profiles(resolver, expert_instance_id)
     outer = _DECISION.get()
     if outer is not None and outer.resolver is resolver:
         if replay_reader is not None and outer.reader is not replay_reader:
             raise ValueError("a nested decision scope cannot switch to a different replay reader")
         yield outer
         return
+    # AFTER the nested-scope return, so "once per pass" is literal: a helper opening a scope
+    # inside the pass reuses the outer state and must not report the same run un-pinned again.
+    _report_unpinned_profiles(resolver, expert_instance_id)
     state = resolver.begin_decision(replay_reader=replay_reader)
     token = _DECISION.set(state)
     try:
