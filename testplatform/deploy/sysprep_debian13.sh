@@ -21,6 +21,7 @@
 #      consumed by the systemd service via LoadCredential= -- see ba2-worker.service's header
 #      comment for why that's the secure-storage answer to "this user has no shell".
 #   9. Install + enable the ba2-worker systemd service (auto-start on boot, Restart=always).
+#  10. (--grid-user only) Share the data caches with a co-tenant GA user -- see its own step below.
 #
 # What it deliberately does NOT do: touch /etc/ssh/sshd_config. Disabling SSH password auth
 # without first confirming key-based access works is a self-lockout trap on a box you can only
@@ -38,6 +39,11 @@
 #   --ssh-port N           sshd port to allow through ufw (default: 22)
 #   --worker-port N        worker server port -- ufw + fail2ban + systemd all use this (default: 8100)
 #   --worker-slots N       trial pool size (default: unset -> auto, nproc-1; see _cmd_worker)
+#   --grid-user NAME       ALSO share this box's data caches with a co-tenant GA user (a box that
+#                          runs a grid as `debian` beside the worker: remote227). Adds the user to
+#                          the worker group and makes the shared cache tree group-writable +
+#                          setgid. Omit on a pure worker. See step 10 for why this is not
+#                          cosmetic.
 #   --skip-upgrade         skip step 1 (apt update/full-upgrade)
 #   --skip-clone           skip step 7 (repo/venv already deployed by other means)
 #   -h, --help
@@ -53,6 +59,7 @@ BRANCH="dev"
 SSH_PORT="22"
 WORKER_PORT="8100"
 WORKER_SLOTS=""
+GRID_USER=""
 SKIP_UPGRADE=0
 SKIP_CLONE=0
 
@@ -61,6 +68,7 @@ usage() { sed -n '2,40p' "$0"; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --worker-user) shift; WORKER_USER="$1" ;;
+        --grid-user) shift; GRID_USER="$1" ;;
         --worker-home) shift; WORKER_HOME="$1" ;;
         --repo-url)    shift; REPO_URL="$1" ;;
         --branch)      shift; BRANCH="$1" ;;
@@ -321,6 +329,43 @@ else
     log "above, then: systemctl start ba2-worker"
 fi
 
+# ---------------------------------------------------------------------------------------------
+# 10. Co-tenant GA user (--grid-user): share the DATA caches, nothing else
+# ---------------------------------------------------------------------------------------------
+# WHY. remote227 runs a stage-1 grid as `debian` beside this worker, and both read the same
+# provider caches under the GA home. Step 5 deliberately makes $WORKER_USER least-privilege, so
+# everything it writes lands 0750/0640 $WORKER_USER:$WORKER_USER -- readable by the group, NOT
+# writable. That is correct for code and secrets and wrong for a cache, because repairing one is
+# a WRITE: on 2026-09-16 the market-condition warm read the OHLCV cache happily, correctly
+# identified 13 symbols whose split basis the cached prices could not settle, and then failed
+# every single re-fetch with `PermissionError: ...ASML_1d.parquet.tmp` and published NOTHING.
+# The operator sees a plan that looks fine followed by a build that refuses, four layers from
+# the cause.
+#
+# WHAT. Add the GA user to the worker group, then make the shared cache tree group-writable and
+# SETGID so anything either user creates there stays group-owned and stays writable by the other.
+# Scope is the data cache only: not $WORKER_HOME, not the repo, not the venv, not the password
+# file. A co-tenant that can write the cache still cannot touch the worker's code or credentials.
+if [ -n "$GRID_USER" ]; then
+    step "sharing data caches with co-tenant GA user $GRID_USER"
+    if ! id -u "$GRID_USER" &>/dev/null; then
+        log "WARNING: $GRID_USER does not exist -- skipping. Create it first, then re-run with --grid-user."
+    else
+        usermod -aG "$WORKER_USER" "$GRID_USER"
+        log "$GRID_USER added to group $WORKER_USER (a NEW login is needed before it takes effect)"
+        shared=0
+        for root in "$WORKER_HOME/Documents/ba2/common/cache" "/home/$GRID_USER/ba2-grid/home/common/cache"; do
+            [ -d "$root" ] || continue
+            # setgid on directories keeps new files group-owned; g+w makes a repair possible.
+            find "$root" -type d -exec chmod g+ws {} +
+            find "$root" -type f -exec chmod g+w {} +
+            log "shared $root (group $WORKER_USER, g+w, setgid)"
+            shared=$((shared + 1))
+        done
+        [ "$shared" -gt 0 ] || log "no cache root found yet -- re-run this after the first warm/fetch populates one"
+    fi
+fi
+
 step "done"
 echo "Summary:"
 echo "  service user     : $WORKER_USER ($WORKER_HOME)"
@@ -330,3 +375,4 @@ echo "  worker slots     : ${WORKER_SLOTS:-auto (nproc-1)}"
 echo "  ssh port         : $SSH_PORT (rate-limited via ufw, fail2ban jail enabled)"
 echo "  worker password  : $PW_FILE (root-only; register the same value on the master)"
 echo "  systemd unit     : ba2-worker.service (enabled; journalctl -u ba2-worker -f to watch)"
+echo "  cache co-tenant  : ${GRID_USER:-none (pure worker; pass --grid-user on a box that also runs a grid)}"

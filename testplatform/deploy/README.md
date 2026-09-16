@@ -88,6 +88,34 @@ ba2-worker`, then update the matching Worker entry on the master.
   `fail2ban` bans repeat auth failures on both SSH and the worker's own bearer-check log lines
   (`app.worker_server - WARNING - auth failed from <ip>: ...` — see `fail2ban/ba2-worker.conf`).
 
+## Boxes that also run a grid (`--grid-user`)
+
+Some boxes are not pure workers: **remote227** runs a stage-1 GA as `debian` alongside this
+worker, and both read the same provider caches. Least privilege makes everything `ba2worker`
+writes `0750`/`0640` `ba2worker:ba2worker` — group-readable, **not** group-writable. That is right
+for code and secrets and wrong for a cache, because repairing one is a *write*.
+
+The failure it produced on 2026-09-16, which is worth recognising: the market-condition warm read
+the OHLCV cache happily, correctly identified 13 symbols whose split basis the cached prices could
+not settle, then failed every re-fetch with `PermissionError: ...ASML_1d.parquet.tmp` and published
+nothing. The plan step looks healthy; the build refuses; the cause is four layers away.
+
+```bash
+sudo ./sysprep_debian13.sh --grid-user debian      # idempotent; safe to re-run
+```
+
+Step 10 adds the GA user to the `ba2worker` group and makes the shared cache tree group-writable
+and **setgid**, so files either user creates there stay group-owned and writable by the other. The
+scope is the data cache only — not `/opt/ba2worker`, not the repo, not the venv, not the password
+file. A co-tenant that can write the cache still cannot touch the worker's code or credentials.
+
+Two notes:
+
+- Group membership applies at **next login**. An already-open ssh session keeps the old groups, so
+  reconnect before concluding it did not work.
+- Run it again after the first warm or fetch creates a cache root that did not exist at provision
+  time; the step says so rather than silently doing nothing.
+
 ## Not automated: SSH password-auth lockdown
 
 `sysprep_debian13.sh` deliberately does not touch `/etc/ssh/sshd_config` — see
