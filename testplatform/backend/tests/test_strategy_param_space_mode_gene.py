@@ -150,6 +150,46 @@ def test_decode_below_and_above_set_both_op_and_comparison_and_keep_mode():
     assert "mode" not in s2.entry_rules[0]["conditions"]["conditions"][1]
 
 
+def test_decode_strips_the_template_metadata_from_a_resolved_leaf(state_field):
+    """A DECODED leaf is a rule, not a template.
+
+    ``mode_optimize``/``mode_choices`` describe WHICH modes the optimizer may pick; once one is
+    picked they describe nothing, and a resolved leaf that still carries them is indistinguishable
+    from an unresolved one -- which is exactly what the deploy exporter refuses
+    (``market_condition_rules.assert_market_conditions_resolved``). Leaving them on made every
+    real gated genome unexportable.
+
+    ``mode`` STAYS: it is the provenance of which choice won. ``optimize`` and the value range
+    stay too on a numeric leaf -- they belong to the THRESHOLD gene, which is untouched by the
+    mode decode, and every export path already carries them on any optimized leaf.
+    """
+    numeric = _by_id(decode_params(_strategy(_numeric_leaf()),
+                                   {"cond:o_ic-market-adx:mode": "above",
+                                    "cond:o_ic-market-adx:value": 30.0}))["o_ic-market-adx"]
+    for key in ("mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
+        assert key not in numeric, key
+    assert numeric["mode"] == "above"
+    assert numeric["optimize"] is True
+    assert (numeric["value_min"], numeric["value_max"], numeric["value_step"]) == (10.0, 40.0, 5.0)
+
+    categorical = _by_id(decode_params(_strategy(_cat_leaf()),
+                                       {"cond:o_ic-market-state:mode": "bull"}))["o_ic-market-state"]
+    for key in ("mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
+        assert key not in categorical, key
+    assert categorical["mode"] == "bull" and categorical["value"] == 1.0
+
+
+def test_decode_strips_the_camelCase_spelling_too(state_field):
+    """A tree that came back through ``normalize_trade_rules`` carries BOTH spellings."""
+    leaf = _numeric_leaf()
+    leaf["modeOptimize"] = True
+    leaf["modeChoices"] = ["off", "below", "above"]
+    out = _by_id(decode_params(_strategy(leaf), {"cond:o_ic-market-adx:mode": "below",
+                                                 "cond:o_ic-market-adx:value": 15.0}))
+    assert "modeOptimize" not in out["o_ic-market-adx"]
+    assert "modeChoices" not in out["o_ic-market-adx"]
+
+
 def test_decode_categorical_choice_sets_equality_and_the_code_as_value(state_field):
     s = _strategy(_cat_leaf())
     leaf = _by_id(decode_params(s, {"cond:o_ic-market-state:mode": "bear"}))["o_ic-market-state"]

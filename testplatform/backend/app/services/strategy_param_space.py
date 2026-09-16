@@ -691,6 +691,16 @@ def _apply_mode(node: Dict[str, Any], cid: str, token: str) -> None:
     if "operator" in node:
         node["operator"] = op
     node["mode"] = token
+    # A DECODED leaf is a RULE, not a template. ``mode_optimize``/``mode_choices`` describe the
+    # SEARCH (which modes the optimizer may pick); once one is chosen they describe nothing, and
+    # leaving them on is what made every real gated genome unexportable -- the deploy exporter
+    # refuses an unresolved mode gene, and a resolved leaf still carrying ``mode_optimize`` looks
+    # exactly like one. ``mode`` stays as provenance (which choice won), and ``optimize`` plus the
+    # value range stay exactly as they are on any other optimized numeric leaf: they are the
+    # THRESHOLD gene's metadata, unrelated to the mode gene, and every export path already
+    # carries them.
+    for key in ("mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
+        node.pop(key, None)
 
 
 def _apply_option_dte(action: Dict[str, Any], center_val: Any) -> None:

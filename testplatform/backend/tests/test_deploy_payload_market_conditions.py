@@ -16,17 +16,33 @@ whole point of the mode decode.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
+import sys
+
 import pytest
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # testplatform/backend
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from ba2_common.core import rule_builders
 from ba2_common.core.market_condition_rules import (
     STRICT_FIELD_NAMES,
     assert_market_conditions_resolved,
     assert_no_market_conditions,
+    iter_market_condition_leaves,
     market_condition_fields,
 )
 from ba2_common.core.market_conditions import PROFILES
 from ba2_common.core.rules_convert import trade_rules_to_live_export
+
+from app.services.strategy_param_space import collect_param_space, decode_params
+
+_LAUNCHER = os.path.normpath(os.path.join(_ROOT, "..", "ba2test_launcher.py"))
+_spec = importlib.util.spec_from_file_location("ba2test_launcher_deploy", _LAUNCHER)
+launcher = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(launcher)
 
 
 def _leaf(**over):
@@ -43,13 +59,46 @@ def _template_leaf(**over):
                  value_min=10.0, value_max=40.0, value_step=5.0, **over)
 
 
+def decoded_gated_rules(genome=None, kind="O_LC"):
+    """A REAL decoded gated genome: the launcher builds the gated strategy, the GA space is
+    collected from it, and ``decode_params`` produces the entry rules a run would persist.
+
+    Hand-writing this fixture is what hid the defect it now guards: a decoded leaf that still
+    carried ``mode_optimize`` made every real gated genome unexportable, and a fixture that popped
+    the flag by hand agreed with the exporter about a shape the decoder never produced.
+    """
+    saved = launcher._MARKET_CONDITION_PROFILES
+    launcher._MARKET_CONDITION_PROFILES = ("ohlcv-v1",)
+    try:
+        strategy = launcher._build_strategy(kind, f"deploy-{kind}", "FMPRating")
+    finally:
+        launcher._MARKET_CONDITION_PROFILES = saved
+    space = collect_param_space(strategy)
+    flat = dict(genome or {"cond:o_lc-market-adx:mode": "below",
+                           "cond:o_lc-market-adx:value": 15.0,
+                           "cond:o_lc-market-slope:mode": "off",
+                           "cond:o_lc-market-slope:value": 0.1,
+                           "cond:o_lc-market-rv:mode": "above",
+                           "cond:o_lc-market-rv:value": 1.25})
+    missing = [g for g in flat if g not in space]
+    assert not missing, f"{kind} does not emit {missing}; the decode below would test nothing"
+    decoded = decode_params(strategy, flat)
+    return decoded["entry_rules"], decoded["exit_rules"]
+
+
 def _resolved_leaf(**over):
-    """The same leaf after a decode: the chosen mode written on as operator + threshold. The
-    RANGE survives the decode (only op/comparison/value/mode are rewritten), which is what keeps
-    the leaf numeric to ``rule_models``."""
-    leaf = _template_leaf(mode="below", op="<", comparison="<", value=18.0, **over)
-    leaf.pop("mode_optimize")
+    """One decoded market leaf, taken from the real decode above."""
+    entry_rules, _exits = decoded_gated_rules()
+    leaf = _market_leaf(entry_rules, "o_lc-market-adx")
+    leaf.update(over)
     return leaf
+
+
+def _market_leaf(rules, leaf_id):
+    for label, leaf in iter_market_condition_leaves(rules, "rules"):
+        if label == leaf_id:
+            return dict(leaf)
+    raise AssertionError(f"{leaf_id} not found in {[l for l, _ in iter_market_condition_leaves(rules, 'r')]}")
 
 
 def _entry_rule(*leaves):
@@ -101,7 +150,7 @@ def test_a_resolved_numeric_leaf_exports_as_an_ordinary_condition():
     export = trade_rules_to_live_export(_entry_rule(_resolved_leaf()), [])
     rule, = export["rulesets"][0]["rules"]
     trigger, = [t for t in rule["triggers"].values() if t["event_type"] == "underlying_adx_14"]
-    assert trigger == {"event_type": "underlying_adx_14", "operator": "<", "value": 18.0}
+    assert trigger == {"event_type": "underlying_adx_14", "operator": "<", "value": 15.0}
 
 
 #: A DECODED categorical leaf: the mode became ``== <registry code>``. Its field is strict but
@@ -126,6 +175,76 @@ def test_a_payload_from_a_newer_server_is_refused_rather_than_deployed_ungated()
     under the same name and the same label."""
     with pytest.raises(ValueError, match="no event type for"):
         trade_rules_to_live_export(_entry_rule(CATEGORICAL_LEAF), [])
+
+
+def test_a_really_decoded_genome_carries_no_template_metadata_and_exports():
+    """THE case the hand-written fixture used to hide: a genome the GA actually produced.
+
+    The `off` leaf is gone from the tree, the two active ones are ordinary numeric conditions,
+    and nothing anywhere still claims to be an optimizer template.
+    """
+    entry_rules, exit_rules = decoded_gated_rules()
+    leaves = dict(iter_market_condition_leaves(entry_rules, "entry_rules"))
+    assert sorted(leaves) == ["o_lc-market-adx", "o_lc-market-rv"]  # the slope leaf decoded off
+    for leaf in leaves.values():
+        for key in ("mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
+            assert key not in leaf, key
+    assert_market_conditions_resolved(entry_rules, "entry_rules")
+    assert_no_market_conditions(exit_rules, "exit_rules")
+
+    export = trade_rules_to_live_export(entry_rules, exit_rules, name="gated")
+    enter, = [r for r in export["rulesets"] if r["subtype"] == "enter_market"]
+    triggers = [t for rule in enter["rules"] for t in rule["triggers"].values()]
+    assert {"event_type": "underlying_adx_14", "operator": "<", "value": 15.0} in triggers
+    assert {"event_type": "underlying_realized_vol_ratio_5_20", "operator": ">",
+            "value": 1.25} in triggers
+    assert not any(t["event_type"] == "underlying_trend_slope_50_atr14" for t in triggers)
+
+
+def test_the_export_payload_of_a_decoded_genome_is_not_a_400(tmp_path):
+    """End to end through the API derivation AND the deploy exporter script."""
+    import json
+    from types import SimpleNamespace
+
+    from app.api.backtests import _derive_export_payload
+
+    entry_rules, exit_rules = decoded_gated_rules()
+    backtest = SimpleNamespace(
+        id=4242, name="gated-run", expert_name="FMPRating", engine_type="daily_expert",
+        strategy_params={"entryRules": entry_rules, "exitRules": exit_rules,
+                         "cond:o_lc-market-adx:value": 15.0},
+        start_date=None, end_date=None, initial_capital=20_000.0)
+    payload = _derive_export_payload(backtest, "ruleset", None)
+    exported = dict(iter_market_condition_leaves(payload["entry_rules"], "entry_rules"))
+    assert sorted(exported) == ["o_lc-market-adx", "o_lc-market-rv"]
+    assert exported["o_lc-market-adx"]["value"] == 15.0
+
+    # ...and the same payload survives the live-export conversion the importer runs.
+    live = trade_rules_to_live_export(payload["entry_rules"], payload["exit_rules"], name="gated")
+    assert [r["subtype"] for r in live["rulesets"]] == ["enter_market", "open_positions"]
+    json.dump(live, open(tmp_path / "payload.json", "w"))  # serialisable, as the tools write it
+
+
+def test_an_undecoded_template_still_fails_that_same_export_path():
+    """The counterpart: the search TEMPLATE (what the strategy row holds) must not export."""
+    from fastapi import HTTPException
+    from types import SimpleNamespace
+
+    from app.api.backtests import _derive_export_payload
+
+    saved = launcher._MARKET_CONDITION_PROFILES
+    launcher._MARKET_CONDITION_PROFILES = ("ohlcv-v1",)
+    try:
+        strategy = launcher._build_strategy("O_LC", "deploy-template", "FMPRating")
+    finally:
+        launcher._MARKET_CONDITION_PROFILES = saved
+    backtest = SimpleNamespace(
+        id=4243, name="template", expert_name="FMPRating", engine_type="daily_expert",
+        strategy_params={"entryRules": strategy.entry_rules, "exitRules": strategy.exit_rules},
+        start_date=None, end_date=None, initial_capital=20_000.0)
+    with pytest.raises(HTTPException) as e:
+        _derive_export_payload(backtest, "ruleset", None)
+    assert e.value.status_code == 400 and "mode_optimize" in str(e.value.detail)
 
 
 # --------------------------------------------------------------------- exit rulesets
@@ -166,6 +285,30 @@ def test_the_save_path_still_accepts_the_optimizer_template_on_an_entry_rule():
     payload = StrategyCreate(name="s", entry_rules=_entry_rule(_template_leaf()), exit_rules=[])
     entry, _exits = _resolve_rule_lists(payload)
     assert entry[0]["conditions"]["conditions"][0]["modeOptimize"] is True
+
+
+def test_the_deploy_tools_route_through_the_checked_paths_and_report_a_refusal():
+    """``tools/export_deploy_payload.py`` is a thin wrapper around ``_derive_export_payload`` and
+    ``tools/import_deploy_payload.py`` around ``trade_rules_to_live_export`` -- which is what makes
+    the checks above cover the deploy path. Both must turn a refusal into a message and write
+    NOTHING for that entry: a half-written plan is worse than none, because the missing entry is
+    the one nobody notices.
+
+    Read from the scripts' source: running them means a live DB and a chdir into the backend.
+    """
+    tools = os.path.normpath(os.path.join(_ROOT, "..", "..", "tools"))
+    exporter = open(os.path.join(tools, "export_deploy_payload.py"), encoding="utf-8").read()
+    importer = open(os.path.join(tools, "import_deploy_payload.py"), encoding="utf-8").read()
+
+    assert "_derive_export_payload(bt, \"ruleset\", db)" in exporter
+    body = exporter[exporter.index("def main("):]
+    guarded = body[body.index("_derive_export_payload"):]
+    assert "FATAL" in guarded and "return 1" in guarded
+    assert body.index("_derive_export_payload") < body.index("json.dump(payloads")
+
+    assert "trade_rules_to_live_export(entry_rules, exit_rules, name=label)" in importer
+    after = importer[importer.index("trade_rules_to_live_export(entry_rules"):]
+    assert "except ValueError" in after and "FATAL" in after
 
 
 # --------------------------------------------------------------------- an older target server
