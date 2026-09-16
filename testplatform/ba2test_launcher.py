@@ -4729,8 +4729,11 @@ def _market_condition_gene_names(strat) -> list:
     return sorted(names)
 
 
-#: (digest, profile) -> the manifest facts, so optimize-batch reads one manifest ONCE for a whole
-#: batch instead of re-reading (and re-validating) the same JSON per job.
+#: (cache root, digest, profile) -> the manifest facts, so optimize-batch reads one manifest ONCE
+#: for a whole batch instead of re-reading (and re-validating) the same JSON per job. The ROOT is
+#: part of the key because it is part of the identity: the same digest names a different file
+#: under a different BA2_HOME, and a process that switches roots (a test, a re-pointed run) must
+#: not be served the first root's reader.
 _MARKET_CONDITION_FACTS: dict = {}
 
 
@@ -4743,7 +4746,8 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
     from ba2_common.config import CACHE_FOLDER
     from ba2_common.core.market_condition_reader import MappedMarketConditionReader
 
-    cached = _MARKET_CONDITION_FACTS.get((digest, profile))
+    key = (str(CACHE_FOLDER), digest, profile)
+    cached = _MARKET_CONDITION_FACTS.get(key)
     if cached is not None:
         return cached
     reader = MappedMarketConditionReader(CACHE_FOLDER, digest, profile)
@@ -4756,7 +4760,7 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
         "window_start": reader.manifest.get("window_start"),
         "window_end": reader.manifest.get("window_end"),
     }
-    _MARKET_CONDITION_FACTS[(digest, profile)] = facts
+    _MARKET_CONDITION_FACTS[key] = facts
     return facts
 
 

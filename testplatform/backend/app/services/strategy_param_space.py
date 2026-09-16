@@ -699,6 +699,12 @@ def _apply_mode(node: Dict[str, Any], cid: str, token: str) -> None:
     # value range stay exactly as they are on any other optimized numeric leaf: they are the
     # THRESHOLD gene's metadata, unrelated to the mode gene, and every export path already
     # carries them.
+    #
+    # ``toggle_optimize`` survives a decode and this does not, deliberately: a decoded ruleset is
+    # the RULE that was deployed, and the mode metadata is the only part of it that describes a
+    # choice already made. Nothing reads it back off a decoded tree either -- re-runs,
+    # warm-starts, robustness variants and the top-N persist all re-decode from the BASE strategy
+    # plus the genes, never from a previous decode's output.
     for key in ("mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
         node.pop(key, None)
 

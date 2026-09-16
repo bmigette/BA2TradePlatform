@@ -674,38 +674,61 @@ def test_a_manifest_that_does_not_cover_the_universe_is_refused_naming_the_symbo
     assert snapshot in message
 
 
-def test_the_coverage_check_sees_the_SCREENED_universe_not_the_static_one(
+def test_the_coverage_check_reads_the_universe_on_the_block_it_is_given(
         profile_on, snapshot, monkeypatch):
-    """A --screener run REPLACES ``enabled_instruments`` with the screened candidate union.
+    """Coverage is checked against ``enabled_instruments`` AS IT STANDS WHEN THE CHECK RUNS.
 
-    That union is the universe the gates are actually asked about, so it is the one coverage must
-    be checked against. Checked against the pre-screener list (which for a screener run is the
-    static --universe, often just a seed), a run whose real universe the snapshot does not cover
-    passes -- and every uncovered symbol then reads ``missing_session`` for the whole run and
-    never enters, which is precisely the silent miss the check exists to prevent.
+    A --screener run replaces that list with the screened candidate union, which is the universe
+    the gates are actually asked about; an uncovered symbol in it must refuse the run. (That the
+    call really happens after the rewrite is the next test's job -- ordering is not observable
+    from a unit call.)
     """
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
-    block = {"enabled_instruments": ["AAA"]}          # the static universe: fully covered
-    block["enabled_instruments"] = ["AAA", "ZZZ"]     # what the screener block writes
+    screened = {"enabled_instruments": ["AAA", "ZZZ"]}   # what the screener block writes
     with pytest.raises(SystemExit, match="ZZZ"):
-        mod._apply_market_conditions("optimize", block, _built("O_LC"))
+        mod._apply_market_conditions("optimize", screened, _built("O_LC"))
 
 
 def test_the_optimize_command_records_the_profile_after_every_universe_rewrite():
     """The ORDER inside ``_cmd_optimize``, read from the source.
 
-    The check above can only fail if the call happens before the rewrite, and that ordering is
-    not observable from any unit call -- so it is pinned where it lives. Both screener blocks
-    (``--screener`` and ``--screener-gate-store``) run between the block's construction and this
-    call; the SCREENER one assigns ``enabled_instruments``.
+    The contract is "after EVERY rewrite of ``enabled_instruments``", so the LAST one is what the
+    call has to follow -- checking only the first would pass a future block that narrows the
+    universe again below it. Both screener blocks (``--screener`` and ``--screener-gate-store``)
+    run between the block's construction and this call; the SCREENER one assigns the list.
     """
     src = open(_LAUNCHER, encoding="utf-8").read()
     start = src.index("def _cmd_optimize(args)")
     body = src[start:src.index("def _cmd_optimize_batch(args)")]
-    rewrite = body.index('backtest_block["enabled_instruments"] = enabled')
+    last_rewrite = body.rindex('backtest_block["enabled_instruments"]')
     call = body.index('_apply_market_conditions("optimize"')
-    assert rewrite < call, ("the market-condition coverage check must run AFTER the screener "
-                            "rewrites the universe")
+    assert last_rewrite < call, ("the market-condition coverage check must run AFTER every "
+                                 "rewrite of the run universe")
+
+
+def test_two_cache_roots_with_the_same_digest_get_their_own_reader(profile_on, tmp_path,
+                                                                    monkeypatch):
+    """The facts cache is a per-batch read saver, not an identity claim about a digest.
+
+    The same digest names a DIFFERENT file under a different BA2_HOME (it is the hash of the
+    manifest, and two hosts can publish the same content), so a process that switches roots --
+    a test, a re-pointed run -- must not be served the first root's reader.
+    """
+    import ba2_common.config as bc
+
+    store_a, digest = _publish_manifest(tmp_path / "a", symbols=("AAA",))
+    store_b, digest_b = _publish_manifest(tmp_path / "b", symbols=("AAA",))
+    assert digest == digest_b, "same content, same digest -- that is the premise"
+
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store_a.cache_root))
+    first = mod._market_condition_manifest_facts(digest, "ohlcv-v1")
+    assert mod._market_condition_manifest_facts(digest, "ohlcv-v1") is first, "cached per root"
+
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store_b.cache_root))
+    second = mod._market_condition_manifest_facts(digest, "ohlcv-v1")
+    assert second is not first
+    assert second["reader"].cache_root == str(store_b.cache_root)
+    assert first["reader"].cache_root == str(store_a.cache_root)
 
 
 def test_the_run_config_records_the_profile_the_manifest_and_the_calc_versions(
