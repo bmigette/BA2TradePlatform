@@ -4494,6 +4494,320 @@ def _hold_assigned_stock(kind: Optional[str]) -> bool:
 _OPTION_GATES_OFF = False
 
 
+# ---------------------------------------------------------------------------------------------
+# MARKET-CONDITION ENTRY GATES (design 2026-09-15 sections 5/6, plan Task 8). OPT-IN per run.
+#
+# ``--market-condition-profile`` selects zero or more REGISTERED profiles
+# (``ba2_common.core.market_conditions.PROFILES``). Empty (the default, CLI ``none``) emits
+# exactly today's rules and genes -- the whole goal2020 archive and every deployed genome stay
+# comparable. Module-level for the same reason as ``_OPTION_GATES_OFF``: the strategy builders
+# run deep inside ``_build_strategy`` (and inside ``_build_strategy_wheel``'s reuse of the CSP
+# builder), far from the parsed args.
+#
+# Everything below is REGISTRY-DRIVEN: one leaf per ``FieldSpec`` with ``searched=True``, ids,
+# ranges, anchors and choice lists all read from the spec. A second profile (Task 10's
+# ``ta-structure-v1``) is therefore data, not a code path here.
+_MARKET_CONDITION_PROFILES: "tuple[str, ...]" = ()
+#: The published snapshot every trial of the run reads (design 4.5). Required for an OPTIMIZE
+#: with a profile on; a plain backtest may omit it and runs in research mode (one warning).
+_MARKET_CONDITION_MANIFEST: "str | None" = None
+
+
+def _market_condition_gates(m: str) -> list:
+    """The market-condition entry leaves for rule prefix ``m`` ([] with no profile selected).
+
+    ONE leaf per searched ``FieldSpec`` across the selected profiles, in REGISTRY order (the
+    registry's own insertion order, filtered to the selection -- so the gene list does not
+    depend on how the operator ordered the comma list), id ``<m>-market-<short>``.
+
+    NUMERIC leaf: the authored ``op``/``value`` are the FieldSpec's declared anchor (the
+    template's explicit fixed interpretation, NOT a claim about which evolved mode is best --
+    design section 5), the threshold gene's range is the spec's, and ``mode_optimize`` adds the
+    ``cond:<id>:mode`` choice gene over ``off``/``below``/``above``.
+
+    CATEGORICAL leaf: ``op`` ``==``, NO threshold (and so no ``optimize``: a value gene on a
+    categorical leaf is refused by ``strategy_param_space``), choices ``off`` + the registry's
+    values in ascending CODE order -- a persisted contract, because the choice gene's index
+    follows it.
+
+    The authored operator is checked against the GENERATED CONDITION CLASS's
+    ``ALLOWED_OPERATORS`` rather than hard-coded here, so launcher and engine cannot drift: a
+    spec that ever declared an operator the condition refuses fails at build time, not as a
+    per-trial crash inside a worker.
+
+    ``toggle_optimize`` is deliberately NOT set: ``mode``'s ``off`` choice already removes the
+    leaf, and the two together are refused by ConditionLeaf and by the gene collector.
+    """
+    if not _MARKET_CONDITION_PROFILES:
+        return []
+    from ba2_common.core.TradeConditions import market_condition_condition_class
+    from ba2_common.core.market_conditions import PROFILES, field_codes
+    from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES
+
+    selected = set(_MARKET_CONDITION_PROFILES)
+    unknown = sorted(selected - set(PROFILES))
+    if unknown:
+        raise ValueError(f"market-condition profile(s) {unknown!r} are not registered "
+                         f"(known: {sorted(PROFILES)!r})")
+    leaves: list = []
+    for prof_name, prof in PROFILES.items():
+        if prof_name not in selected:
+            continue
+        for spec in prof.fields:
+            if not spec.searched:
+                continue
+            allowed = market_condition_condition_class(spec.name).ALLOWED_OPERATORS
+            leaf = {"id": f"{m}-market-{spec.short}", "field": spec.name,
+                    "field_type": "numeric", "mode_optimize": True}
+            if spec.kind == "numeric":
+                if spec.anchor_op not in allowed:
+                    raise ValueError(
+                        f"market-condition field {spec.name!r} declares anchor_op "
+                        f"{spec.anchor_op!r}, which its condition class does not accept "
+                        f"({sorted(allowed)!r})")
+                leaf.update({
+                    "op": spec.anchor_op, "value": float(spec.anchor_value), "optimize": True,
+                    "value_min": float(spec.value_min), "value_max": float(spec.value_max),
+                    "value_step": float(spec.value_step),
+                    "mode_choices": list(NUMERIC_MODE_CHOICES),
+                })
+            else:
+                if "==" not in allowed:
+                    raise ValueError(
+                        f"market-condition field {spec.name!r} is categorical but its condition "
+                        f"class does not accept '==' ({sorted(allowed)!r})")
+                leaf.update({"op": "==", "mode_choices": [MODE_OFF, *field_codes(spec.name)]})
+            leaves.append(leaf)
+    return leaves
+
+
+def _append_market_condition_gates(strategy, kind: str):
+    """Append the market leaves to an EQUITY-entry option strategy's initial-entry AND tree.
+
+    For O_CC / O_PP the entry is the shared S2 builder's stock entry (design section 6: the gate
+    decides when to START the stock-plus-option strategy; it must never delay the covered call or
+    the protective put once the shares are held). ``_build_strategy_row`` is the equity S2 builder
+    used by the whole equity grid, so the leaves are spliced into the RETURNED strategy here
+    instead -- an options-only change, as the plan's "Deferred" section requires.
+
+    Re-normalised through ``normalize_trade_rules`` so the appended leaves carry the same
+    canonical/camelCase shape as the rest of the tree (the mode metadata is declared on
+    ConditionLeaf, so it survives).
+    """
+    gates = _market_condition_gates(kind.lower())
+    if not gates:
+        return strategy
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    trees = [r for r in rules if isinstance(r, dict) and isinstance(r.get("conditions"), dict)
+             and r["conditions"].get("conditions")]
+    if len(trees) != 1:
+        raise ValueError(
+            f"{kind}: expected exactly ONE entry rule with a condition tree to carry the "
+            f"market-condition gates, found {len(trees)} -- placing them on the wrong branch "
+            f"would gate only part of the entry")
+    tree = trees[0]["conditions"]
+    tree["conditions"] = list(tree["conditions"]) + gates
+    strategy.entry_rules = normalize_trade_rules(rules)
+    return strategy
+
+
+def _rename_market_condition_gates(strategy, frm: str, to: str):
+    """Re-prefix the market leaves of a REUSED entry rule (O_WHEEL reuses O_CSP's builder).
+
+    Design section 5: the wheel gets wheel-specific ids even though its entry is the CSP's, so a
+    later composed strategy can demand one regime for the wheel and another for a bare CSP.
+    """
+    if not _MARKET_CONDITION_PROFILES:
+        return strategy
+    old, new = f"{frm}-market-", f"{to}-market-"
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        cid = node.get("id")
+        if isinstance(cid, str) and cid.startswith(old):
+            node["id"] = new + cid[len(old):]
+        for v in node.values():
+            walk(v)
+
+    walk(getattr(strategy, "entry_rules", None))
+    return strategy
+
+
+#: CLI token for "no market-condition gates at all" -- the default, and what the whole existing
+#: archive ran with. Same spelling the trial config and the seam use.
+_MARKET_CONDITION_NONE = "none"
+
+
+def _resolve_market_condition_profiles(raw, command: str) -> tuple:
+    """Parse ``--market-condition-profile`` into the module tuple; sets it and returns it.
+
+    ``none`` (or an absent flag) selects nothing. Every other token must name a REGISTERED
+    profile: an unknown one is an error, never a silent skip, because a job launched with a
+    typo'd profile would run ungated and score as though the gates simply never helped.
+    """
+    global _MARKET_CONDITION_PROFILES
+    from ba2_common.core.market_conditions import PROFILES
+
+    tokens = [t.strip() for t in str(raw or _MARKET_CONDITION_NONE).split(",") if t.strip()]
+    if not tokens or tokens == [_MARKET_CONDITION_NONE]:
+        _MARKET_CONDITION_PROFILES = ()
+        return _MARKET_CONDITION_PROFILES
+    if _MARKET_CONDITION_NONE in tokens:
+        sys.exit(f"{command}: --market-condition-profile {raw!r} mixes 'none' with a profile name; "
+                 f"pass either 'none' or the profile(s) to enable")
+    unknown = [t for t in tokens if t not in PROFILES]
+    if unknown:
+        sys.exit(f"{command}: unknown market-condition profile(s) {unknown!r}; registered: "
+                 f"{sorted(PROFILES)!r} (or {_MARKET_CONDITION_NONE!r})")
+    seen = []
+    for t in tokens:
+        if t not in seen:
+            seen.append(t)
+    if len(seen) > 1:
+        # The trial seam (install_backtest_market_conditions) pins ONE profile per run and one
+        # reader over it. Accepting a list here would produce rules the trials cannot install --
+        # a job that dies per trial rather than at launch. Task 10 widens the seam and lifts this.
+        sys.exit(f"{command}: --market-condition-profile takes ONE profile today (got {seen!r}); "
+                 f"the per-trial reader is pinned to a single profile "
+                 f"(app.services.backtest.seam_wiring.install_backtest_market_conditions)")
+    _MARKET_CONDITION_PROFILES = tuple(seen)
+    return _MARKET_CONDITION_PROFILES
+
+
+def _market_condition_gene_names(strat) -> list:
+    """Every GA gene name the market leaves of a BUILT strategy contribute, sorted.
+
+    Read from the strategy the run will actually store (not re-derived from the registry), so the
+    number recorded next to the unchanged POP/GEN is the number the optimizer really searches.
+    """
+    if not _MARKET_CONDITION_PROFILES:
+        return []
+    from ba2_common.core.market_conditions import PROFILES
+
+    fields = {f.name for prof in PROFILES.values() for f in prof.fields}
+    names: list = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        cid = node.get("id")
+        if cid and node.get("field") in fields:
+            if node.get("mode_optimize") or node.get("modeOptimize"):
+                names.append(f"cond:{cid}:mode")
+            if node.get("optimize") or node.get("optimize_enabled") or node.get("optimizeEnabled"):
+                names.append(f"cond:{cid}:value")
+        for v in node.values():
+            walk(v)
+
+    for attr in ("entry_rules", "exit_rules"):
+        walk(getattr(strat, attr, None))
+    return sorted(names)
+
+
+def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
+    """The pinned snapshot's own provenance, read from the manifest (never re-derived).
+
+    Constructing the mapped reader reads (and re-checks the identity of) the manifest JSON and
+    nothing else -- no arrays are mapped here -- so this is a JSON read, not a preparation.
+    """
+    from ba2_common.config import CACHE_FOLDER
+    from ba2_common.core.market_condition_reader import MappedMarketConditionReader
+
+    reader = MappedMarketConditionReader(CACHE_FOLDER, digest, profile)
+    return {
+        "reader": reader,
+        "source_profile": reader.manifest.get("source_profile"),
+        "timing_policy": reader.manifest.get("timing_policy"),
+        "calendar_version": reader.manifest.get("calendar_version"),
+        "calc_version": reader.calc_version,
+        "window_start": reader.manifest.get("window_start"),
+        "window_end": reader.manifest.get("window_end"),
+    }
+
+
+def _apply_market_conditions(command: str, args, backtest_block: dict, strat) -> dict:
+    """Record the market-condition decisions on a run's backtest block, or do nothing.
+
+    NOTHING is written when no profile is selected: a profile-``none`` run must produce exactly
+    today's stored config (and therefore today's configuration digest and today's checkpoint
+    identity), or the whole existing archive stops being comparable for a change that did not
+    touch it.
+
+    With a profile on, this is the launch-time gate for the two failures the search cannot
+    recover from by itself:
+
+    * NO MANIFEST. Every trial would compute its own 128-session indicators from whatever cache
+      its worker happened to hold, with no two hosts provably agreeing and nothing saying so. The
+      seam refuses such a trial config (Task 7); refusing HERE turns that into one message at
+      launch instead of N identical crashed trials.
+    * A MANIFEST THAT DOES NOT COVER THE RUN. Every gate on a missing symbol reads
+      ``missing_session`` for the whole run: the symbol never enters, and the genome that would
+      have traded it scores as if its strategy simply did not fire there. A feature-cache miss
+      must not become a property of the fitness landscape, so the run is refused NAMING the
+      missing symbols (the same message and the same check the per-trial seam applies).
+
+    Returns the recorded block (``{}`` when the profile is off).
+    """
+    if not _MARKET_CONDITION_PROFILES:
+        return {}
+    from types import SimpleNamespace
+
+    from app.services.backtest.seam_wiring import check_market_condition_coverage
+    from ba2_common.core.market_conditions import PROFILES
+
+    profile = _MARKET_CONDITION_PROFILES[0]
+    digest = _MARKET_CONDITION_MANIFEST
+    if not digest:
+        sys.exit(f"{command}: --market-condition-profile {profile!r} needs "
+                 f"--market-condition-manifest <digest>. An optimization pins ONE prepared "
+                 f"snapshot and carries its digest into every trial "
+                 f"(tools/warm_market_conditions.py plan/build/verify/prepare-host); computing "
+                 f"the indicators per trial is not a fallback this path takes.")
+    try:
+        facts = _market_condition_manifest_facts(digest, profile)
+    except Exception as e:  # noqa: BLE001 -- any manifest fault is a launch-time refusal
+        sys.exit(f"{command}: market-condition manifest {digest!r} for profile {profile!r} is not "
+                 f"usable on this host: {e}")
+    reader = facts.pop("reader")
+    universe = list(backtest_block.get("enabled_instruments") or [])
+    try:
+        check_market_condition_coverage(
+            {"enabled_instruments": universe, "_ga_trial": True},
+            SimpleNamespace(mapped_reader=reader),
+        )
+    except ValueError as e:
+        sys.exit(f"{command}: {e}")
+
+    backtest_block["market_condition_profile"] = profile
+    backtest_block["market_condition_manifest"] = digest
+    genes = _market_condition_gene_names(strat)
+    recorded = {
+        "profiles": list(_MARKET_CONDITION_PROFILES),
+        "manifest": digest,
+        "calc_versions": {p: PROFILES[p].calc_version for p in _MARKET_CONDITION_PROFILES},
+        "fields": [f.to_dict() for p in _MARKET_CONDITION_PROFILES for f in PROFILES[p].fields],
+        "genes": genes,
+        "gene_count": len(genes),
+        **facts,
+    }
+    backtest_block["market_condition"] = recorded
+    print(f"{command}: market-condition profile {profile} manifest {digest} "
+          f"({len(reader.symbols())} symbols warmed, {len(genes)} added genes; population and "
+          f"generations are NOT scaled by the profile)")
+    return recorded
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False,
                        gates_off: "bool | None" = None) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
@@ -4545,6 +4859,11 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
             # rather than folded into an existing leaf so it keeps its own threshold gene,
             # and NOT toggle_optimize -- see _days_to_earnings_gate.
             *([_days_to_earnings_gate(m)] if member in _EVENT_ENTRY_MEMBERS else []),
+            # MARKET-CONDITION gates (--market-condition-profile; [] by default). LAST in the
+            # AND list on purpose: appending keeps every existing leaf at its current index, so
+            # profile `none` emits a byte-identical rule and an older gene key still names the
+            # same gate. Design section 6: the initial-entry tree only -- never an exit rule.
+            *_market_condition_gates(m),
         ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
@@ -4566,8 +4885,16 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
         # node (``strategy_param_space._apply_to_tree``). Removal also takes the gate's
         # ``cond:<id>:enabled`` gene with it, so the GA cannot switch a gate back on for half
         # the population — which no static flag could have prevented.
+        #
+        # ``mode_optimize`` is the SECOND marker of a strategy opinion: a market-condition leaf
+        # carries no ``toggle_optimize`` (its own ``off`` mode already removes it), so the
+        # toggle test alone would leave every market gate standing in a smoke run and the
+        # "pipeline, not strategy" guarantee would quietly stop holding the moment a profile is
+        # on. Both markers mean the same thing here -- the GA may switch this off -- so both
+        # come out.
         rule["conditions"]["conditions"] = [
-            leaf for leaf in rule["conditions"]["conditions"] if not leaf.get("toggle_optimize")]
+            leaf for leaf in rule["conditions"]["conditions"]
+            if not (leaf.get("toggle_optimize") or leaf.get("mode_optimize"))]
     if toggleable:
         rule["toggle_optimize"] = True
     return rule
@@ -4785,6 +5112,10 @@ def _build_strategy_covered_call(kind: str):
     always-matching floor stop and could never fire at all (OPT-B1)."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
     s = _with_round_lot_entry(_build_strategy_S2(kind))  # equity entry in 100-share lots
+    # Design section 6: the gate decides when to START the stock-plus-option strategy, so it
+    # goes on the STOCK entry -- never on the overlay rule, which must stay free to write the
+    # call / buy the put against shares that are already held.
+    s = _append_market_condition_gates(s, kind)
     s.exit_rules = _insert_option_overlay(
         s.exit_rules,
         {"id": "cc_guard",
@@ -4856,6 +5187,9 @@ def _build_strategy_wheel(kind: str):
     """
     s = _build_strategy_option("O_CSP")
     s.name = kind
+    # The entry rule is the CSP's verbatim, market leaves included -- re-prefix them so the
+    # wheel searches its OWN regime genes (design section 5).
+    s = _rename_market_condition_gates(s, "o_csp", "o_wheel")
     s.exit_rules = _insert_option_overlay(
         s.exit_rules,
         {"id": "cc_guard",
@@ -4951,6 +5285,10 @@ def _build_strategy_protective_put(kind: str):
     ``_insert_option_overlay`` for the same reason O_CC's is (OPT-B1)."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
     s = _with_round_lot_entry(_build_strategy_S2(kind))  # equity entry in 100-share lots
+    # Design section 6: the gate decides when to START the stock-plus-option strategy, so it
+    # goes on the STOCK entry -- never on the overlay rule, which must stay free to write the
+    # call / buy the put against shares that are already held.
+    s = _append_market_condition_gates(s, kind)
     s.exit_rules = _insert_option_overlay(
         s.exit_rules,
         {"id": "pp_guard",
@@ -5102,6 +5440,10 @@ def _cmd_optimize(args) -> int:
     _OPTION_MIN_VOLUME = int(getattr(args, "option_min_volume", _OPTION_MIN_VOLUME_DEFAULT))
     # Read BEFORE _build_strategy below — the option builders consult the module global.
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
+    global _MARKET_CONDITION_MANIFEST
+    # Read BEFORE _build_strategy too: the market gates are appended by the same builders.
+    _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
+    _MARKET_CONDITION_MANIFEST = getattr(args, "market_condition_manifest", None)
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -5248,6 +5590,11 @@ def _cmd_optimize(args) -> int:
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
+        # Market-condition gates: record the profile + the pinned manifest on the run config
+        # (persisted, so every _build_daily_trial_config consumer of this run -- trials, re-runs,
+        # robustness variants, top-N persist, tools/backtest_parity.py -- carries the digest), and
+        # refuse a manifest that does not cover this universe. No-op with the profile off.
+        _apply_market_conditions("optimize", args, backtest_block, strat)
         # Options experts get the offline options-cache seam (no-op for equity experts).
         _apply_options_seam(spec, backtest_block)
         # WHICH store the run reads, resolved and recorded here rather than left to whatever
@@ -5481,6 +5828,10 @@ def _cmd_optimize_batch(args) -> int:
     # and reports "no trades" for a reason the operator has just tried to rule out.
     global _OPTION_GATES_OFF
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
+    global _MARKET_CONDITION_MANIFEST
+    _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None),
+                                       "optimize-batch")
+    _MARKET_CONDITION_MANIFEST = getattr(args, "market_condition_manifest", None)
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -5577,6 +5928,8 @@ def _cmd_optimize_batch(args) -> int:
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
+            # Market-condition gates (no-op with the profile off) — see _cmd_optimize.
+            _apply_market_conditions("optimize-batch", args, backtest_block, strat)
             # Options experts get the offline options-cache seam (no-op for equity experts).
             _apply_options_seam(spec, backtest_block)
             # The store decision, resolved once and recorded on the block. THIS driver is the one
@@ -6128,6 +6481,29 @@ def _cmd_worker(args) -> int:
     return 0
 
 
+def _add_market_condition_args(p) -> None:
+    """``--market-condition-profile`` / ``--market-condition-manifest`` on an optimize command.
+
+    Both default to OFF: an existing command line keeps emitting exactly today's rules, today's
+    genes and today's stored config. The manifest is required whenever a profile is on -- see
+    ``_apply_market_conditions`` for why a per-trial computation is not an acceptable fallback.
+    """
+    p.add_argument("--market-condition-profile", default=_MARKET_CONDITION_NONE,
+                   metavar="none|<profile>",
+                   help="Append the market-condition entry gates of a REGISTERED profile "
+                        "(ba2_common.core.market_conditions.PROFILES, e.g. ohlcv-v1) to every "
+                        "option structure's INITIAL-ENTRY tree: one mode gene per searched field "
+                        "(off/below/above, or off/<value> for a categorical one) plus the "
+                        "threshold gene of a numeric one. Default 'none' = exactly today's rules "
+                        "and genes. Population/generations are NOT scaled by the profile.")
+    p.add_argument("--market-condition-manifest", default=None, metavar="DIGEST",
+                   help="The prepared snapshot every trial reads (tools/warm_market_conditions.py "
+                        "plan/build/verify/prepare-host prints it). REQUIRED with a profile: "
+                        "without it each worker would compute the indicators from whatever cache "
+                        "it happened to hold. Refused at launch when it does not cover the run's "
+                        "universe.")
+
+
 def main(argv: "list | None" = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     _enter_backend()
@@ -6337,6 +6713,7 @@ def main(argv: "list | None" = None) -> int:
                           "tracked in git so it syncs across machines).")
 
     op = sub.add_parser("optimize", help="Joint genetic optimization (expert + RM params + TP/SL).")
+    _add_market_condition_args(op)
     op.add_argument("--expert", required=True, help="Expert class (FMPRating/FMPEarningsDrift/...).")
     op.add_argument("--strategy", choices=sorted(_STRATEGY_BUILDERS), default="S2",
                     help="Strategy/exit variant for a ruleset expert: S1 live-import / S2 bracket / "
@@ -6668,6 +7045,7 @@ def main(argv: "list | None" = None) -> int:
                     help="Remote worker NAME to fan trials out to (repeatable). Default: local only.")
     ob.add_argument("--workers", dest="workers_csv", default=None, metavar="A,B,C",
                     help="Comma-separated remote worker names (alternative to repeated --worker).")
+    _add_market_condition_args(ob)
 
     # worker: run THIS machine as a worker SERVER the master pushes trials to.
     wk = sub.add_parser("worker", help="Run a worker server the master pushes GA trials to.")
