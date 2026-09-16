@@ -321,9 +321,17 @@ def test_a_pinned_manifest_serves_published_rows_and_never_computes(ps, tmp_path
 
 
 def test_a_ga_trial_without_a_pinned_manifest_is_refused(ps):
-    with pytest.raises(ValueError, match="market_condition_manifest"):
+    with pytest.raises(ValueError, match="pins no manifest for it"):
         seam_wiring.install_backtest_market_conditions(
             {"market_condition_profile": "ohlcv-v1", "_ga_trial": True}, ps)
+    # ... and PER PROFILE: one profile pinned, the other not, is still a refusal NAMING the
+    # profile whose snapshot is missing -- half a gated genome is a zero-trade fitness that
+    # looks like a verdict.
+    with pytest.raises(ValueError, match="ta-structure-v1"):
+        seam_wiring.install_backtest_market_conditions(
+            {"market_condition_profiles": ["ta-structure-v1", "ohlcv-v1"],
+             "market_condition_manifests": {"ohlcv-v1": "sha256:" + "a" * 64},
+             "_ga_trial": True}, ps)
 
 
 def test_research_mode_computes_but_says_so_once(ps, monkeypatch):
@@ -406,3 +414,67 @@ def test_a_fully_covered_universe_passes_and_an_empty_one_is_not_checked(ps, tmp
     # a real gap, just the absence of the question.
     assert seam_wiring.install_backtest_market_conditions(base, ps) is not None
     assert seam_wiring.market_condition_universe({"enabled_instruments": ["b", "a"]}) == ["A", "B"]
+
+
+# --------------------------------------------------------------------------- plural pins (Task 10)
+def test_the_pins_are_read_from_either_shape():
+    """ONE decoder for the plural keys and the legacy singular pair. Every optimization_config
+    persisted before Task 10 carries the pair, and re-running one of those genomes has to work."""
+    pins = seam_wiring.market_condition_pins
+    assert pins({"market_condition_profile": "none"}) == ([], {})
+    assert pins({"market_condition_profile": "ohlcv-v1",
+                 "market_condition_manifest": "d1"}) == (["ohlcv-v1"], {"ohlcv-v1": "d1"})
+    assert pins({"market_condition_profiles": ["ohlcv-v1", "ta-structure-v1"],
+                 "market_condition_manifests": {"ohlcv-v1": "d1", "ta-structure-v1": "d2"}}) == (
+        ["ohlcv-v1", "ta-structure-v1"], {"ohlcv-v1": "d1", "ta-structure-v1": "d2"})
+    # a comma string is the CLI spelling, accepted so a config written from argv round-trips
+    assert pins({"market_condition_profiles": "ohlcv-v1,ta-structure-v1"})[0] == [
+        "ohlcv-v1", "ta-structure-v1"]
+    # no key at all: required by default (the seam is handed a NORMALISED config) ...
+    with pytest.raises(KeyError):
+        pins({})
+    # ... and optional for the callers that read a RAW stored config
+    assert pins({}, required=False) == ([], {})
+
+
+@pytest.mark.parametrize("config,message", [
+    ({"market_condition_profiles": ["ohlcv-v1"], "market_condition_profile": "ta-structure-v1"},
+     "they disagree"),
+    # "none" is a contradiction too: one key says the gates are off and the other names a
+    # profile, and the quiet reading of that is a run that gates without a word.
+    ({"market_condition_profiles": ["ohlcv-v1"], "market_condition_profile": "none"},
+     "they disagree"),
+    ({"market_condition_profiles": ["ohlcv-v1", "ohlcv-v1"]}, "repeats a profile"),
+    ({"market_condition_profiles": ["none", "ohlcv-v1"]}, "mixes"),
+    ({"market_condition_profiles": ["nope-v1"]}, "not registered"),
+    ({"market_condition_profiles": ["ohlcv-v1", "ta-structure-v1"],
+      "market_condition_manifest": "d1"}, "A manifest names the ONE profile"),
+    ({"market_condition_profiles": ["ohlcv-v1"],
+      "market_condition_manifests": {"ta-structure-v1": "d2"}}, "the run does not use"),
+])
+def test_a_contradictory_pin_is_refused_rather_than_half_applied(config, message):
+    with pytest.raises(ValueError, match=message):
+        seam_wiring.market_condition_pins(config)
+
+
+def test_two_profiles_install_one_reader_each_behind_one_composite(ps):
+    from ba2_common.core.market_condition_readers import CompositeMarketConditionReader
+
+    resolver = seam_wiring.install_backtest_market_conditions(
+        {"market_condition_profiles": ["ohlcv-v1", "ta-structure-v1"]}, ps)
+    reader = resolver.reader
+    assert isinstance(reader, CompositeMarketConditionReader)
+    assert [r.profile for r in reader.readers] == ["ohlcv-v1", "ta-structure-v1"]
+    assert all(r._ps is ps for r in reader.readers)
+    seam_wiring.clear_backtest_market_conditions()
+
+
+def test_one_profile_installs_the_reader_itself_unwrapped(ps):
+    """A single-profile run is byte-identical to what it was before the widening."""
+    from app.services.backtest.market_condition_bt import BacktestMarketConditionReader
+
+    resolver = seam_wiring.install_backtest_market_conditions(
+        {"market_condition_profiles": ["ohlcv-v1"]}, ps)
+    assert type(resolver.reader) is BacktestMarketConditionReader
+    assert resolver.reader.profile == "ohlcv-v1"
+    seam_wiring.clear_backtest_market_conditions()

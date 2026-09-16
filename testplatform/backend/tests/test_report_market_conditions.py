@@ -31,16 +31,21 @@ SLOPE = "underlying_trend_slope_50_atr14"
 ADX = "underlying_adx_14"
 RV = "underlying_realized_vol_ratio_5_20"
 
+_MANIFEST = "sha256:" + "a" * 64
+#: The launcher's recorded config block. PLURAL since Task 10: one manifest and one set of
+#: manifest-read provenance facts PER PROFILE.
 _BLOCK = {
     "profiles": ["ohlcv-v1"],
-    "manifest": "sha256:" + "a" * 64,
-    "source_profile": "fmp-daily-split-adjusted-v1",
-    "timing_policy": "prior_session_v1",
-    "calendar_version": "4.4.1",
-    "calc_version": "ohlcv-v1/calc-1",
+    "manifests": {"ohlcv-v1": _MANIFEST},
     "calc_versions": {"ohlcv-v1": "ohlcv-v1/calc-1"},
-    "window_start": "2022-01-03",
-    "window_end": "2023-12-29",
+    "facts": {"ohlcv-v1": {
+        "source_profile": "fmp-daily-split-adjusted-v1",
+        "timing_policy": "prior_session_v1",
+        "calendar_version": "4.4.1",
+        "calc_version": "ohlcv-v1/calc-1",
+        "window_start": "2022-01-03",
+        "window_end": "2023-12-29",
+    }},
     "gene_count": 6,
     "genes": ["cond:o_lc-market-adx:mode", "cond:o_lc-market-adx:value"],
     "fields": [
@@ -110,8 +115,8 @@ def db(tmp_path):
     equity = [{"date": f"2022-01-0{i}", "equity": 100000.0 + i * 100} for i in (1, 2, 3)]
     equity += [{"date": "2022-12-30", "equity": 110000.0}, {"date": "2023-12-29", "equity": 95000.0}]
     results = {"market_condition": {
-        "profile": "ohlcv-v1", "manifest": _BLOCK["manifest"],
-        "calc_version": "ohlcv-v1/calc-1", "timing_policy": "prior_session_v1",
+        "profiles": ["ohlcv-v1"], "manifests": {"ohlcv-v1": _MANIFEST},
+        "calc_versions": {"ohlcv-v1": "ohlcv-v1/calc-1"}, "timing_policy": "prior_session_v1",
         "stats": {"eligible_recommendations": 400, "market_evaluated": 380,
                   "market_gate_passed": 120, "market_gate_rejected": 240,
                   "market_unknown_recommendations": 20, "market_leaf_evaluations": 380,
@@ -282,7 +287,7 @@ def test_the_report_quotes_the_persisted_versions_and_the_counters(db):
     text = R.render(opt, R.persisted_runs(con, 7), top=3)
     assert "fmp-daily-split-adjusted-v1" in text
     assert "prior_session_v1" in text
-    assert _BLOCK["manifest"] in text
+    assert _MANIFEST in text
     assert "eligible_recommendations       400" in text
     assert "market_gate_rejected           240" in text
     # The BINDING quality, next to the attribution it qualifies.
@@ -341,7 +346,7 @@ def test_the_coverage_section_refuses_a_universe_it_cannot_read(db, tmp_path):
     """An all-clear about zero symbols is a reassuring sentence describing a check that
     examined nothing."""
     con = sqlite3.connect(db)
-    block = dict(_BLOCK)
+    block = dict(_BLOCK)   # a job WITH a pinned snapshot but no enabled_instruments to check
     con.execute("UPDATE strategy_optimizations SET optimization_config = ? WHERE id = 7",
                 (json.dumps({"backtest": {"market_condition": block}}),))
     con.commit()
@@ -404,3 +409,36 @@ def test_the_cli_writes_the_file_it_was_asked_for(db, tmp_path):
     out = tmp_path / "r.md"
     assert R.main(["--opt", "7", "--db", db, "--out", str(out)]) == 0
     assert "market conditions -- optimization 7" in out.read_text(encoding="utf-8")
+
+
+def test_a_pre_task10_block_still_shows_its_versions_and_its_pinned_snapshot(db, monkeypatch):
+    """Every job launched before the block went plural recorded a singular ``manifest`` and the
+    provenance flattened onto the block. Printing only the new spelling would silently drop those
+    versions -- and, worse, tell the coverage diagnostic that a job which pinned a snapshot
+    "pins no manifest"."""
+    legacy = {"profiles": ["ohlcv-v1"], "manifest": _MANIFEST,
+              "source_profile": "fmp-daily-split-adjusted-v1", "timing_policy": "prior_session_v1",
+              "calendar_version": "4.4.1", "calc_version": "ohlcv-v1/calc-1",
+              "window_start": "2022-01-03", "window_end": "2023-12-29", "gene_count": 6,
+              "genes": [], "fields": []}
+    con = sqlite3.connect(db)
+    con.execute("UPDATE strategy_optimizations SET optimization_config = ? WHERE id = 7",
+                (json.dumps({"backtest": {"enabled_instruments": ["AAA"],
+                                          "market_condition": legacy}}),))
+    con.commit()
+    con.close()
+
+    seen = {}
+
+    def _fake(manifest, profile, universe, cache_root=None):
+        seen.update(manifest=manifest, profile=profile)
+        return {"manifest": manifest, "profile": profile, "symbols": {}, "uncovered": []}
+
+    monkeypatch.setattr(R, "coverage_report", _fake)
+    con = R.open_db(db)
+    opt = R.optimizations(con, opt_id=7)[0]
+    text = R.render(opt, [], top=1, want_coverage=True)
+    assert _MANIFEST in text
+    assert "fmp-daily-split-adjusted-v1" in text and "ohlcv-v1/calc-1" in text
+    assert "No manifest is pinned" not in text
+    assert seen == {"manifest": _MANIFEST, "profile": "ohlcv-v1"}

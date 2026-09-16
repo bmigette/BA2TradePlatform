@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.core.instance_resolver import (
     set_instance_resolver,
@@ -192,8 +192,9 @@ def set_backtest_ohlcv_override(provider: Optional[Any]) -> None:
 
 
 # Market-condition entry gates (design 2026-09-15 section 4.1). OPT-IN per run: only a config
-# whose ``market_condition_profile`` is not ``"none"`` installs anything, and only then is the
-# adapter module imported. The TradeConditions seam is process-global while backtests run
+# that pins at least one registered profile installs anything, and only then is the adapter
+# module imported. A run may pin MORE THAN ONE (Task 10) -- one reader each, joined by
+# ``market_condition_reader_for``. The TradeConditions seam is process-global while backtests run
 # CONCURRENTLY in worker threads (see the OHLCV override above), so the process gets ONE
 # dispatching resolver and each run's resolver lives in THIS thread's slot; a thread without a
 # run resolver resolves None (the gate reports ``no_context``).
@@ -214,38 +215,128 @@ def _dispatch_market_condition_context(account: Any, instrument_name: str,
     return resolver(account, instrument_name, expert_recommendation)
 
 
+def market_condition_pins(config: Dict[str, Any], *, required: bool = True
+                          ) -> Tuple[List[str], Dict[str, Optional[str]]]:
+    """``(profiles, digest per profile)`` for one run config, in either shape.
+
+    CANONICAL (Task 10, plural): ``market_condition_profiles`` lists the registered profiles the
+    run's rules were built for and ``market_condition_manifests`` maps each to ITS OWN published
+    digest. One manifest per profile is not a convention but a fact about the format: a manifest
+    names the single profile it was warmed for, so two profiles are two snapshots.
+
+    LEGACY (singular): ``market_condition_profile`` (one name, ``"none"`` for off) plus
+    ``market_condition_manifest`` (one digest). EVERY optimization_config persisted before this
+    change carries that pair, and re-running one of those genomes -- the parity tool, a re-run, a
+    robustness variant, a top-N persist -- has to keep working, so the pair is READ, never
+    refused. The plural keys win when present; a singular pin that contradicts them raises
+    rather than being quietly dropped.
+
+    Refuses an unregistered profile, a repeated one, ``"none"`` mixed with a real profile, and
+    more than one profile pinned by a single unattributed digest.
+
+    ``required`` (the seam's default) raises ``KeyError`` when NEITHER shape is present: the seam
+    is handed a config ``run_daily_backtest`` has already normalised, so a missing pin there means
+    the normalisation did not run, not that the gates are off. Callers that read a RAW stored
+    config -- the trial-config builder, the master prepare -- pass ``required=False``, where
+    "no key" legitimately means "this run predates the feature".
+    """
+    from ba2_common.core.market_conditions import PROFILES
+
+    raw = config.get("market_condition_profiles")
+    legacy_profile = config.get("market_condition_profile")
+    if raw is None:
+        if legacy_profile is None and "market_condition_profile" not in config:
+            if required:
+                raise KeyError("market_condition_profiles")
+            return [], {}
+        raw = [] if legacy_profile in (None, MARKET_CONDITION_PROFILE_NONE) else [legacy_profile]
+    elif isinstance(raw, str):
+        raw = [t for t in (x.strip() for x in raw.split(",")) if t]
+    profiles = [str(p) for p in raw if p]
+    if legacy_profile is not None and profiles and [legacy_profile] != profiles:
+        # ``"none"`` included: a config saying the gates are off in one key and naming a profile
+        # in the other would run GATED without a word, which is the worse of the two readings.
+        raise ValueError(
+            f"config pins market_condition_profiles {profiles!r} AND market_condition_profile "
+            f"{legacy_profile!r}: they disagree. Carry one shape, not two.")
+    if MARKET_CONDITION_PROFILE_NONE in profiles:
+        if len(profiles) > 1:
+            raise ValueError(f"market_condition_profiles {profiles!r} mixes "
+                             f"{MARKET_CONDITION_PROFILE_NONE!r} with a real profile")
+        profiles = []
+    if len(set(profiles)) != len(profiles):
+        raise ValueError(f"market_condition_profiles {profiles!r} repeats a profile")
+    unknown = [p for p in profiles if p not in PROFILES]
+    if unknown:
+        raise ValueError(f"market-condition profile(s) {unknown!r} are not registered "
+                         f"(known: {sorted(PROFILES)!r} or {MARKET_CONDITION_PROFILE_NONE!r})")
+
+    manifests: Dict[str, Optional[str]] = {}
+    given = config.get("market_condition_manifests")
+    if given:
+        extra = [p for p in given if p not in profiles]
+        if extra:
+            raise ValueError(f"market_condition_manifests pins profile(s) {sorted(extra)!r} the "
+                             f"run does not use (profiles: {profiles!r})")
+        manifests = {p: (given.get(p) or None) for p in profiles}
+    legacy_digest = config.get("market_condition_manifest")
+    if legacy_digest:
+        if len(profiles) > 1 and not given:
+            raise ValueError(
+                f"market_condition_manifest {legacy_digest!r} is a single digest but the run pins "
+                f"{len(profiles)} profiles {profiles!r}. A manifest names the ONE profile it was "
+                f"warmed for: pin market_condition_manifests as {{profile: digest}}.")
+        clash = [p for p in profiles if manifests.get(p) not in (None, legacy_digest)]
+        if clash:
+            raise ValueError(
+                f"config pins market_condition_manifests for {clash!r} AND a different "
+                f"market_condition_manifest {legacy_digest!r}: they disagree.")
+        if not given:
+            manifests = {p: legacy_digest for p in profiles}
+    return profiles, {p: manifests.get(p) for p in profiles}
+
+
+def normalize_market_condition_keys(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The canonical plural pins, for a caller that rebuilds a run config (``run_daily_backtest``
+    normalises once so every later reader of that config sees one shape). A config carrying
+    neither shape predates the feature and normalises to "no profile"."""
+    profiles, manifests = market_condition_pins(config, required=False)
+    return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
+
+
 def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any) -> Optional[Any]:
     """Install this thread's market-condition resolver for one run, or nothing.
 
-    ``config["market_condition_profile"]`` is required (``run_daily_backtest`` defaults it to
-    ``"none"``). ``"none"`` returns None without importing the adapter or touching the seam; a
-    registered profile builds the run's reader over ``price_source`` and returns the resolver;
-    anything else raises.
+    The run's profiles come from :func:`market_condition_pins` (the plural keys, or the legacy
+    singular pair). No profile returns None without importing the adapter or touching the seam;
+    one or more registered profiles build ONE reader EACH over ``price_source`` -- every profile
+    is a separate snapshot with its own coverage -- joined by ``market_condition_reader_for``
+    into the single reader a context carries (a one-profile run gets that reader itself,
+    unwrapped, and is unchanged by this).
 
-    ``config["market_condition_manifest"]`` pins the published snapshot: present, the reader is a
+    A profile's manifest digest pins its published snapshot: present, that profile's reader is a
     mapped-store reader (no calculation anywhere in the run); absent, it computes on a miss and
     warns once -- unless the config is an optimizer trial, which is refused (see below).
     """
-    profile = config["market_condition_profile"]
-    if profile == MARKET_CONDITION_PROFILE_NONE:
+    profiles, manifests = market_condition_pins(config)
+    if not profiles:
         # A run with market leaves but no profile would evaluate every gate as no_context and
         # place ZERO entries without a word (e.g. a trial config that dropped the key after an
         # earlier gated run installed the dispatcher in this process). Refuse it instead.
         leaves = market_condition_leaves_in(config)
         if leaves:
             raise ValueError(
-                f"market_condition_profile is 'none' but the run's rules contain market-condition "
-                f"leaves {leaves!r}: every such gate would be unknown and never pass. Set the "
-                f"profile the rules were built for.")
+                f"no market-condition profile is pinned but the run's rules contain "
+                f"market-condition leaves {leaves!r}: every such gate would be unknown and never "
+                f"pass. Set the profile(s) the rules were built for.")
         _market_condition_tl.resolver = None
         return None
     from ba2_common.core import TradeConditions
-    from ba2_common.core.market_condition_readers import warn_research_mode
-    from ba2_common.core.market_conditions import PROFILES
+    from ba2_common.core.market_condition_readers import (
+        market_condition_reader_for,
+        warn_research_mode,
+    )
 
-    if profile not in PROFILES:
-        raise ValueError(f"market_condition_profile {profile!r} is not registered "
-                         f"(known: {sorted(PROFILES)!r} or {MARKET_CONDITION_PROFILE_NONE!r})")
     from app.services.backtest.market_condition_bt import (
         BacktestMarketConditionReader,
         BacktestMarketConditionResolver,
@@ -259,19 +350,24 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
     # and nothing anywhere would say so. So an optimizer-assembled config (``_ga_trial``: GA trial,
     # re-run, robustness variant and top-N persist alike -- see
     # strategy_optimization_handler._build_daily_trial_config) is REFUSED here instead.
-    digest = config.get("market_condition_manifest")
-    if not digest:
-        if config.get("_ga_trial"):
-            raise ValueError(
-                f"market_condition_profile {profile!r} is on but the trial config pins no "
-                f"market_condition_manifest. An optimization must prepare one snapshot "
-                f"(tools/warm_market_conditions.py plan/build/verify/prepare-host) and carry its "
-                f"digest into every trial; computing 128-session indicators per trial is not a "
-                f"fallback this path takes.")
-        warn_research_mode(profile, "backtest reader")
-    reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest)
-    check_market_condition_coverage(config, reader)
-    resolver = BacktestMarketConditionResolver(reader)
+    readers = []
+    for profile in profiles:
+        digest = manifests.get(profile)
+        if not digest:
+            if config.get("_ga_trial"):
+                raise ValueError(
+                    f"market-condition profile {profile!r} is on but the trial config pins no "
+                    f"manifest for it. An optimization must prepare one snapshot PER PROFILE "
+                    f"(tools/warm_market_conditions.py plan/build/verify/prepare-host) and carry "
+                    f"every digest into every trial; computing 128-session indicators per trial "
+                    f"is not a fallback this path takes.")
+            warn_research_mode(profile, "backtest reader")
+        reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest)
+        # PER PROFILE: each snapshot was warmed separately and can cover a different set of
+        # symbols, so "is this run covered" is a question with one answer per profile.
+        check_market_condition_coverage(config, reader)
+        readers.append(reader)
+    resolver = BacktestMarketConditionResolver(market_condition_reader_for(readers))
     if TradeConditions.get_market_condition_context_resolver() is not _dispatch_market_condition_context:
         TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
     _market_condition_tl.resolver = resolver

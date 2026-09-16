@@ -27,7 +27,7 @@ import random
 import sys as _sys
 import time as _time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -1196,6 +1196,18 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     return decoded_flat if out is None else out
 
 
+def _market_condition_pins(backtest_cfg: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """``(profile, digest)`` for every profile this run pins a snapshot for, in config order.
+
+    One reader of the run config for every consumer here (master prepare, worker pre-flight,
+    trial config), so the plural and legacy-singular shapes are decoded in exactly one place
+    (``seam_wiring.market_condition_pins``)."""
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    profiles, manifests = market_condition_pins(backtest_cfg, required=False)
+    return [(p, manifests[p]) for p in profiles if manifests.get(p)]
+
+
 def _prepare_master_market_conditions(opt_id: int, db: Any,
                                       backtest_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Verify + map this run's pinned market-condition snapshot ON THE MASTER, once.
@@ -1214,31 +1226,49 @@ def _prepare_master_market_conditions(opt_id: int, db: Any,
     not hash to its manifest. A search whose feature inputs cannot be proven is not a search, and
     it must not quietly become a population of zero-trade genomes.
     """
-    digest = backtest_cfg.get("market_condition_manifest")
-    if not digest:
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    profiles, manifests = market_condition_pins(backtest_cfg, required=False)
+    if not profiles:
         return None
+    # A PROFILE WITHOUT A DIGEST FAILS HERE, not once per trial. Before Task 10 this was
+    # unreachable (one profile, one digest); now a run can pin two profiles and warm one, and
+    # filtering the unpinned one out would let the master prepare and every worker pre-flight
+    # report success and then have EVERY trial die inside the seam on the worker. The whole
+    # point of preparing on the master is that the job fails before dispatch.
+    unpinned = [p for p in profiles if not manifests.get(p)]
+    if unpinned:
+        return _fail(opt_id, db,
+                     f"market-condition profile(s) {unpinned!r} are on but this run pins no "
+                     f"manifest for them. An optimization prepares one snapshot PER PROFILE "
+                     f"(tools/warm_market_conditions.py plan/build/verify/prepare-host) and "
+                     f"carries every digest into every trial; without one, every trial would be "
+                     f"refused on the worker rather than the job refused here.")
+    pinned = [(p, manifests[p]) for p in profiles]
     from ba2_common.config import CACHE_FOLDER
     from ba2_common.core.market_condition_reader import prepare_host
 
-    logger.warning(f"strategy_optimization {opt_id}: preparing market-condition manifest "
-                   f"{digest} on the master before dispatch")
-    try:
-        report = prepare_host(CACHE_FOLDER, digest,
-                              backtest_cfg.get("market_condition_profile"),
-                              log=lambda m: logger.warning(f"market-conditions: {m}"))
-    except Exception as e:  # noqa: BLE001 -- reported as a failed job, never as a bad run
-        return _fail(opt_id, db, f"market-condition manifest {digest} could not be prepared on "
-                                 f"the master: {e!r}")
-    if not report.ok:
-        return _fail(opt_id, db,
-                     f"market-condition manifest {digest} FAILED verification on the master: "
-                     f"{report.errors}. Every trial of this run would read a snapshot that does "
-                     f"not hash to its manifest; re-sync the market_conditions bucket and "
-                     f"re-launch.")
-    logger.warning(
-        f"strategy_optimization {opt_id}: market-condition snapshot ready on the master "
-        f"({report.objects_checked} object(s) verified, {report.symbols} symbol(s) mapped, "
-        f"{'built' if report.built else 'already warm'}, {report.elapsed_s:.1f}s)")
+    # ONE SNAPSHOT PER PROFILE (Task 10): a manifest names the single profile it was warmed for,
+    # so a two-profile run has two of them and BOTH have to be servable here before dispatch.
+    for profile, digest in pinned:
+        logger.warning(f"strategy_optimization {opt_id}: preparing market-condition manifest "
+                       f"{digest} ({profile}) on the master before dispatch")
+        try:
+            report = prepare_host(CACHE_FOLDER, digest, profile,
+                                  log=lambda m: logger.warning(f"market-conditions: {m}"))
+        except Exception as e:  # noqa: BLE001 -- reported as a failed job, never as a bad run
+            return _fail(opt_id, db, f"market-condition manifest {digest} ({profile}) could not "
+                                     f"be prepared on the master: {e!r}")
+        if not report.ok:
+            return _fail(opt_id, db,
+                         f"market-condition manifest {digest} ({profile}) FAILED verification on "
+                         f"the master: {report.errors}. Every trial of this run would read a "
+                         f"snapshot that does not hash to its manifest; re-sync the "
+                         f"market_conditions bucket and re-launch.")
+        logger.warning(
+            f"strategy_optimization {opt_id}: market-condition snapshot ready on the master "
+            f"({profile}: {report.objects_checked} object(s) verified, {report.symbols} symbol(s) "
+            f"mapped, {'built' if report.built else 'already warm'}, {report.elapsed_s:.1f}s)")
     return None
 
 
@@ -1939,8 +1969,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     # Pre-flight makes every worker verify + map this snapshot before it receives
                     # a trial; one that cannot is excluded rather than left to return zero-trade
                     # results for every gated genome.
-                    market_condition_manifest=backtest_cfg.get("market_condition_manifest"),
-                    market_condition_profile=backtest_cfg.get("market_condition_profile"),
+                    market_condition_manifests=dict(_market_condition_pins(backtest_cfg)),
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 logger.warning(f"strategy_optimization {opt_id}: DISTRIBUTED across "
@@ -2171,6 +2200,16 @@ def _run_trial_backtest(
     raise ValueError(
         f"Unknown backtest engine: {engine!r} (valid: 'daily', 'ml')"
     )
+
+
+def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """The two canonical market-condition keys for a trial config, from a run config in either
+    shape. Its own function because ``_build_daily_trial_config`` is a WHITELIST: a knob that is
+    not written here is inert however correctly it was parsed upstream."""
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    profiles, manifests = market_condition_pins(backtest_cfg, required=False)
+    return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
 
 
 def _build_daily_trial_config(
@@ -2432,16 +2471,17 @@ def _build_daily_trial_config(
         # as stress_spread_bps and robust_fitness above -- this dict rebuilds the trial config key
         # by key, so a knob missing HERE is inert however correctly it was parsed upstream. Both
         # keys are load-bearing and neither can stand without the other:
-        #   * ``market_condition_profile`` decides whether the resolver is installed at all. Absent,
-        #     run_daily_backtest defaults it to "none" and install_backtest_market_conditions then
-        #     REFUSES a run whose rules carry market leaves (rather than letting every gate read
-        #     no_context and place zero entries).
-        #   * ``market_condition_manifest`` pins the ONE prepared snapshot every trial of the run
-        #     reads. Absent from an optimizer trial, the seam raises: computing 128-session
-        #     indicators per trial, per worker, off whatever each host's cache holds is not a
-        #     fallback (section 4.5), and a feature-cache miss must never become a fitness value.
-        "market_condition_profile": backtest_cfg.get("market_condition_profile") or "none",
-        "market_condition_manifest": backtest_cfg.get("market_condition_manifest"),
+        #   * ``market_condition_profiles`` decides whether the resolver is installed at all.
+        #     Empty, install_backtest_market_conditions REFUSES a run whose rules carry market
+        #     leaves (rather than letting every gate read no_context and place zero entries).
+        #   * ``market_condition_manifests`` pins the prepared snapshot PER PROFILE that every
+        #     trial of the run reads. Missing one on an optimizer trial, the seam raises:
+        #     computing 128-session indicators per trial, per worker, off whatever each host's
+        #     cache holds is not a fallback (section 4.5), and a feature-cache miss must never
+        #     become a fitness value.
+        #   Decoded through the ONE reader of both shapes, so a genome persisted before Task 10
+        #   (singular ``market_condition_profile``/``_manifest``) re-runs unchanged.
+        **_market_condition_trial_pins(backtest_cfg),
         # This config was assembled by the OPTIMIZER (GA trial, re-run, robustness variant or
         # top-N persist), not by the single-backtest path. The market-condition seam reads it to
         # tell "a research run may compute on a miss" from "a search may not".

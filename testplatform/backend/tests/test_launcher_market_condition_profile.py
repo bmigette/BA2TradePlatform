@@ -328,12 +328,13 @@ PROFILE_NONE_O_CC_ENTRY = json.loads(r"""
 """)
 
 
-#: A throwaway CATEGORICAL profile: the only way to exercise the categorical branch before Task 10
-#: registers ``ta-structure-v1``. Codes are deliberately NOT in alphabetical order, so the
-#: "ascending CODE order" contract is actually tested.
+#: A throwaway SECOND profile, for the multi-profile paths. Its field/short cannot collide with
+#: a registered one (``register_profile`` refuses that), so it is not a copy of the real
+#: ``structure_state``: the categorical CONTRACT is now tested against the real registry field
+#: (Task 10 registered ``ta-structure-v1``), and this exists only to make "two profiles" real.
 CATEGORICAL = ProfileSpec(
     name="test-categorical-v1", calc_version="test-categorical-v1/calc-1",
-    fields=(FieldSpec(name="structure_state", kind="categorical", short="structure-state",
+    fields=(FieldSpec(name="t_structure_state", kind="categorical", short="t-structure-state",
                       searched=True, codes={"bear": 2, "bull": 1}, ui_name="Structure state"),),
 )
 
@@ -427,22 +428,23 @@ def test_every_authored_operator_is_one_the_condition_class_accepts(profile_on):
 
 
 def test_a_categorical_field_emits_a_mode_gene_and_no_threshold(monkeypatch):
-    with registered_profile(CATEGORICAL):
-        from ba2_common.core import rule_builders
+    """Against the REAL registry field (``ta-structure-v1``'s ``structure_state``), not a
+    throwaway spec: Task 3 wrote the categorical rules before a categorical field existed."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ta-structure-v1",))
+    leaves = mod._market_condition_gates("o_lc")
+    assert len(leaves) == 5                       # the five searched ta-structure fields
+    leaf, = [x for x in leaves if x["field"] == "structure_state"]
+    assert leaf["id"] == "o_lc-market-structure"
+    assert leaf["op"] == "=="
+    assert leaf["mode_choices"] == [MODE_OFF, "bull", "bear"]  # ascending CODE, not alphabet
+    assert "none" not in leaf["mode_choices"]     # stored as code 0, never selectable
+    assert "value" not in leaf and "value_min" not in leaf and "optimize" not in leaf
+    space = {}
+    from app.services.strategy_param_space import _walk_condition_nodes
 
-        rule_builders.register_market_condition_field_events()
-        monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("test-categorical-v1",))
-        leaf, = mod._market_condition_gates("o_lc")
-        assert leaf["id"] == "o_lc-market-structure-state"
-        assert leaf["op"] == "=="
-        assert leaf["mode_choices"] == [MODE_OFF, "bull", "bear"]  # ascending CODE, not alphabet
-        assert "value" not in leaf and "value_min" not in leaf and "optimize" not in leaf
-        space = {}
-        from app.services.strategy_param_space import _walk_condition_nodes
-
-        _walk_condition_nodes({"id": "root", "type": "AND", "conditions": [leaf]}, space)
-        assert sorted(space) == ["cond:o_lc-market-structure-state:mode"]
-        assert space["cond:o_lc-market-structure-state:mode"]["choices"] == [MODE_OFF, "bull", "bear"]
+    _walk_condition_nodes({"id": "root", "type": "AND", "conditions": [leaf]}, space)
+    assert sorted(space) == ["cond:o_lc-market-structure:mode"]
+    assert space["cond:o_lc-market-structure:mode"]["choices"] == [MODE_OFF, "bull", "bear"]
 
 
 # --------------------------------------------------------------------------- placement + genes
@@ -592,10 +594,36 @@ def test_an_unknown_profile_is_refused_at_launch(monkeypatch):
     assert mod._resolve_market_condition_profiles("ohlcv-v1", "optimize") == ("ohlcv-v1",)
 
 
-def test_more_than_one_profile_is_refused_while_the_trial_seam_pins_one(monkeypatch):
+def test_more_than_one_profile_is_accepted_now_that_the_seam_reads_a_list(monkeypatch):
+    """Task 10 widened ``install_backtest_market_conditions`` to one reader per profile behind a
+    composite, so a comma list is no longer a job that would die per trial."""
     with registered_profile(CATEGORICAL):
-        with pytest.raises(SystemExit, match="takes ONE profile today"):
-            mod._resolve_market_condition_profiles("ohlcv-v1,test-categorical-v1", "optimize")
+        assert mod._resolve_market_condition_profiles(
+            "ohlcv-v1,test-categorical-v1", "optimize") == ("ohlcv-v1", "test-categorical-v1")
+        # ... and a repeat is collapsed, not counted twice.
+        assert mod._resolve_market_condition_profiles(
+            "ohlcv-v1,ohlcv-v1", "optimize") == ("ohlcv-v1",)
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ())
+
+
+def test_one_manifest_per_profile_is_required_and_matched(monkeypatch):
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ohlcv-v1", "ta-structure-v1"))
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {})
+    # bare digests are matched POSITIONALLY to the profile list
+    assert mod._resolve_market_condition_manifests("d1,d2", "optimize") == {
+        "ohlcv-v1": "d1", "ta-structure-v1": "d2"}
+    # ... and the counts must agree, or the pin would silently be for the wrong profile
+    with pytest.raises(SystemExit, match="Give one digest per profile"):
+        mod._resolve_market_condition_manifests("d1", "optimize")
+    # profile=digest is explicit and order-free
+    assert mod._resolve_market_condition_manifests(
+        "ta-structure-v1=d2,ohlcv-v1=d1", "optimize") == {"ta-structure-v1": "d2", "ohlcv-v1": "d1"}
+    with pytest.raises(SystemExit, match="does not select"):
+        mod._resolve_market_condition_manifests("nope-v1=d1,ohlcv-v1=d2", "optimize")
+    with pytest.raises(SystemExit, match="mixes bare digests"):
+        mod._resolve_market_condition_manifests("d1,ohlcv-v1=d2", "optimize")
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ohlcv-v1",))
+    assert mod._resolve_market_condition_manifests("abc123", "optimize") == {"ohlcv-v1": "abc123"}
 
 
 def test_the_optimize_flags_exist_with_the_documented_defaults():
@@ -612,8 +640,8 @@ def test_the_optimize_flags_exist_with_the_documented_defaults():
 
 
 def test_an_optimize_with_a_profile_and_no_manifest_is_refused(profile_on, monkeypatch):
-    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", None)
-    with pytest.raises(SystemExit, match="needs --market-condition-manifest"):
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {})
+    with pytest.raises(SystemExit, match="needs a --market-condition-manifest digest OF ITS OWN"):
         mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
 
 
@@ -621,7 +649,7 @@ def test_a_manifest_without_a_profile_is_refused_rather_than_ignored(monkeypatch
     """Ignoring it would run an UNGATED grid from a command line that says otherwise -- and the
     driver folds the manifest into the job-name digest, so it would read as gated afterwards."""
     monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ())
-    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", "abc123")
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"": "abc123"})
     with pytest.raises(SystemExit, match="without --market-condition-profile"):
         mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
 
@@ -665,7 +693,7 @@ def snapshot(tmp_path, monkeypatch):
 
 def test_a_manifest_that_does_not_cover_the_universe_is_refused_naming_the_symbols(
         profile_on, snapshot, monkeypatch):
-    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     with pytest.raises(SystemExit) as e:
         mod._apply_market_conditions(
             "optimize", {"enabled_instruments": ["AAA", "ZZZ", "QQQ"]}, _built("O_LC"))
@@ -683,7 +711,7 @@ def test_the_coverage_check_reads_the_universe_on_the_block_it_is_given(
     call really happens after the rewrite is the next test's job -- ordering is not observable
     from a unit call.)
     """
-    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     screened = {"enabled_instruments": ["AAA", "ZZZ"]}   # what the screener block writes
     with pytest.raises(SystemExit, match="ZZZ"):
         mod._apply_market_conditions("optimize", screened, _built("O_LC"))
@@ -733,17 +761,20 @@ def test_two_cache_roots_with_the_same_digest_get_their_own_reader(profile_on, t
 
 def test_the_run_config_records_the_profile_the_manifest_and_the_calc_versions(
         profile_on, snapshot, monkeypatch):
-    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     strat = _built("O_LC")
     block = {"enabled_instruments": ["AAA", "BBB"]}
     recorded = mod._apply_market_conditions("optimize", block, strat)
 
-    assert block["market_condition_profile"] == "ohlcv-v1"
-    assert block["market_condition_manifest"] == snapshot
+    # PLURAL: one manifest PER PROFILE, and the provenance read off each is keyed by profile.
+    assert block["market_condition_profiles"] == ["ohlcv-v1"]
+    assert block["market_condition_manifests"] == {"ohlcv-v1": snapshot}
+    assert recorded["manifests"] == {"ohlcv-v1": snapshot}
     assert recorded["calc_versions"] == {"ohlcv-v1": PROFILES["ohlcv-v1"].calc_version}
-    assert recorded["source_profile"] == "fmp-daily-split-adjusted-v1"
-    assert recorded["timing_policy"] == "prior_session_v1"
-    assert recorded["calendar_version"]
+    facts = recorded["facts"]["ohlcv-v1"]
+    assert facts["source_profile"] == "fmp-daily-split-adjusted-v1"
+    assert facts["timing_policy"] == "prior_session_v1"
+    assert facts["calendar_version"]
     assert [f["name"] for f in recorded["fields"]] == [f.name for f in PROFILES["ohlcv-v1"].fields]
     # FieldSpec.to_dict, never dataclasses.asdict: the private _code_pairs must not leak.
     assert all("_code_pairs" not in f for f in recorded["fields"])
@@ -786,7 +817,7 @@ def test_the_persisted_digest_round_trips_into_a_trial_config(profile_on, snapsh
     refuses every one of them."""
     from app.services.strategy_optimization_handler import _build_daily_trial_config
 
-    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFEST", snapshot)
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     strat = _built("O_LC")
     backtest_cfg = {
         "backtest_id": "mc", "start_date": "2024-02-01", "end_date": "2024-06-01",
@@ -798,6 +829,64 @@ def test_the_persisted_digest_round_trips_into_a_trial_config(profile_on, snapsh
     # Round-trip through JSON: the persisted optimization_config is a JSON column.
     backtest_cfg = json.loads(json.dumps(backtest_cfg, default=str))
     trial = _build_daily_trial_config(backtest_cfg, decode_params(strat, {}), None)
-    assert trial["market_condition_profile"] == "ohlcv-v1"
-    assert trial["market_condition_manifest"] == snapshot
+    assert trial["market_condition_profiles"] == ["ohlcv-v1"]
+    assert trial["market_condition_manifests"] == {"ohlcv-v1": snapshot}
     assert trial["_ga_trial"] is True
+
+
+def test_a_pre_task10_persisted_config_still_round_trips_into_a_trial_config():
+    """Every optimization_config persisted BEFORE the seam went plural carries the singular
+    ``market_condition_profile``/``_manifest`` pair. Re-running one of those genomes (the parity
+    tool, a re-run, a robustness variant, a top-N persist) has to keep working."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    legacy = {"backtest_id": "mc", "start_date": "2024-02-01", "end_date": "2024-06-01",
+              "enabled_instruments": ["AAA"], "experts": [{"class": "FMPRating", "settings": {}}],
+              "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
+              "market_condition_profile": "ohlcv-v1", "market_condition_manifest": "e" * 64}
+    trial = _build_daily_trial_config(json.loads(json.dumps(legacy)), {})
+    assert trial["market_condition_profiles"] == ["ohlcv-v1"]
+    assert trial["market_condition_manifests"] == {"ohlcv-v1": "e" * 64}
+    assert trial["_ga_trial"] is True
+
+
+# --------------------------------------------------------------------------- ta-structure-v1
+def test_the_ta_structure_gate_leaves_carry_the_registry_ranges_and_anchors(monkeypatch):
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ta-structure-v1",))
+    leaves = {lf["field"]: lf for lf in mod._market_condition_gates("o_lc")}
+    searched = [f for f in PROFILES["ta-structure-v1"].fields if f.searched]
+    assert set(leaves) == {f.name for f in searched}
+    for spec in searched:
+        leaf = leaves[spec.name]
+        assert leaf["id"] == f"o_lc-market-{spec.short}"
+        assert leaf["mode_optimize"] is True
+        if spec.kind == "numeric":
+            assert leaf["mode_choices"] == list(NUMERIC_MODE_CHOICES)
+            assert (leaf["op"], leaf["value"]) == (spec.anchor_op, spec.anchor_value)
+            assert (leaf["value_min"], leaf["value_max"], leaf["value_step"]) == (
+                spec.value_min, spec.value_max, spec.value_step)
+            assert leaf["optimize"] is True
+        else:
+            assert leaf["mode_choices"] == ["off", *spec.codes]
+            assert "value" not in leaf and "optimize" not in leaf
+
+
+def test_the_profile_adds_nine_genes_per_arm_and_both_profiles_add_fifteen(monkeypatch):
+    """Design 3.2: "four numeric and one categorical, NINE genes per arm on top of the six from
+    section 3". Counted on the strategy the run stores, not re-derived from the registry."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ta-structure-v1",))
+    strat = _built("O_LC")
+    genes = mod._market_condition_gene_names(strat)
+    assert len(genes) == 9
+    assert genes == sorted(g for g in collect_param_space(strat) if "-market-" in g)
+
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ohlcv-v1", "ta-structure-v1"))
+    both = mod._market_condition_gene_names(_built("O_LC"))
+    assert len(both) == 15
+
+
+def test_both_profiles_gate_only_the_initial_entry_tree(monkeypatch):
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ohlcv-v1", "ta-structure-v1"))
+    strat = _built("O_LC")
+    assert len(_market_ids(strat.entry_rules)) == 8          # 3 ohlcv + 5 ta-structure leaves
+    assert _market_ids(strat.exit_rules) == []

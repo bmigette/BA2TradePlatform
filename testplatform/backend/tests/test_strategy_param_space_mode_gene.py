@@ -331,3 +331,45 @@ def test_decode_does_not_mutate_the_flat_genome():
     before = dict(flat)
     decode_params(s, flat)
     assert flat == before
+
+
+# ---------------------------------------------------------------------------
+# the REAL categorical field (design 8.16). Everything above uses a throwaway registered
+# profile, because Task 3 wrote the categorical rules before a categorical field existed. Task 10
+# registered ``ta-structure-v1``, so the rules are now pinned against the field the launcher
+# actually emits -- including the two refusals whose whole point is the shape of THAT field.
+# ---------------------------------------------------------------------------
+_REAL_LEAF = {"id": "o_lc-market-structure", "field": "structure_state", "op": "==",
+              "comparison": "==", "mode_optimize": True, "mode_choices": ["off", "bull", "bear"]}
+
+
+def test_the_real_structure_state_emits_one_mode_gene_over_off_bull_bear():
+    space = collect_param_space(_strategy(dict(_REAL_LEAF)))
+    assert list(space) == ["cond:o_lc-market-structure:mode"]
+    assert space["cond:o_lc-market-structure:mode"] == {
+        "type": "choice", "choices": ["off", "bull", "bear"], "min": 0, "max": 2, "step": 1}
+    assert "cond:o_lc-market-structure:value" not in space
+
+
+@pytest.mark.parametrize("mode,code", [("bull", 1.0), ("bear", 2.0)])
+def test_the_real_structure_state_decodes_to_an_equality_on_its_registry_code(mode, code):
+    leaf = _by_id(decode_params(_strategy(dict(_REAL_LEAF)),
+                                {"cond:o_lc-market-structure:mode": mode}))["o_lc-market-structure"]
+    assert (leaf["op"], leaf["comparison"], leaf["mode"]) == ("==", "==", mode)
+    assert leaf["value"] == code and isinstance(leaf["value"], float)
+
+
+def test_a_structure_state_leaf_carrying_a_threshold_is_refused_at_template_load():
+    """A categorical field has no threshold to search: a leaf that claims one describes a search
+    space the decode cannot produce, and it must not reach the GA as a silently ignored gene."""
+    with pytest.raises(ValueError, match=r"o_lc-market-structure.*no threshold gene"):
+        collect_param_space(_strategy(dict(_REAL_LEAF, optimize=True)))
+
+
+def test_a_structure_state_leaf_listing_none_is_refused_at_template_load():
+    """``none`` is STORED (code 0) and is never selectable: a gate on "no classification" is not
+    a regime filter, and the registry's choice list is the contract the template must match."""
+    with pytest.raises(ValueError, match="o_lc-market-structure"):
+        collect_param_space(_strategy(dict(_REAL_LEAF, mode_choices=["off", "bull", "bear", "none"])))
+    with pytest.raises(ValueError, match="o_lc-market-structure"):
+        collect_param_space(_strategy(dict(_REAL_LEAF, mode_choices=["off", "none"])))

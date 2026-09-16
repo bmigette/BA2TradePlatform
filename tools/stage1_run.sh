@@ -110,43 +110,79 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
   MC_END="${STAGE1_END:-2025-12-31}"
   MC_DRY=0
   case " $* " in *" --dry-run "*) MC_DRY=1 ;; esac
-  if [ "$MC_DRY" = "1" ]; then
-    echo "stage1_run.sh: market-condition warm step (profile $MARKET_CONDITION_PROFILE), run ONCE"
-    echo "               before the matrix command below:"
-    echo "  $MC_PYTHON $MC_WARM plan --profile $MARKET_CONDITION_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --out $MC_PLAN"
-    echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN --cache-only --print-digest   # -> MARKET_CONDITION_MANIFEST"
-    echo "  $MC_PYTHON $MC_WARM verify --manifest \$MARKET_CONDITION_MANIFEST"
-    echo "  $MC_PYTHON $MC_WARM prepare-host --manifest \$MARKET_CONDITION_MANIFEST --profile $MARKET_CONDITION_PROFILE"
-    MARKET_CONDITION_MANIFEST="${MARKET_CONDITION_MANIFEST:-DIGEST-FROM-BUILD}"
-  else
-    "$MC_PYTHON" "$MC_WARM" plan --profile "$MARKET_CONDITION_PROFILE" \
-      --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --out "$MC_PLAN" || {
-      echo "stage1_run.sh: market-condition PLAN is actionable (missing coverage or a failed" >&2
-      echo "source preflight) -- resolve it (re-fetch those symbols, or trim the universe) and" >&2
-      echo "re-run. Refusing to launch a gated grid on an incomplete snapshot." >&2
-      exit 1; }
-    if [ -z "$MARKET_CONDITION_MANIFEST" ]; then
-      # --print-digest puts the digest on stdout and the JSON report on stderr; `tail -n 1` is
-      # belt and braces against a library that logs to stdout anyway. A mangled capture cannot
-      # reach a job silently: the launcher opens the manifest before dispatch and refuses the run
-      # naming the digest it could not read.
-      MARKET_CONDITION_MANIFEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN" --cache-only \
-        --print-digest | tail -n 1)" || {
-        echo "stage1_run.sh: market-condition BUILD failed" >&2; exit 1; }
-    fi
-    if [ -z "$MARKET_CONDITION_MANIFEST" ]; then
-      echo "stage1_run.sh: market-condition build published no manifest" >&2
+  # ONE SNAPSHOT PER PROFILE (Task 10): MARKET_CONDITION_PROFILE may be a comma list, and a
+  # manifest names the single profile it was warmed for, so the whole plan/build/verify/
+  # prepare-host sequence runs once per profile and the digests are passed on as profile=digest
+  # pairs. Pre-setting MARKET_CONDITION_MANIFEST skips plan+build for the profiles it names --
+  # and is then what the grid runs on, never built-and-discarded: a digest this script published
+  # while the run used a different one would be a snapshot nobody compared.
+  MC_PROFILES="$(echo "$MARKET_CONDITION_PROFILE" | tr ',' ' ')"
+  MC_N=0
+  for MC_P in $MC_PROFILES; do MC_N=$((MC_N + 1)); done
+  MC_PRESET="$MARKET_CONDITION_MANIFEST"
+  if [ -n "$MC_PRESET" ] && [ "$MC_N" -gt 1 ]; then
+    case "$MC_PRESET" in
+      *=*) ;;
+      *) echo "stage1_run.sh: MARKET_CONDITION_MANIFEST must be profile=digest pairs when more" >&2
+         echo "than one profile is warmed ($MARKET_CONDITION_PROFILE): one bare digest cannot" >&2
+         echo "say which profile's snapshot it is." >&2
+         exit 1 ;;
+    esac
+  fi
+  MC_PINS=""
+  for MC_PROFILE in $MC_PROFILES; do
+    MC_PLAN_P="${MC_PLAN%.json}.${MC_PROFILE}.json"
+    MC_DIGEST=""
+    for MC_TOK in $(echo "$MC_PRESET" | tr ',' ' '); do
+      case "$MC_TOK" in
+        "$MC_PROFILE="*) MC_DIGEST="${MC_TOK#*=}" ;;
+        *=*) ;;
+        *) MC_DIGEST="$MC_TOK" ;;
+      esac
+    done
+    if [ -n "$MC_PRESET" ] && [ -z "$MC_DIGEST" ]; then
+      echo "stage1_run.sh: MARKET_CONDITION_MANIFEST names no digest for profile $MC_PROFILE" >&2
       exit 1
     fi
-    "$MC_PYTHON" "$MC_WARM" verify --manifest "$MARKET_CONDITION_MANIFEST" || {
-      echo "stage1_run.sh: market-condition VERIFY failed for $MARKET_CONDITION_MANIFEST" >&2
-      exit 1; }
-    "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MARKET_CONDITION_MANIFEST" \
-      --profile "$MARKET_CONDITION_PROFILE" || {
-      echo "stage1_run.sh: market-condition PREPARE-HOST failed for $MARKET_CONDITION_MANIFEST" >&2
-      exit 1; }
-    echo "stage1_run.sh: market-condition profile $MARKET_CONDITION_PROFILE manifest $MARKET_CONDITION_MANIFEST prepared"
-  fi
+    if [ "$MC_DRY" = "1" ]; then
+      echo "stage1_run.sh: market-condition warm step (profile $MC_PROFILE), run ONCE"
+      echo "               before the matrix command below:"
+      echo "  $MC_PYTHON $MC_WARM plan --profile $MC_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --out $MC_PLAN_P"
+      echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN_P --cache-only --print-digest   # -> the $MC_PROFILE digest"
+      echo "  $MC_PYTHON $MC_WARM verify --manifest <digest>"
+      echo "  $MC_PYTHON $MC_WARM prepare-host --manifest <digest> --profile $MC_PROFILE"
+      MC_DIGEST="${MC_DIGEST:-DIGEST-FROM-BUILD}"
+    else
+      if [ -z "$MC_DIGEST" ]; then
+        "$MC_PYTHON" "$MC_WARM" plan --profile "$MC_PROFILE" \
+          --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --out "$MC_PLAN_P" || {
+          echo "stage1_run.sh: market-condition PLAN is actionable for $MC_PROFILE (missing" >&2
+          echo "coverage or a failed source preflight) -- resolve it (re-fetch those symbols, or" >&2
+          echo "trim the universe) and re-run. Refusing to launch a gated grid on an incomplete" >&2
+          echo "snapshot." >&2
+          exit 1; }
+        MC_DIGEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN_P" --cache-only \
+          --print-digest | tail -n 1)" || {
+          echo "stage1_run.sh: market-condition BUILD failed for $MC_PROFILE" >&2; exit 1; }
+        if [ -z "$MC_DIGEST" ]; then
+          echo "stage1_run.sh: market-condition build published no manifest for $MC_PROFILE" >&2
+          exit 1
+        fi
+      else
+        echo "stage1_run.sh: market-condition profile $MC_PROFILE uses the pre-set manifest $MC_DIGEST (plan/build skipped)"
+      fi
+      "$MC_PYTHON" "$MC_WARM" verify --manifest "$MC_DIGEST" || {
+        echo "stage1_run.sh: market-condition VERIFY failed for $MC_DIGEST ($MC_PROFILE)" >&2
+        exit 1; }
+      "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MC_DIGEST" \
+        --profile "$MC_PROFILE" || {
+        echo "stage1_run.sh: market-condition PREPARE-HOST failed for $MC_DIGEST ($MC_PROFILE)" >&2
+        exit 1; }
+      echo "stage1_run.sh: market-condition profile $MC_PROFILE manifest $MC_DIGEST prepared"
+    fi
+    MC_PINS="${MC_PINS:+$MC_PINS,}$MC_PROFILE=$MC_DIGEST"
+  done
+  MARKET_CONDITION_MANIFEST="$MC_PINS"
   MC_ARGS=(--market-condition-profile "$MARKET_CONDITION_PROFILE" \
            --market-condition-manifest "$MARKET_CONDITION_MANIFEST")
 fi

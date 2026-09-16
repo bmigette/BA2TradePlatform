@@ -755,6 +755,7 @@ def run_daily_backtest(
         clear_backtest_market_conditions,
         install_backtest_market_conditions,
         make_indicator_provider,
+        normalize_market_condition_keys,
         set_backtest_ohlcv_override,
         wire_backtest_seams,
     )
@@ -775,12 +776,15 @@ def run_daily_backtest(
         # on every non-screener run -> the engine's entry gate is a no-op (behaviour unchanged).
         "screener_runtime": config.get("screener_runtime"),
         # Market-condition entry gates (design 2026-09-15): absent on every existing config, which
-        # means "none" -- nothing is installed and no adapter is imported for the run. The
-        # ``or "none"`` default is DELIBERATE back-compat (every persisted config predates the
-        # key), not a hidden fallback: install_backtest_market_conditions refuses a "none" run
-        # whose rules contain market-condition leaves, so a config that LOST the key fails loudly
+        # means no profile -- nothing is installed and no adapter is imported for the run. That
+        # default is DELIBERATE back-compat (every persisted config predates the keys), not a
+        # hidden fallback: install_backtest_market_conditions refuses a profile-less run whose
+        # rules contain market-condition leaves, so a config that LOST the pin fails loudly
         # instead of evaluating every gate as no_context and placing zero entries.
-        "market_condition_profile": config.get("market_condition_profile") or "none",
+        # Normalised ONCE here, to the plural shape, so no later reader has to know which of the
+        # two shapes (Task 10 plural, or the legacy singular pair every persisted run carries)
+        # this particular config arrived in.
+        **normalize_market_condition_keys(config),
     }
 
     # Free the PREVIOUS run's OHLCV memo if this run's working set (universe + window + interval)
@@ -895,8 +899,8 @@ def run_daily_backtest(
                 # be able to mislabel a run whose gates were on.
                 market_condition_record = MarketConditionRunRecord(
                     market_condition_resolver,
-                    profile=config["market_condition_profile"],
-                    manifest_digest=config.get("market_condition_manifest"))
+                    profiles=config["market_condition_profiles"],
+                    manifests=config["market_condition_manifests"])
             # Clamp the indicator/ATR OHLCV fetches to the backtest clock: PandasIndicatorCalc
             # and get_latest_atr fetch with end_date=now(), which would leak future bars into the
             # ATR/indicators used for sizing + rule conditions. The clamp follows ps.set_clock();

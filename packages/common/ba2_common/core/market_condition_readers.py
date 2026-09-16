@@ -32,7 +32,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, Hashable, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Hashable, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -49,6 +49,7 @@ from ba2_common.core.market_condition_source import (
 from ba2_common.core.market_conditions import (
     COMPUTE_BY_PROFILE,
     PROFILES,
+    STATUS_MISSING_SESSION,
     STATUS_VALID,
     WINDOW,
     FeatureRow,
@@ -57,6 +58,8 @@ from ba2_common.core.market_conditions import (
 
 __all__ = [
     "MEMO_SIZE",
+    "CompositeMarketConditionReader",
+    "market_condition_reader_for",
     "MarketConditionVersionMismatch",
     "ObservedWindow",
     "WindowMarketConditionReader",
@@ -539,3 +542,93 @@ class ReplayMarketConditionReader:
                                     source_profile=self._source_profile,
                                     timing_policy=self._timing_policy, calc_version=self.calc_version)
         return window_from_bytes(self._retained_bytes(payload, identity))
+
+
+class CompositeMarketConditionReader:
+    """One reader per PROFILE behind a single ``MarketConditionReader`` (design 3.2 + Task 10).
+
+    A run can pin more than one profile (``ohlcv-v1`` and ``ta-structure-v1``), but a condition
+    knows only its own FIELD name and a ``MarketConditionContext`` carries one reader. This joins
+    them: ``observe`` asks every profile's reader and MERGES their rows by field into one
+    ``FeatureRow``. Field names are globally unique across profiles (``register_profile``
+    refuses a clash), so the merge can never be ambiguous and no caller has to know which profile
+    served which field.
+
+    A profile with NO row for (symbol, session) contributes its fields as ``missing_session``
+    rather than leaving them out. The difference matters: an ABSENT field raises ``LookupError``
+    in the condition ("the reader was not built for this field's profile"), which is a wiring
+    defect worth raising over, and a profile whose snapshot simply has no row for this symbol on
+    this session is not one -- it is exactly the unknown the gate must refuse to pass on. When
+    NO profile has a row the composite returns ``None``, which is byte-for-byte what a single
+    reader does, so a one-profile run behaves identically whether or not it is wrapped.
+
+    Building one is cheap; ``observe`` is on the decision path, so the merged rows are memoised
+    in the same bounded LRU the window readers use.
+    """
+
+    def __init__(self, readers: Sequence[Any], *, memo_size: int = MEMO_SIZE):
+        readers = tuple(readers)
+        if not readers:
+            raise ValueError("a composite market-condition reader needs at least one reader")
+        profiles = [r.profile for r in readers]
+        if len(set(profiles)) != len(profiles):
+            raise ValueError(f"composite market-condition readers repeat a profile: {profiles!r}")
+        self.readers = readers
+        self.profiles: Tuple[str, ...] = tuple(profiles)
+        self.calc_versions: Dict[str, str] = {r.profile: r.calc_version for r in readers}
+        #: The context's single ``calc_version`` string: one profile's version verbatim (so a
+        #: single-profile run records exactly what it always did), else every profile's, named.
+        self.calc_version = (readers[0].calc_version if len(readers) == 1
+                             else "; ".join(f"{p}={self.calc_versions[p]}" for p in self.profiles))
+        self._memo_size = int(memo_size)
+        self._memo: "OrderedDict[Hashable, Any]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    @property
+    def mapped_readers(self) -> Tuple[Any, ...]:
+        """Each profile's ``MappedMarketConditionReader`` (or None), in profile order. The host
+        asks each snapshot its own coverage question; there is no single answer across profiles."""
+        return tuple(getattr(r, "mapped_reader", None) for r in self.readers)
+
+    def observe(self, symbol: str, session: date) -> Optional[FeatureRow]:
+        key = (symbol, session)
+        with self._lock:
+            hit = self._memo.get(key, _ABSENT)
+            if hit is not _ABSENT:
+                self._memo.move_to_end(key)
+        if hit is not _ABSENT:
+            return hit
+        values: Dict[str, Observation] = {}
+        versions: Dict[str, str] = {}
+        any_row = False
+        for reader in self.readers:
+            row = reader.observe(symbol, session)
+            if row is None:
+                missing = Observation(None, STATUS_MISSING_SESSION,
+                                      f"profile {reader.profile!r} has no feature row for "
+                                      f"{symbol} at {session}")
+                for spec in PROFILES[reader.profile].fields:
+                    values[spec.name] = missing
+                    versions[spec.name] = reader.calc_version
+                continue
+            any_row = True
+            for name, obs in row.by_field().items():
+                values[name] = obs
+                versions[name] = row.calc_versions[name]
+        merged = FeatureRow(values=values, calc_versions=versions) if any_row else None
+        with self._lock:
+            self._memo[key] = merged
+            self._memo.move_to_end(key)
+            while len(self._memo) > self._memo_size:
+                self._memo.popitem(last=False)
+        return merged
+
+
+def market_condition_reader_for(readers: Sequence[Any]) -> Any:
+    """The reader a run installs for ``readers``: the reader itself when there is exactly one
+    profile (no wrapper, no merge, no second memo -- a single-profile run is unchanged by this
+    widening), a :class:`CompositeMarketConditionReader` otherwise."""
+    readers = tuple(readers)
+    if len(readers) == 1:
+        return readers[0]
+    return CompositeMarketConditionReader(readers)

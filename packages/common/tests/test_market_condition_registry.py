@@ -141,7 +141,7 @@ def test_register_profile_rejects_duplicates():
         register_profile(ProfileSpec(name="short", calc_version="x", fields=(_cat("t_other", short="adx"),)))
     with pytest.raises(ValueError):   # empty profile
         register_profile(ProfileSpec(name="empty", calc_version="x", fields=()))
-    assert set(PROFILES) == {"ohlcv-v1"}
+    assert set(PROFILES) == {"ohlcv-v1", "ta-structure-v1"}   # nothing above was registered
 
 
 def test_registered_profile_hook_registers_then_restores():

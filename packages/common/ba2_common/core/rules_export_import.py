@@ -78,6 +78,16 @@ _FIELD_ABBR: Dict[str, str] = {
     "has_position_account": "acctPos", "has_no_position_account": "acctNoPos",
     "has_option_position": "optPos", "has_covered_call": "hasCC",
     "has_protective_put": "hasPP", "has_assigned_shares": "assigned",
+    # Market-condition chart-structure fields (design 2026-09-15 3.2). Curated for the same
+    # reason: the 12-char camelCase fallback renders both distance fields as "structureDis",
+    # both prior-range fields as "closeVsPrior" and both break counters as "structureBar".
+    "structure_dist_support_atr": "distSup", "structure_dist_resistance_atr": "distRes",
+    "structure_support_touches": "supTouch", "structure_resistance_touches": "resTouch",
+    "channel_slope_20_atr": "chanSlope", "channel_width_20_atr": "chanWidth",
+    "channel_pos_20": "chanPos",
+    "close_vs_prior_high_20_atr": "vsPriorHi", "close_vs_prior_low_20_atr": "vsPriorLo",
+    "structure_state": "swing",
+    "structure_bars_since_bos": "sinceBos", "structure_bars_since_choch": "sinceChoch",
 }
 _OP_TOKEN: Dict[str, str] = {
     ">": "gt", ">=": "gte", "<": "lt", "<=": "lte", "==": "eq", "!=": "ne",

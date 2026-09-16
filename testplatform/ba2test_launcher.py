@@ -4508,11 +4508,13 @@ _OPTION_GATES_OFF = False
 # ranges, anchors and choice lists all read from the spec. A second profile (Task 10's
 # ``ta-structure-v1``) is therefore data, not a code path here.
 _MARKET_CONDITION_PROFILES: "tuple[str, ...]" = ()
-#: The published snapshot every trial of the run reads (design 4.5). REQUIRED whenever a profile
-#: is on: every command that sets these globals (optimize / optimize-batch) dispatches GA trials,
-#: and the seam refuses a trial config with a profile and no manifest. Research mode (compute on a
-#: miss, one warning) is for a one-off run assembled in code, not for these commands.
-_MARKET_CONDITION_MANIFEST: "str | None" = None
+#: ``{profile: digest}`` -- the published snapshot every trial of the run reads, ONE PER
+#: PROFILE (design 4.5; a manifest names the single profile it was warmed for). REQUIRED for
+#: every selected profile: every command that sets these globals (optimize / optimize-batch)
+#: dispatches GA trials, and the seam refuses a trial config with a profile and no manifest for
+#: it. Research mode (compute on a miss, one warning) is for a one-off run assembled in code,
+#: not for these commands.
+_MARKET_CONDITION_MANIFESTS: dict = {}
 
 
 def _market_condition_gates(m: str) -> list:
@@ -4684,15 +4686,65 @@ def _resolve_market_condition_profiles(raw, command: str) -> tuple:
     for t in tokens:
         if t not in seen:
             seen.append(t)
-    if len(seen) > 1:
-        # The trial seam (install_backtest_market_conditions) pins ONE profile per run and one
-        # reader over it. Accepting a list here would produce rules the trials cannot install --
-        # a job that dies per trial rather than at launch. Task 10 widens the seam and lifts this.
-        sys.exit(f"{command}: --market-condition-profile takes ONE profile today (got {seen!r}); "
-                 f"the per-trial reader is pinned to a single profile "
-                 f"(app.services.backtest.seam_wiring.install_backtest_market_conditions)")
+    # A LIST IS ACCEPTED since Task 10: the trial seam builds one reader per profile behind a
+    # composite (``seam_wiring.install_backtest_market_conditions`` ->
+    # ``market_condition_reader_for``), so rules gated on two profiles are rules the trials can
+    # install. Each profile still needs its OWN manifest -- see _resolve_market_condition_manifests.
     _MARKET_CONDITION_PROFILES = tuple(seen)
     return _MARKET_CONDITION_PROFILES
+
+
+def _resolve_market_condition_manifests(raw, command: str) -> dict:
+    """Parse ``--market-condition-manifest`` into ``{profile: digest}``; sets the global.
+
+    Two spellings, because one profile is the common case and must stay a bare digest:
+
+    * ``<digest>`` (or a comma list of them) -- matched POSITIONALLY to
+      ``--market-condition-profile``, so the counts must agree;
+    * ``<profile>=<digest>[,<profile>=<digest>...]`` -- explicit, for a command line where the
+      positional reading would be a silent mis-pin.
+
+    A digest given for a profile the run does not select, or a selected profile left without
+    one, is a launch-time refusal: a snapshot pinned to the wrong profile would be read as a
+    profile whose fields it does not contain, and a missing one would send every trial into the
+    seam's own refusal one dispatch later.
+    """
+    global _MARKET_CONDITION_MANIFESTS
+    tokens = [t.strip() for t in str(raw or "").split(",") if t.strip()]
+    if not tokens:
+        _MARKET_CONDITION_MANIFESTS = {}
+        return _MARKET_CONDITION_MANIFESTS
+    if any("=" in t for t in tokens):
+        if not all("=" in t for t in tokens):
+            sys.exit(f"{command}: --market-condition-manifest {raw!r} mixes bare digests with "
+                     f"profile=digest pairs; use one spelling")
+        pins = {}
+        for t in tokens:
+            profile, _, digest = t.partition("=")
+            profile, digest = profile.strip(), digest.strip()
+            if not profile or not digest:
+                sys.exit(f"{command}: --market-condition-manifest entry {t!r} is not profile=digest")
+            if profile in pins:
+                sys.exit(f"{command}: --market-condition-manifest names profile {profile!r} twice")
+            pins[profile] = digest
+    elif _MARKET_CONDITION_PROFILES and len(tokens) != len(_MARKET_CONDITION_PROFILES):
+        sys.exit(f"{command}: {len(tokens)} --market-condition-manifest digest(s) for "
+                 f"{len(_MARKET_CONDITION_PROFILES)} profile(s) "
+                 f"{list(_MARKET_CONDITION_PROFILES)!r}. Give one digest per profile, in the same "
+                 f"order, or use profile=digest pairs.")
+    else:
+        pins = dict(zip(_MARKET_CONDITION_PROFILES, tokens))
+        if not _MARKET_CONDITION_PROFILES:
+            # No profile at all: keep the digests so _apply_market_conditions can refuse the
+            # command line rather than run an UNGATED grid that every listing calls gated.
+            pins = {"": tokens[0]}
+    extra = [p for p in pins if p and p not in _MARKET_CONDITION_PROFILES]
+    if extra and _MARKET_CONDITION_PROFILES:
+        sys.exit(f"{command}: --market-condition-manifest pins profile(s) {sorted(extra)!r} that "
+                 f"--market-condition-profile does not select "
+                 f"({list(_MARKET_CONDITION_PROFILES)!r})")
+    _MARKET_CONDITION_MANIFESTS = pins
+    return _MARKET_CONDITION_MANIFESTS
 
 
 def _market_condition_gene_names(strat) -> list:
@@ -4788,59 +4840,68 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat) -> dict:
     Returns the recorded block (``{}`` when the profile is off).
     """
     if not _MARKET_CONDITION_PROFILES:
-        if _MARKET_CONDITION_MANIFEST:
+        if _MARKET_CONDITION_MANIFESTS:
             # Ignoring it would run an UNGATED grid from a command line that says otherwise, and
             # the driver folds the manifest into the job-name digest -- so the result would look
             # gated in every listing afterwards.
-            sys.exit(f"{command}: --market-condition-manifest {_MARKET_CONDITION_MANIFEST!r} "
-                     f"was given without --market-condition-profile; nothing would read it. "
-                     f"Pass the profile, or drop the manifest.")
+            sys.exit(f"{command}: --market-condition-manifest "
+                     f"{sorted(_MARKET_CONDITION_MANIFESTS.values())!r} was given without "
+                     f"--market-condition-profile; nothing would read it. Pass the profile, or "
+                     f"drop the manifest.")
         return {}
     from types import SimpleNamespace
 
     from app.services.backtest.seam_wiring import check_market_condition_coverage
     from ba2_common.core.market_conditions import PROFILES
 
-    profile = _MARKET_CONDITION_PROFILES[0]
-    digest = _MARKET_CONDITION_MANIFEST
-    if not digest:
-        sys.exit(f"{command}: --market-condition-profile {profile!r} needs "
-                 f"--market-condition-manifest <digest>. An optimization pins ONE prepared "
-                 f"snapshot and carries its digest into every trial "
-                 f"(tools/warm_market_conditions.py plan/build/verify/prepare-host); computing "
-                 f"the indicators per trial is not a fallback this path takes.")
-    try:
-        facts = _market_condition_manifest_facts(digest, profile)
-    except Exception as e:  # noqa: BLE001 -- any manifest fault is a launch-time refusal
-        sys.exit(f"{command}: market-condition manifest {digest!r} for profile {profile!r} is not "
-                 f"usable on this host: {e}")
-    facts = dict(facts)          # the cached dict is shared across a batch's jobs
-    reader = facts.pop("reader")
     universe = list(backtest_block.get("enabled_instruments") or [])
-    try:
-        check_market_condition_coverage(
-            {"enabled_instruments": universe, "_ga_trial": True},
-            SimpleNamespace(mapped_reader=reader),
-        )
-    except ValueError as e:
-        sys.exit(f"{command}: {e}")
+    manifests: dict = {}
+    facts_by_profile: dict = {}
+    warmed: dict = {}
+    for profile in _MARKET_CONDITION_PROFILES:
+        digest = _MARKET_CONDITION_MANIFESTS.get(profile)
+        if not digest:
+            sys.exit(f"{command}: --market-condition-profile {profile!r} needs a "
+                     f"--market-condition-manifest digest OF ITS OWN. An optimization pins one "
+                     f"prepared snapshot PER PROFILE and carries every digest into every trial "
+                     f"(tools/warm_market_conditions.py plan/build/verify/prepare-host); "
+                     f"computing the indicators per trial is not a fallback this path takes.")
+        try:
+            facts = _market_condition_manifest_facts(digest, profile)
+        except Exception as e:  # noqa: BLE001 -- any manifest fault is a launch-time refusal
+            sys.exit(f"{command}: market-condition manifest {digest!r} for profile {profile!r} is "
+                     f"not usable on this host: {e}")
+        facts = dict(facts)          # the cached dict is shared across a batch's jobs
+        reader = facts.pop("reader")
+        try:
+            # PER PROFILE: two snapshots were warmed separately and can cover different symbols.
+            check_market_condition_coverage(
+                {"enabled_instruments": universe, "_ga_trial": True},
+                SimpleNamespace(mapped_reader=reader),
+            )
+        except ValueError as e:
+            sys.exit(f"{command}: {e}")
+        manifests[profile] = digest
+        facts_by_profile[profile] = facts
+        warmed[profile] = len(reader.symbols())
 
-    backtest_block["market_condition_profile"] = profile
-    backtest_block["market_condition_manifest"] = digest
+    backtest_block["market_condition_profiles"] = list(_MARKET_CONDITION_PROFILES)
+    backtest_block["market_condition_manifests"] = manifests
     genes = _market_condition_gene_names(strat)
     recorded = {
         "profiles": list(_MARKET_CONDITION_PROFILES),
-        "manifest": digest,
+        "manifests": manifests,
         "calc_versions": {p: PROFILES[p].calc_version for p in _MARKET_CONDITION_PROFILES},
+        "facts": facts_by_profile,
         "fields": [f.to_dict() for p in _MARKET_CONDITION_PROFILES for f in PROFILES[p].fields],
         "genes": genes,
         "gene_count": len(genes),
-        **facts,
     }
     backtest_block["market_condition"] = recorded
-    print(f"{command}: market-condition profile {profile} manifest {digest} "
-          f"({len(reader.symbols())} symbols warmed, {len(genes)} added genes; population and "
-          f"generations are NOT scaled by the profile)")
+    shown = ", ".join(f"{p} {manifests[p]} ({warmed[p]} symbols warmed)"
+                      for p in _MARKET_CONDITION_PROFILES)
+    print(f"{command}: market-condition {shown}; {len(genes)} added genes; population and "
+          f"generations are NOT scaled by the profile(s)")
     return recorded
 
 
@@ -5476,10 +5537,9 @@ def _cmd_optimize(args) -> int:
     _OPTION_MIN_VOLUME = int(getattr(args, "option_min_volume", _OPTION_MIN_VOLUME_DEFAULT))
     # Read BEFORE _build_strategy below — the option builders consult the module global.
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
-    global _MARKET_CONDITION_MANIFEST
     # Read BEFORE _build_strategy too: the market gates are appended by the same builders.
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
-    _MARKET_CONDITION_MANIFEST = getattr(args, "market_condition_manifest", None)
+    _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -5869,10 +5929,10 @@ def _cmd_optimize_batch(args) -> int:
     # and reports "no trades" for a reason the operator has just tried to rule out.
     global _OPTION_GATES_OFF
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
-    global _MARKET_CONDITION_MANIFEST
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None),
                                        "optimize-batch")
-    _MARKET_CONDITION_MANIFEST = getattr(args, "market_condition_manifest", None)
+    _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
+                                        "optimize-batch")
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -6531,18 +6591,22 @@ def _add_market_condition_args(p) -> None:
     ``_apply_market_conditions`` for why a per-trial computation is not an acceptable fallback.
     """
     p.add_argument("--market-condition-profile", default=_MARKET_CONDITION_NONE,
-                   metavar="none|<profile>",
-                   help="Append the market-condition entry gates of a REGISTERED profile "
-                        "(ba2_common.core.market_conditions.PROFILES, e.g. ohlcv-v1) to every "
-                        "option structure's INITIAL-ENTRY tree: one mode gene per searched field "
-                        "(off/below/above, or off/<value> for a categorical one) plus the "
-                        "threshold gene of a numeric one. Default 'none' = exactly today's rules "
-                        "and genes. Population/generations are NOT scaled by the profile.")
-    p.add_argument("--market-condition-manifest", default=None, metavar="DIGEST",
-                   help="The prepared snapshot every trial reads (tools/warm_market_conditions.py "
-                        "plan/build/verify/prepare-host prints it). REQUIRED with a profile: "
-                        "without it each worker would compute the indicators from whatever cache "
-                        "it happened to hold. Refused at launch when it does not cover the run's "
+                   metavar="none|<profile>[,<profile>...]",
+                   help="Append the market-condition entry gates of one or more REGISTERED "
+                        "profiles (ba2_common.core.market_conditions.PROFILES, e.g. "
+                        "ohlcv-v1,ta-structure-v1) to every option structure's INITIAL-ENTRY "
+                        "tree: one mode gene per searched field (off/below/above, or "
+                        "off/<value> for a categorical one) plus the threshold gene of a numeric "
+                        "one. Default 'none' = exactly today's rules and genes. "
+                        "Population/generations are NOT scaled by the profile(s).")
+    p.add_argument("--market-condition-manifest", default=None,
+                   metavar="DIGEST[,DIGEST...]|<profile>=DIGEST,...",
+                   help="The prepared snapshot every trial reads, ONE PER PROFILE "
+                        "(tools/warm_market_conditions.py plan/build/verify/prepare-host prints "
+                        "each). Bare digests are matched to --market-condition-profile in order; "
+                        "profile=digest pairs are explicit. REQUIRED with a profile: without it "
+                        "each worker would compute the indicators from whatever cache it "
+                        "happened to hold. Refused at launch when it does not cover the run's "
                         "universe.")
 
 

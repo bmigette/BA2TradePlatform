@@ -91,6 +91,7 @@ from ba2_common.core.market_conditions import (
     WINDOW,
     FeatureRow,
 )
+from ba2_common.core.market_conditions_batch import BATCH_BY_PROFILE
 from ba2_common.core.split_basis import (
     REFETCH_VERDICTS,
     CalendarSplit,
@@ -952,6 +953,41 @@ def _coverage_from(statuses: List[Tuple[date, List[str]]], fields: Sequence[str]
             "rows": len(statuses), "exceptions": exceptions}
 
 
+def _batch_rows(batch: Optional[Callable[..., List[Optional[FeatureRow]]]],
+                snap: "_Snapshot", windows: Sequence["_RowWindow"]) -> Dict[date, FeatureRow]:
+    """``{session: row}`` computed in ONE pass over the span these windows cover, when the
+    profile has a batch form; ``{}`` to fall back to the per-window calculator.
+
+    The batch is bit-identical to that calculator
+    (``packages/common/tests/test_chart_structure_batch_equals_reference.py``); each row still
+    reads exactly its own ``WINDOW`` bars, so slicing the span changes nothing. Called per
+    (symbol, month), where the windows are contiguous and the 127-bar warm-up prefix is
+    amortised over the month's rows; a single missing row is left to the per-window path, which
+    is what it costs there anyway.
+
+    Only windows that really span ``WINDOW`` bars take this path. ``_row_windows`` has a second
+    branch that can mark a window usable with a span of a DIFFERENT length ("cannot happen ...
+    but never guess"): there the batch's "the 128 bars ending here" and the per-window path's
+    "this slice" are different inputs, so the two would legitimately disagree. Keyed by SESSION
+    rather than by an index arithmetic on ``lo``, so a caller cannot look a row up for a window
+    this function declined to compute."""
+    if batch is None:
+        return {}
+    usable = [w for w in windows if w.hi - w.lo == WINDOW]
+    if len(usable) < 2:
+        return {}
+    lo = min(w.lo for w in usable)
+    hi = max(w.hi for w in usable)
+    b = snap.bars[lo:hi]
+    rows = batch(b[:, 0], b[:, 1], b[:, 2], b[:, 3], b[:, 4])
+    out: Dict[date, FeatureRow] = {}
+    for w in usable:
+        row = rows[w.hi - 1 - lo]
+        if row is not None:
+            out[w.session] = row
+    return out
+
+
 def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: MarketConditionWarmPlan,
                   inv: SymbolInventory, cal: np.ndarray, counters: _Counters,
                   extra_exceptions: List[Dict[str, Any]], log: Callable[[str], None],
@@ -959,6 +995,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
     profile = PROFILES[plan_.profile]
     fields = [f.name for f in profile.fields]
     compute = COMPUTE_BY_PROFILE[plan_.profile]
+    batch = BATCH_BY_PROFILE.get(plan_.profile)
     sym = inv.symbol
     n_rows = plan_.decision_sessions
 
@@ -1030,6 +1067,8 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
         if not remaining:
             continue
         records = []
+        batch_rows = _batch_rows(
+            batch, snap, [w for w in remaining if w.ok and w.session not in reusable])
         for w in remaining:
             ref = _raw_ref(shards, w.lo, w.hi)
             hit = reusable.get(w.session)
@@ -1037,7 +1076,9 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
                 rec = _copied_record(hit[0], hit[1], fields, w, ref)
                 counters.add("rows_reused")
             else:
-                if w.ok:
+                if w.ok and w.session in batch_rows:
+                    row = batch_rows[w.session]
+                elif w.ok:
                     b = snap.bars[w.lo:w.hi]
                     row = compute(b[:, 0], b[:, 1], b[:, 2], b[:, 3], b[:, 4])
                 else:

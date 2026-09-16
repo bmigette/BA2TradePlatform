@@ -364,9 +364,13 @@ def _all_three(status: str, reason: str) -> MarketConditionValues:
     return MarketConditionValues(trend_slope=obs, adx=obs, rv_ratio=obs)
 
 
-def _invalid_bar_reason(o, h, l, c, v) -> Optional[str]:
-    """Lowest bad index across every check, naming all problems at that index."""
-    checks = []
+def _invalid_bar_checks(o, h, l, c, v) -> List[Tuple[str, np.ndarray]]:
+    """``(label, mask)`` for every per-bar validity check, in report order.
+
+    Factored out of :func:`_invalid_bar_reason` so a batch implementation can run the checks
+    ONCE over a full history and still report the same window-local reason string.
+    """
+    checks: List[Tuple[str, np.ndarray]] = []
     for name, arr in (("open", o), ("high", h), ("low", l), ("close", c)):
         finite = np.isfinite(arr)
         checks.append((f"{name} non-finite", ~finite))
@@ -377,6 +381,12 @@ def _invalid_bar_reason(o, h, l, c, v) -> Optional[str]:
     checks.append(("high < max(open, close)", h < np.maximum(o, c)))
     checks.append(("low > min(open, close)", l > np.minimum(o, c)))
 
+    return checks
+
+
+def _invalid_bar_reason(o, h, l, c, v) -> Optional[str]:
+    """Lowest bad index across every check, naming all problems at that index."""
+    checks = _invalid_bar_checks(o, h, l, c, v)
     any_bad = np.zeros(len(c), dtype=bool)
     for _, mask in checks:
         any_bad |= mask
@@ -384,8 +394,13 @@ def _invalid_bar_reason(o, h, l, c, v) -> Optional[str]:
     if not bad.size:
         return None
     i = int(bad[0])
-    labels = [label for label, mask in checks if mask[i]]
-    return f"index {i} ({', '.join(labels)})"
+    return _invalid_bar_label(checks, i, i)
+
+
+def _invalid_bar_label(checks: Sequence[Tuple[str, np.ndarray]], index: int, local_index: int) -> str:
+    """The reason string for the bad bar at ``index``, reported at ``local_index``."""
+    labels = [label for label, mask in checks if mask[index]]
+    return f"index {local_index} ({', '.join(labels)})"
 
 
 def compute_market_conditions(o, h, l, c, v) -> MarketConditionValues:
@@ -659,3 +674,426 @@ def _compute_ohlcv_v1(o, h, l, c, v) -> FeatureRow:
 #: the compute function up here by profile, so a second profile (Task 10's ``ta-structure-v1``)
 #: registers its calculator next to its ``ProfileSpec`` and no reader changes.
 COMPUTE_BY_PROFILE: Dict[str, Callable[..., FeatureRow]] = {OHLCV_V1.name: _compute_ohlcv_v1}
+
+
+# ===========================================================================================
+# ta-structure-v1 -- chart-structure measurements (design 2026-09-15 sections 3.2 and 3.3)
+# ===========================================================================================
+# Same input as ohlcv-v1: ONE validated window of exactly WINDOW regular-session daily bars,
+# indexed 0..127, and the SAME ATR14 series (``atr14_wilder``).  Every division is by ATR[127];
+# ATR[127] <= 0 makes every field of this profile unknown.
+#
+# Fixed conventions of the profile (part of the calculator version, never genes):
+# pivot span ``PIVOT_K`` = 3, channel lookback ``CHANNEL_LOOKBACK`` = 20, level tolerance
+# ``LEVEL_TOL_ATR`` = 0.25 ATR.
+#
+# CONFIRMED PIVOTS are the lookahead guard for the whole profile: a pivot high at p needs
+# ``H[p] > H[p-i]`` and ``H[p] > H[p+i]`` strictly for i in 1..K (ties are NOT pivots), and it is
+# confirmed only at index p + K.  Inside one window the detection range is p in [K, 127-K], so
+# every detectable pivot is already confirmed at 127; the confirmation rule bites in the BOS /
+# CHoCH walk, which re-derives the swing structure AS EACH EARLIER SESSION SAW IT.
+#
+# UNKNOWN IS NEVER ZERO.  A window with no confirmed pivot above the close has no resistance --
+# not a resistance at its highest bar, and not a distance of 0 (which would say "sitting on the
+# level").  Such a field is reported ``insufficient_history`` (the 128 sessions do not contain
+# the structure the measurement needs), with the vocabulary of section 7 unchanged.  A degenerate
+# channel (sigma == 0, twenty identical closes) is ``invalid_prices``, mirroring ohlcv-v1's
+# "zero 20-session volatility" for the RV ratio.
+#
+# ``structure_state`` is CATEGORICAL and always VALID when ATR is: ``bull`` -> 1.0, ``bear`` ->
+# 2.0, and "no classification" -> 0.0.  ``none`` is stored but is never a gene choice, so an
+# equality gate on 1.0/2.0 simply does not fire on a 0.0 row.
+#
+# INTERPRETATIONS TAKEN where section 3.3 does not spell the case out (each pinned by a test):
+#  * a bar that is BOTH a pivot high and a pivot low (an outside bar) contributes both, and the
+#    HIGH is ordered first at that index;
+#  * collapsing a run of same-kind pivots to its extreme keeps the EARLIEST of equal extremes;
+#  * "ties between equal pivot prices are one level" is realised by the touch count: equal-price
+#    pivots are all touches of the single level they define, never separate levels;
+#  * the touch tolerance is INCLUSIVE (exactly on +/- 0.25 ATR counts);
+#  * ``structure_state == none`` makes BOTH ``bars_since`` fields unknown: section 3.3 item 4
+#    walks "while structure is bull" (or bear), so with no direction there is no break to find.
+
+STRUCTURE_CALC_VERSION = "ta-structure-v1/calc-1"
+STRUCTURE_PROFILE = "ta-structure-v1"
+
+PIVOT_K = 3
+CHANNEL_LOOKBACK = 20
+LEVEL_TOL_ATR = 0.25
+
+FIELD_DIST_SUPPORT = "structure_dist_support_atr"
+FIELD_DIST_RESISTANCE = "structure_dist_resistance_atr"
+FIELD_SUPPORT_TOUCHES = "structure_support_touches"
+FIELD_RESISTANCE_TOUCHES = "structure_resistance_touches"
+FIELD_CHANNEL_SLOPE = "channel_slope_20_atr"
+FIELD_CHANNEL_WIDTH = "channel_width_20_atr"
+FIELD_CHANNEL_POS = "channel_pos_20"
+FIELD_CLOSE_VS_PRIOR_HIGH = "close_vs_prior_high_20_atr"
+FIELD_CLOSE_VS_PRIOR_LOW = "close_vs_prior_low_20_atr"
+FIELD_STRUCTURE_STATE = "structure_state"
+FIELD_BARS_SINCE_BOS = "structure_bars_since_bos"
+FIELD_BARS_SINCE_CHOCH = "structure_bars_since_choch"
+
+#: The twelve stored fields, in the order of the design 3.2 table.
+STRUCTURE_FIELDS = (
+    FIELD_DIST_SUPPORT, FIELD_DIST_RESISTANCE, FIELD_SUPPORT_TOUCHES, FIELD_RESISTANCE_TOUCHES,
+    FIELD_CHANNEL_SLOPE, FIELD_CHANNEL_WIDTH, FIELD_CHANNEL_POS, FIELD_CLOSE_VS_PRIOR_HIGH,
+    FIELD_CLOSE_VS_PRIOR_LOW, FIELD_STRUCTURE_STATE, FIELD_BARS_SINCE_BOS, FIELD_BARS_SINCE_CHOCH,
+)
+
+STATE_BULL = "bull"
+STATE_BEAR = "bear"
+STATE_NONE = "none"
+#: ``value -> code`` for the categorical field. ``none`` is NOT here (design: never selectable).
+STRUCTURE_STATE_CODES: Mapping[str, int] = MappingProxyType({STATE_BULL: 1, STATE_BEAR: 2})
+STRUCTURE_STATE_NONE_CODE = 0.0
+
+PIVOT_HIGH = "high"
+PIVOT_LOW = "low"
+
+
+@dataclass(frozen=True)
+class Pivot:
+    """One confirmed pivot: its window index, ``high``/``low`` kind and its extreme price."""
+
+    index: int
+    kind: str
+    price: float
+
+
+def find_pivots(h: Sequence[float], l: Sequence[float], k: int = PIVOT_K) -> List[Pivot]:
+    """Confirmed pivots of one window, chronological (a HIGH before a LOW at the same index).
+
+    A pivot at index p requires a STRICT extreme against all k neighbours on both sides, so the
+    detection range is ``k <= p <= len - 1 - k`` and equal-price ties are not pivots.
+    """
+    n = len(h)
+    out: List[Pivot] = []
+    for p in range(k, n - k):
+        hp = h[p]
+        if all(hp > h[p - i] and hp > h[p + i] for i in range(1, k + 1)):
+            out.append(Pivot(p, PIVOT_HIGH, hp))
+        lp = l[p]
+        if all(lp < l[p - i] and lp < l[p + i] for i in range(1, k + 1)):
+            out.append(Pivot(p, PIVOT_LOW, lp))
+    return out
+
+
+def reduce_to_swings(pivots: Sequence[Pivot]) -> List[Pivot]:
+    """Alternating swing sequence (design 3.3 item 1): collapse each maximal run of same-kind
+    pivots to its extreme -- the highest of consecutive highs, the lowest of consecutive lows --
+    keeping the EARLIEST of equal extremes. The result alternates high, low, high, low."""
+    out: List[Pivot] = []
+    for p in pivots:
+        if out and out[-1].kind == p.kind:
+            last = out[-1]
+            better = p.price > last.price if p.kind == PIVOT_HIGH else p.price < last.price
+            if better:
+                out[-1] = p
+        else:
+            out.append(p)
+    return out
+
+
+def _recent_swings(pivots: Sequence[Pivot], lo: int, hi: int, want: int
+                   ) -> Tuple[List[float], List[float]]:
+    """The last ``want`` swing-high and swing-low PRICES of ``pivots[lo:hi+1]``, most recent
+    first. Equivalent to the tail of :func:`reduce_to_swings` (each maximal same-kind run
+    collapses to its earliest extreme) but walks backwards and stops early, which is what makes
+    the per-session BOS/CHoCH walk and the batch form affordable."""
+    highs: List[float] = []
+    lows: List[float] = []
+    i = hi
+    while i >= lo and (len(highs) < want or len(lows) < want):
+        kind = pivots[i].kind
+        j = i
+        while j - 1 >= lo and pivots[j - 1].kind == kind:
+            j -= 1
+        ext = pivots[j].price
+        for m in range(j + 1, i + 1):
+            price = pivots[m].price
+            if (price > ext) if kind == PIVOT_HIGH else (price < ext):
+                ext = price
+        (highs if kind == PIVOT_HIGH else lows).append(ext)
+        i = j - 1
+    return highs, lows
+
+
+def fit_channel(closes: Sequence[float]) -> Tuple[float, float, float]:
+    """OLS ``y = a + b*x`` over ``x = 0..n-1`` plus the residual sigma with ``ddof = 2``.
+
+    Every reduction is ``math.fsum`` and every square is ``d*d`` (Task 1's bit-exact contract), so
+    a batch implementation that re-fits the same 20 closes reproduces this bit for bit."""
+    n = len(closes)
+    if n < 3:
+        raise ValueError(f"the channel fit needs at least 3 points (ddof=2), got {n}")
+    xs = [float(i) for i in range(n)]
+    xbar = _fsum_mean(xs)
+    ybar = _fsum_mean(closes)
+    sxy = math.fsum((x - xbar) * (y - ybar) for x, y in zip(xs, closes))
+    sxx = math.fsum((x - xbar) * (x - xbar) for x in xs)
+    b = sxy / sxx
+    a = ybar - b * xbar
+    resid = [y - (a + b * x) for x, y in zip(xs, closes)]
+    sigma = math.sqrt(math.fsum(e * e for e in resid) / (n - 2))
+    return a, b, sigma
+
+
+@dataclass(frozen=True)
+class ChartStructureValues:
+    """The twelve ``ta-structure-v1`` observations of one window, in design 3.2 table order."""
+
+    dist_support: Observation
+    dist_resistance: Observation
+    support_touches: Observation
+    resistance_touches: Observation
+    channel_slope: Observation
+    channel_width: Observation
+    channel_pos: Observation
+    close_vs_prior_high: Observation
+    close_vs_prior_low: Observation
+    structure_state: Observation
+    bars_since_bos: Observation
+    bars_since_choch: Observation
+    calc_version: str = STRUCTURE_CALC_VERSION
+
+    def by_field(self) -> Dict[str, Observation]:
+        return {
+            FIELD_DIST_SUPPORT: self.dist_support,
+            FIELD_DIST_RESISTANCE: self.dist_resistance,
+            FIELD_SUPPORT_TOUCHES: self.support_touches,
+            FIELD_RESISTANCE_TOUCHES: self.resistance_touches,
+            FIELD_CHANNEL_SLOPE: self.channel_slope,
+            FIELD_CHANNEL_WIDTH: self.channel_width,
+            FIELD_CHANNEL_POS: self.channel_pos,
+            FIELD_CLOSE_VS_PRIOR_HIGH: self.close_vs_prior_high,
+            FIELD_CLOSE_VS_PRIOR_LOW: self.close_vs_prior_low,
+            FIELD_STRUCTURE_STATE: self.structure_state,
+            FIELD_BARS_SINCE_BOS: self.bars_since_bos,
+            FIELD_BARS_SINCE_CHOCH: self.bars_since_choch,
+        }
+
+    def as_row(self) -> Dict[str, Any]:
+        """Flat row: value-or-None, ``<field>_status`` and ``calc_version`` (no reasons)."""
+        row: Dict[str, Any] = {}
+        for field, obs in self.by_field().items():
+            row[field] = obs.value
+            row[f"{field}_status"] = obs.status
+        row["calc_version"] = self.calc_version
+        return row
+
+    def to_feature_row(self) -> FeatureRow:
+        values = self.by_field()
+        return FeatureRow(values=values, calc_versions={f: self.calc_version for f in values})
+
+
+def _all_structure(status: str, reason: str) -> ChartStructureValues:
+    obs = Observation(None, status, reason)
+    return ChartStructureValues(*([obs] * 12))
+
+
+_NO_RESISTANCE = "no confirmed pivot high above the close in the window"
+_NO_SUPPORT = "no confirmed pivot low below the close in the window"
+
+
+def _level_fields(pivots: Sequence[Pivot], close: float, atr_last: float
+                  ) -> Tuple[Observation, Observation, Observation, Observation]:
+    """(dist_support, dist_resistance, support_touches, resistance_touches)."""
+    tol = LEVEL_TOL_ATR * atr_last
+    highs = [p.price for p in pivots if p.kind == PIVOT_HIGH and p.price > close]
+    lows = [p.price for p in pivots if p.kind == PIVOT_LOW and p.price < close]
+    if highs:
+        r = min(highs)
+        touches = sum(1 for p in pivots if p.kind == PIVOT_HIGH and abs(p.price - r) <= tol)
+        res = Observation((r - close) / atr_last, STATUS_VALID)
+        res_touch = Observation(float(touches), STATUS_VALID)
+    else:
+        res = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_RESISTANCE)
+        res_touch = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_RESISTANCE)
+    if lows:
+        s = max(lows)
+        touches = sum(1 for p in pivots if p.kind == PIVOT_LOW and abs(p.price - s) <= tol)
+        sup = Observation((close - s) / atr_last, STATUS_VALID)
+        sup_touch = Observation(float(touches), STATUS_VALID)
+    else:
+        sup = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_SUPPORT)
+        sup_touch = Observation(None, STATUS_INSUFFICIENT_HISTORY, _NO_SUPPORT)
+    return sup, res, sup_touch, res_touch
+
+
+def _channel_fields(closes: Sequence[float], atr_last: float
+                    ) -> Tuple[Observation, Observation, Observation]:
+    """(slope, width, position) over the last ``CHANNEL_LOOKBACK`` closes."""
+    tail = list(closes[-CHANNEL_LOOKBACK:])
+    a, b, sigma = fit_channel(tail)
+    slope = Observation(b / atr_last, STATUS_VALID)
+    if not sigma > 0:
+        degenerate = Observation(None, STATUS_INVALID_PRICES,
+                                 f"zero residual dispersion over the {CHANNEL_LOOKBACK}-session channel")
+        return slope, degenerate, degenerate
+    width = Observation(4.0 * sigma / atr_last, STATUS_VALID)
+    lower = a + (CHANNEL_LOOKBACK - 1) * b - 2.0 * sigma
+    pos = Observation((tail[-1] - lower) / (4.0 * sigma), STATUS_VALID)  # deliberately UNCLAMPED
+    return slope, width, pos
+
+
+def swing_state(pivots: Sequence[Pivot]) -> str:
+    """``bull`` / ``bear`` / ``none`` from the last two swing highs and lows (design 3.3 item 3).
+    Equality is neither; fewer than two of either kind is ``none``."""
+    highs, lows = _recent_swings(pivots, 0, len(pivots) - 1, 2)
+    if len(highs) < 2 or len(lows) < 2:
+        return STATE_NONE
+    sh2, sh1 = highs[0], highs[1]
+    sl2, sl1 = lows[0], lows[1]
+    if sh2 > sh1 and sl2 > sl1:
+        return STATE_BULL
+    if sh2 < sh1 and sl2 < sl1:
+        return STATE_BEAR
+    return STATE_NONE
+
+
+def _break_fields(pivots: Sequence[Pivot], closes: Sequence[float], state: str
+                  ) -> Tuple[Observation, Observation]:
+    """(bars_since_bos, bars_since_choch): ``last - index`` of the most recent session whose
+    close broke the swing that was the most recent CONFIRMED one AT THAT SESSION -- with the
+    structure's direction, for the break of structure; against it, for the change of character."""
+    last = len(closes) - 1
+    if state == STATE_NONE:
+        unknown = Observation(None, STATUS_INSUFFICIENT_HISTORY,
+                              "no swing structure: neither a break nor a change of character is defined")
+        return unknown, unknown
+    bull = state == STATE_BULL
+    bos_at: Optional[int] = None
+    choch_at: Optional[int] = None
+    hi = len(pivots) - 1
+    for t in range(last, -1, -1):
+        limit = t - PIVOT_K            # pivots CONFIRMED at session t
+        while hi >= 0 and pivots[hi].index > limit:
+            hi -= 1
+        if hi < 0:
+            break
+        highs, lows = _recent_swings(pivots, 0, hi, 1)
+        close = closes[t]
+        above = bool(highs) and close > highs[0]
+        below = bool(lows) and close < lows[0]
+        broke, changed = (above, below) if bull else (below, above)
+        if bos_at is None and broke:
+            bos_at = t
+        if choch_at is None and changed:
+            choch_at = t
+        if bos_at is not None and choch_at is not None:
+            break
+    bos = (Observation(float(last - bos_at), STATUS_VALID) if bos_at is not None
+           else Observation(None, STATUS_INSUFFICIENT_HISTORY,
+                            "no break of structure in the window"))
+    choch = (Observation(float(last - choch_at), STATUS_VALID) if choch_at is not None
+             else Observation(None, STATUS_INSUFFICIENT_HISTORY,
+                              "no change of character in the window"))
+    return bos, choch
+
+
+def _chart_structure_core(h: List[float], l: List[float], c: List[float],
+                          pivots: List[Pivot], atr_last: float) -> ChartStructureValues:
+    """The measurements themselves, on already-validated window-local lists and pivots.
+
+    Shared verbatim by :func:`compute_chart_structure` and the batch form, which is how
+    "batch == reference" is a property of the code rather than of a test that happened to pass.
+    """
+    last = len(c) - 1
+    close = c[last]
+    sup, res, sup_touch, res_touch = _level_fields(pivots, close, atr_last)
+    slope, width, pos = _channel_fields(c, atr_last)
+    prior_hi = max(h[last - CHANNEL_LOOKBACK:last])     # excludes session ``last`` itself
+    prior_lo = min(l[last - CHANNEL_LOOKBACK:last])
+    vs_high = Observation((close - prior_hi) / atr_last, STATUS_VALID)
+    vs_low = Observation((close - prior_lo) / atr_last, STATUS_VALID)
+    state = swing_state(pivots)
+    bos, choch = _break_fields(pivots, c, state)
+    code = float(STRUCTURE_STATE_CODES.get(state, int(STRUCTURE_STATE_NONE_CODE)))
+    return ChartStructureValues(
+        dist_support=sup, dist_resistance=res,
+        support_touches=sup_touch, resistance_touches=res_touch,
+        channel_slope=slope, channel_width=width, channel_pos=pos,
+        close_vs_prior_high=vs_high, close_vs_prior_low=vs_low,
+        structure_state=Observation(code, STATUS_VALID),
+        bars_since_bos=bos, bars_since_choch=choch)
+
+
+def compute_chart_structure(o, h, l, c, v, atr: Optional[np.ndarray] = None) -> ChartStructureValues:
+    """Compute the twelve ``ta-structure-v1`` observations from exactly ``WINDOW`` bars.
+
+    ``atr`` may be a precomputed ``atr14_wilder(h, l, c)`` over the SAME window (the profile
+    divides by ``atr[WINDOW-1]``); it is recomputed when omitted.
+    Raises ``ValueError`` if the arrays differ in length or exceed ``WINDOW``.
+    """
+    o, h, l, c, v = _f64(o), _f64(h), _f64(l), _f64(c), _f64(v)
+    lengths = {len(o), len(h), len(l), len(c), len(v)}
+    if len(lengths) != 1:
+        raise ValueError(f"OHLCV arrays must have equal lengths, got {sorted(lengths)}")
+    n = len(c)
+    if n > WINDOW:
+        raise ValueError(f"expected at most {WINDOW} bars (pre-slice the window), got {n}")
+    if n < WINDOW:
+        return _all_structure(STATUS_INSUFFICIENT_HISTORY, f"insufficient history: {n} of {WINDOW} bars")
+
+    problem = _invalid_bar_reason(o, h, l, c, v)
+    if problem is not None:
+        return _all_structure(STATUS_INVALID_PRICES, problem)
+
+    last = WINDOW - 1
+    atr_arr = atr14_wilder(h, l, c) if atr is None else _f64(atr)
+    if len(atr_arr) != n:
+        raise ValueError(f"atr length {len(atr_arr)} != bars {n}")
+    atr_last = float(atr_arr[last])
+    if not atr_last > 0:
+        return _all_structure(STATUS_INVALID_PRICES, f"atr<=0 at index {last}")
+
+    hl, ll, cl = h.tolist(), l.tolist(), c.tolist()
+    return _chart_structure_core(hl, ll, cl, find_pivots(hl, ll), atr_last)
+
+
+TA_STRUCTURE_V1 = ProfileSpec(name=STRUCTURE_PROFILE, calc_version=STRUCTURE_CALC_VERSION, fields=(
+    FieldSpec(name=FIELD_DIST_SUPPORT, kind="numeric", short="dist-support", searched=True,
+              value_min=0.0, value_max=5.0, value_step=0.5, anchor_op=">", anchor_value=1.0,
+              ui_name="Distance to support"),
+    FieldSpec(name=FIELD_DIST_RESISTANCE, kind="numeric", short="dist-resistance", searched=True,
+              value_min=0.0, value_max=5.0, value_step=0.5, anchor_op=">", anchor_value=1.0,
+              ui_name="Distance to resistance"),
+    FieldSpec(name=FIELD_SUPPORT_TOUCHES, kind="numeric", short="support-touches", searched=False,
+              value_min=1.0, value_max=5.0, value_step=1.0, anchor_op=">", anchor_value=2.0,
+              ui_name="Support strength"),
+    FieldSpec(name=FIELD_RESISTANCE_TOUCHES, kind="numeric", short="resistance-touches", searched=False,
+              value_min=1.0, value_max=5.0, value_step=1.0, anchor_op=">", anchor_value=2.0,
+              ui_name="Resistance strength"),
+    FieldSpec(name=FIELD_CHANNEL_SLOPE, kind="numeric", short="chan-slope", searched=False,
+              value_min=-0.30, value_max=0.30, value_step=0.05, anchor_op=">", anchor_value=0.0,
+              ui_name="Channel slope"),
+    FieldSpec(name=FIELD_CHANNEL_WIDTH, kind="numeric", short="chan-width", searched=False,
+              value_min=1.0, value_max=8.0, value_step=0.5, anchor_op="<", anchor_value=4.0,
+              ui_name="Channel width"),
+    FieldSpec(name=FIELD_CHANNEL_POS, kind="numeric", short="chan-pos", searched=True,
+              value_min=0.0, value_max=1.0, value_step=0.1, anchor_op="<", anchor_value=0.5,
+              ui_name="Position in channel"),
+    FieldSpec(name=FIELD_CLOSE_VS_PRIOR_HIGH, kind="numeric", short="vs-prior-high", searched=True,
+              value_min=-3.0, value_max=2.0, value_step=0.25, anchor_op=">", anchor_value=0.0,
+              ui_name="Close vs prior 20-session high"),
+    FieldSpec(name=FIELD_CLOSE_VS_PRIOR_LOW, kind="numeric", short="vs-prior-low", searched=False,
+              value_min=-2.0, value_max=3.0, value_step=0.25, anchor_op=">", anchor_value=0.0,
+              ui_name="Close vs prior 20-session low"),
+    FieldSpec(name=FIELD_STRUCTURE_STATE, kind="categorical", short="structure", searched=True,
+              codes=STRUCTURE_STATE_CODES, ui_name="Swing structure"),
+    FieldSpec(name=FIELD_BARS_SINCE_BOS, kind="numeric", short="bos", searched=False,
+              value_min=0.0, value_max=60.0, value_step=5.0, anchor_op="<", anchor_value=20.0,
+              ui_name="Sessions since break of structure"),
+    FieldSpec(name=FIELD_BARS_SINCE_CHOCH, kind="numeric", short="choch", searched=False,
+              value_min=0.0, value_max=60.0, value_step=5.0, anchor_op="<", anchor_value=20.0,
+              ui_name="Sessions since change of character"),
+))
+
+
+def _compute_ta_structure_v1(o, h, l, c, v) -> FeatureRow:
+    return compute_chart_structure(o, h, l, c, v).to_feature_row()
+
+
+register_profile(TA_STRUCTURE_V1)
+COMPUTE_BY_PROFILE[TA_STRUCTURE_V1.name] = _compute_ta_structure_v1

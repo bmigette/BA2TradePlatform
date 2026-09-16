@@ -526,10 +526,22 @@ def render(opt: Dict[str, Any], runs: Sequence[Dict[str, Any]], top: int,
         _line(out, "  Nothing below describes gate behaviour; the coverage section (--coverage)")
         _line(out, "  is the diagnostic that applies to a feature-off run.")
     else:
-        for key in ("profiles", "manifest", "source_profile", "timing_policy", "calendar_version",
-                    "calc_version", "calc_versions", "window_start", "window_end", "gene_count"):
+        # BOTH SHAPES. Task 10 made the block plural (``manifests``/``facts`` keyed by profile,
+        # one snapshot per profile); every job launched before it carries the singular
+        # ``manifest`` plus the provenance flattened onto the block. A report that printed only
+        # the new spelling would silently drop every version an archived job recorded.
+        for key in ("profiles", "manifests", "manifest", "calc_versions", "gene_count"):
             if key in block:
                 _line(out, f"  {key:<17} {block[key]}")
+        flat = {k: block[k] for k in ("source_profile", "timing_policy", "calendar_version",
+                                      "calc_version", "window_start", "window_end") if k in block}
+        for key, value in flat.items():
+            _line(out, f"  {key:<17} {value}")
+        for profile, facts in sorted((block.get("facts") or {}).items()):
+            for key in ("source_profile", "timing_policy", "calendar_version", "calc_version",
+                        "window_start", "window_end"):
+                if key in facts:
+                    _line(out, f"  {profile}.{key:<17} {facts[key]}")
         names = [f.get("name") for f in (block.get("fields") or [])]
         _line(out, f"  {'fields':<17} {names}")
         _line(out, f"  {'genes':<17} {block.get('genes')}")
@@ -560,9 +572,14 @@ def render(opt: Dict[str, Any], runs: Sequence[Dict[str, Any]], top: int,
         # against the snapshot the gated jobs use". With neither given and no persisted block
         # there is nothing to check against, and the report says so rather than guessing a
         # profile name that happens to be the only one registered today.
-        digest = manifest_override or block.get("manifest")
         profiles = block.get("profiles") or []
         profile = profile_override or (profiles[0] if profiles else None)
+        # ONE profile's snapshot at a time: the rows are keyed by profile and the coverage
+        # question is per snapshot. --profile picks which of a multi-profile job's to diagnose.
+        # ``manifest`` is the pre-Task-10 spelling -- without it this diagnostic would report
+        # "no manifest is pinned on this job" about every job that pinned one.
+        digest = (manifest_override or (block.get("manifests") or {}).get(profile)
+                  or block.get("manifest"))
         # ONE branch, so a refusal cannot be followed by advice that contradicts it. Setting
         # ``digest = None`` and falling through printed "REFUSED: a manifest without a profile"
         # and then "No manifest is pinned ... pass --manifest" -- to a reader who had just

@@ -153,10 +153,9 @@ def test_a_resolved_numeric_leaf_exports_as_an_ordinary_condition():
     assert trigger == {"event_type": "underlying_adx_14", "operator": "<", "value": 15.0}
 
 
-#: A DECODED categorical leaf: the mode became ``== <registry code>``. Its field is strict but
-#: not registered until Task 10 lands ``ta-structure-v1``, which makes it the honest stand-in for
-#: "a payload from a NEWER server" in the old-server test below.
-CATEGORICAL_LEAF = {"id": "o_lc-market-structure-state", "field": "structure_state",
+#: A DECODED categorical leaf of the REAL registry field: the mode became ``== <registry code>``.
+#: ``ta-structure-v1`` is registered since Task 10, so this now travels end to end.
+CATEGORICAL_LEAF = {"id": "o_lc-market-structure", "field": "structure_state",
                     "mode": "bull", "op": "==", "comparison": "==", "value": 1.0}
 
 
@@ -169,12 +168,41 @@ def test_a_resolved_categorical_leaf_is_accepted_as_an_equality_on_the_code():
         assert_market_conditions_resolved(_entry_rule(unresolved), "entry_rules")
 
 
-def test_a_payload_from_a_newer_server_is_refused_rather_than_deployed_ungated():
-    """``structure_state`` is a strict name this build has no event type for (Task 10 registers
-    it). Exporting it to live must refuse -- dropping the gate would deploy a different strategy
-    under the same name and the same label."""
+def test_a_resolved_categorical_leaf_exports_as_an_equality_on_the_registry_code():
+    """The round trip Task 8 could only describe: with ``ta-structure-v1`` registered, a decoded
+    categorical gate leaves for live as an ordinary ``==`` trigger whose value is the field's own
+    registry CODE -- not the mode token, which live has no vocabulary for."""
+    from ba2_common.core.market_conditions import field_codes
+
+    export = trade_rules_to_live_export(_entry_rule(CATEGORICAL_LEAF), [])
+    rule, = export["rulesets"][0]["rules"]
+    trigger, = [t for t in rule["triggers"].values() if t["event_type"] == "structure_state"]
+    assert trigger == {"event_type": "structure_state", "operator": "==", "value": 1.0}
+    assert trigger["value"] == float(field_codes("structure_state")["bull"])
+    # The OTHER regime exports as its own code, so the two are not interchangeable downstream.
+    bear = trade_rules_to_live_export(
+        _entry_rule(dict(CATEGORICAL_LEAF, mode="bear", value=2.0)), [])
+    bear_trigger, = [t for rule in bear["rulesets"][0]["rules"]
+                     for t in rule["triggers"].values() if t["event_type"] == "structure_state"]
+    assert bear_trigger["value"] == float(field_codes("structure_state")["bear"]) == 2.0
+
+
+def test_a_payload_from_a_newer_server_is_refused_rather_than_deployed_ungated(monkeypatch):
+    """A strict name this build has NO event type for -- what a payload searched on a newer
+    server looks like here. Exporting it must refuse: dropping the gate would deploy a different
+    strategy under the same name and the same label.
+
+    Every name in today's ``STRICT_FIELD_NAMES`` is registered (Task 10 completed the list), so
+    the future field is added to the strict set for the duration of this test -- which is exactly
+    the state an older server is in when the list travels ahead of its registry.
+    """
+    from ba2_common.core import market_condition_rules as rules_mod
+
+    monkeypatch.setattr(rules_mod, "STRICT_FIELD_NAMES",
+                        rules_mod.STRICT_FIELD_NAMES | {"market_regime_v2"})
+    future = dict(CATEGORICAL_LEAF, id="o_lc-market-regime", field="market_regime_v2")
     with pytest.raises(ValueError, match="no event type for"):
-        trade_rules_to_live_export(_entry_rule(CATEGORICAL_LEAF), [])
+        trade_rules_to_live_export(_entry_rule(future), [])
 
 
 def test_a_really_decoded_genome_carries_no_template_metadata_and_exports():

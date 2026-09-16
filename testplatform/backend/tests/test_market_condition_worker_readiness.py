@@ -356,8 +356,8 @@ def test_the_master_excludes_a_worker_that_cannot_prepare(monkeypatch):
 
     logged = []
     ev = de.DistributedEvaluator(None, "sharpe", n_consumers=0, optimization_id="t", workers=[],
-                                 log=logged.append, market_condition_manifest="d" * 64,
-                                 market_condition_profile="ohlcv-v1")
+                                 log=logged.append,
+                                 market_condition_manifests={"ohlcv-v1": "d" * 64})
     monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, v, **k: True)
     monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
     monkeypatch.setattr(de.worker_client, "push_secrets", lambda w, s, **k: {"set": 0})
@@ -414,14 +414,14 @@ def test_the_ga_trial_config_carries_the_digest_and_the_profile():
         "market_condition_profile": "ohlcv-v1", "market_condition_manifest": "f" * 64,
     }
     cfg = _build_daily_trial_config(backtest_cfg, {})
-    assert cfg["market_condition_profile"] == "ohlcv-v1"
-    assert cfg["market_condition_manifest"] == "f" * 64
+    assert cfg["market_condition_profiles"] == ["ohlcv-v1"]
+    assert cfg["market_condition_manifests"] == {"ohlcv-v1": "f" * 64}
     assert cfg["_ga_trial"] is True
 
     plain = _build_daily_trial_config({**backtest_cfg, "market_condition_profile": None,
                                        "market_condition_manifest": None}, {})
-    assert plain["market_condition_profile"] == "none"
-    assert plain["market_condition_manifest"] is None
+    assert plain["market_condition_profiles"] == []
+    assert plain["market_condition_manifests"] == {}
 
 
 def test_the_worker_env_keys_carry_the_profile_and_manifest():
@@ -558,8 +558,8 @@ def test_the_pinned_digest_round_trips_through_the_persisted_backtest_config():
     # The round trip a re-run tool performs: persist as JSON, read back, rebuild the trial config.
     restored = json.loads(json.dumps({"backtest": persisted}))["backtest"]
     cfg = _build_daily_trial_config(restored, {})
-    assert cfg["market_condition_manifest"] == "e" * 64
-    assert cfg["market_condition_profile"] == "ohlcv-v1"
+    assert cfg["market_condition_manifests"] == {"ohlcv-v1": "e" * 64}
+    assert cfg["market_condition_profiles"] == ["ohlcv-v1"]
     assert cfg["_ga_trial"] is True
 
 
@@ -639,3 +639,48 @@ def test_the_job_sweep_drops_an_unpolled_prepare_jobs_sidecar_entry(worker, monk
     monkeypatch.setattr(ws, "_PREPARED_MC", {})
     monkeypatch.setattr(ws, "_PREPARED_MC_LOADED", False)
     assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [digest]
+
+
+def test_a_profile_with_no_manifest_fails_the_JOB_not_every_trial_of_it(monkeypatch):
+    """Two profiles, one warmed: filtering the unpinned one out would let the master prepare and
+    every worker pre-flight report success, and then have EVERY trial die inside the seam on the
+    worker. The master prepare exists so the job fails before dispatch."""
+    from app.services import strategy_optimization_handler as H_
+
+    calls = []
+    monkeypatch.setattr("ba2_common.core.market_condition_reader.prepare_host",
+                        lambda cache_root, digest, profile=None, **kw:
+                        calls.append((digest, profile)) or _Report())
+    failures = []
+    monkeypatch.setattr(H_, "_fail", lambda opt_id, db, msg: failures.append(msg) or
+                        {"status": "failed", "error": msg})
+
+    cfg = {"market_condition_profiles": ["ohlcv-v1", "ta-structure-v1"],
+           "market_condition_manifests": {"ohlcv-v1": "f" * 64}}
+    out = H_._prepare_master_market_conditions(1, None, cfg)
+    assert out == {"status": "failed", "error": failures[-1]}
+    assert "ta-structure-v1" in failures[-1] and "pins no manifest" in failures[-1]
+    assert calls == [], "nothing may be prepared once the run is known to be under-pinned"
+
+    # Both pinned: both snapshots are prepared, in config order.
+    cfg["market_condition_manifests"]["ta-structure-v1"] = "e" * 64
+    assert H_._prepare_master_market_conditions(1, None, cfg) is None
+    assert calls == [("f" * 64, "ohlcv-v1"), ("e" * 64, "ta-structure-v1")]
+
+
+def test_an_unrecognised_manifests_shape_refuses_the_trial_instead_of_disabling_the_guard():
+    """Reading a shape it does not know as "nothing pinned" would turn the readiness guard into a
+    no-op and produce exactly the zero-trade fitness the guard exists to prevent."""
+    from fastapi import HTTPException
+
+    from app.worker_server import _mc_guard, _mc_required_digests
+
+    assert _mc_required_digests({}) == []
+    assert _mc_required_digests({"market_condition_manifests": {}}) == []
+    assert _mc_required_digests({"market_condition_manifests": {"ohlcv-v1": "d1"}}) == ["d1"]
+    assert _mc_required_digests({"market_condition_manifest": "d0"}) == ["d0"]
+    for bad in (["d1"], "d1", 7):
+        with pytest.raises(HTTPException) as e:
+            _mc_guard({"market_condition_manifests": bad})
+        assert e.value.status_code == 400
+        assert "must be a {profile: digest} object" in e.value.detail

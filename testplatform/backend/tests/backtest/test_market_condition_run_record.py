@@ -71,8 +71,8 @@ SESSION, PRIOR = date(2024, 3, 5), date(2024, 3, 4)
 @pytest.fixture
 def record():
     rows = {("AAA", PRIOR): _row(**dict(zip(FIELDS, (0.05, 20.0, 0.9))))}
-    return MarketConditionRunRecord(_Resolver(rows, SESSION, PRIOR), profile="ohlcv-v1",
-                                    manifest_digest="sha256:" + "b" * 64)
+    return MarketConditionRunRecord(_Resolver(rows, SESSION, PRIOR), profiles=["ohlcv-v1"],
+                                    manifests={"ohlcv-v1": "sha256:" + "b" * 64})
 
 
 # --------------------------------------------------------------------------- counters
@@ -178,8 +178,11 @@ def test_the_metadata_block_carries_no_entry_states(record):
     record.note_entry(object(), "AAA", object())
     block = record.as_dict()
     assert "entry_states" not in block
-    assert block["profile"] == "ohlcv-v1"
-    assert block["calc_version"] == SPEC.calc_version
+    # PLURAL since Task 10: a run can pin more than one profile, every one is its own warmed
+    # snapshot, and there is no single "the manifest"/"the calc version" true of two of them.
+    assert block["profiles"] == ["ohlcv-v1"]
+    assert block["manifests"] == {"ohlcv-v1": "sha256:" + "b" * 64}
+    assert block["calc_versions"] == {"ohlcv-v1": SPEC.calc_version}
     assert block["source_profile"] == "fmp-daily-split-adjusted-v1"
 
 
@@ -343,5 +346,5 @@ def test_the_block_lands_on_the_results_and_the_states_land_on_the_trades(record
     assert results["trades"][0]["entry_state"]["values"]["underlying_adx_14"]["value"] == 20.0
     assert "entry_state" not in results["trades"][1]
     # The metadata is added AFTER the metrics; it must not have grown a metric of its own.
-    assert set(block) == {"profile", "manifest", "calc_version", "source_profile",
+    assert set(block) == {"profiles", "manifests", "calc_versions", "source_profile",
                           "timing_policy", "stats"}

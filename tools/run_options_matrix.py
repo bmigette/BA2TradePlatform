@@ -272,17 +272,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path to the launcher executable (or ba2test_launcher.py). Default: "
                          "the ba2-test installed next to the Python interpreter. Point this at "
                          "a WORKTREE launcher to run code different from the editable install.")
-    ap.add_argument("--market-condition-profile", default="none", metavar="none|<profile>",
+    ap.add_argument("--market-condition-profile", default="none",
+                    metavar="none|<profile>[,<profile>...]",
                     help="Forward --market-condition-profile to every job: append the registered "
-                         "profile's market-condition gates (mode + threshold genes) to each "
+                         "profile(s)' market-condition gates (mode + threshold genes) to each "
                          "structure's INITIAL-ENTRY tree. Default 'none' = today's rules and "
                          "genes. The flag folds into the discovery identity digest, so a gated "
                          "run gets its own job names and never resumes an ungated checkpoint.")
-    ap.add_argument("--market-condition-manifest", default=None, metavar="DIGEST",
-                    help="The prepared snapshot digest every trial reads (required by the "
-                         "launcher whenever a profile is on; tools/warm_market_conditions.py "
-                         "build --print-digest prints it). Part of the identity digest too: a "
-                         "different snapshot is a different experiment, not a resume.")
+    ap.add_argument("--market-condition-manifest", default=None,
+                    metavar="DIGEST[,DIGEST...]|<profile>=DIGEST,...",
+                    help="The prepared snapshot digest every trial reads, ONE PER PROFILE "
+                         "(required by the launcher whenever a profile is on; "
+                         "tools/warm_market_conditions.py build --print-digest prints each). "
+                         "Bare digests are matched to the profiles in order; profile=digest "
+                         "pairs are explicit. Part of the identity digest too: a different "
+                         "snapshot is a different experiment, not a resume.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--screener-gate-store", default=None,
                     help="Attach this parquet metric store as a GATE-ONLY per-bar entry gate on "

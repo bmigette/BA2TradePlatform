@@ -519,6 +519,23 @@ class ExpertEventType(str, Enum):
     N_UNDERLYING_TREND_SLOPE = "underlying_trend_slope_50_atr14"
     N_UNDERLYING_ADX = "underlying_adx_14"
     N_UNDERLYING_RV_RATIO = "underlying_realized_vol_ratio_5_20"
+    # Profile ``ta-structure-v1`` (design 3.2): ALL TWELVE stored fields get a member, not only
+    # the five the first launcher profile searches -- a later profile can search the rest
+    # without an enum change (and therefore without an old server silently dropping the leaf).
+    # ``structure_state`` is CATEGORICAL: its observation value is the float CODE of the regime
+    # (bull = 1, bear = 2, no classification = 0) and its condition compares with ``==``.
+    N_STRUCTURE_DIST_SUPPORT = "structure_dist_support_atr"
+    N_STRUCTURE_DIST_RESISTANCE = "structure_dist_resistance_atr"
+    N_STRUCTURE_SUPPORT_TOUCHES = "structure_support_touches"
+    N_STRUCTURE_RESISTANCE_TOUCHES = "structure_resistance_touches"
+    N_CHANNEL_SLOPE_20 = "channel_slope_20_atr"
+    N_CHANNEL_WIDTH_20 = "channel_width_20_atr"
+    N_CHANNEL_POS_20 = "channel_pos_20"
+    N_CLOSE_VS_PRIOR_HIGH_20 = "close_vs_prior_high_20_atr"
+    N_CLOSE_VS_PRIOR_LOW_20 = "close_vs_prior_low_20_atr"
+    N_STRUCTURE_STATE = "structure_state"
+    N_STRUCTURE_BARS_SINCE_BOS = "structure_bars_since_bos"
+    N_STRUCTURE_BARS_SINCE_CHOCH = "structure_bars_since_choch"
 
 
 class ExpertActionType(str, Enum):
@@ -672,6 +689,18 @@ def get_numeric_event_values():
         ExpertEventType.N_UNDERLYING_TREND_SLOPE.value,
         ExpertEventType.N_UNDERLYING_ADX.value,
         ExpertEventType.N_UNDERLYING_RV_RATIO.value,
+        ExpertEventType.N_STRUCTURE_DIST_SUPPORT.value,
+        ExpertEventType.N_STRUCTURE_DIST_RESISTANCE.value,
+        ExpertEventType.N_STRUCTURE_SUPPORT_TOUCHES.value,
+        ExpertEventType.N_STRUCTURE_RESISTANCE_TOUCHES.value,
+        ExpertEventType.N_CHANNEL_SLOPE_20.value,
+        ExpertEventType.N_CHANNEL_WIDTH_20.value,
+        ExpertEventType.N_CHANNEL_POS_20.value,
+        ExpertEventType.N_CLOSE_VS_PRIOR_HIGH_20.value,
+        ExpertEventType.N_CLOSE_VS_PRIOR_LOW_20.value,
+        ExpertEventType.N_STRUCTURE_STATE.value,
+        ExpertEventType.N_STRUCTURE_BARS_SINCE_BOS.value,
+        ExpertEventType.N_STRUCTURE_BARS_SINCE_CHOCH.value,
     ]
 
 

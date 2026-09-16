@@ -633,3 +633,70 @@ def test_the_fmp_source_calls_the_provider_the_way_the_provider_expects(monkeypa
                      "max_age_days": SPLIT_CALENDAR_MAX_AGE_DAYS, "retain": False,
                      "frozen": True, "purpose": fmp_common.PURPOSE_WARM}]
     assert not fmp_common._is_ttl_frozen()          # the freeze is scoped to the call
+
+
+def test_the_ta_structure_profile_builds_through_the_batch_and_matches_the_window_reader(root):
+    """Task 10: the store build uses ``BATCH_BY_PROFILE`` for ``ta-structure-v1``.
+
+    The check that matters is not "a batch ran" but that the PUBLISHED rows are the ones the
+    per-window calculator produces -- the warmup is where the two implementations could diverge
+    for real, and every trial afterwards reads only what was published here.
+    """
+    from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
+    from ba2_common.core.market_conditions_batch import BATCH_BY_PROFILE
+
+    assert "ta-structure-v1" in BATCH_BY_PROFILE
+
+    src = FakeSource(root)
+    p = W.plan("ta-structure-v1", UNIVERSE, START, END, cache_root=root, source=src)
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())),
+                  fetch_missing=False, concurrency=1, source=src)
+    assert rep.ok and rep.exit_code == 0, rep
+    assert rep.counters["rows_computed"] == p.decision_sessions * len(UNIVERSE)
+
+    store = MarketConditionStore(root)
+    manifest = store.read_manifest(rep.manifest_digest)
+    reader = FMPCacheMarketConditionReader("ta-structure-v1", root)
+    rows = list(store.iter_rows(manifest, "BBB"))
+    assert len(rows) == p.decision_sessions
+    for session, row in rows[::17]:
+        want = reader.observe("BBB", session).by_field()
+        got = row.by_field()
+        assert set(got) == set(want)
+        for field, obs in got.items():
+            assert (obs.value, obs.status) == (want[field].value, want[field].status), field
+    # ... and the profile really produced structure, not a column of unknowns.
+    assert any(r.by_field()["structure_state"].status == STATUS_VALID for _s, r in rows)
+
+
+def test_the_batch_serves_only_windows_that_really_span_the_full_window():
+    """``_row_windows`` has a branch that can mark a window usable with a span of a DIFFERENT
+    length ("cannot happen ... but never guess"). There the batch's "the 128 bars ending here"
+    and the per-window path's "this slice" are different inputs, so the row is left to the
+    per-window calculator rather than answered from a span it does not describe."""
+    from types import SimpleNamespace
+
+    from ba2_common.core.market_conditions import WINDOW, compute_chart_structure
+    from ba2_common.core.market_conditions_batch import BATCH_BY_PROFILE
+
+    n = 400
+    rng = np.random.default_rng(5)
+    c = 100.0 + np.cumsum(rng.normal(0.0, 1.0, n))
+    bars = np.column_stack([c, c + 1.0, c - 1.0, c, np.full(n, 1000.0)])
+    snap = SimpleNamespace(bars=bars)
+    full = [W._RowWindow(date(2025, 1, d), True, "valid", "", "dg", e - WINDOW + 1, e + 1)
+            for d, e in ((6, 300), (7, 301))]
+    short = W._RowWindow(date(2025, 1, 8), True, "valid", "", "dg", 302 - WINDOW + 2, 303)
+
+    rows = W._batch_rows(BATCH_BY_PROFILE["ta-structure-v1"], snap, full + [short])
+    assert sorted(rows) == [w.session for w in full]
+    assert short.session not in rows
+    for w in full:
+        b = bars[w.lo:w.hi]
+        want = compute_chart_structure(b[:, 0], b[:, 1], b[:, 2], b[:, 3], b[:, 4]).to_feature_row()
+        assert dict(rows[w.session].by_field()) == dict(want.by_field())
+
+    # A profile with no batch form, or fewer than two rows to amortise the prefix over, falls
+    # back to the per-window calculator.
+    assert W._batch_rows(None, snap, full) == {}
+    assert W._batch_rows(BATCH_BY_PROFILE["ta-structure-v1"], snap, full[:1]) == {}

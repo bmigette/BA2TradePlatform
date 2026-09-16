@@ -156,8 +156,8 @@ def _run(*, profile, digest, gate=None):
             # What ``run_daily_backtest`` does between installing the seam and running the
             # engine; done here because ``_harness`` predates the profile and builds its own
             # config (extending it would move the two goldens that depend on that fixture).
-            engine._mc = MarketConditionRunRecord(resolver, profile=profile,
-                                                  manifest_digest=digest)
+            engine._mc = MarketConditionRunRecord(resolver, profiles=[profile],
+                                                  manifests={profile: digest})
         engine.run()
         block = engine._mc.as_dict() if engine._mc is not None else None
         if block is not None:
@@ -219,9 +219,9 @@ def test_the_research_metadata_is_the_only_difference(arms):
     """Design 8.8: "additional research metadata is compared separately"."""
     assert arms["none"][1] is None
     block = arms["all_off"][1]
-    assert block["profile"] == "ohlcv-v1"
-    assert block["manifest"]
-    assert block["calc_version"] == PROFILES["ohlcv-v1"].calc_version
+    assert block["profiles"] == ["ohlcv-v1"]
+    assert block["manifests"]["ohlcv-v1"]
+    assert block["calc_versions"] == {"ohlcv-v1": PROFILES["ohlcv-v1"].calc_version}
     assert block["timing_policy"] == "prior_session_v1"
     stats = block["stats"]
     # Eligible is counted even with every gate off -- it is the denominator the gate

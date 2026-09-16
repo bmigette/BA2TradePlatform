@@ -28,17 +28,27 @@ from typing import Any, Iterator, List, Mapping, Tuple
 from ba2_common.core.rule_models import MODE_OFF
 
 #: Every market-condition field name that has ever been deployable, independent of what THIS
-#: process's registry happens to hold. ohlcv-v1 (design 3) and the ta-structure-v1 searched
-#: subset (design 3.2). A new profile adds its names HERE as well as to the registry.
+#: process's registry happens to hold: ohlcv-v1 (design 3) and ALL TWELVE ta-structure-v1 fields
+#: (design 3.2), not only the five the first launcher profile searches -- a name becomes
+#: deployable the moment a payload can carry it, and searching one more field later must not
+#: need a server upgrade to be REFUSED correctly. A new profile adds its names HERE as well as to
+#: the registry (``test_every_registered_field_is_a_strict_name`` enforces that direction).
 STRICT_FIELD_NAMES = frozenset({
     "underlying_trend_slope_50_atr14",
     "underlying_adx_14",
     "underlying_realized_vol_ratio_5_20",
     "structure_dist_support_atr",
     "structure_dist_resistance_atr",
+    "structure_support_touches",
+    "structure_resistance_touches",
+    "channel_slope_20_atr",
+    "channel_width_20_atr",
     "channel_pos_20",
     "close_vs_prior_high_20_atr",
+    "close_vs_prior_low_20_atr",
     "structure_state",
+    "structure_bars_since_bos",
+    "structure_bars_since_choch",
 })
 
 

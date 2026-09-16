@@ -45,7 +45,7 @@ import threading
 import uuid
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
@@ -1010,23 +1010,41 @@ def _mc_forget_prepared(why: str, digests=None) -> list:
     return dropped
 
 
-def _mc_required_digest(config: dict) -> Optional[str]:
-    digest = (config or {}).get("market_condition_manifest")
-    return str(digest) if digest else None
+def _mc_required_digests(config: dict) -> List[str]:
+    """Every manifest this trial config pins -- ONE PER PROFILE since Task 10, and the legacy
+    single ``market_condition_manifest`` of every config persisted before it."""
+    cfg = config or {}
+    given = cfg.get("market_condition_manifests")
+    if given is None or given == {}:
+        out = []
+    elif isinstance(given, dict):
+        out = [str(d) for d in given.values() if d]
+    else:
+        # Reading an unrecognised shape as "nothing pinned" would turn this guard into a no-op
+        # and let the trial run on a worker that prepared nothing -- the zero-trade fitness the
+        # guard exists to prevent, produced by the guard itself.
+        logger.error("market-conditions: market_condition_manifests has shape %r", type(given).__name__)
+        raise HTTPException(
+            status_code=400,
+            detail=(f"market_condition_manifests must be a {{profile: digest}} object, got "
+                    f"{type(given).__name__}. A trial is refused rather than run with its "
+                    f"feature-snapshot guard silently disabled."))
+    legacy = cfg.get("market_condition_manifest")
+    if legacy and str(legacy) not in out:
+        out.append(str(legacy))
+    return out
 
 
 def _mc_guard(config: dict) -> None:
     """Refuse a trial pinning a manifest this worker has not prepared (HTTP 409, a distinct
     error the master routes to "worker unready" rather than to a fitness value)."""
-    digest = _mc_required_digest(config)
-    if not digest:
+    missing = [d for d in _mc_required_digests(config) if not _mc_is_prepared(d)]
+    if not missing:
         return
-    if _mc_is_prepared(digest):
-        return
-    logger.error("market-conditions: refusing a trial pinned to unprepared manifest %s", digest)
+    logger.error("market-conditions: refusing a trial pinned to unprepared manifest(s) %s", missing)
     raise HTTPException(
         status_code=409,
-        detail=(f"market_condition_manifest {digest} is not prepared on this worker: call "
+        detail=(f"market-condition manifest(s) {missing} are not prepared on this worker: call "
                 f"POST /market-conditions/prepare first. A trial is refused rather than run "
                 f"without its feature snapshot (it would score as a zero-trade genome)."))
 

@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import os as _os
 import threading
-from typing import Any, Callable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from app.services import worker_client
 from app.services.trial_broker import TrialBroker
@@ -172,8 +172,7 @@ class DistributedEvaluator:
                  pool_factory: Optional[Callable[[], Any]] = None,
                  max_remote_slots_per_worker: Optional[int] = None,
                  governor: Optional[Any] = None,
-                 market_condition_manifest: Optional[str] = None,
-                 market_condition_profile: Optional[str] = None):
+                 market_condition_manifests: Optional[Dict[str, str]] = None):
         self.pool = submit_pool
         self._pool_factory = pool_factory
         # Dynamic worker allocation. When set, consumers above governor.current PARK
@@ -244,8 +243,9 @@ class DistributedEvaluator:
         # makes each worker VERIFY that digest and build its mapped arrays before it is allowed
         # a single trial; a worker that cannot is excluded, loudly, rather than silently
         # returning zero-trade results for every gated genome it is handed.
-        self.market_condition_manifest = market_condition_manifest
-        self.market_condition_profile = market_condition_profile
+        #: ``{profile: digest}`` -- one snapshot PER PROFILE (a manifest names the single
+        #: profile it was warmed for), empty when the run pins none.
+        self.market_condition_manifests: Dict[str, str] = dict(market_condition_manifests or {})
 
     # -- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
@@ -358,7 +358,7 @@ class DistributedEvaluator:
                 return False
             worker_client.push_cache(w, log=self.log)
             worker_client.push_secrets(w, secrets, log=self.log)
-            if self.market_condition_manifest and not self._prepare_market_conditions(w):
+            if self.market_condition_manifests and not self._prepare_market_conditions(w):
                 return False
             _health = self._health_with_retry(w)
             if _health is not None:
@@ -399,23 +399,26 @@ class DistributedEvaluator:
         returns an ordinary zero-trade fitness the GA happily ranks. Excluding the worker costs
         capacity; including it costs the search its meaning.
         """
-        digest = self.market_condition_manifest
-        try:
-            out = worker_client.prepare_market_conditions(
-                w, digest, self.market_condition_profile, log=self.log)
-        except Exception as e:  # noqa: BLE001 -- unreachable/too old/transport error = unready
-            self.log(f"worker {w.get('name')}: market-condition manifest {digest} could NOT be "
-                     f"prepared ({e!r}); EXCLUDING it from this run")
-            logger.error(f"worker {w.get('name')}: market-condition prepare failed: {e!r}")
-            return False
-        if not out.get("ok"):
-            self.log(f"worker {w.get('name')}: market-condition manifest {digest} is NOT usable "
-                     f"there ({out.get('errors')}); EXCLUDING it from this run")
-            logger.error(f"worker {w.get('name')}: market-condition prepare reported {out}")
-            return False
-        self.log(f"worker {w.get('name')}: market-condition manifest {digest} verified "
-                 f"({out.get('objects_checked')} object(s)) and mapped "
-                 f"({'built' if out.get('built') else 'already warm'}, {out.get('symbols')} symbol(s))")
+        # EVERY pinned snapshot, one per profile: a worker that can serve one profile's
+        # manifest and not the other's would run the gated genome with half its gates reading
+        # missing_session, which is a zero-trade fitness that looks like a verdict.
+        for profile, digest in self.market_condition_manifests.items():
+            try:
+                out = worker_client.prepare_market_conditions(w, digest, profile, log=self.log)
+            except Exception as e:  # noqa: BLE001 -- unreachable/too old/transport error = unready
+                self.log(f"worker {w.get('name')}: market-condition manifest {digest} ({profile}) "
+                         f"could NOT be prepared ({e!r}); EXCLUDING it from this run")
+                logger.error(f"worker {w.get('name')}: market-condition prepare failed: {e!r}")
+                return False
+            if not out.get("ok"):
+                self.log(f"worker {w.get('name')}: market-condition manifest {digest} ({profile}) "
+                         f"is NOT usable there ({out.get('errors')}); EXCLUDING it from this run")
+                logger.error(f"worker {w.get('name')}: market-condition prepare reported {out}")
+                return False
+            self.log(f"worker {w.get('name')}: market-condition manifest {digest} ({profile}) "
+                     f"verified ({out.get('objects_checked')} object(s)) and mapped "
+                     f"({'built' if out.get('built') else 'already warm'}, "
+                     f"{out.get('symbols')} symbol(s))")
         return True
 
     def _health_with_retry(self, w: dict) -> Optional[dict]:

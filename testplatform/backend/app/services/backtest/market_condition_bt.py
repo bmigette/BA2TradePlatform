@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -157,10 +157,17 @@ class MarketConditionRunRecord:
     ambiguous, because this is date proximity and not identity.
     """
 
-    def __init__(self, resolver: Any, *, profile: str, manifest_digest: Optional[str] = None):
+    def __init__(self, resolver: Any, *, profiles: Sequence[str],
+                 manifests: Optional[Mapping[str, Optional[str]]] = None):
+        #: The run's profiles, in the order the config pinned them, and the digest each one's
+        #: snapshot was pinned to. PLURAL since Task 10: a run can gate on ``ohlcv-v1`` and
+        #: ``ta-structure-v1`` at once, every profile is its own warmed snapshot with its own
+        #: digest and coverage, and there is no single "the manifest" to report.
         self.resolver = resolver
-        self.profile = profile
-        self.manifest_digest = manifest_digest
+        self.profiles = [str(p) for p in profiles]
+        if not self.profiles:
+            raise ValueError("a market-condition run record needs at least one profile")
+        self.manifests: Dict[str, Optional[str]] = {p: (manifests or {}).get(p) for p in self.profiles}
         self.eligible_recommendations = 0
         self.market_evaluated = 0
         self.market_gate_passed = 0
@@ -249,8 +256,9 @@ class MarketConditionRunRecord:
                 # it as the status the gate would have reported (``missing_session``) rather
                 # than an empty dict, which the report cannot tell from "this run predates the
                 # entry-state capture".
-                for field in PROFILES[self.profile].fields:
-                    values[field.name] = {"value": None, "status": STATUS_MISSING_SESSION}
+                for profile in self.profiles:
+                    for field in PROFILES[profile].fields:
+                        values[field.name] = {"value": None, "status": STATUS_MISSING_SESSION}
             self._entry_states[key] = {
                 "symbol": symbol,
                 "session": ctx.session_label.isoformat(),
@@ -301,11 +309,23 @@ class MarketConditionRunRecord:
             self._entry_states, key=lambda k: (str(k[1]), str(k[0])))]
 
     def as_dict(self) -> Dict[str, Any]:
+        """The persisted ``market_condition`` block. PLURAL since Task 10 -- ``profiles``,
+        ``manifests`` and ``calc_versions`` are keyed by profile even for a one-profile run.
+
+        The shape changed ONCE, together with the seam, deliberately: a block that reported
+        ``"profile"`` for the first profile and hid the second would be worse than a shape
+        change, and there is no reading of a single ``manifest`` that is true of two snapshots.
+        A run with the gates OFF still produces NO block at all, which is what keeps every
+        existing backtest byte-identical (``test_market_condition_all_off_matches_baseline``).
+        """
         reader = getattr(self.resolver, "reader", None)
+        versions = getattr(reader, "calc_versions", None)
+        if not versions:
+            versions = {self.profiles[0]: getattr(reader, "calc_version", None)}
         return {
-            "profile": self.profile,
-            "manifest": self.manifest_digest,
-            "calc_version": getattr(reader, "calc_version", None),
+            "profiles": list(self.profiles),
+            "manifests": dict(self.manifests),
+            "calc_versions": {p: versions.get(p) for p in self.profiles},
             "source_profile": getattr(self.resolver, "source_profile", None),
             "timing_policy": TIMING_POLICY_PRIOR_SESSION_V1,
             "stats": self.stats(),

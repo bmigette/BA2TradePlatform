@@ -67,6 +67,15 @@ __all__ = [
 ]
 
 #: Environment switch for the live profile. Unset, empty or ``none`` -> nothing is installed.
+#:
+#: SINGLE PROFILE, deliberately. Task 10 widened the BACKTEST seam to a profile LIST (one reader
+#: per profile behind ``market_condition_reader_for``); live still serves ONE, because its reader
+#: is also the capture/replay tape and the coverage subject, and making those plural is its own
+#: piece of work with its own recorded-identity contract. This is not a silent gap: a deployed
+#: leaf whose field belongs to a profile this resolver does not serve raises ``LookupError`` in
+#: ``MarketConditionCompare.evaluate`` ("the reader was not built for this field's profile"), and
+#: a comma list here is refused by the reader as an unregistered profile name. Deploy a
+#: multi-profile genome only after the live side is widened too.
 PROFILE_ENV = "BA2_MARKET_CONDITION_PROFILE"
 
 #: The prepared manifest digest the live instance serves (design section 4.5: "Scheduled analysis
