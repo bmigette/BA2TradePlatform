@@ -56,7 +56,9 @@ class BacktestMarketConditionReader(WindowMarketConditionReader):
             if root is None:
                 from ba2_common.config import CACHE_FOLDER
                 root = CACHE_FOLDER
-            mapped = MappedMarketConditionReader(root, manifest_digest, profile)
+            # memo_size=0: the WindowMarketConditionReader base memoises the same
+            # (symbol, session) key, so a second memo would only double the residency.
+            mapped = MappedMarketConditionReader(root, manifest_digest, profile, memo_size=0)
         super().__init__(profile, memo_size=memo_size, retain_windows=False, mapped=mapped)
         self.manifest_digest = manifest_digest
         self._ps = price_source

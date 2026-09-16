@@ -127,6 +127,18 @@ def _target_pool_size(diag: Any, peak_mb: Any = None) -> Any:
     return max(1, int(budget // float(peak)))
 
 
+def _is_unprepared_snapshot(exc: Any) -> bool:
+    """Is this the worker's 409 "market-condition manifest not prepared" refusal?
+
+    Matched on the STATUS CODE, not the message: 409 is the one code the worker uses for "I am
+    structurally unable to run this trial", and unlike every other dispatch failure it cannot be
+    cured by retrying the same trial there."""
+    import httpx as _httpx
+
+    response = getattr(exc, "response", None)
+    return isinstance(exc, _httpx.HTTPStatusError) and getattr(response, "status_code", None) == 409
+
+
 def _is_backpressure(out: Any) -> bool:
     """True when a worker refused work because it is FULL or under its memory floor.
 
@@ -834,6 +846,16 @@ class DistributedEvaluator:
                 failures = 0
             except Exception as e:  # noqa: BLE001 — push the trial back so local/another worker runs it
                 self.broker.requeue_one(job["trial_id"])
+                if _is_unprepared_snapshot(e):
+                    # The worker REFUSED the trial: it has not prepared this run's
+                    # market-condition snapshot. Retrying cannot change that -- the digest is
+                    # pinned for the whole run -- so the worker goes down at once instead of
+                    # burning three trials' dispatch latency discovering the same answer.
+                    if self._mark_worker_down(w, "market-condition manifest not prepared"):
+                        self.log(f"worker {w['name']} REFUSED trials: this run's "
+                                 f"market-condition snapshot is not prepared there ({e}); "
+                                 f"excluding it. Re-admission re-runs the preparation.")
+                    return
                 failures += 1
                 self.log(f"worker {w['name']} run_trial failed ({failures}/{_MAX_WORKER_FAILURES}): {e}")
                 if failures >= _MAX_WORKER_FAILURES:

@@ -13,6 +13,9 @@ one of the above is theatre).
 """
 from __future__ import annotations
 
+import inspect
+import json
+import os
 from datetime import date
 
 import numpy as np
@@ -42,11 +45,18 @@ class _FakeFuture:
 
 
 class _FakePool:
+    """Runs the submitted callable inline for a PREPARATION (that is the unit under test) and
+    canned-answers a trial (its content is irrelevant here)."""
+
     def __init__(self):
         self.submitted = []
+        self.prepared = []
 
     def submit(self, _fn, *args):
         self.submitted.append(args)
+        if getattr(_fn, "__name__", "") == "prepare_host_job":
+            self.prepared.append(args)
+            return _FakeFuture(_fn(*args))
         return _FakeFuture({"ok": True, "fitness": 1.0, "trades": 0, "error": None})
 
     def shutdown(self, wait=True, cancel_futures=False):
@@ -102,6 +112,26 @@ def _submit(client, digest):
         "fitness_metric": "sharpe"})
 
 
+def _prepare(client, digest, profile=None):
+    """POST /market-conditions/prepare and collect the job's report the way the master does.
+
+    The endpoint is submit/poll (a cold verification of a season of objects is minutes of I/O,
+    and as a blocking handler it was indistinguishable from a hang); the digest is admitted when
+    the poll that collects the result runs, so a test that skipped the poll would be testing a
+    worker nobody ever finished preparing."""
+    body = {"manifest": digest}
+    if profile:
+        body["profile"] = profile
+    r = client.post("/market-conditions/prepare", headers=H, json=body)
+    assert r.status_code == 200, r.text
+    job_id = r.json()["job_id"]
+    status = client.get(f"/job-status/{job_id}", headers=H)
+    assert status.status_code == 200, status.text
+    body = status.json()
+    assert body["status"] == "done", body
+    return body["result"]
+
+
 def test_a_trial_pinned_to_an_unprepared_manifest_is_refused_with_a_distinct_error(worker):
     client, cache, pool = worker
     _store, digest = _publish(cache)
@@ -117,13 +147,12 @@ def test_a_trial_pinned_to_an_unprepared_manifest_is_refused_with_a_distinct_err
 def test_after_prepare_the_same_trial_is_accepted(worker):
     client, cache, pool = worker
     _store, digest = _publish(cache)
-    r = client.post("/market-conditions/prepare", headers=H, json={"manifest": digest})
-    assert r.status_code == 200
-    body = r.json()
+    body = _prepare(client, digest)
     assert body["ok"] and body["verified"] and body["symbols"] == 2 and body["rows"] == 4
     assert body["objects_checked"] == 2
 
     r = _submit(client, digest)
+    pool.submitted = [a for a in pool.submitted if a not in pool.prepared]
     assert r.status_code == 200 and r.json()["job_id"]
     assert len(pool.submitted) == 1
 
@@ -146,32 +175,65 @@ def test_a_corrupt_object_fails_prepare_and_the_worker_stays_unready(worker):
     victim.write_bytes(bytes(data))
     assert victim.stat().st_size == size
 
-    r = client.post("/market-conditions/prepare", headers=H, json={"manifest": digest})
-    assert r.status_code == 200 and r.json()["ok"] is False
-    assert any("corrupt" in e for e in r.json()["errors"])
+    out = _prepare(client, digest)
+    assert out["ok"] is False
+    assert any("corrupt" in e for e in out["errors"])
     assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == []
     assert _submit(client, digest).status_code == 409
-    assert pool.submitted == []
+    assert pool.submitted == pool.prepared, "no TRIAL was accepted"
 
 
 def test_an_unknown_manifest_is_an_unready_answer_not_a_500(worker):
     client, _cache, _pool = worker
-    r = client.post("/market-conditions/prepare", headers=H, json={"manifest": "0" * 64})
-    assert r.status_code == 200 and r.json()["ok"] is False and r.json()["errors"]
+    out = _prepare(client, "0" * 64)
+    assert out["ok"] is False and out["errors"]
+
+
+def test_prepare_is_submit_and_poll_and_reports_its_stage(worker, monkeypatch):
+    """Not a blocking handler: verifying a season of objects and building the mapping is minutes
+    of I/O on a cold box, and a blocked HTTP call is indistinguishable from a hung worker."""
+    client, cache, pool = worker
+    _store, digest = _publish(cache)
+    r = client.post("/market-conditions/prepare", headers=H, json={"manifest": digest})
+    assert r.status_code == 200 and r.json()["job_id"] and r.json()["manifest"] == digest
+    assert pool.prepared, "the preparation runs on the pool, not in the request handler"
+
+    # The job writes its stage into the control block, which /job-status surfaces instead of a
+    # bare "running" (the same ambiguity the trial bar heartbeat removes).
+    from ba2_common.core.market_condition_reader import prepare_host_job
+    ctl = {}
+    out = prepare_host_job(str(cache), digest, None, 1, ctl)
+    assert out["ok"] and ctl.get("stage")
 
 
 def test_health_lists_the_prepared_digests(worker):
     client, cache, _pool = worker
     _store, digest = _publish(cache)
     assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == []
-    client.post("/market-conditions/prepare", headers=H, json={"manifest": digest})
+    _prepare(client, digest)
     assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [digest]
+
+
+def test_health_drops_a_digest_whose_mapping_was_swept(worker):
+    """``build_shared_arrays.py --sweep`` can collect a mapping between runs. A worker that kept
+    advertising it would have the master skip preparation, and every worker process would then
+    rebuild the mapping under its own first trial -- the cold-start stampede the prewarm exists
+    to prevent."""
+    import shutil
+
+    from ba2_common.core.market_condition_reader import _derived_root, mapped_key
+
+    client, cache, _pool = worker
+    _store, digest = _publish(cache)
+    _prepare(client, digest)
+    shutil.rmtree(os.path.join(_derived_root(str(cache)), mapped_key("ohlcv-v1", digest)))
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == []
 
 
 def test_readiness_survives_a_restart_through_the_host_local_marker(worker, monkeypatch):
     client, cache, _pool = worker
     _store, digest = _publish(cache)
-    client.post("/market-conditions/prepare", headers=H, json={"manifest": digest})
+    _prepare(client, digest)
     # A self-update restart drops the process's memory; the _derived marker is what a fresh
     # process reads so the box does not re-verify its whole feature bucket to run one trial.
     monkeypatch.setattr(ws, "_PREPARED_MC", {})
@@ -183,7 +245,7 @@ def test_readiness_survives_a_restart_through_the_host_local_marker(worker, monk
 def test_a_push_that_carries_corrupt_objects_revokes_readiness(worker, tmp_path):
     client, cache, _pool = worker
     store, digest = _publish(cache)
-    client.post("/market-conditions/prepare", headers=H, json={"manifest": digest})
+    _prepare(client, digest)
     assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [digest]
 
     # A "master" whose object bytes differ at the same size (a bad transfer, a bad disk).
@@ -204,6 +266,86 @@ def test_a_push_that_carries_corrupt_objects_revokes_readiness(worker, tmp_path)
     assert body["market_conditions_verified"]["ok"] is False
     assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == []
     assert _submit(client, digest).status_code == 409
+
+
+def _corrupt_push(client, store, cache, tmp_path, digest, name="master"):
+    """Push one object of ``digest`` whose bytes differ at the same size."""
+    master = tmp_path / name
+    manifest = store.read_manifest(digest)
+    rel = f"market_conditions/{manifest['objects'][0]['path']}"
+    target = master / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = bytearray(store.abspath(manifest["objects"][0]["path"]).read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    target.write_bytes(bytes(data))
+    return client.post("/cache/push", headers=H,
+                       content=b"".join(cache_sync.iter_tar([rel], str(master))))
+
+
+def test_a_revoke_holds_even_when_the_markers_were_never_loaded(worker, tmp_path, monkeypatch):
+    """THE BUG THIS PINS. Readiness is remembered in memory AND in a ``_derived`` marker, and the
+    markers are loaded lazily. A revoke that only cleared the dict therefore cleared nothing at
+    all when nothing had triggered the lazy load yet (no /health, no submit since start-up) --
+    and the very next call seeded the revoked digest straight back from its marker. So the load
+    flag is forced before the clear, and the marker is renamed aside."""
+    client, cache, pool = worker
+    store, digest = _publish(cache)
+    _prepare(client, digest)
+    # Simulate a process that has prepared nothing itself and has not read the markers yet.
+    monkeypatch.setattr(ws, "_PREPARED_MC", {})
+    monkeypatch.setattr(ws, "_PREPARED_MC_LOADED", False)
+
+    assert _corrupt_push(client, store, cache, tmp_path, digest).status_code == 200
+
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == []
+    assert _submit(client, digest).status_code == 409
+    assert pool.submitted == pool.prepared
+
+
+def test_a_revoke_survives_a_restart(worker, tmp_path, monkeypatch):
+    """The other half: the marker is what a restarted process reads, so a revoke that leaves it
+    behind re-admits the rejected snapshot on the next start-up."""
+    client, cache, _pool = worker
+    store, digest = _publish(cache)
+    _prepare(client, digest)
+    assert _corrupt_push(client, store, cache, tmp_path, digest).status_code == 200
+
+    monkeypatch.setattr(ws, "_PREPARED_MC", {})
+    monkeypatch.setattr(ws, "_PREPARED_MC_LOADED", False)
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == []
+    assert _submit(client, digest).status_code == 409
+    # The revoked marker is KEPT (renamed), because "this host was ready and stopped being
+    # ready" is the diagnostic an operator needs after a corrupt push.
+    from ba2_common.core.market_condition_reader import _derived_root
+    markers = os.listdir(os.path.join(_derived_root(str(cache)), "_prepared"))
+    assert [m for m in markers if m.endswith(".revoked")] and not [
+        m for m in markers if m.endswith(".json")]
+
+
+def test_a_healthy_digest_survives_a_push_that_corrupts_another_snapshots_object(worker, tmp_path):
+    """Verification is SCOPED to what the push delivered, and only the digests whose OWN objects
+    failed lose readiness -- otherwise one stale snapshot on a long-lived worker revokes every
+    digest on the box, and every push re-hashes the whole bucket."""
+    client, cache, pool = worker
+    good_store, good = _publish(cache, symbols=("AAA", "BBB"))
+    bad_store, bad = _publish(cache, symbols=("CCC",))
+    _prepare(client, good)
+    _prepare(client, bad)
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == sorted(
+        [good, bad])
+
+    r = _corrupt_push(client, bad_store, cache, tmp_path, bad)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["market_conditions_verified"]["ok"] is False
+    assert body["market_conditions_verified"]["failed_digests"] == [bad]
+    # Only the bad snapshot was even LOOKED at: the healthy one shares no object with this push.
+    assert body["market_conditions_verified"]["checked_digests"] == [bad]
+    assert body["market_conditions_revoked"] == [bad]
+
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [good]
+    assert _submit(client, good).status_code == 200
+    assert _submit(client, bad).status_code == 409
 
 
 # ---------------------------------------------------------------------------------------------
@@ -287,3 +429,135 @@ def test_the_worker_env_keys_carry_the_profile_and_manifest():
 
     assert "BA2_MARKET_CONDITION_PROFILE" in _WORKER_ENV_KEYS
     assert "BA2_MARKET_CONDITION_MANIFEST" in _WORKER_ENV_KEYS
+
+
+def test_a_409_takes_the_worker_out_at_once_instead_of_three_requeues(monkeypatch):
+    """A refusal is not a flaky trial: the digest is pinned for the whole run, so retrying the
+    same trial on the same worker cannot succeed. Three requeue rounds would only delay the
+    exclusion while the queue drains through a worker that answers 409 to everything."""
+    import httpx
+
+    from app.services import distributed_eval as de
+
+    logged = []
+    ev = de.DistributedEvaluator(None, "sharpe", n_consumers=0, optimization_id="t",
+                                 workers=[], log=logged.append)
+    w = {"name": "remote1", "url": "http://x", "password": "p"}
+    with ev._worker_lock:
+        ev._active_workers.append(w)
+        ev._worker_epochs[w["name"]] = 0
+
+    request = httpx.Request("POST", "http://x/submit-trial")
+    refusal = httpx.HTTPStatusError(
+        "409", request=request, response=httpx.Response(409, request=request))
+    assert de._is_unprepared_snapshot(refusal) is True
+    assert de._is_unprepared_snapshot(RuntimeError("boom")) is False
+    assert de._is_unprepared_snapshot(httpx.HTTPStatusError(
+        "500", request=request, response=httpx.Response(500, request=request))) is False
+
+    calls = {"n": 0}
+
+    def _refuse(*a, **k):
+        calls["n"] += 1
+        raise refusal
+
+    monkeypatch.setattr(de.worker_client, "run_trial", _refuse)
+    # Drive the dispatcher directly: claim() always has work, so only the refusal handling can
+    # end the loop -- which is exactly the property under test.
+    monkeypatch.setattr(ev.broker, "claim",
+                        lambda worker_id=None: {"trial_id": "t1", "config": {},
+                                                "fitness_metric": "sharpe"})
+    monkeypatch.setattr(ev.broker, "requeue_one", lambda tid: None)
+    ev._dispatch_remote(w, slot_idx=0, epoch=0)
+
+    assert calls["n"] == 1, "the worker must be dropped on the FIRST refusal"
+    assert any("REFUSED" in m for m in logged)
+    with ev._worker_lock:
+        assert w not in ev._active_workers
+
+
+class _Report:
+    def __init__(self, ok=True, errors=None):
+        self.ok = ok
+        self.errors = errors or []
+        self.built = False
+        self.objects_checked = 3
+        self.raw_checked = 1
+        self.symbols = 2
+        self.elapsed_s = 0.1
+
+
+def test_the_master_prepares_its_own_bucket_before_dispatch(monkeypatch):
+    """The master is a worker too: it runs local trials and in-process re-runs. Until this, only
+    REMOTE workers verified the pinned snapshot, which made the runbook's warm step a correctness
+    requirement rather than an optimisation. A failed verification is a FAILED JOB -- every trial
+    would otherwise score against a snapshot that does not hash to its manifest."""
+    from app.services import strategy_optimization_handler as H_
+
+    calls = []
+
+    def _spy(cache_root, digest, profile=None, **kw):
+        calls.append((digest, profile))
+        return _Report()
+
+    monkeypatch.setattr("ba2_common.core.market_condition_reader.prepare_host", _spy)
+    failures = []
+    monkeypatch.setattr(H_, "_fail", lambda opt_id, db, msg: failures.append(msg) or
+                        {"status": "failed", "error": msg})
+
+    # No manifest pinned -> nothing happens at all (every existing run).
+    assert H_._prepare_master_market_conditions(1, None, {}) is None
+    assert calls == []
+
+    cfg = {"market_condition_manifest": "f" * 64, "market_condition_profile": "ohlcv-v1"}
+    assert H_._prepare_master_market_conditions(1, None, cfg) is None
+    assert calls == [("f" * 64, "ohlcv-v1")]
+    assert failures == []
+
+    monkeypatch.setattr("ba2_common.core.market_condition_reader.prepare_host",
+                        lambda *a, **k: _Report(ok=False, errors=["corrupt object x"]))
+    out = H_._prepare_master_market_conditions(1, None, cfg)
+    assert out == {"status": "failed", "error": failures[-1]}
+    assert "FAILED verification" in failures[-1] and "corrupt object x" in failures[-1]
+
+    def _raise(*a, **k):
+        raise FileNotFoundError("no manifest here")
+
+    monkeypatch.setattr("ba2_common.core.market_condition_reader.prepare_host", _raise)
+    assert H_._prepare_master_market_conditions(1, None, cfg)["status"] == "failed"
+    assert "could not be prepared" in failures[-1]
+
+
+def test_the_master_prepare_runs_before_any_trial_is_dispatched():
+    """Placement matters as much as existence: after the evaluator starts, remote workers have
+    already been pre-flighted and local trials are in flight."""
+    from app.services import strategy_optimization_handler as H_
+
+    src = inspect.getsource(H_.handle_strategy_optimization)
+    assert "_prepare_master_market_conditions(" in src
+    assert src.index("_prepare_master_market_conditions(") < src.index("_evaluator.start()")
+
+
+def test_the_pinned_digest_round_trips_through_the_persisted_backtest_config():
+    """CONTRACT for every consumer of ``_build_daily_trial_config`` (tools/backtest_parity.py,
+    run_genome_once.py, recover_missing_topn.py, genome_concentration_check.py): they rebuild a
+    trial config from the PERSISTED ``optimization_config.backtest`` of a stored run, so the
+    manifest digest has to be persisted there by the launcher (Task 8) and read back out here.
+
+    The parity tool is deliberately NOT exempt from the refusal: a gated genome re-run without
+    its manifest would compute its own feature rows and could legitimately produce different
+    trades, which is precisely what a parity check must not silently do."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    persisted = {
+        "backtest_id": 7, "start_date": "2024-01-02", "end_date": "2024-06-28",
+        "enabled_instruments": ["AAPL"], "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 100000.0, "account_settings": {}, "warmup_days": 60, "seed": 3,
+        "market_condition_profile": "ohlcv-v1", "market_condition_manifest": "e" * 64,
+    }
+    # The round trip a re-run tool performs: persist as JSON, read back, rebuild the trial config.
+    restored = json.loads(json.dumps({"backtest": persisted}))["backtest"]
+    cfg = _build_daily_trial_config(restored, {})
+    assert cfg["market_condition_manifest"] == "e" * 64
+    assert cfg["market_condition_profile"] == "ohlcv-v1"
+    assert cfg["_ga_trial"] is True

@@ -1108,6 +1108,52 @@ class _FatalTrialError(RuntimeError):
     than spending the full generation budget producing a result nobody should trust."""
 
 
+def _prepare_master_market_conditions(opt_id: int, db: Any,
+                                      backtest_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Verify + map this run's pinned market-condition snapshot ON THE MASTER, once.
+
+    Returns None when there is nothing to do or the snapshot is good; a ``_fail`` result (the job
+    is over) when it cannot be served here.
+
+    WHY THE MASTER. It is also a worker: it runs trials in its own process pool and its own
+    in-process re-runs, and only REMOTE workers were made to verify and map the pinned snapshot.
+    That made the runbook's warm step a correctness requirement -- forget it and the first local
+    trial either rebuilds the mapping under itself (every pool child racing for one key) or reads
+    an object nobody hashed. Doing it here makes the warm step an OPTIMISATION: run beforehand it
+    costs seconds ("opened"), skipped it costs one build instead of a wrong run.
+
+    WHY A FAILED VERIFICATION FAILS THE JOB. Every trial would score against a snapshot that does
+    not hash to its manifest. A search whose feature inputs cannot be proven is not a search, and
+    it must not quietly become a population of zero-trade genomes.
+    """
+    digest = backtest_cfg.get("market_condition_manifest")
+    if not digest:
+        return None
+    from ba2_common.config import CACHE_FOLDER
+    from ba2_common.core.market_condition_reader import prepare_host
+
+    logger.warning(f"strategy_optimization {opt_id}: preparing market-condition manifest "
+                   f"{digest} on the master before dispatch")
+    try:
+        report = prepare_host(CACHE_FOLDER, digest,
+                              backtest_cfg.get("market_condition_profile"),
+                              log=lambda m: logger.warning(f"market-conditions: {m}"))
+    except Exception as e:  # noqa: BLE001 -- reported as a failed job, never as a bad run
+        return _fail(opt_id, db, f"market-condition manifest {digest} could not be prepared on "
+                                 f"the master: {e!r}")
+    if not report.ok:
+        return _fail(opt_id, db,
+                     f"market-condition manifest {digest} FAILED verification on the master: "
+                     f"{report.errors}. Every trial of this run would read a snapshot that does "
+                     f"not hash to its manifest; re-sync the market_conditions bucket and "
+                     f"re-launch.")
+    logger.warning(
+        f"strategy_optimization {opt_id}: market-condition snapshot ready on the master "
+        f"({report.objects_checked} object(s) verified, {report.symbols} symbol(s) mapped, "
+        f"{'built' if report.built else 'already warm'}, {report.elapsed_s:.1f}s)")
+    return None
+
+
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
     """Mark the StrategyOptimization row failed + return the failure dict."""
     logger.error(f"strategy_optimization {opt_id} failed: {msg}")
@@ -1685,6 +1731,22 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         f"strategy_optimization {opt_id}: warm-started population "
                         f"({len(init_pop)} individuals) from optimization {warm_start_id}"
                     )
+
+        # MARKET-CONDITION SNAPSHOT, ON THIS MACHINE, ONCE (design section 4.5). The master is
+        # also a worker: it runs trials in its own pool and its own in-process re-runs, and until
+        # now only REMOTE workers were made to verify and map the pinned snapshot. That made the
+        # runbook's warm step a correctness requirement -- forget it and the first local trial
+        # either rebuilds the mapping under itself (every pool child racing for the same key) or
+        # reads a corrupt object nobody hashed. Doing it here makes the warm step an OPTIMISATION:
+        # running it beforehand costs this call nothing (it reports "opened", ~seconds), and
+        # skipping it costs a one-time build instead of a wrong run.
+        #
+        # A failed verification FAILS THE JOB. Every trial of this run would score against a
+        # snapshot that does not hash to its manifest, and a search whose feature inputs cannot be
+        # proven is not a search -- it must not quietly become a population of zero-trade genomes.
+        _mc_failure = _prepare_master_market_conditions(opt_id, db, backtest_cfg)
+        if _mc_failure is not None:
+            return _mc_failure
 
         # Suppress per-trial verbose logging for the optimization's duration — across many
         # trials it's pure noise (only a SINGLE standalone backtest should log in detail).

@@ -274,7 +274,9 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
             if root is None:
                 from ba2_common.core import native_cache
                 root = native_cache.CACHE_FOLDER
-            mapped = MappedMarketConditionReader(root, manifest_digest, profile)
+            # memo_size=0: THIS reader memoises (symbol, session) already, and a second memo
+            # over the same key would double the residency without caching anything new.
+            mapped = MappedMarketConditionReader(root, manifest_digest, profile, memo_size=0)
         else:
             warn_research_mode(profile, "live FMP cache reader")
         super().__init__(profile, memo_size=memo_size, mapped=mapped)

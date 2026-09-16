@@ -53,6 +53,37 @@ another snapshot or report a feature-cache miss as a zero-trade strategy result"
 
 ``BA2_SHARED_ARRAYS=0`` loads the same central rows into PRIVATE arrays (``build_or_open``'s escape
 hatch returns ``build_fn()`` directly). Values are identical; nothing is recomputed.
+
+THE LOCAL SIGNATURE IS A STAT, NOT A HASH (``DerivedArrayStore.signature``: path, size,
+mtime_ns). A byte-identical re-copy of the manifest FILE -- a re-push, a restore, a
+``cp`` -- therefore moves the signature and the next reader REBUILDS the mapping, while the
+host's ``_prepared`` marker still claims the digest is ready. That is the safe direction (a
+rebuild costs seconds and produces the same numbers; a stale mapping would not), but it means
+"prepared" means "verified and mapped at some point", not "this exact mapping directory is
+still the current one". ``prepare_host`` is idempotent and cheap on a warm host precisely so
+re-running it is the answer whenever that matters.
+
+MEASURED (2026-09-16, this host).
+  * Fixture (100 symbols x 1000 sessions = 100k rows, 4700 objects): prepare-host cold
+    verify+build 5.6 s, warm verify+open 2.7 s; mapped arrays 3.7 MB / 5 descriptors;
+    ``observe()`` 12.8 us P50 / 15.1 us P95 on a memo miss, 0.60 us on a hit.
+  * PRODUCTION warmup, this machine's real FMP cache, ohlcv-v1 over the option universe
+    (2020-01-01..2025-12-31, 1508 decision sessions). 85 of the 98 symbols: the other 13
+    (ASML BHP DELL GE HON IBM MRK NVS RTX SAN SCCO T WDC) carry a split whose basis the prices
+    cannot settle and need a full provider re-fetch first -- the first-run refetch storm the
+    runbook warns about, and the reason a cache-only build refuses them rather than warming an
+    unproven basis.
+      - plan: 55 s cold (98 split-calendar calls, 56 KB of provider traffic), 3.7 s warm
+        (0 provider calls -- the calendars are cached).
+      - build --cache-only: 143 s for 128,180 rows (49.6 s compute, 92.7 s publish), writing
+        6205 feature objects + 6344 raw shards; bucket on disk 106 MB / 12,550 files.
+      - verify (re-hash all 12,549 referenced files): 8 s.
+      - prepare-host: 10.5 s cold (verify + build), 6.8 s warm (verify + open). Opening the
+        prepared mapping in a fresh process: 0.05 s.
+      - mapped arrays 4.88 MB for the whole universe, 5 descriptors, worker RSS 120 MB.
+      - ``observe()``: 13.2 us P50 / 15.8 us P95 / 22.9 us P99 on a memo miss, 0.50 us / 0.60 us
+        on a hit -- and every row equals the parquet reader's (checked over three symbols'
+        full histories).
 """
 from __future__ import annotations
 
@@ -62,7 +93,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field as dc_field
 from datetime import date
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -96,7 +127,12 @@ __all__ = [
     "PrepareReport",
     "mapped_key",
     "prepare_host",
+    "prepare_host_job",
+    "mapping_exists",
     "prepared_digests",
+    "prepared_entries",
+    "prune_prepared_markers",
+    "revoke_prepared",
 ]
 
 #: Local mapped-array layout version. A change of arrays or meaning gets a new number, which moves
@@ -110,6 +146,15 @@ SYMBOL_CACHE = 256
 #: Where a host records the manifests it has verified and mapped. Under ``_derived`` -- host-local,
 #: never synced, and discarded with the mappings it describes.
 PREPARED_DIRNAME = "_prepared"
+#: A revoked marker keeps its content under this suffix instead of vanishing: "this host WAS
+#: ready for that digest and stopped being ready" is the diagnostic an operator needs after a
+#: corrupt push, and an empty directory does not say it.
+REVOKED_SUFFIX = ".revoked"
+
+#: Symbols whose full ``RowsFrame`` (window digests + raw-shard references) is kept for the
+#: capture path. Live capture touches each symbol once per analysis and a backtest never comes
+#: there at all, so this only has to stop an unbounded walk.
+ROWS_FRAME_CACHE = 8
 
 _ABSENT = object()
 
@@ -145,8 +190,14 @@ class MappedMarketConditionReader:
     calculated on this path.
 
     Thread-safe. Built lazily: constructing the reader reads (and re-checks the identity of) the
-    manifest; the arrays are mapped on the first ``observe``, so a run whose gates are all off
-    costs one JSON read.
+    manifest and nothing else; the arrays are mapped on the first ``observe``. So a run that is
+    pinned to a manifest but never evaluates a market-condition leaf (every mode gene decoded to
+    ``off``) pays one JSON read and no mapping at all. A run with profile ``none`` never
+    constructs this reader in the first place.
+
+    ``memo_size=0`` turns the row memo off, for the case where this reader is WRAPPED by a
+    ``WindowMarketConditionReader`` that already memoises the same (symbol, session) key: two
+    memos over one lookup would double the residency and cache nothing extra.
     """
 
     def __init__(self, cache_root: os.PathLike, manifest_digest: str, profile: str, *,
@@ -250,7 +301,9 @@ class MappedMarketConditionReader:
         session = np.empty(total, dtype=np.int32)
         values = np.empty((total, n_f), dtype=np.float64)
         status = np.empty((total, n_f), dtype=np.int8)
-        reason_codes = np.empty((total, n_f), dtype=np.int16)
+        # zeros, not empty: a symbol with no rows leaves its slice untouched, and uninitialised
+        # int16 would index the reason table out of range if anything ever read it.
+        reason_codes = np.zeros((total, n_f), dtype=np.int16)
         reason_table: Dict[str, int] = {}
         slices: Dict[str, List[int]] = {}
         pos = 0
@@ -362,21 +415,31 @@ class MappedMarketConditionReader:
             if hit is not _ABSENT:
                 self._memo.move_to_end(key)
         if hit is not _ABSENT:
-            # The registry can move under a long-lived reader (a test registering a profile, a
-            # reload): one dict lookup and one string compare per read.
-            if PROFILES[self.profile].calc_version != self.calc_version:
-                self._check_registry()
+            self._recheck_registry()
             return hit
+        self._recheck_registry()
         pos = self._row_position(symbol, session)
         row = None if pos is None else self._row_at(pos)
         if row is not None:
             self.served += 1
-        with self._lock:
-            self._memo[key] = row
-            self._memo.move_to_end(key)
-            while len(self._memo) > self._memo_size:
-                self._memo.popitem(last=False)
+        if self._memo_size > 0:
+            with self._lock:
+                self._memo[key] = row
+                self._memo.move_to_end(key)
+                while len(self._memo) > self._memo_size:
+                    self._memo.popitem(last=False)
         return row
+
+    def _recheck_registry(self) -> None:
+        """One dict lookup and one string compare per read; the full check only when it moved.
+
+        Deliberately on BOTH paths. The registry can change under a long-lived reader (a test
+        registering a profile, a settings reload), and a check that fires only on a memo miss
+        would serve a memoised row computed under the old calculator without a word -- the exact
+        silent-corruption case this reader raises for.
+        """
+        if PROFILES[self.profile].calc_version != self.calc_version:
+            self._check_registry()
 
     # -- retained evidence (capture) ---------------------------------------------------------
     def _frame(self, symbol: str):
@@ -395,19 +458,17 @@ class MappedMarketConditionReader:
         with self._lock:
             self._rows_frames[symbol] = frame
             self._rows_frames.move_to_end(symbol)
-            while len(self._rows_frames) > 8:
+            while len(self._rows_frames) > ROWS_FRAME_CACHE:
                 self._rows_frames.popitem(last=False)
         return frame
 
-    def window_for(self, symbol: str, session: date):
-        """The exact ``(o, h, l, c, v)`` window the row was computed from, or ``None``.
+    def _retained_at(self, symbol: str, session: date):
+        """``(frame, index)`` of a row whose window IS retained, else ``None``.
 
-        ``None`` for an absent row AND for a row whose window could NOT be assembled: such a row
-        carries an ``unavailable_window_digest`` over the bars that happened to exist, which is
-        evidence of absence rather than a window (see ``MarketConditionStore.retained_window``).
-        A retained row's span is exactly ``WINDOW`` rows of a named raw shard list; anything else
-        is the unavailable case. The bytes are re-hashed by ``retained_window``, so a raw shard
-        that no longer matches raises rather than serving a different window.
+        A row's window is retained only when its span is exactly ``WINDOW`` rows of a named raw
+        shard list. Anything else carries an ``unavailable_window_digest`` over the bars that
+        happened to exist, which is evidence of absence rather than a window (see
+        ``MarketConditionStore.retained_window``) and is never served as one.
         """
         frame = self._frame(symbol)
         want = _days(session)
@@ -418,6 +479,19 @@ class MappedMarketConditionReader:
         lo, hi = int(frame.raw_row_lo[at]), int(frame.raw_row_hi[at])
         if not frame.raw_shard_refs[at] or hi - lo != WINDOW:
             return None
+        return frame, at
+
+    def window_for(self, symbol: str, session: date):
+        """The exact ``(o, h, l, c, v)`` window the row was computed from, or ``None``.
+
+        ``None`` for an absent row and for a row with no retained window (see ``_retained_at``).
+        The bytes are re-hashed by ``retained_window``, so a raw shard that no longer matches
+        raises rather than serving a different window.
+        """
+        hit = self._retained_at(symbol, session)
+        if hit is None:
+            return None
+        frame, at = hit
         return self.store.retained_window(frame.window_digests[at], self.manifest)
 
     def window_result_for(self, symbol: str, session: date):
@@ -436,15 +510,8 @@ class MappedMarketConditionReader:
 
     def window_digest_for(self, symbol: str, session: date) -> Optional[str]:
         """The stored window digest of a row whose window is retained, else ``None``."""
-        frame = self._frame(symbol)
-        want = _days(session)
-        days = frame.sessions.astype("datetime64[D]").astype("int64")
-        at = int(np.searchsorted(days, want, side="left"))
-        if at >= len(days) or int(days[at]) != want:
-            return None
-        if not frame.raw_shard_refs[at] or int(frame.raw_row_hi[at]) - int(frame.raw_row_lo[at]) != WINDOW:
-            return None
-        return frame.window_digests[at]
+        hit = self._retained_at(symbol, session)
+        return None if hit is None else hit[0].window_digests[hit[1]]
 
     def memo_len(self) -> int:
         with self._lock:
@@ -483,6 +550,7 @@ class PrepareReport:
 
     def to_dict(self) -> Dict[str, Any]:
         return {"manifest": self.manifest_digest, "profile": self.profile,
+                "key": mapped_key(self.profile, self.manifest_digest),
                 "cache_root": self.cache_root, "ok": self.ok, "verified": self.verified,
                 "objects_checked": self.objects_checked, "raw_checked": self.raw_checked,
                 "symbols": self.symbols, "rows": self.rows,
@@ -496,27 +564,113 @@ def prepared_marker_path(cache_root: os.PathLike, profile: str, manifest_digest:
                         f"{profile}.{_bare(manifest_digest)}.json")
 
 
-def prepared_digests(cache_root: os.PathLike) -> List[str]:
-    """Manifest digests this host has verified and mapped (from the ``_derived`` markers).
-
-    Host-local by construction: the markers live under ``_derived``, which ``cache_sync`` never
-    transfers, so a worker can never inherit another machine's claim of readiness."""
+def _prepared_records(cache_root: os.PathLike) -> List[Tuple[str, Dict[str, Any]]]:
+    """``[(marker path, record)]`` for every live (non-revoked) readiness marker."""
     d = os.path.join(_derived_root(cache_root), PREPARED_DIRNAME)
-    out: List[str] = []
+    out: List[Tuple[str, Dict[str, Any]]] = []
     if not os.path.isdir(d):
         return out
     for name in sorted(os.listdir(d)):
         if not name.endswith(".json"):
             continue
+        path = os.path.join(d, name)
         try:
-            with open(os.path.join(d, name), "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 rec = json.load(f)
         except (OSError, ValueError):
             continue
-        digest = rec.get("manifest")
-        if digest and digest not in out:
-            out.append(str(digest))
+        if isinstance(rec, dict) and rec.get("manifest"):
+            out.append((path, rec))
     return out
+
+
+def _mapping_present(cache_root: os.PathLike, rec: Mapping[str, Any]) -> bool:
+    """Does the mapping this marker describes still exist on disk?
+
+    A marker outlives its arrays in two ordinary ways -- ``build_shared_arrays.py --sweep``
+    collects an unused key, an operator clears ``_derived`` -- and a host that keeps claiming
+    readiness for a mapping that is gone would accept trials and then rebuild under them, one
+    worker at a time, which is the cold-start stampede the prewarm exists to prevent."""
+    key = rec.get("key")
+    if not key:
+        return False
+    return os.path.isdir(os.path.join(_derived_root(cache_root), str(key)))
+
+
+def mapping_exists(cache_root: os.PathLike, profile: str, manifest_digest: str) -> bool:
+    """Is this host still holding the mapped arrays for (profile, digest)?
+
+    The answer can go from True to False without anyone asking this process: the prewarm tool's
+    ``--sweep`` collects an unused key, an operator clears ``_derived``. A host that keeps
+    claiming readiness afterwards accepts trials and then rebuilds the mapping under them, one
+    worker at a time -- the cold-start stampede the prewarm exists to prevent."""
+    return os.path.isdir(os.path.join(_derived_root(cache_root),
+                                      mapped_key(profile, manifest_digest)))
+
+
+def prepared_entries(cache_root: os.PathLike) -> List[Dict[str, Any]]:
+    """Live readiness records on this host (marker present AND mapping still there)."""
+    out: List[Dict[str, Any]] = []
+    for _path, rec in _prepared_records(cache_root):
+        if _mapping_present(cache_root, rec):
+            out.append(dict(rec))
+    return out
+
+
+def prepared_digests(cache_root: os.PathLike) -> List[str]:
+    """Manifest digests this host has verified and mapped AND still holds the mapping for.
+
+    Host-local by construction: the markers live under ``_derived``, which ``cache_sync`` never
+    transfers, so a worker can never inherit another machine's claim of readiness."""
+    out: List[str] = []
+    for _path, rec in _prepared_records(cache_root):
+        digest = str(rec["manifest"])
+        if digest not in out and _mapping_present(cache_root, rec):
+            out.append(digest)
+    return out
+
+
+def revoke_prepared(cache_root: os.PathLike, digests: Optional[Iterable[str]] = None) -> List[str]:
+    """Withdraw this host's readiness claim for ``digests`` (all of them when None).
+
+    The marker is RENAMED to ``<name>.revoked`` rather than deleted: the fact that this host was
+    ready and stopped being ready is what an operator needs after a corrupt push, and a missing
+    file does not say it. Returns the digests actually revoked.
+
+    Clearing an in-memory set is NOT enough on its own -- the marker is exactly what a restarted
+    (or not-yet-loaded) process reads to re-admit a digest, so a revoke that leaves it behind
+    re-admits the very snapshot it just rejected."""
+    wanted = None if digests is None else {_bare(str(d)) for d in digests}
+    revoked: List[str] = []
+    for path, rec in _prepared_records(cache_root):
+        digest = _bare(str(rec["manifest"]))
+        if wanted is not None and digest not in wanted:
+            continue
+        try:
+            os.replace(path, path + REVOKED_SUFFIX)
+        except OSError:
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+        revoked.append(digest)
+    return revoked
+
+
+def prune_prepared_markers(cache_root: os.PathLike) -> List[str]:
+    """Delete readiness markers whose mapping is gone (swept, evicted, manually cleared).
+
+    Called by the prewarm/GC tool after a sweep. Returns the marker file names removed."""
+    removed: List[str] = []
+    for path, rec in _prepared_records(cache_root):
+        if _mapping_present(cache_root, rec):
+            continue
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append(os.path.basename(path))
+    return removed
 
 
 def prepare_host(cache_root: os.PathLike, manifest_digest: str, profile: Optional[str] = None,
@@ -578,6 +732,31 @@ def prepare_host(cache_root: os.PathLike, manifest_digest: str, profile: Optiona
     say(f"{'built' if report.built else 'opened'} mapped arrays for {report.symbols} symbol(s) / "
         f"{report.rows} row(s) in {report.elapsed_s:.1f}s")
     return report
+
+
+def prepare_host_job(cache_root: os.PathLike, manifest_digest: str, profile: Optional[str] = None,
+                     jobs: int = 4, ctl: Any = None) -> Dict[str, Any]:
+    """``prepare_host`` as a picklable unit of work for a worker's trial pool, returning a dict.
+
+    Top-level (not a closure or a method) because a ``ProcessPoolExecutor`` pickles the callable
+    BY REFERENCE. ``ctl`` is the worker's optional per-job control block: the stage is written
+    into it so ``/job-status`` can say what a slow preparation is doing instead of a bare
+    "running" -- the same ambiguity the trial heartbeat exists to remove.
+    """
+    def _stage(msg: str) -> None:
+        if ctl is not None:
+            try:
+                ctl["stage"] = msg[:200]
+            except Exception:  # noqa: BLE001 -- a dead manager must never fail the preparation
+                pass
+
+    try:
+        report = prepare_host(cache_root, manifest_digest, profile, jobs=jobs, log=_stage)
+    except FileNotFoundError as e:
+        return {"ok": False, "manifest": _bare(str(manifest_digest)), "errors": [str(e)]}
+    except Exception as e:  # noqa: BLE001 -- an unready host is an answer, not a crashed job
+        return {"ok": False, "manifest": _bare(str(manifest_digest)), "errors": [repr(e)]}
+    return report.to_dict()
 
 
 def _record_prepared(cache_root: str, profile: str, manifest_digest: str,

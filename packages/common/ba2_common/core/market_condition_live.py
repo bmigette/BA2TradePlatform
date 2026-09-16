@@ -310,6 +310,10 @@ def resolver_from_env(environ: Optional[Any] = None,
     # it proves the SOURCE the rows were computed from is the one this instance believes in, and a
     # cache that fails it degrades the gates to "refuse loudly" whether or not a manifest is set.
     digest = (env.get(MANIFEST_ENV) or "").strip() or None
+    # ``root``, not ``cache_root``: root is the root that was just CERTIFIED (cache_root is None
+    # for the default deployment, and the reader would then resolve its own root again -- so the
+    # certified cache and the served cache could differ, which is the one thing certification is
+    # supposed to establish).
     return LiveMarketConditionResolver(
-        raw, reader=FMPCacheMarketConditionReader(raw, cache_root, manifest_digest=digest),
+        raw, reader=FMPCacheMarketConditionReader(raw, root, manifest_digest=digest),
         manifest_digest=digest)

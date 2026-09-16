@@ -23,10 +23,16 @@ import pytest
 from ba2_common.core.market_calendar import regular_sessions_ending_at
 from ba2_common.core.market_condition_reader import (
     LAYOUT_VERSION,
+    PREPARED_DIRNAME,
     MappedMarketConditionReader,
+    _derived_root,
     mapped_key,
+    mapping_exists,
     prepare_host,
+    prepare_host_job,
     prepared_digests,
+    prune_prepared_markers,
+    revoke_prepared,
 )
 from ba2_common.core.market_condition_readers import MarketConditionVersionMismatch
 from ba2_common.core.market_condition_source import window_digest
@@ -316,3 +322,99 @@ def test_the_mapping_key_and_meta_carry_the_portable_identity(tmp_path):
     assert set(arrays) == {"session", "values", "status", "reason_codes", "meta_json"}
     assert arrays["session"].dtype == np.int32 and arrays["status"].dtype == np.int8
     assert arrays["reason_codes"].dtype == np.int16 and arrays["values"].dtype == np.float64
+
+
+# --------------------------------------------------------------------- readiness markers
+def _markers(cache_root):
+    d = os.path.join(_derived_root(cache_root), PREPARED_DIRNAME)
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def test_revoking_readiness_renames_the_marker_and_the_digest_stops_counting(tmp_path):
+    """A revoke that only clears an in-memory set is not a revoke: the marker is what a restarted
+    process reads, so it would re-admit the snapshot it just rejected. The file is KEPT under
+    ``.revoked`` -- "this host was ready and stopped being ready" is the diagnostic."""
+    store, digest, _w = _fabricate(tmp_path / "cache")
+    assert prepare_host(store.cache_root, digest).ok
+    assert prepared_digests(store.cache_root) == [digest]
+
+    assert revoke_prepared(store.cache_root, [digest]) == [digest]
+
+    assert prepared_digests(store.cache_root) == []
+    names = _markers(store.cache_root)
+    assert names and all(n.endswith(".revoked") for n in names)
+    # Idempotent: a second revoke has nothing left to withdraw.
+    assert revoke_prepared(store.cache_root, [digest]) == []
+
+
+def test_revoking_without_a_digest_list_withdraws_everything(tmp_path):
+    store, digest, _w = _fabricate(tmp_path / "cache")
+    prepare_host(store.cache_root, digest)
+    assert revoke_prepared(store.cache_root) == [digest]
+    assert prepared_digests(store.cache_root) == []
+
+
+def test_a_marker_without_its_mapping_is_not_readiness_and_is_pruned(tmp_path):
+    """The sweep can collect a mapping between runs. A host that kept claiming readiness would
+    have the master skip preparation, and every worker process would rebuild the mapping under
+    its own first trial."""
+    import shutil
+
+    store, digest, _w = _fabricate(tmp_path / "cache")
+    prepare_host(store.cache_root, digest)
+    assert mapping_exists(store.cache_root, "ohlcv-v1", digest)
+
+    shutil.rmtree(os.path.join(_derived_root(store.cache_root), mapped_key("ohlcv-v1", digest)))
+
+    assert not mapping_exists(store.cache_root, "ohlcv-v1", digest)
+    assert prepared_digests(store.cache_root) == []          # claimed by nobody any more
+    assert prune_prepared_markers(store.cache_root)          # and the marker is collected
+    assert _markers(store.cache_root) == []
+    assert prune_prepared_markers(store.cache_root) == []    # idempotent
+
+
+def test_prepare_host_job_is_a_dict_returning_wrapper_that_reports_its_stage(tmp_path):
+    """The worker runs preparation on its trial pool, which pickles the callable BY REFERENCE and
+    collects a plain dict; the stage it writes into the control block is what turns a minutes-long
+    "running" into something an operator can read."""
+    store, digest, _w = _fabricate(tmp_path / "cache")
+    ctl: dict = {}
+    out = prepare_host_job(store.cache_root, digest, None, 2, ctl)
+    assert out["ok"] and out["symbols"] == 3 and out["key"] == mapped_key("ohlcv-v1", digest)
+    assert ctl["stage"]
+
+    # A digest that is not here is an unready ANSWER, never a raised job.
+    missing = prepare_host_job(store.cache_root, "0" * 64, None, 1, None)
+    assert missing["ok"] is False and missing["errors"]
+
+
+def test_memo_size_zero_serves_identical_rows_without_memoising(tmp_path):
+    """The wrapped case: a ``WindowMarketConditionReader`` already memoises this key, and two
+    memos over one lookup would double the residency and cache nothing extra."""
+    store, digest, _w = _fabricate(tmp_path / "cache")
+    memoless = _reader(store, digest, memo_size=0)
+    memoed = _reader(store, digest)
+    for symbol in memoed.symbols():
+        for session in list(EMPTY_SESSIONS) + [VALID_SESSION]:
+            a, b = memoless.observe(symbol, session), memoed.observe(symbol, session)
+            assert {f: (o.value, o.status, o.reason) for f, o in a.by_field().items()} == \
+                   {f: (o.value, o.status, o.reason) for f, o in b.by_field().items()}
+    assert memoless.memo_len() == 0
+    assert memoed.memo_len() == 9
+    # Same VALUES, different objects: nothing is retained between calls.
+    assert memoless.observe("AAA", VALID_SESSION) is not memoless.observe("AAA", VALID_SESSION)
+    assert memoed.observe("AAA", VALID_SESSION) is memoed.observe("AAA", VALID_SESSION)
+
+
+def test_a_calc_version_that_moves_under_a_memoised_row_still_raises(tmp_path, monkeypatch):
+    """The check is on BOTH paths. A version check that fired only on a memo MISS would keep
+    serving rows computed under the old calculator, which is the silent corruption this raises
+    for."""
+    store, digest, _w = _fabricate(tmp_path / "cache")
+    reader = _reader(store, digest)
+    assert reader.observe("AAA", VALID_SESSION) is not None      # now memoised
+
+    moved = dataclasses.replace(PROFILES["ohlcv-v1"], calc_version="ohlcv-v1/calc-2")
+    monkeypatch.setitem(PROFILES, "ohlcv-v1", moved)
+    with pytest.raises(MarketConditionVersionMismatch):
+        reader.observe("AAA", VALID_SESSION)

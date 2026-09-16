@@ -53,6 +53,11 @@ from typing import Callable, Iterable, Iterator, List, Optional
 
 from ba2_common.config import CACHE_FOLDER
 from ba2_common.core.db_maintenance import format_bytes
+from ba2_common.core.market_condition_store import (
+    MANIFESTS_DIRNAME,
+    MC_DIRNAME,
+    RAW_DIRNAME,
+)
 from ba2_common.core.shared_arrays import DERIVED_DIRNAME
 
 logger = logging.getLogger(__name__)
@@ -75,11 +80,12 @@ _SKIP_SUFFIXES = (".tmp", ".part", ".lock", "-wal", "-shm", ".journal")
 # derived cache for a stale leftover of a master rebuild.
 _SKIP_DIRNAMES = (DERIVED_DIRNAME,)
 
-# The central market-condition feature store bucket (ba2_common.core.market_condition_store):
-# ``market_conditions/raw/<sha>.parquet``, ``market_conditions/<profile>/objects/<sha>.parquet``
-# and ``market_conditions/<profile>/manifests/<digest>.json``.
-MC_BUCKET = "market_conditions"
-_MC_RAW_DIRNAME = "raw"
+# The central market-condition feature store bucket. The layout constants come FROM the store
+# module (``market_conditions/raw/<sha>.parquet``,
+# ``market_conditions/<profile>/objects/<sha>.parquet``,
+# ``market_conditions/<profile>/manifests/<digest>.json``) so a layout change moves both ends
+# together instead of leaving a silently-wrong string here.
+MC_BUCKET = MC_DIRNAME
 
 
 def cache_root(root: Optional[str] = None) -> Path:
@@ -279,16 +285,17 @@ def extract_tar(fileobj, dest: Optional[str] = None,
     -- an operator tailing this worker's log then sees a heartbeat instead of a long silent gap
     that looks indistinguishable from a hang.
 
-    ``market_conditions`` counts the members that landed in the feature-store bucket, so the
-    receiving side knows whether it owes a sha256 verification pass without re-walking the tree
-    (every other push must stay exactly as cheap as it is today).
+    ``market_conditions`` counts the members that landed in the feature-store bucket and
+    ``market_condition_paths`` names them, so the receiving side can verify exactly the snapshots
+    this push touched instead of re-hashing every manifest on the host (every other push must
+    stay exactly as cheap as it is today).
     """
     dest_root = cache_root(dest)
     dest_root.mkdir(parents=True, exist_ok=True)
     extracted = 0
     total = 0
     skipped = 0
-    mc = 0
+    mc: List[str] = []
     last_log = time.monotonic()
     with tarfile.open(fileobj=fileobj, mode="r|") as tar:
         for member in tar:
@@ -312,8 +319,9 @@ def extract_tar(fileobj, dest: Optional[str] = None,
                 tmp.unlink(missing_ok=True)  # never orphan a .part on disk-full / I/O error
                 raise
             extracted += 1
-            if member.name.replace("\\", "/").startswith(MC_BUCKET + "/"):
-                mc += 1
+            name = member.name.replace("\\", "/")
+            if name.startswith(MC_BUCKET + "/"):
+                mc.append(name)
             total += member.size
             now = time.monotonic()
             if now - last_log >= _PROGRESS_LOG_INTERVAL_S:
@@ -321,7 +329,7 @@ def extract_tar(fileobj, dest: Optional[str] = None,
                     f"(last: {member.name})")
                 last_log = now
     return {"extracted": extracted, "bytes": total, "skipped": skipped,
-            "market_conditions": mc}
+            "market_conditions": len(mc), "market_condition_paths": mc}
 
 
 def mc_manifest_files(root: Optional[str] = None) -> List[Path]:
@@ -331,9 +339,9 @@ def mc_manifest_files(root: Optional[str] = None) -> List[Path]:
         return []
     out: List[Path] = []
     for profile_dir in sorted(mc.iterdir()):
-        if not profile_dir.is_dir() or profile_dir.name == _MC_RAW_DIRNAME:
+        if not profile_dir.is_dir() or profile_dir.name == RAW_DIRNAME:
             continue
-        manifests = profile_dir / "manifests"
+        manifests = profile_dir / MANIFESTS_DIRNAME
         if manifests.is_dir():
             out.extend(sorted(manifests.glob("*.json")))
     return out
@@ -351,7 +359,7 @@ def mc_referenced_paths(root: Optional[str] = None) -> set:
     """
     protected: set = set()
     for path in mc_manifest_files(root):
-        protected.add(f"{MC_BUCKET}/{path.parent.parent.name}/manifests/{path.name}")
+        protected.add(_manifest_rel(path))
         try:
             with open(path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
@@ -365,39 +373,66 @@ def mc_referenced_paths(root: Optional[str] = None) -> set:
     return protected
 
 
-def verify_market_conditions(root: Optional[str] = None) -> dict:
-    """Re-hash (sha256) every object and raw shard the locally present manifests reference.
+def _manifest_rel(path: Path) -> str:
+    """Cache-relative path of a manifest FILE (``market_conditions/<profile>/manifests/x.json``)."""
+    return f"{MC_BUCKET}/{path.parent.parent.name}/{MANIFESTS_DIRNAME}/{path.name}"
+
+
+def verify_market_conditions(root: Optional[str] = None,
+                             rel_paths: Optional[Iterable[str]] = None) -> dict:
+    """Re-hash (sha256) the objects and raw shards the locally present manifests reference.
 
     Runs on the RECEIVING side after a push that carried the bucket. Size equality is not
     integrity: an object's file name is the sha256 of its bytes, its content decides what a gated
     genome trades, and a same-size corruption is exactly what the ordinary ``(rel_path, size)``
     diff structurally cannot see — it would be mapped by every worker process on the host.
 
-    Returns ``{ok, manifests, checked, missing, corrupt, errors}``. Never raises: the caller
-    (a worker's ``/cache/push``, a preparation step) reports and refuses work rather than dying.
+    SCOPE. ``rel_paths`` (what a push actually delivered) narrows the pass to the manifests that
+    reference at least one of those files, plus any manifest that arrived in the push itself.
+    Without it every manifest on the host is checked, which on a box carrying a season of
+    snapshots means re-hashing the whole bucket on every push that touched one object — and, far
+    worse, lets ONE stale manifest's missing object condemn every other digest. A full scan stays
+    available (``rel_paths=None``) for an explicit integrity check.
+
+    Returns ``{ok, manifests, checked, missing, corrupt, errors, failed_digests, checked_digests}``
+    — the two digest lists are what a caller revokes and keeps. Never raises: the caller (a
+    worker's ``/cache/push``, a preparation step) reports and refuses work rather than dying.
     """
     from ba2_common.core.market_condition_store import manifest_identity, sha256_file
 
     base = cache_root(root)
+    wanted = None
+    if rel_paths is not None:
+        wanted = {str(r).replace("\\", "/").lstrip("/") for r in rel_paths}
     checked = 0
     missing: List[str] = []
     corrupt: List[str] = []
     errors: List[str] = []
-    manifests = mc_manifest_files(root)
-    for path in manifests:
+    failed: List[str] = []
+    seen: List[str] = []
+    for path in mc_manifest_files(root):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
         except (OSError, ValueError) as e:
             errors.append(f"{path.name}: unreadable manifest ({e})")
             continue
+        refs = [f"{MC_BUCKET}/{e['path']}"
+                for key in ("objects", "raw_objects")
+                for e in (manifest.get(key) or ()) if isinstance(e, dict) and e.get("path")]
+        if wanted is not None and _manifest_rel(path) not in wanted and not (wanted & set(refs)):
+            continue                      # nothing this push delivered belongs to this snapshot
+        seen.append(path.stem)
         try:
             if manifest_identity(manifest) != path.stem:
-                corrupt.append(f"{MC_BUCKET}/{path.parent.parent.name}/manifests/{path.name}")
+                corrupt.append(_manifest_rel(path))
+                failed.append(path.stem)
                 continue
         except (KeyError, TypeError, ValueError) as e:
             errors.append(f"{path.name}: malformed manifest ({e})")
+            failed.append(path.stem)
             continue
+        bad = False
         for key in ("objects", "raw_objects"):
             for entry in manifest.get(key) or ():
                 rel = f"{MC_BUCKET}/{entry['path']}"
@@ -405,15 +440,21 @@ def verify_market_conditions(root: Optional[str] = None) -> dict:
                 checked += 1
                 if not target.is_file():
                     missing.append(rel)
+                    bad = True
                     continue
                 try:
                     if sha256_file(target) != entry["sha256"]:
                         corrupt.append(rel)
+                        bad = True
                 except OSError as e:
                     errors.append(f"{rel}: {e}")
-    return {"ok": not (missing or corrupt or errors), "manifests": len(manifests),
+                    bad = True
+        if bad:
+            failed.append(path.stem)
+    return {"ok": not (missing or corrupt or errors), "manifests": len(seen),
             "checked": checked, "missing": sorted(set(missing)), "corrupt": sorted(set(corrupt)),
-            "errors": errors}
+            "errors": errors, "failed_digests": sorted(set(failed)),
+            "checked_digests": sorted(set(seen))}
 
 
 def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:
@@ -434,7 +475,7 @@ def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:
     names the bucket, so every other prune is byte-identical to before.
     """
     base = str(cache_root(root))
-    rel_paths = [r for r in rel_paths]
+    rel_paths = list(rel_paths)
     protected = (mc_referenced_paths(root)
                  if any(str(r).replace("\\", "/").startswith(MC_BUCKET + "/") for r in rel_paths)
                  else set())

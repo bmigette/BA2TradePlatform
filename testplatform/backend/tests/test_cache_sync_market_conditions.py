@@ -175,3 +175,59 @@ def test_a_manifest_whose_content_no_longer_hashes_to_its_name_is_corrupt(tmp_pa
     out = cache_sync.verify_market_conditions(str(tmp_path))
     assert not out["ok"] and out["corrupt"] == [
         f"market_conditions/ohlcv-v1/manifests/{path.name}"]
+
+
+def test_verification_is_scoped_to_the_snapshots_the_push_delivered(tmp_path):
+    """Two rules in one: a push re-hashes only the manifests it actually touched (a host holding
+    a season of snapshots must not re-hash the whole bucket on every push), and only the digests
+    whose OWN objects failed are reported as failed (one stale snapshot must not condemn every
+    other digest on the box)."""
+    good_store, good = _publish(tmp_path, ["AAA"], SESSIONS)
+    bad_store, bad = _publish(tmp_path, ["BBB"], SESSIONS, extra_raw=False)
+    bad_manifest = bad_store.read_manifest(bad)
+    bad_object = f"market_conditions/{bad_manifest['objects'][0]['path']}"
+
+    data = bytearray(bad_store.abspath(bad_manifest["objects"][0]["path"]).read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    bad_store.abspath(bad_manifest["objects"][0]["path"]).write_bytes(bytes(data))
+
+    scoped = cache_sync.verify_market_conditions(str(tmp_path), rel_paths=[bad_object])
+    assert scoped["checked_digests"] == [bad], "only the delivered snapshot is re-hashed"
+    assert scoped["failed_digests"] == [bad] and not scoped["ok"]
+    assert scoped["checked"] == len(bad_manifest["objects"]) + len(bad_manifest["raw_objects"])
+
+    # The healthy snapshot is untouched by that push and stays verifiable on its own.
+    good_manifest = good_store.read_manifest(good)
+    good_object = f"market_conditions/{good_manifest['objects'][0]['path']}"
+    healthy = cache_sync.verify_market_conditions(str(tmp_path), rel_paths=[good_object])
+    assert healthy["ok"] and healthy["checked_digests"] == [good]
+
+    # A full scan still sees both (the explicit integrity check).
+    full = cache_sync.verify_market_conditions(str(tmp_path))
+    assert sorted(full["checked_digests"]) == sorted([good, bad])
+    assert full["failed_digests"] == [bad]
+
+
+def test_a_pushed_manifest_is_verified_even_when_no_object_came_with_it(tmp_path):
+    """The threshold-only rerun: only the manifest travels, its objects are already there. The
+    scope must still include it, or nothing would ever verify the new snapshot."""
+    store, digest = _publish(tmp_path, ["AAA"], SESSIONS)
+    rel = f"market_conditions/ohlcv-v1/manifests/{digest}.json"
+    out = cache_sync.verify_market_conditions(str(tmp_path), rel_paths=[rel])
+    assert out["ok"] and out["checked_digests"] == [digest] and out["checked"] > 0
+
+
+def test_extract_tar_names_the_market_condition_members(tmp_path):
+    master = tmp_path / "master"
+    worker = tmp_path / "worker"
+    _publish(master, ["AAA"], SESSIONS)
+    (master / "FMPOHLCVProvider").mkdir(parents=True)
+    (master / "FMPOHLCVProvider" / "AAPL_1d.parquet").write_bytes(b"x" * 10)
+
+    local = cache_sync.build_manifest(str(master))
+    rels = [f["rel_path"] for f in local["files"]]
+    out = cache_sync.extract_tar(io.BytesIO(b"".join(cache_sync.iter_tar(rels, str(master)))),
+                                 str(worker))
+    assert set(out["market_condition_paths"]) == {r for r in rels if r.startswith("market_conditions/")}
+    assert out["market_conditions"] == len(out["market_condition_paths"])
+    assert "FMPOHLCVProvider/AAPL_1d.parquet" not in out["market_condition_paths"]

@@ -343,6 +343,13 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     return res
 
 
+# A preparation submitted onto a momentarily full pool comes back as ordinary backpressure; that
+# is a busy worker, not an unusable snapshot, so it is waited out rather than counted as unready.
+_PREPARE_BACKPRESSURE_RETRIES = 3
+_PREPARE_BACKPRESSURE_WAIT_S = 15.0
+_PREPARE_POLL_S = 2.0
+
+
 def prepare_market_conditions(worker: dict, manifest_digest: str, profile: Optional[str] = None,
                               log: Callable[[str], None] = logger.info,
                               timeout: float = 1800.0) -> dict:
@@ -356,23 +363,77 @@ def prepare_market_conditions(worker: dict, manifest_digest: str, profile: Optio
     them against ITS OWN cache root; the master's absolute paths mean nothing there, and roots
     legitimately differ between Windows and Linux.
 
-    Returns the worker's report. ``{"ok": False, ...}`` is a normal answer (an unready worker);
-    a transport/HTTP failure raises and the caller treats it the same way. Generous timeout: a
+    Submit/poll, like a trial: the worker answers with a ``job_id`` and this polls
+    ``/job-status`` (logging the stage it reports) until the report comes back. Returns the
+    worker's report; ``{"ok": False, ...}`` is a normal answer (an unready worker) and a
+    transport/HTTP failure raises, which the caller treats the same way. Generous timeout: a
     cold host verifies every object by sha256 and then builds the mapping.
     """
     body = {"manifest": manifest_digest}
     if profile:
         body["profile"] = profile
-    with httpx.Client(timeout=timeout) as c:
-        r = c.post(f"{_base(worker)}/market-conditions/prepare", headers=_headers(worker), json=body)
-        if r.status_code == 404:
-            raise RuntimeError(
-                f"worker {worker.get('name')} has no /market-conditions/prepare endpoint (build "
-                f"predates the market-condition feature store); it cannot serve a pinned manifest")
-        r.raise_for_status()
-        out = r.json()
-    log(f"market-conditions -> {worker['name']}: {out}")
-    return out
+    deadline = time.monotonic() + timeout
+    for attempt in range(_PREPARE_BACKPRESSURE_RETRIES + 1):
+        with httpx.Client(timeout=min(60.0, timeout)) as c:
+            r = c.post(f"{_base(worker)}/market-conditions/prepare", headers=_headers(worker),
+                       json=body)
+            if r.status_code == 404:
+                raise RuntimeError(
+                    f"worker {worker.get('name')} has no /market-conditions/prepare endpoint "
+                    f"(build predates the market-condition feature store); it cannot serve a "
+                    f"pinned manifest")
+            r.raise_for_status()
+            submitted = r.json()
+        job_id = submitted.get("job_id")
+        if job_id is None:
+            # A worker from the blocking-handler generation answered with the report itself.
+            out = submitted
+        else:
+            out = _poll_prepare(worker, job_id, deadline, log)
+        if not out.get("ok") and out.get("backpressure"):
+            # The worker is merely full (its pool admission control), not unable to serve the
+            # snapshot. Waiting is the right answer; declaring it unready on a busy moment would
+            # cost the run a whole box.
+            log(f"market-conditions -> {worker['name']}: worker busy, retrying preparation "
+                f"({attempt + 1}/{_PREPARE_BACKPRESSURE_RETRIES})")
+            time.sleep(_PREPARE_BACKPRESSURE_WAIT_S)
+            continue
+        log(f"market-conditions -> {worker['name']}: {out}")
+        return out
+    log(f"market-conditions -> {worker['name']}: still busy after "
+        f"{_PREPARE_BACKPRESSURE_RETRIES} retries; treating as unready")
+    return {"ok": False, "manifest": manifest_digest,
+            "errors": ["worker stayed under backpressure through every preparation attempt"]}
+
+
+def _poll_prepare(worker: dict, job_id: str, deadline: float,
+                  log: Callable[[str], None]) -> dict:
+    """Poll one preparation job to completion, logging the stage it reports.
+
+    A cold box re-hashes every object of the snapshot and then builds the mapping; without the
+    stage line that is minutes of silence indistinguishable from a hang (the same reason a trial
+    reports its bar count)."""
+    status_url = f"{_base(worker)}/job-status/{job_id}"
+    last_stage = None
+    with httpx.Client(timeout=30.0) as c:
+        while True:
+            if time.monotonic() >= deadline:
+                cancel_job(worker, job_id)
+                raise TimeoutError(f"worker {worker.get('name')} did not finish preparing its "
+                                   f"market-condition mapping in time")
+            r = c.get(status_url, headers=_headers(worker))
+            if r.status_code == 404:
+                raise WorkerJobLost(f"worker {worker.get('name')} lost prepare job {job_id} "
+                                    f"(it restarted mid-preparation)")
+            r.raise_for_status()
+            body = r.json()
+            if body.get("status") == "done":
+                return body.get("result") or {"ok": False, "errors": ["empty prepare result"]}
+            stage = body.get("stage")
+            if stage and stage != last_stage:
+                last_stage = stage
+                log(f"market-conditions -> {worker['name']}: {stage}")
+            time.sleep(_PREPARE_POLL_S)
 
 
 def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
