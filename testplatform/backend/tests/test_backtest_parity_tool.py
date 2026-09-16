@@ -478,3 +478,75 @@ def test_a_child_that_outlives_its_budget_is_killed(monkeypatch):
 ])
 def test_rank_is_read_off_the_row_name(name, expected):
     assert _tool().rank_from_backtest_name(name) == expected
+
+
+# --------------------------------------------------------------------------------------------
+# research metadata (design 8.8) -- excluded from the verdict walk, compared in its own section
+# --------------------------------------------------------------------------------------------
+_MC_BLOCK = {"profiles": ["ohlcv-v1"], "manifests": {"ohlcv-v1": "sha256:" + "a" * 64},
+             "calc_versions": {"ohlcv-v1": "ohlcv-v1/calc-1"}, "timing_policy": "prior_session_v1",
+             "stats": {"eligible_recommendations": 12, "market_gate_rejected": 3}}
+_ENTRY_STATE = {"symbol": "AAPL", "session": "2020-01-03", "prior_session": "2020-01-02",
+                "values": {"underlying_adx_14": {"value": 21.5, "status": "valid"}}}
+
+
+def _loaded(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _gated(m, **over):
+    """A row as a PROFILE-ON run persists it: the block on ``results``, a state on one trade."""
+    row = _fake_row(**over)
+    row.results = {**row.results, "market_condition": _MC_BLOCK}
+    row.trades = [{**row.trades[0], "entry_state": _ENTRY_STATE}, row.trades[1]]
+    return m._row_view(row)
+
+
+def test_the_gated_extras_are_not_part_of_the_byte_for_byte_verdict():
+    """The no-impact gate compares a profile-ON re-run against a profile-OFF archive. Walking
+    the block inside the identity comparison would report the FEATURE ITSELF as a failure."""
+    m = _tool()
+    assert m.compare_rows(_gated(m), _view(m)) == []
+    assert m.compare_rows(_gated(m), _gated(m)) == []
+
+
+def test_a_real_result_difference_is_still_caught_on_a_gated_row():
+    """The exclusion is two keys, not a blanket amnesty for a gated run."""
+    m = _tool()
+    diffs = m.compare_rows(_gated(m), _gated(m, total_return=31.26))
+    assert diffs and any("total_return" in d for d in diffs)
+
+
+def test_the_research_metadata_is_compared_in_its_own_section():
+    m = _tool()
+    assert m.compare_research_metadata(_gated(m), _gated(m)) == []
+    # one row gated, the other not: reported as present/absent, not as a result difference
+    diffs = m.compare_research_metadata(_gated(m), _view(m))
+    assert sorted(diffs) == ["results.market_condition: present != <absent>",
+                             "trades[0].entry_state: present != <absent>"]
+    assert m.compare_rows(_gated(m), _view(m)) == []
+
+
+def test_a_changed_entry_state_behind_identical_trades_is_reported():
+    """Identical trades explained by a different measurement is a reader defect, not a nuance."""
+    m = _tool()
+    other = _gated(m)
+    trades = _loaded(other["trades"])
+    trades[0] = {**trades[0],
+                 "entry_state": {**_ENTRY_STATE,
+                                 "values": {"underlying_adx_14": {"value": 99.0,
+                                                                  "status": "valid"}}}}
+    other["trades"] = json.dumps(trades)
+    diffs = m.compare_research_metadata(_gated(m), other)
+    assert len(diffs) == 1 and diffs[0].startswith("trades[0].entry_state:")
+    assert "21.5" in diffs[0] and "99.0" in diffs[0]
+
+
+def test_a_changed_market_condition_block_is_reported_but_not_as_a_result_difference():
+    m = _tool()
+    other = _gated(m)
+    block = {**_MC_BLOCK, "stats": {**_MC_BLOCK["stats"], "market_gate_rejected": 4}}
+    other["results"] = json.dumps({**_loaded(other["results"]), "market_condition": block})
+    assert m.compare_rows(_gated(m), other) == []
+    diffs = m.compare_research_metadata(_gated(m), other)
+    assert len(diffs) == 1 and diffs[0].startswith("results.market_condition:")

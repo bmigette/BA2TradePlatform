@@ -145,9 +145,21 @@ and equity curves** (same SHA-256 fingerprint), while the fourth trades nothing 
 say why. That compares the actual curves rather than a metric summary, and it runs in CI on every
 commit, which a 15-minute re-run of an archived row never will.
 
-Task 10 should decide whether `market_condition` / `entry_state` join
-`backtest_parity._IDENTITY_KEYS`' exclusions, so that a *gated* genome can be parity-checked at
-all once the universe question is settled.
+**Decided in Task 10 (2026-09-16):** they do -- as their own `_RESEARCH_KEYS` tuple, not by
+being folded into `_IDENTITY_KEYS`. `compare_rows` no longer walks them (a profile-on run
+carries them and a profile-off run does not, and that difference is the FEATURE, not a parity
+failure), and `compare_research_metadata` compares them in a separate section: the block and
+every per-trade `entry_state`, addressed as `results.market_condition` /
+`trades[i].entry_state`. It is part of the verdict for the private-vs-shared pair (identical
+trades explained by different measurements is a reader defect) and informational against an
+archived row, which may legitimately predate the feature or its block shape.
+
+The D(b) gate still could not be RE-RUN through the tool: reason (1) above is unchanged, and a
+search of the test DB on 2026-09-16 found no persisted gated genome to re-run at all (no
+`strategy_optimizations` row carries a `market_condition` block, and no `backtests` row carries
+one in its results). The tool blocker is removed and pinned by
+`tests/test_backtest_parity_tool.py`; the gate becomes runnable as soon as a gated job is
+launched over a universe its manifest fully covers.
 
 ---
 

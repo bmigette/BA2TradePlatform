@@ -121,6 +121,16 @@ _EXCLUDED_NUMERIC = ("id", "optimization_id", "model_id", "strategy_id",
 _IDENTITY_KEYS = ("name", "id", "backtest_id", "created_at", "started_at", "completed_at",
                   "run_seconds", "elapsed", "elapsed_s", "timestamp")
 
+#: RESEARCH METADATA (design 8.8: "additional research metadata is compared separately").
+#: A run with a market-condition profile ON legitimately carries these and a profile-OFF run
+#: legitimately does not, so walking them inside the identity comparison would report the
+#: FEATURE as a parity failure -- which is the one thing the no-impact gate must be able to say
+#: nothing about. They are pulled out and compared in their own section instead, because "not
+#: part of the byte-for-byte verdict" is not "unchecked":
+#:   market_condition -- the run's per-profile block and counters, on ``results``.
+#:   entry_state      -- the measurement behind each executed structure, on a trade.
+_RESEARCH_KEYS = ("market_condition", "entry_state")
+
 _BOOTSTRAPPED = False
 
 
@@ -191,12 +201,54 @@ def _loaded(value: Any) -> Any:
 
 
 def _strip_identity(obj: Any) -> Any:
-    """``_IDENTITY_KEYS`` removed at any depth. Everything else survives to be compared."""
+    """``_IDENTITY_KEYS`` and ``_RESEARCH_KEYS`` removed at any depth. Everything else survives
+    to be compared. The research keys come back in :func:`compare_research_metadata`."""
+    dropped = _IDENTITY_KEYS + _RESEARCH_KEYS
     if isinstance(obj, dict):
-        return {k: _strip_identity(v) for k, v in obj.items() if k not in _IDENTITY_KEYS}
+        return {k: _strip_identity(v) for k, v in obj.items() if k not in dropped}
     if isinstance(obj, (list, tuple)):
         return [_strip_identity(v) for v in obj]
     return obj
+
+
+def _research_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Just the research metadata of one row, addressed so a difference names something findable.
+
+    ``results.market_condition`` is the run's block; each executed structure's ``entry_state`` is
+    keyed by the trade's own position in the blob, since that is the only handle a trade has here
+    (the blob carries no recommendation id -- see ``ENTRY_STATE_MAX_GAP_DAYS``)."""
+    out: Dict[str, Any] = {}
+    results = _loaded(row.get("results"))
+    if isinstance(results, dict) and "market_condition" in results:
+        out["results.market_condition"] = results["market_condition"]
+    trades = _loaded(row.get("trades"))
+    if isinstance(trades, list):
+        for i, trade in enumerate(trades):
+            if isinstance(trade, dict) and "entry_state" in trade:
+                out[f"trades[{i}].entry_state"] = trade["entry_state"]
+    return out
+
+
+def compare_research_metadata(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
+    """Differences in the market-condition block and the per-trade entry states.
+
+    Reported in its OWN section: on a private-vs-shared pair these must match (identical trades
+    with different measurements behind them is a reader defect), while a comparison against an
+    ARCHIVED row legitimately differs -- the archive may predate the feature, or the block's
+    shape."""
+    av, bv = _research_metadata(a), _research_metadata(b)
+    diffs: List[str] = []
+    for key in sorted(set(av) | set(bv)):
+        if key not in av:
+            diffs.append(f"{key}: <absent> != present")
+        elif key not in bv:
+            diffs.append(f"{key}: present != <absent>")
+        elif _canonical(av[key]) != _canonical(bv[key]):
+            leaves: List[str] = []
+            _diff_paths(av[key], bv[key], key, leaves)
+            shown = "; ".join(leaves[:_MAX_REPORTED_LEAVES]) or "(no differing leaf localised)"
+            diffs.append(f"{key}: {len(leaves)} differing leaf/leaves; first: {shown}")
+    return diffs
 
 
 def _canonical(obj: Any) -> str:
@@ -957,6 +1009,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     private_view, shared_view = _load_view(ids["private"]), _load_view(ids["shared"])
     diffs = compare_rows(private_view, shared_view)
+    research = compare_research_metadata(private_view, shared_view)
     print(f"compared backtest {ids['private']} (private) vs {ids['shared']} (shared)")
     if args.bt:
         # INFORMATIONAL ONLY, never part of the verdict. The archived row was persisted by the GA
@@ -964,17 +1017,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         # re-run is allowed to diverge from it by ~0.5% and the platform has a dedicated concept
         # for that (rerun_fitness_divergence). The parity question is private vs shared, and
         # folding the archive into it would fail the gate for a reason that is not about arrays.
-        archived = compare_rows(_load_view(args.bt), private_view)
+        archived_view = _load_view(args.bt)
+        archived = compare_rows(archived_view, private_view)
         if archived:
             print(f"archived vs private (informational, NOT part of the verdict): "
                   f"{len(archived)} difference(s); first: {archived[0]}")
         else:
             print("archived vs private (informational): identical.")
-    if not diffs:
-        print("PASS: the two rows are byte-identical across every blob and metric column.")
+        archived_research = compare_research_metadata(archived_view, private_view)
+        if archived_research:
+            print(f"archived vs private RESEARCH METADATA (informational): "
+                  f"{len(archived_research)} difference(s); first: {archived_research[0]}")
+
+    # RESEARCH METADATA, in its own section (design 8.8). Excluded from the byte-for-byte walk
+    # above -- a profile-on run carries it and a profile-off run does not -- but still compared,
+    # because identical trades explained by different measurements is a reader defect.
+    if not _research_metadata(private_view) and not _research_metadata(shared_view):
+        print("research metadata: none on either row (no market-condition profile was on).")
+    elif research:
+        print(f"research metadata: {len(research)} difference(s) between the two re-runs:")
+        for d in research:
+            print(f"  {d}")
+    else:
+        print("research metadata: the market-condition block and every entry state match.")
+
+    if not diffs and not research:
+        print("PASS: the two rows are byte-identical across every blob and metric column, and "
+              "their research metadata matches.")
         return 0
-    print(f"FAIL: {len(diffs)} difference(s):")
-    for d in diffs:
+    print(f"FAIL: {len(diffs)} result difference(s) and {len(research)} research-metadata "
+          f"difference(s):")
+    for d in diffs + research:
         print(f"  {d}")
     print("A difference is a blocker, not a tolerance discussion: trace it to the cause and fix "
           "it before the shared path ships.")
