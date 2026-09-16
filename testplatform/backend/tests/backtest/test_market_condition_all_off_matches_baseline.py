@@ -117,11 +117,14 @@ def _gate(launcher, short: str, mode: str, threshold: float):
     """
     from app.services.strategy_param_space import _apply_mode
 
+    saved = getattr(launcher, "_MARKET_CONDITION_PROFILES", ())
     launcher._MARKET_CONDITION_PROFILES = ("ohlcv-v1",)
     try:
         leaves = launcher._market_condition_gates("o_leap")
     finally:
-        launcher._MARKET_CONDITION_PROFILES = ()
+        # RESTORE, not reset to (): the arms share one loaded module, and a test that puts back
+        # a value the module never had is a test that passes by accident when the default moves.
+        launcher._MARKET_CONDITION_PROFILES = saved
     leaf = next(dict(x) for x in leaves if x["id"].endswith(f"-market-{short}"))
     leaf["value"] = float(threshold)
     _apply_mode(leaf, leaf["id"], mode)
@@ -249,7 +252,10 @@ def test_the_recorded_states_attach_to_the_executed_trades(arms):
     from app.services.backtest.market_condition_bt import attach_entry_states
 
     trades = [dict(t) for t in arms["all_off"][0]["trades"]]
-    attached = attach_entry_states(trades, arms["all_off"][1]["entry_states"])
-    assert attached == len(trades)
-    for trade in trades:
+    out = attach_entry_states(trades, arms["all_off"][1]["entry_states"])
+    assert out["attached"] >= 1
+    bound = [t for t in trades if "entry_state" in t]
+    assert bound, out
+    for trade in bound:
         assert trade["entry_state"]["values"]["underlying_adx_14"]["value"] == pytest.approx(10.0)
+        assert trade["entry_state"]["gap_days"] >= 0

@@ -1801,10 +1801,13 @@ class DailyBacktestEngine:
             "initial_capital": float(self.account._cfg["starting_cash"]),
             # RECORDED, NOT SCORED -- see ``_record_uncovered_assigned``.
             "uncovered_assigned_bars": self._uncovered_assigned_metric(),
-            # Absent (not None) on every profile-less run: the key itself must not appear, or
-            # the "byte-identical with the profile off" gate would fail on the payload shape.
-            **({"market_condition": self._mc.as_dict()} if self._mc is not None else {}),
         }
+        # NOTE: the market-condition block is NOT emitted here. ``run_daily_backtest`` discards
+        # this payload and builds the persisted one from the account, so a copy here would be a
+        # second, always-unread encoding of the same counters -- and one that could not carry
+        # the entry-state binding, which needs the finished trade list. The single writer is
+        # ``market_condition_bt.apply_market_condition_block``; the record itself is reachable
+        # as ``engine._mc`` for an engine-level test.
 
     @staticmethod
     def _log(msg: str) -> None:

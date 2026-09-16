@@ -24,7 +24,8 @@ rather than run on per-process numbers.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time
+from collections import OrderedDict
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -150,9 +151,10 @@ class MarketConditionRunRecord:
     of the condition evaluations because attribution needs the measurement of the fields whose
     gate was OFF too (with every mode off there are no market leaves at all, and the run still
     has an entry state worth attributing to). Keyed ``(symbol, session_label)``;
-    :func:`attach_entry_states` matches each executed trade to the LATEST recorded session at or
-    before its entry, so a resting entry that fills after the decision bar still carries the
-    state its decision was made on.
+    :func:`attach_entry_states` matches each executed STRUCTURE to the LATEST recorded session
+    at or before its entry, so a resting entry that fills after the decision bar still carries
+    the state its decision was made on -- and records the gap, and whether the choice was
+    ambiguous, because this is date proximity and not identity.
     """
 
     def __init__(self, resolver: Any, *, profile: str, manifest_digest: Optional[str] = None):
@@ -169,6 +171,10 @@ class MarketConditionRunRecord:
         self.entries_staged = 0
         self.entry_read_failures = 0
         self._entry_states: Dict[Any, Dict[str, Any]] = {}
+        #: Filled in by :func:`apply_market_condition_block` from the BINDING, not the capture:
+        #: how many structures took a same-session state, how many took an earlier one, and how
+        #: many had more than one candidate decision to choose from. See :func:`attach_entry_states`.
+        self.binding: Dict[str, int] = {}
 
     # -- counters ---------------------------------------------------------------
     def note_eligible(self) -> None:
@@ -262,6 +268,14 @@ class MarketConditionRunRecord:
             "market_leaf_evaluations": self.market_leaf_evaluations,
             "entries_staged": self.entries_staged,
             "entry_read_failures": self.entry_read_failures,
+            # HOW GOOD THE BINDING WAS, not just how much of it there was. A trade bound on the
+            # decision's own session is as certain as this scheme gets; one bound across a gap,
+            # and above all one whose window held MORE THAN ONE decision, is an inference. The
+            # report prints these next to the attribution table so a reader can see how much of
+            # it rests on date proximity.
+            "bound_same_session": self.binding.get("same_session", 0),
+            "bound_with_gap": self.binding.get("with_gap", 0),
+            "ambiguous": self.binding.get("ambiguous", 0),
         }
 
     def entry_states(self) -> list:
@@ -305,30 +319,70 @@ class MarketConditionRunRecord:
 ENTRY_STATE_MAX_GAP_DAYS = 7
 
 
-def attach_entry_states(trades: Any, entry_states: Any,
-                        max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS) -> int:
-    """Attach ``entry_state`` to every trade an entry-state record covers; return how many.
+def _structure_groups(trades: Any) -> Any:
+    """Trade rows grouped into the units a reader means by "a structure", in first-appearance
+    order: option legs sharing a ``transaction_id`` are ONE bet, everything else is its own.
 
-    A trade is matched on its UNDERLYING (an option leg's ``underlying_symbol``, else
-    ``symbol``) and on the LATEST recorded session at or before its entry date, provided that
-    session is within ``max_gap_days`` of it -- see ``ENTRY_STATE_MAX_GAP_DAYS``. A resting
-    entry that fills a day or two after the decision still carries the state the decision was
-    made on; a position opened by something other than a gated entry rule is left UNTOUCHED.
-    An absent key is honest; an inherited one would be a fabricated observation.
+    The same rule as ``results._cap_groups`` and the report tool's ``structures`` -- stated a
+    third time rather than imported because those two work on a live account and on a persisted
+    blob respectively, and this one runs between them, inside the handler. If it ever needs a
+    fourth copy, that is the moment to lift it into ``results``.
     """
-    from bisect import bisect_right
+    groups: "OrderedDict[Any, list]" = OrderedDict()
+    loose: list = []
+    for trade in trades or ():
+        txn = trade.get("transaction_id")
+        if txn is not None and trade.get("contract_symbol"):
+            groups.setdefault(txn, []).append(trade)
+        else:
+            loose.append([trade])
+    return list(groups.values()) + loose
+
+
+def attach_entry_states(trades: Any, entry_states: Any,
+                        max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS) -> Dict[str, int]:
+    """Attach ``entry_state`` to the structures an entry-state record covers.
+
+    Returns ``{"attached", "same_session", "with_gap", "ambiguous", "legs"}`` -- how many
+    STRUCTURES were bound, how certain each binding was, and how many trade rows carry the key.
+
+    A structure is matched on its UNDERLYING (an option leg's ``underlying_symbol``, else
+    ``symbol``) and on the LATEST recorded session at or before its entry date, provided that
+    session is within ``max_gap_days`` of it (see ``ENTRY_STATE_MAX_GAP_DAYS``). A resting entry
+    that fills a day or two after the decision still carries the state the decision was made on;
+    a position opened by something other than a gated entry rule is left UNTOUCHED. An absent
+    key is honest; an inherited one would be a fabricated observation.
+
+    THE BINDING IS DATE PROXIMITY, NOT IDENTITY, AND IT SAYS SO IN THE DATA. The trade blob
+    carries no recommendation id, and ``note_entry`` records a state whenever an entry RULE
+    fires -- including for decisions the dup-position or equity gate then stopped, which produce
+    no order at all. So a fill can sit within the window of more than one recorded decision, and
+    picking the latest is a choice, not a fact. Every attached state therefore carries
+    ``gap_days`` and, when the window held more than one candidate, ``ambiguous: True``. A
+    reader who never looks still gets the best available answer; a reader checking a surprising
+    bin can see exactly which rows were inferred.
+
+    THE STATE IS WRITTEN ONCE PER STRUCTURE, on its first leg. A four-leg condor is one
+    decision and one measurement, and four copies of the same ~200-byte dict in the persisted
+    trades blob is three copies of nothing -- on every individual of every generation.
+    ``attribution`` reads the first leg of the group that carries one.
+    """
+    from bisect import bisect_left, bisect_right
     from datetime import date as _date
 
     by_symbol: Dict[str, Any] = {}
     for record in entry_states or ():
         by_symbol.setdefault(str(record["symbol"]).upper(), []).append(record)
-    index = {sym: ([r["session"] for r in sorted(recs, key=lambda r: r["session"])],
-                   sorted(recs, key=lambda r: r["session"]))
-             for sym, recs in by_symbol.items()}
-    attached = 0
-    for trade in trades or ():
-        symbol = trade.get("underlying_symbol") or trade.get("symbol")
-        entry = str(trade.get("entry_time") or "")[:10]
+    index = {}
+    for sym, recs in by_symbol.items():
+        recs.sort(key=lambda r: r["session"])          # sorted ONCE, in place
+        index[sym] = ([r["session"] for r in recs], recs)
+
+    out = {"attached": 0, "same_session": 0, "with_gap": 0, "ambiguous": 0, "legs": 0}
+    for group in _structure_groups(trades):
+        head = group[0]
+        symbol = head.get("underlying_symbol") or head.get("symbol")
+        entry = str(head.get("entry_time") or "")[:10]
         if not symbol or not entry:
             continue
         found = index.get(str(symbol).upper())
@@ -345,11 +399,20 @@ def attach_entry_states(trades: Any, entry_states: Any,
             continue                       # an unparseable date is not a match, and not a guess
         if gap > max_gap_days:
             continue
-        trade["entry_state"] = {"session": chosen["session"],
-                                "prior_session": chosen["prior_session"],
-                                "values": chosen["values"]}
-        attached += 1
-    return attached
+        # How many recorded decisions for this symbol fall inside the same window? More than
+        # one and the latest is an inference, not the answer.
+        lo = (_date.fromisoformat(entry) - timedelta(days=max_gap_days)).isoformat()
+        candidates = pos - bisect_left(sessions, lo)
+        state = {"session": chosen["session"], "prior_session": chosen["prior_session"],
+                 "values": chosen["values"], "gap_days": gap}
+        if candidates > 1:
+            state["ambiguous"] = True
+            out["ambiguous"] += 1
+        head["entry_state"] = state
+        out["attached"] += 1
+        out["legs"] += 1
+        out["same_session" if gap == 0 else "with_gap"] += 1
+    return out
 
 
 def apply_market_condition_block(results: Dict[str, Any], record: Any) -> Dict[str, Any]:
@@ -362,8 +425,8 @@ def apply_market_condition_block(results: Dict[str, Any], record: Any) -> Dict[s
     """
     if record is None:
         return results
+    record.binding = attach_entry_states(results.get("trades"), record.entry_states())
     block = record.as_dict()
-    block["stats"]["trades_with_entry_state"] = attach_entry_states(
-        results.get("trades"), record.entry_states())
+    block["stats"]["structures_with_entry_state"] = record.binding.get("attached", 0)
     results["market_condition"] = block
     return results

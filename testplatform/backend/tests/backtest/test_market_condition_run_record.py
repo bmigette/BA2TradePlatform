@@ -175,18 +175,67 @@ def _states(*pairs):
             for i, (sym, s) in enumerate(pairs)]
 
 
+def _leg(symbol, entry, *, txn=None, contract=None):
+    return {"underlying_symbol": symbol, "entry_time": f"{entry}T00:00:00",
+            "transaction_id": txn, "contract_symbol": contract}
+
+
 def test_a_fill_after_the_decision_bar_still_gets_the_decision_s_state():
     states = _states(("AAA", "2024-03-05"))
     trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-08T14:30:00"}]
-    assert attach_entry_states(trades, states) == 1
+    out = attach_entry_states(trades, states)
+    assert out["attached"] == 1 and out["with_gap"] == 1 and out["same_session"] == 0
     assert trades[0]["entry_state"]["session"] == "2024-03-05"
+    # THE GAP IS IN THE DATA. A reader looking at a surprising bin can see which rows were
+    # bound on the decision's own session and which were inferred across days.
+    assert trades[0]["entry_state"]["gap_days"] == 3
+    assert "ambiguous" not in trades[0]["entry_state"]
+
+
+def test_a_same_session_fill_records_a_zero_gap_and_no_ambiguity():
+    trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-05T14:30:00"}]
+    out = attach_entry_states(trades, _states(("AAA", "2024-03-05")))
+    assert out == {"attached": 1, "same_session": 1, "with_gap": 0, "ambiguous": 0, "legs": 1}
+    assert trades[0]["entry_state"]["gap_days"] == 0
+
+
+def test_two_decisions_in_one_week_make_the_binding_AMBIGUOUS_and_say_so():
+    """THE CASE THE BOUND ALONE CANNOT SETTLE. ``note_entry`` records a state whenever an entry
+    RULE fires -- including Monday's decision, which the dup-position or equity gate then
+    stopped, so it produced no order. Wednesday's decision produced Thursday's fill. Both sit
+    inside Thursday's 7-day window, so choosing the later one is a judgement, and the row says
+    so instead of presenting it as the measurement behind that trade."""
+    states = _states(("AAA", "2024-03-04"), ("AAA", "2024-03-06"))   # Monday, Wednesday
+    trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-07T14:30:00"}]  # Thursday
+    out = attach_entry_states(trades, states)
+    assert out["attached"] == 1 and out["ambiguous"] == 1 and out["with_gap"] == 1
+    state = trades[0]["entry_state"]
+    assert state["session"] == "2024-03-06"      # the latest at-or-before is still the answer
+    assert state["gap_days"] == 1
+    assert state["ambiguous"] is True
+    # ...and with only ONE decision in the window the flag is absent, not False: an absent key
+    # is what a reader scanning for problems can grep for.
+    trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-07T14:30:00"}]
+    attach_entry_states(trades, _states(("AAA", "2024-03-06")))
+    assert "ambiguous" not in trades[0]["entry_state"]
+
+
+def test_the_ambiguity_counts_reach_the_run_stats(record):
+    record.resolver.session = record.resolver.prior = None       # not used by this path
+    record.binding = attach_entry_states(
+        [{"underlying_symbol": "AAA", "entry_time": "2024-03-07T00:00:00"}],
+        _states(("AAA", "2024-03-04"), ("AAA", "2024-03-06")))
+    stats = record.stats()
+    assert stats["ambiguous"] == 1
+    assert stats["bound_with_gap"] == 1
+    assert stats["bound_same_session"] == 0
 
 
 def test_each_entry_gets_ITS_OWN_state_not_the_first_or_the_last():
     states = _states(("AAA", "2024-01-05"), ("AAA", "2024-06-05"))
     trades = [{"underlying_symbol": "AAA", "entry_time": "2024-01-08T00:00:00"},
               {"underlying_symbol": "AAA", "entry_time": "2024-06-07T00:00:00"}]
-    attach_entry_states(trades, states)
+    assert attach_entry_states(trades, states)["ambiguous"] == 0
     assert trades[0]["entry_state"]["session"] == "2024-01-05"
     assert trades[1]["entry_state"]["session"] == "2024-06-05"
 
@@ -197,7 +246,7 @@ def test_a_position_opened_LONG_after_the_last_decision_inherits_NOTHING():
     the attribution table would report a measured regime for a trade no measurement produced."""
     states = _states(("AAA", "2024-01-05"))
     trades = [{"underlying_symbol": "AAA", "entry_time": "2024-06-01T00:00:00"}]
-    assert attach_entry_states(trades, states) == 0
+    assert attach_entry_states(trades, states)["attached"] == 0
     assert "entry_state" not in trades[0]
 
 
@@ -211,20 +260,37 @@ def test_the_gap_bound_is_inclusive_and_is_the_documented_constant(entry, attach
 
     assert ENTRY_STATE_MAX_GAP_DAYS == 7
     trades = [{"underlying_symbol": "AAA", "entry_time": f"{entry}T00:00:00"}]
-    assert attach_entry_states(trades, _states(("AAA", "2024-01-05"))) == attached
+    assert attach_entry_states(trades, _states(("AAA", "2024-01-05")))["attached"] == attached
 
 
 def test_an_unparseable_entry_date_is_not_a_match():
     trades = [{"underlying_symbol": "AAA", "entry_time": "not-a-date"}]
-    assert attach_entry_states(trades, _states(("AAA", "2024-01-05"))) == 0
+    assert attach_entry_states(trades, _states(("AAA", "2024-01-05")))["attached"] == 0
     assert "entry_state" not in trades[0]
+
+
+def test_a_multi_leg_structure_stores_the_state_ONCE(record):
+    """One decision, one measurement. Four copies of the same ~200-byte dict in the persisted
+    trades blob is three copies of nothing, on every individual of every generation."""
+    legs = [_leg("AAA", "2024-03-05", txn=77, contract=f"AAA240419C0011000{i}")
+            for i in range(4)]
+    out = attach_entry_states(legs, _states(("AAA", "2024-03-05")))
+    assert out["attached"] == 1 and out["legs"] == 1
+    assert "entry_state" in legs[0]
+    assert all("entry_state" not in leg for leg in legs[1:])
+
+
+def test_legs_of_DIFFERENT_structures_each_get_their_own():
+    legs = [_leg("AAA", "2024-03-05", txn=1, contract="AAA240419C00110000"),
+            _leg("AAA", "2024-03-05", txn=2, contract="AAA240419C00120000")]
+    assert attach_entry_states(legs, _states(("AAA", "2024-03-05")))["attached"] == 2
 
 
 def test_a_trade_with_no_record_before_it_is_left_UNTOUCHED():
     """An assignment, or a position opened by something other than a gated entry rule. An
     empty dict would let the report bin it as though it had been measured."""
     trades = [{"underlying_symbol": "AAA", "entry_time": "2024-01-01T00:00:00"}]
-    assert attach_entry_states(trades, _states(("AAA", "2024-03-05"))) == 0
+    assert attach_entry_states(trades, _states(("AAA", "2024-03-05")))["attached"] == 0
     assert "entry_state" not in trades[0]
 
 
@@ -233,12 +299,12 @@ def test_an_equity_row_matches_on_its_own_symbol_and_an_option_leg_on_its_underl
     trades = [{"symbol": "AAA", "entry_time": "2024-03-06T00:00:00"},
               {"symbol": "AAA240419C00100000", "underlying_symbol": "AAA",
                "entry_time": "2024-03-06T00:00:00"}]
-    assert attach_entry_states(trades, states) == 2
+    assert attach_entry_states(trades, states)["attached"] == 2
 
 
 def test_attaching_nothing_to_nothing_is_not_an_error():
-    assert attach_entry_states([], []) == 0
-    assert attach_entry_states(None, None) == 0
+    assert attach_entry_states([], [])["attached"] == 0
+    assert attach_entry_states(None, None)["attached"] == 0
 
 
 # --------------------------------------------------------------------------- the blob
@@ -258,7 +324,8 @@ def test_the_block_lands_on_the_results_and_the_states_land_on_the_trades(record
                           {"symbol": "ZZZ", "entry_time": f"{SESSION.isoformat()}T15:00:00"}]}
     apply_market_condition_block(results, record)
     block = results["market_condition"]
-    assert block["stats"]["trades_with_entry_state"] == 1
+    assert block["stats"]["structures_with_entry_state"] == 1
+    assert block["stats"]["bound_same_session"] == 1
     assert results["trades"][0]["entry_state"]["values"]["underlying_adx_14"]["value"] == 20.0
     assert "entry_state" not in results["trades"][1]
     # The metadata is added AFTER the metrics; it must not have grown a metric of its own.

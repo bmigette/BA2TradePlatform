@@ -306,10 +306,18 @@ def structures(trades: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
 
 def concentration(values: Sequence[float]) -> Tuple[float, float, float]:
     """``(net, top1_pct, top5_pct)`` -- the share of NET P&L the single best and best five
-    units carry. ``nan`` shares when net is zero: a percentage of nothing is not zero."""
+    units carry.
+
+    ``nan`` shares when net is zero OR NEGATIVE. A percentage of nothing is not zero, and a
+    share of a LOSS is worse than meaningless: dividing a positive best trade by a negative net
+    prints "-42% of net P&L", which reads as a loss concentration when it is the opposite, and
+    a large loser in a losing book prints a reassuring small positive. Concentration is a
+    statement about how a PROFIT was earned; a book that lost money has no profit to
+    concentrate, and the honest answer is that the question does not apply.
+    """
     ordered = sorted(values, reverse=True)
     net = math.fsum(ordered)
-    if not ordered or net == 0.0:
+    if not ordered or net <= 0.0:
         return net, float("nan"), float("nan")
     return net, ordered[0] / net * 100.0, math.fsum(ordered[:5]) / net * 100.0
 
@@ -325,15 +333,23 @@ def attribution(trades: Sequence[Dict[str, Any]], block: Dict[str, Any]) -> Dict
     fields: List[str] = list(specs) or sorted({
         name for t in trades for name in ((t.get("entry_state") or {}).get("values") or {})})
     result: Dict[str, Any] = {"fields": OrderedDict(), "units": 0, "unattributed": 0,
-                              "inconsistent": 0}
+                              "inconsistent": 0, "ambiguous": 0, "gap_days": []}
     units = []
     for group in structures(trades):
-        states = {json.dumps((t.get("entry_state") or {}).get("values") or {}, sort_keys=True)
-                  for t in group}
-        if len(states) > 1:
+        # THE STATE IS WRITTEN ONCE PER STRUCTURE, on whichever leg came first -- a four-leg
+        # condor is one decision and one measurement (see
+        # ``market_condition_bt.attach_entry_states``). So take the first leg that HAS one, and
+        # count as inconsistent only legs that disagree on a state they both carry.
+        present = [t.get("entry_state") for t in group if t.get("entry_state")]
+        distinct = {json.dumps(st.get("values") or {}, sort_keys=True) for st in present}
+        if len(distinct) > 1:
             result["inconsistent"] += 1
             continue
-        state = (group[0].get("entry_state") or {})
+        state = present[0] if present else {}
+        if state.get("ambiguous"):
+            result["ambiguous"] += 1
+        if state:
+            result["gap_days"].append(int(state.get("gap_days") or 0))
         units.append({
             "pnl": math.fsum(_pnl(t) for t in group),
             "symbol": (group[0].get("underlying_symbol") or group[0].get("symbol") or "?"),
@@ -457,6 +473,23 @@ def _pct(x: Any) -> str:
     return "n/a" if math.isnan(v) else f"{v:.1f}%"
 
 
+def _share(pct: Any, net: Any) -> str:
+    """A concentration share, or WHY there isn't one. ``concentration`` returns ``nan`` for a
+    net that is zero or negative; printing that as "n/a" alone would read as a missing
+    measurement rather than a question that does not apply to a losing book."""
+    try:
+        value = float(pct)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isnan(value):
+        return f"{value:.1f}%"
+    try:
+        n = float(net)
+    except (TypeError, ValueError):
+        return "n/a"
+    return "n/a (net<0)" if n < 0 else "n/a (net=0)"
+
+
 def _money(x: Any) -> str:
     try:
         return f"{float(x):,.0f}"
@@ -465,14 +498,26 @@ def _money(x: Any) -> str:
 
 
 def render(opt: Dict[str, Any], runs: Sequence[Dict[str, Any]], top: int,
-           want_coverage: bool = False, cache_root: Optional[str] = None) -> str:
+           want_coverage: bool = False, cache_root: Optional[str] = None,
+           manifest_override: Optional[str] = None,
+           profile_override: Optional[str] = None) -> str:
     out: List[str] = []
     block = ((opt["config"].get("backtest") or {}).get("market_condition")) or {}
-    universe = list((opt["config"].get("backtest") or {}).get("enabled_instruments") or [])
+    # ``enabled_instruments`` can hold a live SENTINEL (EXPERT / DYNAMIC / SCREENER) instead of
+    # symbols -- the instance picks its universe at analysis time. Coverage-checking "SCREENER"
+    # would report a missing symbol that does not exist, so they are dropped here and named.
+    raw_universe = [str(x).upper()
+                    for x in ((opt["config"].get("backtest") or {}).get("enabled_instruments") or [])]
+    sentinels = sorted(set(raw_universe) & _universe_sentinels())
+    universe = [x for x in raw_universe if x not in sentinels]
     _line(out, f"# market conditions -- optimization {opt['id']}: {opt['name']}")
     _line(out, f"status {opt['status']}, best fitness "
                f"{opt['best_fitness'] if opt['best_fitness'] is not None else 'n/a'}, "
                f"{len(universe)} instruments")
+    if sentinels:
+        _line(out, f"  {len(sentinels)} entr(y/ies) of enabled_instruments are universe "
+                   f"SENTINELS ({', '.join(sentinels)}): the instance picks its symbols at "
+                   f"analysis time, so they are not coverage-checkable and are excluded below.")
     _line(out)
 
     _line(out, "## versions (as PERSISTED with the run, never re-derived)")
@@ -510,8 +555,18 @@ def render(opt: Dict[str, Any], runs: Sequence[Dict[str, Any]], top: int,
 
     if want_coverage:
         _line(out, "## feature-off coverage diagnostic")
-        digest = block.get("manifest")
-        profile = (block.get("profiles") or ["ohlcv-v1"])[0]
+        # An OVERRIDE, not a default: ``--manifest``/``--profile`` are what make this useful on
+        # a feature-off job, which by definition pins neither -- "check THIS job's universe
+        # against the snapshot the gated jobs use". With neither given and no persisted block
+        # there is nothing to check against, and the report says so rather than guessing a
+        # profile name that happens to be the only one registered today.
+        digest = manifest_override or block.get("manifest")
+        profiles = block.get("profiles") or []
+        profile = profile_override or (profiles[0] if profiles else None)
+        if digest and not profile:
+            _line(out, "  REFUSED: a manifest without a profile. The snapshot's rows are keyed")
+            _line(out, "  by profile; pass --profile to say which one to read.")
+            digest = None
         if not digest:
             _line(out, "  No manifest is pinned on this job, so there is no published snapshot")
             _line(out, "  to diagnose. Pass --manifest/--profile to check a snapshot anyway.")
@@ -543,8 +598,8 @@ def _render_run(out: List[str], run: Dict[str, Any], block: Dict[str, Any]) -> N
     else:
         for key in ("eligible_recommendations", "market_evaluated", "market_gate_passed",
                     "market_gate_rejected", "market_unknown_recommendations",
-                    "market_leaf_evaluations", "entries_staged", "trades_with_entry_state",
-                    "entry_read_failures"):
+                    "market_leaf_evaluations", "entries_staged",
+                    "structures_with_entry_state", "entry_read_failures"):
             if key in stats:
                 _line(out, f"  {key:<30} {stats[key]}")
         unknown = stats.get("market_unknown_input_by_reason") or {}
@@ -563,7 +618,8 @@ def _render_run(out: List[str], run: Dict[str, Any], block: Dict[str, Any]) -> N
                f"{stats.get('entries_staged', 'n/a')}")
     _line(out, f"  closed round-trip units in the trade blob                {len(groups)}")
     net, top1, top5 = concentration([math.fsum(_pnl(t) for t in g) for g in groups])
-    _line(out, f"  net P&L {_money(net)}, top-1 {_pct(top1)} of it, top-5 {_pct(top5)}")
+    _line(out, f"  net P&L {_money(net)}, top-1 {_share(top1, net)} of it, "
+               f"top-5 {_share(top5, net)}")
     _line(out)
 
     _line(out, "### per year (the WHOLE account, as the engine computed it)")
@@ -582,9 +638,23 @@ def _render_run(out: List[str], run: Dict[str, Any], block: Dict[str, Any]) -> N
     _line(out, "  A BIN IS NOT AN ACCOUNT. These rows hold overlapping trades that happened to")
     _line(out, "  be entered in one measured regime; there is no capital behind a bin and no")
     _line(out, "  annualised return is computed for one. Dollars, counts and shares only.")
+    # THE APPROXIMATION, STATED WHERE IT IS CONSUMED. Anyone reading a bin table is about to
+    # draw a conclusion from it, and this is the assumption that conclusion rests on.
+    _line(out, "  Each structure is matched to a decision by DATE PROXIMITY, not identity (the")
+    _line(out, "  blob carries no recommendation id): the latest recorded decision for its")
+    _line(out, "  underlying within 7 days of the fill, counted as AMBIGUOUS below and flagged")
+    _line(out, "  in the blob when more than one decision fell in that window.")
     data = attribution(run["trades"], block)
+    gaps = data["gap_days"]
     _line(out, f"  units {data['units']}, without a recorded entry state {data['unattributed']}, "
                f"legs disagreeing on their state {data['inconsistent']}")
+    _line(out, f"  bound on the decision's own session {sum(1 for g in gaps if g == 0)}, "
+               f"across a gap {sum(1 for g in gaps if g > 0)} "
+               f"(max {max(gaps) if gaps else 0} days), AMBIGUOUS {data['ambiguous']}")
+    for key, label in (("bound_same_session", "same session"), ("bound_with_gap", "with a gap"),
+                       ("ambiguous", "ambiguous")):
+        if key in stats:
+            _line(out, f"  run-recorded binding: {label:<14} {stats[key]}")
     if data["units"] and data["unattributed"] == data["units"]:
         _line(out, "  NOTHING TO ATTRIBUTE: no trade of this run carries an entry state. Either")
         _line(out, "  the run predates the entry-state capture, or it ran with the profile off.")
@@ -594,10 +664,21 @@ def _render_run(out: List[str], run: Dict[str, Any], block: Dict[str, Any]) -> N
         _line(out, f"  {field}  edges {[_fmt_edge(e) for e in info['edges']] or 'none declared'}")
         _table(out, ("bin", "units", "issuers", "dates", "net P&L", "top-1", "top-5"),
                [[r["bin"], r["units"], r["issuers"], r["dates"], _money(r["net_pnl"]),
-                 _pct(r["top1_pct"]), _pct(r["top5_pct"])] for r in info["rows"]])
+                 _share(r["top1_pct"], r["net_pnl"]), _share(r["top5_pct"], r["net_pnl"])]
+                for r in info["rows"]])
         if info["unknown"]:
             _line(out, f"    not binned: {info['unknown']}")
     _line(out)
+
+
+def _universe_sentinels() -> set:
+    """The live universe sentinels, from their one definition -- never a literal list here."""
+    try:
+        from ba2_common.core.market_condition_live import UNIVERSE_SENTINELS
+
+        return set(UNIVERSE_SENTINELS)
+    except ImportError:                     # a stdlib-only invocation: nothing to filter against
+        return set()
 
 
 def _render_coverage(out: List[str], report: Dict[str, Any]) -> None:
@@ -630,14 +711,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--coverage", action="store_true",
                    help="Append the offline snapshot-coverage diagnostic (feature-off runs).")
     p.add_argument("--cache-root", help="Cache root for --coverage (default: ba2_common CACHE_FOLDER).")
+    p.add_argument("--manifest", help="Check --coverage against THIS snapshot instead of the "
+                                      "one the job pinned (the point of the flag: a feature-off "
+                                      "job pins none).")
+    p.add_argument("--profile", help="Profile to read the --manifest snapshot as; required with "
+                                     "--manifest when the job records no profile of its own.")
     args = p.parse_args(argv)
 
     con = open_db(args.db)
     rows = optimizations(con, opt_id=args.opt, like=args.like)
     if not rows:
         raise SystemExit(f"no optimization matched {args.opt or args.like!r} in {args.db}")
+    if (args.manifest or args.profile) and not args.coverage:
+        raise SystemExit("--manifest/--profile only affect the --coverage diagnostic; pass "
+                         "--coverage too, or drop them")
     text = "\n".join(render(opt, persisted_runs(con, opt["id"]), args.top,
-                            want_coverage=args.coverage, cache_root=args.cache_root)
+                            want_coverage=args.coverage, cache_root=args.cache_root,
+                            manifest_override=args.manifest, profile_override=args.profile)
                      for opt in rows)
     sys.stdout.write(text)
     if args.out:

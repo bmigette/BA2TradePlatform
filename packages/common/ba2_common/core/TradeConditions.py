@@ -111,7 +111,15 @@ _market_condition_resolver_calls = 0
 
 
 def market_condition_resolver_calls() -> int:
-    """How many market-condition leaf evaluations asked for a context in this process."""
+    """How many market-condition leaf evaluations asked for a context in this process.
+
+    KEPT DELIBERATELY, not a debug leftover. The increment is one CPython integer add on a
+    module global -- tens of nanoseconds against the ~0.9 us an evaluated gate costs, and ZERO
+    on a profile-less run, which never reaches this function at all. In exchange, "the gates
+    were never reached" is a number a parity child prints rather than an inference from the
+    absence of a warning. Removing it would save nothing measurable and cost the only direct
+    evidence for the no-impact claim.
+    """
     return _market_condition_resolver_calls
 
 

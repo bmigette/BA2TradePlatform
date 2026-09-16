@@ -888,9 +888,14 @@ def run_daily_backtest(
             market_condition_record = None
             if market_condition_resolver is not None:
                 from app.services.backtest.market_condition_bt import MarketConditionRunRecord
+                # EXPLICIT, no default: ``config`` was normalised at the top of this function
+                # and ``install_backtest_market_conditions`` read the same key with ``[...]``
+                # to decide whether to install at all, so a resolver existing means the key
+                # exists and names a registered profile. A second ``or "none"`` here would only
+                # be able to mislabel a run whose gates were on.
                 market_condition_record = MarketConditionRunRecord(
                     market_condition_resolver,
-                    profile=config.get("market_condition_profile") or "none",
+                    profile=config["market_condition_profile"],
                     manifest_digest=config.get("market_condition_manifest"))
             # Clamp the indicator/ATR OHLCV fetches to the backtest clock: PandasIndicatorCalc
             # and get_latest_atr fetch with end_date=now(), which would leak future bars into the
