@@ -43,22 +43,29 @@ should not be read as passing: the cancel/retry/restart reserve-and-release cycl
 and SEVERAL EXPERTS entering concurrently on one shared account (the gate's
 concurrency tests use one expert per account).
 
-THE TWO PINNED BLOCKERS (plan section 6)
-----------------------------------------
-Two pre-existing discrepancies are deliberately NOT fixed by the leverage feature,
-because fixing either would move historical backtest results. Both are pinned here as
+THE PINNED BLOCKERS (plan section 6)
+------------------------------------
+Pre-existing discrepancies deliberately NOT fixed by the leverage feature, because
+fixing either would move historical backtest results. They are pinned here as
 ``xfail(strict=True)`` -- so the day someone corrects the contract, the pin XPASSes and
 FAILS the suite, forcing the change to be acknowledged rather than absorbed:
 
-  * FINDING 6 -- ``BacktestAccount.get_balance()`` is CASH while a live account's is
-    EQUITY, so after a $1,000 purchase from $4,000 the shared expert math charges the
-    position twice in the backtest ($3,000 virtual / $2,000 free) and once live
-    ($4,000 / $3,000). Flat state is identical; the divergence begins at the first fill.
-  * FINDING 4 -- the classic RM's per-instrument ceiling is ``available x ratio``, not
-    ``virtual x ratio``, so a half-invested expert's 10% cap is 10% of what is LEFT.
+  * FINDING 6 -- STILL OPEN. ``BacktestAccount.get_balance()`` is CASH while a live
+    account's is EQUITY, so after a $1,000 purchase from $4,000 the shared expert math
+    charges the position twice in the backtest ($3,000 virtual / $2,000 free) and once
+    live ($4,000 / $3,000). Flat state is identical; the divergence begins at the first
+    fill. Its companion NON-xfail test records the current backtest number, so the
+    divergence is documented in both directions and a silent drift in either fails.
 
-Each pin has a companion NON-xfail test recording the CURRENT number, so the
-divergence is documented in both directions and a silent drift in either fails.
+  * FINDING 4 -- CORRECTED 2026-09-16, and the mechanism above is exactly how it was
+    noticed: the pin XPASSed. The classic RM's per-instrument ceiling was
+    ``available x ratio`` and is now ``virtual x ratio``, so a half-invested expert's
+    10% cap is 10% of its BOOK rather than 10% of what is left. This moved historical
+    sizing, deliberately and with the user's decision -- every backtest run before that
+    date sized its second and later entries against a shrinking ceiling. The companion
+    "TODAY" pin was deleted with the behaviour it recorded; the surviving test
+    (``test_the_instrument_ceiling_is_ten_percent_of_the_virtual_equity``) is no longer
+    an xfail because it is now simply the contract.
 
 Run from the backend dir:
     python -m pytest tests/backtest/test_margin_live_backtest_parity.py -q
@@ -746,8 +753,11 @@ def test_after_the_first_entry_the_two_live_fundings_still_agree():
     assert levered == unlevered
     assert unlevered["virtual"] == pytest.approx(4_000.0)
     assert unlevered["available"] == pytest.approx(3_000.0)
-    # $3,000 free, less the $1,000 already allocated to this symbol under the 100% cap.
-    assert unlevered["quantity"] == pytest.approx(20.0)
+    # The 100% ceiling is the $4,000 SLEEVE, less the $1,000 this symbol already holds,
+    # so $3,000 of room -- which the $3,000 of free money can exactly pay for: 30 shares.
+    # It was 20 until 2026-09-16, when the ceiling stopped being a share of what was left
+    # (finding 4); the $1,000 held was then subtracted from $3,000 rather than $4,000.
+    assert unlevered["quantity"] == pytest.approx(30.0)
 
 
 def test_the_backtest_charges_the_position_twice_TODAY():
@@ -767,7 +777,10 @@ def test_the_backtest_charges_the_position_twice_TODAY():
 
     assert backtest["virtual"] == pytest.approx(3_000.0)     # cash, not equity
     assert backtest["available"] == pytest.approx(2_000.0)   # cash minus the position again
-    assert backtest["quantity"] == pytest.approx(10.0)       # vs 20 live
+    # 20 = the $3,000 cash-"virtual" ceiling less the $1,000 held. Live reaches 30 from a
+    # $4,000 sleeve, so the cash/equity divergence this test exists for is untouched: only
+    # the DENOMINATOR of the ceiling changed on 2026-09-16 (finding 4), for both arms.
+    assert backtest["quantity"] == pytest.approx(20.0)       # vs 30 live
 
 
 @pytest.mark.xfail(strict=True, reason=(
@@ -856,39 +869,25 @@ def _size_prioritized(arm: _Arm, ratio: float):
     return candidate, total_virtual_balance, max_equity_per_instrument
 
 
-def test_the_instrument_ceiling_is_ten_percent_of_the_REMAINING_funds_TODAY():
-    """COMPANION PIN to the strict xfail below: today's number, asserted positively.
+def test_the_instrument_ceiling_is_ten_percent_of_the_virtual_equity():
+    """FINDING 4, CORRECTED 2026-09-16 -- was the strict-xfail pin below this line.
 
-    ``max_equity_per_instrument = available x ratio`` -- 10% of the $9,000 still free,
-    not 10% of the $18,000 the expert is allocated. So a half-invested expert's
-    "10% per instrument" silently becomes 5% of its book.
+    ``max_virtual_equity_per_instrument_percent`` says VIRTUAL EQUITY, and the setting's
+    own tooltip describes a notional ceiling on the expert's book -- so 10% of $18,000 is
+    $1,800, whatever fraction of the book happens to be deployed today.
+
+    Until this date the classic RM used ``available x ratio``: 10% of the $9,000 still
+    free, so a half-invested expert's "10% per instrument" silently became 5% of its book
+    and the ceiling depended on the order symbols happened to be funded in. The companion
+    pin that recorded that number (``..._of_the_REMAINING_funds_TODAY``, $900 / 9 shares)
+    is gone with the behaviour it documented; this test is now the contract, not the wish.
+
+    The wallet is unchanged and still the FREE money: $9,000 of a $18,000 sleeve.
     """
     with half_invested_world() as arm:
         candidate, total_virtual_balance, max_equity_per_instrument = _size_prioritized(
             arm, 0.10)
 
     assert total_virtual_balance == pytest.approx(9_000.0)
-    assert max_equity_per_instrument == pytest.approx(900.0)
-    assert candidate.quantity == 9
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "finding 4: classic per-instrument ceiling is available x ratio (900), not virtual x "
-    "ratio (1800); changing it changes historical sizing - deferred, see plan section 6"),
-    raises=AssertionError)
-def test_the_instrument_ceiling_is_ten_percent_of_the_virtual_equity():
-    """THE PINNED BLOCKER (plan §6, finding 4).
-
-    ``max_virtual_equity_per_instrument_percent`` says VIRTUAL EQUITY, and the setting's
-    own tooltip describes a notional ceiling on the expert's book -- so 10% of $18,000 is
-    $1,800, whatever fraction of the book happens to be deployed today. Correcting the
-    denominator changes historical sizing for every classic-RM backtest ever run, so it is
-    explicitly out of scope for the (result-neutral) leverage feature and pinned here
-    instead.
-    """
-    with half_invested_world() as arm:
-        candidate, _total_virtual_balance, max_equity_per_instrument = _size_prioritized(
-            arm, 0.10)
-
     assert max_equity_per_instrument == pytest.approx(1_800.0)
     assert candidate.quantity == 18

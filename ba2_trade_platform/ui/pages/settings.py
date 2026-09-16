@@ -1328,6 +1328,7 @@ class ExpertSettingsTab:
                     {'name': 'expert', 'label': 'Expert Type', 'field': 'expert', 'sortable': True},
                     {'name': 'alias', 'label': 'Alias', 'field': 'alias', 'sortable': True},
                     {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},
+                    {'name': 'priority', 'label': 'Priority', 'field': 'priority', 'align': 'right', 'sortable': True},
                     {'name': 'virtual_equity_pct', 'label': 'Virtual Equity %', 'field': 'virtual_equity_pct', 'align': 'right'},
                     {'name': 'account_id', 'label': 'Account ID', 'field': 'account_id'},
                     {'name': 'enter_market_ruleset_name', 'label': 'Enter Market Ruleset', 'field': 'enter_market_ruleset_name'},
@@ -1626,6 +1627,12 @@ class ExpertSettingsTab:
 
                             with ui.row().classes('w-full items-center gap-4'):
                                 self.enabled_checkbox = ui.checkbox('Enabled', value=True)
+                                self.priority_input = ui.number(
+                                    'Priority', value=expert_instance.priority if is_edit else 1,
+                                    min=1, step=1, precision=0).props('dense').classes('w-28')
+                                self.priority_input.tooltip(
+                                    'Higher priority processes trades first for experts scheduled at the same '
+                                    'time on this account. Analysis can run in parallel. Default: 1.')
                                 self.virtual_equity_input = ui.input(
                                     label='Virtual Equity',
                                     value='100.0'
@@ -3748,6 +3755,7 @@ class ExpertSettingsTab:
                             'user_description': self.user_description_textarea.value,
                             'enabled': self.enabled_checkbox.value,
                             'virtual_equity_pct': float(self.virtual_equity_input.value),
+                            'priority': self._validated_priority(),
                         }
                     
                     # Export expert settings if editing
@@ -3876,6 +3884,8 @@ class ExpertSettingsTab:
                         expert_instance.alias = general.get('alias', expert_instance.alias)
                         expert_instance.user_description = general.get('user_description', '')
                         expert_instance.enabled = False  # Always disabled for safety
+                        from ...core.ExpertPriority import priority_from_settings
+                        expert_instance.priority = priority_from_settings(general, current=expert_instance.priority)
                         expert_instance.virtual_equity_pct = float(general.get('virtual_equity_pct', general.get('virtual_equity', 100.0)))
                         
                         # Resolve and set rulesets by name
@@ -3914,7 +3924,9 @@ class ExpertSettingsTab:
                         logger.info(f'Creating new expert')
                         account_id = 1  # Default account
                         
+                        from ...core.ExpertPriority import priority_from_settings
                         new_expert_instance = ExpertInstance(
+                            priority=priority_from_settings(general),
                             account_id=account_id,
                             expert=expert_type,
                             alias=general.get('alias', 'Imported Expert'),
@@ -4147,6 +4159,10 @@ class ExpertSettingsTab:
         assert_fields_served(used, profiles,
                              where=f"enter-market ruleset {enter_market_ruleset_id}")
 
+    def _validated_priority(self):
+        from ...core.ExpertPriority import validate_expert_priority
+        return validate_expert_priority(self.priority_input.value)
+
     def _save_expert(self, expert_instance=None):
         """Save the expert instance."""
         try:
@@ -4164,6 +4180,7 @@ class ExpertSettingsTab:
                 expert_instance.alias = self.alias_input.value or None
                 expert_instance.user_description = self.user_description_textarea.value or None
                 expert_instance.enabled = self.enabled_checkbox.value
+                expert_instance.priority = self._validated_priority()
                 expert_instance.virtual_equity_pct = float(self.virtual_equity_input.value)
                 expert_instance.account_id = account_id
                 
@@ -4245,6 +4262,7 @@ class ExpertSettingsTab:
                     alias=self.alias_input.value or None,
                     user_description=self.user_description_textarea.value or None,
                     enabled=self.enabled_checkbox.value,
+                    priority=self._validated_priority(),
                     virtual_equity_pct=float(self.virtual_equity_input.value),
                     account_id=account_id,
                     enter_market_ruleset_id=enter_market_id,
@@ -4626,6 +4644,7 @@ class ExpertSettingsTab:
                     enter_market_ruleset_id=source.enter_market_ruleset_id,
                     open_positions_ruleset_id=source.open_positions_ruleset_id,
                     user_description=source.user_description,
+                    priority=source.priority,
                     virtual_equity_pct=source.virtual_equity_pct
                 )
                 

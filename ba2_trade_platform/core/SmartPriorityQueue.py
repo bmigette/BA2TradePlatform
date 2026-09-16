@@ -97,7 +97,8 @@ class SmartPriorityQueue(Queue):
         Select the best item from the queue using expert-based round-robin.
         
         Algorithm:
-        1. Group pending tasks by expert_id
+        1. Select highest expert priority within each scheduled time/account group,
+           then group eligible tasks by expert_id
         2. Count currently running tasks per expert
         3. Find expert with FEWEST running tasks (fair distribution)
         4. Use timestamp as tiebreaker if multiple experts have same running count
@@ -109,10 +110,23 @@ class SmartPriorityQueue(Queue):
         if not self.queue:
             return None
             
-        # Group tasks by expert
+        # Priority applies only among tasks from the SAME scheduled fire time
+        # and account. Other times/accounts and manual jobs retain round-robin
+        # fairness, even when an earlier high-priority run is still queued.
+        group_priorities = {}
+        for _, _, task in self.queue:
+            group = getattr(task, 'priority_group', None)
+            if group is not None:
+                priority = getattr(task, 'expert_priority', 1)
+                group_priorities[group] = max(group_priorities.get(group, priority), priority)
+
+        # Group eligible tasks by expert.
         expert_tasks: Dict[Optional[int], list] = {}
         for idx, item in enumerate(self.queue):
             priority, counter, task = item
+            group = getattr(task, 'priority_group', None)
+            if group is not None and getattr(task, 'expert_priority', 1) < group_priorities[group]:
+                continue
             expert_id = self._get_expert_id(task)
             
             if expert_id not in expert_tasks:

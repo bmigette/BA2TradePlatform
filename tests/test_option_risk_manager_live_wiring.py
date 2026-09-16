@@ -24,7 +24,7 @@ import pytest
 def _dispatch_source() -> str:
     from ba2_trade_platform.core.WorkerQueue import WorkerQueue
 
-    return inspect.getsource(WorkerQueue._check_and_process_expert_recommendations)
+    return inspect.getsource(WorkerQueue._process_expert_recommendations)
 
 
 def test_classic_options_is_dispatched_down_the_classic_branch():

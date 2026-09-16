@@ -249,6 +249,8 @@ def main() -> int:
                else f"Old rulesets {old_enter}/{old_open} left orphaned (not deleted).")
         )
         inst.alias = label
+        from ba2_trade_platform.core.ExpertPriority import priority_from_settings
+        inst.priority = priority_from_settings(entry, current=inst.priority)
         update_instance(inst)
         print(f"expertinstance {inst_id}: rulesets repointed, alias/description updated")
 
