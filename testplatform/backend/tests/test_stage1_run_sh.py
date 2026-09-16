@@ -8,6 +8,8 @@ the same wiring-not-mechanism posture as ``test_equity_cap_launcher.py`` and
 """
 import os
 
+import pytest
+
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _SCRIPT = os.path.join(_ROOT, "tools", "stage1_run.sh")
 
@@ -79,6 +81,48 @@ def test_the_market_condition_profile_is_off_by_default_and_adds_nothing_when_of
                   "warm_market_conditions.py verify", "warm_market_conditions.py prepare-host"):
         assert token.split(".py ")[1] in body
     assert "--market-condition-profile" in body and "--market-condition-manifest" in body
+
+
+def test_a_manifest_with_the_profile_off_refuses_the_launch(tmp_path):
+    """Review 2026-09-16, F2, in the wrapper's environment form.
+
+    ``MARKET_CONDITION_MANIFEST`` exported with ``MARKET_CONDITION_PROFILE`` unset used to launch
+    the whole grid UNGATED -- the matrix driver dropped the digest, the launcher never saw it, and
+    the jobs took the ordinary ungated discovery names (so they could also be SKIPped against an
+    existing ungated completion) while the environment said a snapshot was pinned.
+
+    The guard itself is executed here, not just grepped: the slice of the real script from the two
+    variable defaults down to the end of the refusal, run under bash with the offending
+    environment and with the accepted ones.
+    """
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is not available on this host")
+    text = _text()
+    start = text.index('MARKET_CONDITION_PROFILE="${MARKET_CONDITION_PROFILE:-none}"')
+    end = text.index('if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then')
+    fragment = text[start:end] + "\necho REACHED-THE-WARM-STEP\n"
+    script = tmp_path / "guard.sh"
+    script.write_text(fragment, encoding="utf-8", newline="\n")
+
+    def run(env):
+        return subprocess.run([bash, str(script)], capture_output=True, text=True,
+                              env={**os.environ, **env})
+
+    refused = run({"MARKET_CONDITION_MANIFEST": "abc123", "MARKET_CONDITION_PROFILE": ""})
+    assert refused.returncode == 1
+    assert "MARKET_CONDITION_PROFILE is unset/none" in refused.stderr
+    assert "REACHED-THE-WARM-STEP" not in refused.stdout
+
+    # ... and the two configurations that ARE meaningful still pass the guard.
+    both = run({"MARKET_CONDITION_MANIFEST": "ohlcv-v1=abc123",
+                "MARKET_CONDITION_PROFILE": "ohlcv-v1"})
+    assert both.returncode == 0 and "REACHED-THE-WARM-STEP" in both.stdout
+    neither = run({"MARKET_CONDITION_MANIFEST": "", "MARKET_CONDITION_PROFILE": ""})
+    assert neither.returncode == 0 and "REACHED-THE-WARM-STEP" in neither.stdout
 
 
 def test_the_warm_step_runs_once_before_the_matrix_in_the_documented_order():

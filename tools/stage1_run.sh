@@ -101,6 +101,18 @@ fi
 MARKET_CONDITION_PROFILE="${MARKET_CONDITION_PROFILE:-none}"
 MARKET_CONDITION_MANIFEST="${MARKET_CONDITION_MANIFEST:-}"
 MC_ARGS=()
+# A PIN WITH THE PROFILE OFF IS A MISTAKE, NOT AN OMISSION (review 2026-09-16, F2 -- the same
+# rule the matrix driver now applies to its flags). Exporting the digest and forgetting the
+# profile used to launch the whole 32-job grid UNGATED, under the ordinary ungated job names,
+# from an environment that says a snapshot is pinned -- and such a name can then be SKIPped
+# against an existing ungated completion. Refused before anything is warmed or launched.
+if [ "$MARKET_CONDITION_PROFILE" = "none" ] && [ -n "$MARKET_CONDITION_MANIFEST" ]; then
+  echo "stage1_run.sh: MARKET_CONDITION_MANIFEST=$MARKET_CONDITION_MANIFEST is set but" >&2
+  echo "MARKET_CONDITION_PROFILE is unset/none: nothing would read that snapshot and the grid" >&2
+  echo "would run UNGATED under the ungated job names. Set MARKET_CONDITION_PROFILE, or unset" >&2
+  echo "MARKET_CONDITION_MANIFEST." >&2
+  exit 1
+fi
 if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
   MC_PYTHON=/opt/ba2worker/ba2-venvs/test/bin/python
   MC_WARM=tools/warm_market_conditions.py

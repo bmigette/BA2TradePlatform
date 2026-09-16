@@ -140,6 +140,9 @@ def _jobs(experts, strategies, name_suffix=""):
 def _market_condition_passthrough(args) -> list:
     """Extra optimize CLI tokens for the market-condition profile ([] when it is ``none``).
 
+    NOTE that a manifest without a profile never reaches here: dropping it silently is exactly
+    the fault review 2026-09-16 (F2) found, so ``resolve_args`` refuses that combination first.
+
     Both tokens are EXPLICIT per job for the same reason the options store is (see build_cmd): a
     distributed trial carries {config, fitness_metric, cache_root, inmem_trades} and no
     environment, so a profile or a manifest chosen through the environment is a decision the
@@ -147,6 +150,7 @@ def _market_condition_passthrough(args) -> list:
     """
     profile = getattr(args, "market_condition_profile", None) or "none"
     if profile == "none":
+        # A manifest here is refused in resolve_args, before any command or name is built (F2).
         return []
     out = ["--market-condition-profile", profile]
     if getattr(args, "market_condition_manifest", None):
@@ -332,6 +336,18 @@ def resolve_args(ap, argv=None):
         if not args.screener_gate_store or args.max_stock_price != 0:
             ap.error("Discovery requires --screener-gate-store and --max-stock-price 0 "
                      "to retain the launcher's per-structure affordability caps")
+    # A MANIFEST WITHOUT A PROFILE IS A REFUSAL, NOT AN OMISSION (review 2026-09-16, F2).
+    # _market_condition_passthrough used to return [] for it, so the launcher never saw the
+    # manifest and its own manifest-without-profile refusal could not fire. The job then ran
+    # UNGATED under a discovery name identical to the ordinary ungated job -- so it could also be
+    # skipped against an existing ungated completion, and every listing afterwards would read as
+    # though a snapshot had been pinned. Refused HERE, in resolve_args, so it holds for
+    # build_cmd, discovery_name and --dry-run alike.
+    manifest = (getattr(args, "market_condition_manifest", None) or "").strip()
+    if manifest and (args.market_condition_profile or "none") == "none":
+        ap.error("--market-condition-manifest was given without --market-condition-profile: "
+                 "nothing would read that snapshot and the jobs would run UNGATED under the "
+                 "ungated job names. Pass --market-condition-profile, or drop the manifest.")
     try:
         start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
     except ValueError:

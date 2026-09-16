@@ -86,3 +86,51 @@ def test_the_job_name_digest_is_stable_for_the_same_flags():
 def test_both_flags_are_documented(flag):
     help_text = matrix.build_parser().format_help()
     assert flag in help_text
+
+
+# ---------------------------------------------------------------- the driver's own refusal (F2)
+def test_a_manifest_without_a_profile_is_refused_by_the_DRIVER(capsys):
+    """Review 2026-09-16, F2 -- reproduced through ``resolve_args``/``build_cmd``/
+    ``discovery_name`` and fixed here.
+
+    ``_market_condition_passthrough`` returned ``[]`` for ``--market-condition-manifest <digest>``
+    with the default profile ``none``, so the manifest never reached the launcher and the
+    launcher's OWN manifest-without-profile refusal could not fire. The 32 jobs then ran UNGATED
+    under a discovery name byte-identical to the ordinary ungated job -- which also means they
+    could be SKIPped against an existing ungated completion, while every listing afterwards read
+    as though a snapshot had been pinned.
+
+    The refusal therefore belongs in ``resolve_args``: before any command is built, before any
+    name is generated, and on the ``--dry-run`` path too (which resolves the same args).
+    """
+    with pytest.raises(SystemExit):
+        _args(["--market-condition-manifest", "abc123"])
+    assert "without --market-condition-profile" in capsys.readouterr().err
+
+    # It is the ARGUMENT RESOLUTION that refuses, so neither of the two consumers can be reached
+    # with that combination -- the property the previous test suite could not state, because the
+    # dropped argument left both of them looking perfectly ordinary.
+    for build in (_cmd, _name):
+        with pytest.raises(SystemExit):
+            build(["--market-condition-manifest", "abc123"])
+
+
+def test_the_dry_run_path_refuses_it_too(capsys):
+    """``--dry-run`` PRINTS the commands it would run: printing an ungated one under a manifest
+    the operator passed is the same lie, one step earlier."""
+    with pytest.raises(SystemExit):
+        matrix.main(_ARGV + ["--market-condition-manifest", "abc123", "--dry-run"])
+    assert "without --market-condition-profile" in capsys.readouterr().err
+
+
+def test_an_explicit_none_profile_with_a_manifest_is_refused_as_well(capsys):
+    with pytest.raises(SystemExit):
+        _args(["--market-condition-profile", "none", "--market-condition-manifest", "abc123"])
+    assert "without --market-condition-profile" in capsys.readouterr().err
+
+
+def test_both_flags_together_still_pass_and_still_gate():
+    """The refusal must not have cost the supported configuration."""
+    cmd = _cmd(["--market-condition-profile", "ohlcv-v1",
+                "--market-condition-manifest", "ohlcv-v1=abc123"])
+    assert cmd[cmd.index("--market-condition-manifest") + 1] == "ohlcv-v1=abc123"
