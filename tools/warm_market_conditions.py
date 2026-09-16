@@ -125,7 +125,17 @@ def cmd_build(args) -> int:
     except W.WarmupConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return EXIT_CONFIG
-    _out(report.to_dict())
+    if args.print_digest:
+        # STDOUT is then the digest and NOTHING else, so a shell step can capture it with a plain
+        # command substitution; the JSON report still goes out, on stderr, because a build whose
+        # counters nobody can see is a build nobody can audit. An unpublished build (no manifest)
+        # prints nothing and keeps its nonzero exit code -- a caller must not read an empty
+        # capture as "no snapshot needed".
+        print(json.dumps(report.to_dict(), indent=1, sort_keys=True, default=str), file=sys.stderr)
+        if report.manifest_digest:
+            print(report.manifest_digest)
+    else:
+        _out(report.to_dict())
     return report.exit_code
 
 
@@ -206,6 +216,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "calendar, an unverifiable basis, no source data); each is recorded in the "
                         "manifest coverage exceptions and in the report. Without it such a symbol is "
                         "an actionable inventory item and NOTHING is published.")
+    b.add_argument("--print-digest", action="store_true",
+                   help="print ONLY the published manifest digest on stdout (the JSON report goes "
+                        "to stderr), so a launch script can capture it into "
+                        "--market-condition-manifest.")
     b.set_defaults(func=cmd_build)
 
     v = sub.add_parser("verify", parents=[common], help="re-hash every object a manifest references")

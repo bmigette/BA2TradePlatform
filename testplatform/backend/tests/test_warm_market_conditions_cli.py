@@ -137,6 +137,22 @@ def test_plan_build_verify_round_trip(tool, root, universe_file, tmp_path, capsy
     assert json.loads(capsys.readouterr().out)["corrupt"]
 
 
+def test_print_digest_puts_only_the_digest_on_stdout(tool, root, universe_file, tmp_path, capsys):
+    """The stage-1 launch script captures the digest with a plain command substitution, so stdout
+    has to be the digest and nothing else -- while the counters still go somewhere auditable
+    (stderr), because a build nobody can see the counters of is a build nobody can check."""
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out)) == 0
+    capsys.readouterr()
+
+    assert tool.main(["build", "--plan", out, "--cache-only", "--print-digest", "--quiet"]) == 0
+    captured = capsys.readouterr()
+    digest = captured.out.strip()
+    assert digest and len(digest.splitlines()) == 1
+    report = json.loads(captured.err)
+    assert report["manifest_digest"] == digest and report["ok"]
+
+
 def test_prepare_host_verifies_then_maps_and_refuses_a_corrupt_object(tool, root, universe_file,
                                                                       tmp_path, capsys):
     """prepare-host is the step every worker runs before a search dispatches (design 4.4 step 5).

@@ -83,6 +83,69 @@ if [ ! -e "$SCREENER_STORE" ]; then
   exit 1
 fi
 
+# MARKET-CONDITION GATES (design 2026-09-15; plan Task 8). OFF unless MARKET_CONDITION_PROFILE
+# names a registered profile (e.g. ohlcv-v1) -- with it unset this script is byte-for-byte the
+# launch it has always been.
+#
+# The snapshot is prepared ONCE, here, before any job starts: plan (inventory + source preflight)
+# -> build --cache-only (publish the manifest) -> verify (re-hash every object it references) ->
+# prepare-host (map the arrays for this box). Every step must succeed; `set -e` plus the explicit
+# messages below turn any failure into a refusal to launch rather than 32 jobs that each discover
+# the same missing feature store. --cache-only is deliberate: a warmup that fetches while a grid
+# waits is a surprise bill in provider calls and hours, so missing coverage is an actionable
+# inventory item the operator resolves on purpose (re-fetch, or trim the universe).
+#
+# The published digest is then PINNED into every job (--market-condition-manifest). Without it the
+# launcher refuses the run: each worker would otherwise compute 128-session indicators from
+# whatever cache it happened to hold, with no two hosts provably agreeing.
+MARKET_CONDITION_PROFILE="${MARKET_CONDITION_PROFILE:-none}"
+MARKET_CONDITION_MANIFEST="${MARKET_CONDITION_MANIFEST:-}"
+MC_ARGS=()
+if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
+  MC_PYTHON=/opt/ba2worker/ba2-venvs/test/bin/python
+  MC_WARM=tools/warm_market_conditions.py
+  MC_PLAN="${MC_PLAN:-/home/debian/ba2-grid/market_conditions_plan.json}"
+  MC_UNIVERSE="${MC_UNIVERSE:-tools/options_universe_top100.txt}"
+  MC_START="${STAGE1_START:-2020-01-01}"
+  MC_END="${STAGE1_END:-2025-12-31}"
+  MC_DRY=0
+  case " $* " in *" --dry-run "*) MC_DRY=1 ;; esac
+  if [ "$MC_DRY" = "1" ]; then
+    echo "stage1_run.sh: market-condition warm step (profile $MARKET_CONDITION_PROFILE), run ONCE"
+    echo "               before the matrix command below:"
+    echo "  $MC_PYTHON $MC_WARM plan --profile $MARKET_CONDITION_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --out $MC_PLAN"
+    echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN --cache-only --print-digest   # -> MARKET_CONDITION_MANIFEST"
+    echo "  $MC_PYTHON $MC_WARM verify --manifest \$MARKET_CONDITION_MANIFEST"
+    echo "  $MC_PYTHON $MC_WARM prepare-host --manifest \$MARKET_CONDITION_MANIFEST --profile $MARKET_CONDITION_PROFILE"
+    MARKET_CONDITION_MANIFEST="${MARKET_CONDITION_MANIFEST:-DIGEST-FROM-BUILD}"
+  else
+    "$MC_PYTHON" "$MC_WARM" plan --profile "$MARKET_CONDITION_PROFILE" \
+      --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --out "$MC_PLAN" || {
+      echo "stage1_run.sh: market-condition PLAN is actionable (missing coverage or a failed" >&2
+      echo "source preflight) -- resolve it (re-fetch those symbols, or trim the universe) and" >&2
+      echo "re-run. Refusing to launch a gated grid on an incomplete snapshot." >&2
+      exit 1; }
+    if [ -z "$MARKET_CONDITION_MANIFEST" ]; then
+      MARKET_CONDITION_MANIFEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN" --cache-only \
+        --print-digest)" || { echo "stage1_run.sh: market-condition BUILD failed" >&2; exit 1; }
+    fi
+    if [ -z "$MARKET_CONDITION_MANIFEST" ]; then
+      echo "stage1_run.sh: market-condition build published no manifest" >&2
+      exit 1
+    fi
+    "$MC_PYTHON" "$MC_WARM" verify --manifest "$MARKET_CONDITION_MANIFEST" || {
+      echo "stage1_run.sh: market-condition VERIFY failed for $MARKET_CONDITION_MANIFEST" >&2
+      exit 1; }
+    "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MARKET_CONDITION_MANIFEST" \
+      --profile "$MARKET_CONDITION_PROFILE" || {
+      echo "stage1_run.sh: market-condition PREPARE-HOST failed for $MARKET_CONDITION_MANIFEST" >&2
+      exit 1; }
+    echo "stage1_run.sh: market-condition profile $MARKET_CONDITION_PROFILE manifest $MARKET_CONDITION_MANIFEST prepared"
+  fi
+  MC_ARGS=(--market-condition-profile "$MARKET_CONDITION_PROFILE" \
+           --market-condition-manifest "$MARKET_CONDITION_MANIFEST")
+fi
+
 # STAGE1_START/END allow explicit shorter pilots (a 2023 start prints LIMITED WINDOW and gets
 # its own discovery identity). A dry-run (pass --dry-run) prints every resolved command.
 exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
@@ -94,4 +157,5 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   --parallel "$PARALLEL" \
   --screener-gate-store "$SCREENER_STORE" --max-stock-price 0 \
   --name-suffix=-st1 \
+  ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
   "$@"

@@ -1108,6 +1108,71 @@ class _FatalTrialError(RuntimeError):
     than spending the full generation budget producing a result nobody should trust."""
 
 
+def mode_anchor_index(strategy) -> Dict[str, Any]:
+    """``{leaf id: (mode_choices, authored anchor value)}`` for every mode leaf of a strategy.
+
+    Built ONCE per run from the TEMPLATE (the anchor is the template's authored ``value``, i.e.
+    the FieldSpec's declared anchor for a market-condition leaf), so the per-trial work is a dict
+    lookup. Empty for every run with no mode genes -- which is every run that existed before the
+    market-condition profiles, and what keeps their trial keys bit-identical.
+    """
+    out: Dict[str, Any] = {}
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        cid = node.get("id")
+        if cid and (node.get("mode_optimize") or node.get("modeOptimize")):
+            choices = node.get("mode_choices") or node.get("modeChoices")
+            out[str(cid)] = (list(choices or []), node.get("value"))
+        for v in node.values():
+            walk(v)
+
+    for attr in ("entry_rules", "exit_rules"):
+        walk(getattr(strategy, attr, None))
+    return out
+
+
+def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]) -> Dict[str, Any]:
+    """The genome AS A PHENOTYPE: an inactive threshold is replaced by its authored anchor.
+
+    A leaf whose mode decoded to ``off`` is REMOVED from the tree, so its ``cond:<id>:value`` gene
+    describes nothing -- it is an inactive dimension. Two genomes that differ only there produce
+    the identical backtest, and hashing them apart costs a full trial each time the GA wanders
+    along that axis (design section 5: "canonicalize disabled thresholds to the declared anchor
+    for phenotype comparison/deduplication in this profile").
+
+    This affects the MEMO KEY ONLY. The raw genome is persisted untouched as provenance, and the
+    config the trial actually runs is built from the raw decode -- so nothing about the result
+    changes, only how often an identical result is recomputed.
+
+    Returns ``decoded_flat`` ITSELF when nothing needs rewriting, which is the whole guard for
+    older jobs: no mode leaves, no copy, no change of key.
+    """
+    if not anchors:
+        return decoded_flat
+    from app.services.strategy_param_space import mode_token
+    from ba2_common.core.rule_models import MODE_OFF
+
+    out: Optional[Dict[str, Any]] = None
+    for cid, (choices, anchor) in anchors.items():
+        mode_key, value_key = f"cond:{cid}:mode", f"cond:{cid}:value"
+        if mode_key not in decoded_flat or value_key not in decoded_flat or anchor is None:
+            continue
+        if mode_token(decoded_flat[mode_key], choices, cid) != MODE_OFF:
+            continue
+        if decoded_flat[value_key] == anchor:
+            continue
+        if out is None:
+            out = dict(decoded_flat)
+        out[value_key] = anchor
+    return decoded_flat if out is None else out
+
+
 def _prepare_master_market_conditions(opt_id: int, db: Any,
                                       backtest_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Verify + map this run's pinned market-condition snapshot ON THE MASTER, once.
@@ -1260,6 +1325,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # columns — no relationships — so a detached snapshot is sufficient.)
         db.refresh(strategy)
         db.expunge(strategy)
+        # Phenotype canonicalisation for the trial memo (design section 5). Read from the
+        # template ONCE; ``{}`` for every strategy without mode genes, and then
+        # ``canonical_trial_params`` is the identity function and the keys are today's.
+        mode_anchors = mode_anchor_index(strategy)
 
         # --- DETERMINISM: seed both RNGs (Task 4 / determinism_rule) ---
         seed = int(ga["seed"])
@@ -1313,7 +1382,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": decoded_flat,
+                    "params": canonical_trial_params(mode_anchors, decoded_flat),
                 }
             )
             cached = memo.get(key)
@@ -1412,7 +1481,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": decoded_flat,
+                    "params": canonical_trial_params(mode_anchors, decoded_flat),
                 }
             )
 

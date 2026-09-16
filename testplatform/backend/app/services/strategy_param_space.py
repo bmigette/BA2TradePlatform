@@ -604,6 +604,37 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
     return new
 
 
+def mode_token(raw: Any, choices: Any, cid: str) -> str:
+    """The mode TOKEN a decoded ``cond:<id>:mode`` gene means, for one leaf's ``mode_choices``.
+
+    ``GeneticOptimizer.decode_individual`` already hands back the token (a choice gene is
+    chromosome-encoded as an index and mapped back); a raw int index (a hand-built flat dict, a
+    checkpoint, a persisted genome) is resolved through the choices. Anything else raises naming
+    the leaf -- a mode gene nothing can interpret is a broken genome, not "leave it as authored".
+
+    PUBLIC because the optimization handler resolves the same genes when it canonicalises an
+    inactive threshold for deduplication: two readings of one gene are two behaviours waiting to
+    diverge. This is resolution only -- no canonicalisation lives in this module (plan Task 3).
+    """
+    if not choices:
+        raise ValueError(
+            f"condition {cid!r}: a cond:{cid}:mode gene was decoded but the template leaf "
+            f"declares no mode_choices")
+    choices = list(choices)
+    if isinstance(raw, str):
+        token = raw
+    elif (isinstance(raw, (int, float)) and not isinstance(raw, bool)
+          and float(raw).is_integer() and 0 <= int(raw) < len(choices)):
+        token = choices[int(raw)]
+    else:
+        raise ValueError(
+            f"condition {cid!r}: mode gene {raw!r} is neither a choice token nor an index "
+            f"into {choices!r}")
+    if token not in choices:
+        raise ValueError(f"condition {cid!r}: mode {token!r} is not one of {choices!r}")
+    return token
+
+
 def _resolve_modes(tree: Any, by_id: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
     """Map leaf id -> decoded mode TOKEN for every node in ``tree`` with a ``mode`` gene.
 
@@ -624,25 +655,7 @@ def _resolve_modes(tree: Any, by_id: Dict[str, Dict[str, Any]]) -> Dict[str, str
         cid = node.get("id")
         if not cid or "mode" not in by_id.get(cid, {}):
             return
-        raw = by_id[cid]["mode"]
-        choices = node.get("mode_choices")
-        if not choices:
-            raise ValueError(
-                f"condition {cid!r}: a cond:{cid}:mode gene was decoded but the template leaf "
-                f"declares no mode_choices")
-        choices = list(choices)
-        if isinstance(raw, str):
-            token = raw
-        elif (isinstance(raw, (int, float)) and not isinstance(raw, bool)
-              and float(raw).is_integer() and 0 <= int(raw) < len(choices)):
-            token = choices[int(raw)]
-        else:
-            raise ValueError(
-                f"condition {cid!r}: mode gene {raw!r} is neither a choice token nor an index "
-                f"into {choices!r}")
-        if token not in choices:
-            raise ValueError(f"condition {cid!r}: mode {token!r} is not one of {choices!r}")
-        found[cid] = token
+        found[cid] = mode_token(by_id[cid]["mode"], node.get("mode_choices"), cid)
 
     _walk(tree)
     return found

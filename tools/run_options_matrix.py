@@ -137,6 +137,23 @@ def _jobs(experts, strategies, name_suffix=""):
             yield (f"optm-{expert}-{s}{name_suffix}", expert, s)
 
 
+def _market_condition_passthrough(args) -> list:
+    """Extra optimize CLI tokens for the market-condition profile ([] when it is ``none``).
+
+    Both tokens are EXPLICIT per job for the same reason the options store is (see build_cmd): a
+    distributed trial carries {config, fitness_metric, cache_root, inmem_trades} and no
+    environment, so a profile or a manifest chosen through the environment is a decision the
+    master made that the worker cannot see.
+    """
+    profile = getattr(args, "market_condition_profile", None) or "none"
+    if profile == "none":
+        return []
+    out = ["--market-condition-profile", profile]
+    if getattr(args, "market_condition_manifest", None):
+        out += ["--market-condition-manifest", args.market_condition_manifest]
+    return out
+
+
 def _gate_passthrough(args) -> list:
     """Extra optimize CLI tokens for the gate-only screener entry gate ([] when unset)."""
     if not args.screener_gate_store:
@@ -255,6 +272,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path to the launcher executable (or ba2test_launcher.py). Default: "
                          "the ba2-test installed next to the Python interpreter. Point this at "
                          "a WORKTREE launcher to run code different from the editable install.")
+    ap.add_argument("--market-condition-profile", default="none", metavar="none|<profile>",
+                    help="Forward --market-condition-profile to every job: append the registered "
+                         "profile's market-condition gates (mode + threshold genes) to each "
+                         "structure's INITIAL-ENTRY tree. Default 'none' = today's rules and "
+                         "genes. The flag folds into the discovery identity digest, so a gated "
+                         "run gets its own job names and never resumes an ungated checkpoint.")
+    ap.add_argument("--market-condition-manifest", default=None, metavar="DIGEST",
+                    help="The prepared snapshot digest every trial reads (required by the "
+                         "launcher whenever a profile is on; tools/warm_market_conditions.py "
+                         "build --print-digest prints it). Part of the identity digest too: a "
+                         "different snapshot is a different experiment, not a resume.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--screener-gate-store", default=None,
                     help="Attach this parquet metric store as a GATE-ONLY per-bar entry gate on "
@@ -342,6 +370,7 @@ def build_cmd(args, launcher, name, expert, strat, universe):
         # once scored against the wrong vendor's history while every log said otherwise.
         "--options-store", args.options_store]
     cmd += _gate_passthrough(args)
+    cmd += _market_condition_passthrough(args)
     for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
                         ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
         value = getattr(args, field)
