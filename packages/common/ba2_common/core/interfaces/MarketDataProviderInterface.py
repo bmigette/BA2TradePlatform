@@ -643,7 +643,7 @@ class MarketDataProviderInterface(DataProviderInterface):
             logger.warning(
                 f"Failed to refresh parquet cache for {symbol} ({interval}): {e}"
             )
-        return self._repair_split_basis_drift(df, symbol, interval, provider_name)
+        return self._report_split_basis_drift(df, symbol, interval, provider_name)
 
     # ---- split-basis drift (market-condition source contract, plan Task 6) ----------
     #: Providers whose daily history is delivered split-adjusted AS OF THE FETCH set this, so a
@@ -657,16 +657,34 @@ class MarketDataProviderInterface(DataProviderInterface):
         appended cache can drift across a split (FMP)."""
         return None
 
-    def _repair_split_basis_drift(self, df: pd.DataFrame, symbol: str, interval: str,
+    #: ``(provider, symbol, interval)`` already reported as split-basis suspect in this process.
+    #: The check runs on every daily top-up, and the answer only changes when the cache is
+    #: repaired -- one WARNING per symbol per process, not one per refresh.
+    _SPLIT_BASIS_REPORTED: set = set()
+
+    def _report_split_basis_drift(self, df: pd.DataFrame, symbol: str, interval: str,
                                   provider_name: str) -> pd.DataFrame:
-        """Force a FULL re-fetch when the split calendar shows a split after the cached file's
-        first bar that the cached prices are not verifiably on one basis across.
+        """REPORT (never repair) a cached history that is not verifiably on one split basis.
 
         The top-up above APPENDS bars after the last cached one, so a symbol that split after its
         file was first fetched holds unadjusted pre-split bars next to adjusted post-split bars --
         a fake 2x/4x/10x move every reader (the market-condition gates included) would take as
         real. Daily-or-longer intervals only. A split-calendar failure is logged and the refresh
-        result is served unchanged (the warmup preflight refuses such a symbol loudly)."""
+        result is served unchanged.
+
+        IT ONLY REPORTS, deliberately. This runs inside the LIVE analysis pass, on every stale
+        daily cache, for every expert -- gated or not, since the refresh path knows nothing about
+        the market-condition feature. An automatic repair here would mean an unbounded,
+        unrate-limited 15-year re-fetch per symbol inside a decision pass, and on the FIRST
+        refresh after this feature ships NO file carries a full-fetch marker, so every symbol
+        with a historical split factor below ``MIN_DETECTABLE_FACTOR`` (3-for-2, 5-for-4, ...)
+        classifies ``undetectable`` and would trigger one. The repair belongs to a tool an
+        operator runs on purpose: ``tools/warm_market_conditions.py plan`` reports exactly these
+        symbols and its ``--fetch-missing`` path calls :meth:`force_full_refetch` for them.
+
+        The warmup preflight refuses a suspect symbol loudly, so a GATED strategy cannot quietly
+        trade on drifted prices; an ungated one keeps the behaviour it has always had, plus this
+        warning."""
         if interval in _INTRADAY_INTERVALS or df is None or df.empty:
             return df
         try:
@@ -690,23 +708,35 @@ class MarketDataProviderInterface(DataProviderInterface):
                                    symbol=symbol, marker=read_full_fetch_marker(path))
         if not needs_full_refetch(checks):
             return df
-        bad = [c.to_dict() for c in checks if c.verdict in REFETCH_VERDICTS]
-        logger.warning(f"{provider_name} {symbol} ({interval}): cached history is not verifiably on one "
-                       f"split basis ({bad}); forcing a full re-fetch")
-        try:
-            return self.force_full_refetch(symbol, interval, provider_name=provider_name)
-        except Exception as e:
-            logger.error(f"Full re-fetch of {symbol} ({interval}) after split-basis drift failed: {e}",
-                         exc_info=True)
-            return df
+        key = (provider_name, str(symbol).upper(), interval)
+        if key not in type(self)._SPLIT_BASIS_REPORTED:
+            type(self)._SPLIT_BASIS_REPORTED.add(key)
+            bad = [c.to_dict() for c in checks if c.verdict in REFETCH_VERDICTS]
+            logger.warning(
+                f"{provider_name} {symbol} ({interval}): cached history is not verifiably on one "
+                f"split basis ({bad}). NOT repaired here -- a full re-fetch inside a live pass is "
+                f"unbounded. Run tools/warm_market_conditions.py plan (and --fetch-missing) to "
+                f"repair {symbol}; until then a market-condition warmup refuses it.")
+        return df
 
     def force_full_refetch(self, symbol: str, interval: str = '1d',
                            provider_name: Optional[str] = None) -> pd.DataFrame:
         """REPLACE (never merge) the cached daily history of ``symbol`` with a fresh full-history
         fetch -- the same 15-year window as the cold fill -- and record the full-fetch marker.
 
-        Merging would keep the stale pre-split bars, which is exactly what this repairs. Raises
-        when the fetch returns nothing (the existing file is left untouched then)."""
+        Merging would keep the stale pre-split bars, which is exactly what this repairs.
+
+        REFUSES a replacement that would LOSE history: shorter than what is cached, or starting
+        later. ``empty`` alone was the only guard, and a short-but-non-empty answer -- a capped
+        plan or endpoint, a partial payload, a vendor-shortened history -- would overwrite fifteen
+        years of daily bars irrecoverably in the cache the live platform, every backtest and every
+        warmed snapshot read. Worse, the marker written afterwards makes every later
+        ``check_split_basis`` return ``refetched`` and skip the check, so the loss would hide
+        itself. The marker is therefore written only after a replacement that passed this.
+
+        Raises:
+            RuntimeError: the fetch returned nothing, or returned less than the cache already
+                holds (the existing file is left untouched in both cases)."""
         from ba2_common.core import native_cache
         from ba2_common.core.split_basis import write_full_fetch_marker
 
@@ -726,6 +756,7 @@ class MarketDataProviderInterface(DataProviderInterface):
                 logger.warning(f"Could not read {existing_path} to match its timezone convention: {e}")
         out = out.drop_duplicates(subset=['Date'], keep='last').sort_values('Date').reset_index(drop=True)
         out['effective_date'] = out['Date']
+        self._refuse_shorter_replacement(out, existing_path, symbol, interval, provider_name)
         native_cache.write_timeseries(provider_name, symbol, interval, out)
         path = native_cache.find_timeseries_path(provider_name, symbol, interval)
         write_full_fetch_marker(path, first_bar=pd.Timestamp(out['Date'].iloc[0]).date(),
@@ -733,6 +764,40 @@ class MarketDataProviderInterface(DataProviderInterface):
         logger.info(f"{provider_name} {symbol} ({interval}): replaced the cache with {len(out)} "
                     f"freshly fetched bars")
         return out
+
+    @staticmethod
+    def _refuse_shorter_replacement(out: pd.DataFrame, existing_path: Optional[str], symbol: str,
+                                    interval: str, provider_name: str) -> None:
+        """Refuse a full-refetch replacement that holds LESS history than the file it replaces.
+
+        Compared on both axes, because either alone can be satisfied by a bad answer: the ROW
+        COUNT (a capped response) and the FIRST BAR (a vendor that shortened its history window).
+        A file that cannot be read is not treated as "no history" -- that would turn the one
+        failure this guards into a silent pass -- so an unreadable existing file refuses too.
+        """
+        if existing_path is None:
+            return                      # nothing cached yet: a cold fill cannot lose anything
+        try:
+            existing = pd.read_parquet(existing_path, columns=['Date'])
+        except Exception as e:
+            raise RuntimeError(
+                f"full re-fetch of {symbol} ({interval}): the existing cache {existing_path} "
+                f"could not be read to check the replacement against it ({e}). Refusing to "
+                f"overwrite it -- a replacement that cannot be compared is not a repair.") from e
+        if existing.empty:
+            return
+        old_rows = len(existing)
+        old_first = pd.Timestamp(pd.to_datetime(existing['Date']).min()).date()
+        new_rows = len(out)
+        new_first = pd.Timestamp(pd.to_datetime(out['Date']).min()).date()
+        if new_rows >= old_rows and new_first <= old_first:
+            return
+        raise RuntimeError(
+            f"full re-fetch of {symbol} ({interval}) returned LESS history than the cache holds "
+            f"({new_rows} rows from {new_first}, cached {old_rows} rows from {old_first}) -- "
+            f"refusing to replace {provider_name}'s cache and lose the difference. This is what "
+            f"a capped plan, a partial payload or a shortened vendor window looks like; the "
+            f"cache file and its split-basis marker are left untouched.")
 
     def _record_cold_full_fetch(self, provider_name: str, symbol: str, interval: str) -> None:
         """A cold daily fill of an ABSENT file is a full-history fetch: record the marker."""

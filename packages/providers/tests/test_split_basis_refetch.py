@@ -1,6 +1,17 @@
-"""The LIVE path's split-basis repair (plan Task 6): the FMP cache top-up APPENDS bars, so a
-symbol that splits after its file was first fetched ends up on a mixed basis. The provider must
-notice (split calendar + ratio rule at that date) and force a FULL re-fetch, once.
+"""Split-basis drift (plan Task 6) and the refusal that protects the cache from its repair.
+
+The FMP cache top-up APPENDS bars, so a symbol that splits after its file was first fetched ends
+up on a mixed basis. Two halves, deliberately separated (final review I1):
+
+* the LIVE refresh path only REPORTS it -- one WARNING per symbol per process. It runs inside the
+  analysis pass for every symbol of every expert, and an automatic 15-year re-fetch there is
+  unbounded and unrate-limited;
+* :meth:`force_full_refetch` REPAIRS it, and is called by a tool an operator runs on purpose
+  (``warm_market_conditions.py --fetch-missing``).
+
+And the repair itself is guarded (final review C1): a fetch that returns LESS history than the
+cache already holds is refused rather than written, because the marker it would write afterwards
+makes every later check say ``refetched`` -- so the loss would hide itself.
 
 Run from ``packages/providers``:
     ...python.exe -m pytest tests/test_split_basis_refetch.py -q -p no:cacheprovider
@@ -76,7 +87,28 @@ def _write_cache(symbol, df):
     return native_cache.find_timeseries_path("FMPOHLCVProvider", symbol, "1d")
 
 
-def test_pre_split_file_is_fully_refetched_once(tmp_path, monkeypatch):
+@pytest.fixture(autouse=True)
+def _forget_reported_symbols():
+    """The "reported once" memo is process-wide; each test gets a clean one."""
+    from ba2_common.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
+
+    MarketDataProviderInterface._SPLIT_BASIS_REPORTED.clear()
+    yield
+    MarketDataProviderInterface._SPLIT_BASIS_REPORTED.clear()
+
+
+def _full_fetches(provider):
+    return [c for c in provider.impl_calls if (datetime.now().date() - c[1]).days > 365 * 14]
+
+
+def test_a_drifted_file_is_REPORTED_by_the_live_refresh_and_not_refetched(tmp_path, caplog):
+    """THE LIVE PATH. It notices, says so once, and changes nothing.
+
+    An automatic repair here would fire inside the analysis pass, for every symbol of every
+    expert, gated or not -- and on the first refresh after this feature ships no file carries a
+    marker, so every symbol whose historical split factor is below MIN_DETECTABLE_FACTOR
+    classifies ``undetectable`` and would trigger a 15-year re-fetch of its own.
+    """
     symbol = "XSPLIT"
     yesterday = date.today() - timedelta(days=1)
     truth = _truth(yesterday)
@@ -84,24 +116,58 @@ def test_pre_split_file_is_fully_refetched_once(tmp_path, monkeypatch):
     path = _write_cache(symbol, cached)
     provider = _Provider(truth, [CalendarSplit(SPLIT_DAY, 2.0)])
 
-    # The mixed basis is exactly what the checker sees before the repair.
+    # The mixed basis is exactly what the checker sees.
     pre = pd.read_parquet(path)
     checks = check_split_basis(pre["Date"].to_numpy(), pre["Open"], pre["High"], pre["Low"], pre["Close"],
                                provider.splits, symbol=symbol, marker=read_full_fetch_marker(path))
     assert [c.verdict for c in checks] == ["drift"] and needs_full_refetch(checks)
 
-    df = provider._refresh_parquet_if_stale(pre.copy(), symbol, "1d", "FMPOHLCVProvider")
+    with caplog.at_level("WARNING"):
+        df = provider._refresh_parquet_if_stale(pre.copy(), symbol, "1d", "FMPOHLCVProvider")
 
-    # A full-history fetch (15 years back), a REPLACED file and a marker.
-    assert len(provider.impl_calls) == 2                      # the tail top-up, then the full re-fetch
-    full = provider.impl_calls[-1]
-    assert (datetime.now().date() - full[1]).days > 365 * 14
+    assert _full_fetches(provider) == []                 # NO 15-year fetch
+    assert read_full_fetch_marker(path) is None          # and therefore no marker
+    # The ordinary tail TOP-UP still happens (that is what this path is for), but the cached
+    # HISTORY is untouched: same first bar, and the drifted pre-split prices are still drifted --
+    # nothing was replaced from the vendor.
     after = pd.read_parquet(path)
-    assert len(after) == len(truth)
+    assert after["Date"].min() == pre["Date"].min()
+    same = after.merge(pre, on="Date", suffixes=("_a", "_b"))
+    assert len(same) == len(pre) and np.allclose(same["Close_a"], same["Close_b"])
+    assert not np.allclose(
+        after[after["Date"] < pd.Timestamp(SPLIT_DAY)]["Close"].to_numpy(),
+        truth[truth["Date"] < pd.Timestamp(SPLIT_DAY)]["Close"].to_numpy())
+    assert len(df) >= len(pre)
+    said = [r.getMessage() for r in caplog.records if symbol in r.getMessage()]
+    assert len(said) == 1
+    assert "warm_market_conditions" in said[0] and "NOT repaired here" in said[0]
+
+    # ONE warning per symbol per process, not one per refresh: this runs on every daily top-up.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        provider._refresh_parquet_if_stale(pd.read_parquet(path), symbol, "1d", "FMPOHLCVProvider")
+    assert [r.getMessage() for r in caplog.records if symbol in r.getMessage()] == []
+
+
+def test_the_explicit_repair_replaces_the_file_and_writes_the_marker(tmp_path):
+    """THE REPAIR PATH, which an operator reaches through the warm tool: a full-history fetch, a
+    REPLACED file, a marker -- and the marker then turns the verdict into ``refetched`` so the
+    repair happens once."""
+    symbol = "XREPAIR"
+    truth = _truth(date.today() - timedelta(days=1))
+    cached = _unadjusted_before(truth[truth["Date"] <= pd.Timestamp("2025-02-28")], SPLIT_DAY, 2.0)
+    path = _write_cache(symbol, cached)
+    provider = _Provider(truth, [CalendarSplit(SPLIT_DAY, 2.0)])
+
+    out = provider.force_full_refetch(symbol, "1d", provider_name="FMPOHLCVProvider")
+
+    full = _full_fetches(provider)
+    assert len(full) == 1 and (datetime.now().date() - full[0][1]).days > 365 * 14
+    after = pd.read_parquet(path)
+    assert len(after) == len(truth) and len(out) == len(truth)
     merged = after.merge(truth, on="Date", suffixes=("_c", "_t"))
-    assert len(merged) == len(truth)
-    assert np.allclose(merged["Close_c"], merged["Close_t"])
-    assert len(df) == len(truth)
+    assert len(merged) == len(truth) and np.allclose(merged["Close_c"], merged["Close_t"])
+
     marker = read_full_fetch_marker(path)
     assert marker and marker["fetched_on_utc"] == marker["fetched_at_utc"][:10]
     assert marker["fetched_at_utc"].endswith("+00:00")
@@ -111,14 +177,107 @@ def test_pre_split_file_is_fully_refetched_once(tmp_path, monkeypatch):
     assert marker["first_bar"] == truth["Date"].iloc[0].date().isoformat()
     assert marker["last_bar"] == truth["Date"].iloc[-1].date().isoformat()
 
-    # Second refresh: the marker proves the basis, so no SECOND full re-fetch happens (an
-    # ordinary tail top-up still may, and returns nothing new).
-    provider._refresh_parquet_if_stale(after.copy(), symbol, "1d", "FMPOHLCVProvider")
-    full_fetches = [c for c in provider.impl_calls if (datetime.now().date() - c[1]).days > 365 * 14]
-    assert len(full_fetches) == 1
-    checks = check_split_basis(after["Date"].to_numpy(), after["Open"], after["High"], after["Low"], after["Close"],
-                               provider.splits, symbol=symbol, marker=read_full_fetch_marker(path))
+    checks = check_split_basis(after["Date"].to_numpy(), after["Open"], after["High"], after["Low"],
+                               after["Close"], provider.splits, symbol=symbol,
+                               marker=read_full_fetch_marker(path))
     assert [c.verdict for c in checks] == ["refetched"] and not needs_full_refetch(checks)
+
+    # And the live refresh then has nothing to report.
+    provider._refresh_parquet_if_stale(after.copy(), symbol, "1d", "FMPOHLCVProvider")
+    assert len(_full_fetches(provider)) == 1
+
+
+# --------------------------------------------------------- the replacement must not LOSE history
+class _ShortProvider(_Provider):
+    """A vendor that answers a full-history request with a truncated frame: a capped plan or
+    endpoint, a partial payload, a shortened history window."""
+
+    def __init__(self, truth, splits, keep_last=None, start_from=None):
+        super().__init__(truth, splits)
+        self.keep_last = keep_last
+        self.start_from = start_from
+
+    def _get_ohlcv_data_impl(self, symbol, start_date, end_date, interval="1d"):
+        df = super()._get_ohlcv_data_impl(symbol, start_date, end_date, interval)
+        if self.start_from is not None:
+            df = df[df["Date"] >= pd.Timestamp(self.start_from)]
+        if self.keep_last is not None:
+            df = df.tail(self.keep_last)
+        return df.reset_index(drop=True).copy()
+
+
+@pytest.mark.parametrize("kwargs,why", [
+    ({"keep_last": 30}, "a capped plan or endpoint: far fewer rows"),
+    ({"start_from": date(2024, 6, 3)}, "a shortened vendor window: same tail, later first bar"),
+])
+def test_a_refetch_that_returns_LESS_history_is_refused_and_changes_nothing(tmp_path, kwargs, why):
+    """C1. Without this, ``empty`` was the only guard: a short-but-non-empty answer replaced
+    fifteen years of daily bars in the cache the live platform, every backtest and every warmed
+    snapshot read -- and the marker written afterwards made every later check say ``refetched``,
+    so the loss hid itself.
+    """
+    symbol = "XSHORT"
+    truth = _truth(date.today() - timedelta(days=1))
+    path = _write_cache(symbol, truth)
+    before = open(path, "rb").read()
+    provider = _ShortProvider(truth, [CalendarSplit(SPLIT_DAY, 2.0)], **kwargs)
+
+    with pytest.raises(RuntimeError) as e:
+        provider.force_full_refetch(symbol, "1d", provider_name="FMPOHLCVProvider")
+
+    msg = str(e.value)
+    assert symbol in msg and "1d" in msg and "LESS history" in msg
+    assert f"cached {len(truth)} rows" in msg                  # both row counts
+    assert truth["Date"].iloc[0].date().isoformat() in msg     # and both first bars
+    assert open(path, "rb").read() == before, why              # byte-identical
+    assert read_full_fetch_marker(path) is None                # and NO marker
+
+
+def test_a_refetch_that_keeps_every_bar_is_allowed(tmp_path):
+    """The control: equal rows and an equal first bar is not a loss, so it replaces normally --
+    the guard is about losing history, not about growing."""
+    symbol = "XSAME"
+    truth = _truth(date.today() - timedelta(days=1))
+    path = _write_cache(symbol, truth)
+    provider = _Provider(truth, [CalendarSplit(SPLIT_DAY, 2.0)])
+    out = provider.force_full_refetch(symbol, "1d", provider_name="FMPOHLCVProvider")
+    assert len(out) == len(truth)
+    assert read_full_fetch_marker(path)["rows"] == len(truth)
+
+
+def test_an_unreadable_existing_cache_refuses_rather_than_overwriting(tmp_path, monkeypatch):
+    """A file that cannot be READ must not be treated as "no history": that would turn the one
+    failure this guards into a silent pass."""
+    symbol = "XUNREADABLE"
+    truth = _truth(date.today() - timedelta(days=1))
+    path = _write_cache(symbol, truth)
+    before = open(path, "rb").read()
+    provider = _Provider(truth, [CalendarSplit(SPLIT_DAY, 2.0)])
+
+    real_read = pd.read_parquet
+
+    def _boom(p, *a, **k):
+        if str(p) == str(path) and k.get("columns") == ["Date"]:
+            raise OSError("parquet footer is corrupt")
+        return real_read(p, *a, **k)
+
+    monkeypatch.setattr(pd, "read_parquet", _boom)
+    with pytest.raises(RuntimeError, match="could not be read"):
+        provider.force_full_refetch(symbol, "1d", provider_name="FMPOHLCVProvider")
+    monkeypatch.undo()
+    assert open(path, "rb").read() == before
+    assert read_full_fetch_marker(path) is None
+
+
+def test_a_cold_full_fetch_has_nothing_to_compare_against(tmp_path):
+    """No cached file at all: the guard must not stand in the way of a first fill."""
+    symbol = "XCOLD"
+    truth = _truth(date.today() - timedelta(days=1))
+    provider = _Provider(truth, [])
+    out = provider.force_full_refetch(symbol, "1d", provider_name="FMPOHLCVProvider")
+    assert len(out) == len(truth)
+    path = native_cache.find_timeseries_path("FMPOHLCVProvider", symbol, "1d")
+    assert read_full_fetch_marker(path)["rows"] == len(truth)
 
 
 def test_consistent_file_is_not_refetched(tmp_path):
