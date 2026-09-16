@@ -309,14 +309,23 @@ def test_a_deployed_gated_trigger_can_still_be_opened_in_the_rules_editor():
 
     Constructed through the REAL ``ui.select``, because the bug lived in the widget's own
     validation -- asserting on the options list alone is exactly the gap that let this through.
+
+    The explicit ``Client`` context is not decoration. NiceGUI resolves a widget's parent from a
+    per-task slot stack, and building one with that stack empty raises "The current slot cannot be
+    determined". Without it this test PASSED ALONE -- an earlier import happens to leave a slot
+    behind -- and FAILED in a full suite run, so it would have read as a flake rather than as this
+    test's own missing setup. A bare ``with ui.element():`` does not fix it: that container needs a
+    slot to be created in too. In the real editor the dialog supplies the slot.
     """
     from nicegui import ui
+    from nicegui.client import Client
 
     from ba2_trade_platform.ui.pages.settings import _trigger_type_options
 
     value, options = _trigger_type_options({"event_type": ADX})
     assert value == ADX and ADX in options
-    select = ui.select(options=options, label="Trigger Type", value=value)
+    with Client(lambda: None, request=None):
+        select = ui.select(options=options, label="Trigger Type", value=value)
     assert select.value == ADX
 
 
