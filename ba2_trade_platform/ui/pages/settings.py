@@ -32,8 +32,27 @@ from ba2_common.core.market_condition_rules import (
     PROFILE_SETTING_OFF as MARKET_CONDITION_PROFILE_OFF,
     assert_fields_served,
     assert_no_market_fields,
+    market_condition_fields,
     parse_profile_setting,
 )
+
+
+def _authorable_trigger_types() -> list:
+    """The trigger types the live rules editor offers, WITHOUT the market-condition fields.
+
+    Those fifteen field names are ``ExpertEventType`` values like any other, so the editor's
+    ``[t.value for t in ExpertEventType]`` silently started offering them. Hand-authoring one is
+    never the intended route: a market gate is searched by the optimizer and arrives through
+    ``tools/import_deploy_payload.py``, which checks it against the expert's
+    ``market_condition_profile`` and refuses an unserved leaf. Authored here, a gate would carry
+    no profile with it and simply never pass -- and on an OPEN-POSITIONS ruleset it would stop an
+    exit from firing, which ``market_condition_rules`` calls the worst outcome in this design.
+
+    Filtering the MENU is not the refusal (a deployed rule still has to be editable, and the
+    select still displays a value it was given); ``_refuse_market_gates_on_exit_ruleset`` is.
+    """
+    fields = market_condition_fields()
+    return [t.value for t in ExpertEventType if t.value not in fields]
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
 
@@ -5038,7 +5057,7 @@ class TradeSettingsTab:
                 with ui.row().classes('w-full items-center gap-2'):
                     # Trigger type selection
                     trigger_select = ui.select(
-                        options=[t.value for t in ExpertEventType],
+                        options=_authorable_trigger_types(),
                         label='Trigger Type',
                         value=trigger_config.get('event_type', trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value)) if trigger_config else ExpertEventType.F_HAS_POSITION.value
                     ).classes('flex-1').props('dense')
@@ -5834,6 +5853,32 @@ class TradeSettingsTab:
         
         self.rulesets_dialog.open()
     
+    def _refuse_market_gates_on_exit_ruleset(self, subtype_value, selected_rule_ids) -> None:
+        """Refuse a market-condition gate on a ruleset destined for the OPEN-POSITIONS slot.
+
+        THE WORST OUTCOME IN THIS DESIGN, in ``market_condition_rules``' own words. Outside the
+        entry decision pass the live resolver has no context, so the gate reads ``no_context``,
+        the rule NEVER FIRES, and the position's exit or protective-order adjustment silently
+        stops happening.
+
+        The deploy importer gets this refusal from ``trade_rules_to_live_export`` and the expert
+        dialog got it in Task 12 -- but the RULES editor is a third door: editing a ruleset that
+        is ALREADY assigned to the open-positions slot passes through neither. Checked before
+        anything is written, against the rules THIS save selects.
+        """
+        if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value:
+            return
+        fields = market_condition_fields()
+        used = []
+        for rule_id in selected_rule_ids:
+            rule = get_instance(EventAction, rule_id)
+            if rule is None:
+                continue
+            for key, trigger in (rule.triggers or {}).items():
+                if isinstance(trigger, dict) and trigger.get("event_type") in fields:
+                    used.append((f"{rule.name}.{key}", str(trigger["event_type"])))
+        assert_no_market_fields(used, f"ruleset {self.ruleset_name_input.value!r}")
+
     def _save_ruleset(self, ruleset=None):
         """Save the ruleset."""
         try:
@@ -5845,6 +5890,11 @@ class TradeSettingsTab:
                 if checkbox.value:
                     selected_rule_ids.append(rule_id)
             
+
+            # BEFORE any write: a market gate may not ride an open-positions ruleset.
+            self._refuse_market_gates_on_exit_ruleset(
+                self.ruleset_subtype_select.value, selected_rule_ids)
+
             if is_edit:
                 # Update existing ruleset
                 ruleset.name = self.ruleset_name_input.value

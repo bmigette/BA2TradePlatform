@@ -561,3 +561,76 @@ def test_fmp_cache_reader_short_history(tmp_path):
     _write_fmp_parquet(str(tmp_path), "YNG", regular_sessions_ending_at(PRIOR, WINDOW - 10))
     row = FMPCacheMarketConditionReader("ohlcv-v1", str(tmp_path)).observe("YNG", PRIOR)
     assert {o.status for o in row.by_field().values()} == {"insufficient_history"}
+
+
+# ------------------------------------ live research mode is loud, and PER PASS (final review I4)
+def test_an_unpinned_live_profile_errors_once_per_decision_pass(dispatcher, instances, clock,
+                                                                monkeypatch):
+    """A backtest trial with a profile and NO manifest is refused outright: computing 128-session
+    indicators off whatever a worker's cache holds is not a fallback a search may take. Live the
+    same combination was allowed with one ``warn_research_mode`` line per PROCESS -- a platform
+    that runs for weeks says it once, at startup, and every gated decision afterwards reads
+    computed numbers with nothing to say so.
+
+    Not refused (an operator may legitimately run un-pinned), but impossible to miss.
+    """
+    import ba2_common.logger as bl
+
+    spy = _LogSpy()
+    monkeypatch.setattr(bl, "logger", spy)
+    instances[1] = "ohlcv-v1"
+
+    for _ in range(3):
+        with live.market_condition_decision_scope(expert_instance_id=1) as state:
+            assert state is not None                     # the pass runs; it is only reported
+    gated = [e for e in spy.errors if "NO pinned manifest" in e]
+    assert len(gated) == 3, "one ERROR per PASS, not one per process"
+    assert "ohlcv-v1" in gated[0] and "instance 1" in gated[0]
+    assert "warm_market_conditions" in gated[0] and live.MANIFEST_ENV in gated[0]
+
+
+def test_a_pinned_live_profile_says_nothing(dispatcher, instances, monkeypatch):
+    """The configuration the design assumes is silent: a snapshot is pinned, nothing is computed."""
+    import ba2_common.logger as bl
+
+    spy = _LogSpy()
+    monkeypatch.setattr(bl, "logger", spy)
+
+    class _Mapped:
+        manifest_digest = "d" * 64
+
+        def symbols(self):
+            return ("AAA",)
+
+        def coverage(self):
+            return {"AAA": 1}
+
+    instances[1] = "ohlcv-v1"
+    resolver = dispatcher.resolver_for(1)
+    monkeypatch.setattr(type(resolver.reader), "mapped_reader", _Mapped(), raising=False)
+    assert resolver.research_mode_profiles() == ()
+    with live.market_condition_decision_scope(expert_instance_id=1):
+        pass
+    assert [e for e in spy.errors if "NO pinned manifest" in e] == []
+
+
+def test_research_mode_profiles_names_only_the_unpinned_ones():
+    """Per profile, in profile order: a two-profile expert with one snapshot pinned reports the
+    other one alone."""
+    from ba2_common.core.market_condition_readers import CompositeMarketConditionReader
+
+    class _R:
+        def __init__(self, profile, mapped=None):
+            self.profile = profile
+            self.calc_version = f"{profile}/calc-1"
+            self.mapped_reader = mapped
+
+        def observe(self, symbol, session):
+            return None
+
+    pinned = SimpleNamespace(manifest_digest="a" * 64, symbols=lambda: (),
+                             coverage=lambda: {})
+    resolver = live.LiveMarketConditionResolver(
+        ("ohlcv-v1", "ta-structure-v1"),
+        reader=CompositeMarketConditionReader([_R("ohlcv-v1", pinned), _R("ta-structure-v1")]))
+    assert resolver.research_mode_profiles() == ("ta-structure-v1",)

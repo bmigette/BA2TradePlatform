@@ -508,6 +508,17 @@ class LiveMarketConditionResolver:
             return tuple(plural)
         return (getattr(self.reader, "mapped_reader", None),)
 
+    def research_mode_profiles(self) -> Tuple[str, ...]:
+        """The served profiles with NO pinned snapshot behind them, in profile order.
+
+        Such a profile COMPUTES its 128-session indicators on a miss, from whatever this host's
+        FMP cache happens to hold. The backtest seam refuses that combination outright for an
+        optimizer trial (``install_backtest_market_conditions``); live it is allowed -- an
+        operator may legitimately run un-pinned -- but it must be impossible to miss, so the
+        decision scope reports it once per PASS rather than once per process.
+        """
+        return tuple(p for p, mapped in zip(self.profiles, self.mapped_readers) if mapped is None)
+
     def no_context_reason_for(self, symbol: Any) -> Optional[str]:
         """Why THIS symbol has no context, or None to fall back to the generic reason.
 
@@ -677,6 +688,36 @@ def resolver_for_expert_instance(expert_instance_id: Optional[Any]
     return None
 
 
+def _report_unpinned_profiles(resolver: "LiveMarketConditionResolver",
+                              expert_instance_id: Any) -> None:
+    """ONE ERROR PER DECISION PASS for a gated expert serving an UN-PINNED profile.
+
+    THE ASYMMETRY THIS CLOSES. A backtest trial with a profile and no manifest is REFUSED
+    outright (``seam_wiring.install_backtest_market_conditions``): computing 128-session
+    indicators per trial off whatever each worker's cache holds is not a fallback a search may
+    take. Live, the same combination was allowed with ONE ``warn_research_mode`` line per
+    PROCESS -- a platform that runs for weeks would say it once, at startup, and every gated
+    decision afterwards would read computed numbers with nothing to say so.
+
+    It is NOT refused: a live operator may legitimately run un-pinned (a fresh deployment, a
+    profile being warmed). It is raised to an ERROR, per pass, naming the expert and the
+    profiles, so it cannot be mistaken for the pinned configuration the design assumes.
+    """
+    unpinned = resolver.research_mode_profiles()
+    if not unpinned:
+        return
+    from ba2_common.logger import logger
+
+    logger.error(
+        f"market-condition profile(s) {list(unpinned)} serve expert instance "
+        f"{expert_instance_id} with NO pinned manifest: this pass COMPUTES its 128-session "
+        f"indicators from this host's FMP cache instead of reading a published snapshot, so its "
+        f"gate values are not reproducible on another host and no digest records what was read. "
+        f"A backtest refuses this combination outright. Prepare a snapshot "
+        f"(tools/warm_market_conditions.py plan/build/verify/prepare-host) and set "
+        f"{MANIFEST_ENV}.")
+
+
 @contextmanager
 def market_condition_decision_scope(*, expert_instance_id: Optional[Any] = None,
                                     replay_reader: Optional[Any] = None
@@ -698,6 +739,7 @@ def market_condition_decision_scope(*, expert_instance_id: Optional[Any] = None,
     if resolver is None:
         yield None
         return
+    _report_unpinned_profiles(resolver, expert_instance_id)
     outer = _DECISION.get()
     if outer is not None and outer.resolver is resolver:
         if replay_reader is not None and outer.reader is not replay_reader:

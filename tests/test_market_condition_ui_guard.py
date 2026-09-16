@@ -205,3 +205,95 @@ def test_the_save_path_reads_the_guard_and_the_savable_flag():
     guard = saved.index("_market_condition_profile_savable()")
     write = saved.index("save_setting(MARKET_CONDITION_PROFILE_SETTING")
     assert guard < write
+
+
+# ------------------------------------------- the RULES editor, the third door (final review I2)
+def test_the_rules_editor_does_not_offer_the_market_condition_fields():
+    """Those fifteen field names are ``ExpertEventType`` values like any other, so the editor's
+    ``[t.value for t in ExpertEventType]`` silently started offering them. A gate is searched by
+    the optimizer and arrives by deploy import, which checks it against the expert's profile
+    setting; authored here it would carry no profile and simply never pass."""
+    from ba2_common.core.market_condition_rules import market_condition_fields
+    from ba2_trade_platform.core.types import ExpertEventType
+    from ba2_trade_platform.ui.pages.settings import _authorable_trigger_types
+
+    offered = _authorable_trigger_types()
+    fields = market_condition_fields()
+    assert offered, "the editor must still offer every ORDINARY trigger type"
+    assert not (set(offered) & fields)
+    assert set(offered) == {t.value for t in ExpertEventType} - fields
+    # The fields really ARE event types -- which is why the filter is needed at all.
+    assert {t.value for t in ExpertEventType} & fields
+
+
+class _RulesTab:
+    """Just enough of the rules editor to exercise the refusal: the real method, bound."""
+
+    def __init__(self, rules, name="exit rules"):
+        from ba2_trade_platform.ui.pages.settings import TradeSettingsTab
+
+        self.ruleset_name_input = SimpleNamespace(value=name)
+        self._rules = rules
+        self._refuse = TradeSettingsTab._refuse_market_gates_on_exit_ruleset.__get__(self)
+
+
+@pytest.fixture
+def rules_tab(monkeypatch):
+    """A rules editor whose ``get_instance(EventAction, id)`` returns stub rules."""
+    import ba2_trade_platform.ui.pages.settings as sp
+
+    store = {}
+    monkeypatch.setattr(sp, "get_instance", lambda model, rid: store.get(rid))
+    return store
+
+
+def _rule(rid, name, event_type):
+    return SimpleNamespace(id=rid, name=name,
+                           triggers={"cond_0": {"event_type": event_type}})
+
+
+def test_a_market_gate_on_an_open_positions_ruleset_is_refused(rules_tab):
+    """market_condition_rules calls this the worst outcome in the whole design: outside the entry
+    pass the gate reads no_context, the rule never fires, and the position's exit or protective
+    order adjustment silently stops happening."""
+    rules_tab[1] = _rule(1, "stop-loss", "profit_loss_percent")
+    rules_tab[2] = _rule(2, "gated", ADX)
+    tab = _RulesTab(rules_tab)
+    with pytest.raises(ValueError) as e:
+        tab._refuse("open_positions", [1, 2])
+    msg = str(e.value)
+    assert "gated.cond_0" in msg and "open-positions / exit ruleset" in msg
+    assert "stop-loss" not in msg
+
+
+def test_an_ordinary_open_positions_ruleset_saves(rules_tab):
+    rules_tab[1] = _rule(1, "stop-loss", "profit_loss_percent")
+    assert _RulesTab(rules_tab)._refuse("open_positions", [1]) is None
+
+
+def test_the_same_gated_rule_on_an_ENTER_MARKET_ruleset_is_allowed(rules_tab):
+    """The gate belongs on the entry ruleset; only the exit slot refuses it. (Whether the
+    expert's profile SERVES it is the expert dialog's question, not this one's.)"""
+    rules_tab[2] = _rule(2, "gated", ADX)
+    tab = _RulesTab(rules_tab)
+    assert tab._refuse("enter_market", [2]) is None
+    assert tab._refuse(None, [2]) is None
+    assert tab._refuse("", [2]) is None
+
+
+def test_a_selected_rule_that_no_longer_exists_does_not_break_the_save(rules_tab):
+    rules_tab[1] = _rule(1, "stop-loss", "profit_loss_percent")
+    assert _RulesTab(rules_tab)._refuse("open_positions", [1, 999]) is None
+
+
+def test_the_refusal_runs_before_any_write_in_save_ruleset():
+    """Read from the source: a refusal after ``update_instance``/``add_instance`` would leave the
+    ruleset repointed at rules it just refused."""
+    import inspect
+
+    from ba2_trade_platform.ui.pages.settings import TradeSettingsTab
+
+    src = inspect.getsource(TradeSettingsTab._save_ruleset)
+    guard = src.index("_refuse_market_gates_on_exit_ruleset(")
+    writes = [src.index(c) for c in ("update_instance(ruleset)", "add_instance(new_ruleset)")]
+    assert guard < min(writes)

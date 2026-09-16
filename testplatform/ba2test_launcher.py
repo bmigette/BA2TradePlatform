@@ -4841,7 +4841,14 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
     return facts
 
 
-def _apply_market_conditions(command: str, backtest_block: dict, strat) -> dict:
+#: The strategy keys whose builders actually EMIT market-condition leaves: every pure-option
+#: structure (through ``_option_entry_rule``) plus the two equity-entry option overlays
+#: (through ``_append_market_condition_gates``). Design 2026-09-15 "Deferred": the equity grid
+#: S1-S7 is NOT in this delivery, and O_STK has no entry gate of its own to hang leaves on.
+_MARKET_CONDITION_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+
+
+def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
     """Record the market-condition decisions on a run's backtest block, or do nothing.
 
     NOTHING is written when no profile is selected: a profile-``none`` run must produce exactly
@@ -4867,8 +4874,21 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat) -> dict:
     the run's profiles from, so the gates, the data supply and the deployed twin all come from
     one string.
 
+    REFUSED for a strategy key whose builders emit no market leaves (see
+    :data:`_MARKET_CONDITION_STRATEGIES`): the job would be labelled gated, would be held to the
+    snapshot's coverage, and would search no market genes at all.
+
     Returns the recorded block (``{}`` when the profile is off).
     """
+    if _MARKET_CONDITION_PROFILES and kind and kind not in _MARKET_CONDITION_STRATEGIES:
+        # A strategy whose builders emit NO market leaves would be labelled gated, would demand
+        # snapshot coverage of its own universe, and would search exactly zero market genes --
+        # so `optimize-batch --strategies S1,O_LC --market-condition-profile ...` produced an S1
+        # job that failed coverage against the OPTION universe while claiming to be gated.
+        sys.exit(f"{command}: --market-condition-profile is options-only in this delivery, and "
+                 f"{kind!r} emits no market-condition gates (gated keys: "
+                 f"{sorted(_MARKET_CONDITION_STRATEGIES)}). Drop the flag, or run the option "
+                 f"keys in a job of their own.")
     if not _MARKET_CONDITION_PROFILES:
         if _MARKET_CONDITION_MANIFESTS:
             # Ignoring it would run an UNGATED grid from a command line that says otherwise, and
@@ -5881,7 +5901,7 @@ def _cmd_optimize(args) -> int:
         # the screened candidate union, which is the universe the gates are actually asked about.
         # Checked before that rewrite, a run whose real universe the snapshot does not cover would
         # pass -- exactly the silent miss this check exists to prevent.
-        _apply_market_conditions("optimize", backtest_block, strat)
+        _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
         schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}
@@ -6101,7 +6121,7 @@ def _cmd_optimize_batch(args) -> int:
                 backtest_block["entry_action"] = strat_entry_action
             # Market-condition gates (no-op with the profile off) — see _cmd_optimize for why this
             # sits after every block that can still rewrite enabled_instruments.
-            _apply_market_conditions("optimize-batch", backtest_block, strat)
+            _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)
             pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
             cfg = {
                 "populationSize": pop_for_strat,

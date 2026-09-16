@@ -1015,3 +1015,66 @@ def test_the_setting_and_the_run_config_key_agree_by_construction(profile_on, sn
     block = _gated_block()
     mod._apply_market_conditions("optimize", block, _built("O_LC"))
     assert market_condition_pins(block) == (["ohlcv-v1"], {"ohlcv-v1": snapshot})
+
+
+# -------------------------------------------- the flag is OPTIONS-ONLY in this delivery (I5)
+def test_the_profile_flag_is_refused_for_a_strategy_that_emits_no_gates(profile_on, snapshot,
+                                                                        monkeypatch):
+    """``optimize-batch --strategies S1,O_LC --market-condition-profile ...`` produced an S1 job
+    labelled gated, held to the OPTION snapshot's coverage, and searching exactly zero market
+    genes -- only the option builders emit leaves. Refused by name instead."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    with pytest.raises(SystemExit) as e:
+        mod._apply_market_conditions("optimize-batch", _gated_block(), _built("O_LC"), "S1")
+    msg = str(e.value)
+    assert "options-only" in msg and "'S1'" in msg
+    assert "O_LC" in msg                     # the message lists the keys that ARE gated
+
+
+@pytest.mark.parametrize("kind", ["O_LC", "O_CC", "O_PP", "O_WHEEL"])
+def test_every_gate_emitting_key_is_permitted(profile_on, snapshot, monkeypatch, kind):
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    block = _gated_block()
+    mod._apply_market_conditions("optimize", block, _built(kind), kind)
+    assert block["experts"][0]["settings"]["market_condition_profile"] == "ohlcv-v1"
+
+
+def test_the_permitted_set_is_exactly_the_keys_whose_builders_emit_leaves():
+    """Pinned against the builders rather than restated: the pure-option structures get their
+    leaves from ``_option_entry_rule``, O_CC/O_PP from ``_append_market_condition_gates``, and
+    O_STK has no entry gate of its own to hang them on."""
+    assert mod._MARKET_CONDITION_STRATEGIES == mod._PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+    assert "O_STK" not in mod._MARKET_CONDITION_STRATEGIES
+    assert not (mod._MARKET_CONDITION_STRATEGIES & {"S1", "S2", "S5", "S7"})
+
+
+def test_an_ungated_run_is_not_restricted_by_strategy(monkeypatch):
+    """NO IMPACT: with the profile off, every strategy key goes through untouched -- the whole
+    equity grid must be unchanged by a flag it does not pass."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ())
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {})
+    block = _gated_block()
+    before = json.loads(json.dumps(block))
+    assert mod._apply_market_conditions("optimize-batch", block, _built("O_LC"), "S1") == {}
+    assert block == before
+
+
+def test_a_caller_that_names_no_kind_is_still_served(profile_on, snapshot, monkeypatch):
+    """``kind`` defaults to '' so an in-code caller that has no strategy key (a test, a one-off
+    harness) is not refused -- the restriction is on the two CLI commands, which always know it."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    block = _gated_block()
+    mod._apply_market_conditions("optimize", block, _built("O_LC"))
+    assert block["market_condition_profiles"] == ["ohlcv-v1"]
+
+
+def test_both_cli_commands_pass_the_strategy_key():
+    """The guard is worth nothing if the commands do not name the strategy."""
+    import inspect
+
+    for fn in (mod._cmd_optimize, mod._cmd_optimize_batch):
+        calls = [ln for ln in inspect.getsource(fn).splitlines()
+                 if "_apply_market_conditions(" in ln]
+        assert len(calls) == 1, (fn.__name__, calls)
+        assert calls[0].rstrip().endswith("strat, args.strategy)") or \
+            calls[0].rstrip().endswith("strat, strat_kind)"), calls[0]
