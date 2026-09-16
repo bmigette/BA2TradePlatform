@@ -57,6 +57,19 @@ def _tool():
     return m
 
 
+def _pin_cache_root(tmp_path, monkeypatch):
+    """Point CACHE_FOLDER at ``tmp_path`` for a sweep test.
+
+    ``--sweep`` collects the market-condition mapping root too, and that root follows from the
+    cache root rather than from a flag -- so without this a sweep test would collect against the
+    operator's real cache, which is this file's one standing rule."""
+    import ba2_common.config as _bc
+    from app.services import cache_sync as _cs
+
+    monkeypatch.setattr(_bc, "CACHE_FOLDER", str(tmp_path), raising=False)
+    monkeypatch.setattr(_cs, "CACHE_FOLDER", str(tmp_path), raising=False)
+
+
 # --------------------------------------------------------------------------------------------
 # Fixtures. The option store is written through the REAL OptionHistoryParquetStore (the layout
 # under test is the one tools/warm_options_history.py produces); the OHLCV tree is the native
@@ -289,8 +302,9 @@ def test_an_untolerated_ohlcv_miss_exits_non_zero(native_tree, monkeypatch, caps
 # 3. --sweep: the KEY-level collector nothing else has.
 # --------------------------------------------------------------------------------------------
 def test_sweep_removes_aged_and_stale_version_keys_and_keeps_the_current_one(
-        store_root, capsys):
+        store_root, tmp_path, monkeypatch, capsys):
     tool = _tool()
+    _pin_cache_root(tmp_path, monkeypatch)
     derived = Path(SA.derived_root_for(store_root))
     v = pq._RawUnderlying.ARRAYS_VERSION
     aged = _done_dir(derived / f"u_OLD.v{v}" / "sig1", marker_age_s=20 * 86400)
@@ -311,11 +325,13 @@ def test_sweep_removes_aged_and_stale_version_keys_and_keeps_the_current_one(
     assert reclaimed and float(reclaimed.group(1)) > 0, out
 
 
-def test_sweep_does_not_remove_a_key_that_is_old_but_still_in_daily_use(store_root, capsys):
+def test_sweep_does_not_remove_a_key_that_is_old_but_still_in_daily_use(store_root, tmp_path,
+                                                                       monkeypatch, capsys):
     """The age rule is age-since-LAST-USE. ``_try_open`` restamps the marker on every successful
     open, so a key built months ago and mapped by every trial this morning is not garbage -- a
     build-time rule would delete the hottest key on the host and bill the next grid for it."""
     tool = _tool()
+    _pin_cache_root(tmp_path, monkeypatch)
     derived = Path(SA.derived_root_for(store_root))
     key_dir = derived / f"u_ZZ.v{pq._RawUnderlying.ARRAYS_VERSION}"
     pq._load_raw_underlying(store_root, "ZZ")                 # cold: builds
@@ -349,7 +365,8 @@ def test_sweep_of_the_ohlcv_root_uses_the_bar_stores_own_version(native_tree, ca
     assert "1 key(s) removed" in capsys.readouterr().out
 
 
-def test_sweep_also_runs_the_stores_own_within_key_collection(store_root, capsys):
+def test_sweep_also_runs_the_stores_own_within_key_collection(store_root, tmp_path,
+                                                             monkeypatch, capsys):
     """``--sweep`` is both passes: ``sweep()`` for superseded signatures WITHIN a key, then the
     key-level pass. A superseded signature under a current key has no other collector either."""
     tool = _tool()
@@ -468,11 +485,12 @@ def test_sweep_max_age_days_below_one_is_refused(capsys):
     assert "sweep-max-age-days" in capsys.readouterr().err
 
 
-def test_the_metric_store_root_is_swept_with_its_own_version(tmp_path, capsys):
+def test_the_metric_store_root_is_swept_with_its_own_version(tmp_path, monkeypatch, capsys):
     """The THIRD consumer. It publishes one ``u_store.v<n>`` key beside its own directory and
     has no other collector either; it is sweep-only, because the store is built by the first
     trial that reads it and there is no universe/window to prewarm it from."""
     tool = _tool()
+    _pin_cache_root(tmp_path, monkeypatch)
     from ba2_providers.screener.metric_store import METRIC_STORE_ARRAYS_VERSION
 
     store_dir = tmp_path / "screener_metrics"
@@ -494,6 +512,7 @@ def test_a_relative_metric_store_is_resolved_before_the_bootstrap_chdirs(tmp_pat
     exist, printed "nothing at ..." and exited 0 -- so a scheduled sweep would reclaim nothing
     for months and never say so. Every path argument is absolutized as a class, in one pass."""
     tool = _tool()
+    _pin_cache_root(tmp_path, monkeypatch)
     store_dir = tmp_path / "screener_metrics"
     store_dir.mkdir()
     stale = _done_dir(Path(SA.derived_root_for(str(store_dir))) / "u_store.v0" / "sig1")
@@ -501,7 +520,10 @@ def test_a_relative_metric_store_is_resolved_before_the_bootstrap_chdirs(tmp_pat
 
     assert tool.main(["--metric-store", "screener_metrics", "--sweep"]) == 0
 
-    out = capsys.readouterr().out
+    # Scoped to the metric-store lines: the same run also sweeps the market-condition mapping
+    # root, which legitimately reports "nothing at ..." on a host that never prepared one.
+    out = "\n".join(line for line in capsys.readouterr().out.splitlines()
+                     if line.startswith("[metric-store"))
     assert "removed" in out and "nothing at" not in out
     assert not stale.parent.exists()
 
@@ -552,3 +574,72 @@ def test_the_spawn_pool_path_builds_every_symbol(store_root, tmp_path):
     assert "2 built / 0 opened / 0 empty" in proc.stdout
     derived = Path(SA.derived_root_for(store_root))
     assert len([p for p in derived.rglob(SA.DONE_MARKER)]) == 2
+
+
+# --------------------------------------------------------------------------------------------
+# The FOURTH consumer: the market-condition mapping root (plan Task 7)
+# --------------------------------------------------------------------------------------------
+def test_sweep_collects_stale_market_condition_mappings_and_prunes_dead_markers(
+        tmp_path, monkeypatch, capsys):
+    """A LAYOUT_VERSION bump orphans every mapping key, and nothing else in the system collects
+    one. The readiness markers go with them: a marker whose arrays are gone keeps a worker
+    advertising a snapshot it would have to rebuild under the first trial that arrives."""
+    from ba2_common.core.market_condition_reader import (
+        LAYOUT_VERSION,
+        PREPARED_DIRNAME,
+        mapped_key,
+        prepared_digests,
+    )
+    from ba2_common.core.market_condition_store import MC_DIRNAME
+
+    tool = _tool()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _pin_cache_root(cache, monkeypatch)
+    derived = Path(SA.derived_root_for(str(cache / MC_DIRNAME)))
+
+    current_digest = "a" * 64
+    stale_digest = "b" * 64
+    current_key = mapped_key("ohlcv-v1", current_digest)
+    stale_key = f"mc_ohlcv-v1_{stale_digest[:16]}_v{LAYOUT_VERSION - 1}"
+    current = _done_dir(derived / current_key / "sig1")
+    stale = _done_dir(derived / stale_key / "sig1")
+
+    markers = derived / PREPARED_DIRNAME
+    markers.mkdir(parents=True)
+    for digest, key in ((current_digest, current_key), (stale_digest, stale_key)):
+        (markers / f"ohlcv-v1.{digest}.json").write_text(
+            json.dumps({"manifest": digest, "profile": "ohlcv-v1", "key": key}), encoding="utf-8")
+    assert sorted(prepared_digests(str(cache))) == sorted([current_digest, stale_digest])
+
+    assert tool.main(["--sweep", "--cache-root", str(cache)]) == 0
+
+    out = capsys.readouterr().out
+    assert current.parent.is_dir(), "the CURRENT layout's mapping must survive its own sweep"
+    assert not stale.parent.exists(), "a mapping below LAYOUT_VERSION is garbage"
+    assert "1 key(s) removed" in out
+    assert "readiness markers pruned: 1" in out
+    # And the host no longer claims readiness for the snapshot whose arrays it no longer has.
+    assert prepared_digests(str(cache)) == [current_digest]
+
+
+def test_a_market_conditions_dry_run_touches_nothing(tmp_path, monkeypatch, capsys):
+    from ba2_common.core.market_condition_reader import PREPARED_DIRNAME
+    from ba2_common.core.market_condition_store import MC_DIRNAME
+
+    tool = _tool()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _pin_cache_root(cache, monkeypatch)
+    derived = Path(SA.derived_root_for(str(cache / MC_DIRNAME)))
+    stale = _done_dir(derived / "mc_ohlcv-v1_deadbeefdeadbeef_v0" / "sig1")
+    markers = derived / PREPARED_DIRNAME
+    markers.mkdir(parents=True)
+    marker = markers / "ohlcv-v1.cafe.json"
+    marker.write_text(json.dumps({"manifest": "cafe", "profile": "ohlcv-v1",
+                                  "key": "mc_ohlcv-v1_cafe_v9"}), encoding="utf-8")
+
+    assert tool.main(["--sweep", "--cache-root", str(cache), "--dry-run"]) == 0
+
+    assert stale.parent.is_dir() and marker.exists()
+    assert "DRY RUN" in capsys.readouterr().out
