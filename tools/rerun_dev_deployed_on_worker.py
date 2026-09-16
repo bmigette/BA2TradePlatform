@@ -94,7 +94,58 @@ def deployed_targets():
 
 # ─── trial config, rebuilt exactly as the persist phase does ────────
 
-def build_trial_config(opt_id: int, rank: int, label: str) -> dict:
+def _apply_stored_pins(decoded: dict, bt_id: int, label: str) -> list:
+    """Re-apply the hand-written pins the STORED backtest row carries.
+
+    The GA genome and the stored row disagree on purpose. Twelve of the deployed rows were
+    rewritten by hand (``_atr_swap_migration``, 2026-09-06; ``_inert_toggle_pin``, 2026-09-07)
+    so that ``strategy_params`` shows the values that ACTUALLY EXECUTED, after dd1f912e was
+    found to have wired ``atr_risk_budget_pct`` and ``risk_per_trade_pct`` to each other's
+    jobs. Decoding the raw genome therefore does NOT reproduce the stored result: it feeds
+    the pre-swap values back into code that no longer swaps them.
+
+    That is not theoretical. bt1107 executed on a 7% risk budget and re-ran on 0.5%, which
+    is the whole of its apparent CAR 24.49 -> 6.37 "collapse" -- an artefact of this harness,
+    not of anything in the platform.
+
+    Each pin block records its own ``from`` (the genome values it replaced), so the keys to
+    override are the pin's own, and the value to use is what the row says today.
+
+    The pins are written in the row's ``model:<name>`` spelling; ``decode_params`` returns the
+    bare name under ``expert_overrides``. Anything outside that shape raises rather than being
+    skipped: a pin written into a key nothing reads is exactly the silent-no-op this function
+    exists to prevent (the trial-config whitelist drops unknown keys without a word).
+    """
+    con = sqlite3.connect(f"file:{TEST_DB}?mode=ro", uri=True)
+    row = con.execute("select strategy_params from backtests where id = ?", (bt_id,)).fetchone()
+    if not row or not row[0]:
+        return []
+    stored = json.loads(row[0])
+    overrides = decoded.get("expert_overrides")
+    applied = []
+    for pin in ("_atr_swap_migration", "_inert_toggle_pin"):
+        block = stored.get(pin)
+        if not isinstance(block, dict):
+            continue
+        for key in (block.get("from") or {}):
+            if key not in stored:
+                raise RuntimeError(f"{label}: pin {pin} names {key}, absent from the stored row")
+            if not key.startswith("model:"):
+                raise RuntimeError(f"{label}: pin {pin} names {key}, which is not a model: key; "
+                                   f"this function only knows where those live")
+            name = key.split(":", 1)[1]
+            if not isinstance(overrides, dict) or name not in overrides:
+                raise RuntimeError(f"{label}: pin {pin} names {key}, but the decoded genome has "
+                                   f"no expert override {name!r} to pin -- writing it would be "
+                                   f"a no-op the whitelist drops")
+            was, now = overrides[name], stored[key]
+            overrides[name] = now
+            if was != now:
+                applied.append(f"{name} {was}->{now}")
+    return applied
+
+
+def build_trial_config(opt_id: int, rank: int, label: str, bt_id: int = None) -> dict:
     con = sqlite3.connect(f"file:{TEST_DB}?mode=ro", uri=True)
     cfg_json, all_results, strategy_id = con.execute(
         "select optimization_config, all_results, strategy_id "
@@ -129,6 +180,12 @@ def build_trial_config(opt_id: int, rank: int, label: str) -> dict:
         strat = db.query(Strategy).filter_by(id=strategy_id).first()
         bt_block = dict(cfg["backtest"])
         decoded = decode_params(strat, trial["params"])
+        # THE STORED ROW WINS over the genome wherever it was pinned by hand -- see
+        # _apply_stored_pins. Reported, not silent: a re-run that quietly used different
+        # genes from the result it is being compared against is worse than no number.
+        if bt_id is not None:
+            for note in _apply_stored_pins(decoded, bt_id, label):
+                print(f"    [{label}] pin applied: {note}", flush=True)
         # THE HOISTED SCREENER STATE, exactly as ba2test_launcher._persist_top_backtests does.
         # Every row here is a screener run (scr-*), and the GA scored each individual against a
         # hoisted universe; rebuilding without it does not reproduce the stored backtest -- it
@@ -219,7 +276,7 @@ def run_one(worker: dict, t: dict) -> dict:
     label = f"bt{t['bt']}-opt{t['opt']}-top{t['rank']}"
     t0 = time.perf_counter()
     try:
-        cfg, trial = build_trial_config(t["opt"], t["rank"], label)
+        cfg, trial = build_trial_config(t["opt"], t["rank"], label, bt_id=t["bt"])
         out = submit_and_poll(worker, cfg, t["fitness_metric"])
         res = out.get("results") if isinstance(out, dict) and "results" in out else out
         new = {"total_return": res.get("total_return"),
