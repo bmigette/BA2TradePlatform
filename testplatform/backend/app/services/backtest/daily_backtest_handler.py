@@ -882,7 +882,16 @@ def run_daily_backtest(
         # in-memory slice is as_of-correct without an extra wrapper.
         set_backtest_ohlcv_override(ohlcv)
         try:
-            install_backtest_market_conditions(config, ps)
+            # The resolver is the handle the run's telemetry reads its rows through; None on
+            # every profile-less run, which is what makes the block below a no-op there.
+            market_condition_resolver = install_backtest_market_conditions(config, ps)
+            market_condition_record = None
+            if market_condition_resolver is not None:
+                from app.services.backtest.market_condition_bt import MarketConditionRunRecord
+                market_condition_record = MarketConditionRunRecord(
+                    market_condition_resolver,
+                    profile=config.get("market_condition_profile") or "none",
+                    manifest_digest=config.get("market_condition_manifest"))
             # Clamp the indicator/ATR OHLCV fetches to the backtest clock: PandasIndicatorCalc
             # and get_latest_atr fetch with end_date=now(), which would leak future bars into the
             # ATR/indicators used for sizing + rule conditions. The clamp follows ps.set_clock();
@@ -900,11 +909,22 @@ def run_daily_backtest(
                 indicator_provider=indicator_provider,
                 regime_calendar=_build_regime_calendar(
                     raw_ohlcv, config["start_date"], config["end_date"]),
+                market_condition_record=market_condition_record,
             )
             engine.run()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            if market_condition_record is not None:
+                # RESEARCH METADATA, added after the metrics are computed so it cannot reach
+                # any of them: the per-run counters, and the entry state attached to the trades
+                # it explains (design section 7's attribution input). With the profile off this
+                # whole block is skipped and ``results`` is what it has always been.
+                from app.services.backtest.market_condition_bt import attach_entry_states
+                block = market_condition_record.as_dict()
+                block["stats"]["trades_with_entry_state"] = attach_entry_states(
+                    results.get("trades"), market_condition_record.entry_states())
+                results["market_condition"] = block
             # Stamp this run's trade-frequency objective so compute_fitness scores the expert on
             # ITS cadence, not the platform default. Done here because run_daily_backtest is the
             # single chokepoint every path goes through (trial worker, master top-N persist,
