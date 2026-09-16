@@ -194,9 +194,21 @@ def manifest_digests_from_env(profiles: Sequence[str],
     * ``<digest>`` -- a bare digest, valid only when exactly one profile is served (a manifest
       names the ONE profile it was warmed for, so a bare digest for two profiles is refused
       rather than silently applied to both);
-    * ``<profile>=<digest>,<profile>=<digest>`` -- explicit pairs. A pair for a profile the
-      expert does not serve is refused: nothing would read it, while the digest suggests the
-      snapshot is in use.
+    * ``<profile>=<digest>,<profile>=<digest>`` -- explicit pairs, validated against the
+      REGISTERED profiles and then NARROWED to the ones this expert serves.
+
+    THE HOST MAP IS HOST-WIDE, THE PROFILES ARE PER EXPERT (review 2026-09-16, F3). This used to
+    refuse any pair the expert being resolved did not serve, so a host serving
+    ``ohlcv-v1=A,ta-structure-v1=B`` could only run experts naming BOTH: an expert on
+    ``ohlcv-v1`` alone raised on the structure pin, an expert on ``ta-structure-v1`` alone raised
+    on the OHLCV pin, and two independently valid pinned strategies could not coexist. The map is
+    one ops statement about the box ("these snapshots serve this platform"), not a statement
+    about any one expert, so an entry no expert of this pass needs is simply not selected.
+
+    What is still refused, because each one is a configuration fault rather than a subset: an
+    unregistered profile name (the pin names a snapshot nothing can read), a repeated profile, a
+    pair with no digest, and mixing the two shapes. A profile this expert serves that the map
+    does NOT pin stays unpinned -- research mode, which the reader reports once per decision pass.
 
     Unset/empty -> ``{}`` (research mode; the reader computes on a miss and warns once).
     """
@@ -207,6 +219,8 @@ def manifest_digests_from_env(profiles: Sequence[str],
         return {}
     tokens = [t.strip() for t in raw.split(",") if t.strip()]
     if any("=" in t for t in tokens):
+        from ba2_common.core.market_conditions import PROFILES
+
         pins: Dict[str, str] = {}
         for token in tokens:
             if "=" not in token:
@@ -214,14 +228,20 @@ def manifest_digests_from_env(profiles: Sequence[str],
                                  f"profile=digest pairs; use one shape")
             name, _, digest = token.partition("=")
             name, digest = name.strip(), digest.strip()
-            if name not in profiles:
-                raise ValueError(f"{MANIFEST_ENV} pins profile {name!r}, which this expert does "
-                                 f"not serve (profiles: {list(profiles)!r}): nothing would read "
-                                 f"that snapshot.")
+            if name not in PROFILES:
+                raise ValueError(f"{MANIFEST_ENV} pins profile {name!r}, which is not a "
+                                 f"registered market-condition profile "
+                                 f"(registered: {sorted(PROFILES)!r}): nothing could read that "
+                                 f"snapshot.")
             if not digest:
                 raise ValueError(f"{MANIFEST_ENV}={raw!r} has no digest for {name!r}")
+            if name in pins:
+                raise ValueError(f"{MANIFEST_ENV}={raw!r} pins profile {name!r} more than once "
+                                 f"({pins[name]!r}, {digest!r}): which snapshot serves it is not "
+                                 f"something to guess.")
             pins[name] = digest
-        return pins
+        # SELECTED, not required: the map describes the HOST, the profiles describe the EXPERT.
+        return {name: pins[name] for name in profiles if name in pins}
     if len(tokens) != 1 or len(profiles) != 1:
         raise ValueError(
             f"{MANIFEST_ENV}={raw!r} is a bare digest but the expert serves "

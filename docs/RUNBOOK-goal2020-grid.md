@@ -450,24 +450,52 @@ powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Desce
 ## Market-condition feature store (design 2026-09-15)
 
 The `ohlcv-v1` profile adds three entry gates per option structure (trend slope, ADX, realized-
-volatility ratio), six searched genes each. They read a **published snapshot**: a manifest
+volatility ratio), six searched genes in total per entry tree. `ta-structure-v1` adds five gates
+and nine genes; both together add eight gates and fifteen genes. They read a **published snapshot**: a manifest
 pinning immutable feature objects, built once before a run and mapped per host. **Nothing is
 computed in a trial.** With no profile selected (the default) none of this exists — the launcher
 emits no leaves, the seam installs nothing, and the run is byte-for-byte the one it has always
 been (pinned by `tests/backtest/test_market_condition_all_off_matches_baseline.py`).
 
-### Published snapshots — 98 / 98, both profiles
+### Published snapshots — every universe symbol warmed, not every row usable
 
-Pin these. Window 2020-01-02..2025-12-31, universe `tools/options_universe_top100.txt`:
+Pin these. Window 2020-01-02..2025-12-31 (decision dates; the feature sessions they read run
+2019-12-31..2025-12-30), universe `tools/options_universe_top100.txt`:
 
-| profile | digest | symbols | coverage exceptions |
+| profile | digest | symbols the build warmed | symbols with recorded status exceptions |
 |---|---|---|---|
-| `ohlcv-v1` | `c9ba981fbae8726ec749eca4201c98399a4285046733d16cca6b112b8c8371df` | **98 / 98** | 0 |
-| `ta-structure-v1` | `3c3020d05f9e24ded59272050e1f06193abc74e6c00e41e3168a1750bcc44385` | **98 / 98** | 0 |
+| `ohlcv-v1` | `c9ba981fbae8726ec749eca4201c98399a4285046733d16cca6b112b8c8371df` | 98 of 98 | 6 |
+| `ta-structure-v1` | `3c3020d05f9e24ded59272050e1f06193abc74e6c00e41e3168a1750bcc44385` | 98 of 98 | 98 |
 
 Verified on publication: `identity_ok`, 7154 feature objects + 7358 raw shards re-hashed, none
-corrupt or missing. The universe file needs no trimming and the launcher's coverage refusal
-passes for all 98.
+corrupt or missing.
+
+**"98/98" means NO SYMBOL WAS EXCLUDED FROM THE BUILD. It does not mean every row is a valid
+observation** — and the manifest-level exclusion list being empty says only the first of those.
+The per-symbol records say the second, and they are not empty (review 2026-09-16):
+
+* **92 symbols are fully observed** for `ohlcv-v1`: a valid row on every session after their
+  127-session warm-up prefix.
+* **APP, ARM, GEV, PLTR, SNDK** list part-way through the window. Their rows before the listing
+  are `missing_session` and the next 127 are `insufficient_history`. That is the truth about
+  those years, not a defect: no download creates price history a symbol did not have, and no
+  strategy could have traded them then either. The launch check accepts them.
+* **SPCX had NO usable row anywhere in 2020–2025** — all 1,508 `missing_session`, because its
+  daily cache starts 2026-06-12. **Removed from `tools/options_universe_top100.txt` on
+  2026-09-16** (that file is a bare symbol-per-line list which three of its four readers parse by
+  whitespace with no comment syntax, so the reason is recorded here instead). The universe is now
+  97 symbols. Removing it does **not** invalidate the two digests: a manifest's identity is the
+  hash of its own content, the universe file is not part of it, and the launcher's coverage check
+  simply stops asking for that symbol. The published snapshots still carry SPCX's rows and are
+  pinned unchanged. Ungated runs could not trade it either (no price data => no recommendation),
+  so gated and ungated runs stay comparable.
+* Per OHLCV field: 5,307 `missing_session` rows (1,508 of them SPCX) and 635
+  `insufficient_history`. Do not add the three fields' counts as if they were separate sessions.
+* `ta-structure-v1` adds legitimately undefined levels and states — resistance distance alone has
+  15,494 `insufficient_history` rows. **An undefined pivot is not repaired by downloading more
+  history.** Report usable coverage by field and eligible recommendation, never as "98/98 warmed".
+
+See the [implementation review](../reports/strategy_research/market_conditions_review_2026-09-16.md).
 
 > **History, 2026-09-16 — do not pin `1136d489…f5cb3`.** The first build of `ohlcv-v1` covered
 > only 85 of the 98: thirteen symbols (`ASML BHP DELL GE HON IBM MRK NVS RTX SAN SCCO T WDC`)
@@ -483,8 +511,19 @@ passes for all 98.
 pinned manifest does not cover its `enabled_instruments`, and the seam refuses a GA trial on the
 same condition. An uncovered symbol reads `missing_session` at every gate for the whole run, so
 the genome that would have traded it scores as though its strategy simply did not fire there — a
-feature-cache miss silently becoming a property of the fitness landscape. If a future universe
-change reintroduces uncovered symbols, the two ways forward are the same: re-fetch
+feature-cache miss silently becoming a property of the fitness landscape.
+
+**The run's SESSIONS are checked too (added 2026-09-16, review F1).** Symbol presence alone let a
+snapshot warmed for one window be pinned on another: it carries every symbol and not one row the
+run will read, so every gate reports `missing_session` on every decision date. The launcher now
+validates the `(symbol, prior session)` rows the run's `start_date..end_date` actually requires,
+once per (digest, universe, window), before dispatch — and refuses an out-of-range pin or an
+unexplained hole as a **job configuration error**, never as a zero-trade fitness. It deliberately
+does NOT refuse the legitimately undefined observations above (pre-listing rows, the warm-up
+prefix, an unconfirmed pivot). If the refusal names a symbol with "no usable observation
+anywhere", that symbol belongs out of the universe (as SPCX now is) or needs its source history
+repaired. If a future universe change reintroduces uncovered symbols, the two ways forward are
+the same: re-fetch
 (`warm_market_conditions.py build --plan <plan> --fetch-missing`, a real provider bill — size it
 with `plan` first), then re-publish and re-pin; or trim the universe to the covered set and pass
 that file to the driver.
@@ -566,28 +605,46 @@ from a hung worker.
 
 ### Live
 
+Set `market_condition_profile` on each expert to an empty string (off), `ohlcv-v1`,
+`ta-structure-v1`, or `ohlcv-v1,ta-structure-v1`. The setting travels with the deploy payload.
+Do **not** set `BA2_MARKET_CONDITION_PROFILE`: it is retired and a nonempty value is rejected.
+
+For a reproducible pinned reader, the host still uses:
+
 ```
-BA2_MARKET_CONDITION_PROFILE=ohlcv-v1
-BA2_MARKET_CONDITION_MANIFEST=<digest>
+BA2_MARKET_CONDITION_MANIFEST=ohlcv-v1=<digest>,ta-structure-v1=<digest>
 ```
 
-Unset (or `none`) installs nothing. Set, and `wire_all_seams` installs the live resolver after
-**split-certifying** the FMP cache it will read.
+Pin every profile the box serves. The map is HOST-WIDE and the profile is PER EXPERT, so each
+expert selects the subset it needs: with both profiles pinned, an expert on `ohlcv-v1` alone, one
+on `ta-structure-v1` alone and one on both all resolve (fixed 2026-09-16, review F3; before that
+only an expert naming every pinned profile could be built). A single-profile host may still use a
+bare digest. An unregistered profile name, a profile pinned twice, a pin with no digest and
+mixing the two shapes are all still refused. A profile the map does not pin is research mode for
+that expert — reported once per decision pass, not silently computed.
+
+`wire_all_seams` installs a dispatcher; readers and source certification are created lazily for
+experts with a nonempty profile setting. An empty setting performs no feature reads. A profile
+without a manifest computes from the local FMP cache and logs an error for each decision pass;
+it is not the same pinned-input configuration as a GA trial. A historical 2020–2025 manifest
+does not cover current live sessions: prepare a snapshot for the live decision dates before
+pinning it, and renew it as dates advance.
 
 * **A certification failure does not stop the platform.** Exits and protective-order handling
   must keep running, so an `UncertifiedSourceResolver` is installed instead: every gate resolves
   no context with the certification summary as its reason (one ERROR at install, one WARNING per
   field), so gated **entries** are refused loudly while everything else runs.
 * **Coverage is checked against the live universe** — the union of the enabled instruments of
-  every enabled expert instance whose enter-market ruleset carries a market leaf — at install and
-  again whenever that universe changes. Each uncovered symbol gets **one ERROR naming the
+  every enabled expert instance whose enter-market ruleset carries a market leaf — when its
+  resolver is built and at decision passes, with repeated comparisons cached. Each uncovered symbol gets **one ERROR naming the
   digest**, and its gates report `no_context` with that reason. An instance that picks its
   universe at analysis time (`EXPERT`/`DYNAMIC`/`SCREENER`) cannot be pre-checked and is reported
   as such.
-* **The first live run after this ships forces a FULL FMP re-fetch**, synchronously inside the
-  cache refresh, for every symbol whose split calendar shows a post-first-bar split that is mixed
-  or `undetectable` (factor < 1.5). Size it beforehand with `warm_market_conditions plan` over the
-  live universe — on the 98-symbol option universe that was 13 symbols.
+* **Live refresh reports split-basis drift; it does not automatically replace history.** The
+  automatic repair was reversed by operator decision. Inventory the live universe with
+  `warm_market_conditions.py plan`, then use the explicit warmup `--fetch-missing` repair path
+  when required. That path can call `force_full_refetch`; the earlier option-universe repair
+  involved 13 symbols. Do not assume restarting the platform repairs the source cache.
 * Market leaves are refused on open-positions / exit rulesets, and an unresolved mode gene is
   refused at export: live receives concrete conditions only.
 

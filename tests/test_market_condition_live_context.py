@@ -634,3 +634,84 @@ def test_research_mode_profiles_names_only_the_unpinned_ones():
         ("ohlcv-v1", "ta-structure-v1"),
         reader=CompositeMarketConditionReader([_R("ohlcv-v1", pinned), _R("ta-structure-v1")]))
     assert resolver.research_mode_profiles() == ("ta-structure-v1",)
+
+
+# ------------------------------------------- host-wide pins vs per-expert profiles (review F3)
+HOST_MAP = "ohlcv-v1=" + "a" * 64 + ",ta-structure-v1=" + "b" * 64
+
+
+def _pins(profiles, raw=HOST_MAP):
+    return live.manifest_digests_from_env(profiles, {live.MANIFEST_ENV: raw})
+
+
+def test_one_host_map_serves_experts_with_different_profile_sets(dispatcher, instances,
+                                                                 monkeypatch):
+    """Review 2026-09-16, F3 -- reproduced and fixed here.
+
+    ``BA2_MARKET_CONDITION_MANIFEST`` is a PROCESS-WIDE map; the profile is a PER-EXPERT setting.
+    The parser used to refuse any entry the expert being resolved did not serve, so with both
+    profiles pinned on the box an expert on ``ohlcv-v1`` alone raised on the structure pin, an
+    expert on ``ta-structure-v1`` alone raised on the OHLCV pin, and only an expert naming both
+    could be resolved: two independently valid pinned strategies could not coexist on one host.
+
+    Four experts on ONE host map: A (ohlcv only), B (structure only), C (both) and an ungated
+    one. Each gets exactly the pins it serves, nothing raises, and the ungated one still gets no
+    resolver at all.
+    """
+    built = []
+
+    def fake_reader(profile, cache_root=None, *, manifest_digest=None):
+        built.append((profile, manifest_digest))
+        return SimpleNamespace(profile=profile, calc_version=f"{profile}/calc-1",
+                               mapped_reader=SimpleNamespace(manifest_digest=manifest_digest,
+                                                             symbols=lambda: (),
+                                                             coverage=lambda: {}),
+                               observe=lambda symbol, session: None)
+
+    monkeypatch.setattr(live, "_fmp_cache_reader", fake_reader)
+    monkeypatch.setattr(dispatcher, "_environ", {live.MANIFEST_ENV: HOST_MAP})
+    instances[1] = "ohlcv-v1"                       # A
+    instances[2] = "ta-structure-v1"                # B
+    instances[3] = "ohlcv-v1,ta-structure-v1"       # C
+    instances[4] = ""                               # ungated
+
+    assert dispatcher.resolver_for(1).profiles == ("ohlcv-v1",)
+    assert dispatcher.resolver_for(2).profiles == ("ta-structure-v1",)
+    assert dispatcher.resolver_for(3).profiles == ("ohlcv-v1", "ta-structure-v1")
+    assert dispatcher.resolver_for(4) is None, "an empty setting gets no resolver, not an empty one"
+    # Each reader was built with ITS OWN profile's digest -- never the other profile's.
+    assert built == [("ohlcv-v1", "a" * 64), ("ta-structure-v1", "b" * 64),
+                     ("ohlcv-v1", "a" * 64), ("ta-structure-v1", "b" * 64)]
+
+
+def test_the_subset_is_selected_per_expert_and_an_unpinned_profile_stays_unpinned():
+    assert _pins(("ohlcv-v1",)) == {"ohlcv-v1": "a" * 64}
+    assert _pins(("ta-structure-v1",)) == {"ta-structure-v1": "b" * 64}
+    assert _pins(("ohlcv-v1", "ta-structure-v1")) == {"ohlcv-v1": "a" * 64,
+                                                      "ta-structure-v1": "b" * 64}
+    # A profile the map does not pin is research mode for that expert (reported per pass), not a
+    # refusal: a half-pinned host is a legitimate, visible state.
+    assert _pins(("ohlcv-v1", "ta-structure-v1"), "ohlcv-v1=" + "a" * 64) == {
+        "ohlcv-v1": "a" * 64}
+
+
+@pytest.mark.parametrize("raw,match", [
+    ("nope-v1=" + "a" * 64, "not a registered"),
+    ("ohlcv-v1=", "no digest"),
+    ("ohlcv-v1=" + "a" * 64 + ",ohlcv-v1=" + "b" * 64, "more than once"),
+    ("ohlcv-v1=" + "a" * 64 + "," + "c" * 64, "mixes bare digests"),
+])
+def test_a_malformed_host_map_is_still_refused(raw, match):
+    """Selecting a subset is not tolerating a broken map: an unreadable profile name, a pin with
+    no digest, a profile pinned twice and the two shapes mixed are all still configuration faults
+    -- and the ops map is refused loudly, unlike a strategy's own settings fault."""
+    with pytest.raises(ValueError, match=match):
+        _pins(("ohlcv-v1", "ta-structure-v1"), raw)
+
+
+def test_a_bare_digest_still_needs_exactly_one_served_profile():
+    """A manifest names the ONE profile it was warmed for, so a bare digest cannot be applied to
+    two of them -- unchanged by the subset selection."""
+    assert _pins(("ohlcv-v1",), "c" * 64) == {"ohlcv-v1": "c" * 64}
+    with pytest.raises(ValueError, match="bare digest"):
+        _pins(("ohlcv-v1", "ta-structure-v1"), "c" * 64)
