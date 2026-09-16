@@ -361,6 +361,37 @@ def phase_trial(args: Any, symbols: Sequence[str], covered: Sequence[str] = ()) 
     return out
 
 
+def arithmetic_bound(observe: Any, gate: Any, trial: Any, sessions: int,
+                     gates: Optional[int] = None) -> Dict[str, Any]:
+    """The gate cost as a fraction of a trial, computed from the per-operation measurements.
+
+    WHY THIS AND NOT ONLY THE A/B. The A/B difference is a small number sitting inside the
+    rig's own run-to-run spread, so on a good day it comes out NEGATIVE and on a bad day it
+    comes out at a percent for reasons that have nothing to do with the gates. This bound does
+    not depend on that: it multiplies the measured per-operation costs by the number of
+    operations a trial can perform. It is an UPPER bound -- the entry rule short-circuits
+    before most leaves ever run -- so a trial's real cost is at most this.
+
+    One memo MISS per (symbol, session) -- the first market leaf on a bar pays it -- plus one
+    ``evaluate()`` per leaf per bar, which already includes its memo hit.
+    """
+    symbols = int(trial.get("symbols") or 0)
+    leaves = int(gates if gates is not None else (trial.get("gates") or 0))
+    keys = symbols * int(sessions)
+    evaluations = keys * leaves
+    miss_us = float(observe["trial_path"]["miss"]["p50_us"])
+    eval_us = float(gate["evaluate"]["p50_us"])
+    seconds = (keys * miss_us + evaluations * eval_us) / 1e6
+    baseline = float(trial["off"]["median_s"] or 0.0)
+    return {
+        "symbols": symbols, "sessions": int(sessions), "leaves_per_bar": leaves,
+        "memo_misses": keys, "evaluations": evaluations,
+        "observe_miss_p50_us": miss_us, "evaluate_p50_us": eval_us,
+        "seconds": seconds, "trial_median_s": baseline,
+        "pct": (seconds / baseline * 100.0) if baseline else None,
+    }
+
+
 # --------------------------------------------------------------------------- workers
 def _worker(cache_root: str, manifest: str, profile: str, symbol: str, session_ord: int,
             ready, hold) -> None:
@@ -373,9 +404,42 @@ def _worker(cache_root: str, manifest: str, profile: str, symbol: str, session_o
     hold.get()
 
 
+def _reap(procs: Any, hold: Any) -> None:
+    """Release, join, then TERMINATE and KILL whatever is still alive. Never raises.
+
+    THE LEAK THIS CLOSES. The children block on ``hold.get()`` so they can be measured; if
+    anything between start and release raises -- one child dying on import, a timeout waiting
+    for the last ``ready``, psutil refusing a handle -- the release never happens and thirty
+    spawned Python processes stay resident for the life of the parent. A benchmark that leaks
+    the thing it is measuring is worse than one that fails: the next measurement on that box is
+    wrong and nothing says so.
+    """
+    for _ in procs:
+        try:
+            hold.put_nowait(1)
+        except Exception:  # noqa: BLE001 -- a full/closed queue must not stop the kill below
+            pass
+    for proc in procs:
+        proc.join(timeout=30)
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+    for proc in procs:
+        proc.join(timeout=10)
+    for proc in procs:
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=10)
+
+
 def phase_workers(cache_root: str, manifest: str, profile: str, symbol: str, session: date,
-                  workers: int) -> Dict[str, Any]:
-    """Peak RSS and open descriptors/handles with ``workers`` children holding the mapping."""
+                  workers: int, ready_timeout: float = 300.0) -> Dict[str, Any]:
+    """Peak RSS and open descriptors/handles with ``workers`` children holding the mapping.
+
+    Every exit path goes through :func:`_reap`. A child that never reports raises here (a
+    benchmark that cannot measure must refuse, not report the children that did answer as if
+    they were all of them) -- and the survivors are still cleaned up on the way out.
+    """
     import multiprocessing as mp
 
     import psutil
@@ -386,27 +450,36 @@ def phase_workers(cache_root: str, manifest: str, profile: str, symbol: str, ses
                                                session.toordinal(), ready, hold))
              for _ in range(workers)]
     started = _now()
-    for p in procs:
-        p.start()
-    pids = [ready.get(timeout=300) for _ in procs]
-    opened = _now() - started
-    rss, fds = [], []
-    for pid in pids:
-        try:
-            proc = psutil.Process(pid)
-            rss.append(proc.memory_info().rss / (1024 * 1024))
-            counter = getattr(proc, "num_fds", None) or getattr(proc, "num_handles", None)
-            fds.append(counter() if counter else None)
-        except psutil.Error as e:
-            # RECORDED, never treated as zero: a process we could not measure is an unknown,
-            # and an unknown averaged in as 0 MB is how a memory budget passes on paper.
-            rss.append(None)
-            fds.append(None)
-            print(f"[workers] pid {pid} not measurable: {e!r}")
-    for _ in procs:
-        hold.put(1)
-    for p in procs:
-        p.join(timeout=60)
+    try:
+        for proc in procs:
+            proc.start()
+        pids = []
+        for i in range(len(procs)):
+            try:
+                pids.append(ready.get(timeout=ready_timeout))
+            except Exception as e:  # noqa: BLE001 -- queue.Empty and anything else alike
+                alive = sum(1 for proc in procs if proc.is_alive())
+                raise RuntimeError(
+                    f"only {i} of {len(procs)} children opened the mapping within "
+                    f"{ready_timeout}s ({alive} still alive): {e!r}. Their stderr is above; a "
+                    f"child that dies before reporting is usually an import the spawned "
+                    f"process cannot resolve.") from e
+        opened = _now() - started
+        rss, fds = [], []
+        for pid in pids:
+            try:
+                proc = psutil.Process(pid)
+                rss.append(proc.memory_info().rss / (1024 * 1024))
+                counter = getattr(proc, "num_fds", None) or getattr(proc, "num_handles", None)
+                fds.append(counter() if counter else None)
+            except psutil.Error as e:
+                # RECORDED, never treated as zero: a process we could not measure is an unknown,
+                # and an unknown averaged in as 0 MB is how a memory budget passes on paper.
+                rss.append(None)
+                fds.append(None)
+                print(f"[workers] pid {pid} not measurable: {e!r}")
+    finally:
+        _reap(procs, hold)
     measured = [v for v in rss if v is not None]
     handles = [v for v in fds if v is not None]
     return {"workers": workers, "opened_s": opened,
@@ -420,39 +493,50 @@ def phase_workers(cache_root: str, manifest: str, profile: str, symbol: str, ses
 
 # --------------------------------------------------------------------------- main
 def run(args: Any) -> Dict[str, Any]:
-    from ba2_common.core.market_calendar import regular_sessions_ending_at
-    from ba2_common.core.market_condition_reader import MappedMarketConditionReader
+    """Every requested phase, in a temporary store under ``--quick`` and the real one otherwise.
 
-    universe: List[str]
-    cache_root = args.cache_root
-    manifest = args.manifest
-    temp = None
+    ``--quick``'s fabricated store lives in a ``TemporaryDirectory``: a failed run used to leave
+    a ``bench-mc-*`` tree behind on every attempt, and the one thing worse than a benchmark that
+    fails is a benchmark that fails while filling the disk it is measuring.
+    """
+    import tempfile
+
     if args.quick:
-        import tempfile
+        with tempfile.TemporaryDirectory(prefix="bench-mc-") as temp:
+            universe = ["QAAA", "QBBB", "QCCC"]
+            sessions = _sessions_for(date(2024, 6, 28), 40)
+            return _run_phases(args, temp, fabricate_store(temp, universe, sessions),
+                               universe, sessions)
+    if not args.manifest:
+        raise SystemExit("--manifest is required without --quick")
+    cache_root = args.cache_root
+    if cache_root is None:
+        from ba2_common.config import CACHE_FOLDER
+        cache_root = CACHE_FOLDER
+    with open(args.universe_file, encoding="utf-8") as f:
+        universe = [line.strip().upper() for line in f
+                    if line.strip() and not line.startswith("#")]
+    return _run_phases(args, cache_root, args.manifest, universe,
+                       _sessions_for(date.fromisoformat(args.end), args.sessions))
 
-        temp = tempfile.mkdtemp(prefix="bench-mc-")
-        cache_root = temp
-        universe = ["QAAA", "QBBB", "QCCC"]
-        sessions = regular_sessions_ending_at(date(2024, 6, 28), 40)
-        manifest = fabricate_store(cache_root, universe, sessions)
-    else:
-        if not manifest:
-            raise SystemExit("--manifest is required without --quick")
-        if cache_root is None:
-            from ba2_common.config import CACHE_FOLDER
-            cache_root = CACHE_FOLDER
-        with open(args.universe_file, encoding="utf-8") as f:
-            universe = [line.strip().upper() for line in f if line.strip()
-                        and not line.startswith("#")]
-        # ``--end`` is a WINDOW bound (the trial's), which is routinely a weekend or a
-        # holiday; the observe/gate phases need real sessions, so walk back to the last one.
-        from ba2_common.core.market_calendar import prior_regular_session
 
-        anchor = date.fromisoformat(args.end)
-        try:
-            sessions = regular_sessions_ending_at(anchor, args.sessions)
-        except ValueError:
-            sessions = regular_sessions_ending_at(prior_regular_session(anchor), args.sessions)
+def _sessions_for(anchor: date, n: int) -> List[date]:
+    """``n`` regular sessions ending at ``anchor``, walking back when it is not one itself.
+
+    ``--end`` is a WINDOW bound (the trial's) and is routinely a weekend or a holiday; the
+    observe/gate phases need real sessions.
+    """
+    from ba2_common.core.market_calendar import prior_regular_session, regular_sessions_ending_at
+
+    try:
+        return regular_sessions_ending_at(anchor, n)
+    except ValueError:
+        return regular_sessions_ending_at(prior_regular_session(anchor), n)
+
+
+def _run_phases(args: Any, cache_root: str, manifest: str, universe: Sequence[str],
+                sessions: Sequence[date]) -> Dict[str, Any]:
+    from ba2_common.core.market_condition_reader import MappedMarketConditionReader
 
     reader = MappedMarketConditionReader(cache_root, manifest, args.profile)
     phases = set(args.phases.split(","))
@@ -496,8 +580,26 @@ def run(args: Any) -> Dict[str, Any]:
             print(f"[trial] off {out['trial']['off']['median_s']:.2f}s, "
                   f"on {out['trial']['on']['median_s']:.2f}s, "
                   f"overhead {out['trial']['overhead_pct']:.3f}%", flush=True)
+    if "observe" in out and "gate" in out and "trial" in out:
+        # THE NUMBER THE REPORT QUOTES. The A/B overhead sits inside this rig's own run-to-run
+        # spread; this one is arithmetic over the measured per-operation costs and does not.
+        window = _trial_sessions(args)
+        out["arithmetic_bound"] = arithmetic_bound(out["observe"], out["gate"], out["trial"],
+                                                   window)
+        print(f"[bound] {out['arithmetic_bound']['memo_misses']} memo misses + "
+              f"{out['arithmetic_bound']['evaluations']} evaluations = "
+              f"{out['arithmetic_bound']['seconds']:.3f}s = "
+              f"{out['arithmetic_bound']['pct']:.3f}% of a trial", flush=True)
     out["finished_at"] = datetime.now(timezone.utc).isoformat()
     return out
+
+
+def _trial_sessions(args: Any) -> int:
+    """Regular sessions in the trial window -- the number of bars a gate can be asked about."""
+    from ba2_common.core.market_calendar import nyse_regular_sessions
+
+    return len(nyse_regular_sessions(date.fromisoformat(args.start),
+                                     date.fromisoformat(args.end)))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

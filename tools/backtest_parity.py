@@ -40,6 +40,15 @@ Usage
     python tools/backtest_parity.py --bt 1681            # rank read off the row's TOP<n>- name
     python tools/backtest_parity.py --opt 512 --rank 1 --dry-run
 
+FROM A WORKTREE, put ONLY the package directories on PYTHONPATH:
+
+    PYTHONPATH="<wt>/packages/common;<wt>/packages/providers;<wt>/packages/experts"         python tools/backtest_parity.py --bt 1688
+
+Adding ``<wt>/testplatform/backend`` to it looks harmless and is not: ``_bootstrap`` returns
+early when ``app.models.database`` already imports, so ``_enter_backend()`` never points
+``ba2_common`` at the TEST database, and the run dies minutes later on "FMP API key not
+configured" -- about a key that is in the database nobody opened.
+
 Exit codes: 0 = PASS, 1 = FAIL (the rows differ), 2 = the comparison could not be made (a child
 failed or timed out, the parity rows already exist, or the evidence says the two modes did not
 actually differ).
@@ -401,6 +410,13 @@ def parse_child_bt_id(stdout: str) -> Optional[int]:
 # =============================================================================================
 def _bootstrap() -> None:
     """Put the backend on the path and silence logging, once per process.
+
+    RUNNING THIS FROM A WORKTREE: put the three ``packages/*`` directories on ``PYTHONPATH``
+    and NOT ``testplatform/backend``. The early return below asks whether ``app.models.database``
+    is already importable; with the backend on ``PYTHONPATH`` it is, so ``_enter_backend()``
+    never runs, ``ba2_common`` keeps pointing at its neutral default database instead of the
+    TEST one, and the run dies ~160 s later on "FMP API key not configured" -- a message about
+    a key that is sitting in the database nobody opened.
 
     ``logging.disable`` comes BEFORE the heavy imports and is skipped when the backend is already
     importable -- that case is pytest, where disabling the root logger would reach out of this

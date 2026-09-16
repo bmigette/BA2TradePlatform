@@ -63,7 +63,11 @@ def test_quick_runs_every_phase_and_writes_its_json(bench, tmp_path, monkeypatch
     assert set(result["observe"]) == {"trial_path", "capture_path"}
     assert result["gate"]["evaluate"]["n"] > 0
     assert result["workers"]["workers"] == 3
+    # A child we could not measure records None, so ``> 0`` alone would raise a TypeError
+    # instead of reporting the real problem -- assert the measurement EXISTS first.
+    assert result["workers"]["rss_mb_max"] is not None, result["workers"]
     assert result["workers"]["rss_mb_max"] > 0
+    assert result["workers"]["unmeasurable"] == 0
     # "trial" needs a persisted genome and the option caches; --quick drops it rather than
     # pretending to have measured it.
     assert "trial" not in result
@@ -83,8 +87,11 @@ def test_a_pinned_manifest_means_the_reader_computes_nothing(bench, tmp_path):
         assert result[path]["computed"] == 0, path
         assert result[path]["mapped_rows"] == 20, path
         assert result[path]["rows_absent"] == 0, path
-        # A hit must be cheaper than a miss, or the memo is doing nothing.
-        assert result[path]["hit"]["p50_us"] < result[path]["miss"]["p50_us"]
+        # A hit must be MUCH cheaper than a miss, or the memo is doing nothing. A bare ``<``
+        # would pass on a 1% difference, which is what a broken memo looks like under timer
+        # noise; on this store the real ratio is ~20x, so half is a floor with margin, not a
+        # threshold tuned to the number it happens to produce.
+        assert result[path]["hit"]["p50_us"] <= result[path]["miss"]["p50_us"] / 2
 
 
 def test_the_gate_phase_goes_through_the_real_condition_and_restores_the_seam(bench, tmp_path):
@@ -179,3 +186,49 @@ def test_a_rule_with_no_group_to_append_to_is_refused(bench):
 def test_the_manifest_is_required_without_quick(bench):
     with pytest.raises(SystemExit):
         bench.main(["--phases", "observe"])
+
+
+def test_quick_leaves_no_fabricated_store_behind(bench, tmp_path, monkeypatch):
+    """The failure mode is cumulative and invisible: every attempt used to leave a
+    ``bench-mc-*`` tree, so a benchmark run repeatedly filled the disk it was measuring."""
+    import glob
+    import tempfile
+
+    monkeypatch.chdir(tmp_path)
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "bench-mc-*")))
+    bench.main(["--quick", "--out", str(tmp_path / "b.json"), "--workers", "2"])
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "bench-mc-*"))) == before
+
+
+def test_a_child_that_cannot_open_the_mapping_leaves_no_live_process(bench, tmp_path):
+    """THE LEAK THIS CLOSES. The children block waiting to be measured; when anything before
+    the release raises -- here every child dies on a manifest that is not there -- the release
+    used to be skipped and the spawned processes stayed resident for the life of the parent.
+
+    Asserted on the PROCESS TABLE, not on the return value: a cleanup that only sets a flag
+    would satisfy any weaker check."""
+    import psutil
+
+    me = psutil.Process()
+    before = {p.pid for p in me.children(recursive=True)}
+    with pytest.raises(Exception):
+        bench.phase_workers(str(tmp_path), "sha256:" + "0" * 64, "ohlcv-v1", "AAA",
+                            date(2024, 6, 28), workers=2, ready_timeout=3.0)
+    survivors = [p for p in me.children(recursive=True)
+                 if p.pid not in before and p.is_alive()]
+    assert survivors == [], [(p.pid, p.name()) for p in survivors]
+
+
+def test_the_arithmetic_bound_multiplies_the_measured_costs_by_the_operation_count(bench):
+    """The number the report quotes, because the A/B difference sits inside the rig's noise."""
+    observe = {"trial_path": {"miss": {"p50_us": 10.0}}}
+    gate = {"evaluate": {"p50_us": 1.0}}
+    trial = {"symbols": 20, "gates": 3, "off": {"median_s": 10.0}}
+    bound = bench.arithmetic_bound(observe, gate, trial, sessions=500)
+    assert bound["memo_misses"] == 10_000          # 20 symbols x 500 sessions
+    assert bound["evaluations"] == 30_000          # ...x 3 leaves
+    assert bound["seconds"] == pytest.approx((10_000 * 10.0 + 30_000 * 1.0) / 1e6)
+    assert bound["pct"] == pytest.approx(bound["seconds"] / 10.0 * 100.0)
+    # The inputs travel with the answer, so the number can be re-derived from the JSON alone.
+    assert bound["observe_miss_p50_us"] == 10.0 and bound["evaluate_p50_us"] == 1.0
+    assert bound["trial_median_s"] == 10.0

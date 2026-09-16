@@ -65,11 +65,17 @@ def _state(session, slope, adx, rv, adx_status="valid"):
 
 
 def _leg(symbol, session, pnl, *, txn=None, contract=None, slope=0.05, adx=20.0, rv=0.9,
-         adx_status="valid"):
-    return {"symbol": contract or symbol, "underlying_symbol": symbol if contract else None,
-            "contract_symbol": contract, "transaction_id": txn,
-            "entry_time": f"{session}T14:30:00", "exit_time": f"{session}T21:00:00",
-            "pnl": pnl, "entry_state": _state(session, slope, adx, rv, adx_status)}
+         adx_status="valid", state=True, ambiguous=False):
+    """One trade row. ``state=False`` is a SECOND leg of a structure: the entry state is
+    written once per structure, on its first leg (see ``attach_entry_states``)."""
+    row = {"symbol": contract or symbol, "underlying_symbol": symbol if contract else None,
+           "contract_symbol": contract, "transaction_id": txn,
+           "entry_time": f"{session}T14:30:00", "exit_time": f"{session}T21:00:00", "pnl": pnl}
+    if state:
+        row["entry_state"] = dict(_state(session, slope, adx, rv, adx_status), gap_days=0)
+        if ambiguous:
+            row["entry_state"]["ambiguous"] = True
+    return row
 
 
 @pytest.fixture
@@ -88,12 +94,15 @@ def db(tmp_path):
     trades = [
         # One two-leg structure: ONE unit, net +300, in the ADX [15, 25) bin.
         _leg("AAA", "2022-03-01", 500.0, txn=11, contract="AAA220401C00100000", adx=20.0),
-        _leg("AAA", "2022-03-01", -200.0, txn=11, contract="AAA220401C00110000", adx=20.0),
+        # The second leg of the SAME structure carries no state of its own.
+        _leg("AAA", "2022-03-01", -200.0, txn=11, contract="AAA220401C00110000", adx=20.0,
+             state=False),
         # Two single-leg structures in [25, 40).
         _leg("BBB", "2022-06-01", 1000.0, txn=12, contract="BBB220701C00050000", adx=30.0),
         _leg("CCC", "2022-09-01", -100.0, txn=13, contract="CCC221001C00070000", adx=30.0),
         # An ADX the edges do not cover -- reported as outside, never binned.
-        _leg("DDD", "2023-01-03", 50.0, txn=14, contract="DDD230201C00020000", adx=140.0),
+        _leg("DDD", "2023-01-03", 50.0, txn=14, contract="DDD230201C00020000", adx=140.0,
+             ambiguous=True),
         # A recorded-but-UNKNOWN measurement: counted by reason, never given a value.
         _leg("EEE", "2023-02-01", 25.0, txn=15, contract="EEE230301C00030000", adx=None,
              adx_status="insufficient_history"),
@@ -107,6 +116,8 @@ def db(tmp_path):
                   "market_gate_passed": 120, "market_gate_rejected": 240,
                   "market_unknown_recommendations": 20, "market_leaf_evaluations": 380,
                   "entries_staged": 8, "entry_read_failures": 0,
+                  "structures_with_entry_state": 5,
+                  "bound_same_session": 4, "bound_with_gap": 1, "ambiguous": 1,
                   "market_unknown_input_by_reason": {"insufficient_history": 20}}}}
     con.execute(
         "INSERT INTO strategy_optimizations VALUES (?,?,?,?,?,?,?)",
@@ -199,6 +210,21 @@ def test_a_mode_gene_the_persisted_spec_cannot_explain_is_marked_INVALID(value):
 
 
 # --------------------------------------------------------------------------- attribution
+def test_a_universe_sentinel_is_excluded_and_named(db):
+    """EXPERT/DYNAMIC/SCREENER are not symbols: the instance picks its universe at analysis
+    time. Coverage-checking one would report a missing symbol that does not exist."""
+    con = sqlite3.connect(db)
+    con.execute("UPDATE strategy_optimizations SET optimization_config = ? WHERE id = 7",
+                (json.dumps({"backtest": {"enabled_instruments": ["AAA", "SCREENER", "BBB"],
+                                          "market_condition": _BLOCK}}),))
+    con.commit()
+    con.close()
+    con = R.open_db(db)
+    text = R.render(R.optimizations(con, opt_id=7)[0], [], top=1)
+    assert "2 instruments" in text
+    assert "SENTINELS (SCREENER)" in text
+
+
 def test_the_attribution_unit_is_a_structure_not_a_leg(db):
     con = R.open_db(db)
     run = R.persisted_runs(con, 7)[0]
@@ -236,6 +262,19 @@ def test_concentration_is_a_share_of_net_and_refuses_to_divide_by_nothing():
     assert net == 0.0 and math.isnan(top1) and math.isnan(top5)
 
 
+def test_a_LOSING_book_has_no_concentration_to_report():
+    """Dividing a positive best trade by a negative net prints "-42% of net P&L", which reads
+    as a loss concentration when it is the exact opposite; and a big loser in a losing book
+    prints a reassuring small positive. Concentration describes how a PROFIT was earned."""
+    net, top1, top5 = R.concentration([100.0, -500.0])
+    assert net == pytest.approx(-400.0)
+    assert math.isnan(top1) and math.isnan(top5)
+    # ...and the renderer says WHY, rather than an unexplained "n/a".
+    assert R._share(top1, net) == "n/a (net<0)"
+    assert R._share(float("nan"), 0.0) == "n/a (net=0)"
+    assert R._share(12.5, 100.0) == "12.5%"
+
+
 # --------------------------------------------------------------------------- output
 def test_the_report_quotes_the_persisted_versions_and_the_counters(db):
     con = R.open_db(db)
@@ -246,6 +285,8 @@ def test_the_report_quotes_the_persisted_versions_and_the_counters(db):
     assert _BLOCK["manifest"] in text
     assert "eligible_recommendations       400" in text
     assert "market_gate_rejected           240" in text
+    # The BINDING quality, next to the attribution it qualifies.
+    assert "same session" in text and "ambiguous" in text
     assert "insufficient_history" in text
     assert "TOP1" in text and "below" in text
 
@@ -310,6 +351,50 @@ def test_the_coverage_section_refuses_a_universe_it_cannot_read(db, tmp_path):
     text = R.render(opt, [], top=1, want_coverage=True)
     assert "REFUSED" in text
     assert "every instrument" not in text
+
+
+def test_manifest_and_profile_override_the_snapshot_the_coverage_check_reads(db, tmp_path):
+    """The point of the flags: a FEATURE-OFF job pins no manifest, and the useful question
+    about it is how its universe would fare against the snapshot the gated jobs use."""
+    con = sqlite3.connect(db)
+    con.execute("UPDATE strategy_optimizations SET optimization_config = ? WHERE id = 7",
+                (json.dumps({"backtest": {"enabled_instruments": ["AAA"]}}),))
+    con.commit()
+    con.close()
+    seen = {}
+
+    def _fake(manifest, profile, universe, cache_root=None):
+        seen.update(manifest=manifest, profile=profile, universe=list(universe))
+        return {"manifest": manifest, "profile": profile, "symbols": {}, "uncovered": []}
+
+    real, R.coverage_report = R.coverage_report, _fake
+    try:
+        con = R.open_db(db)
+        opt = R.optimizations(con, opt_id=7)[0]
+        text = R.render(opt, [], top=1, want_coverage=True,
+                        manifest_override="sha256:" + "c" * 64, profile_override="ohlcv-v1")
+    finally:
+        R.coverage_report = real
+    assert seen["manifest"] == "sha256:" + "c" * 64
+    assert seen["profile"] == "ohlcv-v1" and seen["universe"] == ["AAA"]
+    assert "every instrument" in text
+
+
+def test_a_manifest_without_a_profile_is_refused_not_guessed(db):
+    con = sqlite3.connect(db)
+    con.execute("UPDATE strategy_optimizations SET optimization_config = ? WHERE id = 7",
+                (json.dumps({"backtest": {"enabled_instruments": ["AAA"]}}),))
+    con.commit()
+    con.close()
+    con = R.open_db(db)
+    text = R.render(R.optimizations(con, opt_id=7)[0], [], top=1, want_coverage=True,
+                    manifest_override="sha256:" + "c" * 64)
+    assert "REFUSED: a manifest without a profile" in text
+
+
+def test_the_overrides_without_coverage_are_refused_rather_than_ignored(db):
+    with pytest.raises(SystemExit):
+        R.main(["--opt", "7", "--db", db, "--manifest", "sha256:" + "c" * 64])
 
 
 def test_the_cli_writes_the_file_it_was_asked_for(db, tmp_path):

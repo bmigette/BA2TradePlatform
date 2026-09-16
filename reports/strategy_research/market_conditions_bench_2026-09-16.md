@@ -98,20 +98,26 @@ resolve.**
 
 ### The arithmetic that says the same thing without the noise
 
-The run has ~502 sessions × 16 symbols = ~8,000 (symbol, session) keys. The first market leaf on
-a bar pays a memo **miss** (14.4 µs); the other two pay hits, and each of the three pays one
-`evaluate()` (0.90 µs including its hit):
+The benchmark emits this itself, as `arithmetic_bound` in its JSON, so the figure below is the
+tool's own and can be re-derived from the file. It multiplies the measured per-operation costs
+by the number of operations a trial can perform: the first market leaf on a bar pays a memo
+**miss**, and each of the three leaves pays one `evaluate()` (which already includes its hit).
 
-```
-8,000 × 14.4 µs  +  24,000 × 0.90 µs  ≈  0.116 s + 0.022 s  ≈  0.14 s
-0.14 s / 35.2 s  ≈  0.39 % of a trial          (an UPPER bound: the entry rule
-                                                short-circuits before most leaves)
-```
+| input | value |
+|---|---|
+| symbols × sessions in the window | 16 × 501 = **8,016 memo misses** |
+| × 3 leaves per bar | **24,048 evaluations** |
+| measured `observe()` miss P50 | 14.400 µs |
+| measured `evaluate()` P50 | 0.900 µs |
+| gate cost per trial | 8,016 × 14.400 µs + 24,048 × 0.900 µs = **0.137 s** |
+| against the measured trial median | 0.137 s / 35.242 s = **0.389 %** |
+
+It is an **upper** bound: the entry rule short-circuits before most leaves ever run.
 
 **Verdict: PASS.** Both the direct measurement and the arithmetic put the gates under the 1 %
-bar, with the arithmetic — which does not depend on run-to-run noise — at ~0.4 %. Nothing in
-the decision path builds a DataFrame, calls a calculator or scans a cache tree: the run's
-`computed` counter stays at 0 and every row comes from the mapped snapshot.
+bar, and the arithmetic — which does not depend on run-to-run noise — puts them at **0.39 %**.
+Nothing in the decision path builds a DataFrame, calls a calculator or scans a cache tree: the
+run's `computed` counter stays at 0 and every row comes from the mapped snapshot.
 
 ### The all-off arm of the acceptance criterion, and why it is not here
 
