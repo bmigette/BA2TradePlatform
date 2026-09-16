@@ -237,6 +237,39 @@ def test_a_refetch_that_returns_LESS_history_is_refused_and_changes_nothing(tmp_
     assert read_full_fetch_marker(path) is None                # and NO marker
 
 
+def test_a_cache_older_than_the_default_reach_is_repaired_not_refused(tmp_path):
+    """FOUND ON THE GRID HOST, not in review. ``force_full_refetch`` used to ask for a fixed 15
+    years. T and WDC there hold 3777 bars from 2011-06-22; a 15-year request can only answer 3769
+    from 2011-09-20, so the C1 guard refused the repair as "LESS history" -- correctly, on the
+    question it was asked, and for ever: the symbol could never be warmed again.
+
+    The fix widens the REQUEST to cover what the cache already holds, rather than relaxing the
+    guard (which would have traded this false refusal for the silent truncation C1 exists to
+    prevent). Pinned here because the difference is invisible to every fixture whose cache starts
+    inside the default reach.
+    """
+    symbol = "XOLD"
+    truth = _truth(date.today() - timedelta(days=1))
+    # A cache reaching back FURTHER than the default 15-year request.
+    old_first = datetime.now() - timedelta(days=365 * 15 + 120)
+    extra = pd.DataFrame({
+        "Date": pd.to_datetime([old_first + timedelta(days=i) for i in range(8)]),
+        "Open": 10.0, "High": 10.5, "Low": 9.5, "Close": 10.0, "Volume": 1000.0,
+    })
+    cached = pd.concat([extra, truth], ignore_index=True).sort_values("Date").reset_index(drop=True)
+    path = _write_cache(symbol, cached)
+    provider = _Provider(cached, [CalendarSplit(SPLIT_DAY, 2.0)])
+
+    provider.force_full_refetch(symbol, "1d", provider_name="FMPOHLCVProvider")
+
+    asked_from = provider.impl_calls[-1][1]
+    assert asked_from <= cached["Date"].iloc[0].date(), "the request must reach the cache's first bar"
+    written = pd.read_parquet(path)
+    assert len(written) == len(cached)                       # nothing dropped
+    assert written["Date"].iloc[0] == cached["Date"].iloc[0]  # including the oldest bar
+    assert read_full_fetch_marker(path) is not None           # and the repair is recorded
+
+
 def test_a_refetch_that_keeps_every_bar_is_allowed(tmp_path):
     """The control: equal rows and an equal first bar is not a loss, so it replaces normally --
     the guard is about losing history, not about growing."""

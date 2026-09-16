@@ -742,12 +742,27 @@ class MarketDataProviderInterface(DataProviderInterface):
 
         provider_name = provider_name or type(self).__name__
         now = datetime.now()
-        fresh = self._get_ohlcv_data_impl(symbol, now - timedelta(days=365 * 15), now, interval)
+        existing_path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        # ASK FOR AT LEAST WHAT THE CACHE ALREADY HOLDS. The default reach is 15 years, but a
+        # cache that starts EARLIER than that would make any faithful answer look short, and
+        # `_refuse_shorter_replacement` would refuse the repair for ever -- observed on the grid
+        # host, where T/WDC hold 3777 bars from 2011-06-22 while a 15-year request can only
+        # return 3769 from 2011-09-20. Widening the request is the fix; relaxing the guard would
+        # trade a false refusal for the silent truncation the guard exists to prevent.
+        start = now - timedelta(days=365 * 15)
+        if existing_path is not None:
+            try:
+                first = pd.to_datetime(pd.read_parquet(existing_path, columns=['Date'])['Date']).min()
+                first = first.tz_localize(None) if getattr(first, 'tzinfo', None) else first
+                start = min(start, first.to_pydatetime())
+            except Exception as e:  # noqa: BLE001 -- unreadable here is not fatal: the guard
+                # below re-reads the file and refuses rather than overwriting what it cannot check.
+                logger.warning(f"Could not read {existing_path} to size the re-fetch window: {e}")
+        fresh = self._get_ohlcv_data_impl(symbol, start, now, interval)
         if fresh is None or fresh.empty:
             raise RuntimeError(f"full re-fetch of {symbol} ({interval}) returned no bars")
         out = self._clean_dataframe(fresh.copy())
         out['Date'] = pd.to_datetime(out['Date'])
-        existing_path = native_cache.find_timeseries_path(provider_name, symbol, interval)
         if existing_path is not None:
             try:
                 existing_dates = pd.to_datetime(pd.read_parquet(existing_path, columns=['Date'])['Date'])
