@@ -616,3 +616,7 @@ def test_golden_rows_are_bit_for_bit_stable(key):
     row = _row(o, h, l, c, v)
     got = {f: (None if row[f] is None else float(row[f]).hex()) for f in STRUCTURE_FIELDS}
     assert got == _GOLDEN[key]
+    # Pinned HERE, next to the hex: a row whose bits changed is a new calculator, and the two
+    # decisions -- re-paste the goldens, bump the calc version -- have to be taken together or
+    # a warmed store will serve rows no longer produced by the version it is labelled with.
+    assert row["calc_version"] == "ta-structure-v1/calc-1"

@@ -249,7 +249,7 @@ as the median of five runs.
 A 100-symbol option universe over the 6-year grid window is therefore about **11 seconds** of
 chart-structure compute, against roughly 36 seconds for the per-window path.
 
-### Why this is ~0.1 ms per ROW and not section 3.3's "~10 ms per SYMBOL"
+### Why this is 75 us per ROW and not section 3.3's "~10 ms per SYMBOL"
 
 Section 3.3 reasons that "none of these fields is recursive, so a batch implementation over full
 history and the 128-bar reference implementation agree exactly", and prices the batch at about
@@ -260,7 +260,7 @@ exactly its last 128 eligible bars, which is what makes live and BT agree whatev
 each holds). A single global ATR pass would produce different numbers and would destroy window
 invariance, so the batch re-runs the 114-step recursion per row. That recursion is the dominant
 cost: it is ~85 % of the 75 us, and it is the entire gap against the design's estimate. The
-estimate should be read as ~0.1 ms per row, i.e. ~0.3 s per fully-warmed symbol, not as a bug.
+estimate should be read as ~75 us per row, i.e. ~0.3 s per fully-warmed symbol, not as a bug.
 
 The three structures section 3.3 prescribes are implemented as prescribed, with one exception:
 
@@ -285,8 +285,10 @@ The three structures section 3.3 prescribes are implemented as prescribed, with 
   small enough to re-open the choice.
 
 Reproduce with `packages/common/tests/test_chart_structure_batch_equals_reference.py`, whose
-`test_cold_build_and_lookup_cost_are_reported` prints the cold-build and lookup figures on every
-run (and refuses a per-row cost that has become absurd), and whose
+`test_cold_build_and_lookup_cost_are_reported` prints **every figure in the table above** on
+each run -- cold build, us/row, the per-window reference over the same rows, the ratio and the
+lookup -- and refuses a per-row cost that has become absurd or a batch slower than the
+reference; and whose
 `test_batch_equals_reference_for_every_session_and_field` pins the equality that makes the whole
 batch legitimate -- exact `==` on every field of every session of three 600-bar synthetic
 histories and 1,200 real AAPL sessions.

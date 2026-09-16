@@ -563,7 +563,8 @@ class CompositeMarketConditionReader:
     reader does, so a one-profile run behaves identically whether or not it is wrapped.
 
     Building one is cheap; ``observe`` is on the decision path, so the merged rows are memoised
-    in the same bounded LRU the window readers use.
+    in its OWN bounded LRU, the same size as a window reader's. (A single-profile run is not
+    wrapped at all -- see :func:`market_condition_reader_for` -- so nothing pays for two memos.)
     """
 
     def __init__(self, readers: Sequence[Any], *, memo_size: int = MEMO_SIZE):
@@ -589,6 +590,27 @@ class CompositeMarketConditionReader:
         """Each profile's ``MappedMarketConditionReader`` (or None), in profile order. The host
         asks each snapshot its own coverage question; there is no single answer across profiles."""
         return tuple(getattr(r, "mapped_reader", None) for r in self.readers)
+
+    @property
+    def mapped_reader(self) -> Any:
+        """There is no such thing here, and asking must HURT.
+
+        Every host-side coverage check in this codebase is written as
+        ``mapped = getattr(reader, "mapped_reader", None)`` followed by "None means research mode,
+        nothing to check". Leave that attribute merely absent on a composite and the check reports
+        a clean bill of health for a run whose snapshots it never opened -- every gate on an
+        uncovered symbol then reads ``missing_session`` for the whole run and the genome scores as
+        though its strategy simply did not fire there.
+
+        So this raises ``TypeError``, deliberately NOT ``AttributeError``: ``getattr(x, name,
+        default)`` swallows AttributeError, which would restore the exact silence this property
+        exists to break. Callers ask :attr:`mapped_readers` and check each profile's snapshot."""
+        raise TypeError(
+            f"a composite market-condition reader over profiles {list(self.profiles)!r} has no "
+            f"single mapped reader: every profile is its own warmed snapshot with its own "
+            f"coverage. Ask .mapped_readers and check each one (this raises TypeError rather "
+            f"than AttributeError on purpose, so getattr(..., None) cannot turn the coverage "
+            f"check off without a word).")
 
     def observe(self, symbol: str, session: date) -> Optional[FeatureRow]:
         key = (symbol, session)

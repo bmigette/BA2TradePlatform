@@ -243,22 +243,24 @@ def market_condition_pins(config: Dict[str, Any], *, required: bool = True
     from ba2_common.core.market_conditions import PROFILES
 
     raw = config.get("market_condition_profiles")
+    has_legacy_key = "market_condition_profile" in config
     legacy_profile = config.get("market_condition_profile")
-    if raw is None:
-        if legacy_profile is None and "market_condition_profile" not in config:
-            if required:
-                raise KeyError("market_condition_profiles")
-            return [], {}
-        raw = [] if legacy_profile in (None, MARKET_CONDITION_PROFILE_NONE) else [legacy_profile]
-    elif isinstance(raw, str):
-        raw = [t for t in (x.strip() for x in raw.split(",")) if t]
-    profiles = [str(p) for p in raw if p]
-    if legacy_profile is not None and profiles and [legacy_profile] != profiles:
-        # ``"none"`` included: a config saying the gates are off in one key and naming a profile
-        # in the other would run GATED without a word, which is the worse of the two readings.
-        raise ValueError(
-            f"config pins market_condition_profiles {profiles!r} AND market_condition_profile "
-            f"{legacy_profile!r}: they disagree. Carry one shape, not two.")
+    #: The legacy key NORMALISED to the plural shape, so the two are compared like for like.
+    #: ``None`` and ``"none"`` both mean "no profile", which is a value, not an absence.
+    legacy_profiles = ([] if legacy_profile in (None, MARKET_CONDITION_PROFILE_NONE)
+                       else [str(legacy_profile)])
+    given = config.get("market_condition_manifests")
+    legacy_digest = config.get("market_condition_manifest")
+
+    neither_shape = raw is None and not has_legacy_key
+    if neither_shape:
+        profiles: List[str] = []
+    else:
+        if raw is None:
+            raw = legacy_profiles
+        elif isinstance(raw, str):
+            raw = [t for t in (x.strip() for x in raw.split(",")) if t]
+        profiles = [str(p) for p in raw if p]
     if MARKET_CONDITION_PROFILE_NONE in profiles:
         if len(profiles) > 1:
             raise ValueError(f"market_condition_profiles {profiles!r} mixes "
@@ -270,16 +272,35 @@ def market_condition_pins(config: Dict[str, Any], *, required: bool = True
     if unknown:
         raise ValueError(f"market-condition profile(s) {unknown!r} are not registered "
                          f"(known: {sorted(PROFILES)!r} or {MARKET_CONDITION_PROFILE_NONE!r})")
+    # COMPARED WHENEVER THE SINGULAR KEY IS PRESENT, including when the plural list is EMPTY:
+    # ``{"market_condition_profiles": [], "market_condition_profile": "ohlcv-v1"}`` is a config
+    # that says the gates are on in one key and off in the other, and the quiet reading of it is
+    # a run that trades UNGATED under the name of a gated one.
+    if has_legacy_key and legacy_profiles != profiles:
+        raise ValueError(
+            f"config pins market_condition_profiles {profiles!r} AND market_condition_profile "
+            f"{legacy_profile!r}: they disagree. Carry one shape, not two.")
+    # A MANIFEST WITHOUT A PROFILE is not a harmless leftover: the digest is what a driver folds
+    # into the job identity, so the run reads as gated everywhere afterwards while nothing ever
+    # reads the snapshot. Checked BEFORE the "predates the feature" return, which would otherwise
+    # drop the pin on exactly the configs that carry one key and not the other.
+    if not profiles and (given or legacy_digest):
+        raise ValueError(
+            f"a market-condition manifest is pinned ({given or legacy_digest!r}) but no profile "
+            f"is: nothing would read it, and the run would be UNGATED while its digest says "
+            f"otherwise. Pin the profile(s) the rules were built for, or drop the manifest.")
+    if neither_shape:
+        if required:
+            raise KeyError("market_condition_profiles")
+        return [], {}
 
     manifests: Dict[str, Optional[str]] = {}
-    given = config.get("market_condition_manifests")
     if given:
         extra = [p for p in given if p not in profiles]
         if extra:
             raise ValueError(f"market_condition_manifests pins profile(s) {sorted(extra)!r} the "
                              f"run does not use (profiles: {profiles!r})")
         manifests = {p: (given.get(p) or None) for p in profiles}
-    legacy_digest = config.get("market_condition_manifest")
     if legacy_digest:
         if len(profiles) > 1 and not given:
             raise ValueError(

@@ -86,9 +86,14 @@ _WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "
                     "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S",
                     # Market-condition feature store (design 2026-09-15 section 4.5). The TRIAL
                     # CONFIG is what actually pins the snapshot for a backtest; these two are
-                    # mirrored into the spawned children so anything in a worker that resolves
-                    # the profile/manifest from the environment (the live-flavoured reader, a
-                    # diagnostic) agrees with the run instead of falling back to its own default.
+                    # mirrored into the spawned children so anything in a worker that resolves the
+                    # profile/manifest from the ENVIRONMENT (the live-flavoured reader, a
+                    # diagnostic) sees this run's pin instead of falling back to its own default.
+                    # Both env vars are SINGULAR and pre-date the plural seam: for a run pinning
+                    # more than one profile they carry whatever the config's legacy keys hold,
+                    # which is nothing. That is a gap for environment-resolved diagnostics only --
+                    # the trial config remains the authority, and the live resolver these mirror
+                    # is itself still single-profile (see market_condition_live.PROFILE_ENV).
                     "BA2_MARKET_CONDITION_PROFILE", "BA2_MARKET_CONDITION_MANIFEST")
 
 
@@ -1201,11 +1206,21 @@ def _market_condition_pins(backtest_cfg: Dict[str, Any]) -> List[Tuple[str, str]
 
     One reader of the run config for every consumer here (master prepare, worker pre-flight,
     trial config), so the plural and legacy-singular shapes are decoded in exactly one place
-    (``seam_wiring.market_condition_pins``)."""
+    (``seam_wiring.market_condition_pins``).
+
+    A profile with NO digest raises rather than being filtered out. ``_prepare_master_market_
+    conditions`` already fails the job for that case and runs first, so this is unreachable
+    today -- which is exactly why it must not be a silent filter: a reordering of those two calls
+    would otherwise hand the evaluator a SHORT manifest list, every worker would pass pre-flight,
+    and every trial would die on the worker instead of the job dying here."""
     from app.services.backtest.seam_wiring import market_condition_pins
 
     profiles, manifests = market_condition_pins(backtest_cfg, required=False)
-    return [(p, manifests[p]) for p in profiles if manifests.get(p)]
+    unpinned = [p for p in profiles if not manifests.get(p)]
+    if unpinned:
+        raise ValueError(f"market-condition profile(s) {unpinned!r} are on but this run pins no "
+                         f"manifest for them; the job should have been failed before dispatch")
+    return [(p, manifests[p]) for p in profiles]
 
 
 def _prepare_master_market_conditions(opt_id: int, db: Any,

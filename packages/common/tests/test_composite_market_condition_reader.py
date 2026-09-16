@@ -119,3 +119,24 @@ def test_a_repeated_profile_and_an_empty_list_are_refused():
         CompositeMarketConditionReader([])
     with pytest.raises(ValueError, match="repeat a profile"):
         CompositeMarketConditionReader([a, _Reader("ohlcv-v1", {})])
+
+
+def test_asking_a_composite_for_ONE_mapped_reader_raises_past_getattr_with_a_default():
+    """Every host-side coverage check is ``getattr(reader, "mapped_reader", None)`` followed by
+    "None means research mode, nothing to check". An ``AttributeError`` would be swallowed by that
+    default and the check would report a clean bill of health for a run whose snapshots it never
+    opened -- so this raises ``TypeError``, which ``getattr(..., default)`` does NOT suppress."""
+    a, b = _readers()
+    reader = CompositeMarketConditionReader([a, b])
+    with pytest.raises(TypeError, match="no single mapped reader"):
+        reader.mapped_reader
+    with pytest.raises(TypeError):
+        getattr(reader, "mapped_reader", None)      # the default must not rescue it
+    message = ""
+    try:
+        reader.mapped_reader
+    except TypeError as e:
+        message = str(e)
+    assert "ohlcv-v1" in message and "ta-structure-v1" in message and "mapped_readers" in message
+    # the plural accessor is the one that answers
+    assert reader.mapped_readers == ("mapped:ohlcv-v1", "mapped:ta-structure-v1")

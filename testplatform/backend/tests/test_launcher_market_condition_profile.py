@@ -850,6 +850,30 @@ def test_a_pre_task10_persisted_config_still_round_trips_into_a_trial_config():
     assert trial["_ga_trial"] is True
 
 
+@pytest.mark.parametrize("config,message", [
+    # The plural list is EMPTY and the legacy key names a profile: one key says the gates are on
+    # and the other says they are off, and the quiet reading is a run that trades UNGATED under
+    # the name of a gated one.
+    ({"market_condition_profiles": [], "market_condition_profile": "ohlcv-v1"}, "they disagree"),
+    # A manifest with no profile at all. The digest folds into the driver's job identity, so the
+    # run reads as gated in every listing afterwards while nothing ever opens the snapshot.
+    ({"market_condition_manifests": {"ohlcv-v1": "d" * 64}}, "but no profile is"),
+    ({"market_condition_profiles": [], "market_condition_manifest": "d" * 64}, "but no profile is"),
+])
+def test_a_legacy_pin_that_contradicts_the_plural_one_is_refused_not_dropped(config, message):
+    """Three shapes that used to resolve to "no profile, no manifest" without a word."""
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    with pytest.raises(ValueError, match=message):
+        market_condition_pins(config, required=False)
+    with pytest.raises(ValueError, match=message):
+        market_condition_pins(config)
+    # ... and the shapes that are NOT contradictions still resolve.
+    assert market_condition_pins({"market_condition_profile": "none"}) == ([], {})
+    assert market_condition_pins({"market_condition_profiles": []}) == ([], {})
+    assert market_condition_pins({}, required=False) == ([], {})
+
+
 # --------------------------------------------------------------------------- ta-structure-v1
 def test_the_ta_structure_gate_leaves_carry_the_registry_ranges_and_anchors(monkeypatch):
     monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ta-structure-v1",))

@@ -49,9 +49,9 @@ divisor of every field here, so it is recomputed per window -- a global ATR woul
 number and the profile would no longer be window-invariant. Section 3.3's "none of these fields
 is recursive" is true of the STRUCTURE measurements and not of the ATR they are divided by; this
 module pays the 114-step recursion per row, which is the dominant cost and the reason the
-measured cold build is ~0.1 ms/row rather than section 3.3's estimated ~10 ms per SYMBOL. The
-measured figures are recorded in
-``reports/strategy_research/market_conditions_bench_2026-09-16.md``.
+measured cold build is 75 us/row (~0.3 s for a fully-warmed symbol) rather than section 3.3's
+estimated ~10 ms per SYMBOL. The measured figures are recorded in
+``reports/strategy_research/market_conditions_bench_2026-09-16.md`` section 6b.
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ def chart_structure_rows(o, h, l, c, v) -> List[Optional[ChartStructureValues]]:
     next_bad = 0                      # bad_at[next_bad:] are the bad bars at or after ``s``
 
     hl, ll, cl = h.tolist(), l.tolist(), c.tolist()
-    pivots = find_pivots(hl, ll, PIVOT_K)
+    pivots = find_pivots(hl, ll)
     roll_hi, roll_lo = _rolling_prior_range(h, l)
 
     #: The confirmed levels of the CURRENT window, sorted: ``insort`` what each session confirms,
@@ -142,7 +142,16 @@ def chart_structure_rows(o, h, l, c, v) -> List[Optional[ChartStructureValues]]:
         while dropped < added and pivots[dropped].index < s + PIVOT_K:
             p = pivots[dropped]
             prices = highs_sorted if p.kind == PIVOT_HIGH else lows_sorted
-            del prices[bisect_left(prices, p.price)]
+            i = bisect_left(prices, p.price)
+            if i >= len(prices) or prices[i] != p.price:
+                # The sliding invariant is that whatever was inserted is still there to remove.
+                # Deleting "whatever bisect landed on" instead would take a DIFFERENT price out of
+                # the level list and mis-level every later row, quietly.
+                raise AssertionError(
+                    f"market-condition batch: pivot {p.kind} {p.price!r} at index {p.index} is "
+                    f"not in the {p.kind} level list of the window ending at {e}; the sliding "
+                    f"window state is broken")
+            del prices[i]
             dropped += 1
         while next_bad < len(bad_at) and bad_at[next_bad] < s:
             next_bad += 1

@@ -196,12 +196,23 @@ def test_cold_build_and_lookup_cost_are_reported(capsys):
         built[i % len(built)].by_field()["channel_pos_20"].value
     lookup_us = (time.perf_counter() - t0) / reps * 1e6
 
+    # The RATIO the bench report quotes, measured by the same run that prints the build time --
+    # a figure in a report with no committed harness behind it is an anecdote.
+    sample = min(400, len(built))
+    t0 = time.perf_counter()
+    for e in range(len(c) - sample, len(c)):
+        compute_chart_structure(*[a[e - WINDOW + 1:e + 1] for a in (o, h, l, c, v)])
+    ref_ms = (time.perf_counter() - t0) * 1e3 / sample * len(built)
+
     with capsys.disabled():
         print(f"\n[ta-structure-v1] cold batch build {label}: {cold_ms:.1f} ms "
-              f"({cold_ms / max(1, len(built)):.3f} ms/row, {len(built)} rows); "
+              f"({cold_ms / max(1, len(built)) * 1e3:.0f} us/row, {len(built)} rows); "
+              f"per-window reference over the same rows {ref_ms:.0f} ms "
+              f"({ref_ms / max(cold_ms, 1e-9):.2f}x); "
               f"stored-row field lookup {lookup_us:.3f} us")
     assert cold_ms / max(1, len(built)) < 5.0, "a batch row must cost well under a millisecond"
     assert lookup_us < 20.0
+    assert ref_ms > cold_ms, "the batch must not be slower than the per-window reference"
     assert math.isfinite(cold_ms)
 
 
@@ -276,7 +287,13 @@ def test_cumulative_sum_ols_is_not_bit_exact_so_the_batch_fits_per_session():
                 differing += 1
                 for g, w in zip(got[k], want):
                     worst = max(worst, abs(g - w) / (abs(w) or 1.0))
-        assert differing, f"{name}: the cumulative-sum fit was bit-exact here -- re-open the choice"
+        # The per-history claim is made only about the SYNTHETIC series, which are fixed by their
+        # seeds. AAPL comes from a cache that is refetched and a BLAS that is upgraded; it feeds
+        # the aggregate below (where it dominates), but it must not be able to turn this red for
+        # something that is not a defect.
+        if name in _HISTORIES:
+            assert differing, (f"{name}: the cumulative-sum fit was bit-exact here -- re-open "
+                               f"the choice")
     assert worst > 1e-9, f"the drift is only {worst:.3e}; re-open the choice if it is this small"
 
 

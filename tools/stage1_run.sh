@@ -115,19 +115,28 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
   # prepare-host sequence runs once per profile and the digests are passed on as profile=digest
   # pairs. Pre-setting MARKET_CONDITION_MANIFEST skips plan+build for the profiles it names --
   # and is then what the grid runs on, never built-and-discarded: a digest this script published
-  # while the run used a different one would be a snapshot nobody compared.
+  # while the run used a different one would be a snapshot nobody compared. NOTE that skipping
+  # `plan` also skips the SOURCE PREFLIGHT it runs (cache certification, the split-basis check):
+  # a pre-set digest is a statement that those questions were answered when it was built, so
+  # pass one only for a snapshot this same universe and window produced. verify + prepare-host
+  # still run, so the digest is always re-hashed and mapped on this box before the grid starts.
   MC_PROFILES="$(echo "$MARKET_CONDITION_PROFILE" | tr ',' ' ')"
   MC_N=0
   for MC_P in $MC_PROFILES; do MC_N=$((MC_N + 1)); done
   MC_PRESET="$MARKET_CONDITION_MANIFEST"
   if [ -n "$MC_PRESET" ] && [ "$MC_N" -gt 1 ]; then
-    case "$MC_PRESET" in
-      *=*) ;;
-      *) echo "stage1_run.sh: MARKET_CONDITION_MANIFEST must be profile=digest pairs when more" >&2
-         echo "than one profile is warmed ($MARKET_CONDITION_PROFILE): one bare digest cannot" >&2
-         echo "say which profile's snapshot it is." >&2
-         exit 1 ;;
-    esac
+    # EVERY token, not just one of them: "ohlcv-v1=abc,deadbeef" carries an '=' and would
+    # otherwise pass, and the bare second token would then be read as the digest of whichever
+    # profile the loop reached last. Same rule the launcher applies to the flag.
+    for MC_TOK in $(echo "$MC_PRESET" | tr ',' ' '); do
+      case "$MC_TOK" in
+        *=*) ;;
+        *) echo "stage1_run.sh: MARKET_CONDITION_MANIFEST must be profile=digest pairs when more" >&2
+           echo "than one profile is warmed ($MARKET_CONDITION_PROFILE); '$MC_TOK' is a bare" >&2
+           echo "digest and cannot say which profile's snapshot it is." >&2
+           exit 1 ;;
+      esac
+    done
   fi
   MC_PINS=""
   for MC_PROFILE in $MC_PROFILES; do

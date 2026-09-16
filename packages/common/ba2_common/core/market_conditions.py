@@ -762,12 +762,19 @@ class Pivot:
     price: float
 
 
-def find_pivots(h: Sequence[float], l: Sequence[float], k: int = PIVOT_K) -> List[Pivot]:
+def find_pivots(h: Sequence[float], l: Sequence[float]) -> List[Pivot]:
     """Confirmed pivots of one window, chronological (a HIGH before a LOW at the same index).
 
-    A pivot at index p requires a STRICT extreme against all k neighbours on both sides, so the
-    detection range is ``k <= p <= len - 1 - k`` and equal-price ties are not pivots.
+    A pivot at index p requires a STRICT extreme against all ``PIVOT_K`` neighbours on both
+    sides, so the detection range is ``PIVOT_K <= p <= len - 1 - PIVOT_K`` and equal-price ties
+    are not pivots.
+
+    The span is NOT a parameter. It is a fixed convention of the profile (design 3.2: "part of
+    the calculator version, not genes"), and ``_break_fields`` reads ``PIVOT_K`` directly for the
+    confirmation lag -- a caller that could pass a different span here would silently get a pivot
+    set and a confirmation rule that disagree.
     """
+    k = PIVOT_K
     n = len(h)
     out: List[Pivot] = []
     for p in range(k, n - k):
@@ -783,7 +790,15 @@ def find_pivots(h: Sequence[float], l: Sequence[float], k: int = PIVOT_K) -> Lis
 def reduce_to_swings(pivots: Sequence[Pivot]) -> List[Pivot]:
     """Alternating swing sequence (design 3.3 item 1): collapse each maximal run of same-kind
     pivots to its extreme -- the highest of consecutive highs, the lowest of consecutive lows --
-    keeping the EARLIEST of equal extremes. The result alternates high, low, high, low."""
+    keeping the EARLIEST of equal extremes. The result alternates high, low, high, low.
+
+    THE REFERENCE ORACLE, not a production path: nothing in this module calls it. It is design
+    3.3 item 1 written the way the design writes it -- a forward fold over the whole sequence --
+    so that :func:`_recent_swings`, which the measurements actually use and which walks backwards
+    and stops early, can be pinned against it
+    (``tests/test_chart_structure_calculators.py::test_recent_swings_is_the_tail_of_the_full_reduction``).
+    Kept here rather than in the test file because it IS the contract, and a reader comparing the
+    code against section 3.3 should find it next to the code it governs."""
     out: List[Pivot] = []
     for p in pivots:
         if out and out[-1].kind == p.kind:
@@ -1061,7 +1076,11 @@ def _chart_structure_core(h: List[float], l: List[float], c: List[float],
     vs_low = Observation((close - prior_lo) / atr_last, STATUS_VALID)
     state = swing_state(pivots)
     bos, choch = _break_fields(pivots, c, state)
-    code = float(STRUCTURE_STATE_CODES.get(state, int(STRUCTURE_STATE_NONE_CODE)))
+    # NOT ``codes.get(state, none)``: a state this function does not recognise would map to
+    # the one code on which no gate ever fires, i.e. a bug would present as "the market simply
+    # had no structure" for as long as it lasted. An unknown state is a programming error.
+    code = (STRUCTURE_STATE_NONE_CODE if state == STATE_NONE
+            else float(STRUCTURE_STATE_CODES[state]))
     return ChartStructureValues(
         dist_support=sup, dist_resistance=res,
         support_touches=sup_touch, resistance_touches=res_touch,
