@@ -413,6 +413,13 @@ def _reap(procs: Any, hold: Any) -> None:
     spawned Python processes stay resident for the life of the parent. A benchmark that leaks
     the thing it is measuring is worse than one that fails: the next measurement on that box is
     wrong and nothing says so.
+
+    ``procs`` must be the processes that actually STARTED, not every one constructed. The
+    failure that brings us here can be ``start()`` itself -- a fork/spawn refused at the
+    thirtieth child, which is exactly the size this phase exists to probe -- and
+    ``Process.join`` on a never-started process raises ``AssertionError: can only join a
+    started process`` from inside the ``finally``, replacing the real error with one about
+    cleanup. The caller appends to its ``started`` list as each ``start()`` returns.
     """
     for _ in procs:
         try:
@@ -449,22 +456,24 @@ def phase_workers(cache_root: str, manifest: str, profile: str, symbol: str, ses
     procs = [ctx.Process(target=_worker, args=(cache_root, manifest, profile, symbol,
                                                session.toordinal(), ready, hold))
              for _ in range(workers)]
-    started = _now()
+    started_at = _now()
+    started: list = []
     try:
         for proc in procs:
             proc.start()
+            started.append(proc)          # AFTER start(), so a refusal leaves it out of the reap
         pids = []
         for i in range(len(procs)):
             try:
                 pids.append(ready.get(timeout=ready_timeout))
             except Exception as e:  # noqa: BLE001 -- queue.Empty and anything else alike
-                alive = sum(1 for proc in procs if proc.is_alive())
+                alive = sum(1 for proc in started if proc.is_alive())
                 raise RuntimeError(
-                    f"only {i} of {len(procs)} children opened the mapping within "
+                    f"only {i} of {len(started)} children opened the mapping within "
                     f"{ready_timeout}s ({alive} still alive): {e!r}. Their stderr is above; a "
                     f"child that dies before reporting is usually an import the spawned "
                     f"process cannot resolve.") from e
-        opened = _now() - started
+        opened = _now() - started_at
         rss, fds = [], []
         for pid in pids:
             try:
@@ -479,7 +488,7 @@ def phase_workers(cache_root: str, manifest: str, profile: str, symbol: str, ses
                 fds.append(None)
                 print(f"[workers] pid {pid} not measurable: {e!r}")
     finally:
-        _reap(procs, hold)
+        _reap(started, hold)
     measured = [v for v in rss if v is not None]
     handles = [v for v in fds if v is not None]
     return {"workers": workers, "opened_s": opened,

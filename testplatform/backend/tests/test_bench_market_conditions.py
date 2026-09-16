@@ -219,6 +219,60 @@ def test_a_child_that_cannot_open_the_mapping_leaves_no_live_process(bench, tmp_
     assert survivors == [], [(p.pid, p.name()) for p in survivors]
 
 
+class _StubProc:
+    """A ``Process`` stand-in whose ``join`` refuses like the real one does on a process that
+    was never started -- which is the whole point: if ``_reap`` joined an unstarted child, the
+    test would fail with THAT AssertionError instead of seeing the caller's real error."""
+
+    def __init__(self, fail: bool):
+        self._fail, self.started, self.joined, self.killed = fail, False, False, False
+
+    def start(self):
+        if self._fail:
+            raise OSError("cannot allocate a process")
+        self.started = True
+
+    def join(self, timeout=None):
+        assert self.started, "can only join a started process"
+        self.joined = True
+
+    def is_alive(self):
+        return self.started and not self.joined
+
+    def terminate(self):
+        self.killed = True
+
+    def kill(self):
+        self.killed = True
+
+
+def test_a_start_that_fails_partway_reports_ITSELF_and_reaps_only_what_started(bench, monkeypatch):
+    """The failure this phase probes FOR is resource exhaustion at the intended worker count,
+    so ``start()`` refusing the second child is not hypothetical. ``Process.join`` on a
+    never-started process raises from inside the ``finally``, which would replace the real
+    error -- "cannot allocate a process" -- with one about cleanup."""
+    import multiprocessing
+
+    made = []
+    real_queue = multiprocessing.get_context("spawn").Queue     # bound BEFORE the patch
+
+    class _Ctx:
+        def Queue(self):
+            return real_queue()
+
+        def Process(self, target=None, args=()):
+            proc = _StubProc(fail=len(made) == 1)     # the SECOND one refuses
+            made.append(proc)
+            return proc
+
+    monkeypatch.setattr(multiprocessing, "get_context", lambda _name: _Ctx())
+    with pytest.raises(OSError, match="cannot allocate a process"):
+        bench.phase_workers("root", "digest", "ohlcv-v1", "AAA", date(2024, 6, 28), workers=3)
+    assert [p.started for p in made] == [True, False, False]   # third never reached
+    assert made[0].joined, "the started child was not reaped"
+    assert not made[1].joined and not made[2].joined
+
+
 def test_the_arithmetic_bound_multiplies_the_measured_costs_by_the_operation_count(bench):
     """The number the report quotes, because the A/B difference sits inside the rig's noise."""
     observe = {"trial_path": {"miss": {"p50_us": 10.0}}}

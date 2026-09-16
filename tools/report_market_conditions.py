@@ -563,11 +563,14 @@ def render(opt: Dict[str, Any], runs: Sequence[Dict[str, Any]], top: int,
         digest = manifest_override or block.get("manifest")
         profiles = block.get("profiles") or []
         profile = profile_override or (profiles[0] if profiles else None)
+        # ONE branch, so a refusal cannot be followed by advice that contradicts it. Setting
+        # ``digest = None`` and falling through printed "REFUSED: a manifest without a profile"
+        # and then "No manifest is pinned ... pass --manifest" -- to a reader who had just
+        # passed one.
         if digest and not profile:
             _line(out, "  REFUSED: a manifest without a profile. The snapshot's rows are keyed")
             _line(out, "  by profile; pass --profile to say which one to read.")
-            digest = None
-        if not digest:
+        elif not digest:
             _line(out, "  No manifest is pinned on this job, so there is no published snapshot")
             _line(out, "  to diagnose. Pass --manifest/--profile to check a snapshot anyway.")
         elif not universe:

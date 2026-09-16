@@ -171,10 +171,16 @@ class MarketConditionRunRecord:
         self.entries_staged = 0
         self.entry_read_failures = 0
         self._entry_states: Dict[Any, Dict[str, Any]] = {}
-        #: Filled in by :func:`apply_market_condition_block` from the BINDING, not the capture:
-        #: how many structures took a same-session state, how many took an earlier one, and how
-        #: many had more than one candidate decision to choose from. See :func:`attach_entry_states`.
-        self.binding: Dict[str, int] = {}
+        #: Set by :func:`apply_market_condition_block` from the BINDING, not the capture: how
+        #: many structures took a same-session state, how many took an earlier one, and how many
+        #: had more than one candidate decision to choose from (:func:`attach_entry_states`).
+        #:
+        #: ``None`` until the binding has actually run, and the counters are then OMITTED from
+        #: ``stats()`` rather than reported as zeros. "No trade was bound across a gap" and "the
+        #: binding has not happened yet" are different facts, and a run whose blob was assembled
+        #: without it -- an engine-level test, a caller that never reaches the handler -- must
+        #: not read as a run with a perfect same-session binding.
+        self.binding: Optional[Dict[str, int]] = None
 
     # -- counters ---------------------------------------------------------------
     def note_eligible(self) -> None:
@@ -257,7 +263,7 @@ class MarketConditionRunRecord:
 
     # -- output -----------------------------------------------------------------
     def stats(self) -> Dict[str, Any]:
-        return {
+        out = {
             "eligible_recommendations": self.eligible_recommendations,
             "market_evaluated": self.market_evaluated,
             "market_gate_passed": self.market_gate_passed,
@@ -268,15 +274,19 @@ class MarketConditionRunRecord:
             "market_leaf_evaluations": self.market_leaf_evaluations,
             "entries_staged": self.entries_staged,
             "entry_read_failures": self.entry_read_failures,
-            # HOW GOOD THE BINDING WAS, not just how much of it there was. A trade bound on the
-            # decision's own session is as certain as this scheme gets; one bound across a gap,
-            # and above all one whose window held MORE THAN ONE decision, is an inference. The
-            # report prints these next to the attribution table so a reader can see how much of
-            # it rests on date proximity.
-            "bound_same_session": self.binding.get("same_session", 0),
-            "bound_with_gap": self.binding.get("with_gap", 0),
-            "ambiguous": self.binding.get("ambiguous", 0),
         }
+        if self.binding is not None:
+            # HOW GOOD THE BINDING WAS, not just how much of it there was. A structure bound on
+            # the decision's own session is as certain as this scheme gets; one bound across a
+            # gap, and above all one whose window held MORE THAN ONE decision, is an inference.
+            # The report prints these next to the attribution table so a reader can see how much
+            # of it rests on date proximity.
+            out.update({
+                "bound_same_session": self.binding.get("same_session", 0),
+                "bound_with_gap": self.binding.get("with_gap", 0),
+                "ambiguous": self.binding.get("ambiguous", 0),
+            })
+        return out
 
     def entry_states(self) -> list:
         """The recorded states, ordered by (session, symbol) so a run is byte-reproducible.
@@ -343,8 +353,11 @@ def attach_entry_states(trades: Any, entry_states: Any,
                         max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS) -> Dict[str, int]:
     """Attach ``entry_state`` to the structures an entry-state record covers.
 
-    Returns ``{"attached", "same_session", "with_gap", "ambiguous", "legs"}`` -- how many
-    STRUCTURES were bound, how certain each binding was, and how many trade rows carry the key.
+    Returns ``{"attached", "same_session", "with_gap", "ambiguous"}`` -- how many STRUCTURES
+    were bound, and how certain each binding was. The counts are of structures throughout:
+    since the state is written once per structure (below), a separate count of trade ROWS
+    carrying the key would always equal ``attached`` and could only ever disagree with it by
+    being wrong.
 
     A structure is matched on its UNDERLYING (an option leg's ``underlying_symbol``, else
     ``symbol``) and on the LATEST recorded session at or before its entry date, provided that
@@ -378,7 +391,7 @@ def attach_entry_states(trades: Any, entry_states: Any,
         recs.sort(key=lambda r: r["session"])          # sorted ONCE, in place
         index[sym] = ([r["session"] for r in recs], recs)
 
-    out = {"attached": 0, "same_session": 0, "with_gap": 0, "ambiguous": 0, "legs": 0}
+    out = {"attached": 0, "same_session": 0, "with_gap": 0, "ambiguous": 0}
     for group in _structure_groups(trades):
         head = group[0]
         symbol = head.get("underlying_symbol") or head.get("symbol")
@@ -410,7 +423,6 @@ def attach_entry_states(trades: Any, entry_states: Any,
             out["ambiguous"] += 1
         head["entry_state"] = state
         out["attached"] += 1
-        out["legs"] += 1
         out["same_session" if gap == 0 else "with_gap"] += 1
     return out
 

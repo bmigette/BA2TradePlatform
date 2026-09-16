@@ -390,6 +390,9 @@ def test_a_manifest_without_a_profile_is_refused_not_guessed(db):
     text = R.render(R.optimizations(con, opt_id=7)[0], [], top=1, want_coverage=True,
                     manifest_override="sha256:" + "c" * 64)
     assert "REFUSED: a manifest without a profile" in text
+    # ...and NOT followed by advice that contradicts it: telling a reader who just passed
+    # --manifest that no manifest is pinned is how a refusal reads as a bug in the tool.
+    assert "No manifest is pinned" not in text
 
 
 def test_the_overrides_without_coverage_are_refused_rather_than_ignored(db):

@@ -76,6 +76,20 @@ def record():
 
 
 # --------------------------------------------------------------------------- counters
+def test_the_binding_counters_are_ABSENT_until_the_binding_has_run(record):
+    """Not zeros. "No structure was bound across a gap" and "the binding has not happened yet"
+    are different facts, and a blob assembled without it -- an engine-level test, a caller that
+    never reaches the handler -- must not read as a run with a perfect same-session binding."""
+    assert record.binding is None
+    stats = record.stats()
+    for key in ("bound_same_session", "bound_with_gap", "ambiguous"):
+        assert key not in stats, key
+    record.binding = attach_entry_states(
+        [{"underlying_symbol": "AAA", "entry_time": f"{SESSION.isoformat()}T00:00:00"}],
+        _states(("AAA", SESSION.isoformat())))
+    assert record.stats()["bound_same_session"] == 1
+
+
 def test_a_recommendation_with_no_market_leaf_is_counted_nowhere_but_eligible(record):
     record.note_eligible()
     record.note_conditions([{"event_type": "confidence", "condition_result": True}])
@@ -195,7 +209,7 @@ def test_a_fill_after_the_decision_bar_still_gets_the_decision_s_state():
 def test_a_same_session_fill_records_a_zero_gap_and_no_ambiguity():
     trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-05T14:30:00"}]
     out = attach_entry_states(trades, _states(("AAA", "2024-03-05")))
-    assert out == {"attached": 1, "same_session": 1, "with_gap": 0, "ambiguous": 0, "legs": 1}
+    assert out == {"attached": 1, "same_session": 1, "with_gap": 0, "ambiguous": 0}
     assert trades[0]["entry_state"]["gap_days"] == 0
 
 
@@ -275,7 +289,7 @@ def test_a_multi_leg_structure_stores_the_state_ONCE(record):
     legs = [_leg("AAA", "2024-03-05", txn=77, contract=f"AAA240419C0011000{i}")
             for i in range(4)]
     out = attach_entry_states(legs, _states(("AAA", "2024-03-05")))
-    assert out["attached"] == 1 and out["legs"] == 1
+    assert out["attached"] == 1                  # the STRUCTURE, not its four rows
     assert "entry_state" in legs[0]
     assert all("entry_state" not in leg for leg in legs[1:])
 
