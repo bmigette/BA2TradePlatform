@@ -561,3 +561,56 @@ def test_the_pinned_digest_round_trips_through_the_persisted_backtest_config():
     assert cfg["market_condition_manifest"] == "e" * 64
     assert cfg["market_condition_profile"] == "ohlcv-v1"
     assert cfg["_ga_trial"] is True
+
+
+def test_a_stale_unreadable_manifest_does_not_revoke_a_healthy_prepared_digest(worker, tmp_path):
+    """The reproduced regression, end to end: a truncated manifest sits in the bucket, an
+    ORDINARY healthy push arrives, and the worker must still be ready for the snapshot it
+    prepared. Before the fix the pass reported failure with no digest named, and
+    ``failed_digests or None`` revoked the entire host."""
+    client, cache, pool = worker
+    store, digest = _publish(cache)
+    _prepare(client, digest)
+
+    # A leftover from some other job: unparseable, nothing to do with this push.
+    stale = cache / "market_conditions" / "ohlcv-v1" / "manifests" / ("c" * 64 + ".json")
+    stale.write_text("{truncated", encoding="utf-8")
+
+    manifest = store.read_manifest(digest)
+    rel = f"market_conditions/{manifest['objects'][0]['path']}"
+    master = tmp_path / "healthy"
+    (master / rel).parent.mkdir(parents=True, exist_ok=True)
+    (master / rel).write_bytes(store.abspath(manifest["objects"][0]["path"]).read_bytes())
+    r = client.post("/cache/push", headers=H,
+                    content=b"".join(cache_sync.iter_tar([rel], str(master))))
+
+    assert r.status_code == 200
+    verdict = r.json()["market_conditions_verified"]
+    assert verdict["ok"] is True and verdict["failed_digests"] == []
+    assert verdict["out_of_scope_errors"], "the stale file is still REPORTED"
+    assert r.json().get("market_conditions_revoked") is None
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [digest]
+    assert _submit(client, digest).status_code == 200
+
+
+def test_a_verification_failure_that_names_no_digest_revokes_nothing(worker, monkeypatch, tmp_path):
+    """Defence in depth for the same hole: if the pass ever says "failed" without naming a
+    snapshot, the honest answer is a loud error, not disarming the whole box."""
+    client, cache, _pool = worker
+    _store, digest = _publish(cache)
+    _prepare(client, digest)
+
+    monkeypatch.setattr(cache_sync, "verify_market_conditions",
+                        lambda *a, **k: {"ok": False, "manifests": 1, "checked": 0, "missing": [],
+                                         "corrupt": [], "errors": ["something odd"],
+                                         "out_of_scope_errors": [], "failed_digests": [],
+                                         "checked_digests": []})
+    master = tmp_path / "m"
+    rel = "market_conditions/ohlcv-v1/manifests/x.json"
+    (master / rel).parent.mkdir(parents=True, exist_ok=True)
+    (master / rel).write_text("{}", encoding="utf-8")
+    r = client.post("/cache/push", headers=H,
+                    content=b"".join(cache_sync.iter_tar([rel], str(master))))
+
+    assert r.status_code == 200 and r.json()["market_conditions_revoked"] == []
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [digest]

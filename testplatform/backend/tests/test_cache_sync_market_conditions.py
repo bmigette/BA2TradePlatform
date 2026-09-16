@@ -231,3 +231,34 @@ def test_extract_tar_names_the_market_condition_members(tmp_path):
     assert set(out["market_condition_paths"]) == {r for r in rels if r.startswith("market_conditions/")}
     assert out["market_conditions"] == len(out["market_condition_paths"])
     assert "FMPOHLCVProvider/AAPL_1d.parquet" not in out["market_condition_paths"]
+
+
+def test_an_unreadable_manifest_the_push_never_touched_cannot_fail_the_pass(tmp_path):
+    """THE BUG THIS PINS. The unreadable-manifest branch ran BEFORE the scope filter, so a stale
+    or truncated file elsewhere in the bucket set ``ok: False`` while naming no digest -- and the
+    worker's ``failed_digests or None`` then revoked EVERY prepared digest on the box. An
+    out-of-scope unreadable manifest is reported, and cannot flip ``ok``."""
+    store, good = _publish(tmp_path, ["AAA"], SESSIONS)
+    _publish(tmp_path, ["BBB"], SESSIONS, extra_raw=False)
+    stale = [p for p in cache_sync.mc_manifest_files(str(tmp_path)) if p.stem != good][0]
+    stale.write_text("{truncated", encoding="utf-8")
+
+    good_object = f"market_conditions/{store.read_manifest(good)['objects'][0]['path']}"
+    scoped = cache_sync.verify_market_conditions(str(tmp_path), rel_paths=[good_object])
+    assert scoped["ok"] is True, scoped
+    assert scoped["failed_digests"] == [] and scoped["checked_digests"] == [good]
+    assert scoped["out_of_scope_errors"] and stale.name in scoped["out_of_scope_errors"][0]
+    assert scoped["errors"] == []
+
+    # A full scan still reports it as an error of ITS OWN pass (nothing is hidden).
+    full = cache_sync.verify_market_conditions(str(tmp_path))
+    assert full["ok"] is False and full["errors"] and full["out_of_scope_errors"] == []
+
+
+def test_an_unreadable_manifest_that_the_push_delivered_is_an_error(tmp_path):
+    _publish(tmp_path, ["AAA"], SESSIONS)
+    bad = cache_sync.mc_manifest_files(str(tmp_path))[0]
+    bad.write_text("{truncated", encoding="utf-8")
+    rel = f"market_conditions/ohlcv-v1/manifests/{bad.name}"
+    out = cache_sync.verify_market_conditions(str(tmp_path), rel_paths=[rel])
+    assert out["ok"] is False and out["errors"] and out["out_of_scope_errors"] == []

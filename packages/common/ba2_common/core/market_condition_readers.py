@@ -166,6 +166,15 @@ class WindowMarketConditionReader:
         #: rows actually computed (memo misses that produced a row) -- test/benchmark visibility.
         self.computed = 0
 
+    @property
+    def mapped_reader(self) -> Optional[Any]:
+        """The ``MappedMarketConditionReader`` this reader serves from, or None in research mode.
+
+        Public because the HOST has to ask the snapshot questions this reader does not answer --
+        above all whether it covers the run's universe (a symbol the warmup could not warm is
+        absent from the manifest, and a gate on it would read ``missing_session`` forever)."""
+        return self._mapped
+
     # -- subclass hooks
     def _bars(self, symbol: str, session: date) -> Optional[Tuple[Any, Any, Any, Any, Any, Any]]:
         """``(dates, o, h, l, c, v)`` covering at least the window ending at ``session`` (more is

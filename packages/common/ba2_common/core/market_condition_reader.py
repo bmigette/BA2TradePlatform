@@ -115,6 +115,7 @@ from ba2_common.core.market_conditions import (
     Observation,
 )
 from ba2_common.core.shared_arrays import (
+    DONE_MARKER,
     DerivedArrayStore,
     derived_root_for,
     ensure_fd_headroom,
@@ -132,6 +133,7 @@ __all__ = [
     "prepared_digests",
     "prepared_entries",
     "prune_prepared_markers",
+    "prune_revoked_markers",
     "revoke_prepared",
 ]
 
@@ -150,6 +152,9 @@ PREPARED_DIRNAME = "_prepared"
 #: ready for that digest and stopped being ready" is the diagnostic an operator needs after a
 #: corrupt push, and an empty directory does not say it.
 REVOKED_SUFFIX = ".revoked"
+#: ...but not forever: the prewarm tool's sweep collects revoked markers older than this. The
+#: diagnostic is worth keeping across the incident and the grid that follows it, not across a year.
+REVOKED_MAX_AGE_DAYS = 30.0
 
 #: Symbols whose full ``RowsFrame`` (window digests + raw-shard references) is kept for the
 #: capture path. Live capture touches each symbol once per analysis and a backtest never comes
@@ -252,6 +257,16 @@ class MappedMarketConditionReader:
         """Every symbol the manifest carries rows for, sorted (read from the manifest, not the
         object directory -- a reader must never glob ``objects/``)."""
         return tuple(sorted({str(o["symbol"]) for o in self.manifest["objects"]}))
+
+    def coverage(self) -> Mapping[str, Any]:
+        """The manifest's per-symbol coverage record: ``{symbol: {rows, first_session,
+        last_session, exceptions[]}}``.
+
+        A symbol the warmup could not warm at all is simply ABSENT from it (and from
+        ``symbols()``); one that was warmed with holes is present with its exceptions recorded.
+        Both matter to a caller checking that a run's universe is served by this snapshot, and
+        neither is visible from the rows alone."""
+        return self.manifest.get("coverage") or {}
 
     def arrays(self) -> Dict[str, np.ndarray]:
         """The mapped (or, under ``BA2_SHARED_ARRAYS=0``, private) arrays; built once per host."""
@@ -594,7 +609,20 @@ def _mapping_present(cache_root: os.PathLike, rec: Mapping[str, Any]) -> bool:
     key = rec.get("key")
     if not key:
         return False
-    return os.path.isdir(os.path.join(_derived_root(cache_root), str(key)))
+    key_dir = os.path.join(_derived_root(cache_root), str(key))
+    if not os.path.isdir(key_dir):
+        return False
+    # A key directory is not a mapping. An eviction that could not finish, an interrupted build
+    # and a swept key all leave the directory (or a signature dir inside it) behind; only a
+    # ``_done.json`` means a set ``_try_open`` will actually serve. Checking for one is the same
+    # question ``DerivedArrayStore`` asks itself.
+    try:
+        for sig in os.listdir(key_dir):
+            if os.path.isfile(os.path.join(key_dir, sig, DONE_MARKER)):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def mapping_exists(cache_root: os.PathLike, profile: str, manifest_digest: str) -> bool:
@@ -619,6 +647,10 @@ def prepared_entries(cache_root: os.PathLike) -> List[Dict[str, Any]]:
 
 def prepared_digests(cache_root: os.PathLike) -> List[str]:
     """Manifest digests this host has verified and mapped AND still holds the mapping for.
+
+    Kept public for tools and diagnostics that only want the digests. The worker uses
+    ``prepared_entries`` instead: it needs each record's ``profile``/``key`` to re-check the
+    mapping later, which a bare digest cannot answer.
 
     Host-local by construction: the markers live under ``_derived``, which ``cache_sync`` never
     transfers, so a worker can never inherit another machine's claim of readiness."""
@@ -655,6 +687,33 @@ def revoke_prepared(cache_root: os.PathLike, digests: Optional[Iterable[str]] = 
                 continue
         revoked.append(digest)
     return revoked
+
+
+def prune_revoked_markers(cache_root: os.PathLike,
+                          max_age_days: float = REVOKED_MAX_AGE_DAYS) -> List[str]:
+    """Delete ``.revoked`` markers older than ``max_age_days``. Returns the file names removed.
+
+    Age-based rather than immediate: the point of keeping a revoked marker is that somebody can
+    still see, days later, that this host rejected a snapshot and when."""
+    import time as _time
+
+    removed: List[str] = []
+    d = os.path.join(_derived_root(cache_root), PREPARED_DIRNAME)
+    if not os.path.isdir(d):
+        return removed
+    cutoff = _time.time() - max_age_days * 86400
+    for name in sorted(os.listdir(d)):
+        if not name.endswith(REVOKED_SUFFIX):
+            continue
+        path = os.path.join(d, name)
+        try:
+            if os.stat(path).st_mtime > cutoff:
+                continue
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append(name)
+    return removed
 
 
 def prune_prepared_markers(cache_root: os.PathLike) -> List[str]:

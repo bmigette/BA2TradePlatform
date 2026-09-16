@@ -643,3 +643,43 @@ def test_a_market_conditions_dry_run_touches_nothing(tmp_path, monkeypatch, caps
 
     assert stale.parent.is_dir() and marker.exists()
     assert "DRY RUN" in capsys.readouterr().out
+
+
+def test_sweep_ages_out_revoked_markers_and_never_evicts_the_prepared_directory(
+        tmp_path, monkeypatch, capsys):
+    """``_prepared`` is not an array key, and a revoked marker is a diagnostic with a shelf life:
+    kept across the incident and the grid that follows it, collected after 30 days."""
+    from ba2_common.core.market_condition_reader import (
+        PREPARED_DIRNAME,
+        REVOKED_SUFFIX,
+        mapped_key,
+    )
+    from ba2_common.core.market_condition_store import MC_DIRNAME
+
+    tool = _tool()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _pin_cache_root(cache, monkeypatch)
+    derived = Path(SA.derived_root_for(str(cache / MC_DIRNAME)))
+    digest = "d" * 64
+    key = mapped_key("ohlcv-v1", digest)
+    _done_dir(derived / key / "sig1")
+
+    markers = derived / PREPARED_DIRNAME
+    markers.mkdir(parents=True)
+    (markers / f"ohlcv-v1.{digest}.json").write_text(
+        json.dumps({"manifest": digest, "profile": "ohlcv-v1", "key": key}), encoding="utf-8")
+    fresh = markers / ("ohlcv-v1.aaaa.json" + REVOKED_SUFFIX)
+    fresh.write_text("{}", encoding="utf-8")
+    old = markers / ("ohlcv-v1.bbbb.json" + REVOKED_SUFFIX)
+    old.write_text("{}", encoding="utf-8")
+    stamp = time.time() - 45 * 86400
+    os.utime(old, (stamp, stamp))
+
+    assert tool.main(["--sweep", "--cache-root", str(cache)]) == 0
+
+    out = capsys.readouterr().out
+    assert markers.is_dir(), "the marker directory is not an array key and must never be evicted"
+    assert (markers / f"ohlcv-v1.{digest}.json").exists(), "a live marker with its mapping stays"
+    assert fresh.exists() and not old.exists()
+    assert "revoked markers older than 30d removed: 1" in out

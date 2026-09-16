@@ -348,3 +348,61 @@ def test_the_once_per_process_warning_is_actually_once(monkeypatch):
     monkeypatch.setattr(readers, "_RESEARCH_WARNED", set())
     assert readers.warn_research_mode("ohlcv-v1", "backtest reader") is True
     assert readers.warn_research_mode("ohlcv-v1", "backtest reader") is False
+
+
+def test_a_ga_trial_whose_universe_the_snapshot_does_not_cover_is_refused(ps, tmp_path,
+                                                                         monkeypatch):
+    """The real snapshot covers 85 of the 98-symbol option universe (13 need a provider re-fetch
+    first). For an uncovered symbol every gate reads missing_session for the whole run: it never
+    enters, and the genome scores as though its strategy simply did not fire there. A
+    feature-cache miss must not become a property of the fitness landscape."""
+    import ba2_common.config as bc
+
+    store, digest = _publish_manifest(tmp_path / "cache", symbol="AAA")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    cfg = {"market_condition_profile": "ohlcv-v1", "market_condition_manifest": digest,
+           "_ga_trial": True, "enabled_instruments": ["AAA", "BBB", "CCC"]}
+
+    with pytest.raises(ValueError) as exc:
+        seam_wiring.install_backtest_market_conditions(cfg, ps)
+    message = str(exc.value)
+    assert "does not cover" in message and "BBB" in message and "CCC" in message
+    assert digest in message
+
+
+def test_research_mode_reports_the_gap_and_proceeds(ps, tmp_path, monkeypatch, caplog):
+    import logging
+
+    import ba2_common.config as bc
+
+    store, digest = _publish_manifest(tmp_path / "cache", symbol="AAA")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    cfg = {"market_condition_profile": "ohlcv-v1", "market_condition_manifest": digest,
+           "enabled_instruments": ["AAA", "BBB"]}
+
+    with caplog.at_level(logging.ERROR, logger="app.services.backtest.seam_wiring"):
+        resolver = seam_wiring.install_backtest_market_conditions(cfg, ps)
+    assert resolver is not None
+    assert any("does not cover" in r.message and "BBB" in r.message for r in caplog.records)
+    # ...and the covered symbol still serves its published row.
+    assert resolver.reader.observe("AAA", SESSION) is not None
+
+
+def test_a_fully_covered_universe_passes_and_an_empty_one_is_not_checked(ps, tmp_path,
+                                                                        monkeypatch):
+    import ba2_common.config as bc
+
+    store, digest = _publish_manifest(tmp_path / "cache", symbol="AAA")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    base = {"market_condition_profile": "ohlcv-v1", "market_condition_manifest": digest,
+            "_ga_trial": True}
+
+    assert seam_wiring.install_backtest_market_conditions(
+        {**base, "enabled_instruments": ["AAA"]}, ps) is not None
+    # Case-insensitively, the way instrument names reach a config.
+    assert seam_wiring.install_backtest_market_conditions(
+        {**base, "enabled_instruments": ["aaa"]}, ps) is not None
+    # A config with no universe recorded has nothing to compare against -- not a silent pass for
+    # a real gap, just the absence of the question.
+    assert seam_wiring.install_backtest_market_conditions(base, ps) is not None
+    assert seam_wiring.market_condition_universe({"enabled_instruments": ["b", "a"]}) == ["A", "B"]

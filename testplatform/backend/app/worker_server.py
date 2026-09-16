@@ -893,6 +893,13 @@ _PREPARED_MC: dict = {}          # digest -> the prepare report that admitted it
 _PREPARED_MC_LOCK = threading.Lock()
 _PREPARED_MC_LOADED = False
 #: prepare job_id -> (digest, profile), so the poll that collects the result also admits it.
+#: Mutated under ``_JOBS_LOCK`` (the lock that already guards every job registry), because the
+#: submit that fills it and the poll that drains it are different request threads.
+#:
+#: A prepare job nobody ever polls (the master died mid-pre-flight) leaves an entry here and no
+#: in-memory admission -- but the WORK still completed and wrote its ``_derived`` marker, so the
+#: next pre-flight's ``_mc_load_markers``/prepare learns the digest from disk. The stale entry is
+#: dropped with the job by ``_sweep_orphaned_jobs``' registry pass on the next submit.
 _MC_JOBS: dict = {}
 
 
@@ -921,7 +928,16 @@ def _mc_load_markers() -> None:
 
 
 def _mc_is_prepared(digest: str) -> bool:
-    """Set membership, on the hot submit path -- no sort, no disk walk per trial."""
+    """Set membership, on the hot submit path -- no sort, no disk walk per trial.
+
+    DELIBERATELY DOES NOT CALL ``mapping_exists``. Every submit would then stat the derived tree,
+    and the answer it would change is vanishingly rare: a mapping swept out from under a running
+    fleet. The consequence of skipping it is bounded and benign -- the trial opens the mapping and
+    rebuilds it once under ``build_or_open``'s per-key lock, which is a slow first trial rather
+    than a wrong one. It does mean this can say True for a moment after ``/health`` (which DOES
+    check, and drops the digest) has said the host is no longer ready; /health is what the master
+    reads at pre-flight, so the master's view is the conservative one.
+    """
     _mc_load_markers()
     with _PREPARED_MC_LOCK:
         return digest in _PREPARED_MC
@@ -1024,7 +1040,8 @@ class PrepareMarketConditionsReq(BaseModel):
 def _mc_job_finished(job_id: str, result) -> None:
     """Admit (or refuse) the digest a finished prepare job was for. Called from ``_job_status``,
     which is the ONE place a job's result is collected."""
-    entry = _MC_JOBS.pop(job_id, None)
+    with _JOBS_LOCK:
+        entry = _MC_JOBS.pop(job_id, None)
     if entry is None:
         return
     digest, _profile = entry
@@ -1065,7 +1082,8 @@ def market_conditions_prepare(req: PrepareMarketConditionsReq, request: Request,
 
     digest = str(req.manifest)
     job_id = _submit_job(prepare_host_job, CACHE_FOLDER, digest, req.profile, int(req.jobs or 4))
-    _MC_JOBS[job_id] = (digest, req.profile)
+    with _JOBS_LOCK:
+        _MC_JOBS[job_id] = (digest, req.profile)
     logger.info("market-conditions: preparing %s as job %s", digest, job_id)
     return {"job_id": job_id, "manifest": digest}
 
@@ -1103,9 +1121,20 @@ async def cache_push(request: Request, authorization: str = Header(default=None)
                 rel_paths=result.get("market_condition_paths"))
             result["market_conditions_verified"] = verdict
             if not verdict["ok"]:
-                revoked = _mc_forget_prepared(
-                    "market-condition objects failed sha256 verification after a push",
-                    verdict.get("failed_digests") or None)
+                # A revoke with nothing NAMED revokes nothing. ``x or None`` here meant an empty
+                # failed_digests list became "revoke everything on this host" -- which a single
+                # unreadable file elsewhere in the bucket was enough to trigger. If the pass says
+                # it failed but cannot say for which snapshot, that is a defect in the pass, and
+                # the honest response is a loud error rather than disarming the whole box.
+                failed = verdict.get("failed_digests") or []
+                if failed:
+                    revoked = _mc_forget_prepared(
+                        "market-condition objects failed sha256 verification after a push", failed)
+                else:
+                    revoked = []
+                    logger.error(
+                        "cache push: market-condition verification failed but named NO digest "
+                        "(%s); revoking nothing -- investigate the bucket by hand", verdict)
                 result["market_conditions_revoked"] = revoked
                 logger.error("cache push: market-condition verification FAILED: %s", verdict)
         logger.info("cache push: %s", result)

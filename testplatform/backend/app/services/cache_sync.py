@@ -394,9 +394,18 @@ def verify_market_conditions(root: Optional[str] = None,
     worse, lets ONE stale manifest's missing object condemn every other digest. A full scan stays
     available (``rel_paths=None``) for an explicit integrity check.
 
-    Returns ``{ok, manifests, checked, missing, corrupt, errors, failed_digests, checked_digests}``
-    — the two digest lists are what a caller revokes and keeps. Never raises: the caller (a
-    worker's ``/cache/push``, a preparation step) reports and refuses work rather than dying.
+    What the scope does and does not cover: the manifest SCAN is always host-wide (every manifest
+    file is opened and its object list read — that is how "does this snapshot reference anything
+    the push delivered" is answered at all), and it is the SHA256 pass, the expensive half, that
+    is scoped. An out-of-scope manifest that cannot even be parsed is therefore still seen: it is
+    reported under ``out_of_scope_errors`` and deliberately does NOT flip ``ok``, because a stale
+    truncated file elsewhere in the bucket says nothing about the snapshot that just arrived --
+    and the caller revokes readiness on ``ok``.
+
+    Returns ``{ok, manifests, checked, missing, corrupt, errors, out_of_scope_errors,
+    failed_digests, checked_digests}`` — the two digest lists are what a caller revokes and keeps.
+    Never raises: the caller (a worker's ``/cache/push``, a preparation step) reports and refuses
+    work rather than dying.
     """
     from ba2_common.core.market_condition_store import manifest_identity, sha256_file
 
@@ -408,6 +417,7 @@ def verify_market_conditions(root: Optional[str] = None,
     missing: List[str] = []
     corrupt: List[str] = []
     errors: List[str] = []
+    out_of_scope: List[str] = []
     failed: List[str] = []
     seen: List[str] = []
     for path in mc_manifest_files(root):
@@ -415,7 +425,16 @@ def verify_market_conditions(root: Optional[str] = None,
             with open(path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
         except (OSError, ValueError) as e:
-            errors.append(f"{path.name}: unreadable manifest ({e})")
+            # SCOPE FIRST, even here. A manifest that cannot be parsed has no object list, so the
+            # only thing that can place it in or out of scope is its own path. Counting an
+            # out-of-scope unreadable file as an error flipped ``ok`` on a scoped pass while
+            # naming no digest -- and the worker then revoked EVERY prepared digest on the box
+            # over a stale file the push had never touched.
+            message = f"{path.name}: unreadable manifest ({e})"
+            if wanted is not None and _manifest_rel(path) not in wanted:
+                out_of_scope.append(message)
+            else:
+                errors.append(message)
             continue
         refs = [f"{MC_BUCKET}/{e['path']}"
                 for key in ("objects", "raw_objects")
@@ -453,8 +472,8 @@ def verify_market_conditions(root: Optional[str] = None,
             failed.append(path.stem)
     return {"ok": not (missing or corrupt or errors), "manifests": len(seen),
             "checked": checked, "missing": sorted(set(missing)), "corrupt": sorted(set(corrupt)),
-            "errors": errors, "failed_digests": sorted(set(failed)),
-            "checked_digests": sorted(set(seen))}
+            "errors": errors, "out_of_scope_errors": out_of_scope,
+            "failed_digests": sorted(set(failed)), "checked_digests": sorted(set(seen))}
 
 
 def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:

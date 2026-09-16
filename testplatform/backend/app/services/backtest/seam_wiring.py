@@ -21,6 +21,7 @@ Confirmed against the installed Phase-0 packages (NOT the plan's draft guesses):
 """
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -198,6 +199,7 @@ def set_backtest_ohlcv_override(provider: Optional[Any]) -> None:
 # run resolver resolves None (the gate reports ``no_context``).
 MARKET_CONDITION_PROFILE_NONE = "none"
 _market_condition_tl = threading.local()
+_log = logging.getLogger(__name__)
 
 
 def _current_market_condition_resolver() -> Optional[Any]:
@@ -267,12 +269,69 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
                 f"digest into every trial; computing 128-session indicators per trial is not a "
                 f"fallback this path takes.")
         warn_research_mode(profile, "backtest reader")
-    resolver = BacktestMarketConditionResolver(
-        BacktestMarketConditionReader(price_source, profile, manifest_digest=digest))
+    reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest)
+    check_market_condition_coverage(config, reader)
+    resolver = BacktestMarketConditionResolver(reader)
     if TradeConditions.get_market_condition_context_resolver() is not _dispatch_market_condition_context:
         TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
     _market_condition_tl.resolver = resolver
     return resolver
+
+
+#: How many missing symbols a message names before it says "and N more".
+_COVERAGE_NAMES = 20
+
+
+def market_condition_universe(config: Any) -> List[str]:
+    """The symbols this run can ever evaluate a market-condition gate for.
+
+    ``enabled_instruments`` is the right list even for a screener run: the screener gates ENTRIES
+    to a per-day subset of it (and the optimizer's ``screener_candidate`` has already narrowed it
+    to what this trial's screen can ever select), so it is the superset a gate can be asked about.
+    """
+    return sorted({str(s).upper() for s in (config.get("enabled_instruments") or ())})
+
+
+def check_market_condition_coverage(config: Dict[str, Any], reader: Any) -> List[str]:
+    """Refuse (or, in research mode, report) a run whose universe the snapshot does not cover.
+
+    THE FAILURE THIS PREVENTS. A pinned manifest covers exactly the symbols the warmup could warm
+    -- the first real one covers 85 of the 98-symbol option universe, because 13 carry a split
+    whose basis the prices cannot settle and need a full provider re-fetch first. For a symbol the
+    manifest omits, every gate reads ``missing_session`` for the whole run: it never enters, and
+    the genome that would have traded it scores as though its strategy simply did not fire there.
+    A feature-cache miss must not become a property of the fitness landscape.
+
+    A GA trial RAISES (the job fails, which is what an environment fault deserves); research mode
+    logs one ERROR naming the symbols and continues, because a one-off run over a wider universe
+    than the snapshot is a legitimate thing to do deliberately. Returns the missing symbols.
+    """
+    mapped = getattr(reader, "mapped_reader", None)
+    if mapped is None:
+        return []                      # research mode without a manifest: nothing to compare to
+    universe = market_condition_universe(config)
+    if not universe:
+        return []                      # no universe recorded on the config: nothing to check
+    covered = set(mapped.symbols())
+    missing = [s for s in universe if s not in covered]
+    if not missing:
+        return []
+    shown = ", ".join(missing[:_COVERAGE_NAMES])
+    if len(missing) > _COVERAGE_NAMES:
+        shown += f", and {len(missing) - _COVERAGE_NAMES} more"
+    recorded = [s for s in missing if s in (mapped.coverage() or {})]
+    detail = (f" ({len(recorded)} of them ARE in the manifest's coverage record, so they were "
+              f"warmed and then excluded -- check its exceptions)" if recorded else "")
+    message = (
+        f"market-condition manifest {mapped.manifest_digest} does not cover "
+        f"{len(missing)} of this run's {len(universe)} instruments: {shown}{detail}. "
+        f"Every gate on those symbols would read missing_session for the whole run, so they "
+        f"would silently never enter. Warm and re-publish the snapshot for the full universe "
+        f"(tools/warm_market_conditions.py plan/build), or run the narrower universe.")
+    if config.get("_ga_trial"):
+        raise ValueError(message)
+    _log.error(message)
+    return missing
 
 
 def market_condition_leaves_in(config: Any) -> List[str]:

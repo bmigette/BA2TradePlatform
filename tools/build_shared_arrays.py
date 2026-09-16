@@ -97,6 +97,8 @@ _OPTIONS_KEY_VERSION = re.compile(r"\.v(\d+)$")
 # (ba2_common.core.market_condition_reader). A LAYOUT_VERSION bump moves every one of them, so
 # without this pattern the old keys would be orphans nothing ever collects.
 _MC_KEY_VERSION = re.compile(r"_v(\d+)$")
+# Directories under a derived root that are NOT array keys and must never be evicted as one.
+_NON_KEY_DIRNAMES = ("_prepared",)
 _OHLCV_KEY_VERSION = re.compile(r"_v(\d+)_[0-9a-f]+$")
 
 #: Every option whose value is a filesystem path. ``_parse`` absolutizes all of them in one pass
@@ -442,6 +444,12 @@ def sweep_root(label: str, derived_root: Path, version_re, current_version: int,
         try:
             if not key_dir.is_dir():
                 continue
+            if key_dir.name in _NON_KEY_DIRNAMES:
+                # Not a mapped-array key at all: the market-condition root keeps its host-local
+                # readiness markers in ``_prepared``. It survives the passes below by accident
+                # today (no signature dirs, no version match), which is exactly the kind of
+                # accident a collector should not depend on.
+                continue
             sigs = [d for d in key_dir.iterdir() if d.is_dir()]
         except OSError:
             continue
@@ -497,7 +505,9 @@ def sweep_market_conditions(cache_root: Optional[str], max_age_days: float,
     from ba2_common.core import shared_arrays as SA
     from ba2_common.core.market_condition_reader import (
         LAYOUT_VERSION,
+        REVOKED_MAX_AGE_DAYS,
         prune_prepared_markers,
+        prune_revoked_markers,
     )
     from ba2_common.core.market_condition_store import MC_DIRNAME
 
@@ -509,11 +519,15 @@ def sweep_market_conditions(cache_root: Optional[str], max_age_days: float,
     removed = sweep_root("market-conditions", derived, _MC_KEY_VERSION, LAYOUT_VERSION,
                          max_age_days, dry_run)
     if dry_run:
-        print("[market-conditions] DRY RUN: would prune readiness markers with no mapping")
+        print("[market-conditions] DRY RUN: would prune readiness markers with no mapping, and "
+              "revoked markers older than 30d")
         return removed
     pruned = prune_prepared_markers(root)
     print(f"[market-conditions] readiness markers pruned: {len(pruned)}"
           + (f" ({', '.join(pruned)})" if pruned else ""))
+    revoked = prune_revoked_markers(root)
+    print(f"[market-conditions] revoked markers older than {REVOKED_MAX_AGE_DAYS:.0f}d "
+          f"removed: {len(revoked)}" + (f" ({', '.join(revoked)})" if revoked else ""))
     return removed
 
 
