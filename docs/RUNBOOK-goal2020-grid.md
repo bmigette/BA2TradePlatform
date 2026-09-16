@@ -690,6 +690,80 @@ the acceptance verdict). `--quick` runs the whole harness on a fabricated store 
 * Never `pgrep -f spawn_main` from an ssh command that contains the string (self-match killed the
   shell); use `pgrep -f multiprocessing.spawn`.
 
+## remote227: updating the build and warming a snapshot (2026-09-16, all four found the hard way)
+
+The 2026-09-16 gated launch hit four host-specific blockers in a row. None is in the code; all
+four are in HOW you drive that box. In order:
+
+**1. The mirror is not yours to write.** The grid clone's `origin` is `/opt/ba2worker/BA2TradePlatform`,
+owned by `ba2worker`. `git fetch origin` inside it fails as `debian` with "insufficient permission
+for adding an object to repository database" as soon as there are new objects — and the mirror's
+local `dev` branch lags whatever it last pulled anyway. **Fetch GitHub directly into the grid
+clone** (the box has outbound access):
+
+```bash
+cd /home/debian/ba2-grid/repo
+git fetch https://github.com/bmigette/BA2TradePlatform.git dev:refs/remotes/gh/dev -f
+git merge --ff-only gh/dev          # the grid branch carries no unique commits; check first:
+                                    #   git log --oneline gh/dev..$(git rev-parse --abbrev-ref HEAD)
+```
+Do NOT "fix" this by updating the mirror: it is the fleet worker's own repository.
+
+**2. Use the worker venv, and hand the tools a database.** The grid clone has no `.venv`, and the
+system `python3` has no numpy:
+
+```bash
+PY=/opt/ba2worker/ba2-venvs/test/bin/python
+export BA2_HOME=/home/debian/ba2-grid/home
+export DB_FILE=/home/debian/ba2-grid/home/test/dl_forecasting.db
+export DATABASE_URL="sqlite:////home/debian/ba2-grid/home/test/dl_forecasting.db"
+export PYTHONPATH=/home/debian/ba2-grid/repo/packages/common:/home/debian/ba2-grid/repo/packages/providers:/home/debian/ba2-grid/repo/packages/experts:/home/debian/ba2-grid/repo/testplatform/backend
+```
+Without `DB_FILE`/`DATABASE_URL` the warm reads no FMP key and EVERY symbol fails preflight with
+"FMP API key not configured" — which reads like a data problem and is not.
+
+**3. The OHLCV cache is owned by `ba2worker`, and the repair needs to WRITE it.**
+`/home/debian/ba2-grid/home/common/cache/FMPOHLCVProvider` was `drwxr-x---  ba2worker ba2worker`.
+`debian` is in the `ba2worker` group, so the plan step READS fine and reports the 13 split-drifted
+symbols — then `build --fetch-missing` fails every one of them with
+`PermissionError: ... ASML_1d.parquet.tmp` and publishes NOTHING. Grant group write once, matching
+the convention the parent cache directory already uses (`ba2worker:debian`, `drwxrwsr-x`):
+
+```bash
+D=/home/debian/ba2-grid/home/common/cache/FMPOHLCVProvider
+sudo chmod g+ws "$D"
+sudo find "$D" -maxdepth 1 -name '*.parquet' -exec chmod g+w {} +
+```
+Only that directory. The option stores are read-only to the warm and were left alone.
+
+**4. A cache older than the re-fetch reach used to be unrepairable.** Fixed in TEST_APP 0046: the
+request now starts at `min(15 years, the cache's first bar)`. Before that, T and WDC there (3777
+bars from 2011-06-22) made a faithful 15-year answer look SHORT, and the C1 data-loss guard refused
+the repair for ever. If you see `full re-fetch of X returned LESS history than the cache holds`,
+check the build is 0046 or newer before suspecting the vendor.
+
+**There is no `ba2-stage1` systemd unit on that host.** `systemctl is-active ba2-stage1` answers
+`inactive` for a unit that does not exist, which reads like a stopped service. `systemctl show
+ba2-stage1 -p FragmentPath` returns empty — that is the tell. Launch detached instead, from the
+repo root, and never edit `tools/stage1_run.sh` while it runs:
+
+```bash
+cd /home/debian/ba2-grid/repo
+export MARKET_CONDITION_PROFILE="ohlcv-v1,ta-structure-v1"
+export MARKET_CONDITION_MANIFEST="ohlcv-v1=<digest>,ta-structure-v1=<digest>"
+nohup bash tools/stage1_run.sh > /home/debian/ba2-grid/stage1_2020.log 2>&1 &
+```
+
+**Digests are per host and that is correct.** The snapshot identity is content-addressed over the
+data actually warmed, so remote227's digests differ from a workstation's whenever the two price
+caches differ. Each host warms and VERIFIES its own; never copy a digest between hosts and assume
+it resolves.
+
+**OWED (do not do while a grid runs):** fold blockers 2 and 3 into `tools/stage1_run.sh` as a
+preflight — refuse with the exact `chmod` line when the provider cache is not writable, and refuse
+when `DB_FILE`/`DATABASE_URL` are unset — so the next operator gets one refusal instead of four
+investigations.
+
 ## Database backups (2026-09-15)
 
 `tools/backup_dbs.py` copies the PROD trade DB, the DEV trade DB and the TEST/GA DB with SQLite's online-backup
