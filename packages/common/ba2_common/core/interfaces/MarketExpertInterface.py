@@ -230,15 +230,18 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 # market-condition data and changes nothing: a ruleset with no market leaf never
                 # asks, and one WITH a leaf is refused at save/import by
                 # market_condition_rules.assert_market_fields_served rather than deployed unable
-                # to enter. ``valid_values`` renders as a select in both UIs; a COMMA LIST (two
+                # to enter. (At EVALUATION time nothing raises: a leaf with no profile behind it
+                # reads ``no_context`` and returns False -- unknown never passes. The refusals
+                # are at save and import, which is where a human can still act on them.) ``valid_values`` renders as a select in both UIs; a COMMA LIST (two
                 # profiles at once) is accepted by the parser but has to be typed/imported rather
                 # than picked, which is deliberate -- picking one is the ordinary case.
                 "market_condition_profile": {
                     "type": "str", "required": False, "default": cls._market_condition_profile_off(),
                     "valid_values": cls._market_condition_profile_choices(),
                     "description": "Market-condition profile(s) this expert's entry rules may "
-                                   "gate on (comma-separated registered names; empty = no "
-                                   "market-condition data is served and any market leaf raises)",
+                                   "gate on (comma-separated registered names). Empty = this "
+                                   "expert is not gated: a market leaf is refused when you save "
+                                   "or import it, and one already in the rules never passes",
                 },
                 # Execution Schedule Settings
                 "execution_schedule_enter_market": {

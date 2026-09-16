@@ -456,9 +456,15 @@ def test_an_ungated_payload_is_unaffected_by_the_refusal():
 
 
 def test_the_import_tool_runs_that_refusal_before_it_writes_anything():
-    """Read from the script's source (running it means a live DB): the two calls must sit between
-    the expert_params assembly and the first ``save_settings``/``update_instance``, and a refusal
-    must print FATAL and return without writing -- the same contract the ruleset conversion has."""
+    """Read from the script's source: the guard must precede EVERY call in ``main`` that writes.
+
+    The minimum over all of them, not one named write. The first version of this test asserted
+    only ``guard < body.index("save_settings")`` and PASSED while the guard actually sat after
+    ``add_instance``, ``import_multiple_rulesets`` AND ``update_instance`` -- each of which
+    commits synchronously, so a refusal left a live instance enabled and pointed at a freshly
+    created gated ruleset whose profile setting was never written. Naming one write is how an
+    ordering check agrees with the bug it is supposed to catch.
+    """
     tools = os.path.normpath(os.path.join(_ROOT, "..", "..", "tools"))
     importer = open(os.path.join(tools, "import_deploy_payload.py"), encoding="utf-8").read()
     body = importer[importer.index("def main("):]
@@ -468,4 +474,151 @@ def test_the_import_tool_runs_that_refusal_before_it_writes_anything():
     guard = body.index("assert_market_fields_served(entry_rules")
     after = body[guard:]
     assert "FATAL" in after[:600] and "return 1" in after[:600]
-    assert guard < body.index("save_settings")
+
+    writes = {call: body.index(call) for call in (
+        "add_instance(inst)",                       # creates a new ExpertInstance (enabled=True)
+        "import_multiple_rulesets(live_export)",    # creates Ruleset + EventAction rows
+        "update_instance(inst)",                    # commits the new ruleset FKs
+        "save_settings(",                           # writes the profile setting itself, LAST
+    )}
+    earliest = min(writes, key=writes.get)
+    assert guard < writes[earliest], (
+        f"the market-condition guard runs AFTER {earliest}, which has already committed")
+
+
+# ------------------------------------------------- the refusal, exercised against a real DB
+@pytest.fixture
+def live_db(tmp_path):
+    """A throwaway sqlite the import tool writes into, plus the tool module bound to it.
+
+    The tool configures ``ba2_common.core.db``'s GLOBAL engine at import time, so the previous
+    configuration is snapshotted and restored: this file runs inside the shared backend suite.
+    """
+    import ba2_common.core.db as ba2db
+    from sqlmodel import SQLModel
+
+    saved_file, saved_engine = ba2db._db_file, ba2db._engine
+    db_path = str(tmp_path / "live.sqlite")
+    tools = os.path.normpath(os.path.join(_ROOT, "..", ".."))
+    saved_env = {k: os.environ.get(k) for k in ("BA2_LIVE_DB", "BA2_REPO")}
+    os.environ["BA2_LIVE_DB"] = db_path
+    os.environ["BA2_REPO"] = tools          # never the main checkout's path
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "import_deploy_payload_under_test",
+            os.path.join(tools, "tools", "import_deploy_payload.py"))
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        SQLModel.metadata.create_all(ba2db.get_engine())
+        yield tool
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        ba2db._db_file, ba2db._engine = saved_file, saved_engine
+
+
+def _db_counts():
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import EventAction, ExpertInstance, Ruleset
+
+    return {m.__name__: len(get_all_instances(m)) for m in (Ruleset, EventAction, ExpertInstance)}
+
+
+def _payload(tmp_path, *, target, expert_params, account_id=None):
+    import json
+
+    entry_rules, exit_rules = decoded_gated_rules()
+    body = [{
+        "backtest_id": 1, "target_instance_id": target, "account_id": account_id,
+        "virtual_equity_pct": 10.0, "expert_name": "FMPRating", "label": "gated-deploy",
+        "ruleset": {"entry_rules": entry_rules, "exit_rules": exit_rules},
+        "settings": {"settings": {"expert_params": expert_params}, "universe": None,
+                     "execution": {}},
+    }]
+    path = str(tmp_path / "payload.json")
+    json.dump(body, open(path, "w"), default=str)
+    return path
+
+
+def _seed_instance(account_id=1):
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import ExpertInstance
+
+    return add_instance(ExpertInstance(account_id=account_id, expert="FMPRating",
+                                       alias="before", enabled=True, virtual_equity_pct=10.0))
+
+
+def _run(tool, payload_path, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["import_deploy_payload.py", payload_path])
+    return tool.main()
+
+
+@pytest.mark.parametrize("expert_params,reason", [
+    ({}, "an empty profile setting under a gated ruleset"),
+    ({"market_condition_profile": ""}, "an explicitly empty setting"),
+    ({"market_condition_profile": "ta-structure-v1"}, "a profile that does not serve the leaf"),
+    ({"market_condition_profile": "ohlcv-v9"}, "a profile this server does not register"),
+])
+def test_a_refused_payload_writes_absolutely_nothing(live_db, tmp_path, monkeypatch,
+                                                     expert_params, reason):
+    """THE behavioural proof, against a real sqlite: a refusal leaves the DB byte-identical.
+
+    Before the ordering fix this test failed on every row -- the rulesets were created and the
+    instance's FKs repointed at them, and only then did the refusal fire. The instance was then
+    live, enabled, pointed at a GATED ruleset, with no profile setting: unable to enter, and
+    indistinguishable from a strategy that found no setup.
+    """
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import ExpertInstance
+
+    inst_id = _seed_instance()
+    before = _db_counts()
+    path = _payload(tmp_path, target=inst_id, expert_params=expert_params)
+
+    assert _run(live_db, path, monkeypatch) == 1, reason
+
+    assert _db_counts() == before          # no Ruleset, no EventAction, no ExpertInstance
+    after = get_instance(ExpertInstance, inst_id)
+    assert (after.enter_market_ruleset_id, after.open_positions_ruleset_id) == (None, None)
+    assert after.alias == "before"         # the alias/description rewrite never ran either
+
+
+def test_a_refused_payload_for_a_NEW_instance_creates_no_instance(live_db, tmp_path, monkeypatch):
+    """``target_instance_id: null`` creates the ExpertInstance with ``enabled=True``. Refusing
+    after that would leave an enabled, unusable sleeve behind for an operator to find."""
+    before = _db_counts()
+    path = _payload(tmp_path, target=None, account_id=1, expert_params={})
+
+    assert _run(live_db, path, monkeypatch) == 1
+    assert _db_counts() == before
+
+
+def test_the_writes_really_do_happen_once_the_gate_is_served(live_db, tmp_path, monkeypatch):
+    """The control, so "nothing was written" above cannot be an artefact of a harness that never
+    writes: the SAME payload with a serving profile setting gets past the guard and creates the
+    rulesets. Stopped at the live expert-registry lookup, which is the first step after the
+    writes and the only one needing the live platform installed.
+    """
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import ExpertInstance
+
+    inst_id = _seed_instance()
+    before = _db_counts()
+    path = _payload(tmp_path, target=inst_id,
+                    expert_params={"market_condition_profile": "ohlcv-v1"})
+
+    def _stop(name):
+        raise RuntimeError("reached the expert registry")
+
+    monkeypatch.setattr(live_db, "_expert_class", _stop)
+    with pytest.raises(RuntimeError, match="reached the expert registry"):
+        _run(live_db, path, monkeypatch)
+
+    after_counts = _db_counts()
+    assert after_counts["Ruleset"] > before["Ruleset"]
+    assert after_counts["EventAction"] > before["EventAction"]
+    after = get_instance(ExpertInstance, inst_id)
+    assert after.enter_market_ruleset_id is not None

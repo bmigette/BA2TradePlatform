@@ -29,7 +29,9 @@ The market-condition profile is an EXPERT SETTING and travels in ``settings.expe
 transport needs nothing special -- but it is CHECKED here against the receiving server's profile
 registry, and against the payload's own entry rules: a gated ruleset whose leaf no listed profile
 serves would deploy a strategy that can never enter, which is indistinguishable from one that
-found no setup. Nothing is written for a refused entry.
+found no setup. The check runs FIRST for each entry -- before the instance is created or looked
+up and before any ruleset is imported -- because every write below commits synchronously, so a
+refusal raised after them would itself produce the half-deployed state it exists to prevent.
 
 For each entry: converts entry/exit TradeRule lists to a live ruleset export via
 ``trade_rules_to_live_export``, imports it as NEW Ruleset+EventAction rows via
@@ -153,6 +155,44 @@ def main() -> int:
         print(f"\n=== {label}: backtest {bt_id} -> instance {inst_id} ===")
 
         expert_name = entry["expert_name"]   # payload is authoritative; no silent default
+        entry_rules = entry["ruleset"]["entry_rules"]
+        exit_rules = entry["ruleset"]["exit_rules"]
+        expert_params = dict(entry["settings"]["settings"]["expert_params"])
+
+        # MARKET-CONDITION GATES, CHECKED FIRST -- before the instance is created or looked up,
+        # before the rulesets are converted, and before anything at all is written.
+        #
+        # The ruleset carries the leaves and the SETTING says which profile feeds them, and the
+        # two travel in different halves of the payload. Refused here:
+        #
+        #   * an unregistered profile name -- a payload built against a newer ba2_common -- would
+        #     leave the live resolver unable to build a reader at all;
+        #   * a gated ruleset whose leaf field no listed profile serves (the empty setting being
+        #     the common case) deploys a strategy that CANNOT ENTER: every gated entry is refused
+        #     for ever, and the instance looks exactly like one whose strategy found no setup.
+        #
+        # THE ORDER IS THE POINT, not a style choice. ``add_instance`` / ``import_multiple_rulesets``
+        # / ``update_instance`` each COMMIT synchronously, so a refusal raised after them would
+        # leave the live instance enabled and pointed at a freshly created GATED ruleset with its
+        # profile setting never written (save_settings is the last step) -- manufacturing, from
+        # inside the guarded path, exactly the state this check exists to prevent.
+        #
+        # ``expert_params`` is the payload's own dict and nothing below adds or removes the
+        # profile key (the universe block, the RM toggles, the forced instrument-selection method
+        # and the schedule all write other names), so checking it here checks what gets saved.
+        #
+        # The exit ruleset is not checked: ``trade_rules_to_live_export`` below already refuses a
+        # market leaf anywhere on it (``assert_no_market_conditions``).
+        try:
+            mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
+            assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
+        except ValueError as e:
+            print(f"FATAL: {label}: {e}")
+            return 1
+        if mc_profiles:
+            print(f"market-condition profile(s): {list(mc_profiles)} (every market gate in the "
+                  f"entry rules is served)")
+
         created = False
         if inst_id is None:
             acct = entry.get("account_id")
@@ -180,8 +220,6 @@ def main() -> int:
         old_enter, old_open = inst.enter_market_ruleset_id, inst.open_positions_ruleset_id
         print(f"current rulesets: enter={old_enter} open={old_open}")
 
-        entry_rules = entry["ruleset"]["entry_rules"]
-        exit_rules = entry["ruleset"]["exit_rules"]
         # The converter REFUSES a payload this platform must not run: an unresolved optimizer
         # mode gene, a market-condition gate on an open-positions ruleset, or a market field this
         # installation has no event type for (older than the payload -- importing would drop the
@@ -215,29 +253,6 @@ def main() -> int:
         print(f"expertinstance {inst_id}: rulesets repointed, alias/description updated")
 
         expert = _expert_class(expert_name)(inst_id)
-        expert_params = dict(entry["settings"]["settings"]["expert_params"])
-        # MARKET-CONDITION GATES: the ruleset carries the leaves, the setting says which profile
-        # feeds them, and the two travel in different halves of the payload. Checked against THIS
-        # server's registry, before anything is written:
-        #
-        #   * an unregistered profile name -- a payload built against a newer ba2_common -- would
-        #     leave the live resolver unable to build a reader at all;
-        #   * a gated ruleset whose leaf field no listed profile serves (the empty setting being
-        #     the common case) deploys a strategy that CANNOT ENTER: every gated entry is refused
-        #     for ever, and the instance looks exactly like one whose strategy found no setup.
-        #
-        # The exit ruleset is not checked here because the converter above already refuses a
-        # market leaf anywhere on it (assert_no_market_conditions).
-        try:
-            mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
-            assert_market_fields_served(entry_rules, mc_profiles,
-                                        where=f"{label}: entry rules")
-        except ValueError as e:
-            print(f"FATAL: {label}: {e}")
-            return 1
-        if mc_profiles:
-            print(f"market-condition profile(s): {list(mc_profiles)} (every market gate in the "
-                  f"entry rules is served)")
         # THE UNIVERSE BLOCK, which this tool used to DROP -- the common root of review
         # findings V1 (the six screener:* genes) and V2 (the $100 underlying-price cap every
         # option grid screened on). The exporter has always built it; consuming only
