@@ -112,7 +112,9 @@ def test_the_capital_line_reads_as_a_chain():
     assert lines[0] == ('Capital: equity $10,000.00 → tradable $20,000.00 (x2) → '
                         'allocation 100% → virtual $20,000.00 → used $5,000.00 → '
                         'available $15,000.00')
-    assert lines[1] == 'Max per instrument: $1,500.00 (10% of available)'
+    # OF VIRTUAL. The $1,500 ceiling is 10% of the $20,000 sleeve, not of the $15,000
+    # left in it -- the label has to name the figure the sizing core actually multiplied.
+    assert lines[1] == 'Max per instrument: $1,500.00 (10% of virtual)'
     assert lines[2] == ('Regime scale 1 · Sizing notional · Diversification 1 · '
                         'Commission $0.00')
     assert lines[3] == 'enable buy: True · enable sell: False'

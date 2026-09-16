@@ -418,8 +418,23 @@ class TradeRiskManagement:
             raise RuntimeError(error_msg)
         available_balance = balances.available
         total_virtual_balance = available_balance
-        max_equity_per_instrument = total_virtual_balance * max_equity_per_instrument_ratio
-        self.logger.info(f"Virtual balance: ${total_virtual_balance:.2f}, "
+        # THE PER-INSTRUMENT CEILING IS A SHARE OF THE SLEEVE, NOT OF WHAT IS LEFT IN IT.
+        #
+        # Two different questions, and they were answered with one number until 2026-09-16:
+        #   * how much may this run still SPEND?      -> balances.available (the wallet above)
+        #   * how much may ONE instrument ever hold?  -> balances.virtual x the ratio
+        #
+        # ``max_virtual_equity_per_instrument_percent`` says virtual in its own name, and
+        # every other place that reads it uses the expert's virtual equity: the option cap
+        # (TradeActions._max_equity_per_instrument_cap, called with _virtual_equity()),
+        # adjust_position_percent, AccountInterface's order validation and both Smart RM
+        # sites. Only this path used ``available``, which made the ceiling SHRINK as the
+        # sleeve filled: at 15% of a $1,895 sleeve the cap is $284, but once $568 was
+        # committed the same setting allowed only $195 for the next symbol -- a tightening
+        # nobody configured, and one that depends on the order symbols happen to be funded in.
+        max_equity_per_instrument = balances.virtual * max_equity_per_instrument_ratio
+        self.logger.info(f"Virtual balance: ${balances.virtual:.2f}, "
+                         f"available: ${total_virtual_balance:.2f}, "
                          f"max per instrument: ${max_equity_per_instrument:.2f} "
                          f"(ratio: {max_equity_per_instrument_ratio:.3f})")
         # ...and WHERE that balance came from: raw equity x the effective margin factor.

@@ -283,7 +283,11 @@ def classic_run_context_lines(context) -> list:
     if cap is not None:
         line = f"Max per instrument: ${cap:,.2f}"
         if ratio is not None:
-            line += f" ({ratio * 100:g}% of available)"
+            # OF VIRTUAL, which is what the sizing core multiplies (and what the setting
+            # max_virtual_equity_per_instrument_percent is named after). This label read
+            # "of available" while the core also used available; both were corrected
+            # together on 2026-09-16, so the line keeps describing the real arithmetic.
+            line += f" ({ratio * 100:g}% of virtual)"
         scaled = _take('max_per_instrument_scaled')
         if scaled is not None:
             line += f" → ${scaled:,.2f} after the regime scale"

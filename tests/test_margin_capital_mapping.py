@@ -414,17 +414,20 @@ def rm_logs(monkeypatch):
     return seen
 
 
-def _size_nothing(account, expert):
+def _size_nothing(account, expert, ratio=0.1):
     """Drive the classic RM's real sizing core with an empty candidate list: the
     balance resolution and its logging is the whole point, and no order is needed to
-    reach it."""
+    reach it.
+
+    ``ratio`` is max_virtual_equity_per_instrument_percent/100, so a caller can pin the
+    per-instrument ceiling at a rate other than the default 10%."""
     from ba2_common.core.TradeRiskManagement import TradeRiskManagement
     from ba2_common.core.db import get_instance
     from ba2_common.core.models import ExpertInstance
 
     expert_instance = get_instance(ExpertInstance, expert.id)
     return _with_account(account, lambda: TradeRiskManagement()._size_prioritized_orders(
-        expert, expert_instance, expert.id, [], 0.1))
+        expert, expert_instance, expert.id, [], ratio))
 
 
 def _mapping_lines(records, level):
@@ -617,3 +620,63 @@ def test_an_unregistered_account_is_an_error_entry_not_a_raised_keyerror():
     assert "KeyError" in mapping["error"], mapping
     assert str(acct_def.id) in mapping["error"]
     assert [lvl for lvl, _ in log.lines] == [logging.ERROR], log.lines
+
+
+# ---------------------------------------------------------------------------------------
+# WHICH balance the per-instrument ceiling is a share of.
+#
+# MEASURED 2026-09-16 from a live run record:
+#   Capital: equity $2,105.84 -> tradable $3,790.51 (x1.8) -> allocation 50%
+#            -> virtual $1,895.26 -> used $567.57 -> available $1,303.17
+#   Max per instrument: $195.48 (15% of available)
+#
+# 15% of the $1,895.26 SLEEVE is $284.29. The ceiling was being taken from what was LEFT
+# in the sleeve, so it shrank as the sleeve filled -- a tightening nobody configured, and
+# one that depends on the order symbols happen to be funded in. The setting is named
+# max_virtual_equity_per_instrument_percent, and every other reader of it (the option cap
+# in TradeActions, adjust_position_percent, AccountInterface's validation and both Smart RM
+# sites) multiplies virtual equity. Only this path did not. Nothing pinned it, which is
+# how it survived from 2026-07-07.
+# ---------------------------------------------------------------------------------------
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_the_per_instrument_cap_is_a_share_of_virtual_not_of_what_is_left(monkeypatch):
+    """THE DEFECT, in the proportions of the live record that exposed it."""
+    from ba2_common.core.interfaces.MarketExpertInterface import ExpertBalance
+
+    account, expert = _setup(balance=2_105.84, multiplier=1.8, factor=1.8, pct=50.0)
+    # A sleeve with money already committed, so "virtual" and "available" cannot coincide.
+    monkeypatch.setattr(expert, "_available_balance_breakdown",
+                        lambda *a, **k: ExpertBalance(virtual=1_895.26, used=567.57,
+                                                      available=1_303.17))
+
+    (_, _, _, wallet, cap) = _size_nothing(account, expert, ratio=0.15)
+
+    assert cap == pytest.approx(1_895.26 * 0.15), "the ceiling is 15% of the sleeve"
+    assert cap == pytest.approx(284.29, abs=0.01)
+    assert cap != pytest.approx(195.48, abs=0.01), "15% of available was the bug"
+    # The WALLET is still what is left: the fix separates the two questions, it does not
+    # let a run spend the committed part of its sleeve a second time.
+    assert wallet == pytest.approx(1_303.17)
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_the_ceiling_does_not_move_as_the_sleeve_fills(monkeypatch):
+    """The property that makes it a LIMIT rather than a function of funding order.
+
+    Same sleeve, two different amounts already committed: the per-instrument ceiling is
+    the same number both times. Under the old arithmetic the second run's ceiling was
+    smaller, so whether a symbol fitted depended on how many symbols had been funded
+    before it -- and re-running the same day in a different order gave a different book.
+    """
+    from ba2_common.core.interfaces.MarketExpertInterface import ExpertBalance
+
+    caps = []
+    for used in (0.0, 900.0):
+        account, expert = _setup(balance=2_000.0, pct=100.0)
+        monkeypatch.setattr(expert, "_available_balance_breakdown",
+                            lambda *a, _u=used, **k: ExpertBalance(
+                                virtual=4_000.0, used=_u, available=4_000.0 - _u))
+        caps.append(_size_nothing(account, expert)[4])
+
+    assert caps[0] == caps[1] == pytest.approx(400.0)
