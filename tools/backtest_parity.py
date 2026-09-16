@@ -129,7 +129,17 @@ _IDENTITY_KEYS = ("name", "id", "backtest_id", "created_at", "started_at", "comp
 #: part of the byte-for-byte verdict" is not "unchecked":
 #:   market_condition -- the run's per-profile block and counters, on ``results``.
 #:   entry_state      -- the measurement behind each executed structure, on a trade.
-_RESEARCH_KEYS = ("market_condition", "entry_state")
+#:
+#: SCOPED, not dropped everywhere. ``entry_state`` is a TRADE-level key, and blanket-dropping the
+#: name at any depth would also erase an unrelated ``entry_state`` a future writer puts somewhere
+#: the parity verdict is supposed to cover -- silently narrowing the comparison instead of moving
+#: one field out of it. ``market_condition`` stays depth-free: the run block is the only thing
+#: that ever carries that name, and it is reached through both ``results`` and the config.
+_RESEARCH_KEYS = ("market_condition",)
+
+#: ``blob column -> research keys withdrawn from THAT column only``. ``entry_state`` lives on a
+#: trade, so it is withdrawn from the ``trades`` blob and compared everywhere else.
+_SCOPED_RESEARCH_KEYS = {"trades": ("entry_state",)}
 
 _BOOTSTRAPPED = False
 
@@ -200,14 +210,21 @@ def _loaded(value: Any) -> Any:
     return value
 
 
-def _strip_identity(obj: Any) -> Any:
-    """``_IDENTITY_KEYS`` and ``_RESEARCH_KEYS`` removed at any depth. Everything else survives
-    to be compared. The research keys come back in :func:`compare_research_metadata`."""
-    dropped = _IDENTITY_KEYS + _RESEARCH_KEYS
+def _strip_identity(obj: Any, scoped: Tuple[str, ...] = ()) -> Any:
+    """``_IDENTITY_KEYS`` and ``_RESEARCH_KEYS`` removed at any depth, plus ``scoped`` -- the
+    keys :data:`_SCOPED_RESEARCH_KEYS` withdraws from THIS BLOB only. Everything else survives to
+    be compared; the research keys come back in :func:`compare_research_metadata`.
+
+    ``scoped`` is seeded from the blob COLUMN by :func:`compare_rows` and then carries all the
+    way down, because a blob is decoded before it is walked -- the trades column arrives here as
+    the trade list itself, with no enclosing ``{"trades": ...}`` to recognise. So a trade's
+    ``entry_state`` is dropped, and an ``entry_state`` in ``results`` or in the config is
+    compared like any other value."""
+    dropped = _IDENTITY_KEYS + _RESEARCH_KEYS + tuple(scoped)
     if isinstance(obj, dict):
-        return {k: _strip_identity(v) for k, v in obj.items() if k not in dropped}
+        return {k: _strip_identity(v, scoped) for k, v in obj.items() if k not in dropped}
     if isinstance(obj, (list, tuple)):
-        return [_strip_identity(v) for v in obj]
+        return [_strip_identity(v, scoped) for v in obj]
     return obj
 
 
@@ -302,8 +319,9 @@ def compare_rows(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
     -- the operator needs "trades[17].exit_price" to go look, not "10 MB of JSON differ"."""
     diffs: List[str] = []
     for col in _BLOB_COLUMNS:
-        av = _strip_identity(_loaded(a.get(col)))
-        bv = _strip_identity(_loaded(b.get(col)))
+        scoped = _SCOPED_RESEARCH_KEYS.get(col, ())
+        av = _strip_identity(_loaded(a.get(col)), scoped)
+        bv = _strip_identity(_loaded(b.get(col)), scoped)
         if _canonical(av) == _canonical(bv):
             continue
         leaves: List[str] = []

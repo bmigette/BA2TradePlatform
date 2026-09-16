@@ -399,6 +399,15 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
     warns once -- unless the config is an optimizer trial, which is refused (see below).
     """
     profiles, manifests = market_condition_pins(config)
+    # THE UNGATED FAST PATH. No profile pinned AND no registered field name anywhere in the
+    # config: neither walk below can find anything, and this function runs once per TRIAL for
+    # every backtest in the system. One substring scan of the config JSON replaces two recursive
+    # walks. Deliberately AFTER the pins, so a gated-but-leafless config still reaches the
+    # refusals that are about config SHAPE (a manifest with no profile, a profile with no
+    # manifest on a GA trial, a setting contradicting a config key).
+    if not profiles and _has_no_market_condition_field(config):
+        _market_condition_tl.resolver = None
+        return None
     # PER EXPERT, before the union is used for anything: a leaf only one expert's profile serves
     # would otherwise ride the shared reader set here and find nothing live. No-op for a run with
     # no market leaves, which is every existing backtest.
@@ -554,6 +563,29 @@ def market_condition_leaves_in(config: Any) -> List[str]:
     """Ids (or config paths) of every market-condition leaf in ``config``; the labels of
     :func:`market_condition_leaf_fields_in`."""
     return [label for label, _ in market_condition_leaf_fields_in(config)]
+
+
+def _has_no_market_condition_field(config: Any) -> bool:
+    """True when NO registered market-condition field name appears anywhere in ``config``.
+
+    A cheap, conservative pre-filter for ``install_backtest_market_conditions``, which runs once
+    per trial for every backtest in the system. False negatives are harmless (the real walks run
+    and find nothing); a false POSITIVE would skip the gates of a gated run, so the test is the
+    weakest possible one: the name as a substring of the config's JSON text.
+
+    Used only together with "no profile is pinned", so a gated run never takes the fast path
+    however its leaves are spelled.
+    """
+    import json
+
+    from ba2_common.core.market_conditions import PROFILES
+
+    names = {f.name for prof in PROFILES.values() for f in prof.fields}
+    try:
+        text = json.dumps(config, default=str)
+    except Exception:  # noqa: BLE001 -- an unserialisable config is not proof of absence
+        return False
+    return not any(name in text for name in names)
 
 
 def assert_each_expert_serves_its_gates(config: Dict[str, Any]) -> None:

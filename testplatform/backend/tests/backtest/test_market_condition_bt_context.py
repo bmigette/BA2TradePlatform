@@ -658,3 +658,53 @@ def test_the_check_is_skipped_when_a_run_carries_no_expert_spec_dicts():
     against; the empty-union refusal in the installer remains the backstop for that shape."""
     assert seam_wiring.assert_each_expert_serves_its_gates(
         {"experts": ["FMPRating"], "entry_rules": _gated_rules()}) is None
+
+
+# ------------------------------------------------ the ungated fast path (final review M2)
+def test_an_ungated_trial_pays_neither_walk(ps, monkeypatch):
+    """This function runs once per TRIAL for every backtest in the system. A config that mentions
+    no registered field name anywhere cannot hold a leaf, so both recursive walks are skipped."""
+    walked = []
+    monkeypatch.setattr(seam_wiring, "market_condition_leaf_fields_in",
+                        lambda cfg, path="config": walked.append(path) or [])
+    plain = {"experts": [{"class": "FMPRating", "settings": {}}],
+             "market_condition_profiles": [],
+             "entry_rules": [{"id": "r", "conditions": {"all": [
+                 {"field": "confidence", "op": ">", "value": 70}]}}]}
+    assert seam_wiring.install_backtest_market_conditions(plain, ps) is None
+    assert walked == []
+
+
+def test_the_fast_path_never_skips_a_config_that_MENTIONS_a_field(ps, monkeypatch):
+    """The test is the weakest possible one -- the field name as a substring of the config JSON --
+    so a false POSITIVE (skipping a gated run) cannot come from an unusual leaf spelling."""
+    assert seam_wiring._has_no_market_condition_field({"a": 1}) is True
+    assert seam_wiring._has_no_market_condition_field(
+        {"entry_rules": [{"field": "underlying_adx_14"}]}) is False
+    # ... including a leaf hidden inside a JSON-encoded string, which is how expert settings
+    # store rule trees.
+    assert seam_wiring._has_no_market_condition_field(
+        {"experts": [{"settings": {"own": '{"field": "structure_state"}'}}]}) is False
+    # An unserialisable config is not proof of absence.
+    assert seam_wiring._has_no_market_condition_field({"x": {object(): 1}}) is False
+
+
+def test_the_fast_path_is_taken_only_when_no_profile_is_pinned(ps):
+    """Deliberately AFTER the pins: a gated-but-leafless config still reaches the refusals that
+    are about config SHAPE. A GA trial pinning a profile with no manifest is the load-bearing
+    one."""
+    with pytest.raises(ValueError, match="pins no manifest"):
+        seam_wiring.install_backtest_market_conditions(
+            {"experts": [_spec("ohlcv-v1")], "_ga_trial": True}, ps)
+    with pytest.raises(ValueError, match="but no profile is"):
+        seam_wiring.install_backtest_market_conditions(
+            {"experts": [{"class": "FMPRating", "settings": {}}],
+             "market_condition_manifests": {"ohlcv-v1": "d" * 64}}, ps)
+
+
+def test_the_fast_path_still_refuses_a_leaf_with_no_profile(ps):
+    """The refusal the fast path must not swallow: leaves present, no profile pinned."""
+    with pytest.raises(ValueError, match="no market-condition profile is pinned"):
+        seam_wiring.install_backtest_market_conditions(
+            {"experts": ["FMPRating"], "market_condition_profiles": [],
+             "entry_rules": _gated_rules()}, ps)

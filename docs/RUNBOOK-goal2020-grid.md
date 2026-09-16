@@ -456,40 +456,38 @@ computed in a trial.** With no profile selected (the default) none of this exist
 emits no leaves, the seam installs nothing, and the run is byte-for-byte the one it has always
 been (pinned by `tests/backtest/test_market_condition_all_off_matches_baseline.py`).
 
-### The 13 uncovered symbols — RESOLVED 2026-09-16: re-fetched, full coverage
+### Published snapshots — 98 / 98, both profiles
 
-The 2026-09-16 snapshot (`1136d489…f5cb3`, window 2020-01-01..2025-12-31) covers **85 of the 98**
-symbols in `tools/options_universe_top100.txt`. The other 13 —
-`ASML BHP DELL GE HON IBM MRK NVS RTX SAN SCCO T WDC` — carry a split whose basis the cached
-prices cannot settle, so the warmup refuses to compute from them (`refetch_required`).
-
-Two ways forward, and one of them must be chosen **before** the first gated grid:
-
-* **re-fetch** — `warm_market_conditions.py build --plan <plan> --fetch-missing`, which forces a
-  FULL FMP re-download for those symbols (a real provider bill and wall time — size it with
-  `plan` first), then re-publish and re-pin the new digest; or
-* **trim the universe** to the covered 85 and pass that file to the driver.
-
-There is no third option: the launcher **refuses to dispatch** a run whose pinned manifest does
-not cover its `enabled_instruments`, and the seam refuses a GA trial on the same condition. That
-refusal is deliberate. An uncovered symbol reads `missing_session` at every gate for the whole
-run, so the genome that would have traded it scores as though its strategy simply did not fire
-there — a feature-cache miss silently becoming a property of the fitness landscape.
-
-**Decision (operator, 2026-09-16): re-fetch.** `build --fetch-missing --concurrency 3` replaced
-the cache file of each of the 13 symbols wholesale — which is what clears a stale split basis; a
-patched file keeps it — in ~6 s and 13 provider calls (DELL 2534 bars, the other twelve 3769 each).
-Both profiles were then published over the repaired cache and verified (`identity_ok`, 7154 feature
-objects + 7358 raw shards re-hashed, none corrupt or missing):
+Pin these. Window 2020-01-02..2025-12-31, universe `tools/options_universe_top100.txt`:
 
 | profile | digest | symbols | coverage exceptions |
 |---|---|---|---|
 | `ohlcv-v1` | `c9ba981fbae8726ec749eca4201c98399a4285046733d16cca6b112b8c8371df` | **98 / 98** | 0 |
 | `ta-structure-v1` | `3c3020d05f9e24ded59272050e1f06193abc74e6c00e41e3168a1750bcc44385` | **98 / 98** | 0 |
 
-Both cover 2020-01-02..2025-12-31. The `ta-structure-v1` build needed **no provider calls** (it
-reads the same repaired raw shards). The 85/98 digest `1136d489…` is superseded: do not pin it.
-The universe file needs no trimming and the launcher's coverage refusal passes for all 98.
+Verified on publication: `identity_ok`, 7154 feature objects + 7358 raw shards re-hashed, none
+corrupt or missing. The universe file needs no trimming and the launcher's coverage refusal
+passes for all 98.
+
+> **History, 2026-09-16 — do not pin `1136d489…f5cb3`.** The first build of `ohlcv-v1` covered
+> only 85 of the 98: thirteen symbols (`ASML BHP DELL GE HON IBM MRK NVS RTX SAN SCCO T WDC`)
+> carried a split whose basis the cached prices could not settle, so the warmup refused to
+> compute from them (`refetch_required`). The operator chose to re-fetch rather than trim the
+> universe: `build --fetch-missing --concurrency 3` replaced each of the thirteen cache files
+> wholesale — which is what clears a stale split basis; a patched file keeps it — in ~6 s and 13
+> provider calls (DELL 2534 bars, the other twelve 3769 each). Both profiles were then published
+> over the repaired cache; `ta-structure-v1` needed no provider calls at all (it reads the same
+> repaired raw shards). The 85/98 digest is superseded.
+
+**Why coverage is refused rather than tolerated.** The launcher refuses to dispatch a run whose
+pinned manifest does not cover its `enabled_instruments`, and the seam refuses a GA trial on the
+same condition. An uncovered symbol reads `missing_session` at every gate for the whole run, so
+the genome that would have traded it scores as though its strategy simply did not fire there — a
+feature-cache miss silently becoming a property of the fitness landscape. If a future universe
+change reintroduces uncovered symbols, the two ways forward are the same: re-fetch
+(`warm_market_conditions.py build --plan <plan> --fetch-missing`, a real provider bill — size it
+with `plan` first), then re-publish and re-pin; or trim the universe to the covered set and pass
+that file to the driver.
 
 **Running the warm tools from a WORKTREE on Windows — two traps.** `PYTHONPATH` does not work: the
 test venv's editable install puts a *meta-path finder* for `ba2_common` ahead of it, pointing at the

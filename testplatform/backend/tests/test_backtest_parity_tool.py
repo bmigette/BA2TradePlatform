@@ -550,3 +550,32 @@ def test_a_changed_market_condition_block_is_reported_but_not_as_a_result_differ
     assert m.compare_rows(_gated(m), other) == []
     diffs = m.compare_research_metadata(_gated(m), other)
     assert len(diffs) == 1 and diffs[0].startswith("results.market_condition:")
+
+
+def test_an_entry_state_OUTSIDE_the_trade_blob_is_still_compared():
+    """M3 (final review). ``entry_state`` used to be dropped at ANY depth, so an unrelated
+    ``entry_state`` a future writer puts somewhere the verdict is supposed to cover -- on
+    ``results``, in the config -- would vanish from the comparison: silently narrowing the
+    verdict instead of moving one trade field out of it. It is scoped to the trade blob now.
+    """
+    m = _tool()
+    a, b = _gated(m), _gated(m)
+    a["results"] = json.dumps({**_loaded(a["results"]), "entry_state": "left"})
+    b["results"] = json.dumps({**_loaded(b["results"]), "entry_state": "right"})
+    diffs = m.compare_rows(a, b)
+    assert diffs and any("entry_state" in d for d in diffs), diffs
+
+    # ... while the TRADE-level one stays out of the verdict (its own section reports it).
+    assert m.compare_rows(_gated(m), _view(m)) == []
+    assert m._RESEARCH_KEYS == ("market_condition",)
+    assert m._SCOPED_RESEARCH_KEYS == {"trades": ("entry_state",)}
+
+
+def test_the_market_condition_block_is_still_dropped_at_any_depth():
+    """It is reached through both ``results`` and the run config, and nothing else ever carries
+    that name -- so it stays depth-free while entry_state does not."""
+    m = _tool()
+    a, b = _gated(m), _gated(m)
+    a["optimization_config"] = json.dumps({"backtest": {"market_condition": {"profiles": ["x"]}}})
+    b["optimization_config"] = json.dumps({"backtest": {"market_condition": {"profiles": ["y"]}}})
+    assert m.compare_rows(a, b) == []
