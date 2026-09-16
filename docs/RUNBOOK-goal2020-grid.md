@@ -447,6 +447,155 @@ that have actually changed conclusions in the past.
 powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Descending | Select-Object -First 5 @{n='MB';e={[math]::Round(\$_.Length/1MB,1)}},Name"
 ```
 
+## Market-condition feature store (design 2026-09-15)
+
+The `ohlcv-v1` profile adds three entry gates per option structure (trend slope, ADX, realized-
+volatility ratio), six searched genes each. They read a **published snapshot**: a manifest
+pinning immutable feature objects, built once before a run and mapped per host. **Nothing is
+computed in a trial.** With no profile selected (the default) none of this exists — the launcher
+emits no leaves, the seam installs nothing, and the run is byte-for-byte the one it has always
+been (pinned by `tests/backtest/test_market_condition_all_off_matches_baseline.py`).
+
+### Before the first gated grid: the 13 uncovered symbols — DECISION OWED
+
+The 2026-09-16 snapshot (`1136d489…f5cb3`, window 2020-01-01..2025-12-31) covers **85 of the 98**
+symbols in `tools/options_universe_top100.txt`. The other 13 —
+`ASML BHP DELL GE HON IBM MRK NVS RTX SAN SCCO T WDC` — carry a split whose basis the cached
+prices cannot settle, so the warmup refuses to compute from them (`refetch_required`).
+
+Two ways forward, and one of them must be chosen **before** the first gated grid:
+
+* **re-fetch** — `warm_market_conditions.py build --plan <plan> --fetch-missing`, which forces a
+  FULL FMP re-download for those symbols (a real provider bill and wall time — size it with
+  `plan` first), then re-publish and re-pin the new digest; or
+* **trim the universe** to the covered 85 and pass that file to the driver.
+
+There is no third option: the launcher **refuses to dispatch** a run whose pinned manifest does
+not cover its `enabled_instruments`, and the seam refuses a GA trial on the same condition. That
+refusal is deliberate. An uncovered symbol reads `missing_session` at every gate for the whole
+run, so the genome that would have traded it scores as though its strategy simply did not fire
+there — a feature-cache miss silently becoming a property of the fitness landscape.
+
+Record which was chosen here when it is.
+
+### Warm the snapshot (once, on the master, before any job)
+
+```bash
+MARKET_CONDITION_PROFILE=ohlcv-v1 tools/stage1_run.sh --dry-run    # prints the four commands
+```
+
+`--dry-run` never fetches and never launches; it prints the exact warm sequence for the
+resolved window and universe. Run those four, in order, on the master:
+
+```bash
+$PY tools/warm_market_conditions.py plan  --profile ohlcv-v1 \
+      --universe-file tools/options_universe_top100.txt \
+      --start 2020-01-01 --end 2025-12-31 --out market_conditions_plan.json
+$PY tools/warm_market_conditions.py build --plan market_conditions_plan.json \
+      --cache-only --print-digest          # stdout = the digest; the JSON report is on stderr
+$PY tools/warm_market_conditions.py verify       --manifest <digest>
+$PY tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1
+```
+
+* `plan` is an inventory plus a source preflight; a plan that reports missing coverage is
+  **actionable**, not a warning to pass. `--cache-only` on `build` is deliberate: a warmup that
+  fetches while a grid waits is a surprise provider bill measured in hours.
+* `verify` re-hashes every object and raw shard the manifest references.
+* `prepare-host` builds this box's mapped arrays. It is an **optimisation, not a correctness
+  requirement** — the master runs `prepare_host` itself before dispatch — but a cold first job
+  otherwise pays it.
+* Then launch with the digest pinned:
+
+```bash
+MARKET_CONDITION_PROFILE=ohlcv-v1 MARKET_CONDITION_MANIFEST=<digest> tools/stage1_run.sh
+```
+
+`stage1_run.sh` does the whole sequence itself when `MARKET_CONDITION_PROFILE` is set and
+`MARKET_CONDITION_MANIFEST` is not; it refuses to launch if any step fails.
+
+**Remote workers prepare themselves.** `distributed_eval._preflight_worker` calls
+`/market-conditions/prepare` after `push_cache`; a worker whose prepare fails is **excluded from
+the run** rather than handed trials it would answer with no rows.
+
+### Is a host ready?
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://<worker>:8100/health | jq .market_conditions.prepared
+```
+
+A list of digests. **A digest absent from it means "unready", never "run it anyway"** — the
+master's pre-flight reads exactly this. `/market-conditions/prepare` is submit/poll like a trial
+(it returns a `job_id`; the digest is admitted when the poll collects an `ok` report), because
+verifying a season of objects is minutes of I/O and as a blocking handler was indistinguishable
+from a hung worker.
+
+### Retention, revocation and sweeping
+
+* **There is no GC or compaction yet.** A future collector must walk **OBJECTS**, not only
+  manifests: whole-object reuse preserves old `raw_shard_ref` values verbatim, so a raw shard is
+  pinned by any manifest that transitively references it. Deleting by "manifests I still care
+  about" would strand exactly the shards a reused object still points at.
+* Progress records under `_derived/market_conditions_build` **expire after 24 h**.
+* Readiness markers of a revoked digest become `.revoked` and are **pruned after 30 days**.
+* **Revocation is scoped.** A corrupt cache push revokes only the digests whose verification
+  failed; manifests outside the push's scope are never revoked by an unreadable file.
+* A **`LAYOUT_VERSION` bump moves every mapped key**, so the old mapping directories are
+  orphaned on every host at once. Collect them with `tools/build_shared_arrays.py --sweep`,
+  which also drops dead readiness markers.
+* `BA2_SHARED_ARRAYS=0` loads the same central rows into **private** arrays: identical values,
+  still nothing recomputed. Use it to isolate a mapping problem from a data problem.
+
+### Live
+
+```
+BA2_MARKET_CONDITION_PROFILE=ohlcv-v1
+BA2_MARKET_CONDITION_MANIFEST=<digest>
+```
+
+Unset (or `none`) installs nothing. Set, and `wire_all_seams` installs the live resolver after
+**split-certifying** the FMP cache it will read.
+
+* **A certification failure does not stop the platform.** Exits and protective-order handling
+  must keep running, so an `UncertifiedSourceResolver` is installed instead: every gate resolves
+  no context with the certification summary as its reason (one ERROR at install, one WARNING per
+  field), so gated **entries** are refused loudly while everything else runs.
+* **Coverage is checked against the live universe** — the union of the enabled instruments of
+  every enabled expert instance whose enter-market ruleset carries a market leaf — at install and
+  again whenever that universe changes. Each uncovered symbol gets **one ERROR naming the
+  digest**, and its gates report `no_context` with that reason. An instance that picks its
+  universe at analysis time (`EXPERT`/`DYNAMIC`/`SCREENER`) cannot be pre-checked and is reported
+  as such.
+* **The first live run after this ships forces a FULL FMP re-fetch**, synchronously inside the
+  cache refresh, for every symbol whose split calendar shows a post-first-bar split that is mixed
+  or `undetectable` (factor < 1.5). Size it beforehand with `warm_market_conditions plan` over the
+  live universe — on the 98-symbol option universe that was 13 symbols.
+* Market leaves are refused on open-positions / exit rulesets, and an unresolved mode gene is
+  refused at export: live receives concrete conditions only.
+
+### Reading the results
+
+```bash
+$PY tools/report_market_conditions.py --opt <id> [--top 5] [--coverage] [--out report.md]
+$PY tools/report_market_conditions.py --like %ohlcv% --top 3
+```
+
+Per job: the versions **as persisted with the run**, the winning modes and thresholds per
+structure, the gate counters (eligible recommendations reported separately from gate rejections,
+and unknown input broken out by reason), submitted vs filled structures, per-year profit /
+return / drawdown from the account engine, and the attribution of net P&L and top-1/top-5
+concentration to explicit entry-state bins. `--coverage` adds the offline snapshot diagnostic,
+which is the one to run on a **feature-off** winner: it says which symbols and sessions would
+have been unknown, reading the manifest only.
+
+A bin is not an account. The report never annualises a filtered subset of overlapping trades,
+and neither should a summary of it.
+
+### Performance
+
+`testplatform/backend/tests_scripts/bench_market_conditions.py` (see
+`reports/strategy_research/market_conditions_bench_2026-09-16.md` for the measured numbers and
+the acceptance verdict). `--quick` runs the whole harness on a fabricated store in a second.
+
 ## remote227 (babatest) traps found 2026-09-15
 
 * **logind `RemoveIPC`** deletes a non-system user's POSIX semaphores (`/dev/shm/sem.mp-*`) when
