@@ -4,8 +4,11 @@ Design: ``docs/plans/2026-09-15-option-market-condition-genes-design.md`` sectio
 live adapter reads ``replay_now()`` once on the coordinating thread, then passes that value into
 any worker fan-out. Different analyses cannot share a mutable global clock."
 
-* The host installs a :class:`LiveMarketConditionResolver` into the ``TradeConditions`` seam
-  (only when a profile is configured; see ``resolver_from_env``).
+* The host installs a :class:`PerInstanceMarketConditionResolver` into the ``TradeConditions``
+  seam. The profile is an EXPERT SETTING (``market_condition_profile``, plan Task 12), so the
+  dispatcher builds and caches one :class:`LiveMarketConditionResolver` per expert instance that
+  names one; an expert with an empty setting gets none and its market leaves read ``no_context``
+  exactly as they do on a platform with the feature off.
 * The analysis coordinator wraps one decision pass in :func:`market_condition_decision_scope`.
   Entering it reads ``replay_now()`` ONCE on that thread -- and only when the resolver is
   installed, so gates-off costs no clock read -- and stores a :class:`DecisionState` in a
@@ -17,10 +20,12 @@ any worker fan-out. Different analyses cannot share a mutable global clock."
   through :func:`submit_in_decision_context` / wrap with :func:`run_in_decision_context`.
 
 Certification failure (DECISION 2026-09-16): a cache that fails split certification must NOT stop
-the platform -- exits and protective-order handling have to keep running. ``resolver_from_env``
-then returns an :class:`UncertifiedSourceResolver`: it resolves NO context for every leaf, its
+the platform -- exits and protective-order handling have to keep running. The dispatcher
+then serves an :class:`UncertifiedSourceResolver`: it resolves NO context for every leaf, its
 ``no_context_reason`` is the certification summary (carried by ``TradeConditions``' once-per-field
-WARNING), and one ERROR naming the failing symbols is logged at install. Every gated entry is
+WARNING), and one ERROR naming the failing symbols is logged when that expert's resolver is first
+built (certification is paid lazily, on the first expert whose setting names a profile, so a
+platform with the gates off everywhere never opens the cache at all). Every gated entry is
 refused loudly; nothing else changes.
 
 Capture/replay: if a replay capture context is active when the scope opens, the reader records
@@ -37,7 +42,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Callable, Iterator, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 from ba2_common.core.market_calendar import NY_TZ, prior_regular_session
 from ba2_common.core.market_condition_context import (
@@ -49,39 +54,50 @@ from ba2_common.core.market_condition_reader import coverage_detail, missing_cov
 from ba2_common.core.market_condition_source import SOURCE_PROFILE_FMP_DAILY
 
 __all__ = [
-    "PROFILE_ENV",
+    "PROFILE_ENV_RETIRED",
     "MANIFEST_ENV",
     "DecisionState",
     "LiveMarketConditionResolver",
+    "PerInstanceMarketConditionResolver",
     "current_decision",
     "market_condition_decision_scope",
     "run_in_decision_context",
     "submit_in_decision_context",
-    "resolver_from_env",
+    "assert_profile_env_retired",
+    "manifest_digests_from_env",
+    "resolver_for_profiles",
+    "resolver_for_expert_instance",
     "SourceCertificationError",
     "UncertifiedSourceResolver",
     "NO_DECISION_SCOPE_REASON",
     "UNIVERSE_SENTINELS",
     "gated_expert_instances",
+    "market_condition_fields_in_ruleset",
     "gated_live_universe",
 ]
 
-#: Environment switch for the live profile. Unset, empty or ``none`` -> nothing is installed.
+#: RETIRED (plan Task 12, operator decision 2026-09-16). The live profile used to be this
+#: process-wide environment variable; it is now the expert setting ``market_condition_profile``
+#: (``market_condition_rules.PROFILE_SETTING``), read by live and by backtests from the same
+#: place, so an expert carries its gates' data supply the way it carries its ruleset.
 #:
-#: SINGLE PROFILE, deliberately. Task 10 widened the BACKTEST seam to a profile LIST (one reader
-#: per profile behind ``market_condition_reader_for``); live still serves ONE, because its reader
-#: is also the capture/replay tape and the coverage subject, and making those plural is its own
-#: piece of work with its own recorded-identity contract. This is not a silent gap: a deployed
-#: leaf whose field belongs to a profile this resolver does not serve raises ``LookupError`` in
-#: ``MarketConditionCompare.evaluate`` ("the reader was not built for this field's profile"), and
-#: a comma list here is refused by the reader as an unregistered profile name. Deploy a
-#: multi-profile genome only after the live side is widened too.
-PROFILE_ENV = "BA2_MARKET_CONDITION_PROFILE"
+#: The name is kept ONLY so a set value can FAIL. A deploy script that still exports it would
+#: otherwise say nothing at all: the variable is read nowhere, every expert's setting decides,
+#: and an operator who believed the export was doing something would be running whatever the
+#: settings rows happen to hold. See :func:`assert_profile_env_retired`.
+PROFILE_ENV_RETIRED = "BA2_MARKET_CONDITION_PROFILE"
 
-#: The prepared manifest digest the live instance serves (design section 4.5: "Scheduled analysis
-#: consumes a pinned manifest"). Set -> the reader serves that published snapshot and calculates
-#: nothing. Unset -> the reader computes on a miss from the FMP cache, which is research/dev
-#: behaviour and is logged ONCE per process by ``warn_research_mode``.
+#: The prepared manifest digest(s) the live instance serves (design section 4.5: "Scheduled
+#: analysis consumes a pinned manifest"). Set -> the reader serves that published snapshot and
+#: calculates nothing. Unset -> the reader computes on a miss from the FMP cache, which is
+#: research/dev behaviour and is logged ONCE per process by ``warn_research_mode``.
+#:
+#: STILL AN ENVIRONMENT VARIABLE, unlike the profile, and deliberately: a manifest is DATA
+#: IDENTITY (which warmed snapshot this host serves), not a property of a strategy -- the same
+#: split the backtest keeps between the per-expert profile setting and the job-level
+#: ``market_condition_manifests`` pin. Two shapes, both parsed by
+#: :func:`manifest_digests_from_env`: a bare digest (only meaningful when the expert names ONE
+#: profile) or ``profile=digest`` pairs, comma-separated.
 MANIFEST_ENV = "BA2_MARKET_CONDITION_MANIFEST"
 
 #: What ``get_enabled_instruments`` returns INSTEAD of symbols when the instance picks its
@@ -107,12 +123,114 @@ class SourceCertificationError(RuntimeError):
         self.report = report
 
 
+def _profile_tuple(profile: Any) -> Tuple[str, ...]:
+    """``profile`` as a tuple of names: one string stays one name, a sequence is taken in order.
+
+    A plain string is NOT split on commas here. The comma list is the SETTING's spelling and it
+    has exactly one parser (``market_condition_rules.parse_profile_setting``, which refuses an
+    unregistered or repeated name); splitting it a second time in this module is how the two
+    would eventually disagree.
+    """
+    if isinstance(profile, str):
+        return (profile,)
+    names = tuple(str(p) for p in profile)
+    if len(set(names)) != len(names):
+        raise ValueError(f"market-condition profiles repeat a name: {list(names)!r}")
+    return names
+
+
+def _reader_profiles(reader: Any) -> Tuple[str, ...]:
+    """The profiles a reader serves: a composite's ``profiles``, else its single ``profile``."""
+    plural = getattr(reader, "profiles", None)
+    if plural is not None:
+        return tuple(plural)
+    return (reader.profile,)
+
+
+def _fmp_cache_reader(profile: str, cache_root: Optional[str] = None, *,
+                      manifest_digest: Optional[str] = None) -> Any:
+    """One profile's live reader. Indirection so a test can build resolvers without a cache."""
+    from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
+
+    if cache_root is None:
+        return FMPCacheMarketConditionReader(profile, manifest_digest=manifest_digest)
+    return FMPCacheMarketConditionReader(profile, cache_root, manifest_digest=manifest_digest)
+
+
+def assert_profile_env_retired(environ: Optional[Any] = None) -> None:
+    """FAIL if the retired ``BA2_MARKET_CONDITION_PROFILE`` is set (plan Task 12).
+
+    Nothing reads the variable any more: the profile is the expert setting
+    ``market_condition_profile``. Ignoring a stale export would leave an operator believing the
+    platform is gated the way the environment says while every expert's setting decides on its
+    own -- so the process refuses to finish wiring instead.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get(PROFILE_ENV_RETIRED) or "").strip()
+    if not raw:
+        return
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING
+
+    raise RuntimeError(
+        f"{PROFILE_ENV_RETIRED}={raw!r} is set, but the market-condition profile is an expert "
+        f"setting now ({PROFILE_SETTING} on each ExpertInstance, chosen in the Settings page and "
+        f"carried by the deploy payload). Nothing reads this variable: leaving it set would say "
+        f"the platform is gated when the settings rows are what decide. Unset it, and set "
+        f"{PROFILE_SETTING} on the experts that should be gated.")
+
+
+def manifest_digests_from_env(profiles: Sequence[str],
+                              environ: Optional[Any] = None) -> Dict[str, str]:
+    """``{profile: digest}`` from :data:`MANIFEST_ENV`, for the profiles an expert names.
+
+    Two accepted shapes, mirroring the backtest seam's singular/plural manifest pins:
+
+    * ``<digest>`` -- a bare digest, valid only when exactly one profile is served (a manifest
+      names the ONE profile it was warmed for, so a bare digest for two profiles is refused
+      rather than silently applied to both);
+    * ``<profile>=<digest>,<profile>=<digest>`` -- explicit pairs. A pair for a profile the
+      expert does not serve is refused: nothing would read it, while the digest suggests the
+      snapshot is in use.
+
+    Unset/empty -> ``{}`` (research mode; the reader computes on a miss and warns once).
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get(MANIFEST_ENV) or "").strip()
+    profiles = tuple(profiles)
+    if not raw:
+        return {}
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if any("=" in t for t in tokens):
+        pins: Dict[str, str] = {}
+        for token in tokens:
+            if "=" not in token:
+                raise ValueError(f"{MANIFEST_ENV}={raw!r} mixes bare digests with "
+                                 f"profile=digest pairs; use one shape")
+            name, _, digest = token.partition("=")
+            name, digest = name.strip(), digest.strip()
+            if name not in profiles:
+                raise ValueError(f"{MANIFEST_ENV} pins profile {name!r}, which this expert does "
+                                 f"not serve (profiles: {list(profiles)!r}): nothing would read "
+                                 f"that snapshot.")
+            if not digest:
+                raise ValueError(f"{MANIFEST_ENV}={raw!r} has no digest for {name!r}")
+            pins[name] = digest
+        return pins
+    if len(tokens) != 1 or len(profiles) != 1:
+        raise ValueError(
+            f"{MANIFEST_ENV}={raw!r} is a bare digest but the expert serves "
+            f"{len(profiles)} profile(s) {list(profiles)!r}. A manifest names the ONE profile it "
+            f"was warmed for: pin it as profile=digest pairs.")
+    return {profiles[0]: tokens[0]}
+
+
 class UncertifiedSourceResolver:
     """Installed instead of a live resolver when the served cache failed certification: resolves
     no context, ever, and says why. Opening a decision scope with it is a no-op (no clock read)."""
 
-    def __init__(self, profile: str, report: Any, *, source_profile: str = SOURCE_PROFILE_FMP_DAILY):
-        self.profile = profile
+    def __init__(self, profile: Any, report: Any, *, source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+        self.profiles = _profile_tuple(profile)
+        self.profile = ",".join(self.profiles)
         self.source_profile = source_profile
         self.report = report
         self.failing_symbols = tuple(c.symbol for c in report.symbols if not c.consistent)
@@ -120,6 +238,12 @@ class UncertifiedSourceResolver:
             f"market-condition gates DISABLED: {SourceCertificationError(report)}")
 
     def __call__(self, account: Any, instrument_name: str, expert_recommendation: Any) -> None:
+        return None
+
+    def no_context_reason_for(self, symbol: Any) -> Optional[str]:
+        """No per-SYMBOL reason: certification is a property of the whole cache, so every symbol
+        gets the same class-level :attr:`no_context_reason`. Defined rather than left absent so
+        the dispatcher can ask any resolver it holds the same question."""
         return None
 
 
@@ -167,6 +291,32 @@ class DecisionState:
             return self._context
 
 
+def market_condition_fields_in_ruleset(ruleset_id: Any) -> Tuple[Tuple[str, str], ...]:
+    """``(label, field)`` for every market-condition leaf in a PERSISTED live ruleset.
+
+    Persisted rules are ``EventAction.triggers`` -- ``{"cond_0": {"event_type": ...}}`` -- NOT
+    the condition trees ``iter_market_condition_leaves`` walks, which key on ``field``. The two
+    vocabularies meet because every market field's ``ExpertEventType`` VALUE is the field name
+    (pinned by ``rule_builders.register_market_condition_field_events``), so the membership test
+    is the trigger's ``event_type`` against ``market_condition_fields()``.
+
+    The label is ``<action name>.<trigger key>`` so a refusal points at something the operator
+    can find on the rules page. ``ruleset_id`` of ``None`` yields nothing (no ruleset assigned).
+    """
+    from ba2_common.core.db import ruleset_event_actions
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
+    if ruleset_id is None:
+        return ()
+    fields = market_condition_fields()
+    found: list = []
+    for action in ruleset_event_actions(ruleset_id):
+        for key, trigger in (action.triggers or {}).items():
+            if isinstance(trigger, Mapping) and trigger.get("event_type") in fields:
+                found.append((f"{action.name}.{key}", str(trigger["event_type"])))
+    return tuple(found)
+
+
 def gated_expert_instances() -> Tuple[int, ...]:
     """Ids of the ENABLED expert instances whose ENTER-MARKET ruleset carries a market leaf.
 
@@ -175,27 +325,18 @@ def gated_expert_instances() -> Tuple[int, ...]:
     open-positions ruleset, and the whole point of that refusal is that the live resolver has no
     context outside the entry decision pass).
 
-    Persisted rules are ``EventAction.triggers`` -- a dict of ``{"cond_0": {"event_type": ...}}``
-    -- NOT the condition trees ``iter_market_condition_leaves`` walks, which key on ``field``.
-    The two vocabularies meet because every market field's ``ExpertEventType`` VALUE is the field
-    name (pinned by ``rule_builders.register_market_condition_field_events``), so the membership
-    test is the trigger's ``event_type`` against :func:`market_condition_fields`.
+    The leaf walk itself is :func:`market_condition_fields_in_ruleset` (persisted rules speak
+    ``EventAction.triggers``, not condition trees).
     """
-    from ba2_common.core.db import get_all_instances, ruleset_event_actions
-    from ba2_common.core.market_condition_rules import market_condition_fields
+    from ba2_common.core.db import get_all_instances
     from ba2_common.core.models import ExpertInstance
 
-    fields = market_condition_fields()
     found: list = []
     for instance in get_all_instances(ExpertInstance):
         if not instance.enabled or not instance.enter_market_ruleset_id:
             continue
-        for action in ruleset_event_actions(instance.enter_market_ruleset_id):
-            triggers = action.triggers or {}
-            if any(isinstance(t, Mapping) and t.get("event_type") in fields
-                   for t in triggers.values()):
-                found.append(int(instance.id))
-                break
+        if market_condition_fields_in_ruleset(instance.enter_market_ruleset_id):
+            found.append(int(instance.id))
     return tuple(found)
 
 
@@ -237,17 +378,31 @@ class LiveMarketConditionResolver:
     #: Surfaced by ``TradeConditions`` when this resolver returns no context.
     no_context_reason = NO_DECISION_SCOPE_REASON
 
-    def __init__(self, profile: str, *, reader: Optional[Any] = None,
+    def __init__(self, profile: Any, *, reader: Optional[Any] = None,
                  source_profile: str = SOURCE_PROFILE_FMP_DAILY,
                  manifest_digest: Optional[str] = None):
+        """``profile`` is ONE registered name or a sequence of them (Task 12: an expert's
+        ``market_condition_profile`` setting may list more than one). ``reader`` must serve
+        exactly those profiles -- a single reader for one, a
+        ``CompositeMarketConditionReader`` for several; build it with
+        :func:`resolver_for_profiles` rather than by hand."""
         from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
 
+        profiles = _profile_tuple(profile)
+        if len(profiles) != 1 and reader is None:
+            raise ValueError(f"a default FMP-cache reader serves ONE profile; {list(profiles)!r} "
+                             f"needs resolver_for_profiles to build one reader per profile")
         self.reader = reader if reader is not None else FMPCacheMarketConditionReader(
-            profile, manifest_digest=manifest_digest)
+            profiles[0], manifest_digest=manifest_digest)
         self.manifest_digest = manifest_digest
-        if self.reader.profile != profile:
-            raise ValueError(f"reader serves profile {self.reader.profile!r}, resolver wants {profile!r}")
-        self.profile = profile
+        served = _reader_profiles(self.reader)
+        if served != profiles:
+            raise ValueError(f"reader serves profile(s) {list(served)!r}, resolver wants "
+                             f"{list(profiles)!r}")
+        self.profiles = profiles
+        #: The comma-joined name, for logs and for a single-profile resolver's ``.profile``
+        #: (unchanged for every existing caller and test).
+        self.profile = ",".join(profiles)
         self.calc_version = self.reader.calc_version
         self.source_profile = source_profile
         #: clock reads taken by ``begin_decision`` (visibility for tests and diagnostics).
@@ -293,9 +448,24 @@ class LiveMarketConditionResolver:
         return DecisionState(resolver=self, decision_time=decision_time, reader=self.reader)
 
     @property
-    def mapped_reader(self) -> Optional[Any]:
-        """The pinned snapshot behind this resolver's reader, or None (research mode)."""
-        return getattr(self.reader, "mapped_reader", None)
+    def mapped_readers(self) -> Tuple[Optional[Any], ...]:
+        """Each served profile's pinned snapshot, in profile order; ``None`` where that profile
+        is in research mode (no manifest pinned, the reader computes on a miss).
+
+        PLURAL, and there is no singular counterpart on purpose. A composite reader's
+        ``mapped_reader`` raises ``TypeError`` (Task 10 review finding): every host-side coverage
+        check in this codebase used to be written ``getattr(reader, "mapped_reader", None)``
+        followed by "None means research mode, nothing to check", which for a two-profile
+        resolver would report a clean bill of health for snapshots it never opened. So the
+        composite is asked its own plural question, and a single reader is wrapped into a
+        one-tuple here. The ``getattr`` below is the SINGLE-reader case only -- a reader that
+        does not define ``mapped_reader`` at all (a test double, a capture wrapper) is genuinely
+        in research mode, which is the same thing a ``None`` attribute means.
+        """
+        plural = getattr(self.reader, "mapped_readers", None)
+        if plural is not None:
+            return tuple(plural)
+        return (getattr(self.reader, "mapped_reader", None),)
 
     def no_context_reason_for(self, symbol: Any) -> Optional[str]:
         """Why THIS symbol has no context, or None to fall back to the generic reason.
@@ -308,7 +478,7 @@ class LiveMarketConditionResolver:
 
     def refresh_coverage(self, universe: Optional[Any] = None, *, force: bool = False,
                          at_install: bool = False) -> list:
-        """Check the pinned snapshot against the LIVE universe; return the missing symbols.
+        """Check every pinned snapshot against the LIVE universe; return the missing symbols.
 
         THE FAILURE THIS PREVENTS is the live twin of the backtest seam's: a symbol the warmup
         could not warm has no row, every gate on it reads ``missing_session``, and the sleeve
@@ -332,9 +502,11 @@ class LiveMarketConditionResolver:
         being checked at all, so it is reported once per distinct cause rather than swallowed
         into the install flag's budget.
         """
-        mapped = self.mapped_reader
-        if mapped is None:
-            return []                    # no manifest pinned: nothing to check against
+        mapped_by_profile = [(profile, mapped)
+                             for profile, mapped in zip(self.profiles, self.mapped_readers)
+                             if mapped is not None]
+        if not mapped_by_profile:
+            return []                    # no manifest pinned anywhere: nothing to check against
         deferred: tuple = ()
         if universe is None:
             try:
@@ -367,38 +539,51 @@ class LiveMarketConditionResolver:
                 f"market-condition coverage: expert instances "
                 f"{sorted({i for i, _ in deferred})} pick their universe at analysis time "
                 f"({sorted({s for _, s in deferred})}), so their symbols cannot be checked "
-                f"against manifest {mapped.manifest_digest} in advance; an uncovered one reads "
-                f"missing_session at the gate.")
+                f"against manifest(s) "
+                f"{ {p: m.manifest_digest for p, m in mapped_by_profile} } in advance; an "
+                f"uncovered one reads missing_session at the gate.")
         # ONE recompute at a time, and the cache key is published LAST. Two analyses can open a
         # decision scope concurrently (the UI route and the worker queue both call the entry
         # pass); setting the key first would let the second pass see "already checked" and read
         # the PREVIOUS ``uncovered`` -- usually empty -- so its uncovered symbols would report
         # the generic reason instead of the coverage one, intermittently.
+        # PER PROFILE. Each profile is its own warmed snapshot with its own symbol set, so
+        # "is this universe covered" has one answer per profile and a symbol that ANY pinned
+        # profile misses is uncovered: the leaves of that profile would read nothing for it,
+        # which is the silent subset this check exists to break.
         with self._coverage_lock:
             if key == self._checked_universe and not force:
                 return [s for s in key if s in self.uncovered]
-            missing = missing_coverage(mapped, key)
-            self.uncovered = {
-                symbol: (f"market-condition manifest {mapped.manifest_digest} has no rows for "
-                         f"{symbol}: its gates are unknown and refuse the entry rather than "
-                         f"passing unmeasured")
-                for symbol in missing}
+            reasons: Dict[str, list] = {}
+            missing_by_profile: list = []
+            for profile, mapped in mapped_by_profile:
+                missing_here = missing_coverage(mapped, key)
+                if missing_here:
+                    missing_by_profile.append((profile, mapped, missing_here))
+                for symbol in missing_here:
+                    reasons.setdefault(symbol, []).append(
+                        f"market-condition manifest {mapped.manifest_digest} has no rows for "
+                        f"{symbol}: its gates are unknown and refuse the entry rather than "
+                        f"passing unmeasured")
+            missing = [s for s in key if s in reasons]
+            self.uncovered = {symbol: "; ".join(why) for symbol, why in reasons.items()}
             self._checked_universe = key
         if missing:
             from ba2_common.logger import logger
 
-            detail = coverage_detail(mapped, missing)
-            for symbol in missing:
-                if symbol in self._coverage_reported:
-                    continue
-                self._coverage_reported.add(symbol)
-                logger.error(
-                    f"market-condition manifest {mapped.manifest_digest} does not cover "
-                    f"{symbol} ({len(missing)} of {len(key)} live instruments uncovered"
-                    f"{detail}). Every gate on {symbol} is unknown, so this sleeve will not "
-                    f"enter it. Warm and re-publish the snapshot for the live universe "
-                    f"(tools/warm_market_conditions.py plan/build), or take the gate off that "
-                    f"instance.")
+            for profile, mapped, missing_here in missing_by_profile:
+                detail = coverage_detail(mapped, missing_here)
+                for symbol in missing_here:
+                    if (profile, symbol) in self._coverage_reported:
+                        continue
+                    self._coverage_reported.add((profile, symbol))
+                    logger.error(
+                        f"market-condition manifest {mapped.manifest_digest} does not cover "
+                        f"{symbol} ({len(missing_here)} of {len(key)} live instruments uncovered"
+                        f"{detail}). Every gate on {symbol} is unknown, so this sleeve will not "
+                        f"enter it. Warm and re-publish the snapshot for the live universe "
+                        f"(tools/warm_market_conditions.py plan/build), or take the gate off that "
+                        f"instance.")
         return missing
 
     def __call__(self, account: Any, instrument_name: str,
@@ -418,17 +603,57 @@ def current_decision() -> Optional[DecisionState]:
     return _DECISION.get()
 
 
-@contextmanager
-def market_condition_decision_scope(*, replay_reader: Optional[Any] = None) -> Iterator[Optional[DecisionState]]:
-    """Open one decision pass. A no-op (no clock read, yields ``None``) unless a
-    ``LiveMarketConditionResolver`` is installed in ``TradeConditions``.
+def resolver_for_expert_instance(expert_instance_id: Optional[Any]
+                                 ) -> Optional["LiveMarketConditionResolver"]:
+    """The live resolver that serves ``expert_instance_id``'s gates, or ``None``.
 
-    Nested scopes reuse the OUTER state (same decision time, same context, no second clock read):
-    one decision pass has one clock, however many helpers open a scope inside it."""
+    ONE reader of the seam for the two live callers (the decision scope and TradeManager's
+    replay-capture scope), so "is this expert gated" is answered the same way in both:
+
+    * a :class:`PerInstanceMarketConditionResolver` (what ``wire_all_seams`` installs) is asked
+      for THIS expert -- the profile is its setting, so there is no process-wide answer, and an
+      id of ``None`` is a wiring defect rather than a reason to pick some other expert's
+      resolver;
+    * a :class:`LiveMarketConditionResolver` installed directly (a test, a benchmark) is used
+      as-is;
+    * anything else -- nothing installed, an ``UncertifiedSourceResolver``, a bare callable --
+      is ``None``: no clock is read and no capture bundle is opened, which is exactly the
+      behaviour an expert with no usable market-condition data must have.
+    """
     from ba2_common.core.TradeConditions import get_market_condition_context_resolver
 
     resolver = get_market_condition_context_resolver()
-    if not isinstance(resolver, LiveMarketConditionResolver):
+    if isinstance(resolver, PerInstanceMarketConditionResolver):
+        if expert_instance_id is None:
+            raise ValueError(
+                "the market-condition profile is an expert setting, so resolving one needs the "
+                "expert_instance_id whose decision pass this is; there is no process-wide "
+                "resolver to fall back on.")
+        resolver = resolver.resolver_for(expert_instance_id)
+    if isinstance(resolver, LiveMarketConditionResolver):
+        return resolver
+    return None
+
+
+@contextmanager
+def market_condition_decision_scope(*, expert_instance_id: Optional[Any] = None,
+                                    replay_reader: Optional[Any] = None
+                                    ) -> Iterator[Optional[DecisionState]]:
+    """Open one decision pass for ONE expert instance. A no-op (no clock read, yields ``None``)
+    unless that expert has a live market-condition resolver.
+
+    ``expert_instance_id`` is what selects the resolver, because the profile is that expert's
+    setting (plan Task 12): the caller is the entry pass, which already knows whose
+    recommendations it is about to evaluate. It is REQUIRED when the installed seam is a
+    :class:`PerInstanceMarketConditionResolver` -- guessing would mean opening a pass under some
+    other expert's profile, and silently serving one strategy's gates from another's snapshot is
+    worse than refusing. A directly installed :class:`LiveMarketConditionResolver` (a test, a
+    benchmark) is used as-is and ignores the id.
+
+    Nested scopes reuse the OUTER state (same decision time, same context, no second clock read):
+    one decision pass has one clock, however many helpers open a scope inside it."""
+    resolver = resolver_for_expert_instance(expert_instance_id)
+    if resolver is None:
         yield None
         return
     outer = _DECISION.get()
@@ -472,33 +697,20 @@ def submit_in_decision_context(executor: Any, fn: Callable, *args, **kwargs):
     return executor.submit(ctx.run, functools.partial(fn, *args, **kwargs))
 
 
-def resolver_from_env(environ: Optional[Any] = None,
-                      cache_root: Optional[str] = None) -> Optional[Any]:
-    """``LiveMarketConditionResolver`` for ``BA2_MARKET_CONDITION_PROFILE``, or ``None`` when the
-    variable is unset/empty/``none``.
+def certify_cache_root(cache_root: Optional[str] = None) -> Tuple[str, Any]:
+    """``(root, report)`` for the FMP cache the live readers will read, MEMOISED per root.
 
-    Before installing, the cache the reader will read is CERTIFIED (``certify_source_columns``:
-    two parquet reads). ``cache_root`` defaults to ``native_cache.CACHE_FOLDER`` -- the root the
-    default ``FMPCacheMarketConditionReader`` resolves its files under, so the certified cache is
-    the served cache.
+    Certification is two parquet reads (``certify_source_columns``) and it proves the SOURCE the
+    rows are computed from is the one this installation believes in. It is paid ONCE per cache
+    root per process, on the first expert whose ``market_condition_profile`` is non-empty -- so a
+    platform with the gates off everywhere pays nothing, which is the same "off costs nothing"
+    contract the rest of this module keeps.
 
-    A cache that fails certification does NOT raise: it returns an
-    ``UncertifiedSourceResolver`` (gates refuse with the certification reason) and logs ONE
-    ERROR naming the failing symbols -- see the module docstring's DECISION.
-
-    Raises:
-        ValueError: an unregistered profile name (loud misconfiguration).
+    ``cache_root=None`` means ``native_cache.CACHE_FOLDER``, the root the default
+    ``FMPCacheMarketConditionReader`` resolves its files under; the RESOLVED root is returned and
+    is what the readers are then built on, so the certified cache and the served cache cannot
+    differ (which is the one thing certification is supposed to establish).
     """
-    env = os.environ if environ is None else environ
-    raw = (env.get(PROFILE_ENV) or "").strip()
-    if not raw or raw.lower() == "none":
-        return None
-    from ba2_common.core.market_conditions import PROFILES
-
-    if raw not in PROFILES:
-        raise ValueError(f"{PROFILE_ENV}={raw!r} is not a registered market-condition profile "
-                         f"({sorted(PROFILES)!r})")
-    from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
     from ba2_common.core.market_condition_source import certify_source_columns
 
     if cache_root is None:
@@ -506,30 +718,247 @@ def resolver_from_env(environ: Optional[Any] = None,
         root = native_cache.CACHE_FOLDER
     else:
         root = cache_root
+    with _CERTIFICATION_LOCK:
+        cached = _CERTIFICATIONS.get(root)
+    if cached is not None:
+        return root, cached
     report = certify_source_columns(root)
-    if not report.consistent:
+    with _CERTIFICATION_LOCK:
+        _CERTIFICATIONS[root] = report
+    return root, report
+
+
+def clear_certification_cache() -> None:
+    """Forget every memoised certification (a test writing a new cache; an ops re-check)."""
+    with _CERTIFICATION_LOCK:
+        _CERTIFICATIONS.clear()
+
+
+def resolver_for_profiles(profiles: Sequence[str], *,
+                          source_profile: str = SOURCE_PROFILE_FMP_DAILY,
+                          manifest_digests: Optional[Mapping[str, str]] = None,
+                          cache_root: Optional[str] = None) -> "LiveMarketConditionResolver":
+    """A live resolver serving ``profiles``: ONE reader per profile, joined by
+    ``market_condition_reader_for`` (the reader itself for a single profile, a
+    ``CompositeMarketConditionReader`` for several -- the same join the backtest seam makes, so
+    the two sides read a multi-profile genome identically).
+
+    ``manifest_digests`` pins each profile's published snapshot; a profile without one computes
+    on a miss and warns once (research/dev). Certification is NOT done here -- the caller
+    (:class:`PerInstanceMarketConditionResolver`) certifies the root once and degrades to an
+    :class:`UncertifiedSourceResolver` when it fails, so a failure refuses every gate loudly
+    instead of being re-decided per expert.
+
+    Raises:
+        ValueError: no profile at all, or a digest for a profile that is not served.
+    """
+    from ba2_common.core.market_condition_readers import market_condition_reader_for
+
+    names = _profile_tuple(profiles)
+    if not names:
+        raise ValueError("resolver_for_profiles needs at least one profile; an expert with an "
+                         "empty market_condition_profile setting gets NO resolver, not an empty "
+                         "one (its market leaves then read no_context, as on a platform with the "
+                         "feature off)")
+    digests = dict(manifest_digests or {})
+    extra = sorted(set(digests) - set(names))
+    if extra:
+        raise ValueError(f"manifest digest(s) pinned for profile(s) {extra!r} this resolver does "
+                         f"not serve (profiles: {list(names)!r}): nothing would read them.")
+    readers = [_fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name))
+               for name in names]
+    return LiveMarketConditionResolver(
+        names, reader=market_condition_reader_for(readers), source_profile=source_profile,
+        manifest_digest=digests.get(names[0]) if len(names) == 1 else None)
+
+
+#: Sentinel for "not in the resolver cache" -- a cached ``None`` (an expert with an empty
+#: setting) is a real answer and must not send every leaf back to the settings.
+_UNBUILT = object()
+
+#: ``cache root -> certification report``, with its lock. Certification is two parquet reads and
+#: its answer is a property of the cache, not of the expert asking.
+_CERTIFICATIONS: Dict[str, Any] = {}
+_CERTIFICATION_LOCK = threading.Lock()
+
+#: The ``(instance id, resolver)`` the LAST dispatch on THIS thread selected (resolver ``None``
+#: when the expert has no profile). Read ONLY by the dispatcher's reason accessors, which
+#: ``TradeConditions`` calls immediately after ``__call__`` returned None on the same thread: the
+#: reason for "no context" depends on WHICH expert was evaluated, and the seam's
+#: ``no_context_reason_for(symbol)`` is handed a symbol only. A ContextVar rather than a global
+#: so two concurrent decision passes cannot read each other's reason.
+_LAST_DISPATCH: contextvars.ContextVar[Optional[Tuple[Any, Any]]] = contextvars.ContextVar(
+    "ba2_market_condition_last_dispatch", default=None)
+
+
+class PerInstanceMarketConditionResolver:
+    """The live ``TradeConditions`` resolver: one :class:`LiveMarketConditionResolver` per EXPERT
+    INSTANCE that names a ``market_condition_profile`` (plan Task 12).
+
+    Installed unconditionally by ``wire_all_seams``; building it touches no cache, reads no
+    settings and certifies nothing. The first expert whose setting is non-empty pays the
+    certification (once per cache root) and gets its own resolver, cached under
+    ``(instance_id, profiles)``; an expert whose setting is empty gets ``None``, and its market
+    leaves read ``no_context`` exactly as on a platform with the feature off. A ruleset carrying
+    such a leaf is refused at settings-save / deploy-import time by
+    ``market_condition_rules.assert_market_fields_served`` rather than deployed unable to enter.
+
+    The cache key carries the PROFILES as well as the id, so a settings change cannot be served
+    from a stale resolver even if an invalidation is missed. The invalidations
+    (:meth:`clear_cache`) are wired to ``/api/reload`` and to the live instance invalidation a
+    settings save triggers all the same, because a changed MANIFEST or cache root does not change
+    the key.
+    """
+
+    def __init__(self, *, source_profile: str = SOURCE_PROFILE_FMP_DAILY,
+                 cache_root: Optional[str] = None,
+                 environ: Optional[Any] = None):
+        self.source_profile = source_profile
+        self.cache_root = cache_root
+        self._environ = environ
+        self._resolvers: Dict[Any, Any] = {}
+        self._lock = threading.Lock()
+        self._settings_errors: set = set()
+
+    # -- settings ---------------------------------------------------------------------------
+    def profiles_for(self, expert_instance_id: Any) -> Tuple[str, ...]:
+        """The profiles this expert's setting names (``()`` when it is empty).
+
+        Reads the expert through the instance-resolver seam -- the same accessor
+        :func:`gated_live_universe` uses, which the live host backs with
+        ``get_expert_instance_from_id`` and its instance/settings caches. An unreadable instance
+        or an unparseable setting is reported ONCE per distinct cause and treated as "no
+        profile": a settings fault must not stop exits and protective-order handling, and the
+        gates it would have fed then refuse every entry loudly on their own.
+        """
+        from ba2_common.core.instance_resolver import get_instance_resolver
+        from ba2_common.core.market_condition_rules import PROFILE_SETTING, parse_profile_setting
+
+        try:
+            expert = get_instance_resolver().get_expert_instance(int(expert_instance_id))
+            return parse_profile_setting(expert.settings.get(PROFILE_SETTING))
+        except Exception as e:  # noqa: BLE001 -- a settings fault never stops the pass
+            from ba2_common.logger import logger
+
+            key = (expert_instance_id, str(e))
+            if key not in self._settings_errors:
+                self._settings_errors.add(key)
+                logger.error(
+                    f"market-condition profile for expert instance {expert_instance_id} could "
+                    f"not be read ({e}): its market-condition gates are unknown and will refuse "
+                    f"every entry until this clears. Every other rule is unaffected.")
+            return ()
+
+    # -- dispatch ---------------------------------------------------------------------------
+    def resolver_for(self, expert_instance_id: Any) -> Optional[Any]:
+        """This expert's resolver, built and cached on first use; ``None`` for an empty setting.
+
+        May return an :class:`UncertifiedSourceResolver` (cached like any other): the served
+        cache failed split certification, so every gated entry is refused with the certification
+        summary as its reason while exits keep running (module DECISION 2026-09-16).
+
+        RAISES on a malformed :data:`MANIFEST_ENV` -- deliberately, and unlike a settings fault.
+        A manifest is the host's ops configuration, not a strategy's preference, and the quiet
+        readings of a broken one are both unacceptable: ignoring it computes the indicators live
+        per decision (design 4.5 forbids that silently) and guessing a mapping serves one
+        profile's snapshot for another. Only the ENTRY pass reaches here, so exits and
+        protective-order handling keep running either way.
+        """
+        profiles = self.profiles_for(expert_instance_id)
+        if not profiles:
+            return None
+        key = (int(expert_instance_id), profiles)
+        with self._lock:
+            hit = self._resolvers.get(key, _UNBUILT)
+        if hit is not _UNBUILT:
+            return hit
+        resolver = self._build(profiles)
+        with self._lock:
+            # Another thread may have built it first; either object is correct, and keeping the
+            # one already published means concurrent passes share a reader (and its memo).
+            resolver = self._resolvers.setdefault(key, resolver)
+        return resolver
+
+    def _build(self, profiles: Tuple[str, ...]) -> Any:
         from ba2_common.logger import logger
 
-        degraded = UncertifiedSourceResolver(raw, report)
-        logger.error(
-            f"{PROFILE_ENV}={raw}: source {report.source_profile} FAILED certification for "
-            f"{', '.join(degraded.failing_symbols)} under {report.cache_root}; market-condition "
-            f"gates will refuse every entry. {SourceCertificationError(report)}")
-        return degraded
-    # The pinned snapshot, if the deployment has one. Certification still runs and still decides:
-    # it proves the SOURCE the rows were computed from is the one this instance believes in, and a
-    # cache that fails it degrades the gates to "refuse loudly" whether or not a manifest is set.
-    digest = (env.get(MANIFEST_ENV) or "").strip() or None
-    # ``root``, not ``cache_root``: root is the root that was just CERTIFIED (cache_root is None
-    # for the default deployment, and the reader would then resolve its own root again -- so the
-    # certified cache and the served cache could differ, which is the one thing certification is
-    # supposed to establish).
-    resolver = LiveMarketConditionResolver(
-        raw, reader=FMPCacheMarketConditionReader(raw, root, manifest_digest=digest),
-        manifest_digest=digest)
-    # AT INSTALL, best effort: ``wire_all_seams`` runs before ``init_db``, so the expert/ruleset
-    # read can legitimately fail here. It is not skipped in that case -- ``begin_decision``
-    # re-checks on every pass -- but an operator who HAS a readable DB finds the uncovered
-    # symbols in the startup log rather than after a week of a sleeve not entering.
-    resolver.refresh_coverage(at_install=True)
-    return resolver
+        root, report = certify_cache_root(self.cache_root)
+        if not report.consistent:
+            degraded = UncertifiedSourceResolver(profiles, report,
+                                                 source_profile=self.source_profile)
+            logger.error(
+                f"market-condition profile(s) {list(profiles)}: source {report.source_profile} "
+                f"FAILED certification for {', '.join(degraded.failing_symbols)} under "
+                f"{report.cache_root}; market-condition gates will refuse every entry. "
+                f"{SourceCertificationError(report)}")
+            return degraded
+        digests = manifest_digests_from_env(profiles, self._environ)
+        resolver = resolver_for_profiles(profiles, source_profile=self.source_profile,
+                                         manifest_digests=digests, cache_root=root)
+        # Best effort, and only now: this runs on the first decision pass for the expert, when
+        # the DB is open, so an operator finds the uncovered symbols in the log before the pass
+        # decides rather than after a week of a sleeve not entering.
+        resolver.refresh_coverage()
+        logger.info(
+            f"market-condition resolver built for profile(s) {list(profiles)} (source "
+            f"{resolver.source_profile}, manifests {digests or 'none -- research mode'})")
+        return resolver
+
+    def clear_cache(self, expert_instance_id: Optional[Any] = None) -> None:
+        """Drop the cached resolver(s) so the next decision re-reads the setting.
+
+        Called from ``/api/reload`` (which drops the instance + settings caches this reads
+        through) and from the live instance invalidation a settings save triggers. Without it a
+        profile changed in the UI would take effect only at the next process restart, while the
+        page said otherwise.
+        """
+        with self._lock:
+            if expert_instance_id is None:
+                self._resolvers.clear()
+                self._settings_errors.clear()
+                return
+            wanted = int(expert_instance_id)
+            for key in [k for k in self._resolvers if k[0] == wanted]:
+                del self._resolvers[key]
+            self._settings_errors = {k for k in self._settings_errors
+                                     if k[0] != expert_instance_id}
+
+    # -- the TradeConditions seam ------------------------------------------------------------
+    #: Surfaced by ``TradeConditions`` when the evaluation carried no expert recommendation, so
+    #: there is no instance whose setting could decide.
+    no_context_reason = (
+        "no expert recommendation reached this market-condition leaf, so the expert instance "
+        "whose market_condition_profile decides the gate is unknown: the gate is unknown and "
+        "never passes")
+
+    def __call__(self, account: Any, instrument_name: str,
+                 expert_recommendation: Any) -> Optional[MarketConditionContext]:
+        instance_id = getattr(expert_recommendation, "instance_id", None)
+        if instance_id is None:
+            _LAST_DISPATCH.set((None, None))
+            return None
+        resolver = self.resolver_for(instance_id)
+        _LAST_DISPATCH.set((instance_id, resolver))
+        if resolver is None:
+            return None
+        return resolver(account, instrument_name, expert_recommendation)
+
+    def no_context_reason_for(self, symbol: Any) -> Optional[str]:
+        """Why THIS symbol got no context, for the expert the last dispatch selected.
+
+        ``None`` falls back to :data:`no_context_reason`, which is the honest answer only for
+        the "no recommendation" case; every other cause names the expert.
+        """
+        from ba2_common.core.market_condition_rules import PROFILE_SETTING
+
+        instance_id, resolver = _LAST_DISPATCH.get() or (None, None)
+        if instance_id is None:
+            return None
+        if resolver is None:
+            return (f"expert instance {instance_id} has an empty {PROFILE_SETTING} setting: no "
+                    f"market-condition data is served for it, so this gate is unknown and never "
+                    f"passes")
+        per_symbol = resolver.no_context_reason_for(symbol)
+        if per_symbol:
+            return per_symbol
+        return resolver.no_context_reason

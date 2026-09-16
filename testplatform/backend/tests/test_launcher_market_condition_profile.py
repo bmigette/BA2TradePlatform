@@ -763,12 +763,15 @@ def test_the_run_config_records_the_profile_the_manifest_and_the_calc_versions(
         profile_on, snapshot, monkeypatch):
     monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
     strat = _built("O_LC")
-    block = {"enabled_instruments": ["AAA", "BBB"]}
+    block = {"enabled_instruments": ["AAA", "BBB"],
+             "experts": [{"class": "FMPRating", "settings": {}}]}
     recorded = mod._apply_market_conditions("optimize", block, strat)
 
     # PLURAL: one manifest PER PROFILE, and the provenance read off each is keyed by profile.
     assert block["market_condition_profiles"] == ["ohlcv-v1"]
     assert block["market_condition_manifests"] == {"ohlcv-v1": snapshot}
+    # ... and THE EXPERT SETTING, which is what live reads and what the seam resolves from.
+    assert block["experts"][0]["settings"]["market_condition_profile"] == "ohlcv-v1"
     assert recorded["manifests"] == {"ohlcv-v1": snapshot}
     assert recorded["calc_versions"] == {"ohlcv-v1": PROFILES["ohlcv-v1"].calc_version}
     facts = recorded["facts"]["ohlcv-v1"]
@@ -914,3 +917,101 @@ def test_both_profiles_gate_only_the_initial_entry_tree(monkeypatch):
     strat = _built("O_LC")
     assert len(_market_ids(strat.entry_rules)) == 8          # 3 ohlcv + 5 ta-structure leaves
     assert _market_ids(strat.exit_rules) == []
+
+
+# ------------------------------------------------- the flag writes the EXPERT SETTING (Task 12)
+def _gated_block():
+    return {"enabled_instruments": ["AAA", "BBB"],
+            "experts": [{"class": "FMPRating", "settings": {"sizing_mode": "risk_atr"}}]}
+
+
+def test_the_flag_writes_the_setting_onto_every_expert_job(profile_on, snapshot, monkeypatch):
+    """``--market-condition-profile`` is what the operator types; the SETTING is what the run
+    carries, what the backtest seam resolves from and what a deploy of the winning genome puts
+    on the live instance. One string, three readers."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    block = _gated_block()
+    block["experts"].append({"class": "FMPRatingB", "settings": {}})
+    mod._apply_market_conditions("optimize", block, _built("O_LC"))
+    assert [spec["settings"]["market_condition_profile"] for spec in block["experts"]] == [
+        "ohlcv-v1", "ohlcv-v1"]
+    # The settings the spec already carried are untouched.
+    assert block["experts"][0]["settings"]["sizing_mode"] == "risk_atr"
+
+
+def test_the_gate_leaves_are_all_served_by_the_setting_the_job_carries(profile_on, snapshot,
+                                                                      monkeypatch):
+    """The gates and the data supply cannot disagree, because both are derived from the setting:
+    ``_market_condition_gates`` reads it through the same parser the seam and live use."""
+    from ba2_common.core.market_condition_rules import (
+        assert_market_fields_served, parse_profile_setting,
+    )
+
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    strat = _built("O_LC")
+    block = _gated_block()
+    mod._apply_market_conditions("optimize", block, strat)
+    setting = block["experts"][0]["settings"]["market_condition_profile"]
+    assert_market_fields_served(strat.entry_rules, parse_profile_setting(setting),
+                                where="entry rules")
+
+
+def test_the_gates_are_built_through_the_settings_parser(monkeypatch):
+    """Not from the global directly: an unregistered or repeated name is refused with the SAME
+    message the seam, the live resolver and the deploy importer produce."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ohlcv-v1",))
+    assert mod._market_condition_setting_value() == "ohlcv-v1"
+    assert mod._market_condition_setting_profiles() == ("ohlcv-v1",)
+    assert [lf["field"] for lf in mod._market_condition_gates("o_lc")] == [
+        f.name for f in PROFILES["ohlcv-v1"].fields if f.searched]
+
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ohlcv-v9",))
+    with pytest.raises(ValueError, match="not a registered"):
+        mod._market_condition_gates("o_lc")
+
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ())
+    assert mod._market_condition_setting_value() == ""
+    assert mod._market_condition_gates("o_lc") == []
+
+
+def test_a_profile_off_run_writes_no_setting_at_all(monkeypatch):
+    """No profile -> the stored config is byte-identical to today's, INCLUDING the expert
+    settings: the whole goal2020 archive stays comparable, and a re-run of an ungated genome
+    cannot acquire a market-condition setting it never had."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ())
+    block = _gated_block()
+    before = json.loads(json.dumps(block))
+    assert mod._apply_market_conditions("optimize", block, _built("O_LC")) == {}
+    assert block == before
+
+
+def test_a_job_with_no_expert_spec_to_carry_the_setting_is_refused(profile_on, snapshot,
+                                                                   monkeypatch):
+    """A run-level key alone would be gated in the config and UNGATED the moment its genome is
+    deployed (a payload carries settings, not that key)."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    with pytest.raises(SystemExit) as e:
+        mod._apply_market_conditions("optimize", {"enabled_instruments": ["AAA"]}, _built("O_LC"))
+    assert "market_condition_profile" in str(e.value)
+
+
+def test_a_setting_naming_a_profile_with_no_manifest_fails_before_dispatch(profile_on,
+                                                                          monkeypatch):
+    """One message at launch instead of N identical crashed trials (the seam refuses such a
+    trial config; this is the same refusal, earlier)."""
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {})
+    with pytest.raises(SystemExit) as e:
+        mod._apply_market_conditions("optimize", _gated_block(), _built("O_LC"))
+    assert "needs a --market-condition-manifest digest OF ITS OWN" in str(e.value)
+
+
+def test_the_setting_and_the_run_config_key_agree_by_construction(profile_on, snapshot,
+                                                                  monkeypatch):
+    """Both are written, and the seam refuses a config where they differ -- so the redundancy is
+    checked rather than trusted."""
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": snapshot})
+    block = _gated_block()
+    mod._apply_market_conditions("optimize", block, _built("O_LC"))
+    assert market_condition_pins(block) == (["ohlcv-v1"], {"ohlcv-v1": snapshot})

@@ -4517,6 +4517,31 @@ _MARKET_CONDITION_PROFILES: "tuple[str, ...]" = ()
 _MARKET_CONDITION_MANIFESTS: dict = {}
 
 
+def _market_condition_setting_value() -> str:
+    """The ``market_condition_profile`` EXPERT SETTING this run writes onto every option job.
+
+    Since Task 12 the setting is what live AND the backtest seam read, so it is also what the
+    gate builder below reads: the leaves and the data supply are derived from ONE string rather
+    than from two readings of the same global that could drift apart.
+    """
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING_OFF
+
+    return ",".join(_MARKET_CONDITION_PROFILES) or PROFILE_SETTING_OFF
+
+
+def _market_condition_setting_profiles() -> tuple:
+    """The profiles the SETTING names, through the platform's one parser.
+
+    Not ``_MARKET_CONDITION_PROFILES`` directly: going through
+    ``market_condition_rules.parse_profile_setting`` means the launcher refuses an unregistered
+    or repeated name with the same message the backtest seam, the live resolver and the deploy
+    importer use, and that the gates are built for exactly the profiles the setting will serve.
+    """
+    from ba2_common.core.market_condition_rules import parse_profile_setting
+
+    return parse_profile_setting(_market_condition_setting_value())
+
+
 def _market_condition_gates(m: str) -> list:
     """The market-condition entry leaves for rule prefix ``m`` ([] with no profile selected).
 
@@ -4542,17 +4567,17 @@ def _market_condition_gates(m: str) -> list:
     ``toggle_optimize`` is deliberately NOT set: ``mode``'s ``off`` choice already removes the
     leaf, and the two together are refused by ConditionLeaf and by the gene collector.
     """
-    if not _MARKET_CONDITION_PROFILES:
+    # READ FROM THE SETTING, not from the global directly: the setting is what the jobs carry
+    # and what live reads, so building the gates from anything else is how the leaves and the
+    # data that feeds them would come to disagree.
+    selected_profiles = _market_condition_setting_profiles()
+    if not selected_profiles:
         return []
     from ba2_common.core.TradeConditions import market_condition_condition_class
     from ba2_common.core.market_conditions import PROFILES, field_codes
     from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES
 
-    selected = set(_MARKET_CONDITION_PROFILES)
-    unknown = sorted(selected - set(PROFILES))
-    if unknown:
-        raise ValueError(f"market-condition profile(s) {unknown!r} are not registered "
-                         f"(known: {sorted(PROFILES)!r})")
+    selected = set(selected_profiles)
     leaves: list = []
     for prof_name, prof in PROFILES.items():
         if prof_name not in selected:
@@ -4837,6 +4862,11 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat) -> dict:
       must not become a property of the fitness landscape, so the run is refused NAMING the
       missing symbols (the same message and the same check the per-trial seam applies).
 
+    With a profile on it ALSO writes the ``market_condition_profile`` EXPERT SETTING onto every
+    expert spec of the job: that setting is what LIVE reads and what the backtest seam resolves
+    the run's profiles from, so the gates, the data supply and the deployed twin all come from
+    one string.
+
     Returns the recorded block (``{}`` when the profile is off).
     """
     if not _MARKET_CONDITION_PROFILES:
@@ -4885,6 +4915,25 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat) -> dict:
         facts_by_profile[profile] = facts
         warmed[profile] = len(reader.symbols())
 
+    # THE EXPERT SETTING is what live reads and what the backtest seam resolves the profiles
+    # from (Task 12), so it is written onto every expert spec of the job. A job with no expert
+    # spec to carry it would produce trials whose gates no DEPLOY could reproduce -- the payload
+    # carries settings, not this run-level key -- so that is refused rather than half-written.
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING
+
+    specs = [spec for spec in (backtest_block.get("experts") or []) if isinstance(spec, dict)]
+    if not specs:
+        sys.exit(f"{command}: --market-condition-profile needs the run's expert spec(s) to write "
+                 f"{PROFILE_SETTING} onto; this backtest block carries none "
+                 f"({sorted(backtest_block)!r}). The setting is what live and the backtest seam "
+                 f"both read, so a job without it would be gated in the config and ungated the "
+                 f"moment its genome is deployed.")
+    setting_value = _market_condition_setting_value()
+    for spec in specs:
+        spec.setdefault("settings", {})[PROFILE_SETTING] = setting_value
+    # The RESOLVED list is recorded too. It is redundant with the setting BY CONSTRUCTION -- the
+    # seam refuses a config where the two disagree -- and it is what every stored-config consumer
+    # (re-runs, robustness variants, top-N persist, tools/backtest_parity.py) already reads.
     backtest_block["market_condition_profiles"] = list(_MARKET_CONDITION_PROFILES)
     backtest_block["market_condition_manifests"] = manifests
     genes = _market_condition_gene_names(strat)

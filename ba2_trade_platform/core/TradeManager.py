@@ -1959,19 +1959,22 @@ class TradeManager:
         from contextlib import nullcontext
         from datetime import timezone as _tz
 
-        from ba2_common.core.TradeConditions import get_market_condition_context_resolver
-        from ba2_common.core.market_condition_live import LiveMarketConditionResolver
+        from ba2_common.core.market_condition_live import resolver_for_expert_instance
         from ba2_common.core.replay import capture_scope, get_replay_store
 
         from .types import AnalysisUseCase
 
-        # ONLY when a market-condition resolver is installed. The scope exists to record the
-        # feature windows those gates read; with no profile wired there is nothing to record,
-        # and opening it anyway would submit a synthetic "TradeManager" AnalysisRecord per
-        # decision pass into every capture session -- which replay inventory counts as an
+        # ONLY when THIS EXPERT has a market-condition resolver. The scope exists to record the
+        # feature windows its gates read; with no profile on the expert there is nothing to
+        # record, and opening it anyway would submit a synthetic "TradeManager" AnalysisRecord
+        # per decision pass into every capture session -- which replay inventory counts as an
         # analysis and expert_replay then reports as COVERAGE_UNSUPPORTED. That silently moves
         # the replay-coverage percentage of deployments that never enable this feature.
-        if not isinstance(get_market_condition_context_resolver(), LiveMarketConditionResolver):
+        #
+        # PER EXPERT since Task 12 (the profile is that expert's setting): a process-wide
+        # "is a resolver installed" test would now be true for every deployment, because the
+        # dispatching resolver is always installed.
+        if resolver_for_expert_instance(expert_instance_id) is None:
             return nullcontext()
         store = get_replay_store()
         if store is None:
@@ -2007,8 +2010,8 @@ class TradeManager:
     def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """Process enter_market recommendations inside ONE market-condition decision scope.
 
-        The scope reads the evaluation clock once, on this (coordinating) thread, and only when a
-        market-condition profile is wired (``BA2_MARKET_CONDITION_PROFILE``); otherwise it is a
+        The scope reads the evaluation clock once, on this (coordinating) thread, and only when
+        THIS EXPERT's ``market_condition_profile`` setting names a profile; otherwise it is a
         no-op. Every market-condition leaf of this pass then resolves the same frozen context.
         See ``_process_expert_recommendations_after_analysis`` for the processing itself.
 
@@ -2020,7 +2023,7 @@ class TradeManager:
         from ba2_common.core.market_condition_live import market_condition_decision_scope
 
         with self._decision_capture_scope(expert_instance_id):
-            with market_condition_decision_scope():
+            with market_condition_decision_scope(expert_instance_id=expert_instance_id):
                 return self._process_expert_recommendations_after_analysis(expert_instance_id, lookback_days)
 
     def _process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:

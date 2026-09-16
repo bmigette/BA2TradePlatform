@@ -11,6 +11,13 @@ Three refusals live here, each closing a failure that is SILENT without it:
   receives concrete conditions only: ``mode_optimize`` is a TEMPLATE marker (the optimizer picks
   the mode), and a leaf still carrying it -- or a ``mode`` token with no concrete operator/value
   behind it -- describes a search space, not a rule.
+* :func:`assert_market_fields_served` -- a market leaf whose FIELD no profile in the expert's
+  ``market_condition_profile`` setting serves. Since Task 12 the profile is an expert setting
+  (:data:`PROFILE_SETTING`), so a ruleset and a setting are two halves of one strategy that can
+  be saved apart. A gated leaf with no profile behind it builds no reader: live the gate reads
+  ``no_context`` (and a leaf whose profile is merely MISSING from a multi-profile reader raises
+  ``LookupError`` in ``MarketConditionCompare.evaluate``), so the sleeve never enters and looks
+  exactly like a strategy that found no setup. Refused at deploy-import and at settings save.
 * :data:`STRICT_FIELD_NAMES` / :func:`market_condition_fields` -- the names that must never be
   DROPPED by a converter that does not recognise them (see
   ``rule_builders.assert_market_fields_mappable``). Importing a gated ruleset onto a server whose
@@ -23,9 +30,20 @@ payload can carry it, whereas a registry entry is code that travels.
 """
 from __future__ import annotations
 
-from typing import Any, Iterator, List, Mapping, Tuple
+from typing import Any, Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 from ba2_common.core.rule_models import MODE_OFF
+
+#: The expert setting that names the market-condition profile(s) an expert's entry rules may gate
+#: on (plan Task 12, operator decision 2026-09-16). Defined HERE, next to the refusals that quote
+#: it, and imported by the interface's settings definition, the live resolver, the backtest seam,
+#: the launcher and the deploy importer -- one spelling, one parser.
+PROFILE_SETTING = "market_condition_profile"
+
+#: How the setting spells "no market-condition data at all". NOT ``"none"``: the launcher's CLI
+#: uses that token, the setting uses the empty string, and accepting both here would let
+#: ``market_condition_profile=none`` read as configured on a settings page while serving nothing.
+PROFILE_SETTING_OFF = ''
 
 #: Every market-condition field name that has ever been deployable, independent of what THIS
 #: process's registry happens to hold: ohlcv-v1 (design 3) and ALL TWELVE ta-structure-v1 fields
@@ -125,3 +143,91 @@ def assert_market_conditions_resolved(rules: Any, where: str) -> None:
             ". Live deployment receives resolved conditions only: export a DECODED genome (the "
             "optimizer's chosen mode written onto the leaf as an ordinary operator/threshold), "
             "never the search template.")
+
+
+def parse_profile_setting(value: Any, *, setting: str = PROFILE_SETTING) -> Tuple[str, ...]:
+    """The profiles named by a ``market_condition_profile`` setting value, in the order given.
+
+    ONE reader for the whole platform: the live per-instance resolver, the backtest seam, the
+    launcher's gate builder and the deploy importer all call this, so an unregistered name, a
+    repeat or a ``none`` is the same loud ``ValueError`` on every side rather than an empty tuple
+    on one of them (which is a strategy running UNGATED under the name of a gated one).
+
+    ``None`` is accepted as empty because that is what ``ExtendableSettingsInterface.settings``
+    returns for a defined-but-unset key, not because a missing value is a default: an empty
+    setting means "no market-condition data is served", which the refusals below then enforce
+    against the expert's rules.
+
+    Raises:
+        ValueError: a non-string value, the token ``none``, a repeat, or a name this process's
+            registry does not know (the message names ``setting`` and lists what IS registered).
+    """
+    from ba2_common.core.market_conditions import PROFILES
+
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        raise ValueError(f"{setting} must be a string (comma-separated profile names), got "
+                         f"{type(value).__name__} {value!r}")
+    names = [t for t in (part.strip() for part in value.split(",")) if t]
+    if not names:
+        return ()
+    seen: List[str] = []
+    for name in names:
+        if name.lower() == "none":
+            raise ValueError(
+                f"{setting}={value!r}: 'none' is not a profile name. Leave the setting empty to "
+                f"serve no market-condition data (registered profiles: {sorted(PROFILES)!r}).")
+        if name in seen:
+            raise ValueError(f"{setting}={value!r} repeats profile {name!r}")
+        if name not in PROFILES:
+            raise ValueError(
+                f"{setting}={value!r} names {name!r}, which is not a registered market-condition "
+                f"profile on this installation (registered: {sorted(PROFILES)!r}). A payload "
+                f"built against a newer ba2_common must not be deployed onto an older one: the "
+                f"gate would have no data and the strategy would never enter.")
+        seen.append(name)
+    return tuple(seen)
+
+
+def served_fields(profiles: Sequence[str]) -> frozenset:
+    """Every field name the listed profiles serve (empty for an empty list)."""
+    from ba2_common.core.market_conditions import PROFILES
+
+    return frozenset(f.name for p in profiles for f in PROFILES[p].fields)
+
+
+def assert_fields_served(used: Iterable[Tuple[str, str]], profiles: Sequence[str], *,
+                         where: str = "rules", setting: str = PROFILE_SETTING) -> None:
+    """Refuse ``(label, field)`` pairs the listed profiles do not serve.
+
+    The pairs form exists because the two callers read two different vocabularies for the same
+    thing: a deploy payload carries condition TREES keyed on ``field``, while a live ruleset is
+    persisted as ``EventAction.triggers`` keyed on ``event_type`` (equal to the field name by
+    ``rule_builders.register_market_condition_field_events``). Both end here so the refusal is
+    one message.
+    """
+    profiles = tuple(profiles)
+    served = served_fields(profiles)
+    bad = [(label, field) for label, field in used if field not in served]
+    if not bad:
+        return
+    shown = "; ".join(f"{label} ({field})" for label, field in bad)
+    if profiles:
+        tail = (f"{setting} lists {list(profiles)!r}, which serves {sorted(served)!r}. Add the "
+                f"profile that owns the field to the setting, or take the leaf off the ruleset.")
+    else:
+        tail = (f"{setting} is empty, so NO market-condition data is served for this expert. Set "
+                f"it to the profile(s) these leaves were built for, or take them off the ruleset.")
+    raise ValueError(
+        f"{where}: market-condition leaf/leaves {shown} name a field no configured profile "
+        f"serves. {tail} A gate with no data behind it never passes, so the strategy would be "
+        f"deployed unable to enter -- which looks exactly like one that found no setup.")
+
+
+def assert_market_fields_served(rules: Any, profiles: Sequence[str], *, where: str = "rules",
+                                setting: str = PROFILE_SETTING) -> None:
+    """Refuse a condition TREE whose market leaves the listed profiles do not serve."""
+    assert_fields_served(((label, str(leaf.get("field")))
+                          for label, leaf in iter_market_condition_leaves(rules, where)),
+                         profiles, where=where, setting=setting)

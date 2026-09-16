@@ -82,19 +82,16 @@ _BACKEND_DIR = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspa
 # carries config/fitness_metric/cache_root/inmem_trades only, and _localize_paths rewrites cache
 # path STRINGS inside the config), so setting BA2_SHARED_ARRAYS on the master says nothing at all
 # about a remote box. Each host's service environment governs its own workers; set it there.
+#
+# NOT MIRRORED (retired with Task 12): BA2_MARKET_CONDITION_PROFILE and
+# BA2_MARKET_CONDITION_MANIFEST. The profile is now an EXPERT SETTING, carried inside the trial
+# config's expert settings and read by live and backtests alike; the variable is read nowhere and
+# a set value now FAILS live startup, so mirroring it into a worker would have propagated a
+# refusal. The manifest goes with it: it only ever rode along for "environment-resolved
+# diagnostics" of a resolver that no longer resolves from the environment, and the trial config's
+# ``market_condition_manifests`` has always been the authority a backtest actually reads.
 _WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY",
-                    "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S",
-                    # Market-condition feature store (design 2026-09-15 section 4.5). The TRIAL
-                    # CONFIG is what actually pins the snapshot for a backtest; these two are
-                    # mirrored into the spawned children so anything in a worker that resolves the
-                    # profile/manifest from the ENVIRONMENT (the live-flavoured reader, a
-                    # diagnostic) sees this run's pin instead of falling back to its own default.
-                    # Both env vars are SINGULAR and pre-date the plural seam: for a run pinning
-                    # more than one profile they carry whatever the config's legacy keys hold,
-                    # which is nothing. That is a gap for environment-resolved diagnostics only --
-                    # the trial config remains the authority, and the live resolver these mirror
-                    # is itself still single-profile (see market_condition_live.PROFILE_ENV).
-                    "BA2_MARKET_CONDITION_PROFILE", "BA2_MARKET_CONDITION_MANIFEST")
+                    "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S")
 
 
 def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
@@ -2218,9 +2215,18 @@ def _run_trial_backtest(
 
 
 def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """The two canonical market-condition keys for a trial config, from a run config in either
-    shape. Its own function because ``_build_daily_trial_config`` is a WHITELIST: a knob that is
-    not written here is inert however correctly it was parsed upstream."""
+    """The two derived market-condition keys for a trial config, from a run config in any shape.
+
+    Its own function because ``_build_daily_trial_config`` is a WHITELIST: a knob that is not
+    written here is inert however correctly it was parsed upstream.
+
+    The PROFILES are not a knob of this dict's own: since Task 12 they come from the expert
+    setting ``market_condition_profile``, which rides inside ``experts[i]["settings"]`` -- copied
+    wholesale by the whitelist, so it cannot be dropped the way a run-level key can. They are
+    still WRITTEN OUT here, derived, because ``install_backtest_market_conditions`` and every
+    stored-config consumer read the resolved list, and because a trial config that carries both
+    is checked for agreement by ``market_condition_pins`` on the way in.
+    """
     from app.services.backtest.seam_wiring import market_condition_pins
 
     profiles, manifests = market_condition_pins(backtest_cfg, required=False)

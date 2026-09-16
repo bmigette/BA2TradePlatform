@@ -364,3 +364,108 @@ def test_an_unknown_NON_market_field_is_still_dropped_with_a_warning(monkeypatch
     rule, = export["rulesets"][0]["rules"]
     assert rule["triggers"] == {}
     assert any("DROPPED" in w for w in warnings)
+
+
+# ------------------------------------------------- the profile setting travels with the payload
+def test_the_export_payload_carries_the_profile_setting_from_the_runs_expert_spec():
+    """Task 12: the profile is an expert SETTING, so it rides in ``settings.expert_params`` --
+    the same dict the importer feeds to ``save_settings`` -- and needs no transport of its own.
+
+    Pinned because the export builds ``expert_params`` from the optimization's expert spec
+    settings, which is where ``_apply_market_conditions`` writes the setting; a change to either
+    end would silently deploy a gated ruleset with an empty profile.
+    """
+    from types import SimpleNamespace
+
+    from app.api.backtests import _derive_export_payload
+
+    entry_rules, exit_rules = decoded_gated_rules()
+    opt_block = {
+        "experts": [{"class": "FMPRating",
+                     "settings": {"market_condition_profile": "ohlcv-v1"}}],
+        "enabled_instruments": ["AAA"], "seed": 1, "warmup_days": 0, "account_settings": {},
+        "market_condition_profiles": ["ohlcv-v1"],
+        "market_condition_manifests": {"ohlcv-v1": "a" * 64},
+    }
+    backtest = SimpleNamespace(
+        id=4244, name="gated-run", expert_name="FMPRating", engine_type="daily_expert",
+        strategy_params={"entryRules": entry_rules, "exitRules": exit_rules},
+        optimization_id=None, start_date=None, end_date=None, initial_capital=20_000.0)
+    import app.api.backtests as bt_api
+
+    saved = bt_api._opt_backtest_block
+    bt_api._opt_backtest_block = lambda backtest, db: (opt_block, None)
+    try:
+        payload = _derive_export_payload(backtest, "expert_settings", None)
+    finally:
+        bt_api._opt_backtest_block = saved
+    assert payload["settings"]["expert_params"]["market_condition_profile"] == "ohlcv-v1"
+
+
+def _import_refusal(expert_params, entry_rules):
+    """The importer's market-condition refusal, as the tool runs it (same two functions, same
+    order). Returns the message, or None when the payload is accepted."""
+    from ba2_common.core.market_condition_rules import (
+        PROFILE_SETTING, assert_market_fields_served, parse_profile_setting,
+    )
+
+    try:
+        profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
+        assert_market_fields_served(entry_rules, profiles, where="label: entry rules")
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def test_a_served_gated_payload_imports():
+    entry_rules, _ = decoded_gated_rules()
+    assert _import_refusal({"market_condition_profile": "ohlcv-v1"}, entry_rules) is None
+
+
+def test_the_import_refuses_a_profile_this_server_does_not_register():
+    """A payload built against a NEWER ba2_common. The live resolver could not build a reader for
+    it at all, so every gated entry would be refused for ever -- said at import instead."""
+    entry_rules, _ = decoded_gated_rules()
+    msg = _import_refusal({"market_condition_profile": "ohlcv-v9"}, entry_rules)
+    assert msg and "ohlcv-v9" in msg and "not a registered" in msg
+
+
+def test_the_import_refuses_a_gated_ruleset_whose_setting_serves_nothing():
+    """THE deploy-time shape of this whole task: the ruleset half arrives gated and the setting
+    half arrives empty, and the instance comes up enabled, scheduled and unable to enter."""
+    entry_rules, _ = decoded_gated_rules()
+    for params in ({}, {"market_condition_profile": ""}):
+        msg = _import_refusal(params, entry_rules)
+        assert msg and "o_lc-market-adx" in msg and "underlying_adx_14" in msg
+        assert "market_condition_profile" in msg and "empty" in msg
+
+
+def test_the_import_refuses_a_leaf_whose_field_the_listed_profile_does_not_serve():
+    """Two profiles exist; naming the wrong one is not the same as naming none, and the message
+    has to say which field is unserved rather than "no profile"."""
+    entry_rules, _ = decoded_gated_rules()
+    msg = _import_refusal({"market_condition_profile": "ta-structure-v1"}, entry_rules)
+    assert msg and "underlying_adx_14" in msg and "ta-structure-v1" in msg
+
+
+def test_an_ungated_payload_is_unaffected_by_the_refusal():
+    """Every existing deploy: no market leaf, so any setting (including none at all) passes."""
+    plain = _entry_rule({"id": "conf", "field": "confidence", "op": ">", "value": 70})
+    assert _import_refusal({}, plain) is None
+    assert _import_refusal({"market_condition_profile": "ohlcv-v1"}, plain) is None
+
+
+def test_the_import_tool_runs_that_refusal_before_it_writes_anything():
+    """Read from the script's source (running it means a live DB): the two calls must sit between
+    the expert_params assembly and the first ``save_settings``/``update_instance``, and a refusal
+    must print FATAL and return without writing -- the same contract the ruleset conversion has."""
+    tools = os.path.normpath(os.path.join(_ROOT, "..", "..", "tools"))
+    importer = open(os.path.join(tools, "import_deploy_payload.py"), encoding="utf-8").read()
+    body = importer[importer.index("def main("):]
+
+    assert "parse_profile_setting(expert_params.get(PROFILE_SETTING))" in body
+    assert "assert_market_fields_served(entry_rules, mc_profiles" in body
+    guard = body.index("assert_market_fields_served(entry_rules")
+    after = body[guard:]
+    assert "FATAL" in after[:600] and "return 1" in after[:600]
+    assert guard < body.index("save_settings")

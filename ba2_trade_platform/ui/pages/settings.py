@@ -27,6 +27,12 @@ from ..components.InstrumentSelector import InstrumentSelector
 from ..components.ModelSelector import ModelSelectorInput
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ...core.rules_export_import import RulesExportImportUI
+from ba2_common.core.market_condition_rules import (
+    PROFILE_SETTING as MARKET_CONDITION_PROFILE_SETTING,
+    PROFILE_SETTING_OFF as MARKET_CONDITION_PROFILE_OFF,
+    assert_fields_served,
+    parse_profile_setting,
+)
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
 
@@ -1925,7 +1931,23 @@ class ExpertSettingsTab:
                                 clearable=True
                             ).classes('w-full')
                             ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
-                    
+
+                            # MARKET-CONDITION PROFILE. Rendered HERE, with the rulesets, because
+                            # it is the data supply for the enter-market ruleset's market gates --
+                            # the two are one strategy and saving them apart is what
+                            # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
+                            # (MarketExpertInterface), and this dialog's Expert Settings tab
+                            # renders only expert-SPECIFIC definitions, so it needs its own widget.
+                            self.market_condition_profile_select = ui.select(
+                                options=self._market_condition_profile_options(),
+                                label='Market-Condition Profile',
+                                value=MARKET_CONDITION_PROFILE_OFF,
+                            ).classes('w-full')
+                            ui.label('Market-condition profile(s) the enter-market ruleset may gate on. '
+                                     'Empty serves no market-condition data: a ruleset with a market '
+                                     'gate then cannot enter, and saving that combination is refused.'
+                                     ).classes('text-body2 text-grey-7 ml-2')
+
                     # Instruments tab
                     with ui.tab_panel('Instruments').style('display: flex; flex-direction: column; flex: 1; overflow: hidden'):
                         # Instrument selection method dropdown at top of tab
@@ -1982,6 +2004,8 @@ class ExpertSettingsTab:
                         if expert:
                             instrument_method = expert.settings.get('instrument_selection_method', 'static')
                             self.instrument_selection_method_select.value = instrument_method
+                            self._fill_market_condition_profile(
+                                expert.settings.get(MARKET_CONDITION_PROFILE_SETTING))
                     except Exception as e:
                         logger.debug(f'Could not load instrument selection method: {e}')
                         self.instrument_selection_method_select.value = 'static'
@@ -3949,6 +3973,63 @@ class ExpertSettingsTab:
         """Handle instrument selection changes."""
         logger.debug(f'Instrument selection changed: {len(selected_instruments)} instruments selected')
     
+    # ----------------------------------------------------------------- market-condition profile
+    def _market_condition_profile_options(self) -> list:
+        """The select's options: "" (off) plus every profile registered in THIS build.
+
+        Read from the interface's own settings definition rather than from the registry, so the
+        dialog and the setting can never offer different lists.
+        """
+        from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+
+        MarketExpertInterface._ensure_builtin_settings()
+        return list(MarketExpertInterface._builtin_settings[
+            MARKET_CONDITION_PROFILE_SETTING]["valid_values"])
+
+    def _fill_market_condition_profile(self, value) -> None:
+        """Show a stored value, INCLUDING one the select's options do not contain.
+
+        A comma list (two profiles at once) and a profile this build no longer registers are both
+        storable -- a deploy payload can carry either -- and a select that silently snapped them
+        back to "" would show an ungated expert whose rules are gated. So the value is added to
+        the options rather than dropped, and the save path writes back what is shown.
+        """
+        shown = '' if value is None else str(value)
+        options = self._market_condition_profile_options()
+        if shown not in options:
+            options = [*options, shown]
+            self.market_condition_profile_select.options = options
+        self.market_condition_profile_select.value = shown
+
+    def _market_condition_profile_value(self) -> str:
+        """The profile setting the dialog is about to save (``''`` when the widget is absent)."""
+        if not hasattr(self, 'market_condition_profile_select'):
+            return MARKET_CONDITION_PROFILE_OFF
+        return str(self.market_condition_profile_select.value or MARKET_CONDITION_PROFILE_OFF)
+
+    def _refuse_unserved_market_gates(self, enter_market_ruleset_id) -> None:
+        """Refuse a (ruleset, profile setting) combination that leaves a market gate unserved.
+
+        THE FAILURE THIS PREVENTS. The gates and the data that feeds them are two halves of one
+        strategy held in two places: the enter-market RULESET carries the leaves, the expert
+        SETTING says which profile is served. Saved apart -- a gated ruleset assigned while the
+        profile is still empty, or a profile cleared under a gated ruleset -- the instance comes
+        up enabled, scheduled and correct-looking, and every gated entry is refused for ever:
+        indistinguishable from a strategy that found no setup. The same refusal runs at deploy
+        import (tools/import_deploy_payload.py), so neither door is the unguarded one.
+
+        Raises ValueError, which ``_save_expert``'s handler turns into a red notification with
+        the leaf, the field and the setting named.
+        """
+        from ba2_common.core.market_condition_live import market_condition_fields_in_ruleset
+
+        used = market_condition_fields_in_ruleset(enter_market_ruleset_id)
+        if not used:
+            return          # no market leaf: any profile setting is fine, including empty
+        profiles = parse_profile_setting(self._market_condition_profile_value())
+        assert_fields_served(used, profiles,
+                             where=f"enter-market ruleset {enter_market_ruleset_id}")
+
     def _save_expert(self, expert_instance=None):
         """Save the expert instance."""
         try:
@@ -3998,6 +4079,11 @@ class ExpertSettingsTab:
                     selected_display_name = self.open_positions_ruleset_select.value
                     expert_instance.open_positions_ruleset_id = self.open_positions_ruleset_map.get(selected_display_name)
                 
+                # BEFORE the first write: a gated enter-market ruleset needs a profile setting
+                # that serves its leaves. Nothing has been persisted yet (the assignments above
+                # are on a detached row), so a refusal here leaves the instance untouched.
+                self._refuse_unserved_market_gates(expert_instance.enter_market_ruleset_id)
+
                 update_instance(expert_instance)
                 logger.info(f"Updated expert instance: {expert_instance.id}")
                 
@@ -4030,6 +4116,9 @@ class ExpertSettingsTab:
                     selected_display_name = self.open_positions_ruleset_select.value
                     open_positions_id = self.open_positions_ruleset_map.get(selected_display_name)
                 
+                # Same refusal as the edit branch, before the row exists.
+                self._refuse_unserved_market_gates(enter_market_id)
+
                 new_instance = ExpertInstance(
                     expert=self.expert_select.value,
                     alias=self.alias_input.value or None,
@@ -4217,6 +4306,14 @@ class ExpertSettingsTab:
                 analysis_window_hours = 24  # Default value
             expert.save_setting('smart_risk_manager_analysis_window_hours', analysis_window_hours, setting_type="int")
             logger.debug(f'Saved smart risk manager analysis window: {analysis_window_hours}h')
+
+        # Save the market-condition profile (a BUILTIN setting with its own widget next to the
+        # ruleset assignment; _refuse_unserved_market_gates has already checked this value
+        # against the enter-market ruleset's leaves, so nothing unserved reaches the DB).
+        if hasattr(self, 'market_condition_profile_select'):
+            profile_value = self._market_condition_profile_value()
+            expert.save_setting(MARKET_CONDITION_PROFILE_SETTING, profile_value, setting_type="str")
+            logger.debug(f'Saved {MARKET_CONDITION_PROFILE_SETTING}: {profile_value!r}')
 
         # Save instrument selection method (moved to main panel)
         if hasattr(self, 'instrument_selection_method_select'):

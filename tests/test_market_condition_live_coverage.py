@@ -214,11 +214,14 @@ def test_the_universe_is_the_union_of_the_GATED_instances_enabled_instruments(mo
         SimpleNamespace(id=4, enabled=True, enter_market_ruleset_id=None),  # no entry ruleset
         SimpleNamespace(id=5, enabled=True, enter_market_ruleset_id=30),    # gated, dynamic
     ]
+    # ``name`` is a NOT NULL column on EventAction and the leaf walk labels its findings with
+    # it, so the doubles carry one (a double missing a required column is a test artefact, not
+    # a shape the DB can produce).
     rules = {
-        10: [SimpleNamespace(triggers={"cond_0": {"event_type": "confidence"},
-                                       "cond_1": {"event_type": FIELD.value}})],
-        20: [SimpleNamespace(triggers={"cond_0": {"event_type": "confidence"}})],
-        30: [SimpleNamespace(triggers={"cond_0": {"event_type": FIELD.value}})],
+        10: [SimpleNamespace(name="entry", triggers={"cond_0": {"event_type": "confidence"},
+                                                     "cond_1": {"event_type": FIELD.value}})],
+        20: [SimpleNamespace(name="entry", triggers={"cond_0": {"event_type": "confidence"}})],
+        30: [SimpleNamespace(name="entry", triggers={"cond_0": {"event_type": FIELD.value}})],
     }
     experts = {1: SimpleNamespace(get_enabled_instruments=lambda: ["aaa", "BBB"]),
                5: SimpleNamespace(get_enabled_instruments=lambda: ["SCREENER"])}

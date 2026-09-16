@@ -25,6 +25,12 @@ payload does not carry it. The forced/derived settings the backtest handler appl
 the payload through the shared table in ba2_common.core.deploy_parity (pinned by
 testplatform/backend/tests/backtest/test_deploy_round_trip_parity.py).
 
+The market-condition profile is an EXPERT SETTING and travels in ``settings.expert_params``, so
+transport needs nothing special -- but it is CHECKED here against the receiving server's profile
+registry, and against the payload's own entry rules: a gated ruleset whose leaf no listed profile
+serves would deploy a strategy that can never enter, which is indistinguishable from one that
+found no setup. Nothing is written for a refused entry.
+
 For each entry: converts entry/exit TradeRule lists to a live ruleset export via
 ``trade_rules_to_live_export``, imports it as NEW Ruleset+EventAction rows via
 ``RulesImporter.import_multiple_rulesets`` (never touches the existing rulesets -- old ones are
@@ -56,6 +62,9 @@ from ba2_common.core import db as _ba2_db  # noqa: E402
 _ba2_db.configure_db(LIVE_DB)
 
 from ba2_common.core.db import add_instance, get_instance, update_instance  # noqa: E402
+from ba2_common.core.market_condition_rules import (  # noqa: E402
+    PROFILE_SETTING, assert_market_fields_served, parse_profile_setting,
+)
 from ba2_common.core.deploy_parity import (  # noqa: E402
     SCREENER_UNIVERSE_SETTING, live_settings_from_universe, unmapped_screener_keys,
 )
@@ -207,6 +216,28 @@ def main() -> int:
 
         expert = _expert_class(expert_name)(inst_id)
         expert_params = dict(entry["settings"]["settings"]["expert_params"])
+        # MARKET-CONDITION GATES: the ruleset carries the leaves, the setting says which profile
+        # feeds them, and the two travel in different halves of the payload. Checked against THIS
+        # server's registry, before anything is written:
+        #
+        #   * an unregistered profile name -- a payload built against a newer ba2_common -- would
+        #     leave the live resolver unable to build a reader at all;
+        #   * a gated ruleset whose leaf field no listed profile serves (the empty setting being
+        #     the common case) deploys a strategy that CANNOT ENTER: every gated entry is refused
+        #     for ever, and the instance looks exactly like one whose strategy found no setup.
+        #
+        # The exit ruleset is not checked here because the converter above already refuses a
+        # market leaf anywhere on it (assert_no_market_conditions).
+        try:
+            mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
+            assert_market_fields_served(entry_rules, mc_profiles,
+                                        where=f"{label}: entry rules")
+        except ValueError as e:
+            print(f"FATAL: {label}: {e}")
+            return 1
+        if mc_profiles:
+            print(f"market-condition profile(s): {list(mc_profiles)} (every market gate in the "
+                  f"entry rules is served)")
         # THE UNIVERSE BLOCK, which this tool used to DROP -- the common root of review
         # findings V1 (the six screener:* genes) and V2 (the $100 underlying-price cap every
         # option grid screened on). The exporter has always built it; consuming only

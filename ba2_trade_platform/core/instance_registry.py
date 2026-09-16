@@ -83,3 +83,28 @@ class LiveInstanceResolver:
             logger.warning(
                 f"AccountInstanceCache.invalidate_instance failed for id={instance_id}: {e}"
             )
+        # The market-condition resolver caches a reader per (expert instance, profiles), built
+        # from the ``market_condition_profile`` SETTING this write may have just changed. Without
+        # this drop, changing the profile in the UI would take effect only at the next process
+        # restart while the settings page said otherwise.
+        drop_market_condition_resolver(instance_id)
+
+
+def drop_market_condition_resolver(instance_id: "int | None" = None) -> None:
+    """Drop the cached market-condition resolver(s) behind the installed TradeConditions seam.
+
+    Called after any write that can change an expert's ``market_condition_profile`` setting or
+    the instance/settings caches it is read through: a settings save (above) and ``/api/reload``.
+    A no-op when the installed resolver is not the per-instance dispatcher (nothing wired, a test
+    resolver), and never raises -- the cache is an optimisation, and failing a settings write
+    over it would be worse than serving one stale read.
+    """
+    try:
+        from ba2_common.core.TradeConditions import get_market_condition_context_resolver
+        from ba2_common.core.market_condition_live import PerInstanceMarketConditionResolver
+
+        resolver = get_market_condition_context_resolver()
+        if isinstance(resolver, PerInstanceMarketConditionResolver):
+            resolver.clear_cache(instance_id)
+    except Exception as e:  # pragma: no cover - defensive, never break a write
+        logger.warning(f"market-condition resolver cache drop failed for id={instance_id}: {e}")

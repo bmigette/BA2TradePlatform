@@ -5,7 +5,8 @@ object ``app.on_shutdown`` already hooks into).
 Two endpoints so far: the DB reload callback (an external caller -- a script, the DB-editing
 UI in another process, an ops action -- can hit this after changing expert/account settings
 directly in the database to force the running platform to drop its in-memory singleton
-instance/settings caches and re-read from the DB, without a full process restart) and a
+instance/settings caches -- and the market-condition resolvers built from those settings --
+and re-read from the DB, without a full process restart) and a
 manual schedule trigger (the API equivalent of the Scheduled Jobs page's "Run Now" button,
 for restarting a job that's already fired today -- e.g. a screener scan that returned nothing
 because of a since-fixed data bug -- without waiting for its next scheduled occurrence).
@@ -43,6 +44,7 @@ def reload_from_db(body: ReloadRequest = ReloadRequest()):
     """
     from ..core.AccountInstanceCache import AccountInstanceCache
     from ..core.ExpertInstanceCache import ExpertInstanceCache
+    from ..core.instance_registry import drop_market_condition_resolver
     from ..core.JobManager import get_job_manager
 
     if body.expert_instance_id is None and body.account_id is None:
@@ -50,11 +52,17 @@ def reload_from_db(body: ReloadRequest = ReloadRequest()):
         ExpertInstanceCache.clear_cache()
         accounts_reloaded = "all"
         AccountInstanceCache.clear_cache()
+        # The market-condition resolver caches one reader per (expert instance, profiles), keyed
+        # on the ``market_condition_profile`` SETTING it reads through the instance cache just
+        # dropped. Leaving it would keep serving a retired profile's snapshot after a reload that
+        # reports the settings as re-read.
+        drop_market_condition_resolver()
     else:
         experts_reloaded: List[int] = []
         accounts_reloaded: List[int] = []
         if body.expert_instance_id is not None:
             ExpertInstanceCache.invalidate_instance(body.expert_instance_id)
+            drop_market_condition_resolver(body.expert_instance_id)
             experts_reloaded.append(body.expert_instance_id)
         if body.account_id is not None:
             AccountInstanceCache.invalidate_instance(body.account_id)

@@ -174,6 +174,28 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         from ba2_common.core.OptionRiskManagement import VALID_RISK_MANAGER_MODES
         return VALID_RISK_MANAGER_MODES
 
+    @staticmethod
+    def _market_condition_profile_choices():
+        """``["", *registered profile names]`` for the ``market_condition_profile`` select.
+
+        Imported LAZILY (this runs when the builtin settings are first built, long after import)
+        so the interface module keeps no load-time edge to the market-condition calculators --
+        the same rule ``_valid_risk_manager_modes`` follows. The list is read once per class and
+        cached with the rest of ``_builtin_settings``; a profile registered afterwards (the test
+        registry hook) is not offered until the cache is rebuilt, which is why the PARSER, not
+        this list, is what refuses an unknown name.
+        """
+        from ba2_common.core.market_conditions import PROFILES
+        from ba2_common.core.market_condition_rules import PROFILE_SETTING_OFF
+
+        return [PROFILE_SETTING_OFF, *sorted(PROFILES)]
+
+    @staticmethod
+    def _market_condition_profile_off():
+        from ba2_common.core.market_condition_rules import PROFILE_SETTING_OFF
+
+        return PROFILE_SETTING_OFF
+
     @classmethod
     def _ensure_builtin_settings(cls):
         """Ensure builtin settings are initialized for the class."""
@@ -199,6 +221,24 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "allow_automated_trade_modification": {
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic modification and closing of existing positions"
+                },
+                # MARKET-CONDITION GATES (plan Task 12, operator decision 2026-09-16). The
+                # profile travels WITH THE EXPERT, like its ruleset does, instead of being a
+                # process-wide environment variable live and a launcher flag in backtests -- so
+                # live and a backtest read the entry gates' data supply from the same place and
+                # cannot disagree. Empty (the default, and every existing instance) serves NO
+                # market-condition data and changes nothing: a ruleset with no market leaf never
+                # asks, and one WITH a leaf is refused at save/import by
+                # market_condition_rules.assert_market_fields_served rather than deployed unable
+                # to enter. ``valid_values`` renders as a select in both UIs; a COMMA LIST (two
+                # profiles at once) is accepted by the parser but has to be typed/imported rather
+                # than picked, which is deliberate -- picking one is the ordinary case.
+                "market_condition_profile": {
+                    "type": "str", "required": False, "default": cls._market_condition_profile_off(),
+                    "valid_values": cls._market_condition_profile_choices(),
+                    "description": "Market-condition profile(s) this expert's entry rules may "
+                                   "gate on (comma-separated registered names; empty = no "
+                                   "market-condition data is served and any market leaf raises)",
                 },
                 # Execution Schedule Settings
                 "execution_schedule_enter_market": {

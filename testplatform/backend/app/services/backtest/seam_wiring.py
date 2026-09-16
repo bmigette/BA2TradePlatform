@@ -215,33 +215,78 @@ def _dispatch_market_condition_context(account: Any, instrument_name: str,
     return resolver(account, instrument_name, expert_recommendation)
 
 
+def market_condition_profile_setting(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """``(the setting is present, the profiles it names)`` from the run's EXPERT SETTINGS.
+
+    THE AUTHORITY since Task 12: the profile is the expert setting ``market_condition_profile``
+    (``market_condition_rules.PROFILE_SETTING``), the same setting the LIVE resolver reads, so a
+    deployed genome and the backtest that scored it cannot end up gated on different data. In a
+    run config the expert settings live at ``config["experts"][i]["settings"]`` -- the dict
+    ``_build_daily_trial_config`` copies wholesale into every trial, which is why the setting
+    survives that whitelist while the run-level keys each have to be listed by hand.
+
+    A run may carry more than one expert. Their profiles are UNIONED (first appearance wins the
+    order): the run installs ONE reader set for the process-wide condition seam, a condition
+    knows only its own field name, and every field is served by exactly one profile -- so the
+    union serves each expert exactly what it asked for and nothing else changes hands.
+
+    "Present" means at least one expert spec HAS the key, whatever its value: an explicit empty
+    string is an expert that says the gates are off, which is a statement to be checked against
+    the legacy keys, not an absence.
+    """
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING, parse_profile_setting
+
+    present = False
+    profiles: List[str] = []
+    for spec in (config.get("experts") or ()):
+        if not isinstance(spec, dict):
+            continue                      # a bare class name carries no settings
+        settings = spec.get("settings")
+        if not isinstance(settings, dict) or PROFILE_SETTING not in settings:
+            continue
+        present = True
+        for name in parse_profile_setting(settings[PROFILE_SETTING]):
+            if name not in profiles:
+                profiles.append(name)
+    return present, profiles
+
+
 def market_condition_pins(config: Dict[str, Any], *, required: bool = True
                           ) -> Tuple[List[str], Dict[str, Optional[str]]]:
-    """``(profiles, digest per profile)`` for one run config, in either shape.
+    """``(profiles, digest per profile)`` for one run config, in any of its shapes.
 
-    CANONICAL (Task 10, plural): ``market_condition_profiles`` lists the registered profiles the
-    run's rules were built for and ``market_condition_manifests`` maps each to ITS OWN published
-    digest. One manifest per profile is not a convention but a fact about the format: a manifest
-    names the single profile it was warmed for, so two profiles are two snapshots.
+    CANONICAL (Task 12): the profiles come from the EXPERT SETTING
+    ``experts[i].settings["market_condition_profile"]`` -- see
+    :func:`market_condition_profile_setting`. ``market_condition_manifests`` stays a RUN-LEVEL
+    pin mapping each profile to ITS OWN published digest, because a manifest is data identity
+    (which warmed snapshot this search reads), not a property of a strategy. One manifest per
+    profile is not a convention but a fact about the format: a manifest names the single profile
+    it was warmed for, so two profiles are two snapshots.
 
-    LEGACY (singular): ``market_condition_profile`` (one name, ``"none"`` for off) plus
-    ``market_condition_manifest`` (one digest). EVERY optimization_config persisted before this
-    change carries that pair, and re-running one of those genomes -- the parity tool, a re-run, a
-    robustness variant, a top-N persist -- has to keep working, so the pair is READ, never
-    refused. The plural keys win when present; a singular pin that contradicts them raises
-    rather than being quietly dropped.
+    CONFIG KEYS (Task 10 plural ``market_condition_profiles``; pre-Task-10 singular
+    ``market_condition_profile`` + ``market_condition_manifest``): still READ, never refused.
+    Every optimization_config persisted before Task 12 carries one of them and no setting, and
+    re-running one of those genomes -- the parity tool, a re-run, a robustness variant, a top-N
+    persist -- has to keep working. ``_build_daily_trial_config`` also writes the derived plural
+    key into every trial config, so the two shapes normally travel together and AGREE.
+
+    A config whose setting and whose legacy key DISAGREE raises. That pair is exactly the shape
+    of the failure this whole task exists to prevent: one of them says the run is gated and the
+    other says it is not, and the quiet reading of it is a run that trades UNGATED under the name
+    of a gated one.
 
     Refuses an unregistered profile, a repeated one, ``"none"`` mixed with a real profile, and
     more than one profile pinned by a single unattributed digest.
 
-    ``required`` (the seam's default) raises ``KeyError`` when NEITHER shape is present: the seam
-    is handed a config ``run_daily_backtest`` has already normalised, so a missing pin there means
-    the normalisation did not run, not that the gates are off. Callers that read a RAW stored
-    config -- the trial-config builder, the master prepare -- pass ``required=False``, where
-    "no key" legitimately means "this run predates the feature".
+    ``required`` (the seam's default) raises ``KeyError`` when NO shape is present at all: the
+    seam is handed a config ``run_daily_backtest`` has already normalised, so a missing pin there
+    means the normalisation did not run, not that the gates are off. Callers that read a RAW
+    stored config -- the trial-config builder, the master prepare -- pass ``required=False``,
+    where "no key" legitimately means "this run predates the feature".
     """
     from ba2_common.core.market_conditions import PROFILES
 
+    has_setting, setting_profiles = market_condition_profile_setting(config)
     raw = config.get("market_condition_profiles")
     has_legacy_key = "market_condition_profile" in config
     legacy_profile = config.get("market_condition_profile")
@@ -252,9 +297,10 @@ def market_condition_pins(config: Dict[str, Any], *, required: bool = True
     given = config.get("market_condition_manifests")
     legacy_digest = config.get("market_condition_manifest")
 
-    neither_shape = raw is None and not has_legacy_key
-    if neither_shape:
-        profiles: List[str] = []
+    no_shape = raw is None and not has_legacy_key and not has_setting
+    if raw is None and not has_legacy_key:
+        # The setting alone (Task 12's canonical shape), or nothing at all.
+        profiles: List[str] = list(setting_profiles)
     else:
         if raw is None:
             raw = legacy_profiles
@@ -280,6 +326,19 @@ def market_condition_pins(config: Dict[str, Any], *, required: bool = True
         raise ValueError(
             f"config pins market_condition_profiles {profiles!r} AND market_condition_profile "
             f"{legacy_profile!r}: they disagree. Carry one shape, not two.")
+    # SAME CHECK against the expert SETTING, which is the authority since Task 12 and the one
+    # thing that also reaches LIVE. A config key saying "ohlcv-v1" over a setting saying nothing
+    # would install the readers for a run whose deployed twin is ungated (and the reverse would
+    # score a gated strategy on data the trial never pinned) -- so the two must agree exactly,
+    # including the empty-vs-named case the config-key check above already refuses.
+    if has_setting and list(setting_profiles) != profiles:
+        from ba2_common.core.market_condition_rules import PROFILE_SETTING
+
+        raise ValueError(
+            f"config pins market_condition_profiles {profiles!r} but the run's expert "
+            f"{PROFILE_SETTING} setting names {list(setting_profiles)!r}: they disagree. The "
+            f"setting is what LIVE reads, so a run whose config key and setting differ scores a "
+            f"different strategy from the one it would deploy.")
     # A MANIFEST WITHOUT A PROFILE is not a harmless leftover: the digest is what a driver folds
     # into the job identity, so the run reads as gated everywhere afterwards while nothing ever
     # reads the snapshot. Checked BEFORE the "predates the feature" return, which would otherwise
@@ -289,7 +348,7 @@ def market_condition_pins(config: Dict[str, Any], *, required: bool = True
             f"a market-condition manifest is pinned ({given or legacy_digest!r}) but no profile "
             f"is: nothing would read it, and the run would be UNGATED while its digest says "
             f"otherwise. Pin the profile(s) the rules were built for, or drop the manifest.")
-    if neither_shape:
+    if no_shape:
         if required:
             raise KeyError("market_condition_profiles")
         return [], {}

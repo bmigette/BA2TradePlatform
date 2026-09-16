@@ -424,11 +424,21 @@ def test_the_ga_trial_config_carries_the_digest_and_the_profile():
     assert plain["market_condition_manifests"] == {}
 
 
-def test_the_worker_env_keys_carry_the_profile_and_manifest():
+def test_the_worker_env_keys_no_longer_carry_the_profile_or_manifest():
+    """RETIRED with Task 12. The profile is an expert setting carried INSIDE the trial config's
+    expert settings, and a set ``BA2_MARKET_CONDITION_PROFILE`` now fails live startup -- so
+    mirroring it into a spawned worker would have propagated a refusal. The manifest goes with
+    it: it only rode along for environment-resolved diagnostics of a resolver that no longer
+    resolves from the environment, while ``market_condition_manifests`` on the trial config has
+    always been what a backtest actually reads."""
     from app.services.strategy_optimization_handler import _WORKER_ENV_KEYS
 
-    assert "BA2_MARKET_CONDITION_PROFILE" in _WORKER_ENV_KEYS
-    assert "BA2_MARKET_CONDITION_MANIFEST" in _WORKER_ENV_KEYS
+    assert "BA2_MARKET_CONDITION_PROFILE" not in _WORKER_ENV_KEYS
+    assert "BA2_MARKET_CONDITION_MANIFEST" not in _WORKER_ENV_KEYS
+    # The keys that ARE mirrored are unchanged (this list is not a free-for-all).
+    assert _WORKER_ENV_KEYS == ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY",
+                                "OPENAI_API_KEY", "BA2_SHARED_ARRAYS",
+                                "BA2_SHARED_ARRAYS_LOCK_STALE_S")
 
 
 def test_a_409_takes_the_worker_out_at_once_instead_of_three_requeues(monkeypatch):

@@ -478,3 +478,104 @@ def test_one_profile_installs_the_reader_itself_unwrapped(ps):
     assert type(resolver.reader) is BacktestMarketConditionReader
     assert resolver.reader.profile == "ohlcv-v1"
     seam_wiring.clear_backtest_market_conditions()
+
+
+# ------------------------------------------------------- the profile is an expert setting (T12)
+def _spec(profile, cls="FMPRating"):
+    return {"class": cls, "settings": {"market_condition_profile": profile}}
+
+
+def test_the_profiles_come_from_the_expert_setting():
+    """THE canonical shape since Task 12: no config key at all, just the setting live also reads.
+
+    ``required=True`` is satisfied by the setting -- it is a shape, not an absence -- so the seam
+    does not mistake a setting-only config for one that skipped normalisation.
+    """
+    pins = seam_wiring.market_condition_pins
+    assert pins({"experts": [_spec("ohlcv-v1")]}) == (["ohlcv-v1"], {"ohlcv-v1": None})
+    assert pins({"experts": [_spec("ohlcv-v1,ta-structure-v1")],
+                 "market_condition_manifests": {"ohlcv-v1": "d1", "ta-structure-v1": "d2"}}) == (
+        ["ohlcv-v1", "ta-structure-v1"], {"ohlcv-v1": "d1", "ta-structure-v1": "d2"})
+    # An EXPLICIT empty setting is a statement ("this expert is not gated"), not an absence.
+    assert pins({"experts": [_spec("")]}) == ([], {})
+
+
+def test_two_experts_settings_are_unioned_in_first_appearance_order():
+    """One run, two experts, one reader set: the union serves each expert exactly its own fields
+    (every field belongs to exactly one profile, so nothing else changes hands)."""
+    pins = seam_wiring.market_condition_pins
+    assert pins({"experts": [_spec("ta-structure-v1"), _spec("ohlcv-v1", "FMPRatingB"),
+                             _spec("ta-structure-v1", "FMPRatingC")]})[0] == [
+        "ta-structure-v1", "ohlcv-v1"]
+
+
+def test_an_unregistered_or_repeated_setting_is_refused_by_the_shared_parser():
+    with pytest.raises(ValueError, match="not a registered"):
+        seam_wiring.market_condition_pins({"experts": [_spec("nope-v1")]})
+    with pytest.raises(ValueError, match="repeats"):
+        seam_wiring.market_condition_pins({"experts": [_spec("ohlcv-v1,ohlcv-v1")]})
+
+
+def test_a_setting_that_contradicts_the_config_key_is_refused():
+    """The failure this task exists to prevent, in its backtest half: one key says the run is
+    gated and the other says it is not, and the setting is the half that also reaches LIVE."""
+    pins = seam_wiring.market_condition_pins
+    with pytest.raises(ValueError, match="setting names"):
+        pins({"experts": [_spec("")], "market_condition_profiles": ["ohlcv-v1"]})
+    with pytest.raises(ValueError, match="setting names"):
+        pins({"experts": [_spec("ohlcv-v1")], "market_condition_profiles": []})
+    with pytest.raises(ValueError, match="setting names"):
+        pins({"experts": [_spec("ohlcv-v1")], "market_condition_profile": "ta-structure-v1"})
+    # Agreement, in each of the two config shapes, is fine.
+    assert pins({"experts": [_spec("ohlcv-v1")],
+                 "market_condition_profiles": ["ohlcv-v1"]})[0] == ["ohlcv-v1"]
+    assert pins({"experts": [_spec("ohlcv-v1")],
+                 "market_condition_profile": "ohlcv-v1"})[0] == ["ohlcv-v1"]
+
+
+def test_a_legacy_only_persisted_config_still_resolves():
+    """No setting anywhere -- every config persisted before Task 12. Read, never refused."""
+    pins = seam_wiring.market_condition_pins
+    assert pins({"experts": [{"class": "FMPRating", "settings": {}}],
+                 "market_condition_profile": "ohlcv-v1",
+                 "market_condition_manifest": "d1"}) == (["ohlcv-v1"], {"ohlcv-v1": "d1"})
+    assert pins({"experts": ["FMPRating"], "market_condition_profiles": ["ohlcv-v1"]})[0] == [
+        "ohlcv-v1"]
+    with pytest.raises(KeyError):
+        pins({"experts": [{"class": "FMPRating", "settings": {}}]})
+
+
+def test_the_setting_alone_installs_the_readers(ps):
+    """End to end: a config carrying ONLY the setting installs the same resolver the config key
+    would have -- that is what makes the setting safe to be the authority."""
+    resolver = seam_wiring.install_backtest_market_conditions(
+        {"experts": [_spec("ohlcv-v1,ta-structure-v1")]}, ps)
+    assert [r.profile for r in resolver.reader.readers] == ["ohlcv-v1", "ta-structure-v1"]
+    seam_wiring.clear_backtest_market_conditions()
+
+
+def test_the_setting_survives_the_trial_config_whitelist():
+    """``_build_daily_trial_config`` rebuilds the config KEY BY KEY, so a run-level knob missing
+    from it is inert. The setting escapes that trap by riding inside the expert SETTINGS dict,
+    which the builder copies wholesale -- pinned here because it is the reason the profile was
+    made a setting rather than another run-level key."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    cfg = _build_daily_trial_config(
+        {"backtest_id": "mc", "start_date": "2024-02-01", "end_date": "2024-06-01",
+         "enabled_instruments": ["AAA"], "experts": [_spec("ohlcv-v1")],
+         "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
+         "market_condition_manifests": {"ohlcv-v1": "d1"}}, {})
+    assert cfg["experts"][0]["settings"]["market_condition_profile"] == "ohlcv-v1"
+    # ... and the derived keys are written out too, so every stored-config consumer still reads
+    # a resolved list (and the two are checked against each other on the way back in).
+    assert cfg["market_condition_profiles"] == ["ohlcv-v1"]
+    assert cfg["market_condition_manifests"] == {"ohlcv-v1": "d1"}
+    assert seam_wiring.market_condition_pins(cfg) == (["ohlcv-v1"], {"ohlcv-v1": "d1"})
+
+
+def test_a_manifestless_setting_still_fails_an_optimizer_trial(ps):
+    """Task 10 behaviour, reached through the setting: a search may not compute on a miss."""
+    with pytest.raises(ValueError, match="pins no manifest"):
+        seam_wiring.install_backtest_market_conditions(
+            {"experts": [_spec("ohlcv-v1")], "_ga_trial": True}, ps)
