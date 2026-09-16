@@ -102,11 +102,32 @@ def get_market_condition_context_resolver():
     return _market_condition_context_resolver
 
 
+#: Every entry into :func:`resolve_market_condition_context` in this process, installed resolver
+#: or not. THE NO-IMPACT EVIDENCE (plan Task 9): a run with the profile off must not merely
+#: produce the same numbers, it must never reach this code at all -- identical results with the
+#: gates quietly evaluating would be a much worse outcome than a diff. ``tools/backtest_parity.py``
+#: prints it per child, so "the resolver was never called" is a measurement rather than a belief.
+_market_condition_resolver_calls = 0
+
+
+def market_condition_resolver_calls() -> int:
+    """How many market-condition leaf evaluations asked for a context in this process."""
+    return _market_condition_resolver_calls
+
+
+def reset_market_condition_resolver_calls() -> None:
+    """Zero the counter (test isolation; a benchmark's warm-up phase)."""
+    global _market_condition_resolver_calls
+    _market_condition_resolver_calls = 0
+
+
 def resolve_market_condition_context(account, instrument_name: str,
                                      expert_recommendation) -> Optional[MarketConditionContext]:
     """Resolve the context for one evaluation; None when no resolver is installed or the
     resolver has no context for it. A resolver returning anything else is a wiring defect and
     raises (it must never be mistaken for a usable context)."""
+    global _market_condition_resolver_calls
+    _market_condition_resolver_calls += 1
     fn = _market_condition_context_resolver
     if fn is None:
         return None
@@ -4116,11 +4137,24 @@ class MarketConditionCompare(CompareCondition):
             if resolver is not None:
                 # A resolver IS installed but has no context for this evaluation (live: a leaf
                 # outside the enter-market decision scope). Never raise -- exit rulesets must keep
-                # running -- but say so ONCE per field instead of a DEBUG line per evaluation.
+                # running -- but say so ONCE per cause instead of a DEBUG line per evaluation.
                 reason = getattr(resolver, "no_context_reason", None) or \
                     "the installed market-condition resolver has no context for this evaluation"
-                if self.FIELD not in _warned_no_market_condition_context_fields:
-                    _warned_no_market_condition_context_fields.add(self.FIELD)
+                # PER-SYMBOL FIRST. A resolver can refuse ONE symbol for a reason of its
+                # own -- live, a pinned snapshot that carries no rows for it -- and
+                # collapsing that into the resolver's one class-level sentence is how
+                # "this sleeve stopped entering NVDA in March" stays invisible. The
+                # generic reason is the fallback, not the only answer.
+                reason_for = getattr(resolver, "no_context_reason_for", None)
+                per_symbol = reason_for(self.instrument_name) if callable(reason_for) else None
+                if per_symbol:
+                    reason = per_symbol
+                # Keyed on (field, reason), not the field alone: the reasons are bounded
+                # (one per uncovered symbol plus the generic one), and one WARNING per
+                # distinct CAUSE is the point of warning at all.
+                warned_key = (self.FIELD, reason)
+                if warned_key not in _warned_no_market_condition_context_fields:
+                    _warned_no_market_condition_context_fields.add(warned_key)
                     logger.warning("Market-condition leaf %s (%s): %s",
                                    self.FIELD, self.instrument_name, reason)
                 return self._unknown(_MC_STATUS_NO_CONTEXT, reason)
@@ -4172,7 +4206,9 @@ class MarketConditionCompare(CompareCondition):
 
 
 _warned_no_market_condition_resolver = False
-#: Fields already warned about "resolver installed, no context" (once per field per process).
+#: ``(field, reason)`` pairs already warned about for "resolver installed, no context":
+#: one WARNING per distinct CAUSE per process, not per field -- a per-symbol coverage
+#: reason is a different failure from "no decision scope is open".
 _warned_no_market_condition_context_fields: set = set()
 
 _OPERATORS_BY_KIND = {

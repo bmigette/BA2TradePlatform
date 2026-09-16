@@ -306,22 +306,19 @@ def check_market_condition_coverage(config: Dict[str, Any], reader: Any) -> List
     logs one ERROR naming the symbols and continues, because a one-off run over a wider universe
     than the snapshot is a legitimate thing to do deliberately. Returns the missing symbols.
     """
+    from ba2_common.core.market_condition_reader import coverage_detail, missing_coverage
+
     mapped = getattr(reader, "mapped_reader", None)
     if mapped is None:
         return []                      # research mode without a manifest: nothing to compare to
     universe = market_condition_universe(config)
-    if not universe:
-        return []                      # no universe recorded on the config: nothing to check
-    covered = set(mapped.symbols())
-    missing = [s for s in universe if s not in covered]
+    missing = missing_coverage(mapped, universe)
     if not missing:
         return []
     shown = ", ".join(missing[:_COVERAGE_NAMES])
     if len(missing) > _COVERAGE_NAMES:
         shown += f", and {len(missing) - _COVERAGE_NAMES} more"
-    recorded = [s for s in missing if s in (mapped.coverage() or {})]
-    detail = (f" ({len(recorded)} of them ARE in the manifest's coverage record, so they were "
-              f"warmed and then excluded -- check its exceptions)" if recorded else "")
+    detail = coverage_detail(mapped, missing)
     message = (
         f"market-condition manifest {mapped.manifest_digest} does not cover "
         f"{len(missing)} of this run's {len(universe)} instruments: {shown}{detail}. "

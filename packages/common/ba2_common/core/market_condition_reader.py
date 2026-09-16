@@ -135,6 +135,9 @@ __all__ = [
     "prune_prepared_markers",
     "prune_revoked_markers",
     "revoke_prepared",
+    "COVERAGE_NAMES",
+    "missing_coverage",
+    "coverage_detail",
 ]
 
 #: Local mapped-array layout version. A change of arrays or meaning gets a new number, which moves
@@ -838,3 +841,41 @@ def _record_prepared(cache_root: str, profile: str, manifest_digest: str,
         os.replace(tmp, path)
     except OSError as e:
         report.warnings.append(f"prepared marker not written: {e}")
+
+
+#: How many missing symbols a coverage message names before it says "and N more".
+COVERAGE_NAMES = 20
+
+
+def missing_coverage(mapped: Any, universe: Any) -> List[str]:
+    """The symbols of ``universe`` this mapped snapshot has no rows for, in universe order.
+
+    ONE implementation because there are two callers with the same question and different
+    ANSWERS to it: the backtest seam refuses a GA trial and logs an error otherwise
+    (``app.services.backtest.seam_wiring.check_market_condition_coverage``), while the live
+    resolver logs one error per symbol and gates those symbols ``no_context``
+    (``market_condition_live.LiveMarketConditionResolver.refresh_coverage``). The set
+    difference is the same in both, and a second copy of it is a second place for the
+    upper-casing to drift.
+
+    ``mapped`` is a :class:`MappedMarketConditionReader` (anything exposing ``symbols()``);
+    ``None`` means research mode with no pinned manifest, and there is nothing to compare to.
+    """
+    if mapped is None:
+        return []
+    wanted = [str(s).upper() for s in (universe or ())]
+    if not wanted:
+        return []
+    covered = set(mapped.symbols())
+    return [s for s in wanted if s not in covered]
+
+
+def coverage_detail(mapped: Any, missing: Any) -> str:
+    """" (N of them ARE in the coverage record ...)" or "" -- the half of a coverage message
+    that distinguishes "never warmed" from "warmed and then excluded", which is the difference
+    between a universe mistake and a source problem."""
+    recorded = [s for s in missing if s in ((mapped.coverage() if mapped else None) or {})]
+    if not recorded:
+        return ""
+    return (f" ({len(recorded)} of them ARE in the manifest's coverage record, so they were "
+            f"warmed and then excluded -- check its exceptions)")
