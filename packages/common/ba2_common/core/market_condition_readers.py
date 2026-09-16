@@ -16,8 +16,13 @@ Design: ``docs/plans/2026-09-15-option-market-condition-genes-design.md`` sectio
 * :class:`ReplayMarketConditionReader` -- serves exactly what was recorded, verifies the window
   digest, and raises ``ReplayMiss`` for anything not on the tape; it never touches a cache.
 
-Task 7 replaces the compute path of the backtest/live readers with the mapped feature store; the
-reader protocol, the memo contract and the capture payload stay.
+Task 7 replaced the COMPUTE path with the mapped feature store: a reader handed a
+``MappedMarketConditionReader`` (``mapped=``, built from a pinned manifest digest) serves that
+manifest's published rows and NEVER calculates -- ``_bars`` is not called at all. Without a
+manifest the reader keeps computing on a miss, which is research/dev behaviour only and says so
+ONCE per process (``warn_research_mode``); a GA trial that reaches this state is refused at
+install time (``seam_wiring.install_backtest_market_conditions``), never run on computed rows.
+The reader protocol, the memo contract and the capture payload are unchanged either way.
 """
 from __future__ import annotations
 
@@ -62,11 +67,36 @@ __all__ = [
     "CAPTURE_METHOD",
     "CAPTURE_SCHEMA",
     "capture_identity",
+    "warn_research_mode",
 ]
 
 #: Bounded memo: (symbol, session) rows kept per reader. One backtest bar touches at most one
 #: session per symbol, so 2000 covers a wide universe without eviction churn.
 MEMO_SIZE = 2000
+
+#: One WARNING per process for a reader running without a pinned manifest. A grid job never gets
+#: here (the BT installer refuses it); a research run should still be told that its numbers come
+#: from a per-process calculation rather than from the snapshot a job would have pinned.
+_RESEARCH_WARNED: set = set()
+_RESEARCH_LOCK = threading.Lock()
+
+
+def warn_research_mode(profile: str, where: str) -> bool:
+    """Log (once per process, per profile+site) that this reader computes on a miss. Returns
+    whether it actually logged, so a test can pin the once-ness without parsing a log."""
+    key = (profile, where)
+    with _RESEARCH_LOCK:
+        if key in _RESEARCH_WARNED:
+            return False
+        _RESEARCH_WARNED.add(key)
+    from ba2_common.logger import logger
+
+    logger.warning(
+        f"market-condition profile {profile!r} ({where}): no manifest pinned -- computing on miss "
+        f"(research mode). A search or a live analysis must pin a prepared manifest digest so "
+        f"every consumer reads the one published snapshot.")
+    return True
+
 
 CAPTURE_PROVIDER = "market_conditions"
 CAPTURE_METHOD = "window"
@@ -112,11 +142,19 @@ def _check_row(profile: str, calc_version: str, row: Optional[FeatureRow]) -> No
 class WindowMarketConditionReader:
     """Base reader: bars -> window -> ``FeatureRow``, memoised. Thread-safe."""
 
-    def __init__(self, profile: str, *, memo_size: int = MEMO_SIZE, retain_windows: bool = True):
+    def __init__(self, profile: str, *, memo_size: int = MEMO_SIZE, retain_windows: bool = True,
+                 mapped: Optional[Any] = None):
         if profile not in PROFILES:
             raise KeyError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)!r}")
         if profile not in COMPUTE_BY_PROFILE:
             raise KeyError(f"no calculator registered for profile {profile!r} in COMPUTE_BY_PROFILE")
+        #: A ``MappedMarketConditionReader`` over a pinned manifest, or None (compute on miss).
+        #: When set, ``_bars``/the calculator are never reached -- see the module docstring.
+        if mapped is not None and mapped.profile != profile:
+            raise ValueError(f"mapped reader serves profile {mapped.profile!r}, this reader wants {profile!r}")
+        self._mapped = mapped
+        #: rows served from a pinned manifest (mirror of ``computed`` for the mapped path).
+        self.mapped_rows = 0
         self.profile = profile
         self.calc_version = PROFILES[profile].calc_version
         self._memo_size = int(memo_size)
@@ -163,6 +201,8 @@ class WindowMarketConditionReader:
         return entry
 
     def _compute(self, symbol: str, session: date) -> Optional[ObservedWindow]:
+        if self._mapped is not None:
+            return self._mapped_entry(symbol, session)
         bars = self._bars(symbol, session)
         if bars is None:
             return None
@@ -180,6 +220,24 @@ class WindowMarketConditionReader:
         _check_row(self.profile, self.calc_version, row)
         self.computed += 1
         return entry
+
+    def _mapped_entry(self, symbol: str, session: date) -> Optional[ObservedWindow]:
+        """One row from the pinned manifest. Nothing is assembled and nothing is calculated;
+        ``computed`` therefore stays at zero (that counter is the test for it).
+
+        The retained window is fetched only when this reader retains windows at all (live capture;
+        a backtest reader sets ``retain_windows=False``), and comes from the store's retained raw
+        shards -- the same bytes the row was computed from, re-hashed on the way out."""
+        row = self._mapped.observe(symbol, session)
+        if row is None:
+            return None
+        window = digest = None
+        if self._retain_windows:
+            window = self._mapped.window_result_for(symbol, session)
+            digest = self._mapped.window_digest_for(symbol, session)
+        _check_row(self.profile, self.calc_version, row)
+        self.mapped_rows += 1
+        return ObservedWindow(row=row, window=window, digest=digest)
 
     def memo_len(self) -> int:
         with self._lock:
@@ -203,8 +261,24 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
     if the file is rewritten between them; the capture records each distinct window served.
     """
 
-    def __init__(self, profile: str, cache_root: Optional[str] = None, *, memo_size: int = MEMO_SIZE):
-        super().__init__(profile, memo_size=memo_size)
+    def __init__(self, profile: str, cache_root: Optional[str] = None, *, memo_size: int = MEMO_SIZE,
+                 manifest_digest: Optional[str] = None):
+        """``manifest_digest`` pins the published snapshot this reader serves (design section 4.5:
+        a scheduled analysis consumes a pinned manifest). With it the FMP cache is never read and
+        nothing is calculated; without it the reader computes on a miss and says so once."""
+        mapped = None
+        if manifest_digest:
+            from ba2_common.core.market_condition_reader import MappedMarketConditionReader
+
+            root = cache_root
+            if root is None:
+                from ba2_common.core import native_cache
+                root = native_cache.CACHE_FOLDER
+            mapped = MappedMarketConditionReader(root, manifest_digest, profile)
+        else:
+            warn_research_mode(profile, "live FMP cache reader")
+        super().__init__(profile, memo_size=memo_size, mapped=mapped)
+        self.manifest_digest = manifest_digest
         self._cache_root = cache_root
 
     def _path(self, symbol: str) -> Optional[str]:
@@ -212,6 +286,10 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
         return fmp_daily_cache_path(symbol, self._cache_root)
 
     def _memo_key(self, symbol: str, session: date) -> Hashable:
+        if self._mapped is not None:
+            # A pinned manifest is immutable, so the file-freshness part of the key (a stat per
+            # observe) would only be dead weight -- and the file it stats need not even exist.
+            return (symbol, session)
         path = self._path(symbol)
         if path is None:
             return (symbol, session, None)

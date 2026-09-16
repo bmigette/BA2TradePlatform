@@ -137,6 +137,46 @@ def test_plan_build_verify_round_trip(tool, root, universe_file, tmp_path, capsy
     assert json.loads(capsys.readouterr().out)["corrupt"]
 
 
+def test_prepare_host_verifies_then_maps_and_refuses_a_corrupt_object(tool, root, universe_file,
+                                                                      tmp_path, capsys):
+    """prepare-host is the step every worker runs before a search dispatches (design 4.4 step 5).
+
+    Order is the contract: VERIFY (re-hash every object and raw shard), and only then build the
+    mapped arrays. A corrupt object must leave the host with no mapping at all -- an array set is
+    immutable once published and is mapped by every worker process on the box.
+    """
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out)) == 0
+    capsys.readouterr()
+    assert tool.main(["--quiet", "build", "--plan", out, "--cache-only"]) == 0
+    digest = json.loads(capsys.readouterr().out)["manifest_digest"]
+
+    assert tool.main(["--quiet", "prepare-host", "--manifest", digest, "--cache-root", root]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["ok"] and first["built"] and first["symbols"] == 3 and first["rows"] > 0
+
+    # Second run on a warm host: opened, not rebuilt -- the "0 built / N opened" signal.
+    assert tool.main(["--quiet", "prepare-host", "--manifest", digest, "--cache-root", root]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["ok"] and not second["built"] and second["opened"]
+
+    from ba2_common.core.market_condition_reader import _derived_root, mapped_key
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    store = MarketConditionStore(root)
+    obj = store.abspath(store.read_manifest(digest)["objects"][0]["path"])
+    size = obj.stat().st_size
+    data = bytearray(obj.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    obj.write_bytes(bytes(data))
+    assert obj.stat().st_size == size
+    assert tool.main(["--quiet", "prepare-host", "--manifest", digest, "--cache-root", root]) == 1
+    bad = json.loads(capsys.readouterr().out)
+    assert not bad["ok"] and not bad["verified"] and any("corrupt" in e for e in bad["errors"])
+    # The already-published mapping is untouched (nothing rewrites a published set); what the
+    # failure guarantees is that no NEW mapping was built from the corrupt bytes.
+    assert os.path.isdir(os.path.join(_derived_root(root), mapped_key("ohlcv-v1", digest)))
+
+
 def test_cache_only_with_missing_coverage_exits_one_and_fetches_nothing(tool, root, universe_file, tmp_path, capsys):
     os.remove(Path(root) / "FMPOHLCVProvider" / "CCC_1d.parquet")
     out = str(tmp_path / "plan.json")
@@ -162,12 +202,16 @@ def test_configuration_errors_exit_two(tool, root, universe_file, tmp_path, caps
     assert tool.main(["--quiet", "build", "--plan", str(bad), "--cache-only"]) == 2
     # build requires exactly one mode
     assert tool.main(["--quiet", "build", "--plan", out]) == 2
-    assert tool.main(["--quiet", "prepare-host", "--manifest", "abc"]) == 2
+    # prepare-host without a digest has nothing to prepare: a configuration error.
+    assert tool.main(["--quiet", "prepare-host"]) == 2
     capsys.readouterr()
 
 
 def test_unknown_manifest_verification_exits_one(tool, root, capsys):
     assert tool.main(["--quiet", "verify", "--manifest", "0" * 64, "--cache-root", root]) == 1
+    # Same for prepare-host: a digest that is not on this host is an ACTIONABLE failure (sync it,
+    # then prepare), not a malformed command line.
+    assert tool.main(["--quiet", "prepare-host", "--manifest", "0" * 64, "--cache-root", root]) == 1
     capsys.readouterr()
 
 

@@ -21,9 +21,13 @@ ONE preparation for a whole search (design section 4.4). Typical use:
     # 3. Prove a published snapshot (re-hashes every referenced object).
     python tools/warm_market_conditions.py verify --manifest <digest>
 
+    # 4. Prepare THIS host: verify, then build the memory-mapped arrays every worker maps.
+    #    Run it on the master and on every worker before dispatching a search.
+    python tools/warm_market_conditions.py prepare-host --manifest <digest> --jobs 4
+
 Exit codes: 0 success; 1 an actionable inventory, a failed preflight, a build error or a failed
-verification; 2 a configuration error (unknown profile/source profile, bad dates, missing files).
-``prepare-host`` (the per-host mapped arrays) lands in Task 7 of the implementation plan.
+verification (``prepare-host`` included: a corrupt object NEVER becomes a mapping); 2 a
+configuration error (unknown profile/source profile, bad dates, missing files).
 
 Nothing here decides anything: arguments and reporting only. The orchestration lives in
 ``ba2_providers.market_conditions.warmup`` so the CLI, the job queue and live pre-analysis
@@ -143,10 +147,29 @@ def cmd_verify(args) -> int:
 
 
 def cmd_prepare_host(args) -> int:
-    print("prepare-host (per-host mapped arrays) lands in Task 7 of "
-          "docs/plans/2026-09-15-option-market-condition-genes-impl.md; it is not implemented yet.",
-          file=sys.stderr)
-    return EXIT_CONFIG
+    """Verify the manifest on THIS host, then build its mapped arrays (design section 4.4 step 5).
+
+    Verification comes first and is not optional: the mapping is an immutable, atomically
+    published array set that every worker process on the host then maps, so building it from an
+    object that failed its hash would bake corrupt numbers into the whole box. A failure exits 1
+    and leaves no mapping behind."""
+    from ba2_common.core.market_condition_reader import prepare_host
+    from ba2_common.core.market_condition_store import ManifestError
+
+    root = _cache_root(args.cache_root)
+    if not args.manifest:
+        print("prepare-host needs --manifest <digest>", file=sys.stderr)
+        return EXIT_CONFIG
+    try:
+        report = prepare_host(root, args.manifest, args.profile, jobs=args.jobs, log=_logger(args))
+    except FileNotFoundError as e:
+        print(f"prepare-host failed: {e}", file=sys.stderr)
+        return EXIT_ACTIONABLE
+    except ManifestError as e:
+        print(f"prepare-host failed: {e}", file=sys.stderr)
+        return EXIT_ACTIONABLE
+    _out(report.to_dict())
+    return EXIT_OK if report.ok else EXIT_ACTIONABLE
 
 
 def _logger(args):
@@ -190,8 +213,15 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--cache-root", default=None)
     v.set_defaults(func=cmd_verify)
 
-    h = sub.add_parser("prepare-host", parents=[common], help="(Task 7) prepare this host's mapped arrays")
+    h = sub.add_parser("prepare-host", parents=[common],
+                       help="verify a manifest here, then build this host's mapped arrays")
     h.add_argument("--manifest", default=None)
+    h.add_argument("--profile", default=None,
+                   help="only needed to disambiguate a digest across profiles (the manifest "
+                        "names its own profile)")
+    h.add_argument("--cache-root", default=None)
+    h.add_argument("--jobs", type=int, default=4,
+                   help="concurrent object reads while building the mapping")
     h.set_defaults(func=cmd_prepare_host)
     return ap
 

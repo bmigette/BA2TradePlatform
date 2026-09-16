@@ -49,6 +49,7 @@ from ba2_common.core.market_condition_source import SOURCE_PROFILE_FMP_DAILY
 
 __all__ = [
     "PROFILE_ENV",
+    "MANIFEST_ENV",
     "DecisionState",
     "LiveMarketConditionResolver",
     "current_decision",
@@ -63,6 +64,12 @@ __all__ = [
 
 #: Environment switch for the live profile. Unset, empty or ``none`` -> nothing is installed.
 PROFILE_ENV = "BA2_MARKET_CONDITION_PROFILE"
+
+#: The prepared manifest digest the live instance serves (design section 4.5: "Scheduled analysis
+#: consumes a pinned manifest"). Set -> the reader serves that published snapshot and calculates
+#: nothing. Unset -> the reader computes on a miss from the FMP cache, which is research/dev
+#: behaviour and is logged ONCE per process by ``warn_research_mode``.
+MANIFEST_ENV = "BA2_MARKET_CONDITION_MANIFEST"
 
 #: Why a live leaf got no context: read by ``TradeConditions`` for its once-per-field WARNING.
 NO_DECISION_SCOPE_REASON = (
@@ -149,10 +156,13 @@ class LiveMarketConditionResolver:
     no_context_reason = NO_DECISION_SCOPE_REASON
 
     def __init__(self, profile: str, *, reader: Optional[Any] = None,
-                 source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+                 source_profile: str = SOURCE_PROFILE_FMP_DAILY,
+                 manifest_digest: Optional[str] = None):
         from ba2_common.core.market_condition_readers import FMPCacheMarketConditionReader
 
-        self.reader = reader if reader is not None else FMPCacheMarketConditionReader(profile)
+        self.reader = reader if reader is not None else FMPCacheMarketConditionReader(
+            profile, manifest_digest=manifest_digest)
+        self.manifest_digest = manifest_digest
         if self.reader.profile != profile:
             raise ValueError(f"reader serves profile {self.reader.profile!r}, resolver wants {profile!r}")
         self.profile = profile
@@ -296,4 +306,10 @@ def resolver_from_env(environ: Optional[Any] = None,
             f"{', '.join(degraded.failing_symbols)} under {report.cache_root}; market-condition "
             f"gates will refuse every entry. {SourceCertificationError(report)}")
         return degraded
-    return LiveMarketConditionResolver(raw, reader=FMPCacheMarketConditionReader(raw, cache_root))
+    # The pinned snapshot, if the deployment has one. Certification still runs and still decides:
+    # it proves the SOURCE the rows were computed from is the one this instance believes in, and a
+    # cache that fails it degrades the gates to "refuse loudly" whether or not a manifest is set.
+    digest = (env.get(MANIFEST_ENV) or "").strip() or None
+    return LiveMarketConditionResolver(
+        raw, reader=FMPCacheMarketConditionReader(raw, cache_root, manifest_digest=digest),
+        manifest_digest=digest)

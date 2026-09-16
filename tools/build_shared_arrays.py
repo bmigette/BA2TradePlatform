@@ -92,7 +92,7 @@ _OHLCV_KEY_VERSION = re.compile(r"_v(\d+)_[0-9a-f]+$")
 #: Every option whose value is a filesystem path. ``_parse`` absolutizes all of them in one pass
 #: because ``_bootstrap`` chdirs: a relative path typed at the repo root does not survive into
 #: the rest of the run. Add an option here the day you add the option.
-_PATH_ARGS = ("universe_file", "metric_store")
+_PATH_ARGS = ("universe_file", "metric_store", "cache_root")
 
 #: One symbol's outcome: (symbol, rows, status, seconds, error). status is one of
 #: built / opened / empty / error.
@@ -536,6 +536,12 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
                    help="Screener metric-store directory to SWEEP (it publishes one "
                         "'u_store.v<n>' key beside itself). Sweep-only: the store is built by "
                         "the first trial that reads it, not by this tool.")
+    p.add_argument("--market-conditions", metavar="DIGEST",
+                   help="ALSO prepare this host's market-condition mapping for the given manifest "
+                        "digest: verify every object by sha256, then build the mapped arrays "
+                        "(identical to 'tools/warm_market_conditions.py prepare-host --manifest'). "
+                        "Lets one prewarm pass ready everything a gated search touches.")
+    p.add_argument("--cache-root", help="Cache root for --market-conditions (default: CACHE_FOLDER).")
     p.add_argument("--sweep-max-age-days", type=float, default=14.0)
     p.add_argument("--dry-run", action="store_true", help="Print what would happen; touch nothing.")
     args = p.parse_args(argv)
@@ -543,9 +549,9 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     if args.options_store in ("sqlite",):
         p.error("--options-store sqlite has no parquet tree and therefore no derived array "
                 "cache; there is nothing to prewarm or sweep. Choose thetadata or tastytrade.")
-    if not (args.options_store or args.ohlcv_provider or args.metric_store):
+    if not (args.options_store or args.ohlcv_provider or args.metric_store or args.market_conditions):
         p.error("nothing to do: pass --options-store and/or --ohlcv-provider "
-                "(or --metric-store with --sweep).")
+                "(or --metric-store with --sweep, or --market-conditions <digest>).")
     # EVERY PATH ARGUMENT IS ABSOLUTIZED HERE, AS A CLASS. ``_bootstrap`` chdirs into
     # testplatform/backend, so a relative path typed at the repo root -- which is what the
     # documented invocations use -- means something different to every line that runs after it.
@@ -559,8 +565,9 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
             setattr(args, _name, os.path.abspath(_value))
     # Read once, here: ``args.symbol_list`` is the only copy anything downstream uses.
     args.symbol_list = _symbols(args.universe_file, args.symbols)
-    if not args.symbol_list and not args.sweep:
-        p.error("no symbols: pass --universe-file or --symbols (or --sweep to only collect).")
+    if not args.symbol_list and not args.sweep and not args.market_conditions:
+        p.error("no symbols: pass --universe-file or --symbols (or --sweep to only collect, or "
+                "--market-conditions <digest> to only prepare a feature-store mapping).")
     if args.symbol_list and args.ohlcv_provider and not (args.start and args.end):
         p.error("--ohlcv-provider needs --start and --end (the window is part of the cache key).")
     if args.metric_store and not args.sweep:
@@ -592,6 +599,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     symbols = args.symbol_list          # resolved and read ONCE, in _parse, before the chdir
     errors = 0
+
+    if args.market_conditions:
+        # The SAME routine prepare-host runs (ba2_common.core.market_condition_reader.prepare_host):
+        # verify every referenced object and raw shard by sha256, then publish the mapped arrays.
+        # One command can therefore ready a host for a gated search -- option tree, bar cache and
+        # feature mapping -- instead of three, which is the difference between "the runbook says
+        # run three things" and "a worker is warm".
+        from ba2_common.core.market_condition_reader import prepare_host
+
+        root = args.cache_root
+        if not root:
+            from ba2_common.config import CACHE_FOLDER
+            root = CACHE_FOLDER
+        if args.dry_run:
+            print(f"[market-conditions] would verify + map manifest {args.market_conditions} "
+                  f"under {root}")
+        else:
+            report = prepare_host(root, args.market_conditions, jobs=args.jobs,
+                                  log=lambda m: print(f"[market-conditions] {m}"))
+            print(f"[market-conditions] {report.to_dict()}")
+            if not report.ok:
+                errors += 1
 
     options_root = None
     if args.options_store:
