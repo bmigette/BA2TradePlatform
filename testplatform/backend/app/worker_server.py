@@ -216,6 +216,10 @@ def _sweep_orphaned_jobs() -> None:
             _JOBS.pop(jid, None)
             _JOBS_SUBMITTED_AT.pop(jid, None)
             _JOBS_LAST_POLL_AT.pop(jid, None)
+            # A market-condition preparation nobody polled leaves its sidecar entry here too;
+            # without this the dict is the one registry the sweep does not clear, and it grows
+            # for the life of the process (see _MC_JOBS, which claims the sweep drops it).
+            _MC_JOBS.pop(jid, None)
             ctl = _JOB_CTL.pop(jid, None)
             if ctl is not None:
                 # Sweeping an orphan now also STOPS it. Previously the registry entry was
@@ -899,7 +903,7 @@ _PREPARED_MC_LOADED = False
 #: A prepare job nobody ever polls (the master died mid-pre-flight) leaves an entry here and no
 #: in-memory admission -- but the WORK still completed and wrote its ``_derived`` marker, so the
 #: next pre-flight's ``_mc_load_markers``/prepare learns the digest from disk. The stale entry is
-#: dropped with the job by ``_sweep_orphaned_jobs``' registry pass on the next submit.
+#: dropped with the job by ``_sweep_orphaned_jobs``' registry pass (which pops this dict too).
 _MC_JOBS: dict = {}
 
 

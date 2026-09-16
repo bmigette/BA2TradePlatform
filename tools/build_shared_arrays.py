@@ -98,6 +98,10 @@ _OPTIONS_KEY_VERSION = re.compile(r"\.v(\d+)$")
 # without this pattern the old keys would be orphans nothing ever collects.
 _MC_KEY_VERSION = re.compile(r"_v(\d+)$")
 # Directories under a derived root that are NOT array keys and must never be evicted as one.
+# Hardcoded because ``sweep_root`` runs before (and without) the ba2_common import, and CHECKED
+# against the owning constant once the bootstrap makes it importable -- see
+# ``sweep_market_conditions``. A rename there would otherwise leave this collector quietly
+# evicting the readiness markers as though they were an obsolete key.
 _NON_KEY_DIRNAMES = ("_prepared",)
 _OHLCV_KEY_VERSION = re.compile(r"_v(\d+)_[0-9a-f]+$")
 
@@ -505,11 +509,20 @@ def sweep_market_conditions(cache_root: Optional[str], max_age_days: float,
     from ba2_common.core import shared_arrays as SA
     from ba2_common.core.market_condition_reader import (
         LAYOUT_VERSION,
+        PREPARED_DIRNAME,
         REVOKED_MAX_AGE_DAYS,
         prune_prepared_markers,
         prune_revoked_markers,
     )
     from ba2_common.core.market_condition_store import MC_DIRNAME
+
+    if PREPARED_DIRNAME not in _NON_KEY_DIRNAMES:
+        # Not an assert: -O would strip it, and the failure it guards is silent (the marker
+        # directory evicted as an obsolete key, so every worker on the host forgets what it
+        # prepared).
+        raise RuntimeError(
+            f"market_condition_reader.PREPARED_DIRNAME is {PREPARED_DIRNAME!r} but this tool "
+            f"protects {_NON_KEY_DIRNAMES!r}; update _NON_KEY_DIRNAMES before sweeping")
 
     root = cache_root
     if not root:

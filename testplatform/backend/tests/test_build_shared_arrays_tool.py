@@ -683,3 +683,20 @@ def test_sweep_ages_out_revoked_markers_and_never_evicts_the_prepared_directory(
     assert (markers / f"ohlcv-v1.{digest}.json").exists(), "a live marker with its mapping stays"
     assert fresh.exists() and not old.exists()
     assert "revoked markers older than 30d removed: 1" in out
+
+
+def test_the_protected_directory_name_is_checked_against_its_owner(tmp_path, monkeypatch, capsys):
+    """The tool hardcodes ``_prepared`` (it sweeps before ba2_common is importable). A rename in
+    market_condition_reader would otherwise leave this collector evicting the readiness markers as
+    though they were an obsolete key, silently, on every host."""
+    from ba2_common.core import market_condition_reader as MCR
+
+    tool = _tool()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _pin_cache_root(cache, monkeypatch)
+    assert MCR.PREPARED_DIRNAME in tool._NON_KEY_DIRNAMES
+
+    monkeypatch.setattr(MCR, "PREPARED_DIRNAME", "_renamed_by_someone")
+    with pytest.raises(RuntimeError, match="_NON_KEY_DIRNAMES"):
+        tool.sweep_market_conditions(str(cache), 14.0, False)

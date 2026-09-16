@@ -614,3 +614,28 @@ def test_a_verification_failure_that_names_no_digest_revokes_nothing(worker, mon
 
     assert r.status_code == 200 and r.json()["market_conditions_revoked"] == []
     assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [digest]
+
+
+def test_the_job_sweep_drops_an_unpolled_prepare_jobs_sidecar_entry(worker, monkeypatch):
+    """``_MC_JOBS`` is the sidecar that lets the poll admit the digest. A preparation nobody polls
+    (the master died mid-pre-flight) must not leave an entry behind for the life of the process --
+    the registry sweep that drops the job drops this too. The WORK is not lost: it wrote its
+    ``_derived`` marker, so the next pre-flight learns the digest from disk."""
+    client, cache, _pool = worker
+    _store, digest = _publish(cache)
+
+    r = client.post("/market-conditions/prepare", headers=H, json={"manifest": digest})
+    job_id = r.json()["job_id"]
+    assert job_id in ws._MC_JOBS                    # submitted, never polled
+
+    # Age the registry past the abandoned threshold and run the sweep (what the next submit does).
+    with ws._JOBS_LOCK:
+        ws._JOBS_SUBMITTED_AT[job_id] -= ws._JOBS_ABANDONED_AFTER + 60
+    ws._sweep_orphaned_jobs()
+
+    assert job_id not in ws._MC_JOBS
+    assert job_id not in ws._JOBS
+    # ...and the host still knows it prepared that snapshot, from the marker on disk.
+    monkeypatch.setattr(ws, "_PREPARED_MC", {})
+    monkeypatch.setattr(ws, "_PREPARED_MC_LOADED", False)
+    assert client.get("/health", headers=H).json()["market_conditions"]["prepared"] == [digest]
