@@ -98,7 +98,7 @@ def test_prune_paths_deletes_and_guards_traversal(tmp_path):
         ],
         str(tmp_path),
     )
-    assert res == {"pruned": 1, "skipped": 1, "failed": 0}
+    assert res == {"pruned": 1, "skipped": 1, "failed": 0, "protected": 0}
     assert not (tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part-00001.parquet").exists()
     assert (tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part.parquet").exists()
 
@@ -280,7 +280,7 @@ def test_prune_paths_survives_an_undeletable_file(tmp_path, monkeypatch):
 
     res = cache_sync.prune_paths(["locked.parquet", "after.parquet"], str(tmp_path))
 
-    assert res == {"pruned": 1, "skipped": 0, "failed": 1}
+    assert res == {"pruned": 1, "skipped": 0, "failed": 1, "protected": 0}
     assert not (tmp_path / "after.parquet").exists()   # the loop continued past the failure
     assert (tmp_path / "locked.parquet").exists()
     assert len(warned) == 1 and "locked.parquet" in warned[0], warned

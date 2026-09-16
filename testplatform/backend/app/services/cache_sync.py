@@ -18,10 +18,29 @@ only send genuinely new files. ``diff_stale``/``prune_paths`` are the reverse di
 the worker has that the master's CURRENT manifest no longer lists is a leftover from before a
 rebuild — a partition-globbing reader (e.g. the screener metric_store's ``load_store``) would
 otherwise keep ingesting it alongside the fresh file, silently corrupting that worker's results.
+
+MARKET-CONDITION FEATURE OBJECTS are the one bucket with stronger rules than the rest of the
+cache (design 2026-09-15 section 4.5), and both of them are implemented here:
+
+  * ARRIVAL IS VERIFIED BY SHA256, not by size. Every other bucket is append-only vendor history
+    where ``(rel_path, size)`` is identity; a feature object's name IS its sha256, its content
+    decides what a gated genome trades, and a truncated-then-repadded or bit-flipped transfer
+    would match on size and be mapped into every worker on the box. ``verify_market_conditions``
+    re-hashes every object and raw shard any locally present manifest references, and the worker
+    runs it after each push that touched the bucket.
+  * PRUNING IS SNAPSHOT-SCOPED. ``diff_stale`` lists what the master's CURRENT manifest does not
+    carry, which for this bucket includes objects pinned by a manifest ANOTHER job (or a stored
+    backtest, or a captured replay) still reads on that worker. ``prune_paths`` therefore walks
+    the worker's own manifests first and refuses to delete anything they reference.
+
+Neither adds work to the ordinary path: the hash pass reads only the market-condition bucket, and
+a threshold-only rerun pushes nothing but a manifest (its objects are already there, matched by
+the same cheap ``(rel_path, size)`` diff as everything else).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -55,6 +74,12 @@ _SKIP_SUFFIXES = (".tmp", ".part", ".lock", "-wal", "-shm", ".journal")
 # manifest on BOTH ends, which also keeps diff_stale/prune_paths from mistaking a worker's own
 # derived cache for a stale leftover of a master rebuild.
 _SKIP_DIRNAMES = (DERIVED_DIRNAME,)
+
+# The central market-condition feature store bucket (ba2_common.core.market_condition_store):
+# ``market_conditions/raw/<sha>.parquet``, ``market_conditions/<profile>/objects/<sha>.parquet``
+# and ``market_conditions/<profile>/manifests/<digest>.json``.
+MC_BUCKET = "market_conditions"
+_MC_RAW_DIRNAME = "raw"
 
 
 def cache_root(root: Optional[str] = None) -> Path:
@@ -253,12 +278,17 @@ def extract_tar(fileobj, dest: Optional[str] = None,
     disk, so *log* is called at most every ``_PROGRESS_LOG_INTERVAL_S`` seconds while extracting
     -- an operator tailing this worker's log then sees a heartbeat instead of a long silent gap
     that looks indistinguishable from a hang.
+
+    ``market_conditions`` counts the members that landed in the feature-store bucket, so the
+    receiving side knows whether it owes a sha256 verification pass without re-walking the tree
+    (every other push must stay exactly as cheap as it is today).
     """
     dest_root = cache_root(dest)
     dest_root.mkdir(parents=True, exist_ok=True)
     extracted = 0
     total = 0
     skipped = 0
+    mc = 0
     last_log = time.monotonic()
     with tarfile.open(fileobj=fileobj, mode="r|") as tar:
         for member in tar:
@@ -282,30 +312,141 @@ def extract_tar(fileobj, dest: Optional[str] = None,
                 tmp.unlink(missing_ok=True)  # never orphan a .part on disk-full / I/O error
                 raise
             extracted += 1
+            if member.name.replace("\\", "/").startswith(MC_BUCKET + "/"):
+                mc += 1
             total += member.size
             now = time.monotonic()
             if now - last_log >= _PROGRESS_LOG_INTERVAL_S:
                 log(f"cache extract: {extracted} file(s), {format_bytes(total)} so far "
                     f"(last: {member.name})")
                 last_log = now
-    return {"extracted": extracted, "bytes": total, "skipped": skipped}
+    return {"extracted": extracted, "bytes": total, "skipped": skipped,
+            "market_conditions": mc}
+
+
+def mc_manifest_files(root: Optional[str] = None) -> List[Path]:
+    """Every market-condition manifest FILE present under *root* (all profiles, sorted)."""
+    mc = cache_root(root) / MC_BUCKET
+    if not mc.is_dir():
+        return []
+    out: List[Path] = []
+    for profile_dir in sorted(mc.iterdir()):
+        if not profile_dir.is_dir() or profile_dir.name == _MC_RAW_DIRNAME:
+            continue
+        manifests = profile_dir / "manifests"
+        if manifests.is_dir():
+            out.extend(sorted(manifests.glob("*.json")))
+    return out
+
+
+def mc_referenced_paths(root: Optional[str] = None) -> set:
+    """Cache-relative paths of every object and raw shard referenced by ANY manifest under *root*.
+
+    This is the PROTECTED set. Whole-object reuse means an extension's manifest keeps the previous
+    manifest's object hashes verbatim, and a raw shard is pinned by every manifest that
+    transitively references it — so "the master's newest manifest does not list it" says nothing
+    about whether something on this host still needs it. A manifest that cannot be parsed protects
+    nothing of its own but is never treated as absent: it is reported by
+    ``verify_market_conditions`` and left in place.
+    """
+    protected: set = set()
+    for path in mc_manifest_files(root):
+        protected.add(f"{MC_BUCKET}/{path.parent.parent.name}/manifests/{path.name}")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for key in ("objects", "raw_objects"):
+            for entry in manifest.get(key) or ():
+                rel = entry.get("path") if isinstance(entry, dict) else None
+                if rel:
+                    protected.add(f"{MC_BUCKET}/{rel}")
+    return protected
+
+
+def verify_market_conditions(root: Optional[str] = None) -> dict:
+    """Re-hash (sha256) every object and raw shard the locally present manifests reference.
+
+    Runs on the RECEIVING side after a push that carried the bucket. Size equality is not
+    integrity: an object's file name is the sha256 of its bytes, its content decides what a gated
+    genome trades, and a same-size corruption is exactly what the ordinary ``(rel_path, size)``
+    diff structurally cannot see — it would be mapped by every worker process on the host.
+
+    Returns ``{ok, manifests, checked, missing, corrupt, errors}``. Never raises: the caller
+    (a worker's ``/cache/push``, a preparation step) reports and refuses work rather than dying.
+    """
+    from ba2_common.core.market_condition_store import manifest_identity, sha256_file
+
+    base = cache_root(root)
+    checked = 0
+    missing: List[str] = []
+    corrupt: List[str] = []
+    errors: List[str] = []
+    manifests = mc_manifest_files(root)
+    for path in manifests:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError) as e:
+            errors.append(f"{path.name}: unreadable manifest ({e})")
+            continue
+        try:
+            if manifest_identity(manifest) != path.stem:
+                corrupt.append(f"{MC_BUCKET}/{path.parent.parent.name}/manifests/{path.name}")
+                continue
+        except (KeyError, TypeError, ValueError) as e:
+            errors.append(f"{path.name}: malformed manifest ({e})")
+            continue
+        for key in ("objects", "raw_objects"):
+            for entry in manifest.get(key) or ():
+                rel = f"{MC_BUCKET}/{entry['path']}"
+                target = base / Path(*rel.split("/"))
+                checked += 1
+                if not target.is_file():
+                    missing.append(rel)
+                    continue
+                try:
+                    if sha256_file(target) != entry["sha256"]:
+                        corrupt.append(rel)
+                except OSError as e:
+                    errors.append(f"{rel}: {e}")
+    return {"ok": not (missing or corrupt or errors), "manifests": len(manifests),
+            "checked": checked, "missing": sorted(set(missing)), "corrupt": sorted(set(corrupt)),
+            "errors": errors}
 
 
 def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:
     """Delete *rel_paths* under *root* (default ``CACHE_FOLDER``). Traversal-guarded via
     ``safe_resolve``; a path outside the root is skipped, not deleted. Missing files are a
-    no-op (already gone). Returns ``{pruned, skipped, failed}``.
+    no-op (already gone). Returns ``{pruned, skipped, failed, protected}``.
 
     One undeletable path never aborts the sweep: on Windows a file another process still has
     open/memory-mapped refuses to unlink (WinError 32 -> PermissionError), and letting that
     escape mid-loop would leave every genuinely-stale file AFTER it un-pruned — exactly the
     silent-corruption case ``diff_stale`` exists to prevent. Each failure is counted and logged.
+
+    SNAPSHOT SCOPE. Anything under ``market_conditions/`` that a manifest ON THIS HOST references
+    is PROTECTED and counted rather than deleted: the caller's stale list is computed against the
+    master's current manifest, which knows nothing about the other jobs, stored backtests and
+    captured replays pinned here (design section 4.5: "generic stale-file pruning must not remove
+    another job's retained history"). The protected set is walked only when the list actually
+    names the bucket, so every other prune is byte-identical to before.
     """
     base = str(cache_root(root))
+    rel_paths = [r for r in rel_paths]
+    protected = (mc_referenced_paths(root)
+                 if any(str(r).replace("\\", "/").startswith(MC_BUCKET + "/") for r in rel_paths)
+                 else set())
     pruned = 0
     skipped = 0
     failed = 0
+    kept = 0
     for rel in rel_paths:
+        if protected and str(rel).replace("\\", "/") in protected:
+            kept += 1
+            logger.info(f"cache prune: keeping {rel} — referenced by a manifest on this host")
+            continue
         try:
             target = safe_resolve(rel, base)
         except ValueError:
@@ -319,4 +460,4 @@ def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:
         except OSError as e:  # PermissionError (locked/mapped file) and friends
             failed += 1
             logger.warning(f"cache prune: could not delete {rel}: {e}")
-    return {"pruned": pruned, "skipped": skipped, "failed": failed}
+    return {"pruned": pruned, "skipped": skipped, "failed": failed, "protected": kept}
