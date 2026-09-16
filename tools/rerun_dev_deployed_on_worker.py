@@ -393,9 +393,14 @@ def main() -> int:
     out_dir = ROOT / "reports" / "strategy_research"
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d")
-    json_path = out_dir / f"dev_rerun_ceiling_fix_{stamp}.json"
+    # A PARTIAL RUN GETS ITS OWN FILENAME. Re-running two rows to check something used to
+    # overwrite the finished 26-row report with a 2-row one, silently, under the same name --
+    # which is exactly what happened on 2026-09-16 and had to be rebuilt from a git object and
+    # a console log. --all and the default keep the canonical name; --only never does.
+    suffix = "" if not args.only else "_partial-" + "-".join(str(t["bt"]) for t in targets)
+    json_path = out_dir / f"dev_rerun_ceiling_fix_{stamp}{suffix}.json"
     json_path.write_text(json.dumps(rows, indent=1, default=str), encoding="utf-8")
-    md = report(rows, out_dir / f"dev_rerun_ceiling_fix_{stamp}.md")
+    md = report(rows, out_dir / f"dev_rerun_ceiling_fix_{stamp}{suffix}.md")
     # This console is cp1252: the report FILE keeps its arrows, stdout gets ASCII, because
     # losing a finished 26-backtest run to a UnicodeEncodeError on the last line would be absurd.
     print("\n" + md.replace("→", "->"))
