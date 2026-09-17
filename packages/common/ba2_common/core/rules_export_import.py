@@ -494,6 +494,98 @@ class RulesImporter:
             raise
 
     @staticmethod
+    def import_rulesets_reusing_by_name(rulesets_data: Dict[str, Any],
+                                        name_suffix: str = "") -> Tuple[List[int], List[str]]:
+        """Import rulesets, REUSING an existing ruleset of the same name instead of renaming it.
+
+        ``import_multiple_rulesets`` always creates a new row and suffixes a colliding name
+        (``foo`` -> ``foo-1``), which is right when you are adding a strategy alongside what is
+        already there. It is wrong when you are re-importing the SAME strategy: every round trip
+        would leave another ``foo-N`` behind and the expert would point at the newest copy while
+        the old ones linger.
+
+        Here a name match means "this is that ruleset": the row is kept (so every OTHER expert
+        pointing at it follows the update, which is the whole reason a ruleset is a shared
+        object) and its rules are replaced by the payload's.
+
+        Only the LINKS are deleted, never the ``EventAction`` rows themselves -- a rule may be
+        shared with a ruleset this import was never asked to touch. Rules are matched and reused
+        by name+content through the same ``_import_rule_to_session`` path as every other import,
+        so a replacement that happens to be identical creates nothing.
+
+        Returns ``(ruleset_ids, warnings)`` with ids in the input's order, same as its sibling.
+        """
+        ruleset_ids: List[int] = []
+        all_warnings: List[str] = []
+        processed_rule_names: Dict[str, int] = {}
+
+        try:
+            with get_db() as session:
+                for ruleset_info in rulesets_data["rulesets"]:
+                    warnings: List[str] = []
+                    name = ruleset_info["name"]
+
+                    ruleset = session.exec(select(Ruleset).where(Ruleset.name == name)).first()
+                    if ruleset is None:
+                        ruleset = Ruleset(
+                            name=name,
+                            description=ruleset_info.get("description"),
+                            type=ruleset_info.get("type"),
+                            subtype=ruleset_info.get("subtype"),
+                        )
+                        session.add(ruleset)
+                        session.flush()
+                    else:
+                        # Reuse the row, refresh what the payload describes, and drop the old
+                        # membership so the rule list is the payload's rather than a merge of
+                        # both -- a merge would silently keep a rule the export had removed.
+                        ruleset.description = ruleset_info.get("description")
+                        if ruleset_info.get("type") is not None:
+                            ruleset.type = ruleset_info["type"]
+                        if ruleset_info.get("subtype") is not None:
+                            ruleset.subtype = ruleset_info["subtype"]
+                        old_links = session.exec(
+                            select(RulesetEventActionLink)
+                            .where(RulesetEventActionLink.ruleset_id == ruleset.id)
+                        ).all()
+                        for link in old_links:
+                            session.delete(link)
+                        session.flush()
+                        warnings.append(
+                            f"Ruleset '{name}' already existed (id {ruleset.id}); reused it and "
+                            f"replaced its {len(old_links)} rule(s) with the {len(ruleset_info['rules'])} "
+                            f"in the file"
+                        )
+
+                    ruleset_ids.append(ruleset.id)
+
+                    for rule_data in ruleset_info["rules"]:
+                        rule_name = f"{rule_data['name']}{name_suffix}"
+                        if rule_name in processed_rule_names:
+                            rule_id = processed_rule_names[rule_name]
+                        else:
+                            rule_id, rule_warnings = RulesImporter._import_rule_to_session(
+                                session, rule_data, name_suffix
+                            )
+                            processed_rule_names[rule_name] = rule_id
+                            warnings.extend(rule_warnings)
+
+                        session.add(RulesetEventActionLink(
+                            ruleset_id=ruleset.id,
+                            eventaction_id=rule_id,
+                            order_index=rule_data.get("order_index", 0),
+                        ))
+
+                    all_warnings.extend(warnings)
+
+                session.commit()
+                return ruleset_ids, all_warnings
+
+        except Exception as e:
+            logger.error(f"Error importing rulesets by name: {e}", exc_info=True)
+            raise
+
+    @staticmethod
     def import_multiple_rules(rules_data: Dict[str, Any], name_suffix: str = "") -> Tuple[List[int], List[str]]:
         """Import multiple rules. Returns (rule_ids, warnings)."""
         rule_ids = []

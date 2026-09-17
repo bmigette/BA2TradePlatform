@@ -1336,9 +1336,24 @@ class ExpertSettingsTab:
                     {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                 ],
                 rows=self._get_all_expert_instances(),
-                row_key='id'
+                row_key='id',
+                selection='multiple'
             ).classes('w-full')
-            
+            self.experts_table.selected = []
+
+            with self.experts_table.add_slot('top-left'):
+                with ui.row().classes('items-center gap-4'):
+                    ui.button('Export Selected', icon='download',
+                              on_click=self._export_selected_experts) \
+                        .props('flat') \
+                        .bind_enabled_from(self.experts_table, 'selected',
+                                           backward=lambda val: bool(val))
+                    ui.button('Import Batch', icon='upload',
+                              on_click=self._show_batch_import_dialog).props('flat')
+                    ui.label().bind_text_from(self.experts_table, 'selected',
+                                              backward=lambda val: f'{len(val)} selected' if val else '') \
+                        .classes('text-sm text-grey-6')
+
             self.experts_table.add_slot('body-cell-enabled', '''
                 <q-td :props="props">
                     <q-icon :name="props.value ? 'check_circle' : 'cancel'" 
@@ -1430,6 +1445,118 @@ class ExpertSettingsTab:
         if self.experts_table:
             self.experts_table.rows = self._get_all_expert_instances()
             logger.debug('Expert instances table rows updated')
+
+    # ─── batch export / import ──────────────────────────────────────────────
+    #
+    # The per-expert Import/Export tab inside the edit dialog does ONE expert and records its
+    # rulesets by name only. These two do a whole selection and carry the rules themselves, so
+    # the file can rebuild them somewhere that has never seen them. Logic lives in
+    # core/expert_batch_export_import.py; this is only the screen.
+
+    def _export_selected_experts(self):
+        """Download one JSON file describing every ticked expert, rules included."""
+        from ...core.expert_batch_export_import import build_batch_export
+
+        selected = list(self.experts_table.selected or [])
+        if not selected:
+            ui.notify('Tick the experts to export first', type='warning')
+            return
+        try:
+            import json
+            from datetime import datetime
+
+            payload = build_batch_export([row['id'] for row in selected])
+            filename = f"expert_batch_{len(selected)}_{datetime.now():%Y%m%d_%H%M%S}.json"
+            ui.download(json.dumps(payload, indent=2).encode('utf-8'), filename=filename)
+            logger.info(f'Exported {len(selected)} expert(s) to {filename}')
+            ui.notify(f'Exporting {len(selected)} expert(s)', type='positive')
+        except Exception as e:
+            logger.error(f'Batch export failed: {e}', exc_info=True)
+            ui.notify(f'Export failed: {e}', type='negative')
+
+    def _show_batch_import_dialog(self):
+        """Upload a batch file, show what it WOULD do, and only then offer to apply it."""
+        from ...core.expert_batch_export_import import parse_batch_payload, plan_batch_import
+
+        dialog = ui.dialog().props('no-backdrop-dismiss')
+        with dialog, ui.card().classes('w-[52rem] max-w-full'):
+            ui.label('Import Experts').classes('text-h6')
+            ui.label('Upload a batch export. Nothing is written until you confirm.') \
+                .classes('text-body2 text-grey-6 mb-2')
+            preview = ui.column().classes('w-full')
+
+            async def handle_upload(e: UploadEventArguments):
+                preview.clear()
+                try:
+                    payload = parse_batch_payload(e.content.read())
+                    plan = plan_batch_import(payload)
+                except Exception as ex:
+                    logger.error(f'Could not read batch import file: {ex}', exc_info=True)
+                    with preview:
+                        ui.label(f'Could not read that file: {ex}').classes('text-negative')
+                    return
+                self._render_import_plan(preview, plan, dialog)
+
+            ui.upload(label='Batch export file (.json)', on_upload=handle_upload,
+                      max_files=1, auto_upload=True).props('accept=.json').classes('w-full')
+            with ui.row().classes('w-full justify-end mt-2'):
+                ui.button('Close', on_click=dialog.close).props('flat')
+        dialog.open()
+
+    def _render_import_plan(self, container, plan, dialog):
+        """The preview: one line per expert, then the button that actually writes."""
+        with container:
+            if not plan.experts:
+                ui.label('The file contains no experts.').classes('text-warning')
+                return
+
+            for planned in plan.experts:
+                colour = {'create': 'text-positive', 'update': 'text-primary',
+                          'skip': 'text-negative'}[planned.action]
+                with ui.row().classes('items-center gap-2 w-full'):
+                    ui.label(planned.action.upper()).classes(f'{colour} font-mono text-sm w-20')
+                    ui.label(f"{planned.existing_id if planned.existing_id else '--':>4}") \
+                        .classes('font-mono text-sm text-grey-6')
+                    ui.label(planned.alias).classes('text-sm')
+                    ui.label(f'({planned.expert_type})').classes('text-sm text-grey-6')
+                detail = []
+                if planned.problem:
+                    detail.append(planned.problem)
+                else:
+                    detail.append(f'{planned.settings_changed} setting(s) changed')
+                    if planned.ruleset_names:
+                        detail.append('rulesets: ' + ', '.join(planned.ruleset_names))
+                ui.label('   ' + ' | '.join(detail)).classes('text-xs text-grey-6 mb-1')
+
+            if plan.skips:
+                ui.label(f'{len(plan.skips)} entry(ies) will be skipped and left untouched.') \
+                    .classes('text-xs text-negative')
+            ui.label('Imported experts are never enabled: a new one is created disabled and an '
+                     'existing one keeps its current state.').classes('text-xs text-grey-6 mt-2')
+
+            def apply_now():
+                from ...core.expert_batch_export_import import apply_batch_import
+                try:
+                    messages = apply_batch_import(plan)
+                except Exception as e:
+                    logger.error(f'Batch import failed: {e}', exc_info=True)
+                    ui.notify(f'Import failed: {e}', type='negative')
+                    return
+                for m in messages:
+                    logger.info(f'Batch import: {m}')
+                failed = [m for m in messages if m.startswith(('FAILED', 'SKIP'))]
+                dialog.close()
+                self._update_table_rows()
+                self.experts_table.selected = []
+                if failed:
+                    ui.notify(f'Imported with {len(failed)} problem(s) - see the log',
+                              type='warning', timeout=8000)
+                else:
+                    ui.notify(f'Imported {plan.write_count} expert(s)', type='positive')
+
+            with ui.row().classes('w-full justify-end mt-2'):
+                ui.button(f'Apply {plan.write_count} change(s)', icon='save', on_click=apply_now) \
+                    .props(f'color=primary {"disable" if plan.write_count == 0 else ""}')
     
     def _get_available_expert_types(self):
         """Get list of available expert types."""
