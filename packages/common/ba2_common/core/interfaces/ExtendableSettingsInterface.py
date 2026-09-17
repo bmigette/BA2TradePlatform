@@ -122,11 +122,14 @@ class ExtendableSettingsInterface(ABC):
         
         Args:
             setting_key: The setting key to retrieve
-            log_warning: Whether to log a warning when using interface default
-            
+            log_warning: Whether to log (at DEBUG) that the interface default was used. The
+                name is kept for its callers; the message was demoted from WARNING because
+                falling back to a DECLARED default is normal, not a fault -- see the comment
+                at the log site.
+
         Returns:
             The setting value or interface default
-            
+
         Raises:
             ValueError: If setting key not found in interface definitions
         """
@@ -142,7 +145,25 @@ class ExtendableSettingsInterface(ABC):
             if setting_key in merged_defs:
                 default_value = merged_defs[setting_key].get('default')
                 if log_warning:
-                    logger.warning(
+                    # DEBUG, NOT WARNING. A setting that HAS a declared default and is not
+                    # overridden is normal operation, not a problem: an expert only stores the
+                    # keys its deploy actually chose. Live prod expert 10 (DeterministicScorer)
+                    # stores 39 of the class's 130 -- the 20 GA-optimised genes plus its
+                    # operational settings -- and the other 91 are internal scorer knobs that
+                    # were never in the GA search space, so the backtest resolved them to these
+                    # same defaults and live matches what was validated. (Checked against all
+                    # 179 DeterministicScorer goal2020 backtests: none of the 91 appears in any
+                    # of them, and every gene they DO set is stored.)
+                    #
+                    # At WARNING it was 7,592 of 32,562 lines in the prod log -- 23% of it, and
+                    # more than double every other warning and error combined, which is what
+                    # buried the ones that mattered (a FRED series missing from the cache, an
+                    # account-configuration validation failure, FMP 429 backoffs).
+                    #
+                    # A genuinely MISSING setting -- one with no declared default -- still
+                    # raises the ValueError below. That is the case worth shouting about, and
+                    # it is unchanged.
+                    logger.debug(
                         f"Setting '{setting_key}' not configured for {type(self).__name__} "
                         f"(ID: {getattr(self, 'id', 'unknown')}), using interface default: {default_value}"
                     )
