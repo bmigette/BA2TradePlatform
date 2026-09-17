@@ -1527,11 +1527,18 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # interrupted job -- which inserts a NEW StrategyOptimization row -- still finds them.
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(param_space, ga)
+        # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
+        # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
+        # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
+        robust_on = bool(backtest_cfg.get("robust_fitness"))
 
         def checkpoint_cb(generation: int, population: list, partial: bool = False):
             data = optimizer.get_checkpoint_data(generation, population)
             data["fingerprint"] = ckpt_fingerprint   # refuse to resume into a changed gene space
             data["partial"] = partial               # resume INTO this generation, not after it
+            # The objective's robustness setting, so a resume cannot mix two incomparable
+            # scales in one population (the fingerprint covers the GENE SPACE, not the metric).
+            data["robust_fitness"] = robust_on
             # The best entries SO FAR, so a resumed run's top-N persist can still see the
             # winners found before the interruption. See _elite_slice for why this is cheap
             # (and why the older "it would embed every trial's trades JSON" reading was wrong).
@@ -1816,6 +1823,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             _clear_checkpoint(ckpt_task_id)
             ckpt = None
         if ckpt:
+            # REFUSE a checkpoint scored under a different objective, BEFORE anything is resumed.
+            _assert_checkpoint_robustness_matches(ckpt, robust_on, opt.name, ckpt_task_id)
             start_gen, init_pop, init_fits = optimizer.resume_from_checkpoint(ckpt)
             logger.warning(
                 f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
@@ -2808,6 +2817,41 @@ def _seed_all_results_from_checkpoint(
     if not isinstance(carried, list):
         return
     all_results.extend(r for r in carried if isinstance(r, dict))
+
+
+def _assert_checkpoint_robustness_matches(ckpt: Dict[str, Any], robust_on: bool,
+                                          job_name: Optional[str], task_id: str) -> None:
+    """REFUSE to resume a checkpoint that was scored under a different fitness objective.
+
+    A GA checkpoint is found by the JOB NAME (checkpoint_task_id), never by the row id, so a
+    relaunch of an interrupted job picks up the population it left behind. That is exactly right
+    for a restart and exactly wrong across a change of objective: the robustness adjustment
+    RESCALES the metric (concentration x monte-carlo x spread), so a population whose elites were
+    ranked raw and whose new individuals are ranked robust carries two incomparable objectives at
+    once -- and nothing in the row, the log or the results would say so. The gene-space
+    ``fingerprint`` cannot catch it: the genes are identical, only their scores mean something
+    different.
+
+    A checkpoint written BEFORE 2026-09-17 has no such key. Missing is read as **False**, because
+    that is what those runs actually did (the flag was opt-in and no grid driver passed it), so an
+    old checkpoint resumed under the new default refuses loudly instead of silently changing
+    objective mid-search.
+    """
+    was = bool(ckpt.get("robust_fitness"))
+    if was == bool(robust_on):
+        return
+    missing = "robust_fitness" not in ckpt
+    raise ValueError(
+        f"checkpoint {task_id} for job {job_name!r} was scored with robust_fitness="
+        f"{was}{' (key absent -- every checkpoint written before 2026-09-17 ranked on the RAW '
+                'metric, so it is read as False)' if missing else ''}, but this run is configured "
+        f"with robust_fitness={bool(robust_on)}. Resuming would mix two incomparable objectives in "
+        f"one population (the robustness adjustment rescales the metric; the gene-space "
+        f"fingerprint cannot see it). Two ways out: pass --no-robust-fitness to match the "
+        f"checkpoint (or --robust-fitness if the checkpoint is the robust one), or give the job a "
+        f"NEW name (STAGE1_SUFFIX / --name-suffix / --name) so the search starts fresh under the "
+        f"objective you want."
+    )
 
 
 def _save_checkpoint(task_id: str, checkpoint_data: Dict[str, Any]) -> None:

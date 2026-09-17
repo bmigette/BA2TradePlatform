@@ -248,6 +248,43 @@ if [ -n "$STAGE1_FITNESS" ]; then
   FITNESS_ARGS=(--fitness "$STAGE1_FITNESS")
 fi
 
+# ROBUSTNESS (2026-09-17). The robustness-adjusted fitness -- the metric multiplied by a
+# concentration factor (share of net P&L from the top 1/5 trades), a Monte-Carlo factor
+# (1000-path bootstrap; penalises a genome whose 5th-percentile path loses money) and a spread
+# factor -- is now ON BY DEFAULT in `ba2-test optimize`, so this script passes nothing and every
+# job inherits it. It was opt-in for a year and NO grid driver ever passed it, which is why the
+# gated stage-1 run ranked its whole search on the RAW metric and produced an elite at 43-58%/yr
+# on 61-94% drawdown with nothing asking whether that was an edge or two trades carrying it.
+#
+# STAGE1_ROBUST=0 (or off/false/no) opts back out. Like STAGE1_FITNESS it RE-RANKS the search, so
+# it is REFUSED without its own STAGE1_SUFFIX: job names are the resume key, and a population
+# whose elites were scored raw while its new individuals are scored robust carries two
+# incomparable objectives at once. (The backend refuses that outright as well -- a checkpoint
+# records the setting it was scored under -- but the wrapper must not produce the collision in
+# the first place. Note that the same guard means the existing -st1 checkpoints, all written raw,
+# will now refuse to resume: that refusal is the point, and the way forward is a new suffix.)
+STAGE1_ROBUST="${STAGE1_ROBUST:-}"
+ROBUST_ARGS=()
+if [ -n "$STAGE1_ROBUST" ]; then
+  case "$STAGE1_ROBUST" in
+    0|off|OFF|false|FALSE|no|NO)
+      if [ "$STAGE1_SUFFIX" = "-st1" ]; then
+        echo "stage1_run.sh: STAGE1_ROBUST=$STAGE1_ROBUST re-ranks the search onto the RAW metric," >&2
+        echo "so it needs its own job names -- STAGE1_SUFFIX is still the default '-st1' and those" >&2
+        echo "jobs are already banked under the robustness-adjusted objective. Set STAGE1_SUFFIX" >&2
+        echo "(e.g. -st1raw) so the run cannot resume into checkpoints scored on a different" >&2
+        echo "objective. Scores are NOT comparable across this setting." >&2
+        exit 1
+      fi
+      ROBUST_ARGS=(--no-robust-fitness) ;;
+    1|on|ON|true|TRUE|yes|YES)
+      : ;;   # the default; nothing to pass
+    *)
+      echo "stage1_run.sh: STAGE1_ROBUST=$STAGE1_ROBUST is not a recognised value (use 1/on or 0/off)." >&2
+      exit 1 ;;
+  esac
+fi
+
 # STAGE1_START/END allow explicit shorter pilots (a 2023 start prints LIMITED WINDOW and gets
 # its own discovery identity). A dry-run (pass --dry-run) prints every resolved command.
 exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
@@ -260,5 +297,6 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   --screener-gate-store "$SCREENER_STORE" --max-stock-price 0 \
   --name-suffix="$STAGE1_SUFFIX" \
   ${FITNESS_ARGS[@]+"${FITNESS_ARGS[@]}"} \
+  ${ROBUST_ARGS[@]+"${ROBUST_ARGS[@]}"} \
   ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
   "$@"

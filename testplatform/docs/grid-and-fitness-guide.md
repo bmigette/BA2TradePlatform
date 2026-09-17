@@ -119,8 +119,34 @@ of the CAR formula, so it still applies.
 
 ## 3. Optional fitness knobs
 
-All are `store_true` flags (default OFF) plus companion value args where noted. They ride in
+All are `store_true` flags (default OFF) plus companion value args where noted -- **except
+`--robust-fitness`, which is ON by default since 2026-09-17** (see below). They ride in
 `optimization_config.backtest` and are threaded per-trial by `strategy_optimization_handler.py`.
+
+### `--robust-fitness` / `--no-robust-fitness` -- **DEFAULT: ON** (since 2026-09-17)
+Multiplies the metric by three factors, so a genome must clear all of them: a **concentration**
+factor (how much of net P&L came from the top 1/5 trades), a **Monte-Carlo** factor (1000-path
+bootstrap of the trade sequence; penalises a genome whose 5th-percentile path loses money) and a
+**spread** factor (fraction of profit surviving a wider spread). A big winner that will not repeat
+therefore stops being rewarded.
+
+It was opt-in for a year and no grid driver ever passed it, so the option stage-1 discovery run
+ranked its whole search on the raw metric -- an elite at 43-58%/yr on 61-94% drawdown with nothing
+asking whether that was an edge or two trades carrying the book. Hence the flip.
+
+- **Both numbers are always stored**: `fitness_raw`, `fitness_robust` (explicitly `None` when off)
+  and every `robustness` component, per trial. The score is always decomposable.
+- **Scores are NOT comparable across the setting.** Never rank a robust run against a raw one.
+- **Resuming across the setting is REFUSED.** A GA checkpoint records the setting it was scored
+  under; resuming it under the other one raises, naming both values and the job. A checkpoint
+  written before 2026-09-17 has no such key and is read as **off** -- which is what those runs
+  actually did -- so an old checkpoint refuses loudly instead of silently changing objective.
+  Two ways out: `--no-robust-fitness` to match the checkpoint, or a new job name to start fresh.
+- Cost: ~3 ms per trial at 300 trades, ~10 ms at 1000 (measured 2026-09-17) -- immaterial against
+  a 100-200 s trial.
+- `--no-robust-fitness` is the opt-out (the pre-2026-09-17 behaviour). `tools/stage1_run.sh`
+  exposes it as `STAGE1_ROBUST=0` and refuses it without its own `STAGE1_SUFFIX`, for the same
+  reason the `STAGE1_FITNESS` guard exists: job names are the resume key.
 
 ### `--fitness-trade-scale` [`--fitness-trade-scale-cap N`, default 100]
 Multiplies a **positive** fitness by `min(avg_trades_per_year, cap) / 100`, down-weighting

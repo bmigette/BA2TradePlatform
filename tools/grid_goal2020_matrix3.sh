@@ -105,7 +105,11 @@ STRESS_BPS=$(awk -v s="$SPREAD_BPS" -v m="$STRESS_SPREAD_MULT" 'BEGIN{printf "%.
 # search converges to, not a quirk of a few rows. Set ROBUST_FITNESS=0 for a like-for-like
 # comparison against a pre-2026-08-16 run (scores are NOT comparable across this flag).
 ROBUST_FITNESS="${ROBUST_FITNESS:-1}"
-robust_args=(); [ "$ROBUST_FITNESS" = "1" ] && robust_args=(--robust-fitness)
+# Robustness became the LAUNCHER default on 2026-09-17, so "not passing a flag" no longer
+# means off -- ROBUST_FITNESS=0 must forward the explicit opt-out or this escape hatch
+# would silently stop working (and the like-for-like comparison it exists for would be
+# robustness-ranked after all).
+robust_args=(--no-robust-fitness); [ "$ROBUST_FITNESS" = "1" ] && robust_args=(--robust-fitness)
 
 stress_args=()
 if awk -v v="$STRESS_BPS" 'BEGIN{exit !(v>0)}'; then

@@ -283,6 +283,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fitness-win-rate-factor", action="store_true",
                     help="Multiply a positive fitness by 2 x win_rate_fraction. Passed through "
                          "to `ba2-test optimize`.")
+    ap.add_argument("--robust-fitness", dest="robust_fitness", action="store_true", default=True,
+                    help="Rank on the ROBUSTNESS-ADJUSTED fitness (concentration x monte-carlo x "
+                         "spread). ON BY DEFAULT since 2026-09-17 -- this driver passes NO flag "
+                         "and every job inherits `ba2-test optimize`'s default -- so the flag is "
+                         "only an explicit restatement of it.")
+    ap.add_argument("--no-robust-fitness", dest="robust_fitness", action="store_false",
+                    help="Rank every job on the RAW metric instead (the pre-2026-09-17 default). "
+                         "Forwarded to every `optimize` call AND folded into the discovery "
+                         "identity digest, so a raw-ranked run gets its own job names and can "
+                         "never resume a robustness-ranked checkpoint (the backend refuses that "
+                         "outright). Scores are NOT comparable across this setting.")
     ap.add_argument("--launcher", default=None,
                     help="Path to the launcher executable (or ba2test_launcher.py). Default: "
                          "the ba2-test installed next to the Python interpreter. Point this at "
@@ -413,6 +424,11 @@ def build_cmd(args, launcher, name, expert, strat, universe):
                 "--fitness-trade-scale-target", str(args.fitness_trade_scale_target)]
     if args.fitness_win_rate_factor:
         cmd += ["--fitness-win-rate-factor"]
+    # Robustness is DEFAULT-ON in the launcher, so the ON case passes nothing (every existing
+    # job name is unchanged) and only the opt-OUT is forwarded -- and it is a digest token, so a
+    # raw-ranked run cannot share a name, and therefore a checkpoint, with a robust one.
+    if not args.robust_fitness:
+        cmd += ["--no-robust-fitness"]
     if args.workers:
         cmd += ["--workers", args.workers]
     return cmd
@@ -431,7 +447,8 @@ def discovery_name(args, launcher, name, expert, strat, universe):
     i = 0
     while i < len(tokens):
         flag = tokens[i]
-        if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor"):
+        if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor",
+                    "--no-robust-fitness"):
             config[flag] = True
             i += 1
         else:
@@ -478,6 +495,12 @@ def main(argv=None) -> int:
     print(f"options matrix: {len(jobs)} jobs (experts={experts}, strategies={strategies}, "
           f"universe={len(universe.split(','))} symbols); "
           f"{sum(1 for j in jobs if j[0] in done)} already completed.")
+    # The OBJECTIVE, in full and unconditionally. The robustness adjustment rescales the metric,
+    # so a launch line naming only the metric states half of what the search is ranked on -- which
+    # is how the first gated stage-1 run spent its whole life ranking raw with nothing saying so.
+    print(f"Objective: fitness={args.fitness or 'per-job default'}, robust_fitness="
+          f"{'ON (launcher default)' if args.robust_fitness else 'OFF (--no-robust-fitness)'}"
+          " -- scores are NOT comparable across the robustness setting.")
     if args.dry_run:
         for nm, exp, s in jobs:
             print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s})")
