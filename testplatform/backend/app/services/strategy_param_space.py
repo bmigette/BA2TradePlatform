@@ -23,6 +23,10 @@ Namespacing:
   cond:<id>:value                  a condition node's threshold (any rule's tree)
   cond:<id>:confirmation_bars      that node's confirmation bars
   cond:<id>:enabled                that node's ON/OFF toggle
+  cond:<id>:mode                   that leaf's MODE (choice; design 2026-09-15 §5): numeric
+                                   leaf off|below|above (with its :value threshold gene),
+                                   categorical leaf off + the field's registry values in
+                                   ascending code order (no :value gene). off removes the leaf.
   entry:<rid>:enabled              entry rule ON/OFF toggle (rule.toggle_optimize)
   entry:<rid>:a<i>:action_value    entry rule action i's value
   entry:<rid>:a<i>:enabled         entry rule action i's ON/OFF toggle
@@ -62,6 +66,9 @@ quick-load path, not by this module.
 import copy
 import logging
 from typing import Any, Dict, Optional
+
+from ba2_common.core.market_conditions import field_codes, field_spec
+from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES, leaf_mode_kind
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +165,11 @@ def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -
     if not cid:
         return
     if cond.get("optimize") or cond.get("optimize_enabled"):
+        if cond.get("mode_optimize") and all(
+                cond.get(k) is None for k in ("value_min", "value_max", "value_step")):
+            raise ValueError(
+                f"condition {cid!r}: optimize is set on a mode leaf with no value_min/value_max/"
+                f"value_step -- a categorical leaf has no threshold gene")
         out[f"cond:{cid}:value"] = _range_entry(
             cond.get("value_min"), cond.get("value_max"), cond.get("value_step"),
             is_int=False,
@@ -169,6 +181,48 @@ def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -
         )
     if cond.get("toggle_optimize"):
         out[f"cond:{cid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
+    if cond.get("mode_optimize"):
+        _collect_mode_gene(cond, cid, out)
+
+
+def _expected_mode_choices(leaf: Dict[str, Any], cid: str, kind: Optional[str]) -> list:
+    """The ONLY mode choice list a leaf of this kind may declare: numeric -> off/below/above;
+    categorical -> off + the field's registry values in ascending CODE order (a persisted
+    contract: the choice gene's index follows it). An unknown categorical field propagates the
+    registry's KeyError, re-raised naming the leaf."""
+    if kind == "numeric":
+        return list(NUMERIC_MODE_CHOICES)
+    try:
+        spec = field_spec(leaf["field"])
+    except KeyError as e:
+        raise KeyError(f"condition {cid!r}: {e.args[0] if e.args else e}") from e
+    return [MODE_OFF, *spec.codes]
+
+
+def _collect_mode_gene(cond: Dict[str, Any], cid: str, out: Dict[str, Any]) -> None:
+    """``cond:<id>:mode`` choice gene for a ``mode_optimize`` leaf (design 2026-09-15 §5).
+
+    The toggle check comes first so the message names the id even though the model rejects
+    the combination too: ``off`` already removes the leaf, a second removal gene is redundant.
+    ``leaf_mode_kind`` validates the leaf through ConditionLeaf and raises on a group, hence
+    the explicit group check before it.
+    """
+    if cond.get("toggle_optimize"):
+        raise ValueError(
+            f"condition {cid!r}: mode_optimize and toggle_optimize cannot both be set (the mode "
+            f"gene's 'off' choice already removes the leaf)")
+    if "conditions" in cond:
+        raise ValueError(f"condition {cid!r}: mode_optimize is only valid on a leaf, not a group")
+    kind = leaf_mode_kind(cond)
+    expected = _expected_mode_choices(cond, cid, kind)
+    declared = list(cond.get("mode_choices") or [])
+    if declared != expected:
+        raise ValueError(
+            f"condition {cid!r}: a {kind} leaf's mode_choices must be exactly {expected!r}, "
+            f"got {declared!r}")
+    out[f"cond:{cid}:mode"] = {
+        "type": "choice", "choices": expected, "min": 0, "max": len(expected) - 1, "step": 1,
+    }
 
 
 def _validate_value_offsets(tree: Optional[Dict[str, Any]], where: str) -> None:
@@ -498,6 +552,14 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
             return sub["value"]
         return authored.get(cid)
 
+    modes = _resolve_modes(new, by_id)
+    if isinstance(new, dict) and modes.get(new.get("id")) == MODE_OFF:
+        # Removing the ROOT would leave the rule with no conditions at all -- the opposite of
+        # "this gate is off" for a rule with other gates; refuse loudly instead.
+        raise ValueError(
+            f"condition {new.get('id')!r}: mode 'off' on the ROOT of a condition tree cannot be "
+            f"removed; a mode leaf must sit inside an AND/OR group")
+
     def _recurse(node):
         if not isinstance(node, dict):
             return
@@ -508,6 +570,10 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
                 ccid = child.get("id") if isinstance(child, dict) else None
                 # ON/OFF toggle: a child whose 'enabled' gene decoded to 0 is dropped.
                 if ccid and by_id.get(ccid, {}).get("enabled") == 0:
+                    continue
+                # MODE off: removed exactly like a toggle-off -- never evaluated, even when
+                # its data is missing.
+                if ccid and modes.get(ccid) == MODE_OFF:
                     continue
                 _recurse(child)
                 kept.append(child)
@@ -531,9 +597,116 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
                     node["value"] = float(base) + float(sub["value"])
             if "confirmation_bars" in sub:
                 node["confirmation_bars"] = sub["confirmation_bars"]
+            if cid in modes:
+                _apply_mode(node, cid, modes[cid])
 
     _recurse(new)
     return new
+
+
+def mode_token(raw: Any, choices: Any, cid: str) -> str:
+    """The mode TOKEN a decoded ``cond:<id>:mode`` gene means, for one leaf's ``mode_choices``.
+
+    ``GeneticOptimizer.decode_individual`` already hands back the token (a choice gene is
+    chromosome-encoded as an index and mapped back); a raw int index (a hand-built flat dict, a
+    checkpoint, a persisted genome) is resolved through the choices. Anything else raises naming
+    the leaf -- a mode gene nothing can interpret is a broken genome, not "leave it as authored".
+
+    PUBLIC because the optimization handler resolves the same genes when it canonicalises an
+    inactive threshold for deduplication: two readings of one gene are two behaviours waiting to
+    diverge. This is resolution only -- no canonicalisation lives in this module (plan Task 3).
+    """
+    if not choices:
+        raise ValueError(
+            f"condition {cid!r}: a cond:{cid}:mode gene was decoded but the template leaf "
+            f"declares no mode_choices")
+    choices = list(choices)
+    if isinstance(raw, str):
+        token = raw
+    elif (isinstance(raw, (int, float)) and not isinstance(raw, bool)
+          and float(raw).is_integer() and 0 <= int(raw) < len(choices)):
+        token = choices[int(raw)]
+    else:
+        raise ValueError(
+            f"condition {cid!r}: mode gene {raw!r} is neither a choice token nor an index "
+            f"into {choices!r}")
+    if token not in choices:
+        raise ValueError(f"condition {cid!r}: mode {token!r} is not one of {choices!r}")
+    return token
+
+
+def _resolve_modes(tree: Any, by_id: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    """Map leaf id -> decoded mode TOKEN for every node in ``tree`` with a ``mode`` gene.
+
+    Normalised ONCE per tree, before any node is dropped or rewritten. GeneticOptimizer's
+    ``decode_individual`` already hands back the token (a choice gene is chromosome-encoded as
+    an index and mapped back); a raw int index (a hand-built flat dict) is resolved through
+    the TEMPLATE leaf's own ``mode_choices``. Anything unresolvable raises naming the leaf --
+    a mode gene the tree cannot interpret is a broken genome, not "leave it as authored"."""
+    if not any("mode" in sub for sub in by_id.values()):
+        return {}  # no mode genes at all: legacy trees pay nothing
+    found: Dict[str, str] = {}
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        for child in (node.get("conditions") or []):
+            _walk(child)
+        cid = node.get("id")
+        if not cid or "mode" not in by_id.get(cid, {}):
+            return
+        found[cid] = mode_token(by_id[cid]["mode"], node.get("mode_choices"), cid)
+
+    _walk(tree)
+    return found
+
+
+_THRESHOLD_OPS = {"below": "<", "above": ">"}
+
+
+def _apply_mode(node: Dict[str, Any], cid: str, token: str) -> None:
+    """Write a decoded non-off mode onto its (deep-copied) leaf.
+
+    ``op`` AND ``comparison`` are both set: ConditionLeaf reads ``comparison`` first, but a
+    stale ``op`` alias surviving export would otherwise restore the authored operator. A legacy
+    ``operator`` spelling, when present on the leaf, is synchronised for the same reason."""
+    if token == MODE_OFF:  # dropped by the parent's child loop; nothing to write
+        return
+    # PER-TRIAL path: the kind is derived structurally, never by model validation. below/above
+    # <=> numeric (ConditionLeaf forbids those tokens on a categorical leaf, and collection
+    # already validated the template); any other non-off token <=> categorical.
+    if token in _THRESHOLD_OPS:
+        op = _THRESHOLD_OPS[token]
+    else:
+        codes = field_codes(node["field"])  # memoised in the registry: one dict hit per trial
+        # Kept at decode on purpose: catches a remote worker whose ba2_common registry dropped
+        # a value the master's template still offers.
+        if token not in codes:
+            raise ValueError(
+                f"condition {cid!r}: categorical mode {token!r} is not a registered value of "
+                f"{node['field']!r} ({list(codes)!r})")
+        op = "=="
+        node["value"] = float(codes[token])
+    node["op"] = node["comparison"] = op
+    if "operator" in node:
+        node["operator"] = op
+    node["mode"] = token
+    # A DECODED leaf is a RULE, not a template. ``mode_optimize``/``mode_choices`` describe the
+    # SEARCH (which modes the optimizer may pick); once one is chosen they describe nothing, and
+    # leaving them on is what made every real gated genome unexportable -- the deploy exporter
+    # refuses an unresolved mode gene, and a resolved leaf still carrying ``mode_optimize`` looks
+    # exactly like one. ``mode`` stays as provenance (which choice won), and ``optimize`` plus the
+    # value range stay exactly as they are on any other optimized numeric leaf: they are the
+    # THRESHOLD gene's metadata, unrelated to the mode gene, and every export path already
+    # carries them.
+    #
+    # ``toggle_optimize`` survives a decode and this does not, deliberately: a decoded ruleset is
+    # the RULE that was deployed, and the mode metadata is the only part of it that describes a
+    # choice already made. Nothing reads it back off a decoded tree either -- re-runs,
+    # warm-starts, robustness variants and the top-N persist all re-decode from the BASE strategy
+    # plus the genes, never from a previous decode's output.
+    for key in ("mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
+        node.pop(key, None)
 
 
 def _apply_option_dte(action: Dict[str, Any], center_val: Any) -> None:

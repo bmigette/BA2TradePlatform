@@ -161,6 +161,102 @@ class TestRulesImporter:
         assert len(re_exported["ruleset"]["rules"]) == len(exported["ruleset"]["rules"])
 
 
+class TestImportRulesetsReusingByName:
+    """The batch-import path: a name match MEANS "that ruleset", so re-importing the same
+    strategy updates it in place instead of leaving a trail of ``foo-1``, ``foo-2`` copies."""
+
+    def _payload(self, name, rule_names):
+        return {"rulesets": [{
+            "name": name,
+            "description": "batch",
+            "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
+            "subtype": None,
+            "rules": [{
+                "name": rn,
+                "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
+                "triggers": {"t0": {"event_type": ExpertEventType.F_BULLISH.value}},
+                "actions": {"a0": {"action_type": ExpertActionType.BUY.value}},
+                "continue_processing": False,
+                "order_index": i,
+            } for i, rn in enumerate(rule_names)],
+        }]}
+
+    def test_a_new_name_creates_the_ruleset(self):
+        ids, warnings = RulesImporter.import_rulesets_reusing_by_name(
+            self._payload("ReuseByName Fresh", ["r1", "r2"]))
+        assert len(ids) == 1
+        assert get_instance(Ruleset, ids[0]).name == "ReuseByName Fresh"
+        assert RulesExporter.export_ruleset(ids[0])["ruleset"]["rules"].__len__() == 2
+
+    def test_the_same_name_reuses_the_row_instead_of_suffixing_it(self):
+        """THE POINT: the expert's ruleset id does not move, so every other expert pointing at
+        it follows the update -- and no 'foo-1' is left behind."""
+        ids1, _ = RulesImporter.import_rulesets_reusing_by_name(
+            self._payload("ReuseByName Same", ["r1"]))
+        ids2, warnings = RulesImporter.import_rulesets_reusing_by_name(
+            self._payload("ReuseByName Same", ["r1"]))
+        assert ids1 == ids2, "a second import must not create a second ruleset"
+        assert get_instance(Ruleset, ids2[0]).name == "ReuseByName Same"
+        assert any("reused it" in w for w in warnings)
+        # and import_multiple_rulesets, the sibling, still does the opposite
+        other, _ = RulesImporter.import_multiple_rulesets(self._payload("ReuseByName Same", ["r1"]))
+        assert other[0] != ids1[0]
+        assert get_instance(Ruleset, other[0]).name == "ReuseByName Same-1"
+
+    def test_the_rule_list_is_replaced_not_merged(self):
+        """A rule the export dropped must not survive in the reused ruleset."""
+        ids1, _ = RulesImporter.import_rulesets_reusing_by_name(
+            self._payload("ReuseByName Replace", ["keep", "drop"]))
+        assert len(RulesExporter.export_ruleset(ids1[0])["ruleset"]["rules"]) == 2
+
+        ids2, _ = RulesImporter.import_rulesets_reusing_by_name(
+            self._payload("ReuseByName Replace", ["keep"]))
+        names = [r["name"] for r in RulesExporter.export_ruleset(ids2[0])["ruleset"]["rules"]]
+        assert names == ["keep"], f"expected the dropped rule to be gone, got {names}"
+
+    @staticmethod
+    def _linked_rule_ids(ruleset_id):
+        """Rule ids linked to a ruleset, read in its own session (the relationship lazy-loads,
+        so touching it on a detached instance raises)."""
+        from ba2_common.core.db import get_db
+        from ba2_common.core.models import RulesetEventActionLink
+        from sqlmodel import select as _select
+        with get_db() as s:
+            return [l.eventaction_id for l in s.exec(
+                _select(RulesetEventActionLink)
+                .where(RulesetEventActionLink.ruleset_id == ruleset_id)
+                .order_by(RulesetEventActionLink.order_index)).all()]
+
+    def test_a_replaced_rule_row_survives_for_other_rulesets(self):
+        """Only the LINK is removed -- the EventAction may be shared with a ruleset this import
+        was never asked to touch, and deleting it would silently edit that one too."""
+        shared, _ = RulesImporter.import_rulesets_reusing_by_name(
+            self._payload("ReuseByName Bystander", ["shared_rule"]))
+        bystander_rule_id = self._linked_rule_ids(shared[0])[0]
+
+        owner, _ = RulesImporter.import_rulesets_reusing_by_name(
+            self._payload("ReuseByName Owner", ["shared_rule"]))
+        assert self._linked_rule_ids(owner[0]) == [bystander_rule_id], "the rule is shared"
+
+        # Drop it from the owner; the bystander ruleset must still have it.
+        RulesImporter.import_rulesets_reusing_by_name(
+            {"rulesets": [{"name": "ReuseByName Owner", "type":
+                           ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value, "rules": []}]})
+        assert self._linked_rule_ids(owner[0]) == []
+        assert get_instance(EventAction, bystander_rule_id) is not None
+        assert self._linked_rule_ids(shared[0]) == [bystander_rule_id]
+
+    def test_ids_come_back_in_the_input_order(self):
+        """The caller maps them onto enter_market / open_positions by position."""
+        payload = {"rulesets": [
+            self._payload("ReuseByName OrderA", ["a"])["rulesets"][0],
+            self._payload("ReuseByName OrderB", ["b"])["rulesets"][0],
+        ]}
+        ids, _ = RulesImporter.import_rulesets_reusing_by_name(payload)
+        assert [get_instance(Ruleset, i).name for i in ids] == \
+               ["ReuseByName OrderA", "ReuseByName OrderB"]
+
+
 class TestContentAwareDedup:
     """Same name + identical content -> reuse; same name + DIFFERENT content -> import as a new
     variant (so the imported rule isn't silently dropped onto the pre-existing one)."""

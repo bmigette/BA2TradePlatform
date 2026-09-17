@@ -6,7 +6,7 @@ EventAction shape the TradeActionEvaluator parses (event_type/operator/value, ac
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ba2_common.logger import logger
 from ba2_common.core.types import (
@@ -15,6 +15,7 @@ from ba2_common.core.types import (
     ReferenceValue,
     is_option_action,
 )
+from ba2_common.core.market_conditions import PROFILES
 
 # Strategy condition-tree field -> ExpertEventType for value (N_*) gates. These are the
 # numeric fields an entry/exit condition tree tunes on; an unknown field is skipped (it
@@ -87,6 +88,36 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "rec_days_to_earnings": ExpertEventType.N_REC_DAYS_TO_EARNINGS,
     "days_after_event": ExpertEventType.N_DAYS_AFTER_EVENT,
 }
+
+
+def register_market_condition_field_events() -> List[str]:
+    """Market-condition entry gates (design 2026-09-15): ``FIELD_EVENT[field] =
+    ExpertEventType(field)`` for every field of every registered profile -- GENERATED from the
+    registry, not listed above. Idempotent; runs at import and is re-callable after
+    ``market_conditions.register_profile``. A field without an enum member is skipped with a
+    WARNING and returned. Guarded by tests/test_condition_registry_coverage.py (every
+    CONDITION_MAP entry needs a mapping here) and tests/test_market_condition_conditions.py
+    (every registered field has an ExpertEventType member). Raises if a field is already mapped
+    to a DIFFERENT event type."""
+    skipped: List[str] = []
+    for prof in PROFILES.values():
+        for spec in prof.fields:
+            try:
+                event = ExpertEventType(spec.name)
+            except ValueError:
+                logger.warning("Market-condition field %r has no ExpertEventType member; a rule "
+                               "leaf naming it is not mapped", spec.name)
+                skipped.append(spec.name)
+                continue
+            existing = FIELD_EVENT.get(spec.name)
+            if existing is not None and existing is not event:
+                raise ValueError(f"FIELD_EVENT[{spec.name!r}] is already {existing.name}; "
+                                 f"refusing to replace it with {event.name}")
+            FIELD_EVENT[spec.name] = event
+    return skipped
+
+
+register_market_condition_field_events()
 
 # Flag (boolean) condition fields -> ExpertEventType (no operator/value). Used by exit
 # (open_positions) rules whose triggers include sentiment / term / risk / rating-change /
@@ -217,6 +248,33 @@ def tree_leaves(node: Any) -> Iterable[dict]:
             yield from tree_leaves(child)
     elif node.get("field"):
         yield node
+
+
+def assert_market_fields_mappable(tree: Any, where: str) -> None:
+    """Refuse a MARKET-CONDITION leaf this server cannot map to an event type.
+
+    ``triggers_from_condition_tree`` DROPS an unknown field (with a warning) so a partially-edited
+    tree still seeds a working rule. That is the right default for a hand-edited condition and
+    exactly the wrong one for a deploy: importing a gated ruleset onto a server whose
+    ``FIELD_EVENT`` predates these fields would drop every gate and run the strategy UNGATED --
+    not a degraded version of it, a different strategy with the same name and the same label.
+
+    So for the names in ``STRICT_FIELD_NAMES`` (permanent, registry-independent -- see
+    ``market_condition_rules``) the drop becomes a refusal. Callers on the DEPLOY path
+    (``rules_convert.trade_rules_to_live_export``) invoke it; the editing paths keep the warning.
+    """
+    from ba2_common.core.market_condition_rules import iter_market_condition_leaves
+
+    unmapped = [f"{label} ({leaf.get('field')})"
+                for label, leaf in iter_market_condition_leaves(tree, where)
+                if leaf.get("field") not in FIELD_EVENT and leaf.get("field") not in FLAG_FIELD_EVENT]
+    if unmapped:
+        raise ValueError(
+            f"{where}: market-condition leaf/leaves {unmapped!r} name a field this server has no "
+            f"event type for. It is NEWER than this installation's condition vocabulary: importing "
+            f"would drop the gate and trade the strategy ungated. Update the target platform "
+            f"(ba2_common market_conditions + TradeConditions registration) before deploying this "
+            f"ruleset.")
 
 
 def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:

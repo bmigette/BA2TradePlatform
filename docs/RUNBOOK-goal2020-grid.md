@@ -447,6 +447,231 @@ that have actually changed conclusions in the past.
 powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Descending | Select-Object -First 5 @{n='MB';e={[math]::Round(\$_.Length/1MB,1)}},Name"
 ```
 
+## Market-condition feature store (design 2026-09-15)
+
+The `ohlcv-v1` profile adds three entry gates per option structure (trend slope, ADX, realized-
+volatility ratio), six searched genes in total per entry tree. `ta-structure-v1` adds five gates
+and nine genes; both together add eight gates and fifteen genes. They read a **published snapshot**: a manifest
+pinning immutable feature objects, built once before a run and mapped per host. **Nothing is
+computed in a trial.** With no profile selected (the default) none of this exists — the launcher
+emits no leaves, the seam installs nothing, and the run is byte-for-byte the one it has always
+been (pinned by `tests/backtest/test_market_condition_all_off_matches_baseline.py`).
+
+### Published snapshots — every universe symbol warmed, not every row usable
+
+Pin these. Window 2020-01-02..2025-12-31 (decision dates; the feature sessions they read run
+2019-12-31..2025-12-30), universe `tools/options_universe_top100.txt`:
+
+| profile | digest | symbols the build warmed | symbols with recorded status exceptions |
+|---|---|---|---|
+| `ohlcv-v1` | `c9ba981fbae8726ec749eca4201c98399a4285046733d16cca6b112b8c8371df` | 98 of 98 | 6 |
+| `ta-structure-v1` | `3c3020d05f9e24ded59272050e1f06193abc74e6c00e41e3168a1750bcc44385` | 98 of 98 | 98 |
+
+Verified on publication: `identity_ok`, 7154 feature objects + 7358 raw shards re-hashed, none
+corrupt or missing.
+
+**"98/98" means NO SYMBOL WAS EXCLUDED FROM THE BUILD. It does not mean every row is a valid
+observation** — and the manifest-level exclusion list being empty says only the first of those.
+The per-symbol records say the second, and they are not empty (review 2026-09-16):
+
+* **92 symbols are fully observed** for `ohlcv-v1`: a valid row on every session after their
+  127-session warm-up prefix.
+* **APP, ARM, GEV, PLTR, SNDK** list part-way through the window. Their rows before the listing
+  are `missing_session` and the next 127 are `insufficient_history`. That is the truth about
+  those years, not a defect: no download creates price history a symbol did not have, and no
+  strategy could have traded them then either. The launch check accepts them.
+* **SPCX had NO usable row anywhere in 2020–2025** — all 1,508 `missing_session`, because its
+  daily cache starts 2026-06-12. **Removed from `tools/options_universe_top100.txt` on
+  2026-09-16** (that file is a bare symbol-per-line list which three of its four readers parse by
+  whitespace with no comment syntax, so the reason is recorded here instead). The universe is now
+  97 symbols. Removing it does **not** invalidate the two digests: a manifest's identity is the
+  hash of its own content, the universe file is not part of it, and the launcher's coverage check
+  simply stops asking for that symbol. The published snapshots still carry SPCX's rows and are
+  pinned unchanged. Ungated runs could not trade it either (no price data => no recommendation),
+  so gated and ungated runs stay comparable.
+* Per OHLCV field: 5,307 `missing_session` rows (1,508 of them SPCX) and 635
+  `insufficient_history`. Do not add the three fields' counts as if they were separate sessions.
+* `ta-structure-v1` adds legitimately undefined levels and states — resistance distance alone has
+  15,494 `insufficient_history` rows. **An undefined pivot is not repaired by downloading more
+  history.** Report usable coverage by field and eligible recommendation, never as "98/98 warmed".
+
+See the [implementation review](../reports/strategy_research/market_conditions_review_2026-09-16.md).
+
+> **History, 2026-09-16 — do not pin `1136d489…f5cb3`.** The first build of `ohlcv-v1` covered
+> only 85 of the 98: thirteen symbols (`ASML BHP DELL GE HON IBM MRK NVS RTX SAN SCCO T WDC`)
+> carried a split whose basis the cached prices could not settle, so the warmup refused to
+> compute from them (`refetch_required`). The operator chose to re-fetch rather than trim the
+> universe: `build --fetch-missing --concurrency 3` replaced each of the thirteen cache files
+> wholesale — which is what clears a stale split basis; a patched file keeps it — in ~6 s and 13
+> provider calls (DELL 2534 bars, the other twelve 3769 each). Both profiles were then published
+> over the repaired cache; `ta-structure-v1` needed no provider calls at all (it reads the same
+> repaired raw shards). The 85/98 digest is superseded.
+
+**Why coverage is refused rather than tolerated.** The launcher refuses to dispatch a run whose
+pinned manifest does not cover its `enabled_instruments`, and the seam refuses a GA trial on the
+same condition. An uncovered symbol reads `missing_session` at every gate for the whole run, so
+the genome that would have traded it scores as though its strategy simply did not fire there — a
+feature-cache miss silently becoming a property of the fitness landscape.
+
+**The run's SESSIONS are checked too (added 2026-09-16, review F1).** Symbol presence alone let a
+snapshot warmed for one window be pinned on another: it carries every symbol and not one row the
+run will read, so every gate reports `missing_session` on every decision date. The launcher now
+validates the `(symbol, prior session)` rows the run's `start_date..end_date` actually requires,
+once per (digest, universe, window), before dispatch — and refuses an out-of-range pin or an
+unexplained hole as a **job configuration error**, never as a zero-trade fitness. It deliberately
+does NOT refuse the legitimately undefined observations above (pre-listing rows, the warm-up
+prefix, an unconfirmed pivot). If the refusal names a symbol with "no usable observation
+anywhere", that symbol belongs out of the universe (as SPCX now is) or needs its source history
+repaired. If a future universe change reintroduces uncovered symbols, the two ways forward are
+the same: re-fetch
+(`warm_market_conditions.py build --plan <plan> --fetch-missing`, a real provider bill — size it
+with `plan` first), then re-publish and re-pin; or trim the universe to the covered set and pass
+that file to the driver.
+
+**Running the warm tools from a WORKTREE on Windows — two traps.** `PYTHONPATH` does not work: the
+test venv's editable install puts a *meta-path finder* for `ba2_common` ahead of it, pointing at the
+MAIN checkout, so the tool dies on `No module named ba2_common.core.market_condition_source`. Only a
+`sys.path.insert` of the three `packages/*` dirs **before the first import** wins. And the tools read
+the FMP key from the TEST database, so `DB_FILE` and `DATABASE_URL` must point at
+`~/Documents/ba2/test/dl_forecasting.db` — without them every symbol fails preflight with
+"FMP API key not configured", which reads like a data problem and is not.
+
+### Warm the snapshot (once, on the master, before any job)
+
+```bash
+MARKET_CONDITION_PROFILE=ohlcv-v1 tools/stage1_run.sh --dry-run    # prints the four commands
+```
+
+`--dry-run` never fetches and never launches; it prints the exact warm sequence for the
+resolved window and universe. Run those four, in order, on the master:
+
+```bash
+$PY tools/warm_market_conditions.py plan  --profile ohlcv-v1 \
+      --universe-file tools/options_universe_top100.txt \
+      --start 2020-01-01 --end 2025-12-31 --out market_conditions_plan.json
+$PY tools/warm_market_conditions.py build --plan market_conditions_plan.json \
+      --cache-only --print-digest          # stdout = the digest; the JSON report is on stderr
+$PY tools/warm_market_conditions.py verify       --manifest <digest>
+$PY tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1
+```
+
+* `plan` is an inventory plus a source preflight; a plan that reports missing coverage is
+  **actionable**, not a warning to pass. `--cache-only` on `build` is deliberate: a warmup that
+  fetches while a grid waits is a surprise provider bill measured in hours.
+* `verify` re-hashes every object and raw shard the manifest references.
+* `prepare-host` builds this box's mapped arrays. It is an **optimisation, not a correctness
+  requirement** — the master runs `prepare_host` itself before dispatch — but a cold first job
+  otherwise pays it.
+* Then launch with the digest pinned:
+
+```bash
+MARKET_CONDITION_PROFILE=ohlcv-v1 MARKET_CONDITION_MANIFEST=<digest> tools/stage1_run.sh
+```
+
+`stage1_run.sh` does the whole sequence itself when `MARKET_CONDITION_PROFILE` is set and
+`MARKET_CONDITION_MANIFEST` is not; it refuses to launch if any step fails.
+
+**Remote workers prepare themselves.** `distributed_eval._preflight_worker` calls
+`/market-conditions/prepare` after `push_cache`; a worker whose prepare fails is **excluded from
+the run** rather than handed trials it would answer with no rows.
+
+### Is a host ready?
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://<worker>:8100/health | jq .market_conditions.prepared
+```
+
+A list of digests. **A digest absent from it means "unready", never "run it anyway"** — the
+master's pre-flight reads exactly this. `/market-conditions/prepare` is submit/poll like a trial
+(it returns a `job_id`; the digest is admitted when the poll collects an `ok` report), because
+verifying a season of objects is minutes of I/O and as a blocking handler was indistinguishable
+from a hung worker.
+
+### Retention, revocation and sweeping
+
+* **There is no GC or compaction yet.** A future collector must walk **OBJECTS**, not only
+  manifests: whole-object reuse preserves old `raw_shard_ref` values verbatim, so a raw shard is
+  pinned by any manifest that transitively references it. Deleting by "manifests I still care
+  about" would strand exactly the shards a reused object still points at.
+* Progress records under `_derived/market_conditions_build` **expire after 24 h**.
+* Readiness markers of a revoked digest become `.revoked` and are **pruned after 30 days**.
+* **Revocation is scoped.** A corrupt cache push revokes only the digests whose verification
+  failed; manifests outside the push's scope are never revoked by an unreadable file.
+* A **`LAYOUT_VERSION` bump moves every mapped key**, so the old mapping directories are
+  orphaned on every host at once. Collect them with `tools/build_shared_arrays.py --sweep`,
+  which also drops dead readiness markers.
+* `BA2_SHARED_ARRAYS=0` loads the same central rows into **private** arrays: identical values,
+  still nothing recomputed. Use it to isolate a mapping problem from a data problem.
+
+### Live
+
+Set `market_condition_profile` on each expert to an empty string (off), `ohlcv-v1`,
+`ta-structure-v1`, or `ohlcv-v1,ta-structure-v1`. The setting travels with the deploy payload.
+Do **not** set `BA2_MARKET_CONDITION_PROFILE`: it is retired and a nonempty value is rejected.
+
+For a reproducible pinned reader, the host still uses:
+
+```
+BA2_MARKET_CONDITION_MANIFEST=ohlcv-v1=<digest>,ta-structure-v1=<digest>
+```
+
+Pin every profile the box serves. The map is HOST-WIDE and the profile is PER EXPERT, so each
+expert selects the subset it needs: with both profiles pinned, an expert on `ohlcv-v1` alone, one
+on `ta-structure-v1` alone and one on both all resolve (fixed 2026-09-16, review F3; before that
+only an expert naming every pinned profile could be built). A single-profile host may still use a
+bare digest. An unregistered profile name, a profile pinned twice, a pin with no digest and
+mixing the two shapes are all still refused. A profile the map does not pin is research mode for
+that expert — reported once per decision pass, not silently computed.
+
+`wire_all_seams` installs a dispatcher; readers and source certification are created lazily for
+experts with a nonempty profile setting. An empty setting performs no feature reads. A profile
+without a manifest computes from the local FMP cache and logs an error for each decision pass;
+it is not the same pinned-input configuration as a GA trial. A historical 2020–2025 manifest
+does not cover current live sessions: prepare a snapshot for the live decision dates before
+pinning it, and renew it as dates advance.
+
+* **A certification failure does not stop the platform.** Exits and protective-order handling
+  must keep running, so an `UncertifiedSourceResolver` is installed instead: every gate resolves
+  no context with the certification summary as its reason (one ERROR at install, one WARNING per
+  field), so gated **entries** are refused loudly while everything else runs.
+* **Coverage is checked against the live universe** — the union of the enabled instruments of
+  every enabled expert instance whose enter-market ruleset carries a market leaf — when its
+  resolver is built and at decision passes, with repeated comparisons cached. Each uncovered symbol gets **one ERROR naming the
+  digest**, and its gates report `no_context` with that reason. An instance that picks its
+  universe at analysis time (`EXPERT`/`DYNAMIC`/`SCREENER`) cannot be pre-checked and is reported
+  as such.
+* **Live refresh reports split-basis drift; it does not automatically replace history.** The
+  automatic repair was reversed by operator decision. Inventory the live universe with
+  `warm_market_conditions.py plan`, then use the explicit warmup `--fetch-missing` repair path
+  when required. That path can call `force_full_refetch`; the earlier option-universe repair
+  involved 13 symbols. Do not assume restarting the platform repairs the source cache.
+* Market leaves are refused on open-positions / exit rulesets, and an unresolved mode gene is
+  refused at export: live receives concrete conditions only.
+
+### Reading the results
+
+```bash
+$PY tools/report_market_conditions.py --opt <id> [--top 5] [--coverage] [--out report.md]
+$PY tools/report_market_conditions.py --like %ohlcv% --top 3
+```
+
+Per job: the versions **as persisted with the run**, the winning modes and thresholds per
+structure, the gate counters (eligible recommendations reported separately from gate rejections,
+and unknown input broken out by reason), submitted vs filled structures, per-year profit /
+return / drawdown from the account engine, and the attribution of net P&L and top-1/top-5
+concentration to explicit entry-state bins. `--coverage` adds the offline snapshot diagnostic,
+which is the one to run on a **feature-off** winner: it says which symbols and sessions would
+have been unknown, reading the manifest only.
+
+A bin is not an account. The report never annualises a filtered subset of overlapping trades,
+and neither should a summary of it.
+
+### Performance
+
+`testplatform/backend/tests_scripts/bench_market_conditions.py` (see
+`reports/strategy_research/market_conditions_bench_2026-09-16.md` for the measured numbers and
+the acceptance verdict). `--quick` runs the whole harness on a fabricated store in a second.
+
 ## remote227 (babatest) traps found 2026-09-15
 
 * **logind `RemoveIPC`** deletes a non-system user's POSIX semaphores (`/dev/shm/sem.mp-*`) when
@@ -465,6 +690,80 @@ powershell -NoProfile -Command "Get-ChildItem *.log* | Sort-Object Length -Desce
 * Never `pgrep -f spawn_main` from an ssh command that contains the string (self-match killed the
   shell); use `pgrep -f multiprocessing.spawn`.
 
+## remote227: updating the build and warming a snapshot (2026-09-16, all four found the hard way)
+
+The 2026-09-16 gated launch hit four host-specific blockers in a row. None is in the code; all
+four are in HOW you drive that box. In order:
+
+**1. The mirror is not yours to write.** The grid clone's `origin` is `/opt/ba2worker/BA2TradePlatform`,
+owned by `ba2worker`. `git fetch origin` inside it fails as `debian` with "insufficient permission
+for adding an object to repository database" as soon as there are new objects — and the mirror's
+local `dev` branch lags whatever it last pulled anyway. **Fetch GitHub directly into the grid
+clone** (the box has outbound access):
+
+```bash
+cd /home/debian/ba2-grid/repo
+git fetch https://github.com/bmigette/BA2TradePlatform.git dev:refs/remotes/gh/dev -f
+git merge --ff-only gh/dev          # the grid branch carries no unique commits; check first:
+                                    #   git log --oneline gh/dev..$(git rev-parse --abbrev-ref HEAD)
+```
+Do NOT "fix" this by updating the mirror: it is the fleet worker's own repository.
+
+**2. Use the worker venv, and hand the tools a database.** The grid clone has no `.venv`, and the
+system `python3` has no numpy:
+
+```bash
+PY=/opt/ba2worker/ba2-venvs/test/bin/python
+export BA2_HOME=/home/debian/ba2-grid/home
+export DB_FILE=/home/debian/ba2-grid/home/test/dl_forecasting.db
+export DATABASE_URL="sqlite:////home/debian/ba2-grid/home/test/dl_forecasting.db"
+export PYTHONPATH=/home/debian/ba2-grid/repo/packages/common:/home/debian/ba2-grid/repo/packages/providers:/home/debian/ba2-grid/repo/packages/experts:/home/debian/ba2-grid/repo/testplatform/backend
+```
+Without `DB_FILE`/`DATABASE_URL` the warm reads no FMP key and EVERY symbol fails preflight with
+"FMP API key not configured" — which reads like a data problem and is not.
+
+**3. The OHLCV cache is owned by `ba2worker`, and the repair needs to WRITE it.**
+`/home/debian/ba2-grid/home/common/cache/FMPOHLCVProvider` was `drwxr-x---  ba2worker ba2worker`.
+`debian` is in the `ba2worker` group, so the plan step READS fine and reports the 13 split-drifted
+symbols — then `build --fetch-missing` fails every one of them with
+`PermissionError: ... ASML_1d.parquet.tmp` and publishes NOTHING. Grant group write once, matching
+the convention the parent cache directory already uses (`ba2worker:debian`, `drwxrwsr-x`):
+
+```bash
+D=/home/debian/ba2-grid/home/common/cache/FMPOHLCVProvider
+sudo chmod g+ws "$D"
+sudo find "$D" -maxdepth 1 -name '*.parquet' -exec chmod g+w {} +
+```
+Only that directory. The option stores are read-only to the warm and were left alone.
+
+**4. A cache older than the re-fetch reach used to be unrepairable.** Fixed in TEST_APP 0046: the
+request now starts at `min(15 years, the cache's first bar)`. Before that, T and WDC there (3777
+bars from 2011-06-22) made a faithful 15-year answer look SHORT, and the C1 data-loss guard refused
+the repair for ever. If you see `full re-fetch of X returned LESS history than the cache holds`,
+check the build is 0046 or newer before suspecting the vendor.
+
+**There is no `ba2-stage1` systemd unit on that host.** `systemctl is-active ba2-stage1` answers
+`inactive` for a unit that does not exist, which reads like a stopped service. `systemctl show
+ba2-stage1 -p FragmentPath` returns empty — that is the tell. Launch detached instead, from the
+repo root, and never edit `tools/stage1_run.sh` while it runs:
+
+```bash
+cd /home/debian/ba2-grid/repo
+export MARKET_CONDITION_PROFILE="ohlcv-v1,ta-structure-v1"
+export MARKET_CONDITION_MANIFEST="ohlcv-v1=<digest>,ta-structure-v1=<digest>"
+nohup bash tools/stage1_run.sh > /home/debian/ba2-grid/stage1_2020.log 2>&1 &
+```
+
+**Digests are per host and that is correct.** The snapshot identity is content-addressed over the
+data actually warmed, so remote227's digests differ from a workstation's whenever the two price
+caches differ. Each host warms and VERIFIES its own; never copy a digest between hosts and assume
+it resolves.
+
+**OWED (do not do while a grid runs):** fold blockers 2 and 3 into `tools/stage1_run.sh` as a
+preflight — refuse with the exact `chmod` line when the provider cache is not writable, and refuse
+when `DB_FILE`/`DATABASE_URL` are unset — so the next operator gets one refusal instead of four
+investigations.
+
 ## Database backups (2026-09-15)
 
 `tools/backup_dbs.py` copies the PROD trade DB, the DEV trade DB and the TEST/GA DB with SQLite's online-backup
@@ -477,7 +776,8 @@ overlapping instances. Log: `G:\Mon Driveackup\BA2ackup.log`. Measured 2026-09
 
 **Weekly remote pull (stage-1 isolated DB).** `tools/backup_remote_db.py` runs the same online
 backup + `quick_check` + zip ON remote227 (python3 over one ssh session, `nice`d so the grid is
-not disturbed), scp's it to `G:\Mon Driveackup\BA2emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
+not disturbed), scp's it to `G:\Mon Driveackup\BA2
+emote227-stage1_<YYYY-MM-DD>.sqlite.zip`,
 deletes the remote copy and keeps the newest 4. Task **`BA2 Remote DB Backup`**, Sunday 01:00,
 interactive user (needs the ssh key + G:). Stage-1 results live ONLY in that isolated DB
 (`/home/debian/ba2-grid/home/test/dl_forecasting.db`); nothing syncs them to the local test DB.

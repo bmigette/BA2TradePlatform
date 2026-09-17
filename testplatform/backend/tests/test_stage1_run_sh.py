@@ -8,6 +8,8 @@ the same wiring-not-mechanism posture as ``test_equity_cap_launcher.py`` and
 """
 import os
 
+import pytest
+
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _SCRIPT = os.path.join(_ROOT, "tools", "stage1_run.sh")
 
@@ -64,6 +66,96 @@ def test_a_preflight_check_refuses_to_launch_without_the_gate_store():
     # Some existence check on the store path before the exec, not a silent proceed.
     assert "exit 1" in text
     assert text.index("exit 1") < text.index("exec ")
+
+
+def test_the_market_condition_profile_is_off_by_default_and_adds_nothing_when_off():
+    """Unset MARKET_CONDITION_PROFILE must leave this script the launch it has always been: the
+    warm step and both flags live inside one guard, so nothing runs and nothing is passed."""
+    text = _text()
+    assert 'MARKET_CONDITION_PROFILE="${MARKET_CONDITION_PROFILE:-none}"' in text
+    guard = 'if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then'
+    assert guard in text
+    # Every warm command and both forwarded flags sit AFTER the guard and BEFORE the exec.
+    body = text[text.index(guard):text.index("exec ")]
+    for token in ("warm_market_conditions.py plan", "warm_market_conditions.py build",
+                  "warm_market_conditions.py verify", "warm_market_conditions.py prepare-host"):
+        assert token.split(".py ")[1] in body
+    assert "--market-condition-profile" in body and "--market-condition-manifest" in body
+
+
+def test_a_manifest_with_the_profile_off_refuses_the_launch(tmp_path):
+    """Review 2026-09-16, F2, in the wrapper's environment form.
+
+    ``MARKET_CONDITION_MANIFEST`` exported with ``MARKET_CONDITION_PROFILE`` unset used to launch
+    the whole grid UNGATED -- the matrix driver dropped the digest, the launcher never saw it, and
+    the jobs took the ordinary ungated discovery names (so they could also be SKIPped against an
+    existing ungated completion) while the environment said a snapshot was pinned.
+
+    The guard itself is executed here, not just grepped: the slice of the real script from the two
+    variable defaults down to the end of the refusal, run under bash with the offending
+    environment and with the accepted ones.
+    """
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is not available on this host")
+    text = _text()
+    start = text.index('MARKET_CONDITION_PROFILE="${MARKET_CONDITION_PROFILE:-none}"')
+    end = text.index('if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then')
+    fragment = text[start:end] + "\necho REACHED-THE-WARM-STEP\n"
+    script = tmp_path / "guard.sh"
+    script.write_text(fragment, encoding="utf-8", newline="\n")
+
+    def run(env):
+        return subprocess.run([bash, str(script)], capture_output=True, text=True,
+                              env={**os.environ, **env})
+
+    refused = run({"MARKET_CONDITION_MANIFEST": "abc123", "MARKET_CONDITION_PROFILE": ""})
+    assert refused.returncode == 1
+    assert "MARKET_CONDITION_PROFILE is unset/none" in refused.stderr
+    assert "REACHED-THE-WARM-STEP" not in refused.stdout
+
+    # ... and the two configurations that ARE meaningful still pass the guard.
+    both = run({"MARKET_CONDITION_MANIFEST": "ohlcv-v1=abc123",
+                "MARKET_CONDITION_PROFILE": "ohlcv-v1"})
+    assert both.returncode == 0 and "REACHED-THE-WARM-STEP" in both.stdout
+    neither = run({"MARKET_CONDITION_MANIFEST": "", "MARKET_CONDITION_PROFILE": ""})
+    assert neither.returncode == 0 and "REACHED-THE-WARM-STEP" in neither.stdout
+
+
+def test_the_warm_step_runs_once_before_the_matrix_in_the_documented_order():
+    text = _text()
+    body = text[:text.index("exec ")]
+    order = [body.index(step) for step in
+             (" plan --profile", " build --plan", " verify --manifest", " prepare-host --manifest")]
+    assert order == sorted(order), "plan -> build -> verify -> prepare-host"
+    # The digest the build publishes is what gets pinned into every job.
+    assert "--print-digest" in body
+    assert 'MC_ARGS=(--market-condition-profile "$MARKET_CONDITION_PROFILE" \\' in text
+    assert '${MC_ARGS[@]+"${MC_ARGS[@]}"}' in text
+
+
+def test_every_warm_step_aborts_the_launch_rather_than_running_a_gated_grid_half_warmed():
+    """`set -euo pipefail` plus an explicit message per step: a failed plan/build/verify/prepare
+    must not fall through into 32 jobs that each rediscover the same missing feature store."""
+    text = _text()
+    body = text[text.index('if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then'):text.index("exec ")]
+    assert body.count("exit 1") >= 4
+    assert "PLAN is actionable" in body and "VERIFY failed" in body and "PREPARE-HOST failed" in body
+    assert "--cache-only" in body  # never fetch while a grid waits
+
+
+def test_a_dry_run_prints_the_warm_commands_before_the_matrix_command():
+    """--dry-run must SHOW the preparation it would do, not silently skip to the matrix."""
+    text = _text()
+    body = text[text.index('if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then'):text.index("exec ")]
+    assert 'case " $* " in *" --dry-run "*) MC_DRY=1 ;; esac' in body
+    dry = body[body.index('if [ "$MC_DRY" = "1" ]; then'):body.index("  else")]
+    for step in ("plan --profile", "build --plan", "verify --manifest", "prepare-host --manifest"):
+        assert step in dry, step
+    assert "echo" in dry and "$MC_PYTHON $MC_WARM" in dry
 
 
 def test_elitism_is_not_hardcoded_here_it_relies_on_the_launchers_fixed_default():

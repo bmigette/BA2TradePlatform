@@ -142,23 +142,38 @@ class StrategyUpdate(BaseModel):
 
 def _resolve_rule_lists(payload) -> tuple:
     """(entry_rules, exit_rules) from a create/update payload: the unified lists when given
-    (normalized), else the legacy trio converted via the shared trade_rules_from_legacy."""
+    (normalized), else the legacy trio converted via the shared trade_rules_from_legacy.
+
+    THE canonical save path, and therefore where a market-condition gate on an exit ruleset is
+    refused (design 2026-09-15 section 6): such a leaf can only ever prevent an exit, a reduction
+    or a protective-order adjustment, and live it would read ``no_context`` and never pass at all
+    -- a stop-loss rule that silently cannot fire. Entry rules are unrestricted here: a SAVED
+    strategy is allowed to carry the optimizer template (``mode_optimize``); it is the EXPORT and
+    the DEPLOY that require a resolved one.
+    """
+    from ba2_common.core.market_condition_rules import assert_no_market_conditions
     from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
 
     if payload.entry_rules is not None or payload.exit_rules is not None:
-        return (normalize_trade_rules(payload.entry_rules or []),
-                normalize_trade_rules(payload.exit_rules or []))
-    if any(getattr(payload, f, None) is not None for f in
-           ("entry_conditions", "buy_entry_conditions", "sell_entry_conditions",
-            "exit_conditions", "entry_actions")):
+        entry, exits = (normalize_trade_rules(payload.entry_rules or []),
+                        normalize_trade_rules(payload.exit_rules or []))
+    elif any(getattr(payload, f, None) is not None for f in
+             ("entry_conditions", "buy_entry_conditions", "sell_entry_conditions",
+              "exit_conditions", "entry_actions")):
         converted = trade_rules_from_legacy(
             buy_tree=payload.buy_entry_conditions or payload.entry_conditions,
             sell_tree=payload.sell_entry_conditions,
             entry_actions=payload.entry_actions,
             exit_conditions=payload.exit_conditions,
         )
-        return converted["entry_rules"], converted["exit_rules"]
-    return None, None
+        entry, exits = converted["entry_rules"], converted["exit_rules"]
+    else:
+        return None, None
+    try:
+        assert_no_market_conditions(exits, "exit_rules")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return entry, exits
 
 
 def extract_required_fields(entry_rules: list = None, exit_rules: list = None) -> List[str]:

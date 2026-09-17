@@ -361,16 +361,20 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:3782":
+    "ba2_trade_platform/ui/pages/settings.py:4016":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
         "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
-        "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747)",
-    "ba2_trade_platform/ui/pages/settings.py:3830":
+        "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
+        "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
+        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016)",
+    "ba2_trade_platform/ui/pages/settings.py:4066":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
-        "continuation line 3795, one past the outer .get(...)'s opening line 3794)",
+        "continuation line 3795, one past the outer .get(...)'s opening line 3794; plan "
+        "Task 12's widget + guard then moved the pair to :3850/:3898, then :3889/:3939; the "
+        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066)",
     "ba2_trade_platform/ui/components/performance_charts.py:475":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
         "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging)",
@@ -384,7 +388,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:1549":
+    "packages/common/ba2_common/core/TradeActions.py:1576":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "

@@ -137,6 +137,27 @@ def _jobs(experts, strategies, name_suffix=""):
             yield (f"optm-{expert}-{s}{name_suffix}", expert, s)
 
 
+def _market_condition_passthrough(args) -> list:
+    """Extra optimize CLI tokens for the market-condition profile ([] when it is ``none``).
+
+    NOTE that a manifest without a profile never reaches here: dropping it silently is exactly
+    the fault review 2026-09-16 (F2) found, so ``resolve_args`` refuses that combination first.
+
+    Both tokens are EXPLICIT per job for the same reason the options store is (see build_cmd): a
+    distributed trial carries {config, fitness_metric, cache_root, inmem_trades} and no
+    environment, so a profile or a manifest chosen through the environment is a decision the
+    master made that the worker cannot see.
+    """
+    profile = getattr(args, "market_condition_profile", None) or "none"
+    if profile == "none":
+        # A manifest here is refused in resolve_args, before any command or name is built (F2).
+        return []
+    out = ["--market-condition-profile", profile]
+    if getattr(args, "market_condition_manifest", None):
+        out += ["--market-condition-manifest", args.market_condition_manifest]
+    return out
+
+
 def _gate_passthrough(args) -> list:
     """Extra optimize CLI tokens for the gate-only screener entry gate ([] when unset)."""
     if not args.screener_gate_store:
@@ -205,7 +226,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "(option_consistent_annual_return for pure-option kinds OS1-4/O_* "
                          "AND the equity-entry overlays O_CC/O_PP, sharpe_ratio for O_STK -- "
                          "see _resolve_fitness/_OPTION_CAR_STRATEGIES) -- passing this flag "
-                         "here overrides that auto-resolution uniformly for the whole matrix.")
+                         "here overrides that auto-resolution uniformly for the whole matrix. "
+                         "'option_car_over_risk' is the other option objective: ~50%%/yr WITH "
+                         "a drawdown tolerance (full credit to 40%% dd), which is what to pass "
+                         "when the auto-resolved option_consistent_annual_return's 16x "
+                         "small-drawdown reward is producing low-return grinders. The two are "
+                         "NOT comparable -- a matrix run under one never shares a table with a "
+                         "matrix run under the other.")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "
                          "need more headroom than the equity grid's 10k).")
@@ -255,6 +282,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path to the launcher executable (or ba2test_launcher.py). Default: "
                          "the ba2-test installed next to the Python interpreter. Point this at "
                          "a WORKTREE launcher to run code different from the editable install.")
+    ap.add_argument("--market-condition-profile", default="none",
+                    metavar="none|<profile>[,<profile>...]",
+                    help="Forward --market-condition-profile to every job: append the registered "
+                         "profile(s)' market-condition gates (mode + threshold genes) to each "
+                         "structure's INITIAL-ENTRY tree. Default 'none' = today's rules and "
+                         "genes. The flag folds into the discovery identity digest, so a gated "
+                         "run gets its own job names and never resumes an ungated checkpoint.")
+    ap.add_argument("--market-condition-manifest", default=None,
+                    metavar="DIGEST[,DIGEST...]|<profile>=DIGEST,...",
+                    help="The prepared snapshot digest every trial reads, ONE PER PROFILE "
+                         "(required by the launcher whenever a profile is on; "
+                         "tools/warm_market_conditions.py build --print-digest prints each). "
+                         "Bare digests are matched to the profiles in order; profile=digest "
+                         "pairs are explicit. Part of the identity digest too: a different "
+                         "snapshot is a different experiment, not a resume.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--screener-gate-store", default=None,
                     help="Attach this parquet metric store as a GATE-ONLY per-bar entry gate on "
@@ -300,6 +342,18 @@ def resolve_args(ap, argv=None):
         if not args.screener_gate_store or args.max_stock_price != 0:
             ap.error("Discovery requires --screener-gate-store and --max-stock-price 0 "
                      "to retain the launcher's per-structure affordability caps")
+    # A MANIFEST WITHOUT A PROFILE IS A REFUSAL, NOT AN OMISSION (review 2026-09-16, F2).
+    # _market_condition_passthrough used to return [] for it, so the launcher never saw the
+    # manifest and its own manifest-without-profile refusal could not fire. The job then ran
+    # UNGATED under a discovery name identical to the ordinary ungated job -- so it could also be
+    # skipped against an existing ungated completion, and every listing afterwards would read as
+    # though a snapshot had been pinned. Refused HERE, in resolve_args, so it holds for
+    # build_cmd, discovery_name and --dry-run alike.
+    manifest = (getattr(args, "market_condition_manifest", None) or "").strip()
+    if manifest and (args.market_condition_profile or "none") == "none":
+        ap.error("--market-condition-manifest was given without --market-condition-profile: "
+                 "nothing would read that snapshot and the jobs would run UNGATED under the "
+                 "ungated job names. Pass --market-condition-profile, or drop the manifest.")
     try:
         start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
     except ValueError:
@@ -342,6 +396,7 @@ def build_cmd(args, launcher, name, expert, strat, universe):
         # once scored against the wrong vendor's history while every log said otherwise.
         "--options-store", args.options_store]
     cmd += _gate_passthrough(args)
+    cmd += _market_condition_passthrough(args)
     for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
                         ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
         value = getattr(args, field)

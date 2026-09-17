@@ -83,6 +83,161 @@ if [ ! -e "$SCREENER_STORE" ]; then
   exit 1
 fi
 
+# MARKET-CONDITION GATES (design 2026-09-15; plan Task 8). OFF unless MARKET_CONDITION_PROFILE
+# names a registered profile (e.g. ohlcv-v1) -- with it unset this script is byte-for-byte the
+# launch it has always been.
+#
+# The snapshot is prepared ONCE, here, before any job starts: plan (inventory + source preflight)
+# -> build --cache-only (publish the manifest) -> verify (re-hash every object it references) ->
+# prepare-host (map the arrays for this box). Every step must succeed; `set -e` plus the explicit
+# messages below turn any failure into a refusal to launch rather than 32 jobs that each discover
+# the same missing feature store. --cache-only is deliberate: a warmup that fetches while a grid
+# waits is a surprise bill in provider calls and hours, so missing coverage is an actionable
+# inventory item the operator resolves on purpose (re-fetch, or trim the universe).
+#
+# The published digest is then PINNED into every job (--market-condition-manifest). Without it the
+# launcher refuses the run: each worker would otherwise compute 128-session indicators from
+# whatever cache it happened to hold, with no two hosts provably agreeing.
+MARKET_CONDITION_PROFILE="${MARKET_CONDITION_PROFILE:-none}"
+MARKET_CONDITION_MANIFEST="${MARKET_CONDITION_MANIFEST:-}"
+MC_ARGS=()
+# A PIN WITH THE PROFILE OFF IS A MISTAKE, NOT AN OMISSION (review 2026-09-16, F2 -- the same
+# rule the matrix driver now applies to its flags). Exporting the digest and forgetting the
+# profile used to launch the whole 32-job grid UNGATED, under the ordinary ungated job names,
+# from an environment that says a snapshot is pinned -- and such a name can then be SKIPped
+# against an existing ungated completion. Refused before anything is warmed or launched.
+if [ "$MARKET_CONDITION_PROFILE" = "none" ] && [ -n "$MARKET_CONDITION_MANIFEST" ]; then
+  echo "stage1_run.sh: MARKET_CONDITION_MANIFEST=$MARKET_CONDITION_MANIFEST is set but" >&2
+  echo "MARKET_CONDITION_PROFILE is unset/none: nothing would read that snapshot and the grid" >&2
+  echo "would run UNGATED under the ungated job names. Set MARKET_CONDITION_PROFILE, or unset" >&2
+  echo "MARKET_CONDITION_MANIFEST." >&2
+  exit 1
+fi
+if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
+  MC_PYTHON=/opt/ba2worker/ba2-venvs/test/bin/python
+  MC_WARM=tools/warm_market_conditions.py
+  MC_PLAN="${MC_PLAN:-/home/debian/ba2-grid/market_conditions_plan.json}"
+  MC_UNIVERSE="${MC_UNIVERSE:-tools/options_universe_top100.txt}"
+  MC_START="${STAGE1_START:-2020-01-01}"
+  MC_END="${STAGE1_END:-2025-12-31}"
+  MC_DRY=0
+  case " $* " in *" --dry-run "*) MC_DRY=1 ;; esac
+  # ONE SNAPSHOT PER PROFILE (Task 10): MARKET_CONDITION_PROFILE may be a comma list, and a
+  # manifest names the single profile it was warmed for, so the whole plan/build/verify/
+  # prepare-host sequence runs once per profile and the digests are passed on as profile=digest
+  # pairs. Pre-setting MARKET_CONDITION_MANIFEST skips plan+build for the profiles it names --
+  # and is then what the grid runs on, never built-and-discarded: a digest this script published
+  # while the run used a different one would be a snapshot nobody compared. NOTE that skipping
+  # `plan` also skips the SOURCE PREFLIGHT it runs (cache certification, the split-basis check):
+  # a pre-set digest is a statement that those questions were answered when it was built, so
+  # pass one only for a snapshot this same universe and window produced. verify + prepare-host
+  # still run, so the digest is always re-hashed and mapped on this box before the grid starts.
+  MC_PROFILES="$(echo "$MARKET_CONDITION_PROFILE" | tr ',' ' ')"
+  MC_N=0
+  for MC_P in $MC_PROFILES; do MC_N=$((MC_N + 1)); done
+  MC_PRESET="$MARKET_CONDITION_MANIFEST"
+  if [ -n "$MC_PRESET" ] && [ "$MC_N" -gt 1 ]; then
+    # EVERY token, not just one of them: "ohlcv-v1=abc,deadbeef" carries an '=' and would
+    # otherwise pass, and the bare second token would then be read as the digest of whichever
+    # profile the loop reached last. Same rule the launcher applies to the flag.
+    for MC_TOK in $(echo "$MC_PRESET" | tr ',' ' '); do
+      case "$MC_TOK" in
+        *=*) ;;
+        *) echo "stage1_run.sh: MARKET_CONDITION_MANIFEST must be profile=digest pairs when more" >&2
+           echo "than one profile is warmed ($MARKET_CONDITION_PROFILE); '$MC_TOK' is a bare" >&2
+           echo "digest and cannot say which profile's snapshot it is." >&2
+           exit 1 ;;
+      esac
+    done
+  fi
+  MC_PINS=""
+  for MC_PROFILE in $MC_PROFILES; do
+    MC_PLAN_P="${MC_PLAN%.json}.${MC_PROFILE}.json"
+    MC_DIGEST=""
+    for MC_TOK in $(echo "$MC_PRESET" | tr ',' ' '); do
+      case "$MC_TOK" in
+        "$MC_PROFILE="*) MC_DIGEST="${MC_TOK#*=}" ;;
+        *=*) ;;
+        *) MC_DIGEST="$MC_TOK" ;;
+      esac
+    done
+    if [ -n "$MC_PRESET" ] && [ -z "$MC_DIGEST" ]; then
+      echo "stage1_run.sh: MARKET_CONDITION_MANIFEST names no digest for profile $MC_PROFILE" >&2
+      exit 1
+    fi
+    if [ "$MC_DRY" = "1" ]; then
+      echo "stage1_run.sh: market-condition warm step (profile $MC_PROFILE), run ONCE"
+      echo "               before the matrix command below:"
+      echo "  $MC_PYTHON $MC_WARM plan --profile $MC_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --out $MC_PLAN_P"
+      echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN_P --cache-only --print-digest   # -> the $MC_PROFILE digest"
+      echo "  $MC_PYTHON $MC_WARM verify --manifest <digest>"
+      echo "  $MC_PYTHON $MC_WARM prepare-host --manifest <digest> --profile $MC_PROFILE"
+      MC_DIGEST="${MC_DIGEST:-DIGEST-FROM-BUILD}"
+    else
+      if [ -z "$MC_DIGEST" ]; then
+        "$MC_PYTHON" "$MC_WARM" plan --profile "$MC_PROFILE" \
+          --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --out "$MC_PLAN_P" || {
+          echo "stage1_run.sh: market-condition PLAN is actionable for $MC_PROFILE (missing" >&2
+          echo "coverage or a failed source preflight) -- resolve it (re-fetch those symbols, or" >&2
+          echo "trim the universe) and re-run. Refusing to launch a gated grid on an incomplete" >&2
+          echo "snapshot." >&2
+          exit 1; }
+        MC_DIGEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN_P" --cache-only \
+          --print-digest | tail -n 1)" || {
+          echo "stage1_run.sh: market-condition BUILD failed for $MC_PROFILE" >&2; exit 1; }
+        if [ -z "$MC_DIGEST" ]; then
+          echo "stage1_run.sh: market-condition build published no manifest for $MC_PROFILE" >&2
+          exit 1
+        fi
+      else
+        echo "stage1_run.sh: market-condition profile $MC_PROFILE uses the pre-set manifest $MC_DIGEST (plan/build skipped)"
+      fi
+      "$MC_PYTHON" "$MC_WARM" verify --manifest "$MC_DIGEST" || {
+        echo "stage1_run.sh: market-condition VERIFY failed for $MC_DIGEST ($MC_PROFILE)" >&2
+        exit 1; }
+      "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MC_DIGEST" \
+        --profile "$MC_PROFILE" || {
+        echo "stage1_run.sh: market-condition PREPARE-HOST failed for $MC_DIGEST ($MC_PROFILE)" >&2
+        exit 1; }
+      echo "stage1_run.sh: market-condition profile $MC_PROFILE manifest $MC_DIGEST prepared"
+    fi
+    MC_PINS="${MC_PINS:+$MC_PINS,}$MC_PROFILE=$MC_DIGEST"
+  done
+  MARKET_CONDITION_MANIFEST="$MC_PINS"
+  MC_ARGS=(--market-condition-profile "$MARKET_CONDITION_PROFILE" \
+           --market-condition-manifest "$MARKET_CONDITION_MANIFEST")
+fi
+
+# FITNESS (2026-09-17). Unset -> run_options_matrix --profile discovery's own default,
+# ``option_consistent_annual_return``, which is what every -st1 job so far ran under; with it
+# unset this block is a no-op and the launch is byte-for-byte the one it has always been.
+#
+# Set STAGE1_FITNESS=option_car_over_risk for the OTHER option objective: ~50%/yr WITH a
+# drawdown tolerance (annualized return / sqrt(max(dd,10%)), full credit to 40% dd then a
+# (40/dd)^1.5 penalty). That is what to run when the default's 16x small-drawdown reward is
+# producing low-return grinders -- as it did on the first gated stage-1 job, which converged on
+# a 10.6%-CAR / 8.9%-DD genome (fitness 13.5, about 2.4x the score it gave a 50%-CAR / 30%-DD
+# one) and was stopped for exactly that reason.
+#
+# CHANGING THE FITNESS REQUIRES A NEW SUFFIX, and is refused without one. Job names are the
+# RESUME KEY: re-ranking a search and then resuming into checkpoints scored under the other
+# metric silently mixes two objectives in one population, and the two metrics' scores are not
+# comparable at all (the new one ranks a 50%/30% genome ABOVE a 25%/10% one; the default ranks
+# them the other way round). Same rule as every other economic/search change here.
+STAGE1_FITNESS="${STAGE1_FITNESS:-}"
+STAGE1_SUFFIX="${STAGE1_SUFFIX:--st1}"
+FITNESS_ARGS=()
+if [ -n "$STAGE1_FITNESS" ]; then
+  if [ "$STAGE1_SUFFIX" = "-st1" ]; then
+    echo "stage1_run.sh: STAGE1_FITNESS=$STAGE1_FITNESS re-ranks the search, so it needs its own" >&2
+    echo "job names -- STAGE1_SUFFIX is still the default '-st1' and those jobs are already" >&2
+    echo "banked under option_consistent_annual_return. Set STAGE1_SUFFIX (e.g. -st1cor) so the" >&2
+    echo "run cannot resume into checkpoints scored on a different objective." >&2
+    exit 1
+  fi
+  FITNESS_ARGS=(--fitness "$STAGE1_FITNESS")
+fi
+
 # STAGE1_START/END allow explicit shorter pilots (a 2023 start prints LIMITED WINDOW and gets
 # its own discovery identity). A dry-run (pass --dry-run) prints every resolved command.
 exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
@@ -93,5 +248,7 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   --population "$POP" --generations "$GEN" --early-stop 8 \
   --parallel "$PARALLEL" \
   --screener-gate-store "$SCREENER_STORE" --max-stock-price 0 \
-  --name-suffix=-st1 \
+  --name-suffix="$STAGE1_SUFFIX" \
+  ${FITNESS_ARGS[@]+"${FITNESS_ARGS[@]}"} \
+  ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
   "$@"

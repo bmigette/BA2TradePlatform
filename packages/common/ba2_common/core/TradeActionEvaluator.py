@@ -882,7 +882,19 @@ class TradeActionEvaluator:
                 actual_display = condition.get_actual_value_display()
                 if actual_display is not None:
                     condition_evaluation["actual_value_display"] = actual_display
-                
+
+                # Market-condition gates (design 2026-09-15 section 7) record WHY an observation
+                # was unusable, not only that the gate failed: a threshold miss and a missing
+                # feature row are the same False here and must never be counted as the same
+                # thing (the per-run report separates "gate rejected" from "unknown input by
+                # reason"). Only MarketConditionCompare defines ``last_status``, so this is one
+                # attribute lookup for every other condition and adds no key to their records.
+                mc_status = getattr(condition, "last_status", None)
+                if mc_status is not None:
+                    condition_evaluation["market_condition_status"] = mc_status
+                    condition_evaluation["market_condition_reason"] = getattr(
+                        condition, "last_reason", "")
+
                 # For flag conditions (like new_target_higher), try to capture comparison values
                 # Check if condition has stored comparison attributes after evaluation
                 if hasattr(condition, 'current_tp_price'):

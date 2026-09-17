@@ -8,6 +8,7 @@ expert's tracking -- both silently consume REAL account cash the expert's own ma
 about, letting it believe it can afford more than the account actually has.
 """
 import pytest
+from types import SimpleNamespace
 
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 
@@ -141,3 +142,32 @@ def test_actual_balance_falls_back_to_get_balance_when_account_info_raises():
 
     account = _BrokenInfoAccount(1, balance=88.0, account_info=None)
     assert MarketExpertInterface._get_actual_available_balance(account) == 88.0
+
+
+def test_actual_balance_prefers_the_snapshot_seam_over_the_raw_info_probe():
+    """Alpaca's raw TradeAccount.buying_power is the EFFECTIVE figure; the snapshot carries the
+    REMAINING (Reg-T) power. The clamp must read the same number the UI shows."""
+    class _SnapAccount(_FakeAccount):
+        def get_account_snapshot(self):
+            return SimpleNamespace(buying_power=869.43)
+
+    account = _SnapAccount(1, balance=999.0, account_info=_InfoObj(buying_power=2_077.27))
+    assert MarketExpertInterface._get_actual_available_balance(account) == 869.43
+
+
+def test_actual_balance_falls_back_to_the_info_probe_when_the_snapshot_has_none():
+    class _SnapAccount(_FakeAccount):
+        def get_account_snapshot(self):
+            return SimpleNamespace(buying_power=None)
+
+    account = _SnapAccount(1, balance=999.0, account_info=_InfoObj(buying_power=5_000.0))
+    assert MarketExpertInterface._get_actual_available_balance(account) == 5_000.0
+
+
+def test_actual_balance_falls_back_when_the_snapshot_call_raises():
+    class _SnapAccount(_FakeAccount):
+        def get_account_snapshot(self):
+            raise RuntimeError("broker down")
+
+    account = _SnapAccount(1, balance=999.0, account_info={"buying_power": 4_000.0})
+    assert MarketExpertInterface._get_actual_available_balance(account) == 4_000.0

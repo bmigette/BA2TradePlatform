@@ -1,0 +1,365 @@
+"""The central market-condition feature store (plan Task 6, design sections 4.3 and 4.6).
+
+Pinned here: the parquet schema is the DECLARED one (an all-invalid field stays float64, never
+an inferred object/null column); objects are immutable and content-addressed; the manifest
+identity ignores ``created_at`` and dict order; ``verify`` re-hashes (a same-size corruption is
+caught); ``retained_window`` rebuilds the exact window from retained raw shards; and a manifest
+whose objects carry the same (symbol, session) twice is refused.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+from datetime import date
+
+import numpy as np
+import pytest
+
+from ba2_common.core.market_calendar import regular_sessions_ending_at
+from ba2_common.core.market_condition_source import window_digest
+from ba2_common.core.market_condition_store import (
+    ManifestConflictError,
+    ManifestError,
+    MarketConditionStore,
+    feature_schema,
+    manifest_identity,
+    month_of,
+)
+from ba2_common.core.market_conditions import (
+    PROFILES,
+    STATUS_INSUFFICIENT_HISTORY,
+    STATUS_VALID,
+    WINDOW,
+    compute_market_conditions,
+)
+
+PROFILE = PROFILES["ohlcv-v1"]
+FIELDS = [f.name for f in PROFILE.fields]
+
+
+def _bars(n, seed=3):
+    rng = np.random.default_rng(seed)
+    c = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
+    o = c * (1 + rng.normal(0, 0.002, n))
+    h = np.maximum(o, c) * 1.01
+    l = np.minimum(o, c) * 0.99
+    v = rng.integers(1_000_000, 2_000_000, n).astype(float)
+    return o, h, l, c, v
+
+
+def _invalid_row(session, reason="young listing"):
+    return {"session": session, "values": [None] * len(FIELDS), "status": [STATUS_INSUFFICIENT_HISTORY] * len(FIELDS),
+            "reasons": [reason] * len(FIELDS), "window_digest": "sha256:" + "0" * 64, "raw_shard_ref": "",
+            "raw_row_lo": 0, "raw_row_hi": 0}
+
+
+@pytest.fixture
+def store(tmp_path):
+    return MarketConditionStore(tmp_path)
+
+
+def _valid_setup(store, session=date(2024, 3, 28), seed=3):
+    """One raw shard set + one valid feature row for ``session``; returns (row, raw entries, arrays)."""
+    days = np.array(regular_sessions_ending_at(session, WINDOW), dtype="datetime64[D]")
+    o, h, l, c, v = _bars(WINDOW, seed)
+    raws, lo = [], 0
+    months = sorted({month_of(d.astype(object)) for d in days})
+    for m in months:
+        sel = np.array([month_of(d.astype(object)) == m for d in days])
+        entry, _ = store.write_raw_shard(days[sel], o[sel], h[sel], l[sel], c[sel], v[sel])
+        raws.append(entry)
+    row = compute_market_conditions(o, h, l, c, v)
+    obs = row.by_field()
+    rec = {"session": session, "values": [obs[f].value for f in FIELDS], "status": [obs[f].status for f in FIELDS],
+           "reasons": [obs[f].reason for f in FIELDS], "window_digest": window_digest(o, h, l, c, v),
+           "raw_shard_ref": ";".join(r.sha256 for r in raws), "raw_row_lo": 0, "raw_row_hi": WINDOW}
+    return rec, raws, (o, h, l, c, v)
+
+
+def _manifest(store, objects, raws, symbols=("AAA",), sessions=(date(2024, 3, 27), date(2024, 3, 28))):
+    return store.make_manifest(PROFILE, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
+                               objects=objects, raw_objects=raws, coverage={s: {"rows": 1} for s in symbols},
+                               universe=symbols, sessions=sessions, window_start=date(2024, 3, 1),
+                               window_end=date(2024, 3, 29))
+
+
+def test_schema_is_declared_even_when_every_value_is_invalid(store):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = [_invalid_row(date(2024, 3, d)) for d in (4, 5, 6)]
+    entry, reused = store.write_feature_object(PROFILE, "AAA", rows)
+    assert not reused
+    schema = pq.read_schema(store.abspath(entry.path))
+    assert schema.remove_metadata().equals(feature_schema(FIELDS))
+    for f in FIELDS:
+        assert schema.field(f).type == pa.float64()
+        assert schema.field(f"{f}_status").type == pa.int8()
+    assert schema.field("session").type == pa.date32()
+    t = store.read_table(entry.path)
+    assert all(np.isnan(t.column(f).to_numpy()).all() for f in FIELDS)
+
+
+def test_objects_are_immutable_and_content_addressed(store):
+    import hashlib
+
+    rows = [_invalid_row(date(2024, 3, 4))]
+    e1, r1 = store.write_feature_object(PROFILE, "AAA", rows)
+    path = store.abspath(e1.path)
+    mtime = os.stat(path).st_mtime_ns
+    e2, r2 = store.write_feature_object(PROFILE, "AAA", rows)
+    assert (r1, r2) == (False, True) and e1 == e2
+    assert os.stat(path).st_mtime_ns == mtime  # reused, not rewritten
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == e1.sha256 == path.stem
+    e3, _ = store.write_feature_object(PROFILE, "AAA", [_invalid_row(date(2024, 3, 4), reason="other")])
+    assert e3.sha256 != e1.sha256
+    assert not list(path.parent.glob("*.part"))
+    with pytest.raises(ValueError):
+        store.write_feature_object(PROFILE, "AAA", [_invalid_row(date(2024, 3, 4)), _invalid_row(date(2024, 4, 1))])
+
+
+def test_manifest_identity_ignores_created_at_and_dict_order(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    other, _ = store.write_feature_object(PROFILE, "BBB", [_invalid_row(date(2024, 3, 27))])
+    assert len(raws) > 1 and other.sha256 != obj.sha256
+    m1 = _manifest(store, [obj, other], raws, symbols=("AAA", "BBB"))
+    # Reversed key order AND reversed object/raw lists: neither carries meaning.
+    m2 = dict(reversed(list(m1.items())))
+    m2["objects"] = list(reversed(m1["objects"]))
+    m2["raw_objects"] = list(reversed(m1["raw_objects"]))
+    m2["created_at"] = "1999-01-01T00:00:00+00:00"
+    m2["coverage"] = {"BBB": {"rows": 1}, "AAA": {"rows": 1}}
+    assert manifest_identity(m1) == manifest_identity(m2)
+    d1 = store.write_manifest(m1)
+    d2 = store.write_manifest(m2)
+    assert d1 == d2 == manifest_identity(m1)
+    loaded = store.read_manifest(d1)
+    assert loaded["created_at"] == m1["created_at"]  # the first publication is kept
+    assert store.list_manifests("ohlcv-v1") == [d1]
+    assert json.loads(store.manifest_path("ohlcv-v1", d1).read_text())["objects"][0]["symbol"] == "AAA"
+    m3 = dict(m1, window_end="2024-03-30")
+    assert manifest_identity(m3) != d1
+    # A tampered manifest file no longer matches its name.
+    p = store.manifest_path("ohlcv-v1", d1)
+    data = json.loads(p.read_text())
+    data["timing_policy"] = "x"
+    p.write_text(json.dumps(data))
+    with pytest.raises(ManifestError):
+        store.read_manifest(d1)
+
+
+def test_verify_catches_same_size_corruption_and_missing(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    m = _manifest(store, [obj], raws)
+    digest = store.write_manifest(m)
+    m = store.read_manifest(digest)
+    rep = store.verify(m, digest)
+    assert rep.ok and rep.objects_checked == 1 and rep.raw_checked == len(raws)
+
+    p = store.abspath(obj.path)
+    size = p.stat().st_size
+    data = bytearray(p.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    p.write_bytes(bytes(data))
+    assert p.stat().st_size == size
+    rep = store.verify(m, digest)
+    assert not rep.ok and rep.corrupt == [obj.path] and not rep.missing
+
+    # A RAW shard corrupted in place (same size) is caught too -- the evidence must re-hash.
+    raw_path = store.abspath(raws[0].path)
+    raw_size = raw_path.stat().st_size
+    raw_data = bytearray(raw_path.read_bytes())
+    raw_data[len(raw_data) // 2] ^= 0x7F
+    raw_path.write_bytes(bytes(raw_data))
+    assert raw_path.stat().st_size == raw_size
+    rep = store.verify(m, digest)
+    assert sorted(rep.corrupt) == sorted([obj.path, raws[0].path]) and not rep.missing
+
+    os.remove(raw_path)
+    rep = store.verify(m, digest)
+    assert raws[0].path in rep.missing
+
+
+def test_retained_window_round_trips_the_digest(store):
+    rec, raws, arrays = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    digest = store.write_manifest(_manifest(store, [obj], raws))
+    got = MarketConditionStore(store.cache_root).retained_window(rec["window_digest"])
+    for a, b in zip(got, arrays):
+        assert a.dtype == np.float64 and np.array_equal(a, b)
+    assert window_digest(*got) == rec["window_digest"]
+    with pytest.raises(KeyError):
+        store.retained_window("sha256:" + "f" * 64, store.read_manifest(digest))
+
+
+def test_iter_rows_rebuilds_feature_rows(store):
+    rec, raws, arrays = _valid_setup(store)
+    bad = _invalid_row(date(2024, 3, 27))
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec, bad])
+    m = store.read_manifest(store.write_manifest(_manifest(store, [obj], raws)))
+    rows = list(store.iter_rows(m, "AAA"))
+    assert [s for s, _ in rows] == [date(2024, 3, 27), date(2024, 3, 28)]
+    expected = compute_market_conditions(*arrays).by_field()
+    assert dict(rows[1][1].by_field()) == dict(expected)
+    assert rows[0][1].by_field()[FIELDS[0]].status == STATUS_INSUFFICIENT_HISTORY
+    assert rows[0][1].calc_versions[FIELDS[0]] == PROFILE.calc_version
+    assert expected[FIELDS[0]].status == STATUS_VALID
+    assert list(store.iter_rows(m, "ZZZ")) == []
+
+
+def test_duplicate_conflicting_rows_across_objects_rejected(store):
+    rec, raws, _ = _valid_setup(store)
+    obj1, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    conflicting = dict(rec, values=[1.0] + list(rec["values"][1:]))
+    obj2, _ = store.write_feature_object(PROFILE, "AAA", [conflicting])
+    assert obj1.sha256 != obj2.sha256
+    with pytest.raises(ManifestConflictError, match="conflicting"):
+        store.write_manifest(_manifest(store, [obj1, obj2], raws))
+    assert store.list_manifests("ohlcv-v1") == []
+
+
+def test_manifest_refuses_missing_raw_reference(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    with pytest.raises(ManifestError, match="raw shards not in raw_objects"):
+        store.write_manifest(_manifest(store, [obj], raws[1:]))
+
+
+def test_a_lost_replace_race_over_the_same_content_is_not_an_error(store, monkeypatch):
+    """Windows refuses ``os.replace`` over a file another process holds open, and a concurrent
+    publisher may have written the SAME bytes there a moment earlier. The name IS the content, so
+    finding the right bytes in place is success, not failure -- but only then."""
+    import os as _os
+
+    rows = [_invalid_row(date(2024, 3, 4))]
+    entry, _ = store.write_feature_object(PROFILE, "AAA", rows)
+    final = store.abspath(entry.path)
+    good = final.read_bytes()
+
+    calls = {"n": 0}
+    real_hash = MarketConditionStore._publish_bytes.__globals__["sha256_file"]
+
+    def blind_first(path, *a, **kw):
+        calls["n"] += 1
+        return "0" * 64 if calls["n"] == 1 else real_hash(path, *a, **kw)
+
+    def refusing_replace(src, dst):
+        raise PermissionError(13, "the file is in use by another process")
+
+    monkeypatch.setitem(MarketConditionStore._publish_bytes.__globals__, "sha256_file", blind_first)
+    monkeypatch.setattr(_os, "replace", refusing_replace)
+    again, reused = store.write_feature_object(PROFILE, "AAA", rows)
+    assert again == entry and reused                      # the object in place is ours
+    assert final.read_bytes() == good and not list(final.parent.glob("*.part"))
+
+    # A refused replace over the WRONG bytes is a real failure and must surface.
+    final.write_bytes(good + b"tail")
+    calls["n"] = 0
+    with pytest.raises(PermissionError):
+        store.write_feature_object(PROFILE, "AAA", rows)
+
+
+def test_verify_refuses_a_manifest_without_its_object_lists(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    m = _manifest(store, [obj], raws)
+    digest = store.write_manifest(m)
+    broken = {k: v for k, v in store.read_manifest(digest).items() if k != "objects"}
+    rep = store.verify(broken)
+    assert not rep.ok and rep.errors and "object lists" in rep.errors[0]
+    assert rep.objects_checked == 0 and rep.raw_checked == 0
+    # And the untouched published manifest still verifies.
+    assert store.verify(store.read_manifest(digest), digest).ok
+
+
+def test_sessions_digest_is_part_of_the_identity(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    m1 = _manifest(store, [obj], raws)
+    m2 = _manifest(store, [obj], raws, sessions=(date(2024, 3, 26), date(2024, 3, 27), date(2024, 3, 28)))
+    assert m1["sessions_digest"] != m2["sessions_digest"]
+    assert manifest_identity(m1) != manifest_identity(m2)
+    assert _manifest(store, [obj], raws, sessions=(date(2024, 3, 28), date(2024, 3, 27)))["sessions_digest"] \
+        == m1["sessions_digest"]                       # a set of sessions, not their order
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows refuses a replace over an open file")
+def test_publishing_while_a_reader_holds_the_object_open_windows(store, monkeypatch):
+    """The real Windows behaviour, not a simulated one: a reader (another worker mapping the
+    store) holds the object open while a second publisher writes the same bytes."""
+    rows = [_invalid_row(date(2024, 3, 5))]
+    entry, _ = store.write_feature_object(PROFILE, "AAA", rows)
+    final = store.abspath(entry.path)
+    expected = final.read_bytes()
+
+    calls = {"n": 0}
+    real_hash = MarketConditionStore._publish_bytes.__globals__["sha256_file"]
+
+    def blind_first(path, *a, **kw):    # force the write path, as a concurrent publisher would hit
+        calls["n"] += 1
+        return "0" * 64 if calls["n"] == 1 else real_hash(path, *a, **kw)
+
+    monkeypatch.setitem(MarketConditionStore._publish_bytes.__globals__, "sha256_file", blind_first)
+    with open(final, "rb") as reader:
+        again, reused = store.write_feature_object(PROFILE, "AAA", rows)
+        assert reader.read() == expected          # the reader's view never changed
+    assert again == entry and reused
+    assert final.read_bytes() == expected and not list(final.parent.glob("*.part"))
+
+
+def test_two_threads_asking_for_a_window_during_one_index_build(store, monkeypatch):
+    """The window index is built lazily on first ask. A second reader arriving mid-build must WAIT
+    for it, not conclude the digest is absent: which thread wins the race is not an answer."""
+    import threading
+
+    rec, raws, arrays = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    store.write_manifest(_manifest(store, [obj], raws))
+
+    reader = MarketConditionStore(store.cache_root)
+    started, indexed = threading.Event(), []
+    real_read_table = MarketConditionStore.read_table
+
+    def slow_read_table(self, rel, columns=None):
+        if columns and "window_digest" in columns:
+            indexed.append(rel)
+            started.set()
+            time.sleep(0.6)
+        return real_read_table(self, rel, columns=columns)
+
+    monkeypatch.setattr(MarketConditionStore, "read_table", slow_read_table)
+    results, errors = {}, {}
+
+    def ask(k):
+        try:
+            results[k] = reader.retained_window(rec["window_digest"])
+        except Exception as e:                      # noqa: BLE001 -- the failure IS the finding
+            errors[k] = e
+
+    t0 = threading.Thread(target=ask, args=(0,))
+    t0.start()
+    assert started.wait(5), "the first reader never started indexing"
+    t1 = threading.Thread(target=ask, args=(1,))
+    t1.start()
+    for t in (t0, t1):
+        t.join(timeout=20)
+
+    assert not errors, errors
+    assert len(indexed) == 1, "the manifest was indexed twice"
+    for k in (0, 1):
+        for got, want in zip(results[k], arrays):
+            assert np.array_equal(got, want)
+
+
+def test_an_absent_digest_still_raises_key_error(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    store.write_manifest(_manifest(store, [obj], raws))
+    reader = MarketConditionStore(store.cache_root)
+    with pytest.raises(KeyError):
+        reader.retained_window("sha256:" + "e" * 64)
+    # ... and the index it built on the way is reusable, not poisoned.
+    assert reader.retained_window(rec["window_digest"])[0].size == WINDOW

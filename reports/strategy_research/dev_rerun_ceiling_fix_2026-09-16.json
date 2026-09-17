@@ -1,0 +1,665 @@
+[
+ {
+  "instance": 3,
+  "account": 1,
+  "alias": "ft1-mid-Rating-S1-riskatr-bt1070",
+  "bt": 1070,
+  "name": "TOP1-scr-mid-FMPRating-S1-goal2020-riskatr-from2022",
+  "opt": 364,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 85.11,
+   "annualized_return": 16.69,
+   "max_drawdown": -15.24,
+   "total_trades": 200
+  },
+  "new": {
+   "total_trades": 184,
+   "total_return": 84.12,
+   "annualized_return": 16.53,
+   "max_drawdown": -15.43
+  },
+  "ga_fitness": 6.046551700548899,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 8,
+  "account": 1,
+  "alias": "ft1-lg-FactorRanker-riskatr-bt1064",
+  "bt": 1064,
+  "name": "TOP2-scr-large-FactorRanker-goal2020-riskatr",
+  "opt": 362,
+  "rank": 2,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 98.39,
+   "annualized_return": 12.11,
+   "max_drawdown": -11.67,
+   "total_trades": 1151
+  },
+  "new": {
+   "total_return": 98.39,
+   "annualized_return": 12.11,
+   "max_drawdown": -11.67,
+   "total_trades": 1151
+  },
+  "ga_fitness": 4.789184884851983,
+  "elapsed_s": 465.9,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 19,
+  "account": 3,
+  "alias": "ft3-lg-DetScorer-S2-notional-bt1017",
+  "bt": 1017,
+  "name": "TOP3-scr-large-DeterministicScorer-S2-goal2020-notional-ds",
+  "opt": 350,
+  "rank": 3,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 161.98,
+   "annualized_return": 17.43,
+   "max_drawdown": -17.24,
+   "total_trades": 273
+  },
+  "new": {
+   "total_trades": 242,
+   "total_return": 213.42,
+   "annualized_return": 21.0,
+   "max_drawdown": -17.88
+  },
+  "ga_fitness": 5.0638051044083525,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 7,
+  "account": 1,
+  "alias": "ft1-lg-FactorRanker-riskatr-bt1065",
+  "bt": 1065,
+  "name": "TOP1-scr-large-FactorRanker-goal2020-riskatr",
+  "opt": 362,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 104.43,
+   "annualized_return": 12.67,
+   "max_drawdown": -12.04,
+   "total_trades": 1279
+  },
+  "new": {
+   "total_return": 104.43,
+   "annualized_return": 12.67,
+   "max_drawdown": -12.04,
+   "total_trades": 1279
+  },
+  "ga_fitness": 4.888933937655742,
+  "elapsed_s": 489.5,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 11,
+  "account": 2,
+  "alias": "ft2-mid-EarnDrift-S1-riskatr-bt1088",
+  "bt": 1088,
+  "name": "TOP1-scr-mid-FMPEarningsDrift-S1-goal2020-riskatr",
+  "opt": 370,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 346.98,
+   "annualized_return": 28.38,
+   "max_drawdown": -16.28,
+   "total_trades": 562
+  },
+  "new": {
+   "total_trades": 531,
+   "total_return": 375.05,
+   "annualized_return": 29.69,
+   "max_drawdown": -17.18
+  },
+  "ga_fitness": 8.288082565325416,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 9,
+  "account": 1,
+  "alias": "ft1-mid-FactorRanker-riskatr-bt1143",
+  "bt": 1143,
+  "name": "TOP1-scr-mid-FactorRanker-goal2020-riskatr",
+  "opt": 382,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 29.66,
+   "annualized_return": 4.43,
+   "max_drawdown": -7.31,
+   "total_trades": 236
+  },
+  "new": {
+   "total_return": 29.66,
+   "annualized_return": 4.43,
+   "max_drawdown": -7.31,
+   "total_trades": 236
+  },
+  "ga_fitness": 0.5413961686806587,
+  "elapsed_s": 474.2,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 23,
+  "account": 3,
+  "alias": "ft3-sm-DetScorer-S1-riskatr-bt1000",
+  "bt": 1000,
+  "name": "TOP4-scr-small-DeterministicScorer-S1-goal2020-risk_atr-ds",
+  "opt": 346,
+  "rank": 4,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 136.97,
+   "annualized_return": 15.48,
+   "max_drawdown": -16.14,
+   "total_trades": 261
+  },
+  "new": {
+   "total_trades": 133,
+   "total_return": 112.71,
+   "annualized_return": 13.42,
+   "max_drawdown": -21.79
+  },
+  "ga_fitness": 4.74362993773419,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 10,
+  "account": 1,
+  "alias": "ft1-mid-FactorRanker-riskatr-bt1146",
+  "bt": 1146,
+  "name": "TOP4-scr-mid-FactorRanker-goal2020-riskatr",
+  "opt": 382,
+  "rank": 4,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 43.29,
+   "annualized_return": 6.19,
+   "max_drawdown": -12.85,
+   "total_trades": 191
+  },
+  "new": {
+   "total_return": 34.06,
+   "annualized_return": 5.01,
+   "max_drawdown": -12.34,
+   "total_trades": 35
+  },
+  "ga_fitness": 0.2640664748327218,
+  "elapsed_s": 525.2,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 21,
+  "account": 3,
+  "alias": "ft3-mid-DetScorer-S2-notional-bt1030",
+  "bt": 1030,
+  "name": "TOP1-scr-mid-DeterministicScorer-S2-goal2020-notional-ds",
+  "opt": 353,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 146.59,
+   "annualized_return": 16.25,
+   "max_drawdown": -13.5,
+   "total_trades": 327
+  },
+  "new": {
+   "total_trades": 283,
+   "total_return": 184.58,
+   "annualized_return": 19.06,
+   "max_drawdown": -14.5
+  },
+  "ga_fitness": 5.892882818356944,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 1,
+  "account": 1,
+  "alias": "ft1-lg-Rating-S1-notional-bt1182",
+  "bt": 1182,
+  "name": "TOP3-scr-large-FMPRating-S1-goal2020-notional-from2022",
+  "opt": 390,
+  "rank": 3,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 90.25,
+   "annualized_return": 17.49,
+   "max_drawdown": -11.71,
+   "total_trades": 256
+  },
+  "new": {
+   "total_trades": 240,
+   "total_return": 107.49,
+   "annualized_return": 20.08,
+   "max_drawdown": -11.54
+  },
+  "ga_fitness": 7.467976088812979,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 20,
+  "account": 3,
+  "alias": "ft3-lg-DetScorer-S6-riskatr-bt1107",
+  "bt": 1107,
+  "name": "TOP1-scr-large-DeterministicScorer-S6-goal2020-risk_atr-ds",
+  "opt": 375,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 271.68,
+   "annualized_return": 24.49,
+   "max_drawdown": -15.59,
+   "total_trades": 451
+  },
+  "new": {
+   "total_trades": 344,
+   "total_return": 332.43,
+   "annualized_return": 27.67,
+   "max_drawdown": -16.88
+  },
+  "ga_fitness": 7.801002325558459,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 22,
+  "account": 3,
+  "alias": "ft3-mid-DetScorer-S6-riskatr-bt1173",
+  "bt": 1173,
+  "name": "TOP3-scr-mid-DeterministicScorer-S6-goal2020-risk_atr-ds",
+  "opt": 389,
+  "rank": 3,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 208.17,
+   "annualized_return": 20.66,
+   "max_drawdown": -12.78,
+   "total_trades": 231
+  },
+  "new": {
+   "total_trades": 214,
+   "total_return": 215.02,
+   "annualized_return": 21.1,
+   "max_drawdown": -15.35
+  },
+  "ga_fitness": 7.961493984165997,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 15,
+  "account": 2,
+  "alias": "ft2-mid-Insider-S1-notional-bt1298",
+  "bt": 1298,
+  "name": "TOP1-scr-mid-FMPInsiderClusterBuy-S1-goal2020-notional",
+  "opt": 430,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 140.82,
+   "annualized_return": 15.79,
+   "max_drawdown": -9.38,
+   "total_trades": 269
+  },
+  "new": {
+   "total_trades": 258,
+   "total_return": 158.4,
+   "annualized_return": 17.16,
+   "max_drawdown": -10.52
+  },
+  "ga_fitness": 7.475797581819648,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 2,
+  "account": 1,
+  "alias": "ft1-lg-Rating-S6-riskatr-bt1434",
+  "bt": 1434,
+  "name": "TOP2-scr-large-FMPRating-S6-goal2020-riskatr-from2022",
+  "opt": 462,
+  "rank": 2,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 99.89,
+   "annualized_return": 18.96,
+   "max_drawdown": -13.24,
+   "total_trades": 382
+  },
+  "new": {
+   "total_return": 102.51,
+   "annualized_return": 19.35,
+   "max_drawdown": -13.41,
+   "total_trades": 336
+  },
+  "ga_fitness": 7.098551892668552,
+  "elapsed_s": 132.8,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 5,
+  "account": 1,
+  "alias": "ft1-sm-Rating-S6-riskatr-bt1508",
+  "bt": 1508,
+  "name": "TOP1-scr-small-FMPRating-S6-goal2020-riskatr-from2022",
+  "opt": 481,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 51.14,
+   "annualized_return": 10.91,
+   "max_drawdown": -12.05,
+   "total_trades": 198
+  },
+  "new": {
+   "total_return": 53.73,
+   "annualized_return": 11.38,
+   "max_drawdown": -11.98,
+   "total_trades": 194
+  },
+  "ga_fitness": 3.862785380204539,
+  "elapsed_s": 292.6,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 17,
+  "account": 2,
+  "alias": "ft2-sm-Insider-S1-notional-bt1386",
+  "bt": 1386,
+  "name": "TOP2-scr-small-FMPInsiderClusterBuy-S1-goal2020-notional",
+  "opt": 447,
+  "rank": 2,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 327.09,
+   "annualized_return": 27.41,
+   "max_drawdown": -12.51,
+   "total_trades": 299
+  },
+  "new": {
+   "total_trades": 296,
+   "total_return": 338.66,
+   "annualized_return": 27.98,
+   "max_drawdown": -13.99
+  },
+  "ga_fitness": 8.672585591872402,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 4,
+  "account": 1,
+  "alias": "ft1-mid-Rating-S6-notional-bt1583",
+  "bt": 1583,
+  "name": "TOP5-scr-mid-FMPRating-S6-goal2020-notional-from2022",
+  "opt": 501,
+  "rank": 5,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 52.42,
+   "annualized_return": 11.14,
+   "max_drawdown": -15.17,
+   "total_trades": 284
+  },
+  "new": {
+   "total_return": 60.82,
+   "annualized_return": 12.65,
+   "max_drawdown": -17.27,
+   "total_trades": 238
+  },
+  "ga_fitness": 2.428544898126101,
+  "elapsed_s": 222.7,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 13,
+  "account": 2,
+  "alias": "ft2-sm-EarnDrift-S2-notional-bt1367",
+  "bt": 1367,
+  "name": "TOP3-scr-small-FMPEarningsDrift-S2-goal2020-notional",
+  "opt": 441,
+  "rank": 3,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 242.37,
+   "annualized_return": 22.79,
+   "max_drawdown": -19.15,
+   "total_trades": 237
+  },
+  "new": {
+   "total_trades": 157,
+   "total_return": 267.08,
+   "annualized_return": 24.23,
+   "max_drawdown": -21.74
+  },
+  "ga_fitness": 6.654478469919774,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 14,
+  "account": 2,
+  "alias": "ft2-sm-EarnDrift-S6-riskatr-bt1528",
+  "bt": 1528,
+  "name": "TOP1-scr-small-FMPEarningsDrift-S6-goal2020-riskatr",
+  "opt": 488,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 187.7,
+   "annualized_return": 19.28,
+   "max_drawdown": -23.12,
+   "total_trades": 365
+  },
+  "new": {
+   "total_return": 173.41,
+   "annualized_return": 18.27,
+   "max_drawdown": -23.65,
+   "total_trades": 331
+  },
+  "ga_fitness": 3.7740394075835946,
+  "elapsed_s": 564.6,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 25,
+  "account": 3,
+  "alias": "ft3-sen-Senate-S1-riskatr-bt1439",
+  "bt": 1439,
+  "name": "TOP1-sen-S1-goal2020-risk_atr",
+  "opt": 460,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 119.53,
+   "annualized_return": 14.02,
+   "max_drawdown": -11.25,
+   "total_trades": 178
+  },
+  "new": {
+   "total_trades": 160,
+   "total_return": 124.04,
+   "annualized_return": 14.41,
+   "max_drawdown": -12.39
+  },
+  "ga_fitness": 6.1688,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 16,
+  "account": 2,
+  "alias": "ft2-mid-Insider-S6-notional-bt1619",
+  "bt": 1619,
+  "name": "TOP1-scr-mid-FMPInsiderClusterBuy-S6-goal2020-notional",
+  "opt": 509,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 52.45,
+   "annualized_return": 7.29,
+   "max_drawdown": -13.22,
+   "total_trades": 158
+  },
+  "new": {
+   "total_return": 55.21,
+   "annualized_return": 7.61,
+   "max_drawdown": -13.38,
+   "total_trades": 153
+  },
+  "ga_fitness": 1.7787579805202487,
+  "elapsed_s": 172.1,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 12,
+  "account": 2,
+  "alias": "ft2-mid-EarnDrift-S7-notional-bt1607",
+  "bt": 1607,
+  "name": "TOP2-scr-mid-FMPEarningsDrift-S7-goal2020-notional",
+  "opt": 506,
+  "rank": 2,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 124.68,
+   "annualized_return": 14.46,
+   "max_drawdown": -8.06,
+   "total_trades": 315
+  },
+  "new": {
+   "total_return": 133.75,
+   "annualized_return": 15.22,
+   "max_drawdown": -8.04,
+   "total_trades": 307
+  },
+  "ga_fitness": 6.979637038079023,
+  "elapsed_s": 343.8,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 24,
+  "account": 3,
+  "alias": "ft3-sm-DetScorer-S7-riskatr-bt1358",
+  "bt": 1358,
+  "name": "TOP2-scr-small-DeterministicScorer-S7-goal2020-risk_atr-ds",
+  "opt": 440,
+  "rank": 2,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 128.8,
+   "annualized_return": 14.81,
+   "max_drawdown": -12.36,
+   "total_trades": 488
+  },
+  "new": {
+   "total_trades": 357,
+   "total_return": 142.84,
+   "annualized_return": 15.95,
+   "max_drawdown": -18.4
+  },
+  "ga_fitness": 5.659869113445839,
+  "error": null,
+  "pins_applied": true
+ },
+ {
+  "instance": 18,
+  "account": 2,
+  "alias": "ft2-sm-Insider-S7-notional-bt1681",
+  "bt": 1681,
+  "name": "TOP1-scr-small-FMPInsiderClusterBuy-S7-goal2020-notional",
+  "opt": 521,
+  "rank": 1,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 226.73,
+   "annualized_return": 21.84,
+   "max_drawdown": -17.52,
+   "total_trades": 168
+  },
+  "new": {
+   "total_return": 243.59,
+   "annualized_return": 22.87,
+   "max_drawdown": -18.95,
+   "total_trades": 161
+  },
+  "ga_fitness": 4.7755805862644225,
+  "elapsed_s": 413.8,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 26,
+  "account": 3,
+  "alias": "ft3-sen-Senate-S6-notional-bt1649",
+  "bt": 1649,
+  "name": "TOP2-sen-S6-goal2020-notional",
+  "opt": 512,
+  "rank": 2,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 124.17,
+   "annualized_return": 14.42,
+   "max_drawdown": -9.41,
+   "total_trades": 468
+  },
+  "new": {
+   "total_return": 136.26,
+   "annualized_return": 15.42,
+   "max_drawdown": -10.79,
+   "total_trades": 451
+  },
+  "ga_fitness": 5.340108316330435,
+  "elapsed_s": 514.2,
+  "error": null,
+  "pins_applied": false
+ },
+ {
+  "instance": 6,
+  "account": 1,
+  "alias": "ft1-sm-Rating-S5-notional-bt1633",
+  "bt": 1633,
+  "name": "TOP2-scr-small-FMPRating-S5-goal2020-notional-from2022",
+  "opt": 511,
+  "rank": 2,
+  "fitness_metric": "consistent_annual_return",
+  "stored": {
+   "total_return": 30.98,
+   "annualized_return": 7.0,
+   "max_drawdown": -10.66,
+   "total_trades": 524
+  },
+  "new": {
+   "total_return": 48.22,
+   "annualized_return": 10.37,
+   "max_drawdown": -17.22,
+   "total_trades": 360
+  },
+  "ga_fitness": 2.8547013385878164,
+  "elapsed_s": 695.8,
+  "error": null,
+  "pins_applied": false
+ }
+]

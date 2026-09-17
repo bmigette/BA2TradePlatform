@@ -53,6 +53,19 @@ Call order (locked by the Phase 6 re-plan):
    only when the singleton has not already been built avoids clobbering a host that
    built it earlier.
 
+7. **Market-condition gates (per EXPERT, setting ``market_condition_profile``).** A
+   ``PerInstanceMarketConditionResolver`` is installed unconditionally; building it reads no
+   settings, opens no cache and certifies nothing. The FIRST expert whose setting names a
+   profile pays the split certification (once per cache root) and gets its own resolver, cached
+   under ``(instance id, profiles)``; an expert with an empty setting -- every existing instance
+   -- gets none, and its market leaves read ``no_context`` exactly as before this feature
+   existed. DECISION (2026-09-16): a certification failure does NOT stop startup -- exits and
+   protective-order handling must keep running; that expert gets an ``UncertifiedSourceResolver``
+   instead, refusing every gated entry with the certification summary as its reason (one ERROR,
+   one WARNING per field on evaluation). The retired ``BA2_MARKET_CONDITION_PROFILE`` variable is
+   checked here and a set value FAILS startup: nothing reads it any more, and leaving it to say
+   nothing would let an operator believe a stale export still gates the platform.
+
 After ``wire_all_seams()`` returns, ``init_db()`` runs and hits the engine the
 DB seam configured.
 """
@@ -129,6 +142,28 @@ def wire_all_seams() -> None:
                 )
         except Exception as e:  # pragma: no cover - defensive; ATR sizing degrades gracefully
             logger.warning(f"ATR indicator-provider injection skipped: {e}")
+
+        # 7) Market-condition entry gates: ONE dispatching resolver for the process, which
+        #    resolves each evaluation through the EXPERT INSTANCE's own
+        #    ``market_condition_profile`` setting (plan Task 12). Installing it is free -- no
+        #    settings read, no cache open, no certification -- and an expert with an empty
+        #    setting (every existing instance) is served no context at all, so this is inert
+        #    until a profile is actually configured. See step 7 in the module docstring.
+        from ba2_common.core.market_condition_live import (
+            PerInstanceMarketConditionResolver,
+            assert_profile_env_retired,
+        )
+
+        # A stale ``BA2_MARKET_CONDITION_PROFILE`` export must not pass silently: it is read
+        # nowhere now, so the platform would run on whatever the settings rows hold while the
+        # operator believed the variable decided.
+        assert_profile_env_retired()
+        market_condition_resolver = PerInstanceMarketConditionResolver()
+        TradeConditions.set_market_condition_context_resolver(market_condition_resolver)
+        logger.info(
+            "Market-condition context resolver installed (per expert instance, setting "
+            "market_condition_profile; no data is served for an expert whose setting is empty)"
+        )
 
         _wired = True
         logger.info(

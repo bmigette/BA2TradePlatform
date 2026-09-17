@@ -752,7 +752,10 @@ def run_daily_backtest(
     )
     from app.services.backtest.results import build_results
     from app.services.backtest.seam_wiring import (
+        clear_backtest_market_conditions,
+        install_backtest_market_conditions,
         make_indicator_provider,
+        normalize_market_condition_keys,
         set_backtest_ohlcv_override,
         wire_backtest_seams,
     )
@@ -772,6 +775,16 @@ def run_daily_backtest(
         # universe. Forwarded explicitly here so the engine constructor receives it; absent/None
         # on every non-screener run -> the engine's entry gate is a no-op (behaviour unchanged).
         "screener_runtime": config.get("screener_runtime"),
+        # Market-condition entry gates (design 2026-09-15): absent on every existing config, which
+        # means no profile -- nothing is installed and no adapter is imported for the run. That
+        # default is DELIBERATE back-compat (every persisted config predates the keys), not a
+        # hidden fallback: install_backtest_market_conditions refuses a profile-less run whose
+        # rules contain market-condition leaves, so a config that LOST the pin fails loudly
+        # instead of evaluating every gate as no_context and placing zero entries.
+        # Normalised ONCE here, to the plural shape, so no later reader has to know which of the
+        # two shapes (Task 10 plural, or the legacy singular pair every persisted run carries)
+        # this particular config arrived in.
+        **normalize_market_condition_keys(config),
     }
 
     # Free the PREVIOUS run's OHLCV memo if this run's working set (universe + window + interval)
@@ -873,6 +886,21 @@ def run_daily_backtest(
         # in-memory slice is as_of-correct without an extra wrapper.
         set_backtest_ohlcv_override(ohlcv)
         try:
+            # The resolver is the handle the run's telemetry reads its rows through; None on
+            # every profile-less run, which is what makes the block below a no-op there.
+            market_condition_resolver = install_backtest_market_conditions(config, ps)
+            market_condition_record = None
+            if market_condition_resolver is not None:
+                from app.services.backtest.market_condition_bt import MarketConditionRunRecord
+                # EXPLICIT, no default: ``config`` was normalised at the top of this function
+                # and ``install_backtest_market_conditions`` read the same key with ``[...]``
+                # to decide whether to install at all, so a resolver existing means the key
+                # exists and names a registered profile. A second ``or "none"`` here would only
+                # be able to mislabel a run whose gates were on.
+                market_condition_record = MarketConditionRunRecord(
+                    market_condition_resolver,
+                    profiles=config["market_condition_profiles"],
+                    manifests=config["market_condition_manifests"])
             # Clamp the indicator/ATR OHLCV fetches to the backtest clock: PandasIndicatorCalc
             # and get_latest_atr fetch with end_date=now(), which would leak future bars into the
             # ATR/indicators used for sizing + rule conditions. The clamp follows ps.set_clock();
@@ -890,11 +918,19 @@ def run_daily_backtest(
                 indicator_provider=indicator_provider,
                 regime_calendar=_build_regime_calendar(
                     raw_ohlcv, config["start_date"], config["end_date"]),
+                market_condition_record=market_condition_record,
             )
             engine.run()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            if market_condition_record is not None:
+                # RESEARCH METADATA, added after the metrics are computed so it cannot reach
+                # any of them: the per-run counters, and the entry state attached to the trades
+                # it explains (design section 7's attribution input). With the profile off the
+                # record is None, no key is added, and ``results`` is what it has always been.
+                from app.services.backtest.market_condition_bt import apply_market_condition_block
+                apply_market_condition_block(results, market_condition_record)
             # Stamp this run's trade-frequency objective so compute_fitness scores the expert on
             # ITS cadence, not the platform default. Done here because run_daily_backtest is the
             # single chokepoint every path goes through (trial worker, master top-N persist,
@@ -904,6 +940,7 @@ def run_daily_backtest(
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
+            clear_backtest_market_conditions()
 
 
 def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float]:

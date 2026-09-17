@@ -314,7 +314,7 @@ def test_cache_prune_invalidates_manifest(client, tmp_path, monkeypatch):
 
     assert client.get("/cache/manifest", headers=H).json()["count"] == 1
     r = client.post("/cache/prune", headers=H, json={"rel_paths": ["screener/old.parquet"]})
-    assert r.json() == {"pruned": 1, "skipped": 0, "failed": 0}
+    assert r.json() == {"pruned": 1, "skipped": 0, "failed": 0, "protected": 0}
     assert client.get("/cache/manifest", headers=H).json()["count"] == 0   # prune invalidated
 
 
@@ -338,7 +338,8 @@ def test_cache_prune_deletes_stale_leftovers(client, tmp_path, monkeypatch):
 
     r = client.post("/cache/prune", headers=H,
                     json={"rel_paths": ["screener/metric_store/ym=2024-01/part-00001.parquet"]})
-    assert r.status_code == 200 and r.json() == {"pruned": 1, "skipped": 0, "failed": 0}
+    assert r.status_code == 200 and r.json() == {"pruned": 1, "skipped": 0, "failed": 0,
+                                                 "protected": 0}
     assert not stale.exists()
     assert fresh.exists()
     # auth still enforced

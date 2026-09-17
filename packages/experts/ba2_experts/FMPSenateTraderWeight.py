@@ -126,6 +126,14 @@ _WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_SCORING_LRU_MAX", "3"))
 _PRICE_MAP_MEM: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _PRICE_MAP_MEM_MAX = int(os.environ.get("BA2_SENATE_PRICE_MAP_MAX", "4096"))
 
+#: How many HELD-BACK symbols a live basket analysis keeps in its state row.
+#:
+#: A cycle scans the whole disclosure feed -- measured on prod 2026-09-15 at up to ~250 symbols,
+#: with up to 241 of them held back. The most active are kept (by qualifying trade count) and the
+#: rest are COUNTED in ``held_back_omitted``, so a cut list says it was cut instead of reading as
+#: complete. Recommended symbols are never capped: they are what the cycle actually acted on.
+BASKET_HELD_BACK_MAX = 50
+
 
 def clear_price_map_memo() -> None:
     """Drop the projection memo (tests / between unrelated universes)."""
@@ -3327,6 +3335,267 @@ All {len(trade_details)} trades shown above for transparency.
         finally:
             session.close()
     
+    # ------------------------------------------------------------------------------------------
+    # Per-symbol breakdown for the basket analysis page.
+    #
+    # The basket cycle already computes, per trade, who traded, their skill, their symbol focus,
+    # the disclosed amount and a per-trade confidence (_calculate_recommendation's trade_info).
+    # Before 2026-09-15 it persisted only a count and a comma-joined symbol list, so none of that
+    # reached the analysis page. These helpers copy it into the state row VERBATIM -- nothing
+    # here re-derives a score, so the page shows exactly what the decision was made on.
+    # ------------------------------------------------------------------------------------------
+    @staticmethod
+    def _json_num(value: Any) -> Optional[float]:
+        """A JSON-safe number, or None. Never 0.0 for a value that was absent."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _basket_trader_rows(cls, trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """One JSON-safe row per trade, carrying the scores the ranking used.
+
+        ``amount`` is the disclosed RANGE -- Congress only discloses ranges, so that string is
+        the fact. ``amount_mid_usd`` is the midpoint the confidence and totals are computed
+        from, and is named as an estimate so the page cannot present it as the amount.
+        """
+        rows = []
+        for t in trades or []:
+            hit_rate = t.get('trader_skill_hit_rate')
+            rows.append({
+                'trader': str(t.get('trader') or 'Unknown'),
+                'type': str(t.get('type') or ''),
+                'amount': str(t.get('amount') or ''),
+                'amount_mid_usd': cls._parse_amount(t.get('amount')),
+                'exec_date': str(t.get('exec_date') or ''),
+                'disclose_date': str(t.get('disclose_date') or ''),
+                'days_since_exec': t.get('days_since_exec'),
+                'days_since_disclose': t.get('days_since_disclose'),
+                'exec_price': cls._json_num(t.get('exec_price')),
+                'price_delta_pct': cls._json_num(t.get('price_delta_pct')),
+                'still_held': bool(t.get('still_held', False)),
+                'symbol_focus_pct': cls._json_num(t.get('symbol_focus_pct')),
+                'trader_skill': cls._json_num(t.get('trader_skill')),
+                'trader_skill_trades': int(t.get('trader_skill_trades') or 0),
+                'trader_skill_hit_rate': cls._json_num(hit_rate),
+                'signal_weight': cls._json_num(t.get('signal_weight')),
+                'size_boost': cls._json_num(t.get('size_boost')),
+                'confidence': cls._json_num(t.get('confidence')),
+                'trader_yearly_buys': t.get('trader_yearly_buys'),
+                'yearly_symbol_buys': t.get('yearly_symbol_buys'),
+            })
+        return rows
+
+    @classmethod
+    def _basket_symbol_breakdown(cls, rec: Recommendation,
+                                 recommendation_id: Optional[int]) -> Dict[str, Any]:
+        """The recommended symbol, its headline scores, and every trade behind it."""
+        data = rec.raw_outputs.get("recommendation") or {}
+        signal = data.get('signal', rec.signal)
+        return {
+            'signal': getattr(signal, 'value', str(signal)),
+            'confidence': cls._json_num(data.get('confidence', rec.confidence)),
+            'expected_profit_percent': cls._json_num(data.get('expected_profit_percent')),
+            'current_price': cls._json_num(rec.current_price),
+            'recommendation_id': recommendation_id,
+            'buy_count': int(data.get('buy_count') or 0),
+            'sell_count': int(data.get('sell_count') or 0),
+            'total_buy_amount': cls._json_num(data.get('total_buy_amount')),
+            'total_sell_amount': cls._json_num(data.get('total_sell_amount')),
+            'winning_traders': data.get('winning_traders'),
+            'avg_trader_skill': cls._json_num(data.get('avg_trader_skill')),
+            'consensus_bonus': cls._json_num(data.get('consensus_bonus')),
+            'avg_size_boost': cls._json_num(data.get('avg_size_boost')),
+            'traders': cls._basket_trader_rows(data.get('trades') or []),
+        }
+
+    @classmethod
+    def _basket_held_back_row(cls, rec: Recommendation) -> Optional[Dict[str, Any]]:
+        """Why a scanned symbol was NOT recommended -- or None when there is nothing to say.
+
+        None for a symbol with no qualifying trade: it carries no information, and a cycle can
+        hold back ~240 symbols, so listing those would bury the ones that do.
+
+        ``reason`` is the calculation's own one-line verdict (below thresholds, no trades)
+        when it produced one. A HOLD reached through the FULL calculation carries a multi-page
+        report instead, whose first line is a heading, not a decision -- so the reason is left
+        None rather than invented from it.
+        """
+        data = rec.raw_outputs.get("recommendation") or {}
+        trades = data.get('trades') or []
+        if not trades:
+            return None
+        details = (data.get('details') or '').strip()
+        reason = details if details and '\n' not in details else None
+        return {
+            'symbol': rec.raw_outputs.get("symbol"),
+            'signal': getattr(rec.signal, 'value', str(rec.signal)),
+            'skipped': bool(rec.skip),
+            'trade_count': len(trades),
+            'unique_traders': len({t.get('trader') for t in trades}),
+            'total_buy_amount': cls._json_num(data.get('total_buy_amount')),
+            'total_sell_amount': cls._json_num(data.get('total_sell_amount')),
+            'reason': reason[:300] if reason else None,
+        }
+
+    @staticmethod
+    def _basket_trader_table_rows(traders: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """Display strings for the per-symbol trader table. Pure, so it is tested without a page.
+
+        An absent value is drawn as a dash, never as zero -- and a trader with no scored history
+        reads NEUTRAL: ``trader_skill`` is 0.0 both for a coin-flip trader and for one that was
+        never scored, and only the first of those is a measurement.
+        """
+        def _pct(value, fmt):
+            return '—' if value is None else format(value, fmt)
+
+        rows = []
+        for t in traders or []:
+            kind = (t.get('type') or '').lower()
+            if 'purchase' in kind or 'buy' in kind:
+                side = 'BUY'
+            elif 'sale' in kind or 'sell' in kind:
+                side = 'SELL'
+            else:
+                side = kind.upper() or '—'
+
+            scored = int(t.get('trader_skill_trades') or 0)
+            skill = t.get('trader_skill')
+            if scored <= 0 or skill is None:
+                skill_text = 'neutral (no scored history)'
+            else:
+                hit = t.get('trader_skill_hit_rate')
+                hit_text = f", {hit:.0%} hit" if hit is not None else ''
+                skill_text = f"{skill:+.2f} ({scored} scored{hit_text})"
+
+            mid = t.get('amount_mid_usd')
+            days_exec, days_disc = t.get('days_since_exec'), t.get('days_since_disclose')
+            rows.append({
+                'trader': t.get('trader') or 'Unknown',
+                'side': side,
+                'amount': t.get('amount') or '—',
+                'amount_mid': f"≈ ${mid:,.0f}" if mid else '—',
+                'exec': (t.get('exec_date') or '—')
+                        + (f" ({days_exec}d ago)" if days_exec is not None else ''),
+                'disclosed': (t.get('disclose_date') or '—')
+                             + (f" ({days_disc}d ago)" if days_disc is not None else ''),
+                'move': _pct(t.get('price_delta_pct'), '+.1f') + ('%' if t.get('price_delta_pct') is not None else ''),
+                'held': 'yes' if t.get('still_held') else 'sold',
+                'focus': _pct(t.get('symbol_focus_pct'), '.1f') + ('%' if t.get('symbol_focus_pct') is not None else ''),
+                'skill': skill_text,
+                'weight': _pct(t.get('signal_weight'), '.2f'),
+                'confidence': _pct(t.get('confidence'), '.1f') + ('%' if t.get('confidence') is not None else ''),
+            })
+        return rows
+
+    #: Columns of the per-symbol trader table, in reading order.
+    _BASKET_TRADER_COLUMNS = [
+        {'name': 'trader', 'label': 'Trader', 'field': 'trader', 'align': 'left', 'sortable': True},
+        {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'left'},
+        {'name': 'amount', 'label': 'Disclosed amount', 'field': 'amount', 'align': 'left'},
+        {'name': 'amount_mid', 'label': 'Midpoint (est.)', 'field': 'amount_mid', 'align': 'right'},
+        {'name': 'skill', 'label': 'Skill (history)', 'field': 'skill', 'align': 'left'},
+        {'name': 'focus', 'label': 'Symbol focus', 'field': 'focus', 'align': 'right'},
+        {'name': 'weight', 'label': 'Signal weight', 'field': 'weight', 'align': 'right'},
+        {'name': 'confidence', 'label': 'Trade conf.', 'field': 'confidence', 'align': 'right'},
+        {'name': 'move', 'label': 'Move since exec', 'field': 'move', 'align': 'right'},
+        {'name': 'held', 'label': 'Still held', 'field': 'held', 'align': 'center'},
+        {'name': 'exec', 'label': 'Executed', 'field': 'exec', 'align': 'left'},
+        {'name': 'disclosed', 'label': 'Disclosed', 'field': 'disclosed', 'align': 'left'},
+    ]
+
+    _BASKET_HELD_BACK_COLUMNS = [
+        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+        {'name': 'trade_count', 'label': 'Trades', 'field': 'trade_count', 'align': 'right', 'sortable': True},
+        {'name': 'unique_traders', 'label': 'Traders', 'field': 'unique_traders', 'align': 'right'},
+        {'name': 'bought', 'label': 'Bought (est.)', 'field': 'bought', 'align': 'right'},
+        {'name': 'sold', 'label': 'Sold (est.)', 'field': 'sold', 'align': 'right'},
+        {'name': 'reason', 'label': 'Why not recommended', 'field': 'reason', 'align': 'left'},
+    ]
+
+    @staticmethod
+    def _basket_money(value: Optional[float]) -> str:
+        return '—' if value is None else f"${value:,.0f}"
+
+    def _render_basket_symbol_breakdown(self, breakdown: Dict[str, Dict[str, Any]]) -> None:
+        """One expansion per recommended symbol, most confident first, each with its traders."""
+        from nicegui import ui
+
+        ui.label('Recommended symbols').classes('text-weight-medium q-mt-md')
+        ordered = sorted(breakdown.items(),
+                         key=lambda kv: (-(kv[1].get('confidence') or 0.0), kv[0]))
+        for symbol, info in ordered:
+            traders = info.get('traders') or []
+            conf = info.get('confidence')
+            profit = info.get('expected_profit_percent')
+            header = (f"{symbol} — {info.get('signal', '?')} "
+                      f"{'—' if conf is None else f'{conf:.1f}%'} · "
+                      f"exp {'—' if profit is None else f'{profit:+.1f}%'} · "
+                      f"{len({t.get('trader') for t in traders})} trader(s) · "
+                      f"{self._basket_money(info.get('total_buy_amount'))} bought / "
+                      f"{self._basket_money(info.get('total_sell_amount'))} sold")
+            with ui.expansion(header).classes('w-full'):
+                skill = info.get('avg_trader_skill')
+                price = info.get('current_price')
+                consensus = info.get('consensus_bonus')
+                size = info.get('avg_size_boost')
+                ui.label(
+                    f"Price {'—' if price is None else f'${price:,.2f}'} · "
+                    f"{info.get('buy_count', 0)} buy / {info.get('sell_count', 0)} sell trade(s) · "
+                    f"avg skill {'—' if skill is None else f'{skill:+.2f}'} · "
+                    f"consensus {'—' if consensus is None else f'+{consensus:.1f}'} · "
+                    f"size {'—' if size is None else f'+{size:.1f}'}"
+                ).classes('text-sm text-grey-5')
+                rows = [dict(r, id=i) for i, r in enumerate(self._basket_trader_table_rows(traders))]
+                ui.table(columns=self._BASKET_TRADER_COLUMNS, rows=rows, row_key='id') \
+                    .classes('w-full').props('dense flat')
+
+    def _render_basket_held_back(self, held_back: List[Dict[str, Any]], omitted: int) -> None:
+        """Symbols Congress traded that this cycle did NOT recommend, and why."""
+        from nicegui import ui
+
+        total = len(held_back) + int(omitted or 0)
+        with ui.expansion(f"Held back — {total} traded symbol(s) not recommended").classes('w-full q-mt-sm'):
+            rows = [{
+                'id': i,
+                'symbol': h.get('symbol'),
+                'trade_count': h.get('trade_count'),
+                'unique_traders': h.get('unique_traders'),
+                'bought': self._basket_money(h.get('total_buy_amount')),
+                'sold': self._basket_money(h.get('total_sell_amount')),
+                # No reason is shown as "—", never invented: see _basket_held_back_row.
+                'reason': h.get('reason') or ('skipped' if h.get('skipped') else '—'),
+            } for i, h in enumerate(held_back)]
+            ui.table(columns=self._BASKET_HELD_BACK_COLUMNS, rows=rows, row_key='id') \
+                .classes('w-full').props('dense flat')
+            if omitted:
+                ui.label(f"+ {omitted} more held-back symbol(s) not listed — the "
+                         f"{len(held_back)} most active are shown.").classes('text-xs text-grey-6')
+
+    def _render_basket_legacy_reports(self, recommendation_ids: List[int]) -> None:
+        """Analyses written before 2026-09-15 carry no breakdown -- but each recommended
+        symbol's ExpertRecommendation already holds the full text report, so show that."""
+        from nicegui import ui
+        from ba2_common.core.db import get_instance, InstanceNotFound
+
+        ui.label('Recommended symbols (full reports)').classes('text-weight-medium q-mt-md')
+        for rid in recommendation_ids:
+            try:
+                rec = get_instance(ExpertRecommendation, rid)
+            except InstanceNotFound:
+                # Said, not skipped: a missing row is a fact about this analysis's record.
+                ui.label(f"Recommendation #{rid} no longer exists.").classes('text-xs text-grey-6')
+                continue
+            action = getattr(rec.recommended_action, 'value', rec.recommended_action)
+            conf = rec.confidence
+            header = f"{rec.symbol} — {action} {'—' if conf is None else f'{conf:.1f}%'}"
+            with ui.expansion(header).classes('w-full'):
+                ui.label(rec.details or 'No report was stored for this recommendation.') \
+                    .classes('text-xs').style('white-space: pre-wrap; font-family: monospace')
+
     def _run_basket_analysis(self, market_analysis: MarketAnalysis) -> None:
         """
         Basket-mode live entry point for the "EXPERT" symbol (senate-basket-dispatch plan,
@@ -3413,6 +3682,7 @@ All {len(trade_details)} trades shown above for transparency.
 
             recommendation_ids = []
             symbols_analyzed = []
+            symbol_breakdown: Dict[str, Dict[str, Any]] = {}
             for rec in actionable:
                 trade_symbol = rec.raw_outputs["symbol"]
                 recommendation_data = rec.raw_outputs["recommendation"]
@@ -3423,9 +3693,24 @@ All {len(trade_details)} trades shown above for transparency.
                     )
                     recommendation_ids.append(recommendation_id)
                     symbols_analyzed.append(trade_symbol)
+                    symbol_breakdown[trade_symbol] = self._basket_symbol_breakdown(
+                        rec, recommendation_id)
                 except Exception as e:
                     self.logger.error(f"Error creating recommendation for {trade_symbol}: {e}", exc_info=True)
                     # Continue with other symbols -- one bad symbol shouldn't drop the rest.
+
+            # HELD BACK: the symbols this cycle scanned and did not act on, most active first.
+            # HOLD rows are never persisted as recommendations (review L2), so this is the only
+            # record of why a symbol that WAS traded by Congress was passed over.
+            # By IDENTITY: Recommendation compares by value, so two distinct HOLD symbols with
+            # equal fields would otherwise be taken for an actionable one.
+            actionable_ids = {id(rec) for rec in actionable}
+            held_back_all = [row for row in (self._basket_held_back_row(rec)
+                                             for rec in recommendations
+                                             if id(rec) not in actionable_ids)
+                             if row is not None]
+            held_back_all.sort(key=lambda r: (-r['trade_count'], r['symbol'] or ''))
+            held_back = held_back_all[:BASKET_HELD_BACK_MAX]
 
             self.logger.info(f"FMPSenateTraderWeight basket analysis found {len(bundle_by_symbol)} qualifying "
                        f"symbol(s), created {len(recommendation_ids)} recommendation(s) "
@@ -3439,6 +3724,9 @@ All {len(trade_details)} trades shown above for transparency.
                     'skipped_hold_count': skipped_hold_count,
                     'symbols_analyzed': sorted(symbols_analyzed),
                     'expert_recommendation_ids': recommendation_ids,
+                    'symbols': symbol_breakdown,
+                    'held_back': held_back,
+                    'held_back_omitted': len(held_back_all) - len(held_back),
                     'settings': {
                         'max_disclose_date_days': int(settings['max_disclose_date_days']),
                         'max_trade_exec_days': int(settings['max_trade_exec_days']),
@@ -3659,9 +3947,20 @@ All {len(trade_details)} trades shown above for transparency.
                         ui.label(str(skipped_hold_count)).classes('text-h4 text-weight-bold text-grey-6')
                         ui.label('HOLD/SKIP (not persisted)').classes('text-caption text-grey-6')
 
-                if symbols_analyzed:
+                breakdown = state.get('symbols')
+                if breakdown:
+                    # Per symbol: the traders, their scores, and the money (2026-09-15).
+                    self._render_basket_symbol_breakdown(breakdown)
+                elif symbols_analyzed and state.get('expert_recommendation_ids'):
+                    # An analysis written before the breakdown existed: show the stored reports.
+                    self._render_basket_legacy_reports(state['expert_recommendation_ids'])
+                elif symbols_analyzed:
                     ui.label('Symbols with a recommendation:').classes('text-weight-medium q-mt-md')
                     ui.label(', '.join(sorted(symbols_analyzed))).classes('text-grey-4')
+
+                held_back = state.get('held_back') or []
+                if held_back:
+                    self._render_basket_held_back(held_back, state.get('held_back_omitted', 0))
 
                 if settings:
                     ui.label('Settings').classes('text-weight-medium q-mt-md')

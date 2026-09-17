@@ -27,7 +27,7 @@ import random
 import sys as _sys
 import time as _time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -82,6 +82,16 @@ _BACKEND_DIR = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspa
 # carries config/fitness_metric/cache_root/inmem_trades only, and _localize_paths rewrites cache
 # path STRINGS inside the config), so setting BA2_SHARED_ARRAYS on the master says nothing at all
 # about a remote box. Each host's service environment governs its own workers; set it there.
+#
+# NOT MIRRORED (retired with Task 12): BA2_MARKET_CONDITION_PROFILE and
+# BA2_MARKET_CONDITION_MANIFEST. Mirroring them into a worker is now a pure no-op -- nothing
+# under testplatform/ reads either variable (the refusal lives in the LIVE ``wire_all_seams``,
+# which a backtest worker never calls), and the only justification the pair ever had was
+# "environment-resolved diagnostics" of a live-flavoured resolver that no longer resolves from
+# the environment at all. The trial config remains, and has always been, the authority a
+# backtest actually reads: the profile inside its expert settings, the snapshot in
+# ``market_condition_manifests``. Carrying dead names in this tuple invites the next reader to
+# believe the environment still decides something here.
 _WORKER_ENV_KEYS = ("FMP_API_KEY", "ALPHA_VANTAGE_API_KEY", "FINNHUB_API_KEY", "OPENAI_API_KEY",
                     "BA2_SHARED_ARRAYS", "BA2_SHARED_ARRAYS_LOCK_STALE_S")
 
@@ -1102,6 +1112,180 @@ class _FatalTrialError(RuntimeError):
     than spending the full generation budget producing a result nobody should trust."""
 
 
+def mode_anchor_index(strategy) -> Dict[str, Any]:
+    """``{leaf id: (mode_choices, authored anchor value)}`` for every mode leaf of a strategy.
+
+    Built ONCE per run from the TEMPLATE (the anchor is the template's authored ``value``, i.e.
+    the FieldSpec's declared anchor for a market-condition leaf), so the per-trial work is a dict
+    lookup. Empty for every run with no mode genes -- which is every run that existed before the
+    market-condition profiles, and what keeps their trial keys bit-identical.
+
+    REFUSES a template in which a mode leaf is the BASE of another leaf's ``value_offset_from``.
+    Such a base is read for its decoded gene even when its own mode is ``off`` and the leaf is
+    dropped (``_apply_to_tree._resolved`` resolves from the gene map, deliberately, so a
+    toggled-off base still anchors its dependant), so that inactive threshold is NOT an inactive
+    dimension: canonicalising it to the anchor would fold two genuinely different phenotypes onto
+    one key and hand the second one the first one's fitness. The template is the wrong place for
+    that dependency -- a gate the optimizer can switch off cannot also be somebody's ruler -- so
+    this raises at index build, once per run, naming both leaves.
+    """
+    out: Dict[str, Any] = {}
+    offset_bases: Dict[str, list] = {}
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        cid = node.get("id")
+        base = node.get("value_offset_from") or node.get("valueOffsetFrom")
+        if base:
+            offset_bases.setdefault(str(base), []).append(str(cid or "<unnamed>"))
+        if cid and (node.get("mode_optimize") or node.get("modeOptimize")):
+            choices = node.get("mode_choices") or node.get("modeChoices")
+            out[str(cid)] = (list(choices or []), node.get("value"))
+        for v in node.values():
+            walk(v)
+
+    for attr in ("entry_rules", "exit_rules"):
+        walk(getattr(strategy, attr, None))
+    clash = sorted(cid for cid in out if cid in offset_bases)
+    if clash:
+        detail = "; ".join(f"{cid!r} is the offset base of {sorted(set(offset_bases[cid]))!r}"
+                           for cid in clash)
+        raise ValueError(
+            f"mode leaf/leaves used as a value_offset_from base: {detail}. A leaf the optimizer "
+            f"can switch off cannot also be another leaf's ruler: the dependant reads the base's "
+            f"decoded threshold even when the base is dropped, so that threshold stays live and "
+            f"must not be canonicalised away for deduplication. Give the dependant an absolute "
+            f"range, or anchor it on a leaf without a mode gene.")
+    return out
+
+
+def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]) -> Dict[str, Any]:
+    """The genome AS A PHENOTYPE: an inactive threshold is replaced by its authored anchor.
+
+    A leaf whose mode decoded to ``off`` is REMOVED from the tree, so its ``cond:<id>:value`` gene
+    describes nothing -- it is an inactive dimension. Two genomes that differ only there produce
+    the identical backtest, and hashing them apart costs a full trial each time the GA wanders
+    along that axis (design section 5: "canonicalize disabled thresholds to the declared anchor
+    for phenotype comparison/deduplication in this profile").
+
+    This affects the MEMO KEY ONLY. The raw genome is persisted untouched as provenance, and the
+    config the trial actually runs is built from the raw decode -- so nothing about the result
+    changes, only how often an identical result is recomputed.
+
+    Returns ``decoded_flat`` ITSELF when nothing needs rewriting, which is the whole guard for
+    older jobs: no mode leaves, no copy, no change of key.
+    """
+    if not anchors:
+        return decoded_flat
+    from app.services.strategy_param_space import mode_token
+    from ba2_common.core.rule_models import MODE_OFF
+
+    out: Optional[Dict[str, Any]] = None
+    for cid, (choices, anchor) in anchors.items():
+        mode_key, value_key = f"cond:{cid}:mode", f"cond:{cid}:value"
+        if mode_key not in decoded_flat or value_key not in decoded_flat or anchor is None:
+            continue
+        if mode_token(decoded_flat[mode_key], choices, cid) != MODE_OFF:
+            continue
+        if decoded_flat[value_key] == anchor:
+            continue
+        if out is None:
+            out = dict(decoded_flat)
+        out[value_key] = anchor
+    return decoded_flat if out is None else out
+
+
+def _market_condition_pins(backtest_cfg: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """``(profile, digest)`` for every profile this run pins a snapshot for, in config order.
+
+    One reader of the run config for every consumer here (master prepare, worker pre-flight,
+    trial config), so the plural and legacy-singular shapes are decoded in exactly one place
+    (``seam_wiring.market_condition_pins``).
+
+    A profile with NO digest raises rather than being filtered out. ``_prepare_master_market_
+    conditions`` already fails the job for that case and runs first, so this is unreachable
+    today -- which is exactly why it must not be a silent filter: a reordering of those two calls
+    would otherwise hand the evaluator a SHORT manifest list, every worker would pass pre-flight,
+    and every trial would die on the worker instead of the job dying here."""
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    profiles, manifests = market_condition_pins(backtest_cfg, required=False)
+    unpinned = [p for p in profiles if not manifests.get(p)]
+    if unpinned:
+        raise ValueError(f"market-condition profile(s) {unpinned!r} are on but this run pins no "
+                         f"manifest for them; the job should have been failed before dispatch")
+    return [(p, manifests[p]) for p in profiles]
+
+
+def _prepare_master_market_conditions(opt_id: int, db: Any,
+                                      backtest_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Verify + map this run's pinned market-condition snapshot ON THE MASTER, once.
+
+    Returns None when there is nothing to do or the snapshot is good; a ``_fail`` result (the job
+    is over) when it cannot be served here.
+
+    WHY THE MASTER. It is also a worker: it runs trials in its own process pool and its own
+    in-process re-runs, and only REMOTE workers were made to verify and map the pinned snapshot.
+    That made the runbook's warm step a correctness requirement -- forget it and the first local
+    trial either rebuilds the mapping under itself (every pool child racing for one key) or reads
+    an object nobody hashed. Doing it here makes the warm step an OPTIMISATION: run beforehand it
+    costs seconds ("opened"), skipped it costs one build instead of a wrong run.
+
+    WHY A FAILED VERIFICATION FAILS THE JOB. Every trial would score against a snapshot that does
+    not hash to its manifest. A search whose feature inputs cannot be proven is not a search, and
+    it must not quietly become a population of zero-trade genomes.
+    """
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    profiles, manifests = market_condition_pins(backtest_cfg, required=False)
+    if not profiles:
+        return None
+    # A PROFILE WITHOUT A DIGEST FAILS HERE, not once per trial. Before Task 10 this was
+    # unreachable (one profile, one digest); now a run can pin two profiles and warm one, and
+    # filtering the unpinned one out would let the master prepare and every worker pre-flight
+    # report success and then have EVERY trial die inside the seam on the worker. The whole
+    # point of preparing on the master is that the job fails before dispatch.
+    unpinned = [p for p in profiles if not manifests.get(p)]
+    if unpinned:
+        return _fail(opt_id, db,
+                     f"market-condition profile(s) {unpinned!r} are on but this run pins no "
+                     f"manifest for them. An optimization prepares one snapshot PER PROFILE "
+                     f"(tools/warm_market_conditions.py plan/build/verify/prepare-host) and "
+                     f"carries every digest into every trial; without one, every trial would be "
+                     f"refused on the worker rather than the job refused here.")
+    pinned = [(p, manifests[p]) for p in profiles]
+    from ba2_common.config import CACHE_FOLDER
+    from ba2_common.core.market_condition_reader import prepare_host
+
+    # ONE SNAPSHOT PER PROFILE (Task 10): a manifest names the single profile it was warmed for,
+    # so a two-profile run has two of them and BOTH have to be servable here before dispatch.
+    for profile, digest in pinned:
+        logger.warning(f"strategy_optimization {opt_id}: preparing market-condition manifest "
+                       f"{digest} ({profile}) on the master before dispatch")
+        try:
+            report = prepare_host(CACHE_FOLDER, digest, profile,
+                                  log=lambda m: logger.warning(f"market-conditions: {m}"))
+        except Exception as e:  # noqa: BLE001 -- reported as a failed job, never as a bad run
+            return _fail(opt_id, db, f"market-condition manifest {digest} ({profile}) could not "
+                                     f"be prepared on the master: {e!r}")
+        if not report.ok:
+            return _fail(opt_id, db,
+                         f"market-condition manifest {digest} ({profile}) FAILED verification on "
+                         f"the master: {report.errors}. Every trial of this run would read a "
+                         f"snapshot that does not hash to its manifest; re-sync the "
+                         f"market_conditions bucket and re-launch.")
+        logger.warning(
+            f"strategy_optimization {opt_id}: market-condition snapshot ready on the master "
+            f"({profile}: {report.objects_checked} object(s) verified, {report.symbols} symbol(s) "
+            f"mapped, {'built' if report.built else 'already warm'}, {report.elapsed_s:.1f}s)")
+    return None
+
+
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
     """Mark the StrategyOptimization row failed + return the failure dict."""
     logger.error(f"strategy_optimization {opt_id} failed: {msg}")
@@ -1208,6 +1392,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # columns — no relationships — so a detached snapshot is sufficient.)
         db.refresh(strategy)
         db.expunge(strategy)
+        # Phenotype canonicalisation for the trial memo (design section 5). Read from the
+        # template ONCE; ``{}`` for every strategy without mode genes, and then
+        # ``canonical_trial_params`` is the identity function and the keys are today's.
+        mode_anchors = mode_anchor_index(strategy)
 
         # --- DETERMINISM: seed both RNGs (Task 4 / determinism_rule) ---
         seed = int(ga["seed"])
@@ -1261,7 +1449,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": decoded_flat,
+                    "params": canonical_trial_params(mode_anchors, decoded_flat),
                 }
             )
             cached = memo.get(key)
@@ -1360,7 +1548,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": decoded_flat,
+                    "params": canonical_trial_params(mode_anchors, decoded_flat),
                 }
             )
 
@@ -1680,6 +1868,22 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         f"({len(init_pop)} individuals) from optimization {warm_start_id}"
                     )
 
+        # MARKET-CONDITION SNAPSHOT, ON THIS MACHINE, ONCE (design section 4.5). The master is
+        # also a worker: it runs trials in its own pool and its own in-process re-runs, and until
+        # now only REMOTE workers were made to verify and map the pinned snapshot. That made the
+        # runbook's warm step a correctness requirement -- forget it and the first local trial
+        # either rebuilds the mapping under itself (every pool child racing for the same key) or
+        # reads a corrupt object nobody hashed. Doing it here makes the warm step an OPTIMISATION:
+        # running it beforehand costs this call nothing (it reports "opened", ~seconds), and
+        # skipping it costs a one-time build instead of a wrong run.
+        #
+        # A failed verification FAILS THE JOB. Every trial of this run would score against a
+        # snapshot that does not hash to its manifest, and a search whose feature inputs cannot be
+        # proven is not a search -- it must not quietly become a population of zero-trade genomes.
+        _mc_failure = _prepare_master_market_conditions(opt_id, db, backtest_cfg)
+        if _mc_failure is not None:
+            return _mc_failure
+
         # Suppress per-trial verbose logging for the optimization's duration — across many
         # trials it's pure noise (only a SINGLE standalone backtest should log in detail).
         # A per-name setLevel() list was used before but did NOT hold: the levels get clobbered
@@ -1776,6 +1980,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     pool_factory=_make_pool if parallel >= 1 else None,
                     max_remote_slots_per_worker=_max_remote_slots,
                     governor=_governor,
+                    # Pre-flight makes every worker verify + map this snapshot before it receives
+                    # a trial; one that cannot is excluded rather than left to return zero-trade
+                    # results for every gated genome.
+                    market_condition_manifests=dict(_market_condition_pins(backtest_cfg)),
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 logger.warning(f"strategy_optimization {opt_id}: DISTRIBUTED across "
@@ -2006,6 +2214,25 @@ def _run_trial_backtest(
     raise ValueError(
         f"Unknown backtest engine: {engine!r} (valid: 'daily', 'ml')"
     )
+
+
+def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """The two derived market-condition keys for a trial config, from a run config in any shape.
+
+    Its own function because ``_build_daily_trial_config`` is a WHITELIST: a knob that is not
+    written here is inert however correctly it was parsed upstream.
+
+    The PROFILES are not a knob of this dict's own: since Task 12 they come from the expert
+    setting ``market_condition_profile``, which rides inside ``experts[i]["settings"]`` -- copied
+    wholesale by the whitelist, so it cannot be dropped the way a run-level key can. They are
+    still WRITTEN OUT here, derived, because ``install_backtest_market_conditions`` and every
+    stored-config consumer read the resolved list, and because a trial config that carries both
+    is checked for agreement by ``market_condition_pins`` on the way in.
+    """
+    from app.services.backtest.seam_wiring import market_condition_pins
+
+    profiles, manifests = market_condition_pins(backtest_cfg, required=False)
+    return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
 
 
 def _build_daily_trial_config(
@@ -2263,6 +2490,25 @@ def _build_daily_trial_config(
         # SCREENER seam: the per-individual effective screener settings + store path the engine
         # uses to gate entries to the per-day screened universe. None for non-screener runs.
         "screener_runtime": screener_runtime,
+        # MARKET-CONDITION entry gates (design 2026-09-15 sections 4.1/4.5). Same whitelist reason
+        # as stress_spread_bps and robust_fitness above -- this dict rebuilds the trial config key
+        # by key, so a knob missing HERE is inert however correctly it was parsed upstream. Both
+        # keys are load-bearing and neither can stand without the other:
+        #   * ``market_condition_profiles`` decides whether the resolver is installed at all.
+        #     Empty, install_backtest_market_conditions REFUSES a run whose rules carry market
+        #     leaves (rather than letting every gate read no_context and place zero entries).
+        #   * ``market_condition_manifests`` pins the prepared snapshot PER PROFILE that every
+        #     trial of the run reads. Missing one on an optimizer trial, the seam raises:
+        #     computing 128-session indicators per trial, per worker, off whatever each host's
+        #     cache holds is not a fallback (section 4.5), and a feature-cache miss must never
+        #     become a fitness value.
+        #   Decoded through the ONE reader of both shapes, so a genome persisted before Task 10
+        #   (singular ``market_condition_profile``/``_manifest``) re-runs unchanged.
+        **_market_condition_trial_pins(backtest_cfg),
+        # This config was assembled by the OPTIMIZER (GA trial, re-run, robustness variant or
+        # top-N persist), not by the single-backtest path. The market-condition seam reads it to
+        # tell "a research run may compute on a miss" from "a search may not".
+        "_ga_trial": True,
     }
 
 

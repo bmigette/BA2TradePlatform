@@ -6,7 +6,7 @@ that can be used in rulesets and automated trading decisions.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Callable, Type
 from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
 
@@ -28,6 +28,17 @@ from ba2_common.core.earnings_stamp import (
     order_event_date,
     stamped_days_to_earnings,
 )
+# Market-condition entry gates (design 2026-09-15 option-market-condition-genes): the profile
+# registry the condition classes are GENERATED from, and the evaluation-scoped context type.
+from ba2_common.core.market_conditions import (
+    PROFILES as _MC_PROFILES,
+    STATUS_MISSING_SESSION as _MC_STATUS_MISSING_SESSION,
+    STATUS_NO_CONTEXT as _MC_STATUS_NO_CONTEXT,
+    STATUS_VALID as _MC_STATUS_VALID,
+    field_codes as _mc_field_codes,
+    field_spec as _mc_field_spec,
+)
+from ba2_common.core.market_condition_context import MarketConditionContext
 
 
 # --- Provider-injection seam -------------------------------------------------
@@ -59,6 +70,81 @@ def set_provider_resolver(fn):
 def get_provider_resolver():
     """Return the injected provider resolver (or None if not configured)."""
     return _provider_resolver
+
+
+# --- Market-condition context seam --------------------------------------------
+# The market-condition gates need an evaluation-scoped MarketConditionContext (decision time,
+# session, reader, ...). Neither create_condition nor TradeActionEvaluator threads anything but
+# ``account``, so -- exactly like the provider seam above -- the host installs a resolver:
+#   fn(account, instrument_name, expert_recommendation) -> Optional[MarketConditionContext]
+# It is called LAZILY, only from MarketConditionCompare.evaluate(): a ruleset with no market
+# leaves never reaches it, so the gates being off costs no clock or market-data read. With no
+# resolver (or a resolver returning None) the gate is UNKNOWN (status ``no_context``) and never
+# passes -- there is deliberately no fallback to an end-of-day helper.
+_market_condition_context_resolver: Optional[Callable[..., Optional[MarketConditionContext]]] = None
+
+#: Reason recorded when no context could be resolved for a market-condition gate.
+NO_MARKET_CONDITION_CONTEXT_REASON = "market-condition profile not wired for this process"
+
+
+def set_market_condition_context_resolver(fn) -> None:
+    """Install (or, with None, remove) the market-condition context resolver.
+
+    fn(account, instrument_name, expert_recommendation) -> Optional[MarketConditionContext].
+    Injected by the backtest / live host; the previous resolver is replaced.
+    """
+    global _market_condition_context_resolver
+    _market_condition_context_resolver = fn
+
+
+def get_market_condition_context_resolver():
+    """Return the installed market-condition context resolver (or None)."""
+    return _market_condition_context_resolver
+
+
+#: Every entry into :func:`resolve_market_condition_context` in this process, installed resolver
+#: or not. THE NO-IMPACT EVIDENCE (plan Task 9): a run with the profile off must not merely
+#: produce the same numbers, it must never reach this code at all -- identical results with the
+#: gates quietly evaluating would be a much worse outcome than a diff. ``tools/backtest_parity.py``
+#: prints it per child, so "the resolver was never called" is a measurement rather than a belief.
+_market_condition_resolver_calls = 0
+
+
+def market_condition_resolver_calls() -> int:
+    """How many market-condition leaf evaluations asked for a context in this process.
+
+    KEPT DELIBERATELY, not a debug leftover. The increment is one CPython integer add on a
+    module global -- tens of nanoseconds against the ~0.9 us an evaluated gate costs, and ZERO
+    on a profile-less run, which never reaches this function at all. In exchange, "the gates
+    were never reached" is a number a parity child prints rather than an inference from the
+    absence of a warning. Removing it would save nothing measurable and cost the only direct
+    evidence for the no-impact claim.
+    """
+    return _market_condition_resolver_calls
+
+
+def reset_market_condition_resolver_calls() -> None:
+    """Zero the counter (test isolation; a benchmark's warm-up phase)."""
+    global _market_condition_resolver_calls
+    _market_condition_resolver_calls = 0
+
+
+def resolve_market_condition_context(account, instrument_name: str,
+                                     expert_recommendation) -> Optional[MarketConditionContext]:
+    """Resolve the context for one evaluation; None when no resolver is installed or the
+    resolver has no context for it. A resolver returning anything else is a wiring defect and
+    raises (it must never be mistaken for a usable context)."""
+    global _market_condition_resolver_calls
+    _market_condition_resolver_calls += 1
+    fn = _market_condition_context_resolver
+    if fn is None:
+        return None
+    ctx = fn(account, instrument_name, expert_recommendation)
+    if ctx is not None and not isinstance(ctx, MarketConditionContext):
+        raise TypeError(
+            f"market-condition context resolver returned {type(ctx).__name__}, "
+            f"expected MarketConditionContext or None")
+    return ctx
 
 
 def _is_missing(value) -> bool:
@@ -3996,6 +4082,194 @@ class HasAssignedSharesCondition(FlagCondition):
         return f"Assigned shares found: {'Yes' if has else 'No'}"
 
 
+class MarketConditionCompare(CompareCondition):
+    """Base of the GENERATED market-condition gates (one subclass per registered field; see
+    ``market_condition_condition_class``). Design 2026-09-15 §4.1/§5/§7.
+
+    Reads the observation for ``FIELD`` from the evaluation's ``MarketConditionContext``
+    (resolved lazily through the seam above) at the context's ``prior_session``. NUMERIC
+    fields accept only strict ``<``/``>`` (equality passes neither); CATEGORICAL fields only
+    ``==`` against the float code. Any other operator raises ``ValueError`` at construction.
+
+    UNKNOWN NEVER PASSES: no context (``no_context``), no feature row (``missing_session``) or
+    any non-``valid`` observation -> ``calculated_value`` None, ``evaluate()`` False, and
+    ``last_status``/``last_reason`` say why. The recorder is called only on a valid read.
+
+    WIRING DEFECTS RAISE (they are never an "unknown" the GA could learn "mode=off wins" from):
+    a resolver returning a non-context (``TypeError``), a feature row that does not carry
+    ``FIELD`` (``LookupError`` -- leaves are placed by profile, so this is a launcher/reader
+    bug), and any exception from the reader or recorder.
+    """
+
+    #: Canonical market-condition field name (== ExpertEventType value). Set by the factory.
+    FIELD: str = ""
+    #: "numeric" | "categorical" -- the FieldSpec kind. Set by the factory.
+    KIND: str = ""
+    #: Operators this field's leaves may use. Set by the factory from KIND.
+    ALLOWED_OPERATORS: frozenset = frozenset()
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, operator_str, value,
+                         existing_order)
+        if not self.FIELD or not self.ALLOWED_OPERATORS:
+            raise TypeError(f"{type(self).__name__} has no FIELD/ALLOWED_OPERATORS: build it "
+                            f"with market_condition_condition_class(field)")
+        if operator_str not in self.ALLOWED_OPERATORS:
+            raise ValueError(f"{self.FIELD} ({self.KIND}) accepts only "
+                             f"{sorted(self.ALLOWED_OPERATORS)}, got {operator_str!r}")
+        self.last_status: Optional[str] = None
+        self.last_reason: str = ""
+
+    def _unknown(self, status: str, reason: str) -> bool:
+        self.calculated_value = None
+        self.last_status = status
+        self.last_reason = reason
+        logger.debug("Market condition %s for %s is unknown (%s): %s",
+                     self.FIELD, self.instrument_name, status, reason)
+        return False
+
+    def evaluate(self) -> bool:
+        global _warned_no_market_condition_resolver
+        ctx = resolve_market_condition_context(self.account, self.instrument_name,
+                                               self.expert_recommendation)
+        if ctx is None:
+            if _market_condition_context_resolver is None and not _warned_no_market_condition_resolver:
+                _warned_no_market_condition_resolver = True
+                logger.warning(
+                    "Market-condition leaf %s evaluated with NO context resolver installed: "
+                    "every market-condition gate in this process is unknown and never passes "
+                    "(%s)", self.FIELD, NO_MARKET_CONDITION_CONTEXT_REASON)
+            resolver = _market_condition_context_resolver
+            if resolver is not None:
+                # A resolver IS installed but has no context for this evaluation (live: a leaf
+                # outside the enter-market decision scope). Never raise -- exit rulesets must keep
+                # running -- but say so ONCE per cause instead of a DEBUG line per evaluation.
+                reason = getattr(resolver, "no_context_reason", None) or \
+                    "the installed market-condition resolver has no context for this evaluation"
+                # PER-SYMBOL FIRST. A resolver can refuse ONE symbol for a reason of its
+                # own -- live, a pinned snapshot that carries no rows for it -- and
+                # collapsing that into the resolver's one class-level sentence is how
+                # "this sleeve stopped entering NVDA in March" stays invisible. The
+                # generic reason is the fallback, not the only answer.
+                reason_for = getattr(resolver, "no_context_reason_for", None)
+                per_symbol = reason_for(self.instrument_name) if callable(reason_for) else None
+                if per_symbol:
+                    reason = per_symbol
+                # Keyed on (field, reason), not the field alone: the reasons are bounded
+                # (one per uncovered symbol plus the generic one), and one WARNING per
+                # distinct CAUSE is the point of warning at all.
+                warned_key = (self.FIELD, reason)
+                if warned_key not in _warned_no_market_condition_context_fields:
+                    _warned_no_market_condition_context_fields.add(warned_key)
+                    logger.warning("Market-condition leaf %s (%s): %s",
+                                   self.FIELD, self.instrument_name, reason)
+                return self._unknown(_MC_STATUS_NO_CONTEXT, reason)
+            return self._unknown(_MC_STATUS_NO_CONTEXT, NO_MARKET_CONDITION_CONTEXT_REASON)
+        session = ctx.prior_session
+        values = ctx.reader.observe(self.instrument_name, session)
+        if values is None:
+            return self._unknown(_MC_STATUS_MISSING_SESSION,
+                                 f"no feature row for {self.instrument_name} at {session}")
+        by_field = values.by_field()
+        obs = by_field.get(self.FIELD)
+        if obs is None:
+            raise LookupError(
+                f"feature row for {self.instrument_name} at {session} carries no {self.FIELD!r} "
+                f"(row fields: {sorted(by_field)!r}) -- the reader was not built for this "
+                f"field's profile")
+        if obs.status != _MC_STATUS_VALID:
+            return self._unknown(obs.status, obs.reason)
+        self.calculated_value = obs.value
+        self.last_status = obs.status
+        self.last_reason = obs.reason
+        if ctx.recorder is not None:
+            ctx.recorder(self.instrument_name, session, values)
+        return self.operator_func(obs.value, self.value)
+
+    def _code_name(self, code) -> Optional[str]:
+        """The categorical value name for ``code``; None for numeric fields (no registry read)."""
+        if self.KIND != "categorical":
+            return None
+        for name, c in _mc_field_codes(self.FIELD).items():  # memoised; cleared on registration
+            if float(c) == float(code):
+                return name
+        return None
+
+    def get_description(self) -> str:
+        shown = self.value
+        name = self._code_name(self.value)
+        if name is not None:
+            shown = f"{name} ({float(self.value):g})"
+        return f"Check if {self.instrument_name} {self.FIELD} is {self.operator_str} {shown}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return f"unknown ({self.last_status})" if self.last_status else None
+        name = self._code_name(self.calculated_value)
+        if name is not None:
+            return name
+        return f"{self.calculated_value:.4g}"
+
+
+_warned_no_market_condition_resolver = False
+#: ``(field, reason)`` pairs already warned about for "resolver installed, no context":
+#: one WARNING per distinct CAUSE per process, not per field -- a per-symbol coverage
+#: reason is a different failure from "no decision scope is open".
+_warned_no_market_condition_context_fields: set = set()
+
+_OPERATORS_BY_KIND = {
+    "numeric": frozenset({"<", ">"}),
+    "categorical": frozenset({"=="}),
+}
+
+#: Memo keyed by the FieldSpec itself, so a field re-registered with a different spec (e.g. a
+#: different kind) never gets a stale class back.
+_MARKET_CONDITION_CLASSES: Dict[Any, Type[MarketConditionCompare]] = {}
+
+
+def _class_name_for_field(field: str) -> str:
+    return "".join(p[:1].upper() + p[1:] for p in field.split("_") if p) + "Condition"
+
+
+def market_condition_condition_class(field: str) -> Type[MarketConditionCompare]:
+    """The (memoised) ``MarketConditionCompare`` subclass for a REGISTERED field, e.g.
+    ``underlying_adx_14`` -> ``UnderlyingAdx14Condition``. KeyError for an unknown field.
+
+    The memo is keyed by the FieldSpec, not the field name: ANY spec change on re-registration
+    yields a NEW class, and a second ``register_market_condition_conditions()`` then hits the
+    CONDITION_MAP conflict guard on purpose (a changed field must not silently keep serving
+    rules built against the old spec).
+
+    The class is also bound as a module global under its own name, so it pickles by
+    reference (GA workers spawn on Windows; distributed payloads pickle). If that name is
+    unbound, or bound to a generated class for the SAME field, it is (re)bound so the latest
+    class pickles; bound to anything else (e.g. a hand-written condition class whose name a
+    field happens to generate) raises ``ValueError`` rather than silently keeping the wrong one."""
+    spec = _mc_field_spec(field)  # KeyError naming the known fields
+    cls = _MARKET_CONDITION_CLASSES.get(spec)
+    if cls is not None:
+        return cls
+    name = _class_name_for_field(spec.name)
+    bound = globals().get(name)
+    if bound is not None and not (isinstance(bound, type) and issubclass(bound, MarketConditionCompare)
+                                  and bound.FIELD == spec.name):
+        raise ValueError(f"market-condition field {spec.name!r} generates class name {name!r}, which "
+                         f"is already bound in {__name__} to {bound!r}")
+    cls = type(name, (MarketConditionCompare,), {
+        "FIELD": spec.name,
+        "KIND": spec.kind,
+        "ALLOWED_OPERATORS": _OPERATORS_BY_KIND[spec.kind],
+        "__doc__": f"Market-condition gate on {spec.name} ({spec.kind}); see MarketConditionCompare.",
+        "__module__": __name__,
+        "__qualname__": name,
+    })
+    _MARKET_CONDITION_CLASSES[spec] = cls
+    globals()[name] = cls
+    return cls
+
+
 # Factory function to create conditions based on event type
 
 # (from_rating, to_rating) for the six 3-bucket rating TRANSITION events, all served by
@@ -4076,6 +4350,42 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
     ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
 }
+
+
+def register_market_condition_conditions() -> List[str]:
+    """Map every field of every registered market-condition profile into ``CONDITION_MAP``
+    (``ExpertEventType(field)`` -> its generated class). Idempotent; called at import for the
+    profiles registered then, and re-callable after ``market_conditions.register_profile``.
+
+    A field with no ``ExpertEventType`` member (enum members cannot be added at runtime) is
+    SKIPPED with a WARNING and its name returned -- tests/test_market_condition_conditions.py
+    fails for any registered field without a member, so a skip never survives CI. Raises if an
+    event type is already mapped to a different class (a registry clash)."""
+    skipped: List[str] = []
+    fields = [f.name for prof in _MC_PROFILES.values() for f in prof.fields]
+    for field in fields:
+        try:
+            event = ExpertEventType(field)
+        except ValueError:
+            logger.warning("Market-condition field %r has no ExpertEventType member; "
+                           "no condition registered for it", field)
+            skipped.append(field)
+            continue
+        cls = market_condition_condition_class(field)
+        existing = CONDITION_MAP.get(event)
+        if existing is not None and existing is not cls:
+            raise ValueError(f"CONDITION_MAP[{event.name}] is already {existing.__name__}; "
+                             f"refusing to replace it with {cls.__name__}")
+        CONDITION_MAP[event] = cls
+    return skipped
+
+
+register_market_condition_conditions()
+
+#: Explicit names for the ohlcv-v1 gates (the generated classes, not hand-written ones).
+UnderlyingTrendSlopeCondition = market_condition_condition_class(ExpertEventType.N_UNDERLYING_TREND_SLOPE.value)
+UnderlyingAdxCondition = market_condition_condition_class(ExpertEventType.N_UNDERLYING_ADX.value)
+UnderlyingRealizedVolRatioCondition = market_condition_condition_class(ExpertEventType.N_UNDERLYING_RV_RATIO.value)
 
 
 def create_condition(event_type: ExpertEventType, account: AccountInterface,

@@ -67,8 +67,17 @@ def main() -> int:
         if bt is None:
             print(f"FATAL: backtest {bt_id} not found")
             return 1
-        ruleset = _derive_export_payload(bt, "ruleset", db)
-        settings = _derive_export_payload(bt, "expert_settings", db)
+        try:
+            ruleset = _derive_export_payload(bt, "ruleset", db)
+            settings = _derive_export_payload(bt, "expert_settings", db)
+        except Exception as e:  # noqa: BLE001 -- HTTPException or ValueError, both fatal here
+            # The market-condition refusals (unresolved mode gene, a gate on an exit ruleset)
+            # come through here. Print the reason instead of a traceback: it names the leaf and
+            # what to do about it, and NOTHING is written -- a half-exported plan is worse than
+            # none, because the missing entry is the one the operator would not notice.
+            print(f"FATAL: backtest {bt_id} cannot be exported: "
+                  f"{getattr(e, 'detail', None) or e}")
+            return 1
         payloads.append({
             "backtest_id": bt_id,
             "target_instance_id": inst_id,          # None -> import creates the instance

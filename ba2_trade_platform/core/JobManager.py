@@ -12,7 +12,7 @@ import threading
 import time
 import queue
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from enum import Enum
 from zoneinfo import ZoneInfo
@@ -195,11 +195,15 @@ class JobManager:
             "max_instances": 1,
             "misfire_grace_time": 600,  # 10 minutes
         }
-        self._scheduler = BackgroundScheduler(job_defaults=job_defaults)
+        from .ScheduledExpertExecutor import ScheduledExpertExecutor
+        self._scheduler = BackgroundScheduler(job_defaults=job_defaults,
+                                             executors={"experts": ScheduledExpertExecutor()})
         self._scheduler.start()
         self._running = False
         self._scheduled_jobs: Dict[str, Job] = {}  # Maps job_id to APScheduler Job
         self._lock = threading.Lock()
+        self._dispatch_lock = threading.Lock()
+        self._dispatched_slots = set()
 
         # Running live expert instances keyed by expert_instance_id
         self._live_experts: Dict[int, Any] = {}
@@ -1087,12 +1091,13 @@ class JobManager:
             # Create the scheduled job with error handling
             try:
                 job = self._scheduler.add_job(
-                    func=self._execute_scheduled_analysis,
+                    func=self._execute_scheduled_group,
                     args=[expert_instance.id, symbol, subtype],
                     trigger=trigger,
                     id=job_id,
                     name=f"Analysis: Expert {expert_instance.id}, Symbol {symbol}, Subtype {subtype}",
                     replace_existing=True,
+                    executor="experts",
                     max_instances=1,         # Prevent job overlap
                     coalesce=True,           # Coalesce multiple missed executions
                     misfire_grace_time=600,  # Hundreds of jobs share the same trigger time;
@@ -1206,7 +1211,63 @@ class JobManager:
             logger.error(f"Safety release of parked OPEN_POSITIONS for expert "
                          f"{expert_instance_id} failed: {e}", exc_info=True)
 
-    def _execute_scheduled_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET):
+    def _execute_scheduled_group(self, expert_instance_id, symbol, subtype, scheduled_for=None):
+        """One callback registers and submits every expert due at this exact fire time.
+
+        APScheduler invokes each scheduled job, potentially on different threads.
+        The slot claim makes the remaining callbacks no-ops. Registration happens
+        before any analysis can finish, even if the lowest-priority callback wins.
+        """
+        if scheduled_for is None:
+            raise ValueError("Scheduled expert execution requires its scheduler fire time")
+        from .ExpertPriority import ExpertRun, validate_expert_priority
+        from .utils import get_expert_instance_from_id, expert_uses_risk_manager
+        slot = scheduled_for.astimezone(timezone.utc).isoformat()
+        with self._dispatch_lock:
+            if slot in self._dispatched_slots:
+                return
+            with self._lock:
+                # This registry also contains account refresh and IV snapshots.
+                # They must retain their own callbacks and never join an expert cohort.
+                jobs = [job for job_id, job in self._scheduled_jobs.items()
+                        if job_id.startswith("expert_") and job.next_run_time is not None]
+            due = [job for job in jobs
+                   if job.trigger.get_next_fire_time(None, scheduled_for) == scheduled_for]
+            records = {}
+            for job in due:
+                expert_id = job.args[0]
+                if expert_id not in records:
+                    record = get_instance(ExpertInstance, expert_id)
+                    if record is not None and record.enabled:
+                        records[expert_id] = record
+            runs = []
+            for record in records.values():
+                expert = get_expert_instance_from_id(record.id)
+                if expert is None:
+                    raise ValueError(f"Cannot load scheduled expert {record.id}")
+                runs.append(ExpertRun(
+                    batch_id=f"{record.id}_{scheduled_for.astimezone().strftime('%H%M_%Y%m%d')}",
+                    cohort=slot, expert_id=record.id, account_id=record.account_id,
+                    priority=validate_expert_priority(record.priority),
+                    self_trading=not expert_uses_risk_manager(type(expert))))
+            worker_queue = get_worker_queue()
+            worker_queue._expert_priority.register(runs)
+            self._dispatched_slots.add(slot)
+            # Bound history; callbacks older than the grace window cannot execute.
+            cutoff = (scheduled_for - timedelta(days=1)).astimezone(timezone.utc).isoformat()
+            self._dispatched_slots = {key for key in self._dispatched_slots if key >= cutoff}
+        try:
+            # Put all higher-priority initial work into the queue first; the queue
+            # also propagates the priority to children produced by expansions.
+            for job in sorted(due, key=lambda j: (
+                    -records[j.args[0]].priority if j.args[0] in records else 0,
+                    str(j.args[2]))):
+                if job.args[0] in records:
+                    self._execute_scheduled_analysis(*job.args, scheduled_for=scheduled_for)
+        finally:
+            worker_queue._expert_priority.seal([run.batch_id for run in runs])
+
+    def _execute_scheduled_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, scheduled_for=None):
         """Execute a scheduled analysis job."""
         try:
             logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
@@ -1214,7 +1275,7 @@ class JobManager:
             # Generate batch_id for this scheduled job execution
             # Format: expert_id_HHmm_YYYYMMDD (e.g., "3_0930_20251030")
             from datetime import datetime
-            now = datetime.now()
+            now = scheduled_for.astimezone().replace(tzinfo=None) if scheduled_for else datetime.now()
             time_str = now.strftime("%H%M")  # HHmm (e.g., "0930")
             date_str = now.strftime("%Y%m%d")  # YYYYMMDD (e.g., "20251030")
             batch_id = f"{expert_instance_id}_{time_str}_{date_str}"

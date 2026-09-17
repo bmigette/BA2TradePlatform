@@ -376,6 +376,7 @@ class DailyBacktestEngine:
         progress_cb: Optional[Callable[[float, str], None]] = None,
         indicator_provider: Any = None,
         regime_calendar: Any = None,
+        market_condition_record: Any = None,
     ) -> None:
         self.account = account
         self.experts = experts
@@ -430,6 +431,13 @@ class DailyBacktestEngine:
         self._uncovered_assigned_max: Dict[str, int] = {}
         self._uncovered_assigned_total: Dict[str, int] = {}
         self._uncovered_assigned_reasons: Dict[str, str] = {}
+
+        # MARKET-CONDITION telemetry (design 2026-09-15 sections 6 and 7), or None.
+        # ``install_backtest_market_conditions`` returns a resolver only when the run carries a
+        # profile, and the handler builds the record from it; every other run passes None and
+        # the three call sites below are one ``is None`` test each. This is what keeps a
+        # profile-less run's blob and counters the ones it has always produced.
+        self._mc = market_condition_record
 
     def _bypass_manager(self, expert_id: int) -> Any:
         """Lazily build + cache the portfolio manager for a bypass expert (run-constant).
@@ -969,6 +977,13 @@ class DailyBacktestEngine:
         if recommendation is None:
             return False
 
+        if self._mc is not None:
+            # ELIGIBLE = a recommendation that actually reached the entry ruleset. Counted
+            # HERE, before any condition runs, because design section 6 wants the denominator
+            # the gate rejections are a fraction OF -- a SKIP/HOLD the expert never emitted and
+            # a symbol the screener never offered are not gate rejections and are not counted.
+            self._mc.note_eligible()
+
         try:
             evaluator = TradeActionEvaluator(
                 account=self.account,
@@ -981,8 +996,22 @@ class DailyBacktestEngine:
                 ruleset_id=ruleset_id,
                 existing_order=None,
             )
+            if self._mc is not None:
+                # Classify this recommendation's market leaves. NOTE the evaluator's default
+                # ``evaluate_all_conditions=False``: it stops at the FIRST failing condition,
+                # and the market gates are appended at the END of the entry AND list, so a
+                # recommendation rejected by an earlier leaf records no market row at all.
+                # ``market_evaluated`` is therefore "reached a market gate", which is the
+                # honest denominator for the gate's own reject/unknown split.
+                self._mc.note_conditions(evaluator.condition_evaluations)
             if not action_summaries or any("error" in s for s in action_summaries):
                 return False  # conditions not met / evaluation error -> no order this symbol.
+
+            if self._mc is not None:
+                # THE ENTRY RULE FIRED: record the measurement the decision was made on, before
+                # the dup/equity gates (which are account bookkeeping, not a different market).
+                # One memoised read of a row the gates have just read.
+                self._mc.note_entry(self.account, symbol, recommendation)
 
             # LIVE-PARITY DUP-POSITION GATE (mirrors TradeManager.process_expert_recommendations_
             # after_analysis:1130-1144): after the enter ruleset passes but BEFORE executing,
@@ -1773,6 +1802,12 @@ class DailyBacktestEngine:
             # RECORDED, NOT SCORED -- see ``_record_uncovered_assigned``.
             "uncovered_assigned_bars": self._uncovered_assigned_metric(),
         }
+        # NOTE: the market-condition block is NOT emitted here. ``run_daily_backtest`` discards
+        # this payload and builds the persisted one from the account, so a copy here would be a
+        # second, always-unread encoding of the same counters -- and one that could not carry
+        # the entry-state binding, which needs the finished trade list. The single writer is
+        # ``market_condition_bt.apply_market_condition_block``; the record itself is reachable
+        # as ``engine._mc`` for an engine-level test.
 
     @staticmethod
     def _log(msg: str) -> None:

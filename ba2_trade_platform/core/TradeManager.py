@@ -1940,7 +1940,93 @@ class TradeManager:
             
         return None
         
+    def _decision_capture_scope(self, expert_instance_id: int):
+        """A replay-capture scope for ONE enter-market decision pass (no-op when capture is off).
+
+        WHY THE DECISION PASS NEEDS ITS OWN SCOPE. Capture is opened per ANALYSIS, by
+        ``MarketExpertInterface._analysis_capture``. The market-condition gates are not read
+        during an analysis: they are read HERE, when the entry ruleset is evaluated, after every
+        analysis of the pass has finished and its scope has closed. Without a scope of its own
+        the pass records nothing, ``LiveMarketConditionResolver.begin_decision`` sees no capture
+        context, and a replay of a gated bundle raises ``ReplayMiss`` in ``begin_decision``
+        because the windows it needs were never written down. A gated live decision that cannot
+        be replayed is a decision nobody can audit.
+
+        Returns a context manager. Every failure to describe the pass degrades to "not
+        recorded", never to "the pass does not run": recording is evidence, not a dependency.
+        """
+        import uuid
+        from contextlib import nullcontext
+        from datetime import timezone as _tz
+
+        from ba2_common.core.market_condition_live import resolver_for_expert_instance
+        from ba2_common.core.replay import capture_scope, get_replay_store
+
+        from .types import AnalysisUseCase
+
+        # ONLY when THIS EXPERT has a market-condition resolver. The scope exists to record the
+        # feature windows its gates read; with no profile on the expert there is nothing to
+        # record, and opening it anyway would submit a synthetic "TradeManager" AnalysisRecord
+        # per decision pass into every capture session -- which replay inventory counts as an
+        # analysis and expert_replay then reports as COVERAGE_UNSUPPORTED. That silently moves
+        # the replay-coverage percentage of deployments that never enable this feature.
+        #
+        # PER EXPERT since Task 12 (the profile is that expert's setting): a process-wide
+        # "is a resolver installed" test would now be true for every deployment, because the
+        # dispatching resolver is always installed.
+        if resolver_for_expert_instance(expert_instance_id) is None:
+            return nullcontext()
+        store = get_replay_store()
+        if store is None:
+            return nullcontext()
+        try:
+            session_id = store.current_session_id()
+            if session_id is None:
+                logger.error(
+                    "replay capture is enabled but no session is open; the enter-market decision "
+                    "pass for expert %s is not recorded and a gated decision in it cannot be "
+                    "replayed", expert_instance_id)
+                return nullcontext()
+            meta = {
+                # The pass is not a MarketAnalysis, so it carries an id of its own shape rather
+                # than borrowing one analysis's id and colliding with that analysis's bundle.
+                "analysis_id": f"decision-{expert_instance_id}-{uuid.uuid4().hex}",
+                "attempt_id": uuid.uuid4().hex,
+                "session_id": session_id,
+                "expert_class": "TradeManager",
+                "expert_instance_id": expert_instance_id,
+                # One pass decides for every symbol the expert recommended; the per-symbol
+                # identity is on each recorded observation, not on the bundle.
+                "symbol": "",
+                "use_case": str(AnalysisUseCase.ENTER_MARKET.value),
+                "scheduled_at": None,
+                "started_at": datetime.now(_tz.utc),
+            }
+        except Exception as e:  # noqa: BLE001 -- a recording problem never stops a decision
+            logger.error(f"replay capture: could not describe the decision pass: {e}", exc_info=True)
+            return nullcontext()
+        return capture_scope(store, meta)
+
     def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
+        """Process enter_market recommendations inside ONE market-condition decision scope.
+
+        The scope reads the evaluation clock once, on this (coordinating) thread, and only when
+        THIS EXPERT's ``market_condition_profile`` setting names a profile; otherwise it is a
+        no-op. Every market-condition leaf of this pass then resolves the same frozen context.
+        See ``_process_expert_recommendations_after_analysis`` for the processing itself.
+
+        ORDER IS LOAD-BEARING: the capture scope opens FIRST. ``begin_decision`` reads
+        ``current_capture()`` to decide whether to wrap the reader in a
+        ``CapturingMarketConditionReader``, so a capture scope opened inside the decision scope
+        would be too late and the pass would record no windows at all.
+        """
+        from ba2_common.core.market_condition_live import market_condition_decision_scope
+
+        with self._decision_capture_scope(expert_instance_id):
+            with market_condition_decision_scope(expert_instance_id=expert_instance_id):
+                return self._process_expert_recommendations_after_analysis(expert_instance_id, lookback_days)
+
+    def _process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations after all market analysis jobs for enter_market are completed.
         

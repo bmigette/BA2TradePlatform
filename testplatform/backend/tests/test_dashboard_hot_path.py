@@ -4,13 +4,29 @@ indexes (db_migrate/031). Background: the ORM `.all()` it used loaded 20 x ~10 M
 """
 from __future__ import annotations
 
+import itertools
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import event
 
 _BLOB_RE = re.compile(r"\b(trades|equity_curve|drawdown_curve|results|all_results)\b", re.I)
+
+# EXPLICIT, STRICTLY INCREASING created_at for every seeded row. Both models default it to
+# ``server_default=func.now()``, and SQLite's CURRENT_TIMESTAMP has ONE-SECOND resolution, so a
+# whole seeding run usually lands on a single timestamp -- and the route sorts its activity list
+# by that timestamp with a stable sort that keeps backtests (appended first) ahead of the
+# optimizations on every tie. The stats test then passed or failed on whether the seeding happened
+# to cross a second boundary: adding unrelated test FILES ahead of this one in the session was
+# enough to flip it. A far-future base also keeps rows other tests in the session left behind out
+# of the newest-20 window.
+_SEED_CLOCK = itertools.count()
+_SEED_BASE = datetime(2030, 1, 1)
+
+
+def _stamp():
+    return _SEED_BASE + timedelta(seconds=next(_SEED_CLOCK))
 
 
 @pytest.fixture
@@ -37,7 +53,7 @@ def _seed_backtests(db, n):
     rows = []
     for i in range(n):
         bt = Backtest(
-            name=f"bt-{i}", engine_type="daily_expert", status="completed",
+            name=f"bt-{i}", engine_type="daily_expert", status="completed", created_at=_stamp(),
             start_date=datetime(2020, 1, 1), end_date=datetime(2020, 6, 1),
             initial_capital=10000.0,
             trades=[{"symbol": "AAPL", "pnl": 1.0}] * 50,      # the blobs the query must not read
@@ -62,7 +78,7 @@ def _seed_optimizations(db, n):
     for i in range(n):
         o = StrategyOptimization(strategy_id=s.id, name=f"opt-{i}", status="completed",
                                  fitness_metric="sharpe", optimization_type="genetic",
-                                 all_results=[{"fitness": 1.0}] * 50)
+                                 created_at=_stamp(), all_results=[{"fitness": 1.0}] * 50)
         db.add(o)
         rows.append(o)
     db.commit()

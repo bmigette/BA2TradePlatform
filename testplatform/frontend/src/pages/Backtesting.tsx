@@ -488,7 +488,7 @@ const serializeConditionTree = (node: ConditionTree): Record<string, unknown> =>
   }
   const leaf = node as unknown as Record<string, unknown> & {
     optimizeEnabled?: boolean; valueMin?: number; valueMax?: number; valueStep?: number;
-    toggleOptimize?: boolean;
+    toggleOptimize?: boolean; mode?: string; modeOptimize?: boolean; modeChoices?: string[];
     confirmationBars?: number; confirmationBarsMin?: number; confirmationBarsMax?: number; confirmationBarsStep?: number;
   };
   return {
@@ -499,6 +499,9 @@ const serializeConditionTree = (node: ConditionTree): Record<string, unknown> =>
     value_max: leaf.valueMax,
     value_step: leaf.valueStep,
     toggle_optimize: leaf.toggleOptimize,
+    mode: leaf.mode,
+    mode_optimize: leaf.modeOptimize,
+    mode_choices: leaf.modeChoices,
     confirmation_bars: leaf.confirmationBars,
     confirmation_bars_min: leaf.confirmationBarsMin,
     confirmation_bars_max: leaf.confirmationBarsMax,
@@ -692,6 +695,9 @@ const normalizeLeaf = (raw: Record<string, unknown>): ConditionTree => {
     value: (raw.value as ConditionNode['value']) ?? (isFlag ? 1 : 0),
     optimizeEnabled: (pick('optimizeEnabled', 'optimize') as boolean) ?? false,
     toggleOptimize: pick('toggleOptimize', 'toggle_optimize') as boolean | undefined,
+    mode: pick('mode') as string | undefined,
+    modeOptimize: pick('modeOptimize', 'mode_optimize') as boolean | undefined,
+    modeChoices: pick('modeChoices', 'mode_choices') as string[] | undefined,
     valueMin: pick('valueMin', 'value_min') as number | undefined,
     valueMax: pick('valueMax', 'value_max') as number | undefined,
     valueStep: pick('valueStep', 'value_step') as number | undefined,

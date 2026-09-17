@@ -8,22 +8,26 @@ On import, existing settings are merged/overwritten by key.
 
 Usage:
     # Export all settings
-    python settings_export_import.py export settings_backup.json
+    python tools/settings_export_import.py export settings_backup.json
 
     # Export only app settings
-    python settings_export_import.py export settings_backup.json --only app
+    python tools/settings_export_import.py export settings_backup.json --only app
 
     # Export only accounts (with their settings)
-    python settings_export_import.py export settings_backup.json --only accounts
+    python tools/settings_export_import.py export settings_backup.json --only accounts
 
     # Export only experts (with their settings)
-    python settings_export_import.py export settings_backup.json --only experts
+    python tools/settings_export_import.py export settings_backup.json --only experts
 
     # Import all settings (merge/overwrite)
-    python settings_export_import.py import settings_backup.json
+    python tools/settings_export_import.py import settings_backup.json
 
     # Import with --dry-run to preview changes
-    python settings_export_import.py import settings_backup.json --dry-run
+    python tools/settings_export_import.py import settings_backup.json --dry-run
+
+    # Against a specific database.
+    # Default: the live platform's own DB_FILE, i.e. <BA2_HOME>/trade/db.sqlite.
+    python tools/settings_export_import.py export prod.json --db-file <path-to>/db.sqlite
 """
 
 import argparse
@@ -31,8 +35,10 @@ import json
 import sys
 import os
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add project root to path. dirname(dirname(...)) because this script lives in tools/:
+# its own directory is NOT the root, and ba2_trade_platform would not import from here.
+# Same shape as the other tools/ scripts (see tools/warm_options_history.py).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -376,14 +382,63 @@ def do_import(filepath: str, dry_run: bool = False):
 
 # ─── CLI ────────────────────────────────────────────────────────────
 
+def _resolve_db(db_file: Optional[str]) -> str:
+    """Point ba2_common at the LIVE trade database before anything opens a session.
+
+    Without this the script inherits ``ba2_common.config.DB_FILE``, which is deliberately
+    NOT the live path: the shared package must not bake in a trade- or test-specific
+    default, so it falls back to ``<BA2_HOME>/db.sqlite`` -- a file that has existed
+    empty since June. An export against it printed "App settings: 0, Accounts: 0,
+    Experts: 0" and wrote a valid-looking JSON of nothing. The live platform's own
+    config already resolves the right path (``ba2_trade_platform.config.DB_FILE``,
+    i.e. ``<BA2_HOME>/trade/db.sqlite``, DB_FILE env still winning), and every other
+    tool in this folder calls ``configure_db`` for exactly this reason.
+    """
+    from ba2_trade_platform import config as live_config
+    from ba2_common.core.db import configure_db
+
+    resolved = os.path.abspath(db_file or live_config.DB_FILE)
+    if not os.path.exists(resolved):
+        # A missing file would be CREATED empty by SQLModel, and the export would then
+        # report zeros for a database that never existed. Refuse instead.
+        print(f"Error: database file does not exist: {resolved}")
+        sys.exit(1)
+    configure_db(resolved)
+
+    # An existing file is not necessarily a platform database -- the old default was an
+    # empty one. Say so here rather than reporting zero rows for a real-looking export.
+    import sqlite3
+    with sqlite3.connect(f"file:{resolved}?mode=ro", uri=True) as probe:
+        tables = {row[0] for row in probe.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    missing = {"appsetting", "accountdefinition", "expertinstance"} - tables
+    if missing:
+        print(f"Error: {resolved} is not a trade-platform database "
+              f"(missing table(s): {', '.join(sorted(missing))})")
+        sys.exit(1)
+
+    print(f"Database: {resolved}")
+    return resolved
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export/Import BA2 Trade Platform settings"
     )
+    # Shared by both subcommands, so `export --db-file X out.json` works as well as
+    # `--db-file X export out.json`.
+    db_option = argparse.ArgumentParser(add_help=False)
+    db_option.add_argument(
+        "--db-file",
+        default=None,
+        help="Trade-platform database to read/write "
+             "(default: the live platform's own DB_FILE, <BA2_HOME>/trade/db.sqlite)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Export command
-    export_parser = subparsers.add_parser("export", help="Export settings to JSON")
+    export_parser = subparsers.add_parser("export", help="Export settings to JSON",
+                                          parents=[db_option])
     export_parser.add_argument("file", help="Output JSON file path")
     export_parser.add_argument(
         "--only",
@@ -392,7 +447,8 @@ def main():
     )
 
     # Import command
-    import_parser = subparsers.add_parser("import", help="Import settings from JSON")
+    import_parser = subparsers.add_parser("import", help="Import settings from JSON",
+                                          parents=[db_option])
     import_parser.add_argument("file", help="Input JSON file path")
     import_parser.add_argument(
         "--dry-run",
@@ -401,6 +457,7 @@ def main():
     )
 
     args = parser.parse_args()
+    _resolve_db(args.db_file)
 
     if args.command == "export":
         do_export(args.file, only=args.only)

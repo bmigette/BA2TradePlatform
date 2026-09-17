@@ -30,12 +30,18 @@ NOTHING CALLS ``sweep()`` AT RUNTIME. This tool is the only collector in the sys
     worker accumulates one full set (~48 B/bar; 5.6 GB for a 116M-bar band) per window it has
     ever run, and nothing removes the windows that are done with.
 
-THERE ARE THREE CONSUMERS, and "only collector" is a claim about the ROOTS you name on the
+THERE ARE FOUR CONSUMERS, and "only collector" is a claim about the ROOTS you name on the
 command line, not about the whole disk. ``--options-store`` and ``--ohlcv-provider`` cover the
 option reader and the bar cache; the screener metric store publishes one ``u_store.v<n>`` key
 beside its own directory and is reached with ``--metric-store <dir> --sweep`` (sweep only --
 that store is built by the first trial that reads it, and there is no universe or window to
-prewarm it from). A root you do not name is a root nothing collects.
+prewarm it from); the market-condition feature store publishes one
+``mc_<profile>_<digest>_v<LAYOUT_VERSION>`` key per prepared manifest under
+``<cache>/_derived/market_conditions`` and is BOTH warmed (``--market-conditions <digest>``) and
+swept (``--sweep``, always -- its root is derived from the cache root, not from a flag, because
+a stale mapping there is charged to every grid on the box). Its host-local ``_prepared`` markers
+are pruned with it: a marker whose mapping has been swept would keep a worker advertising
+readiness for arrays that are gone. A root you do not name is a root nothing collects.
 
 ``--sweep-max-age-days`` IS AN AGE-SINCE-LAST-USE RULE, not age-since-build. That only holds
 because ``shared_arrays._try_open`` touches the done-marker on every successful open. Without
@@ -87,12 +93,22 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: spelling and version -- sweeping one root with the other's rule would either spare garbage or
 #: delete a live set.
 _OPTIONS_KEY_VERSION = re.compile(r"\.v(\d+)$")
+# ``mc_<profile>_<manifest digest[:16]>_v<LAYOUT_VERSION>`` -- the market-condition mapping key
+# (ba2_common.core.market_condition_reader). A LAYOUT_VERSION bump moves every one of them, so
+# without this pattern the old keys would be orphans nothing ever collects.
+_MC_KEY_VERSION = re.compile(r"_v(\d+)$")
+# Directories under a derived root that are NOT array keys and must never be evicted as one.
+# Hardcoded because ``sweep_root`` runs before (and without) the ba2_common import, and CHECKED
+# against the owning constant once the bootstrap makes it importable -- see
+# ``sweep_market_conditions``. A rename there would otherwise leave this collector quietly
+# evicting the readiness markers as though they were an obsolete key.
+_NON_KEY_DIRNAMES = ("_prepared",)
 _OHLCV_KEY_VERSION = re.compile(r"_v(\d+)_[0-9a-f]+$")
 
 #: Every option whose value is a filesystem path. ``_parse`` absolutizes all of them in one pass
 #: because ``_bootstrap`` chdirs: a relative path typed at the repo root does not survive into
 #: the rest of the run. Add an option here the day you add the option.
-_PATH_ARGS = ("universe_file", "metric_store")
+_PATH_ARGS = ("universe_file", "metric_store", "cache_root")
 
 #: One symbol's outcome: (symbol, rows, status, seconds, error). status is one of
 #: built / opened / empty / error.
@@ -432,6 +448,12 @@ def sweep_root(label: str, derived_root: Path, version_re, current_version: int,
         try:
             if not key_dir.is_dir():
                 continue
+            if key_dir.name in _NON_KEY_DIRNAMES:
+                # Not a mapped-array key at all: the market-condition root keeps its host-local
+                # readiness markers in ``_prepared``. It survives the passes below by accident
+                # today (no signature dirs, no version match), which is exactly the kind of
+                # accident a collector should not depend on.
+                continue
             sigs = [d for d in key_dir.iterdir() if d.is_dir()]
         except OSError:
             continue
@@ -471,6 +493,54 @@ def sweep_root(label: str, derived_root: Path, version_re, current_version: int,
           f"{_human(reclaimed)} reclaimed, {len(skipped)} skipped (still mapped)")
     for name in skipped:
         print(f"    skipped {name} (a process on this host still maps a file inside it)")
+    return removed
+
+
+def sweep_market_conditions(cache_root: Optional[str], max_age_days: float,
+                            dry_run: bool) -> int:
+    """Sweep the market-condition mapping root and prune readiness markers left without arrays.
+
+    The marker prune is the half that is easy to forget and expensive to skip: a worker reports
+    the digests in ``_derived/market_conditions/_prepared`` as ready, so a marker that outlives
+    its mapping makes the master skip preparation and every worker process then rebuilds the
+    mapping under its own first trial -- the cold-start stampede this tool exists to prevent.
+    """
+    _bootstrap()
+    from ba2_common.core import shared_arrays as SA
+    from ba2_common.core.market_condition_reader import (
+        LAYOUT_VERSION,
+        PREPARED_DIRNAME,
+        REVOKED_MAX_AGE_DAYS,
+        prune_prepared_markers,
+        prune_revoked_markers,
+    )
+    from ba2_common.core.market_condition_store import MC_DIRNAME
+
+    if PREPARED_DIRNAME not in _NON_KEY_DIRNAMES:
+        # Not an assert: -O would strip it, and the failure it guards is silent (the marker
+        # directory evicted as an obsolete key, so every worker on the host forgets what it
+        # prepared).
+        raise RuntimeError(
+            f"market_condition_reader.PREPARED_DIRNAME is {PREPARED_DIRNAME!r} but this tool "
+            f"protects {_NON_KEY_DIRNAMES!r}; update _NON_KEY_DIRNAMES before sweeping")
+
+    root = cache_root
+    if not root:
+        from ba2_common.config import CACHE_FOLDER
+        root = CACHE_FOLDER
+    derived = Path(SA.derived_root_for(os.path.join(root, MC_DIRNAME)))
+    removed = sweep_root("market-conditions", derived, _MC_KEY_VERSION, LAYOUT_VERSION,
+                         max_age_days, dry_run)
+    if dry_run:
+        print("[market-conditions] DRY RUN: would prune readiness markers with no mapping, and "
+              "revoked markers older than 30d")
+        return removed
+    pruned = prune_prepared_markers(root)
+    print(f"[market-conditions] readiness markers pruned: {len(pruned)}"
+          + (f" ({', '.join(pruned)})" if pruned else ""))
+    revoked = prune_revoked_markers(root)
+    print(f"[market-conditions] revoked markers older than {REVOKED_MAX_AGE_DAYS:.0f}d "
+          f"removed: {len(revoked)}" + (f" ({', '.join(revoked)})" if revoked else ""))
     return removed
 
 
@@ -531,11 +601,20 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
                         "frame it parses (~7-8 GB for ThetaData TSLA).")
     p.add_argument("--sweep", action="store_true",
                    help="Also collect superseded signatures and obsolete KEYS (stale "
-                        "ARRAYS_VERSION, or unused for --sweep-max-age-days).")
+                        "ARRAYS_VERSION, or unused for --sweep-max-age-days). The "
+                        "market-condition mapping root is always included (it needs no flag: "
+                        "its location follows from the cache root), along with a prune of "
+                        "readiness markers whose mapping is gone.")
     p.add_argument("--metric-store",
                    help="Screener metric-store directory to SWEEP (it publishes one "
                         "'u_store.v<n>' key beside itself). Sweep-only: the store is built by "
                         "the first trial that reads it, not by this tool.")
+    p.add_argument("--market-conditions", metavar="DIGEST",
+                   help="ALSO prepare this host's market-condition mapping for the given manifest "
+                        "digest: verify every object by sha256, then build the mapped arrays "
+                        "(identical to 'tools/warm_market_conditions.py prepare-host --manifest'). "
+                        "Lets one prewarm pass ready everything a gated search touches.")
+    p.add_argument("--cache-root", help="Cache root for --market-conditions (default: CACHE_FOLDER).")
     p.add_argument("--sweep-max-age-days", type=float, default=14.0)
     p.add_argument("--dry-run", action="store_true", help="Print what would happen; touch nothing.")
     args = p.parse_args(argv)
@@ -543,9 +622,11 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     if args.options_store in ("sqlite",):
         p.error("--options-store sqlite has no parquet tree and therefore no derived array "
                 "cache; there is nothing to prewarm or sweep. Choose thetadata or tastytrade.")
-    if not (args.options_store or args.ohlcv_provider or args.metric_store):
+    if not (args.options_store or args.ohlcv_provider or args.metric_store
+            or args.market_conditions or args.sweep):
         p.error("nothing to do: pass --options-store and/or --ohlcv-provider "
-                "(or --metric-store with --sweep).")
+                "(or --metric-store with --sweep, or --market-conditions <digest>, or --sweep "
+                "on its own to collect the market-condition mapping root).")
     # EVERY PATH ARGUMENT IS ABSOLUTIZED HERE, AS A CLASS. ``_bootstrap`` chdirs into
     # testplatform/backend, so a relative path typed at the repo root -- which is what the
     # documented invocations use -- means something different to every line that runs after it.
@@ -559,8 +640,9 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
             setattr(args, _name, os.path.abspath(_value))
     # Read once, here: ``args.symbol_list`` is the only copy anything downstream uses.
     args.symbol_list = _symbols(args.universe_file, args.symbols)
-    if not args.symbol_list and not args.sweep:
-        p.error("no symbols: pass --universe-file or --symbols (or --sweep to only collect).")
+    if not args.symbol_list and not args.sweep and not args.market_conditions:
+        p.error("no symbols: pass --universe-file or --symbols (or --sweep to only collect, or "
+                "--market-conditions <digest> to only prepare a feature-store mapping).")
     if args.symbol_list and args.ohlcv_provider and not (args.start and args.end):
         p.error("--ohlcv-provider needs --start and --end (the window is part of the cache key).")
     if args.metric_store and not args.sweep:
@@ -592,6 +674,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     symbols = args.symbol_list          # resolved and read ONCE, in _parse, before the chdir
     errors = 0
+
+    if args.market_conditions:
+        # The SAME routine prepare-host runs (ba2_common.core.market_condition_reader.prepare_host):
+        # verify every referenced object and raw shard by sha256, then publish the mapped arrays.
+        # One command can therefore ready a host for a gated search -- option tree, bar cache and
+        # feature mapping -- instead of three, which is the difference between "the runbook says
+        # run three things" and "a worker is warm".
+        from ba2_common.core.market_condition_reader import prepare_host
+
+        root = args.cache_root
+        if not root:
+            from ba2_common.config import CACHE_FOLDER
+            root = CACHE_FOLDER
+        if args.dry_run:
+            print(f"[market-conditions] would verify + map manifest {args.market_conditions} "
+                  f"under {root}")
+        else:
+            report = prepare_host(root, args.market_conditions, jobs=args.jobs,
+                                  log=lambda m: print(f"[market-conditions] {m}"))
+            print(f"[market-conditions] {report.to_dict()}")
+            if not report.ok:
+                errors += 1
 
     options_root = None
     if args.options_store:
@@ -641,6 +745,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             label = "metric-store:" + Path(args.metric_store).name
             sweep_root(label, Path(SA.derived_root_for(args.metric_store)), _OPTIONS_KEY_VERSION,
                        METRIC_STORE_ARRAYS_VERSION, args.sweep_max_age_days, args.dry_run)
+
+        # THE FOURTH CONSUMER. Unlike the three above it needs no flag: its root follows from the
+        # cache root, every host that ever prepared a manifest has one, and an obsolete mapping
+        # there (a LAYOUT_VERSION bump, or a manifest no grid asks for any more) is dead weight
+        # charged to every run on the box.
+        sweep_market_conditions(args.cache_root, args.sweep_max_age_days, args.dry_run)
 
     return 1 if errors else 0
 

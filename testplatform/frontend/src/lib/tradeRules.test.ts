@@ -171,3 +171,53 @@ describe('tradeRulesToLegacyEditor', () => {
     });
   });
 });
+
+describe('countStrategyGenes with mode genes', () => {
+  // Mirrors strategy_param_space (design 2026-09-15 section 5): one `cond:<id>:mode` gene per
+  // mode leaf, and NO `:value` gene for a categorical one -- the backend refuses `optimize` on a
+  // leaf with no threshold range, so counting one would show a space no run can have. Both
+  // spellings are accepted because a payload may arrive snake_case from the API.
+  const marketLeaf = {
+    id: 'o_lc-market-adx', field: 'underlying_adx_14', comparison: '<', value: 25,
+    optimizeEnabled: true, valueMin: 10, valueMax: 40, valueStep: 5,
+    modeOptimize: true, modeChoices: ['off', 'below', 'above'],
+  };
+  const rule = (leaf: unknown): TradeRule => ({
+    id: 'o_lc-entry', name: 'O_LC-entry',
+    conditions: { id: 'o_lc-root', operator: 'AND', conditions: [leaf] },
+    actions: [{ action_type: 'buy_call' }],
+  } as never);
+
+  it('counts mode + threshold for a numeric market leaf', () => {
+    const { genes } = countStrategyGenes([rule(marketLeaf)], []);
+    expect(genes.map(g => g.name).sort())
+      .toEqual(['cond:o_lc-market-adx:mode', 'cond:o_lc-market-adx:value']);
+    expect(genes.find(g => g.name.endsWith(':mode'))!.choices).toBe(3);
+    expect(genes.find(g => g.name.endsWith(':value'))!.choices).toBe(7);
+  });
+
+  it('reads the snake_case spelling too', () => {
+    const snake = { id: 'o_lc-market-adx', optimize: true, value_min: 10, value_max: 40,
+                    value_step: 5, mode_optimize: true, mode_choices: ['off', 'below', 'above'] };
+    const { genes } = countStrategyGenes([rule(snake)], []);
+    expect(genes.map(g => g.name).sort())
+      .toEqual(['cond:o_lc-market-adx:mode', 'cond:o_lc-market-adx:value']);
+  });
+
+  it('counts only the mode gene for a categorical market leaf', () => {
+    const categorical = { id: 'o_lc-market-structure-state', field: 'structure_state',
+                          optimizeEnabled: true, modeOptimize: true,
+                          modeChoices: ['off', 'bull', 'bear'] };
+    const { genes, searchSpace } = countStrategyGenes([rule(categorical)], []);
+    expect(genes).toEqual([{ name: 'cond:o_lc-market-structure-state:mode', choices: 3 }]);
+    expect(searchSpace).toBe(3);
+  });
+
+  it('leaves a leaf without mode metadata exactly as it was counted before', () => {
+    const plain = { id: 'gate_confidence', optimizeEnabled: true, valueMin: 40, valueMax: 75,
+                    valueStep: 5, toggleOptimize: true };
+    const { genes } = countStrategyGenes([rule(plain)], []);
+    expect(genes.map(g => g.name).sort())
+      .toEqual(['cond:gate_confidence:enabled', 'cond:gate_confidence:value']);
+  });
+});

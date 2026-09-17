@@ -27,6 +27,61 @@ from ..components.InstrumentSelector import InstrumentSelector
 from ..components.ModelSelector import ModelSelectorInput
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ...core.rules_export_import import RulesExportImportUI
+from ba2_common.core.market_condition_rules import (
+    PROFILE_SETTING as MARKET_CONDITION_PROFILE_SETTING,
+    PROFILE_SETTING_OFF as MARKET_CONDITION_PROFILE_OFF,
+    assert_fields_served,
+    assert_no_market_fields,
+    market_condition_fields,
+    parse_profile_setting,
+)
+
+
+def _authorable_trigger_types() -> list:
+    """The trigger types the live rules editor offers, WITHOUT the market-condition fields.
+
+    Those fifteen field names are ``ExpertEventType`` values like any other, so the editor's
+    ``[t.value for t in ExpertEventType]`` silently started offering them. Hand-authoring one is
+    never the intended route: a market gate is searched by the optimizer and arrives through
+    ``tools/import_deploy_payload.py``, which checks it against the expert's
+    ``market_condition_profile`` and refuses an unserved leaf. Authored here, a gate would carry
+    no profile with it and simply never pass -- and on an OPEN-POSITIONS ruleset it would stop an
+    exit from firing, which ``market_condition_rules`` calls the worst outcome in this design.
+
+    Filtering the MENU is not the refusal (a deployed rule still has to be editable, and the
+    select still displays a value it was given); ``_refuse_market_gates_on_exit_ruleset`` is.
+    """
+    fields = market_condition_fields()
+    return [t.value for t in ExpertEventType if t.value not in fields]
+
+
+def _trigger_type_options(trigger_config) -> tuple:
+    """``(value, options)`` for one trigger row's Trigger Type select.
+
+    The value is the persisted ``event_type`` (legacy rows spell it ``type``), defaulting to
+    ``F_HAS_POSITION`` for a new row. The options are :func:`_authorable_trigger_types` PLUS that
+    value when the menu does not already carry it.
+
+    THE FAILURE THIS PREVENTS. NiceGUI refuses a select value outside its options
+    (``choice_element.py``: ``ValueError: Invalid value: ...``) and ``show_rule_dialog`` wraps
+    nothing, so an option list that dropped the market-condition fields made a DEPLOYED gated
+    rule raise mid-build and leave a half-rendered dialog -- the gate became impossible even to
+    LOOK at, on the live platform this feature exists to run on. Adding the one value back is not
+    a hole in the filter: the extra option appears only on the row that already holds it, so a
+    NEW trigger still cannot be given a market field, and the exit-slot refusal
+    (``_refuse_market_gates_on_exit_ruleset``) is untouched either way.
+    """
+    options = _authorable_trigger_types()
+    # The value expression is the ORIGINAL one, character for character: this fix is about the
+    # OPTIONS, and quietly changing which value a malformed row displays (an explicit
+    # ``event_type: None`` showed an empty select, and still does) would be a second change
+    # wearing the first one's justification.
+    value = (trigger_config.get('event_type',
+                                trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value))
+             if trigger_config else ExpertEventType.F_HAS_POSITION.value)
+    if value is not None and value not in options:
+        options = [*options, value]
+    return value, options
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
 
@@ -1273,6 +1328,7 @@ class ExpertSettingsTab:
                     {'name': 'expert', 'label': 'Expert Type', 'field': 'expert', 'sortable': True},
                     {'name': 'alias', 'label': 'Alias', 'field': 'alias', 'sortable': True},
                     {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},
+                    {'name': 'priority', 'label': 'Priority', 'field': 'priority', 'align': 'right', 'sortable': True},
                     {'name': 'virtual_equity_pct', 'label': 'Virtual Equity %', 'field': 'virtual_equity_pct', 'align': 'right'},
                     {'name': 'account_id', 'label': 'Account ID', 'field': 'account_id'},
                     {'name': 'enter_market_ruleset_name', 'label': 'Enter Market Ruleset', 'field': 'enter_market_ruleset_name'},
@@ -1280,9 +1336,24 @@ class ExpertSettingsTab:
                     {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                 ],
                 rows=self._get_all_expert_instances(),
-                row_key='id'
+                row_key='id',
+                selection='multiple'
             ).classes('w-full')
-            
+            self.experts_table.selected = []
+
+            with self.experts_table.add_slot('top-left'):
+                with ui.row().classes('items-center gap-4'):
+                    ui.button('Export Selected', icon='download',
+                              on_click=self._export_selected_experts) \
+                        .props('flat') \
+                        .bind_enabled_from(self.experts_table, 'selected',
+                                           backward=lambda val: bool(val))
+                    ui.button('Import Batch', icon='upload',
+                              on_click=self._show_batch_import_dialog).props('flat')
+                    ui.label().bind_text_from(self.experts_table, 'selected',
+                                              backward=lambda val: f'{len(val)} selected' if val else '') \
+                        .classes('text-sm text-grey-6')
+
             self.experts_table.add_slot('body-cell-enabled', '''
                 <q-td :props="props">
                     <q-icon :name="props.value ? 'check_circle' : 'cancel'" 
@@ -1374,6 +1445,118 @@ class ExpertSettingsTab:
         if self.experts_table:
             self.experts_table.rows = self._get_all_expert_instances()
             logger.debug('Expert instances table rows updated')
+
+    # ─── batch export / import ──────────────────────────────────────────────
+    #
+    # The per-expert Import/Export tab inside the edit dialog does ONE expert and records its
+    # rulesets by name only. These two do a whole selection and carry the rules themselves, so
+    # the file can rebuild them somewhere that has never seen them. Logic lives in
+    # core/expert_batch_export_import.py; this is only the screen.
+
+    def _export_selected_experts(self):
+        """Download one JSON file describing every ticked expert, rules included."""
+        from ...core.expert_batch_export_import import build_batch_export
+
+        selected = list(self.experts_table.selected or [])
+        if not selected:
+            ui.notify('Tick the experts to export first', type='warning')
+            return
+        try:
+            import json
+            from datetime import datetime
+
+            payload = build_batch_export([row['id'] for row in selected])
+            filename = f"expert_batch_{len(selected)}_{datetime.now():%Y%m%d_%H%M%S}.json"
+            ui.download(json.dumps(payload, indent=2).encode('utf-8'), filename=filename)
+            logger.info(f'Exported {len(selected)} expert(s) to {filename}')
+            ui.notify(f'Exporting {len(selected)} expert(s)', type='positive')
+        except Exception as e:
+            logger.error(f'Batch export failed: {e}', exc_info=True)
+            ui.notify(f'Export failed: {e}', type='negative')
+
+    def _show_batch_import_dialog(self):
+        """Upload a batch file, show what it WOULD do, and only then offer to apply it."""
+        from ...core.expert_batch_export_import import parse_batch_payload, plan_batch_import
+
+        dialog = ui.dialog().props('no-backdrop-dismiss')
+        with dialog, ui.card().classes('w-[52rem] max-w-full'):
+            ui.label('Import Experts').classes('text-h6')
+            ui.label('Upload a batch export. Nothing is written until you confirm.') \
+                .classes('text-body2 text-grey-6 mb-2')
+            preview = ui.column().classes('w-full')
+
+            async def handle_upload(e: UploadEventArguments):
+                preview.clear()
+                try:
+                    payload = parse_batch_payload(e.content.read())
+                    plan = plan_batch_import(payload)
+                except Exception as ex:
+                    logger.error(f'Could not read batch import file: {ex}', exc_info=True)
+                    with preview:
+                        ui.label(f'Could not read that file: {ex}').classes('text-negative')
+                    return
+                self._render_import_plan(preview, plan, dialog)
+
+            ui.upload(label='Batch export file (.json)', on_upload=handle_upload,
+                      max_files=1, auto_upload=True).props('accept=.json').classes('w-full')
+            with ui.row().classes('w-full justify-end mt-2'):
+                ui.button('Close', on_click=dialog.close).props('flat')
+        dialog.open()
+
+    def _render_import_plan(self, container, plan, dialog):
+        """The preview: one line per expert, then the button that actually writes."""
+        with container:
+            if not plan.experts:
+                ui.label('The file contains no experts.').classes('text-warning')
+                return
+
+            for planned in plan.experts:
+                colour = {'create': 'text-positive', 'update': 'text-primary',
+                          'skip': 'text-negative'}[planned.action]
+                with ui.row().classes('items-center gap-2 w-full'):
+                    ui.label(planned.action.upper()).classes(f'{colour} font-mono text-sm w-20')
+                    ui.label(f"{planned.existing_id if planned.existing_id else '--':>4}") \
+                        .classes('font-mono text-sm text-grey-6')
+                    ui.label(planned.alias).classes('text-sm')
+                    ui.label(f'({planned.expert_type})').classes('text-sm text-grey-6')
+                detail = []
+                if planned.problem:
+                    detail.append(planned.problem)
+                else:
+                    detail.append(f'{planned.settings_changed} setting(s) changed')
+                    if planned.ruleset_names:
+                        detail.append('rulesets: ' + ', '.join(planned.ruleset_names))
+                ui.label('   ' + ' | '.join(detail)).classes('text-xs text-grey-6 mb-1')
+
+            if plan.skips:
+                ui.label(f'{len(plan.skips)} entry(ies) will be skipped and left untouched.') \
+                    .classes('text-xs text-negative')
+            ui.label('Imported experts are never enabled: a new one is created disabled and an '
+                     'existing one keeps its current state.').classes('text-xs text-grey-6 mt-2')
+
+            def apply_now():
+                from ...core.expert_batch_export_import import apply_batch_import
+                try:
+                    messages = apply_batch_import(plan)
+                except Exception as e:
+                    logger.error(f'Batch import failed: {e}', exc_info=True)
+                    ui.notify(f'Import failed: {e}', type='negative')
+                    return
+                for m in messages:
+                    logger.info(f'Batch import: {m}')
+                failed = [m for m in messages if m.startswith(('FAILED', 'SKIP'))]
+                dialog.close()
+                self._update_table_rows()
+                self.experts_table.selected = []
+                if failed:
+                    ui.notify(f'Imported with {len(failed)} problem(s) - see the log',
+                              type='warning', timeout=8000)
+                else:
+                    ui.notify(f'Imported {plan.write_count} expert(s)', type='positive')
+
+            with ui.row().classes('w-full justify-end mt-2'):
+                ui.button(f'Apply {plan.write_count} change(s)', icon='save', on_click=apply_now) \
+                    .props(f'color=primary {"disable" if plan.write_count == 0 else ""}')
     
     def _get_available_expert_types(self):
         """Get list of available expert types."""
@@ -1571,6 +1754,12 @@ class ExpertSettingsTab:
 
                             with ui.row().classes('w-full items-center gap-4'):
                                 self.enabled_checkbox = ui.checkbox('Enabled', value=True)
+                                self.priority_input = ui.number(
+                                    'Priority', value=expert_instance.priority if is_edit else 1,
+                                    min=1, step=1, precision=0).props('dense').classes('w-28')
+                                self.priority_input.tooltip(
+                                    'Higher priority processes trades first for experts scheduled at the same '
+                                    'time on this account. Analysis can run in parallel. Default: 1.')
                                 self.virtual_equity_input = ui.input(
                                     label='Virtual Equity',
                                     value='100.0'
@@ -1925,7 +2114,27 @@ class ExpertSettingsTab:
                                 clearable=True
                             ).classes('w-full')
                             ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
-                    
+
+                            # MARKET-CONDITION PROFILE. Rendered HERE, with the rulesets, because
+                            # it is the data supply for the enter-market ruleset's market gates --
+                            # the two are one strategy and saving them apart is what
+                            # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
+                            # (MarketExpertInterface), and this dialog's Expert Settings tab
+                            # renders only expert-SPECIFIC definitions, so it needs its own widget.
+                            self.market_condition_profile_select = ui.select(
+                                options=self._market_condition_profile_options(),
+                                label='Market-Condition Profile',
+                                value=MARKET_CONDITION_PROFILE_OFF,
+                            ).classes('w-full')
+                            # A NEW instance has no stored value to read, so the widget IS the
+                            # operator's input and is saveable from the start. The edit branch
+                            # below clears this if it cannot read what is stored.
+                            self._market_condition_profile_loaded = True
+                            ui.label('Market-condition profile(s) the enter-market ruleset may gate on. '
+                                     'Empty serves no market-condition data: a ruleset with a market '
+                                     'gate then cannot enter, and saving that combination is refused.'
+                                     ).classes('text-body2 text-grey-7 ml-2')
+
                     # Instruments tab
                     with ui.tab_panel('Instruments').style('display: flex; flex-direction: column; flex: 1; overflow: hidden'):
                         # Instrument selection method dropdown at top of tab
@@ -1985,6 +2194,28 @@ class ExpertSettingsTab:
                     except Exception as e:
                         logger.debug(f'Could not load instrument selection method: {e}')
                         self.instrument_selection_method_select.value = 'static'
+
+                    # THE PROFILE IS READ IN ITS OWN TRY, and failing to read it is recorded.
+                    # Sharing the handler above meant a failure left the select on its
+                    # constructor default ('') while _save_expert_settings wrote that default
+                    # back unconditionally -- silently CLEARING a gated expert's profile (or
+                    # making it unsaveable with a refusal about leaves the operator never
+                    # touched), with one DEBUG line naming the wrong setting as the only trace.
+                    self._market_condition_profile_loaded = False
+                    try:
+                        from ...core.utils import get_expert_instance_from_id
+                        expert = get_expert_instance_from_id(expert_instance.id)
+                        if expert is None:
+                            raise ValueError(f'no live expert instance for id {expert_instance.id}')
+                        self._fill_market_condition_profile(
+                            expert.settings.get(MARKET_CONDITION_PROFILE_SETTING))
+                        self._market_condition_profile_loaded = True
+                    except Exception as e:
+                        logger.error(
+                            f'Could not read {MARKET_CONDITION_PROFILE_SETTING} for expert '
+                            f'instance {expert_instance.id}: {e}. The field is shown empty and '
+                            f'will NOT be saved by this dialog, so the stored value stands.',
+                            exc_info=True)
                 else:
                     if expert_types:
                         self.expert_select.value = expert_types[0]
@@ -3651,6 +3882,7 @@ class ExpertSettingsTab:
                             'user_description': self.user_description_textarea.value,
                             'enabled': self.enabled_checkbox.value,
                             'virtual_equity_pct': float(self.virtual_equity_input.value),
+                            'priority': self._validated_priority(),
                         }
                     
                     # Export expert settings if editing
@@ -3779,6 +4011,8 @@ class ExpertSettingsTab:
                         expert_instance.alias = general.get('alias', expert_instance.alias)
                         expert_instance.user_description = general.get('user_description', '')
                         expert_instance.enabled = False  # Always disabled for safety
+                        from ...core.ExpertPriority import priority_from_settings
+                        expert_instance.priority = priority_from_settings(general, current=expert_instance.priority)
                         expert_instance.virtual_equity_pct = float(general.get('virtual_equity_pct', general.get('virtual_equity', 100.0)))
                         
                         # Resolve and set rulesets by name
@@ -3817,7 +4051,9 @@ class ExpertSettingsTab:
                         logger.info(f'Creating new expert')
                         account_id = 1  # Default account
                         
+                        from ...core.ExpertPriority import priority_from_settings
                         new_expert_instance = ExpertInstance(
+                            priority=priority_from_settings(general),
                             account_id=account_id,
                             expert=expert_type,
                             alias=general.get('alias', 'Imported Expert'),
@@ -3949,6 +4185,111 @@ class ExpertSettingsTab:
         """Handle instrument selection changes."""
         logger.debug(f'Instrument selection changed: {len(selected_instruments)} instruments selected')
     
+    # ----------------------------------------------------------------- market-condition profile
+    def _market_condition_profile_options(self) -> list:
+        """The select's options: "" (off) plus every profile registered in THIS build.
+
+        Read from the interface's own settings definition rather than from the registry, so the
+        dialog and the setting can never offer different lists.
+        """
+        from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+
+        MarketExpertInterface._ensure_builtin_settings()
+        return list(MarketExpertInterface._builtin_settings[
+            MARKET_CONDITION_PROFILE_SETTING]["valid_values"])
+
+    def _fill_market_condition_profile(self, value) -> None:
+        """Show a stored value, INCLUDING one the select's options do not contain.
+
+        A comma list (two profiles at once) and a profile this build no longer registers are both
+        storable -- a deploy payload can carry either -- and a select that silently snapped them
+        back to "" would show an ungated expert whose rules are gated. So the value is added to
+        the options rather than dropped, and the save path writes back what is shown.
+        """
+        shown = '' if value is None else str(value)
+        options = self._market_condition_profile_options()
+        if shown not in options:
+            options = [*options, shown]
+            self.market_condition_profile_select.options = options
+        self.market_condition_profile_select.value = shown
+
+    def _market_condition_profile_value(self) -> str:
+        """The profile setting shown in the dialog (``''`` when the widget is absent)."""
+        if not hasattr(self, 'market_condition_profile_select'):
+            return MARKET_CONDITION_PROFILE_OFF
+        return str(self.market_condition_profile_select.value or MARKET_CONDITION_PROFILE_OFF)
+
+    def _market_condition_profile_savable(self) -> bool:
+        """Whether this dialog may WRITE the profile setting.
+
+        False when the widget is absent, and when editing an instance whose stored value could
+        not be read: the select then shows its constructor default, and saving that would clear
+        a gated expert's profile because of an unrelated read failure.
+        """
+        return (hasattr(self, 'market_condition_profile_select')
+                and getattr(self, '_market_condition_profile_loaded', False))
+
+    def _effective_market_condition_profile(self, expert_instance_id) -> str:
+        """The profile setting the SAVED instance will end up with.
+
+        The widget's value when this dialog is going to write it; otherwise the value already
+        stored, because the save is about to skip that write and leave the stored one standing.
+        If neither can be established the combination cannot be judged at all -- and a save that
+        repoints a ruleset must not proceed unjudged -- so this raises.
+        """
+        if self._market_condition_profile_savable():
+            return self._market_condition_profile_value()
+        try:
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if expert is None:
+                raise ValueError(f'no live expert instance for id {expert_instance_id}')
+            return str(expert.settings.get(MARKET_CONDITION_PROFILE_SETTING) or
+                       MARKET_CONDITION_PROFILE_OFF)
+        except Exception as e:
+            raise ValueError(
+                f'cannot verify the market-condition gates: '
+                f'{MARKET_CONDITION_PROFILE_SETTING} for expert instance '
+                f'{expert_instance_id} could not be read ({e}), and this save changes the '
+                f'ruleset assignment. Fix the instance (or reopen the dialog) before saving.') from e
+
+    def _refuse_unserved_market_gates(self, enter_market_ruleset_id, open_positions_ruleset_id,
+                                      expert_instance_id=None) -> None:
+        """Refuse a (ruleset, profile setting) combination the live platform cannot run.
+
+        THE FAILURE THIS PREVENTS. The gates and the data that feeds them are two halves of one
+        strategy held in two places: the enter-market RULESET carries the leaves, the expert
+        SETTING says which profile is served. Saved apart -- a gated ruleset assigned while the
+        profile is still empty, or a profile cleared under a gated ruleset -- the instance comes
+        up enabled, scheduled and correct-looking, and every gated entry is refused for ever:
+        indistinguishable from a strategy that found no setup.
+
+        BOTH DOORS, and they refuse different things. The open-positions slot may carry NO market
+        leaf at all, whatever the profile says: outside the entry decision pass the live resolver
+        has no context, so such a leaf reads ``no_context`` and its rule never fires -- an exit or
+        protective-order adjustment that silently stops happening. The deploy importer gets that
+        refusal from ``trade_rules_to_live_export``; this dialog can attach an EXISTING gated
+        ruleset to that slot without converting anything, so it needs its own.
+
+        Raises ValueError, which ``_save_expert``'s handler turns into a red notification naming
+        the leaf, the field and the setting.
+        """
+        from ba2_common.core.market_condition_live import market_condition_fields_in_ruleset
+
+        on_exit = market_condition_fields_in_ruleset(open_positions_ruleset_id)
+        assert_no_market_fields(on_exit, f"open-positions ruleset {open_positions_ruleset_id}")
+
+        used = market_condition_fields_in_ruleset(enter_market_ruleset_id)
+        if not used:
+            return          # no market leaf: any profile setting is fine, including empty
+        profiles = parse_profile_setting(
+            self._effective_market_condition_profile(expert_instance_id))
+        assert_fields_served(used, profiles,
+                             where=f"enter-market ruleset {enter_market_ruleset_id}")
+
+    def _validated_priority(self):
+        from ...core.ExpertPriority import validate_expert_priority
+        return validate_expert_priority(self.priority_input.value)
+
     def _save_expert(self, expert_instance=None):
         """Save the expert instance."""
         try:
@@ -3966,6 +4307,7 @@ class ExpertSettingsTab:
                 expert_instance.alias = self.alias_input.value or None
                 expert_instance.user_description = self.user_description_textarea.value or None
                 expert_instance.enabled = self.enabled_checkbox.value
+                expert_instance.priority = self._validated_priority()
                 expert_instance.virtual_equity_pct = float(self.virtual_equity_input.value)
                 expert_instance.account_id = account_id
                 
@@ -3998,6 +4340,14 @@ class ExpertSettingsTab:
                     selected_display_name = self.open_positions_ruleset_select.value
                     expert_instance.open_positions_ruleset_id = self.open_positions_ruleset_map.get(selected_display_name)
                 
+                # BEFORE the first write: a gated enter-market ruleset needs a profile setting
+                # that serves its leaves, and the open-positions slot may carry none at all.
+                # Nothing has been persisted yet (the assignments above are on a detached row),
+                # so a refusal here leaves the instance untouched.
+                self._refuse_unserved_market_gates(expert_instance.enter_market_ruleset_id,
+                                                   expert_instance.open_positions_ruleset_id,
+                                                   expert_instance.id)
+
                 update_instance(expert_instance)
                 logger.info(f"Updated expert instance: {expert_instance.id}")
                 
@@ -4030,11 +4380,16 @@ class ExpertSettingsTab:
                     selected_display_name = self.open_positions_ruleset_select.value
                     open_positions_id = self.open_positions_ruleset_map.get(selected_display_name)
                 
+                # Same refusal as the edit branch, before the row exists. No instance id: there
+                # is nothing stored to fall back to, and the widget is what will be written.
+                self._refuse_unserved_market_gates(enter_market_id, open_positions_id)
+
                 new_instance = ExpertInstance(
                     expert=self.expert_select.value,
                     alias=self.alias_input.value or None,
                     user_description=self.user_description_textarea.value or None,
                     enabled=self.enabled_checkbox.value,
+                    priority=self._validated_priority(),
                     virtual_equity_pct=float(self.virtual_equity_input.value),
                     account_id=account_id,
                     enter_market_ruleset_id=enter_market_id,
@@ -4217,6 +4572,18 @@ class ExpertSettingsTab:
                 analysis_window_hours = 24  # Default value
             expert.save_setting('smart_risk_manager_analysis_window_hours', analysis_window_hours, setting_type="int")
             logger.debug(f'Saved smart risk manager analysis window: {analysis_window_hours}h')
+
+        # Save the market-condition profile (a BUILTIN setting with its own widget next to the
+        # ruleset assignment; _refuse_unserved_market_gates has already checked this value
+        # against the ruleset's leaves, so nothing unserved reaches the DB).
+        #
+        # SKIPPED when the dialog could not READ the stored value: the widget then shows its
+        # constructor default (''), and writing that back would clear a gated expert's profile
+        # because of an unrelated read failure. Never write a default you did not read.
+        if self._market_condition_profile_savable():
+            profile_value = self._market_condition_profile_value()
+            expert.save_setting(MARKET_CONDITION_PROFILE_SETTING, profile_value, setting_type="str")
+            logger.debug(f'Saved {MARKET_CONDITION_PROFILE_SETTING}: {profile_value!r}')
 
         # Save instrument selection method (moved to main panel)
         if hasattr(self, 'instrument_selection_method_select'):
@@ -4404,6 +4771,7 @@ class ExpertSettingsTab:
                     enter_market_ruleset_id=source.enter_market_ruleset_id,
                     open_positions_ruleset_id=source.open_positions_ruleset_id,
                     user_description=source.user_description,
+                    priority=source.priority,
                     virtual_equity_pct=source.virtual_equity_pct
                 )
                 
@@ -4862,11 +5230,20 @@ class TradeSettingsTab:
         with self.triggers_container:
             with ui.card().classes('w-full p-2') as trigger_card:
                 with ui.row().classes('w-full items-center gap-2'):
-                    # Trigger type selection
+                    # Trigger type selection. A PERSISTED value that the menu no longer offers
+                    # is ADDED to the options rather than dropped -- same reasoning as
+                    # ``_fill_market_condition_profile``: NiceGUI raises ValueError on a value
+                    # outside its options, and ``show_rule_dialog`` has no handler, so filtering
+                    # the market-condition fields out of the menu made a DEPLOYED gated rule
+                    # impossible to open at all. Uninspectable and uneditable is worse than
+                    # un-authorable; the filter's job is only to stop a NEW gate being authored
+                    # here (they are searched by the optimizer and arrive by deploy import), and
+                    # that still holds because the extra option exists solely for this trigger.
+                    trigger_value, trigger_options = _trigger_type_options(trigger_config)
                     trigger_select = ui.select(
-                        options=[t.value for t in ExpertEventType],
+                        options=trigger_options,
                         label='Trigger Type',
-                        value=trigger_config.get('event_type', trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value)) if trigger_config else ExpertEventType.F_HAS_POSITION.value
+                        value=trigger_value
                     ).classes('flex-1').props('dense')
 
                     # Inline container for operator/value inputs
@@ -5660,6 +6037,32 @@ class TradeSettingsTab:
         
         self.rulesets_dialog.open()
     
+    def _refuse_market_gates_on_exit_ruleset(self, subtype_value, selected_rule_ids) -> None:
+        """Refuse a market-condition gate on a ruleset destined for the OPEN-POSITIONS slot.
+
+        THE WORST OUTCOME IN THIS DESIGN, in ``market_condition_rules``' own words. Outside the
+        entry decision pass the live resolver has no context, so the gate reads ``no_context``,
+        the rule NEVER FIRES, and the position's exit or protective-order adjustment silently
+        stops happening.
+
+        The deploy importer gets this refusal from ``trade_rules_to_live_export`` and the expert
+        dialog got it in Task 12 -- but the RULES editor is a third door: editing a ruleset that
+        is ALREADY assigned to the open-positions slot passes through neither. Checked before
+        anything is written, against the rules THIS save selects.
+        """
+        if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value:
+            return
+        fields = market_condition_fields()
+        used = []
+        for rule_id in selected_rule_ids:
+            rule = get_instance(EventAction, rule_id)
+            if rule is None:
+                continue
+            for key, trigger in (rule.triggers or {}).items():
+                if isinstance(trigger, dict) and trigger.get("event_type") in fields:
+                    used.append((f"{rule.name}.{key}", str(trigger["event_type"])))
+        assert_no_market_fields(used, f"ruleset {self.ruleset_name_input.value!r}")
+
     def _save_ruleset(self, ruleset=None):
         """Save the ruleset."""
         try:
@@ -5671,6 +6074,11 @@ class TradeSettingsTab:
                 if checkbox.value:
                     selected_rule_ids.append(rule_id)
             
+
+            # BEFORE any write: a market gate may not ride an open-positions ruleset.
+            self._refuse_market_gates_on_exit_ruleset(
+                self.ruleset_subtype_select.value, selected_rule_ids)
+
             if is_edit:
                 # Update existing ruleset
                 ruleset.name = self.ruleset_name_input.value

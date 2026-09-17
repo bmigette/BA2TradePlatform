@@ -11,8 +11,10 @@ up) and backs off; after repeated failures it gives up on that worker — gracef
 local-only.
 
 Pre-flight per selected worker: ``ensure_synced`` (auto-update+wait so it runs a compatible build,
-matched on app version) then ``push_cache`` (stream the missing cache as one tar). Workers
-that can't be reached/synced are dropped with a warning.
+matched on app version), then ``push_cache`` (stream the missing cache as one tar), then -- when
+the run pins a market-condition manifest -- ``prepare_market_conditions`` (the worker re-hashes
+every referenced object and builds its mapped arrays). Workers that can't be reached/synced, or
+that cannot prepare the pinned snapshot, are dropped with a warning.
 
 Re-admission: a worker that failed pre-flight (or gave up mid-run) is not excluded for the rest
 of the job. Every ``n_consumers`` individuals completed, one background re-check re-runs the same
@@ -30,7 +32,7 @@ from __future__ import annotations
 import logging
 import os as _os
 import threading
-from typing import Any, Callable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from app.services import worker_client
 from app.services.trial_broker import TrialBroker
@@ -125,6 +127,18 @@ def _target_pool_size(diag: Any, peak_mb: Any = None) -> Any:
     return max(1, int(budget // float(peak)))
 
 
+def _is_unprepared_snapshot(exc: Any) -> bool:
+    """Is this the worker's 409 "market-condition manifest not prepared" refusal?
+
+    Matched on the STATUS CODE, not the message: 409 is the one code the worker uses for "I am
+    structurally unable to run this trial", and unlike every other dispatch failure it cannot be
+    cured by retrying the same trial there."""
+    import httpx as _httpx
+
+    response = getattr(exc, "response", None)
+    return isinstance(exc, _httpx.HTTPStatusError) and getattr(response, "status_code", None) == 409
+
+
 def _is_backpressure(out: Any) -> bool:
     """True when a worker refused work because it is FULL or under its memory floor.
 
@@ -157,7 +171,8 @@ class DistributedEvaluator:
                  requeue_timeout: float = 12600.0,
                  pool_factory: Optional[Callable[[], Any]] = None,
                  max_remote_slots_per_worker: Optional[int] = None,
-                 governor: Optional[Any] = None):
+                 governor: Optional[Any] = None,
+                 market_condition_manifests: Optional[Dict[str, str]] = None):
         self.pool = submit_pool
         self._pool_factory = pool_factory
         # Dynamic worker allocation. When set, consumers above governor.current PARK
@@ -224,6 +239,13 @@ class DistributedEvaluator:
         self._remote_peak_child: dict = {}
         self._remote_settle_until: dict = {}
         self._secrets: dict = {}
+        # The run's pinned market-condition snapshot (design section 4.5). When set, pre-flight
+        # makes each worker VERIFY that digest and build its mapped arrays before it is allowed
+        # a single trial; a worker that cannot is excluded, loudly, rather than silently
+        # returning zero-trade results for every gated genome it is handed.
+        #: ``{profile: digest}`` -- one snapshot PER PROFILE (a manifest names the single
+        #: profile it was warmed for), empty when the run pins none.
+        self.market_condition_manifests: Dict[str, str] = dict(market_condition_manifests or {})
 
     # -- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
@@ -336,6 +358,8 @@ class DistributedEvaluator:
                 return False
             worker_client.push_cache(w, log=self.log)
             worker_client.push_secrets(w, secrets, log=self.log)
+            if self.market_condition_manifests and not self._prepare_market_conditions(w):
+                return False
             _health = self._health_with_retry(w)
             if _health is not None:
                 w["capacity"] = max(1, int(_health.get("capacity") or 1))
@@ -366,6 +390,36 @@ class DistributedEvaluator:
         except Exception as e:  # noqa: BLE001 — a bad worker must never abort the run
             self.log(f"worker {w.get('name')} pre-flight failed: {e}; excluding")
             return False
+
+    def _prepare_market_conditions(self, w: dict) -> bool:
+        """Verify + map this run's pinned manifest on *w*. False = the worker is UNREADY.
+
+        Loud on purpose. The failure this prevents is invisible by construction: a worker without
+        the snapshot observes no feature row, every gate is unknown, nothing enters, and the trial
+        returns an ordinary zero-trade fitness the GA happily ranks. Excluding the worker costs
+        capacity; including it costs the search its meaning.
+        """
+        # EVERY pinned snapshot, one per profile: a worker that can serve one profile's
+        # manifest and not the other's would run the gated genome with half its gates reading
+        # missing_session, which is a zero-trade fitness that looks like a verdict.
+        for profile, digest in self.market_condition_manifests.items():
+            try:
+                out = worker_client.prepare_market_conditions(w, digest, profile, log=self.log)
+            except Exception as e:  # noqa: BLE001 -- unreachable/too old/transport error = unready
+                self.log(f"worker {w.get('name')}: market-condition manifest {digest} ({profile}) "
+                         f"could NOT be prepared ({e!r}); EXCLUDING it from this run")
+                logger.error(f"worker {w.get('name')}: market-condition prepare failed: {e!r}")
+                return False
+            if not out.get("ok"):
+                self.log(f"worker {w.get('name')}: market-condition manifest {digest} ({profile}) "
+                         f"is NOT usable there ({out.get('errors')}); EXCLUDING it from this run")
+                logger.error(f"worker {w.get('name')}: market-condition prepare reported {out}")
+                return False
+            self.log(f"worker {w.get('name')}: market-condition manifest {digest} ({profile}) "
+                     f"verified ({out.get('objects_checked')} object(s)) and mapped "
+                     f"({'built' if out.get('built') else 'already warm'}, "
+                     f"{out.get('symbols')} symbol(s))")
+        return True
 
     def _health_with_retry(self, w: dict) -> Optional[dict]:
         """``worker_client.health(w)``, retried ``_HEALTH_PREFLIGHT_RETRIES`` times before giving
@@ -795,6 +849,16 @@ class DistributedEvaluator:
                 failures = 0
             except Exception as e:  # noqa: BLE001 — push the trial back so local/another worker runs it
                 self.broker.requeue_one(job["trial_id"])
+                if _is_unprepared_snapshot(e):
+                    # The worker REFUSED the trial: it has not prepared this run's
+                    # market-condition snapshot. Retrying cannot change that -- the digest is
+                    # pinned for the whole run -- so the worker goes down at once instead of
+                    # burning three trials' dispatch latency discovering the same answer.
+                    if self._mark_worker_down(w, "market-condition manifest not prepared"):
+                        self.log(f"worker {w['name']} REFUSED trials: this run's "
+                                 f"market-condition snapshot is not prepared there ({e}); "
+                                 f"excluding it. Re-admission re-runs the preparation.")
+                    return
                 failures += 1
                 self.log(f"worker {w['name']} run_trial failed ({failures}/{_MAX_WORKER_FAILURES}): {e}")
                 if failures >= _MAX_WORKER_FAILURES:
