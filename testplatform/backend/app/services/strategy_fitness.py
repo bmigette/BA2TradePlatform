@@ -142,6 +142,68 @@ _OCAR_DD_FLOOR = 5.0
 _OCAR_WIPED_OUT_DD_PCT = 100.0
 _OCAR_ALIASES = ("option_consistent_annual_return", "option_car", "ocar")
 
+# --- option_car_over_risk metric constants ------------------------------------------------------
+# THE OBJECTIVE THIS METRIC EXISTS FOR (operator, 2026-09-17): ~50% CAR on the option book, WITH
+# a real tolerance for a larger drawdown. ``option_consistent_annual_return`` above cannot express
+# that, and the first gated stage-1 job is the proof: its superlinear ``_option_dd_penalty``
+# ((20/max(dd,5))**2) pays up to 16x for a tiny drawdown, so a 10.6%-CAR / 8.9%-DD grinder scored
+# fitness 13.5 -- about 2.4x ABOVE a 50%-CAR / 30%-DD genome. The search converged on exactly those
+# grinders and was stopped. A search cannot find what its objective punishes.
+#
+# A SEPARATE METRIC, NOT A KNOB ON THE OLD ONE -- for the same reason ``option_car`` was separate
+# from ``consistent_annual_return``: a metric a run never NAMES is a code path that run cannot
+# reach, so every banked ``option_car`` score keeps its meaning and ``_option_dd_penalty`` /
+# ``_option_consistent_annual_return`` stay bit-identical (there are frozen tests).
+#
+# THE SHAPE.
+#
+#     score = base / sqrt(max(|dd|, FLOOR)) x high_dd_penalty(|dd|) x consistency x trade_gate
+#     high_dd_penalty(dd) = 1.0                       if dd <= TOLERANCE
+#                           (TOLERANCE / dd) ** 1.5   if dd >  TOLERANCE
+#
+# WHY sqrt AND NOT A RATIO. A pure ratio (base/dd, i.e. Calmar) is scale-free: 25%@10% and
+# 50%@20% and 100%@40% all tie, so the metric is indifferent to how much return is actually on
+# the table and the GA has no reason to climb toward 50%. Dividing by sqrt(dd) keeps risk priced
+# but makes RETURN the stronger term: doubling return multiplies the score by 2, doubling the
+# risk that bought it only divides it by 1.41. That is what puts the 25%@10% "safe-moderate trap"
+# BELOW the 50%@30% target (7.91 vs 9.13) where a ratio metric would have put it well above.
+#
+# THE APPROVED RANKING (simulated and signed off 2026-09-17; pinned in
+# tests/test_strategy_fitness_car_over_risk.py). CAR%, DD% -> score:
+#
+#     50/12 -> 14.43   80/40 -> 12.65   100/50 -> 10.12   50/30 -> 9.13 (TARGET)   50/40 -> 7.91
+#     25/10 ->  7.91   120/70 -> 6.20   20/15 ->  5.16   10.6/8.9 -> 3.35        5/2  -> 1.58
+#
+# The four properties the operator asked for, and which the tests assert as ORDERINGS rather than
+# numbers: 80%@40% ranks ABOVE the 50%@30% target (more return for a drawdown still inside the
+# tolerance is "interesting", not a disqualification); 120%@70% ranks BELOW it (reckless is
+# DEMOTED, not banned -- the GA still gets a gradient out of that region); 25%@10% does NOT
+# outrank the target; and today's 10.6/8.9 stage-1 winner lands near LAST.
+_OCR_DD_FLOOR = 10.0
+# % -- below this a smaller drawdown buys NO further reward. It is what kills the micro-grinder:
+# without it a 5%@2% genome scores 3.54, ABOVE the 10.6%@8.9% row (3.35), and since 1/sqrt(dd) is
+# unbounded as dd -> 0 a 5%@0.5% one would score 7.07 -- ahead of 20%@15% and of every other real
+# strategy in the table below 25%@10%. Set at 10 because that is the bottom of where real option
+# genomes live (the stopped job's winner sat at 8.9%), so
+# anything under it is thinness rather than skill. Same role as _OCAR_DD_FLOOR, moved up: under a
+# sqrt the CAR-family 5% rail would still pay 1.41x over this one for a drawdown nobody can trust.
+_OCR_DD_TOLERANCE = 40.0
+# % -- full credit up to here, penalised beyond. This number IS the operator's stated tolerance:
+# "80% CAR at 40% DD is interesting" sits exactly at the knee, scoring full credit and ranking
+# above the 50%@30% target. Raising it would make 70-80% drawdowns free; lowering it would start
+# charging the aggressive-but-wanted 100%@50% region twice (once through sqrt, once here).
+_OCR_DD_EXPONENT = 1.5
+# The high-DD penalty exponent. > 1 so that past the tolerance the penalty decays FASTER than the
+# sqrt term grows the score, which is what makes 120%@70% (6.20) rank below 50%@30% (9.13) even
+# though it earns 2.4x the return. 1.5 rather than 2.0: at 2.0 the 100%@50% "aggressive" genome
+# would fall to 9.05, below the 50%@30% target, and the operator wants that region ranked above
+# it, not below.
+_OCR_ALIASES = ("option_car_over_risk",)
+# ONE name on purpose, exactly as for ``option_convex``. ``option_car``'s short aliases exist for
+# history; a metric landing today gets a single unambiguous spelling, because a short alias
+# ("ocr") next to an existing "ocar" is a one-character typo away from silently ranking a grid
+# under the metric this one was written to replace.
+
 # --- option_convex metric constants (CONFIG, not genes) ----------------------------------------
 # The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
 # §3). A book of cheap far-OTM medium/long-dated calls across many names: most tickets expire
@@ -279,6 +341,7 @@ _CATALOG_META = {
 _MAX_DRAWDOWN_KEY = "max_drawdown"
 _CAR_KEY = _CAR_ALIASES[0]  # "consistent_annual_return"
 _OCAR_KEY = _OCAR_ALIASES[0]  # "option_consistent_annual_return"
+_OCR_KEY = _OCR_ALIASES[0]  # "option_car_over_risk"
 _CONVEX_KEY = _CONVEX_ALIASES[0]  # "option_convex"
 
 _SPECIAL_META = {
@@ -306,6 +369,21 @@ _SPECIAL_META = {
                        "((20/dd)^2 instead of 20/dd), so doubling position size at double the "
                        "drawdown scores strictly WORSE instead of scoring the same. For OPTION "
                        "grids: scores are NOT comparable with the plain metric.",
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": True,
+        "uses_adjusted_under_caps": True,
+    },
+    _OCR_KEY: {
+        "label": "CAR over Risk (Option)",
+        "description": "The ~50%/yr option objective WITH a drawdown tolerance: annualized "
+                       "return / sqrt(max(dd,10%)), full credit up to a 40% drawdown and a "
+                       "(40/dd)^1.5 penalty beyond it, x consistency x trade gate. Ranks a "
+                       "50%/30% genome ABOVE a 25%/10% one -- which "
+                       "option_consistent_annual_return ranks the other way round, so scores "
+                       "are NOT comparable with it, with the plain metric, or with "
+                       "option_convex.",
+        # Same wrappers as the CAR family: the trade gate replaces the trade-scale multiplier,
+        # and win rate is no part of this formula either, so the optional factor still applies.
         "supports_trade_scale": False,
         "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
@@ -362,9 +440,10 @@ def _build_metrics_catalog() -> list:
         _MAX_DRAWDOWN_KEY: ["drawdown", "max_dd"],
         _CAR_KEY: sorted(a for a in _CAR_ALIASES if a != _CAR_KEY),
         _OCAR_KEY: sorted(a for a in _OCAR_ALIASES if a != _OCAR_KEY),
+        _OCR_KEY: sorted(a for a in _OCR_ALIASES if a != _OCR_KEY),
         _CONVEX_KEY: sorted(a for a in _CONVEX_ALIASES if a != _CONVEX_KEY),
     }
-    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _CONVEX_KEY):
+    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _CONVEX_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -394,7 +473,7 @@ def assert_catalog_complete() -> None:
     """
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
     expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
-                | set(_OCAR_ALIASES) | set(_CONVEX_ALIASES))
+                | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_CONVEX_ALIASES))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -455,6 +534,18 @@ def compute_fitness(fitness_metric: str, results: dict,
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
 
+    if metric in _OCR_ALIASES:
+        # OPTION-ONLY, and a DIFFERENT OBJECTIVE from the branch above rather than a rescaling
+        # of it (see _option_car_over_risk): ~50%/yr with a drawdown tolerance. Same three
+        # wrappers as CAR and option_car -- win-rate factor, spread stress, robustness -- so
+        # --robust-fitness / --stress-spread behave identically whichever option metric a grid
+        # names; only the drawdown factor inside differs. Reached ONLY by an explicit
+        # "option_car_over_risk", which is what keeps every running grid out of this path.
+        _fit = _apply_win_rate_factor(_option_car_over_risk(results), results)
+        return _maybe_robust(
+            _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
+            fitness_metric, results, stress_spread_bps, robust)
+
     if metric in _CONVEX_ALIASES:
         # CONVEX-HARVEST-ONLY. Reached only by an explicit ``option_convex``, which is what
         # keeps every running equity and option_car grid out of this code path entirely (no
@@ -485,7 +576,7 @@ def compute_fitness(fitness_metric: str, results: dict,
     if key is None:
         raise ValueError(
             f"Unknown fitness_metric: {fitness_metric!r}. "
-            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES) | set(_CONVEX_ALIASES))}"
+            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_CONVEX_ALIASES))}"
         )
     # Profit-cap-aware: when EITHER cap was applied (per-trade basis cap ``profit_cap_pct`` or
     # portfolio-share cap ``profit_share_cap_pct``), the GA must rank on the ADJUSTED return-based
@@ -1232,6 +1323,155 @@ def _option_consistent_annual_return(results: dict) -> float:
         )
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
     return base * dd_penalty * consistency * trade_gate
+
+
+
+
+# ---------------------------------------------------------------------------
+# option_car_over_risk: the ~50%-CAR-with-drawdown-tolerance metric
+# ---------------------------------------------------------------------------
+def _option_car_over_risk_dd_factor(dd: float) -> float:
+    """The drawdown factor: ``1/sqrt(max(|dd|, FLOOR))`` times the high-drawdown penalty.
+
+    Reads the MAGNITUDE (``max_drawdown`` is recorded negative by ``results._drawdown_curve``,
+    but a positive spelling must score identically rather than inverting the shape), exactly as
+    ``_option_dd_penalty`` and ``_convex_dd_factor`` do.
+
+    Flat at ``1/sqrt(10) = 0.3162`` for every drawdown at or below the 10% floor, strictly
+    decreasing above it, exactly ``1/sqrt(40) = 0.1581`` at the 40% tolerance (the penalty is
+    1.0 there, so the factor is continuous through the knee), and decaying faster than
+    ``1/sqrt(dd)`` beyond it -- 0.1005 at 50%, 0.0516 at 70%.
+
+    Lives as its own function so the SHAPE is testable without constructing a results dict.
+    """
+    _dd = max(abs(float(dd)), _OCR_DD_FLOOR)
+    factor = 1.0 / math.sqrt(_dd)
+    if _dd > _OCR_DD_TOLERANCE:
+        factor *= (_OCR_DD_TOLERANCE / _dd) ** _OCR_DD_EXPONENT
+    return factor
+
+
+def _option_car_over_risk(results: dict) -> float:
+    """OPTION-ONLY goal metric: ``base / sqrt(dd) x high_dd_penalty x consistency x trade_gate``.
+
+    THE OBJECTIVE. ~50% annualised return on the option book, with a genuine tolerance for a
+    larger drawdown (operator, 2026-09-17). See the ``_OCR_*`` constants above for the measured
+    reason ``option_consistent_annual_return`` could not express it: its squared penalty pays up
+    to 16x for a tiny drawdown, which ranked a 10.6%-CAR / 8.9%-DD grinder ~2.4x ABOVE a
+    50%-CAR / 30%-DD genome, and the first gated stage-1 job duly converged on the grinders.
+
+    THE PROPERTIES THIS METRIC IS FOR, each pinned by its own test in
+    ``tests/test_strategy_fitness_car_over_risk.py``:
+
+      * 80% CAR at 40% DD ranks ABOVE the 50%/30% target (12.65 vs 9.13). More return bought at
+        a drawdown still inside the tolerance is "interesting", not a disqualification.
+      * 120% CAR at 70% DD ranks BELOW the target (6.20). Reckless is DEMOTED, not banned: the
+        region still scores, so the GA has a gradient leading out of it rather than a cliff.
+      * 25% CAR at 10% DD does NOT outrank the target (7.91 vs 9.13). A pure ratio metric would
+        have tied them -- Calmar is scale-free and therefore indifferent to how much return is
+        on the table. The ``sqrt`` is what makes return the stronger term and breaks that tie
+        in favour of the genome that actually earns 50%.
+      * The stopped job's winner (10.6% CAR at 8.9% DD) lands near LAST (3.35).
+
+    EVERYTHING ELSE IS ``_option_consistent_annual_return``'s BEHAVIOUR, TERM FOR TERM, IN THE
+    SAME ORDER: the read-and-disqualify drawdown guard FIRST (absent/None/non-numeric/non-finite
+    raise; >= 100% returns WIPED_OUT_SENTINEL), the profit-cap-aware base switch, the
+    STRUCTURES-per-year trade gate with its hard floor and per-run cadence overrides, the
+    unfactored negative-base early return, and the loud missing-equity_curve guard before the
+    consistency factor. Only the drawdown factor differs.
+
+    IT IS A COPY, NOT A REFACTOR, ON PURPOSE -- the same decision, for the same reason, as the
+    copy it was made from: factoring the shared body out would edit
+    ``_option_consistent_annual_return`` and ``_consistent_annual_return``, both of which are
+    frozen bit-for-bit by tests (``test_strategy_fitness_option_car.py``,
+    ``test_strategy_fitness_equity_frozen.py``) because grids ranked under them are banked.
+    Fold all three together when nothing is running. AND HERE IS WHAT THAT COSTS, so the next
+    person can price it: the previous copy silently missed the ``avg_trades_per_year`` ->
+    ``_trades_per_year`` (legs -> STRUCTURES) fix for weeks. This copy takes
+    ``_trades_per_year`` from the start, and ``test_strategy_fitness_structure_count.py``'s
+    drift guard refuses any read of ``avg_trades_per_year`` outside that helper.
+
+    Scores from this metric are NOT comparable with ``consistent_annual_return`` scores, NOT
+    comparable with ``option_consistent_annual_return`` scores, and NOT comparable with
+    ``option_convex`` scores. It is a different objective, not a rescaling of the same one: it
+    ranks a 50%/30% genome above a 25%/10% one, which the option CAR metric ranks the other way.
+    Never put two of these side by side in one table.
+    """
+    # --- drawdown: READ AND DISQUALIFY FIRST, LITERALLY FIRST ---------------------------------
+    # Same placement and the same reasoning as _option_consistent_annual_return (F9(a),
+    # 2026-08-30): ahead of `base` and ahead of the trade gate, so the invariant "a measured
+    # wipeout ranks WORST of every disqualification this metric can produce"
+    # (WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0) holds unconditionally
+    # rather than by scope. A losing wiped genome must not escape through `base <= 0`, and a
+    # thin-trading wiped genome must not escape through LOW_TRADE_SENTINEL (-1e8), which is
+    # numerically ABOVE WIPED_OUT_SENTINEL (-2e9).
+    dd_raw = results.get("max_drawdown")
+    if dd_raw is None:
+        raise ValueError(
+            "option_car_over_risk requires results['max_drawdown'] and it is "
+            "absent or None. An unmeasurable drawdown is not a zero drawdown: defaulting it "
+            "would hand this genome the largest multiplier the metric can produce."
+        )
+    try:
+        dd = abs(float(dd_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"option_car_over_risk: max_drawdown is not numeric: {dd_raw!r}"
+        ) from e
+    if not math.isfinite(dd):
+        raise ValueError(
+            f"option_car_over_risk: max_drawdown is not finite ({dd_raw!r}). The "
+            f"run produced nonsense and is rejected rather than scored as risk-free."
+        )
+    if dd >= _OCAR_WIPED_OUT_DD_PCT:
+        # Total loss is terminal, and it is terminal HERE more than anywhere: this metric
+        # deliberately tolerates large drawdowns, so without the cutoff a +3000% genome at
+        # -100% would still score positively and keep breeding. Shares _OCAR_WIPED_OUT_DD_PCT
+        # because "the account is gone" is a property of the run, not of the objective.
+        return WIPED_OUT_SENTINEL
+
+    # --- base: (adjusted) annualized return, %/yr ---------------------------------------------
+    if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
+        base = results.get("adjusted_annualized_return")
+        if base is None:
+            base = results.get("annualized_return")
+    else:
+        base = results.get("annualized_return")
+    if base is None or (isinstance(base, float) and (math.isnan(base) or math.isinf(base))):
+        return ZERO_TRADE_SENTINEL
+    base = float(base)
+
+    # --- trade gate: proportional ramp, hard floor below it -----------------------------------
+    # STRUCTURES per year, not legs (see _trades_per_year). An iron condor is ONE bet and four
+    # rows; reading the published leg rate here would inflate essentially every genome in a
+    # pure-option population, which is the exact defect the previous copy shipped with.
+    tpy = _trades_per_year(results)
+    if tpy is None:
+        return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
+    _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
+    _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
+    if float(tpy) < _floor:
+        return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
+    trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
+
+    if base <= 0:
+        return base  # unfactored: penalty factors on a negative would flip its sign
+
+    dd_factor = _option_car_over_risk_dd_factor(dd)
+
+    # --- yearly consistency -------------------------------------------------------------------
+    # Same loud guard as CAR and option_car: re-scoring a stored Backtest whose equity_curve
+    # column was not restored silently inflates this factor to 1.0 (measured 4x overstatement).
+    if results.get("trades") and "equity_curve" not in results:
+        raise ValueError(
+            "option_car_over_risk requires results['equity_curve'] to measure the "
+            "consistency factor, and the key is absent. If you are re-scoring a stored "
+            "Backtest, note that `results` excludes the curve -- restore it from the "
+            "equity_curve column first, or the score is silently inflated (~4x when the run "
+            "has an uneven year)."
+        )
+    consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
+    return base * dd_factor * consistency * trade_gate
 
 
 # ---------------------------------------------------------------------------
