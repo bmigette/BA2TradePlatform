@@ -3239,6 +3239,16 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     other way round. Switching the default would silently re-rank every option grid resumed
     under it. A run that wants it names it, and its scores never share a table with an
     ``option_car`` score.
+
+    ``option_car_target`` (2026-09-17, registered in ``strategy_fitness.py``) is the THIRD
+    option objective and, for the same reason, NOT a default for any kind either. It is the
+    operator's stated target stated as a target: CAR > 35%/yr AND CAR > drawdown, as two soft
+    ramps (``min(CAR/35,1) x min(CAR/DD,1)``) past which neither term pays anything, plus the
+    same ``(40/dd)^1.5`` high-drawdown penalty. It is the only one of the three that prices the
+    CAR/DD RATIO at all -- ``option_car_over_risk`` divides by sqrt(dd) and therefore scores a
+    40%/40% genome and a 20%/10% one identically. Its scores are not comparable with either
+    other option metric's, so a run that changes to it needs its own ``--name-suffix``: job
+    names are the resume key.
     """
     if cli_fitness:
         return cli_fitness
@@ -6921,7 +6931,17 @@ def main(argv: "list | None" = None) -> int:
                          "(40/dd)^1.5 penalty, x consistency x the same trade gate) -- never a "
                          "default, name it explicitly; it ranks a 50%%/30%% genome ABOVE a "
                          "25%%/10%% one, which 'option_consistent_annual_return' ranks the "
-                         "other way, so their scores are NOT comparable. 'option_convex' is the "
+                         "other way, so their scores are NOT comparable. 'option_car_target' is "
+                         "the THIRD option objective, the operator's targets stated as targets: "
+                         "CAR > 35%%/yr AND CAR > drawdown, as two SOFT ramps "
+                         "(x min(CAR/35,1) x min((CAR/DD)/1,1), neither paying anything above "
+                         "its target so over-safety earns nothing) plus the same (40/dd)^1.5 "
+                         "penalty past 40%% dd, x consistency x the same trade gate. It is the "
+                         "only one of the three that prices the CAR/DD RATIO -- "
+                         "'option_car_over_risk' divides by sqrt(dd) and scores a 40%%/40%% "
+                         "genome and a 20%%/10%% one identically. Never a default, name it "
+                         "explicitly, and its scores are NOT comparable with either other "
+                         "option metric's. 'option_convex' is the "
                          "CONVEX-HARVEST metric (end-of-window total return, drawdown free "
                          "below 50%%, breadth floor >=30 tickets/yr AND >=20 underlyings, hit "
                          "rate/concentration recorded not scored) -- never a default, name it "
@@ -7160,8 +7180,11 @@ def main(argv: "list | None" = None) -> int:
                          "(OS1-OS4/O_*) AND the equity-entry overlays O_CC/O_PP, "
                          "'calmar_ratio' for O_STK and stock kinds (the historical batch "
                          "default). Pass 'option_car_over_risk' to rank the whole batch on the "
-                         "~50%%/yr-with-drawdown-tolerance objective instead (never a default; "
-                         "its scores are not comparable with the resolved one's). See optimize "
+                         "~50%%/yr-with-drawdown-tolerance objective instead, or "
+                         "'option_car_target' to rank it on the CAR > 35%%/yr AND CAR > "
+                         "drawdown objective -- the only one of the three that prices the "
+                         "CAR/DD ratio (never a default; no two of these three metrics' scores "
+                         "are comparable with each other or with the resolved one's). See optimize "
                          "--fitness for what those metrics mean; matches _resolve_fitness / "
                          "_OPTION_CAR_STRATEGIES.")
     ob.add_argument("--generations", type=int, default=8)

@@ -204,6 +204,72 @@ _OCR_ALIASES = ("option_car_over_risk",)
 # ("ocr") next to an existing "ocar" is a one-character typo away from silently ranking a grid
 # under the metric this one was written to replace.
 
+# --- option_car_target metric constants ---------------------------------------------------------
+# THE OBJECTIVE THIS METRIC EXISTS FOR (operator, 2026-09-17, stated precisely after watching the
+# first two try): "a fitness calibrated for CAR > 35 and CAR > DD". Two TARGETS, not a risk
+# preference -- and neither existing option metric aims at them:
+#
+#   * ``option_consistent_annual_return`` pays up to 16x for a tiny drawdown ((20/max(dd,5))**2)
+#     and converged a real grid onto 10.6%-CAR / 8.9%-DD grinders. It rewards the wrong thing.
+#   * ``option_car_over_risk`` divides by sqrt(dd), which is scale-FREE in the ratio: a
+#     40%-CAR / 40%-DD genome (CAR/DD = 1.00, the target met exactly) and a 20%-CAR / 10%-DD one
+#     (ratio 2.00, half the return) both score 6.32. It cannot express "CAR > DD" at all, and the
+#     live run's whole elite sits at ratios 0.18-0.53 where it hands out no signal about the
+#     ratio whatsoever.
+#
+# A THIRD METRIC, NOT A KNOB ON EITHER -- the same decision, for the same reason, as the two
+# before it: a metric a run never NAMES is a code path that run cannot reach, so every banked
+# score under the other two keeps its meaning and both of their implementations stay bit-for-bit
+# frozen (there are frozen tests over each).
+#
+# THE SHAPE.
+#
+#     score = base
+#           x min(base / CAR_TARGET, 1.0)          # ramp to the 35% CAR target, neutral above
+#           x min((base / dd) / MAR_TARGET, 1.0)   # ramp to CAR == DD, neutral above
+#           x high_dd_penalty(dd)                  # 1.0 to 40% dd, then (40/dd)**1.5
+#           x consistency x trade_gate
+#
+# BOTH RAMPS ARE SOFT, DELIBERATELY. A hard gate ("score 0 unless CAR >= 35 and CAR >= DD") would
+# zero EVERY genome in a fresh population -- nothing in the live run meets either target today --
+# leaving the GA a flat landscape with no gradient to climb and reducing the search to a random
+# walk until something stumbles over both thresholds at once. The linear ramps mean a genome at
+# half the CAR target still scores half-credit, so "closer to the target" is always measurably
+# better than "further from it", which is the only thing that makes the target reachable.
+#
+# NEITHER RAMP PAYS ABOVE ITS TARGET (``min(..., 1.0)``): this metric asks for 35%+ CAR at
+# CAR >= DD and is INDIFFERENT to more. Over-safety earns nothing -- that is what puts a
+# 25%-CAR / 10%-DD genome (ratio 2.5, both terms "better than asked" on the ratio but only 71% of
+# the CAR target) BELOW a 35/35 one sitting exactly on both thresholds.
+_OCT_CAR_TARGET = 35.0
+# % annualised -- the operator's stated CAR target, and the denominator of the first ramp. What it
+# buys: a genome earning less than 35%/yr is scaled by exactly the fraction of the target it
+# reached, so CAR is priced twice below the target (once as ``base``, once through the ramp) and
+# only once above it. That quadratic-below/linear-above shape is what makes the search climb
+# toward 35 rather than settle for a comfortable 15.
+_OCT_MAR_TARGET = 1.0
+# CAR/DD -- "CAR > DD", stated as a ratio. What it buys: the term the other two option metrics
+# cannot express. At CAR == DD it is satisfied (1.0) and stops paying, so the metric never rewards
+# buying the ratio with less return. Below it the score is scaled by the ratio itself, which is
+# what demotes the live run's elite (ratios 0.18-0.53) without zeroing them.
+_OCT_DD_TOLERANCE = 40.0
+# % -- the knee of the high-drawdown penalty, and LOAD-BEARING, not cosmetic. It is the ONLY term
+# that still discriminates on drawdown once the ratio term is satisfied: 50%-CAR / 30%-DD and
+# 50%-CAR / 45%-DD both clear both targets, and without a knee BELOW 45 they would tie at 50.00.
+# At 40 the second is charged (40/45)**1.5 = 0.838 and scores 41.90, so the safer genome wins.
+# Set at 40 rather than 50 for exactly that reason (a 50 knee would tie them), and the same value
+# as ``_OCR_DD_TOLERANCE`` because "drawdown past 40% is no longer ordinary risk" is a property of
+# the option book, not of the objective -- the two metrics agreeing here is deliberate.
+_OCT_DD_EXPONENT = 1.5
+# The high-DD penalty exponent, same as the other metric's. > 1 so that past the knee the penalty
+# decays faster than ``base`` can grow: it is what crushes a 100%-CAR / 90%-DD genome to 29.63
+# (below the 50/30 target's 50.00) even though its CAR/DD ratio of 1.11 passes the ratio term
+# outright. A ratio test alone would rank that genome as a full success.
+_OCT_ALIASES = ("option_car_target",)
+# ONE name, same reasoning as ``option_car_over_risk`` above: there are now three option metrics
+# whose names all begin "option_car", so a short alias would be a typo away from silently ranking
+# a grid under a different objective. The full spelling is the whole safety margin.
+
 # --- option_convex metric constants (CONFIG, not genes) ----------------------------------------
 # The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
 # §3). A book of cheap far-OTM medium/long-dated calls across many names: most tickets expire
@@ -342,6 +408,7 @@ _MAX_DRAWDOWN_KEY = "max_drawdown"
 _CAR_KEY = _CAR_ALIASES[0]  # "consistent_annual_return"
 _OCAR_KEY = _OCAR_ALIASES[0]  # "option_consistent_annual_return"
 _OCR_KEY = _OCR_ALIASES[0]  # "option_car_over_risk"
+_OCT_KEY = _OCT_ALIASES[0]  # "option_car_target"
 _CONVEX_KEY = _CONVEX_ALIASES[0]  # "option_convex"
 
 _SPECIAL_META = {
@@ -384,6 +451,22 @@ _SPECIAL_META = {
                        "option_convex.",
         # Same wrappers as the CAR family: the trade gate replaces the trade-scale multiplier,
         # and win rate is no part of this formula either, so the optional factor still applies.
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": True,
+        "uses_adjusted_under_caps": True,
+    },
+    _OCT_KEY: {
+        "label": "CAR Target (Option)",
+        "description": "The CAR > 35%/yr AND CAR > drawdown objective: annualized return x a "
+                       "soft ramp to a 35% CAR target x a soft ramp to CAR/DD = 1.0 (neither "
+                       "pays anything above its target) x a (40/dd)^1.5 penalty past a 40% "
+                       "drawdown, x consistency x trade gate. Both ramps are SOFT so a fresh "
+                       "population, which meets neither target, still has a gradient. Scores "
+                       "are NOT comparable with option_car_over_risk, with "
+                       "option_consistent_annual_return, with the plain metric, or with "
+                       "option_convex.",
+        # Same wrappers as the rest of the CAR family: the trade gate replaces the trade-scale
+        # multiplier, and win rate is no part of this formula, so the optional factor applies.
         "supports_trade_scale": False,
         "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
@@ -441,9 +524,10 @@ def _build_metrics_catalog() -> list:
         _CAR_KEY: sorted(a for a in _CAR_ALIASES if a != _CAR_KEY),
         _OCAR_KEY: sorted(a for a in _OCAR_ALIASES if a != _OCAR_KEY),
         _OCR_KEY: sorted(a for a in _OCR_ALIASES if a != _OCR_KEY),
+        _OCT_KEY: sorted(a for a in _OCT_ALIASES if a != _OCT_KEY),
         _CONVEX_KEY: sorted(a for a in _CONVEX_ALIASES if a != _CONVEX_KEY),
     }
-    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _CONVEX_KEY):
+    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _OCT_KEY, _CONVEX_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -473,7 +557,8 @@ def assert_catalog_complete() -> None:
     """
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
     expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
-                | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_CONVEX_ALIASES))
+                | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES)
+                | set(_CONVEX_ALIASES))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -546,6 +631,20 @@ def compute_fitness(fitness_metric: str, results: dict,
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
 
+    if metric in _OCT_ALIASES:
+        # OPTION-ONLY, and a THIRD DISTINCT OBJECTIVE rather than a rescaling of either branch
+        # above (see _option_car_target): CAR > 35%/yr AND CAR > drawdown. The branch above is
+        # indifferent to the CAR/DD ratio (it divides by sqrt(dd), so 40%/40% and 20%/10% score
+        # identically); this one ramps on it. Same three wrappers as CAR, option_car and
+        # option_car_over_risk -- win-rate factor, spread stress, robustness -- so
+        # --robust-fitness / --stress-spread behave identically whichever option metric a grid
+        # names; only the factor product inside differs. Reached ONLY by an explicit
+        # "option_car_target", which is what keeps every running grid out of this path.
+        _fit = _apply_win_rate_factor(_option_car_target(results), results)
+        return _maybe_robust(
+            _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
+            fitness_metric, results, stress_spread_bps, robust)
+
     if metric in _CONVEX_ALIASES:
         # CONVEX-HARVEST-ONLY. Reached only by an explicit ``option_convex``, which is what
         # keeps every running equity and option_car grid out of this code path entirely (no
@@ -576,7 +675,7 @@ def compute_fitness(fitness_metric: str, results: dict,
     if key is None:
         raise ValueError(
             f"Unknown fitness_metric: {fitness_metric!r}. "
-            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_CONVEX_ALIASES))}"
+            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES) | set(_CONVEX_ALIASES))}"
         )
     # Profit-cap-aware: when EITHER cap was applied (per-trade basis cap ``profit_cap_pct`` or
     # portfolio-share cap ``profit_share_cap_pct``), the GA must rank on the ADJUSTED return-based
@@ -1472,6 +1571,196 @@ def _option_car_over_risk(results: dict) -> float:
         )
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
     return base * dd_factor * consistency * trade_gate
+
+
+# ---------------------------------------------------------------------------
+# option_car_target: the "CAR > 35 AND CAR > DD" metric
+# ---------------------------------------------------------------------------
+def _option_car_target_dd_penalty(dd: float) -> float:
+    """The high-drawdown penalty: 1.0 up to the 40% tolerance, ``(40/dd)**1.5`` beyond it.
+
+    Reads the MAGNITUDE (``max_drawdown`` is recorded negative by ``results._drawdown_curve``,
+    but a positive spelling must score identically rather than inverting the shape), exactly as
+    ``_option_dd_penalty``, ``_option_car_over_risk_dd_factor`` and ``_convex_dd_factor`` do.
+
+    Exactly 1.0 at and below 40% and CONTINUOUS through the knee ((40/40)**1.5 == 1.0), then
+    strictly decreasing: 0.838 at 45%, 0.716 at 50%, 0.296 at 90%.
+
+    Lives as its own function so the SHAPE is testable without constructing a results dict.
+    """
+    d = abs(float(dd))
+    if d <= _OCT_DD_TOLERANCE:
+        return 1.0
+    return (_OCT_DD_TOLERANCE / d) ** _OCT_DD_EXPONENT
+
+
+def _option_car_target_factor(base: float, dd: float) -> float:
+    """The full factor product applied to ``base``: CAR ramp x MAR ramp x high-dd penalty.
+
+    Split out for the same reason ``_option_car_over_risk_dd_factor`` is: the SHAPE is then
+    testable directly, without building a results dict and without the consistency/trade-gate
+    terms in the way. Unlike that one it takes BOTH arguments, because the middle term is a
+    ratio -- which is the whole point of this metric.
+
+      * CAR ramp ``min(base / 35, 1.0)``: linear up to the 35%/yr target, flat 1.0 above it.
+      * MAR ramp ``min((base / dd) / 1.0, 1.0)``: linear in the CAR/DD ratio up to CAR == DD,
+        flat 1.0 above it -- over-safety earns NOTHING.
+      * ``_option_car_target_dd_penalty(dd)``: the only term that still discriminates on
+        drawdown once the ratio is satisfied.
+
+    A dd of ZERO (or negative-zero, or any dd <= 0) makes the ratio undefined, and a measured
+    zero drawdown must NOT divide by zero. The ratio term is then treated as 1.0, i.e. FULLY
+    SATISFIED: a run that never gave anything back has met "CAR > DD" as completely as a run
+    can, and the alternative readings are both wrong -- 0.0 would rank a flawless curve worst,
+    and an infinite ratio is the same 1.0 after the ``min``. The CAR ramp still applies, so a
+    thin 2%-CAR / 0%-DD genome is still scaled to 2/35 of its base rather than promoted.
+
+    Assumes a POSITIVE ``base``: the caller returns a negative base unfactored (multiplying a
+    loss by a factor <= 1.0 would IMPROVE it), so this is never reached with one.
+    """
+    d = abs(float(dd))
+    car_ramp = min(float(base) / _OCT_CAR_TARGET, 1.0)
+    if d <= 0.0:
+        mar_ramp = 1.0
+    else:
+        mar_ramp = min((float(base) / d) / _OCT_MAR_TARGET, 1.0)
+    return car_ramp * mar_ramp * _option_car_target_dd_penalty(d)
+
+
+def _option_car_target(results: dict) -> float:
+    """OPTION-ONLY goal metric: ``base x CAR-ramp x MAR-ramp x high_dd_penalty x consistency x
+    trade_gate``.
+
+    THE OBJECTIVE, stated by the operator on 2026-09-17 after watching the other two option
+    metrics rank a real population: "a fitness calibrated for CAR > 35 and CAR > DD". TWO
+    targets, and neither existing metric aims at them:
+
+      * ``option_consistent_annual_return`` pays up to 16x for a tiny drawdown and converged a
+        gated stage-1 job onto 10.6%-CAR / 8.9%-DD grinders.
+      * ``option_car_over_risk`` divides by ``sqrt(dd)``, which is indifferent to the CAR/DD
+        RATIO: a 40%/40% genome (ratio 1.00, the target met exactly) and a 20%/10% one (ratio
+        2.00, half the return) both score 6.32 under it. The live run's entire elite sits at
+        ratios 0.18-0.53, a region that metric says nothing about.
+
+    THE PROPERTIES THIS METRIC IS FOR, each pinned by its own test in
+    ``tests/test_strategy_fitness_car_target.py`` as a COMPARISON rather than a number:
+
+      * Every genome meeting BOTH targets outranks every genome meeting neither.
+      * Above both targets the ranking follows CAR alone: 80/40 (80.00) > 60/45 (50.28) >
+        50/30 (50.00).
+      * Drawdown STILL discriminates above the ratio threshold: 50/30 (50.00) > 50/45 (41.90).
+        That is what the 40% knee is for, and why it is not 50 -- at 50 those two would tie.
+      * Over-safety earns nothing: 25/10 (ratio 2.5) ranks BELOW 35/35 (ratio 1.0), 17.86 vs
+        35.00, because neither ramp pays above its target and 25 is only 71% of the CAR one.
+      * A 90% drawdown is crushed even though its ratio passes: 100/90 -> 29.63, below 50/30.
+      * The ramps are SOFT: today's leader (23.7/44.4, meeting neither target) still scores
+        7.33 rather than 0, so the GA has a gradient to climb.
+
+    WHY SOFT RAMPS AND NOT HARD GATES. Nothing in the live run meets either target yet. A hard
+    gate would score the ENTIRE population 0, leaving a flat landscape with no gradient -- the
+    search would be a random walk until some genome stumbled across both thresholds at once.
+    The linear ramps make "closer to the target" always measurably better than "further away",
+    which is the only thing that makes the target reachable by a search at all.
+
+    EVERYTHING ELSE IS ``_option_car_over_risk``'s BEHAVIOUR, TERM FOR TERM, IN THE SAME ORDER:
+    the read-and-disqualify drawdown guard FIRST (absent/None/non-numeric/non-finite raise;
+    >= 100% returns WIPED_OUT_SENTINEL), the profit-cap-aware base switch, the STRUCTURES-per-
+    year trade gate with its hard floor and per-run cadence overrides, the unfactored
+    negative-base early return, and the loud missing-equity_curve guard before the consistency
+    factor. Only the factor applied to ``base`` differs.
+
+    IT IS A COPY, NOT A REFACTOR, ON PURPOSE -- the same decision, for the same reason, as the
+    two copies before it: factoring the shared body out would edit ``_option_car_over_risk``,
+    ``_option_consistent_annual_return`` and ``_consistent_annual_return``, all of which are
+    frozen bit-for-bit by tests (``test_strategy_fitness_car_over_risk.py``,
+    ``test_strategy_fitness_option_car.py``, ``test_strategy_fitness_equity_frozen.py``)
+    because grids ranked under them are banked. Fold all four together when nothing is running.
+    This copy takes ``_trades_per_year`` (STRUCTURES, not legs) from the start, and
+    ``test_strategy_fitness_structure_count.py``'s drift guard refuses any read of
+    ``avg_trades_per_year`` outside that helper.
+
+    Scores from this metric are NOT comparable with ``option_car_over_risk`` scores, NOT
+    comparable with ``option_consistent_annual_return`` scores, NOT comparable with
+    ``consistent_annual_return`` scores, and NOT comparable with ``option_convex`` scores. It
+    is a different objective, not a rescaling of any of them -- it is the only one of the four
+    that prices the CAR/DD ratio at all. Never put two of them side by side in one table.
+    """
+    # --- drawdown: READ AND DISQUALIFY FIRST, LITERALLY FIRST ---------------------------------
+    # Same placement and the same reasoning as _option_consistent_annual_return (F9(a),
+    # 2026-08-30) and _option_car_over_risk: ahead of `base` and ahead of the trade gate, so the
+    # invariant "a measured wipeout ranks WORST of every disqualification this metric can
+    # produce" (WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0) holds
+    # unconditionally rather than by scope. A losing wiped genome must not escape through
+    # `base <= 0`, and a thin-trading wiped genome must not escape through LOW_TRADE_SENTINEL
+    # (-1e8), which is numerically ABOVE WIPED_OUT_SENTINEL (-2e9).
+    dd_raw = results.get("max_drawdown")
+    if dd_raw is None:
+        raise ValueError(
+            "option_car_target requires results['max_drawdown'] and it is "
+            "absent or None. An unmeasurable drawdown is not a zero drawdown: defaulting it "
+            "would hand this genome the largest multiplier the metric can produce."
+        )
+    try:
+        dd = abs(float(dd_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"option_car_target: max_drawdown is not numeric: {dd_raw!r}"
+        ) from e
+    if not math.isfinite(dd):
+        raise ValueError(
+            f"option_car_target: max_drawdown is not finite ({dd_raw!r}). The "
+            f"run produced nonsense and is rejected rather than scored as risk-free."
+        )
+    if dd >= _OCAR_WIPED_OUT_DD_PCT:
+        # Total loss is terminal. It is terminal HERE for the same reason as in the metric this
+        # was copied from: both ramps saturate at 1.0, so a +3000% genome at -100% would clear
+        # every target this metric has and score its full base. Shares _OCAR_WIPED_OUT_DD_PCT
+        # because "the account is gone" is a property of the run, not of the objective.
+        return WIPED_OUT_SENTINEL
+
+    # --- base: (adjusted) annualized return, %/yr ---------------------------------------------
+    if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
+        base = results.get("adjusted_annualized_return")
+        if base is None:
+            base = results.get("annualized_return")
+    else:
+        base = results.get("annualized_return")
+    if base is None or (isinstance(base, float) and (math.isnan(base) or math.isinf(base))):
+        return ZERO_TRADE_SENTINEL
+    base = float(base)
+
+    # --- trade gate: proportional ramp, hard floor below it -----------------------------------
+    # STRUCTURES per year, not legs (see _trades_per_year). An iron condor is ONE bet and four
+    # rows; reading the published leg rate here would inflate essentially every genome in a
+    # pure-option population.
+    tpy = _trades_per_year(results)
+    if tpy is None:
+        return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
+    _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
+    _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
+    if float(tpy) < _floor:
+        return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
+    trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
+
+    if base <= 0:
+        return base  # unfactored: penalty factors on a negative would flip its sign
+
+    target_factor = _option_car_target_factor(base, dd)
+
+    # --- yearly consistency -------------------------------------------------------------------
+    # Same loud guard as CAR, option_car and option_car_over_risk: re-scoring a stored Backtest
+    # whose equity_curve column was not restored silently inflates this factor to 1.0 (measured
+    # 4x overstatement).
+    if results.get("trades") and "equity_curve" not in results:
+        raise ValueError(
+            "option_car_target requires results['equity_curve'] to measure the "
+            "consistency factor, and the key is absent. If you are re-scoring a stored "
+            "Backtest, note that `results` excludes the curve -- restore it from the "
+            "equity_curve column first, or the score is silently inflated (~4x when the run "
+            "has an uneven year)."
+        )
+    consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
+    return base * target_factor * consistency * trade_gate
 
 
 # ---------------------------------------------------------------------------

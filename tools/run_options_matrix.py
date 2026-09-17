@@ -227,12 +227,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "AND the equity-entry overlays O_CC/O_PP, sharpe_ratio for O_STK -- "
                          "see _resolve_fitness/_OPTION_CAR_STRATEGIES) -- passing this flag "
                          "here overrides that auto-resolution uniformly for the whole matrix. "
-                         "'option_car_over_risk' is the other option objective: ~50%%/yr WITH "
+                         "'option_car_over_risk' is the second option objective: ~50%%/yr WITH "
                          "a drawdown tolerance (full credit to 40%% dd), which is what to pass "
                          "when the auto-resolved option_consistent_annual_return's 16x "
-                         "small-drawdown reward is producing low-return grinders. The two are "
-                         "NOT comparable -- a matrix run under one never shares a table with a "
-                         "matrix run under the other.")
+                         "small-drawdown reward is producing low-return grinders. "
+                         "'option_car_target' is the third: CAR > 35%%/yr AND CAR > drawdown, "
+                         "as two soft ramps that stop paying at their targets, plus the same "
+                         "(40/dd)^1.5 penalty past 40%% dd -- the only one of the three that "
+                         "prices the CAR/DD ratio (option_car_over_risk divides by sqrt(dd), "
+                         "so it scores a 40%%/40%% genome and a 20%%/10%% one identically). "
+                         "No two of the three are comparable -- a matrix run under one never "
+                         "shares a table with a matrix run under another.")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "
                          "need more headroom than the equity grid's 10k).")

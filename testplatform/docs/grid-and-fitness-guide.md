@@ -78,15 +78,19 @@ metadata fails a drift-guard test, so the catalog can never silently drift from 
 | `consistent_annual_return` | `car`, `goal` | See below — the current default "goal" metric. |
 | `option_consistent_annual_return` | `option_car`, `ocar` | OPTION-only: the goal metric with a **superlinear** `(20/max(dd,5))²` drawdown penalty. The auto-default for pure-option strategy kinds. |
 | `option_car_over_risk` | | OPTION-only: **~50%/yr WITH a drawdown tolerance** — `annualized_return / sqrt(max(dd,10%))`, full credit up to a 40% drawdown then a `(40/dd)^1.5` penalty, × consistency × the same trade gate. Never a default; name it explicitly. |
+| `option_car_target` | | OPTION-only: **CAR > 35%/yr AND CAR > drawdown** — `annualized_return × min(CAR/35, 1) × min((CAR/DD)/1, 1) × the same (40/dd)^1.5 penalty past 40% dd`, × consistency × the same trade gate. Both ramps are **soft** (a hard gate would zero a whole fresh population and leave the GA no gradient) and neither pays anything above its target, so over-safety earns nothing. The only one of the three that prices the CAR/DD **ratio**. Never a default; name it explicitly. |
 | `option_convex` | | CONVEX-HARVEST only: end-of-window total return, drawdown free below 50%, behind a breadth floor (≥30 tickets/yr **and** ≥20 underlyings). `O_CONVEX`-only and refused for anything else. |
 
-**The three option metrics are mutually non-comparable, and not comparable with
+**The four option metrics are mutually non-comparable, and not comparable with
 `consistent_annual_return` either.** They are different objectives, not rescalings of one:
 `option_consistent_annual_return` ranks a 25%-CAR/10%-DD genome ABOVE a 50%-CAR/30%-DD one,
 `option_car_over_risk` ranks them the other way round (that inversion is the whole point of it —
 the first gated stage-1 job converged on 10.6%-CAR/8.9%-DD grinders under the former and was
-stopped). Never put two of them in one table, and give a run that changes metric a fresh
-`--name-suffix` — job names are the resume key.
+stopped), and `option_car_target` ranks on **distance to two targets** rather than on a risk
+preference at all — it is the only one that prices the CAR/DD ratio, which `option_car_over_risk`
+cannot express (dividing by `sqrt(dd)` scores a 40%-CAR/40%-DD genome and a 20%-CAR/10%-DD one
+identically at 6.32). Never put two of them in one table, and give a run that changes metric a
+fresh `--name-suffix` — job names are the resume key.
 
 ### `consistent_annual_return` ("car" / "goal")
 

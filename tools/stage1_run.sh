@@ -212,18 +212,28 @@ fi
 # ``option_consistent_annual_return``, which is what every -st1 job so far ran under; with it
 # unset this block is a no-op and the launch is byte-for-byte the one it has always been.
 #
-# Set STAGE1_FITNESS=option_car_over_risk for the OTHER option objective: ~50%/yr WITH a
+# Set STAGE1_FITNESS=option_car_over_risk for the SECOND option objective: ~50%/yr WITH a
 # drawdown tolerance (annualized return / sqrt(max(dd,10%)), full credit to 40% dd then a
 # (40/dd)^1.5 penalty). That is what to run when the default's 16x small-drawdown reward is
 # producing low-return grinders -- as it did on the first gated stage-1 job, which converged on
 # a 10.6%-CAR / 8.9%-DD genome (fitness 13.5, about 2.4x the score it gave a 50%-CAR / 30%-DD
 # one) and was stopped for exactly that reason.
 #
+# Set STAGE1_FITNESS=option_car_target for the THIRD, which is the operator's objective stated
+# as targets rather than as a risk preference: CAR > 35%/yr AND CAR > drawdown. Two SOFT ramps
+# (x min(CAR/35,1) x min(CAR/DD,1)) that stop paying the moment each target is met, so
+# over-safety earns nothing, plus the same (40/dd)^1.5 penalty past 40% dd. It is the only one
+# of the three that prices the CAR/DD RATIO at all -- option_car_over_risk divides by sqrt(dd)
+# and therefore scores a 40%-CAR/40%-DD genome (ratio 1.00) and a 20%/10% one (ratio 2.00)
+# identically, and the live run's entire elite sits at ratios 0.18-0.53 where it says nothing.
+#
 # CHANGING THE FITNESS REQUIRES A NEW SUFFIX, and is refused without one. Job names are the
-# RESUME KEY: re-ranking a search and then resuming into checkpoints scored under the other
-# metric silently mixes two objectives in one population, and the two metrics' scores are not
-# comparable at all (the new one ranks a 50%/30% genome ABOVE a 25%/10% one; the default ranks
-# them the other way round). Same rule as every other economic/search change here.
+# RESUME KEY: re-ranking a search and then resuming into checkpoints scored under another
+# metric silently mixes two objectives in one population, and NO TWO of the three option
+# metrics' scores are comparable at all (option_car_over_risk ranks a 50%/30% genome ABOVE a
+# 25%/10% one; the default ranks them the other way round; option_car_target ranks on distance
+# to two targets and is on a different scale again). Same rule as every other economic/search
+# change here -- e.g. -st1cor for option_car_over_risk, -st1cat for option_car_target.
 STAGE1_FITNESS="${STAGE1_FITNESS:-}"
 STAGE1_SUFFIX="${STAGE1_SUFFIX:--st1}"
 FITNESS_ARGS=()
