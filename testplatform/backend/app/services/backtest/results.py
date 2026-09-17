@@ -210,8 +210,9 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     (``HistoricalOptionsProvider``) has. ``ParquetOptionsProvider`` exposes ``root`` /
     ``store_path`` instead, so on the parquet backend this function returned None and the
     refinement switched itself OFF with no log and no warning. That is not just a missing
-    feature: ``strategy_fitness.option_consistent_annual_return`` divides by
-    ``max_drawdown``, so the same strategy over the same window SCORED DIFFERENTLY depending
+    feature: ``strategy_fitness.option_consistent_annual_return`` (and
+    ``option_car_over_risk``) divides by ``max_drawdown``, so the same strategy over the same
+    window SCORED DIFFERENTLY depending
     on which store served the options, for a reason nothing in the result could show. Both
     readers now implement ``delta_at_entry(underlying, occ_symbol, when)``; a reader that does
     not is a WARNING, because silence is the actual defect.
@@ -228,7 +229,8 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
             "[backtest] intraday drawdown refinement SKIPPED: option reader %s exposes no "
             "delta_at_entry(underlying, occ_symbol, when). max_drawdown stays at the "
             "daily-close figure, so any metric divided by it (calmar_ratio, "
-            "option_consistent_annual_return) is NOT comparable with a run whose reader "
+            "option_consistent_annual_return, option_car_over_risk) is NOT comparable with a "
+            "run whose reader "
             "supports it.", type(options).__name__)
         return None
     # ``commission_per_trade`` lives under ``account_settings`` (the BacktestAccount's resolved

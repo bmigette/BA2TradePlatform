@@ -208,6 +208,36 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
            --market-condition-manifest "$MARKET_CONDITION_MANIFEST")
 fi
 
+# FITNESS (2026-09-17). Unset -> run_options_matrix --profile discovery's own default,
+# ``option_consistent_annual_return``, which is what every -st1 job so far ran under; with it
+# unset this block is a no-op and the launch is byte-for-byte the one it has always been.
+#
+# Set STAGE1_FITNESS=option_car_over_risk for the OTHER option objective: ~50%/yr WITH a
+# drawdown tolerance (annualized return / sqrt(max(dd,10%)), full credit to 40% dd then a
+# (40/dd)^1.5 penalty). That is what to run when the default's 16x small-drawdown reward is
+# producing low-return grinders -- as it did on the first gated stage-1 job, which converged on
+# a 10.6%-CAR / 8.9%-DD genome (fitness 13.5, about 2.4x the score it gave a 50%-CAR / 30%-DD
+# one) and was stopped for exactly that reason.
+#
+# CHANGING THE FITNESS REQUIRES A NEW SUFFIX, and is refused without one. Job names are the
+# RESUME KEY: re-ranking a search and then resuming into checkpoints scored under the other
+# metric silently mixes two objectives in one population, and the two metrics' scores are not
+# comparable at all (the new one ranks a 50%/30% genome ABOVE a 25%/10% one; the default ranks
+# them the other way round). Same rule as every other economic/search change here.
+STAGE1_FITNESS="${STAGE1_FITNESS:-}"
+STAGE1_SUFFIX="${STAGE1_SUFFIX:--st1}"
+FITNESS_ARGS=()
+if [ -n "$STAGE1_FITNESS" ]; then
+  if [ "$STAGE1_SUFFIX" = "-st1" ]; then
+    echo "stage1_run.sh: STAGE1_FITNESS=$STAGE1_FITNESS re-ranks the search, so it needs its own" >&2
+    echo "job names -- STAGE1_SUFFIX is still the default '-st1' and those jobs are already" >&2
+    echo "banked under option_consistent_annual_return. Set STAGE1_SUFFIX (e.g. -st1cor) so the" >&2
+    echo "run cannot resume into checkpoints scored on a different objective." >&2
+    exit 1
+  fi
+  FITNESS_ARGS=(--fitness "$STAGE1_FITNESS")
+fi
+
 # STAGE1_START/END allow explicit shorter pilots (a 2023 start prints LIMITED WINDOW and gets
 # its own discovery identity). A dry-run (pass --dry-run) prints every resolved command.
 exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
@@ -218,6 +248,7 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   --population "$POP" --generations "$GEN" --early-stop 8 \
   --parallel "$PARALLEL" \
   --screener-gate-store "$SCREENER_STORE" --max-stock-price 0 \
-  --name-suffix=-st1 \
+  --name-suffix="$STAGE1_SUFFIX" \
+  ${FITNESS_ARGS[@]+"${FITNESS_ARGS[@]}"} \
   ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
   "$@"

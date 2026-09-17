@@ -3231,6 +3231,14 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     ``option_convex`` (``_CONVEX_FITNESS``) is NOT a default for any kind: the convex-harvest
     grid names it explicitly, and the ``cli_fitness`` short-circuit above is what carries it.
     See ``_refuse_convex_fitness_mismatch`` for the Task-13 mutual-refusal seam.
+
+    ``option_car_over_risk`` (2026-09-17, registered in ``strategy_fitness.py``) is likewise
+    NOT a default for any kind, and deliberately so: it is the ~50%/yr-WITH-drawdown-tolerance
+    objective, a DIFFERENT objective from the ~30%/yr goal metric rather than a rescaling of
+    it, and it ranks a 50%/30% genome ABOVE a 25%/10% one where the default ranks them the
+    other way round. Switching the default would silently re-rank every option grid resumed
+    under it. A run that wants it names it, and its scores never share a table with an
+    ``option_car`` score.
     """
     if cli_fitness:
         return cli_fitness
@@ -6907,7 +6915,13 @@ def main(argv: "list | None" = None) -> int:
                          "EVERY year: (adjusted) annualized return, hard >=30 trades/yr gate, "
                          "soft drawdown penalty beyond 20%%, x worst-year/mean-year consistency "
                          "(--fitness-trade-scale is a no-op for it); the option default is that "
-                         "shape applied to an option book. 'option_convex' is the "
+                         "shape applied to an option book. 'option_car_over_risk' is the "
+                         "~50%%/yr OPTION objective WITH a drawdown tolerance (annualized "
+                         "return / sqrt(max(dd,10%%)), full credit to 40%% dd then a "
+                         "(40/dd)^1.5 penalty, x consistency x the same trade gate) -- never a "
+                         "default, name it explicitly; it ranks a 50%%/30%% genome ABOVE a "
+                         "25%%/10%% one, which 'option_consistent_annual_return' ranks the "
+                         "other way, so their scores are NOT comparable. 'option_convex' is the "
                          "CONVEX-HARVEST metric (end-of-window total return, drawdown free "
                          "below 50%%, breadth floor >=30 tickets/yr AND >=20 underlyings, hit "
                          "rate/concentration recorded not scored) -- never a default, name it "
@@ -7145,8 +7159,11 @@ def main(argv: "list | None" = None) -> int:
                          "'option_consistent_annual_return' for pure-option kinds "
                          "(OS1-OS4/O_*) AND the equity-entry overlays O_CC/O_PP, "
                          "'calmar_ratio' for O_STK and stock kinds (the historical batch "
-                         "default). See optimize --fitness for what those metrics mean; "
-                         "matches _resolve_fitness / _OPTION_CAR_STRATEGIES.")
+                         "default). Pass 'option_car_over_risk' to rank the whole batch on the "
+                         "~50%%/yr-with-drawdown-tolerance objective instead (never a default; "
+                         "its scores are not comparable with the resolved one's). See optimize "
+                         "--fitness for what those metrics mean; matches _resolve_fitness / "
+                         "_OPTION_CAR_STRATEGIES.")
     ob.add_argument("--generations", type=int, default=8)
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
