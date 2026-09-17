@@ -1379,6 +1379,32 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         pass
 
+    def get_broker_floating_pl(self) -> Optional[float]:
+        """The BROKER's own open P/L for this account, or ``None`` if it publishes none.
+
+        Optional hook, default ``None`` -- most brokers publish a usable per-position
+        ``unrealized_pl`` and callers should keep summing that. Override only where the
+        broker's account-level valuation is better than anything the caller can rebuild
+        from per-position quotes.
+
+        TastyTrade is why this exists (measured 2026-09-17 on the live account). Its API
+        publishes NO open-P/L field at all -- not on a position, not on the balances -- so
+        the platform derived it as ``(mark_price - average_open_price) x qty``. On a book of
+        thin ETFs that is not the broker's number and cannot be: ``mark_price`` is the
+        bid/ask MIDPOINT, and for a name quoted 22.55/37.99 that never traded that day the
+        midpoint sits ~20% away from where the broker marks it. One such position (CAS)
+        moved the account total by $19 on its own, and the account's 75 positions summed
+        $66.91 away from the broker's screen -- while the COST BASIS agreed to the cent
+        ($7,635.40 both), which is what proves the gap is valuation and not bookkeeping.
+
+        An implementation answers with the broker's own valuation minus the cost basis, and
+        answers ``None`` -- never a guess -- when it cannot.
+
+        Returns:
+            Optional[float]: open P/L in account currency, or ``None`` when unavailable.
+        """
+        return None
+
     def get_available_position_quantity(self, symbol: str) -> float:
         """Broker-side AVAILABLE (not held-for-orders) quantity for ``symbol``.
 
