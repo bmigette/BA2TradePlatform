@@ -353,13 +353,33 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 .text-orange-600 { color: #ffa94d !important; }
 .text-yellow-600 { color: #ffd93d !important; }
 
-/* Override Quasar grey text classes for dark theme */
-.text-grey, .text-grey-1, .text-grey-2, .text-grey-3 { color: #ffffff !important; }
-.text-grey-4, .text-grey-5 { color: #e0e0e0 !important; }
-.text-grey-6 { color: #b0bec5 !important; }
-.text-grey-7 { color: #90a4ae !important; }
-.text-grey-8 { color: #78909c !important; }
-.text-grey-9, .text-grey-10 { color: #607d8b !important; }
+/* Override Quasar grey text classes for dark theme.
+ *
+ * INSIDE `@layer theme`, AND THAT IS THE WHOLE FIX. This block existed unlayered for months
+ * and painted NOTHING: Quasar ships its palette in a cascade layer named `quasar_importants`
+ * (the page declares `theme, base, quasar, nicegui, components, utilities, overrides,
+ * quasar_importants`), and for IMPORTANT declarations the layer order is REVERSED -- every
+ * layered `!important` beats an unlayered one, whatever its specificity. So Quasar's
+ * `.text-grey-8 { #424242 }` won, and `body .text-grey-8 { ... !important }` would have lost
+ * too; raising specificity cannot cross a layer boundary.
+ *
+ * `theme` is declared FIRST, and for important declarations the earliest layer wins, so these
+ * now apply. MEASURED in the running app before and after, one synthetic div per class:
+ *   .text-grey-7  rgb(117,117,117) -> rgb(160,174,192)
+ *   .text-grey-8  rgb( 97, 97, 97) -> rgb(144,164,174)
+ * The dark end is clamped at #78909c rather than continuing down to #607d8b: on this
+ * background anything dimmer is the complaint that started this (an expert's open-market
+ * buyer list rendering near-invisible), and grey-9+ is used for the same kind of secondary
+ * text as grey-8. 139 call sites across the UI and the expert panels wear these classes. */
+@layer theme {
+  .text-grey, .text-grey-1, .text-grey-2, .text-grey-3 { color: #ffffff !important; }
+  .text-grey-4, .text-grey-5 { color: #e0e0e0 !important; }
+  .text-grey-6 { color: #b0bec5 !important; }
+  .text-grey-7 { color: #a0aec0 !important; }
+  .text-grey-8 { color: #90a4ae !important; }
+  .text-grey-9, .text-grey-10, .text-grey-11,
+  .text-grey-12, .text-grey-13, .text-grey-14 { color: #78909c !important; }
+}
 
 /* Quasar dark mode overrides - FORCE ALL TEXT WHITE */
 .q-dark, body.body--dark {
