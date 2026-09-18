@@ -759,7 +759,15 @@ class LiveTradesTab:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Could not compute live-trade totals: {e}")
         self._totals = totals
-        self._refresh_totals_row()
+        # INSIDE the guard, because the docstring's promise covers the repaint too. It sat
+        # outside, so a failure here escaped into the loader's own except and blanked the whole
+        # TABLE -- the thing the strip is explicitly worth less than. Demonstrated by the
+        # account-filter tests: a missing `_totals_row` attribute took out all 7 of them, none
+        # of which is about totals.
+        try:
+            self._refresh_totals_row()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not repaint the live-trade totals strip: {e}")
 
     def _account_ids_for_transactions(self, session, txn_ids: List[int]) -> Dict[int, int]:
         """``{transaction_id: account_id}`` for all *txn_ids* in ONE query.
