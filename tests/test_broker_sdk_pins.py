@@ -1,10 +1,22 @@
-"""The two broker SDKs this platform writes directly against must be PINNED.
+"""The two broker SDKs this platform writes directly against must be BOUNDED.
 
 tastytrade 12.x is the OAuth-only async rewrite: `Account.place_order` became a
 coroutine with a `dry_run` parameter that defaults to True, and `Session` moved to
-`provider_secret`/`refresh_token`. An unpinned `tastytrade` line lets a routine
+`provider_secret`/`refresh_token`. An unbounded `tastytrade` line lets a routine
 `pip install -r requirements.txt` move that API under TastyTradeAccount. alpaca-py
-is pinned for the same reason (TradeAccount/Asset field shapes).
+is bounded for the same reason (TradeAccount/Asset field shapes).
+
+BOUNDS, NOT AN EXACT PIN -- changed 2026-09-18 after the exact pin became the hazard it
+existed to prevent. `==12.0.2` / `==0.43.2` were written from some other reference and were
+never what was installed here: both venvs, the live trading one included, have run 12.4.1 /
+0.43.4 since May, so `pip install -r requirements.txt` would have DOWNGRADED the SDK the
+platform trades on by three minor versions. An exact pin only holds while someone keeps it
+equal to reality, and for a month nobody did.
+
+What actually has to be true is a floor and a ceiling: the install can never go BACKWARDS from
+what production runs, and can never cross into the next breaking version by accident. These
+tests assert those two properties against the installed distribution, so they stay true as the
+version moves instead of going stale the next time it does.
 
 pandas-market-calendars is guarded here too. It is not an SDK we write against, but it is the
 offline NYSE holiday/half-day calendar behind ba2_common.core.market_calendar, which is the
@@ -19,24 +31,54 @@ REQUIREMENTS = Path(__file__).resolve().parents[1] / "requirements.txt"
 PYPROJECT = Path(__file__).resolve().parents[1] / "packages" / "common" / "pyproject.toml"
 
 
-def _pinned_versions():
-    """Parse `name==version` lines out of requirements.txt, ignoring comments."""
-    pins = {}
+def _requirements():
+    """Every requirement line in requirements.txt, parsed, keyed by lowercased name."""
+    from packaging.requirements import Requirement
+
+    out = {}
     for raw_line in REQUIREMENTS.read_text(encoding="utf-8").splitlines():
         line = raw_line.split("#", 1)[0].strip()
-        if "==" not in line:
+        if not line or line.startswith("-"):
             continue
-        name, _, pinned = line.partition("==")
-        pins[name.strip().lower()] = pinned.strip()
-    return pins
+        try:
+            req = Requirement(line)
+        except Exception:
+            continue
+        out[req.name.lower()] = req
+    return out
 
 
-def test_tastytrade_is_pinned_to_the_installed_version():
-    assert _pinned_versions().get("tastytrade") == version("tastytrade")
+def _assert_bounded(dist_name, next_breaking):
+    """The installed version satisfies the line, cannot be downgraded by it, and the line
+    refuses the next breaking version."""
+    from packaging.version import Version
+
+    req = _requirements().get(dist_name)
+    assert req is not None, f"{dist_name} is not in requirements.txt at all"
+    installed = Version(version(dist_name))
+
+    assert req.specifier.contains(installed), (
+        f"{dist_name}=={installed} is installed but does not satisfy {req.specifier} -- "
+        f"`pip install -r requirements.txt` would CHANGE the SDK the live platform trades on")
+
+    lower = [s for s in req.specifier if s.operator in (">=", "==", "~=")]
+    assert lower, f"{dist_name} has no lower bound; an install could downgrade it"
+    assert max(Version(s.version) for s in lower) >= installed, (
+        f"{dist_name}'s floor is below the installed {installed}; an install could DOWNGRADE "
+        f"production")
+
+    assert not req.specifier.contains(Version(next_breaking)), (
+        f"{dist_name} would accept {next_breaking}, which may move the broker API under us "
+        f"on a routine install")
 
 
-def test_alpaca_py_is_pinned_to_the_installed_version():
-    assert _pinned_versions().get("alpaca-py") == version("alpaca-py")
+def test_tastytrade_cannot_be_downgraded_or_cross_a_major():
+    _assert_bounded("tastytrade", "13.0.0")
+
+
+def test_alpaca_py_cannot_be_downgraded_or_cross_a_breaking_minor():
+    # alpaca-py is 0.x, where the MINOR is the breaking number.
+    _assert_bounded("alpaca-py", "0.44.0")
 
 
 def _requirement_names():
