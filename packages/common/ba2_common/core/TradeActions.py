@@ -3378,19 +3378,28 @@ class SellCoveredCallAction(_OptionEntryAction):
         return ExpertActionType.SELL_COVERED_CALL.value
 
     def _decline(self, reason: str, detail: str,
-                 held: Optional[float] = None) -> Dict[str, Any]:
+                 held: Optional[float] = None,
+                 extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """ONE place formats the warning and stamps the reason.
 
         Per-site logging would drift in wording and in what it names; a caller counting these
         bars needs the REASON as a value, and an operator reading the log needs the symbol and
         the share count on the same line as the cause.
+
+        ``extra`` MERGES the declining check's own numbers rather than replacing them. The
+        cover check computes required/held/pledged and this wrapper used to throw all three
+        away and rebuild the result from the sentence alone -- so the one decline an operator
+        can actually act on ("buy 200 shares, or write one fewer contract") arrived as prose to
+        be re-parsed. The stamped reason still wins on a key clash: the marker is what counters
+        read and a check must not be able to rename its own decline.
         """
         shares = "unknown" if held is None else f"{held:g}"
         logger.warning(
             f"{COVERED_CALL_DECLINE_MARKER} on {self.instrument_name} "
             f"(shares held: {shares}) -- {reason}: {detail}")
-        return self._result(False, detail,
-                            data={COVERED_CALL_DECLINE_KEY: reason, "held_shares": held})
+        data = dict(extra or {})
+        data.update({COVERED_CALL_DECLINE_KEY: reason, "held_shares": held})
+        return self._result(False, detail, data=data)
 
     def execute(self) -> "TradeActionResult":
         # The non-options account is refused by the BASE execute with a plain result; named
@@ -3455,9 +3464,12 @@ class SellCoveredCallAction(_OptionEntryAction):
         if refusal is not None:
             # The seam decided it and worded it; this only gives it the same NAME and the
             # same one-line warning as the other five, so a counter sees every decline.
+            # ...and its NUMBERS, not only its sentence: required/held/pledged are the
+            # operator's remedy, and re-deriving them from prose is worse than carrying them.
             return self._decline(COVERED_CALL_DECLINE_COVER_SHORT,
                                  str((refusal or {}).get("message") or "cover is short"),
-                                 held=held)
+                                 held=held,
+                                 extra=(refusal or {}).get("data"))
         # THE STOCK COVER (2026-08-31, operator decision): both holding checks have now
         # passed -- this expert's own filled buys hold >= 100 shares/contract AND the
         # account-wide cover verdict is ok -- so the cover leg may be supplied to the
