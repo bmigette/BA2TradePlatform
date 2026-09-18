@@ -170,12 +170,54 @@ def refresh_series(series_id: str, api_key: str) -> int:
     return len(rows)
 
 
+def _fill_cache_on_the_live_path(sid: str, path: str) -> bool:
+    """Fetch a missing series and write it to the cache. True when the file now exists.
+
+    LIVE ONLY, and that asymmetry is the point. A backtest must read a file that was already
+    on disk before it started: fetching mid-run makes the run non-reproducible, un-syncable to
+    a GA worker, and dependent on FRED being up -- which is why ``_load`` still raises there.
+
+    Live has the opposite problem. The guard was refusing on a cache that nothing ever filled:
+    the live platform has no prewarm step (``tools/refresh_fred_cache.py`` says it should run
+    "on a schedule for the live platform" and nothing ever did), so prod's ``cache/fred`` was
+    EMPTY and every analysis logged a macro failure. Live is already allowed to reach the
+    network for every other provider; macro was the one that refused and then had no other way
+    to get the data.
+
+    Best effort by design: a failure here returns False and the caller raises the same
+    FileNotFoundError it always did. Macro is an overlay -- it must never be the reason a live
+    analysis dies.
+    """
+    try:
+        from ba2_common.config import get_app_setting
+        api_key = get_app_setting("fred_api_key")
+        if not api_key:
+            logger.error(
+                "FRED series %s is missing and 'fred_api_key' is not configured, so it cannot "
+                "be fetched; the macro overlay is unavailable until one is set", sid)
+            return False
+        logger.info("FRED %s not cached; fetching it once and writing the cache", sid)
+        refresh_series(sid, api_key)
+        return os.path.exists(path)
+    except Exception as e:  # noqa: BLE001 -- see the docstring: never kill a live analysis
+        logger.error("FRED %s could not be fetched on the live path: %s", sid, e, exc_info=True)
+        return False
+
+
 def _load(series_id: str) -> List[dict]:
     sid = series_id.upper()
     cached = _MEM.get(sid)
     if cached is not None:
         return cached
     path = cache_path(sid)
+    if not os.path.exists(path):
+        # CACHED WINS. This only runs when the file is absent, so a warm cache behaves exactly
+        # as before -- no network, no staleness check, same bytes.
+        from ba2_providers.fmp_common import _is_hermetic_fmp_history, _is_ttl_frozen
+
+        offline = _is_ttl_frozen() or _is_hermetic_fmp_history()
+        if not offline:
+            _fill_cache_on_the_live_path(sid, path)
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"FRED series {sid} is not in the cache ({path}). Run the FRED refresh/prewarm "
