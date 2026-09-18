@@ -1025,6 +1025,15 @@ class TastyTradeAccount(AccountInterface):
         "gtd": OrderTimeInForce.GTD,
         "ext": OrderTimeInForce.EXT,
         "gtc_ext": OrderTimeInForce.GTC_EXT,
+        # THE OVERNIGHT PAIR. The map was written against tastytrade 12.0.2's six-member enum;
+        # the version actually installed (12.4.1, in both venvs including the live one) ships
+        # eight. Without these two, a broker-originated overnight order pulled into the platform
+        # and re-submitted was downgraded to plain GTC -- a different expiry AND no overnight
+        # session, which is the exact defect the GTC_EXT row above records. Warned rather than
+        # silent, and the platform's own writers only emit day/gtc, so this reached broker-
+        # originated orders only.
+        "ext_overnight": OrderTimeInForce.OVERNIGHT,
+        "gtc_ext_overnight": OrderTimeInForce.GTC_OVERNIGHT,
         "ioc": OrderTimeInForce.IOC,
     }
 
