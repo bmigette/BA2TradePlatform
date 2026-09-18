@@ -47,8 +47,9 @@ from alembic.script import ScriptDirectory
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 VERSIONS_DIR = REPO_ROOT / "alembic" / "versions"
 
-#: The alembic head this task INHERITED and must leave untouched.
-EXPECTED_HEAD = "b7f3d21c98ae"
+#: The alembic head this task INHERITED. Kept for the record, deliberately NOT asserted on --
+#: see test_alembic_still_has_exactly_one_head.
+INHERITED_HEAD = "b7f3d21c98ae"
 
 #: The revision that added the per-leg column, long before this task.
 PER_LEG_COLUMN_REVISION = "08de6c7b6eed"
@@ -72,14 +73,25 @@ LEGACY_EXPIRY = SIM_TODAY + timedelta(days=30)      # an ordinary single-expiry 
 # ===========================================================================
 # 1-2. alembic is untouched
 # ===========================================================================
-def test_alembic_still_has_exactly_one_head_and_it_is_unchanged():
-    """Two heads are not cosmetic — ``alembic upgrade head`` refuses outright."""
+def test_alembic_still_has_exactly_one_head():
+    """Two heads are not cosmetic — ``alembic upgrade head`` refuses outright.
+
+    ONE HEAD is the invariant; WHICH head is not. This asserted ``heads == ["b7f3d21c98ae"]``
+    and so failed on every unrelated revision that landed afterwards -- account_symbol_facts,
+    symbol_market_stats, and the expert-priority column -- none of which touches ``transaction``.
+    It sat red for two weeks saying nothing true.
+
+    The claim the absolute pin was standing in for -- that THIS task added no column to
+    ``transaction`` -- is pinned precisely and version-independently by
+    ``test_the_transaction_table_gained_no_column``, which compares the whole frozen column set.
+    So nothing is lost by asserting the invariant this test actually names.
+    """
     script = ScriptDirectory.from_config(Config(str(REPO_ROOT / "alembic.ini")))
     heads = list(script.get_heads())
 
-    assert heads == [EXPECTED_HEAD], (
-        f"alembic head moved to {heads}. Task 6-PRE added no migration; if a later change "
-        f"needs one, update EXPECTED_HEAD here and say why in the commit.")
+    assert len(heads) == 1, (
+        f"alembic forked into {len(heads)} heads: {heads}. `alembic upgrade head` refuses to "
+        f"run at all until they are merged.")
 
 
 def test_this_task_added_no_revision_file():
@@ -139,7 +151,11 @@ def test_the_per_leg_column_was_added_by_an_earlier_revision():
         "the revision that was supposed to add tradingorder.expiry no longer does"
 
     script = ScriptDirectory.from_config(Config(str(REPO_ROOT / "alembic.ini")))
-    ancestry = {rev.revision for rev in script.iterate_revisions(EXPECTED_HEAD, "base")}
+    # From the CURRENT head, which is what the assertion below actually claims. Walking from a
+    # frozen literal would keep answering about the chain as it stood in September 2026 and stop
+    # noticing the day a new revision lands off a different parent -- the same staleness that
+    # kept the head assertion above red for two weeks.
+    ancestry = {rev.revision for rev in script.iterate_revisions("heads", "base")}
     assert PER_LEG_COLUMN_REVISION in ancestry, \
         "the per-leg column's revision is not an ancestor of head — it may never be applied"
 

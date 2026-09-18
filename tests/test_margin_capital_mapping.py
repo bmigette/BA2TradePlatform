@@ -49,6 +49,7 @@ class _Account(ReadOnlyAccountInterface):
         self._snap = snapshot
         self._stored = settings
         self.snapshot_calls = 0
+        self.broker_reads = 0
 
     @property
     def settings(self):
@@ -60,14 +61,19 @@ class _Account(ReadOnlyAccountInterface):
 
     def get_account_snapshot(self):
         self.snapshot_calls += 1
+        self.broker_reads += 1
         return self._snap
 
     def get_balance(self):
         return self._balance
 
     def get_account_info(self):
-        # The expert's broker-BP clamp reads this; it is a separate broker call from the
-        # snapshot, which is why it does not touch snapshot_calls.
+        # BOTH broker reads are counted, in ONE counter. They were counted separately on the
+        # premise that the expert's BP clamp reads get_account_info while the snapshot is a
+        # different call -- true when written, false since b913de9b (2026-09-15) pointed the
+        # clamp at the snapshot seam. What the tests below actually care about is "how many
+        # times did margin-off touch the broker", and that is one number.
+        self.broker_reads += 1
         return {"buying_power": self._snap.buying_power}
 
     # --- remaining abstract methods, stubbed ---------------------------------
@@ -259,7 +265,13 @@ def test_margin_off_costs_no_snapshot_and_no_order_store_read(monkeypatch):
     for key in ("margin_factor", "broker_multiplier", "broker_buying_power",
                 "gross_exposure", "pending_entries", "headroom"):
         assert mapping[key] is None, key
-    assert account.snapshot_calls == 0, "margin off must not cost a broker round trip"
+    # ONE broker read with margin off, not zero. The clamp that reads it is the 2026-07-21
+    # oversubscription clamp -- deliberately NOT margin-gated, because it caps an expert at
+    # what the account can really spend whatever the leverage. b913de9b pointed it at the
+    # snapshot seam, which on Alpaca is CACHED 5s where the old get_account_info was an
+    # uncached REST call every time -- so live round trips went DOWN, not up. What must not
+    # regress is margin-off asking the broker more than once.
+    assert account.broker_reads == 1, "margin off must not cost EXTRA broker round trips"
     assert store_reads == [], "margin off must not query the order store"
 
 
@@ -488,7 +500,7 @@ def test_the_classic_rm_logs_the_mapping_at_debug_with_margin_off(rm_logs):
 
     assert len(_mapping_lines(rm_logs, logging.DEBUG)) == 1, rm_logs
     assert not _mapping_lines(rm_logs, logging.INFO)
-    assert account.snapshot_calls == 0
+    assert account.broker_reads == 1
 
 
 @pytest.mark.usefixtures("reset_test_db")

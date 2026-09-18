@@ -748,6 +748,23 @@ class FloatingPLPerAccountWidget(_FloatingPLWidgetBase):
         # paths feed the same columns and must not be able to disagree about them.
         balance, tradable, broker_bp = self._read_money(account, account_id)
 
+        # THE BROKER'S OWN NUMBER FIRST, where it publishes one that beats a per-position
+        # sum. On TastyTrade the per-position figure has to be derived from `mark_price`,
+        # the bid/ask MIDPOINT -- and on a book of thin ETFs the midpoint is not where the
+        # broker marks: one position quoted 22.55/37.99 with no volume that day sat ~20%
+        # off and moved the account total by $19 on its own (measured 2026-09-17, $66.91
+        # across 75 positions, against a cost basis that agreed to the cent). Default is
+        # None, so every other broker keeps summing per-position as before.
+        try:
+            broker_pl = account.get_broker_floating_pl()
+        except Exception as e:
+            logger.error(f"get_broker_floating_pl() raised for account {account_id}: {e}",
+                         exc_info=True)
+            broker_pl = None
+        if broker_pl is not None:
+            return [PLRow(name=name, pl=float(broker_pl), balance=balance,
+                          tradable=tradable, broker_bp=broker_bp)]
+
         try:
             broker_positions = account.get_positions()
         except Exception as e:

@@ -3989,6 +3989,41 @@ class ExpertSettingsTab:
                         _bt_settings = import_data.get('settings') or {}
                         expert_settings = dict(_bt_settings.get('expert_params') or {})
 
+                    # THE UNIVERSE IS A SETTING, AND IT IS NOT IN expert_params.
+                    #
+                    # _derive_export_payload carries the screened universe in its OWN top-level
+                    # `universe` block, so an import that reads only `settings.expert_params`
+                    # deploys the genome onto whatever universe the live instance happened to
+                    # have. That is the same defect fixed in tools/import_deploy_payload.py
+                    # (parity review 2026-09-07) and never here: measured on bt1298 this path
+                    # dropped EIGHT settings, `instrument_selection_method=screener` among them
+                    # -- without which the expert does not screen at all and simply trades its
+                    # static instrument list.
+                    #
+                    # The universe is part of WHAT WAS SCORED, so it wins over the run's base
+                    # settings, exactly as the tool orders it. Same shared helper, not a second
+                    # implementation: it also canonicalises the metric store's unprefixed names
+                    # (market_cap_max -> screener_market_cap_max), whose live default is 0 = NO
+                    # CEILING, which is how prod instances lost the upper bound of their cap band.
+                    _universe = import_data.get('universe')
+                    if _universe:
+                        from ba2_common.core.deploy_parity import (
+                            live_settings_from_universe, unmapped_screener_keys)
+                        _universe_params = live_settings_from_universe(_universe)
+                        if _universe_params:
+                            expert_settings = {**expert_settings, **_universe_params}
+                            logger.info(f'Applied {len(_universe_params)} setting(s) from the '
+                                        f'payload universe: {sorted(_universe_params)}')
+                        _stray = unmapped_screener_keys(_universe)
+                        if _stray:
+                            # Loud, not silent: a screener key under a name nothing reads leaves
+                            # the live screener on its own default while the file looks complete.
+                            logger.warning(f'Universe carries screener keys with no live setting: '
+                                           f'{sorted(_stray)}')
+                            ui.notify(f'⚠️ {len(_stray)} screener key(s) in the file have no live '
+                                      f'setting and were NOT applied: {", ".join(sorted(_stray))}',
+                                      type='warning', timeout=10000)
+
                     logger.info(f'Extracted expert_type: {expert_type}')
 
                     if not expert_type:
@@ -4104,7 +4139,23 @@ class ExpertSettingsTab:
                         # stale value the instance had from a PRIOR deploy instead of reverting to
                         # the class default - this is exactly how instance 6 ended up on "smart" RM
                         # mode despite the validating backtest never having set it.
-                        expert.reset_settings()
+                        #
+                        # ONLY WHEN THE FILE ACTUALLY CARRIES SETTINGS. The reset was
+                        # unconditional, and the export dialog lets you untick "Expert Settings" --
+                        # so importing such a file wiped every setting on a live expert and wrote
+                        # NOTHING back, leaving it on class defaults. That is not a subtle
+                        # difference: allow_automated_trade_opening defaults False (the expert
+                        # silently stops placing trades) and use_atr_stop defaults True (its stops
+                        # resize). A file that says nothing about settings must CHANGE nothing
+                        # about settings.
+                        if expert_settings:
+                            expert.reset_settings()
+                        else:
+                            logger.warning(
+                                f'Import for expert {target_expert_id} carries no expert_settings; '
+                                f'leaving its existing settings untouched rather than clearing them')
+                            ui.notify('This file carries no expert settings — existing settings '
+                                      'were left as they are', type='warning', timeout=8000)
 
                         # Save all expert settings
                         for setting_key, setting_value in expert_settings.items():

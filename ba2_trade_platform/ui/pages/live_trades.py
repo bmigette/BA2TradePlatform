@@ -18,6 +18,56 @@ from ..components.account_scope import scope_transactions_to_account
 from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
 
+#: How close to a bracket leg counts as "about to hit it", as a fraction of the leg's price.
+PRICE_NEAR_LEG_FRACTION = 0.05
+
+
+def price_proximity_zone(current_price, take_profit, stop_loss, side,
+                         fraction: float = PRICE_NEAR_LEG_FRACTION) -> str:
+    """``'sl'``, ``'tp'`` or ``''`` -- which bracket leg the price is within ``fraction`` of.
+
+    Lets the Current column say at a glance which positions are about to resolve, instead of
+    the reader eyeballing three numbers per row against each other.
+
+    WHICH SIDE IS "NEAR" DEPENDS ON THE DIRECTION. A long's stop sits BELOW the price and its
+    target ABOVE, so it approaches the stop by falling; a short is the mirror image. Reading a
+    short with a long's arithmetic would paint it green exactly when it is in trouble.
+
+    Long   : near SL when current <= sl x (1 + f);  near TP when current >= tp x (1 - f)
+    Short  : near SL when current >= sl x (1 - f);  near TP when current <= tp x (1 + f)
+
+    SL WINS A TIE. Inside a bracket tighter than 2 x fraction both can be true at once, and
+    "you are about to be stopped out" is the half of that the reader needs.
+
+    A missing or non-positive leg is simply not a leg -- many rows carry a stop and no target,
+    and those must be judged on the stop alone rather than dropped.
+    """
+    try:
+        price = float(current_price)
+    except (TypeError, ValueError):
+        return ''
+    if price <= 0:
+        return ''
+
+    def _leg(value):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    tp, sl = _leg(take_profit), _leg(stop_loss)
+    is_long = getattr(side, 'value', side) == OrderDirection.BUY.value
+
+    if sl is not None:
+        if (price <= sl * (1 + fraction)) if is_long else (price >= sl * (1 - fraction)):
+            return 'sl'
+    if tp is not None:
+        if (price >= tp * (1 - fraction)) if is_long else (price <= tp * (1 + fraction)):
+            return 'tp'
+    return ''
+
+
 class LiveTradesTab:
     """Comprehensive transactions management tab with full control over positions."""
 
@@ -456,12 +506,15 @@ class LiveTradesTab:
             current_pnl = ''
             current_pnl_numeric = 0
             current_price_str = ''
+            current_price_zone = ''
 
             if txn.status in (TransactionStatus.OPENED, TransactionStatus.CLOSING) and txn.open_price and txn.quantity:
                 try:
                     current_price = current_prices.get(txn.symbol)
                     if current_price:
                         current_price_str = f"${current_price:.2f}"
+                        current_price_zone = price_proximity_zone(
+                            current_price, txn.take_profit, txn.stop_loss, txn.side)
                         pnl = TransactionHelper.calculate_pnl(txn, current_price)
                         if pnl:
                             current_pnl = f"${pnl['amount']:+.2f} ({pnl['percent']:+.1f}%)"
@@ -576,6 +629,8 @@ class LiveTradesTab:
                 'quantity': f"{txn.quantity:.2f}",
                 'open_price': f"${txn.open_price:.2f}" if txn.open_price else '',
                 'current_price': current_price_str,
+                # '' | 'sl' | 'tp' -- the Current cell paints from this, see LiveTradesTable.
+                'current_price_zone': current_price_zone,
                 'value': value_str,
                 'close_price': f"${txn.close_price:.2f}" if txn.close_price else '',
                 'take_profit': f"${txn.take_profit:.2f}" if txn.take_profit else '',
@@ -704,7 +759,15 @@ class LiveTradesTab:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Could not compute live-trade totals: {e}")
         self._totals = totals
-        self._refresh_totals_row()
+        # INSIDE the guard, because the docstring's promise covers the repaint too. It sat
+        # outside, so a failure here escaped into the loader's own except and blanked the whole
+        # TABLE -- the thing the strip is explicitly worth less than. Demonstrated by the
+        # account-filter tests: a missing `_totals_row` attribute took out all 7 of them, none
+        # of which is about totals.
+        try:
+            self._refresh_totals_row()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not repaint the live-trade totals strip: {e}")
 
     def _account_ids_for_transactions(self, session, txn_ids: List[int]) -> Dict[int, int]:
         """``{transaction_id: account_id}`` for all *txn_ids* in ONE query.

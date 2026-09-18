@@ -275,7 +275,11 @@ STRESS_SPREAD_MULT="${STRESS_SPREAD_MULT:-1.5}"
 # (7 of 9 cells had NO result with a top-5 share under 40%), which is what an unpenalised search
 # converges to. Set ROBUST_FITNESS=0 for a like-for-like comparison against a pre-2026-08-16 run.
 ROBUST_FITNESS="${ROBUST_FITNESS:-1}"
-robust_args=(); [ "$ROBUST_FITNESS" = "1" ] && robust_args=(--robust-fitness)
+# Robustness became the LAUNCHER default on 2026-09-17, so "not passing a flag" no longer
+# means off -- ROBUST_FITNESS=0 must forward the explicit opt-out or this escape hatch
+# would silently stop working (and the like-for-like comparison it exists for would be
+# robustness-ranked after all).
+robust_args=(--no-robust-fitness); [ "$ROBUST_FITNESS" = "1" ] && robust_args=(--robust-fitness)
 
 spread_for() {
   case "$1" in

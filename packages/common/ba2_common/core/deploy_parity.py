@@ -66,6 +66,17 @@ class BacktestRunFacts:
     #: instead of staging an RM candidate.
     entry_action: Optional[Any]
 
+    #: What the run ACTUALLY executed for the two historically-inert RM toggles. MEASURED, not
+    #: assumed: these were hardcoded ``False`` here, which is true of every run on record and
+    #: becomes a lie the first time one is deployed with the ATR stop genuinely on. Both sides
+    #: read the value the run resolved -- the handler from the expert's own settings (where
+    #: INERT_RM_TOGGLES is applied last), the exporter from the row's ``model:*`` genes -- so
+    #: the export follows automatically the day ``INERT_RM_TOGGLES`` is lifted, with no second
+    #: edit here to forget. Default False keeps every legacy row (and every expert that never
+    #: had the gene) reading exactly as it did.
+    use_atr_stop: bool = False
+    regime_overlay_enabled: bool = False
+
 
 @dataclass(frozen=True)
 class ForcedSetting:
@@ -96,8 +107,8 @@ _VALUES = {
     "enable_sell": lambda f: bool(f.enable_short),
     "hold_assigned_stock": lambda f: bool(f.hold_assigned_stock),
     "entry_action": lambda f: f.entry_action,
-    "use_atr_stop": lambda f: False,
-    "regime_overlay_enabled": lambda f: False,
+    "use_atr_stop": lambda f: bool(f.use_atr_stop),
+    "regime_overlay_enabled": lambda f: bool(f.regime_overlay_enabled),
 }
 
 

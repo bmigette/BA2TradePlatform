@@ -1619,8 +1619,13 @@ class AllocationWizard:
             # value, and neither is asking "which way did this trade go".
             _order_value = (-row['estimated_value'] if row['side'] == 'SELL'
                             else row['estimated_value'])
-            ui.label(f"{_order_value:,.2f}").classes(
-                _col('estimated_value', 'text-green-500' if _order_value < 0 else ''))
+            # ``_label``, not ``ui.label``: text-green-500 is one of the classes Tailwind emits
+            # NOTHING for on this build, so worn alone it falls through to styles.css's blanket
+            # white and the SELL row's signed value reads as ordinary body text. _label runs
+            # class_color_style and adds the inline `color: ... !important` that actually paints.
+            # Every neighbouring cell in this row already goes through it.
+            _label(f"{_order_value:,.2f}",
+                   _col('estimated_value', 'text-green-500' if _order_value < 0 else ''))
             ui.label(f"{row['target_notional']:,.2f}").classes(_col('target'))
             projected = row['projected_notional']
             # The header names the mode this figure is in; the tooltip carries the

@@ -3239,6 +3239,16 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     other way round. Switching the default would silently re-rank every option grid resumed
     under it. A run that wants it names it, and its scores never share a table with an
     ``option_car`` score.
+
+    ``option_car_target`` (2026-09-17, registered in ``strategy_fitness.py``) is the THIRD
+    option objective and, for the same reason, NOT a default for any kind either. It is the
+    operator's stated target stated as a target: CAR > 35%/yr AND CAR > drawdown, as two soft
+    ramps (``min(CAR/35,1) x min(CAR/DD,1)``) past which neither term pays anything, plus the
+    same ``(40/dd)^1.5`` high-drawdown penalty. It is the only one of the three that prices the
+    CAR/DD RATIO at all -- ``option_car_over_risk`` divides by sqrt(dd) and therefore scores a
+    40%/40% genome and a 20%/10% one identically. Its scores are not comparable with either
+    other option metric's, so a run that changes to it needs its own ``--name-suffix``: job
+    names are the resume key.
     """
     if cli_fitness:
         return cli_fitness
@@ -5748,7 +5758,7 @@ def _cmd_optimize(args) -> int:
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
-            "robust_fitness": bool(getattr(args, "robust_fitness", False)),
+            "robust_fitness": bool(getattr(args, "robust_fitness", True)),
             "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
             "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                         if getattr(args, "fitness_trade_scale_cap", None) else None),
@@ -5931,9 +5941,13 @@ def _cmd_optimize(args) -> int:
         opt_id = opt.id
         if _worker_ids:
             print(f"optimize: distributing across worker ids {_worker_ids} + local")
+        # The objective is printed IN FULL -- metric AND robustness -- so a log tail answers
+        # "what was this ranked on" without a database query. Robustness is default-ON and
+        # rescales the score, so a line naming only the metric is only half the objective.
         print(f"optimize: strategy #{strat.id} + StrategyOptimization #{opt_id} "
               f"({expert} x {len(universe)} syms, pop={args.population} gen={args.generations} "
-              f"parallel={args.parallel} fitness={fitness})")
+              f"parallel={args.parallel} fitness={fitness} "
+              f"robust_fitness={'ON' if bool(getattr(args, 'robust_fitness', True)) else 'OFF (--no-robust-fitness)'})")
     finally:
         db.close()
 
@@ -6042,6 +6056,7 @@ def _cmd_optimize_batch(args) -> int:
     tq = get_task_queue()
     print(f"optimize-batch: {len(jobs)} job(s) {jobs} x {len(universe)} syms, "
           f"fitness={args.fitness or 'auto (car for pure-option, calmar_ratio otherwise)'}, "
+          f"robust_fitness={'ON' if bool(getattr(args, 'robust_fitness', True)) else 'OFF (--no-robust-fitness)'}, "
           f"pop={args.population} gen={args.generations} parallel={args.parallel}")
 
     for n, (expert, strat_kind) in enumerate(jobs, 1):
@@ -6091,7 +6106,7 @@ def _cmd_optimize_batch(args) -> int:
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
-                "robust_fitness": bool(getattr(args, "robust_fitness", False)),
+                "robust_fitness": bool(getattr(args, "robust_fitness", True)),
                 "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
                 "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                             if getattr(args, "fitness_trade_scale_cap", None) else None),
@@ -6656,6 +6671,40 @@ def _cmd_worker(args) -> int:
     return 0
 
 
+def _add_robust_fitness_args(p) -> None:
+    """``--robust-fitness`` / ``--no-robust-fitness`` on an optimize command. DEFAULT: ON.
+
+    Shared by `optimize` and `optimize-batch` so the two can never drift -- a driver that
+    dispatches through the batch command must not be ranking on a different objective from the
+    same driver's per-job `optimize` calls.
+
+    DEFAULT-ON since 2026-09-17. It was opt-in for a year and no grid driver passed it, so the
+    option stage-1 discovery run ranked its whole search on the RAW metric: its elite reached
+    43-58%%/yr at 61-94%% drawdown with nothing asking whether that was an edge or two trades
+    carrying the book -- the same concentration the 2026-08-16 audit found in 81 of 84 goal2020
+    results. Turning it on by default is what makes that mistake structurally impossible; the
+    companion guard is in strategy_optimization_handler (a checkpoint may not be resumed under a
+    different setting, see _assert_checkpoint_robustness_matches).
+    """
+    p.add_argument("--robust-fitness", dest="robust_fitness", action="store_true", default=True,
+                   help="Rank on the ROBUSTNESS-ADJUSTED fitness rather than the raw metric -- "
+                        "ON BY DEFAULT since 2026-09-17, so this flag is now only an explicit "
+                        "restatement of the default. The metric is multiplied by a concentration "
+                        "factor (how much of net P&L came from the top 1/5 trades), a Monte-Carlo "
+                        "factor (1000-path bootstrap of the trade sequence; penalises a genome "
+                        "whose 5th-percentile path loses money) and a spread factor (fraction of "
+                        "profit surviving a wider spread), so a big winner that is not "
+                        "reproducible stops being rewarded. BOTH numbers are stored "
+                        "(fitness_raw + fitness_robust + every robustness component), but scores "
+                        "are NOT comparable across this setting.")
+    p.add_argument("--no-robust-fitness", dest="robust_fitness", action="store_false",
+                   help="Rank on the RAW metric (the pre-2026-09-17 default). Use it to reproduce "
+                        "or resume a run scored without the robustness adjustment -- resuming a "
+                        "checkpoint under a different setting is REFUSED, and this is one of the "
+                        "two ways out of that refusal (the other is a new job name). Scores "
+                        "produced with and without it are NOT comparable.")
+
+
 def _add_market_condition_args(p) -> None:
     """``--market-condition-profile`` / ``--market-condition-manifest`` on an optimize command.
 
@@ -6921,7 +6970,17 @@ def main(argv: "list | None" = None) -> int:
                          "(40/dd)^1.5 penalty, x consistency x the same trade gate) -- never a "
                          "default, name it explicitly; it ranks a 50%%/30%% genome ABOVE a "
                          "25%%/10%% one, which 'option_consistent_annual_return' ranks the "
-                         "other way, so their scores are NOT comparable. 'option_convex' is the "
+                         "other way, so their scores are NOT comparable. 'option_car_target' is "
+                         "the THIRD option objective, the operator's targets stated as targets: "
+                         "CAR > 35%%/yr AND CAR > drawdown, as two SOFT ramps "
+                         "(x min(CAR/35,1) x min((CAR/DD)/1,1), neither paying anything above "
+                         "its target so over-safety earns nothing) plus the same (40/dd)^1.5 "
+                         "penalty past 40%% dd, x consistency x the same trade gate. It is the "
+                         "only one of the three that prices the CAR/DD RATIO -- "
+                         "'option_car_over_risk' divides by sqrt(dd) and scores a 40%%/40%% "
+                         "genome and a 20%%/10%% one identically. Never a default, name it "
+                         "explicitly, and its scores are NOT comparable with either other "
+                         "option metric's. 'option_convex' is the "
                          "CONVEX-HARVEST metric (end-of-window total return, drawdown free "
                          "below 50%%, breadth floor >=30 tickets/yr AND >=20 underlyings, hit "
                          "rate/concentration recorded not scored) -- never a default, name it "
@@ -6972,15 +7031,7 @@ def main(argv: "list | None" = None) -> int:
                          "whose per-trade edge barely clears the modelled cost. 0 = off "
                          "(default). NOTE: a non-zero value RESCALES fitness, so scores "
                          "are not comparable with runs made at a different level.")
-    op.add_argument("--robust-fitness", action="store_true",
-                    help="Rank on a ROBUSTNESS-ADJUSTED fitness instead of the raw metric: the "
-                         "metric is multiplied by a concentration factor (how much of net P&L came "
-                         "from the top 1/5 trades), a Monte-Carlo factor (1000-path bootstrap of the "
-                         "trade sequence; penalises a genome whose 5th-percentile path loses money) "
-                         "and a spread factor (fraction of profit surviving a wider spread). A big "
-                         "winner that is not reproducible therefore stops being rewarded. BOTH "
-                         "numbers are stored (fitness_raw + fitness_robust + every component), but "
-                         "scores are NOT comparable with a run made without this flag. Default: off.")
+    _add_robust_fitness_args(op)
     op.add_argument("--fitness-trade-scale", action="store_true",
                     help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
                          "statistically thin (few-trade) configs are down-weighted (~target trades/yr "
@@ -7160,8 +7211,11 @@ def main(argv: "list | None" = None) -> int:
                          "(OS1-OS4/O_*) AND the equity-entry overlays O_CC/O_PP, "
                          "'calmar_ratio' for O_STK and stock kinds (the historical batch "
                          "default). Pass 'option_car_over_risk' to rank the whole batch on the "
-                         "~50%%/yr-with-drawdown-tolerance objective instead (never a default; "
-                         "its scores are not comparable with the resolved one's). See optimize "
+                         "~50%%/yr-with-drawdown-tolerance objective instead, or "
+                         "'option_car_target' to rank it on the CAR > 35%%/yr AND CAR > "
+                         "drawdown objective -- the only one of the three that prices the "
+                         "CAR/DD ratio (never a default; no two of these three metrics' scores "
+                         "are comparable with each other or with the resolved one's). See optimize "
                          "--fitness for what those metrics mean; matches _resolve_fitness / "
                          "_OPTION_CAR_STRATEGIES.")
     ob.add_argument("--generations", type=int, default=8)
@@ -7185,6 +7239,7 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--profit-share-cap-pct", type=float, default=25.0,
                     help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
                          "fitness/return (25). Default-on; see `optimize --profit-share-cap-pct`.")
+    _add_robust_fitness_args(ob)
     ob.add_argument("--commission", type=float, default=0.1,
                     help="Flat $ commission per FILL (see optimize --commission; default lowered "
                          "from 1.0 on 2026-08-16). Kept in step with the optimize default so a "

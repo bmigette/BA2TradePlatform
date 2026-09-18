@@ -212,18 +212,28 @@ fi
 # ``option_consistent_annual_return``, which is what every -st1 job so far ran under; with it
 # unset this block is a no-op and the launch is byte-for-byte the one it has always been.
 #
-# Set STAGE1_FITNESS=option_car_over_risk for the OTHER option objective: ~50%/yr WITH a
+# Set STAGE1_FITNESS=option_car_over_risk for the SECOND option objective: ~50%/yr WITH a
 # drawdown tolerance (annualized return / sqrt(max(dd,10%)), full credit to 40% dd then a
 # (40/dd)^1.5 penalty). That is what to run when the default's 16x small-drawdown reward is
 # producing low-return grinders -- as it did on the first gated stage-1 job, which converged on
 # a 10.6%-CAR / 8.9%-DD genome (fitness 13.5, about 2.4x the score it gave a 50%-CAR / 30%-DD
 # one) and was stopped for exactly that reason.
 #
+# Set STAGE1_FITNESS=option_car_target for the THIRD, which is the operator's objective stated
+# as targets rather than as a risk preference: CAR > 35%/yr AND CAR > drawdown. Two SOFT ramps
+# (x min(CAR/35,1) x min(CAR/DD,1)) that stop paying the moment each target is met, so
+# over-safety earns nothing, plus the same (40/dd)^1.5 penalty past 40% dd. It is the only one
+# of the three that prices the CAR/DD RATIO at all -- option_car_over_risk divides by sqrt(dd)
+# and therefore scores a 40%-CAR/40%-DD genome (ratio 1.00) and a 20%/10% one (ratio 2.00)
+# identically, and the live run's entire elite sits at ratios 0.18-0.53 where it says nothing.
+#
 # CHANGING THE FITNESS REQUIRES A NEW SUFFIX, and is refused without one. Job names are the
-# RESUME KEY: re-ranking a search and then resuming into checkpoints scored under the other
-# metric silently mixes two objectives in one population, and the two metrics' scores are not
-# comparable at all (the new one ranks a 50%/30% genome ABOVE a 25%/10% one; the default ranks
-# them the other way round). Same rule as every other economic/search change here.
+# RESUME KEY: re-ranking a search and then resuming into checkpoints scored under another
+# metric silently mixes two objectives in one population, and NO TWO of the three option
+# metrics' scores are comparable at all (option_car_over_risk ranks a 50%/30% genome ABOVE a
+# 25%/10% one; the default ranks them the other way round; option_car_target ranks on distance
+# to two targets and is on a different scale again). Same rule as every other economic/search
+# change here -- e.g. -st1cor for option_car_over_risk, -st1cat for option_car_target.
 STAGE1_FITNESS="${STAGE1_FITNESS:-}"
 STAGE1_SUFFIX="${STAGE1_SUFFIX:--st1}"
 FITNESS_ARGS=()
@@ -238,6 +248,43 @@ if [ -n "$STAGE1_FITNESS" ]; then
   FITNESS_ARGS=(--fitness "$STAGE1_FITNESS")
 fi
 
+# ROBUSTNESS (2026-09-17). The robustness-adjusted fitness -- the metric multiplied by a
+# concentration factor (share of net P&L from the top 1/5 trades), a Monte-Carlo factor
+# (1000-path bootstrap; penalises a genome whose 5th-percentile path loses money) and a spread
+# factor -- is now ON BY DEFAULT in `ba2-test optimize`, so this script passes nothing and every
+# job inherits it. It was opt-in for a year and NO grid driver ever passed it, which is why the
+# gated stage-1 run ranked its whole search on the RAW metric and produced an elite at 43-58%/yr
+# on 61-94% drawdown with nothing asking whether that was an edge or two trades carrying it.
+#
+# STAGE1_ROBUST=0 (or off/false/no) opts back out. Like STAGE1_FITNESS it RE-RANKS the search, so
+# it is REFUSED without its own STAGE1_SUFFIX: job names are the resume key, and a population
+# whose elites were scored raw while its new individuals are scored robust carries two
+# incomparable objectives at once. (The backend refuses that outright as well -- a checkpoint
+# records the setting it was scored under -- but the wrapper must not produce the collision in
+# the first place. Note that the same guard means the existing -st1 checkpoints, all written raw,
+# will now refuse to resume: that refusal is the point, and the way forward is a new suffix.)
+STAGE1_ROBUST="${STAGE1_ROBUST:-}"
+ROBUST_ARGS=()
+if [ -n "$STAGE1_ROBUST" ]; then
+  case "$STAGE1_ROBUST" in
+    0|off|OFF|false|FALSE|no|NO)
+      if [ "$STAGE1_SUFFIX" = "-st1" ]; then
+        echo "stage1_run.sh: STAGE1_ROBUST=$STAGE1_ROBUST re-ranks the search onto the RAW metric," >&2
+        echo "so it needs its own job names -- STAGE1_SUFFIX is still the default '-st1' and those" >&2
+        echo "jobs are already banked under the robustness-adjusted objective. Set STAGE1_SUFFIX" >&2
+        echo "(e.g. -st1raw) so the run cannot resume into checkpoints scored on a different" >&2
+        echo "objective. Scores are NOT comparable across this setting." >&2
+        exit 1
+      fi
+      ROBUST_ARGS=(--no-robust-fitness) ;;
+    1|on|ON|true|TRUE|yes|YES)
+      : ;;   # the default; nothing to pass
+    *)
+      echo "stage1_run.sh: STAGE1_ROBUST=$STAGE1_ROBUST is not a recognised value (use 1/on or 0/off)." >&2
+      exit 1 ;;
+  esac
+fi
+
 # STAGE1_START/END allow explicit shorter pilots (a 2023 start prints LIMITED WINDOW and gets
 # its own discovery identity). A dry-run (pass --dry-run) prints every resolved command.
 exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
@@ -250,5 +297,6 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   --screener-gate-store "$SCREENER_STORE" --max-stock-price 0 \
   --name-suffix="$STAGE1_SUFFIX" \
   ${FITNESS_ARGS[@]+"${FITNESS_ARGS[@]}"} \
+  ${ROBUST_ARGS[@]+"${ROBUST_ARGS[@]}"} \
   ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
   "$@"

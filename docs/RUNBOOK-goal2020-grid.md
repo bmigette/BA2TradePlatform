@@ -147,6 +147,7 @@ bash tools/grid_goal2020.sh --dry-run
 | `SPREAD_BPS_LARGE` | `3` | round-trip spread, large band |
 | `SPREAD_BPS_MID` | `10` | round-trip spread, mid band |
 | `SPREAD_BPS_SMALL` | `40` | round-trip spread, small band |
+| `ROBUST_FITNESS` | `1` | rank on the robustness-adjusted fitness (concentration x monte-carlo x spread). `0` forwards `--no-robust-fitness` and ranks raw. |
 
 The spread values are **assumptions from US equity market structure, not measurements** — we have
 no quote data. A Corwin-Schultz high-low estimate was tried and rejected: it returns 76 bps for
@@ -306,6 +307,21 @@ Resume is *refused*, and the job restarts cleanly from generation 0, when:
   different space — so changing `_RM_OPT` deliberately invalidates every in-flight checkpoint.
 - the job was **renamed** (`grid_abandon.py` does exactly this — deliberately).
 - the checkpoint is **exhausted** (already at the final generation).
+
+Resume is *refused and the job FAILS* (it does not restart, because silently restarting would
+throw away work you may want) when:
+
+- the **robustness setting changed**. Since 2026-09-17 the robustness-adjusted fitness is **ON by
+  default** (`--robust-fitness`; `--no-robust-fitness` opts out, `ROBUST_FITNESS=0` in the grid
+  scripts). It rescales the metric — concentration × monte-carlo × spread — so a population whose
+  elites were scored raw and whose new individuals are scored robust carries two incomparable
+  objectives at once, and the gene-space fingerprint cannot see it (the genes are identical).
+  A checkpoint records the setting it was scored under; a mismatch raises, naming both values and
+  the job name. A checkpoint written **before 2026-09-17 has no such key and is read as raw**,
+  which is what those runs actually did — so every pre-flip checkpoint now refuses on resume.
+  Two ways out: pass `--no-robust-fitness` (`ROBUST_FITNESS=0`) to match the checkpoint, or give
+  the job a new name (`--name-suffix` / `STAGE1_SUFFIX`) and start fresh under the new objective.
+  Scores either side of the setting are **not comparable** — never rank across it.
 
 Known limitation: a resumed run's `all_results` restarts empty, so its row records only
 post-resume trials. The search is intact (population, elites, best individual, both RNG states);

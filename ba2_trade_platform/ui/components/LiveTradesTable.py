@@ -113,6 +113,16 @@ class LiveTradesTable(LazyTable):
                 <template v-else-if="col.name === 'status'">
                     <q-badge :color="props.row.status_color" :label="col.value" />
                 </template>
+                <template v-else-if="col.name === 'current_price'">
+                    <!-- Painted when the price is within 5% of a bracket leg, so the rows about
+                         to resolve stand out without reading Current against TP and SL by eye.
+                         `current_price_zone` is computed per row by
+                         live_trades.price_proximity_zone, which is where the long/short
+                         asymmetry lives -- a short approaches its stop by RISING. -->
+                    <span :class="props.row.current_price_zone === 'sl' ? 'number-negative font-bold' : props.row.current_price_zone === 'tp' ? 'number-positive font-bold' : ''">
+                        {{ props.row.current_price }}
+                    </span>
+                </template>
                 <template v-else-if="col.name === 'current_pnl'">
                     <span :class="props.row.current_pnl_numeric > 0 ? 'number-positive font-bold' : props.row.current_pnl_numeric < 0 ? 'number-negative font-bold' : ''">
                         {{ props.row.current_pnl }}

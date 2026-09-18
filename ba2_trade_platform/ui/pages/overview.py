@@ -1511,10 +1511,22 @@ class AccountOverviewTab:
                 filter_input.bind_value(positions_table, 'filter')
 
                 # Labels column: render each label as a chip
+                # WRAPS, and is bounded. A Quasar table cell is `white-space: nowrap`, so a
+                # symbol carrying eight expert labels rendered them on one endless line: the
+                # cell grew to fit, and every column after it (Exchange, the prices) was
+                # pushed off the right edge. The flex row wraps them onto as many lines as
+                # they need and the max-width stops one busy row from setting the width of
+                # the whole column.
+                #
+                # Inline styles rather than utility classes on purpose: this build ships a
+                # subset of them (see test_ui_colour_classes_paint), and a class that paints
+                # nothing here would fail silently and look like the same bug again.
                 positions_table.add_slot('body-cell-labels', r'''
-                    <q-td :props="props">
-                        <q-chip v-for="l in props.row.labels_list" :key="l" dense size="sm"
-                                color="indigo-5" text-color="white" class="q-ma-none q-mr-xs">{{ l }}</q-chip>
+                    <q-td :props="props" style="white-space: normal; max-width: 20rem;">
+                        <div style="display: flex; flex-wrap: wrap; gap: 3px;">
+                            <q-chip v-for="l in props.row.labels_list" :key="l" dense size="sm"
+                                    color="indigo-5" text-color="white" class="q-ma-none">{{ l }}</q-chip>
+                        </div>
                         <span v-if="!props.row.labels_list || props.row.labels_list.length === 0"
                               class="text-grey-6">—</span>
                     </q-td>

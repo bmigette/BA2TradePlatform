@@ -78,15 +78,19 @@ metadata fails a drift-guard test, so the catalog can never silently drift from 
 | `consistent_annual_return` | `car`, `goal` | See below — the current default "goal" metric. |
 | `option_consistent_annual_return` | `option_car`, `ocar` | OPTION-only: the goal metric with a **superlinear** `(20/max(dd,5))²` drawdown penalty. The auto-default for pure-option strategy kinds. |
 | `option_car_over_risk` | | OPTION-only: **~50%/yr WITH a drawdown tolerance** — `annualized_return / sqrt(max(dd,10%))`, full credit up to a 40% drawdown then a `(40/dd)^1.5` penalty, × consistency × the same trade gate. Never a default; name it explicitly. |
+| `option_car_target` | | OPTION-only: **CAR > 35%/yr AND CAR > drawdown** — `annualized_return × min(CAR/35, 1) × min((CAR/DD)/1, 1) × the same (40/dd)^1.5 penalty past 40% dd`, × consistency × the same trade gate. Both ramps are **soft** (a hard gate would zero a whole fresh population and leave the GA no gradient) and neither pays anything above its target, so over-safety earns nothing. The only one of the three that prices the CAR/DD **ratio**. Never a default; name it explicitly. |
 | `option_convex` | | CONVEX-HARVEST only: end-of-window total return, drawdown free below 50%, behind a breadth floor (≥30 tickets/yr **and** ≥20 underlyings). `O_CONVEX`-only and refused for anything else. |
 
-**The three option metrics are mutually non-comparable, and not comparable with
+**The four option metrics are mutually non-comparable, and not comparable with
 `consistent_annual_return` either.** They are different objectives, not rescalings of one:
 `option_consistent_annual_return` ranks a 25%-CAR/10%-DD genome ABOVE a 50%-CAR/30%-DD one,
 `option_car_over_risk` ranks them the other way round (that inversion is the whole point of it —
 the first gated stage-1 job converged on 10.6%-CAR/8.9%-DD grinders under the former and was
-stopped). Never put two of them in one table, and give a run that changes metric a fresh
-`--name-suffix` — job names are the resume key.
+stopped), and `option_car_target` ranks on **distance to two targets** rather than on a risk
+preference at all — it is the only one that prices the CAR/DD ratio, which `option_car_over_risk`
+cannot express (dividing by `sqrt(dd)` scores a 40%-CAR/40%-DD genome and a 20%-CAR/10%-DD one
+identically at 6.32). Never put two of them in one table, and give a run that changes metric a
+fresh `--name-suffix` — job names are the resume key.
 
 ### `consistent_annual_return` ("car" / "goal")
 
@@ -115,8 +119,34 @@ of the CAR formula, so it still applies.
 
 ## 3. Optional fitness knobs
 
-All are `store_true` flags (default OFF) plus companion value args where noted. They ride in
+All are `store_true` flags (default OFF) plus companion value args where noted -- **except
+`--robust-fitness`, which is ON by default since 2026-09-17** (see below). They ride in
 `optimization_config.backtest` and are threaded per-trial by `strategy_optimization_handler.py`.
+
+### `--robust-fitness` / `--no-robust-fitness` -- **DEFAULT: ON** (since 2026-09-17)
+Multiplies the metric by three factors, so a genome must clear all of them: a **concentration**
+factor (how much of net P&L came from the top 1/5 trades), a **Monte-Carlo** factor (1000-path
+bootstrap of the trade sequence; penalises a genome whose 5th-percentile path loses money) and a
+**spread** factor (fraction of profit surviving a wider spread). A big winner that will not repeat
+therefore stops being rewarded.
+
+It was opt-in for a year and no grid driver ever passed it, so the option stage-1 discovery run
+ranked its whole search on the raw metric -- an elite at 43-58%/yr on 61-94% drawdown with nothing
+asking whether that was an edge or two trades carrying the book. Hence the flip.
+
+- **Both numbers are always stored**: `fitness_raw`, `fitness_robust` (explicitly `None` when off)
+  and every `robustness` component, per trial. The score is always decomposable.
+- **Scores are NOT comparable across the setting.** Never rank a robust run against a raw one.
+- **Resuming across the setting is REFUSED.** A GA checkpoint records the setting it was scored
+  under; resuming it under the other one raises, naming both values and the job. A checkpoint
+  written before 2026-09-17 has no such key and is read as **off** -- which is what those runs
+  actually did -- so an old checkpoint refuses loudly instead of silently changing objective.
+  Two ways out: `--no-robust-fitness` to match the checkpoint, or a new job name to start fresh.
+- Cost: ~3 ms per trial at 300 trades, ~10 ms at 1000 (measured 2026-09-17) -- immaterial against
+  a 100-200 s trial.
+- `--no-robust-fitness` is the opt-out (the pre-2026-09-17 behaviour). `tools/stage1_run.sh`
+  exposes it as `STAGE1_ROBUST=0` and refuses it without its own `STAGE1_SUFFIX`, for the same
+  reason the `STAGE1_FITNESS` guard exists: job names are the resume key.
 
 ### `--fitness-trade-scale` [`--fitness-trade-scale-cap N`, default 100]
 Multiplies a **positive** fitness by `min(avg_trades_per_year, cap) / 100`, down-weighting

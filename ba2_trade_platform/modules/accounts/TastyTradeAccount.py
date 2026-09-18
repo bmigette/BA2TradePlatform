@@ -601,6 +601,75 @@ class TastyTradeAccount(AccountInterface):
             f"TastyTrade ({skipped_non_equity} non-equity rows skipped)")
         return positions
 
+    def get_broker_floating_pl(self) -> Optional[float]:
+        """TastyTrade's OWN open P/L on the equity book: its equity value minus cost basis.
+
+        TastyTrade publishes no open-P/L field anywhere (see the base method), so this is
+        assembled from the two things it DOES publish and does mark itself:
+
+            balances.long_equity_value  -  sum(average_open_price x |qty| x multiplier)
+
+        The right-hand side is the broker's own cost basis, which the platform already
+        reproduces exactly -- $7,635.40 against the broker screen's own total, to the cent,
+        on 2026-09-17. The left-hand side is the part the platform must NOT rebuild: summing
+        ``mark_price x qty`` gave $7,546.76 where TastyTrade's own balances said $7,515.69,
+        so the broker's marks are not its own ``mark_price`` field and a mid-quote sum can
+        never converge on its screen.
+
+        SHORTS ARE REFUSED, not guessed. ``short_equity_value``'s sign convention is
+        unverified here (the live account has held no short equity to measure it against),
+        and a sign error would not look wrong -- it would look like a P/L. ``None`` sends the
+        caller back to the per-position sum, which is a documented fallback rather than a
+        fabricated number.
+
+        Returns:
+            Optional[float]: open P/L on equity positions, or ``None`` when it cannot be
+            measured (not authenticated, fetch failed, short equity held, or the broker
+            published no equity value).
+        """
+        if not self._check_authentication():
+            return None
+        try:
+            balances = self._run_async(self._account.get_balances(self._session))
+            tt_positions = self._run_async(
+                self._account.get_positions(self._session, include_marks=True))
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Could not read the broker's floating P/L: "
+                         f"{self._describe_broker_error(e, 'the balance/position fetch')}",
+                         exc_info=True)
+            return None
+
+        short_equity = balances.short_equity_value
+        if short_equity:
+            logger.info(f"[Account {self.id}] short_equity_value={short_equity} -- this "
+                        f"account holds short equity, whose sign convention in the balances "
+                        f"payload is unverified; deferring to the per-position sum")
+            return None
+
+        long_equity = balances.long_equity_value
+        if long_equity is None:
+            logger.error(f"[Account {self.id}] balances published no long_equity_value; the "
+                         f"broker's floating P/L is unknown, not zero")
+            return None
+
+        cost_basis = 0.0
+        for pos in tt_positions:
+            # EQUITY only, to match the value being differenced against: options are
+            # carried in long/short_derivative_value, not long_equity_value.
+            if pos.instrument_type != TTInstrumentType.EQUITY:
+                continue
+            qty = float(pos.quantity)
+            if qty == 0:
+                continue
+            multiplier = int(pos.multiplier) if pos.multiplier else 1
+            cost_basis += float(pos.average_open_price) * abs(qty) * multiplier
+
+        floating = float(long_equity) - cost_basis
+        logger.debug(f"[Account {self.id}] broker floating P/L: long_equity_value "
+                     f"${float(long_equity):.2f} - cost basis ${cost_basis:.2f} = "
+                     f"${floating:.2f}")
+        return floating
+
     #: TastyTrade order status -> platform OrderStatus. TastyTrade's enum lives in
     #: tastytrade.order (imported here as TTOrderStatus); the platform's is
     #: ba2_common.core.types.OrderStatus. Keep this the ONE place they meet.
@@ -956,6 +1025,15 @@ class TastyTradeAccount(AccountInterface):
         "gtd": OrderTimeInForce.GTD,
         "ext": OrderTimeInForce.EXT,
         "gtc_ext": OrderTimeInForce.GTC_EXT,
+        # THE OVERNIGHT PAIR. The map was written against tastytrade 12.0.2's six-member enum;
+        # the version actually installed (12.4.1, in both venvs including the live one) ships
+        # eight. Without these two, a broker-originated overnight order pulled into the platform
+        # and re-submitted was downgraded to plain GTC -- a different expiry AND no overnight
+        # session, which is the exact defect the GTC_EXT row above records. Warned rather than
+        # silent, and the platform's own writers only emit day/gtc, so this reached broker-
+        # originated orders only.
+        "ext_overnight": OrderTimeInForce.OVERNIGHT,
+        "gtc_ext_overnight": OrderTimeInForce.GTC_OVERNIGHT,
         "ioc": OrderTimeInForce.IOC,
     }
 

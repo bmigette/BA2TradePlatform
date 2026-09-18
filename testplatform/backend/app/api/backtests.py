@@ -16,6 +16,7 @@ from app.services.sync_client import push_backtest
 from ba2_common.core.deploy_parity import (
     BacktestRunFacts, backtest_only_settings, forced_expert_settings,
 )
+from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 
 logger = logging.getLogger(__name__)
 
@@ -1277,11 +1278,35 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
         # highest-severity one is allow_automated_trade_modification: it defaults False live and
         # gates every exit, so without this a deployed sleeve evaluates its exits and never
         # submits them (2026-09-02 review, V3).
+        # The two RM toggles come from the ROW'S OWN GENES, not a constant. They were hardcoded
+        # False in the table, which is true of every run on record (INERT_RM_TOGGLES pins them)
+        # and becomes a lie the first time a run is scored with the ATR stop genuinely on -- the
+        # deploy would then declare use_atr_stop=False for a run that used it, and size its live
+        # stops differently from the backtest it came from. Reading the gene makes the export
+        # follow the day that pin is lifted, with nothing here to remember to change.
+        #
+        # ABSENT means False: 244 of the 692 rows carry no such gene (the expert never had it),
+        # and those ran with it off exactly as the constant said. coerce_bool because the gene
+        # arrives as an int and a legacy row can hold the JSON string "1" -- which is the very
+        # defect these two were pinned for, and which bool() reads backwards.
+        def _executed_toggle(name: str) -> bool:
+            raw = sp.get(f"model:{name}")
+            if raw is None:
+                return False
+            try:
+                return coerce_bool(raw)
+            except ValueError:
+                logger.warning(f"backtest {backtest.id}: model:{name}={raw!r} is not a boolean "
+                               f"spelling; exporting it OFF, as every run on record was")
+                return False
+
         facts = BacktestRunFacts(
             enable_short=bool(execution.get("enable_short")),
             hold_assigned_stock=bool((acct if bt_block is not None else {}).get(
                 "hold_assigned_stock")),
             entry_action=(bt_block.get("entry_action") if bt_block is not None else None),
+            use_atr_stop=_executed_toggle("use_atr_stop"),
+            regime_overlay_enabled=_executed_toggle("regime_overlay_enabled"),
         )
         expert_params = {**expert_params, **forced_expert_settings(facts)}
         return {
