@@ -27,6 +27,7 @@ from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
+from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.types import is_option_action
 
 from app.models.backtest import Backtest
@@ -994,19 +995,46 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
     return out
 
 
-def _run_facts(config: Dict[str, Any]) -> BacktestRunFacts:
-    """The run-level facts the forced-settings table is a function of, read off a TRIAL config.
+def _run_facts(config: Dict[str, Any],
+               expert_settings: Optional[Dict[str, Any]] = None) -> BacktestRunFacts:
+    """The facts the forced-settings table is a function of, read off a TRIAL config.
 
-    The export side reads the same three facts off the persisted
+    The export side reads the same facts off the persisted
     ``optimization_config['backtest']`` block, where two of them are spelled differently
     (``hold_assigned_stock`` lives under ``account_settings`` on both, ``enable_short`` is
     top-level on both). Naming them here is what makes the two reads provably the same read.
+
+    ``expert_settings`` is THIS expert's resolved settings, and the two RM toggles are read
+    from there rather than from the run: they are per-expert genes, and the table's forced
+    values are applied over ``decision_settings`` below, so reading them from anywhere else
+    would let the override contradict the settings it is overriding. Today
+    ``INERT_RM_TOGGLES`` is merged last into every spec, so this reads False for every run on
+    record and nothing moves; the day that pin is lifted, the gene's real value flows through
+    with no edit here.
+
+    Through ``coerce_bool`` because that is the whole reason these two were pinned: the GA
+    passes genes as integers and a bool once round-tripped through the settings writer as the
+    JSON string ``"1"``, which ``bool()`` reads as True and ``bool("0")`` reads as True as well.
     """
     account_settings = config.get("account_settings") or {}
+    settings = expert_settings or {}
+
+    def _toggle(key: str) -> bool:
+        if key not in settings:
+            return False
+        try:
+            return coerce_bool(settings[key])
+        except ValueError:
+            logger.warning(f"{key}={settings[key]!r} is not a boolean spelling; treating the "
+                           f"run as having it OFF, which is what every run on record did")
+            return False
+
     return BacktestRunFacts(
         enable_short=bool(config.get("enable_short")),
         hold_assigned_stock=bool(account_settings.get("hold_assigned_stock")),
         entry_action=config.get("entry_action"),
+        use_atr_stop=_toggle("use_atr_stop"),
+        regime_overlay_enabled=_toggle("regime_overlay_enabled"),
     )
 
 
@@ -1223,7 +1251,7 @@ def _build_experts(
             # THE ONE TABLE (ba2_common.core.deploy_parity). Written here and READ BY THE
             # EXPORT PAYLOAD, so a gate forced onto a trial's expert cannot be added here
             # without the deploy carrying it to the live ExpertInstance -- the review's V3.
-            for k, v in forced_expert_settings(_run_facts(config)).items():
+            for k, v in forced_expert_settings(_run_facts(config, decision_settings)).items():
                 gate_settings[k] = (v, _setting_type(v))
             expert.save_settings(gate_settings)
 
