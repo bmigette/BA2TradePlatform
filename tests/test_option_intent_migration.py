@@ -14,6 +14,7 @@ import os
 import pathlib
 import sqlite3
 import subprocess
+import sys
 
 import pytest
 from alembic.migration import MigrationContext
@@ -113,8 +114,13 @@ def _alembic_upgrade_head(db_path, target=REV):
     keeps each revision's own tests measuring that revision.
     """
     env = {**os.environ, "BA2_DB_FILE": str(db_path)}
+    # ``sys.executable``, not a hardcoded path. This read ``ROOT / "venv/bin/python"`` from the
+    # day the file was written, which is a POSIX layout this repo does not have (the interpreter
+    # is ``.venv/Scripts/python.exe``), so all 16 subprocess tests raised FileNotFoundError and
+    # had NEVER passed on Windows -- 16 of the suite's 35 standing failures, from one line.
+    # The sibling migration suite already does it this way (test_instrument_unique_migration.py).
     result = subprocess.run(
-        [str(ROOT / "venv/bin/python"), "-m", "alembic", "upgrade", target],
+        [sys.executable, "-m", "alembic", "upgrade", target],
         capture_output=True, text=True, env=env, cwd=str(ROOT))
     assert result.returncode == 0, result.stdout + result.stderr
     return result

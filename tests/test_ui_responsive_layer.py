@@ -173,7 +173,7 @@ def test_the_identity_column_is_never_hidden_on_the_priority_tables():
     import pathlib
     for page in ('overview.py', 'marketanalysis.py'):
         src = (pathlib.Path(__file__).resolve().parents[1]
-               / 'ba2_trade_platform' / 'ui' / 'pages' / page).read_text()
+               / 'ba2_trade_platform' / 'ui' / 'pages' / page).read_text(encoding='utf-8')
         for line in src.splitlines():
             if 'mobile-hide' in line:
                 assert "'label': 'Symbol'" not in line, f"{page}: {line.strip()}"

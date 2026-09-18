@@ -80,7 +80,15 @@ def loader(monkeypatch):
     (status Waiting/Open/Closing, no expert/symbol/broker-id filter), which is what
     the user sees on a freshly opened page.
     """
-    tab = LiveTradesTab.__new__(LiveTradesTab)
+    # The real constructor, not ``__new__``. ``__init__`` only assigns attributes -- ``render()``
+    # is separate and async -- so it stays outside a NiceGUI context and still leaves the filter
+    # widgets absent, which is the "freshly opened page" premise above.
+    #
+    # ``__new__`` skipped it, so every attribute ``__init__`` sets was missing. When the totals
+    # strip landed two days after this file was written it added ``_totals_row``, the loader's
+    # broad except swallowed the AttributeError, and all 7 tests failed on a totals strip none of
+    # them is about. Constructing properly is what stops the next attribute doing it again.
+    tab = LiveTradesTab()
 
     # Only the ROW BUILD is stubbed -- it fetches broker prices and margin factors.
     monkeypatch.setattr(
