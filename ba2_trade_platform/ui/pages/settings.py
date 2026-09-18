@@ -4139,7 +4139,23 @@ class ExpertSettingsTab:
                         # stale value the instance had from a PRIOR deploy instead of reverting to
                         # the class default - this is exactly how instance 6 ended up on "smart" RM
                         # mode despite the validating backtest never having set it.
-                        expert.reset_settings()
+                        #
+                        # ONLY WHEN THE FILE ACTUALLY CARRIES SETTINGS. The reset was
+                        # unconditional, and the export dialog lets you untick "Expert Settings" --
+                        # so importing such a file wiped every setting on a live expert and wrote
+                        # NOTHING back, leaving it on class defaults. That is not a subtle
+                        # difference: allow_automated_trade_opening defaults False (the expert
+                        # silently stops placing trades) and use_atr_stop defaults True (its stops
+                        # resize). A file that says nothing about settings must CHANGE nothing
+                        # about settings.
+                        if expert_settings:
+                            expert.reset_settings()
+                        else:
+                            logger.warning(
+                                f'Import for expert {target_expert_id} carries no expert_settings; '
+                                f'leaving its existing settings untouched rather than clearing them')
+                            ui.notify('This file carries no expert settings — existing settings '
+                                      'were left as they are', type='warning', timeout=8000)
 
                         # Save all expert settings
                         for setting_key, setting_value in expert_settings.items():

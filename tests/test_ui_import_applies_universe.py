@@ -110,3 +110,27 @@ def test_the_handler_calls_the_shared_helper():
     src = inspect.getsource(ExpertSettingsTab._render_import_export_tab)
     assert "live_settings_from_universe" in src
     assert "unmapped_screener_keys" in src
+
+
+def test_an_import_with_no_settings_block_does_not_wipe_the_expert():
+    """A file that says nothing about settings must CHANGE nothing about settings.
+
+    The reset was unconditional, and the per-expert Export dialog lets you untick "Expert
+    Settings" -- so importing such a file cleared every setting on a live expert and wrote
+    nothing back, leaving it on class defaults. allow_automated_trade_opening defaults False
+    (the expert silently stops placing trades) and use_atr_stop defaults True (its stops
+    resize), so the blast radius is the whole strategy, silently.
+
+    Pinned at the source, since the handler is a NiceGUI upload callback with no seam: the
+    reset must be guarded by the presence of the settings, and the guard must be the one that
+    wraps it.
+    """
+    import inspect
+    from ba2_trade_platform.ui.pages.settings import ExpertSettingsTab
+
+    src = inspect.getsource(ExpertSettingsTab._render_import_export_tab)
+    reset_at = src.index("expert.reset_settings()")
+    before = src[:reset_at].rstrip().splitlines()[-1]
+    assert before.strip() == "if expert_settings:", (
+        "expert.reset_settings() must be guarded by `if expert_settings:` -- an unguarded "
+        f"reset wipes a live expert on a settings-less file. Line above it was: {before!r}")
