@@ -2793,6 +2793,24 @@ def pnl_div_color(pnl: UnrealisedPnL) -> str:
     return PNL_POSITIVE_COLOR if pnl.total_pct > 0 else PNL_NEGATIVE_COLOR
 
 
+def pnl_div_delta_color(pnl: UnrealisedPnL) -> str:
+    """Quasar colour NAME for the ``w/ div`` half -- the TABLE's twin of ``pnl_div_color``.
+
+    The label bar styles its dividend half inline and the symbol table colours its cells with
+    ``'text-' + <quasar name>``, so the same verdict needs both spellings. Sharing the rule
+    here, rather than letting the table reach for ``delta_color``, is what keeps the two
+    surfaces agreeing: ``delta_color`` calls anything non-zero a direction, while this half has
+    a neutral band (``PNL_PCT_EPSILON``) because a flat 0.00% is not a verdict.
+
+    Same reason as ``pnl_div_color`` for keying on ``total_pct`` and not ``amount``: this half
+    IS a percentage, and colouring it by the money would paint the dividend figure with the
+    sign of the number it exists to contradict.
+    """
+    if pnl is None or pnl.total_pct is None or abs(pnl.total_pct) <= PNL_PCT_EPSILON:
+        return 'grey-5'
+    return 'positive' if pnl.total_pct > 0 else 'negative'
+
+
 def pnl_div_classes(pnl: UnrealisedPnL) -> str:
     """CSS for the ``w/ div`` half. Pure; the colour twin of ``pnl_div_color``."""
     if pnl is None or pnl.total_pct is None or abs(pnl.total_pct) <= PNL_PCT_EPSILON:

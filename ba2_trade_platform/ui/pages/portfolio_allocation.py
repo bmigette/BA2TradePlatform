@@ -116,7 +116,7 @@ from ...core.portfolio_allocation import (
     LabelTarget, SymbolTarget, blocking_messages, build_base_snapshot,
     compute_allocation,
     cash_dividends_by_symbol, compute_base_notional, compute_label_investment,
-    current_value, format_unrealised_pnl, is_blocking_message,
+    current_value, format_unrealised_pnl, is_blocking_message, split_unrealised_pnl,
     unconsumed_income_notice, validate_symbol_weights,
 )
 from ...core.portfolio_allocation_store import (
@@ -166,7 +166,7 @@ from ..utils.portfolio_allocation_view import (
     important_color_style,
     SUBMIT_FAILED_FMT, format_pnl_caption_parts, missing_quote_symbols,
     picker_options, pnl_classes,
-    pnl_color, pnl_div_classes, pnl_div_color, submit_result_cell,
+    pnl_color, pnl_div_classes, pnl_div_color, pnl_div_delta_color, submit_result_cell,
     submit_summary_line,
     positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
@@ -2666,6 +2666,21 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # in it is not always a loss. ``delta_color`` is the same function the live
         # deltas use, so the two greens and the two reds are the same two colours.
         'pnl_color': delta_color(r.pnl.amount),
+        # THE "w/ div" HALF IS COLOURED BY ITS OWN SIGN, as it already was on the label
+        # bar above. The two numbers disagree on exactly the rows worth looking at -- an
+        # income sleeve down on price and up on total return -- and painting the whole
+        # caption by the FIRST one reports the opposite of what the second says. The row
+        # carried one string in one span, so a symbol like BLOX (-0.65% raw, +16.97% with
+        # dividends) read entirely red. Operator, 2026-09-07: "keep the raw red, and div
+        # green" -- true of the bar since then, and now of the table under it.
+        #
+        # Split HERE, by the shared splitter, never by a regex in the browser:
+        # head + div + tail is exactly ``format_unrealised_pnl`` and a caption that
+        # somehow lost its note degrades to one colour instead of raising in a render loop.
+        **dict(zip(('pnl_head', 'pnl_div', 'pnl_tail'),
+                   (lambda parts: (parts[0], parts[1] or '', parts[2]))(
+                       split_unrealised_pnl(r.pnl)))),
+        'pnl_div_color': pnl_div_delta_color(r.pnl),
         # Bumped when an edit is REFUSED, and used as the ``:key`` of the cell's
         # input so the refusal actually puts the typed text back -- see
         # ``_revert_symbol_cell``.
@@ -2867,9 +2882,16 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     ''')
     # P&L in the SAME two colours as the deltas above it. It was plain white, which
     # made the one column that is purely a gain-or-loss the only one not saying so.
+    # Three spans, not one: the middle is the "w/ div" figure and it carries its OWN
+    # verdict (see the row builder). ``pnl_div`` is '' when there is nothing
+    # dividend-adjusted to show, and then this renders exactly the single string it always
+    # did -- v-if, so no empty span and no stray spacing.
     table.add_slot('body-cell-pnl', r'''
         <q-td :props="props">
-            <span :class="'text-' + props.row.pnl_color">{{ props.value }}</span>
+            <span :class="'text-' + props.row.pnl_color">{{ props.row.pnl_head }}</span
+            ><span v-if="props.row.pnl_div" :class="'text-' + props.row.pnl_div_color"
+              >{{ props.row.pnl_div }}</span
+            ><span :class="'text-' + props.row.pnl_color">{{ props.row.pnl_tail }}</span>
         </q-td>
     ''')
     table.on('weightChange',
