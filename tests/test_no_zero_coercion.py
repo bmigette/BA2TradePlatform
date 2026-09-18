@@ -361,14 +361,14 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:4016":
+    "ba2_trade_platform/ui/pages/settings.py:4051":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
         "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
         "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
         ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016)",
-    "ba2_trade_platform/ui/pages/settings.py:4066":
+    "ba2_trade_platform/ui/pages/settings.py:4101":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
@@ -485,9 +485,12 @@ BASELINE: dict = {
     "packages/providers/ba2_providers/insider/FMPInsiderProvider.py": 4,
     "testplatform/backend/app/services/backtest/backtest_account.py": 26,
     "testplatform/backend/app/services/backtest_handler.py": 1,
-    "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
+    # strategy_optimization_handler.py is GONE from this register, not zeroed: its one
+    # coercion went away with 02d99d8c (robustness-adjusted fitness on by default), and a
+    # 0 entry would be a row claiming "this file is fine", which is the one thing BASELINE
+    # must never say. Debt paid off leaves the register entirely.
 }
-BASELINE_TOTAL = 169
+BASELINE_TOTAL = 168
 
 
 # =========================================================================== #
