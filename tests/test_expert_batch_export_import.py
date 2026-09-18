@@ -250,3 +250,76 @@ class TestParse:
 def get_all(model):
     from ba2_trade_platform.core.db import get_all_instances
     return get_all_instances(model)
+
+
+class TestSettingsSurviveTheRoundTripUnchanged:
+    """An import REPLACES an expert's settings (reset_settings, then write the file's keys), so
+    anything the export loses or re-types is silently corrupted rather than reported.
+
+    These compare the expert's OWN resolved settings before and after, which is what every
+    reader sees -- not the raw rows, which legitimately differ (an unset key has no row).
+    """
+
+    @staticmethod
+    def _settings(instance_id):
+        from ba2_trade_platform.core.utils import get_expert_instance_from_id
+        expert = get_expert_instance_from_id(instance_id)
+        expert._invalidate_settings_cache()
+        return dict(expert.settings)
+
+    def test_every_value_type_comes_back_identical(self, seeded):
+        """str / float / int / bool / json, plus the untyped extras a deploy writes."""
+        inst = seeded["instance"]
+        expert = get_expert_instance_from_id(inst.id)
+        expert.save_settings({
+            "target_price_type": ("consensus", None),      # str
+            "profit_ratio": (0.6180339887, None),          # float, non-round
+            "min_analysts": (7, None),                     # int
+            "enable_sell": (True, None),                   # bool True
+            "enable_buy": (False, None),                   # bool False
+            "price_target_window_days": (0, None),         # int zero -- not "unset"
+            "enabled_instruments": ({"AAPL": {"enabled": True, "weight": 60.0}}, None),  # json
+        })
+        before = self._settings(inst.id)
+
+        payload = build_batch_export([inst.id])
+        apply_batch_import(plan_batch_import(payload))
+        after = self._settings(inst.id)
+
+        for key in ("target_price_type", "profit_ratio", "min_analysts", "enable_sell",
+                    "enable_buy", "price_target_window_days", "enabled_instruments"):
+            assert after[key] == before[key], (
+                f"{key}: {before[key]!r} ({type(before[key]).__name__}) -> "
+                f"{after[key]!r} ({type(after[key]).__name__})")
+            assert type(after[key]) is type(before[key]), f"{key} changed type"
+
+    def test_a_false_bool_is_not_lost_as_if_unset(self, seeded):
+        """The classic: `if value:` drops False, and an expert silently starts BUYING again."""
+        inst = seeded["instance"]
+        get_expert_instance_from_id(inst.id).save_settings({"enable_buy": (False, None)})
+        apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
+        assert self._settings(inst.id)["enable_buy"] is False
+
+    def test_a_zero_is_not_lost_as_if_unset(self, seeded):
+        inst = seeded["instance"]
+        get_expert_instance_from_id(inst.id).save_settings({"min_analysts": (0, None)})
+        apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
+        assert self._settings(inst.id)["min_analysts"] == 0
+
+    def test_the_whole_resolved_settings_dict_is_unchanged(self, seeded):
+        """The strongest form: nothing at all moves, across all ~100 declared settings."""
+        inst = seeded["instance"]
+        before = self._settings(inst.id)
+        apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
+        after = self._settings(inst.id)
+        moved = {k: (before.get(k), after.get(k))
+                 for k in set(before) | set(after) if before.get(k) != after.get(k)}
+        assert not moved, f"settings changed across an export/import round trip: {moved}"
+
+    def test_a_second_round_trip_is_also_a_no_op(self, seeded):
+        """Idempotent: re-importing the same file must not drift further each time."""
+        inst = seeded["instance"]
+        apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
+        once = self._settings(inst.id)
+        apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
+        assert self._settings(inst.id) == once
