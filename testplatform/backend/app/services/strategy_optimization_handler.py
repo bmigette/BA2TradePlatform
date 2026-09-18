@@ -2841,10 +2841,15 @@ def _assert_checkpoint_robustness_matches(ckpt: Dict[str, Any], robust_on: bool,
     if was == bool(robust_on):
         return
     missing = "robust_fitness" not in ckpt
+    # Built OUTSIDE the f-string: a string literal cannot span lines inside an f-string
+    # expression before Python 3.12 (PEP 701), and this repo runs 3.11 -- as written it was a
+    # SyntaxError that made this whole module unimportable, taking the GA and 19 test files
+    # with it. Same message, same conditional.
+    absent_note = (" (key absent -- every checkpoint written before 2026-09-17 ranked on the RAW "
+                   "metric, so it is read as False)") if missing else ""
     raise ValueError(
         f"checkpoint {task_id} for job {job_name!r} was scored with robust_fitness="
-        f"{was}{' (key absent -- every checkpoint written before 2026-09-17 ranked on the RAW '
-                'metric, so it is read as False)' if missing else ''}, but this run is configured "
+        f"{was}{absent_note}, but this run is configured "
         f"with robust_fitness={bool(robust_on)}. Resuming would mix two incomparable objectives in "
         f"one population (the robustness adjustment rescales the metric; the gene-space "
         f"fingerprint cannot see it). Two ways out: pass --no-robust-fitness to match the "
