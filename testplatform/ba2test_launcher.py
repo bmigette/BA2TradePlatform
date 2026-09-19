@@ -1297,8 +1297,18 @@ _EXPERT_OPT = {
     # stay fixed in v1 — widen the space only after this first grid reports OOS.
     "DeterministicScorer": {
         "expert_params": {
-            "w_technical": {"optimize": True, "min": 0.2, "max": 0.8, "step": 0.1, "type": "float"},
-            "w_fundamental": {"optimize": True, "min": 0.1, "max": 0.7, "step": 0.1, "type": "float"},
+            # FLOORS DROPPED TO 0.0 (2026-09-19). The old floors (0.2 / 0.1) made the two
+            # core sections permanently mixed: "technical only" needs w_fundamental == 0 and
+            # "fundamental only" needs w_technical == 0, and neither was reachable, so the
+            # grid could never answer which section carries the signal. Nothing downstream
+            # objects -- combine.normalize_weights renormalises over the POSITIVE weights, a
+            # single surviving section gets weight 1.0, and no guard rejects a one-section
+            # config (n_sections is recorded, never consulted as a floor). The degenerate
+            # all-zero genome scores 0.0 everywhere, emits HOLD, trades nothing and is
+            # disqualified by the trade gate like any other dead genome -- a handful of wasted
+            # trials, which is cheaper than a search space that cannot express the question.
+            "w_technical": {"optimize": True, "min": 0.0, "max": 0.8, "step": 0.1, "type": "float"},
+            "w_fundamental": {"optimize": True, "min": 0.0, "max": 0.7, "step": 0.1, "type": "float"},
             "w_analyst": {"optimize": True, "min": 0.0, "max": 0.4, "step": 0.1, "type": "float"},
             # Same bias question as w_analyst, for the PEAD section: FMPEarningsDrift
             # already trades this signal standalone, so the grid — not the default —
@@ -2791,6 +2801,22 @@ def _build_strategy_phase_gated(kind: str):
 _OPTION_ENTRY_GATE = {k: "bullish" for k in _OPTION_STRATS}
 _OPTION_ENTRY_GATE["O_LP"] = "bearish"
 _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
+# NON-DIRECTIONAL members (2026-09-19): a straddle, a strangle and an iron condor are bets on
+# the size of the move, not its sign, so gating them on the expert's BULLISH flag was a
+# category error inherited from the "every original key is bullish" default. They now gate on
+# the NEUTRAL reading -- `current_rating_neutral` is the HOLD bucket
+# (CurrentRatingNeutralCondition: recommended_action == OrderRecommendation.HOLD), which is
+# the expert saying "no directional view", i.e. exactly the precondition for a no-movement
+# structure. Measured supply on the stage-1 universe (97 large caps, 313 Mondays, 2020-2025):
+# BUY 78.5%, HOLD 15.6%, SELL 2.3% -- so HOLD is ~7x the sell signal and is a real, tradeable
+# population rather than the 11-symbol rump that makes the bearish arms untestable.
+# STILL toggle_optimize=True like every other signal leaf, so the GA can drop the direction
+# filter entirely and let the structure fire on any reading; this widens the search space, it
+# does not impose a thesis. See also _low_confidence_gate, the other half of the pair.
+_NEUTRAL_ENTRY_MEMBERS = {"O_STRD", "O_STRG", "O_IC"}
+for _neutral_kind in sorted(_NEUTRAL_ENTRY_MEMBERS):
+    if _neutral_kind in _OPTION_ENTRY_GATE:
+        _OPTION_ENTRY_GATE[_neutral_kind] = "current_rating_neutral"
 # GRID 2: O_LEAPP is the grid's only bearish long-dated arm (design §2, "the bearish twin"),
 # so it gates on the expert's SELL signal exactly as O_LP does. O_LEAPC is bullish; O_CBS
 # (upside convexity) is bullish; O_PBS is the crash hedge and is the family's other bearish
@@ -4429,6 +4455,40 @@ def _days_to_earnings_gate(m: str) -> dict:
             "optimize": True, **_EVENT_ENTRY_DAYS}
 
 
+def _low_confidence_gate(m: str) -> dict:
+    """The LOW-conviction entry gate leaf for the non-directional members (``m`` = prefix).
+
+    The mirror of ``shared-gate_confidence``, which is hardcoded ``confidence > X`` at every
+    call site because the GA's gene space searches a condition's threshold and its enabled
+    flag but NEVER its operator. That fixed operator is why "enter only when conviction is
+    LOW" was unreachable: there was no leaf spelling ``<=``. This is that leaf.
+
+    WHY IT IS THE RIGHT GATE FOR A NO-MOVEMENT STRUCTURE. DeterministicScorer's confidence is
+    not an independent axis -- ``confidence_from_score`` is ``max(5, 100*min(1,|final|))``, a
+    pure function of the composite score's MAGNITUDE. So low confidence IS "the composite sits
+    near zero", i.e. the model sees no move in either direction. That is the precondition a
+    straddle/strangle seller wants, and no other gate in the vocabulary expresses it: the
+    neutral FLAG says the action bucket was HOLD, this says the conviction behind it was
+    small, and they are not the same statement.
+
+    NOT ``shared-``: unlike conviction-above-a-bar, which means the same thing to every
+    structure, this leaf only exists for the members in ``_NEUTRAL_ENTRY_MEMBERS``, so a
+    shared id would create a gene that most members never carry.
+
+    RANGE 5-30. The floor is 5 because ``confidence_from_score`` cannot emit less on a
+    directional action, so a threshold below it can never pass. The ceiling is 30, well under
+    ``_EXPERT_CONFIDENCE_CEILING['DeterministicScorer']`` (50) so ``_clamp_confidence_genes``
+    never touches it -- and deliberately so: a "low conviction" gate that admits 50 on an
+    expert topping out near 56 would admit nearly everything and gate nothing.
+
+    ``toggle_optimize=True`` like every optional gate: the GA decides whether low conviction
+    is actually a precondition, rather than the launcher asserting it.
+    """
+    return {"id": f"{m}-low_confidence", "field": "confidence", "op": "<=", "value": 20,
+            "optimize": True, "value_min": 5, "value_max": 30, "value_step": 5,
+            "toggle_optimize": True}
+
+
 def _assert_option_expiry_clears_event_window(kind: str) -> None:
     """The straddle's expiry must land AFTER the print (amendment 2).
 
@@ -5028,9 +5088,20 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
             {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member], "field_type": "flag",
              "toggle_optimize": True},
             {"id": f"{m}-flat", "field": "has_no_position", "field_type": "flag"},
-            {"id": "shared-gate_confidence", "field": "confidence", "op": ">", "value": 50,
-             "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
-             "toggle_optimize": True},
+            # HIGH-conviction gate, for DIRECTIONAL members only. The non-directional members
+            # get the `<=` mirror instead (below), a SWAP rather than an addition: it keeps
+            # their genome at the same width -- the 31-gene grid-1 budget pinned by
+            # test_option_grid_foundations::test_grid1_genomes_did_not_move -- and it drops a
+            # gate that is close to arithmetically dead for them. A neutral-gated member only
+            # fires when the action is HOLD, and on a scorer whose confidence is
+            # 100*|composite| a HOLD by definition sits below the buy/sell threshold, so
+            # `confidence > 40..75` and `current_rating_neutral` are nearly unsatisfiable
+            # together. Asking a structure that wants NO view to also want STRONG conviction
+            # is a contradiction, not a search dimension.
+            *([] if member in _NEUTRAL_ENTRY_MEMBERS else [
+                {"id": "shared-gate_confidence", "field": "confidence", "op": ">", "value": 50,
+                 "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
+                 "toggle_optimize": True}]),
             _iv_rank_gate(m, member),
             _relative_volume_gate(),
             _iv_rv_gate(m, member),
@@ -5039,6 +5110,13 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
             # rather than folded into an existing leaf so it keeps its own threshold gene,
             # and NOT toggle_optimize -- see _days_to_earnings_gate.
             *([_days_to_earnings_gate(m)] if member in _EVENT_ENTRY_MEMBERS else []),
+            # NON-DIRECTIONAL members only (O_STRD/O_STRG/O_IC): the low-conviction gate, the
+            # `<=` mirror of shared-gate_confidence that a no-movement thesis needs and the
+            # fixed-operator shared leaf cannot express. Appended like the earnings gate, and
+            # its own id keeps its threshold gene separate from the shared high-conviction
+            # one -- a member can now search BOTH bounds and the GA may enable either, both
+            # or neither. See _low_confidence_gate.
+            *([_low_confidence_gate(m)] if member in _NEUTRAL_ENTRY_MEMBERS else []),
             # MARKET-CONDITION gates (--market-condition-profile; [] by default). LAST in the
             # AND list on purpose: appending keeps every existing leaf at its current index, so
             # profile `none` emits a byte-identical rule and an older gene key still names the
