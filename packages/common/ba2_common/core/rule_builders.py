@@ -87,6 +87,11 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # recommendation and every position that did not come from an earnings-event expert.
     "rec_days_to_earnings": ExpertEventType.N_REC_DAYS_TO_EARNINGS,
     "days_after_event": ExpertEventType.N_DAYS_AFTER_EVENT,
+    # THE DIRECTION CALL AS A NUMBER (SELL -2 .. BUY +2, HOLD 0). MANDATORY here and not
+    # merely tidy: the option grid's entry gate is this leaf, and an unmapped field is
+    # DROPPED by triggers_from_condition_tree with nothing but a WARNING -- every option
+    # strategy would then enter in BOTH directions while the GA kept tuning its mode gene.
+    "rec_direction": ExpertEventType.N_REC_DIRECTION,
 }
 
 

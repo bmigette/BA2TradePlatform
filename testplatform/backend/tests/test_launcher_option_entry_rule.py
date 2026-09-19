@@ -30,17 +30,129 @@ def _find_cond(rule, cond_id):
     raise AssertionError(f"condition {cond_id} not found in rule {rule['id']}")
 
 
-def test_signal_gate_is_toggleable():
+# --- the direction MODE gene (2026-09-19) ---------------------------------------------------
+# The signal leaf used to be a FLAG (``bullish``/``bearish``) with an ON/OFF toggle: the GA could
+# drop the direction requirement but never FLIP it, so a long call on a SELL signal -- the
+# contrarian arm of every structure -- was unreachable by construction. It is now a NUMERIC leaf
+# on ``rec_direction`` (the grade centred on HOLD: SELL -2 .. BUY +2) with the threshold pinned
+# at 0 and a mode gene over off/below/above. Against 0 those are exactly "no filter" / "bearish"
+# / "bullish", and the mode gene REPLACES the toggle gene, so the direction became searchable at
+# zero net gene cost.
+
+def test_signal_gate_is_a_direction_mode_gene_not_a_flag():
     rule = mod._option_entry_rule("O_LC")
     signal = _find_cond(rule, "o_lc-signal")
-    assert signal["field"] == "bullish"
-    assert signal["toggle_optimize"] is True
+    assert signal["field"] == "rec_direction"
+    assert signal["field_type"] == "numeric"
+    assert signal["mode_optimize"] is True
+    assert signal["mode_choices"] == ["off", "below", "above"]
+    # the threshold is the fixed point of a signed scale, never a searched gene -- searching it
+    # would put back the gene the mode gene replaced
+    assert signal["value"] == 0.0
+    assert signal["optimize"] is False
+    # ... and the two cannot coexist: 'off' already removes the leaf
+    assert "toggle_optimize" not in signal
 
 
-def test_bearish_member_gets_bearish_signal_field():
-    rule = mod._option_entry_rule("O_LP")
-    signal = _find_cond(rule, "o_lp-signal")
-    assert signal["field"] == "bearish"
+def test_the_authored_mode_reproduces_the_flag_it_replaced():
+    """Bullish members author ``>`` (== mode 'above'), bearish members ``<`` (== 'below').
+
+    This is the parity statement: at the AUTHORED default the rule is the one the flag leaf
+    expressed, so a run launched after this change starts from where the old one did.
+    """
+    assert _find_cond(mod._option_entry_rule("O_LC"), "o_lc-signal")["op"] == ">"
+    assert _find_cond(mod._option_entry_rule("O_VERT"), "o_vert-signal")["op"] == ">"
+    assert _find_cond(mod._option_entry_rule("O_LP"), "o_lp-signal")["op"] == "<"
+    assert _find_cond(mod._option_entry_rule("O_BEARCS"), "o_bearcs-signal")["op"] == "<"
+    for member, word in mod._OPTION_ENTRY_GATE.items():
+        if member in mod._NEUTRAL_ENTRY_MEMBERS:
+            continue
+        leaf = _find_cond(mod._option_entry_rule(member), f"{member.lower()}-signal")
+        assert leaf["op"] == mod._ENTRY_GATE_OP[mod._ENTRY_GATE_MODE[word]], member
+
+
+def test_the_direction_field_is_mapped_or_the_gate_is_silently_dropped():
+    """``triggers_from_condition_tree`` DROPS an unmapped field with only a WARNING -- every
+    option strategy would then enter in BOTH directions while the GA kept tuning the mode."""
+    from ba2_common.core.rule_builders import FIELD_EVENT
+    assert "rec_direction" in FIELD_EVENT
+
+
+#: The 15 pure-option structures that are LAUNCHABLE on their own (``--strategy <key>``), i.e.
+#: the grid-1 set ``test_option_grid_foundations.PURE`` parametrises. The other
+#: ``_OPTION_STRATS`` entries are group-only members (O_LEAPC/O_LEAPP, O_CONVEXC/O_CONVEXP),
+#: grid-2 singles with their own budget tables (O_ERN/O_CBS/O_PBS), or phase-gated (O_PMCC).
+_PURE_SINGLES = ["O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_BEARCS", "O_BULLPS",
+                 "O_CSP", "O_IC", "O_JL", "O_RS", "O_SSTD", "O_SSTG", "O_STRD", "O_STRG"]
+
+#: Gene counts measured on the committed code IMMEDIATELY BEFORE the direction-mode change
+#: (expert DeterministicScorer, ``collect_param_space(_build_strategy(...))``). Hand-
+#: transcribed from that run so "unchanged" is checked against a RECORDED number rather than
+#: against whatever the code happens to produce now.
+_GENE_COUNTS_BEFORE_THE_DIRECTION_MODE = {
+    "O_LC": 28, "O_LP": 28, "O_VERT": 28, "O_BF": 27, "O_BULLCS": 28, "O_BEARCS": 31,
+    "O_BULLPS": 31, "O_CSP": 31, "O_IC": 30, "O_JL": 30, "O_RS": 30, "O_SSTD": 26,
+    "O_SSTG": 27, "O_STRD": 25, "O_STRG": 28,
+}
+
+
+def test_every_member_spends_exactly_one_gene_on_its_direction_gate():
+    """The leaf-level half of the NET-ZERO claim, over EVERY structure including the
+    group-only and grid-2 ones: directional members carry ``mode_optimize`` and no toggle,
+    neutral members the reverse. Never both -- ConditionLeaf and the gene collector each
+    refuse the pair, because ``off`` already removes the leaf."""
+    for member in sorted(mod._OPTION_STRATS):
+        leaf = _find_cond(mod._option_entry_rule(member), f"{member.lower()}-signal")
+        neutral = member in mod._NEUTRAL_ENTRY_MEMBERS
+        assert bool(leaf.get("mode_optimize")) is not neutral, member
+        assert bool(leaf.get("toggle_optimize")) is neutral, member
+
+
+def test_the_mode_gene_replaces_the_toggle_gene_exactly():
+    """NET ZERO GENES on the real collected space: the direction gate costs ONE gene before
+    and after, it is just a different one.
+
+    The mode gene is only free because ``mode_optimize`` and ``toggle_optimize`` cannot
+    coexist and the threshold is not searched. If either changed, every directional member
+    would grow a gene and the 31-gene grid-1 budget
+    (test_option_grid_foundations::test_grid1_genomes_did_not_move) would have to move.
+    """
+    from app.services.strategy_param_space import collect_param_space
+
+    for member in _PURE_SINGLES:
+        space = collect_param_space(
+            mod._build_strategy(member, f"g-{member}", "DeterministicScorer"))
+        cid = f"{member.lower()}-signal"
+        neutral = member in mod._NEUTRAL_ENTRY_MEMBERS
+        assert (f"cond:{cid}:mode" in space) is not neutral, member
+        assert (f"cond:{cid}:enabled" in space) is neutral, member
+        assert len([g for g in space if g.startswith(f"cond:{cid}:")]) == 1, member
+
+
+def test_no_pure_option_member_changed_gene_COUNT():
+    """The budget statement the 31-gene pin depends on, stated PER MEMBER rather than as a
+    ceiling: a swap that grew one member and shrank another would pass a ceiling test."""
+    from app.services.strategy_param_space import collect_param_space
+
+    assert set(_GENE_COUNTS_BEFORE_THE_DIRECTION_MODE) == set(_PURE_SINGLES)
+    assert set(_PURE_SINGLES) <= set(mod._OPTION_STRATS)
+    got = {member: len(collect_param_space(
+        mod._build_strategy(member, f"g-{member}", "DeterministicScorer")))
+        for member in _PURE_SINGLES}
+    assert got == _GENE_COUNTS_BEFORE_THE_DIRECTION_MODE
+
+
+def test_the_neutral_members_keep_their_FLAG_leaf():
+    """off/below/above cannot say ``== HOLD``: that is an equality on the INTERIOR of the
+    scale, not an ordering, and 'below OR above' is its complement rather than the thing
+    itself. They also want no direction at all, so there is nothing for a mode gene to
+    search."""
+    for member in sorted(mod._NEUTRAL_ENTRY_MEMBERS):
+        signal = _find_cond(mod._option_entry_rule(member), f"{member.lower()}-signal")
+        assert signal["field"] == "current_rating_neutral", member
+        assert signal["field_type"] == "flag", member
+        assert signal["toggle_optimize"] is True, member
+        assert "mode_optimize" not in signal, member
 
 
 def test_every_pure_option_member_gets_the_expected_profit_gate():

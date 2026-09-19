@@ -1299,6 +1299,85 @@ class RatingDowngradedCondition(RatingDirectionCondition):
         return f"Check if rating was downgraded (rank decreased) for {self.instrument_name}"
 
 
+# The 5-grade scale RE-CENTRED ON HOLD, which is what makes it comparable against a fixed
+# threshold of 0: SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2. DERIVED from
+# ``_RATING_RANK`` rather than retyped, so the two orderings cannot drift apart -- and ERROR
+# stays absent here for the same reason it is absent there: a grade the scale does not know
+# yields NO signal, never a plausible-looking zero.
+_REC_DIRECTION_CODE = {
+    grade: rank - _RATING_RANK[OrderRecommendation.HOLD]
+    for grade, rank in _RATING_RANK.items()
+}
+
+
+class RecommendationDirectionCondition(CompareCondition):
+    """The expert's direction call AS A SIGNED NUMBER -- ``rec_direction``.
+
+    ``calculated_value`` is the recommendation's grade on the 5-grade scale re-centred on
+    HOLD (``_REC_DIRECTION_CODE``): SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2.
+
+    WHY THIS EXISTS BESIDE ``BullishCondition`` / ``BearishCondition``
+    -----------------------------------------------------------------
+    Those are FLAG conditions: the field is authored into the leaf, so a rule can only switch
+    the gate off, never flip it. A pure-option strategy's entry direction was therefore fixed
+    at build time -- a long call could be tested on the BUY signal or on no signal at all, but
+    never on the SELL signal, so the contrarian arm of every structure was unreachable by
+    construction. As a NUMBER the same question becomes an ordering against a fixed threshold
+    of 0, and the optimizer's three-way mode gene (``off`` / ``below`` / ``above``) spans
+    exactly "no direction filter", "bearish only" and "bullish only" -- one gene where the
+    flag needed one gene to say strictly less.
+
+    EQUIVALENCE AT THE THRESHOLD 0. ``> 0`` is true for BUY and OVERWEIGHT, ``< 0`` for SELL
+    and UNDERWEIGHT, and both are false for HOLD. On the 3-grade experts (DeterministicScorer,
+    FMPRating) that is exactly ``bullish`` / ``bearish``. On a 5-grade expert (FactorRanker,
+    FinnHubRating) it is DELIBERATELY WIDER: the question this field answers is "which way is
+    the expert leaning", and an OVERWEIGHT that read as "not bullish" would have to read as
+    HOLD instead -- claiming the expert has no view when it has a weak one. The two flags stay
+    exactly as they are for anyone who wants the strict ``== BUY`` reading.
+
+    UNEVALUABLE, NOT ZERO. ERROR -- and any grade the scale does not carry -- leaves
+    ``calculated_value`` at None and makes ``evaluate()`` return False for EVERY operator,
+    the ``RecommendationDaysToEarningsCondition`` / ``DaysToExpiryCondition`` discipline. 0 is
+    already a meaningful reading here (it IS HOLD), so an unevaluable grade folded into it
+    would be indistinguishable from a real neutral call, and a failed analysis would gate the
+    same way a considered "no view" does.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            action = getattr(self.expert_recommendation, 'recommended_action', None)
+            code = _REC_DIRECTION_CODE.get(action)
+            if code is None:
+                # WARNING, not debug: unlike rec_days_to_earnings (absent on every
+                # non-event expert, so a per-symbol-per-bar warning would be noise), every
+                # recommendation carries a graded action. Getting here means ERROR or a
+                # grade outside the 5-grade scale, which is an expert that failed.
+                logger.warning(
+                    f"rec_direction for {self.instrument_name} is unevaluable: recommended "
+                    f"action {action!r} is not one of the 5 trading grades")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = code
+            return self.operator_func(code, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating rec_direction condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the expert's direction call for {self.instrument_name} "
+                f"(SELL -2 .. BUY +2) is {self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        if self.calculated_value is None:
+            return None
+        return f"{action.value} ({int(self.calculated_value):+d})"
+
+
 # Numeric Condition Implementations
 
 class ExpectedProfitTargetPercentCondition(CompareCondition):
@@ -4303,6 +4382,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
     ExpertEventType.F_SHORT_TERM: ShortTermCondition,
     ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
+    ExpertEventType.N_REC_DIRECTION: RecommendationDirectionCondition,
     ExpertEventType.F_CURRENT_RATING_OVERWEIGHT: CurrentRatingOverweightCondition,
     ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
     ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,

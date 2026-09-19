@@ -52,6 +52,14 @@ PERMITTED = ["O_LC", "O_LP", "O_VERT", "O_BULLCS", "O_BULLPS", "O_BEARCS", "O_BF
 
 #: ``_option_entry_rule("O_LC")`` as the code before this change produced it. See the module
 #: docstring for how it was obtained; it is a PIN, never regenerate it to make a test pass.
+#:
+#: AMENDED ONCE, 2026-09-19, for the ``-signal`` leaf ONLY: the direction gate became a
+#: ``rec_direction`` numeric leaf with a MODE gene so the GA can also pick the CONTRARIAN
+#: direction (the flag leaf could only be switched off). That is a deliberate change to the
+#: authored rule, not profile drift, and it is behaviour-preserving at the authored default
+#: (``> 0`` on a HOLD-centred scale IS the old ``bullish`` flag -- see
+#: test_launcher_option_entry_rule.py). Every other leaf, and the leaf ORDER, is untouched,
+#: which is what this pin exists to protect: profile ``none`` must still append NOTHING.
 PROFILE_NONE_O_LC = json.loads(r"""
 {
     "id": "o_lc-entry",
@@ -62,9 +70,16 @@ PROFILE_NONE_O_LC = json.loads(r"""
         "conditions": [
             {
                 "id": "o_lc-signal",
-                "field": "bullish",
-                "field_type": "flag",
-                "toggle_optimize": true
+                "field": "rec_direction",
+                "field_type": "numeric",
+                "op": ">",
+                "value": 0.0,
+                "optimize": false,
+                "value_min": 0.0,
+                "value_max": 0.0,
+                "value_step": 1.0,
+                "mode_optimize": true,
+                "mode_choices": ["off", "below", "above"]
             },
             {
                 "id": "o_lc-flat",
@@ -528,20 +543,59 @@ def _build_without_profile(kind: str):
 
 
 # --------------------------------------------------------------------------- the all-off control
+def _market_mode_genes(space) -> list:
+    """The MARKET-CONDITION mode genes of a collected space.
+
+    A gene-level filter, not "every ``:mode`` gene", and the distinction became load-bearing on
+    2026-09-19: the option DIRECTION gate is now a mode leaf too (``<m>-signal`` on
+    ``rec_direction``, off/below/above). That gene is not part of the market-condition profile
+    and exists under profile ``none`` as well, so switching it off would not build the control
+    -- it would build a DIFFERENT strategy (one that enters in both directions) and the
+    comparison below would fail for a reason that has nothing to do with the profile. The
+    control holds it at its authored mode on both sides, which is exactly what "the same run
+    with the market gates off" means.
+    """
+    return [g for g in space if g.endswith(":mode") and "-market-" in g]
+
+
 @pytest.mark.parametrize("kind", PERMITTED)
 def test_the_all_off_control_decodes_to_the_profile_none_tree(kind, profile_on):
-    """Explicit ``mode=off`` on every market gene must leave the SAME tree profile ``none``
+    """Explicit ``mode=off`` on every MARKET gene must leave the SAME tree profile ``none``
     builds -- for every permitted structure, since Task 9's compatibility gate compares a whole
     frozen run and one structure's stray leaf would move its orders."""
     gated = _built(kind)
     space = collect_param_space(gated)
-    genome = {g: (MODE_OFF if g.endswith(":mode") else _authored(gated, g))
+    market_modes = _market_mode_genes(space)
+    assert len(market_modes) == 3, (kind, market_modes)
+    genome = {g: (MODE_OFF if g in market_modes else _authored(gated, g))
               for g in space if g.startswith("cond:") or g.startswith("entry:")}
     decoded = decode_params(gated, {k: v for k, v in genome.items() if v is not None})
     plain = decode_params(_build_without_profile(kind), {})
     assert _market_ids(decoded["entry_rules"]) == []
     assert decoded["entry_rules"] == plain["entry_rules"]
     assert decoded["exit_rules"] == plain["exit_rules"]
+
+
+@pytest.mark.parametrize("kind", PERMITTED)
+def test_the_control_holds_the_direction_gate_and_only_the_market_gates_go_off(kind, profile_on):
+    """The exclusion above, pinned rather than left implicit.
+
+    Two halves. (1) The market mode genes the control switches off are EXACTLY the three the
+    profile added -- turning a fourth one off would be a different strategy, not a control.
+    (2) The direction mode gene, where the structure has one, is present in BOTH the gated and
+    the profile-``none`` space, which is why holding it at its authored mode is the honest
+    comparison. The overlays (O_CC / O_PP, whose entry is the shared equity builder's) and the
+    non-directional structures have no direction mode gene at all, so the set is empty for
+    them -- asserted here so this test still says something for every kind.
+    """
+    gated_space = collect_param_space(_built(kind))
+    plain_space = collect_param_space(_build_without_profile(kind))
+    market = set(_market_mode_genes(gated_space))
+    assert market == {f"cond:{kind.lower()}-market-{s}:mode" for s in ("slope", "adx", "rv")}
+    other_gated = {g for g in gated_space if g.endswith(":mode")} - market
+    other_plain = {g for g in plain_space if g.endswith(":mode")}
+    assert other_gated == other_plain, kind
+    assert not [g for g in plain_space if "-market-" in g], kind
 
 
 def _authored(strategy, gene):

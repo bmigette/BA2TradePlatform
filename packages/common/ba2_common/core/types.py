@@ -413,6 +413,26 @@ class ExpertEventType(str, Enum):
     N_DAYS_SINCE_LAST_PROFITABLE_CLOSE = "days_since_last_profitable_close"
     N_DAYS_SINCE_LAST_LOSING_CLOSE = "days_since_last_losing_close"
     N_CONFIDENCE = "confidence"
+    # THE EXPERT'S DIRECTION CALL AS A SIGNED NUMBER, so a rule can gate on it with an
+    # ORDERING rather than with one of the three ``bullish``/``bearish``/
+    # ``current_rating_neutral`` boolean flags. Ordinal, centred on HOLD and derived from the
+    # SAME 5-grade scale the rating-change events use (TradeConditions._RATING_RANK, shifted
+    # so HOLD == 0): SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2.
+    #
+    # WHY A NUMBER AND NOT THE FLAGS. A flag leaf can only be switched OFF; the FIELD is
+    # authored and fixed, so "long calls, but on the SELL signal" (the contrarian arm) was
+    # not expressible at all. A numeric leaf carries a MODE gene whose three choices are
+    # exactly off / below / above, so with the threshold pinned at 0 one gene says
+    # "bullish only" (> 0), "bearish only" (< 0) or "no direction filter" (off) -- and it
+    # REPLACES the flag's on/off gene, so the direction becomes searchable at zero net gene
+    # cost (testplatform/ba2test_launcher.py::_option_entry_rule).
+    #
+    # ERROR (and any grade absent from the scale) is UNEVALUABLE -- it fires in NEITHER
+    # direction, exactly like rec_days_to_earnings with no stamp. Mapping it to 0 would read
+    # as HOLD, i.e. an expert that FAILED would look like an expert with no view, and a
+    # `< 0` gate would silently admit nothing while a `> 0` gate silently admitted nothing
+    # either -- the failure would be invisible rather than refused.
+    N_REC_DIRECTION = "rec_direction"
     N_INSTRUMENT_ACCOUNT_SHARE = "instrument_account_share"    # Current instrument value as % of expert virtual equity
     N_PERCENT_OPEN_TO_NEW_TARGET = "percent_open_to_new_target"  # Distance from open price to new expert target as %
     # Option-related numeric events

@@ -334,6 +334,22 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Enter the straddle 1-5 days before the print: rec_days_to_earnings <= 3"
         },
+        ExpertEventType.N_REC_DIRECTION.value: {
+            "name": "Recommendation Direction (signed)",
+            "description": (
+                "The expert's direction call as a signed number on the 5-grade scale, centred "
+                "on HOLD: SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2. The numeric "
+                "twin of the bullish / bearish / current_rating_neutral flags: 'rec_direction "
+                "> 0' is bullish (BUY or OVERWEIGHT), '< 0' is bearish (SELL or UNDERWEIGHT). "
+                "Use it when the direction itself should be a searchable choice -- one "
+                "threshold comparison covers both directions, where the flags fix the "
+                "direction at authoring time. A recommendation whose action is ERROR (or any "
+                "grade outside the five) is UNEVALUABLE and does NOT fire in either "
+                "direction; it is never read as 0 (which would mean HOLD)."
+            ),
+            "type": "numeric",
+            "example": "Enter only on a bearish call: rec_direction < 0"
+        },
         ExpertEventType.N_DAYS_AFTER_EVENT.value: {
             "name": "Days after the Event",
             "description": (

@@ -2791,13 +2791,19 @@ def _build_strategy_phase_gated(kind: str):
     raise RuntimeError(f"{kind} is phase-gated")  # unreachable: the line above exits
 
 
-# Directional entry gate per pure-option strategy: which signal flag the entry rule requires.
+# Entry gate per pure-option strategy. THE VALUE IS A DIRECTION WORD for every directional
+# member -- "bullish"/"bearish" name which way the expert must be leaning, NOT a field: since
+# 2026-09-19 those members gate on the NUMERIC ``rec_direction`` leaf and the word is mapped
+# to the leaf's authored MODE through ``_ENTRY_GATE_MODE`` below. Only the non-directional
+# members (``_NEUTRAL_ENTRY_MEMBERS``) still hold a flag FIELD NAME here, because
+# "== HOLD" is not an ordering and cannot be said with off/below/above.
+#
 # Every original O_* key fires on the expert's BULLISH signal (including O_VERT — a bearish
 # STRUCTURE opened on a bullish signal as a hedge-shaped premium play, the original grid
 # semantics, kept unchanged). O_LP and O_BEARCS (both bearish structures) are the true
 # bearish-signal entries. O_STRD/O_STRG (non-directional vol plays) keep the "bullish"
-# default here too, but the gate condition is toggle_optimize=True in _option_entry_rule, so
-# the GA can turn direction-gating off entirely and let them fire on either signal.
+# default here too, but the direction is a MODE gene in _option_entry_rule, so the GA can
+# turn direction-gating off entirely -- or FLIP it, which the old flag leaf could not do.
 _OPTION_ENTRY_GATE = {k: "bullish" for k in _OPTION_STRATS}
 _OPTION_ENTRY_GATE["O_LP"] = "bearish"
 _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
@@ -2821,14 +2827,36 @@ for _neutral_kind in sorted(_NEUTRAL_ENTRY_MEMBERS):
 # so it gates on the expert's SELL signal exactly as O_LP does. O_LEAPC is bullish; O_CBS
 # (upside convexity) is bullish; O_PBS is the crash hedge and is the family's other bearish
 # structure. O_ERN is non-directional and keeps the "bullish" default like O_STRD/O_STRG --
-# that leaf is toggle_optimize=True in _option_entry_rule, so the GA can drop the direction
-# gate entirely and let the straddle fire on either signal, which is what a vol bet wants.
+# that leaf carries the direction MODE gene in _option_entry_rule, so the GA can drop the
+# direction gate entirely (mode ``off``) and let the straddle fire on either signal, which is
+# what a vol bet wants -- or flip it to the SELL side if that scores better.
 _OPTION_ENTRY_GATE["O_LEAPP"] = "bearish"
 _OPTION_ENTRY_GATE["O_PBS"] = "bearish"
 # CONVEX-HARVEST GRID (plan Task 13): O_CONVEXP is the put/tail-hedge arm of the O_CONVEX
 # group, so it gates on the expert's SELL signal exactly as O_LP/O_LEAPP do. O_CONVEXC keeps
 # the "bullish" default like every call arm above.
 _OPTION_ENTRY_GATE["O_CONVEXP"] = "bearish"
+
+# Direction word -> the numeric leaf's AUTHORED mode (design 2026-09-19). ``rec_direction`` is
+# the expert's grade centred on HOLD (SELL -2 .. BUY +2), so against the pinned threshold 0
+# ``above`` (``> 0``) IS the old ``bullish`` flag and ``below`` (``< 0``) IS the old
+# ``bearish`` one -- the authored default therefore reproduces today's behaviour exactly. What
+# is NEW is that the mode is a GENE with three choices (off/below/above), so the GA can also
+# pick the OPPOSITE direction: a long call entered on a SELL signal, the contrarian arm that
+# was unreachable while the field itself was hard-coded. It costs nothing: ConditionLeaf
+# forbids ``mode_optimize`` beside ``toggle_optimize`` (the ``off`` choice already removes the
+# leaf), so the one ``cond:<id>:mode`` gene REPLACES the one ``cond:<id>:enabled`` gene the
+# flag leaf used to emit.
+_ENTRY_GATE_MODE = {"bullish": "above", "bearish": "below"}
+#: The authored operator each mode means on a leaf whose threshold is 0.
+_ENTRY_GATE_OP = {"above": ">", "below": "<"}
+_undirected = sorted(k for k, v in _OPTION_ENTRY_GATE.items()
+                     if k not in _NEUTRAL_ENTRY_MEMBERS and v not in _ENTRY_GATE_MODE)
+if _undirected:
+    raise RuntimeError(
+        f"_OPTION_ENTRY_GATE holds no direction word for directional member(s) {_undirected}: "
+        f"a member that is not in _NEUTRAL_ENTRY_MEMBERS must map to one of "
+        f"{sorted(_ENTRY_GATE_MODE)}")
 
 # FULL-NOTIONAL structures: those whose per-contract buying-power reserve scales with the
 # STRIKE (cash-secured / un-netted naked notional) rather than with a defined-risk spread
@@ -5051,10 +5079,51 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     return recorded
 
 
+def _option_signal_gate(m: str, member: str) -> dict:
+    """The entry rule's DIRECTION leaf for one structure (id ``<m>-signal``, unchanged).
+
+    DIRECTIONAL members get a NUMERIC leaf on ``rec_direction`` -- the expert's grade centred
+    on HOLD (SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2) -- with the threshold
+    PINNED at 0 and a MODE gene over ``off``/``below``/``above``. Against a 0 threshold those
+    three are exactly "no direction filter", "enter on the SELL signal" and "enter on the BUY
+    signal", so the GA now chooses the DIRECTION and not merely whether to require one. The
+    authored mode is the member's historical direction (``_ENTRY_GATE_MODE``), so the default
+    genome is the flag leaf this replaced.
+
+    ZERO NET GENES, which is the reason this is a mode leaf and not a second rule: the model
+    forbids ``mode_optimize`` beside ``toggle_optimize`` (``off`` already removes the leaf),
+    so the single ``cond:<id>:mode`` gene stands exactly where ``cond:<id>:enabled`` stood.
+    ``optimize`` is False on purpose -- the threshold is the fixed point of a signed scale,
+    not a quantity to search, and searching it would add the gene back. The degenerate
+    ``value_min``/``value_max``/``value_step`` are NOT a search range: a mode leaf is
+    classified NUMERIC (``rule_models.leaf_mode_kind``) precisely by carrying a threshold
+    range, and a leaf classified CATEGORICAL may not offer ``below``/``above`` at all.
+
+    NON-DIRECTIONAL members (``_NEUTRAL_ENTRY_MEMBERS``: the straddle, the strangle and the
+    iron condor) KEEP the ``current_rating_neutral`` FLAG leaf with its ON/OFF toggle. Two
+    reasons, both hard. (1) ``off``/``below``/``above`` cannot express ``== HOLD``: that is an
+    equality on the interior of the scale, not an ordering, and ``below`` OR ``above`` is its
+    complement rather than the thing itself. (2) They do not want a direction anyway -- they
+    are bets on the SIZE of the move, so "the expert has no view" is the gate, and flipping it
+    to a direction would be the category error the neutral override exists to undo.
+    """
+    if member in _NEUTRAL_ENTRY_MEMBERS:
+        return {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member],
+                "field_type": "flag", "toggle_optimize": True}
+    from ba2_common.core.rule_models import NUMERIC_MODE_CHOICES
+
+    mode = _ENTRY_GATE_MODE[_OPTION_ENTRY_GATE[member]]
+    return {"id": f"{m}-signal", "field": "rec_direction", "field_type": "numeric",
+            "op": _ENTRY_GATE_OP[mode], "value": 0.0, "optimize": False,
+            "value_min": 0.0, "value_max": 0.0, "value_step": 1.0,
+            "mode_optimize": True, "mode_choices": list(NUMERIC_MODE_CHOICES)}
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False,
                        gates_off: "bool | None" = None) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
-    (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
+    (a ``rec_direction`` MODE gene authored to the member's historical direction -- bullish
+    for every original key, bearish for O_LP; see _option_signal_gate) + flat +
     optimizable confidence gate + the iv_rank / relative-volume / iv-vs-realised-vol gates +
     ONE expected-profit gate, action = the member's option action config. Rule/condition ids
     are prefixed with the member key so a GROUP of these rules yields uniquely-keyed genes per
@@ -5068,9 +5137,10 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
     silently). ``toggleable`` adds the rule-level enabled gene (group members only — a
     single-strategy job keeps its one entry always-on).
 
-    Every gate except ``-flat`` is independently ``toggle_optimize=True``: ``-flat``
-    (``has_no_position``) is a correctness guard, not a strategy opinion, so the GA may not
-    switch it off. Op is fixed per gate — the GA's gene space only ever searches a condition's
+    Every gate except ``-flat`` is independently switchable off by the GA -- via
+    ``toggle_optimize=True``, or (the ``-signal`` leaf) via its mode gene's ``off`` choice:
+    ``-flat`` (``has_no_position``) is a correctness guard, not a strategy opinion, so the GA
+    may not switch it off. Op is fixed per gate — the GA's gene space only ever searches a condition's
     threshold value and its enabled flag, never its operator (see
     docs/plans/2026-07-21-options-price-target-conditions.md's "Design reference"). That is why
     ``_iv_rank_gate`` and ``_iv_rv_gate`` are built PER MEMBER: their direction flips between
@@ -5088,8 +5158,7 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
         "id": f"{m}-entry",
         "name": f"{member}-entry",
         "conditions": {"id": f"{m}-root", "type": "AND", "conditions": [
-            {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member], "field_type": "flag",
-             "toggle_optimize": True},
+            _option_signal_gate(m, member),
             {"id": f"{m}-flat", "field": "has_no_position", "field_type": "flag"},
             # HIGH-conviction gate, for DIRECTIONAL members only. The non-directional members
             # get the `<=` mirror instead (below), a SWAP rather than an addition: it keeps
