@@ -91,9 +91,23 @@ def test_low_confidence_range_stays_under_the_scorer_ceiling():
     """
     ceiling = mod._EXPERT_CONFIDENCE_CEILING["DeterministicScorer"]
     leaf = mod._low_confidence_gate("o_strd")
-    assert leaf["value_max"] < ceiling
-    # floor: confidence_from_score cannot emit below 5 on a directional action
-    assert leaf["value_min"] >= 5
+    # The AUTHORED range now runs to 70 so a loose "anything but high conviction" gate is
+    # expressible on an expert that can reach 100. What keeps it meaningful on the scorer is
+    # the clamp, not the authored ceiling: _clamp_confidence_genes caps it at 50 there.
+    assert leaf["value_max"] == 70
+    assert leaf["value_min"] == 10
+    assert leaf["value_min"] < ceiling, "the floor must stay reachable under the clamp"
+
+
+def test_low_confidence_range_is_clamped_for_the_scorer():
+    """The widened ceiling must still be cut to what DeterministicScorer can emit."""
+    strat = mod._build_strategy("O_STRD", "x", "DeterministicScorer")
+    leaves = [c for r in strat.entry_rules for c in r["conditions"]["conditions"]
+              if isinstance(c, dict) and c.get("id", "").endswith("-low_confidence")]
+    assert leaves, "the low-confidence leaf is missing from the built strategy"
+    ceiling = mod._EXPERT_CONFIDENCE_CEILING["DeterministicScorer"]
+    for leaf in leaves:
+        assert leaf["value_max"] <= ceiling, leaf
 
 
 def test_directional_members_get_no_low_confidence_gate():

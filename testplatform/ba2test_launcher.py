@@ -4475,17 +4475,20 @@ def _low_confidence_gate(m: str) -> dict:
     structure, this leaf only exists for the members in ``_NEUTRAL_ENTRY_MEMBERS``, so a
     shared id would create a gene that most members never carry.
 
-    RANGE 5-30. The floor is 5 because ``confidence_from_score`` cannot emit less on a
-    directional action, so a threshold below it can never pass. The ceiling is 30, well under
-    ``_EXPERT_CONFIDENCE_CEILING['DeterministicScorer']`` (50) so ``_clamp_confidence_genes``
-    never touches it -- and deliberately so: a "low conviction" gate that admits 50 on an
-    expert topping out near 56 would admit nearly everything and gate nothing.
+    RANGE 10-70 (operator call 2026-09-19, widened from 5-30). The floor is 10 rather than
+    ``confidence_from_score``'s own floor of 5 because a threshold AT the floor admits nothing
+    a directional action can produce; the ceiling is 70 so the search can also express a LOOSE
+    "anything but high conviction" gate, not only a strict one. Note the interaction with
+    ``_clamp_confidence_genes``: for DeterministicScorer the ceiling is clamped to 50 (its
+    confidence tops out near 56), so this gene searches 10-50 under that expert and the full
+    10-70 under one that can reach 100. That clamp is what stops the loose end of the range
+    becoming a gate that admits everything.
 
     ``toggle_optimize=True`` like every optional gate: the GA decides whether low conviction
     is actually a precondition, rather than the launcher asserting it.
     """
-    return {"id": f"{m}-low_confidence", "field": "confidence", "op": "<=", "value": 20,
-            "optimize": True, "value_min": 5, "value_max": 30, "value_step": 5,
+    return {"id": f"{m}-low_confidence", "field": "confidence", "op": "<=", "value": 30,
+            "optimize": True, "value_min": 10, "value_max": 70, "value_step": 5,
             "toggle_optimize": True}
 
 
