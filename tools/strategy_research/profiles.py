@@ -232,7 +232,9 @@ def variants(family, baseline):
 def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                    start="2020-01-01", end="2025-12-31", search="grid",
                    population=24, generations=4, parallel=1, seed=42,
-                   workers=(), save_top=5, store=None, spread_bps=None, etf_symbols=None):
+                   workers=(), save_top=5, store=None, spread_bps=None, etf_symbols=None,
+                   market_condition_profile="none", market_condition_manifest=None,
+                   market_condition_mode="search"):
     """Build a portable manifest. No data access; --preflight resolves the actual universe."""
     if not families or len(set(families)) != len(families) or not set(families) <= set(FAMILIES):
         raise ValueError("Select distinct, known strategy families")
@@ -244,6 +246,10 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
         raise ValueError("Invalid search budget")
     if search == "grid" and workers:
         raise ValueError("The existing exhaustive-grid handler is local/serial; use --search genetic for remote workers")
+    from tools.strategy_research.market_conditions import selection, attach
+    profiles, pins = selection(market_condition_profile, market_condition_manifest, market_condition_mode)
+    if profiles and market_condition_mode == "search" and search != "genetic":
+        raise ValueError("Market-condition gene search requires --search genetic; exhaustive grids are too large")
     if parallel == 0 and not workers:
         raise ValueError("--parallel 0 requires named remote workers")
     if spread_bps is not None and spread_bps < 0:
@@ -274,8 +280,9 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
             settings = bt["experts"][0]["settings"]
             settings["execution_schedule_enter_market"] = deepcopy(bt["run_schedule_override"])
             settings["execution_schedule_open_positions"] = deepcopy(bt["manage_schedule_override"])
+            attach(job, bt, profiles, pins, market_condition_mode)
             expert_params = job.pop("expert_params")
-            has_rule_gene = any(n.get("optimize") or n.get("action_value_optimize")
+            has_rule_gene = any(n.get("optimize") or n.get("action_value_optimize") or n.get("mode_optimize")
                                 for n in walk(job["strategy"]))
             fixed = not expert_params and not has_rule_gene
             if fixed:

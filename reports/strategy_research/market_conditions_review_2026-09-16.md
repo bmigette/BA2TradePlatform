@@ -6,6 +6,13 @@ Reviewed 2026-09-16 at `23e457aad86f8743c8ca955ca65eb7079c58be65`.
 
 This pass changed documentation only. No strategy, calculator, stored backtest, production setting or database was changed; no optimization or provider warmup was launched. Stage 2 was deliberately deferred. The equity follow-up integration is specified in [goal2020_followups.md](../../docs/strategy_research/goal2020_followups.md); it is not implemented by this review.
 
+**Follow-up status (2026-09-17):** F1 (session-window validation), F2 (manifest-only
+argument refusal) and F3 (per-expert host-manifest selection) are now fixed in the current
+branch (`16eae91e`, `fb7437d7` and `4dd86f94`). The opt-in equity follow-up adapter and its
+cache-only preflight/export driver are implemented; the launch contract and
+verification plan are recorded in [goal2020_followups.md](../../docs/strategy_research/goal2020_followups.md).
+The original findings below remain the historical evidence from the 2026-09-16 review.
+
 ## Findings
 
 ### F1 — High: snapshot coverage checks do not validate the requested sessions
@@ -141,7 +148,6 @@ The skips include optional TA-Lib reference comparisons; this is not a claim tha
 
 Recommended order:
 
-1. Fix F1 and F2 with focused launch/preflight regressions before the next gated stage-1 campaign; leave all calculators and existing backtest results unchanged.
-2. Fix F3 before deploying a mixture of profile sets on one live platform. Verify that capture/replay and exits retain their current behavior.
-3. Use explicit frozen ungated controls and matched seeds. Compare profit, CAR, drawdown, trades, capital usage and top-five winner concentration, plus missing-data versus measured-condition rejections. Do not infer improvement from fewer trades alone.
-4. Implement the equity entry-rule adapter and manifest-aware follow-up driver specified in [the updated follow-up plan](../../docs/strategy_research/goal2020_followups.md), then run those as new experiments. Stage 2 remains a separate review.
+1. Keep the F1/F2/F3 launch and resolver regressions in the blocking gate; leave all calculators and existing backtest results unchanged.
+2. Use explicit frozen ungated controls and matched seeds. Compare profit, CAR, drawdown, trades, capital usage and top-five winner concentration, plus missing-data versus measured-condition rejections. Do not infer improvement from fewer trades alone.
+3. Run the opt-in equity follow-up driver only after each pinned profile passes warmup, verification and host preparation. Stage 2 remains a separate review.

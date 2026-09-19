@@ -83,22 +83,13 @@ def code_signature():
                         for p in sorted(files)])
 
 
-def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
-    """Resolve the *fixed* screened union, require files, and sample date coverage.
-
-    This is a read-only cache check, not a fetch. It cannot certify every intraday gap
-    or point-in-time fundamental record; the engine's hermetic cache checks still apply.
-    """
+def resolve_universe(bt):
+    """Resolve the full fixed-screen union without consulting prices or providers."""
     add_source_paths()
     import pandas as pd
     from ba2_providers.screener.metric_store import load_store, screened_symbol_union
 
-    ready = deepcopy(job)
-    bt = ready["optimization_config"]["backtest"]
-    cache_dir = Path(cache_dir).resolve()
     start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
-    if not cache_dir.is_dir():
-        raise ValueError(f"Missing OHLCV directory: {cache_dir}")
     store_files = []
     if "screener_opt" in bt:
         store = Path(bt["screener_opt"]["store"])
@@ -117,7 +108,25 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     else:
         symbols = sorted(bt["enabled_instruments"])
     if not symbols:
-        raise ValueError(f"{job['name']}: fixed screen selects no symbols")
+        raise ValueError("Fixed screen selects no symbols")
+    return symbols, store_files
+
+
+def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
+    """Check price coverage and pinned features without fetching any market data.
+
+    Market-condition preparation may build host-local mappings from published objects.
+    """
+    add_source_paths()
+    import pandas as pd
+
+    ready = deepcopy(job)
+    bt = ready["optimization_config"]["backtest"]
+    cache_dir = Path(cache_dir).resolve()
+    start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
+    if not cache_dir.is_dir():
+        raise ValueError(f"Missing OHLCV directory: {cache_dir}")
+    symbols, store_files = resolve_universe(bt)
     intervals = tuple(dict.fromkeys(("1d", bt["execution_interval"])))
     files = [cache_dir / f"{symbol}_{interval}.parquet" for symbol in symbols for interval in intervals]
     missing = [str(p) for p in files if not p.is_file()]
@@ -165,6 +174,11 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
                 "code_signature": code_signature(),
                 "cache_signature": fingerprint([(str(p), p.stat().st_size, p.stat().st_mtime_ns)
                                                  for p in sorted(files + store_files)])}
+    from tools.strategy_research.market_conditions import preflight as condition_preflight
+    conditions = condition_preflight(bt, cache_dir.parent)
+    if conditions is not None:
+        evidence["market_conditions"] = conditions
+        evidence["market_condition_cache_root"] = str(cache_dir.parent)
     ready["preflight"] = evidence
     ready["planned_name"] = job["name"]
     ready["name"] = f"{job['name']}-data{fingerprint(evidence)[:10]}"
@@ -222,6 +236,10 @@ def persist_top(db, opt, job):
         params = {**result["params"], "expertFixedSettings": block["experts"][0]["settings"],
                   "entryRules": decoded["entry_rules"], "exitRules": decoded["exit_rules"],
                   "equityCap": block["account_settings"]["equity_cap"]}
+        if "market_condition" in block:
+            params["market_condition"] = deepcopy(block["market_condition"])
+            params["market_condition_profiles"] = list(block["market_condition_profiles"])
+            params["market_condition_manifests"] = dict(block["market_condition_manifests"])
         if bt is None:
             bt = Backtest(name=name, model_id=None, engine_type="daily_expert", expert_name=job["expert"],
                           optimization_id=opt.id, labels=block["labels"], strategy_params=params,

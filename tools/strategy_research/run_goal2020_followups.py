@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 from tools.strategy_research.profiles import FAMILIES, build_manifest, fingerprint
 from tools.strategy_research.runtime import (
-    check_database, execute_ready, job_lock, preflight, write_json)
+    check_database, execute_ready, job_lock, preflight, resolve_universe, write_json)
 
 
 def parser():
@@ -28,6 +28,8 @@ def parser():
     mode.add_argument("--dry-run", action="store_true", help="Offline manifest only (the default).")
     mode.add_argument("--preflight", action="store_true", help="Read existing caches; do not create backtest jobs.")
     mode.add_argument("--run", action="store_true", help="Execute jobs and save results in the test database.")
+    mode.add_argument("--export-universe", type=Path,
+                      help="Write the full selected symbol union for warmup; no price fetch or job creation.")
     ap.add_argument("--families", nargs="+", choices=FAMILIES, default=list(FAMILIES))
     ap.add_argument("--variants", nargs="+", help="Optional subset, e.g. control timeout.")
     ap.add_argument("--equity", type=float, default=10000.0, help="Starting account equity per independent job.")
@@ -41,6 +43,12 @@ def parser():
     ap.add_argument("--workers", default="", help="Comma-separated configured worker names (genetic search only).")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-top", type=int, default=5)
+    ap.add_argument("--market-condition-profile", default="none",
+                    help="none, ohlcv-v1, ta-structure-v1, or their comma-separated combination.")
+    ap.add_argument("--market-condition-manifest",
+                    help="Pinned digest, or profile=digest pairs for multiple profiles.")
+    ap.add_argument("--market-condition-mode", choices=("search", "all-off"), default="search",
+                    help="Search entry genes, or retain original rules with pinned condition diagnostics.")
     ap.add_argument("--spread-bps", type=float, help="Override every family's spread; 0 is preserved.")
     ap.add_argument("--store", help="Override the snapshot's metric-store directory.")
     ap.add_argument("--etf-symbols", nargs="+", help="Fixed ETF research universe; default SPY IEF TLT GLD.")
@@ -60,6 +68,8 @@ def verify_job(job):
 
 
 def run_child(args):
+    # Bind the engine to the same central cache checked below, before backend imports.
+    os.environ["CACHE_FOLDER"] = str(args.cache_dir.resolve().parent)
     path = args.job_file.resolve()
     job = json.loads(path.read_text(encoding="utf-8"))
     verify_job(job)
@@ -106,7 +116,10 @@ def main(argv=None):
             start=args.start, end=args.end, search=args.search, population=args.population,
             generations=args.generations, parallel=args.parallel, seed=args.seed,
             workers=[s.strip() for s in args.workers.split(",") if s.strip()],
-            save_top=args.save_top, store=args.store, spread_bps=args.spread_bps, etf_symbols=args.etf_symbols)
+            save_top=args.save_top, store=args.store, spread_bps=args.spread_bps, etf_symbols=args.etf_symbols,
+            market_condition_profile=args.market_condition_profile,
+            market_condition_manifest=args.market_condition_manifest,
+            market_condition_mode=args.market_condition_mode)
         if args.variants is not None:
             available = {j["variant"] for j in manifest["jobs"]}
             unknown = set(args.variants) - available
@@ -123,7 +136,21 @@ def main(argv=None):
             cap = bt["account_settings"]["equity_cap"]
             print(f"  {job['family']:16} {job['variant']:26} {bt['start_date']}..{bt['end_date']} "
                   f"equity={bt['initial_capital']:g} cap={cap} {job['optimization_type']}")
+            if "market_condition" in bt:
+                mc = bt["market_condition"]
+                print(f"    conditions={','.join(mc['profiles'])} mode={mc['mode']} "
+                      f"added_genes={mc['gene_count']}; budget={args.population}x{args.generations}")
         print(f"{len(manifest['jobs'])} jobs. Each is an independent account.", flush=True)
+        if args.export_universe is not None:
+            path = args.export_universe.resolve()
+            if path.parent == ROOT:
+                raise ValueError("Put the warmup universe in a research subdirectory, not the repository root")
+            symbols = sorted({s for job in manifest["jobs"]
+                              for s in resolve_universe(job["optimization_config"]["backtest"])[0]})
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(symbols) + "\n", encoding="utf-8")
+            print(f"Warmup universe: {path} ({len(symbols)} symbols); no optimization started.")
+            return 0
         if args.run:
             return run_jobs(manifest["jobs"], output, args)
         if args.preflight:
