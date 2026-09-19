@@ -441,7 +441,15 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                 skip_reason="insufficient_history")
 
         # ---- TECHNICAL ----
-        tech = technical_score(df, settings)
+        # The view is the SAME cached frame `df` was sliced out of, handed over
+        # so the indicators can be read off memoised full-frame series instead
+        # of being rebuilt from the slice on every bar. It is a lookup, never a
+        # fetch, and it changes no input: when it is absent or does not match
+        # (a synthetic frame in a test, a replayed bundle), technical_score
+        # falls back to the per-slice arithmetic and returns the same floats.
+        # Both callers -- analyze_as_of and the live _gather_and_process -- come
+        # through here; there is no backtest/live branch.
+        tech = technical_score(df, settings, view=data.frame_view(symbol))
 
         # ---- FUNDAMENTAL ----
         fund = self._build_fundamental(data_bundle, settings, as_of)
