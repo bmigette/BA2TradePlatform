@@ -35,6 +35,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -84,6 +85,16 @@ _locks: Dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 # Process-wide memo so a per-bar expert parses each series file once, not once per bar.
 _MEM: Dict[str, List[dict]] = {}
+# The PARSED form of each memoized series: {series id: (rows object, _ParsedSeries)}.
+#
+# STALENESS. The rows object is stored WITH the parse and re-checked with ``is`` on every
+# read, so the memo can only ever be served for the exact payload it was built from. That
+# matters on the LIVE path, where ``_fill_cache_on_the_live_path`` can rewrite a series
+# mid-process: ``_load`` then returns a NEW list and this memo misses by construction. A
+# memo keyed on the series id alone would happily serve yesterday's macro data into today's
+# trading. ``reset_cache()`` and ``refresh_series()`` drop it alongside ``_MEM`` as well --
+# belt and braces, and it keeps the parse from outliving the rows it describes.
+_PARSED: Dict[str, Any] = {}
 
 
 def _lock_for(key: str) -> threading.Lock:
@@ -167,6 +178,7 @@ def refresh_series(series_id: str, api_key: str) -> int:
                        "vintage": _spec(sid)["vintage"], "observations": rows}, fh)
         os.replace(tmp, path)        # atomic: a concurrent reader never sees a partial file
         _MEM.pop(sid, None)
+        _PARSED.pop(sid, None)       # the parse describes the rows we just replaced
     return len(rows)
 
 
@@ -230,8 +242,98 @@ def _load(series_id: str) -> List[dict]:
 
 
 def reset_cache() -> None:
-    """Drop the in-process memo (tests, and the live /api/reload path)."""
+    """Drop the in-process memos -- raw rows AND their parse (tests, live /api/reload)."""
     _MEM.clear()
+    _PARSED.clear()
+
+
+class _ParsedSeries:
+    """``get_series_as_of``'s per-row parse, done ONCE per cached payload.
+
+    WHY. The function used to walk every raw row on EVERY call, doing two
+    ``pd.Timestamp(<string>)`` parses per row, and it is called once per (series,
+    decision date). Measured on a real 10-symbol / 501-bar DeterministicScorer
+    backtest: 2,004 calls, 633,264 ``strptime`` calls, 49.9 s -- 59% of the whole
+    run. The answer for a given cut is a pure FILTER over a parse that never
+    changes, so the parse moves here and the call becomes a mask + Series build.
+
+    WHAT IS STORED, and why it is stored this way:
+
+      * ``index``  -- observation dates of the surviving rows, IN ORIGINAL ROW
+        ORDER. The order is load-bearing: ``get_series_as_of`` ends in
+        ``.sort_index()``, pandas' default sort is not stable, so a different
+        pre-sort order can reorder ties and change the returned series.
+      * ``known``  -- the date each surviving row became public: ``realtime_start``
+        for a vintage series, the observation date otherwise (``_spec(sid)``
+        decides, exactly as before).
+      * ``values`` -- the parsed floats, aligned with ``index``.
+      * ``deferred_known`` / ``deferred_exc`` -- see SKIP SEMANTICS.
+
+    SKIP SEMANTICS, reproduced exactly. The original loop dropped a row when the
+    date parse raised KeyError/ValueError, and -- separately -- when
+    ``float(row["value"])`` raised TypeError/ValueError; note it appended the
+    VALUE first, so a bad value skipped the row entirely rather than leaving the
+    two lists misaligned. Both drops are unconditional (a dropped row is dropped
+    for every cut), so they happen here.
+
+    A row whose ``"value"`` KEY is missing is the one case that is NOT
+    unconditional: ``row["value"]`` raises KeyError, which the original did not
+    catch -- but it was only reached for rows INSIDE the cut, because the cut was
+    tested first. Such rows are therefore parked in ``deferred_known`` and the
+    KeyError is re-raised only by a call whose cut reaches them.
+
+    One accepted narrowing: the DatetimeIndex is built over the full surviving
+    set rather than per cut. For a payload whose dates are homogeneous -- every
+    FRED file, whose dates are plain ``YYYY-MM-DD`` strings -- that is identical.
+    A payload mixing tz-aware and naive dates would raise here for every cut
+    instead of only for the cuts that span both, which is the loud direction.
+    """
+
+    __slots__ = ("index", "known", "values", "deferred_known", "deferred_exc")
+
+    def __init__(self, rows: List[dict], vintage: bool) -> None:
+        dates: List[pd.Timestamp] = []
+        known: List[pd.Timestamp] = []
+        values: List[float] = []
+        deferred: List[pd.Timestamp] = []
+        deferred_exc: Optional[KeyError] = None
+        for row in rows:
+            try:
+                obs_date = pd.Timestamp(row["date"])
+                known_on = pd.Timestamp(row["realtime_start"]) if vintage else obs_date
+            except (KeyError, ValueError):
+                continue
+            try:
+                value = float(row["value"])
+            except (TypeError, ValueError):
+                continue
+            except KeyError as e:
+                # No "value" key at all: the original raised this, but only once a
+                # cut reached the row. Defer it rather than dropping the row.
+                deferred.append(known_on)
+                if deferred_exc is None:
+                    deferred_exc = e
+                continue
+            values.append(value)
+            dates.append(obs_date)
+            known.append(known_on)
+        self.index = pd.DatetimeIndex(dates)
+        # Non-vintage rows are known on their observation date -- the same objects,
+        # so the index is aliased rather than rebuilt.
+        self.known = pd.DatetimeIndex(known) if vintage else self.index
+        self.values = np.asarray(values, dtype="float64")
+        self.deferred_known = pd.DatetimeIndex(deferred) if deferred else None
+        self.deferred_exc = deferred_exc
+
+
+def _parsed(sid: str, rows: List[dict], vintage: bool) -> _ParsedSeries:
+    """The parse of *rows*, built once and served only back to that same object."""
+    entry = _PARSED.get(sid)
+    if entry is not None and entry[0] is rows:
+        return entry[1]
+    parsed = _ParsedSeries(rows, vintage)
+    _PARSED[sid] = (rows, parsed)
+    return parsed
 
 
 def series_identity(args):
@@ -265,6 +367,8 @@ def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
     # as a confusing "not in the cache" that sends you looking for a prewarm problem.
     vintage = _spec(sid)["vintage"]
     rows = _load(sid)
+    # Parse once per payload (see _ParsedSeries); this call is then a filter + build.
+    parsed = _parsed(sid, rows, vintage)
 
     cut = None
     if as_of is not None:
@@ -272,22 +376,19 @@ def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
         if cut.tz is not None:
             cut = cut.tz_convert("UTC").tz_localize(None)
 
-    dates: List[pd.Timestamp] = []
-    values: List[float] = []
-    for row in rows:
-        try:
-            obs_date = pd.Timestamp(row["date"])
-            known_on = pd.Timestamp(row["realtime_start"]) if vintage else obs_date
-        except (KeyError, ValueError):
-            continue
-        if cut is not None and known_on > cut:
-            continue
-        try:
-            values.append(float(row["value"]))
-        except (TypeError, ValueError):
-            continue
-        dates.append(obs_date)
+    if cut is None:
+        if parsed.deferred_exc is not None:
+            raise parsed.deferred_exc
+        keep = np.ones(parsed.values.shape, dtype=bool)
+    else:
+        if parsed.deferred_known is not None and bool((~(parsed.deferred_known > cut)).any()):
+            raise parsed.deferred_exc
+        # ``~(known > cut)``, NOT ``known <= cut``. ``pd.Timestamp(None)`` is NaT, which
+        # compares False both ways -- and the original only skipped on ``known_on > cut``,
+        # so a NaT row was KEPT. Spelling this as <= would silently start dropping it.
+        keep = ~np.asarray(parsed.known > cut)
 
-    if not dates:
+    values = parsed.values[keep]
+    if not values.size:
         return pd.Series(dtype="float64")
-    return pd.Series(values, index=pd.DatetimeIndex(dates)).sort_index()
+    return pd.Series(values, index=parsed.index[keep]).sort_index()
