@@ -22,7 +22,7 @@ def test_split_changes_only_three_neutral_job_identities():
         assert ("--neutral-entry-mode" in cmd) == (kind in M._NEUTRAL_STRUCTURES)
 
 
-@pytest.mark.parametrize("modes", ["", "hold,hold", "legacy,hold", "invalid"])
+@pytest.mark.parametrize("modes", ["", "hold,hold", "legacy,hold", "invalid", "joint,hold"])
 def test_invalid_modes_refused(modes):
     with pytest.raises(SystemExit):
         discovery_args("--neutral-entry-modes", modes)
@@ -65,3 +65,71 @@ def test_cli_policy_survives_trial_config_and_export(mode, monkeypatch):
     saved = _backtest(strategy_params={"expertFixedSettings": base["experts"][0]["settings"]})
     payload = _derive_export_payload(saved, "expert_settings", db=None)
     assert payload["settings"]["expert_params"]["neutral_option_entry_mode"] == mode
+
+
+def test_joint_is_16_jobs_with_only_three_changed_identities():
+    def jobs(args):
+        return list(M.planned_jobs(args, "launcher.py", ["DeterministicScorer"],
+                                  args.strategies.split(","), "AAPL,F"))
+    old = jobs(discovery_args())
+    joint = jobs(discovery_args("--neutral-entry-modes", "joint"))
+    assert len(joint) == len({j[0] for j in joint}) == 16
+    assert [j for j in old if j[2] not in M._NEUTRAL_STRUCTURES] == [
+        j for j in joint if j[2] not in M._NEUTRAL_STRUCTURES]
+    assert all(j[3] == "joint" and "-joint-" in j[0]
+               for j in joint if j[2] in M._NEUTRAL_STRUCTURES)
+
+
+@pytest.mark.parametrize("mode", ["hold", "low_confidence"])
+def test_joint_gene_reaches_trial_and_saved_backtest_export(mode, monkeypatch):
+    from tests.test_robust_fitness_default_on import _parse, _run_optimize, _BASE_ARGV
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from tests.test_backtest_export_fixed_settings import _backtest
+    from app.api.backtests import _derive_export_payload
+    args = _parse([*_BASE_ARGV, "--strategy", "O_IC", "--neutral-entry-mode", "joint",
+                   "--options-store", "thetadata", "--name", "neutral-joint"])
+    config = _run_optimize(args, monkeypatch)
+    strategy = L._build_strategy("O_IC", "joint", "FMPRating", neutral_entry_mode="joint")
+    # The handler splits schedule/screener namespaces before expert collection.
+    space = collect_param_space(strategy, {k: v for k, v in config["expert_params"].items()
+                                          if not k.startswith(("schedule:", "screener:"))})
+    key = "model:neutral_option_entry_mode"
+    assert space[key]["choices"] == ["hold", "low_confidence"]
+    assert "cond:o_ic-signal:enabled" not in space
+    assert "cond:o_ic-low_confidence:enabled" not in space
+    genes = {key: mode}
+    decoded = decode_params(strategy, genes)
+    trial = _build_daily_trial_config(config["backtest"], decoded)
+    assert trial["experts"][0]["settings"]["neutral_option_entry_mode"] == mode
+    saved = _backtest(strategy_params={**genes,
+        "expertFixedSettings": config["backtest"]["experts"][0]["settings"]})
+    payload = _derive_export_payload(saved, "expert_settings", db=None)
+    assert payload["settings"]["expert_params"]["neutral_option_entry_mode"] == mode
+
+
+@pytest.mark.parametrize("kind", ["O_STRD", "O_STRG", "O_IC"])
+@pytest.mark.parametrize("mode", ["hold", "low_confidence"])
+def test_joint_template_materializes_exactly_the_fixed_arm(kind, mode):
+    strategy = L._build_strategy(kind, "joint", "DeterministicScorer", neutral_entry_mode="joint")
+    decoded = decode_params(strategy, {"model:neutral_option_entry_mode": mode})
+    fixed = L._build_strategy(kind, "joint", "DeterministicScorer", neutral_entry_mode=mode)
+    assert decoded["entry_rules"] == decode_params(fixed, {})["entry_rules"]
+    assert "neutral_entry_mode_search" in strategy.entry_rules[0], "decode must not mutate the template"
+
+
+def test_joint_marker_survives_normalization_and_undecoded_rules_cannot_execute():
+    from ba2_common.core.rule_models import normalize_trade_rules
+    from ba2_common.core.rules_convert import live_actions_from_trade_rule
+    strategy = L._build_strategy("O_IC", "joint", "FMPRating", neutral_entry_mode="joint")
+    strategy.entry_rules = normalize_trade_rules(strategy.entry_rules)
+    with pytest.raises(ValueError, match="must be decoded"):
+        live_actions_from_trade_rule(strategy.entry_rules[0])
+    decoded = decode_params(strategy, {"model:neutral_option_entry_mode": "low_confidence"})
+    assert live_actions_from_trade_rule(decoded["entry_rules"][0])
+
+
+def test_joint_default_is_explicit_hold_and_unknown_modes_are_refused():
+    strategy = L._build_strategy("O_IC", "joint", "FMPRating", neutral_entry_mode="joint")
+    assert decode_params(strategy, {})["expert_overrides"]["neutral_option_entry_mode"] == "hold"
+    with pytest.raises(ValueError):
+        decode_params(strategy, {"model:neutral_option_entry_mode": "typo"})

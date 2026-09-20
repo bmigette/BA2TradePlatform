@@ -1,6 +1,26 @@
 # Option stage 1: HOLD versus low-confidence entries
 
-Decision: September 20, 2026. Explore both separately for DeterministicScorer.
+Decision: September 20, 2026. Explore both for DeterministicScorer. The user then
+selected a **single joint job per neutral structure**, superseding the initial
+separate-job campaign. The fixed arms remain available for controlled comparisons.
+
+## Joint search (current campaign)
+
+Use `--neutral-entry-modes joint` on the stage-1 driver. O_STRD, O_STRG and O_IC each
+get one job with the categorical gene `model:neutral_option_entry_mode`, whose values
+are `hold` and `low_confidence`. All other structures keep their identities; the
+campaign has **16 jobs**, not 19. Each candidate uses exactly one entry mode.
+
+Before a trial runs, the decoder removes the other arm's gates and writes the
+selected mode into the expert settings. The resulting rules match the corresponding
+fixed-arm rules exactly. Top-N backtests preserve both the concrete rules and the
+selected mode; deploy export lets the optimized gene override the authored HOLD
+default. Live receives ordinary rules and a concrete mode, never a `joint` value.
+An unresolved joint template is refused by execution/deployment converters.
+
+The two modes share the job's population/generation budget. The GA can favor either,
+so Top 5 may all use the same mode. Separate jobs are still useful if equal search
+effort per mode is later wanted. Neither mode requires new cache data.
 
 DeterministicScorer emits HOLD between its buy/sell score thresholds. With the
 defaults, +0.10 means HOLD, +0.35 means BUY at 35% confidence and -0.25 means SELL
@@ -44,11 +64,11 @@ and the existing importer. No schema migration or live-account activation is nee
 
 ## Driver and cache
 
-Add `--neutral-entry-modes hold,low_confidence` to `tools/stage1_run.sh` (forwarded to
+For the optional separate comparison, add `--neutral-entry-modes hold,low_confidence` to `tools/stage1_run.sh` (forwarded to
 the discovery driver). This produces 19 jobs per expert: 13 unchanged structures
 plus 6 neutral experiments. Without the flag the existing 16-job plan remains.
 The launcher also accepts `--neutral-entry-mode hold` or `low_confidence` for a
-single O_STRD/O_STRG/O_IC optimization.
+single O_STRD/O_STRG/O_IC optimization, or `joint` to search both in that job.
 
 Neutral arm names include their mode and a configuration digest. Their Top-N
 backtests inherit those names. Other job identities do not change, permitting

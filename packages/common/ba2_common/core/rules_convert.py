@@ -474,6 +474,8 @@ def live_actions_from_trade_rule(rule: dict) -> Optional[Dict[str, dict]]:
     all, so THIS guard, not that one, is what makes "authored off" true for it."""
     if rule.get("enabled") is False:
         return None
+    if "neutral_entry_mode_search" in rule:
+        raise ValueError("Joint neutral entry template must be decoded before execution or deployment")
     actions: Dict[str, dict] = {}
     for ai, action in enumerate(a for a in (rule.get("actions") or []) if isinstance(a, dict)):
         converted = _action_cfg_to_live(action, key=f"a{ai}")

@@ -176,7 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Comma list of experts (default FMPRating; EarningsDrift/Insider "
                          "excluded — no large-cap signal on this options universe).")
     ap.add_argument("--neutral-entry-modes", default="legacy",
-                    help="Discovery only: hold,low_confidence runs two separate jobs for each "
+                    help="Discovery only: joint evolves HOLD vs low-confidence in one job; "
+                         "hold,low_confidence runs two separate jobs for each "
                          "neutral structure. Other structures retain their existing identities.")
     ap.add_argument("--strategies", default=None,
                     help="Comma list of option strategy keys: grouped OS1-4 and/or singles "
@@ -336,9 +337,9 @@ def resolve_args(ap, argv=None):
     discovery = args.profile == "discovery"
     modes = [m.strip() for m in args.neutral_entry_modes.split(",")]
     if (not modes or len(modes) != len(set(modes))
-            or set(modes) - {"legacy", "hold", "low_confidence"}
-            or ("legacy" in modes and len(modes) > 1)):
-        ap.error("--neutral-entry-modes must be legacy, hold, low_confidence or hold,low_confidence")
+            or set(modes) - {"legacy", "hold", "low_confidence", "joint"}
+            or (set(modes) & {"legacy", "joint"} and len(modes) > 1)):
+        ap.error("--neutral-entry-modes must be legacy, hold, low_confidence, hold,low_confidence or joint")
     if modes != ["legacy"] and not discovery:
         ap.error("--neutral-entry-modes requires --profile discovery")
     args.neutral_entry_modes = ",".join(modes)

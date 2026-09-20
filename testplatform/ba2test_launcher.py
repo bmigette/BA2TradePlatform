@@ -5761,15 +5761,28 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
 
 
 def _configure_neutral_entry(strategy, kind, mode):
-    """Separate HOLD and low-confidence experiments; never an impossible AND."""
-    if kind not in _NEUTRAL_ENTRY_MEMBERS or mode not in ("hold", "low_confidence"):
+    """Fixed or joint HOLD/low-confidence experiments; never an impossible AND."""
+    if kind not in _NEUTRAL_ENTRY_MEMBERS or mode not in ("hold", "low_confidence", "joint"):
         raise ValueError("--neutral-entry-mode requires O_STRD, O_STRG or O_IC")
     if _OPTION_GATES_OFF:
         raise ValueError("--neutral-entry-mode cannot be combined with --gates-off")
     m = kind.lower()
     for rule in strategy.entry_rules:
         leaves = rule["conditions"]["conditions"]
-        if mode == "hold":
+        if mode == "joint":
+            # The decoder materializes ONE ordinary AND tree per genome, then
+            # removes this search metadata. Saved/live rules need no conditional
+            # gene machinery and cannot accidentally AND the two arms together.
+            signal = next(c for c in leaves if c["id"] == f"{m}-signal")
+            low = next(c for c in leaves if c["id"] == f"{m}-low_confidence")
+            for c in (signal, low):
+                c["toggle_optimize"] = False
+                c["toggleOptimize"] = False
+            rule["neutral_entry_mode_search"] = {
+                "hold": [f"{m}-low_confidence", f"{m}-exp_profit"],
+                "low_confidence": [f"{m}-signal"],
+            }
+        elif mode == "hold":
             # HOLD has no directional price target. Requiring expected_profit > N
             # would silently make this arm untradeable even after admitting HOLD.
             leaves = [c for c in leaves if c["id"] not in
@@ -5790,7 +5803,16 @@ def _configure_neutral_entry(strategy, kind, mode):
 def _apply_neutral_entry_setting(backtest_block, mode):
     if mode != "legacy":
         for expert in backtest_block["experts"]:
-            expert["settings"]["neutral_option_entry_mode"] = mode
+            # Authored default for the joint template; every GA individual overrides
+            # this through model:neutral_option_entry_mode with one concrete mode.
+            expert["settings"]["neutral_option_entry_mode"] = "hold" if mode == "joint" else mode
+
+
+def _neutral_entry_genes(mode):
+    if mode != "joint":
+        return {}
+    return {"neutral_option_entry_mode": {
+        "type": "choice", "choices": ["hold", "low_confidence"], "optimize": True}}
 
 
 def _cmd_optimize(args) -> int:
@@ -6121,6 +6143,7 @@ def _cmd_optimize(args) -> int:
         }
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
+        cfg["expert_params"].update(_neutral_entry_genes(neutral_mode))
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -6349,6 +6372,7 @@ def _cmd_optimize_batch(args) -> int:
                                         **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,
             }
+            cfg["expert_params"].update(_neutral_entry_genes(neutral_mode))
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=name, fitness_metric=fitness,
                 optimization_type="genetic", optimization_config=cfg,
@@ -7230,9 +7254,10 @@ def main(argv: "list | None" = None) -> int:
                          "(default). NOTE: a non-zero value RESCALES fitness, so scores "
                          "are not comparable with runs made at a different level.")
     _add_robust_fitness_args(op)
-    op.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence"),
+    op.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence", "joint"),
                     default="legacy", help="Separate neutral-option experiment; HOLD-only or "
-                    "low-confidence directional signals. Requires O_STRD/O_STRG/O_IC and a new job name.")
+                    "low-confidence directional signals, or joint to evolve the choice in one job. "
+                    "Requires O_STRD/O_STRG/O_IC and a new job name.")
     op.add_argument("--fitness-trade-scale", action="store_true",
                     help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
                          "statistically thin (few-trade) configs are down-weighted (~target trades/yr "
@@ -7441,7 +7466,7 @@ def main(argv: "list | None" = None) -> int:
                     help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
                          "fitness/return (25). Default-on; see `optimize --profit-share-cap-pct`.")
     _add_robust_fitness_args(ob)
-    ob.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence"),
+    ob.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence", "joint"),
                     default="legacy", help="Neutral option experiment (O_STRD/O_STRG/O_IC only).")
     ob.add_argument("--commission", type=float, default=0.1,
                     help="Flat $ commission per FILL (see optimize --commission; default lowered "

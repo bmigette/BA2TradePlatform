@@ -7,13 +7,14 @@ from tests.backtest import test_option_entry_path as fixture
 from tests.backtest.test_options_rule_e2e import START, _EXPIRY, _PREMIUM_180
 
 
+@pytest.mark.parametrize("joint", [False, True])
 @pytest.mark.parametrize("mode,signal,confidence,opens", [
     ("hold", Signal.HOLD, 10, True), ("hold", Signal.BUY, 20, False),
     ("hold", Signal.SELL, 20, False), ("low_confidence", Signal.BUY, 20, True),
     ("low_confidence", Signal.SELL, 20, True), ("low_confidence", Signal.BUY, 60, False),
     ("low_confidence", Signal.HOLD, 10, False), ("legacy", Signal.HOLD, 10, False),
 ])
-def test_real_straddle_entry(mode, signal, confidence, opens, monkeypatch):
+def test_real_straddle_entry(mode, signal, confidence, opens, joint, monkeypatch):
     original_seed = fixture._seed_cache
     def seed(db_path):
         original_seed(db_path)
@@ -36,6 +37,16 @@ def test_real_straddle_entry(mode, signal, confidence, opens, monkeypatch):
         gate = ({"id": "hold", "field": "current_rating_neutral", "field_type": "flag"}
                 if mode != "low_confidence" else
                 {"id": "low", "field": "confidence", "op": "<=", "value": 30})
+        if joint and mode != "legacy":
+            from tests.test_launcher_option_entry_rule import mod as launcher
+            from app.services.strategy_param_space import decode_params
+            strategy = launcher._build_strategy("O_STRD", "joint", "DeterministicScorer",
+                                                neutral_entry_mode="joint")
+            decoded = decode_params(strategy, {"model:neutral_option_entry_mode": mode,
+                                               "cond:o_strd-exp_profit:enabled": 0})
+            expert.settings.update(decoded["expert_overrides"])
+            gate = next(c for c in decoded["entry_rules"][0]["conditions"]["conditions"]
+                        if c.get("field") == ("current_rating_neutral" if mode == "hold" else "confidence"))
         rules = [{"id": "neutral", "conditions": {"type": "AND", "conditions": [gate,
             {"id": "flat", "field": "has_no_position", "field_type": "flag"}]},
             "actions": [action], "continue_processing": False}]

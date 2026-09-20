@@ -1,5 +1,9 @@
 # Option grid review before neutral-entry experiments
 
+**Latest decision:** use one joint job per neutral structure. The original 19-job
+split below is retained as deployment history; the requested replacement has 16
+jobs and a categorical HOLD/low-confidence gene. See the follow-up section below.
+
 Reviewed the dedicated grid database on `debian@141.94.199.227`, under
 `/home/debian/ba2-grid/home/test/dl_forecasting.db`, before the next restart.
 All values below describe historical, optimized in-sample results. They are not
@@ -121,3 +125,27 @@ Local [restart receipt](option_neutral_restart_2026-09-20.json) records the comm
 command, new optimization row, archive name, checkpoint and fleet verification.
 The subsequent documentation-only commit increments APP to `2026.09.1176`; the
 grid continues running the tested implementation commit above.
+
+## Follow-up: one job explores both modes
+
+The driver now accepts `--neutral-entry-modes joint`. O_STRD, O_STRG and O_IC each
+get one new `-joint-` experiment. The other 13 jobs retain their identities and
+checkpoint compatibility. The existing split-mode flags remain available.
+
+The gene `model:neutral_option_entry_mode` selects `hold` or `low_confidence` per
+candidate. Decoding resolves its gates into an ordinary AND ruleset and persists
+the concrete mode. This keeps the rule engine and live deployment on their existing
+semantics. Undecoded joint templates fail before execution or export. Prior saved
+backtests, archived jobs, default strategies and caches are unchanged.
+
+Tests: **1,524 backend/backtest checks passed** (plus one skip and one expected
+failure), **39 live option checks passed**, and **21 shared rule-conversion checks
+passed**. Tests prove both gene choices survive trial configuration and export, both
+produce cached two-leg fills where appropriate, and all three neutral templates
+resolve to the same rules as their fixed-mode counterparts. Existing parity and
+golden fingerprints passed. APP `2026.09.1177`, TEST `2026.09.0063`.
+
+The two modes share the unchanged population/generation budget; the GA does not
+guarantee equal effort per mode or one representative of each in Top 5. The latter
+remain the highest-ranked distinct candidates. Operational restart evidence is
+recorded on the grid host at `/home/debian/ba2-grid/joint_restart_receipt.json`.
