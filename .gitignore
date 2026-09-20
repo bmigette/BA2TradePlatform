@@ -11,6 +11,7 @@ __pycache__/
 
 logs/
 logs/*
+logs_option_warmup/
 # Distribution / packaging
 .Python
 build/
