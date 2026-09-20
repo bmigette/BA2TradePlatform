@@ -39,6 +39,27 @@ class HistoricalReference(BaseModel):
     reason: Optional[str] = None
 
 
+class ContractDetail(BaseModel):
+    """Greeks/IV/OI for one contract at one event, as the option cache recorded them.
+
+    A NULL field is NOT RECORDED -- the column migration left older rows NULL deliberately.
+    ``quality`` says how much of the row was actually there: ``cache_bar`` (iv present),
+    ``partial`` (the bar exists but the greeks were never fetched) or ``unavailable``.
+    """
+
+    asOf: Optional[str] = None
+    iv: Optional[float] = None
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega: Optional[float] = None
+    openInterest: Optional[float] = None
+    volume: Optional[float] = None
+    quality: Literal["cache_bar", "partial", "unavailable"] = "unavailable"
+    source: Optional[str] = None
+    reason: Optional[str] = None
+
+
 class TradeChartLeg(BaseModel):
     """One saved leg, normalised, with the option terms the recorder published."""
 
@@ -65,6 +86,8 @@ class TradeChartLeg(BaseModel):
     positionStatus: PositionStatus = "unknown"
     entryUnderlying: HistoricalReference = Field(default_factory=HistoricalReference)
     exitUnderlying: HistoricalReference = Field(default_factory=HistoricalReference)
+    entryContract: ContractDetail = Field(default_factory=ContractDetail)
+    exitContract: ContractDetail = Field(default_factory=ContractDetail)
     unavailableFields: List[str] = Field(default_factory=list)
 
 

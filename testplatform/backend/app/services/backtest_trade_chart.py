@@ -52,8 +52,71 @@ _MONEY_FIELDS = (
 )
 
 
+#: Greeks + IV + open interest, as the option cache stores them per contract bar.
+_CONTRACT_FIELDS = ('iv', 'delta', 'gamma', 'theta', 'vega', 'open_interest', 'volume')
+
+
 class TradeChartRowNotFound(LookupError):
     """The requested ``trade_id`` is not a row of this backtest's saved array."""
+
+
+def options_store_path(backtest: Any) -> Optional[str]:
+    """The option store the RUN used, when the saved row carries one.
+
+    The store path travels in the run CONFIG (``options_cache_db``), not on the backtest row,
+    so this looks for it wherever a saved result might have kept it and otherwise returns
+    None. It deliberately does NOT fall back to a platform default: reading a different
+    store than the run used would chart one dataset's greeks beside another's prices, which
+    is worse than an honest "unavailable".
+    """
+    for attribute in ('options_cache_db', 'options_db_path'):
+        value = getattr(backtest, attribute, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for container in ('settings', 'opt_block', 'config'):
+        block = getattr(backtest, container, None)
+        if isinstance(block, dict):
+            for key in ('options_cache_db', 'options_db_path'):
+                value = block.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
+
+
+def contract_detail(reader: Any, occ_symbol: Optional[str], event: Optional[datetime]) -> Dict[str, Any]:
+    """Greeks/IV/OI for one contract as of one event, from the CACHE only.
+
+    ``latest_bar_on_or_before`` is the cache's own point-in-time reader, so the lookup is
+    clamped and NEVER looks forward: a bar after the event is not evidence about the event.
+
+    A NULL field stays ``None``. The migration that added these columns left older rows NULL
+    on purpose -- "those greeks were never fetched" -- and a zero would read as a measured
+    delta of zero.
+    """
+    blank = {
+        'asOf': None, 'quality': 'unavailable', 'source': None,
+        **{field: None for field in _CONTRACT_FIELDS},
+    }
+    if reader is None or not occ_symbol or event is None:
+        return {**blank, 'reason': 'no option store or no contract identity for this leg'}
+
+    try:
+        row = reader.latest_bar_on_or_before(occ_symbol, event.date().isoformat())
+    except Exception as exc:  # an unreadable cache is a data error, not an invented price
+        logger.warning(f"option cache read failed for {occ_symbol}: {exc}")
+        return {**blank, 'reason': f'option cache unreadable: {exc}'}
+
+    if not row:
+        return {**blank, 'reason': 'no cached contract bar at or before the event'}
+
+    values = {field: row.get(field) for field in _CONTRACT_FIELDS}
+    return {
+        **values,
+        'asOf': row.get('date'),
+        'quality': 'cache_bar' if any(values[field] is not None for field in ('iv', 'delta')) else 'partial',
+        'source': getattr(reader, 'db_path', None),
+        'reason': None if values.get('iv') is not None else 'iv/greeks were never fetched for this bar',
+    }
 
 
 def saved_trades(backtest: Any) -> List[Dict[str, Any]]:
@@ -343,6 +406,16 @@ def build_trade_chart_context(backtest: Any, trade_id: int) -> Dict[str, Any]:
 
     legs = [_leg(candidate, id_of.get(id(candidate), 0)) for candidate in rows]
 
+    # ONE reader for the whole context, and only if the run's store is actually known.
+    store_path = options_store_path(backtest)
+    contract_reader = None
+    if store_path:
+        try:
+            from app.services.backtest.options_cache import OptionsHistoryCache
+            contract_reader = OptionsHistoryCache(store_path)
+        except Exception as exc:
+            logger.warning(f"could not open the option store at {store_path}: {exc}")
+
     engine_type = _text(getattr(backtest, "engine_type", None)) or ""
     provider = PROVIDER_BY_ENGINE.get(engine_type)
     underlying_symbol = _underlying_symbol(rows)
@@ -407,8 +480,25 @@ def build_trade_chart_context(backtest: Any, trade_id: int) -> Dict[str, Any]:
             })
 
     for leg, candidate in zip(legs, rows):
-        leg["entryUnderlying"] = _reference(bars, _parse_event(candidate.get("entry_time")), provider)
-        leg["exitUnderlying"] = _reference(bars, _parse_event(candidate.get("exit_time")), provider)
+        entry_event = _parse_event(candidate.get("entry_time"))
+        exit_event = _parse_event(candidate.get("exit_time"))
+        leg["entryUnderlying"] = _reference(bars, entry_event, provider)
+        leg["exitUnderlying"] = _reference(bars, exit_event, provider)
+        # Contract detail (spec step 11): the greeks/IV/OI the CACHE recorded for this
+        # contract at these two events. Context only -- it never touches the payoff.
+        leg["entryContract"] = contract_detail(contract_reader, leg.get("contractSymbol"), entry_event)
+        leg["exitContract"] = contract_detail(contract_reader, leg.get("contractSymbol"), exit_event)
+
+    if legs and contract_reader is None:
+        notices.append({
+            "code": "option_store_unresolved",
+            "message": (
+                "The run's option store is not recorded on this saved result, so per-leg "
+                "greeks/IV/open interest are not shown. The store path travels in the run "
+                "config (options_cache_db) rather than on the backtest row, and no platform "
+                "default is substituted: that would read a different dataset's greeks."
+            ),
+        })
 
     if bars:
         notices.append({

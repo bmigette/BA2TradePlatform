@@ -1,7 +1,11 @@
 # Option trade details in backtest results
 
 Date: 2026-09-20  
-Status: specification only; application changes are not implemented.  
+Status: IMPLEMENTED 2026-09-20. Test platform steps 1-5 and live steps 7-12 have landed
+(steps 11-12 of the plan: contract detail on both runtimes). Outstanding: step 13
+verification, which needs the two apps running — the frontend suite, backend context/cache
+tests and the live-tests suites are green, but no screenshot or interactive check has been
+done.  
 Scope: the test platform's existing trade chart popup, plus the same view ported to the live
 platform's transaction-details popup.
 
@@ -401,6 +405,16 @@ Rules:
 - Coverage is broker-dependent: a broker that publishes no greeks must produce **unknown**, never
   0. The values are CURRENT, so they never enter the expiration curve or a moneyness claim about
   entry (§4).
+
+### Known limitation, stated rather than papered over
+
+On the BACKTEST side the run's option store path travels in the run config
+(``options_cache_db``), not on the saved backtest row, so a saved result cannot always be
+traced back to the store it read. The service therefore reports per-leg contract detail as
+**unavailable** with a notice (``option_store_unresolved``) instead of falling back to a
+platform default — that fallback would put one dataset's greeks beside another's prices. It
+lights up as soon as the path is persisted on the row (or supplied by the caller); the
+injection point and its tests are already there.
 
 ## 10. References
 

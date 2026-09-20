@@ -9,6 +9,7 @@ cannot be resolved -- are each asserted as a first-class outcome.
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -295,3 +296,135 @@ def test_open_at_end_is_not_reported_as_closed(client, db, cache):
 
     assert leg["positionStatus"] == "open_at_end"
     assert leg["exitUnderlying"]["quality"] == "unavailable"
+
+
+# --------------------------------------------------------------------- step 11 ----
+# Contract detail: the greeks/IV/OI the option CACHE recorded for a contract at an event.
+
+
+def _seed_option_store(path, rows):
+    """A real OptionsHistoryCache sqlite with the given option_bar rows."""
+    import sqlite3
+
+    from app.services.backtest.options_cache import OptionsHistoryCache
+
+    OptionsHistoryCache(path)  # creates the tables (idempotent)
+    connection = sqlite3.connect(path)
+    for row in rows:
+        connection.execute(
+            "INSERT OR REPLACE INTO option_bar"
+            "(occ_symbol,date,open,high,low,close,volume,underlying,option_type,strike,expiry,"
+            " iv,delta,gamma,theta,vega) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            row,
+        )
+    connection.commit()
+    connection.close()
+    return path
+
+
+CONTRACT = 'ACN260918C00095000'
+
+
+def _bar(date, iv=0.42, delta=0.55, gamma=0.02, theta=-0.08, vega=0.11):
+    return (CONTRACT, date, 8.0, 9.0, 7.5, 8.5, 120, 'ACN', 'call', 95.0, '2026-09-18',
+            iv, delta, gamma, theta, vega)
+
+
+@pytest.fixture
+def option_store(tmp_path):
+    return _seed_option_store(str(tmp_path / 'options.sqlite'), [
+        _bar('2026-09-04', iv=0.40, delta=0.50),
+        _bar('2026-09-08', iv=0.44, delta=0.58),
+        _bar('2026-09-10', iv=0.50, delta=0.70),
+    ])
+
+
+class TestContractDetail:
+    def test_a_leg_gets_the_cached_greeks_at_its_event(self, client, db, cache, option_store,
+                                                      monkeypatch):
+        monkeypatch.setattr('app.services.backtest_trade_chart.options_store_path',
+                            lambda backtest: option_store)
+        cache('ACN')
+        backtest = _seed(db, [SPREAD_LEGS[0]])
+
+        leg = client.get(URL.format(backtest_id=backtest.id),
+                         params={'trade_id': 1}).json()['legs'][0]
+
+        entry = leg['entryContract']
+        assert entry['quality'] == 'cache_bar'
+        assert entry['asOf'] == '2026-09-08'
+        assert entry['iv'] == pytest.approx(0.44)
+        assert entry['delta'] == pytest.approx(0.58)
+        assert entry['gamma'] is not None and entry['theta'] is not None and entry['vega'] is not None
+        assert entry['source'] == option_store
+
+    def test_the_lookup_never_looks_forward(self, client, db, cache, tmp_path, monkeypatch):
+        # Only a LATER bar exists: it is not evidence about the entry.
+        store = _seed_option_store(str(tmp_path / 'later.sqlite'), [_bar('2026-09-09')])
+        monkeypatch.setattr('app.services.backtest_trade_chart.options_store_path',
+                            lambda backtest: store)
+        cache('ACN')
+        backtest = _seed(db, [SPREAD_LEGS[0]])
+
+        entry = client.get(URL.format(backtest_id=backtest.id),
+                           params={'trade_id': 1}).json()['legs'][0]['entryContract']
+
+        assert entry['quality'] == 'unavailable'
+        assert entry['iv'] is None
+        assert 'at or before' in entry['reason']
+
+    def test_a_bar_without_fetched_greeks_stays_null(self, client, db, cache, tmp_path, monkeypatch):
+        store = _seed_option_store(str(tmp_path / 'nulls.sqlite'),
+                                   [_bar('2026-09-04', iv=None, delta=None, gamma=None,
+                                         theta=None, vega=None)])
+        monkeypatch.setattr('app.services.backtest_trade_chart.options_store_path',
+                            lambda backtest: store)
+        cache('ACN')
+        backtest = _seed(db, [SPREAD_LEGS[0]])
+
+        entry = client.get(URL.format(backtest_id=backtest.id),
+                           params={'trade_id': 1}).json()['legs'][0]['entryContract']
+
+        assert entry['quality'] == 'partial'
+        assert entry['iv'] is None and entry['delta'] is None
+        assert 'never fetched' in entry['reason']
+
+    def test_an_unresolvable_store_says_so_and_leaves_the_rest_working(self, client, db, cache):
+        cache('ACN')
+        backtest = _seed(db, [SPREAD_LEGS[0]])
+
+        body = client.get(URL.format(backtest_id=backtest.id), params={'trade_id': 1}).json()
+
+        assert body['legs'][0]['entryContract']['quality'] == 'unavailable'
+        assert 'option_store_unresolved' in [notice['code'] for notice in body['notices']]
+        # The terms, the bars and the money are all still there.
+        assert body['legs'][0]['strike'] == 95.0
+        assert body['legs'][0]['entryPrice'] == 8.0
+        assert body['underlying']['bars']
+
+
+class TestStoreResolution:
+    def test_a_path_on_the_row_is_used(self):
+        from app.services.backtest_trade_chart import options_store_path
+
+        assert options_store_path(SimpleNamespace(options_cache_db=' C:/x/o.sqlite ')) == 'C:/x/o.sqlite'
+
+    def test_a_path_inside_a_saved_config_block_is_used(self):
+        from app.services.backtest_trade_chart import options_store_path
+
+        assert options_store_path(
+            SimpleNamespace(settings={'options_cache_db': 'C:/y/o.sqlite'})) == 'C:/y/o.sqlite'
+
+    def test_no_path_anywhere_is_none_rather_than_a_platform_default(self):
+        from app.services.backtest_trade_chart import options_store_path
+
+        assert options_store_path(SimpleNamespace()) is None
+        assert options_store_path(SimpleNamespace(settings={'other': 1})) is None
+
+    def test_contract_detail_without_a_reader_explains_itself(self):
+        from app.services.backtest_trade_chart import contract_detail
+
+        detail = contract_detail(None, CONTRACT, datetime(2026, 9, 8, 13, 30))
+        assert detail['quality'] == 'unavailable'
+        assert detail['iv'] is None
+
