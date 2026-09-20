@@ -14,6 +14,9 @@ from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from ..components.option_structure_chart import (
+    fetch_underlying_bars, render_option_structure_chart,
+)
 from .option_trades import OptionTradesTab
 from ..account_filter_context import get_selected_account_id
 from ..components.account_scope import scope_transactions_to_account
@@ -2095,6 +2098,13 @@ class LiveTradesTab:
                 ui.table(columns=[{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in columns],
                          rows=rows, row_key='Contract').classes('w-full mt-3').props('dense flat')
 
+            # THE CHART (spec steps 9-10): cached-style daily candles for the underlying,
+            # one dashed line per strike, both marker sets, and the expiration payoff drawn
+            # rotated onto the price axis. Built from a worker thread because it fetches
+            # bars; the payoff itself is derived from the recorded terms alone.
+            self._option_chart_container = ui.column().classes('w-full mt-3')
+            asyncio.create_task(self._fill_option_chart(self._option_chart_container, txn, orders))
+
             # BROKER data lands here, off the render path.
             self._option_detail_container = ui.column().classes('w-full mt-3')
             if option_orders:
@@ -2104,6 +2114,72 @@ class LiveTradesTab:
                         self._option_detail_container, account_id,
                         [o.contract_symbol for o in option_orders], txn.symbol,
                     ))
+
+    def _payoff_for(self, txn, orders):
+        """The expiration payoff of this transaction, from its recorded order terms.
+
+        A live ORDER's multiplier is a recorded contract term (the order carries the real
+        one, and it is copied onto the transaction at creation), so it is trusted when
+        present -- and a missing one still refuses to price rather than assuming 100.
+        """
+        from ba2_common.core.option_payoff_chart import build_payoff_chart, chart_legs_from_rows
+
+        rows = []
+        for order in orders:
+            if not getattr(order, 'contract_symbol', None):
+                continue
+            side = getattr(order.side, 'value', getattr(order, 'side', None))
+            right = getattr(order.option_type, 'value', getattr(order, 'option_type', None))
+            expiry = getattr(order, 'expiry', None)
+            rows.append({
+                'side': side,
+                'option_type': right,
+                'strike': order.strike,
+                'entry_price': order.open_price,
+                'size': order.quantity,
+                'multiplier': getattr(order, 'multiplier', None) or getattr(txn, 'multiplier', None),
+                # A live order carries the real contract term, so it is trusted when present;
+                # an absent one still refuses rather than being priced at 100x.
+                'multiplier_recorded': True,
+                'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else expiry,
+                'underlying_symbol': getattr(order, 'underlying_symbol', None) or txn.symbol,
+            })
+        return build_payoff_chart(chart_legs_from_rows(rows))
+
+    async def _fill_option_chart(self, container, txn, orders) -> None:
+        """Fetch the underlying's bars off the render path, then paint the figure."""
+        from ba2_common.core.option_payoff_chart import PayoffUnavailable
+
+        payoff = self._payoff_for(txn, orders)
+
+        stamps = [getattr(order, 'created_at', None) for order in orders]
+        stamps += [getattr(txn, 'open_date', None), getattr(txn, 'close_date', None)]
+        stamps = [stamp for stamp in stamps if stamp is not None]
+        if stamps:
+            start = min(stamps) - timedelta(days=20)
+            end = max(stamps) + timedelta(days=20)
+        else:
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=60)
+
+        bars = None
+        try:
+            bars = await asyncio.to_thread(fetch_underlying_bars, txn.symbol, start, end)
+        except Exception as exc:
+            # A missing bar series is not a broken popup: the strikes, the leg table and
+            # the payoff figures are all still there.
+            logger.warning(f"[OPTION CHART] no bars for {txn.symbol}: {exc}")
+
+        try:
+            render_option_structure_chart(
+                container, txn=txn, orders=orders, payoff=payoff, bars=bars,
+                underlying=txn.symbol)
+            if isinstance(payoff, PayoffUnavailable):
+                with container:
+                    ui.label(f'Expiration payoff unavailable — {payoff.reason}').classes(
+                        'text-xs text-secondary-custom')
+        except Exception as exc:
+            logger.warning(f"[OPTION CHART] could not render for txn {txn.id}: {exc}")
 
     def _collect_option_contract_detail(self, account_id, contracts, underlying):
         """BLOCKING broker reads for the leg table's detail block.
