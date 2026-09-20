@@ -104,14 +104,20 @@ def test_the_band_never_reaches_zero_or_the_whole_account(kind):
 
 
 @pytest.mark.parametrize("kind", sorted(_CONVEX_MEMBERS))
-def test_the_convex_members_band_never_reaches_zero_or_past_the_designs_2_percent_ceiling(kind):
-    """The convex-harvest grid's OWN floor/ceiling (design §2: 0.5-2.0% of sleeve) -- narrower
-    than every other structure's band on purpose, not a relaxation of the zero-size guard
-    above: 0.5% still cannot open a zero-trade genome, and 2.0% is far inside the shared 50%
-    leverage ceiling."""
+def test_the_convex_members_band_never_reaches_zero_or_past_the_designs_ceiling(kind):
+    """The convex-harvest grid's OWN floor/ceiling -- narrower than every other structure's band
+    on purpose, not a relaxation of the zero-size guard above: 0.5% still cannot open a
+    zero-trade genome, and the ceiling is far inside the shared 50% leverage ceiling.
+
+    The ceiling moved 2.0% -> 5.0% on 2026-09-20 (design §9, operator decision, grid not yet
+    run): at the grid's $20k account a 2% ticket is $400, which could not buy the long-dated
+    premiums this arm exists to buy. The FLOOR is unchanged, and breadth still comes from the
+    FIXED one-ticket-per-underlying rule rather than from the ceiling -- so this test pins both
+    ends: a band that drifts to zero would open unopenable genomes, and one that drifts past the
+    design's ceiling would silently turn the arm into a concentrated LEAPS bet."""
     spec = collect_param_space(_build(kind))[f"entry:{kind.lower()}-entry:a0:option_sizing"]
     assert spec["min"] == 0.5, f"{kind}: expected the design's 0.5% floor, got {spec['min']}%"
-    assert spec["max"] == 2.0, f"{kind}: expected the design's 2.0% ceiling, got {spec['max']}%"
+    assert spec["max"] == 5.0, f"{kind}: expected the design's 5.0% ceiling, got {spec['max']}%"
 
 
 def test_the_bands_differ_by_structure_class():

@@ -2679,13 +2679,14 @@ _OPTION_STRATS = {
         "option_dte_min": 300, "option_dte_max": 420,
         "option_dte_optimize": True, "option_dte_min_range": 240,
         "option_dte_max_range": 480, "option_dte_step": 40,
-        # PER-TICKET PREMIUM SIZING 0.5-2.0% of sleeve (design §2). ``option_sizing`` (% of
+        # PER-TICKET PREMIUM SIZING 0.5-5.0% of sleeve (design §2, ceiling widened 2026-09-20).
+        # ``option_sizing`` (% of
         # equity committed per structure) IS the existing "percent of sleeve" mechanism -- and
         # combined with the FIXED 1-ticket-per-underlying rule (``has_no_position``,
         # unconditional on every option entry rule -- see _option_entry_rule), a structure's
         # sizing % already reads as its per-ticket cap: "many small tickets, no single ticket
-        # dominates ex-ante" is exactly what a low option_sizing ceiling enforces. Authored 1.0
-        # is a NEW row in _OPTION_SIZING_BANDS (band 0.5-2.0 step 0.25, 7 levels) -- no existing
+        # dominates ex-ante" is what the low floor plus that rule enforce. Authored 1.0 is its
+        # own row in _OPTION_SIZING_BANDS (band 0.5-5.0 step 0.5, 10 levels) -- no existing
         # authored value covers a sub-5% debit band.
         "option_sizing": 1.0},
     "O_CONVEXP": {  # convex-harvest PUT arm -- the tail-hedge twin; same genes, kind=put.
@@ -3461,11 +3462,17 @@ _OPTION_SIZING_BANDS = {
     # _OPTION_RM_OVERRIDE have to move together or neither moves anything.
     20.0: (5.0, 50.0, 5.0),
     # CONVEX-HARVEST (plan Task 13, design 2026-08-31-convex-harvest-grid-design.md §2):
-    # "per-ticket premium sizing 0.5-2.0% of sleeve -- many small tickets, no single ticket may
-    # dominate ex-ante". A NEW row: no existing authored value's band reaches below 1.0% (the
-    # 5.0 row's floor), and the design's own ceiling (2.0%) sits BELOW that row's floor entirely
-    # -- sharing it would either refuse the whole band or silently widen it past the design.
-    1.0: (0.5, 2.0, 0.25),
+    # "many small tickets, no single ticket may dominate ex-ante". A NEW row: no existing
+    # authored value's band reaches below 1.0% (the 5.0 row's floor), so sharing the 5.0 row
+    # would refuse the whole small-ticket band.
+    # CEILING WIDENED 2.0% -> 5.0% (2026-09-20, operator decision; grid not yet run): on the
+    # grid's $20k account a 2% ticket is $400, and 180-540 DTE premiums are expensive enough
+    # that the old ceiling effectively restricted the arm to cheap underlyings / deeper-OTM
+    # contracts. The FLOOR stays 0.5% and the step coarsens to 0.5 (10 levels) because the
+    # convex grid is small (pop 40 / gen 6) and a 19-level band would be barely searchable
+    # there. Breadth is still the thesis: the FIXED one-ticket-per-underlying rule is what
+    # keeps a single ticket from dominating, not the ceiling alone.
+    1.0: (0.5, 5.0, 0.5),
 }
 _missing_sizings = sorted({cfg["option_sizing"] for cfg in _OPTION_STRATS.values()
                            if cfg.get("option_sizing") is not None}
