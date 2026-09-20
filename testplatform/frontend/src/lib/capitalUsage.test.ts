@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { capitalUsageSeries, summariseUsage, IDLE_PCT, HEAVY_PCT } from './capitalUsage';
+import {
+  capitalUsageSeries, summariseUsage, usageExclusions, IDLE_PCT, HEAVY_PCT,
+} from './capitalUsage';
 
 /**
  * Asked for from live use on 2026-09-05: a tab charting the percent of equity used.
@@ -155,5 +157,93 @@ describe('summariseUsage', () => {
     expect(summariseUsage([])).toEqual({
       avgPct: 0, maxPct: 0, idleDaysPct: 0, heavyDaysPct: 0, peakDate: null,
     });
+  });
+});
+
+describe('option structures (2026-09-20)', () => {
+  const leg = (over: Partial<Record<string, unknown>> = {}) => trade({
+    optionType: 'call', contractSymbol: 'ACN260918C00095000', transactionId: 't7',
+    direction: 'long', entryPrice: 8, size: 1, multiplier: 100, ...over,
+  });
+
+  it('counts a debit spread at its NET premium, not the sum of its legs', () => {
+    // long 95 @8 = $800 paid, short 105 @2 = $200 received -> $600 actually committed.
+    // The equity-shaped version reported $1,000: the credit leg ADDED.
+    const points = capitalUsageSeries(
+      [leg({ strike: 95 }), leg({ strike: 105, direction: 'short', entryPrice: 2 })],
+      eq(['2024-01-02', 10000]));
+    expect(Math.round(points[0].pct)).toBe(6);
+    expect(points[0].positions).toBe(1);
+  });
+
+  it('counts an iron condor as ONE position, at its net premium', () => {
+    const points = capitalUsageSeries([
+      leg({ optionType: 'put', strike: 90, entryPrice: 1 }),
+      leg({ optionType: 'put', strike: 95, entryPrice: 2, direction: 'short' }),
+      leg({ optionType: 'call', strike: 105, entryPrice: 2, direction: 'short' }),
+      leg({ optionType: 'call', strike: 110, entryPrice: 1 }),
+    ], eq(['2024-01-02', 10000]));
+    expect(points[0].positions).toBe(1);          // one bet, not four
+    expect(Math.round(points[0].pct)).toBe(2);    // |100 - 200 - 200 + 100| = $200
+  });
+
+  it('keeps the whole structure occupying capital across its legs\' windows', () => {
+    const points = capitalUsageSeries(
+      [leg({ entryDate: '2024-01-02T09:30:00', exitDate: '2024-01-03T16:00:00' }),
+       leg({ strike: 105, direction: 'short', entryPrice: 2,
+             entryDate: '2024-01-02T09:30:00', exitDate: '2024-01-04T16:00:00' })],
+      eq(['2024-01-02', 10000], ['2024-01-03', 10000], ['2024-01-04', 10000],
+         ['2024-01-05', 10000]));
+    expect(points.map(p => Math.round(p.pct))).toEqual([6, 6, 6, 0]);
+  });
+
+  it('flags a credit structure rather than reading it as free', () => {
+    // The premium was RECEIVED; what it really ties up is margin, which this does not model.
+    const trades = [leg({ direction: 'short', entryPrice: 4 }),
+                    leg({ optionType: 'put', strike: 95, entryPrice: 1 })];
+    const points = capitalUsageSeries(trades, eq(['2024-01-02', 10000]));
+    expect(Math.round(points[0].pct)).toBe(3);
+    expect(usageExclusions(trades).credit).toBe(1);
+  });
+
+  it('leaves out a structure whose multiplier was never recorded, instead of using 1', () => {
+    // `multiplier || 1` counted this at 1/100th: $600 of real exposure read as $6.
+    const trades = [leg({ multiplier: null }), leg({ strike: 105, direction: 'short',
+                                                     entryPrice: 2, multiplier: null })];
+    const points = capitalUsageSeries(trades, eq(['2024-01-02', 10000]));
+    expect(points[0].pct).toBe(0);                 // not 0.06%
+    expect(points[0].positions).toBe(0);
+    expect(usageExclusions(trades)).toEqual({ positions: 0, unpriced: 1, credit: 0 });
+  });
+
+  it('leaves out a LONE option row with no recorded multiplier too', () => {
+    const trades = [leg({ multiplier: null, transactionId: null })];
+    expect(capitalUsageSeries(trades, eq(['2024-01-02', 10000]))[0].pct).toBe(0);
+    expect(usageExclusions(trades).unpriced).toBe(1);
+  });
+
+  it('still prices a lone option leg with a recorded multiplier', () => {
+    const points = capitalUsageSeries(
+      [leg({ entryPrice: 4.2, multiplier: 100, transactionId: null })],
+      eq(['2024-01-02', 4200]));
+    expect(Math.round(points[0].pct)).toBe(10);
+    expect(points[0].positions).toBe(1);
+  });
+
+  it('an equity row needs no multiplier and is not treated as unpriced', () => {
+    const trades = [trade({ entryPrice: 100, size: 10 })];
+    expect(usageExclusions(trades)).toEqual({ positions: 1, unpriced: 0, credit: 0 });
+    expect(Math.round(capitalUsageSeries(trades, eq(['2024-01-02', 10000]))[0].pct)).toBe(10);
+  });
+
+  it('counts only what it could measure, and reports the rest', () => {
+    const trades = [
+      leg({ strike: 95 }), leg({ strike: 105, direction: 'short', entryPrice: 2 }),
+      leg({ strike: 50, transactionId: 't8', multiplier: null }),
+    ];
+    const points = capitalUsageSeries(trades, eq(['2024-01-02', 10000]));
+    expect(points[0].positions).toBe(1);            // the priced structure only
+    expect(Math.round(points[0].pct)).toBe(6);
+    expect(usageExclusions(trades)).toEqual({ positions: 1, unpriced: 1, credit: 0 });
   });
 });

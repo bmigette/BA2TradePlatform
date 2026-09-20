@@ -1,7 +1,9 @@
 import { API_BASE } from '../lib/config';
 import { actionRefOf, actionValueOf } from '../lib/actionValues';
 import { boldNumbers } from '../lib/textParts';
-import { capitalUsageSeries, summariseUsage, IDLE_PCT, HEAVY_PCT } from '../lib/capitalUsage';
+import {
+  capitalUsageSeries, summariseUsage, usageExclusions, IDLE_PCT, HEAVY_PCT,
+} from '../lib/capitalUsage';
 import {
   contractValue, groupTradesByStructure, isOptionTrade, optionBadge, summariseStructure,
 } from '../lib/optionTrades';
@@ -3232,6 +3234,10 @@ const Backtesting: React.FC = () => {
                       selectedBacktest.results?.trades,
                       adjEquityCurve ?? selectedBacktest.results?.equityCurve);
                     const stats = summariseUsage(usage);
+                    // What the series could not measure. An option position whose contract
+                    // multiplier was never recorded is left OUT (never counted at 1x), and a
+                    // credit structure's real constraint is margin, which this does not model.
+                    const exclusions = usageExclusions(selectedBacktest.results?.trades);
                     if (!usage.length) {
                       return (
                         <p className="text-sm text-gray-500 dark:text-gray-400 py-8 text-center">
@@ -3265,7 +3271,30 @@ const Backtesting: React.FC = () => {
                           Open position notional as a share of account equity that day —
                           how much of the account this strategy actually occupies, and so
                           how much is left for another to run alongside it.
+                          {exclusions.positions > 0
+                            ? ` An option structure counts once, at its NET premium`
+                              + ` (${exclusions.positions} position${exclusions.positions === 1 ? '' : 's'} counted).`
+                            : ''}
                         </p>
+                        {(exclusions.unpriced > 0 || exclusions.credit > 0) && (
+                          <ul className="text-[11px] text-amber-700 dark:text-amber-300 mb-2 space-y-0.5">
+                            {exclusions.unpriced > 0 && (
+                              <li>
+                                {exclusions.unpriced} option position
+                                {exclusions.unpriced === 1 ? '' : 's'} left out: the contract
+                                multiplier was never recorded, so their notional is unknown.
+                                They are NOT counted as zero.
+                              </li>
+                            )}
+                            {exclusions.credit > 0 && (
+                              <li>
+                                {exclusions.credit} credit structure
+                                {exclusions.credit === 1 ? '' : 's'} counted at the net premium
+                                RECEIVED — the margin they actually tie up is not modelled here.
+                              </li>
+                            )}
+                          </ul>
+                        )}
                         <div className="h-80">
                           <ResponsiveContainer width="100%" height="100%">
                             <AreaChart data={usage}>
