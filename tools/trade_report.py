@@ -11,6 +11,7 @@ America/New_York trading day and converted back to UTC for queries.
 Usage:
   python tools/trade_report.py --mode morning            # prod: open trades, today's closes + realized P&L, top5 analyses
   python tools/trade_report.py --mode evening            # dev: daily delta per expert
+  python tools/trade_report.py --mode close              # prod: market-close summary (open book + today's closes + realized P&L)
   python tools/trade_report.py --mode morning --date 2026-08-27 --top 5
   python tools/trade_report.py --auto                    # cron entrypoint: picks mode by current ET time
 
@@ -35,23 +36,32 @@ DEFAULT_DBS = {
 
 MORNING_WINDOW = (10, 30)  # 1h after open -> prod report
 EVENING_WINDOW = (15, 30)  # 30min before close -> dev report
+CLOSE_WINDOW = (16, 5)     # just after the 16:00 ET close -> prod close summary
+# NOTE: the cron tick grid is */10, so the close report effectively fires on the first
+# tick at/after 16:05 ET (16:10 ET). That lag is deliberate: it lets the engine write its
+# end-of-day closes before we read the book.
 WINDOW_MINUTES = 30        # wide window: survives a missed tick; dedupe keeps output once/day
 STATE_FILE = os.path.join(os.environ.get("LOCALAPPDATA", "."), "hermes", "state", "ba2_trade_report_last.json")
 
 
 def _claim(mode: str, day: str) -> bool:
-    """Return True only for the first call per (mode, day) — dedupes cron ticks."""
+    """Return True only for the first call per (mode, day) — dedupes cron ticks.
+
+    Keeps a per-mode map so the morning/evening/close reports cannot clobber each
+    other's claim; the legacy single "last" key is still written for compatibility.
+    """
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
     except (OSError, ValueError):
         state = {}
-    key = f"{mode}:{day}"
-    if state.get("last") == key:
+    days = state.get("days") if isinstance(state.get("days"), dict) else {}
+    if days.get(mode) == day:
         return False
+    days[mode] = day
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"last": key}, f)
+        json.dump({"last": f"{mode}:{day}", "days": days}, f)
     return True
 
 
@@ -72,7 +82,7 @@ def et_day_bounds_utc(day: str | None) -> tuple[str, str, str]:
 
 
 def experts_map(con) -> dict[int, str]:
-    return {r["id"]: (r["alias"] or r["expert"]) for r in con.execute("select id, expert, alias from expertinstance")}
+    return {r["id"]: (r["alias"] or r["expert"] or f"expert#{r['id']}") for r in con.execute("select id, expert, alias from expertinstance")}
 
 
 def realized_pl(row) -> float:
@@ -191,23 +201,147 @@ def evening_report(db: str, day: str | None) -> str:
     return "\n".join(out)
 
 
-def auto() -> str:
-    """Cron entrypoint: report only when inside an ET reporting window."""
-    now = datetime.now(ET)
+def _book_snapshot(con) -> dict[str, dict]:
+    """Latest broker position snapshot keyed by symbol (may be empty between syncs)."""
+    try:
+        rows = list(con.execute("select * from position"))
+    except sqlite3.Error:
+        return {}
+    return {r["symbol"]: dict(r) for r in rows}
+
+
+def close_report(db: str, day: str | None) -> str:
+    """Market-close summary for the PROD book: the open book (aggregated), the day's
+    closes with realized P&L, and unrealized P&L when the broker snapshot is populated.
+
+    Deliberately excludes the recommendations / market-analysis section and the dev
+    instance: this is the end-of-day book summary, not an ideas report.
+    """
+    con = connect(db)
+    experts = experts_map(con)
+    label, start_utc, end_utc = et_day_bounds_utc(day)
+    book = _book_snapshot(con)
+
+    out = [f"🔔 BA2 PROD — close report {label} (ET trading day, 16:00 ET close)"]
+
+    def notional_of(r) -> float:
+        return abs((r["open_price"] or 0.0) * (r["quantity"] or 0.0) * (r["multiplier"] or 1))
+
+    def who_of(r) -> str:
+        return experts.get(r["expert_id"]) or ("unassigned" if r["expert_id"] is None else f"expert#{r['expert_id']}")
+
+    # 1) the open book carried into the close — aggregated: 80+ positions would flood the channel
+    open_rows = list(con.execute(
+        'select * from "transaction" where status=\'OPENED\' and open_date < ? order by open_date',
+        (end_utc,)))
+    longs = sum(1 for r in open_rows if (r["side"] or "BUY").upper() == "BUY")
+    notional = sum(notional_of(r) for r in open_rows)
+    unreal_total = 0.0
+    unreal_seen = False
+    if open_rows:
+        out.append(f"\n📂 OPEN AT CLOSE — {len(open_rows)} positions "
+                   f"({longs} long / {len(open_rows) - longs} short, exposure ≈ {notional:,.0f}$)")
+        per_expert: dict[str, list] = {}
+        for r in open_rows:
+            slot = per_expert.setdefault(who_of(r), [0, 0.0])
+            slot[0] += 1
+            slot[1] += notional_of(r)
+        out.append("   by expert: " + " | ".join(
+            f"{who} {n} ({v:,.0f}$)" for who, (n, v) in sorted(per_expert.items(), key=lambda kv: -kv[1][1])))
+        ranked = sorted(open_rows, key=notional_of, reverse=True)
+        show = ranked if len(ranked) <= 8 else ranked[:5]
+        for r in show:
+            line = (f"  • {r['symbol']} {r['side']} x{(r['quantity'] or 0):g} @ {(r['open_price'] or 0):.2f} "
+                    f"(since {str(r['open_date'])[:10]}) — {who_of(r)}")
+            pos = book.get(r["symbol"])
+            if pos and pos.get("unrealized_pl") is not None:
+                unreal_seen = True
+                unreal_total += pos["unrealized_pl"]
+                line += f"  [now {pos.get('current_price') or 0:.2f}, {fmt_pl(pos['unrealized_pl'])}"
+                if pos.get("unrealized_plpc") is not None:
+                    line += f" / {pos['unrealized_plpc'] * 100:+.1f}%"
+                line += "]"
+            out.append(line)
+        if len(ranked) > len(show):
+            out.append(f"   … +{len(ranked) - len(show)} smaller positions (largest shown above)")
+    else:
+        out.append("\n📂 OPEN AT CLOSE — none")
+
+    # 2) everything closed during the ET day + realized P&L
+    closed = list(con.execute(
+        'select * from "transaction" where status=\'CLOSED\' and close_date >= ? and close_date < ? order by close_date',
+        (start_utc, end_utc)))
+    total = 0.0
+    wins = losses = 0
+    best = worst = None
+    per_expert_pl: dict[str, list] = {}
+    for r in closed:
+        pl = realized_pl(r)
+        total += pl
+        if pl > 0:
+            wins += 1
+        elif pl < 0:
+            losses += 1
+        if best is None or pl > best[1]:
+            best = (r, pl)
+        if worst is None or pl < worst[1]:
+            worst = (r, pl)
+        slot = per_expert_pl.setdefault(who_of(r), [0, 0.0])
+        slot[0] += 1
+        slot[1] += pl
+    if closed:
+        out.append(f"\n✅ CLOSED TODAY — {len(closed)} ({wins} win / {losses} loss / "
+                   f"{len(closed) - wins - losses} flat)")
+        for r in closed[:15]:
+            pl = realized_pl(r)
+            reason = f" ({r['close_reason']})" if r["close_reason"] else ""
+            out.append(f"  • {r['symbol']} {r['side']} {(r['open_price'] or 0):.2f}→{(r['close_price'] or 0):.2f} "
+                       f"= {fmt_pl(pl)}{reason} — {who_of(r)}")
+        if len(closed) > 15:
+            out.append(f"   … +{len(closed) - 15} more")
+        if len(per_expert_pl) > 1:
+            out.append("   by expert: " + " | ".join(
+                f"{who} {n} {fmt_pl(v)}" for who, (n, v) in sorted(per_expert_pl.items(), key=lambda kv: -kv[1][1])))
+    else:
+        out.append("\n✅ CLOSED TODAY — none")
+
+    # 3) the day's numbers
+    out.append(f"\n💰 Realized P&L today: {fmt_pl(total)}")
+    if closed:
+        out.append(f"   best: {best[0]['symbol']} {fmt_pl(best[1])} | worst: {worst[0]['symbol']} {fmt_pl(worst[1])}")
+    if unreal_seen:
+        out.append(f"📈 Unrealized P&L (broker snapshot): {fmt_pl(unreal_total)}")
+    out.append(f"📌 Book at close: {len(open_rows)} open / {len(closed)} closed today | exposure ≈ {notional:,.0f}$")
+    con.close()
+    return "\n".join(out)
+
+
+def auto(now: datetime | None = None) -> str:
+    """Cron entrypoint: report only when inside an ET reporting window.
+
+    `now` may be injected for tests; production callers omit it.
+    """
+    now = now or datetime.now(ET)
     if now.weekday() >= 5:  # Sat/Sun: markets closed
         return ""
     minutes = now.hour * 60 + now.minute
     day = now.date().isoformat()
-    for (h, m), mode, dbkey in ((MORNING_WINDOW, "morning", "prod"), (EVENING_WINDOW, "evening", "dev")):
+    for (h, m), mode, dbkey in ((MORNING_WINDOW, "morning", "prod"),
+                                (EVENING_WINDOW, "evening", "dev"),
+                                (CLOSE_WINDOW, "close", "prod")):
         if 0 <= minutes - (h * 60 + m) < WINDOW_MINUTES and _claim(mode, day):
-            return morning_report(DEFAULT_DBS[dbkey], day, 5) if mode == "morning" else evening_report(DEFAULT_DBS[dbkey], day)
+            if mode == "morning":
+                return morning_report(DEFAULT_DBS[dbkey], day, 5)
+            if mode == "evening":
+                return evening_report(DEFAULT_DBS[dbkey], day)
+            return close_report(DEFAULT_DBS[dbkey], day)
     return ""
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="BA2 daily trade report")
-    p.add_argument("--mode", choices=["morning", "evening", "auto"])
-    p.add_argument("--db", help="sqlite path (defaults: prod for morning, dev for evening)")
+    p.add_argument("--mode", choices=["morning", "evening", "close", "auto"])
+    p.add_argument("--db", help="sqlite path (defaults: prod for morning/close, dev for evening)")
     p.add_argument("--date", help="ET day YYYY-MM-DD (default: today)")
     p.add_argument("--top", type=int, default=5)
     a = p.parse_args()
@@ -215,8 +349,13 @@ def main() -> int:
     if a.mode == "auto" or not a.mode:
         text = auto()
     else:
-        db = a.db or DEFAULT_DBS["prod" if a.mode == "morning" else "dev"]
-        text = morning_report(db, a.date, a.top) if a.mode == "morning" else evening_report(db, a.date)
+        db = a.db or DEFAULT_DBS["prod" if a.mode in ("morning", "close") else "dev"]
+        if a.mode == "morning":
+            text = morning_report(db, a.date, a.top)
+        elif a.mode == "evening":
+            text = evening_report(db, a.date)
+        else:
+            text = close_report(db, a.date)
     if text:
         print(text)
     return 0
