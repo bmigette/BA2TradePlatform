@@ -49,6 +49,25 @@ export interface HistoricalReference {
 }
 
 /** One saved leg of the selected transaction, with whatever terms were RECORDED. */
+/** Greeks/IV/OI for one contract at one event, as the option cache recorded them.
+ *
+ * A null field is NOT RECORDED -- the cache migration left older rows null deliberately --
+ * so it must render as "—", never as zero.
+ *
+ * `quality` says WHICH observation it is: `approximate_prior_session` (the last completed
+ * session before a timestamped event, because a daily bar is known only at its close),
+ * `daily_reference` (a date-only event reading its own session), `cache_bar`, `partial`
+ * (the bar exists but the greeks were never fetched) or `unavailable`.
+ */
+export interface ContractDetail {
+  asOf: string | null; observedAt: string | null;
+  iv: number | null; delta: number | null; gamma: number | null;
+  theta: number | null; vega: number | null;
+  openInterest: number | null; volume: number | null;
+  quality: 'cache_bar' | 'approximate_prior_session' | 'daily_reference' | 'partial' | 'unavailable';
+  source: string | null; reason: string | null;
+}
+
 export interface TradeChartLeg {
   id: number;
   symbol: string | null; underlyingSymbol: string | null; contractSymbol: string | null;
@@ -62,6 +81,8 @@ export interface TradeChartLeg {
   transactionId: string | null; rowBasis: 'aggregate_round_trip';
   positionStatus: 'closed' | 'open_at_end' | 'unknown';
   entryUnderlying: HistoricalReference; exitUnderlying: HistoricalReference;
+  /** Optional so a fixture or an older payload without them still typechecks. */
+  entryContract?: ContractDetail | null; exitContract?: ContractDetail | null;
   unavailableFields: string[];
 }
 

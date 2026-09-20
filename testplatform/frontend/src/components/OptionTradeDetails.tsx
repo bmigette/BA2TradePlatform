@@ -1,4 +1,5 @@
 import React from 'react';
+import { contractDetailRows, hasContractDetail } from '../lib/contractDetail';
 import { moneyness, spotVsStrikePercent } from '../lib/optionTradeChart';
 import { payoffFor, payoffSummary } from '../lib/optionChartView';
 import type { HistoricalReference, TradeChartContext, TradeChartLeg } from '../lib/btApi';
@@ -26,6 +27,25 @@ const qualityLabel: Record<HistoricalReference['quality'], string> = {
   daily_reference: 'daily reference',
   unavailable: 'unavailable',
 };
+
+/**
+ * One row of recorded contract detail. The mapping (dashes for not-recorded, the observation
+ * label, the reason) lives in `lib/contractDetail` so it is testable without a browser.
+ */
+const ContractDetailRow: React.FC<{ row: ReturnType<typeof contractDetailRows>[number] }> = ({ row }) => (
+  <tr className="border-t border-gray-100 dark:border-gray-700">
+    <td className="py-1">{row.legLabel}</td>
+    <td>{row.at}</td>
+    <td className="font-mono text-[11px]">{row.asOf}</td>
+    <td>{row.observation}</td>
+    <td className="text-right">{row.iv}</td>
+    <td className="text-right">{row.delta}</td>
+    <td className="text-right">{row.gamma}</td>
+    <td className="text-right">{row.theta}</td>
+    <td className="text-right">{row.vega}</td>
+    <td className="text-right">{row.openInterest}</td>
+  </tr>
+);
 
 const MoneynessBadge: React.FC<{ leg: TradeChartLeg; reference: HistoricalReference }> = ({
   leg, reference,
@@ -196,6 +216,46 @@ const OptionTradeDetails: React.FC<{
           </tbody>
         </table>
       </div>
+
+      {hasContractDetail(legs) && (
+        <div>
+          <div className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-1">
+            Contract detail — as the option cache recorded it
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-gray-500 dark:text-gray-400">
+                <tr>
+                  <th className="text-left py-1">Leg</th>
+                  <th className="text-left">At</th>
+                  <th className="text-left">As of</th>
+                  <th className="text-left">Observation</th>
+                  <th className="text-right">IV</th>
+                  <th className="text-right">Δ</th>
+                  <th className="text-right">Γ</th>
+                  <th className="text-right">Θ</th>
+                  <th className="text-right">V</th>
+                  <th className="text-right">OI</th>
+                </tr>
+              </thead>
+              <tbody className="text-gray-800 dark:text-gray-200">
+                {contractDetailRows(legs).map(row => (
+                  <ContractDetailRow key={row.key} row={row} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+            A daily bar is known only at its session close, so a timestamped event reads the
+            last completed session before it — an approximation with a date, not an entry-time
+            quote. A dash means NOT RECORDED, never zero.
+ {contractDetailRows(legs)
+   .filter(row => row.reason)
+   .map(row => ` ${row.legLabel} at ${row.at}: ${row.reason}.`)
+   .join('')}
+          </p>
+        </div>
+      )}
 
       {legs.some(leg => leg.unavailableFields.length > 0) && (
         <p className="text-[11px] text-amber-700 dark:text-amber-300">

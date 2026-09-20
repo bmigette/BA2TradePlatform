@@ -55,8 +55,11 @@ export type ChartMarker = {
   time: string;
   position: 'aboveBar' | 'belowBar';
   color: string;
-  shape: 'arrowUp' | 'arrowDown';
+  shape: 'arrowUp' | 'arrowDown' | 'circle';
+  /** SHORT canvas label. Long labels overlap into an unreadable smear on the bars. */
   text: string;
+  /** Full sentence, shown on hover. The detail lives here, not on the canvas. */
+  title?: string;
   kind: 'structure' | 'leg';
 };
 
@@ -267,16 +270,33 @@ export function structureMarkers(legs: TradeChartLeg[]): ChartMarker[] {
     position: 'belowBar',
     color: '#2563eb',
     shape: 'arrowUp',
-    text: `Structure entry`,
+    text: 'Entry',
+    title: `Structure entry — ${entries[0]}`,
     kind: 'structure',
   }];
-  if (exits.length > 0) {
+
+  // `open_at_end` is a MARK-TO-RUN-END value, not a fill: the position was still open when
+  // the run stopped. Labelling it "Structure exit" claimed an exit that never happened.
+  if (legs.some(leg => leg.positionStatus === 'open_at_end')) {
+    const last = [...entries, ...exits].sort().pop()!;
+    markers.push({
+      time: last,
+      position: 'aboveBar',
+      color: '#f59e0b',
+      shape: 'circle',
+      text: 'Run-end',
+      title: 'Run-end valuation — the position was still open when the run ended; '
+        + 'this is where it was marked, not an exit fill',
+      kind: 'structure',
+    });
+  } else if (exits.length > 0) {
     markers.push({
       time: exits[exits.length - 1],
       position: 'aboveBar',
       color: '#7c3aed',
       shape: 'arrowDown',
-      text: `Structure exit`,
+      text: 'Exit',
+      title: `Structure exit — ${exits[exits.length - 1]}`,
       kind: 'structure',
     });
   }
@@ -291,14 +311,12 @@ export function structureMarkers(legs: TradeChartLeg[]): ChartMarker[] {
  * at the same time hide each other, and the tooltip is where the detail belongs.
  */
 export function legMarkers(legs: TradeChartLeg[]): ChartMarker[] {
-  const byTime = new Map<string, string[]>();
-  const order: string[] = [];
-
-  const record = (iso: string | null, text: string) => {
-    const day = dayOf(iso);
-    if (!day) return;
-    if (!byTime.has(day)) { byTime.set(day, []); order.push(day); }
-    byTime.get(day)!.push(text);
+  // ENTRY and EXIT are separate markers. Collapsing both onto one below-bar up-arrow made an
+  // exit look like an entry, and put two long labels on the same bar.
+  const byDay = new Map<string, { entries: string[]; exits: string[] }>();
+  const touch = (day: string) => {
+    if (!byDay.has(day)) byDay.set(day, { entries: [], exits: [] });
+    return byDay.get(day)!;
   };
 
   for (const leg of legs) {
@@ -307,27 +325,51 @@ export function legMarkers(legs: TradeChartLeg[]): ChartMarker[] {
       `${leg.optionType === 'call' ? 'Call' : 'Put'} $${leg.strike ?? '?'}`;
     // "premium/share", never a stock-axis price: the number beside a premium is
     // per-share and must say so.
-    record(leg.entryAt, `▸ ${name} @ ${money(leg.entryPrice)}/share`);
-    record(leg.exitAt, `◂ ${name} @ ${money(leg.exitPrice)}/share`);
+    const entryDay = dayOf(leg.entryAt);
+    if (entryDay) touch(entryDay).entries.push(`${name} @ ${money(leg.entryPrice)}/share`);
+    const exitDay = dayOf(leg.exitAt);
+    if (exitDay) touch(exitDay).exits.push(`${name} @ ${money(leg.exitPrice)}/share`);
   }
 
-  return order.map(day => ({
-    time: day,
-    position: 'belowBar' as const,
-    color: '#0891b2',
-    shape: 'arrowUp' as const,
-    text: byTime.get(day)!.join('\n'),
-    kind: 'leg' as const,
-  }));
+  const shortLabel = (legs_: string[], verb: string) =>
+    legs_.length === 1 ? `${verb} leg` : `${verb} ${legs_.length} legs`;
+
+  const markers: ChartMarker[] = [];
+  for (const [day, group] of byDay) {
+    if (group.entries.length > 0) {
+      markers.push({
+        time: day, position: 'belowBar', color: '#0891b2', shape: 'arrowUp',
+        text: shortLabel(group.entries, 'Entry'),
+        title: `Leg entry — ${day}\n${group.entries.join('\n')}`,
+        kind: 'leg',
+      });
+    }
+    if (group.exits.length > 0) {
+      markers.push({
+        time: day, position: 'aboveBar', color: '#db2777', shape: 'arrowDown',
+        text: shortLabel(group.exits, 'Exit'),
+        title: `Leg exit — ${day}\n${group.exits.join('\n')}`,
+        kind: 'leg',
+      });
+    }
+  }
+  return markers;
 }
 
 /** Both marker sets, structure first — the toggle in the UI decides what to show. */
 export const allMarkers = (legs: TradeChartLeg[], opts: { structure?: boolean; legs?: boolean } = {}) => {
   const { structure = true, legs: showLegs = true } = opts;
+  // Sorted by time: the marker sequence used to be entry, exit, entry, exit, which the chart
+  // processes in order and which put same-bar markers in an arbitrary order. Same-day
+  // structure/leg markers keep the structure first (position: 'aboveBar' < 'belowBar').
   return [
     ...(structure ? structureMarkers(legs) : []),
     ...(showLegs ? legMarkers(legs) : []),
-  ];
+  ].sort((left, right) =>
+    left.time.localeCompare(right.time)
+    || (left.kind === right.kind ? 0 : left.kind === 'structure' ? -1 : 1)
+    || left.position.localeCompare(right.position),
+  );
 };
 
 /**

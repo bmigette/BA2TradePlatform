@@ -204,6 +204,10 @@ const TradeChartModal: React.FC<{
           position: marker.position,
           color: marker.color,
           shape: marker.shape,
+          // Short on the canvas, deliberately: a bar marker has no tooltip in this version of
+          // lightweight-charts (`SeriesMarkerBar` carries no `title`), so the long labels that
+          // used to be painted here overlapped into an unreadable smear. The detail lives in
+          // the leg table beside the chart -- the "linked panel" the review asked for.
           text: marker.text,
         });
       }
@@ -232,9 +236,38 @@ const TradeChartModal: React.FC<{
       recompute();
     };
     window.addEventListener('resize', onResize);
+
+    // A vertical PRICE-axis drag moves every candle and strike line without firing the
+    // time-range event or a resize, so the SVG overlay kept the projection it was built with
+    // and its strike kinks and zero crossing pointed at the wrong underlying prices (review
+    // R4 -- a calculation error, not a cosmetic one).
+    //
+    // The library emits no "price scale moved" event, so the projection is WATCHED instead:
+    // two known prices are sampled every frame, and when their screen coordinates (or the
+    // scale's width) change, the scale moved and the overlay is rebuilt from the new one.
+    const probes = [
+      data.length > 0 ? data[data.length - 1].close : 0,
+      data.reduce((lowest, bar) => Math.min(lowest, bar.low), Number.POSITIVE_INFINITY),
+    ].filter(value => Number.isFinite(value));
+    let signature = '';
+    let frame = 0;
+    const watchProjection = () => {
+      const current = [
+        ...probes.map(price => series.priceToCoordinate(price)),
+        series.priceScale().width(),
+      ].join('|');
+      if (current !== signature) {
+        signature = current;
+        recompute();
+      }
+      frame = requestAnimationFrame(watchProjection);
+    };
+    if (isOptionView && probes.length > 0) frame = requestAnimationFrame(watchProjection);
+
     recompute();
 
     return () => {
+      if (frame) cancelAnimationFrame(frame);
       window.removeEventListener('resize', onResize);
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(recompute);
       seriesRef.current = null;

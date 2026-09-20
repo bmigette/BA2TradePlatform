@@ -221,15 +221,18 @@ describe('marker sets (decision 2c)', () => {
     expect(markers.every(marker => marker.kind === 'structure')).toBe(true);
   });
 
-  it('labels every leg, premium per share, collapsing legs that share a bar', () => {
+  it('labels every leg, premium per share, with the detail on hover', () => {
     const markers = legMarkers(spread);
-    // Both legs of this fixture enter on 2026-09-08 and exit on 2026-09-11, so the
-    // two sets collapse into two markers carrying both labels each.
+    // Both legs of this fixture enter on 2026-09-08 and exit on 2026-09-11, so each day
+    // carries one entry and one exit marker.
     expect(markers.map(marker => marker.time)).toEqual(['2026-09-08', '2026-09-11']);
-    expect(markers[0].text.split('\n')).toHaveLength(2);
-    expect(markers[0].text).toContain('Long Call $95');
-    expect(markers[0].text).toContain('$8.00/share');
-    expect(markers[0].text).toContain('Short Call $105');
+    // SHORT on the canvas: two long labels on one bar painted over each other (review R5).
+    expect(markers[0].text).toBe('Entry 2 legs');
+    expect(markers[1].text).toBe('Exit 2 legs');
+    // The full labels live in the hover title.
+    expect(markers[0].title).toContain('Long Call $95');
+    expect(markers[0].title).toContain('$8.00/share');
+    expect(markers[0].title).toContain('Short Call $105');
     expect(markers.every(marker => marker.kind === 'leg')).toBe(true);
   });
 
@@ -242,14 +245,55 @@ describe('marker sets (decision 2c)', () => {
     expect(markers.map(marker => marker.text.split('\n').length)).toEqual([1, 1, 1]);
   });
 
-  it('collapses same-bar leg markers into one, keeping every label', () => {
+  it('collapses same-bar leg markers into one, keeping every label on hover', () => {
     const markers = legMarkers([
       leg({ id: 1, entryAt: '2026-09-08T13:30:00' }),
       leg({ id: 2, optionType: 'put', entryAt: '2026-09-08T13:30:00' }),
     ]);
     const entry = markers.filter(marker => marker.time === '2026-09-08');
     expect(entry).toHaveLength(1);
-    expect(entry[0].text.split('\n')).toHaveLength(2);
+    expect(entry[0].text).toBe('Entry 2 legs');
+    expect(entry[0].title!.split('\n').slice(1)).toHaveLength(2);
+  });
+
+  it('gives an exit its own shape instead of an entry arrow', () => {
+    // The same bar carrying both an entry and an exit: an exit used to be drawn as another
+    // below-bar up-arrow, i.e. as an entry (review R5).
+    const markers = legMarkers([
+      leg({ id: 1, entryAt: '2026-09-08T13:30:00', exitAt: '2026-09-08T19:45:00' }),
+    ]);
+    const entry = markers.find(marker => marker.text.startsWith('Entry'))!;
+    const exit = markers.find(marker => marker.text.startsWith('Exit'))!;
+    expect(entry.position).toBe('belowBar');
+    expect(entry.shape).toBe('arrowUp');
+    expect(exit.position).toBe('aboveBar');
+    expect(exit.shape).toBe('arrowDown');
+    expect(exit.color).not.toBe(entry.color);
+  });
+
+  it('sorts both marker sets chronologically', () => {
+    const markers = allMarkers(spread);
+    const times = markers.map(marker => marker.time);
+    expect(times).toEqual([...times].sort());
+  });
+
+  it('labels an open_at_end position as a run-end valuation, not an exit', () => {
+    // The fixture never exited: the popup used to draw a "Structure exit" arrow for a
+    // position that was still open when the run ended (review R5).
+    const open = [leg({ id: 1, exitAt: null, exitPrice: null, positionStatus: 'open_at_end' })];
+    const marker = structureMarkers(open).find(m => m.text === 'Run-end');
+    expect(marker).toBeDefined();
+    expect(marker!.text).toBe('Run-end');
+    expect(marker!.shape).toBe('circle');
+    expect(marker!.title).toContain('still open when the run ended');
+    expect(structureMarkers(open).some(m => m.text === 'Exit')).toBe(false);
+  });
+
+  it('keeps the structure labels short and puts the date on hover', () => {
+    const markers = structureMarkers(spread);
+    expect(markers.map(marker => marker.text)).toEqual(['Entry', 'Exit']);
+    expect(markers[0].title).toContain('Structure entry');
+    expect(markers[1].title).toContain('Structure exit');
   });
 
   it('does not invent an exit marker for a leg that never exited', () => {
