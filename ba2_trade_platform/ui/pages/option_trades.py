@@ -33,6 +33,7 @@ from nicegui import ui
 
 from ...core.db import get_db
 from ...core.option_pnl_display import option_closed_pnl, option_transaction_pnl
+from ...core.option_positions import opening_legs
 from ...core.utils import get_account_instance_from_id, get_expert_options_for_ui
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
@@ -41,6 +42,11 @@ from ..components.account_scope import scope_transactions_to_account
 
 #: Columns whose sort is computed per row (money, DTE, leg count) and therefore sorted in
 #: memory, exactly as the equity tab does for its P&L columns.
+#: The totals pass covers the WHOLE filtered set so the numbers cannot change with
+#: pagination or sort mode (review R9), but the work stays bounded: beyond this many rows the
+#: strip says it is partial instead of quietly summing a subset.
+_TOTALS_ROW_LIMIT = 500
+
 _COMPUTED_SORT_FIELDS = frozenset({
     'current_pnl_numeric', 'closed_pnl_numeric', 'value', 'expiry_display', 'leg_count',
 })
@@ -63,6 +69,22 @@ def _status_map():
 
 def _money(value: Optional[float]) -> str:
     return '—' if value is None else f'${value:,.2f}'
+
+
+def _row_sort_key(sort_by: str):
+    """Sort key for a built row: numbers numerically, text as text, unknowns last.
+
+    Sorting happens in memory now, because the rows come from the whole filtered set (R9)
+    rather than from a pre-sorted page.
+    """
+    def key(row: Dict[str, Any]):
+        value = row.get(sort_by)
+        if value is None:
+            return (1, 0.0, '')
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return (0, float(value), '')
+        return (0, 0.0, str(value))
+    return key
 
 
 def _pnl_text(amount: Optional[float], percent: Optional[float]) -> str:
@@ -94,6 +116,10 @@ class OptionTradesTab:
         self.on_retry_close = on_retry_close
         self.on_recreate_tpsl = on_recreate_tpsl
         self.on_view_recommendation = on_view_recommendation
+        #: One broker read per contract per load pass (review R10), and whether the totals
+        #: pass hit its row cap (review R9) -- both are per-refresh state.
+        self._quote_snapshot: Dict[str, Any] = {}
+        self._totals_truncated = False
 
         self.table: Optional[LiveTradesTable] = None
         self.status_filter = None
@@ -191,6 +217,26 @@ class OptionTradesTab:
         self, page: int, page_size: int, filters: Dict[str, Any],
         sort_by: str, descending: bool,
     ) -> Tuple[List[Dict], int]:
+        """Async entry point: the blocking reads happen OFF the event loop (review R10).
+
+        ``_collect_rows`` opens a DB session and can call the broker once per contract; run
+        on the event loop that would freeze every other UI callback for the duration. It goes
+        to a worker thread, and the totals strip is repainted here, on the UI thread, once the
+        work is done.
+        """
+        rows, total_count = await asyncio.to_thread(
+            self._collect_rows, page, page_size, filters, sort_by, descending,
+        )
+        try:
+            self._refresh_totals()
+        except Exception as exc:  # a totals strip must never take the table down
+            logger.debug(f"[OPTION TABS] totals repaint skipped: {exc}")
+        return rows, total_count
+
+    def _collect_rows(
+        self, page: int, page_size: int, filters: Dict[str, Any],
+        sort_by: str, descending: bool,
+    ) -> Tuple[List[Dict], int]:
         from sqlmodel import select
         from sqlalchemy import func
 
@@ -233,34 +279,22 @@ class OptionTradesTab:
 
             total_count = session.exec(select(func.count()).select_from(base.subquery())).one()
 
-            computed_sort = sort_by in _COMPUTED_SORT_FIELDS
-            if computed_sort:
-                results = list(session.exec(base.order_by(Transaction.created_at.desc())).all())
-            else:
-                order_column = {
-                    'id': Transaction.id,
-                    'symbol': Transaction.symbol,
-                    'status': Transaction.status,
-                    'quantity': Transaction.quantity,
-                    'open_price': Transaction.open_price,
-                    'created_at': Transaction.created_at,
-                    'closed_at': Transaction.close_date,
-                }.get(sort_by, Transaction.created_at)
-                results = list(session.exec(
-                    base.order_by(order_column.desc() if descending else order_column.asc())
-                    .offset((page - 1) * page_size).limit(page_size)
-                ).all())
+            # ONE pass over the whole filtered set (bounded), so the totals cannot depend on
+            # which page happened to be loaded -- the review's R9 defect was that merely
+            # changing sort mode changed the displayed cost and P&L. The page is then sliced
+            # out of the same rows, and the per-refresh quote snapshot keeps the overlap cheap.
+            self._quote_snapshot = {}
+            results = list(session.exec(
+                base.order_by(Transaction.created_at.desc()).limit(_TOTALS_ROW_LIMIT)
+            ).all())
 
             transactions = [row[0] for row in results]
             experts = {row[0].id: row[1] for row in results}
             rows = self._build_rows(transactions, experts, session)
+            self._totals_truncated = total_count > len(rows)
 
-            if computed_sort:
-                rows.sort(key=lambda row: row.get(sort_by) if isinstance(row.get(sort_by), (int, float)) else 0,
-                          reverse=descending)
-                rows = rows[(page - 1) * page_size: page * page_size]
-
-            return rows, total_count
+            rows.sort(key=_row_sort_key(sort_by), reverse=descending)
+            return rows[(page - 1) * page_size: page * page_size], total_count
         except Exception as exc:
             logger.error(f"[OPTION TABS] data load failed: {exc}", exc_info=True)
             return [], 0
@@ -284,7 +318,10 @@ class OptionTradesTab:
                 .order_by(TradingOrder.created_at)
             ).all())
             option_orders = [o for o in orders if getattr(o, 'contract_symbol', None)]
-            legs = len(option_orders) or len(orders)
+            # The ENTRY structure, not the order history: exits, cancels and unfilled legs
+            # are not positions (review R2), and the count is what the Legs column means.
+            leg_set = opening_legs(txn, orders)
+            legs = leg_set.count
             first_order = orders[0] if orders else None
             account_id = getattr(first_order, 'account_id', None)
 
@@ -301,17 +338,25 @@ class OptionTradesTab:
             current_price = None
             is_open = txn.status in (TransactionStatus.OPENED, TransactionStatus.CLOSING)
             if is_open:
-                # The representative order: a leg prices off its own contract, a multi-leg
-                # parent off the structure's net premium (the seam decides).
-                representative = option_orders[0] if option_orders else first_order
+                # The representative: for a STRUCTURE it is the parent (the seam resolves the
+                # legs itself), for a single contract it is that contract's own order. The
+                # count is passed too, so the seam is chosen by the structure (review R1).
+                if leg_set.is_multi_leg:
+                    representative = leg_set.representative_order()
+                else:
+                    # The real ORDER, not the normalised leg: the seam resolves the
+                    # transaction from the order it is handed.
+                    representative = leg_set.legs[0].order if leg_set.legs else first_order
                 if representative is not None and account_id:
                     account_inst = get_account_instance_from_id(account_id, session=session)
                     if account_inst is not None:
-                        priced = option_transaction_pnl(account_inst, representative)
+                        priced = option_transaction_pnl(
+                            account_inst, representative, opening_legs=leg_set.count,
+                        )
                         if priced.available:
                             current_pnl = priced
-                        if len(option_orders) == 1:
-                            quote = self._contract_quote(account_inst, option_orders[0])
+                        if leg_set.count == 1:
+                            quote = self._contract_quote(account_inst, leg_set.legs[0])
                             current_price = quote
 
             closed = None if is_open else option_closed_pnl(txn)
@@ -370,22 +415,31 @@ class OptionTradesTab:
             })
 
         self._totals = totals
-        # Repaint from the loader, like the equity tab does; a loader that runs outside a
-        # UI slot must not take the page down over a totals strip.
-        try:
-            self._refresh_totals()
-        except Exception as exc:
-            logger.debug(f"[OPTION TABS] totals repaint skipped: {exc}")
+        # NOT repainted here: this now runs in a worker thread, and UI calls belong to the
+        # loader's async wrapper (_data_loader) once the work is done.
         return rows
 
     @staticmethod
-    def _contract_quote(account_inst, order) -> Optional[float]:
-        """Current premium for a single-leg contract, or None. Never fabricated."""
-        try:
-            quote = account_inst.get_option_quote(order.contract_symbol)
-        except Exception as exc:
-            logger.debug(f"[OPTION TABS] no quote for {order.contract_symbol}: {exc}")
-            return None
+    def _contract_quote(self, account_inst, order) -> Optional[float]:
+        """Current premium for a single-leg contract, or None. Never fabricated.
+
+        Reads go through a per-refresh snapshot keyed by contract, so the Current column and
+        anything else asking about the same contract in the same load share ONE broker call
+        (review R10). The snapshot is cleared at the start of each collect pass.
+        """
+        symbol = getattr(order, 'contract_symbol', None)
+        if symbol and symbol in self._quote_snapshot:
+            quote = self._quote_snapshot[symbol]
+            if quote is None:
+                return None
+        else:
+            try:
+                quote = account_inst.get_option_quote(order.contract_symbol)
+            except Exception as exc:
+                logger.debug(f"[OPTION TABS] no quote for {order.contract_symbol}: {exc}")
+                quote = None
+            if symbol:
+                self._quote_snapshot[symbol] = quote
         if quote is None:
             return None
         if getattr(order.side, 'value', '') == 'BUY':
@@ -399,7 +453,10 @@ class OptionTradesTab:
         unpriced = int(totals.get('unpriced', 0))
         self._totals_row.clear()
         with self._totals_row:
-            ui.label('TOTAL (open option structures):').classes('text-sm font-bold text-secondary-custom')
+            label = 'TOTAL (open option structures):'
+            if getattr(self, '_totals_truncated', False):
+                label = f'TOTAL (open option structures, first {_TOTALS_ROW_LIMIT} matching):'
+            ui.label(label).classes('text-sm font-bold text-secondary-custom')
             ui.label(f"Cost: {_money(totals.get('cost', 0.0))}").classes('text-sm font-semibold')
             pnl = totals.get('pnl', 0.0)
             ui.label(f"Unrealized P/L: ${pnl:+,.2f}").classes(

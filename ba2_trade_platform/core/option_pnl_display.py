@@ -56,15 +56,21 @@ def option_transaction_pnl(
     account: Any,
     order: Any,
     *,
+    opening_legs: Optional[int] = None,
     single_leg: Optional[Callable[[Any, Any], Optional[Dict[str, float]]]] = None,
     multi_leg: Optional[Callable[[Any, Any], Optional[Dict[str, float]]]] = None,
 ) -> OptionPnlDisplay:
     """Unrealised P&L of an OPEN option transaction, from the shared pricing seam.
 
-    ``order`` is any order of the transaction. The dispatch is the same one the rules engine
-    uses: a leg WITH a contract symbol is priced off that contract's quote; a multi-leg
-    parent (asset_class OPTION, no contract symbol -- the contracts live on the children) is
-    priced off the structure's net premium.
+    ``order`` is the pricing representative and ``opening_legs`` is how many contracts the
+    ENTRY structure actually holds (see ``core.option_positions``). Pass it: the dispatch
+    must follow the STRUCTURE, because dispatching on the representative's own shape is the
+    review's R1 defect. A spread has contract legs, so handing over ``legs[0]`` sent the whole
+    structure down the single-contract path, which marks that ONE leg against the parent's NET
+    premium and quantity -- +730 displayed where the executable mark was +370.
+
+    When ``opening_legs`` is omitted the old shape-based dispatch is kept, so a caller that
+    only has one order still works; production callers pass the count.
 
     The two seam functions are injectable so the dispatch itself is testable without a live
     broker account; production always uses the rules engine's own functions.
@@ -79,13 +85,18 @@ def option_transaction_pnl(
         single_leg = single_leg or _get_option_pnl_via_transaction
         multi_leg = multi_leg or _get_spread_pnl_via_transaction
 
+    if opening_legs is None:
+        is_structure = not getattr(order, "contract_symbol", None)
+    else:
+        is_structure = opening_legs > 1
+
     try:
-        if getattr(order, "contract_symbol", None):
-            pnl = single_leg(account, order)
-            source = "single_leg_premium"
-        else:
+        if is_structure:
             pnl = multi_leg(account, order)
             source = "structure_net_premium"
+        else:
+            pnl = single_leg(account, order)
+            source = "single_leg_premium"
     except Exception as exc:  # a pricing failure is UNKNOWN, never zero
         logger.warning(f"Option P&L unavailable for order {getattr(order, 'id', '?')}: {exc}")
         return _unavailable(UNAVAILABLE_NO_QUOTE)

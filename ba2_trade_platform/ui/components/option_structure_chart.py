@@ -119,22 +119,66 @@ def chart_inputs_from(txn: Any, orders: Sequence[Any], bars: Any
                          f"{order.quantity:g} {str(right).capitalize()} · K ${strike:.2f}")
         strike_lines.append({'price': strike, 'label': ' / '.join(parts)})
 
+    # Markers are anchored to the EVENT's OWN candle (review R3). Using the latest close for
+    # every historical event put a Sep 8 entry on the Sep 11 close -- outside its own bar, and
+    # with enough chart padding possibly a price from after the exit. The anchor is a VISUAL
+    # position on that bar, not a quote: no entry price is implied by it.
+    by_date = {bar['date']: bar for bar in normalised}
+
+    def _anchor(day: str, entry: bool) -> Tuple[Optional[float], str]:
+        """(price, session) for an event on ``day``: its own bar, else the prior session."""
+        bar = by_date.get(day)
+        session = 'on_date'
+        if bar is None:
+            earlier = [candidate for candidate in normalised if candidate['date'] < day]
+            if not earlier:
+                return None, 'missing'
+            bar, session = earlier[-1], 'prior_session'
+        # Below the candle for an entry, above it for an exit, so the two never sit on top of
+        # each other on the same bar.
+        return (bar['low'] if entry else bar['high']), session
+
+    slots: Dict[Any, int] = {}
+
+    def _marker(day: str, kind: str, text: str, entry: bool,
+                short: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        price, session = _anchor(day, entry)
+        if price is None:
+            return None  # no session at or before the event: no marker rather than a wrong one
+
+        # Same-bar collisions: each further marker on the same day/side steps away from the
+        # candle, so a structure entry and its leg orders are readable instead of stacked on
+        # one bar. The label stays SHORT on the canvas; the full sentence goes to hover.
+        slot = slots.get((day, entry), 0)
+        slots[(day, entry)] = slot + 1
+        if slot:
+            bar = by_date.get(day) or next(
+                (candidate for candidate in reversed(normalised) if candidate['date'] < day), None)
+            span = (bar['high'] - bar['low']) if bar else 0.0
+            step = span * 0.16 if span > 0 else max(abs(price) * 0.005, 0.05)
+            price = price - slot * step if entry else price + slot * step
+
+        return {
+            'date': day, 'kind': kind, 'text': text if session == 'on_date'
+                    else f'{text} (prior session)', 'price': price,
+            'short': short or text,
+            'anchor': 'event_bar_low' if entry else 'event_bar_high', 'session': session,
+            'text_position': 'bottom center' if entry else 'top center',
+        }
+
     markers: List[Dict[str, Any]] = []
-    spot = normalised[-1]['close'] if normalised else None
     open_date = getattr(txn, 'open_date', None)
     if open_date is not None:
-        markers.append({
-            'date': open_date.strftime('%Y-%m-%d'), 'kind': 'structure',
-            'text': 'Structure entry',
-            'price': spot,
-        })
+        marker = _marker(open_date.strftime('%Y-%m-%d'), 'structure', 'Structure entry', True,
+                         short='Entry')
+        if marker:
+            markers.append(marker)
     close_date = getattr(txn, 'close_date', None)
     if close_date is not None:
-        markers.append({
-            'date': close_date.strftime('%Y-%m-%d'), 'kind': 'structure',
-            'text': 'Structure exit',
-            'price': spot,
-        })
+        marker = _marker(close_date.strftime('%Y-%m-%d'), 'structure', 'Structure exit', False,
+                         short='Exit')
+        if marker:
+            markers.append(marker)
     for order in orders or []:
         created = getattr(order, 'created_at', None)
         if created is None:
@@ -144,14 +188,22 @@ def chart_inputs_from(txn: Any, orders: Sequence[Any], bars: Any
         right = getattr(order, 'option_type', None)
         right = getattr(right, 'value', right)
         premium = _as_float(getattr(order, 'open_price', None))
-        markers.append({
-            'date': created.strftime('%Y-%m-%d'), 'kind': 'leg', 'price': spot,
-            'text': (
-                f"{'Long' if str(side).upper().endswith('BUY') else 'Short'} "
-                f"{str(right).capitalize()} ${_as_float(getattr(order, 'strike', None)) or 0:.2f} "
-                f"order placed" + ('' if premium is None else f' @ ${premium:.2f}/share')
-            ),
-        })
+        is_long = str(side).upper().endswith('BUY')
+        is_call = str(right).lower().startswith('call')
+        marker = _marker(
+            created.strftime('%Y-%m-%d'), 'leg',
+            f"{'Long' if is_long else 'Short'} "
+            f"{str(right).capitalize()} ${_as_float(getattr(order, 'strike', None)) or 0:.2f} "
+            f"order placed" + ('' if premium is None else f' @ ${premium:.2f}/share'),
+            True,
+            short=f"{'L' if is_long else 'S'} {_as_float(getattr(order, 'strike', None)) or 0:.0f}"
+                  f"{'C' if is_call else 'P'}",
+        )
+        if marker:
+            markers.append(marker)
+
+    # Chronological, so a same-day entry/exit pair is processed in a defined order.
+    markers.sort(key=lambda marker: (marker['date'], marker['kind'] != 'structure'))
     return normalised, strike_lines, markers
 
 
@@ -239,9 +291,12 @@ def build_option_structure_figure(
             mode='markers+text', name='Structure' if kind == 'structure' else 'Leg orders',
             marker=dict(symbol='diamond' if kind == 'structure' else 'circle',
                         size=10 if kind == 'structure' else 7, color=colour),
-            text=[m.get('text', '') for m in selected],
-            textposition='top center', textfont=dict(size=9),
-            hovertemplate='%{text}<extra></extra>',
+            # Short label on the canvas (long labels overlap into an unreadable smear),
+            # full sentence on hover.
+            text=[m.get('short') or m.get('text', '') for m in selected],
+            textposition=[m.get('text_position', 'top center') for m in selected],
+            textfont=dict(size=9),
+            hovertext=[m.get('text', '') for m in selected], hoverinfo='text',
         ))
 
     axis2: Dict[str, Any] = {

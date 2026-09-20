@@ -6,6 +6,7 @@ import asyncio
 
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
+from ...core.option_positions import opening_legs
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType, OrderDirection
 from ...core.types import AssetClass
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_order_status_color, get_expert_options_for_ui
@@ -2124,27 +2125,12 @@ class LiveTradesTab:
         """
         from ba2_common.core.option_payoff_chart import build_payoff_chart, chart_legs_from_rows
 
-        rows = []
-        for order in orders:
-            if not getattr(order, 'contract_symbol', None):
-                continue
-            side = getattr(order.side, 'value', getattr(order, 'side', None))
-            right = getattr(order.option_type, 'value', getattr(order, 'option_type', None))
-            expiry = getattr(order, 'expiry', None)
-            rows.append({
-                'side': side,
-                'option_type': right,
-                'strike': order.strike,
-                'entry_price': order.open_price,
-                'size': order.quantity,
-                'multiplier': getattr(order, 'multiplier', None) or getattr(txn, 'multiplier', None),
-                # A live order carries the real contract term, so it is trusted when present;
-                # an absent one still refuses rather than being priced at 100x.
-                'multiplier_recorded': True,
-                'expiry': expiry.isoformat() if hasattr(expiry, 'isoformat') else expiry,
-                'underlying_symbol': getattr(order, 'underlying_symbol', None) or txn.symbol,
-            })
-        return build_payoff_chart(chart_legs_from_rows(rows))
+        # The ENTRY structure, never the order history (review R2). Concatenating every order
+        # with a contract symbol drew the net cash of already-closed fills as if it were the
+        # structure's expiration outcomes: a spread's -600/+400 curve flattened to +370 at
+        # every price, and a cancelled order could add exposure that was never held.
+        leg_set = opening_legs(txn, orders)
+        return build_payoff_chart(chart_legs_from_rows(leg_set.chart_rows()))
 
     async def _fill_option_chart(self, container, txn, orders) -> None:
         """Fetch the underlying's bars off the render path, then paint the figure."""
