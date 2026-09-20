@@ -12,6 +12,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, defer
 
 from app.models import get_db, Backtest, Strategy, TrainedModel, Dataset
+from app.schemas.trade_chart import TradeChartContext
+from app.services.backtest_trade_chart import (
+    TradeChartRowNotFound, build_trade_chart_context,
+)
 from app.services.sync_client import push_backtest
 from ba2_common.core.deploy_parity import (
     BacktestRunFacts, backtest_only_settings, forced_expert_settings,
@@ -819,6 +823,40 @@ def get_backtest(
         raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
 
     return backtest.to_dict()
+
+
+@router.get("/{backtest_id}/trade-chart")
+def get_backtest_trade_chart(
+    backtest_id: int,
+    trade_id: int,
+    db: Session = Depends(get_db)
+):
+    """Read-only chart context for ONE saved trade row of this backtest.
+
+    ``trade_id`` is the saved-array index plus one -- the same ``id`` the trade list
+    renders. Resolves the row's complete transaction and its cached underlying
+    history.
+
+    Cache-only and side-effect free: no provider is constructed and no network call
+    is made, so opening the popup cannot fetch, warm or start anything. A cold cache
+    is a 200 with a notice, because the leg table and the expiration payoff do not
+    need bars. See ``app/services/backtest_trade_chart.py``.
+    """
+    if trade_id < 1:
+        raise HTTPException(status_code=422, detail="trade_id must be >= 1")
+
+    backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
+    if not backtest:
+        raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
+
+    try:
+        context = build_trade_chart_context(backtest, trade_id)
+    except TradeChartRowNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # Validate through the response model so a field renamed in the service fails
+    # here rather than arriving at the chart as undefined.
+    return TradeChartContext.model_validate(context).model_dump()
 
 
 @router.get("/{backtest_id}/yearly")
