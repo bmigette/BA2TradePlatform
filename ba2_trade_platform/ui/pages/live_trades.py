@@ -1,5 +1,5 @@
 from nicegui import ui
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from sqlmodel import select, func, Session
 from typing import Dict, Any, List, Tuple, Optional
 import asyncio
@@ -1819,6 +1819,13 @@ class LiveTradesTab:
                 ui.button(icon='close', on_click=dialog.close).props('flat round')
 
             with ui.scroll_area().classes('w-full h-full'):
+                # OPTION STRUCTURE (spec 2026-09-20, step 8). Rendered BEFORE the generic
+                # cards because a structure's terms are what make the numbers below
+                # readable at all: without them "Open Price $8.00" reads like a share
+                # price, and four legs of one condor read as four separate trades.
+                if getattr(txn, 'asset_class', None) == AssetClass.OPTION:
+                    self._render_option_structure_section(txn, orders)
+
                 # Transaction Overview
                 with ui.card().classes('w-full mb-4'):
                     ui.label('📊 Transaction Overview').classes('text-h6 mb-3')
@@ -2009,6 +2016,242 @@ class LiveTradesTab:
                         ui.label('No orders found for this transaction').classes('text-grey-6 text-center q-pa-md')
 
         dialog.open()
+
+    # ------------------------------------------------------------------ options ---
+    #: Fewer stored ATM-IV samples than this and a "rank" would be a percentile of noise.
+    IV_RANK_MIN_SAMPLES = 20
+
+    def _render_option_structure_section(self, txn, orders) -> None:
+        """The option intent, its legs, and the legs' live contract detail.
+
+        Reads only what the transaction and its orders already hold, so it cannot fail on
+        the network. The contract detail (quote, IV, greeks, moneyness) is a BROKER call and
+        is filled in afterwards on a worker thread -- see ``_fill_option_contract_detail``.
+        """
+        from ...core.types import OrderDirection, OrderStatus
+
+        option_orders = [o for o in orders if getattr(o, 'contract_symbol', None)]
+        multiplier = getattr(txn, 'multiplier', None)
+        expiry = getattr(txn, 'expiry', None)
+        today = datetime.now(timezone.utc).date()
+        dte = (expiry - today).days if isinstance(expiry, date) else None
+        is_debit = getattr(txn, 'side', None) == OrderDirection.BUY
+
+        with ui.card().classes('w-full mb-4'):
+            with ui.row().classes('items-center gap-2 mb-2'):
+                ui.label('🧩 Option Structure').classes('text-h6')
+                ui.badge('OPTION', color='purple')
+                if getattr(txn, 'option_strategy', None):
+                    ui.badge(str(txn.option_strategy), color='indigo')
+
+            with ui.grid(columns=4).classes('w-full gap-4'):
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Strategy').classes('text-caption text-grey-7')
+                    ui.label(str(getattr(txn, 'option_strategy', None) or '—')).classes('text-body1 font-bold')
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Expiry').classes('text-caption text-grey-7')
+                    ui.label(
+                        '—' if expiry is None
+                        else f'{expiry.isoformat()}' + (f' · {dte} DTE' if dte is not None else '')
+                    ).classes('text-body1 font-bold')
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Legs / Multiplier').classes('text-caption text-grey-7')
+                    ui.label(
+                        f'{len(option_orders) or len(orders)} legs · '
+                        + (f'x{multiplier}' if multiplier else 'multiplier NOT recorded')
+                    ).classes('text-body1 font-bold')
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Net Premium / share').classes('text-caption text-grey-7')
+                    ui.label(
+                        '—' if txn.open_price is None
+                        else f"${abs(float(txn.open_price)):.2f} {'debit' if is_debit else 'credit'}"
+                    ).classes('text-body1 font-bold')
+
+            if not multiplier:
+                # Say it here rather than letting a 100x-undersized P&L read as a fact.
+                ui.label(
+                    'Contract multiplier not recorded: dollar P&L for this transaction cannot be '
+                    'derived (it is NOT assumed to be 100).'
+                ).classes('text-xs text-orange-400 mt-2')
+
+            ui.label(
+                'TP / SL on this transaction are PREMIUM levels (per share), not underlying prices.'
+            ).classes('text-xs text-secondary-custom mt-2')
+
+            if option_orders:
+                columns = ['Leg', 'Contract', 'Strike', 'Expiry', 'Qty × mult', 'Intent', 'Status', 'Fill prem.']
+                rows = []
+                for order in option_orders:
+                    rows.append({
+                        'Leg': f"{getattr(order.side, 'value', '?')} {getattr(order.option_type, 'value', getattr(order, 'option_type', '') or '?')}",
+                        'Contract': order.contract_symbol,
+                        'Strike': '—' if order.strike is None else f'${float(order.strike):.2f}',
+                        'Expiry': order.expiry.isoformat() if getattr(order, 'expiry', None) else '—',
+                        'Qty × mult': f"{order.quantity:g} × {getattr(order, 'multiplier', None) or '?'}",
+                        'Intent': getattr(order, 'position_intent', None) or '—',
+                        'Status': getattr(order.status, 'value', '') or '—',
+                        'Fill prem.': '—' if order.open_price is None else f'${float(order.open_price):.2f}/share',
+                    })
+                ui.table(columns=[{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in columns],
+                         rows=rows, row_key='Contract').classes('w-full mt-3').props('dense flat')
+
+            # BROKER data lands here, off the render path.
+            self._option_detail_container = ui.column().classes('w-full mt-3')
+            if option_orders:
+                account_id = next((o.account_id for o in orders if getattr(o, 'account_id', None)), None)
+                if account_id:
+                    asyncio.create_task(self._fill_option_contract_detail(
+                        self._option_detail_container, account_id,
+                        [o.contract_symbol for o in option_orders], txn.symbol,
+                    ))
+
+    def _collect_option_contract_detail(self, account_id, contracts, underlying):
+        """BLOCKING broker reads for the leg table's detail block.
+
+        Only ever called inside ``asyncio.to_thread`` (the repo's convention for broker
+        round trips). Every failure is per-leg and reported as unknown: a missing greek is
+        never rendered as zero, and an account that does not implement the options
+        interface simply has no detail to show.
+        """
+        from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+        detail = {'account_supports_options': False, 'spot': None, 'atm_iv': None,
+                  'iv_rank': None, 'quotes': {}, 'errors': {}}
+        try:
+            account = get_account_instance_from_id(account_id)
+        except Exception as exc:
+            detail['errors']['account'] = str(exc)
+            return detail
+
+        if not isinstance(account, OptionsAccountInterface):
+            detail['errors']['account'] = 'account does not implement the options interface'
+            return detail
+        detail['account_supports_options'] = True
+
+        try:
+            detail['spot'] = account.get_instrument_current_price(underlying, 'mid')
+        except Exception as exc:
+            detail['errors']['spot'] = str(exc)
+
+        for contract in contracts:
+            try:
+                quote = account.get_option_quote(contract)
+            except Exception as exc:
+                detail['errors'][contract] = str(exc)
+                continue
+            if quote is None:
+                detail['errors'][contract] = 'no snapshot'
+                continue
+            detail['quotes'][contract] = {
+                'bid': getattr(quote, 'bid', None), 'ask': getattr(quote, 'ask', None),
+                'last': getattr(quote, 'last', None), 'mid': getattr(quote, 'mid', None),
+                'iv': getattr(quote, 'implied_volatility', None),
+                'delta': getattr(quote, 'delta', None), 'gamma': getattr(quote, 'gamma', None),
+                'theta': getattr(quote, 'theta', None), 'vega': getattr(quote, 'vega', None),
+                'timestamp': getattr(quote, 'timestamp', None),
+            }
+
+        try:
+            detail['atm_iv'] = account.get_atm_implied_volatility(underlying)
+        except Exception as exc:
+            detail['errors']['atm_iv'] = str(exc)
+
+        return detail
+
+    def _iv_rank(self, account_id, underlying, current_iv):
+        """IV rank from OUR OWN stored ATM-IV series (brokers publish no IV history).
+
+        Returns ``(rank_percent, sample_count)`` or ``(None, count)`` when the window is too
+        short to mean anything -- a percentile of four samples is not a rank.
+        """
+        from ...core.models import OptionIVSnapshot
+
+        # The session is acquired INSIDE the guard: a DB handle that cannot be obtained is
+        # the same outcome as a read that fails -- no rank -- and must not escape into the
+        # task that is painting the dialog.
+        session = None
+        try:
+            session = get_db()
+            rows = session.exec(
+                select(OptionIVSnapshot)
+                .where(OptionIVSnapshot.account_id == account_id,
+                       OptionIVSnapshot.underlying == underlying)
+                .order_by(OptionIVSnapshot.recorded_at)
+            ).all()
+        except Exception as exc:
+            logger.debug(f"[OPTION DETAIL] IV history read failed: {exc}")
+            return None, 0
+        finally:
+            if session is not None:
+                session.close()
+
+        samples = [float(r.atm_iv) for r in rows if getattr(r, 'atm_iv', None) is not None]
+        if len(samples) < self.IV_RANK_MIN_SAMPLES or current_iv is None:
+            return None, len(samples)
+        at_or_below = sum(1 for value in samples if value <= float(current_iv))
+        return (at_or_below / len(samples)) * 100.0, len(samples)
+
+    async def _fill_option_contract_detail(self, container, account_id, contracts, underlying) -> None:
+        """Fill the contract-detail block from a worker thread, then paint it."""
+        try:
+            detail = await asyncio.to_thread(
+                self._collect_option_contract_detail, account_id, contracts, underlying)
+        except Exception as exc:
+            logger.warning(f"[OPTION DETAIL] contract detail unavailable: {exc}")
+            return
+
+        iv_rank, samples = self._iv_rank(account_id, underlying, detail.get('atm_iv'))
+
+        with container:
+            if not detail.get('account_supports_options'):
+                ui.label(
+                    'Contract detail unavailable: ' + detail['errors'].get('account', 'no options interface')
+                ).classes('text-xs text-secondary-custom')
+                return
+
+            with ui.row().classes('items-center gap-3'):
+                ui.label('📈 Contract detail (CURRENT — not the position\'s P&L)').classes('text-subtitle1 font-bold')
+                if detail.get('spot') is not None:
+                    ui.label(f"underlying now ${float(detail['spot']):.2f}").classes('text-xs text-secondary-custom')
+                if detail.get('atm_iv') is not None:
+                    ui.label(f"ATM IV now {float(detail['atm_iv']) * 100:.1f}%").classes('text-xs text-secondary-custom')
+                if iv_rank is not None:
+                    ui.label(f"IV rank {iv_rank:.0f}% ({samples} samples)").classes('text-xs text-secondary-custom')
+                elif detail.get('atm_iv') is not None:
+                    ui.label(
+                        f'IV rank not available yet ({samples} of {self.IV_RANK_MIN_SAMPLES} stored samples)'
+                    ).classes('text-xs text-secondary-custom')
+
+            def cell(value, fmt='{:.2f}'):
+                return '—' if value is None else fmt.format(float(value))
+
+            table_rows = []
+            for contract in contracts:
+                quote = detail['quotes'].get(contract)
+                if quote is None:
+                    table_rows.append({
+                        'Contract': contract, 'Bid': '—', 'Ask': '—', 'Mid': '—', 'Last': '—',
+                        'IV': '—', 'Delta': '—', 'Gamma': '—', 'Theta': '—', 'Vega': '—',
+                        'Note': detail['errors'].get(contract, 'unavailable'),
+                    })
+                    continue
+                table_rows.append({
+                    'Contract': contract,
+                    'Bid': cell(quote['bid']), 'Ask': cell(quote['ask']),
+                    'Mid': cell(quote['mid']), 'Last': cell(quote['last']),
+                    'IV': '—' if quote['iv'] is None else f"{float(quote['iv']) * 100:.1f}%",
+                    'Delta': cell(quote['delta'], '{:+.3f}'), 'Gamma': cell(quote['gamma'], '{:.4f}'),
+                    'Theta': cell(quote['theta'], '{:+.3f}'), 'Vega': cell(quote['vega'], '{:.3f}'),
+                    'Note': '',
+                })
+
+            columns = ['Contract', 'Bid', 'Ask', 'Mid', 'Last', 'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'Note']
+            ui.table(columns=[{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in columns],
+                     rows=table_rows, row_key='Contract').classes('w-full').props('dense flat')
+            ui.label(
+                'Broker-sourced and current: greeks and IV describe the contract RIGHT NOW, '
+                'and are not part of any expiration payoff.'
+            ).classes('text-xs text-secondary-custom')
 
     def _get_transaction_status_color(self, status):
         """Get color for transaction status badge."""
