@@ -1,0 +1,105 @@
+{
+  "reviewed": [
+    "4ce1e6e8",
+    "f359ab9a"
+  ],
+  "option_runs": [
+    {
+      "template_gate": "O_LC",
+      "mode": "above",
+      "signal": "BUY",
+      "confidence": 90,
+      "option_positions": 1,
+      "cash": 95600.0
+    },
+    {
+      "template_gate": "O_LC",
+      "mode": "above",
+      "signal": "SELL",
+      "confidence": 90,
+      "option_positions": 0,
+      "cash": 100000.0
+    },
+    {
+      "template_gate": "O_LC",
+      "mode": "below",
+      "signal": "SELL",
+      "confidence": 90,
+      "option_positions": 1,
+      "cash": 95600.0
+    },
+    {
+      "template_gate": "O_LC",
+      "mode": "below",
+      "signal": "BUY",
+      "confidence": 90,
+      "option_positions": 0,
+      "cash": 100000.0
+    },
+    {
+      "template_gate": "O_LC",
+      "mode": "off",
+      "signal": "HOLD",
+      "confidence": 90,
+      "option_positions": 0,
+      "cash": 100000.0
+    },
+    {
+      "template_gate": "O_STRD",
+      "mode": null,
+      "signal": "HOLD",
+      "confidence": 20,
+      "option_positions": 0,
+      "cash": 100000.0
+    },
+    {
+      "template_gate": "O_STRD",
+      "mode": "off",
+      "signal": "BUY",
+      "confidence": 20,
+      "option_positions": 1,
+      "cash": 95600.0
+    },
+    {
+      "template_gate": "O_STRD",
+      "mode": "off",
+      "signal": "SELL",
+      "confidence": 20,
+      "option_positions": 1,
+      "cash": 95600.0
+    },
+    {
+      "template_gate": "O_STRD",
+      "mode": "off",
+      "signal": "BUY",
+      "confidence": 50,
+      "option_positions": 0,
+      "cash": 100000.0
+    },
+    {
+      "template_gate": "O_STRD",
+      "mode": null,
+      "signal": "BUY",
+      "confidence": 20,
+      "option_positions": 0,
+      "cash": 100000.0
+    },
+    {
+      "template_gate": "O_STRD",
+      "mode": null,
+      "signal": "SELL",
+      "confidence": 20,
+      "option_positions": 0,
+      "cash": 100000.0
+    }
+  ],
+  "neutral_hold_staged": false,
+  "preflight_passed": true,
+  "trial_guard_error": "market-condition manifest d389524737f0e12f2e68d4ff49399d3824b0c424fe30168e28bca7c57882a416 does not serve the feature rows this run's 2024-03-26..2024-03-28 decision window needs: market-condition snapshot d389524737f0e12f2e68d4ff49399d3824b0c424fe30168e28bca7c57882a416 was built for decision dates 2024-03-25..2024-03-27; this run decides on 2024-03-26..2024-03-28, which it does not cover. Every gate outside the snapshot's window reads missing_session, so every gated entry would be refused for a cache reason and the search would score that as strategy behaviour. Pin (or warm) a snapshot for this window: tools/warm_market_conditions.py plan/build.. Each of those decision dates would read missing_session, so the gated entries would be refused for a cache reason and the search would score that as strategy behaviour. This is a job configuration fault, not a result.",
+  "all_off_still_searches": [
+    "model:mom_lookback_days",
+    "model:theta_buy",
+    "entry:research_buy:a1:action_value",
+    "cond:research_days:value"
+  ]
+}

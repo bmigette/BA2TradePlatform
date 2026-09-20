@@ -236,7 +236,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "(40/dd)^1.5 penalty past 40%% dd -- the only one of the three that "
                          "prices the CAR/DD ratio (option_car_over_risk divides by sqrt(dd), "
                          "so it scores a 40%%/40%% genome and a 20%%/10%% one identically). "
-                         "No two of the three are comparable -- a matrix run under one never "
+                         "'option_car_target_soft30' keeps those targets but replaces the "
+                         "annual trade floor/ramp with min(completed structures / 30, 1) "
+                         "over the whole backtest; a positive count is penalised, not discarded. "
+                         "These objectives are not comparable -- a matrix run under one never "
                          "shares a table with a matrix run under another.")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "

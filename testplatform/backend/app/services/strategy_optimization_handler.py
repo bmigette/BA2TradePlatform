@@ -1539,6 +1539,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # The objective's robustness setting, so a resume cannot mix two incomparable
             # scales in one population (the fingerprint covers the GENE SPACE, not the metric).
             data["robust_fitness"] = robust_on
+            data["fitness_metric"] = opt.fitness_metric
             # The best entries SO FAR, so a resumed run's top-N persist can still see the
             # winners found before the interruption. See _elite_slice for why this is cheap
             # (and why the older "it would embed every trial's trades JSON" reading was wrong).
@@ -1825,6 +1826,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         if ckpt:
             # REFUSE a checkpoint scored under a different objective, BEFORE anything is resumed.
             _assert_checkpoint_robustness_matches(ckpt, robust_on, opt.name, ckpt_task_id)
+            _assert_checkpoint_metric_matches(ckpt, opt.fitness_metric, opt.name, ckpt_task_id)
             start_gen, init_pop, init_fits = optimizer.resume_from_checkpoint(ckpt)
             logger.warning(
                 f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
@@ -2817,6 +2819,36 @@ def _seed_all_results_from_checkpoint(
     if not isinstance(carried, list):
         return
     all_results.extend(r for r in carried if isinstance(r, dict))
+
+
+def _assert_checkpoint_metric_matches(ckpt: Dict[str, Any], metric: str,
+                                      job_name: Optional[str], task_id: str) -> None:
+    """Never mix the new soft-count objective with an old population's scores.
+
+    Legacy checkpoints did not record the metric. Preserve their existing resume
+    behavior for legacy objectives; they cannot have used the new soft30 metric.
+    Newly written checkpoints require a matching canonical metric in both directions.
+    """
+    from app.services.strategy_fitness import METRICS_CATALOG, _OCT_SOFT30_KEY
+
+    def canonical(value: str) -> str:
+        value = value.lower()
+        for item in METRICS_CATALOG:
+            if value == item["key"] or value in item["aliases"]:
+                return item["key"]
+        return value
+
+    previous = ckpt.get("fitness_metric")
+    current = canonical(metric)
+    if previous is None and current != _OCT_SOFT30_KEY:
+        return
+    if previous is not None and canonical(previous) == current:
+        return
+    raise ValueError(
+        f"checkpoint {task_id} for job {job_name!r} has fitness_metric={previous!r}, "
+        f"requested {metric!r}. Give the job a NEW name (--name / --name-suffix / "
+        "STAGE1_SUFFIX) to keep populations scored under different objectives separate."
+    )
 
 
 def _assert_checkpoint_robustness_matches(ckpt: Dict[str, Any], robust_on: bool,

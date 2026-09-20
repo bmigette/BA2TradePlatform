@@ -269,6 +269,11 @@ _OCT_ALIASES = ("option_car_target",)
 # ONE name, same reasoning as ``option_car_over_risk`` above: there are now three option metrics
 # whose names all begin "option_car", so a short alias would be a typo away from silently ranking
 # a grid under a different objective. The full spelling is the whole safety margin.
+_OCT_SOFT30_KEY = "option_car_target_soft30"
+# Explicit research objective: full credit at 30 completed structures over the
+# WHOLE window, with a linear penalty below it and no positive-count hard floor.
+# Keep a separate metric name so stored scores and discovery identities retain
+# their original meaning. The legacy CAR objectives are unchanged.
 
 # --- option_convex metric constants (CONFIG, not genes) ----------------------------------------
 # The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
@@ -471,6 +476,17 @@ _SPECIAL_META = {
         "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
     },
+    _OCT_SOFT30_KEY: {
+        "label": "CAR Target, Soft 30 Trades (Option)",
+        "description": "CAR Target with a linear completed-structure count penalty: "
+                       "min(structures / 30, 1) over the whole backtest, replacing the "
+                       "annual trade floor and ramp. Positive-count runs remain scoreable. "
+                       "Zero trades, wipeout, concentration and other robustness checks "
+                       "still apply. Scores are not comparable with option_car_target.",
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": True,
+        "uses_adjusted_under_caps": True,
+    },
     _CONVEX_KEY: {
         "label": "Convex Harvest (Option)",
         "description": "For a CONVEX option book (many cheap far-OTM long-dated tickets): "
@@ -525,9 +541,11 @@ def _build_metrics_catalog() -> list:
         _OCAR_KEY: sorted(a for a in _OCAR_ALIASES if a != _OCAR_KEY),
         _OCR_KEY: sorted(a for a in _OCR_ALIASES if a != _OCR_KEY),
         _OCT_KEY: sorted(a for a in _OCT_ALIASES if a != _OCT_KEY),
+        _OCT_SOFT30_KEY: [],
         _CONVEX_KEY: sorted(a for a in _CONVEX_ALIASES if a != _CONVEX_KEY),
     }
-    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _OCT_KEY, _CONVEX_KEY):
+    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _OCT_KEY,
+                    _OCT_SOFT30_KEY, _CONVEX_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -558,7 +576,7 @@ def assert_catalog_complete() -> None:
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
     expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
                 | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES)
-                | set(_CONVEX_ALIASES))
+                | {_OCT_SOFT30_KEY} | set(_CONVEX_ALIASES))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -631,16 +649,17 @@ def compute_fitness(fitness_metric: str, results: dict,
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
 
-    if metric in _OCT_ALIASES:
+    if metric in _OCT_ALIASES or metric == _OCT_SOFT30_KEY:
         # OPTION-ONLY, and a THIRD DISTINCT OBJECTIVE rather than a rescaling of either branch
         # above (see _option_car_target): CAR > 35%/yr AND CAR > drawdown. The branch above is
         # indifferent to the CAR/DD ratio (it divides by sqrt(dd), so 40%/40% and 20%/10% score
         # identically); this one ramps on it. Same three wrappers as CAR, option_car and
         # option_car_over_risk -- win-rate factor, spread stress, robustness -- so
         # --robust-fitness / --stress-spread behave identically whichever option metric a grid
-        # names; only the factor product inside differs. Reached ONLY by an explicit
-        # "option_car_target", which is what keeps every running grid out of this path.
-        _fit = _apply_win_rate_factor(_option_car_target(results), results)
+        # names; only the factor product inside differs. The explicitly named soft30
+        # variant replaces only the trade gate, preserving the legacy metric's results.
+        _fit = _apply_win_rate_factor(
+            _option_car_target(results, soft_total_trades=(metric == _OCT_SOFT30_KEY)), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
@@ -675,7 +694,7 @@ def compute_fitness(fitness_metric: str, results: dict,
     if key is None:
         raise ValueError(
             f"Unknown fitness_metric: {fitness_metric!r}. "
-            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES) | set(_CONVEX_ALIASES))}"
+            f"Valid: {sorted(catalog_accepted_metrics())}"
         )
     # Profit-cap-aware: when EITHER cap was applied (per-trade basis cap ``profit_cap_pct`` or
     # portfolio-share cap ``profit_share_cap_pct``), the GA must rank on the ADJUSTED return-based
@@ -1627,9 +1646,13 @@ def _option_car_target_factor(base: float, dd: float) -> float:
     return car_ramp * mar_ramp * _option_car_target_dd_penalty(d)
 
 
-def _option_car_target(results: dict) -> float:
+def _option_car_target(results: dict, *, soft_total_trades: bool = False) -> float:
     """OPTION-ONLY goal metric: ``base x CAR-ramp x MAR-ramp x high_dd_penalty x consistency x
     trade_gate``.
+
+    ``soft_total_trades=True`` is used exclusively by ``option_car_target_soft30``:
+    replace the annual trade gate below with min(completed structures / 30, 1).
+    The default path retains the legacy objective and all of its scores.
 
     THE OBJECTIVE, stated by the operator on 2026-09-17 after watching the other two option
     metrics rank a real population: "a fitness calibrated for CAR > 35 and CAR > DD". TWO
@@ -1729,18 +1752,28 @@ def _option_car_target(results: dict) -> float:
         return ZERO_TRADE_SENTINEL
     base = float(base)
 
-    # --- trade gate: proportional ramp, hard floor below it -----------------------------------
-    # STRUCTURES per year, not legs (see _trades_per_year). An iron condor is ONE bet and four
-    # rows; reading the published leg rate here would inflate essentially every genome in a
-    # pure-option population.
-    tpy = _trades_per_year(results)
-    if tpy is None:
-        return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
-    _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
-    _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
-    if float(tpy) < _floor:
-        return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
-    trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
+    # Only the explicitly named soft30 objective replaces the legacy annual gate.
+    if soft_total_trades:
+        trades = results.get("trades")
+        if not isinstance(trades, list):
+            raise ValueError(
+                "option_car_target_soft30 requires results['trades'] to count completed "
+                "structures, not legs. Restore the trades column when re-scoring a backtest."
+            )
+        structures = _structure_count(trades)
+        if structures == 0:
+            return ZERO_TRADE_SENTINEL
+        trade_gate = min(structures / 30.0, 1.0)
+    else:
+        # Legacy objective, including explicit per-run/expert cadence overrides.
+        tpy = _trades_per_year(results)
+        if tpy is None:
+            return LOW_TRADE_SENTINEL
+        _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
+        _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
+        if float(tpy) < _floor:
+            return LOW_TRADE_SENTINEL
+        trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
 
     if base <= 0:
         return base  # unfactored: penalty factors on a negative would flip its sign
