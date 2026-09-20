@@ -14,6 +14,7 @@ platform's transaction-details popup.
 | 3 | **3 all — the live platform port** (`ba2-trade` transaction-details popup) gets option terms + leg table, then the price chart with markers, then the payoff overlay, in that order (§6). |
 | 4 | **No new options page/menu.** `docs/superpowers/specs/2026-08-24-option-model-and-lifecycle-design.md` §8 names a "dedicated options UI page" as follow-up **F** in one line and never designs it — no scope, no mockup, nothing else in the docs tree references it. The live transaction-details popup is the delivery surface until that page is actually designed. |
 | 5 | **Two tabs in Live Trades** (2026-09-20, follow-up to decision 3): **Stocks first/default, Options second**, each with its own columns, filters and totals, split strictly on `Transaction.asset_class`. See §6. |
+| 6 | **Contract detail (greeks / IV / open interest) in the option popup** — asked 2026-09-20. Both runtimes already hold the data; nothing needs buying. See §9. |
 
 ## 1. Result to deliver
 
@@ -304,7 +305,9 @@ Each tab owns its filter state (status/expert/symbol today, plus strategy and DT
 | 8. Live: popup option terms + leg table | `ui/pages/live_trades.py` `_show_transaction_details_dialog` (intent block + leg table from the child orders); `LiveTradesTable.py` surfaces `asset_class`/`option_strategy`/`expiry`/`multiplier`. | The popup lists every leg with terms and opens from both tabs; an equity transaction renders exactly as before. |
 | 9. Live: price chart + markers | New component (e.g. `ui/components/option_structure_chart.py`) reusing `symbol_chart_data.build_chart_data` and the Plotly dark-template conventions, called from the popup. `InstrumentGraph` untouched. | Chart renders in the dialog with both marker sets and the right underlying; SYMBOL360 and Market Analysis history are unchanged. |
 | 10. Live: payoff overlay | Same component: payoff trace on a second overlaying x-axis (x = P&L, y = price). | The overlay reproduces the React fixtures for the same structure and disables itself with a stated reason when terms are missing. |
-| 11. Verification (both runtimes) | Frontend build + focused tests; backend context/cache tests; `tests/` and `packages/common/tests/` run separately (conftest collision); live checks in a dev instance against seeded option fixtures. | Acceptance list (§8) satisfied on both runtimes. |
+| 11. Contract detail — backtest | `services/backtest_trade_chart.py` + schemas: per-leg `entryContract` / `exitContract` (`iv`, `delta`, `gamma`, `theta`, `vega`, `openInterest`, `volume`, `asOf`, `quality`) read from the run's own option store via `OptionsHistoryCache.latest_bar_on_or_before`. | Greeks/IV/OI at entry and exit where the store covers the contract; NULL stays unknown; the as-of date and the coverage gap are visible; no network call. |
+| 12. Contract detail — live | `ui/pages/live_trades.py` option view: per-leg `account.get_option_quote(contract_symbol)` (bid/ask/mid/last, IV, greeks), `get_atm_implied_volatility(underlying)`, and IV rank from `option_iv_snapshot` with its sample count. | Current values labelled current and never inside the payoff curve; unknown where the broker publishes none; IV rank hidden with its reason when the window is too short. |
+| 13. Verification (both runtimes) | Frontend build + focused tests; backend context/cache tests; `tests/` and `packages/common/tests/` run separately (conftest collision); live checks in a dev instance against seeded option fixtures. | Acceptance list (§8) satisfied on both runtimes. |
 
 Out of scope: expert/rules changes, option selection, pricing/fill simulation, sizing, margin, stops, risk manager, GA genes/fitness, worker caches, backtest metrics, and any re-save/recompute of historical results. Also out of scope for this spec: **the live options page/menu** (decision 4 — follow-up F is a one-line deferral with no design; do not build a page under this spec), **the numeric-axis payoff diagram** (decision 1a replaced it; revisit only if the rotated overlay proves unreadable), live option order submission, and any change to the option lifecycle decisions. The popup must never write to the backtest row. Exact underlying-at-fill snapshots could be added to future run artifacts in a separately scoped follow-up; they are not a prerequisite for showing existing results honestly.
 
@@ -340,13 +343,66 @@ Required checks:
 - [ ] The payoff overlay is drawn in price space: it is not a dated series, and pan/zoom/resize never change the breakevens, max profit or max loss.
 - [ ] Both marker sets are distinguishable and toggleable; leg markers on one bar do not overdraw each other; a single-leg trade still shows the structure pair.
 - [ ] The overlay's green/red regions are correct for both wings of a long straddle and both tails of an iron condor, and the fill leaves the candles legible.
+- [ ] **Contract detail:** greeks/IV/OI show for a leg the store covers, are **unknown** (not 0) for one it does not, carry the as-of date, and never change the payoff curve, the breakevens or the max profit/loss figures.
 - [ ] **Live:** Live Trades has two tabs — Stocks (first, default) and Options — each with its own columns, filters and totals; the split is `Transaction.asset_class` and nothing else; the Stocks tab is behaviourally unchanged, equity P&L included.
 - [ ] **Live:** the Options tab's Current/Value/P&L and its totals are multiplier-aware and priced off option premiums (bid for a long, ask for a short, last as the fallback), never off the underlying quote; a missing quote or multiplier reads **unknown**, not zero; TP/SL are labelled as premium levels.
 - [ ] **Live:** an option transaction is identifiable in the Options tab; the popup's leg table matches the child orders exactly; an equity transaction renders as before; a transaction with unrecorded option terms shows the honest empty state and never a terms-from-OCC guess.
 - [ ] **Live:** with zero option trades in either DB, the port is demonstrated on seeded fixtures and the empty state is exercised deliberately.
 - [ ] Responsive/light/dark screenshots are reviewed; keyboard opening/closing and focus return work; profit/loss remains understandable without color.
 
-## 9. References
+## 9. Contract detail: greeks, IV, open interest (asked 2026-09-20)
+
+**Yes — both runtimes already hold this data.** Nothing needs buying and no new vendor is involved.
+
+### Backtest popup: the option cache already carries the greeks
+
+`services/backtest/options_cache.py` (`OptionsHistoryCache`) stores per-contract bars with
+`iv, delta, gamma, theta, vega, open_interest, volume` beside OHLCV (`_BAR_COLS`, `_GREEK_COLS`),
+and the module's own note records the migration that added them: **iv and the four greeks are
+present on 88.2% of `option_bar` rows and 46.0% of `option_chain` rows**. That comment was
+re-verified against the store and deliberately replaces an older claim that `get_atm_iv` returned
+None for everything.
+
+The point-in-time reader already exists — `OptionsHistoryCache.latest_bar_on_or_before(occ_symbol,
+on_or_before)`, documented as "used to attach POINT-IN-TIME iv/greeks to a contract at an arbitrary
+as-of date ... Falls back to the nearest PRIOR trading day on a no-trade day". That is exactly what
+the popup needs at entry and at exit.
+
+Rules:
+
+- Resolve the store the RUN used (`options_store.resolve_options_store(config)` picks sqlite vs
+  parquet, and the store choice picks the VENDOR), never whichever store is configured today.
+- Clamp to the event date, never forward, and show the bar's own date: a no-trade-day fallback is a
+  different day's greeks and must not read as the event's.
+- NULL greeks / IV / OI are **unknown**, never 0. The migration left old rows NULL on purpose and
+  "every reader already treats a NULL iv/delta as unusable".
+- The coverage gap stays visible: ~12% of bar rows carry no iv/greeks, so a leg can show complete
+  terms and a payoff with its contract detail unavailable.
+- These are the CACHE's computed greeks, not the broker's, and the cache may have been corrected
+  since the run — the same labelling rule as the bars (§3A).
+- Greeks are context; the payoff is terms. They never enter the curve, the breakevens or the
+  max profit/loss figures.
+
+### Live popup: the broker quote already carries them
+
+- `OptionsAccountInterface.get_option_quote(contract_symbol) -> OptionQuote` — `bid, ask, last,
+  implied_volatility, delta, gamma, theta, vega, timestamp`, plus a `mid` property. One call per
+  contract symbol, through the same seam the option P&L path already uses (§6).
+- `get_atm_implied_volatility(underlying)` — the underlying's current near-ATM IV (0-1).
+- **IV rank** comes from our own recorded series: `OptionIVSnapshot` (`option_iv_snapshot`:
+  `account_id`, `underlying`, `atm_iv`, `recorded_at`) is written daily by
+  `TradeManager.record_daily_iv_snapshots()` on the `option_iv_snapshot_job`, and the model's own
+  docstring says brokers expose no IV history, so we persist our own and compute IV-rank as a
+  percentile over the stored window. `ba2_common.core.iv_rank_audit` exists to audit that series.
+- **Both live DBs currently hold 0 rows** in `option_iv_snapshot` (and 0 in `option_activity`) —
+  the same "no option trade has ever run live" state as §2b. IV rank therefore renders as "not
+  enough history yet (N samples)" rather than a number until the window is long enough, and the
+  window length travels with the value.
+- Coverage is broker-dependent: a broker that publishes no greeks must produce **unknown**, never
+  0. The values are CURRENT, so they never enter the expiration curve or a moneyness claim about
+  entry (§4).
+
+## 10. References
 
 - User-supplied `options_trading_strategies_cheat_sheet.pdf` (tastytrade, 2025): visual inspiration for strike guides, colored payoff areas, and profit/loss/breakeven summaries. Its wording and branded layout are not reproduced. The supplied copy is a single tall poster covering ten strategies.
 - [Options Industry Council: Understanding Profit and Loss Graphs](https://www.optionseducation.org/getmedia/69e25d84-d06d-4073-82dc-37c87e3d8aeb/understanding-profit-loss-graphs.pdf): confirms the axes and the distinction between intrinsic-value payoff at expiration and an earlier realized result. This spec's cache and UI design comes from the repository inspection above.
