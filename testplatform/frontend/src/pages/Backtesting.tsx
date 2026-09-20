@@ -3722,7 +3722,15 @@ const Backtesting: React.FC = () => {
 
   return (
     <div className="p-6 space-y-6">
-      <TradeChartModal trade={chartTrade} onClose={() => setChartTrade(null)} />
+      {/* An OPTION row opens the option view: the complete transaction's terms, its
+          strikes, both marker sets and the expiration payoff overlay. Its data comes
+          from the cache-only trade-chart endpoint, keyed by backtest + saved row id. */}
+      <TradeChartModal
+        trade={chartTrade}
+        optionSelection={chartTrade && isOptionTrade(chartTrade) && selectedBacktest?.id
+          ? { backtestId: selectedBacktest.id, tradeId: Number(chartTrade.id) }
+          : null}
+        onClose={() => setChartTrade(null)} />
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold flex items-center gap-2 text-gray-900 dark:text-gray-100">
           <BarChart3 className="w-8 h-8 text-blue-500" />

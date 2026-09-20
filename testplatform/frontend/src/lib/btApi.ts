@@ -38,6 +38,57 @@ export const getOhlcvBars = (symbol: string, start: string, end: string, interva
 export const rerunBacktest = (id: number) =>
   jpost<{ status: string; task_id: string; backtest_id: number }>(`/backtests/${id}/rerun`, {});
 
+/** A cached daily bar from the trade-chart context (lower-case, unlike `/tools/ohlcv/bars`). */
+export interface ChartBar { date: string; open: number | null; high: number | null; low: number | null; close: number | null; }
+
+/** How the underlying at one event was obtained. `unavailable` is a real answer, not an error. */
+export interface HistoricalReference {
+  price: number | null; eventAt: string | null; observedAt: string | null; availableAt: string | null;
+  quality: 'recorded_snapshot' | 'last_known_bar' | 'daily_reference' | 'unavailable';
+  source: string | null; reason: string | null;
+}
+
+/** One saved leg of the selected transaction, with whatever terms were RECORDED. */
+export interface TradeChartLeg {
+  id: number;
+  symbol: string | null; underlyingSymbol: string | null; contractSymbol: string | null;
+  optionType: 'call' | 'put' | null; strike: number | null; expiry: string | null;
+  /** null when not recorded. `multiplierRecorded` says whether the number is evidence. */
+  multiplier: number | null; multiplierRecorded: boolean;
+  direction: 'long' | 'short' | null; size: number | null;
+  entryAt: string | null; exitAt: string | null;
+  entryPrice: number | null; exitPrice: number | null;
+  pnl: number | null; pnlPercent: number | null; exitReason: string | null;
+  transactionId: string | null; rowBasis: 'aggregate_round_trip';
+  positionStatus: 'closed' | 'open_at_end' | 'unknown';
+  entryUnderlying: HistoricalReference; exitUnderlying: HistoricalReference;
+  unavailableFields: string[];
+}
+
+export interface ChartNotice { code: string; message: string; }
+
+/** Read-only chart context for ONE saved trade row: its complete transaction plus cached bars. */
+export interface TradeChartContext {
+  schemaVersion: 1; backtestId: number; resultDigest: string; selectedTradeId: number;
+  transactionId: string | null;
+  legs: TradeChartLeg[];
+  underlying: {
+    symbol: string | null; provider: string | null; interval: '1d';
+    cacheStatus: 'complete' | 'partial' | 'missing' | 'unavailable';
+    provenance: 'run_snapshot' | 'current_historical_cache' | 'unknown';
+    bars: ChartBar[];
+  };
+  notices: ChartNotice[];
+}
+
+/**
+ * The option trade popup's data. Cache-only server side — opening it never fetches
+ * bars from a provider, so a cold cache comes back as a notice rather than a wait.
+ * `resultDigest` identifies the revision the row id belongs to; discard on mismatch.
+ */
+export const getTradeChartContext = (backtestId: number, tradeId: number) =>
+  jget<TradeChartContext>(`/backtests/${backtestId}/trade-chart?trade_id=${tradeId}`);
+
 /** Update a saved backtest's editable fields (description/name/labels). Passing `labels: []` or
  * `null` clears all labels. */
 export const updateBacktest = (id: number, update: { description?: string; name?: string; labels?: string[] | null }) =>
