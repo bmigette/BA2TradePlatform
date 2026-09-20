@@ -86,6 +86,39 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='closed_at', label='Closed', field='closed_at', align='left', sortable=True),
         ColumnDef(name='actions', label='Actions', field='actions', align='center'),
     ]
+
+    #: The OPTIONS tab's columns (spec 2026-09-20, decision 5).
+    #:
+    #: The equity set is wrong for a structure in both directions: it carries no strike,
+    #: expiry, strategy or leg count at all, and its price columns would be read as the
+    #: UNDERLYING's price. Here every money column is per-share PREMIUM and every dollar
+    #: column is multiplied by the contract multiplier, so TP/SL are labelled as premium
+    #: levels -- comparing them to the underlying would be meaningless.
+    OPTION_TRANSACTION_COLUMNS = [
+        ColumnDef(name='select', label='', field='select', align='left', sortable=False),
+        ColumnDef(name='expand', label='', field='expand', align='left', sortable=False),
+        ColumnDef(name='id', label='ID', field='id', align='center', sortable=True),
+        ColumnDef(name='account', label='Account', field='account_name', align='left', sortable=True),
+        ColumnDef(name='symbol', label='Underlying', field='symbol', align='left', sortable=True),
+        ColumnDef(name='strategy', label='Strategy', field='option_strategy', align='left', sortable=True),
+        ColumnDef(name='expiry', label='Expiry / DTE', field='expiry_display', align='left', sortable=True),
+        ColumnDef(name='legs', label='Legs', field='leg_count', align='center', sortable=True),
+        ColumnDef(name='direction', label='Net', field='direction', align='center', sortable=True),
+        ColumnDef(name='quantity', label='Contracts', field='quantity', align='right', sortable=True),
+        ColumnDef(name='open_price', label='Net Premium', field='open_price', align='right', sortable=True),
+        ColumnDef(name='current_price', label='Current Prem.', field='current_price', align='right'),
+        ColumnDef(name='value', label='Value / CapReq', field='value', align='right', sortable=True),
+        ColumnDef(name='close_price', label='Close Premium', field='close_price', align='right'),
+        ColumnDef(name='take_profit', label='TP (prem.)', field='take_profit', align='right'),
+        ColumnDef(name='stop_loss', label='SL (prem.)', field='stop_loss', align='right'),
+        ColumnDef(name='current_pnl', label='Current P/L', field='current_pnl_numeric', align='right', sortable=True),
+        ColumnDef(name='closed_pnl', label='Closed P/L', field='closed_pnl_numeric', align='right', sortable=True),
+        ColumnDef(name='status', label='Status', field='status', align='center', sortable=True),
+        ColumnDef(name='order_count', label='Orders', field='order_count', align='center'),
+        ColumnDef(name='created_at', label='Created', field='created_at', align='left', sortable=True),
+        ColumnDef(name='closed_at', label='Closed', field='closed_at', align='left', sortable=True),
+        ColumnDef(name='actions', label='Actions', field='actions', align='center'),
+    ]
     
     # Vue template for the table body with expansion
     BODY_TEMPLATE = '''
@@ -264,6 +297,7 @@ class LiveTradesTable(LazyTable):
         on_view_recommendation: Optional[Callable[[int], None]] = None,
         on_view_transaction_details: Optional[Callable[[int], None]] = None,
         on_selection_change: Optional[Callable[[List[int]], None]] = None,
+        columns: Optional[List[ColumnDef]] = None,
     ):
         """
         Initialize LiveTradesTable.
@@ -278,6 +312,9 @@ class LiveTradesTable(LazyTable):
             on_view_recommendation: Callback when view recommendation button is clicked (receives rec_id)
             on_view_transaction_details: Callback when view transaction details button is clicked (receives transaction_id)
             on_selection_change: Callback when selection changes (receives list of selected ids)
+            columns: Column set to render. Defaults to the equity ``TRANSACTION_COLUMNS``; the
+                Options tab passes ``OPTION_TRANSACTION_COLUMNS``, whose money columns are
+                per-share premiums and whose TP/SL are premium levels.
         """
         self._config = config or LiveTradesTableConfig()
         
@@ -295,7 +332,7 @@ class LiveTradesTable(LazyTable):
         
         # Initialize parent class
         super().__init__(
-            columns=self.TRANSACTION_COLUMNS,
+            columns=columns if columns is not None else self.TRANSACTION_COLUMNS,
             data_loader=data_loader,
             config=self._config,
             on_selection_change=None  # We handle selection ourselves

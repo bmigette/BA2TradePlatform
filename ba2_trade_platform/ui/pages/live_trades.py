@@ -7,16 +7,33 @@ import asyncio
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType, OrderDirection
+from ...core.types import AssetClass
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_order_status_color, get_expert_options_for_ui
 from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from .option_trades import OptionTradesTab
 from ..account_filter_context import get_selected_account_id
 from ..components.account_scope import scope_transactions_to_account
 from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
+
+#: The Live Trades tabs, IN ORDER. Stocks first and DEFAULT, so the page's existing view is
+#: what you get before touching anything.
+#:
+#: The split is made on ``Transaction.asset_class`` -- the explicit, indexed field. The
+#: pre-``asset_class`` tell (``multiplier == 100``) is deliberately NOT used: it is a
+#: heuristic, and a mis-filed row would be listed under the wrong tab instead of showing
+#: as unclassified.
+#:
+#: Module-level so the tab contract is unit-testable without rendering a page, the same
+#: reason ``ui/menus.py`` keeps ``MENU_ITEMS`` at module level.
+ASSET_CLASS_TABS: tuple = (
+    ('Stocks', AssetClass.EQUITY, 'show_chart'),
+    ('Options', AssetClass.OPTION, 'donut_large'),
+)
 
 #: How close to a bracket leg counts as "about to hit it", as a fraction of the leg's price.
 PRICE_NEAR_LEG_FRACTION = 0.05
@@ -99,77 +116,101 @@ class LiveTradesTab:
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label('💼 Live Trades').classes('text-h6')
 
-                # Filter controls
-                with ui.row().classes('gap-2'):
-                    # Multi-select status filter with all except CLOSED selected by default
-                    self.status_filter = ui.select(
-                        label='Status Filter',
-                        options=['Waiting', 'Open', 'Closing', 'Closed'],
-                        value=['Waiting', 'Open', 'Closing'],  # Default: all except Closed
-                        multiple=True,
-                        on_change=lambda: self._refresh_transactions()
-                    ).classes('w-48')
+            with ui.tabs().classes('w-full') as _tabs:
+                _tab_refs = [ui.tab(label, icon=icon) for label, _asset, icon in ASSET_CLASS_TABS]
 
-                    # Expert filter - populated with all experts
-                    self.expert_filter = ui.select(
-                        label='Expert',
-                        options=expert_options,
-                        value='All',
-                        on_change=lambda: self._refresh_transactions()
-                    ).classes('w-48')
+            with ui.tab_panels(_tabs, value=_tab_refs[0]).classes('w-full'):
+                # STOCKS (first and default): the existing view, byte for byte.
+                with ui.tab_panel(_tab_refs[0]):
+                    self._render_equity_filter_row(expert_options)
+                    self.transactions_container = ui.column().classes('w-full')
+                    with self.transactions_container:
+                        await self._render_transactions_table_async()
 
-                    self.symbol_filter = ui.input(
-                        label='Symbol',
-                        placeholder='Filter by symbol...',
-                        on_change=lambda: self._refresh_transactions()
-                    ).props('stack-label').classes('w-40')
-
-                    self.broker_order_id_filter = ui.input(
-                        label='Broker Order ID',
-                        placeholder='Search by broker order ID...',
-                        on_change=lambda: self._refresh_transactions()
-                    ).props('stack-label').classes('w-48')
-
-                    ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
-
-                    ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
-
-                    # Batch operation buttons
-                    self.batch_operations_container = ui.row().classes('gap-2 ml-4')
-                    self.batch_select_all_btn = ui.button(
-                        'Select All',
-                        icon='done_all',
-                        on_click=self._select_all_transactions
-                    ).props('outline size=md').classes('hidden')
-                    self.batch_select_all_btn.set_visibility(False)
-
-                    self.batch_clear_btn = ui.button(
-                        'Clear',
-                        icon='clear',
-                        on_click=self._clear_selected_transactions
-                    ).props('outline size=md').classes('hidden')
-                    self.batch_clear_btn.set_visibility(False)
-
-                    self.batch_close_btn = ui.button(
-                        'Batch Close',
-                        icon='close',
-                        on_click=self._batch_close_transactions
-                    ).props('outline color=negative size=md').classes('hidden')
-                    self.batch_close_btn.set_visibility(False)
-
-                    self.batch_adjust_tp_btn = ui.button(
-                        'Batch Adjust TP',
-                        icon='trending_up',
-                        on_click=self._batch_adjust_tp_dialog
-                    ).props('outline color=info size=md').classes('hidden')
-                    self.batch_adjust_tp_btn.set_visibility(False)
-
-            # Transactions table container
-            self.transactions_container = ui.column().classes('w-full')
-            with self.transactions_container:
-                await self._render_transactions_table_async()
+                # OPTIONS: its own columns, filters, totals and PRICING -- see the module
+                # docstring of ui/pages/option_trades.py. A separate class on purpose: the
+                # equity path above is never reached from it.
+                with ui.tab_panel(_tab_refs[1]):
+                    self.option_tab = OptionTradesTab(
+                        on_view_details=self._handle_view_transaction_details,
+                        on_close_transaction=self._handle_close_transaction,
+                        on_edit_transaction=self._handle_edit_transaction,
+                    )
+                    await self.option_tab.render()
         
         render_timer.stop("filters_rendered")
+
+    def _render_equity_filter_row(self, expert_options) -> None:
+        """The STOCKS tab's filter row and batch controls (unchanged from the single-tab page).
+
+        Extracted verbatim so tabs could be added AROUND it: the batch buttons act on the
+        STOCKS table, which is why they belong in this row and not above both tabs.
+        """
+        # Filter controls
+        with ui.row().classes('gap-2'):
+            # Multi-select status filter with all except CLOSED selected by default
+            self.status_filter = ui.select(
+                label='Status Filter',
+                options=['Waiting', 'Open', 'Closing', 'Closed'],
+                value=['Waiting', 'Open', 'Closing'],  # Default: all except Closed
+                multiple=True,
+                on_change=lambda: self._refresh_transactions()
+            ).classes('w-48')
+
+            # Expert filter - populated with all experts
+            self.expert_filter = ui.select(
+                label='Expert',
+                options=expert_options,
+                value='All',
+                on_change=lambda: self._refresh_transactions()
+            ).classes('w-48')
+
+            self.symbol_filter = ui.input(
+                label='Symbol',
+                placeholder='Filter by symbol...',
+                on_change=lambda: self._refresh_transactions()
+            ).props('stack-label').classes('w-40')
+
+            self.broker_order_id_filter = ui.input(
+                label='Broker Order ID',
+                placeholder='Search by broker order ID...',
+                on_change=lambda: self._refresh_transactions()
+            ).props('stack-label').classes('w-48')
+
+            ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
+
+            ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
+
+            # Batch operation buttons
+            self.batch_operations_container = ui.row().classes('gap-2 ml-4')
+            self.batch_select_all_btn = ui.button(
+                'Select All',
+                icon='done_all',
+                on_click=self._select_all_transactions
+            ).props('outline size=md').classes('hidden')
+            self.batch_select_all_btn.set_visibility(False)
+
+            self.batch_clear_btn = ui.button(
+                'Clear',
+                icon='clear',
+                on_click=self._clear_selected_transactions
+            ).props('outline size=md').classes('hidden')
+            self.batch_clear_btn.set_visibility(False)
+
+            self.batch_close_btn = ui.button(
+                'Batch Close',
+                icon='close',
+                on_click=self._batch_close_transactions
+            ).props('outline color=negative size=md').classes('hidden')
+            self.batch_close_btn.set_visibility(False)
+
+            self.batch_adjust_tp_btn = ui.button(
+                'Batch Adjust TP',
+                icon='trending_up',
+                on_click=self._batch_adjust_tp_dialog
+            ).props('outline color=info size=md').classes('hidden')
+            self.batch_adjust_tp_btn.set_visibility(False)
+
 
     def _get_expert_options(self):
         """Get list of expert options and ID mapping."""
