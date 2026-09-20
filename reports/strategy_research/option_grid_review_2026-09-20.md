@@ -68,7 +68,7 @@ unchanged-payload hashes. Rows still labelled running (2–5 and 7) were not ren
 Automatic approval review rejected a broader rename because of those status labels;
 the narrowed completed/failed-only transaction succeeded.
 
-## Implemented experiment change
+## Initial experiment change (superseded below)
 
 Explore HOLD and low-confidence BUY/SELL independently for straddles, strangles
 and iron condors. See [the experiment contract](../../docs/strategy_research/option_neutral_entry_experiments.md).
@@ -126,7 +126,7 @@ command, new optimization row, archive name, checkpoint and fleet verification.
 The subsequent documentation-only commit increments APP to `2026.09.1176`; the
 grid continues running the tested implementation commit above.
 
-## Follow-up: one job explores both modes
+## Intermediate implementation: one job explores both modes (superseded below)
 
 The driver now accepts `--neutral-entry-modes joint`. O_STRD, O_STRG and O_IC each
 get one new `-joint-` experiment. The other 13 jobs retain their identities and
@@ -149,3 +149,39 @@ The two modes share the unchanged population/generation budget; the GA does not
 guarantee equal effort per mode or one representative of each in Top 5. The latter
 remain the highest-ranked distinct candidates. Operational restart evidence is
 recorded on the grid host at `/home/debian/ba2-grid/joint_restart_receipt.json`.
+
+## Current correction: simple HOLD admission and ordinary rules
+
+The original entry paths exclude HOLD before rules run. Open-position management
+already permits it, and the rule engine already implements `current_rating_neutral`.
+The user's requested compatibility switch is therefore needed only at entry admission.
+
+Replaced `neutral_option_entry_mode` with the default-off boolean
+`evaluate_entry_rules_on_hold`. Enabled HOLD recommendations reach the normal rules
+and risk-management flow; the setting does not decide which signals trade. A live
+regression test verifies that an explicit BUY rule on HOLD reaches the existing
+candidate risk manager and that its refusal to fund still prevents an order.
+
+The joint neutral experiment now contains two ordinary rules with existing
+rule-enabled genes. One requires HOLD; the other requires a directional rating
+and low confidence. Either or both can be selected. Removed the custom GA decoder
+and unresolved-template guard completely: `strategy_param_space.py` and
+`rules_convert.py` match the pre-neutral baseline `acd94dde`.
+
+Expert scoring, trade conditions, trade actions, risk sizing and open-position
+management are unchanged. The opt-in live pure-option branch uses the existing
+option sizing/submission flow already used by backtests. Missing/null/false
+settings retain the original entry behavior. Existing live settings are untouched.
+
+The three neutral job names now include `rules1`; other job/checkpoint identities
+remain unchanged. See the [current contract](../../docs/strategy_research/option_neutral_entry_experiments.md).
+The earlier mode-based descriptions and test counts above describe historical
+implementations, not this replacement.
+
+Validation of the replacement: **1,733 backend/backtest tests passed**, one skip
+and one expected failure; **71 live entry/option tests passed**; **15 shared rule
+conversion tests passed**. The existing golden backtest fingerprints passed
+unchanged. Tests cover default-off/null settings, HOLD and directional option
+fills, rule toggles, low-confidence rejection of HOLD, risk-manager funding
+refusal, automatic-opening and duplicate-position guards, and settings export.
+APP `2026.09.1178`, TEST `2026.09.0064`.

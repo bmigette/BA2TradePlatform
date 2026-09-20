@@ -56,15 +56,16 @@ def test_cli_policy_survives_trial_config_and_export(mode, monkeypatch):
                    "--options-store", "thetadata", "--name", "neutral-" + mode])
     config = _run_optimize(args, monkeypatch)
     base = config["backtest"]
-    assert base["experts"][0]["settings"]["neutral_option_entry_mode"] == mode
+    assert base["experts"][0]["settings"]["evaluate_entry_rules_on_hold"] is True
     strategy = L._build_strategy("O_IC", "trial", "FMPRating", neutral_entry_mode=mode)
     trial = _build_daily_trial_config(base, decode_params(strategy, {}))
-    assert trial["experts"][0]["settings"]["neutral_option_entry_mode"] == mode
+    assert trial["experts"][0]["settings"]["evaluate_entry_rules_on_hold"] is True
     from tests.test_backtest_export_fixed_settings import _backtest
     from app.api.backtests import _derive_export_payload
     saved = _backtest(strategy_params={"expertFixedSettings": base["experts"][0]["settings"]})
     payload = _derive_export_payload(saved, "expert_settings", db=None)
-    assert payload["settings"]["expert_params"]["neutral_option_entry_mode"] == mode
+    assert payload["settings"]["expert_params"]["evaluate_entry_rules_on_hold"] is True
+    assert "neutral_option_entry_mode" not in payload["settings"]["expert_params"]
 
 
 def test_joint_is_16_jobs_with_only_three_changed_identities():
@@ -93,43 +94,51 @@ def test_joint_gene_reaches_trial_and_saved_backtest_export(mode, monkeypatch):
     # The handler splits schedule/screener namespaces before expert collection.
     space = collect_param_space(strategy, {k: v for k, v in config["expert_params"].items()
                                           if not k.startswith(("schedule:", "screener:"))})
-    key = "model:neutral_option_entry_mode"
-    assert space[key]["choices"] == ["hold", "low_confidence"]
+    assert "model:neutral_option_entry_mode" not in space
+    assert "model:evaluate_entry_rules_on_hold" not in space
     assert "cond:o_ic-signal:enabled" not in space
     assert "cond:o_ic-low_confidence:enabled" not in space
-    genes = {key: mode}
+    genes = {f"entry:o_ic-entry-{arm}:enabled": int(arm == mode)
+             for arm in ("hold", "low_confidence")}
+    assert all(key in space for key in genes)
     decoded = decode_params(strategy, genes)
     trial = _build_daily_trial_config(config["backtest"], decoded)
-    assert trial["experts"][0]["settings"]["neutral_option_entry_mode"] == mode
+    assert trial["experts"][0]["settings"]["evaluate_entry_rules_on_hold"] is True
+    assert decoded["expert_overrides"] == {}
     saved = _backtest(strategy_params={**genes,
         "expertFixedSettings": config["backtest"]["experts"][0]["settings"]})
     payload = _derive_export_payload(saved, "expert_settings", db=None)
-    assert payload["settings"]["expert_params"]["neutral_option_entry_mode"] == mode
+    assert payload["settings"]["expert_params"]["evaluate_entry_rules_on_hold"] is True
 
 
 @pytest.mark.parametrize("kind", ["O_STRD", "O_STRG", "O_IC"])
 @pytest.mark.parametrize("mode", ["hold", "low_confidence"])
 def test_joint_template_materializes_exactly_the_fixed_arm(kind, mode):
     strategy = L._build_strategy(kind, "joint", "DeterministicScorer", neutral_entry_mode="joint")
-    decoded = decode_params(strategy, {"model:neutral_option_entry_mode": mode})
+    decoded = decode_params(strategy, {f"entry:{kind.lower()}-entry-{arm}:enabled": int(arm == mode)
+                                       for arm in ("hold", "low_confidence")})
     fixed = L._build_strategy(kind, "joint", "DeterministicScorer", neutral_entry_mode=mode)
-    assert decoded["entry_rules"] == decode_params(fixed, {})["entry_rules"]
-    assert "neutral_entry_mode_search" in strategy.entry_rules[0], "decode must not mutate the template"
+    selected = decoded["entry_rules"][0]
+    fixed_rule = decode_params(fixed, {})["entry_rules"][0]
+    assert selected["conditions"] == fixed_rule["conditions"]
+    assert selected["actions"] == fixed_rule["actions"]
+    assert len(strategy.entry_rules) == 2, "decode must not mutate the template"
 
 
-def test_joint_marker_survives_normalization_and_undecoded_rules_cannot_execute():
+def test_joint_uses_ordinary_rules_that_survive_normalization():
     from ba2_common.core.rule_models import normalize_trade_rules
     from ba2_common.core.rules_convert import live_actions_from_trade_rule
     strategy = L._build_strategy("O_IC", "joint", "FMPRating", neutral_entry_mode="joint")
     strategy.entry_rules = normalize_trade_rules(strategy.entry_rules)
-    with pytest.raises(ValueError, match="must be decoded"):
-        live_actions_from_trade_rule(strategy.entry_rules[0])
-    decoded = decode_params(strategy, {"model:neutral_option_entry_mode": "low_confidence"})
-    assert live_actions_from_trade_rule(decoded["entry_rules"][0])
+    for rule in strategy.entry_rules:
+        assert "neutral_entry_mode_search" not in rule
+        assert live_actions_from_trade_rule(rule)
 
 
-def test_joint_default_is_explicit_hold_and_unknown_modes_are_refused():
+@pytest.mark.parametrize("hold,low", [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_joint_uses_existing_rule_enabled_genes(hold, low):
     strategy = L._build_strategy("O_IC", "joint", "FMPRating", neutral_entry_mode="joint")
-    assert decode_params(strategy, {})["expert_overrides"]["neutral_option_entry_mode"] == "hold"
-    with pytest.raises(ValueError):
-        decode_params(strategy, {"model:neutral_option_entry_mode": "typo"})
+    decoded = decode_params(strategy, {"entry:o_ic-entry-hold:enabled": hold,
+                                       "entry:o_ic-entry-low_confidence:enabled": low})
+    assert len(decoded["entry_rules"]) == hold + low
+    assert decoded["expert_overrides"] == {}

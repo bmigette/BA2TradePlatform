@@ -5766,23 +5766,31 @@ def _configure_neutral_entry(strategy, kind, mode):
         raise ValueError("--neutral-entry-mode requires O_STRD, O_STRG or O_IC")
     if _OPTION_GATES_OFF:
         raise ValueError("--neutral-entry-mode cannot be combined with --gates-off")
+    if mode == "joint":
+        # Two ordinary rules with the existing rule-enabled genes. No new
+        # expert mode, condition class or decoder behavior is needed.
+        from copy import deepcopy
+        rules = []
+        for arm in ("hold", "low_confidence"):
+            branch = deepcopy(strategy)
+            _configure_neutral_entry(branch, kind, arm)
+            for rule in branch.entry_rules:
+                rule["id"] += "-" + arm
+                rule["name"] += "-" + arm
+                rule["toggle_optimize"] = True
+                rule["toggleOptimize"] = True
+                rules.append(rule)
+        strategy.entry_rules = rules
+        return
     m = kind.lower()
     for rule in strategy.entry_rules:
         leaves = rule["conditions"]["conditions"]
-        if mode == "joint":
-            # The decoder materializes ONE ordinary AND tree per genome, then
-            # removes this search metadata. Saved/live rules need no conditional
-            # gene machinery and cannot accidentally AND the two arms together.
-            signal = next(c for c in leaves if c["id"] == f"{m}-signal")
-            low = next(c for c in leaves if c["id"] == f"{m}-low_confidence")
-            for c in (signal, low):
-                c["toggle_optimize"] = False
-                c["toggleOptimize"] = False
-            rule["neutral_entry_mode_search"] = {
-                "hold": [f"{m}-low_confidence", f"{m}-exp_profit"],
-                "low_confidence": [f"{m}-signal"],
-            }
-        elif mode == "hold":
+        if mode == "low_confidence":
+            # Confidence alone also accepts HOLD. Make the directional arm explicit
+            # using the existing condition, rather than filtering expert outputs.
+            leaves.append({"id": f"{m}-directional", "field": "rec_direction",
+                           "op": "!=", "value": 0})
+        if mode == "hold":
             # HOLD has no directional price target. Requiring expected_profit > N
             # would silently make this arm untradeable even after admitting HOLD.
             leaves = [c for c in leaves if c["id"] not in
@@ -5803,16 +5811,8 @@ def _configure_neutral_entry(strategy, kind, mode):
 def _apply_neutral_entry_setting(backtest_block, mode):
     if mode != "legacy":
         for expert in backtest_block["experts"]:
-            # Authored default for the joint template; every GA individual overrides
-            # this through model:neutral_option_entry_mode with one concrete mode.
-            expert["settings"]["neutral_option_entry_mode"] = "hold" if mode == "joint" else mode
-
-
-def _neutral_entry_genes(mode):
-    if mode != "joint":
-        return {}
-    return {"neutral_option_entry_mode": {
-        "type": "choice", "choices": ["hold", "low_confidence"], "optimize": True}}
+            # Admission only, fixed for the experiment. The rules choose signals.
+            expert["settings"]["evaluate_entry_rules_on_hold"] = True
 
 
 def _cmd_optimize(args) -> int:
@@ -6143,7 +6143,6 @@ def _cmd_optimize(args) -> int:
         }
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
-        cfg["expert_params"].update(_neutral_entry_genes(neutral_mode))
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -6372,7 +6371,6 @@ def _cmd_optimize_batch(args) -> int:
                                         **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,
             }
-            cfg["expert_params"].update(_neutral_entry_genes(neutral_mode))
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=name, fitness_metric=fitness,
                 optimization_type="genetic", optimization_config=cfg,

@@ -33,21 +33,24 @@ def test_real_straddle_entry(mode, signal, confidence, opens, joint, monkeypatch
         action_type="open_straddle", strike_method="percent_otm", strike_param=0.,
         dte_min=20, dte_max=45, sizing=10.)
     try:
-        expert.settings["neutral_option_entry_mode"] = mode
+        expert.settings["evaluate_entry_rules_on_hold"] = mode != "legacy"
         gate = ({"id": "hold", "field": "current_rating_neutral", "field_type": "flag"}
                 if mode != "low_confidence" else
                 {"id": "low", "field": "confidence", "op": "<=", "value": 30})
+        gates = [gate]
+        if mode == "low_confidence":
+            gates.append({"id": "directional", "field": "rec_direction", "op": "!=", "value": 0})
         if joint and mode != "legacy":
             from tests.test_launcher_option_entry_rule import mod as launcher
             from app.services.strategy_param_space import decode_params
             strategy = launcher._build_strategy("O_STRD", "joint", "DeterministicScorer",
                                                 neutral_entry_mode="joint")
-            decoded = decode_params(strategy, {"model:neutral_option_entry_mode": mode,
-                                               "cond:o_strd-exp_profit:enabled": 0})
-            expert.settings.update(decoded["expert_overrides"])
-            gate = next(c for c in decoded["entry_rules"][0]["conditions"]["conditions"]
-                        if c.get("field") == ("current_rating_neutral" if mode == "hold" else "confidence"))
-        rules = [{"id": "neutral", "conditions": {"type": "AND", "conditions": [gate,
+            decoded = decode_params(strategy, {
+                f"entry:o_strd-entry-{arm}:enabled": int(arm == mode)
+                for arm in ("hold", "low_confidence")})
+            gates = [c for c in decoded["entry_rules"][0]["conditions"]["conditions"]
+                     if c.get("field") in ("current_rating_neutral", "confidence", "rec_direction")]
+        rules = [{"id": "neutral", "conditions": {"type": "AND", "conditions": [*gates,
             {"id": "flat", "field": "has_no_position", "field_type": "flag"}]},
             "actions": [action], "continue_processing": False}]
         ruleset = seed_entry_ruleset_from_rules(rules, name="neutral")

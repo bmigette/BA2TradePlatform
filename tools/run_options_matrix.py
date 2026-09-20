@@ -486,7 +486,7 @@ def planned_jobs(args, launcher, experts, strategies, universe):
     for name, expert, strategy in _jobs(experts, strategies, args.name_suffix):
         modes = args.neutral_entry_modes.split(",") if strategy in _NEUTRAL_STRUCTURES else ["legacy"]
         for mode in modes:
-            arm_name = name if mode == "legacy" else name + "-" + mode
+            arm_name = name if mode == "legacy" else name + "-" + mode + "-rules1"
             if args.profile == "discovery":
                 arm_name = discovery_name(args, launcher, arm_name, expert, strategy, universe, mode)
             yield arm_name, expert, strategy, mode

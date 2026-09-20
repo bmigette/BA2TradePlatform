@@ -932,23 +932,6 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
                                     optsel_by_half)
                   if _template_exit else None)
 
-    # Joint neutral search: select one concrete gate set with the same gene that
-    # controls live/BT signal admission. Persist only ordinary resolved rules.
-    # Missing gene uses the authored HOLD default, matching the launcher's base
-    # settings; legacy templates carry no marker and are completely unchanged.
-    for rule in entry_rules or []:
-        if not isinstance(rule, dict):
-            continue
-        arms = rule.pop("neutral_entry_mode_search", None)
-        if arms is not None:
-            setting = "neutral_option_entry_mode"
-            mode = mode_token(expert_overrides.get(setting, "hold"),
-                              ["hold", "low_confidence"], setting)
-            expert_overrides[setting] = mode
-            drop = set(arms[mode])
-            tree = rule["conditions"]
-            tree["conditions"] = [c for c in tree["conditions"] if c.get("id") not in drop]
-
     # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a
     # dead config the fitness function can't even distinguish from "just unlucky"), so force the
     # first weekday (fixed SCHEDULE_DAYS order) back ON rather than wasting a trial evaluating it.

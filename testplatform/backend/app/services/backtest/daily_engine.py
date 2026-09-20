@@ -964,14 +964,11 @@ class DailyBacktestEngine:
         from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
         from ba2_common.core.db import get_instance as _get_instance
 
-        from ba2_common.core.neutral_option_entry import entry_mode, accepts_signal, validate_actions
-        mode = entry_mode(getattr(expert, "settings", {}))
-        if mode != "legacy" and not accepts_signal(mode, rec.signal):
-            return False
+        from ba2_common.core.hold_entry import evaluate_hold_entries
         rec_id = _recommendation_to_expert_recommendation(
             rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of,
             subtype=AnalysisUseCase.ENTER_MARKET,
-            allow_hold=(mode == "hold" and self._entry_is_option),
+            allow_hold=evaluate_hold_entries(getattr(expert, "settings", {})),
         )
         if rec_id is None:
             return False  # SKIP / HOLD / ERROR — nothing to stage.
@@ -1012,9 +1009,6 @@ class DailyBacktestEngine:
             if not action_summaries or any("error" in s for s in action_summaries):
                 return False  # conditions not met / evaluation error -> no order this symbol.
 
-            if mode != "legacy":
-                validate_actions(action_summaries)
-
             if self._mc is not None:
                 # THE ENTRY RULE FIRED: record the measurement the decision was made on, before
                 # the dup/equity gates (which are account bookkeeping, not a different market).
@@ -1053,7 +1047,7 @@ class DailyBacktestEngine:
                               f"@ {as_of:%Y-%m-%d} — {equity_reason}")
                     return False
 
-            if self._entry_is_option or mode != "legacy":
+            if self._entry_is_option:
                 # OPTION entry: the option action sizes + submits ITSELF in execute (no equity
                 # leg, no RM candidate sizing) — submit directly, like the open-positions path.
                 results = evaluator.execute(submit_to_broker=True)
