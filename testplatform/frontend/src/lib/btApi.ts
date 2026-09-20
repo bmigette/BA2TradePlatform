@@ -152,6 +152,10 @@ export interface OptScreenerSettings {
   screener_settings?: Record<string, number | string>;
   screener_store?: string;
   screener_cadence_days?: number;
+  // Emitted by the export path (see lib/btExport.ts) for a screener universe that
+  // carries a built metric store; the interface simply never listed them.
+  group?: string;
+  cache_db?: string;
 }
 export interface OptJobSettings {
   ga: Partial<Record<

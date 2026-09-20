@@ -24,7 +24,12 @@ const equity = (over: Partial<any> = {}) => ({
   id: 9, symbol: 'AAPL', entryDate: '2024-03-06T09:30:00',
   exitDate: '2024-03-08T16:00:00', entryPrice: 150, exitPrice: 155, size: 10,
   direction: 'long' as const, pnl: 50, pnlPercent: 0.5, duration: 2,
-  exitReason: 'exit', ...over,
+  exitReason: 'exit',
+  // NULL, not absent: `_transform_trades_for_frontend` publishes every option field
+  // on every row and leaves them null for equity. Carrying them here is what makes
+  // "optionType is the ONE discriminator" an assertion rather than a coincidence.
+  optionType: null, strike: null, expiry: null, multiplier: null,
+  underlyingSymbol: null, contractSymbol: null, transactionId: null, ...over,
 });
 
 describe('isOptionTrade', () => {

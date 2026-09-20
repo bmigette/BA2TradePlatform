@@ -111,7 +111,7 @@ describe('capitalUsageSeries', () => {
 
   it('does not leak capital across many gapped exits', () => {
     // The failure mode was cumulative, so one trade is not enough to catch it.
-    const trades = Array.from({ length: 50 }, (_, i) => trade({
+    const trades = Array.from({ length: 50 }, () => trade({
       entryDate: '2024-01-02', exitDate: '2024-01-06T16:00:00', entryPrice: 100, size: 1,
     }));
     const points = capitalUsageSeries(trades, eq(['2024-01-02', 10000], ['2024-01-08', 10000]));

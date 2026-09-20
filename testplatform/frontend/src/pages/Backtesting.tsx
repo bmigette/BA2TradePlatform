@@ -2086,7 +2086,10 @@ const Backtesting: React.FC = () => {
       setUniverse({
         mode: 'screener',
         screener_settings: (u as any).screener_settings ?? {},
-        ...(typeof st === 'string' && st.trim() ? { screener_store: st } : {}),
+        // `screener_store` is REQUIRED to run, so an import without one sets the
+        // picker's own empty value rather than silently inheriting whatever store
+        // the page happened to be pointed at.
+        screener_store: typeof st === 'string' ? st : '',
         ...(typeof cad === 'number' && cad > 0 ? { screener_cadence_days: cad } : {}),
       });
       // Also keep the separate page-level screenerStore/screenerCadenceDays in sync
@@ -2284,7 +2287,7 @@ const Backtesting: React.FC = () => {
   // and the money that actually moved (premium x contracts x 100) -- without the
   // second figure a 4.20 option entry reads exactly like a 4.20 stock.
   const tradeRow = (trade: Trade, asLeg = false) => {
-    const isHidden = hiddenTradeIds.has(trade.id);
+    const isHidden = hiddenTradeIds.has(String(trade.id));
     const option = isOptionTrade(trade);
     const badge = optionBadge(trade);
     const entryCash = contractValue(trade.entryPrice, trade.size, trade.multiplier);
@@ -2294,7 +2297,7 @@ const Backtesting: React.FC = () => {
           onClick={() => setChartTrade(trade)}
           title="Click to view the daily chart with entry/exit markers"
           className={`cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${isHidden ? 'opacity-40' : ''}`}>
-        <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(trade.id); }}>
+        <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(String(trade.id)); }}>
           <button type="button"
                   title={isHidden ? 'Show: include this trade in the metrics again' : 'Hide: exclude this trade and recompute the metrics'}
                   className="text-gray-400 hover:text-amber-600 dark:hover:text-amber-400">
@@ -3047,7 +3050,7 @@ const Backtesting: React.FC = () => {
                   <p className="text-xs text-gray-500 dark:text-gray-400">Profit Factor</p>
                   {(() => {
                     const fullRaw = selectedBacktest.profitFactor ?? 0;
-                    const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_profit_factor;
+                    const a = (selectedBacktest.results as unknown as Record<string, number> | undefined)?.adjusted_profit_factor;
                     const hasAdj = !hiding && a != null && Math.abs(a - fullRaw) > 0.05;
                     const primary = rc ? rc.profitFactor : (hasAdj ? a! : fullRaw);
                     return (<>
@@ -3075,7 +3078,7 @@ const Backtesting: React.FC = () => {
                   <p className="text-xs text-gray-500 dark:text-gray-400">Best Trade</p>
                   {(() => {
                     const fullRaw = selectedBacktest.bestTrade ?? 0;
-                    const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_best_trade;
+                    const a = (selectedBacktest.results as unknown as Record<string, number> | undefined)?.adjusted_best_trade;
                     const hasAdj = !hiding && a != null && Math.abs(a - fullRaw) > 0.05;
                     const primary = rc ? rc.best : (hasAdj ? a! : fullRaw);
                     return (<>
