@@ -1,0 +1,47 @@
+{
+  "head": "a4689f6fd4cbdaaf16d46637a8b228f8182463e7",
+  "launched_utc": "20260920T082249Z",
+  "pid": 731306,
+  "log": "/home/debian/ba2-grid/stage1_neutral_20260920T082249Z.log",
+  "command": [
+    "bash",
+    "tools/stage1_run.sh",
+    "--experts",
+    "DeterministicScorer",
+    "--neutral-entry-modes",
+    "hold,low_confidence"
+  ],
+  "archive": "/home/debian/ba2-grid/archive/before-neutral-restart-20260920T082015Z",
+  "prior_stopped_job": {
+    "id": 7,
+    "old_name": "optm-DeterministicScorer-O_LC-st1soft30-dbf86bd781123",
+    "new_name": "optm-DeterministicScorer-O_LC-st1soft30-dbf86bd781123-archive20260920-opt7",
+    "unchanged_payload_sha256": "1f8d3099350e34231deefa3b7363b1174af21f673e9da38eac745210d6ccd68c"
+  },
+  "checkpoint_task_id": "ckpt-ebe7cb6cebea69f2512595f7",
+  "expected_jobs": 19,
+  "jobs_at_verification": [
+    {
+      "id": 7,
+      "name": "optm-DeterministicScorer-O_LC-st1soft30-dbf86bd781123-archive20260920-opt7",
+      "status": "running",
+      "progress": 0.575,
+      "best_fitness": 0.000010771631775435946
+    },
+    {
+      "id": 8,
+      "name": "optm-DeterministicScorer-O_LC-st1soft30-dbf86bd781123",
+      "status": "running",
+      "progress": 0,
+      "best_fitness": null
+    }
+  ],
+  "fleet_start_ticks": {
+    "1369": "5240",
+    "653399": "154732639"
+  },
+  "traceback_count": 0,
+  "resume_lines": [
+    "strategy_optimization 8: RESUMING 'optm-DeterministicScorer-O_LC-st1soft30-dbf86bd781123' at generation 0/60 from checkpoint ckpt-ebe7cb6cebea69f2512595f7"
+  ]
+}

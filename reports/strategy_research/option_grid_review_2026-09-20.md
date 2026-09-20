@@ -88,4 +88,36 @@ The 13 other structures keep their job/checkpoint identities.
   settings. The compatibility resolver now treats missing/null as legacy; all
   reported pass counts above are from the corrected implementation.
 
-APP `2026.09.1175`; TEST `2026.09.0062`. Operational restart evidence follows separately.
+Implementation: `a4689f6fd4cbdaaf16d46637a8b228f8182463e7`, pushed to `dev`.
+APP `2026.09.1175`; TEST `2026.09.0062` at that commit.
+
+## Restart verified
+
+Restarted at **2026-09-20 08:22:49 UTC / 10:22:49 Paris**, with 19 planned jobs.
+Optimization **8** explicitly logged a resume from the existing partial-generation
+checkpoint `ckpt-ebe7cb6cebea69f2512595f7`. The unchanged long-call experiment resumes
+first; the HOLD and low-confidence arms follow at their positions in the matrix.
+This verifies restart and checkpoint use, not completion of the research campaign.
+
+Before updating code, the exact grid sequencer, master and child process identities
+were verified and stopped. The two separate fleet processes retained their original
+start ticks. Job 7 was then renamed `-archive20260920-opt7`; its other columns
+again passed the unchanged-payload hash check. Its old `running` database status
+is retained as historical data, but its processes are stopped. Earlier rows 2–5
+also retain their pre-existing stale status labels.
+
+The complete pre/post-stop database snapshots, previous log, dry-run plan and stop
+receipt are under `/home/debian/ba2-grid/archive/before-neutral-restart-20260920T082015Z/`.
+No archived row or saved Top-N was overwritten. A verified Git bundle delivered the
+pushed commit directly to the grid checkout; the fleet checkout was not updated.
+
+Both pinned market-condition manifests verified 7,081 objects and mapped 97 symbols.
+The OHLCV preloads reported zero missing symbols. No traceback appeared at the
+verification snapshot. The grid retains the previous window, $20k equity, 200/60
+population/generations, patience 8, parallelism 24, robust scoring and soft30 objective.
+
+New log: `/home/debian/ba2-grid/stage1_neutral_20260920T082249Z.log`.
+Local [restart receipt](option_neutral_restart_2026-09-20.json) records the commit,
+command, new optimization row, archive name, checkpoint and fleet verification.
+The subsequent documentation-only commit increments APP to `2026.09.1176`; the
+grid continues running the tested implementation commit above.
