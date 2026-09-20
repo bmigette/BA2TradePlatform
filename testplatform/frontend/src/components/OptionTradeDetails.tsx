@@ -87,6 +87,9 @@ const OptionTradeDetails: React.FC<{
   const entries = legs.map(leg => leg.entryAt).filter(Boolean).sort() as string[];
   const exits = legs.map(leg => leg.exitAt).filter(Boolean).sort() as string[];
   const recordedPnl = legs.reduce((total, leg) => total + (leg.pnl ?? 0), 0);
+  // A leg with no recorded P&L used to contribute ZERO, which reads as "flat" and quietly
+  // understates the total. It is counted instead, and the total says it is partial.
+  const missingPnl = legs.filter(leg => leg.pnl == null).length;
   const openAtEnd = legs.some(leg => leg.positionStatus === 'open_at_end');
 
   return (
@@ -122,6 +125,9 @@ const OptionTradeDetails: React.FC<{
           </div>
           <div className="text-[11px] font-normal text-gray-500">
             {openAtEnd ? 'marked, not realised' : 'stored result · includes recorded commissions'}
+            {missingPnl > 0
+              ? ` · ${missingPnl} leg${missingPnl === 1 ? '' : 's'} without a recorded P&L, so this total is partial`
+              : ''}
           </div>
         </Card>
         <Card label="Contracts">

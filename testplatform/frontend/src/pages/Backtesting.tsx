@@ -2286,6 +2286,24 @@ const Backtesting: React.FC = () => {
   // per share (what the chain quotes, and what these columns have always held)
   // and the money that actually moved (premium x contracts x 100) -- without the
   // second figure a 4.20 option entry reads exactly like a 4.20 stock.
+  /**
+   * The row handed to the chart modal for a STRUCTURE.
+   *
+   * The modal resolves the whole transaction from the row's id (the legs share one
+   * transactionId), so the CHART was already complete -- but the header showed that one leg's
+   * own percent and reason, which reads as the structure's result. The aggregate numbers are
+   * passed instead, and the modal labels the scope.
+   */
+  const structureChartTrade = (legs: Trade[]): Trade => {
+    const summary = summariseStructure(legs);
+    const first = legs[0];
+    return {
+      ...first,
+      entryDate: summary.entryDate, exitDate: summary.exitDate,
+      pnl: summary.pnl, pnlPercent: summary.pnlPercent, exitReason: summary.exitReason,
+    };
+  };
+
   const tradeRow = (trade: Trade, asLeg = false) => {
     const isHidden = hiddenTradeIds.has(String(trade.id));
     const option = isOptionTrade(trade);
@@ -3366,8 +3384,8 @@ const Backtesting: React.FC = () => {
                               const someHidden = !allHidden && ids.some(id => hiddenTradeIds.has(id));
                               return (
                                 <React.Fragment key={group.key}>
-                                  <tr onClick={() => toggleStructure(group.key)}
-                                      title="Click to show or hide this structure's legs"
+                                  <tr onClick={() => setChartTrade(structureChartTrade(group.legs))}
+                                      title="Click to view the daily chart for the whole structure"
                                       className={`cursor-pointer bg-gray-50/60 dark:bg-gray-800/40 hover:bg-blue-50 dark:hover:bg-blue-900/20 ${allHidden ? 'opacity-40' : ''}`}>
                                     <td className="px-2 py-2 text-center"
                                         onClick={(e) => { e.stopPropagation(); toggleHideStructure(group.legs); }}>
@@ -3381,8 +3399,14 @@ const Backtesting: React.FC = () => {
                                     </td>
                                     <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${allHidden ? 'line-through' : ''}`}>
                                       <span className="inline-flex items-center gap-1">
-                                        {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" />
-                                              : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                                        <span
+                                          role="button"
+                                          title="Show or hide this structure's legs"
+                                          onClick={(e) => { e.stopPropagation(); toggleStructure(group.key); }}
+                                          className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                                          {open ? <ChevronDown className="w-3.5 h-3.5" />
+                                                : <ChevronRight className="w-3.5 h-3.5" />}
+                                        </span>
                                         {s.symbol || '—'}
                                         <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 text-[11px] font-semibold text-indigo-700 dark:text-indigo-300"
                                               title={`${s.legCount} legs: ${s.longLegs} long / ${s.shortLegs} short. One structure, one bet.`}>

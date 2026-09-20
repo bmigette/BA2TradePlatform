@@ -6,7 +6,8 @@ import type { IChartApi, ISeriesApi, CandlestickData, Time, SeriesMarker } from 
 import { getOhlcvBars, getTradeChartContext } from '../lib/btApi';
 import type { TradeChartContext } from '../lib/btApi';
 import {
-  allMarkers, payoffFor, payoffGeometry, strikeLineLegs, strikeLines, zoneBands,
+  allMarkers, payoffFor, payoffGeometry, payoffSummary, pnlTicks, strikeLineLegs, strikeLines,
+  zoneBands,
 } from '../lib/optionChartView';
 import OptionTradeDetails from './OptionTradeDetails';
 
@@ -49,7 +50,9 @@ type OverlayShape = {
   zeroX: number;
   curve: string;
   fills: Array<{ sign: 'profit' | 'loss'; path: string }>;
-  bandRects: Array<{ y: number; height: number; sign: 'profit' | 'loss' }>;
+  bandRects: Array<{ y: number; height: number; sign: 'profit' | 'loss' | 'neutral' }>;
+  /** The horizontal P&L scale the locked design puts along the top (decision 1a). */
+  ticks: Array<{ x: number; label: string }>;
 };
 
 /**
@@ -329,10 +332,26 @@ const TradeChartModal: React.FC<{
       }
     }
 
+    // The P&L scale along the top: without it the reader cannot tell how much P&L the
+    // horizontal distance represents, which is the whole point of the rotated overlay.
+    const ticks: OverlayShape['ticks'] = [];
+    for (const value of pnlTicks(geometry.maxAbsPnl)) {
+      const x = zeroX + value * scale;
+      if (x < 0 || x > plotWidth) continue;
+      ticks.push({ x, label: `${value >= 0 ? '+' : '−'}$${Math.abs(value)}` });
+    }
+
     // Sign-only bands, projected here rather than during render (a ref read during
-    // render is not a legal way to get them).
+    // render is not a legal way to get them). Clipped to the price range on screen, so a
+    // profitable region is shaded wherever it is visible.
+    const priceRange = data.length > 0
+      ? {
+          min: data.reduce((lowest, bar) => Math.min(lowest, bar.low), Number.POSITIVE_INFINITY),
+          max: data.reduce((highest, bar) => Math.max(highest, bar.high), Number.NEGATIVE_INFINITY),
+        }
+      : null;
     const bandRects: OverlayShape['bandRects'] = [];
-    for (const band of zoneBands(payoff)) {
+    for (const band of zoneBands(payoff, priceRange)) {
       const top = series.priceToCoordinate(band.to);
       const bottom = series.priceToCoordinate(band.from);
       if (top == null || bottom == null) continue;
@@ -345,15 +364,42 @@ const TradeChartModal: React.FC<{
 
     setOverlay({
       width: plotWidth, height: CHART_HEIGHT, zeroX,
-      curve: toPath(defined), fills, bandRects,
+      curve: toPath(defined), fills, bandRects, ticks,
     });
-  }, [payoff, isOptionView, viewport, context]);
+    // `data` is a dep because the bands are clipped to the bars on screen.
+  }, [payoff, isOptionView, viewport, context, data]);
 
+  // Escape closes, and the dialog takes focus when it opens so the keyboard is not left
+  // behind on the row that was clicked. (Full Tab containment is not implemented; the
+  // chart's own canvas is focusable, so a trap would need a real focus scope.)
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!trade) return;
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [trade, onClose]);
   if (!trade) return null;
+
 
   const headerRight = isOptionView && context
     ? `${context.legs.length} leg${context.legs.length === 1 ? '' : 's'} · ${context.underlying.symbol || 'underlying unavailable'}`
     : `${trade.direction} · ${dayOf(trade.entryDate)} → ${dayOf(trade.exitDate)}`;
+
+  // SCOPE AND DENOMINATOR, explicitly. The header used to show the clicked LEG's percent and
+  // reason beside a chart of the whole structure, so a structure reading +$370 could show
+  // +5.30% with a single leg's exit reason. The structure's own dollars are the headline when
+  // there is more than one leg, and the percentage is labelled for what it is a percentage of.
+  const structurePnl = context ? context.legs.reduce((total, leg) => total + (leg.pnl ?? 0), 0) : null;
+  const structureLegs = context?.legs.length ?? 0;
+  const structureMissingPnl = context ? context.legs.filter(leg => leg.pnl == null).length : 0;
+  const isStructureView = isOptionView && structureLegs > 1;
+  const structureNetEntry = isStructureView && payoff && payoff.available
+    ? payoffSummary(payoff).netEntryLabel
+    : null;
 
   const emptyMessage = isOptionView
     ? 'No cached daily bars for this underlying in the window. The leg table and the payoff below are unaffected.'
@@ -362,7 +408,12 @@ const TradeChartModal: React.FC<{
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
       <div
-        className={`bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full p-4 max-h-[90vh] overflow-y-auto ${isOptionView ? 'max-w-6xl' : 'max-w-4xl'}`}
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${trade.symbol || 'Trade'} daily chart`}
+        className={`bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full p-4 max-h-[90vh] overflow-y-auto outline-none ${isOptionView ? 'max-w-6xl' : 'max-w-4xl'}`}
         onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-3">
           <div>
@@ -371,9 +422,29 @@ const TradeChartModal: React.FC<{
             </div>
             <div className="text-xs text-gray-500 dark:text-gray-400">
               {headerRight} ·{' '}
-              <span className={trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}>
-                {trade.pnl >= 0 ? '+' : ''}{trade.pnlPercent.toFixed(2)}%
-              </span> · {trade.exitReason}
+              {isStructureView && structurePnl != null ? (
+                <>
+                  <span className={structurePnl >= 0 ? 'text-green-600' : 'text-red-600'}>
+                    structure {structurePnl >= 0 ? '+' : '−'}${Math.abs(structurePnl).toFixed(2)}
+                  </span>
+                  {structureNetEntry ? ` on ${structureNetEntry}` : ''}
+                  {' · '}
+                  <span title="The row you clicked is one leg of this structure">
+                    clicked row: leg of {structureLegs}, {trade.pnlPercent >= 0 ? '+' : ''}
+                    {trade.pnlPercent.toFixed(2)}%
+                  </span>
+                  {structureMissingPnl > 0
+                    ? ` · ${structureMissingPnl} leg${structureMissingPnl === 1 ? '' : 's'} without a recorded P&L`
+                    : ''}
+                </>
+              ) : (
+                <>
+                  <span className={trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}>
+                    {trade.pnl >= 0 ? '+' : ''}{trade.pnlPercent.toFixed(2)}%
+                  </span>
+                  {' · '}{trade.exitReason}
+                </>
+              )}
             </div>
           </div>
           <button onClick={onClose}
@@ -421,10 +492,13 @@ const TradeChartModal: React.FC<{
                         viewBox={`0 0 ${overlay.width} ${overlay.height}`}
                         aria-hidden="true">
                         {overlay.bandRects.map((band, index) => (
-                          <rect key={`band-${index}`} x={0} y={band.y}
-                                width={overlay.width} height={band.height}
-                                fill={band.sign === 'profit' ? '#16a34a' : '#dc2626'}
-                                fillOpacity={showOverlay ? 0.06 : 0.10} />
+                          // A flat-zero interval is NEUTRAL: not shaded as profit.
+                          band.sign === 'neutral' ? null : (
+                            <rect key={`band-${index}`} x={0} y={band.y}
+                                  width={overlay.width} height={band.height}
+                                  fill={band.sign === 'profit' ? '#16a34a' : '#dc2626'}
+                                  fillOpacity={showOverlay ? 0.06 : 0.10} />
+                          )
                         ))}
                         {showOverlay && overlay.fills.map((fill, index) => (
                           <path key={`fill-${index}`} d={fill.path}
@@ -436,6 +510,16 @@ const TradeChartModal: React.FC<{
                             <line x1={overlay.zeroX} y1={0} x2={overlay.zeroX} y2={overlay.height}
                                   stroke="#94a3b8" strokeWidth={1} strokeDasharray="4 4" />
                             <path d={overlay.curve} fill="none" stroke="#0e7490" strokeWidth={2} />
+                            {/* The P&L scale: a tick per round dollar value, so the
+                                horizontal distance has a readable magnitude. */}
+                            {overlay.ticks.map(tick => (
+                              <g key={`tick-${tick.label}`}>
+                                <line x1={tick.x} y1={0} x2={tick.x} y2={5}
+                                      stroke="#94a3b8" strokeWidth={1} />
+                                <text x={tick.x} y={13} textAnchor="middle" fontSize={9}
+                                      fill="#94a3b8">{tick.label}</text>
+                              </g>
+                            ))}
                           </>
                         )}
                       </svg>

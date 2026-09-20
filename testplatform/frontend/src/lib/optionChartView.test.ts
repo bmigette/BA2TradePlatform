@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
-  allMarkers, legMarkers, payoffFor, payoffGeometry, payoffSegments, payoffSummary,
-  samplePayoff, strikeLines, structureMarkers, toPayoffLegs, zoneBands,
+  allMarkers, combinationProblem, legMarkers, nicePnlStep, payoffFor, payoffGeometry,
+  payoffSegments, payoffSummary, pnlTicks, samplePayoff, strikeLines, structureMarkers,
+  toPayoffLegs, zoneBands,
 } from './optionChartView';
 import type { TradeChartLeg } from './btApi';
 
@@ -329,5 +330,86 @@ describe('summary figures', () => {
     expect(summary.netEntryLabel).toBe('Credit $500.00');
     expect(summary.maxProfit).toBe('$500.00');
     expect(summary.maxLoss).toBe('Unlimited');
+  });
+});
+
+describe('shading domain (review: incomplete shading)', () => {
+  it('shades the profitable region wherever it is visible, not only the suggested domain', () => {
+    const model = payoffFor(spread);
+    if (!model.available) throw new Error('the spread fixture should be priced');
+
+    // Without a range the bands stop at the payoff's own suggested domain -- which is why
+    // candles at 108-110 had no shading even though the position is profitable there.
+    const narrow = zoneBands(model);
+    expect(narrow[narrow.length - 1].to).toBeLessThan(108);
+
+    // With the chart's price range they run to the visible edge.
+    const wide = zoneBands(model, { min: 94, max: 110 });
+    expect(wide[0].from).toBe(94);
+    expect(wide[0].sign).toBe('loss');
+    expect(wide[wide.length - 1].to).toBe(110);
+    expect(wide[wide.length - 1].sign).toBe('profit');
+  });
+
+  it('keeps a flat zero interval NEUTRAL instead of shading it as profit', () => {
+    const free = payoffFor([leg({ strike: 100, entryPrice: 0 })]);
+    if (!free.available) throw new Error('a zero premium is a real price');
+
+    const bands = zoneBands(free, { min: 0, max: 130 });
+
+    expect(bands[0].sign).toBe('neutral');   // [0, 100] pays exactly nothing
+    expect(bands[1].sign).toBe('profit');
+  });
+
+  it('draws no band at all for an empty range', () => {
+    const model = payoffFor(spread);
+    if (!model.available) throw new Error('the spread fixture should be priced');
+    expect(zoneBands(model, { min: 100, max: 100 })).toEqual([]);
+  });
+});
+
+describe('the horizontal P&L scale (decision 1a)', () => {
+  it('ticks round numbers, symmetrically about zero', () => {
+    expect(nicePnlStep(900)).toBe(200);
+    expect(pnlTicks(900)).toEqual([-800, -600, -400, -200, 200, 400, 600, 800]);
+  });
+
+  it('has no scale for a structure with no reach', () => {
+    expect(nicePnlStep(0)).toBe(0);
+    expect(pnlTicks(0)).toEqual([]);
+  });
+});
+
+describe('expiry and underlying compatibility (review: stricter handling)', () => {
+  const secondLeg = (over: Partial<TradeChartLeg> = {}) =>
+    leg({ id: 2, strike: 105, direction: 'short', entryPrice: 2, ...over });
+
+  it('refuses to combine two different expiries into one curve', () => {
+    const legs = [leg({ id: 1 }), secondLeg({ expiry: '2026-10-16' })];
+    expect(combinationProblem(legs)).toContain('different expiries');
+    const result = payoffFor(legs);
+    expect(result.available).toBe(false);
+    expect(result.available === false && result.reason).toContain('expiration curve');
+  });
+
+  it('refuses a structure where an expiry is missing on one leg', () => {
+    // A missing term is unprovable, not compatible: this could be a diagonal.
+    const legs = [leg({ id: 1 }), secondLeg({ expiry: null })];
+    expect(combinationProblem(legs)).toContain('missing');
+  });
+
+  it('does not invent a conflict when no leg records an expiry at all', () => {
+    const legs = [leg({ id: 1, expiry: null }), secondLeg({ expiry: null })];
+    expect(combinationProblem(legs)).toBeNull();
+  });
+
+  it('refuses two different underlyings', () => {
+    const legs = [leg({ id: 1 }), secondLeg({ underlyingSymbol: 'MSFT' })];
+    expect(combinationProblem(legs)).toContain('underlyings');
+  });
+
+  it('still lets one leg be scoped out of a mixed structure', () => {
+    const legs = [leg({ id: 1 }), secondLeg({ expiry: '2026-10-16' })];
+    expect(payoffFor(legs, 0).available).toBe(true);
   });
 });

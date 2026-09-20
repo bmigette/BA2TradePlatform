@@ -26,7 +26,7 @@ const LABEL_COLLISION_FRACTION = 0.02;
 
 export type OverlayPoint = { underlying: number; pnl: number };
 export type OverlaySegment = { sign: 'profit' | 'loss'; points: OverlayPoint[] };
-export type ZoneBand = { from: number; to: number; sign: 'profit' | 'loss' };
+export type ZoneBand = { from: number; to: number; sign: 'profit' | 'loss' | 'neutral' };
 
 /**
  * What a strike line needs: the strike and enough identity to label it. NOT the
@@ -94,9 +94,48 @@ export const toPayoffLegs = (legs: TradeChartLeg[]): OptionLegInput[] =>
     underlyingSymbol: leg.underlyingSymbol,
   }));
 
+/**
+ * Why a set of legs cannot be combined into ONE expiration curve, or null.
+ *
+ * Mirrors the Python view (`ba2_common.core.option_payoff_chart`): a curve is a statement
+ * about what happens at ONE expiration, so legs with different expiries are not a structure
+ * with one payoff -- and a structure where an expiry is missing on some legs cannot be
+ * ASSUMED to be single-expiry either. A missing term is unprovable, not compatible.
+ */
+export function combinationProblem(legs: TradeChartLeg[]): string | null {
+  if (legs.length < 2) return null;
+
+  const expiries = legs.map(leg => (leg.expiry || '').trim());
+  const present = Array.from(new Set(expiries.filter(Boolean))).sort();
+  if (present.length > 1) {
+    return `${present.length} different expiries (${present.join(', ')}) cannot share one `
+      + `expiration curve`;
+  }
+  if (present.length === 1 && expiries.some(expiry => !expiry)) {
+    const missing = expiries.filter(expiry => !expiry).length;
+    return `the expiry is missing on ${missing} leg${missing === 1 ? '' : 's'}, so a `
+      + `single-expiry curve cannot be assumed`;
+  }
+
+  const underlyings = Array.from(new Set(
+    legs.map(leg => (leg.underlyingSymbol || leg.symbol || '').trim()).filter(Boolean),
+  )).sort();
+  if (underlyings.length > 1) {
+    return `${underlyings.length} different underlyings (${underlyings.join(', ')}) cannot `
+      + `share one expiration curve`;
+  }
+  return null;
+}
+
 /** The payoff for the whole transaction, or the reason it cannot be drawn. */
-export const payoffFor = (legs: TradeChartLeg[], scope?: number) =>
-  buildPayoff(toPayoffLegs(legs), scope == null ? {} : { scope });
+export const payoffFor = (legs: TradeChartLeg[], scope?: number) => {
+  // A single-leg scope isolates one leg, so compatibility is a STRUCTURE question only.
+  if (scope == null) {
+    const problem = combinationProblem(legs);
+    if (problem) return { available: false as const, reason: problem };
+  }
+  return buildPayoff(toPayoffLegs(legs), scope == null ? {} : { scope });
+};
 
 /**
  * Sample the payoff across the display domain.
@@ -184,22 +223,75 @@ export function payoffGeometry(model: PayoffCurve, samples = 160): OverlayGeomet
  * Band boundaries are the breakevens, so a two-tailed structure yields three bands
  * and the middle one is the loss.
  */
-export function zoneBands(model: PayoffCurve): ZoneBand[] {
-  const bounds = [
-    model.suggestedDomain.min,
-    ...model.breakevens,
-    model.suggestedDomain.max,
-  ].filter(value => value >= 0).sort((a, b) => a - b);
+export function zoneBands(
+  model: PayoffCurve,
+  priceRange?: { min: number; max: number } | null,
+): ZoneBand[] {
+  // The bands used to STOP at the payoff's suggested domain, so a 95/105 spread shaded only
+  // ~94-106 and the candles at 108-110 had no profit shading even though the position is
+  // profitable there at expiration (review: incomplete shading domain).
+  //
+  // The sign can only change AT a breakeven, so the mathematically complete partition is the
+  // breakevens between the edges; the tails run to the edge of what is on screen. A band whose
+  // payoff is exactly zero is NEUTRAL, not green: a flat interval is not a profit.
+  // A SUPPLIED but empty range means nothing is on screen, so there is nothing to shade;
+  // only an ABSENT range falls back to the payoff's own suggested domain.
+  if (priceRange && !(priceRange.max > priceRange.min)) return [];
+  const range = priceRange ?? null;
+  const low = Math.max(range ? range.min : model.suggestedDomain.min, 0);
+  const high = range ? range.max : model.suggestedDomain.max;
+  if (!(high > low)) return [];
+
+  const edges = [
+    low,
+    ...model.breakevens.filter(value => value > low && value < high),
+    high,
+  ].sort((a, b) => a - b);
 
   const bands: ZoneBand[] = [];
-  for (let index = 0; index < bounds.length - 1; index += 1) {
-    const from = bounds[index];
-    const to = bounds[index + 1];
+  for (let index = 0; index < edges.length - 1; index += 1) {
+    const from = edges[index];
+    const to = edges[index + 1];
     if (!(to > from)) continue;
     const pnl = model.payoffAt((from + to) / 2);
-    bands.push({ from, to, sign: pnl >= 0 ? 'profit' : 'loss' });
+    const sign: ZoneBand['sign'] =
+      Math.abs(pnl) < FLAT_ZERO_EPSILON ? 'neutral' : pnl > 0 ? 'profit' : 'loss';
+    bands.push({ from, to, sign });
   }
   return bands;
+}
+
+/** Below this the payoff is treated as flat, not as a very small profit. */
+export const FLAT_ZERO_EPSILON = 0.005;
+
+/**
+ * A readable step for the horizontal P&L scale.
+ *
+ * The locked one-chart design puts a P&L scale along the top, and a scale needs round numbers:
+ * the step is the 1/2/5 x 10^k value closest to a quarter of the reach, in log space, so a
+ * $900 reach ticks every $200 rather than every $500 (too sparse) or $100 (too dense).
+ */
+export function nicePnlStep(maxAbsPnl: number): number {
+  if (!(maxAbsPnl > 0) || !Number.isFinite(maxAbsPnl)) return 0;
+  const rough = maxAbsPnl / 4;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rough)));
+  const candidates = [1, 2, 5, 10].map(factor => factor * magnitude);
+  let best = candidates[0];
+  for (const candidate of candidates) {
+    if (Math.abs(Math.log(candidate / rough)) < Math.abs(Math.log(best / rough))) best = candidate;
+  }
+  return best;
+}
+
+/** Signed tick values for the P&L scale, ascending. Symmetric, from the step outwards. */
+export function pnlTicks(maxAbsPnl: number): number[] {
+  const step = nicePnlStep(maxAbsPnl);
+  if (step <= 0) return [];
+  const ticks: number[] = [];
+  for (let value = step; value <= maxAbsPnl + 1e-9; value += step) {
+    ticks.push(value, -value);
+  }
+  return ticks.sort((a, b) => a - b);
 }
 
 /**
