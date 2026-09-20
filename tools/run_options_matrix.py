@@ -102,6 +102,7 @@ _DISCOVERY_STRATEGIES = [
 # Both singles are refused by the launcher; this is not a performance survival gate.
 _DISCOVERY_EXCLUDED = {"O_SSTG", "O_SSTD"}
 _DISCOVERY_EXPERTS = ["FMPRating", "DeterministicScorer"]
+_NEUTRAL_STRUCTURES = {"O_IC", "O_STRD", "O_STRG"}
 
 
 def _universe(path=_UNIVERSE_FILE) -> str:
@@ -174,6 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--experts", default=None,
                     help="Comma list of experts (default FMPRating; EarningsDrift/Insider "
                          "excluded — no large-cap signal on this options universe).")
+    ap.add_argument("--neutral-entry-modes", default="legacy",
+                    help="Discovery only: hold,low_confidence runs two separate jobs for each "
+                         "neutral structure. Other structures retain their existing identities.")
     ap.add_argument("--strategies", default=None,
                     help="Comma list of option strategy keys: grouped OS1-4 and/or singles "
                          "(O_LC,O_LP,O_VERT,O_BULLCS,O_BF,O_SSTG,O_SSTD,O_IC,O_CSP,O_JL,O_RS,"
@@ -330,6 +334,14 @@ def build_parser() -> argparse.ArgumentParser:
 def resolve_args(ap, argv=None):
     args = ap.parse_args(argv)
     discovery = args.profile == "discovery"
+    modes = [m.strip() for m in args.neutral_entry_modes.split(",")]
+    if (not modes or len(modes) != len(set(modes))
+            or set(modes) - {"legacy", "hold", "low_confidence"}
+            or ("legacy" in modes and len(modes) > 1)):
+        ap.error("--neutral-entry-modes must be legacy, hold, low_confidence or hold,low_confidence")
+    if modes != ["legacy"] and not discovery:
+        ap.error("--neutral-entry-modes requires --profile discovery")
+    args.neutral_entry_modes = ",".join(modes)
     if args.experts is None:
         args.experts = ",".join(_DISCOVERY_EXPERTS if discovery else _DEFAULT_EXPERTS)
     if args.strategies is None:
@@ -400,7 +412,7 @@ def resolve_args(ap, argv=None):
     return args
 
 
-def build_cmd(args, launcher, name, expert, strat, universe):
+def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode="legacy"):
     cmd = ([sys.executable, launcher] if launcher.endswith(".py") else [launcher]) + [
         "optimize", "--expert", expert, "--universe", universe, "--strategy", strat,
         "--start", args.start, "--end", args.end,
@@ -416,6 +428,8 @@ def build_cmd(args, launcher, name, expert, strat, universe):
         "--options-store", args.options_store]
     cmd += _gate_passthrough(args)
     cmd += _market_condition_passthrough(args)
+    if neutral_entry_mode != "legacy":
+        cmd += ["--neutral-entry-mode", neutral_entry_mode]
     for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
                         ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
         value = getattr(args, field)
@@ -437,14 +451,14 @@ def build_cmd(args, launcher, name, expert, strat, universe):
     return cmd
 
 
-def discovery_name(args, launcher, name, expert, strat, universe):
+def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_mode="legacy"):
     """Version the experiment, not the machine's consumer count or selected job subset.
 
     Name is also the backend checkpoint key. Changed window/seed/capital/GA knobs
     must neither skip an older completion nor resume its incompatible experiment.
     Cache contents/code changes at the same paths still require a fresh name suffix.
     """
-    cmd = build_cmd(args, launcher, "", expert, strat, universe)
+    cmd = build_cmd(args, launcher, "", expert, strat, universe, neutral_entry_mode)
     tokens = cmd[cmd.index("optimize") + 1:]
     config = {}
     i = 0
@@ -466,6 +480,17 @@ def discovery_name(args, launcher, name, expert, strat, universe):
     return f"{name}-d{digest}"
 
 
+def planned_jobs(args, launcher, experts, strategies, universe):
+    """Separate neutral arms without changing any other job/checkpoint identity."""
+    for name, expert, strategy in _jobs(experts, strategies, args.name_suffix):
+        modes = args.neutral_entry_modes.split(",") if strategy in _NEUTRAL_STRUCTURES else ["legacy"]
+        for mode in modes:
+            arm_name = name if mode == "legacy" else name + "-" + mode
+            if args.profile == "discovery":
+                arm_name = discovery_name(args, launcher, arm_name, expert, strategy, universe, mode)
+            yield arm_name, expert, strategy, mode
+
+
 def main(argv=None) -> int:
     ap = build_parser()
     args = resolve_args(ap, argv)
@@ -479,10 +504,8 @@ def main(argv=None) -> int:
         launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test.exe")
         if not os.path.exists(launcher):
             launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test")
-    jobs = list(_jobs(experts, strategies, args.name_suffix))
+    jobs = list(planned_jobs(args, launcher, experts, strategies, universe))
     if args.profile == "discovery":
-        jobs = [(discovery_name(args, launcher, nm, exp, strat, universe), exp, strat)
-                for nm, exp, strat in jobs]
         print("DISCOVERY: permitted singles only; all remain eligible for composition. "
               "Stage-1 rankings provide seeds, not a survival gate.")
         print("Risk-policy exclusions: O_SSTG, O_SSTD (2026-08-31; not performance exclusions).")
@@ -505,20 +528,20 @@ def main(argv=None) -> int:
           f"{'ON (launcher default)' if args.robust_fitness else 'OFF (--no-robust-fitness)'}"
           " -- scores are NOT comparable across the robustness setting.")
     if args.dry_run:
-        for nm, exp, s in jobs:
+        for nm, exp, s, mode in jobs:
             print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s})")
-            print("    " + shlex.join(build_cmd(args, launcher, nm, exp, s, universe)))
+            print("    " + shlex.join(build_cmd(args, launcher, nm, exp, s, universe, mode)))
         print("Dry-run only: cache coverage and vendor compatibility have NOT been validated.")
         return 0
 
     if args.screener_gate_store and not Path(args.screener_gate_store).exists():
         ap.error(f"Screener gate store does not exist: {args.screener_gate_store}")
 
-    for i, (name, expert, strat) in enumerate(jobs, 1):
+    for i, (name, expert, strat, mode) in enumerate(jobs, 1):
         if name in _completed_names():   # re-read each loop (resumable)
             print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
             continue
-        cmd = build_cmd(args, launcher, name, expert, strat, universe)
+        cmd = build_cmd(args, launcher, name, expert, strat, universe, mode)
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)

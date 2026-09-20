@@ -1,0 +1,81 @@
+{
+  "archive": "/home/debian/ba2-grid/archive/before-neutral-rename-20260920T080720Z",
+  "changes": [
+    {
+      "table": "strategy_optimizations",
+      "id": 1,
+      "old_name": "optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2",
+      "new_name": "optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2-archive20260920-opt1",
+      "unchanged_payload_sha256": "0b7fd5afe12e716129a8b3899dcf8ffffa167f2e58f746b024e7e534f1545beb"
+    },
+    {
+      "table": "strategy_optimizations",
+      "id": 6,
+      "old_name": "optm-DeterministicScorer-O_LC-st1rob-d91b4958ae604",
+      "new_name": "optm-DeterministicScorer-O_LC-st1rob-d91b4958ae604-archive20260920-opt6",
+      "unchanged_payload_sha256": "0f0feffaaabf715acb1b9a81b42753427e9e66c675b0bcbed01e2d8097b1674b"
+    },
+    {
+      "table": "backtests",
+      "id": 1,
+      "old_name": "TOP5-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2",
+      "new_name": "TOP5-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2-archive20260920-bt1",
+      "unchanged_payload_sha256": "72cd5314a11d988a58e052a020181f524d37826419e43c28c139ccfb5217c702"
+    },
+    {
+      "table": "backtests",
+      "id": 2,
+      "old_name": "TOP1-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2",
+      "new_name": "TOP1-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2-archive20260920-bt2",
+      "unchanged_payload_sha256": "10554c1a464287e9912e4eb222258a813cbc6ec20cec2081abbac7257d0afa5f"
+    },
+    {
+      "table": "backtests",
+      "id": 3,
+      "old_name": "TOP2-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2",
+      "new_name": "TOP2-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2-archive20260920-bt3",
+      "unchanged_payload_sha256": "7d2de4c21cf36f5a7485ce80b5beeaf01b0117532e5e56829dffaf194be6c190"
+    },
+    {
+      "table": "backtests",
+      "id": 4,
+      "old_name": "TOP4-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2",
+      "new_name": "TOP4-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2-archive20260920-bt4",
+      "unchanged_payload_sha256": "fe1c0232f349a068adc732ba9556a43ef196ae9c55e93e963a964484e0dddddb"
+    },
+    {
+      "table": "backtests",
+      "id": 5,
+      "old_name": "TOP3-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2",
+      "new_name": "TOP3-optm-FMPRating-O_LC-st1rob-d7beb1ddf92c2-archive20260920-bt5",
+      "unchanged_payload_sha256": "a4756309968467a55e0f7919caf57cf2ac3c5cc6eb312c7db8b5b3b9ee4021cf"
+    }
+  ],
+  "running_jobs_unchanged": [
+    {
+      "id": 2,
+      "name": "optm-FMPRating-O_LP-st1rob-d96e92c4d0231",
+      "status": "running"
+    },
+    {
+      "id": 3,
+      "name": "optm-DeterministicScorer-O_LC-st1rob-d91b4958ae604",
+      "status": "running"
+    },
+    {
+      "id": 4,
+      "name": "optm-DeterministicScorer-O_LC-st1rob-d91b4958ae604",
+      "status": "running"
+    },
+    {
+      "id": 5,
+      "name": "optm-DeterministicScorer-O_LC-st1rob-d91b4958ae604",
+      "status": "running"
+    },
+    {
+      "id": 7,
+      "name": "optm-DeterministicScorer-O_LC-st1soft30-dbf86bd781123",
+      "status": "running"
+    }
+  ]
+}

@@ -20,6 +20,10 @@ establish that every newly advertised strategy can trade.
 
 ## Findings
 
+September 20 follow-up: R1 now has separate opt-in HOLD and low-confidence
+experiments, documented in [the grid review](option_grid_review_2026-09-20.md).
+The default legacy behavior is preserved. R2 remains a separate follow-up item.
+
 ### R1 — High: neutral-signal option entries are unreachable
 
 **Origin:** `d66a5a75`, retained by `f359ab9a`; this is an adjacent existing issue, not a new

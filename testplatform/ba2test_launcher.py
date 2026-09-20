@@ -5739,7 +5739,7 @@ def _clamp_confidence_genes(strat, expert: str):
     return strat
 
 
-def _build_strategy(kind: str, name: str, expert: str):
+def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="legacy"):
     """Dispatch to the right strategy builder.
 
     Every S-strategy is EXPERT-AGNOSTIC (2026-08-17): S1 used to load a per-expert live/default
@@ -5755,7 +5755,42 @@ def _build_strategy(kind: str, name: str, expert: str):
         if builder is None:
             sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
         strat = builder(name)
+    if neutral_entry_mode != "legacy":
+        _configure_neutral_entry(strat, kind, neutral_entry_mode)
     return _clamp_confidence_genes(strat, expert)
+
+
+def _configure_neutral_entry(strategy, kind, mode):
+    """Separate HOLD and low-confidence experiments; never an impossible AND."""
+    if kind not in _NEUTRAL_ENTRY_MEMBERS or mode not in ("hold", "low_confidence"):
+        raise ValueError("--neutral-entry-mode requires O_STRD, O_STRG or O_IC")
+    if _OPTION_GATES_OFF:
+        raise ValueError("--neutral-entry-mode cannot be combined with --gates-off")
+    m = kind.lower()
+    for rule in strategy.entry_rules:
+        leaves = rule["conditions"]["conditions"]
+        if mode == "hold":
+            # HOLD has no directional price target. Requiring expected_profit > N
+            # would silently make this arm untradeable even after admitting HOLD.
+            leaves = [c for c in leaves if c["id"] not in
+                      (f"{m}-low_confidence", f"{m}-exp_profit")]
+            for c in leaves:
+                if c["id"] == f"{m}-signal":
+                    c["toggle_optimize"] = False
+                    c["toggleOptimize"] = False
+        else:
+            leaves = [c for c in leaves if c["id"] != f"{m}-signal"]
+            for c in leaves:
+                if c["id"] == f"{m}-low_confidence":
+                    c["toggle_optimize"] = False
+                    c["toggleOptimize"] = False
+        rule["conditions"]["conditions"] = leaves
+
+
+def _apply_neutral_entry_setting(backtest_block, mode):
+    if mode != "legacy":
+        for expert in backtest_block["experts"]:
+            expert["settings"]["neutral_option_entry_mode"] = mode
 
 
 def _cmd_optimize(args) -> int:
@@ -5868,7 +5903,11 @@ def _cmd_optimize(args) -> int:
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
-        strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(args.strategy, _sname, expert)
+        neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
+        if bypass and neutral_mode != "legacy":
+            raise ValueError("Neutral option entry experiments require a ruleset expert")
+        strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(
+            args.strategy, _sname, expert, neutral_entry_mode=neutral_mode)
         # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
         # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
         # affect it, then thread it into the run config below so the handler's _build_experts (and
@@ -5929,6 +5968,7 @@ def _cmd_optimize(args) -> int:
         _apply_options_store(args, backtest_block)
         # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
         _apply_option_trade_floor(None if bypass else args.strategy, backtest_block)
+        _apply_neutral_entry_setting(backtest_block, neutral_mode)
 
         # Screener-settings optimization: when --screener, attach a screener_opt block to the
         # backtest config (store + base settings + scan cadence — an OPTIMIZATION config option,
@@ -6223,7 +6263,11 @@ def _cmd_optimize_batch(args) -> int:
         name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
         db = SessionLocal()
         try:
-            strat = _build_strategy_minimal(name) if bypass else _build_strategy(strat_kind, name, expert)
+            neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
+            if bypass and neutral_mode != "legacy":
+                raise ValueError("Neutral option entry experiments require a ruleset expert")
+            strat = _build_strategy_minimal(name) if bypass else _build_strategy(
+                strat_kind, name, expert, neutral_entry_mode=neutral_mode)
             # Pure-option kinds carry a transient `entry_action`; capture before commit/refresh.
             strat_entry_action = getattr(strat, "entry_action", None)
             db.add(strat); db.commit(); db.refresh(strat)
@@ -6275,6 +6319,7 @@ def _cmd_optimize_batch(args) -> int:
             _apply_options_store(args, backtest_block)
             # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
             _apply_option_trade_floor(None if bypass else strat_kind, backtest_block)
+            _apply_neutral_entry_setting(backtest_block, neutral_mode)
             # Target-anchored variants (S4): the TP-on-target anchoring lives on the Strategy row
             # itself (strat.entry_actions, seeded by _build_strategy_S4) — nothing to thread onto
             # the run config here.
@@ -7185,6 +7230,9 @@ def main(argv: "list | None" = None) -> int:
                          "(default). NOTE: a non-zero value RESCALES fitness, so scores "
                          "are not comparable with runs made at a different level.")
     _add_robust_fitness_args(op)
+    op.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence"),
+                    default="legacy", help="Separate neutral-option experiment; HOLD-only or "
+                    "low-confidence directional signals. Requires O_STRD/O_STRG/O_IC and a new job name.")
     op.add_argument("--fitness-trade-scale", action="store_true",
                     help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
                          "statistically thin (few-trade) configs are down-weighted (~target trades/yr "
@@ -7393,6 +7441,8 @@ def main(argv: "list | None" = None) -> int:
                     help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
                          "fitness/return (25). Default-on; see `optimize --profit-share-cap-pct`.")
     _add_robust_fitness_args(ob)
+    ob.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence"),
+                    default="legacy", help="Neutral option experiment (O_STRD/O_STRG/O_IC only).")
     ob.add_argument("--commission", type=float, default=0.1,
                     help="Flat $ commission per FILL (see optimize --commission; default lowered "
                          "from 1.0 on 2026-08-16). Kept in step with the optimize default so a "

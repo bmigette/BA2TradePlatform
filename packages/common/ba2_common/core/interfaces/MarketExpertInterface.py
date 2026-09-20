@@ -218,6 +218,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic opening of new trading positions"
                 },
+                "neutral_option_entry_mode": {
+                    "type": "str", "required": False, "default": "legacy",
+                    "valid_values": ["legacy", "hold", "low_confidence"],
+                    "description": "Neutral option entries: legacy behavior, HOLD only, or "
+                                   "directional signals filtered by the ruleset confidence limit. "
+                                   "Opt-in modes require straddle, strangle or iron-condor actions."
+                },
                 "allow_automated_trade_modification": {
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic modification and closing of existing positions"

@@ -2127,6 +2127,8 @@ class TradeManager:
 
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            from ba2_common.core.neutral_option_entry import entry_mode, accepts_signal, validate_actions
+            neutral_mode = entry_mode(expert.settings)
 
             # INVARIANT FOR THIS WHOLE BLOCK: `session` is READ-ONLY. Nothing loaded through it
             # may be mutated, and nothing may be added to it.
@@ -2150,8 +2152,10 @@ class TradeManager:
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,
                     ExpertRecommendation.created_at >= cutoff_time,
-                    ExpertRecommendation.recommended_action != OrderRecommendation.HOLD
                 ).order_by(ExpertRecommendation.created_at.desc())  # Most recent first
+                if neutral_mode == "legacy":
+                    statement = statement.where(
+                        ExpertRecommendation.recommended_action != OrderRecommendation.HOLD)
 
                 all_recommendations = session.exec(statement).all()
 
@@ -2173,6 +2177,11 @@ class TradeManager:
                     key=lambda r: r.expected_profit_percent,
                     reverse=True
                 )
+                if neutral_mode != "legacy":
+                    # Choose the latest signal before filtering it: an older HOLD must
+                    # never be resurrected when today's recommendation is BUY (or vice versa).
+                    recommendations = [r for r in recommendations
+                                       if accepts_signal(neutral_mode, r.recommended_action)]
                 
                 self.logger.info(f"Found {len(recommendations)} unique instruments with recommendations for expert {expert_instance_id} (filtered from {len(all_recommendations)} total recommendations)")
                 self.logger.info(f"Evaluating recommendations through enter_market ruleset: {expert_instance.enter_market_ruleset_id}")
@@ -2245,6 +2254,8 @@ class TradeManager:
                             continue
                         
                         self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
+                        if neutral_mode != "legacy":
+                            validate_actions(action_summaries)
                         
                         # SAFETY CHECK: For enter_market, check if there's already an open/waiting transaction
                         # for this symbol and expert to prevent duplicate positions
@@ -2273,6 +2284,19 @@ class TradeManager:
                             )
                             continue
                         
+                        if neutral_mode != "legacy":
+                            # Neutral option actions size and submit themselves through
+                            # their shared option risk/capacity guards, as in backtests.
+                            # Never fabricate an equity candidate from a HOLD signal.
+                            for result in evaluator.execute(submit_to_broker=True):
+                                if result.get("success"):
+                                    oid = (result.get("data") or {}).get("order_id")
+                                    if oid:
+                                        order = get_instance(TradingOrder, oid)
+                                        if order:
+                                            created_orders.append(order)
+                            continue
+
                         # TEMP-ORDER-LIST FLOW: do NOT execute (persist) yet. Stage a TRANSIENT
                         # candidate order (via the shared trade_cycle builder — same shape the
                         # backtest uses) for the in-memory RM sizing pass below; only the funded
