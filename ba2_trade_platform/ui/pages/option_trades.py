@@ -81,13 +81,19 @@ class OptionTradesTab:
         on_view_details: Optional[Any] = None,
         on_close_transaction: Optional[Any] = None,
         on_edit_transaction: Optional[Any] = None,
+        on_retry_close: Optional[Any] = None,
+        on_recreate_tpsl: Optional[Any] = None,
+        on_view_recommendation: Optional[Any] = None,
     ):
         # Handlers are INJECTED from the page so the option tab reuses the existing
-        # transaction-details popup, close dialog and edit dialog rather than growing a
-        # second copy of each.
+        # dialogs rather than growing a second copy of each -- and so NO button in the
+        # actions column is dead on this tab.
         self.on_view_details = on_view_details
         self.on_close_transaction = on_close_transaction
         self.on_edit_transaction = on_edit_transaction
+        self.on_retry_close = on_retry_close
+        self.on_recreate_tpsl = on_recreate_tpsl
+        self.on_view_recommendation = on_view_recommendation
 
         self.table: Optional[LiveTradesTable] = None
         self.status_filter = None
@@ -174,6 +180,9 @@ class OptionTradesTab:
             on_close=self._handle_close,
             on_edit=self._handle_edit,
             on_view_transaction_details=self._handle_view_details,
+            on_retry_close=self._handle_retry_close,
+            on_recreate_tpsl=self._handle_recreate_tpsl,
+            on_view_recommendation=self._handle_view_recommendation,
         )
         await self.table.render()
 
@@ -412,3 +421,15 @@ class OptionTradesTab:
     def _handle_edit(self, transaction_id: int):
         if self.on_edit_transaction:
             self.on_edit_transaction(transaction_id)
+
+    def _handle_retry_close(self, transaction_id: int):
+        if self.on_retry_close:
+            self.on_retry_close(transaction_id)
+
+    def _handle_recreate_tpsl(self, transaction_id: int):
+        if self.on_recreate_tpsl:
+            self.on_recreate_tpsl(transaction_id)
+
+    def _handle_view_recommendation(self, rec_id: int):
+        if self.on_view_recommendation:
+            self.on_view_recommendation(rec_id)

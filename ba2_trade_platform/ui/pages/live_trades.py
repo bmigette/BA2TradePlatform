@@ -135,6 +135,9 @@ class LiveTradesTab:
                         on_view_details=self._handle_view_transaction_details,
                         on_close_transaction=self._handle_close_transaction,
                         on_edit_transaction=self._handle_edit_transaction,
+                        on_retry_close=self._handle_retry_close_transaction,
+                        on_recreate_tpsl=self._handle_recreate_tpsl,
+                        on_view_recommendation=self._handle_view_recommendation,
                     )
                     await self.option_tab.render()
         
