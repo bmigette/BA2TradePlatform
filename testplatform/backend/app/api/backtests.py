@@ -850,7 +850,7 @@ def get_backtest_trade_chart(
         raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
 
     try:
-        context = build_trade_chart_context(backtest, trade_id)
+        context = build_trade_chart_context(backtest, trade_id, db)
     except TradeChartRowNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

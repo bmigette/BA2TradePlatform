@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,67 +56,183 @@ _MONEY_FIELDS = (
 #: Greeks + IV + open interest, as the option cache stores them per contract bar.
 _CONTRACT_FIELDS = ('iv', 'delta', 'gamma', 'theta', 'vega', 'open_interest', 'volume')
 
+#: Cache column -> response field. Explicit because the schema is camelCase: the service used
+#: to emit ``open_interest`` while the response model declares ``openInterest``, so that value
+#: was silently DROPPED even when the cache had it (review R6(3)).
+_CONTRACT_RESPONSE_FIELDS = {
+    'iv': 'iv', 'delta': 'delta', 'gamma': 'gamma', 'theta': 'theta', 'vega': 'vega',
+    'open_interest': 'openInterest', 'volume': 'volume',
+}
+
 
 class TradeChartRowNotFound(LookupError):
     """The requested ``trade_id`` is not a row of this backtest's saved array."""
 
 
-def options_store_path(backtest: Any) -> Optional[str]:
-    """The option store the RUN used, when the saved row carries one.
+@dataclass(frozen=True)
+class OptionStoreProvenance:
+    """Which option store the RUN read, as persisted -- or nothing, if it is not recorded.
 
-    The store path travels in the run CONFIG (``options_cache_db``), not on the backtest row,
-    so this looks for it wherever a saved result might have kept it and otherwise returns
-    None. It deliberately does NOT fall back to a platform default: reading a different
-    store than the run used would chart one dataset's greeks beside another's prices, which
-    is worse than an honest "unavailable".
+    Provenance is not optional. Reading whichever store is configured TODAY would chart one
+    dataset's greeks beside another dataset's prices, so an unrecorded store yields no detail
+    rather than a plausible one.
     """
-    for attribute in ('options_cache_db', 'options_db_path'):
-        value = getattr(backtest, attribute, None)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    for container in ('settings', 'opt_block', 'config'):
-        block = getattr(backtest, container, None)
-        if isinstance(block, dict):
-            for key in ('options_cache_db', 'options_db_path'):
-                value = block.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-    return None
+
+    store: Optional[str] = None
+    db_path: Optional[str] = None
+    source: Optional[str] = None
+
+    @property
+    def resolved(self) -> bool:
+        return self.store is not None
+
+    @property
+    def is_sqlite(self) -> bool:
+        return (self.store or '').strip().lower() == 'sqlite'
+
+
+def _store_keys(node: Any, found: Dict[str, str]) -> None:
+    """Collect the option-store keys from a persisted config blob, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ('options_store', 'options_cache_db', 'options_db_path') and value:
+                found.setdefault(key, str(value).strip())
+            _store_keys(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _store_keys(value, found)
+
+
+def _json_blob(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    return value
+
+
+def option_store_provenance(backtest: Any, session: Any = None) -> OptionStoreProvenance:
+    """Resolve the option store this RUN used, from what was actually persisted.
+
+    Two real places, in order (the review's R6(1) -- the ``settings``/``opt_block``/``config``
+    attributes this used to probe do not exist on the ``Backtest`` model, so the normal
+    saved-result path could never resolve anything):
+
+    1. ``backtest.strategy_params`` -- the row's own JSON blob.
+    2. ``backtest.optimization_id`` -> ``strategy_optimizations.optimization_config`` -- the
+       optimization row that launched the run. In the live DB this is where the store is
+       recorded (``options_store`` in 134 configs; ``strategy_params`` in none of 692 runs).
+
+    ``options_store`` decides WHICH reader is legitimate (sqlite vs parquet vs a vendor
+    store); the path alone does not prove that SQLite supplied the data.
+    """
+    found: Dict[str, str] = {}
+    source = None
+
+    blob = _json_blob(getattr(backtest, 'strategy_params', None))
+    if blob:
+        _store_keys(blob, found)
+        if found:
+            source = 'strategy_params'
+
+    optimization_id = getattr(backtest, 'optimization_id', None)
+    if not found and optimization_id is not None and session is not None:
+        try:
+            from sqlmodel import select
+
+            from app.models.strategy_optimization import StrategyOptimization
+
+            optimization = session.exec(
+                select(StrategyOptimization).where(StrategyOptimization.id == optimization_id)
+            ).first()
+        except Exception as exc:
+            # Provenance that cannot be read is not provenance: fall through to unresolved
+            # rather than guessing a store.
+            logger.warning(f"could not read optimization {optimization_id}: {exc}")
+            optimization = None
+        if optimization is not None:
+            config = _json_blob(getattr(optimization, 'optimization_config', None))
+            if config:
+                _store_keys(config, found)
+                if found:
+                    source = f'optimization_config#{optimization_id}'
+
+    if not found:
+        return OptionStoreProvenance()
+
+    return OptionStoreProvenance(
+        store=found.get('options_store'),
+        db_path=found.get('options_cache_db') or found.get('options_db_path'),
+        source=source,
+    )
 
 
 def contract_detail(reader: Any, occ_symbol: Optional[str], event: Optional[datetime]) -> Dict[str, Any]:
     """Greeks/IV/OI for one contract as of one event, from the CACHE only.
 
-    ``latest_bar_on_or_before`` is the cache's own point-in-time reader, so the lookup is
-    clamped and NEVER looks forward: a bar after the event is not evidence about the event.
+    **Observation availability (review R7).** A daily bar is known only at its session close,
+    so a 13:30 entry cannot read its OWN day's bar: that bar's IV/delta is built from a close
+    that had not happened yet. A timestamped event therefore reads the newest session
+    STRICTLY BEFORE it and is labelled ``approximate_prior_session`` -- the same rule, and the
+    same helper, the underlying-reference panel already uses, so the two panels cannot
+    describe different observation times. A date-only event cannot be placed inside a session
+    at all, so its own session's bar is used and labelled ``daily_reference``.
 
     A NULL field stays ``None``. The migration that added these columns left older rows NULL
     on purpose -- "those greeks were never fetched" -- and a zero would read as a measured
     delta of zero.
     """
     blank = {
-        'asOf': None, 'quality': 'unavailable', 'source': None,
-        **{field: None for field in _CONTRACT_FIELDS},
+        'asOf': None, 'observedAt': None, 'quality': 'unavailable', 'source': None,
+        **{field: None for field in _CONTRACT_RESPONSE_FIELDS.values()},
     }
     if reader is None or not occ_symbol or event is None:
         return {**blank, 'reason': 'no option store or no contract identity for this leg'}
 
+    if _has_time_of_day(event):
+        # The session whose close the event could have known is the PRIOR one.
+        lookup_day = _session_date(event) - timedelta(days=1)
+        quality = 'approximate_prior_session'
+    else:
+        lookup_day = _session_date(event)
+        quality = 'daily_reference'
+
     try:
-        row = reader.latest_bar_on_or_before(occ_symbol, event.date().isoformat())
+        row = reader.latest_bar_on_or_before(occ_symbol, lookup_day.isoformat())
     except Exception as exc:  # an unreadable cache is a data error, not an invented price
         logger.warning(f"option cache read failed for {occ_symbol}: {exc}")
         return {**blank, 'reason': f'option cache unreadable: {exc}'}
 
     if not row:
-        return {**blank, 'reason': 'no cached contract bar at or before the event'}
+        return {**blank, 'reason': f'no cached contract bar at or before {lookup_day.isoformat()}'}
 
-    values = {field: row.get(field) for field in _CONTRACT_FIELDS}
+    values = {_CONTRACT_RESPONSE_FIELDS[field]: row.get(field) for field in _CONTRACT_FIELDS}
+    has_greeks = any(values[field] is not None for field in ('iv', 'delta'))
+    as_of = row.get('date')
+
+    # Every caveat travels with the value, rather than one replacing another.
+    notes: List[str] = []
+    if not has_greeks:
+        notes.append('iv/greeks were never fetched for this bar')
+    if quality == 'approximate_prior_session':
+        notes.append(
+            'daily bars are known only at their session close, so this is the last completed '
+            'session before the event -- an approximation, not an entry-time quote'
+        )
+    if has_greeks and values.get('openInterest') is None:
+        # Open interest is NOT in the daily contract-bar table (it lives on option_chain, a
+        # per-build snapshot): say so rather than leaving a bare null that reads as zero or as
+        # a bug. No unrelated snapshot is substituted for it.
+        notes.append("open interest is not part of this store's daily contract bars")
+    reason = '; '.join(notes) or None
     return {
         **values,
-        'asOf': row.get('date'),
-        'quality': 'cache_bar' if any(values[field] is not None for field in ('iv', 'delta')) else 'partial',
+        'asOf': as_of,
+        'observedAt': as_of,
+        'quality': quality if has_greeks else 'partial',
         'source': getattr(reader, 'db_path', None),
-        'reason': None if values.get('iv') is not None else 'iv/greeks were never fetched for this bar',
+        'reason': reason,
     }
 
 
@@ -397,8 +514,13 @@ def _reference(
     }
 
 
-def build_trade_chart_context(backtest: Any, trade_id: int) -> Dict[str, Any]:
-    """Assemble the chart context for one saved row of one backtest."""
+def build_trade_chart_context(backtest: Any, trade_id: int, session: Any = None) -> Dict[str, Any]:
+    """Assemble the chart context for one saved row of one backtest.
+
+    ``session`` is only used to follow ``optimization_id`` to the run's recorded option
+    store (see ``option_store_provenance``); passing nothing still yields the bars, the legs
+    and the money, with contract detail reported as unavailable.
+    """
     row = row_for_trade_id(backtest, trade_id)
     rows = _transaction_rows(backtest, row)
     saved = saved_trades(backtest)
@@ -407,14 +529,23 @@ def build_trade_chart_context(backtest: Any, trade_id: int) -> Dict[str, Any]:
     legs = [_leg(candidate, id_of.get(id(candidate), 0)) for candidate in rows]
 
     # ONE reader for the whole context, and only if the run's store is actually known.
-    store_path = options_store_path(backtest)
+    provenance = option_store_provenance(backtest, session)
     contract_reader = None
-    if store_path:
+    store_problem = None
+    if provenance.resolved and provenance.is_sqlite and provenance.db_path:
         try:
             from app.services.backtest.options_cache import OptionsHistoryCache
-            contract_reader = OptionsHistoryCache(store_path)
+            # read_only: serving a chart must not create, migrate or index anything (R8).
+            contract_reader = OptionsHistoryCache(provenance.db_path, read_only=True)
         except Exception as exc:
-            logger.warning(f"could not open the option store at {store_path}: {exc}")
+            store_problem = f"the run's option store could not be opened read-only: {exc}"
+            logger.warning(f"could not open the option store at {provenance.db_path}: {exc}")
+    elif provenance.resolved:
+        store_problem = (
+            f"the run read a '{provenance.store}' option store; this popup's read-only reader "
+            f"covers the sqlite store only, and reading a different store would put another "
+            f"dataset's greeks beside these prices"
+        )
 
     engine_type = _text(getattr(backtest, "engine_type", None)) or ""
     provider = PROVIDER_BY_ENGINE.get(engine_type)
@@ -492,11 +623,12 @@ def build_trade_chart_context(backtest: Any, trade_id: int) -> Dict[str, Any]:
     if legs and contract_reader is None:
         notices.append({
             "code": "option_store_unresolved",
-            "message": (
-                "The run's option store is not recorded on this saved result, so per-leg "
-                "greeks/IV/open interest are not shown. The store path travels in the run "
-                "config (options_cache_db) rather than on the backtest row, and no platform "
-                "default is substituted: that would read a different dataset's greeks."
+            "message": store_problem or (
+                "The option store this run read is not recorded on the saved result, so "
+                "per-leg greeks/IV/open interest are not shown. The store is recorded in the "
+                "run config (options_store / options_cache_db) and reached through "
+                "strategy_params or the linked optimization; no platform default is "
+                "substituted, because that would read a different dataset's greeks."
             ),
         })
 

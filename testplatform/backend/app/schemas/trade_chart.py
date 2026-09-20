@@ -43,11 +43,21 @@ class ContractDetail(BaseModel):
     """Greeks/IV/OI for one contract at one event, as the option cache recorded them.
 
     A NULL field is NOT RECORDED -- the column migration left older rows NULL deliberately.
-    ``quality`` says how much of the row was actually there: ``cache_bar`` (iv present),
-    ``partial`` (the bar exists but the greeks were never fetched) or ``unavailable``.
+
+    ``quality`` says WHICH observation this is, not just whether it loaded:
+
+    * ``approximate_prior_session`` -- the newest session STRICTLY BEFORE a timestamped event.
+      A daily bar is known only at its session close, so a 13:30 entry cannot read its own
+      day's bar; this is an approximation with an age, never an entry-time quote.
+    * ``daily_reference`` -- a date-only event, which cannot be placed inside a session at
+      all, reading its own session's bar.
+    * ``cache_bar`` -- iv present for the event's own session.
+    * ``partial`` -- a bar exists but the greeks were never fetched.
+    * ``unavailable`` -- nothing was read, with ``reason`` saying why.
     """
 
     asOf: Optional[str] = None
+    observedAt: Optional[str] = None
     iv: Optional[float] = None
     delta: Optional[float] = None
     gamma: Optional[float] = None
@@ -55,7 +65,9 @@ class ContractDetail(BaseModel):
     vega: Optional[float] = None
     openInterest: Optional[float] = None
     volume: Optional[float] = None
-    quality: Literal["cache_bar", "partial", "unavailable"] = "unavailable"
+    quality: Literal[
+        "cache_bar", "approximate_prior_session", "daily_reference", "partial", "unavailable",
+    ] = "unavailable"
     source: Optional[str] = None
     reason: Optional[str] = None
 
