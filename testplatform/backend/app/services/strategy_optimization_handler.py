@@ -662,6 +662,12 @@ class MemoryGovernor:
         return "ok"
 
 
+#: How long ``_SlotPools.abandon_slot`` waits for a wedged worker to honour SIGTERM before
+#: escalating to SIGKILL. Kept short: the worker is already known to be unresponsive, and this delay
+#: sits directly in the recovery path.
+_ABANDON_KILL_GRACE_S = 5.0
+
+
 class _SlotPools:
     """One SINGLE-WORKER pool per slot, so a worker can be recycled without a global barrier.
 
@@ -737,12 +743,28 @@ class _SlotPools:
         except Exception:  # noqa: BLE001 -- best effort; terminating the process is the real fix
             pass
         killed = 0
-        for proc in list((getattr(pool, "_processes", None) or {}).values()):
+        procs = list((getattr(pool, "_processes", None) or {}).values())
+        for proc in procs:
             try:
                 proc.terminate()
                 killed += 1
             except Exception:  # noqa: BLE001 -- a process already gone is the desired end state
                 pass
+        # ESCALATE (2026-09-21 review): terminate() is best effort. A worker wedged in an
+        # uninterruptible state, or one that ignores SIGTERM, would otherwise leave the slot dead
+        # for the rest of the run -- exactly the "one wedge kills the grid" failure this whole path
+        # exists to remove. Bounded grace, then SIGKILL, which cannot be caught or ignored.
+        hard = 0
+        deadline = _time.monotonic() + _ABANDON_KILL_GRACE_S
+        while _time.monotonic() < deadline and any(p.is_alive() for p in procs):
+            _time.sleep(0.05)
+        for proc in procs:
+            if proc.is_alive():
+                try:
+                    proc.kill()
+                    hard += 1
+                except Exception:  # noqa: BLE001
+                    pass
         try:
             pool.shutdown(wait=False, cancel_futures=True)
         except Exception as e:  # noqa: BLE001 -- a failed teardown must not lose the run
@@ -750,8 +772,9 @@ class _SlotPools:
         self.pools[idx] = self._make()
         self.tasks[idx] = 0
         self.recycles += 1
-        log(f"slot {idx}: abandoned a wedged trial ({killed} worker process(es) terminated) -- "
-            f"fresh pool built, slot reusable")
+        log(f"slot {idx}: abandoned a wedged trial ({killed} worker process(es) terminated"
+            + (f", {hard} SIGKILLed after ignoring SIGTERM" if hard else "")
+            + ") -- fresh pool built, slot reusable")
         return idx
 
     def release_all(self) -> Dict[str, float]:
@@ -1327,6 +1350,40 @@ def _prepare_master_market_conditions(opt_id: int, db: Any,
     return None
 
 
+#: Prefix of the error_message written when a search ends with ZERO MEASURED trials (every trial
+#: either crashed or was abandoned as stalled). ``tools/run_options_matrix.py`` reads this prefix and
+#: CONTINUES to the next job instead of stopping the campaign: the 2026-09-20 abort showed that
+#: killing the whole matrix over one job costs far more than the job is worth, and a stall-only
+#: search has no result worth protecting. The row stays `failed` (never `completed`) so it is
+#: visible and re-runnable, and its checkpoint is PRESERVED rather than cleared. Keep the literal in
+#: sync with tools/run_options_matrix.py -- test_no_measurement_policy pins the two together.
+NO_MEASUREMENT_MARKER = "no measured trials"
+
+
+def _count_measured(all_results: list) -> int:
+    """How many records came from a REAL backtest run.
+
+    Derived from the records rather than counted alongside them: there is more than one append site
+    (the local-trial path and the dispatcher's result path), so a hand-maintained counter drifts --
+    the first cut of this fix produced "11 record(s), 0 measured" and an UnboundLocalError in the
+    path that never incremented it. Stalled diagnostics are the only non-measurements.
+    """
+    return sum(1 for r in (all_results or [])
+               if isinstance(r, dict) and r.get("status") != "stalled")
+
+
+def _final_status(all_results: list) -> str:
+    """End-of-search outcome: ``'completed'`` | ``'no_measurements'`` | ``'failed'``.
+
+    ``all_results`` is NOT the test: a stalled record lands there too, and treating a non-empty
+    list as evidence of success marked an all-stalled search ``completed``, cleared its checkpoint
+    and let Top-N export a "winner" that never ran (2026-09-21 review, G2).
+    """
+    if _count_measured(all_results) > 0:
+        return "completed"
+    return "no_measurements" if all_results else "failed"
+
+
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
     """Mark the StrategyOptimization row failed + return the failure dict."""
     logger.error(f"strategy_optimization {opt_id} failed: {msg}")
@@ -1667,6 +1724,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                             "total_return": 0.0,
                             "max_drawdown": 0.0,
                             "secs": _stall_s,
+                            "slot": slot,
                             "error": f"stalled: no progress in {_stall_s:.0f}s",
                         })
                     logger.error(
@@ -1840,7 +1898,16 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                             all_results.append({
                                 "params": flat, "fitness": fit, "key": key, "trades": 0,
                                 "fitness_raw": fit, "robustness": None,
-                                "total_return": 0.0, "max_drawdown": 0.0})
+                                "total_return": 0.0, "max_drawdown": 0.0,
+                                # DIAGNOSTICS, not a measurement (2026-09-21 review): the score is a
+                                # sentinel, so record WHAT happened -- reason, how long it burned,
+                                # which slot wedged -- instead of leaving zeros to imply a measured
+                                # flat result. `status` is what Top-N selection and the finalization
+                                # guard key on, so it must never be dropped.
+                                "status": "stalled",
+                                "stall_reason": out.get("error"),
+                                "stall_secs": out.get("secs"),
+                                "stall_slot": out.get("slot")})
                             logger.error(f"trial STALLED (scored {fit:.0e}, memoized): "
                                          f"{out.get('error')}")
                         else:
@@ -2122,11 +2189,32 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # empty and best_fitness is a meaningless default. The GA swallows per-trial
         # exceptions as warnings, so without this guard the optimization would report
         # "completed" having evaluated NOTHING. Fail loudly instead.
-        if not all_results:
+        #
+        # `measured == 0` matters as much as an EMPTY all_results: stalled records now live in
+        # all_results (so the frequency stays countable), which means a stall-only search would
+        # otherwise sail through this guard as `completed`, clear its checkpoint and let Top-N
+        # export a "winner" that never ran (2026-09-21 review, G2). Both are failures; the
+        # stall-only one is named with a marker the matrix driver treats as SKIP-not-STOP, and its
+        # checkpoint is PRESERVED.
+        _outcome = _final_status(all_results)
+        if _outcome != "completed":
             if fatal["msg"]:
                 # A FATAL data error (OHLCV cache miss) — surface the actionable message directly
                 # instead of the generic "check the logs" hint.
                 return _fail(opt_id, db, fatal["msg"])
+            if _outcome == "no_measurements":
+                n_stalled = sum(1 for r in all_results if r.get("status") == "stalled")
+                res = _fail(
+                    opt_id, db,
+                    f"{NO_MEASUREMENT_MARKER}: {len(all_results)} record(s), {n_stalled} stalled "
+                    f"and 0 measured. The checkpoint was PRESERVED so this job can be resumed or "
+                    f"re-run; no Top-N backtest was exported. If the trials are genuinely SLOW "
+                    f"rather than wedged, raise BT_LOCAL_STALL_TIMEOUT_S (default 5400s).",
+                )
+                # Distinct from a generic failure: tools/run_options_matrix.py skips the job rather
+                # than stopping the campaign, and the CLI can print this without the JSON dump.
+                res["status"] = "no_measurements"
+                return res
             return _fail(
                 opt_id, db,
                 "optimization produced 0 successful trials — every backtest failed. Check the "

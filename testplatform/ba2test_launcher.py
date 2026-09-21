@@ -6189,6 +6189,14 @@ def _cmd_optimize(args) -> int:
         return 0
 
     res = handle_strategy_optimization("cli-optimize", {"optimization_id": opt_id})
+    if res.get("status") == "no_measurements":
+        # Stall-only search (2026-09-21 review, G2): nothing was measured, so there is no winner to
+        # export (and _persist_top_backtests would find no candidate anyway). The row is `failed`
+        # with a marker that tools/run_options_matrix.py reads to SKIP this job rather than stop the
+        # campaign; its checkpoint was preserved for a retry.
+        print(f"ba2-test: optimization {opt_id} produced NO measured trials (every trial stalled or "
+              f"failed). Checkpoint PRESERVED; the matrix skips this job and continues.")
+        sys.exit(1)
     if res.get("status") != "completed":
         print(json.dumps(res, indent=2, default=str))
         sys.exit(f"ba2-test: optimization {opt_id} did not complete")
@@ -6473,6 +6481,77 @@ def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitnes
     return _persist_trial_worker(trial_cfg)
 
 
+def _kill_executor(ex) -> None:
+    """Terminate a ProcessPoolExecutor's workers WITHOUT waiting for their work (best effort).
+
+    Mirrors the GA's stall recovery: ``shutdown(wait=True)`` -- what a ``with`` block does -- blocks
+    on a wedged worker, which is exactly the thing being walked away from. SIGTERM first, a bounded
+    grace period, then SIGKILL (uncatchable), so a worker that ignores SIGTERM still cannot hold the
+    process open.
+    """
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    import time  # local, like the rest of this module's stdlib use
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and any(p.is_alive() for p in procs):
+        time.sleep(0.05)
+    for p in procs:
+        if p.is_alive():
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
+    """Top-N candidates by DISTINCT fitness, EXCLUDING non-measurements (stalled records).
+
+    Returns ``(ranked, skipped)``: ``ranked`` is a list of ``(params, key, fitness)`` and
+    ``skipped`` counts the diagnostic records that were dropped.
+
+    Dedup is on fitness, not raw params: a converged GA yields many param sets that differ only in
+    INERT genes (e.g. ``exit:<id>:action_value`` while ``exit:<id>:enabled=0``) yet score the same
+    and produce identical backtests -- keying on params would persist N behaviourally-identical rows.
+
+    WHY NON-MEASUREMENTS ARE EXCLUDED (2026-09-21 review, G1): a stalled record carries a sentinel
+    score and has NO buffered result, so selecting it here makes the export RE-RUN -- with no
+    timeout of its own -- the very trial the stall guard just abandoned. That can hang the grid
+    again AFTER a successful recovery. Diagnostics stay in ``all_results`` so the frequency stays
+    countable; they are not candidates. Fewer saved backtests is the correct answer when the search
+    is thin.
+    """
+    from app.services.strategy_fitness import STALLED_SENTINEL
+    seen, ranked, skipped = set(), [], 0
+    for r in sorted(all_results or [],
+                    key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9),
+                    reverse=True):
+        fit = r.get("fitness")
+        if r.get("status") == "stalled" or fit == STALLED_SENTINEL:
+            skipped += 1
+            continue
+        dedup_key = (round(fit, 6) if isinstance(fit, (int, float))
+                     else _json.dumps(r.get("params"), sort_keys=True, default=str))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        # Carry the FITNESS, not just the params. It is the only record of how the GA actually
+        # ranked these rows -- the persisted metric columns are its inputs, and re-deriving the
+        # order from any one of them drops the other three terms.
+        ranked.append((r["params"], r.get("key"), fit))
+        if len(ranked) >= n:
+            break
+    if not ranked and best_params and best_fitness != STALLED_SENTINEL:
+        # No trial key known -> always falls back to re-run. best_fitness is the score of exactly
+        # this genome (it is what made it `best`), so it is the right value here -- UNLESS the
+        # search never measured anything, in which case there is no winner to export at all.
+        ranked = [(best_params, None, best_fitness)]
+    return ranked, skipped
+
+
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
                             last_gen_full_results: Optional[Dict[str, Any]] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
@@ -6530,28 +6609,18 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 break
 
         # Top-N param sets by DISTINCT fitness (fall back to best_params if all_results is thin).
-        # Dedup on fitness, not raw params: a converged GA yields many param sets that differ only
-        # in INERT genes (e.g. exit:<id>:action_value while exit:<id>:enabled=0) yet score the same
-        # and produce identical backtests — keying on params would persist N behaviourally-identical
-        # rows. Distinct fitness gives genuinely different performers across the search landscape.
+        # The selection itself lives in _rank_measured_candidates so that excluding
+        # non-measurements (stalled records) is unit-testable -- see the 2026-09-21 review, G1.
         last_gen_full_results = last_gen_full_results or {}
-        seen, ranked = set(), []
-        for r in sorted(opt.all_results or [], key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9), reverse=True):
-            fit = r.get("fitness")
-            dedup_key = round(fit, 6) if isinstance(fit, (int, float)) else _json.dumps(r.get("params"), sort_keys=True, default=str)
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            # Carry the FITNESS, not just the params. It is the only record of how the GA
-            # actually ranked these rows -- the persisted metric columns are its inputs, and
-            # re-deriving the order from any one of them drops the other three terms.
-            ranked.append((r["params"], r.get("key"), fit))
-            if len(ranked) >= n:
-                break
-        if not ranked and opt.best_params:
-            # No trial key known -> always falls back to re-run. best_fitness is the score of
-            # exactly this genome (it is what made it `best`), so it is the right value here.
-            ranked = [(opt.best_params, None, opt.best_fitness)]
+        ranked, _skipped_non_measured = _rank_measured_candidates(
+            opt.all_results, n, opt.best_params, opt.best_fitness)
+        if _skipped_non_measured:
+            print(f"    top-N: skipped {_skipped_non_measured} non-measured (stalled) record(s) "
+                  f"-- a stall is a diagnostic, not a candidate")
+        if not ranked:
+            print("    top-N: nothing to persist -- no MEASURED candidate (every trial stalled or "
+                  "failed). No backtest was exported; the optimization row carries the reason.")
+            return 0
 
         # 1) Build every re-run's spec in the MASTER (cheap: decode + config + display params).
         #    Store the raw optimized genes (for the "Optimized Parameters" display) AND the CONCRETE
@@ -6675,32 +6744,44 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             master_version = get_version_info().get("app_version")
             remote_workers = [w for w in remote_workers if ensure_synced(w, master_version, log=print)]
 
-        if (n_local > 1 or remote_workers) and len(specs) > 1:
-            import multiprocessing as _mp
-            import os as _os
-            from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-            from app.services.strategy_optimization_handler import (
-                _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
-            )
-            env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
-            fitness_metric = opt.fitness_metric or "consistent_annual_return"
-            print(f"    persisting top {len(specs)} across {n_local} local + "
-                  f"{len(remote_workers)} remote worker(s)...")
-            with ProcessPoolExecutor(
-                max_workers=n_local, mp_context=_mp.get_context("spawn"),
-                initializer=_worker_init, initargs=(_BACKEND_DIR, env),
-            ) as local_ex, ThreadPoolExecutor(max_workers=max(1, len(remote_workers))) as remote_ex:
-                # Round-robin each spec across every available slot (n_local local + one per
-                # remote worker) -- with n <= save-top (default 5) this just spreads a handful of
-                # re-runs across whatever capacity is on hand, no need for real load balancing.
-                slots = (["local"] * n_local) + remote_workers
-                futs = {}
-                for idx, (rk, tc, sp2) in enumerate(specs):
-                    slot = slots[idx % len(slots)]
-                    fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
-                           else remote_ex.submit(_remote_then_local, slot, tc, fitness_metric))
-                    futs[fut] = (rk, tc, sp2)
-                for fut in as_completed(futs):
+        if not specs:
+            return persisted
+        import multiprocessing as _mp
+        import os as _os
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+        from concurrent.futures import TimeoutError as _FutureTimeout
+        from app.services.strategy_optimization_handler import (
+            _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
+        )
+        env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
+        fitness_metric = opt.fitness_metric or "consistent_annual_return"
+        # BOUND THE EXPORT (2026-09-21 review, G1). A re-run of an otherwise VALID candidate can
+        # hang exactly like a GA trial, and this phase used to wait on it FOREVER: as_completed had
+        # no timeout, and the `with` block's shutdown(wait=True) would block on the hung worker even
+        # if the loop had returned. Same policy as the GA's stall recovery -- bounded window, drop
+        # what has not finished, kill the pool rather than wait on it. This also removes the old
+        # synchronous single-candidate branch, which had no bound at all.
+        export_timeout = float(_os.environ.get("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
+        print(f"    persisting top {len(specs)} across {n_local} local + "
+              f"{len(remote_workers)} remote worker(s) (export bound {export_timeout:.0f}s)...")
+        local_ex = ProcessPoolExecutor(
+            max_workers=n_local, mp_context=_mp.get_context("spawn"),
+            initializer=_worker_init, initargs=(_BACKEND_DIR, env),
+        )
+        remote_ex = ThreadPoolExecutor(max_workers=max(1, len(remote_workers)))
+        try:
+            # Round-robin each spec across every available slot (n_local local + one per remote
+            # worker) -- with n <= save-top (default 5) this just spreads a handful of re-runs
+            # across whatever capacity is on hand, no need for real load balancing.
+            slots = (["local"] * n_local) + remote_workers
+            futs = {}
+            for idx, (rk, tc, sp2) in enumerate(specs):
+                slot = slots[idx % len(slots)]
+                fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
+                       else remote_ex.submit(_remote_then_local, slot, tc, fitness_metric))
+                futs[fut] = (rk, tc, sp2)
+            try:
+                for fut in as_completed(futs, timeout=export_timeout):
                     rk, tc, sp2 = futs[fut]
                     try:
                         out = fut.result()
@@ -6710,11 +6791,18 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                     if _persist_one(rk, tc, sp2, out):
                         persisted += 1
                         print(f"    persisted TOP{rk} ({persisted}/{len(ranked)})")
-        else:
-            for rk, cfg, sp2 in specs:
-                if _persist_one(rk, cfg, sp2, _persist_trial_worker(cfg)):
-                    persisted += 1
-                    print(f"    persisted TOP{rk} ({persisted}/{len(ranked)})")
+            except _FutureTimeout:
+                stuck = [rk for f, (rk, _, _) in futs.items() if not f.done()]
+                print(f"    TOP-N export exceeded {export_timeout:.0f}s -- DROPPING TOP{stuck} "
+                      f"(persisted {persisted}/{len(ranked)}). A hung re-run must not stop the "
+                      f"matrix; the pool is killed rather than waited on.")
+        finally:
+            _kill_executor(local_ex)
+            for ex in (local_ex, remote_ex):
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except Exception:  # noqa: BLE001 — teardown must never mask the export result
+                    pass
         return persisted
     finally:
         db.close()

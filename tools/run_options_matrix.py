@@ -117,6 +117,15 @@ def _db_path() -> str:
     return os.getenv("DB_FILE", r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db")
 
 
+#: Mirrors ``NO_MEASUREMENT_MARKER`` in
+#: testplatform/backend/app/services/strategy_optimization_handler.py -- keep the two literals
+#: identical (test_no_measurement_policy pins them together). A job that ends with ZERO MEASURED
+#: trials (every trial crashed or was abandoned as stalled) is recorded as `failed` with this prefix
+#: in error_message, and the campaign CONTINUES: killing the whole matrix over one job costs far more
+#: than the job is worth, and a stall-only search has no result worth protecting.
+NO_MEASUREMENT_MARKER = "no measured trials"
+
+
 def _completed_names() -> set:
     import sqlite3
     path = Path(_db_path()).resolve()
@@ -129,6 +138,31 @@ def _completed_names() -> set:
     finally:
         c.close()
     return {r[0] for r in rows}
+
+
+def _failure_reason(name: str) -> str:
+    """error_message of the newest row for ``name`` ('' when there is none).
+
+    Read-only and best effort: the driver must never crash on a DB hiccup, and an unreadable reason
+    simply means "treat it as an ordinary failure" (stop the campaign), which is the safe default.
+    """
+    import sqlite3
+    path = Path(_db_path()).resolve()
+    if not path.exists():
+        return ""
+    try:
+        c = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        row = c.execute(
+            "SELECT error_message FROM strategy_optimizations WHERE name=? "
+            "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        c.close()
+    return (row[0] or "") if row else ""
 
 
 def _jobs(experts, strategies, name_suffix=""):
@@ -547,6 +581,15 @@ def main(argv=None) -> int:
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
         if rc != 0:
+            reason = _failure_reason(name)
+            if reason.startswith(NO_MEASUREMENT_MARKER):
+                # A stall-only job (2026-09-21 review, G2). Its checkpoint was PRESERVED, so a later
+                # pass can resume or re-run it; it must not stop the other 15 jobs, which is what
+                # happened on 2026-09-20 when the same class of failure killed the campaign.
+                print(f"[{i}/{len(jobs)}] {name} produced {NO_MEASUREMENT_MARKER} (stall-only); "
+                      f"recorded and SKIPPED -- the campaign continues. Re-run this job later; "
+                      f"its checkpoint was preserved.", flush=True)
+                continue
             print(f"options matrix stopped: {name} failed; remaining jobs were not launched.", flush=True)
             return rc if rc > 0 else 1
     print("options matrix driver: done.")
