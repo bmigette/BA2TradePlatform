@@ -364,6 +364,13 @@ def test_remote_then_local_falls_back_after_two_remote_failures(monkeypatch):
         _soh, "_persist_trial_worker",
         lambda cfg: {"ok": True, "results": {"from": "local-fallback"}},
     )
+    # The fallback now runs in a KILLABLE PROCESS POOL, bounded by the export deadline
+    # (2026-09-21 recheck, H1), and a patched lambda cannot be pickled into a spawned worker.
+    # Swap in a thread pool so this test keeps testing the FALLBACK DECISION; the process
+    # isolation itself is covered by tests/test_grid_stall_recheck_fixes.py.
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(mod, "_new_local_pool",
+                        lambda max_workers=1: ThreadPoolExecutor(max_workers))
 
     out = mod._remote_then_local(_FAKE_WORKER, {"name": "TOP1"}, "sharpe")
 

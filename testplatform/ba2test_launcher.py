@@ -6504,11 +6504,16 @@ def _new_local_pool(max_workers: int = 1):
     Shared so the remote fallback runs the same way a `local` slot does: same interpreter, same
     worker env, same backend dir. (2026-09-21 recheck, H1.)
     """
+    # Self-contained imports: the export block reaches these through LOCAL aliases of its own
+    # (`_os`, `_mp`, and a local `from ... import _WORKER_ENV_KEYS`), which do not exist at module
+    # scope. A helper that borrowed them raised NameError the moment it was called from anywhere
+    # else -- caught by the persist-top tests, which exercise the fallback path directly.
+    import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
-    from app.services.strategy_optimization_handler import _worker_init
-    env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
+    from app.services.strategy_optimization_handler import _WORKER_ENV_KEYS, _worker_init
+    env = {k: os.environ[k] for k in _WORKER_ENV_KEYS if os.environ.get(k)}
     return ProcessPoolExecutor(
-        max_workers=max_workers, mp_context=_mp.get_context("spawn"),
+        max_workers=max_workers, mp_context=mp.get_context("spawn"),
         initializer=_worker_init, initargs=(_BACKEND_DIR, env),
     )
 
