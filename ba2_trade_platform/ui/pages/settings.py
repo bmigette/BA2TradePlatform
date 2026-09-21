@@ -1488,7 +1488,12 @@ class ExpertSettingsTab:
             async def handle_upload(e: UploadEventArguments):
                 preview.clear()
                 try:
-                    payload = parse_batch_payload(e.content.read())
+                    # NiceGUI 3.x upload events carry `e.file` (a FileUpload with an ASYNC read),
+                    # not the 2.x-style `e.content` file-like. `e.content.read()` raised
+                    # AttributeError on every machine and the except below rendered it as a
+                    # bogus "could not read that file". Same idiom as the other handlers in
+                    # this module (instrument import, expert settings import).
+                    payload = parse_batch_payload(await e.file.read())
                     plan = plan_batch_import(payload)
                 except Exception as ex:
                     logger.error(f'Could not read batch import file: {ex}', exc_info=True)
