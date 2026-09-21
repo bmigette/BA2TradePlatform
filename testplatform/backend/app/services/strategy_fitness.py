@@ -35,6 +35,16 @@ LOW_TRADE_SENTINEL = -1.0e8
 # alongside it.
 WIPED_OUT_SENTINEL = -2.0e9
 
+# A trial whose WORKER WEDGED. The local pool's stall guard saw no completion for
+# BT_LOCAL_STALL_TIMEOUT_S (default 5400s) and now ABANDONS that individual instead of failing the
+# whole job (2026-09-21: one wedged genome killed a 16-job matrix and cost 7.5h of downtime).
+# Distinct from every sentinel above so the frequency is COUNTABLE in all_results -- the operator
+# asked to see how often it happens -- and ranked BELOW WIPED_OUT_SENTINEL because it is the only
+# value here that is not a measurement of the genome at all, and the documented invariant is that
+# a real outcome outranks a non-measurement:
+#   STALLED_SENTINEL < WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0
+STALLED_SENTINEL = -3.0e9
+
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
 _CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above this, linear below
@@ -135,7 +145,8 @@ _OCAR_DD_FLOOR = 5.0
 # LOW_TRADE_SENTINEL (-1e8), which is numerically ABOVE WIPED_OUT_SENTINEL (-2e9) and even
 # ABOVE ZERO_TRADE_SENTINEL (-1e9) -- "a 3-trade blow-up outranks never trading". The decided
 # invariant is that a measured wipeout ranks WORST of every other disqualification the metric
-# produces, full stop: WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0. A
+# produces, full stop: WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0 (with
+# STALLED_SENTINEL below all three: a wedged worker is not a measurement of the genome). A
 # wiped account teaches the GA nothing a losing-but-alive or merely-thin-data genome would, and
 # collapsing it into either of those buckets would let the search read it as "somewhat bad"
 # instead of "never do this again".
@@ -914,7 +925,7 @@ def _min_with_stressed(base_fitness: float, fitness_metric: str, results: dict,
         stress_spread_bps = float(results.get("stress_spread_bps") or 0.0)
     if stress_spread_bps <= 0:
         return base_fitness
-    if base_fitness in (ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
+    if base_fitness in (STALLED_SENTINEL, ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
         return base_fitness
     stressed = stressed_results(results, stress_spread_bps)
     if stressed is None:
@@ -1057,7 +1068,7 @@ def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0) 
     a bad genome look BETTER, which is the classic sign-flip bug in penalty schemes.
     """
     comp = robustness_metrics(results, spread_bps)
-    if base_fitness in (ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
+    if base_fitness in (STALLED_SENTINEL, ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
         return base_fitness, comp
     if base_fitness <= 0:
         return base_fitness, comp
