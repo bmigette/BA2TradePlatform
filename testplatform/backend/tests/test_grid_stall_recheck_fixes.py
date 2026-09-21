@@ -59,6 +59,16 @@ _SENTINEL = fitness.STALLED_SENTINEL
 # --- H2/H5: ONE measurement predicate, shared by counting and ranking --------------------------
 
 class TestOneMeasurementPredicate:
+    @pytest.mark.parametrize('score', [float('nan'), float('inf'), float('-inf'), True, False,
+                                      pytest.param(10 ** 400, id='overflowing_integer')])
+    def test_nonfinite_scores_and_booleans_are_not_measurements(self, score):
+        assert fitness.is_measured_result({'params': {}, 'fitness': score}) is False
+
+    @pytest.mark.parametrize('score', [fitness.ZERO_TRADE_SENTINEL, fitness.LOW_TRADE_SENTINEL,
+                                      fitness.WIPED_OUT_SENTINEL, 0.0, -2.5, 10.0])
+    def test_finite_observed_outcomes_remain_measurements(self, score):
+        assert fitness.is_measured_result({'params': {}, 'fitness': score}) is True
+
     def test_an_old_format_stalled_record_is_not_a_measurement(self):
         # What the patch BEFORE the recheck wrote: the sentinel, and no status field at all.
         assert fitness.is_measured_result({"params": {"a": 1}, "fitness": _SENTINEL}) is False
@@ -92,6 +102,33 @@ class TestOneMeasurementPredicate:
 # --- H5: ranking tolerates a missing fitness instead of raising --------------------------------
 
 class TestRankingToleratesMissingFitness:
+    def test_records_without_a_usable_genome_are_not_exported(self):
+        records = [{'fitness': 100.0}, {'params': None, 'fitness': 200.0},
+                   {'params': 'bad', 'fitness': 300.0}, {'params': {}, 'fitness': 1.0}]
+        ranked, skipped = _launcher_mod._rank_measured_candidates(records, 5, None, None)
+        assert ranked == [({}, None, 1.0)]
+        assert skipped == 3
+
+    def test_invalid_best_genome_is_not_exported(self):
+        assert _launcher_mod._rank_measured_candidates([], 5, 'bad', 1.0)[0] == []
+
+    def test_malformed_records_are_filtered_before_sorting_and_counting(self):
+        invalid = [None, 'diagnostic', {'fitness': 'high'}, {'fitness': True},
+                   {'fitness': float('nan')}, {'fitness': float('inf')}]
+        records = invalid + [{'params': {'x': 1}, 'fitness': 3.0},
+                             {'params': {'x': 2}, 'fitness': 9.0}]
+        ranked, skipped = _launcher_mod._rank_measured_candidates(records, 1, None, None)
+        assert ranked == [({'x': 2}, None, 9.0)]
+        assert skipped == len(invalid)
+        assert handler._count_measured(records) == 2
+        assert handler._final_status(invalid) == 'no_measurements'
+
+    @pytest.mark.parametrize('score', [None, 'high', True, float('nan'), float('inf'),
+                                      float('-inf'), _SENTINEL])
+    def test_best_params_cannot_bypass_measurement_validation(self, score):
+        ranked, _ = _launcher_mod._rank_measured_candidates([], 5, {'x': 1}, score)
+        assert ranked == []
+
     def test_a_null_fitness_no_longer_raises(self):
         # Before: NameError from `_json.dumps` in the dedup key.
         ranked, skipped = _launcher_mod._rank_measured_candidates(
@@ -219,6 +256,40 @@ class TestFailureMarkerIsBoundToTheAttempt:
 # --- H1: a timed-out attempt must not keep the launcher alive ----------------------------------
 
 class TestExportIsActuallyBounded:
+    def test_the_real_export_pool_starts_in_the_backend_directory(self):
+        # Persistence unit tests mock the executor; this protects the real factory and
+        # initializer, including the import-scope regression that motivated 7f2f58a5.
+        pool = _launcher_mod._new_local_pool(1)
+        try:
+            assert Path(pool.submit(os.getcwd).result(timeout=60)).resolve() == Path(_root).resolve()
+        finally:
+            _launcher_mod._kill_executor(pool)
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def test_the_real_fallback_pool_is_killed_at_its_deadline(self, monkeypatch):
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+
+        pools = []
+
+        def new_pool(n):
+            pool = ProcessPoolExecutor(max_workers=n, mp_context=multiprocessing.get_context('spawn'))
+            pools.append(pool)
+            return pool
+
+        monkeypatch.setattr(_launcher_mod, '_new_local_pool', new_pool)
+        monkeypatch.setattr(handler, '_persist_trial_worker', time.sleep)
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError, match='remaining export budget'):
+                _launcher_mod._run_local_fallback_bounded(20, deadline=started + 0.5)
+            assert time.monotonic() - started < 10
+            assert pools
+        finally:
+            for pool in pools:
+                _launcher_mod._kill_executor(pool)
+                pool.shutdown(wait=False, cancel_futures=True)
+
     def test_a_past_deadline_refuses_to_start_the_local_fallback(self, monkeypatch):
         started = []
         monkeypatch.setattr(_launcher_mod, "_run_local_fallback_bounded",

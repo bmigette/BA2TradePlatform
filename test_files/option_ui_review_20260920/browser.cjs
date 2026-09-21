@@ -6,7 +6,8 @@ const root = path.resolve(__dirname, '../..');
 const bundled = path.join(os.homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules');
 const {chromium} = require(path.join(bundled, 'playwright'));
 const esbuild = require(path.join(root, 'testplatform/frontend/node_modules/esbuild'));
-const out = path.join(os.tmpdir(), 'ba2-option-ui-review-20260920');
+const label = (process.argv[2] || '20260920').replace(/[^a-zA-Z0-9-]/g, '');
+const out = path.join(os.tmpdir(), `ba2-option-ui-review-${label}`);
 fs.mkdirSync(out, {recursive:true});
 
 const ref = (price) => ({price, eventAt:null, observedAt:'2026-09-07', availableAt:null,
@@ -17,8 +18,8 @@ const leg = {id:1,symbol:'XYZ',underlyingSymbol:'XYZ',contractSymbol:'XYZ260918C
   entryPrice:8,exitPrice:13.3,pnl:530,pnlPercent:5.3,exitReason:'exit',transactionId:'7',
   rowBasis:'aggregate_round_trip',positionStatus:'closed',entryUnderlying:ref(100),
   exitUnderlying:ref(108),unavailableFields:[],
-  entryContract:{iv:.40,delta:.65,gamma:.03,theta:-.04,vega:.20,open_interest:1234,volume:78,quality:'cache_bar',asOf:'2026-09-07'},
-  exitContract:{iv:.38,delta:.75,gamma:.02,theta:-.03,vega:.18,open_interest:1250,volume:82,quality:'cache_bar',asOf:'2026-09-11'}};
+  entryContract:{iv:.40,delta:.65,gamma:.03,theta:-.04,vega:.20,openInterest:1234,volume:78,quality:'approximate_prior_session',asOf:'2026-09-07'},
+  exitContract:{iv:.38,delta:.75,gamma:.02,theta:-.03,vega:.18,openInterest:1250,volume:82,quality:'approximate_prior_session',asOf:'2026-09-10'}};
 const context={schemaVersion:1,backtestId:77,resultDigest:'fixture',selectedTradeId:1,transactionId:'7',
  legs:[leg,{...leg,id:2,contractSymbol:'XYZ260918C00105000',direction:'short',strike:105,
   entryPrice:2,exitPrice:3.6,pnl:-160,pnlPercent:-1.6}],
@@ -71,8 +72,9 @@ const context={schemaVersion:1,backtestId:77,resultDigest:'fixture',selectedTrad
    markersSorted:markers.every((m,i)=>i===0||m.time>=markers[i-1].time),
    priceAxisDragChangedCanvas:canvasBefore!==canvasAfter,
    priceAxisDragUpdatedOverlay:before!==after,
-   rendersGreeks:/Delta|Gamma|Theta|Vega|Open interest/.test(body),
-   rendersPnlScale:canvasTexts.filter(t=>/P&L|expiration/i.test(t)),
+   rendersGreeks:body.includes('Contract detail') && body.includes('0.650') && body.includes('0.0300'),
+   rendersOpenInterest:body.includes('1234') && body.includes('1250'),
+   pnlTickLabels:await page.locator('svg.absolute text').allTextContents(),
    screenshotDirectory:out,canvasTexts};
   fs.writeFileSync(path.join(out,'evidence.json'),JSON.stringify(evidence,null,2));
   console.log(JSON.stringify(evidence,null,2));

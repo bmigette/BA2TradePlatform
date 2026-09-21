@@ -6622,19 +6622,17 @@ def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
     countable; they are not candidates. Fewer saved backtests is the correct answer when the search
     is thin.
     """
-    from app.services.strategy_fitness import STALLED_SENTINEL, is_measured_result
+    from app.services.strategy_fitness import is_measured_result
     seen, ranked, skipped = set(), [], 0
-    for r in sorted(all_results or [],
-                    key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9),
-                    reverse=True):
-        # ONE predicate for counting and ranking (2026-09-21 recheck, H2). It also rejects a
-        # missing/non-numeric fitness, so `fit` is numeric from here on and the dedup key no
-        # longer needs a JSON fallback -- the one that called an out-of-scope `_json` and raised
-        # NameError on exactly the record this helper used to tolerate (H5).
-        if not is_measured_result(r):
+    measured = []
+    for record in all_results or []:
+        if is_measured_result(record) and isinstance(record.get("params"), dict):
+            measured.append(record)
+        else:
             skipped += 1
-            continue
-        fit = r.get("fitness")
+    # Filter before sorting: malformed diagnostic records must never enter comparisons.
+    for r in sorted(measured, key=lambda record: record["fitness"], reverse=True):
+        fit = r["fitness"]
         dedup_key = round(fit, 6)
         if dedup_key in seen:
             continue
@@ -6645,7 +6643,8 @@ def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
         ranked.append((r["params"], r.get("key"), fit))
         if len(ranked) >= n:
             break
-    if not ranked and best_params and best_fitness != STALLED_SENTINEL:
+    if (not ranked and isinstance(best_params, dict) and best_params
+            and is_measured_result({"fitness": best_fitness})):
         # No trial key known -> always falls back to re-run. best_fitness is the score of exactly
         # this genome (it is what made it `best`), so it is the right value here -- UNLESS the
         # search never measured anything, in which case there is no winner to export at all.

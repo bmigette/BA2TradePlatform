@@ -1,0 +1,11 @@
+{
+  "observed_at": "2026-09-21T08:11:24.61751+02:00",
+  "optimization_id": 11,
+  "status": "running",
+  "progress": 0.0,
+  "best_fitness": null,
+  "recorded_results": 0,
+  "stalled_results": 0,
+  "checkpoint_generation": 6,
+  "checkpoint_partial": true
+}

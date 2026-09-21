@@ -1,0 +1,123 @@
+{
+  "reviewed_head": "7f2f58a5",
+  "ranking": {
+    "mixed_numeric_and_string": {
+      "error": "TypeError",
+      "message": "'<' not supported between instances of 'float' and 'str'"
+    },
+    "non_dict_record": {
+      "error": "AttributeError",
+      "message": "'NoneType' object has no attribute 'get'"
+    },
+    "missing_best_fitness_fallback": [
+      [
+        {
+          "x": 1
+        },
+        null,
+        null
+      ]
+    ],
+    "nonfinite_considered_measured": {
+      "nan": true,
+      "infinity": true
+    }
+  },
+  "option_sort": {
+    "current_pnl": {
+      "ids": [
+        2,
+        3
+      ],
+      "total": 3,
+      "pnl_amounts": [
+        200.0,
+        100.0
+      ]
+    },
+    "current_pnl_numeric": {
+      "ids": [
+        1,
+        2
+      ],
+      "total": 3,
+      "pnl_amounts": [
+        900.0,
+        200.0
+      ]
+    },
+    "strategy": {
+      "ids": [
+        3,
+        2
+      ],
+      "total": 3,
+      "pnl_amounts": [
+        100.0,
+        200.0
+      ]
+    },
+    "sortable_name_field_pairs": [
+      [
+        "id",
+        "id"
+      ],
+      [
+        "account",
+        "account_name"
+      ],
+      [
+        "symbol",
+        "symbol"
+      ],
+      [
+        "strategy",
+        "option_strategy"
+      ],
+      [
+        "expiry",
+        "expiry_display"
+      ],
+      [
+        "legs",
+        "leg_count"
+      ],
+      [
+        "direction",
+        "direction"
+      ],
+      [
+        "quantity",
+        "quantity"
+      ],
+      [
+        "open_price",
+        "open_price"
+      ],
+      [
+        "value",
+        "value"
+      ],
+      [
+        "current_pnl",
+        "current_pnl_numeric"
+      ],
+      [
+        "closed_pnl",
+        "closed_pnl_numeric"
+      ],
+      [
+        "status",
+        "status"
+      ],
+      [
+        "created_at",
+        "created_at"
+      ],
+      [
+        "closed_at",
+        "closed_at"
+      ]
+    ]
+  }
+}

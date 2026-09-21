@@ -1,18 +1,16 @@
 # Option trade details in backtest results
 
 Date: 2026-09-20  
-Status: IMPLEMENTATION PRESENT; review corrections largely landed (2026-09-20).
-The [implementation review](../../reports/ui/option_trade_ui_review_2026-09-20.md) reproduced
-ten defects. **Nine are fixed with regressions** — R1/R2 (live spread pricing and the
-order-history payoff, the two money defects), R3 (marker anchoring), R5 (marker layout),
-R6 (contract-detail provenance, field mapping and rendering), R7 (observation availability),
-R8 (read-only cache access), R9 (pagination-independent totals), R10 (worker-thread reads).
-**R4 (price-axis drag) has a fix — the overlay now watches the price projection instead of
-trusting the time-range event — but its browser regression has NOT been re-run**, so it is
-unverified rather than done. Not started: the review's remaining presentation items (P&L tick
-labels on the SVG overlay, shading clipped to the visible price range, live moneyness/limit
-figures, structure-parent selection, Escape/focus containment). The acceptance checklist is
-therefore still incomplete, and deployed-app/broker validation remains separate.
+Status: IMPLEMENTATION PRESENT; synced review through `7f2f58a5` completed 2026-09-21.
+The [latest review](../../reports/strategy_research/synced_grid_option_ui_review_2026-09-21.md)
+confirms corrections to the earlier single-leg loader crash, SQLAlchemy provenance lookup,
+500-row browse cap, incomplete executed-leg valuation and quote snapshot scope. The subsequent
+local fix resolves the Options table's UI column names before sorting and pagination; missing
+P&L sorts last and its unavailable reason is visible. Live option tests pass (94). The earlier browser verification of price-axis
+dragging, markers, Greek/OI rendering and P&L ticks remains applicable to the unchanged frontend.
+Live moneyness/limit figures/toggles, non-SQLite contract detail, full visible-range shading,
+snapshot/adjustment context and focus containment remain incomplete. Deployed-app/broker
+validation remains separate.
 
 Scope: the test platform's existing trade chart popup, plus the same view ported to the live
 platform's transaction-details popup.

@@ -160,6 +160,9 @@ class LiveTradesTable(LazyTable):
                     <span :class="props.row.current_pnl_numeric > 0 ? 'number-positive font-bold' : props.row.current_pnl_numeric < 0 ? 'number-negative font-bold' : ''">
                         {{ props.row.current_pnl }}
                     </span>
+                    <q-icon v-if="props.row.pnl_reason" name="info_outline" class="q-ml-xs">
+                        <q-tooltip>{{ props.row.pnl_reason }}</q-tooltip>
+                    </q-icon>
                 </template>
                 <template v-else-if="col.name === 'closed_pnl'">
                     <span :class="props.row.closed_pnl_numeric > 0 ? 'number-positive font-bold' : props.row.closed_pnl_numeric < 0 ? 'number-negative font-bold' : ''">

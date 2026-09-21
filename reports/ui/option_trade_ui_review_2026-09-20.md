@@ -2,6 +2,8 @@
 
 Date: 2026-09-20
 
+**Latest follow-up:** [Synced review through `7f2f58a5`](../strategy_research/synced_grid_option_ui_review_2026-09-21.md) confirms the subsequent fixes and records the remaining sorting and delivery gaps. The findings below and the [second review](option_trade_ui_recheck_2026-09-21.md) are retained as history.
+
 Implementation reviewed: `778abf67` through `c41f8156` on `dev`. HEAD advanced to `16e02a06` during review; the intervening commits only add existing reports and an ignore rule.
 
 Verdict: the feature is present, but **not ready to treat its live structure P&L and charts as reliable**. Two incorrect-money calculations and several presentation/data-wiring defects remain.

@@ -15,12 +15,12 @@ found that the first version's fixtures were not the real thing:
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from ba2_common.core import TradeConditions
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
@@ -150,6 +150,66 @@ class TestBrowsingIsNotCappedByTheTotals:
         finally:
             session.close()
         assert instance._totals['pnl'] == pytest.approx(30 * 370.0)   # not 20 x 370
+
+
+class TestSortingFromTableHeaders:
+    @pytest.mark.parametrize('column', ['current_pnl', 'closed_pnl'])
+    @pytest.mark.parametrize('descending', [True, False])
+    def test_pnl_is_sorted_numerically_before_pagination(self, column, descending):
+        engine, session = _seed_database(3)
+        transactions = session.exec(select(Transaction).order_by(Transaction.id)).all()
+        ids = [txn.id for txn in transactions]
+        percentages = dict(zip(ids, (90.0, 20.0, 10.0)))
+        for i, txn in enumerate(transactions):
+            txn.created_at = datetime(2026, 9, 1) + timedelta(days=i)
+            if column == 'closed_pnl':
+                txn.status = TransactionStatus.CLOSED
+                txn.close_price = txn.open_price * (1 + percentages[txn.id] / 100)
+            session.add(txn)
+        session.commit()
+        account = MagicMock(spec=OptionsAccountInterface)
+        account.get_option_quote.return_value = NS(bid=13.3, ask=13.4, last=13.35)
+        with patch.object(option_trades, 'get_db', lambda: session), \
+                patch.object(option_trades, 'scope_transactions_to_account', lambda q, *a: q), \
+                patch.object(option_trades, 'get_selected_account_id', lambda: None), \
+                patch.object(option_trades, 'get_account_instance_from_id', lambda *a, **k: account), \
+                patch.object(TradeConditions, '_get_option_pnl_via_transaction',
+                             lambda a, o: {'amount': percentages[o.transaction_id] * 6,
+                                           'percent': percentages[o.transaction_id]}):
+            rows, total = tab()._collect_rows(1, 2, {}, column, descending)
+        engine.dispose()
+        assert total == 3
+        assert [r['id'] for r in rows] == (ids[:2] if descending else ids[:0:-1])
+
+    def test_strategy_header_orders_the_whole_result(self):
+        engine, session = _seed_database(3)
+        transactions = session.exec(select(Transaction).order_by(Transaction.id)).all()
+        ids = [txn.id for txn in transactions]
+        for i, txn in enumerate(transactions):
+            txn.created_at = datetime(2026, 9, 1) + timedelta(days=i)
+            txn.option_strategy = ('long_call', 'long_put', 'bull_call_spread')[i]
+            session.add(txn)
+        session.commit()
+        rows, total = collect(tab(), session, page_size=2, sort_by='strategy', descending=True)
+        engine.dispose()
+        assert total == 3
+        assert [r['id'] for r in rows] == [ids[1], ids[0]]
+
+    @pytest.mark.parametrize('descending', [True, False])
+    def test_unpriced_rows_sort_after_real_gains_and_losses(self, descending):
+        engine, session = _seed_database(3)
+        transactions = session.exec(select(Transaction).order_by(Transaction.id)).all()
+        ids = [txn.id for txn in transactions]
+        for txn, closing_price in zip(transactions, (None, 9, 3)):
+            txn.status = TransactionStatus.CLOSED
+            txn.close_price = closing_price
+            session.add(txn)
+        session.commit()
+        rows, _ = collect(tab(), session, page_size=3, sort_by='closed_pnl', descending=descending)
+        engine.dispose()
+        assert rows[-1]['id'] == ids[0]
+        assert rows[-1]['closed_pnl_numeric'] is None
+        assert [r['id'] for r in rows[:2]] == (ids[1:] if descending else ids[:0:-1])
 
 
 # ---------------------------------------------------------------- N1: the real call

@@ -52,7 +52,10 @@ _TOTALS_ROW_LIMIT = 500
 
 _COMPUTED_SORT_FIELDS = frozenset({
     'current_pnl_numeric', 'closed_pnl_numeric', 'value', 'expiry_display', 'leg_count',
+    'account_name',
 })
+_SORT_FIELDS = {column.name: column.field
+                for column in LiveTradesTable.OPTION_TRANSACTION_COLUMNS if column.sortable}
 
 _STATUS_MAP = None
 
@@ -75,11 +78,7 @@ def _money(value: Optional[float]) -> str:
 
 
 def _row_sort_key(sort_by: str):
-    """Sort key for a built row: numbers numerically, text as text, unknowns last.
-
-    Sorting happens in memory now, because the rows come from the whole filtered set (R9)
-    rather than from a pre-sorted page.
-    """
+    """Compare computed row fields numerically or as text, never formatted P&L."""
     def key(row: Dict[str, Any]):
         value = row.get(sort_by)
         if value is None:
@@ -300,24 +299,32 @@ class OptionTradesTab:
             # N3): sharing one fetch meant the 500-row cap also removed transactions from the
             # table, so the last advertised page came back empty and older rows were
             # unreachable. The quote cache above keeps the second pass cheap.
-            computed_sort = sort_by in _COMPUTED_SORT_FIELDS
+            # Quasar sends the column NAME, not its field (current_pnl vs
+            # current_pnl_numeric). Resolve before choosing SQL pagination or a global sort.
+            sort_field = _SORT_FIELDS.get(sort_by, sort_by or 'created_at')
+            computed_sort = sort_field in _COMPUTED_SORT_FIELDS
             if computed_sort:
                 # A computed column can only be ordered once the rows are built, so this pass
                 # needs the whole filtered set (as it did before the totals work).
                 page_rows = list(session.exec(
-                    base.order_by(Transaction.created_at.desc())).all())
+                    base.order_by(Transaction.created_at.desc(), Transaction.id.desc())).all())
             else:
                 order_column = {
                     'id': Transaction.id,
                     'symbol': Transaction.symbol,
+                    'option_strategy': Transaction.option_strategy,
+                    'direction': Transaction.side,
                     'status': Transaction.status,
                     'quantity': Transaction.quantity,
                     'open_price': Transaction.open_price,
                     'created_at': Transaction.created_at,
                     'closed_at': Transaction.close_date,
-                }.get(sort_by, Transaction.created_at)
+                }.get(sort_field, Transaction.created_at)
                 page_rows = list(session.exec(
-                    base.order_by(order_column.desc() if descending else order_column.asc())
+                    base.order_by(
+                        (order_column.desc() if descending else order_column.asc()).nulls_last(),
+                        Transaction.id.desc(),
+                    )
                     .offset((page - 1) * page_size).limit(page_size)
                 ).all())
 
@@ -325,8 +332,10 @@ class OptionTradesTab:
                 [row[0] for row in page_rows], {row[0].id: row[1] for row in page_rows}, session,
                 collect_totals=False,
             )
-            rows.sort(key=_row_sort_key(sort_by), reverse=descending)
             if computed_sort:
+                rows.sort(key=_row_sort_key(sort_field), reverse=descending)
+                # Missing valuations are unknown, not zero; keep them last in both directions.
+                rows.sort(key=lambda row: row.get(sort_field) in (None, '—'))
                 rows = rows[(page - 1) * page_size: page * page_size]
             return rows, total_count
         except Exception as exc:
@@ -405,8 +414,7 @@ class OptionTradesTab:
                         priced = option_transaction_pnl(
                             account_inst, representative, opening_legs=leg_set.count,
                         )
-                        if priced.available:
-                            current_pnl = priced
+                        current_pnl = priced
                         if leg_set.count == 1:
                             quote = self._contract_quote(account_inst, leg_set.legs[0])
                             current_price = quote
@@ -447,9 +455,9 @@ class OptionTradesTab:
                 # WHY a row has no P&L, when the reason is not "the broker had no quote": an
                 # incompletely recorded structure must not read as a plain blank (N4).
                 'pnl_reason': getattr(current_pnl, 'reason', None),
-                'current_pnl_numeric': current_pnl.percent if current_pnl and current_pnl.percent is not None else 0,
+                'current_pnl_numeric': current_pnl.percent if current_pnl else None,
                 'closed_pnl': _pnl_text(closed.amount, closed.percent) if closed else '—',
-                'closed_pnl_numeric': closed.percent if closed and closed.percent is not None else 0,
+                'closed_pnl_numeric': closed.percent if closed else None,
                 'status': getattr(txn.status, 'value', '') or '—',
                 'order_count': len(orders),
                 'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '—',

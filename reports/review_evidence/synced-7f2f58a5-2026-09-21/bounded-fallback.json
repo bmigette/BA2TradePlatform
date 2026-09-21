@@ -1,0 +1,6 @@
+{
+  "returncode": 0,
+  "elapsed_seconds": 0.7029999999795109,
+  "stdout": "main exiting just before export deadline with a live fallback child\n",
+  "stderr": ""
+}

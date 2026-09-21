@@ -1,0 +1,12 @@
+{
+  "commit": "96cb472f5f275d43a4d0033a4f9b52d9c92ce04c",
+  "focused_tests_passed": 21,
+  "checks": [
+    {"recovery_slots": 1, "seconds": 2.109, "stalled_results": 1, "subsequent_trial": "completed", "retired_workers_alive": 0},
+    {"recovery_slots": 2, "seconds": 2.125, "stalled_results": 2, "subsequent_trial": "completed", "retired_workers_alive": 0},
+    {"batch_memo_and_callback": "pass", "executions_for_two_identical_requests": 1},
+    {"all_stalled_final_status": "completed", "best_fitness": -3000000000.0, "checkpoint_cleared": true},
+    {"export_top_5_scores": [0.0, -100000000.0, -1000000000.0, -2000000000.0, -3000000000.0], "stalled_candidate_selected_for_rerun": true},
+    {"checkpoint_elites_preserve_stall_record": false, "scope": "resumed all_results; old optimization row may retain original record"}
+  ]
+}

@@ -70,7 +70,10 @@ def is_measured_result(result: Any) -> bool:
     fitness = result.get("fitness")
     if not isinstance(fitness, (int, float)) or isinstance(fitness, bool):
         return False
-    return float(fitness) != STALLED_SENTINEL
+    try:
+        return math.isfinite(fitness) and fitness != STALLED_SENTINEL
+    except OverflowError:
+        return False
 
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
