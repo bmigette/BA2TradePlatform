@@ -23,6 +23,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
+from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
 logger = logging.getLogger(__name__)
 
 #: Why a P&L could not be produced, in words the UI can show.
@@ -31,6 +33,7 @@ UNAVAILABLE_NO_QUOTE = "no current option quote or contract multiplier"
 UNAVAILABLE_NO_FILLS = "no executed option legs recorded"
 UNAVAILABLE_FLAT = "structure already flat"
 UNAVAILABLE_NO_MULTIPLIER = "contract multiplier not recorded"
+UNAVAILABLE_INCOMPLETE = "executed structure incompletely recorded"
 UNAVAILABLE_NO_PRICES = "entry or exit premium not recorded"
 
 
@@ -50,6 +53,73 @@ class OptionPnlDisplay:
 
 def _unavailable(reason: str) -> OptionPnlDisplay:
     return OptionPnlDisplay(amount=None, percent=None, source="unavailable", reason=reason)
+
+
+class QuoteCachingAccount(OptionsAccountInterface):
+    """Wrap an options account so each contract is quoted ONCE per refresh.
+
+    The pricing seam quotes a contract itself, and the Options tab also wants the current
+    premium for its Current column. Same contract, same account, same refresh: one broker call
+    (second review, N5).
+
+    It must BE an ``OptionsAccountInterface`` -- that ``isinstance`` is how the seam decides it
+    can price options at all -- so the abstract set is emptied here and every other call is
+    delegated by ``__getattr__``. The cache key includes the ACCOUNT: two accounts can hold the
+    same contract, and one account's quote is not the other's.
+    """
+
+    #: Attributes that stay LOCAL to the wrapper; everything else is forwarded to the wrapped
+    #: account. `__getattr__` alone is NOT enough: a method the ABC itself defines (abstract or
+    #: concrete) is found by ordinary lookup and would run the ABC's own body against the
+    #: wrapper -- returning None for `get_option_positions` and silently skipping the real
+    #: account. Forwarding has to happen at lookup time.
+    _LOCAL = frozenset({
+        'get_option_quote', '_account', '_cache', '_account_id', '_LOCAL',
+        '__class__', '__dict__', '__getattribute__', '__setattr__', '__init__',
+        '__abstractmethods__', '__weakref__', '__module__', '__doc__',
+    })
+
+    def __init__(self, account: Any, cache: Dict[Any, Any], account_id: Any = None):
+        self._account = account
+        self._cache = cache
+        self._account_id = account_id
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in QuoteCachingAccount._LOCAL:
+            return object.__getattribute__(self, name)
+        return getattr(object.__getattribute__(self, '_account'), name)
+
+    def get_option_quote(self, contract_symbol: str) -> Any:
+        cache = object.__getattribute__(self, '_cache')
+        key = (object.__getattribute__(self, '_account_id'), contract_symbol)
+        if key not in cache:
+            wrapped = object.__getattribute__(self, '_account')
+            cache[key] = wrapped.get_option_quote(contract_symbol)
+        return cache[key]
+
+
+# ABCMeta computes __abstractmethods__ while the class is being created, so this has to happen
+# AFTER the body. It is honest rather than a dodge: every capability really is available,
+# forwarded to the wrapped account by __getattribute__. What matters is that the wrapper still
+# IS an OptionsAccountInterface -- that isinstance is how the pricing seam decides it may price
+# options at all, so a duck-typed proxy would not work.
+QuoteCachingAccount.__abstractmethods__ = frozenset()
+
+
+def quote_caching_account(account: Any, cache: Dict[Any, Any], account_id: Any = None) -> Any:
+    """``account`` wrapped for per-refresh quote reuse (already-wrapped accounts pass through)."""
+    if isinstance(account, QuoteCachingAccount):
+        return account
+    return QuoteCachingAccount(account, cache, account_id)
+
+
+def unavailable_pnl(reason: str) -> OptionPnlDisplay:
+    """An explicitly UNAVAILABLE P&L, for a caller that knows why it must not price.
+
+    Public because the Options tab refuses to price an incompletely recorded structure and has
+    to say so on the row, rather than showing a blank that reads as flat.
+    """
+    return _unavailable(reason)
 
 
 def option_transaction_pnl(

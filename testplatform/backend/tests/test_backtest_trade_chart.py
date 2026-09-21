@@ -512,24 +512,9 @@ class TestStoreProvenance:
 
         assert provenance.db_path == 'C:/y/o.sqlite'
 
-    def test_the_linked_optimization_is_used(self):
-        # This is where the live DB actually records it: 134 optimization configs carry
-        # options_store; none of 692 backtests carries it in strategy_params.
-        from app.services.backtest_trade_chart import option_store_provenance
-
-        optimization = SimpleNamespace(optimization_config={
-            'backtest': {'options_store': 'sqlite', 'options_cache_db': 'C:/opt/o.sqlite'}})
-
-        class FakeSession:
-            def exec(self, _):
-                return SimpleNamespace(first=lambda: optimization)
-
-        provenance = option_store_provenance(
-            SimpleNamespace(strategy_params=None, optimization_id=42), FakeSession())
-
-        assert provenance.store == 'sqlite'
-        assert provenance.db_path == 'C:/opt/o.sqlite'
-        assert provenance.source == 'optimization_config#42'
+    # The optimization-linked path is covered in TestStoreProvenanceThroughARealSession
+    # below, with the backend's ACTUAL session type. It used to be tested here against a fake
+    # session that implemented `exec` -- the mismatch the second review caught (N2).
 
     def test_nothing_anywhere_is_unresolved_not_a_platform_default(self):
         from app.services.backtest_trade_chart import option_store_provenance
@@ -545,3 +530,47 @@ class TestStoreProvenance:
         detail = contract_detail(None, CONTRACT, datetime(2026, 9, 8, 13, 30))
         assert detail['quality'] == 'unavailable'
         assert detail['iv'] is None
+
+class TestStoreProvenanceThroughARealSession:
+    """N2: the service is handed a SQLAlchemy Session, not SQLModel's `exec`-bearing one.
+
+    The first version called `session.exec(...)`, which raises `'Session' object has no
+    attribute 'exec'` on the backend's session; the except below it turned that into a silent
+    "unresolved", so the GA-result path never supplied contract detail. The `db` fixture is the
+    backend's own session type, which is what makes this a regression rather than a mock test.
+    """
+
+    def test_the_fixture_is_the_backend_session_type(self, db):
+        # Guards the test itself: a SQLModel session would have `exec` and would hide the bug.
+        assert not hasattr(db, 'exec')
+
+    def test_an_optimization_row_resolves_the_recorded_store(self, db):
+        from app.models.strategy_optimization import StrategyOptimization
+        from app.services.backtest_trade_chart import option_store_provenance
+
+        optimization = StrategyOptimization(
+            strategy_id=1, name='stall-recovery-run', fitness_metric='sharpe',
+            optimization_type='genetic',
+            optimization_config={'backtest': {
+                'options_store': 'sqlite', 'options_cache_db': 'C:/opt/o.sqlite'}},
+        )
+        db.add(optimization)
+        db.commit()
+        db.refresh(optimization)
+        backtest = _seed(db, [SPREAD_LEGS[0]], optimization_id=optimization.id)
+
+        provenance = option_store_provenance(backtest, db)
+
+        assert provenance.store == 'sqlite'
+        assert provenance.db_path == 'C:/opt/o.sqlite'
+        assert provenance.source == f'optimization_config#{optimization.id}'
+        assert provenance.is_sqlite
+
+    def test_a_missing_optimization_row_stays_unresolved_without_raising(self, db):
+        from app.services.backtest_trade_chart import option_store_provenance
+
+        backtest = _seed(db, [SPREAD_LEGS[0]], optimization_id=999999)
+
+        provenance = option_store_provenance(backtest, db)
+
+        assert not provenance.resolved

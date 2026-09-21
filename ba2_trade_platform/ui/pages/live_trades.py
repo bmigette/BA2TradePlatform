@@ -2123,13 +2123,23 @@ class LiveTradesTab:
         one, and it is copied onto the transaction at creation), so it is trusted when
         present -- and a missing one still refuses to price rather than assuming 100.
         """
-        from ba2_common.core.option_payoff_chart import build_payoff_chart, chart_legs_from_rows
+        from ba2_common.core.option_payoff_chart import (
+            PayoffUnavailable, build_payoff_chart, chart_legs_from_rows,
+        )
 
         # The ENTRY structure, never the order history (review R2). Concatenating every order
         # with a contract symbol drew the net cash of already-closed fills as if it were the
         # structure's expiration outcomes: a spread's -600/+400 curve flattened to +370 at
         # every price, and a cancelled order could add exposure that was never held.
         leg_set = opening_legs(txn, orders)
+
+        # An executed OPENING leg dropped for a missing size or premium leaves a DIFFERENT
+        # position, so the curve is refused rather than drawn for the remainder (second
+        # review, N4): a 95/105 spread missing its short leg's premium would otherwise plot as
+        # a lone long call with UNLIMITED maximum profit.
+        if leg_set.incomplete:
+            return PayoffUnavailable(leg_set.unavailable_reason or 'structure incompletely recorded')
+
         return build_payoff_chart(chart_legs_from_rows(leg_set.chart_rows()))
 
     async def _fill_option_chart(self, container, txn, orders) -> None:

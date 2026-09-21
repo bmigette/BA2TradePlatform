@@ -169,12 +169,66 @@ class FakeSession:
 
 
 def loader_rows(orders, transactions=None):
+    """Rows from the REAL tab class.
+
+    A hand-built namespace was how the first version of these tests missed a real crash
+    (second review, N1: the tab's `_contract_quote` was still a staticmethod). `__init__` only
+    assigns attributes, so a real instance costs nothing here.
+    """
     account = MagicMock(spec=OptionsAccountInterface)
-    tab = NS(_totals={}, _refresh_totals=lambda: None, _contract_quote=lambda *a: None)
-    with patch.object(OptionTradesTab, '__init__', lambda *a, **k: None), \
-            patch('ba2_trade_platform.ui.pages.option_trades.get_account_instance_from_id',
-                  lambda *a, **k: account):
+    account.get_option_quote.return_value = NS(bid=13.3, ask=13.4, last=13.35)
+    tab = OptionTradesTab()
+    with patch('ba2_trade_platform.ui.pages.option_trades.get_account_instance_from_id',
+               lambda *a, **k: account):
         return OptionTradesTab._build_rows(tab, transactions or [TXN], {}, FakeSession(orders))
+
+
+class TestAnIncompleteStructureIsRefused:
+    """N4: dropping an executed opening leg must not silently reprice a DIFFERENT position."""
+
+    def test_a_spread_missing_a_legs_fill_premium_is_not_priced_as_the_remainder(self):
+        # Without this refusal the short leg vanishes and the curve becomes a lone long call
+        # with UNLIMITED maximum profit -- a different trade, drawn as if it were this one.
+        short_without_premium = order(2, 'XYZ_C105', OrderDirection.SELL, 105, None,
+                                      position_intent='sell_to_open')
+        chart = LiveTradesTab._payoff_for(None, TXN, [ENTRY[0], short_without_premium])
+
+        assert chart.available is False
+        assert 'incompletely recorded' in chart.reason
+        assert 'no fill premium recorded' in chart.reason
+
+    def test_a_missing_executed_size_marks_it_incomplete_too(self):
+        partial = order(2, 'XYZ_C105', OrderDirection.SELL, 105, 2,
+                        status=OrderStatus.PARTIALLY_FILLED, quantity=5, filled_qty=None)
+        leg_set = opening_legs(TXN, [ENTRY[0], partial])
+
+        assert leg_set.incomplete is True
+        assert leg_set.usable is False
+        assert 'partially filled without a recorded filled quantity' in leg_set.incomplete_reasons
+
+    def test_a_complete_structure_is_usable(self):
+        leg_set = opening_legs(TXN, ENTRY)
+        assert leg_set.usable is True
+        assert leg_set.unavailable_reason is None
+
+    def test_closing_cancelled_and_parent_exclusions_do_NOT_make_it_incomplete(self):
+        # Dropping these leaves the position intact -- that is the whole distinction.
+        cancelled = order(5, 'XYZ_C110', OrderDirection.BUY, 110, 1,
+                          status=OrderStatus.CANCELED, position_intent='buy_to_open')
+        leg_set = opening_legs(TXN, [PARENT] + ENTRY + CLOSING + [cancelled])
+
+        assert leg_set.count == 2
+        assert leg_set.incomplete is False
+        assert leg_set.usable is True
+
+    def test_the_loader_row_says_why_instead_of_a_blank(self):
+        short_without_premium = order(2, 'XYZ_C105', OrderDirection.SELL, 105, None,
+                                      position_intent='sell_to_open')
+        rows = loader_rows([ENTRY[0], short_without_premium])
+
+        assert rows[0]['current_pnl'] == '—'
+        assert 'incompletely recorded' in rows[0]['pnl_reason']
+        assert 'no fill premium recorded' in rows[0]['pnl_reason']
 
 
 class TestSpreadIsPricedAsAStructure:

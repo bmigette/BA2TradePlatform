@@ -143,9 +143,16 @@ def option_store_provenance(backtest: Any, session: Any = None) -> OptionStorePr
 
             from app.models.strategy_optimization import StrategyOptimization
 
-            optimization = session.exec(
-                select(StrategyOptimization).where(StrategyOptimization.id == optimization_id)
-            ).first()
+            # The backtest backend hands this a SQLAlchemy Session, which has get()/execute()
+            # -- NOT SQLModel's exec() (second review, N2: the old call raised
+            # "'Session' object has no attribute 'exec'" and the except below turned a real
+            # provenance lookup into a silent "unresolved"). get() exists on both session
+            # types, so it is the portable choice.
+            optimization = session.get(StrategyOptimization, optimization_id)
+            if optimization is None and hasattr(session, 'exec'):
+                optimization = session.exec(  # SQLModel session, if that is what arrived
+                    select(StrategyOptimization).where(StrategyOptimization.id == optimization_id)
+                ).first()
         except Exception as exc:
             # Provenance that cannot be read is not provenance: fall through to unresolved
             # rather than guessing a store.

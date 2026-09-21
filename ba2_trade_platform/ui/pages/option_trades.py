@@ -32,7 +32,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from nicegui import ui
 
 from ...core.db import get_db
-from ...core.option_pnl_display import option_closed_pnl, option_transaction_pnl
+from ...core.option_pnl_display import (
+    UNAVAILABLE_INCOMPLETE, option_closed_pnl, option_transaction_pnl, quote_caching_account,
+    unavailable_pnl,
+)
 from ...core.option_positions import opening_legs
 from ...core.utils import get_account_instance_from_id, get_expert_options_for_ui
 from ...logger import logger
@@ -281,27 +284,64 @@ class OptionTradesTab:
 
             # ONE pass over the whole filtered set (bounded), so the totals cannot depend on
             # which page happened to be loaded -- the review's R9 defect was that merely
-            # changing sort mode changed the displayed cost and P&L. The page is then sliced
-            # out of the same rows, and the per-refresh quote snapshot keeps the overlap cheap.
+            # changing sort mode changed the displayed cost and P&L.
             self._quote_snapshot = {}
-            results = list(session.exec(
+            totals_rows = list(session.exec(
                 base.order_by(Transaction.created_at.desc()).limit(_TOTALS_ROW_LIMIT)
             ).all())
+            self._build_rows(
+                [row[0] for row in totals_rows],
+                {row[0].id: row[1] for row in totals_rows},
+                session,
+            )
+            self._totals_truncated = total_count > len(totals_rows)
 
-            transactions = [row[0] for row in results]
-            experts = {row[0].id: row[1] for row in results}
-            rows = self._build_rows(transactions, experts, session)
-            self._totals_truncated = total_count > len(rows)
+            # BROWSING is a SEPARATE pass and is NOT capped by the totals limit (second review,
+            # N3): sharing one fetch meant the 500-row cap also removed transactions from the
+            # table, so the last advertised page came back empty and older rows were
+            # unreachable. The quote cache above keeps the second pass cheap.
+            computed_sort = sort_by in _COMPUTED_SORT_FIELDS
+            if computed_sort:
+                # A computed column can only be ordered once the rows are built, so this pass
+                # needs the whole filtered set (as it did before the totals work).
+                page_rows = list(session.exec(
+                    base.order_by(Transaction.created_at.desc())).all())
+            else:
+                order_column = {
+                    'id': Transaction.id,
+                    'symbol': Transaction.symbol,
+                    'status': Transaction.status,
+                    'quantity': Transaction.quantity,
+                    'open_price': Transaction.open_price,
+                    'created_at': Transaction.created_at,
+                    'closed_at': Transaction.close_date,
+                }.get(sort_by, Transaction.created_at)
+                page_rows = list(session.exec(
+                    base.order_by(order_column.desc() if descending else order_column.asc())
+                    .offset((page - 1) * page_size).limit(page_size)
+                ).all())
 
+            rows = self._build_rows(
+                [row[0] for row in page_rows], {row[0].id: row[1] for row in page_rows}, session,
+                collect_totals=False,
+            )
             rows.sort(key=_row_sort_key(sort_by), reverse=descending)
-            return rows[(page - 1) * page_size: page * page_size], total_count
+            if computed_sort:
+                rows = rows[(page - 1) * page_size: page * page_size]
+            return rows, total_count
         except Exception as exc:
             logger.error(f"[OPTION TABS] data load failed: {exc}", exc_info=True)
             return [], 0
         finally:
             session.close()
 
-    def _build_rows(self, transactions, transaction_experts, session) -> List[Dict]:
+    def _build_rows(self, transactions, transaction_experts, session, *,
+                    collect_totals: bool = True) -> List[Dict]:
+        """Build display rows. ``collect_totals=False`` leaves ``self._totals`` alone.
+
+        The loader runs TWO passes: a bounded totals pass over the whole filtered set, then the
+        page. The page pass must not overwrite the totals with its own page-sized sums.
+        """
         from sqlmodel import select
 
         from ...core.models import AccountDefinition, TradingOrder
@@ -320,6 +360,8 @@ class OptionTradesTab:
             option_orders = [o for o in orders if getattr(o, 'contract_symbol', None)]
             # The ENTRY structure, not the order history: exits, cancels and unfilled legs
             # are not positions (review R2), and the count is what the Legs column means.
+            # `leg_set.incomplete` means an executed opening leg could not be read, which
+            # changes the pricing decision below (second review, N4).
             leg_set = opening_legs(txn, orders)
             legs = leg_set.count
             first_order = orders[0] if orders else None
@@ -337,7 +379,13 @@ class OptionTradesTab:
             current_pnl = None
             current_price = None
             is_open = txn.status in (TransactionStatus.OPENED, TransactionStatus.CLOSING)
-            if is_open:
+            if is_open and leg_set.incomplete:
+                # Refuse rather than price the remainder: the seam would see a DIFFERENT
+                # structure (second review, N4 -- a spread missing one leg's recorded premium
+                # prices as a lone long call).
+                current_pnl = unavailable_pnl(
+                    f'{UNAVAILABLE_INCOMPLETE}: ' + '; '.join(leg_set.incomplete_reasons))
+            elif is_open:
                 # The representative: for a STRUCTURE it is the parent (the seam resolves the
                 # legs itself), for a single contract it is that contract's own order. The
                 # count is passed too, so the seam is chosen by the structure (review R1).
@@ -350,6 +398,10 @@ class OptionTradesTab:
                 if representative is not None and account_id:
                     account_inst = get_account_instance_from_id(account_id, session=session)
                     if account_inst is not None:
+                        # One quote per (account, contract) for the whole refresh, shared by
+                        # the pricing seam and the Current column (second review, N5).
+                        account_inst = quote_caching_account(
+                            account_inst, self._quote_snapshot, account_id)
                         priced = option_transaction_pnl(
                             account_inst, representative, opening_legs=leg_set.count,
                         )
@@ -392,6 +444,9 @@ class OptionTradesTab:
                 'take_profit': txn.take_profit,
                 'stop_loss': txn.stop_loss,
                 'current_pnl': _pnl_text(current_pnl.amount, current_pnl.percent) if current_pnl else '—',
+                # WHY a row has no P&L, when the reason is not "the broker had no quote": an
+                # incompletely recorded structure must not read as a plain blank (N4).
+                'pnl_reason': getattr(current_pnl, 'reason', None),
                 'current_pnl_numeric': current_pnl.percent if current_pnl and current_pnl.percent is not None else 0,
                 'closed_pnl': _pnl_text(closed.amount, closed.percent) if closed else '—',
                 'closed_pnl_numeric': closed.percent if closed and closed.percent is not None else 0,
@@ -414,32 +469,25 @@ class OptionTradesTab:
                 ],
             })
 
-        self._totals = totals
+        if collect_totals:
+            self._totals = totals
         # NOT repainted here: this now runs in a worker thread, and UI calls belong to the
         # loader's async wrapper (_data_loader) once the work is done.
         return rows
 
-    @staticmethod
     def _contract_quote(self, account_inst, order) -> Optional[float]:
         """Current premium for a single-leg contract, or None. Never fabricated.
 
-        Reads go through a per-refresh snapshot keyed by contract, so the Current column and
-        anything else asking about the same contract in the same load share ONE broker call
-        (review R10). The snapshot is cleared at the start of each collect pass.
+        ``account_inst`` is normally the quote-caching wrapper, so this read and the pricing
+        seam share ONE broker call per (account, contract) per refresh (second review, N5: the
+        old cache was keyed by contract alone, so two accounts holding the same contract shared
+        one account's quote, and the seam's own reads were not covered at all).
         """
-        symbol = getattr(order, 'contract_symbol', None)
-        if symbol and symbol in self._quote_snapshot:
-            quote = self._quote_snapshot[symbol]
-            if quote is None:
-                return None
-        else:
-            try:
-                quote = account_inst.get_option_quote(order.contract_symbol)
-            except Exception as exc:
-                logger.debug(f"[OPTION TABS] no quote for {order.contract_symbol}: {exc}")
-                quote = None
-            if symbol:
-                self._quote_snapshot[symbol] = quote
+        try:
+            quote = account_inst.get_option_quote(order.contract_symbol)
+        except Exception as exc:
+            logger.debug(f"[OPTION TABS] no quote for {order.contract_symbol}: {exc}")
+            return None
         if quote is None:
             return None
         if getattr(order.side, 'value', '') == 'BUY':
@@ -463,7 +511,8 @@ class OptionTradesTab:
                 f'text-sm font-bold {"text-green-500" if pnl >= 0 else "text-red-500"}')
             if unpriced:
                 ui.label(
-                    f'({unpriced} unpriced: no quote or contract multiplier recorded — excluded, not counted as zero)'
+                    f'({unpriced} unpriced: no quote, no recorded contract multiplier, or an '
+                    f'incompletely recorded structure — excluded, not counted as zero)'
                 ).classes('text-xs text-secondary-custom')
 
     # ---- handlers ------------------------------------------------------------

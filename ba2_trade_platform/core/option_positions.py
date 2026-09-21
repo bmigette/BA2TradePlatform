@@ -48,6 +48,15 @@ EXCLUDED_SIZE_UNKNOWN = 'partially filled without a recorded filled quantity'
 EXCLUDED_NO_SIZE = 'no quantity recorded'
 EXCLUDED_NO_PREMIUM = 'no fill premium recorded'
 
+#: Reasons that mean the EXECUTED OPENING structure itself is incompletely recorded.
+#:
+#: These are NOT the same as "this order is not part of the position" (a parent, a cancelled
+#: order, a closing fill): dropping one of those leaves the position intact, while dropping an
+#: executed opening leg leaves a DIFFERENT position. Pricing what remains would describe that
+#: other position -- a 95/105 spread whose short leg has no recorded fill premium becomes a
+#: lone long call with unlimited maximum profit. Callers must refuse instead.
+_INCOMPLETE_REASONS = frozenset({EXCLUDED_NO_PREMIUM, EXCLUDED_NO_SIZE, EXCLUDED_SIZE_UNKNOWN})
+
 
 @dataclass(frozen=True)
 class OpeningLeg:
@@ -89,15 +98,36 @@ class OpeningLeg:
 
 @dataclass(frozen=True)
 class OpeningLegSet:
-    """The entry structure of one transaction, plus what was left out and why."""
+    """The entry structure of one transaction, plus what was left out and why.
+
+    ``incomplete`` is the one that must change a caller's behaviour: an executed OPENING leg
+    was dropped because its size or premium was never recorded, so the leg set describes a
+    DIFFERENT position than the transaction actually holds.
+    """
 
     legs: Tuple[OpeningLeg, ...] = ()
     parent: Any = None
     excluded: Tuple[str, ...] = ()
+    incomplete: bool = False
+    incomplete_reasons: Tuple[str, ...] = ()
 
     @property
     def count(self) -> int:
         return len(self.legs)
+
+    @property
+    def usable(self) -> bool:
+        """True when the structure may be PRICED: it has legs and nothing was dropped."""
+        return bool(self.legs) and not self.incomplete
+
+    @property
+    def unavailable_reason(self) -> Optional[str]:
+        """Why this structure cannot be priced, or None."""
+        if not self.incomplete:
+            return None
+        return ('the executed structure is incompletely recorded ('
+                + '; '.join(self.incomplete_reasons)
+                + '), so pricing what remains would describe a different position')
 
     @property
     def is_multi_leg(self) -> bool:
@@ -177,6 +207,7 @@ def opening_legs(transaction: Any, orders: Any) -> OpeningLegSet:
     """
     ordered = list(orders or ())
     excluded: List[str] = []
+    incomplete: List[str] = []
     parent = None
 
     # Earliest executed side per contract, which is what the no-intent close detection needs.
@@ -212,11 +243,15 @@ def opening_legs(transaction: Any, orders: Any) -> OpeningLegSet:
 
         size, size_source, size_problem = _size_of(order)
         if size is None:
-            excluded.append(size_problem or EXCLUDED_NO_SIZE)
+            problem = size_problem or EXCLUDED_NO_SIZE
+            excluded.append(problem)
+            # An executed opening leg with no usable size: the position is not knowable.
+            incomplete.append(problem)
             continue
         premium = _fill_premium(order)
         if premium is None:
             excluded.append(EXCLUDED_NO_PREMIUM)
+            incomplete.append(EXCLUDED_NO_PREMIUM)
             continue
 
         key = (contract, str(side))
@@ -273,4 +308,8 @@ def opening_legs(transaction: Any, orders: Any) -> OpeningLegSet:
         ))
 
     legs.sort(key=lambda leg: (leg.strike is None, leg.strike, leg.contract_symbol))
-    return OpeningLegSet(legs=tuple(legs), parent=parent, excluded=tuple(excluded))
+    reasons = tuple(dict.fromkeys(incomplete))
+    return OpeningLegSet(
+        legs=tuple(legs), parent=parent, excluded=tuple(excluded),
+        incomplete=bool(reasons), incomplete_reasons=reasons,
+    )
