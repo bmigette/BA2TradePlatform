@@ -70,6 +70,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+from typing import Optional
 
 # Sibling helper in tools/ (shared by all three matrix drivers). The directory is put on the
 # path explicitly so the import works however the script is reached (path, -m, or a test import).
@@ -140,8 +141,14 @@ def _completed_names() -> set:
     return {r[0] for r in rows}
 
 
-def _failure_reason(name: str) -> str:
-    """error_message of the newest row for ``name`` ('' when there is none).
+def _failure_reason(name: str, created_after: Optional[int] = None) -> str:
+    """error_message of the newest row for ``name`` created AFTER ``created_after`` ('' if none).
+
+    ``created_after`` is the optimization id that existed BEFORE a job was launched: only a row
+    created later can speak for the attempt that just exited (2026-09-21 recheck, H4). A marker
+    left by an earlier run of the same name is not evidence about this one, and treating it as
+    such hid a fresh launch failure (bad args, preflight, import, startup -- all of which write no
+    row at all).
 
     Read-only and best effort: the driver must never crash on a DB hiccup, and an unreadable reason
     simply means "treat it as an ordinary failure" (stop the campaign), which is the safe default.
@@ -155,14 +162,60 @@ def _failure_reason(name: str) -> str:
     except Exception:  # noqa: BLE001
         return ""
     try:
-        row = c.execute(
-            "SELECT error_message FROM strategy_optimizations WHERE name=? "
-            "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+        sql = "SELECT error_message FROM strategy_optimizations WHERE name=?"
+        params: list = [name]
+        if created_after is not None:
+            # ONLY a row created after the launch that just failed can speak for it (2026-09-21
+            # recheck, H4). Without this the newest row with the same NAME was used, so a marker
+            # left by an earlier run hid a fresh launch failure.
+            sql += " AND id > ?"
+            params.append(int(created_after))
+        row = c.execute(sql + " ORDER BY id DESC LIMIT 1", tuple(params)).fetchone()
     except Exception:  # noqa: BLE001
         return ""
     finally:
         c.close()
     return (row[0] or "") if row else ""
+
+
+def _classify_failure(name: str, prior_max_id: Optional[int]) -> str:
+    """``'skip'`` or ``'stop'`` for a job that just exited non-zero.
+
+    ONLY a no-measurement marker on a row created AFTER the launch may skip the job (2026-09-21
+    recheck, H4). Anything else stops the campaign: a marker left by an earlier run of the same
+    name is not evidence about this attempt, and an unreadable table means the marker cannot be
+    attributed at all -- skipping on either would hide a real launch failure (bad args, preflight,
+    import, startup), none of which write a row.
+    """
+    if prior_max_id is None:
+        return "stop"
+    reason = _failure_reason(name, created_after=prior_max_id)
+    return "skip" if reason.startswith(NO_MEASUREMENT_MARKER) else "stop"
+
+
+def _newest_optimization_id() -> Optional[int]:
+    """The highest ``strategy_optimizations.id`` right now, or ``None`` if it cannot be read.
+
+    Captured BEFORE a job is launched so the post-mortem can require a row created after it
+    (2026-09-21 recheck, H4). Read-only and best effort, like ``_failure_reason``; ``None`` means
+    the driver cannot tell whether a marker belongs to the attempt that failed, and it must then
+    STOP rather than skip. An empty table yields 0, which lets any new row qualify.
+    """
+    import sqlite3
+    path = Path(_db_path()).resolve()
+    if not path.exists():
+        return None
+    try:
+        c = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        row = c.execute("SELECT MAX(id) FROM strategy_optimizations").fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        c.close()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def _jobs(experts, strategies, name_suffix=""):
@@ -576,21 +629,29 @@ def main(argv=None) -> int:
         if name in _completed_names():   # re-read each loop (resumable)
             print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
             continue
+        # BEFORE the launch, so the post-mortem below can tell THIS attempt's row from an older
+        # one with the same name (2026-09-21 recheck, H4).
+        prior_max_id = _newest_optimization_id()
         cmd = build_cmd(args, launcher, name, expert, strat, universe, mode)
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
         if rc != 0:
-            reason = _failure_reason(name)
-            if reason.startswith(NO_MEASUREMENT_MARKER):
+            decision = _classify_failure(name, prior_max_id)
+            if decision == "skip":
                 # A stall-only job (2026-09-21 review, G2). Its checkpoint was PRESERVED, so a later
                 # pass can resume or re-run it; it must not stop the other 15 jobs, which is what
                 # happened on 2026-09-20 when the same class of failure killed the campaign.
-                print(f"[{i}/{len(jobs)}] {name} produced {NO_MEASUREMENT_MARKER} (stall-only); "
-                      f"recorded and SKIPPED -- the campaign continues. Re-run this job later; "
-                      f"its checkpoint was preserved.", flush=True)
+                print(f"[{i}/{len(jobs)}] {name} produced {NO_MEASUREMENT_MARKER} (stall-only, "
+                      f"verified against this launch); recorded and SKIPPED -- the campaign "
+                      f"continues. Re-run this job later; its checkpoint was preserved.", flush=True)
                 continue
-            print(f"options matrix stopped: {name} failed; remaining jobs were not launched.", flush=True)
+            if prior_max_id is None:
+                print(f"[{i}/{len(jobs)}] options matrix stopped: {name} failed and its marker "
+                      f"could not be verified (no readable optimization table).", flush=True)
+            else:
+                print(f"[{i}/{len(jobs)}] options matrix stopped: {name} failed; remaining jobs "
+                      f"were not launched.", flush=True)
             return rc if rc > 0 else 1
     print("options matrix driver: done.")
     return 0

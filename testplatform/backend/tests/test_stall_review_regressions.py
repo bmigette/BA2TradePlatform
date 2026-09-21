@@ -19,6 +19,7 @@ import importlib
 import importlib.util
 import os
 import re
+import sqlite3
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -40,6 +41,13 @@ sys.modules.setdefault("ba2test_launcher", _launcher_mod)
 _spec.loader.exec_module(_launcher_mod)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# The matrix driver: loaded as a module so its DECISIONS can be exercised, not just grepped.
+_MATRIX_PATH = os.path.normpath(os.path.join(_root, "..", "..", "tools", "run_options_matrix.py"))
+_mspec = importlib.util.spec_from_file_location("run_options_matrix", _MATRIX_PATH)
+_matrix_mod = importlib.util.module_from_spec(_mspec)
+sys.modules.setdefault("run_options_matrix", _matrix_mod)
+_mspec.loader.exec_module(_matrix_mod)
 
 
 # --- G2: completion is decided by MEASURED results, never by a non-empty all_results -----------
@@ -81,10 +89,30 @@ def test_no_measurement_marker_is_identical_in_handler_and_matrix_driver():
     assert m.group(1) == handler.NO_MEASUREMENT_MARKER
 
 
-def test_the_matrix_driver_skips_a_no_measurement_job_instead_of_stopping():
-    src = (_REPO_ROOT / "tools" / "run_options_matrix.py").read_text(encoding="utf-8")
-    assert "reason.startswith(NO_MEASUREMENT_MARKER)" in src
-    assert "_failure_reason(name)" in src
+def test_the_matrix_driver_skips_a_no_measurement_job_instead_of_stopping(tmp_path, monkeypatch):
+    """A stall-only job is recorded and SKIPPED, not campaign-fatal.
+
+    Behaviour, not source shape: the previous version of this test pinned the literal call
+    `_failure_reason(name)`, which is exactly the line the recheck had to change -- a name-based
+    lookup let a stale marker hide a fresh launch failure (H4). The marker now only counts when it
+    sits on a row created AFTER the launch.
+    """
+    marker = "no measured trials"
+    db = tmp_path / "opt.db"
+    connection = sqlite3.connect(db)
+    connection.execute("CREATE TABLE strategy_optimizations "
+                       "(id INTEGER PRIMARY KEY, name TEXT, error_message TEXT)")
+    connection.executemany(
+        "INSERT INTO strategy_optimizations (id, name, error_message) VALUES (?, ?, ?)",
+        [(7, "optm-x-grid", f"{marker}: 2 stalled"),      # an OLDER run's marker
+         (8, "optm-x-grid", f"{marker}: 4 stalled")])     # the launch that just exited
+    connection.commit()
+    connection.close()
+    monkeypatch.setenv("DB_FILE", str(db))
+
+    assert _matrix_mod._classify_failure("optm-x-grid", 7) == "skip"
+    assert _matrix_mod._classify_failure("optm-x-grid", 8) == "stop", (
+        "a marker older than this launch must not speak for it")
 
 
 # --- G1: Top-N export must never re-run a non-measurement --------------------------------------

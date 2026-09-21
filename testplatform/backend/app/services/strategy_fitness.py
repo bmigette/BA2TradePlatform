@@ -15,7 +15,7 @@ win_rate, sortino_ratio, calmar_ratio, sqn, max_drawdown (all confirmed present)
 import math
 from datetime import date, datetime
 import os as _os
-from typing import Optional
+from typing import Any, Optional
 
 # Distinct from 0.0 (the exception fallback) so a no-trade config is never
 # confused with a crashed trial, and is always worse than any real config.
@@ -44,6 +44,33 @@ WIPED_OUT_SENTINEL = -2.0e9
 # a real outcome outranks a non-measurement:
 #   STALLED_SENTINEL < WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0
 STALLED_SENTINEL = -3.0e9
+
+
+def is_measured_result(result: Any) -> bool:
+    """True when a trial/checkpoint record carries a REAL measurement of its genome.
+
+    ONE predicate, used by BOTH the count that decides the run's final status and the Top-N
+    ranking that decides what to export (2026-09-21 recheck, H2). They disagreed: the count only
+    tested ``status``, but the patch immediately before this one wrote the sentinel WITHOUT a
+    status field, so an old-format stalled record counted as a measurement, ``_final_status``
+    reported ``completed``, finalization cleared an all-stalled checkpoint and the matrix skipped
+    the job -- while Top-N correctly excluded the same record. Two tests, two answers, one record.
+
+    Both markers are recognised, and an ordinary historical record (a numeric fitness and no
+    status at all) stays measured, which is what the older checkpoints contain.
+
+    A MISSING or non-numeric fitness is NOT a measurement (2026-09-21 recheck, H5): it cannot be
+    ranked, and treating it as one made the ranking helper raise while formatting its dedup key.
+    Deciding it here keeps that decision in one place instead of in an exception handler.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("status") == "stalled":
+        return False
+    fitness = result.get("fitness")
+    if not isinstance(fitness, (int, float)) or isinstance(fitness, bool):
+        return False
+    return float(fitness) != STALLED_SENTINEL
 
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.

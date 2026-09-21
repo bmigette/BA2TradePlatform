@@ -6189,7 +6189,7 @@ def _cmd_optimize(args) -> int:
         return 0
 
     res = handle_strategy_optimization("cli-optimize", {"optimization_id": opt_id})
-    if res.get("status") == "no_measurements":
+    if res.get("failure_kind") == "no_measurements" or res.get("status") == "no_measurements":
         # Stall-only search (2026-09-21 review, G2): nothing was measured, so there is no winner to
         # export (and _persist_top_backtests would find no candidate anyway). The row is `failed`
         # with a marker that tools/run_options_matrix.py reads to SKIP this job rather than stop the
@@ -6455,7 +6455,8 @@ def _cmd_optimize_batch(args) -> int:
 _REMOTE_RETRY_BACKOFF_S = 5.0
 
 
-def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]:
+def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitness_metric: str,
+                       deadline: Optional[float] = None) -> Dict[str, Any]:
     """Try *worker* for a top-N re-run, retrying once after a short backoff, then fall back to
     running the trial directly (the same path a "local" slot uses) rather than permanently
     losing this rank.
@@ -6466,19 +6467,111 @@ def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitnes
     by hand. Both were transient -- a retry a few seconds later, or falling back to a box that's
     definitely not restarting, gets the row on the first attempt instead."""
     import time
-    from app.services.strategy_optimization_handler import _persist_trial_worker
     from app.services.worker_client import run_trial_full
     last_exc: Optional[Exception] = None
+
+    def _past_deadline() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
     for attempt in range(2):
+        if _past_deadline():
+            # The caller has already dropped this rank. Starting anything now would run a backtest
+            # nobody is waiting for (2026-09-21 recheck, H1).
+            raise TimeoutError(
+                f"export deadline passed before the remote attempt to {worker.get('name')} finished")
         try:
             return run_trial_full(worker, trial_cfg, fitness_metric)
         except Exception as e:  # noqa: BLE001 -- transient remote failure; retry/fallback below
             last_exc = e
             if attempt == 0:
                 print(f"    remote {worker.get('name')} failed ({e!r}); retrying once...")
+                if deadline is not None and time.monotonic() + _REMOTE_RETRY_BACKOFF_S >= deadline:
+                    print(f"    no budget left for the retry (export deadline) -- going straight to "
+                          f"the fallback decision")
+                    break
                 time.sleep(_REMOTE_RETRY_BACKOFF_S)
+    if _past_deadline():
+        raise TimeoutError(
+            f"export deadline passed after {worker.get('name')} failed twice ({last_exc!r}) -- "
+            f"NOT starting a local fallback")
     print(f"    remote {worker.get('name')} failed twice ({last_exc!r}); falling back to local")
-    return _persist_trial_worker(trial_cfg)
+    return _run_local_fallback_bounded(trial_cfg, deadline)
+
+
+def _new_local_pool(max_workers: int = 1):
+    """A spawn-based local pool built EXACTLY like the export phase's.
+
+    Shared so the remote fallback runs the same way a `local` slot does: same interpreter, same
+    worker env, same backend dir. (2026-09-21 recheck, H1.)
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    from app.services.strategy_optimization_handler import _worker_init
+    env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
+    return ProcessPoolExecutor(
+        max_workers=max_workers, mp_context=_mp.get_context("spawn"),
+        initializer=_worker_init, initargs=(_BACKEND_DIR, env),
+    )
+
+
+def _submit_daemon(fn, *args, **kwargs):
+    """Run one attempt in a DAEMON thread and return a real ``Future`` for it.
+
+    WHY NOT A ThreadPoolExecutor (2026-09-21 recheck, H1): Python 3.9+ registers an atexit hook
+    that JOINS a ThreadPoolExecutor's threads. `shutdown(wait=False, cancel_futures=True)` cannot
+    stop a thread that is already running, so a remote call that never returns kept the WHOLE
+    launcher alive at interpreter exit -- the export deadline dropped the rank and the process
+    still hung. Daemon threads are abandoned at exit, which is the only behaviour that makes a
+    bounded export actually bounded. The Future is a plain one, so `as_completed(futs, timeout=...)`
+    and `fut.done()` keep working unchanged.
+    """
+    import threading
+    from concurrent.futures import Future
+    fut: Future = Future()
+
+    def _run() -> None:
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 -- handed to the caller through the Future
+            fut.set_exception(exc)
+
+    threading.Thread(target=_run, name=f"remote-{getattr(fn, '__name__', 'attempt')}",
+                     daemon=True).start()
+    return fut
+
+
+def _run_local_fallback_bounded(trial_cfg: Dict[str, Any], deadline: Optional[float] = None) -> Dict[str, Any]:
+    """Run the remote fallback in a KILLABLE process pool, bounded by what is left of the export.
+
+    Inline -- what this used to do -- a wedged fallback ran in a thread that cannot be terminated
+    and, worse, STARTED FRESH WORK after the export deadline had already dropped the rank: nobody
+    was waiting for that backtest any more (2026-09-21 recheck, H1). Now it runs where it can be
+    killed, its wait is bounded, and past the deadline it refuses to start at all.
+    """
+    import time
+    from concurrent.futures import TimeoutError as _FutureTimeout
+    from app.services.strategy_optimization_handler import _persist_trial_worker
+
+    budget = None if deadline is None else deadline - time.monotonic()
+    if budget is not None and budget <= 0:
+        raise TimeoutError(
+            "the export deadline passed before the local fallback could start -- not starting a "
+            "backtest that nothing is waiting for")
+    pool = _new_local_pool(1)
+    try:
+        fut = pool.submit(_persist_trial_worker, trial_cfg)
+        return fut.result(timeout=budget)
+    except _FutureTimeout:
+        raise TimeoutError("the local fallback exceeded the remaining export budget") from None
+    finally:
+        # Terminate then kill, never wait: the whole point is that a wedged worker cannot hold
+        # this process open.
+        _kill_executor(pool)
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001 -- teardown must never mask the export result
+            pass
 
 
 def _kill_executor(ex) -> None:
@@ -6524,17 +6617,20 @@ def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
     countable; they are not candidates. Fewer saved backtests is the correct answer when the search
     is thin.
     """
-    from app.services.strategy_fitness import STALLED_SENTINEL
+    from app.services.strategy_fitness import STALLED_SENTINEL, is_measured_result
     seen, ranked, skipped = set(), [], 0
     for r in sorted(all_results or [],
                     key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9),
                     reverse=True):
-        fit = r.get("fitness")
-        if r.get("status") == "stalled" or fit == STALLED_SENTINEL:
+        # ONE predicate for counting and ranking (2026-09-21 recheck, H2). It also rejects a
+        # missing/non-numeric fitness, so `fit` is numeric from here on and the dedup key no
+        # longer needs a JSON fallback -- the one that called an out-of-scope `_json` and raised
+        # NameError on exactly the record this helper used to tolerate (H5).
+        if not is_measured_result(r):
             skipped += 1
             continue
-        dedup_key = (round(fit, 6) if isinstance(fit, (int, float))
-                     else _json.dumps(r.get("params"), sort_keys=True, default=str))
+        fit = r.get("fitness")
+        dedup_key = round(fit, 6)
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
@@ -6748,7 +6844,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             return persisted
         import multiprocessing as _mp
         import os as _os
-        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+        from concurrent.futures import as_completed
         from concurrent.futures import TimeoutError as _FutureTimeout
         from app.services.strategy_optimization_handler import (
             _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
@@ -6764,11 +6860,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         export_timeout = float(_os.environ.get("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
         print(f"    persisting top {len(specs)} across {n_local} local + "
               f"{len(remote_workers)} remote worker(s) (export bound {export_timeout:.0f}s)...")
-        local_ex = ProcessPoolExecutor(
-            max_workers=n_local, mp_context=_mp.get_context("spawn"),
-            initializer=_worker_init, initargs=(_BACKEND_DIR, env),
-        )
-        remote_ex = ThreadPoolExecutor(max_workers=max(1, len(remote_workers)))
+        local_ex = _new_local_pool(n_local)
+        # NO ThreadPoolExecutor for the remote attempts: its threads cannot be killed and Python
+        # joins them at exit, which is how a timed-out remote call kept this launcher alive
+        # (2026-09-21 recheck, H1). Daemon threads are abandoned instead.
+        import time as _time
+        export_deadline = _time.monotonic() + export_timeout
         try:
             # Round-robin each spec across every available slot (n_local local + one per remote
             # worker) -- with n <= save-top (default 5) this just spreads a handful of re-runs
@@ -6778,7 +6875,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             for idx, (rk, tc, sp2) in enumerate(specs):
                 slot = slots[idx % len(slots)]
                 fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
-                       else remote_ex.submit(_remote_then_local, slot, tc, fitness_metric))
+                       else _submit_daemon(_remote_then_local, slot, tc, fitness_metric,
+                                           export_deadline))
                 futs[fut] = (rk, tc, sp2)
             try:
                 for fut in as_completed(futs, timeout=export_timeout):
@@ -6798,11 +6896,10 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                       f"matrix; the pool is killed rather than waited on.")
         finally:
             _kill_executor(local_ex)
-            for ex in (local_ex, remote_ex):
-                try:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                except Exception:  # noqa: BLE001 — teardown must never mask the export result
-                    pass
+            try:
+                local_ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001 — teardown must never mask the export result
+                pass
         return persisted
     finally:
         db.close()

@@ -1358,6 +1358,13 @@ def _prepare_master_market_conditions(opt_id: int, db: Any,
 #: visible and re-runnable, and its checkpoint is PRESERVED rather than cleared. Keep the literal in
 #: sync with tools/run_options_matrix.py -- test_no_measurement_policy pins the two together.
 NO_MEASUREMENT_MARKER = "no measured trials"
+#: The FAILURE KIND that distinguishes "the search measured nothing" from a real failure. It rides
+#: ALONGSIDE the ordinary ``status="failed"`` contract instead of replacing it (2026-09-21 recheck,
+#: H3): the task queue, the UI and polling clients all already treat `failed` as failure, and
+#: inventing a second success-like status meant the main queue marked an all-stalled optimization
+#: COMPLETED (progress 100%, no error) while its row said failed -- two contradictory outcomes for
+#: one job, and `optimize-batch` could walk into its success/export path.
+NO_MEASUREMENT_KIND = "no_measurements"
 
 
 def _count_measured(all_results: list) -> int:
@@ -1366,10 +1373,13 @@ def _count_measured(all_results: list) -> int:
     Derived from the records rather than counted alongside them: there is more than one append site
     (the local-trial path and the dispatcher's result path), so a hand-maintained counter drifts --
     the first cut of this fix produced "11 record(s), 0 measured" and an UnboundLocalError in the
-    path that never incremented it. Stalled diagnostics are the only non-measurements.
+    path that never incremented it.
+
+    Uses the SAME predicate as the Top-N ranking (2026-09-21 recheck, H2). Counting on `status`
+    alone disagreed with ranking on old-format records, which carry the sentinel and no status.
     """
-    return sum(1 for r in (all_results or [])
-               if isinstance(r, dict) and r.get("status") != "stalled")
+    from app.services.strategy_fitness import is_measured_result
+    return sum(1 for r in (all_results or []) if is_measured_result(r))
 
 
 def _final_status(all_results: list) -> str:
@@ -2211,9 +2221,12 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     f"re-run; no Top-N backtest was exported. If the trials are genuinely SLOW "
                     f"rather than wedged, raise BT_LOCAL_STALL_TIMEOUT_S (default 5400s).",
                 )
-                # Distinct from a generic failure: tools/run_options_matrix.py skips the job rather
-                # than stopping the campaign, and the CLI can print this without the JSON dump.
-                res["status"] = "no_measurements"
+                # Distinct from a generic failure -- but through the EXISTING failure contract, so
+                # no consumer has to learn a new success-like status (2026-09-21 recheck, H3).
+                # tools/run_options_matrix.py skips the job rather than stopping the campaign, and
+                # the CLI prints this without the JSON dump; both read `failure_kind`/the marker.
+                res["status"] = "failed"
+                res["failure_kind"] = NO_MEASUREMENT_KIND
                 return res
             return _fail(
                 opt_id, db,
