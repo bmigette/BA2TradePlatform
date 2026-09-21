@@ -104,15 +104,30 @@ def morning_report(db: str, day: str | None, top_n: int) -> str:
 
     out = [f"🌅 BA2 PROD — morning report {label} (ET day, 10:30 ET)"]
 
-    # 1) open trades
+    # 1) open book — AGGREGATE ONLY. User, 2026-09-21: "remove open trades from report? Too many..."
+    #    The per-trade listing reached 80 lines and flooded the channel; the count, the exposure and
+    #    the per-expert split carry the same signal in two lines.
+    def notional_of(r) -> float:
+        return abs((r["open_price"] or 0.0) * (r["quantity"] or 0.0) * (r["multiplier"] or 1))
+
+    def who_of(r) -> str:
+        return experts.get(r["expert_id"]) or ("unassigned" if r["expert_id"] is None else f"expert#{r['expert_id']}")
+
     open_rows = list(con.execute(
         'select * from "transaction" where status=\'OPENED\' order by open_date'))
     if open_rows:
-        out.append(f"\n📂 Open trades ({len(open_rows)}):")
+        notional = sum(notional_of(r) for r in open_rows)
+        longs = sum(1 for r in open_rows if (r["side"] or "BUY").upper() == "BUY")
+        out.append(f"\n📂 Open book: {len(open_rows)} position(s) "
+                   f"({longs} long / {len(open_rows) - longs} short, exposure ≈ {notional:,.0f}$)")
+        per_expert: dict[str, int] = {}
         for r in open_rows:
-            out.append(f"  • {r['symbol']} {r['side']} x{r['quantity']:g} @ {r['open_price']:.2f} — {experts.get(r['expert_id'], r['expert_id'])}")
+            per_expert[who_of(r)] = per_expert.get(who_of(r), 0) + 1
+        top = sorted(per_expert.items(), key=lambda kv: -kv[1])[:3]
+        out.append("   by expert: " + ", ".join(f"{k} {n}" for k, n in top)
+                   + (f" (+{len(per_expert) - len(top)} more)" if len(per_expert) > len(top) else ""))
     else:
-        out.append("\n📂 Open trades: none")
+        out.append("\n📂 Open book: none")
 
     # 2) closed today + realized P&L
     closed = list(con.execute(
@@ -248,22 +263,14 @@ def close_report(db: str, day: str | None) -> str:
             slot[1] += notional_of(r)
         out.append("   by expert: " + " | ".join(
             f"{who} {n} ({v:,.0f}$)" for who, (n, v) in sorted(per_expert.items(), key=lambda kv: -kv[1][1])))
-        ranked = sorted(open_rows, key=notional_of, reverse=True)
-        show = ranked if len(ranked) <= 8 else ranked[:5]
-        for r in show:
-            line = (f"  • {r['symbol']} {r['side']} x{(r['quantity'] or 0):g} @ {(r['open_price'] or 0):.2f} "
-                    f"(since {str(r['open_date'])[:10]}) — {who_of(r)}")
+        # NO per-position listing. User, 2026-09-21: "remove open trades from report? Too many..."
+        # The unrealized P&L still lands in the day's numbers below, now summed over EVERY open
+        # position instead of only the handful that used to be listed.
+        for r in open_rows:
             pos = book.get(r["symbol"])
             if pos and pos.get("unrealized_pl") is not None:
                 unreal_seen = True
                 unreal_total += pos["unrealized_pl"]
-                line += f"  [now {pos.get('current_price') or 0:.2f}, {fmt_pl(pos['unrealized_pl'])}"
-                if pos.get("unrealized_plpc") is not None:
-                    line += f" / {pos['unrealized_plpc'] * 100:+.1f}%"
-                line += "]"
-            out.append(line)
-        if len(ranked) > len(show):
-            out.append(f"   … +{len(ranked) - len(show)} smaller positions (largest shown above)")
     else:
         out.append("\n📂 OPEN AT CLOSE — none")
 
