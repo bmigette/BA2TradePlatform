@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import bisect
 import math
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -81,6 +82,20 @@ from .options_provider import HistoricalOptionsProvider
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class StaleMarkToMarket(RuntimeError):
+    """The mark-to-market memo served a value the current book no longer produces.
+
+    Raised (never logged-and-continued) by the ``BT_MTM_AUDIT=1`` guard: a stale mark is a wrong
+    available balance, which changes what the run trades. A run that hits this must fail, not
+    finish on numbers derived from a book that had already moved."""
+
+
+#: Set BT_MTM_AUDIT=1 to re-derive the mark on EVERY memo hit and raise on any disagreement.
+#: Read once at import — a per-call env read would itself show up in the profile the memo exists
+#: for. Off by default; the test suite and the acceptance backtests turn it on.
+_MTM_AUDIT = os.environ.get("BT_MTM_AUDIT", "").strip().lower() in ("1", "true", "yes")
 
 
 class _AttrDict(dict):
@@ -335,6 +350,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # (_cap_single_leg_option_entry / _fill_multi_leg_parent) — those change what the
         # memos must report without any new order row.
         self._option_memo_gen: int = 0
+        # BOOK GENERATION for the mark-to-market memo (``_open_positions_mtm``). Bumped by EVERY
+        # mutation of the marked book: the order set (``invalidate_order_cache``), the equity
+        # ledger (``_update_position``), the option ledger (``_update_option_position`` and the
+        # settle/assign/liquidate paths via ``_zero_option_lot``), and every in-place order
+        # quantity/status mutation that already moved ``_option_memo_gen`` — all of which funnel
+        # through ``_bump_option_memo``/``_touch_book`` so a new mutation site cannot silently
+        # keep the memo alive. See ``_open_positions_mtm`` for why the memo exists and
+        # ``BT_MTM_AUDIT`` for the guard that proves it never serves a stale book.
+        #
+        # CASH IS DELIBERATELY NOT IN IT: the memo covers the POSITION mark only, and
+        # ``equity() = cash + mark``, so a cash movement needs no bump (and gets none).
+        self._book_gen: int = 0
+        # (book_gen, clock, marked value) memo for _open_positions_mtm.
+        self._mtm_memo: Optional[tuple] = None
         # (generation, contract_group, group_bounds) memo for _option_group_bounds.
         self._group_bounds_memo: Optional[tuple] = None
         # contract_symbol -> the order carrying the contract's terms (first row with a strike,
@@ -465,8 +494,90 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # ======================================================================
     # Ledger internals
     # ======================================================================
+    def _touch_book(self) -> None:
+        """Record that the MARKED BOOK changed, so ``_open_positions_mtm`` recomputes.
+
+        Every mutation of the positions/orders the mark reads funnels through here (or through
+        ``_bump_option_memo``, which calls it). A missed bump is a CORRECTNESS bug, not a
+        performance miss: a stale mark is a wrong available balance, which changes trading
+        decisions. ``BT_MTM_AUDIT=1`` re-derives the mark on every memo hit and raises on any
+        disagreement -- run a real backtest under it after touching any ledger path.
+        """
+        self._book_gen += 1
+
+    def _bump_option_memo(self) -> None:
+        """Invalidate the options memos (``_option_group_bounds`` / the ``_lot_order`` index)
+        AND the mark-to-market memo. Single funnel: every site that used to write
+        ``self._option_memo_gen += 1`` calls this, so the two can never drift apart."""
+        self._option_memo_gen += 1
+        self._book_gen += 1
+
+    def _zero_option_lot(self, lot: "_OptionLot") -> None:
+        """Retire an option lot (expiry settlement, assignment, margin-call buy-back).
+
+        The ONE place a lot is zeroed, so the book generation cannot be forgotten at any of the
+        three settlement paths that do it. (The lot object is kept rather than removed -- other
+        readers rely on ``qty == 0`` lots still being present.)"""
+        lot.qty = 0.0
+        lot.avg_price = 0.0
+        self._touch_book()
+
     def _open_positions_mtm(self) -> float:
-        """Mark-to-market value of all open positions at the current bar's close.
+        """Mark-to-market value of all open positions at the current bar's close — MEMOISED.
+
+        THE MEMO (2026-09-21). Every entry candidate that reaches the live-parity equity gate
+        calls ``has_sufficient_equity_for_trading`` -> ``get_available_balance`` -> this, which
+        re-marks the WHOLE open option book: it walks the order set to resolve each structure's
+        defined-risk bounds and re-prices every leg (bar lookup, no-arb clamp, Black-Scholes
+        fallback). The cost is (entry candidates) x (open positions), and BOTH grow with how
+        much a genome trades, so it is quadratic in trade count -- measured as the reason the
+        heaviest option genomes run ~100x slower than the thin ones and straggle every GA
+        generation (profile: 132.7s of a 409s run, 54ms per equity check).
+
+        The book is invariant between mutations, so the mark is memoised on
+        ``(self._book_gen, clock)``: the book generation (bumped by every position/order/
+        settlement mutation -- see ``_touch_book``) and the simulated clock (``set_clock`` once
+        per bar, so the memo never spans bars). No time-based expiry and no tolerance: a memo
+        that could serve a changed book would silently produce a wrong available balance.
+
+        The mark itself (below, in ``_compute_open_positions_mtm``) is unchanged.
+
+        Signed value (long positions positive, short positions negative). A held symbol
+        with no EXACT bar at the current clock tick is valued at its last-known close
+        (forward-fill) — NOT $0 — because the clock is the union of every symbol's
+        timestamps, so a held symbol routinely lacks a bar on ticks driven by other symbols
+        (and on gaps / half-days / split days). Dropping it to $0 made positions vanish from
+        the equity curve and produced spurious 90%+ drawdowns (corrupting max_drawdown /
+        Calmar / Sharpe). Final fallback is the entry price for a never-yet-priced symbol.
+        Equity positions are valued at the equity bar's close; OPTION positions are
+        valued separately at the current premium close x qty x multiplier (with a
+        fall-back to the entry premium when there is no premium bar for the day).
+        """
+        # The clock is the memo's other key half. A price source with no clock set yet (bare
+        # unit-test doubles, and the window before the engine's first set_clock) simply does not
+        # memoise -- there is no bar to key on and the un-memoised path is the old behaviour.
+        current = getattr(self._price, "current", None)
+        clock = current() if current is not None else None
+        if clock is None:
+            return self._compute_open_positions_mtm()
+        memo = self._mtm_memo
+        if memo is not None and memo[0] == self._book_gen and memo[1] == clock:
+            if _MTM_AUDIT:
+                fresh = self._compute_open_positions_mtm()
+                if fresh != memo[2]:
+                    raise StaleMarkToMarket(
+                        f"[backtest] the mark-to-market memo served {memo[2]!r} at book "
+                        f"generation {memo[0]} / clock {memo[1]}, but re-marking the book now "
+                        f"gives {fresh!r}: some mutation of the position/order state did not "
+                        f"bump the book generation (see BacktestAccount._touch_book)."
+                    )
+            return memo[2]
+        value = self._compute_open_positions_mtm()
+        self._mtm_memo = (self._book_gen, clock, value)
+        return value
+
+    def _compute_open_positions_mtm(self) -> float:
+        """The actual mark — see ``_open_positions_mtm`` (its memoising caller) for the contract.
 
         Signed value (long positions positive, short positions negative). A held symbol
         with no EXACT bar at the current clock tick is valued at its last-known close
@@ -737,18 +848,27 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return memo[1], memo[2]
 
         held = self._option_positions
-        orders = self.get_orders()  # ONE fetch reused by all three passes below
+        orders = self.get_orders()  # ONE fetch reused by every pass below
         # parent order id -> (strategy, structure quantity, [opening strikes], multiplier)
         parent_info: Dict[int, Dict[str, Any]] = {}
         single_info: Dict[str, Dict[str, Any]] = {}
-        # collect opening legs' strikes per parent + parent strategy/qty
+        children: List[Any] = []
+        # contract_symbol -> the FIRST option order carrying it (same first-match rule the
+        # per-lot rescan below used to re-derive for EVERY held lot: that was O(held x orders)
+        # on top of the two passes, and the dominant own-time in the options profile).
+        owner_of: Dict[str, Any] = {}
+        # ONE pass: parent/single strategy+qty, the child legs (their strikes need the completed
+        # parent set), and each held contract's owning order.
         for o in orders:
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
+            cs = getattr(o, "contract_symbol", None)
+            if cs is not None and cs not in owner_of:
+                owner_of[cs] = o
             if o.parent_order_id is None:
                 # multi-leg PARENT (no contract) or a single-leg option order.
                 if o.id is not None and getattr(o, "option_strategy", None):
-                    if not getattr(o, "contract_symbol", None):
+                    if not cs:
                         parent_info.setdefault(
                             o.id,
                             {"strategy": o.option_strategy,
@@ -756,17 +876,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                              "strikes": [], "multiplier": float(o.multiplier or 100)},
                         )
                     else:  # single-leg option (its own group)
-                        single_info[o.contract_symbol] = {
+                        single_info[cs] = {
                             "strategy": o.option_strategy,
                             "qty": abs(float(o.quantity or 0.0)) or 1.0,
                             "strikes": [float(o.strike)] if o.strike is not None else [],
                             "multiplier": float(o.multiplier or 100),
                         }
+            else:
+                children.append(o)
         # opening child legs contribute their strikes to the parent group
-        for o in orders:
-            if getattr(o, "asset_class", None) != AssetClass.OPTION:
-                continue
-            if o.parent_order_id is not None and o.parent_order_id in parent_info and o.strike is not None:
+        for o in children:
+            if o.parent_order_id in parent_info and o.strike is not None:
                 parent_info[o.parent_order_id]["strikes"].append(float(o.strike))
 
         def _width(info):
@@ -780,12 +900,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         contract_group: Dict[str, Any] = {}
         group_bounds: Dict[Any, Dict[str, Any]] = {}
         for cs in held:
-            # find the order that owns this contract to route it to its group
-            owner = None
-            for o in orders:
-                if getattr(o, "contract_symbol", None) == cs and getattr(o, "asset_class", None) == AssetClass.OPTION:
-                    owner = o
-                    break
+            # the order that owns this contract routes it to its group (index built above)
+            owner = owner_of.get(cs)
             if owner is None:
                 continue
             if owner.parent_order_id is not None and owner.parent_order_id in parent_info:
@@ -1626,8 +1742,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             pos = self._option_position_for_lot(lot, txn)
             if pos is not None:
                 self._record_option_expiry_close(txn, pos, float(premium))
-        lot.qty = 0.0
-        lot.avg_price = 0.0
+        self._zero_option_lot(lot)
         if txn is not None and self._all_legs_resolved(txn):
             from ba2_common.core.utils import close_transaction_with_logging
 
@@ -1787,6 +1902,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # (order fills + option assignment), mirroring invalidate_order_cache's discipline.
         if self._opened_txn_snapshot:
             self._opened_txn_snapshot = {}
+        # The equity ledger IS part of the marked book (see _open_positions_mtm's memo).
+        self._touch_book()
 
         pos = self._positions.get(symbol)
         if pos is None:
@@ -1927,8 +2044,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._order_cache = None
         self._active_order_cache = None
         # Any order-set change also invalidates the options memos (_option_group_bounds /
-        # the _lot_order index) — they are keyed on this generation, not recomputed per bar.
-        self._option_memo_gen += 1
+        # the _lot_order index) — they are keyed on this generation, not recomputed per bar —
+        # and the mark-to-market memo, whose defined-risk bounds are derived from the orders.
+        self._bump_option_memo()
 
     def opened_position_snapshot(self, expert_id: int) -> Dict[str, List[tuple]]:
         """Expert-scoped snapshot of this account's OPENED transactions, cached + invalidated on
@@ -2269,7 +2387,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
         if expired_any:
             self.invalidate_order_cache()
-            self._option_memo_gen += 1
+            self._bump_option_memo()
         return expired_any
 
     def _is_single_leg_option(self, order) -> bool:
@@ -2639,7 +2757,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             order.status = OrderStatus.CANCELED
             order.quantity = 0
             update_instance(order)
-            self._option_memo_gen += 1  # in-place quantity mutation: refresh the F6 memos
+            self._bump_option_memo()  # in-place quantity mutation: refresh the F6 memos
             self._cancel_oco_sibling(order)
             return False
         logger.error(
@@ -2648,7 +2766,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             order.contract_symbol, qty, fill_px, self._cash, affordable,
         )
         order.quantity = float(affordable)
-        self._option_memo_gen += 1  # in-place quantity mutation: refresh the F6 memos
+        self._bump_option_memo()  # in-place quantity mutation: refresh the F6 memos
         # Keep the shared Transaction row in sync (it was created at the pre-cap contract
         # count and otherwise over-reports the position size forever).
         self._sync_transaction_quantity(order.transaction_id, float(affordable))
@@ -2788,7 +2906,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     parent.status = OrderStatus.CANCELED
                     parent.quantity = 0
                     update_instance(parent)
-                    self._option_memo_gen += 1  # in-place quantity mutation: refresh F6 memos
+                    self._bump_option_memo()  # in-place quantity mutation: refresh F6 memos
                     return
                 logger.error(
                     "BACKTEST option cash-secured: DEBIT combo %s sized %g structures @ $%.2f "
@@ -2804,7 +2922,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 ratio = abs(float(leg.quantity or 0.0)) / structures
                 leg.quantity = ratio * capped
             parent.quantity = capped
-            self._option_memo_gen += 1  # in-place quantity mutation: refresh F6 memos
+            self._bump_option_memo()  # in-place quantity mutation: refresh F6 memos
             # Keep the shared Transaction row (created at the pre-cap STRUCTURE count) in sync.
             self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
@@ -3755,8 +3873,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         #    conversion below moves the share-leg cash). Worthless simply zeroes it out.
         lot = self._option_positions.get(position.contract_symbol)
         if lot is not None:
-            lot.qty = 0.0
-            lot.avg_price = 0.0
+            self._zero_option_lot(lot)
 
         # 3. Exercise/assignment -> create the resulting SHARE position settled at the STRIKE (NOT
         #    the market — the option holder transacts stock at the strike). The share cost basis is
@@ -4155,8 +4272,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._record_option_expiry_close(txn, pos, float(intrinsic))
             lot = self._option_positions.get(pos.contract_symbol)
             if lot is not None:
-                lot.qty = 0.0
-                lot.avg_price = 0.0
+                self._zero_option_lot(lot)
 
         if self._all_legs_resolved(txn):
             # Carry the NET payoff per contract-share on the transaction row (a hardcoded 0.0
@@ -4771,8 +4887,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # A NEW held contract changes _option_group_bounds' contract->group mapping, but a
             # fill mutates in place (no invalidate_order_cache) — bump the memo generation so
             # the F6 memos refresh. Adds to an EXISTING lot change nothing the memos read.
-            self._option_memo_gen += 1
+            self._bump_option_memo()
         lot.multiplier = multiplier
+        # Every option fill moves qty/avg_price, i.e. the mark — not only the NEW-lot case the
+        # generation bump above covers (that one is about the contract->group MAPPING).
+        self._touch_book()
         # Task 3: seed/refresh last_iv at FILL time too, not only from a later equity-mark
         # bar lookup — a position that opens and then immediately hits a missing-bar day
         # (before any snapshot has run at the entry bar) must not lose the entry bar's iv
