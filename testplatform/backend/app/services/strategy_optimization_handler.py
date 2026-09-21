@@ -713,6 +713,47 @@ class _SlotPools:
                 self.busy[i] = None
                 return
 
+    def abandon_slot(self, fut, log=logger.warning) -> int:
+        """Drop an in-flight future whose worker has WEDGED, and respawn that slot AT ONCE.
+
+        NOT ``_recycle_pool``: that calls ``shutdown(wait=True)``, which is exactly wrong here --
+        it would block on the very worker we are trying to get rid of (the 2026-09-20 stall sat
+        2h47m with one trial pending; a wait here would have hung the recovery itself). The slot's
+        process is TERMINATED first, so the teardown is immediate and the batch carries on.
+
+        Returns the slot index, or -1 when the future was not in flight.
+        """
+        idx = -1
+        for i, f in enumerate(self.busy):
+            if f is fut:
+                idx = i
+                break
+        if idx < 0:
+            return -1
+        self.busy[idx] = None
+        pool = self.pools[idx]
+        try:
+            fut.cancel()
+        except Exception:  # noqa: BLE001 -- best effort; terminating the process is the real fix
+            pass
+        killed = 0
+        for proc in list((getattr(pool, "_processes", None) or {}).values()):
+            try:
+                proc.terminate()
+                killed += 1
+            except Exception:  # noqa: BLE001 -- a process already gone is the desired end state
+                pass
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:  # noqa: BLE001 -- a failed teardown must not lose the run
+            log(f"slot {idx}: shutdown after a stall raised {e!r}; building a fresh pool anyway")
+        self.pools[idx] = self._make()
+        self.tasks[idx] = 0
+        self.recycles += 1
+        log(f"slot {idx}: abandoned a wedged trial ({killed} worker process(es) terminated) -- "
+            f"fresh pool built, slot reusable")
+        return idx
+
     def release_all(self) -> Dict[str, float]:
         """Drop data caches in every slot and RETURN what they freed, summed over the slots.
 
@@ -1600,11 +1641,39 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 done, _ = _fwait(list(pending), timeout=_stall_s,
                                  return_when=FIRST_COMPLETED)
                 if not done:
+                    # SURGICAL STALL RECOVERY (2026-09-21, operator decision: "a stall should not
+                    # kill grid"). The old behaviour raised TimeoutError, which failed the WHOLE
+                    # job: one wedged genome killed a 16-job matrix at job 1/16 (2026-09-20
+                    # 21:54Z) and cost 7.5h of downtime. Now the wedged individual is scored at
+                    # STALLED_SENTINEL -- a value DISTINCT from the other sentinels so the
+                    # frequency stays countable in all_results -- and its slot is RESPAWNED (the
+                    # wedged worker is terminated, see _SlotPools.abandon_slot) so the next
+                    # generation cannot inherit a dead slot. The job continues.
+                    from app.services.strategy_fitness import STALLED_SENTINEL
+                    n_stalled = len(pending)
+                    for fut in list(pending):
+                        i, flat, key = pending.pop(fut)
+                        slot = _pool.abandon_slot(fut)
+                        logger.error(
+                            f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no "
+                            f"progress in {_stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
+                            f"(STALLED), slot {slot} respawned; job CONTINUES")
+                        yield (i, flat, key, {
+                            "ok": False,
+                            "stalled": True,
+                            "fitness": STALLED_SENTINEL,
+                            "fitness_raw": STALLED_SENTINEL,
+                            "trades": 0,
+                            "total_return": 0.0,
+                            "max_drawdown": 0.0,
+                            "secs": _stall_s,
+                            "error": f"stalled: no progress in {_stall_s:.0f}s",
+                        })
                     logger.error(
-                        f"LOCAL POOL STALLED: {len(pending)} trial(s) made no progress in "
-                        f"{_stall_s:.0f}s. Aborting the job so it can be restarted rather than "
-                        f"hanging silently.")
-                    raise TimeoutError("local pool stalled")
+                        f"LOCAL POOL STALLED: {n_stalled} individual(s) marked STALLED "
+                        f"({STALLED_SENTINEL:.0e}) after {_stall_s:.0f}s; slots respawned, "
+                        f"job continues")
+                    continue
                 for fut in done:
                     i, flat, key = pending.pop(fut)
                     _pool.mark_done(fut)
@@ -1756,22 +1825,41 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         # and do NOT memo it — a crash is an environment event, not a property
                         # of the genome, so a re-selection should re-run it.
                         from app.services.strategy_fitness import ZERO_TRADE_SENTINEL
-                        fit = ZERO_TRADE_SENTINEL
-                        fits[i] = fit
-                        if out.get("error"):
-                            mem = out.get("mem")
-                            logger.warning(f"trial failed in worker: {out['error']}"
-                                           + (f" | worker mem: {mem}" if mem else ""))
-                            if out.get("fatal") and fatal["msg"] is None:
-                                fatal["msg"] = out["error"]
-                                # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
-                                # an incomplete prewarm, a missing OHLCV cache -- so it affects
-                                # every remaining trial identically. Before this, fatal["msg"] was
-                                # recorded and then only consulted if all_results ended up EMPTY;
-                                # when most trials happened to succeed (the goal2020 OP case) the
-                                # run ground through all 8 generations and reported a confident
-                                # winner chosen partly by which genomes dodged the broken data.
-                                raise _FatalTrialError(out["error"])
+                        if out.get("stalled"):
+                            # A STALL is not a genome property either, but it IS reproducible
+                            # in-process: this genome wedged once, so re-selecting it would burn
+                            # another _stall_s of the batch -- up to 8-15 generations of it. So:
+                            # score it at the DEDICATED sentinel (distinct, so the frequency is
+                            # COUNTABLE in all_results -- the operator asked to see how often this
+                            # happens), memoize it, and record it. A crash stays un-memoized below.
+                            from app.services.strategy_fitness import STALLED_SENTINEL
+                            fit = STALLED_SENTINEL
+                            fits[i] = fit
+                            memo.put(key, fit)
+                            _report_trial_result(on_result, i, fit)
+                            all_results.append({
+                                "params": flat, "fitness": fit, "key": key, "trades": 0,
+                                "fitness_raw": fit, "robustness": None,
+                                "total_return": 0.0, "max_drawdown": 0.0})
+                            logger.error(f"trial STALLED (scored {fit:.0e}, memoized): "
+                                         f"{out.get('error')}")
+                        else:
+                            fit = ZERO_TRADE_SENTINEL
+                            fits[i] = fit
+                            if out.get("error"):
+                                mem = out.get("mem")
+                                logger.warning(f"trial failed in worker: {out['error']}"
+                                               + (f" | worker mem: {mem}" if mem else ""))
+                                if out.get("fatal") and fatal["msg"] is None:
+                                    fatal["msg"] = out["error"]
+                                    # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
+                                    # an incomplete prewarm, a missing OHLCV cache -- so it affects
+                                    # every remaining trial identically. Before this, fatal["msg"] was
+                                    # recorded and then only consulted if all_results ended up EMPTY;
+                                    # when most trials happened to succeed (the goal2020 OP case) the
+                                    # run ground through all 8 generations and reported a confident
+                                    # winner chosen partly by which genomes dodged the broken data.
+                                    raise _FatalTrialError(out["error"])
                     if best["fitness"] is None or fit > best["fitness"]:
                         best["fitness"] = fit
                         best["params"] = flat
