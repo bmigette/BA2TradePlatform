@@ -74,33 +74,11 @@ jobs:
         run: python -m pytest tests/backtest -q -rA --junitxml=junit-backtest.xml
 
       - name: Surface the failure tracebacks as annotations
-        # Runs ONLY on failure. The junit XML holds the full traceback, but downloading an
-        # artifact -- like downloading the log -- needs admin rights on the repo and 401s
-        # otherwise. The annotations API does NOT, so echoing the traceback as ::error::
-        # workflow commands is the one channel a non-admin can actually read. Without this a
-        # red build says only "Process completed with exit code 1".
+        # Runs ONLY on failure. See .github/scripts/annotate_junit_failures.py for why this is
+        # the only channel a non-admin can read.
         if: failure()
         working-directory: testplatform/backend
-        run: |
-          python - <<'EOF'
-          import xml.etree.ElementTree as ET, os, textwrap
-          path = "junit-backtest.xml"
-          if not os.path.exists(path):
-              print("::error::no junit-backtest.xml was produced"); raise SystemExit(0)
-          root = ET.parse(path).getroot()
-          n = 0
-          for case in root.iter("testcase"):
-              for bad in list(case.findall("failure")) + list(case.findall("error")):
-                  n += 1
-                  where = "%s::%s" % (case.get("classname"), case.get("name"))
-                  body = (bad.text or bad.get("message") or "").strip()
-                  # One annotation per chunk: GitHub truncates a long single message, and the
-                  # LAST frames are the informative ones, so keep the tail.
-                  for i, chunk in enumerate(textwrap.wrap(body[-3000:], 900)):
-                      print("::error title=%s (%d)::%s" % (where, i, chunk.replace("
-", " ")))
-          print("::error::%d failing test(s) reported above" % n)
-          EOF
+        run: python "$GITHUB_WORKSPACE/.github/scripts/annotate_junit_failures.py" junit-backtest.xml
       - name: Shared decision-path branch coverage (artifact, non-blocking)
         working-directory: testplatform/backend
         continue-on-error: true
