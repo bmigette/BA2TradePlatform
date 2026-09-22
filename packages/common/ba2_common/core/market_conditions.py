@@ -81,7 +81,7 @@ from contextlib import contextmanager
 from dataclasses import InitVar, dataclass
 from dataclasses import field as dc_field
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -465,6 +465,23 @@ _FIELD_KINDS = ("numeric", "categorical")
 _ANCHOR_OPS = ("<", ">")
 _FORBIDDEN_CODE = "none"
 
+#: The comparison operators a gate on a field of each kind may use -- the ONE table, read by
+#: ``TradeConditions.market_condition_condition_class`` (which enforces it at condition
+#: construction) and by ``trigger_catalog.operator_options_for`` (which is what the rule editor
+#: offers). Two lists would drift, and the drift only shows up when a deployed rule raises.
+#:
+#: A NUMERIC gate is a threshold: ``==`` on a float measurement passes essentially never, and
+#: ``>=``/``<=`` differ from the strict forms only on a measure-zero set. A CATEGORICAL field
+#: holds a regime CODE (``structure_state``: bull=1, bear=2), so an ORDERING on it is not a
+#: weaker condition but a meaningless one -- ``> 1`` reads as "bear only", which is the opposite
+#: of what somebody who knows "1 = bull" is trying to say. ``!=`` is excluded for the same
+#: reason the code ``none`` is never selectable: "not bull" silently includes the unclassified
+#: state, so it is not the complement the reader expects.
+OPERATORS_BY_KIND: Mapping[str, FrozenSet[str]] = MappingProxyType({
+    "numeric": frozenset({"<", ">"}),
+    "categorical": frozenset({"=="}),
+})
+
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -498,6 +515,14 @@ class FieldSpec:
     anchor_value: Optional[float] = None
     codes: InitVar[Optional[Mapping[str, int]]] = None   # categorical only; never contains "none"
     ui_name: str = ""
+    #: What the number MEANS, in words ("ATR14 multiples", "sessions", "ADX index points").
+    #: A market-condition measurement is not self-describing: ``structure_dist_support_atr`` and
+    #: ``structure_bars_since_bos`` are both "a number around 2", and an operator who reads the
+    #: first as sessions or the second as ATRs authors a gate that is off by an order of
+    #: magnitude and still looks plausible. Carried HERE rather than in the rule editor because
+    #: the unit is a property of the measurement, and a copy in the UI would go stale the day a
+    #: field's normalisation changes. Empty for a categorical field, which counts nothing.
+    unit: str = ""
     _code_pairs: Optional[Tuple[Tuple[str, int], ...]] = dc_field(default=None, init=False)
 
     def __post_init__(self, codes: Optional[Mapping[str, int]]) -> None:
@@ -551,6 +576,7 @@ class FieldSpec:
             "anchor_value": self.anchor_value,
             "codes": None if self._code_pairs is None else dict(self._code_pairs),
             "ui_name": self.ui_name,
+            "unit": self.unit,
         }
 
 
@@ -579,13 +605,13 @@ class ProfileSpec:
 OHLCV_V1 = ProfileSpec(name="ohlcv-v1", calc_version=CALC_VERSION, fields=(
     FieldSpec(name=FIELD_TREND_SLOPE, kind="numeric", short="slope", searched=True,
               value_min=-0.30, value_max=0.30, value_step=0.05, anchor_op=">", anchor_value=0.0,
-              ui_name="Underlying trend slope"),
+              ui_name="Underlying trend slope", unit="ATR14 multiples per session"),
     FieldSpec(name=FIELD_ADX, kind="numeric", short="adx", searched=True,
               value_min=10.0, value_max=40.0, value_step=5.0, anchor_op="<", anchor_value=25.0,
-              ui_name="Underlying trend strength"),
+              ui_name="Underlying trend strength", unit="ADX index points (0-100)"),
     FieldSpec(name=FIELD_RV_RATIO, kind="numeric", short="rv", searched=True,
               value_min=0.50, value_max=2.00, value_step=0.25, anchor_op="<", anchor_value=1.0,
-              ui_name="Realized volatility expansion"),
+              ui_name="Realized volatility expansion", unit="ratio of 5-session to 20-session realized volatility"),
 ))
 PROFILES: Dict[str, ProfileSpec] = {OHLCV_V1.name: OHLCV_V1}
 
@@ -1126,39 +1152,39 @@ def compute_chart_structure(o, h, l, c, v, atr: Optional[np.ndarray] = None) -> 
 TA_STRUCTURE_V1 = ProfileSpec(name=STRUCTURE_PROFILE, calc_version=STRUCTURE_CALC_VERSION, fields=(
     FieldSpec(name=FIELD_DIST_SUPPORT, kind="numeric", short="dist-support", searched=True,
               value_min=0.0, value_max=5.0, value_step=0.5, anchor_op=">", anchor_value=1.0,
-              ui_name="Distance to support"),
+              ui_name="Distance to support", unit="ATR14 multiples below the close"),
     FieldSpec(name=FIELD_DIST_RESISTANCE, kind="numeric", short="dist-resistance", searched=True,
               value_min=0.0, value_max=5.0, value_step=0.5, anchor_op=">", anchor_value=1.0,
-              ui_name="Distance to resistance"),
+              ui_name="Distance to resistance", unit="ATR14 multiples above the close"),
     FieldSpec(name=FIELD_SUPPORT_TOUCHES, kind="numeric", short="support-touches", searched=False,
               value_min=1.0, value_max=5.0, value_step=1.0, anchor_op=">", anchor_value=2.0,
-              ui_name="Support strength"),
+              ui_name="Support strength", unit="confirmed pivot-low touches on the level"),
     FieldSpec(name=FIELD_RESISTANCE_TOUCHES, kind="numeric", short="resistance-touches", searched=False,
               value_min=1.0, value_max=5.0, value_step=1.0, anchor_op=">", anchor_value=2.0,
-              ui_name="Resistance strength"),
+              ui_name="Resistance strength", unit="confirmed pivot-high touches on the level"),
     FieldSpec(name=FIELD_CHANNEL_SLOPE, kind="numeric", short="chan-slope", searched=False,
               value_min=-0.30, value_max=0.30, value_step=0.05, anchor_op=">", anchor_value=0.0,
-              ui_name="Channel slope"),
+              ui_name="Channel slope", unit="ATR14 multiples per session"),
     FieldSpec(name=FIELD_CHANNEL_WIDTH, kind="numeric", short="chan-width", searched=False,
               value_min=1.0, value_max=8.0, value_step=0.5, anchor_op="<", anchor_value=4.0,
-              ui_name="Channel width"),
+              ui_name="Channel width", unit="ATR14 multiples"),
     FieldSpec(name=FIELD_CHANNEL_POS, kind="numeric", short="chan-pos", searched=True,
               value_min=0.0, value_max=1.0, value_step=0.1, anchor_op="<", anchor_value=0.5,
-              ui_name="Position in channel"),
+              ui_name="Position in channel", unit="fraction of the channel, 0 = floor and 1 = ceiling (unclamped)"),
     FieldSpec(name=FIELD_CLOSE_VS_PRIOR_HIGH, kind="numeric", short="vs-prior-high", searched=True,
               value_min=-3.0, value_max=2.0, value_step=0.25, anchor_op=">", anchor_value=0.0,
-              ui_name="Close vs prior 20-session high"),
+              ui_name="Close vs prior 20-session high", unit="ATR14 multiples"),
     FieldSpec(name=FIELD_CLOSE_VS_PRIOR_LOW, kind="numeric", short="vs-prior-low", searched=False,
               value_min=-2.0, value_max=3.0, value_step=0.25, anchor_op=">", anchor_value=0.0,
-              ui_name="Close vs prior 20-session low"),
+              ui_name="Close vs prior 20-session low", unit="ATR14 multiples"),
     FieldSpec(name=FIELD_STRUCTURE_STATE, kind="categorical", short="structure", searched=True,
               codes=STRUCTURE_STATE_CODES, ui_name="Swing structure"),
     FieldSpec(name=FIELD_BARS_SINCE_BOS, kind="numeric", short="bos", searched=False,
               value_min=0.0, value_max=60.0, value_step=5.0, anchor_op="<", anchor_value=20.0,
-              ui_name="Sessions since break of structure"),
+              ui_name="Sessions since break of structure", unit="sessions"),
     FieldSpec(name=FIELD_BARS_SINCE_CHOCH, kind="numeric", short="choch", searched=False,
               value_min=0.0, value_max=60.0, value_step=5.0, anchor_op="<", anchor_value=20.0,
-              ui_name="Sessions since change of character"),
+              ui_name="Sessions since change of character", unit="sessions"),
 ))
 
 

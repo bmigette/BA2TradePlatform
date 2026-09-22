@@ -7,14 +7,15 @@ from sqlmodel import select
 
 from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, EventAction, Ruleset
 from ...logger import logger
-from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
+from ...core.db import (get_db, get_all_instances, delete_instance, add_instance,
+                        update_instance, get_instance, rulesets_for_event_action)
 from ...core.instrument_enrichment import enrich_instruments
 from ba2_common.core.instrument_info import needs_instrument_info
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
     preview_trade_action_result_retention, execute_trade_action_result_retention,
@@ -35,53 +36,234 @@ from ba2_common.core.market_condition_rules import (
     market_condition_fields,
     parse_profile_setting,
 )
+from ba2_common.core.trigger_catalog import (
+    CATEGORIES as TRIGGER_CATEGORIES,
+    categorical_codes_for,
+    category_counts,
+    operator_options_for,
+    search_triggers,
+    trigger_catalog,
+)
+from functools import partial
 
 
-def _authorable_trigger_types() -> list:
-    """The trigger types the live rules editor offers, WITHOUT the market-condition fields.
+class TriggerTypePicker:
+    """The rule editor's Trigger Type control: a button that opens a categorised modal.
 
-    Those fifteen field names are ``ExpertEventType`` values like any other, so the editor's
-    ``[t.value for t in ExpertEventType]`` silently started offering them. Hand-authoring one is
-    never the intended route: a market gate is searched by the optimizer and arrives through
-    ``tools/import_deploy_payload.py``, which checks it against the expert's
-    ``market_condition_profile`` and refuses an unserved leaf. Authored here, a gate would carry
-    no profile with it and simply never pass -- and on an OPEN-POSITIONS ruleset it would stop an
-    exit from firing, which ``market_condition_rules`` calls the worst outcome in this design.
+    WHAT IT REPLACES, and why each replacement is not a loosening.
 
-    Filtering the MENU is not the refusal (a deployed rule still has to be editable, and the
-    select still displays a value it was given); ``_refuse_market_gates_on_exit_ruleset`` is.
+    * ``_authorable_trigger_types`` filtered the fifteen market-condition field names out of
+      the menu, because a gate authored with no profile behind it reads ``no_context`` and
+      never passes. The cure removed the feature from the UI entirely: an operator could not
+      author a gate for an expert whose profile IS set, could not READ one a deployed expert
+      was already running, and had no way to learn the vocabulary existed. The fields are
+      offered here like any other trigger, each carrying the name of the profile the expert
+      needs -- a message the operator can act on instead of an absence they cannot see. The
+      refusals are untouched: ``_refuse_market_gates_on_exit_rule`` and
+      ``_refuse_market_gates_on_exit_ruleset`` still stop a gate reaching an exit, and the
+      deploy importer still checks every leaf against the expert's profile setting.
+    * ``_trigger_type_options`` existed only because NiceGUI refuses a select value outside
+      its options (``choice_element``: ``ValueError: Invalid value: ...``) and
+      ``show_rule_dialog`` wraps nothing, so a persisted trigger the menu did not offer raised
+      mid-build and left a half-rendered dialog -- the rule became impossible even to LOOK at.
+      A button has no options list to be outside of, so the workaround has nothing left to work
+      around; a key this platform's catalog does not know renders as itself, and says so.
+
+    The modal has no Save and no Cancel: picking IS the action, and Escape or the backdrop
+    cancels (which is why the dialog must NOT be ``persistent``). It opens on a category that
+    holds the current value, so the rows beside it are its alternatives.
     """
-    fields = market_condition_fields()
-    return [t.value for t in ExpertEventType if t.value not in fields]
 
+    MARKER_BUTTON = 'trigger-picker-button'
+    MARKER_VALUE_NAME = 'trigger-picker-value-name'
+    MARKER_VALUE_KEY = 'trigger-picker-value-key'
+    MARKER_UNKNOWN = 'trigger-picker-unknown'
+    MARKER_PROFILE = 'trigger-picker-profile'
+    MARKER_DIALOG = 'trigger-picker-dialog'
+    MARKER_SEARCH = 'trigger-picker-search'
+    MARKER_CHIP = 'trigger-picker-chip'
+    MARKER_ENTRY = 'trigger-picker-entry'
+    MARKER_ENTRY_NAME = 'trigger-picker-entry-name'
+    MARKER_ENTRY_KEY = 'trigger-picker-entry-key'
+    MARKER_ENTRY_KIND = 'trigger-picker-entry-kind'
+    MARKER_ENTRY_PROFILE = 'trigger-picker-entry-profile'
 
-def _trigger_type_options(trigger_config) -> tuple:
-    """``(value, options)`` for one trigger row's Trigger Type select.
+    #: Said of a market field, in the picker and on the button. It names the SETTING that makes
+    #: the gate work, because "be careful" is not something an operator can do anything with.
+    PROFILE_NOTE = '⚠ Needs the {profile} market-condition profile on the expert'
+    #: Said of a key no catalog entry claims -- a rule deployed from a newer platform, or one
+    #: whose trigger has since been retired. Shown, never hidden and never repaired.
+    UNKNOWN_NOTE = 'not in this platform\'s catalog'
 
-    The value is the persisted ``event_type`` (legacy rows spell it ``type``), defaulting to
-    ``F_HAS_POSITION`` for a new row. The options are :func:`_authorable_trigger_types` PLUS that
-    value when the menu does not already carry it.
+    def __init__(self, value, on_change=None):
+        self._value = value
+        self._on_change = on_change
+        self._category = 'all'
 
-    THE FAILURE THIS PREVENTS. NiceGUI refuses a select value outside its options
-    (``choice_element.py``: ``ValueError: Invalid value: ...``) and ``show_rule_dialog`` wraps
-    nothing, so an option list that dropped the market-condition fields made a DEPLOYED gated
-    rule raise mid-build and leave a half-rendered dialog -- the gate became impossible even to
-    LOOK at, on the live platform this feature exists to run on. Adding the one value back is not
-    a hole in the filter: the extra option appears only on the row that already holds it, so a
-    NEW trigger still cannot be given a market field, and the exit-slot refusal
-    (``_refuse_market_gates_on_exit_ruleset``) is untouched either way.
-    """
-    options = _authorable_trigger_types()
-    # The value expression is the ORIGINAL one, character for character: this fix is about the
-    # OPTIONS, and quietly changing which value a malformed row displays (an explicit
-    # ``event_type: None`` showed an empty select, and still does) would be a second change
-    # wearing the first one's justification.
-    value = (trigger_config.get('event_type',
-                                trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value))
-             if trigger_config else ExpertEventType.F_HAS_POSITION.value)
-    if value is not None and value not in options:
-        options = [*options, value]
-    return value, options
+        self.root = ui.column().classes('flex-1 gap-1')
+        with self.root:
+            self.button = (ui.button(on_click=self.open)
+                           .props('outline no-caps align=left dense')
+                           .classes('w-full').mark(self.MARKER_BUTTON))
+        self._render_face()
+
+        # The dialog SHELL is built here, in the trigger row's own slot, and never rebuilt.
+        # Building it inside the click handler would leak a full dialog tree into the page on
+        # every open, and a rule under construction is clicked over and over; the expensive
+        # part -- eighty entry rows -- is rendered into ``_results`` on open instead.
+        with self.root:
+            with ui.dialog().props('full-width').mark(self.MARKER_DIALOG) as self.dialog:
+                with ui.card().classes('w-full').style('max-width: 720px; max-height: 80vh; '
+                                                       'display: flex; flex-direction: column'):
+                    ui.label('Choose a trigger').classes('text-subtitle1')
+                    self.search = (ui.input(placeholder='Search name, key or description…')
+                                   .props('dense outlined clearable autofocus')
+                                   .classes('w-full').mark(self.MARKER_SEARCH))
+                    self.search.on_value_change(self._on_search)
+                    # Chips, not tabs: seven labels with counts wrap at a narrow width, where a
+                    # tab bar would either scroll sideways or shrink each label to nothing.
+                    self._chip_row = ui.row().classes('w-full gap-1 items-center').style(
+                        'flex-wrap: wrap')
+                    self._results = ui.column().classes('w-full gap-1').style(
+                        'flex: 1; overflow-y: auto')
+
+    # ------------------------------------------------------------------ the value it carries
+
+    @property
+    def value(self):
+        """The ``event_type`` that will be stored. Unchanged in shape by this control."""
+        return self._value
+
+    def open(self, _event=None) -> None:
+        self._category = self._category_for(self._value)
+        # A query left over from the last open would show a short list that reads as a short
+        # CATALOG. The category is re-derived instead of reset, for the same reason.
+        self.search.value = ''
+        self._render()
+        self.dialog.open()
+
+    def pick(self, value, _event=None) -> None:
+        if value == self._value:
+            # Picking the row that is ALREADY selected is a no-op, and must stay one. ``ui.select``
+            # never fired a change event for an unchanged value; this control would have, and
+            # ``on_change`` rebuilds the operator/value widgets from the trigger's PERSISTED
+            # config -- so re-picking the current trigger threw away whatever the operator had
+            # just typed into the value box and silently restored the stored number. Closing is
+            # still right: picking is the action, whichever row was clicked.
+            self.dialog.close()
+            return
+        self._value = value
+        self._render_face()
+        self.dialog.close()
+        if self._on_change is not None:
+            # The operator/value controls beside the trigger are rebuilt from the new kind. Skip
+            # this and a flag keeps the previous trigger's threshold widgets -- and its value.
+            self._on_change()
+
+    # ------------------------------------------------------------------------- the drawing
+
+    def _entry(self, value):
+        """The catalog entry for ``value``, or None when this platform does not know the key."""
+        for entry in trigger_catalog():
+            if entry.value == value:
+                return entry
+        return None
+
+    def _category_for(self, value) -> str:
+        """The category the modal opens on: the first one holding ``value``, else All."""
+        entry = self._entry(value)
+        if entry is None:
+            return 'all'
+        for category in TRIGGER_CATEGORIES:
+            if category in entry.categories:
+                return category
+        return 'all'
+
+    def _render_face(self) -> None:
+        """The button: friendly name over the raw key, in mono.
+
+        BOTH, not either. The name is what a reader understands; the key is what is stored and
+        what every log, deploy payload and backtest genome spells, so an operator holding the
+        editor against a payload is not translating between two vocabularies.
+        """
+        entry = self._entry(self._value)
+        self.button.clear()
+        with self.button:
+            with ui.column().classes('items-start gap-0 py-1 w-full'):
+                ui.label('Trigger Type').classes(
+                    'text-[10px] uppercase tracking-wide text-grey-6 leading-tight')
+                ui.label(entry.name if entry is not None else (self._value or '—')).classes(
+                    'text-sm font-medium leading-tight').mark(self.MARKER_VALUE_NAME)
+                if self._value:
+                    ui.label(self._value).classes(
+                        'text-xs font-mono text-grey-6 leading-tight').mark(self.MARKER_VALUE_KEY)
+                if entry is None and self._value:
+                    ui.label(self.UNKNOWN_NOTE).classes(
+                        'text-xs text-orange leading-tight').mark(self.MARKER_UNKNOWN)
+                elif entry is not None and entry.requires_profile:
+                    # Kept on the CHOSEN trigger too, not only in the list: a warning that
+                    # disappears at the moment the gate starts existing warns nobody.
+                    ui.label(self.PROFILE_NOTE.format(profile=entry.requires_profile)).classes(
+                        'text-xs text-orange leading-tight').mark(self.MARKER_PROFILE)
+
+    def _render(self) -> None:
+        self._render_chips()
+        self._render_results()
+
+    def _render_chips(self) -> None:
+        counts = category_counts()
+        self._chip_row.clear()
+        with self._chip_row:
+            for category in TRIGGER_CATEGORIES:
+                chip = ui.chip(f'{category.title()} {counts[category]}',
+                               selectable=True, selected=(category == self._category),
+                               on_click=partial(self._choose_category, category))
+                chip.props('dense' if category == self._category else 'dense outline')
+                chip.mark(self.MARKER_CHIP, f'{self.MARKER_CHIP}-{category}')
+
+    def _choose_category(self, category, _event=None) -> None:
+        self._category = category
+        self._render()
+
+    def _on_search(self, _event=None) -> None:
+        self._render_results()
+
+    def _render_results(self) -> None:
+        # An empty query matches everything, so search and category compose through one call:
+        # a second "no query" code path is how a category chip silently stops applying.
+        entries = search_triggers(self.search.value or '', self._category)
+        self._results.clear()
+        with self._results:
+            if not entries:
+                ui.label('No trigger matches that search.').classes('text-xs text-grey-6 p-2')
+            for entry in entries:
+                with ui.card().classes(
+                        'w-full p-2 gap-0 cursor-pointer hover:bg-white/5').mark(
+                        self.MARKER_ENTRY, f'{self.MARKER_ENTRY}-{entry.value}') as row:
+                    row.on('click', partial(self.pick, entry.value))
+                    with ui.row().classes('w-full items-center justify-between gap-2'):
+                        ui.label(entry.name).classes(
+                            'text-sm font-medium').mark(self.MARKER_ENTRY_NAME)
+                        ui.label(entry.kind).classes(
+                            'text-xs text-grey-6').mark(self.MARKER_ENTRY_KIND)
+                    ui.label(entry.value).classes(
+                        'text-xs font-mono text-grey-6').mark(self.MARKER_ENTRY_KEY)
+                    if entry.description:
+                        ui.label(entry.description).classes('text-xs text-secondary-custom')
+                    if entry.requires_profile:
+                        ui.label(self.PROFILE_NOTE.format(profile=entry.requires_profile)).classes(
+                            'text-xs text-orange').mark(self.MARKER_ENTRY_PROFILE)
+#: Marks on the trigger ROW (not on the picker): the code legend printed beside a categorical
+#: trigger's value box, and the note on a persisted operator the engine will not accept.
+MARKER_TRIGGER_LEGEND = 'trigger-value-legend'
+MARKER_TRIGGER_OPERATOR_REFUSED = 'trigger-operator-refused'
+
+#: Said of an operator that is stored on a rule but outside what the engine accepts for that
+#: trigger -- e.g. ``structure_state > 1``, which this editor itself allowed until the operator
+#: control started reading the catalog's ``kind``. Shown rather than repaired: silently
+#: rewriting it to ``==`` would change the strategy behind the operator's back.
+OPERATOR_REFUSED_NOTE = '⚠ The engine refuses {operator} on this trigger; allowed: {allowed}'
+
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
 
@@ -5286,21 +5468,20 @@ class TradeSettingsTab:
         with self.triggers_container:
             with ui.card().classes('w-full p-2') as trigger_card:
                 with ui.row().classes('w-full items-center gap-2'):
-                    # Trigger type selection. A PERSISTED value that the menu no longer offers
-                    # is ADDED to the options rather than dropped -- same reasoning as
-                    # ``_fill_market_condition_profile``: NiceGUI raises ValueError on a value
-                    # outside its options, and ``show_rule_dialog`` has no handler, so filtering
-                    # the market-condition fields out of the menu made a DEPLOYED gated rule
-                    # impossible to open at all. Uninspectable and uneditable is worse than
-                    # un-authorable; the filter's job is only to stop a NEW gate being authored
-                    # here (they are searched by the optimizer and arrive by deploy import), and
-                    # that still holds because the extra option exists solely for this trigger.
-                    trigger_value, trigger_options = _trigger_type_options(trigger_config)
-                    trigger_select = ui.select(
-                        options=trigger_options,
-                        label='Trigger Type',
-                        value=trigger_value
-                    ).classes('flex-1').props('dense')
+                    # The value expression is the ORIGINAL one, character for character. A row
+                    # written before the ``event_type`` spelling still says ``type``, and a
+                    # malformed row (``event_type`` present but null) shows no trigger at all --
+                    # quietly turning that null into ``has_position`` would relabel a broken rule
+                    # as a position check, which is a different change wearing this one's name.
+                    trigger_value = (trigger_config.get('event_type',
+                                                        trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value))
+                                     if trigger_config else ExpertEventType.F_HAS_POSITION.value)
+                    # A BUTTON, not a select: see TriggerTypePicker for the two failures that
+                    # buys off (a menu that hid the market gates, and a select that raised
+                    # ValueError on any value outside its own options). The stored shape is
+                    # unchanged -- the picker carries one ``event_type`` and nothing else.
+                    trigger_picker = TriggerTypePicker(
+                        trigger_value, on_change=lambda: update_value_inputs())
 
                     # Inline container for operator/value inputs
                     value_container = ui.row().classes('items-center gap-2')
@@ -5316,7 +5497,7 @@ class TradeSettingsTab:
                 def update_trigger_documentation():
                     """Update the documentation for the selected trigger type."""
                     docs_container.clear()
-                    selected_type = trigger_select.value
+                    selected_type = trigger_picker.value
                     if selected_type:
                         event_docs = get_event_type_documentation()
                         if selected_type in event_docs:
@@ -5333,34 +5514,68 @@ class TradeSettingsTab:
 
                 def update_value_inputs():
                     value_container.clear()
-                    selected_type = trigger_select.value
+                    selected_type = trigger_picker.value
 
                     # Update documentation
                     update_trigger_documentation()
 
-                    if selected_type and is_numeric_event(selected_type):
+                    # The OPERATORS THE ENGINE ACCEPTS for this trigger, not "all six because the
+                    # enum name starts with N_". ``is_numeric_event('structure_state')`` is True
+                    # -- the stored value is a float -- so this row used to offer ``>`` on a
+                    # regime CODE, and ``structure_state > 1`` means "bear only" (bull=1, bear=2),
+                    # the opposite of what somebody who has just read "1 = bull" intends.
+                    # ``MarketConditionCompare`` refuses everything but ``==`` there and
+                    # everything but ``<``/``>`` on a numeric market field, so an operator this
+                    # list does not hold could only ever author a rule that raises.
+                    allowed_operators = operator_options_for(selected_type)
+                    if allowed_operators:
                         # Numeric trigger - show operator and value inline
                         with value_container:
                             nonlocal operator_select, value_input
+                            stored_operator = trigger_config.get('operator') if trigger_config else None
+                            options = list(allowed_operators)
+                            refused = bool(stored_operator) and stored_operator not in options
+                            if refused:
+                                # Kept in the list so the row can be OPENED at all (NiceGUI
+                                # raises on a select value outside its options, which is how a
+                                # trigger the menu did not offer used to make a rule
+                                # uninspectable). Flagged below, never silently corrected.
+                                options.append(stored_operator)
                             operator_select = ui.select(
-                                options=get_operator_options(),
+                                options=options,
                                 label='Op',
-                                value=trigger_config.get('operator', '>') if trigger_config else '>'
+                                value=stored_operator or options[0]
                             ).classes('w-32').props('dense')
 
                             value_input = ui.input(
                                 label='Value',
                                 value=str(trigger_config.get('value', '')) if trigger_config else ''
                             ).classes('w-32').props('dense')
+
+                            # The value box of a categorical takes a regime CODE. Without the
+                            # legend the number being typed has no meaning on screen, and the
+                            # difference between 1 and 2 is bull and bear. Read from the
+                            # registry: a re-typed legend would go stale the day a code is added,
+                            # and a wrong legend reads as authoritative.
+                            codes = categorical_codes_for(selected_type)
+                            if codes:
+                                ui.label(', '.join(f'{name}={code}' for name, code in codes)).classes(
+                                    'text-xs text-secondary-custom').mark(MARKER_TRIGGER_LEGEND)
+
+                            if refused:
+                                ui.label(OPERATOR_REFUSED_NOTE.format(
+                                    operator=stored_operator,
+                                    allowed=' '.join(allowed_operators))).classes(
+                                    'text-xs text-orange').mark(MARKER_TRIGGER_OPERATOR_REFUSED)
                 
-                # Initial setup
+                # Initial setup. The picker calls back into update_value_inputs itself, so
+                # there is no model-value event to subscribe to.
                 update_value_inputs()
-                trigger_select.on('update:model-value', lambda: update_value_inputs())
-                
+
                 # Store references
                 self.triggers[trigger_id] = {
                     'card': trigger_card,
-                    'type_select': trigger_select,
+                    'type_picker': trigger_picker,
                     'operator_select': lambda: operator_select,
                     'value_input': lambda: value_input
                 }
@@ -5736,6 +5951,58 @@ class TradeSettingsTab:
         if action_id in self.actions:
             del self.actions[action_id]
     
+    def _refuse_market_gates_on_exit_rule(self, subtype_value, triggers_data, rule_id=None) -> None:
+        """Refuse a market-condition gate on a rule that runs on the OPEN-POSITIONS pass.
+
+        The same failure ``_refuse_market_gates_on_exit_ruleset`` names, caught one door
+        earlier: outside the entry decision pass the live resolver has no context, so the gate
+        reads ``no_context``, the rule NEVER FIRES, and the position's exit or protective-order
+        adjustment silently stops happening.
+
+        TWO QUESTIONS, BECAUSE THE RULE'S OWN SUBTYPE IS ONLY A PROXY.
+
+        * **Where the rule is LINKED** (``rule_id``). ``db.ruleset_event_actions`` loads a
+          ruleset's rules by the link table alone -- there is no ``EventAction.subtype`` filter
+          anywhere on the live read path -- so a link into an open-positions ruleset is what
+          actually decides that this rule runs on the exit pass. Without this half the guard is
+          walked past in three clicks: rule R (open_positions, ungated) is linked into ruleset S
+          (open_positions), S is assigned to an expert's open-positions slot; the operator edits
+          R, sets its Subtype to Enter Market and adds a gate. A refusal reading R's own subtype
+          sees enter_market and allows it, no ruleset save and no expert save happen so neither
+          of those doors runs, the (S, R) link survives -- and live, R still evaluates on the
+          open-positions pass and never fires again.
+        * **What the rule SAYS about itself** (``subtype_value``). Kept as well, because a rule
+          being created has no id and no links yet: its Subtype is the only statement there is
+          of where it is headed.
+
+        The link table is consulted only when a gate is actually present, so an ordinary save
+        pays for no query.
+
+        The message comes from ``assert_no_market_fields``, the same function the ruleset door
+        and the deploy importer use. One failure, one vocabulary: two wordings would read as two
+        different problems and send the operator looking for two different fixes. The linked
+        ruleset is NAMED in it, because "somewhere" is not a place the operator can go and fix.
+        """
+        fields = market_condition_fields()
+        used = [(key, str(config["event_type"]))
+                for key, config in (triggers_data or {}).items()
+                if config["event_type"] in fields]
+        if not used:
+            return
+
+        where = f"rule {self.rule_name_input.value!r}"
+        if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value:
+            # A rule being CREATED has no id and no links; its Subtype is all there is.
+            linked = rulesets_for_event_action(rule_id) if rule_id is not None else []
+            exit_rulesets = [rs.name for rs in linked
+                             if rs.subtype is not None
+                             and str(rs.subtype.value) == AnalysisUseCase.OPEN_POSITIONS.value]
+            if not exit_rulesets:
+                return
+            where = (f"{where}, which is linked into open-positions ruleset(s) "
+                     f"{exit_rulesets!r},")
+        assert_no_market_fields(used, where)
+
     def _save_rule(self, rule=None):
         """Save the rule (EventAction)."""
         try:
@@ -5744,10 +6011,13 @@ class TradeSettingsTab:
             # Collect triggers
             triggers_data = {}
             for trigger_id, trigger_refs in self.triggers.items():
-                trigger_type = trigger_refs['type_select'].value
+                trigger_type = trigger_refs['type_picker'].value
                 trigger_config = {'event_type': trigger_type}  # Use 'event_type' instead of 'type'
                 
-                if is_numeric_event(trigger_type):
+                # The SAME question the row asked when it decided whether to draw the
+                # operator box. Two predicates here would let the row render a threshold the
+                # save then silently drops.
+                if operator_options_for(trigger_type):
                     # Numeric trigger
                     operator_select = trigger_refs['operator_select']()
                     value_input = trigger_refs['value_input']()
@@ -5760,7 +6030,13 @@ class TradeSettingsTab:
                             return
                 
                 triggers_data[trigger_id] = trigger_config
-            
+
+            # BEFORE any write: a market gate may not ride a rule that runs on the
+            # open-positions pass -- by its own subtype, or by the ruleset it is linked into.
+            self._refuse_market_gates_on_exit_rule(
+                self.rule_subtype_select.value, triggers_data,
+                rule.id if rule is not None else None)
+
             # Collect actions
             actions_data = {}
             for action_id, action_refs in self.actions.items():
