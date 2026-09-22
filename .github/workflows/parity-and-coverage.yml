@@ -34,7 +34,20 @@ jobs:
           # ../../BA2Trade*): those are replaced by the packages/* installs above.
           grep -vE '^\s*-e\s+\.\./\.\./BA2Trade' testplatform/backend/requirements.txt > /tmp/be-reqs.txt || true
           pip install -r /tmp/be-reqs.txt
-          pip install pytest pytest-cov coverage
+          # pytest-github-actions-annotate-failures turns every failure into a ::error::
+          # annotation. That matters for more than tidiness: downloading a run's LOGS needs
+          # ADMIN rights on the repo and returns 403 otherwise, while the annotations API is
+          # readable by anyone who can see this public repo. Without it a red build is a bare
+          # "Process completed with exit code 1" to everybody but the owner.
+          pip install pytest pytest-cov coverage pytest-github-actions-annotate-failures
+
+      - name: Record the resolved dependency set (nothing is pinned, so it drifts)
+        # Every one of the 54 backend requirements is declared '>=', so each run resolves
+        # whatever is newest. A build can therefore go from green to red with NO commit,
+        # which is exactly what happened on 2026-09-21 (green faf553a6 21:23Z -> red on a
+        # one-line docs change 22:07Z). Freezing the resolution makes the next such shift a
+        # diff instead of a mystery.
+        run: pip freeze > pip-freeze.txt && cat pip-freeze.txt
 
       - name: Guard — ba2_common resolves to the monorepo (not the stale sibling)
         run: |
@@ -56,7 +69,9 @@ jobs:
 
       - name: Backtest engine + shared decision suite (blocking)
         working-directory: testplatform/backend
-        run: python -m pytest tests/backtest -q
+        # -rA prints a reason line for every outcome and --junitxml is uploaded below, so a
+        # failure is diagnosable from the artifact alone when the log is not readable.
+        run: python -m pytest tests/backtest -q -rA --junitxml=junit-backtest.xml
 
       - name: Shared decision-path branch coverage (artifact, non-blocking)
         working-directory: testplatform/backend
@@ -76,4 +91,14 @@ jobs:
         with:
           name: coverage-decision
           path: testplatform/backend/coverage-decision.xml
+          if-no-files-found: ignore
+
+      - name: Upload failure diagnostics (junit + the resolved dependency set)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-diagnostics
+          path: |
+            testplatform/backend/junit-backtest.xml
+            pip-freeze.txt
           if-no-files-found: ignore
