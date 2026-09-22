@@ -1517,46 +1517,60 @@ def test_save_allocation_targets_is_scoped_to_one_account(account_id):
 # ---------------------------------------------------------------------------
 # W2: one generation of "what did I allocate with last time".
 #
-# The shift lives ONLY in save_allocation_targets. That is the whole design:
+# "Last" is stamped by save_allocation_targets and by NOTHING else: it is the
+# number the RUN went out with. The two inline setters must stay out of it --
 # `_write_symbol_comment` re-writes weight_pct on every debounced keystroke, so a
-# shift inside `set_symbol_weight` would grind the real previous weight away one
-# character at a time. The two setters are pinned byte-identical below.
+# value that followed them would be a keystroke's history rather than a run's.
+# They are pinned byte-identical below.
+#
+# It used to be a SHIFT, firing only when the save found the stored number
+# different from the incoming one. On this page that is never: the table writes
+# each edit to the row as it is typed, so the run always saves the number that is
+# already there and the comparison was against the page's own write. Prod carried
+# 76 symbol rows of 76 and 12 labels of 12 at NULL, and a Last % column blank on
+# every line (2026-09-22).
 # ---------------------------------------------------------------------------
 
-def test_saving_a_changed_label_target_shifts_the_old_one_into_previous(account_id):
+def test_saving_a_label_target_records_it_as_what_the_run_used(account_id):
     store.set_managed_label(account_id, "ARK26", target_pct=60.0)
 
     store.save_allocation_targets(account_id, [_label_target("ARK26", 70.0)])
 
     row = store.get_managed_labels(account_id)[0]
-    assert (row.target_pct, row.previous_target_pct) == (70.0, 60.0)
+    assert (row.target_pct, row.previous_target_pct) == (70.0, 70.0)
 
 
-def test_saving_an_unchanged_label_target_leaves_previous_alone(account_id):
-    """Pressing Continue twice with the same numbers must not grind the real
-    previous away. One generation per CHANGE, not per keystroke and not per click."""
+def test_the_run_records_its_own_number_over_whatever_the_page_stored(account_id):
+    """THE bug this replaced. The page writes every inline edit to the row before
+    a run is ever launched, so a run that recorded "the value I found here" would
+    record its own input and a run that shifted "only on a change" would never
+    fire at all. Both read the page's write; neither reads the last RUN."""
     store.set_managed_label(account_id, "ARK26", target_pct=60.0)
     store.save_allocation_targets(account_id, [_label_target("ARK26", 70.0)])
 
-    store.save_allocation_targets(account_id, [_label_target("ARK26", 70.0)])
+    # The operator drags the label to 85 on the page. Inline, straight to the row.
+    store.set_managed_label(account_id, "ARK26", target_pct=85.0)
+    assert store.get_managed_labels(account_id)[0].previous_target_pct == 70.0
+
+    store.save_allocation_targets(account_id, [_label_target("ARK26", 85.0)])
 
     row = store.get_managed_labels(account_id)[0]
-    assert (row.target_pct, row.previous_target_pct) == (70.0, 60.0)
+    assert (row.target_pct, row.previous_target_pct) == (85.0, 85.0)
 
 
-def test_the_first_save_records_the_zero_the_picker_created_the_row_with(account_id):
-    """0.0 is a REAL prior state -- the engine reads it as "hold none of this" --
-    so "last" after the first save is "what it was before you touched it". NULL is
-    reserved for "this row has never been saved through the wizard at all"."""
+def test_the_first_run_records_its_own_target_not_the_picker_zero(account_id):
+    """The picker creates the row at 0.0 and the engine reads 0 as "hold none of
+    this" -- but nothing was ever allocated at that 0. "Last" is a run, and the
+    first run's own number is the first one there has been."""
     store.set_managed_label(account_id, "ARK26")
     assert store.get_managed_labels(account_id)[0].previous_target_pct is None
 
     store.save_allocation_targets(account_id, [_label_target("ARK26", 60.0)])
 
-    assert store.get_managed_labels(account_id)[0].previous_target_pct == 0.0
+    assert store.get_managed_labels(account_id)[0].previous_target_pct == 60.0
 
 
-def test_saving_a_changed_symbol_weight_shifts_the_old_one_into_previous(account_id):
+def test_saving_a_symbol_weight_records_it_as_what_the_run_used(account_id):
     store.set_managed_label(account_id, "ARK26")
     store.set_symbol_weight(account_id, "ARK26", "AAPL", weight_pct=30.0)
 
@@ -1564,10 +1578,12 @@ def test_saving_a_changed_symbol_weight_shifts_the_old_one_into_previous(account
         account_id, [_label_target("ARK26", 100.0, [("AAPL", 80.0)])])
 
     row = store.get_symbol_rows(account_id, "ARK26")["AAPL"]
-    assert (row.weight_pct, row.previous_weight_pct) == (80.0, 30.0)
+    assert (row.weight_pct, row.previous_weight_pct) == (80.0, 80.0)
 
 
-def test_saving_an_unchanged_symbol_weight_leaves_previous_alone(account_id):
+def test_running_twice_with_the_same_weight_records_the_same_last(account_id):
+    """Idempotent. Pressing Continue twice is one number allocated twice, and the
+    second press has nothing new to record."""
     store.set_managed_label(account_id, "ARK26")
     store.set_symbol_weight(account_id, "ARK26", "AAPL", weight_pct=30.0)
     store.save_allocation_targets(
@@ -1577,24 +1593,24 @@ def test_saving_an_unchanged_symbol_weight_leaves_previous_alone(account_id):
         account_id, [_label_target("ARK26", 100.0, [("AAPL", 80.0)])])
 
     row = store.get_symbol_rows(account_id, "ARK26")["AAPL"]
-    assert row.previous_weight_pct == 30.0
+    assert row.previous_weight_pct == 80.0
 
 
-def test_a_symbol_row_created_by_the_save_has_no_previous_weight(account_id):
-    """The row did not exist, so there is no value it held before. NULL, not the
-    even-split default it was notionally taking -- inventing one would put a number
-    behind the Load-last button that the user never allocated with."""
+def test_a_symbol_row_created_by_the_save_records_what_the_run_used(account_id):
+    """The row did not exist -- the symbol was silently taking the even split --
+    but the user has just allocated real money with this number, so it has a last.
+    NULL stays reserved for a symbol no run has ever gone out with."""
     store.set_managed_label(account_id, "ARK26")
 
     store.save_allocation_targets(
         account_id, [_label_target("ARK26", 100.0, [("AAPL", 100.0)])])
 
-    assert store.get_symbol_rows(account_id, "ARK26")["AAPL"].previous_weight_pct is None
+    assert store.get_symbol_rows(account_id, "ARK26")["AAPL"].previous_weight_pct == 100.0
 
 
-def test_skipping_the_label_percentages_skips_their_shift_too(account_id):
+def test_skipping_the_label_percentages_skips_their_last_too(account_id):
     """An INVEST run does not choose a label percentage, so it must not record one
-    as "last" either -- the weights it DID choose still shift."""
+    as "last" either -- the weights it DID choose are still recorded."""
     store.set_managed_label(account_id, "ARK26", target_pct=25.0)
     store.set_symbol_weight(account_id, "ARK26", "AAPL", weight_pct=40.0)
 
@@ -1603,28 +1619,28 @@ def test_skipping_the_label_percentages_skips_their_shift_too(account_id):
         save_label_targets=False)
 
     assert store.get_managed_labels(account_id)[0].previous_target_pct is None
-    assert store.get_symbol_rows(account_id, "ARK26")["AAPL"].previous_weight_pct == 40.0
+    assert store.get_symbol_rows(account_id, "ARK26")["AAPL"].previous_weight_pct == 60.0
 
 
 def test_set_managed_label_never_touches_the_previous_target(account_id):
     """``set_managed_label`` is the comment writer AND the per-label target writer,
-    and the page calls it on every debounced comment keystroke. A shift here would
-    destroy the real previous weight the moment somebody typed a note."""
+    and the page calls it on every debounced comment keystroke. A write here would
+    replace what the last run allocated with the moment somebody typed a note."""
     store.set_managed_label(account_id, "ARK26", target_pct=60.0)
     store.save_allocation_targets(account_id, [_label_target("ARK26", 70.0)])
 
     store.set_managed_label(account_id, "ARK26", target_pct=10.0)
     store.set_managed_label(account_id, "ARK26", comment="a note")
 
-    assert store.get_managed_labels(account_id)[0].previous_target_pct == 60.0
+    assert store.get_managed_labels(account_id)[0].previous_target_pct == 70.0
 
 
 def test_set_symbol_weight_never_touches_the_previous_weight(account_id):
     """THE hazard this design exists to prevent. ``_write_symbol_comment``
     deliberately re-writes ``weight_pct`` on EVERY debounced keystroke (a bare
     comment write would create the row at 0.0 and the engine reads 0 as "hold none
-    of this" -- the c63d34c bug). If the shift fired here, one comment edit would
-    destroy the previous weight, and a long comment would do it repeatedly."""
+    of this" -- the c63d34c bug). A write here would put a comment's keystrokes
+    behind a column that is supposed to name a run."""
     store.set_managed_label(account_id, "ARK26")
     store.set_symbol_weight(account_id, "ARK26", "AAPL", weight_pct=30.0)
     store.save_allocation_targets(
@@ -1636,9 +1652,22 @@ def test_set_symbol_weight_never_touches_the_previous_weight(account_id):
                                 comment=text)
 
     row = store.get_symbol_rows(account_id, "ARK26")["AAPL"]
-    assert row.previous_weight_pct == 30.0
+    assert row.previous_weight_pct == 80.0
     assert row.weight_pct == 80.0
     assert row.comment == "trim"
+
+
+def test_an_inline_share_edit_leaves_last_on_the_run_that_earned_it(account_id):
+    """What the column is FOR: it holds still while the share moves, so the gap
+    between the two is how far this symbol has drifted from what was deployed."""
+    store.set_managed_label(account_id, "ARK26")
+    store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 100.0, [("AAPL", 5.0)])])
+
+    store.set_symbol_weight(account_id, "ARK26", "AAPL", weight_pct=8.0)
+
+    row = store.get_symbol_rows(account_id, "ARK26")["AAPL"]
+    assert (row.weight_pct, row.previous_weight_pct) == (8.0, 5.0)
 
 
 def test_replace_managed_labels_leaves_the_previous_targets_alone(account_id):
@@ -1650,7 +1679,7 @@ def test_replace_managed_labels_leaves_the_previous_targets_alone(account_id):
     store.replace_managed_labels(account_id, ["ARK26", "TECH"])
 
     by_label = {row.label: row for row in store.get_managed_labels(account_id)}
-    assert by_label["ARK26"].previous_target_pct == 60.0
+    assert by_label["ARK26"].previous_target_pct == 70.0
     assert by_label["TECH"].previous_target_pct is None
 
 
@@ -1661,13 +1690,13 @@ def test_get_previous_label_targets_returns_none_for_a_label_with_no_history(acc
     assert store.get_previous_label_targets(account_id) == {"ARK26": None}
 
 
-def test_get_previous_label_targets_returns_the_shifted_values(account_id):
+def test_get_previous_label_targets_returns_what_each_label_last_ran_with(account_id):
     store.set_managed_label(account_id, "ARK26", target_pct=60.0)
     store.set_managed_label(account_id, "TECH", target_pct=40.0)
     store.save_allocation_targets(account_id, [_label_target("ARK26", 70.0),
                                                _label_target("TECH", 30.0)])
 
-    assert store.get_previous_label_targets(account_id) == {"ARK26": 60.0, "TECH": 40.0}
+    assert store.get_previous_label_targets(account_id) == {"ARK26": 70.0, "TECH": 30.0}
 
 
 def test_get_previous_label_targets_of_an_unmanaged_account_is_empty(account_id):
@@ -1685,14 +1714,14 @@ def test_get_previous_symbol_weights_gives_none_rather_than_an_even_split(accoun
         "AAPL": None, "MSFT": None}
 
 
-def test_get_previous_symbol_weights_returns_the_shifted_values(account_id):
+def test_get_previous_symbol_weights_returns_what_the_run_went_out_with(account_id):
     store.set_managed_label(account_id, "ARK26")
     store.set_symbol_weight(account_id, "ARK26", "AAPL", weight_pct=30.0)
     store.save_allocation_targets(
         account_id, [_label_target("ARK26", 100.0, [("AAPL", 80.0), ("MSFT", 20.0)])])
 
     assert store.get_previous_symbol_weights(account_id, "ARK26", ["AAPL", "MSFT"]) == {
-        "AAPL": 30.0, "MSFT": None}
+        "AAPL": 80.0, "MSFT": 20.0}
 
 
 def test_get_previous_symbol_weights_normalises_the_symbols_it_is_asked_about(account_id):
@@ -1702,7 +1731,7 @@ def test_get_previous_symbol_weights_normalises_the_symbols_it_is_asked_about(ac
         account_id, [_label_target("ARK26", 100.0, [("AAPL", 80.0)])])
 
     assert store.get_previous_symbol_weights(account_id, "ARK26", [" aapl "]) == {
-        "AAPL": 30.0}
+        "AAPL": 80.0}
 
 
 def test_the_previous_readers_are_scoped_to_one_account(account_id):

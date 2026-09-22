@@ -1561,11 +1561,17 @@ def test_the_run_makes_a_silently_defaulted_symbol_weight_EXPLICIT(
                                                                 'MSFT': 40.0}
 
 
-def test_the_run_does_NOT_consume_a_generation_when_nothing_changed(
+def test_a_run_records_the_numbers_IT_went_out_with(
         monkeypatch, nicegui_client, account_id):
-    """``save_allocation_targets`` shifts the previous generation on a CHANGE only.
-    A run launched against numbers the page already stored changes nothing, so
-    "Load last" keeps pointing at the run before it rather than at itself."""
+    """"Last" is what the last RUN allocated with -- stamped by the run, whatever
+    the page had stored a moment before it.
+
+    It used to be a shift that fired only when the run saw the stored number
+    CHANGE, and on this page that is never: the table's inline boxes write every
+    edit straight to the row, so by the time the run saves, the row already holds
+    the number the run is launching with. The shift could not fire, and the Last %
+    column read blank on every symbol that had ever been allocated (prod: 76 rows
+    of 76, 12 labels of 12, all NULL)."""
     from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
     from ba2_trade_platform.core.portfolio_allocation_store import (
         get_managed_labels, save_allocation_targets)
@@ -1574,11 +1580,12 @@ def test_the_run_does_NOT_consume_a_generation_when_nothing_changed(
     add_label_to_instruments(['AAPL'], 'ARK26')
     save_allocation_targets(account_id, [LabelTarget(
         'ARK26', 70.0, [SymbolTarget('AAPL', 100.0)])])
-    assert get_managed_labels(account_id)[0].previous_target_pct == 40.0
+    assert get_managed_labels(account_id)[0].previous_target_pct == 70.0
 
     _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
-    assert get_managed_labels(account_id)[0].previous_target_pct == 40.0
+    row = get_managed_labels(account_id)[0]
+    assert row.previous_target_pct == row.target_pct
 
 
 def test_an_invest_run_persists_the_weights_but_not_the_labels_percentage(
@@ -1908,10 +1915,12 @@ def test_the_flow_opens_with_the_previous_generation_attached(monkeypatch, accou
         account_id, VALUATION_MODE_MARKET)
 
     assert labels[0].target_pct == 80.0
-    assert labels[0].previous_target_pct == 60.0
+    # 80/55/45 -- what the RUN went out with, not the 60/30/70 the page happened to
+    # hold before it. The inline values are gone the moment they are allocated with.
+    assert labels[0].previous_target_pct == 80.0
     by_symbol = {st.symbol: st for st in labels[0].symbols}
-    assert (by_symbol['AAPL'].weight_pct, by_symbol['AAPL'].previous_weight_pct) == (55.0, 30.0)
-    assert (by_symbol['MSFT'].weight_pct, by_symbol['MSFT'].previous_weight_pct) == (45.0, 70.0)
+    assert (by_symbol['AAPL'].weight_pct, by_symbol['AAPL'].previous_weight_pct) == (55.0, 55.0)
+    assert (by_symbol['MSFT'].weight_pct, by_symbol['MSFT'].previous_weight_pct) == (45.0, 45.0)
 
 
 def test_a_label_with_no_history_loads_with_no_previous_target(monkeypatch, account_id):
@@ -3955,9 +3964,9 @@ def test_the_page_and_the_wizard_write_the_SAME_target_column(account_id):
         symbols=[SymbolTarget(symbol='AAPL', weight_pct=100.0)])])
 
     assert get_managed_labels(account_id)[0].target_pct == 55.0
-    # ...and the wizard's write recorded the INLINE value as the previous
-    # generation, so Load-last restores what the page had.
-    assert get_managed_labels(account_id)[0].previous_target_pct == 70.0
+    # ...and the run recorded ITS OWN number as "last", so Load-last restores what
+    # was allocated rather than the inline 70.0 that was only ever typed.
+    assert get_managed_labels(account_id)[0].previous_target_pct == 55.0
 
 
 def test_the_wizards_write_never_touches_the_colour_or_the_comment(account_id):
@@ -3992,7 +4001,7 @@ def test_the_page_and_the_wizard_write_the_SAME_symbol_weight_column(account_id)
 
     rows = get_symbol_rows(account_id, 'ARK26')
     assert rows['AAPL'].weight_pct == 80.0
-    assert rows['AAPL'].previous_weight_pct == 62.5
+    assert rows['AAPL'].previous_weight_pct == 80.0
 
 
 def test_an_inline_weight_edit_does_not_shift_the_previous_generation(account_id):
@@ -4009,13 +4018,13 @@ def test_an_inline_weight_edit_does_not_shift_the_previous_generation(account_id
     save_allocation_targets(account_id, [LabelTarget(
         label='ARK26', target_pct=100.0,
         symbols=[SymbolTarget(symbol='AAPL', weight_pct=40.0)])])
-    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 30.0
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 40.0
 
     page._write_symbol_weight(account_id, 'ARK26', 'AAPL', 90.0)
 
     row = get_symbol_rows(account_id, 'ARK26')['AAPL']
     assert row.weight_pct == 90.0
-    assert row.previous_weight_pct == 30.0        # untouched by the inline path
+    assert row.previous_weight_pct == 40.0        # untouched by the inline path
 
 
 def test_an_inline_label_target_edit_does_not_shift_the_previous_generation(account_id):
@@ -4026,12 +4035,12 @@ def test_an_inline_label_target_edit_does_not_shift_the_previous_generation(acco
     save_allocation_targets(account_id, [LabelTarget(
         label='ARK26', target_pct=20.0,
         symbols=[SymbolTarget(symbol='AAPL', weight_pct=100.0)])])
-    assert get_managed_labels(account_id)[0].previous_target_pct == 10.0
+    assert get_managed_labels(account_id)[0].previous_target_pct == 20.0
 
     page._write_label_target(account_id, 'ARK26', 65.0)
 
     row = get_managed_labels(account_id)[0]
-    assert (row.target_pct, row.previous_target_pct) == (65.0, 10.0)
+    assert (row.target_pct, row.previous_target_pct) == (65.0, 20.0)
 
 
 def test_the_allocate_button_is_still_there_for_executing_the_saved_targets(
@@ -5690,8 +5699,8 @@ def test_the_page_reads_the_previous_generation_out_of_the_store(monkeypatch,
     """End to end: the numbers the last RUN was launched with, not the current ones.
 
     ``save_allocation_targets`` is the only writer of the previous generation, and
-    it shifts on a CHANGE -- so writing 40 over a stored 25 is what puts 25 behind
-    "last".
+    it stamps what the run went out with -- so the 40/100 the run carried is what
+    lands behind "last", never the 25/70 the page had stored up to that moment.
     """
     from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
     from ba2_trade_platform.core.portfolio_allocation_store import (
@@ -5708,8 +5717,8 @@ def test_the_page_reads_the_previous_generation_out_of_the_store(monkeypatch,
 
     payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
     view = payload['views'][0]
-    assert view.previous_target_pct == 25.0
-    assert view.rows[0].previous_weight_pct == 70.0
+    assert view.previous_target_pct == 40.0
+    assert view.rows[0].previous_weight_pct == 100.0
 
 
 def test_the_migrated_last_figure_is_NOT_restated_against_the_gross_base(
@@ -7828,7 +7837,7 @@ def test_the_delta_markup_reads_its_colour_off_the_row(nicegui_client, account_i
     slots = _tables(root)[0].slots
 
     assert "props.row.value_delta_color" in slots['body-cell-target_value'].template
-    assert "props.row.qty_delta_color" in slots['body-cell-quantity'].template
+    assert "props.row.qty_delta_color" in slots['body-cell-target_quantity'].template
     assert "props.row.share_delta_color" in slots['body-cell-weight_pct'].template
 
 
@@ -8468,3 +8477,256 @@ def test_the_bar_only_goes_determinate_once_there_is_a_denominator():
     sink.update(done=4)
     _paint()
     assert bar.value == 1.0
+
+
+# ---------------------------------------------------------------------------
+# THE TWO QUANTITY COLUMNS
+#
+# "add current qty after current value". There was one ``Qty`` column and it was
+# already the HELD quantity -- but it sat past ``Target value``, wearing the
+# buy/sell change as its caption, which is the dress of a target column. It reads
+# as one now: the held shares beside the held money, the target shares beside the
+# target money, and the change under the figure it is a change TO.
+# ---------------------------------------------------------------------------
+
+def _column_names(root, index=0):
+    return [c['name'] for c in _tables(root)[index].columns]
+
+
+def test_the_held_quantity_sits_immediately_after_the_current_value(nicegui_client,
+                                                                    account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    names = _column_names(root)
+
+    assert names[names.index('current_value') + 1] == 'quantity'
+
+
+def test_the_target_quantity_sits_immediately_after_the_target_value(nicegui_client,
+                                                                     account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    names = _column_names(root)
+
+    assert names[names.index('target_value') + 1] == 'target_quantity'
+
+
+def test_neither_quantity_is_printed_twice(nicegui_client, account_id):
+    """The held figure moved; it was not copied. The same number in two columns is
+    two places for it to be read from and one of them to go stale."""
+    names = _column_names(_draw(nicegui_client, account_id, _one_label(account_id)))
+
+    assert names.count('quantity') == 1
+    assert names.count('target_quantity') == 1
+
+
+def test_the_two_quantity_columns_say_which_is_which(nicegui_client, account_id):
+    cols = {c['name']: c['label']
+            for c in _tables(_draw(nicegui_client, account_id,
+                                   _one_label(account_id)))[0].columns}
+
+    assert cols['quantity'] == 'Qty'
+    assert cols['target_quantity'] == 'Target qty'
+
+
+def test_the_target_quantity_is_the_target_money_divided_by_the_price(nicegui_client,
+                                                                      account_id):
+    """The SAME division ``symbol_delta`` does, through the same helper -- the
+    column and the change under it cannot disagree by a rounding step."""
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL',), weights={'AAPL': 100.0}))
+    row = _tables(root)[0].rows[0]
+
+    assert row['target_quantity'] == round(row['target_value'] / row['price'], 4)
+
+
+def test_an_unpriced_row_has_no_target_quantity_rather_than_a_zero(nicegui_client,
+                                                                   account_id):
+    """No price, no answer. A 0.0 there is a claim that the target is no shares."""
+    views = _views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                   weights={'ARK26': {'AAPL': 100.0}}, prices={})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert _tables(root)[0].rows[0]['target_quantity'] is None
+
+
+def test_the_quantity_change_is_drawn_under_the_TARGET_quantity(nicegui_client,
+                                                                account_id):
+    """It is the distance from held to target, so it belongs under the end of that
+    journey -- and the held column is now a plain fact with nothing under it."""
+    table = _tables(_draw(nicegui_client, account_id, _one_label(account_id)))[0]
+
+    assert 'qty_delta' in table.slots['body-cell-target_quantity'].template
+    assert 'body-cell-quantity' not in table.slots
+
+
+def test_the_held_the_target_and_the_change_between_them_agree(nicegui_client,
+                                                               account_id):
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL',), weights={'AAPL': 100.0}))
+    row = _tables(root)[0].rows[0]
+
+    assert (round(row['target_quantity'] - row['quantity'], 4)
+            == round(float(row['qty_delta'].replace(',', '')), 4))
+
+
+def test_the_target_quantity_is_rewritten_when_a_share_is_edited(nicegui_client,
+                                                                 account_id):
+    """One writer for the first render and for every edit, same as the deltas
+    beside it: a target quantity left describing a target value that has since
+    moved is the failure ``_write_row_deltas`` exists to make impossible."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    row = _tables(root)[0].rows[0]
+    before = row['target_quantity']
+
+    row['target_value'] = float(row['target_value']) * 2
+    page._write_row_deltas(row)
+
+    assert row['target_quantity'] == round(before * 2, 4)
+
+
+# ---------------------------------------------------------------------------
+# THE SYMBOL-COUNT BADGE
+#
+# "after the label name, add a badge with the number of symbols under this
+# label". Beside the name, not in a column: it is a fact about the label's
+# identity, and it has to be legible while the section is folded shut.
+# ---------------------------------------------------------------------------
+
+def _count_badge(root, index=0):
+    return _marked(root, page.MARKER_LABEL_COUNT_BADGE)[index]
+
+
+def test_the_label_row_badges_how_many_symbols_it_holds(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT', 'TSLA')))
+
+    assert _count_badge(root).text == '3'
+
+
+def test_the_count_badge_is_drawn_AFTER_the_label_name(nicegui_client, account_id):
+    from nicegui import ui
+
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    order = list(_marked(root, page.MARKER_BAR_ROW)[0].descendants())
+    name = next(el for el in order
+                if isinstance(el, ui.label) and el.text == 'ARK26')
+
+    assert order.index(name) < order.index(_count_badge(root))
+
+
+def test_an_empty_label_still_badges_its_zero(nicegui_client, account_id):
+    """Unlike the orange zero-share badge, which hides itself: "no symbols at all"
+    is the one state of this count worth walking over to look at."""
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 40.0)], {'ARK26': []}))
+    badge = _count_badge(root)
+
+    assert badge.text == '0'
+    assert badge.visible
+
+
+def test_the_count_badge_is_not_the_zero_share_one(nicegui_client, account_id):
+    """Two badges on one row. They count different things and must not be read as
+    one another -- the orange one is a warning, this one is just a size."""
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT', 'TSLA'),
+                            weights={'AAPL': 100.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+
+    assert _count_badge(root).text == '3'
+    assert _zero_badge(root).text == '2'
+    assert 'orange' not in _count_badge(root)._props.get('color', '')
+
+
+def test_the_count_badge_tooltip_names_the_label(nicegui_client, account_id):
+    from nicegui import ui
+
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT')))
+    tooltips = [el._text for el in _count_badge(root).descendants()
+                if isinstance(el, ui.tooltip)]
+
+    assert len(tooltips) == 1
+    assert 'ARK26' in tooltips[0] and '2' in tooltips[0]
+
+
+# ---------------------------------------------------------------------------
+# "LAST %" IS WHAT THE LAST RUN ALLOCATED WITH
+#
+# The column was blank on every row of a live account (76 symbol rows and 12
+# labels, all NULL). The previous generation was shifted only when the run saw
+# the stored weight CHANGE -- and it cannot: the table's inline boxes write each
+# edit to the row as it is typed, so the run always saves the number that is
+# already there. The run stamps what IT went out with now, which is what every
+# docstring on the page already claimed the column meant.
+# ---------------------------------------------------------------------------
+
+def test_a_run_stamps_the_share_it_used_even_though_the_page_saved_it_first(account_id):
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import save_allocation_targets
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    page._write_symbol_weight(account_id, 'ARK26', 'AAPL', 60.0)   # the inline box
+
+    save_allocation_targets(account_id, [LabelTarget(
+        label='ARK26', target_pct=100.0,
+        symbols=[SymbolTarget(symbol='AAPL', weight_pct=60.0)])])
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 60.0
+
+
+def test_a_row_the_run_itself_creates_records_what_the_run_used(account_id):
+    """A symbol that was silently taking the even split gets its row here, and the
+    user has just allocated real money with that number -- so it has a last."""
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import save_allocation_targets
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    save_allocation_targets(account_id, [LabelTarget(
+        label='ARK26', target_pct=100.0,
+        symbols=[SymbolTarget(symbol='AAPL', weight_pct=25.0)])])
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 25.0
+
+
+def test_editing_after_a_run_leaves_LAST_on_the_run_that_earned_it(account_id):
+    """The whole point of the column: it holds still while the share moves, so the
+    gap between them is how far you have drifted from what was allocated."""
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import save_allocation_targets
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    save_allocation_targets(account_id, [LabelTarget(
+        label='ARK26', target_pct=100.0,
+        symbols=[SymbolTarget(symbol='AAPL', weight_pct=5.0)])])
+
+    page._write_symbol_weight(account_id, 'ARK26', 'AAPL', 8.0)
+    page._write_label_target(account_id, 'ARK26', 30.0)
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 5.0
+    assert get_managed_labels(account_id)[0].previous_target_pct == 100.0
+
+
+def test_a_symbol_that_has_never_been_ALLOCATED_still_has_no_last(account_id):
+    """NULL is reserved for "never run with", and an inline share is not a run.
+    "never allocated" and "allocated nothing" stay different facts."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    page._write_symbol_weight(account_id, 'ARK26', 'AAPL', 60.0)
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct is None
+    assert get_managed_labels(account_id)[0].previous_target_pct is None
+
+
+def test_an_invest_run_stamps_the_weights_but_leaves_the_labels_last_alone(account_id):
+    """``save_label_targets=False``: the label's percentage played no part in an
+    INVEST_LABEL run, so recording it as what that run allocated with would be a
+    choice the user never made. Its weights DID split the money."""
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import save_allocation_targets
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    save_allocation_targets(account_id, [LabelTarget(
+        label='ARK26', target_pct=100.0,
+        symbols=[SymbolTarget(symbol='AAPL', weight_pct=70.0)])],
+        save_label_targets=False)
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 70.0
+    assert get_managed_labels(account_id)[0].previous_target_pct is None
