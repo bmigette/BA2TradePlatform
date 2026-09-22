@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
@@ -1397,7 +1398,11 @@ class DailyBacktestEngine:
         """The FILLED entry order of the oldest transaction (for DaysOpened-style conditions)."""
         if not txns:
             return None
-        oldest = min(txns, key=lambda t: t.open_date or t.created_at or datetime.max.replace(tzinfo=timezone.utc))
+        # as_utc_key, not an inline `or`: open_date/created_at come back from SQLite naive
+        # or aware depending on how the row was written, and mixing either with the aware
+        # fallback raises TypeError. It only bites when one run holds BOTH shapes, which is
+        # why this passed everywhere and failed in CI.  ba2_common.core.utils.as_utc_key
+        oldest = min(txns, key=lambda t: as_utc_key(t.open_date or t.created_at))
         return self.account._entry_order_for_transaction(oldest)
 
     def _run_bypass_expert_bar(

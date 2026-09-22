@@ -72,6 +72,7 @@ from ba2_common.core.types import (
     OptionRight,
 )
 from ba2_common.core.option_types import OptionPosition
+from ba2_common.core.utils import as_utc_key
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
 from ba2_common.core.trade_store import orders_where, transactions_where
@@ -4925,7 +4926,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                             depends_on_order=None)
         if not rows:
             return None
-        rows.sort(key=lambda o: (o.created_at or datetime.min.replace(tzinfo=timezone.utc), o.id or 0))
+        # Same naive/aware hazard as daily_engine._oldest_entry_order: created_at may be
+        # either shape, and the aware fallback cannot be compared with a naive value.
+        rows.sort(key=lambda o: (as_utc_key(o.created_at, default=datetime.min), o.id or 0))
         return rows[0]
 
     # NOTE: the WAITING_TRIGGER/OCO leg factory (_replace_leg) + its helper (_existing_legs) were
