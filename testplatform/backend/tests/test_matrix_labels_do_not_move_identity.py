@@ -42,7 +42,27 @@ def test_two_different_labels_still_give_the_same_name():
 def test_the_label_is_actually_forwarded_to_the_launcher():
     cmd = mod.build_cmd(_args("--labels", "ForwardTest,opt"), _DRIVER, "n", "X", "O_LC", "AAPL", "legacy")
     assert "--labels" in cmd, "the driver accepted --labels but never passed it on"
-    assert cmd[cmd.index("--labels") + 1] == "ForwardTest,opt"
+    assert cmd[cmd.index("--labels") + 1] == "ForwardTest,opt,O_LC"
+
+
+def test_the_structure_is_appended_per_job():
+    """One --labels string cannot vary across the 16 jobs a campaign launches, and the structure
+    is exactly the thing that does. It has no column of its own, unlike the expert."""
+    for strat in ("O_LC", "O_LP", "O_IC"):
+        cmd = mod.build_cmd(_args("--labels", "OptionStage1"), _DRIVER, "n", "X", strat, "AAPL", "legacy")
+        assert cmd[cmd.index("--labels") + 1] == "OptionStage1," + strat, strat
+
+
+def test_the_structure_is_not_duplicated_if_already_named():
+    cmd = mod.build_cmd(_args("--labels", "OptionStage1,O_LC"), _DRIVER, "n", "X", "O_LC", "AAPL", "legacy")
+    assert cmd[cmd.index("--labels") + 1] == "OptionStage1,O_LC"
+
+
+def test_the_expert_is_not_added_as_a_label():
+    """backtests.expert_name is already an indexed column; a label would duplicate it."""
+    cmd = mod.build_cmd(_args("--labels", "OptionStage1"), _DRIVER, "n", "DeterministicScorer",
+                        "O_LC", "AAPL", "legacy")
+    assert "DeterministicScorer" not in cmd[cmd.index("--labels") + 1]
 
 
 def test_no_label_emits_no_flag():

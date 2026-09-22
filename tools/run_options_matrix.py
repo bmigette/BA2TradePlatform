@@ -520,7 +520,14 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
         # once scored against the wrong vendor's history while every log said otherwise.
         "--options-store", args.options_store]
     if args.labels:
-        cmd += ["--labels", args.labels]
+        # The STRUCTURE is appended per job, because one --labels string cannot vary across
+        # the 16 jobs a campaign launches and the structure is the one thing that does. The
+        # EXPERT is deliberately NOT added: backtests.expert_name is already an indexed
+        # column, so a label would duplicate it; there is no column for the structure.
+        labels = [t.strip() for t in args.labels.split(",") if t.strip()]
+        if strat not in labels:
+            labels.append(strat)
+        cmd += ["--labels", ",".join(labels)]
     cmd += _gate_passthrough(args)
     cmd += _market_condition_passthrough(args)
     if neutral_entry_mode != "legacy":
