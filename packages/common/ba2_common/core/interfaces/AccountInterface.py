@@ -14,6 +14,7 @@ from ba2_common.core.interfaces.ReadOnlyAccountInterface import (
     WORKING_ORDER_STATUSES, ReadOnlyAccountInterface)
 from ba2_common.core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.washtrade import stamp_complex_submit
 
 #: Marker carried by every refusal to sell shares that are acting as COVER for an open
 #: short call — the EXIT half of OPT-L1, produced by exactly one function,
@@ -481,6 +482,15 @@ class AccountInterface(ReadOnlyAccountInterface):
                     blocker_status = blocker.status.value if hasattr(blocker.status, 'value') else blocker.status
                     if tp_price or sl_price:
                         use_complex_order = True
+                        # STAMP WHAT WE ARE ABOUT TO DO. The exemption is the broker's
+                        # documented behaviour, not a guarantee: measured 2026-09-22, four
+                        # contended BRACKET entries were accepted and then CANCELED by
+                        # Alpaca within ~100 ms, unfilled, with the blocker being another
+                        # expert's resting protective stop (see docs/WASHTRADE-LOCK.md).
+                        # Without this stamp that outcome is an ordinary zero-fill cancel
+                        # in the database and the wash-trade cause is unrecoverable.
+                        stamp_complex_submit(trading_order, blocker)
+                        update_instance(trading_order)
                         logger.info(
                             f"Order {trading_order.id} ({symbol} {side.value}) is blocked by "
                             f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "

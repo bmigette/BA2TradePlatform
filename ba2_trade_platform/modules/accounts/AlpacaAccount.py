@@ -56,6 +56,33 @@ _MARKET_TZ = pytz.timezone("America/New_York")
 # protect, so it has to measure the breach with the very same number.
 OCO_STOP_LIMIT_CUSHION = 0.005
 
+# PENDING_CANCEL lifetime. A cancel is a WAIT for the broker's confirmation, and a wait
+# that can never end is a deadlock. Measured on dev 2026-09-22: four protective SELL_STOPs
+# (orders behind txns 28/29/131/133) sat in PENDING_CANCEL for up to 8 days while the
+# broker had them CANCELED all along — they were OCO legs, so refresh_orders' Step 4 put
+# them in its "safe set" and never asked about them, and the paginated list had long since
+# stopped returning them. _reconcile_pending_cancel_orders now asks by id every refresh, so
+# these ages are only reached when the BROKER keeps answering non-terminally (or stops
+# recognising the id at all). Past the max, the local PENDING_CANCEL fiction is dropped and
+# the broker's own last answer is adopted; see the method for what each case resolves to.
+_PENDING_CANCEL_MAX_AGE_HOURS = 24.0
+# Below the max but past this, log at WARNING instead of DEBUG. The 2026-08-05 wash-trade
+# deadlock went unnoticed for 9 days precisely because a still-waiting order logged at DEBUG.
+_PENDING_CANCEL_WARN_AGE_HOURS = 1.0
+
+# Hard ceiling on by-id broker lookups issued by ONE refresh for stuck PENDING_CANCEL
+# orders. THIS IS NOT A POLLER, and this constant is what keeps it from becoming one.
+#
+# The by-id pass runs only inside refresh_orders, only for orders whose LOCAL status is
+# PENDING_CANCEL, and only for those the refresh's own order listing did not already
+# answer for free. In a healthy account that set is EMPTY and the pass costs zero extra
+# API calls; the whole dev database had FOUR such orders at its worst (2026-09-22). So a
+# ceiling in the low tens is generous, and anything above it means something is wrong in a
+# way that more API calls will not fix. Past the cap the oldest go first and the rest are
+# deferred to the next refresh with a WARNING naming the count: a pathological state must
+# degrade into "slower to heal", never into hundreds of calls per cycle.
+_PENDING_CANCEL_LOOKUP_BUDGET = 20
+
 
 def _to_market_utc(value: Optional[datetime]) -> Optional[datetime]:
     """Normalise a broker datetime to tz-aware UTC.
@@ -2852,6 +2879,237 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error refreshing positions from Alpaca: {e}", exc_info=True)
             return False
 
+    @alpaca_api_retry
+    def _get_broker_order_or_absent(self, broker_order_id: str):
+        """Ask Alpaca about ONE order by id. Returns ``(TradingOrder | None, absent)``.
+
+        ``absent`` is True ONLY when the broker positively answers that it does not know
+        this id (``40410000`` / HTTP 404). Every other failure — transport, auth, rate
+        limit — RAISES, because "I could not ask" and "the broker says it never existed"
+        are different facts and collapsing them into one None is how a live order gets
+        written off. (``get_order`` above deliberately collapses them, which is why this
+        exists alongside it rather than replacing it.)
+
+        PROBE TRAP (docs/WASHTRADE-LOCK.md): a 40410000 also appears when the id belongs
+        to a DIFFERENT Alpaca account. Callers must only pass ids of orders whose
+        ``account_id`` is this account's, which is what makes ``absent`` meaningful.
+        """
+        try:
+            raw = self.client.get_order_by_id(broker_order_id)
+        except APIError as e:
+            text = str(e).lower()
+            if "40410000" in text or "not found" in text or "404" in text:
+                return None, True
+            raise
+        return self.alpaca_order_to_tradingorder(raw), False
+
+    def _reconcile_pending_cancel_orders(self, listed_broker_ids) -> int:
+        """Resolve STUCK PENDING_CANCEL orders by asking the broker about each DIRECTLY.
+
+        WHY IT CANNOT BE LEFT TO THE LIST. ``refresh_orders`` promotes PENDING_CANCEL from
+        the paginated ``GetOrdersRequest`` listing, so an order the listing stops returning
+        is never revisited and waits forever. Two things guarantee that happens: Alpaca's
+        listing does not carry OCO LEGS at all (they are metadata on their parent, and the
+        parent is itself gone once cancelled), and old orders fall out of the window.
+        Measured on dev 2026-09-22 — four protective SELL_STOPs stuck in PENDING_CANCEL for
+        up to 8 days, every one of them ``CANCELED`` at the broker, filled 0, and answered
+        instantly by ``get_order_by_id``. Step 4's "not in the listing" sweep could not
+        catch them either: it adds every OCO leg's broker id to its own safe set.
+
+        THIS IS NOT A POLLER, and four properties keep it from becoming one:
+
+        1. **Only PENDING_CANCEL.** No other status earns a by-id call. Nothing else in
+           the platform acquires a per-order round trip because of this method.
+        2. **Only inside the refresh cycle.** It has exactly one caller,
+           ``refresh_orders``. No timer, no background task, and nothing on a submit /
+           fill / render path.
+        3. **Only what the refresh did not already answer.** ``listed_broker_ids`` is the
+           set of broker ids the listing just returned; those were already resolved for
+           free by the main loop, so they are skipped here. In a healthy account the
+           remainder is EMPTY and this costs ZERO extra API calls — that empty set is the
+           normal case, and the stuck orders are precisely the ones outside it.
+        4. **Capped.** At most ``_PENDING_CANCEL_LOOKUP_BUDGET`` lookups per refresh,
+           oldest first, with a WARNING naming how many were deferred to the next pass.
+
+        WHAT IT WILL NOT DO. It never marks an order CANCELED on its own authority. The
+        promotion goes through ``OrderStatus.resolve_pending_cancel``, exactly as the list
+        path does, so a dependent replacement still fires only on a real terminal answer
+        (see ``cancel_order``'s note on why optimistic CANCELED is refused).
+
+        LAST RESORT. Past ``_PENDING_CANCEL_MAX_AGE_HOURS`` the local PENDING_CANCEL is
+        dropped — not replaced by another endless wait — and the BROKER'S OWN last answer
+        is adopted: its reported (non-terminal) status when it still knows the order, or
+        CANCELED when it has consistently not known it for a full day. Neither invents a
+        fact; both end the wait.
+
+        Args:
+            listed_broker_ids: broker ids the just-completed listing returned. Orders
+                whose id is in this set are skipped — the refresh already answered them.
+
+        Returns the number of orders whose status this pass changed.
+        """
+        from sqlmodel import Session, select
+
+        covered = set(listed_broker_ids or ())
+        with Session(get_db().bind) as session:
+            rows = session.exec(
+                select(TradingOrder).where(
+                    TradingOrder.account_id == self.id,
+                    TradingOrder.status == OrderStatus.PENDING_CANCEL,
+                )
+            ).all()
+            pending = [
+                (r.id, r.broker_order_id, r.symbol, r.created_at) for r in rows
+                if r.broker_order_id is None or r.broker_order_id not in covered
+            ]
+            skipped_free = len(rows) - len(pending)
+
+        if skipped_free:
+            logger.debug(
+                f"{skipped_free} PENDING_CANCEL order(s) were answered by the order "
+                f"listing itself — no by-id lookup needed for them")
+
+        if not pending:
+            logger.debug("No unresolved PENDING_CANCEL orders — no by-id lookups issued")
+            return 0
+
+        # Oldest first, so a capped pass always makes progress on the worst offenders.
+        # Sorted on the NORMALISED age (created_at can be naive or aware in this table,
+        # and comparing the two raises); undated rows go last rather than crashing.
+        def _oldest_first(row):
+            age = self._order_age_hours(row[3])
+            return (age is None, -age if age is not None else 0.0)
+
+        pending.sort(key=_oldest_first)
+        if len(pending) > _PENDING_CANCEL_LOOKUP_BUDGET:
+            deferred = len(pending) - _PENDING_CANCEL_LOOKUP_BUDGET
+            logger.warning(
+                f"{len(pending)} PENDING_CANCEL orders are unresolved by the order listing, "
+                f"more than the {_PENDING_CANCEL_LOOKUP_BUDGET}-lookup budget for one "
+                f"refresh: resolving the {_PENDING_CANCEL_LOOKUP_BUDGET} oldest and "
+                f"deferring {deferred} to the next refresh. A healthy account has none of "
+                f"these; this many means something upstream is not cancelling cleanly")
+            pending = pending[:_PENDING_CANCEL_LOOKUP_BUDGET]
+
+        logger.debug(f"Reconciling {len(pending)} PENDING_CANCEL order(s) by direct lookup")
+        resolved_count = 0
+
+        for order_id, broker_order_id, symbol, created_at in pending:
+            try:
+                age_hours = self._order_age_hours(created_at)
+                if not broker_order_id:
+                    # PENDING_CANCEL is only ever written by cancel_order, which needs a
+                    # broker id to call the broker at all. A row without one contradicts
+                    # itself and cannot be resolved by asking anyone.
+                    logger.error(
+                        f"Order {order_id} ({symbol}) is PENDING_CANCEL with NO "
+                        f"broker_order_id — nothing can be asked about it; an operator "
+                        f"must resolve this row")
+                    continue
+
+                try:
+                    broker_order, absent = self._get_broker_order_or_absent(broker_order_id)
+                except (APIError, OSError) as e:
+                    logger.warning(
+                        f"Order {order_id} ({symbol}) PENDING_CANCEL: could not read "
+                        f"broker order {broker_order_id} this pass ({e}); retrying next refresh")
+                    continue
+
+                if absent:
+                    logger.error(
+                        f"Order {order_id} ({symbol}) is PENDING_CANCEL but Alpaca does NOT "
+                        f"KNOW broker order {broker_order_id} (40410000). That is not a "
+                        f"confirmation of cancellation — it also happens when an id belongs "
+                        f"to a different Alpaca account (see docs/WASHTRADE-LOCK.md). "
+                        f"Order age: {f'{age_hours:.1f}h' if age_hours is not None else 'unknown'}")
+                    if age_hours is not None and age_hours >= _PENDING_CANCEL_MAX_AGE_HOURS:
+                        logger.error(
+                            f"Order {order_id} ({symbol}): the broker has not recognised "
+                            f"{broker_order_id} for {age_hours:.1f}h (limit "
+                            f"{_PENDING_CANCEL_MAX_AGE_HOURS}h) — marking CANCELED as a last "
+                            f"resort so the wait ends; nothing is working under this id")
+                        if self._write_pending_cancel_result(order_id, OrderStatus.CANCELED, None):
+                            resolved_count += 1
+                    continue
+
+                resolved = OrderStatus.resolve_pending_cancel(broker_order.status)
+                if resolved is not None:
+                    logger.info(
+                        f"Order {order_id} ({symbol}) PENDING_CANCEL -> {resolved.value} "
+                        f"(direct lookup of {broker_order_id}; broker reported "
+                        f"{broker_order.status})")
+                    if self._write_pending_cancel_result(order_id, resolved, broker_order):
+                        resolved_count += 1
+                    continue
+
+                # Still working at the broker: the cancel has not landed.
+                msg = (
+                    f"Order {order_id} ({symbol}) still PENDING_CANCEL after "
+                    f"{age_hours:.1f}h — broker reports {broker_order.status}"
+                    if age_hours is not None else
+                    f"Order {order_id} ({symbol}) still PENDING_CANCEL — broker reports "
+                    f"{broker_order.status}"
+                )
+                if age_hours is not None and age_hours >= _PENDING_CANCEL_MAX_AGE_HOURS:
+                    logger.error(
+                        f"{msg}. Past the {_PENDING_CANCEL_MAX_AGE_HOURS}h limit: the cancel "
+                        f"never took, so the order is NOT pending cancel — adopting the "
+                        f"broker's own status. It is a WORKING order and must be treated as one")
+                    if self._write_pending_cancel_result(order_id, broker_order.status, broker_order):
+                        resolved_count += 1
+                elif age_hours is not None and age_hours >= _PENDING_CANCEL_WARN_AGE_HOURS:
+                    logger.warning(msg)
+                else:
+                    logger.debug(msg)
+            except Exception as e:
+                logger.error(
+                    f"Error reconciling PENDING_CANCEL order {order_id}: {e}", exc_info=True)
+
+        return resolved_count
+
+    def _write_pending_cancel_result(self, order_id: int, new_status, broker_order) -> bool:
+        """Persist the broker's answer onto a PENDING_CANCEL order. Returns True if written.
+
+        Copies any execution the cancel raced (``filled_qty`` / ``open_price``) and folds a
+        partial fill back into its transaction, exactly as the list path does — a cancel
+        that lost the race to a fill leaves real shares behind.
+        """
+        fresh = get_instance(TradingOrder, order_id)
+        if not fresh or fresh.status != OrderStatus.PENDING_CANCEL:
+            logger.debug(
+                f"Order {order_id} left PENDING_CANCEL before the direct lookup landed; "
+                f"not overwriting")
+            return False
+        fresh.status = new_status
+        if broker_order is not None:
+            if broker_order.filled_qty is not None:
+                fresh.filled_qty = float(broker_order.filled_qty)
+            if broker_order.open_price:
+                fresh.open_price = broker_order.open_price
+        update_instance(fresh)
+        # A NULL filled_qty is UNKNOWN, not zero: it means the broker's answer carried no
+        # quantity, so there is nothing to reconcile and nothing to assume either.
+        filled = fresh.filled_qty
+        if (fresh.status == OrderStatus.CANCELED
+                and filled is not None and float(filled) > 0):
+            from ba2_trade_platform.core.TransactionHelper import TransactionHelper
+            TransactionHelper.reconcile_canceled_partial_fill(fresh)
+        return True
+
+    @staticmethod
+    def _order_age_hours(created_at) -> Optional[float]:
+        """Hours since ``created_at``, or None when it is missing.
+
+        A missing timestamp must never read as age 0 (silently disabling an expiry) nor as
+        infinitely old (expiring a fresh order); callers skip the age checks on None. Same
+        contract as ``TradeManager._washtrade_lock_age_hours``.
+        """
+        if not created_at:
+            return None
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created_at).total_seconds() / 3600.0
+
     def refresh_orders(self, heuristic_mapping: bool = False, fetch_all: bool = True) -> bool:
         """
         Refresh/synchronize account orders from Alpaca broker.
@@ -2877,6 +3135,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
             if not raw_alpaca_orders:
                 logger.warning("No orders returned from Alpaca during refresh")
+                # The listing answered NOTHING, so every PENDING_CANCEL is unresolved and
+                # the budgeted by-id pass is the only thing that can end their wait. It is
+                # capped, so an empty/failed listing cannot turn this into a flood.
+                self._reconcile_pending_cancel_orders(listed_broker_ids=())
                 return True
 
             updated_count = 0
@@ -3199,6 +3461,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                 fresh_order.status = OrderStatus.CANCELED
                                 update_instance(fresh_order)
                                 canceled_count += 1
+
+            # Step 4b: Any PENDING_CANCEL the listing did NOT mention is stuck — the list
+            # can never end its wait, because being absent from the list is exactly why it
+            # is stuck (OCO legs are never listed separately; old orders fall out of the
+            # window). Ask the broker about those, and ONLY those, by id. Everything the
+            # listing did mention was already resolved for free in Step 3 above, so a
+            # healthy account issues zero calls here. Budgeted; see the method.
+            #
+            # Runs BEFORE Step 5 so a newly confirmed CANCELED can trigger its dependent
+            # replacement in this same pass.
+            self._reconcile_pending_cancel_orders(
+                listed_broker_ids={str(o.id) for o in raw_alpaca_orders if o.id})
 
             # Step 5: Check for dependent orders that can now be submitted
             triggered_count = self._check_and_submit_dependent_orders()
