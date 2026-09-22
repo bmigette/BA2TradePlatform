@@ -37,6 +37,7 @@ from ba2_common.core.market_conditions import (
     STATUS_VALID as _MC_STATUS_VALID,
     field_codes as _mc_field_codes,
     field_spec as _mc_field_spec,
+    OPERATORS_BY_KIND as _mc_operators_by_kind,
 )
 from ba2_common.core.market_condition_context import MarketConditionContext
 
@@ -4298,10 +4299,11 @@ _warned_no_market_condition_resolver = False
 #: reason is a different failure from "no decision scope is open".
 _warned_no_market_condition_context_fields: set = set()
 
-_OPERATORS_BY_KIND = {
-    "numeric": frozenset({"<", ">"}),
-    "categorical": frozenset({"=="}),
-}
+#: Re-exported, not re-typed. The table lives beside ``FieldSpec`` in ``market_conditions``
+#: because the rule EDITOR has to offer exactly what this class accepts: a second copy here is a
+#: list that drifts, and the drift is invisible until a deployed rule raises at condition
+#: construction on a Monday morning.
+_OPERATORS_BY_KIND = _mc_operators_by_kind
 
 #: Memo keyed by the FieldSpec itself, so a field re-registered with a different spec (e.g. a
 #: different kind) never gets a stale class back.

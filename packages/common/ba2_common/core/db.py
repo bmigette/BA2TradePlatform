@@ -177,6 +177,34 @@ def ruleset_event_actions(ruleset_id):
         return session.exec(statement).all()
 
 
+def rulesets_for_event_action(eventaction_id):
+    """Every ``Ruleset`` holding this rule, loaded eagerly.
+
+    The inverse of :func:`ruleset_event_actions`, and it exists for the same reason: the live
+    engine reads a ruleset's rules through the LINK TABLE ALONE -- there is no
+    ``EventAction.subtype`` filter on that path -- so a rule's own subtype says where it was
+    MEANT to run, while the links say where it actually does. An editor that judges a rule by
+    its own subtype can be walked straight past: flip an open-positions rule to Enter Market,
+    add a market gate, and the link into the exit ruleset survives untouched while the gate
+    reads ``no_context`` live and the exit silently stops firing.
+
+    ``Ruleset`` rows come back materialised (``EventAction.rulesets`` is a lazy relationship and
+    every accessor hands back a detached instance, so touching it outside a session raises).
+    Unordered: a rule's rulesets are a set, not a precedence.
+    """
+    from sqlmodel import select
+
+    from ba2_common.core.models import Ruleset, RulesetEventActionLink
+
+    with get_db() as session:
+        statement = (
+            select(Ruleset)
+            .join(RulesetEventActionLink, Ruleset.id == RulesetEventActionLink.ruleset_id)
+            .where(RulesetEventActionLink.eventaction_id == eventaction_id)
+        )
+        return session.exec(statement).all()
+
+
 def get_engine():
     """Lazily build (and memoize) the SQLModel engine. A per-thread override wins; otherwise
     the shared global engine. No DB I/O happens at import."""

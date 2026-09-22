@@ -62,8 +62,9 @@ def category_counts() -> dict[str, int]: ...
 - `get_event_type_documentation()` → `name`, `description`, and `kind` from its
   `"type"` key.
 - `market_conditions.PROFILES` → the fifteen market fields' `ui_name`, their
-  `kind` (`numeric` → `number`, `categorical` → `categorical`), and the profile
-  that registers each one, which becomes `requires_profile`.
+  `kind` (`numeric` → `number`, `categorical` → `categorical`), the profile
+  that registers each one (→ `requires_profile`), and — amendment below — their
+  `description`.
 - `_CATEGORIES` below → `categories`.
 
 Name resolution falls back in that order and ends at the raw enum value. A
@@ -129,12 +130,80 @@ own comments in `types.py`:
 The three cooldown entries must state the large-sentinel behaviour: with no
 prior close the value is a big number, so a `>` cooldown gate passes.
 
+### Amendment (review finding 5) — the market fields describe themselves
+
+`rules_documentation` covers every trigger except exactly the fifteen this
+feature exists to expose. As first written, the catalog therefore shipped the
+market fields as the only rows with a name and no line under them: the operator
+learned that `structure_dist_support_atr` exists and nothing else — no unit, no
+range, no code legend. That is the worst place for the gap to be, because these
+are the only entries whose vocabulary is new to the reader.
+
+`FieldSpec` already carries `value_min`/`value_max`/`value_step`/`anchor_op`/
+`codes`, and `_market_field_kinds_and_profiles()` already walks it, so
+`_market_field_description(spec)` composes the line instead of anyone writing
+it: friendly name, unit, searched range and step, and the template's own fixed
+reading — or, for the categorical, the code legend. Composed rather than typed
+out for the same reason `requires_profile` is read from the registry: a retuned
+range or an added code leaves a hand-written line WRONG, and a wrong description
+reads as authoritative in a way a missing one does not.
+
+The unit is the one fact the spec did not hold, so `FieldSpec` gains
+`unit: str = ""` (`"ATR14 multiples"`, `"sessions"`, `"ADX index points
+(0-100)"`, …). It belongs beside the measurement, not in the rule editor:
+`structure_dist_support_atr` and `structure_bars_since_bos` are both "a number
+around 2", and an operator who reads the first as sessions authors a gate that
+is off by an order of magnitude and still looks plausible. A copy of the units
+in the UI would go stale the day a field's normalisation changes.
+
+
 ## Part 2 — the picker
 
 The trigger row's `ui.select` becomes a button showing the current trigger —
 friendly name over the raw key in mono — that opens the modal. **The stored
-shape is unchanged:** `{'event_type': value}` and nothing else. The
-operator/value controls beside the trigger are untouched.
+shape is unchanged:** `{'event_type': value}` and nothing else.
+
+### Amendment (review finding 2) — the operator control reads `kind`
+
+The plan said the operator/value controls beside the trigger were untouched.
+They could not be. `kind` was cosmetic: the row decided what to draw from
+`is_numeric_event()`, and `is_numeric_event('structure_state')` is **True** —
+it is an `N_` member, because the stored value is a float. So the editor offered
+all six operators on a regime CODE, and `structure_state > 1` is authorable.
+That expression means "bear only" (bull=1, bear=2), the opposite of what
+somebody who has just read "1 = bull" is trying to say, and nothing refused it.
+The comment in `trigger_catalog.py` claiming a categorical "must NEVER be
+offered an ordering" described a protection that did not exist.
+
+So the operator list now comes from `trigger_catalog.operator_options_for()`,
+which reads `market_conditions.OPERATORS_BY_KIND` — **the same table
+`MarketConditionCompare` enforces at condition construction**, moved next to
+`FieldSpec` and imported by `TradeConditions` rather than copied. The editor
+therefore cannot offer an operator the engine will refuse, and cannot withhold
+one it accepts:
+
+| trigger | offered |
+|---|---|
+| categorical market field (`structure_state`) | `==` only |
+| numeric market field (the other fourteen) | `>` and `<` only |
+| any other numeric trigger | all six |
+| a flag | none — no operator box at all |
+
+Note `!=` is **not** offered on the categorical, although the review suggested
+`==`/`!=`: the engine's table allows `==` alone, so a `!=` leaf raises the
+moment the condition is built. It is also not the complement a reader expects —
+"not bull" silently includes the unclassified state, whose code is 0.
+
+Beside the value box of a categorical the row prints the code legend
+(`bull=1, bear=2`), read from `FieldSpec.codes`, so the number being typed has a
+meaning on screen. And an operator that is *already stored* outside the allowed
+set — `structure_state > 1` is exactly what this editor used to permit — is kept
+in the options and flagged, never hidden and never silently rewritten: dropping
+it would make the rule impossible to open (the `ui.select` `ValueError` again),
+and correcting it would change the strategy behind the operator's back.
+
+`_save_rule` asks `operator_options_for()` the same question the row asked, so
+the row cannot render a threshold the save then silently drops.
 
 ```
 ┌ Choose a trigger ─────────────────────────────┐
@@ -184,6 +253,51 @@ Exposing the fields removes a menu filter, not a guard.
 - **The deploy importer is unchanged.** `import_deploy_payload.py` still checks
   each leaf against the expert's `market_condition_profile`.
 
+### Amendment (review finding 1) — the rule refusal must key on the LINK
+
+As first written, `_refuse_market_gates_on_exit_rule` returned early unless the
+rule's own subtype was `open_positions`. That is a proxy for where the rule runs,
+not the thing the engine reads: `db.ruleset_event_actions` loads a ruleset's
+rules **by `RulesetEventActionLink` alone** — there is no `EventAction.subtype`
+filter anywhere on the live read path — and editing a rule does not touch its
+links.
+
+The failure that buys, in three clicks: rule R (open_positions, ungated) is in
+ruleset S (open_positions), and S is assigned to an expert's open-positions slot.
+The operator edits R, sets Subtype to Enter Market and adds
+`underlying_adx_14 > 25`. The rule refusal sees `enter_market` and allows it. No
+ruleset save and no expert save happen, so neither of those doors runs. The
+(S, R) link is untouched — so live, R still evaluates on the open-positions pass,
+reads `no_context`, never fires, and the exit or protective-order adjustment
+silently stops.
+
+So the rule save refuses a market gate when the rule is linked into **any**
+ruleset whose subtype is `open_positions`, whatever the rule's own subtype says,
+and the message names those rulesets so the operator knows where to go. The
+own-subtype check is kept as well — a rule being created has no id and no links,
+and its Subtype is the only statement there is of where it is headed. The link
+table is read only when a gate is actually present, so an ordinary save pays for
+no query. `_refuse_market_gates_on_exit_ruleset` is unchanged.
+
+`db.rulesets_for_event_action()` is the inverse of `ruleset_event_actions()` and
+exists for this.
+
+### Amendment (review finding 1, same hole) — the fourth door: JSON import
+
+`rules_export_import.py` had **no market-field check anywhere in the module**.
+`_import_rule_to_session` builds an `EventAction` from the payload verbatim and
+links it, so a payload whose ruleset is `open_positions` and whose rule says
+`enter_market` imported clean — and the link is what the engine reads. Closed
+with the same `assert_no_market_fields` message, in both halves:
+
+- every ruleset importer (`import_ruleset`, `import_multiple_rulesets`,
+  `import_rulesets_reusing_by_name`) checks the payload's rules against the
+  RULESET's subtype, before anything is created — and, for the reuse-by-name
+  importer, before the existing ruleset's links are dropped, since refusing after
+  that would leave a live exit ruleset with no rules at all;
+- `_import_rule_to_session` checks the rule's OWN subtype, for the standalone
+  `import_rule` path, which links nothing.
+
 Deliberately not blocked: a market gate on an Enter Market rule for an expert
 with no profile. The gate never passes, so the rule produces no entries. The
 per-entry message is the mitigation.
@@ -192,10 +306,14 @@ per-entry message is the mitigation.
 
 | File | Change |
 |---|---|
-| `packages/common/ba2_common/core/trigger_catalog.py` | new — the registry |
+| `packages/common/ba2_common/core/trigger_catalog.py` | new — the registry, the market-field descriptions, `operator_options_for` |
 | `packages/common/ba2_common/core/rules_documentation.py` | +11 entries |
-| `ba2_trade_platform/ui/pages/settings.py` | picker; delete the two helpers; add the rule-save refusal |
+| `packages/common/ba2_common/core/market_conditions.py` | `FieldSpec.unit`; `OPERATORS_BY_KIND` moved here from `TradeConditions` |
+| `packages/common/ba2_common/core/db.py` | `rulesets_for_event_action` |
+| `packages/common/ba2_common/core/rules_export_import.py` | the fourth door's refusal |
+| `ba2_trade_platform/ui/pages/settings.py` | picker; delete the two helpers; the rule-save refusal; kind-driven operator control |
 | `packages/common/tests/test_trigger_catalog.py` | new |
+| `packages/common/tests/test_rules_import_market_gates.py` | new |
 | `tests/test_rule_trigger_picker.py` | new |
 
 **Registry tests.** Every `ExpertEventType` appears exactly once. No entry
@@ -212,9 +330,26 @@ instead of raising — the failure `_trigger_type_options` dodged, now pinned
 directly.
 
 **Refusal tests.** A rule with subtype Open Positions carrying a market gate is
-refused at rule save; the same gate on Enter Market saves. The ruleset-level
-refusal still fires — a regression test, since the menu filter that used to make
-it nearly unreachable is going away.
+refused at rule save; the same gate on Enter Market saves. A gate on a rule
+LINKED into an open-positions ruleset is refused whatever its own subtype says,
+and the message names the ruleset. The link table is not read at all when there
+is no gate. The ruleset-level refusal still fires — a regression test, since the
+menu filter that used to make it nearly unreachable is going away. Every JSON
+importer refuses a gate arriving on an open-positions ruleset, writes nothing
+when it does, and leaves an existing ruleset's rules in place.
+
+**Operator tests.** A categorical offers `==` alone, a numeric market field `>`
+and `<`, an ordinary numeric all six, a flag none — asserted against
+`MarketConditionCompare.ALLOWED_OPERATORS` itself, so one table cannot drift from
+the other. The code legend is printed for the categorical and for nothing else.
+A stored operator outside the allowed set opens, and says the engine refuses it.
+
+**Row tests.** A persisted trigger opens on exactly what is stored, including a
+null `event_type` (which stays null — turning it into `has_position` would
+relabel a broken rule as a position check) and an empty config (a new row).
+Re-picking the trigger that is already selected closes the modal and fires no
+change, so an operator/value the user has typed but not saved survives —
+`ui.select` never fired on an unchanged value, and the picker must not either.
 
 ## Operational notes
 
