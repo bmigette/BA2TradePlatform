@@ -236,14 +236,46 @@ def test_the_market_field_legend_and_range_are_read_from_the_registry():
                       codes={"calm": 1, "storm": 2}, ui_name="Probe regime")
     description = _market_field_description(probe)
     assert "calm=1" in description and "storm=2" in description, description
-    assert "Probe regime" in description
 
     ranged = FieldSpec(name="probe_width", kind="numeric", short="pw", searched=True,
                        value_min=1.0, value_max=8.0, value_step=0.5, anchor_op="<",
                        anchor_value=4.0, ui_name="Probe width", unit="widgets")
     numeric = _market_field_description(ranged)
-    assert "widgets" in numeric and "1" in numeric and "8" in numeric, numeric
+    # Case-insensitively: the unit LEADS the line and is capitalised there, which is a
+    # presentation choice. What this pins is that it came from the spec at all.
+    assert "widgets" in numeric.lower() and "1" in numeric and "8" in numeric, numeric
     assert "< 4" in numeric, numeric
+
+
+def test_a_market_field_description_is_in_the_operators_vocabulary_not_the_optimizers():
+    """``FieldSpec`` is an optimizer-facing structure and composing from it dragged its words
+    along: the first version told somebody hand-typing a threshold that the field was "Searched
+    1 to 5 in steps of 1" with an "optimizer template's fixed reading". The step is the GA's
+    grid, not a constraint on what may be typed, and "searched" names a run they are not doing.
+
+    The facts survive as a range and a reference point. Only the register changed."""
+    spec = FieldSpec(name="probe_width", kind="numeric", short="pw", searched=True,
+                     value_min=1.0, value_max=8.0, value_step=0.5, anchor_op="<",
+                     anchor_value=4.0, ui_name="Probe width", unit="widgets")
+    description = _market_field_description(spec)
+
+    for optimizer_word in ("Searched", "searched", "steps of", "optimizer", "template"):
+        assert optimizer_word not in description, f"{optimizer_word!r} in {description!r}"
+    assert "Typical range 1 to 8" in description, description
+
+
+def test_a_market_field_description_leads_with_what_the_number_MEASURES():
+    """``structure_dist_support_atr`` and ``structure_bars_since_bos`` are both "about 2", and
+    reading one as the other authors a gate off by an order of magnitude that still looks
+    plausible. The unit is the fact the bare number cannot carry, so it goes first -- and the
+    name does NOT lead, because the picker prints it in bold directly above."""
+    by_value = {e.value: e for e in trigger_catalog()}
+
+    distance = by_value["structure_dist_support_atr"].description
+    sessions = by_value["structure_bars_since_bos"].description
+    assert distance.startswith("ATR14 multiples"), distance
+    assert sessions.startswith("Sessions"), sessions
+    assert not distance.startswith(by_value["structure_dist_support_atr"].name), distance
 
 
 def test_the_three_cooldown_triggers_document_the_large_sentinel():

@@ -255,18 +255,28 @@ def _market_field_description(spec: Any) -> str:
 
     Composed from the spec rather than written out, for the reason ``requires_profile`` is read
     from the registry: a retuned range or an added code would leave a hand-written line wrong,
-    and a wrong description reads as authoritative in a way a missing one does not. Factual only
-    -- the anchor is reported as the template's own fixed reading, not as advice.
+    and a wrong description reads as authoritative in a way a missing one does not.
+
+    SAID IN THE OPERATOR'S VOCABULARY, NOT THE OPTIMIZER'S. ``FieldSpec`` is an optimizer-facing
+    structure, and composing from it first dragged its words along: "Searched 1 to 5 in steps of
+    1; the optimizer template's fixed reading is > 2" was shown to somebody hand-typing a
+    threshold into a box. The step is meaningless to them -- it is the GA's grid, not a
+    constraint on what they may type -- and "searched" describes a run they are not doing. The
+    facts underneath survive as range and reference point; only the register changes. The
+    leading restatement of the name went with it: the bold line directly above already says it.
     """
     codes = spec.codes
     if codes is not None:
         legend = ", ".join(f"{name}={code}" for name, code in codes.items())
-        return (f"{spec.ui_name or spec.name}: a regime CODE, compared with '=='. "
-                f"Codes: {legend} (an unclassified market is 0 and matches neither).")
-    unit = f" Unit: {spec.unit}." if spec.unit else ""
-    return (f"{spec.ui_name or spec.name}.{unit} Searched {spec.value_min:g} to "
-            f"{spec.value_max:g} in steps of {spec.value_step:g}; the optimizer template's "
-            f"fixed reading is {spec.anchor_op} {spec.anchor_value:g}.")
+        return (f"A regime CODE, compared with '=='. Codes: {legend} "
+                f"(an unclassified market is 0 and matches neither).")
+    # The UNIT leads, because it is the fact a bare number cannot carry:
+    # ``structure_dist_support_atr`` and ``structure_bars_since_bos`` are both "about 2", and
+    # reading one as the other authors a gate off by an order of magnitude that still looks fine.
+    measures = (spec.unit or spec.ui_name or spec.name).strip()
+    return (f"{measures[:1].upper()}{measures[1:]}. "
+            f"Typical range {spec.value_min:g} to {spec.value_max:g}; "
+            f"a common setting is {spec.anchor_op} {spec.anchor_value:g}.")
 
 
 def _market_field_specs() -> Dict[str, Any]:
