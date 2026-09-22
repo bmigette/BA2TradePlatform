@@ -211,6 +211,7 @@ class GeneticOptimizer:
         self.best_individual = None
         self.best_fitness = None
         self.history = []
+        self._resumed_no_improvement = 0
 
         # Write a partial checkpoint every N completed trials within a generation. Bounds what a
         # restart loses to N trials instead of a whole generation. 0 disables.
@@ -484,6 +485,10 @@ class GeneticOptimizer:
             Tuple of (start_generation, population_data, fitnesses)
         """
         self.history = checkpoint.get('history', [])
+        # Restore the patience clock too. Without this every resume restarted it at 0
+        # while best_fitness was restored, so a frequently-restarted search could never
+        # early-stop. Derived from history -- see no_improvement_from_history.
+        self._resumed_no_improvement = self.no_improvement_from_history(self.history)
         self.best_fitness = checkpoint.get('best_fitness')
         self.best_individual = checkpoint.get('best_individual')
 
@@ -569,6 +574,42 @@ class GeneticOptimizer:
             population.append(ind)
         return population
 
+    @staticmethod
+    def no_improvement_from_history(history: list) -> int:
+        """Consecutive generations at the end of ``history`` that did not beat the ALL-TIME best.
+
+        DERIVED, never stored-and-trusted, and that is deliberate. The counter itself is a local
+        of ``optimize()`` zeroed on entry, so every resume used to restart the patience clock at 0
+        while ``best_fitness`` WAS restored -- a restart-happy campaign could therefore never
+        early-stop, because the streak was wiped faster than it could reach the limit. This
+        campaign had four incarnations in two days.
+
+        Storing the counter instead would inherit an ORDERING hazard: the checkpoint is written
+        (``checkpoint_callback``) BEFORE the best/counter update below it, so a stored value is
+        one generation stale by construction. ``history`` is appended BEFORE the save and is
+        therefore always consistent with the generation the checkpoint claims to be at, which
+        makes it the one safe source. It also means EXISTING checkpoints, written before this
+        key existed, resume with the correct streak rather than a zero.
+
+        NOTE ``history[i]['best_fitness']`` is the GENERATION best, not the running best, so the
+        running maximum is reconstructed here rather than assuming the series is monotonic --
+        elitism usually makes it so, but nothing in this loop guarantees it.
+        """
+        running = None
+        last_improved = -1
+        for i, entry in enumerate(history or []):
+            try:
+                fitness = entry["best_fitness"]
+            except (KeyError, TypeError):
+                continue          # a malformed entry must not silently zero the streak
+            if fitness is None:
+                continue
+            if running is None or fitness > running:
+                running, last_improved = fitness, i
+        if last_improved < 0:
+            return 0
+        return max(0, len(history) - 1 - last_improved)
+
     def get_checkpoint_data(self, generation: int, population: list) -> Dict:
         """
         Get current state for checkpointing.
@@ -593,6 +634,10 @@ class GeneticOptimizer:
             'best_individual': list(self.best_individual) if self.best_individual else None,
             'best_fitness': self.best_fitness,
             'history': self.history,
+            # Derived from history at write time, so it can never disagree with it. Resume
+            # re-derives rather than trusting this; it is here so a monitor can READ the
+            # patience clock, which was previously invisible outside the running process.
+            'no_improvement_count': self.no_improvement_from_history(self.history),
             'random_state': _py_state_to_jsonable(random.getstate()),
             'np_random_state': _np_state_to_jsonable(np.random.get_state()),
             # The GA's OWN generator (self._rng) -- the only one whose position decides the rest
@@ -661,7 +706,7 @@ class GeneticOptimizer:
 
         # Track best fitness for early stopping
         best_fitness_history = []
-        no_improvement_count = 0
+        no_improvement_count = getattr(self, '_resumed_no_improvement', 0)
 
         # Restore best fitness history from resumed state
         if self.history:
