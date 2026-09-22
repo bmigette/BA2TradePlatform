@@ -309,6 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Per-gene mutation probability passthrough (default: launcher's).")
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed, included in discovery job identity; vary for stability pilots.")
+    ap.add_argument("--labels", default="",
+                    help="Comma-separated labels stamped on every persisted Top-N backtest "
+                         "of every job (forwarded to the launcher's --labels). NOT part of "
+                         "the discovery identity digest, so labelling a campaign does not "
+                         "rename its jobs or orphan their checkpoints.")
     ap.add_argument("--elitism-percent", type=float, default=10.0)
     ap.add_argument("--interval", default="1d",
                     help="Analysis/fill interval (default 1d — option cache bars are daily).")
@@ -514,6 +519,8 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
         # the worker would silently re-resolve to the sqlite default. That is how a whole grid
         # once scored against the wrong vendor's history while every log said otherwise.
         "--options-store", args.options_store]
+    if args.labels:
+        cmd += ["--labels", args.labels]
     cmd += _gate_passthrough(args)
     cmd += _market_condition_passthrough(args)
     if neutral_entry_mode != "legacy":
@@ -557,7 +564,10 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
             config[flag] = True
             i += 1
         else:
-            if flag not in ("--name", "--parallel", "--workers"):
+            # --labels is METADATA, not search configuration: it must not move the job
+            # identity, or adding a label would rename every job and orphan its GA
+            # checkpoint. Same reasoning as --name/--parallel/--workers.
+            if flag not in ("--name", "--parallel", "--workers", "--labels"):
                 config[flag] = tokens[i + 1]
             i += 2
     identity = {"schema": 1, "args": config, "launcher": os.path.abspath(launcher),
