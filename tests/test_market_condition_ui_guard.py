@@ -278,15 +278,25 @@ def test_a_selected_rule_that_no_longer_exists_does_not_break_the_save(rules_tab
 
 
 def test_the_refusal_runs_before_any_write_in_save_ruleset():
-    """Read from the source: a refusal after ``update_instance``/``add_instance`` would leave the
-    ruleset repointed at rules it just refused."""
+    """Read from the source: a refusal after the row or the links are written would leave the
+    ruleset repointed at rules it just refused.
+
+    The markers are every statement that can reach the database in ``_save_ruleset``, and the
+    save now does all of them inside ONE ``with get_db()`` transaction: the link delete, the
+    link inserts, and the ruleset row itself (``session.add`` on the create path,
+    ``update_instance(..., session=session)`` -- which commits that session -- on the edit
+    path). A spelling that disappears from the source fails this test loudly rather than
+    quietly checking nothing, so keep the list in step with the save."""
     import inspect
 
     from ba2_trade_platform.ui.pages.settings import TradeSettingsTab
 
     src = inspect.getsource(TradeSettingsTab._save_ruleset)
     guard = src.index("_refuse_market_gates_on_exit_ruleset(")
-    writes = [src.index(c) for c in ("update_instance(ruleset)", "add_instance(new_ruleset)")]
+    writes = [src.index(c) for c in ("with get_db() as session:",
+                                     "delete(RulesetEventActionLink)",
+                                     "session.add(new_ruleset)",
+                                     "update_instance(ruleset, session=session)")]
     assert guard < min(writes)
 
 

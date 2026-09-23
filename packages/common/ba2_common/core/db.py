@@ -1061,7 +1061,14 @@ def reorder_ruleset_rules(ruleset_id: int, rule_order: list[int]) -> bool:
     """
     Reorder the rules in a ruleset by updating the order_index field.
     Thread-safe: Uses a lock to prevent concurrent write conflicts.
-    
+
+    NO PRODUCTION CALLER since 2026-09-22. The Edit Ruleset dialog used to reorder through
+    this (and through ``move_rule_up``/``move_rule_down``); it now deletes and rewrites
+    every link of the ruleset in the one transaction that also writes the ruleset row, so
+    order_index comes out of the dialog's own list. ``tests/test_db.py`` is the only caller
+    left. Said here because three tested reordering helpers read like the ones the dialog
+    uses, and the next reader will otherwise fix a ruleset-ordering bug in the wrong place.
+
     Args:
         ruleset_id: The ID of the ruleset to reorder
         rule_order: List of eventaction_ids in the desired order

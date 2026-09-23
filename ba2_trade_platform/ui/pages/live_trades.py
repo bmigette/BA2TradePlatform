@@ -2095,7 +2095,14 @@ class LiveTradesTab:
 
     def _render_rule_group(self, title: str, views, *, tone: str, color: str,
                            ruleset_id) -> None:
-        """One side of the strategy: a heading, the ruleset's name, and its rules."""
+        """One side of the strategy: a heading, the ruleset's name, and its rules.
+
+        The clause markup is ``ruleset_view.render_clause``, shared with the RULESET
+        EDITOR: two copies of it is how the read-only view and the editable one start
+        describing one rule in two different shapes.
+        """
+        from ..utils.ruleset_view import render_clause
+
         if not views:
             return
         with ui.row().classes('w-full items-baseline gap-2 mt-2'):
@@ -2118,22 +2125,8 @@ class LiveTradesTab:
                         with ui.badge('continues', color='orange'):
                             ui.tooltip('Evaluation carries on to the next rule even '
                                        'after this one matches.')
-                self._render_clause('WHEN', 'AND', view.when)
-                self._render_clause('THEN', 'AND', view.then)
-
-    @staticmethod
-    def _render_clause(label: str, joiner: str, lines) -> None:
-        """One clause of a rule sentence, one line per item, joiner in the gutter.
-
-        The gutter is a fixed width so WHEN/THEN and the ANDs beneath them share a
-        right edge and every clause body starts at the same x -- which is what lets the
-        eye read down a column of rules instead of across each one.
-        """
-        for index, line in enumerate(lines or ()):
-            with ui.row().classes('items-baseline gap-2 no-wrap'):
-                ui.label(label if index == 0 else joiner) \
-                    .classes('text-caption text-grey-7 w-12 text-right')
-                ui.label(line).classes('text-body2 font-mono')
+                render_clause('WHEN', 'AND', view.when)
+                render_clause('THEN', 'AND', view.then)
 
     @staticmethod
     def _screener_definitions():

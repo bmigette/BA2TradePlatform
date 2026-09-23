@@ -8,14 +8,15 @@ from sqlmodel import select
 from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, EventAction, Ruleset
 from ...logger import logger
 from ...core.db import (get_db, get_all_instances, delete_instance, add_instance,
-                        update_instance, get_instance, rulesets_for_event_action)
+                        update_instance, get_instance, ruleset_event_actions,
+                        rulesets_for_event_action)
 from ...core.instrument_enrichment import enrich_instruments
 from ba2_common.core.instrument_info import needs_instrument_info
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
     preview_trade_action_result_retention, execute_trade_action_result_retention,
@@ -5113,14 +5114,41 @@ class TradeSettingsTab:
     UI tab for managing trading rules and rulesets.
     Features: separate sections for rules (EventAction) and rulesets (Ruleset) with edit/delete functions.
     """
-    
+
+    #: The ruleset dialog's own list: one card per rule THIS ruleset holds, and the three
+    #: controls on each. The id-suffixed marks are how a test reaches one card's arrow.
+    MARKER_RULESET_RULE = 'ruleset-rule'
+    MARKER_RULESET_RULE_NAME = 'ruleset-rule-name'
+    MARKER_RULESET_UP = 'ruleset-rule-up'
+    MARKER_RULESET_DOWN = 'ruleset-rule-down'
+    MARKER_RULESET_REMOVE = 'ruleset-rule-remove'
+    MARKER_RULESET_EMPTY = 'ruleset-rules-empty'
+    #: The Add-rules modal: the button that opens it, its search box, one tick per
+    #: candidate (``MARKER_RULESET_CANDIDATE-<rule id>`` is on the CHECKBOX) and the confirm.
+    MARKER_RULESET_ADD = 'ruleset-add-rules'
+    MARKER_RULESET_ADD_DIALOG = 'ruleset-add-dialog'
+    MARKER_RULESET_ADD_SEARCH = 'ruleset-add-search'
+    MARKER_RULESET_CANDIDATE = 'ruleset-candidate'
+    MARKER_RULESET_CANDIDATE_NAME = 'ruleset-candidate-name'
+    MARKER_RULESET_ADD_CONFIRM = 'ruleset-add-confirm'
+    MARKER_RULESET_ADD_EMPTY = 'ruleset-add-empty'
+
+    #: Printed beside the list, in the words the transaction-details dialog uses.
+    #: ``TradeActionEvaluator`` breaks after the first rule whose conditions pass unless
+    #: that rule carries ``continue_processing``, so a reader who takes the list as "all
+    #: of these apply" has the mechanism backwards -- and here they can REORDER it.
+    RULESET_PRECEDENCE_NOTE = '— evaluated in order; the first match wins'
+    #: On the ×. A rule is shared: several rulesets link the same ``EventAction``, and
+    #: deleting the row from here would gut every one of them.
+    RULESET_REMOVE_TOOLTIP = ('Remove this rule from this ruleset. The rule itself is not '
+                              'deleted — other rulesets may be using it.')
+
     def __init__(self):
         logger.debug('Initializing TradeSettingsTab')
         self.rules_dialog = ui.dialog()
         self.rules_dialog.props('no-backdrop-dismiss')
         self.rulesets_dialog = ui.dialog()
         self.rulesets_dialog.props('no-backdrop-dismiss')
-        self.reorder_dialog = ui.dialog()
         self.rules_table = None
         self.rulesets_table = None
         self.triggers = {}
@@ -5245,7 +5273,6 @@ class TradeSettingsTab:
                             <q-btn @click="$parent.$emit('test', props)" icon="science" flat dense color='green' title="Test Ruleset"/>
                             <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue' title="Edit Ruleset"/>
                             <q-btn @click="$parent.$emit('duplicate', props)" icon="content_copy" flat dense color='orange' title="Duplicate Ruleset"/>
-                            <q-btn @click="$parent.$emit('reorder', props)" icon="reorder" flat dense color='purple' title="Reorder Rules"/>
                             <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red' title="Delete Ruleset"/>
                         </q-td>
                     """)
@@ -5253,7 +5280,6 @@ class TradeSettingsTab:
                     self.rulesets_table.on('test', self._on_ruleset_test_click)
                     self.rulesets_table.on('edit', self._on_ruleset_edit_click)
                     self.rulesets_table.on('duplicate', self._on_ruleset_duplicate_click)
-                    self.rulesets_table.on('reorder', self._on_ruleset_reorder_click)
                     self.rulesets_table.on('del', self._on_ruleset_del_click)
         
         logger.debug('TradeSettingsTab UI rendered')
@@ -6223,17 +6249,61 @@ class TradeSettingsTab:
             ui.notify(f"Error saving rule: {e}", type='negative')
     
     def show_ruleset_dialog(self, ruleset=None):
-        """Show the add/edit ruleset dialog."""
+        """The Edit/Add Ruleset dialog: THIS ruleset's rules, in the order it evaluates them.
+
+        WHAT THIS REPLACED. Every rule in the platform whose subtype matched was drawn
+        here with a checkbox, folded shut, as one scrolling list -- so a ruleset of two
+        rules was authored by hunting two ticks among dozens of irrelevant ones, and
+        nothing on screen said that the sequence of those ticks decides which rule fires.
+
+        The list now holds only the rules this ruleset links, unfolded (it is short), with
+        arrows that are THE ONLY thing that changes precedence, and an "Add rules" modal
+        for everything else. ``_save_ruleset`` writes ``order_index`` from this list's own
+        order: it used to rebuild it from ``get_all_instances(EventAction)`` -- id order --
+        so opening a hand-ranked ruleset and pressing Save silently re-ranked it.
+
+        The cards are drawn through ``ui.utils.ruleset_view``, the same formatter the
+        transaction-details dialog prints a live position's rules with, so an operator
+        holding one screen against the other is not translating between two vocabularies.
+        """
+        from ..utils import ruleset_picker
+
         logger.debug(f'Showing ruleset dialog for ruleset: {ruleset.id if ruleset else "new ruleset"}')
-        
+
         is_edit = ruleset is not None
-        
+        # ONE reading of a missing subtype, used by both the filter below and the Subtype
+        # select further down. Read twice, it was the bug this dialog would have shipped:
+        # ``Ruleset.subtype`` is nullable (the table prints "Not set", and the rules
+        # importer writes whatever the payload carries), the select fell back to Enter
+        # Market, and the filter fell back to None -- which matches NO rule -- so opening a
+        # subtype-less ruleset emptied its list and a Save deleted every link. Falling back
+        # here instead means such a ruleset opens as the Enter Market ruleset the select
+        # already claimed it was, and saving repairs the missing subtype.
+        subtype = (ruleset.subtype.value if is_edit and ruleset.subtype
+                   else AnalysisUseCase.ENTER_MARKET.value)
+        if is_edit and not ruleset.subtype:
+            # SAID ONCE, ON OPEN. The default above is the right one -- it is what the
+            # select already claimed -- but a subtype-less ruleset can be sitting in an
+            # expert's open-positions slot, and there the default makes the drop below
+            # take EVERY rule and a Save write an empty Enter Market ruleset over a live
+            # exit. The operator is the only one who knows which slot it is wired into.
+            ui.notify(ruleset_picker.SUBTYPE_MISSING, type='warning')
+
+        # THE SOURCE OF TRUTH for what this dialog will save, seeded from the LINK table in
+        # ``order_index`` order -- never from the global rule list, which is id order.
+        # A linked rule of another subtype is dropped here, loudly: see
+        # ``_drop_rules_not_matching``. Nothing is written by this drop -- the links are
+        # still in the database and Cancel puts the list back -- so it says so.
+        self.ruleset_rule_ids = [rule.id for rule in ruleset_event_actions(ruleset.id)] \
+            if is_edit else []
+        self._drop_rules_not_matching(subtype, ruleset_picker.DROPPED_FOR_SUBTYPE_PENDING)
+
         with self.rulesets_dialog:
             self.rulesets_dialog.clear()
-            
+
             with ui.card().classes('w-full').style('width: 90vw; max-width: 1200px; height: 90vh; margin: auto; display: flex; flex-direction: column'):
                 ui.label('Add Ruleset' if not is_edit else 'Edit Ruleset').classes('text-h6 mb-4')
-                
+
                 # Basic ruleset information
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full gap-4'):
@@ -6243,132 +6313,309 @@ class TradeSettingsTab:
                         ).classes('flex-1').props('dense')
 
                         self.ruleset_subtype_select = ui.select(
-                            options={subtype.value: subtype.value.replace('_', ' ').title() for subtype in AnalysisUseCase},
+                            # ``use_case``, not ``subtype``: ``value=subtype`` on the line
+                            # below means the ONE reading of the missing subtype made
+                            # above, and a comprehension variable of that name reads as
+                            # though it were the loop's last item. It is correct today
+                            # only because Python 3 scopes comprehension variables -- a
+                            # coincidence, not a decision, and this is the exact double
+                            # reading this dialog already shipped once.
+                            options={use_case.value: ruleset_picker.subtype_label(use_case.value)
+                                     for use_case in AnalysisUseCase},
                             label='Subtype (Analysis Use Case)',
-                            value=ruleset.subtype.value if is_edit and ruleset.subtype else AnalysisUseCase.ENTER_MARKET.value
+                            value=subtype
                         ).classes('flex-1').props('dense')
 
                     self.ruleset_description_input = ui.textarea(
                         label='Description',
                         value=ruleset.description if is_edit and ruleset.description else ''
                     ).classes('w-full').props('dense rows=2')
-                
-                # Rules selection section
-                ui.label('Select Rules for this Ruleset').classes('text-subtitle1 mt-2 mb-1')
-                ui.label('Choose which rules should be part of this ruleset. Only rules with matching subtype are shown.').classes('text-grey-7 text-xs mb-2')
 
-                # Container for rules that will be updated when subtype changes
-                self.rules_selection_container = ui.column().classes('w-full').style('flex: 1; overflow-y: auto')
-                
-                # Function to update available rules based on selected subtype
-                def update_available_rules():
-                    self.rules_selection_container.clear()
-                    
-                    # Get selected subtype
-                    selected_subtype = self.ruleset_subtype_select.value
-                    if not selected_subtype:
-                        with self.rules_selection_container:
-                            ui.label('Please select a subtype first.').classes('text-orange')
-                        return
-                    
-                    # Get all available rules that match the subtype
-                    available_rules = [rule for rule in get_all_instances(EventAction) 
-                                     if rule.subtype and rule.subtype.value == selected_subtype]
-                    
-                    if not available_rules:
-                        with self.rules_selection_container:
-                            ui.label(f'No rules available for subtype "{selected_subtype.replace("_", " ").title()}". Create some rules with this subtype first.').classes('text-orange')
-                        return
-                    
-                    # Get currently selected rule IDs if editing
-                    selected_rule_ids = set()
-                    if is_edit:
-                        session = get_db()
-                        from sqlmodel import select
-                        from ...core.models import RulesetEventActionLink
-                        stmt = select(RulesetEventActionLink).where(RulesetEventActionLink.ruleset_id == ruleset.id)
-                        links = session.exec(stmt).all()
-                        selected_rule_ids = {link.eventaction_id for link in links}
-                        logger.debug(f'Loaded selected rule IDs for ruleset {ruleset.id}: {selected_rule_ids}')
-                        session.close()
-                    
-                    # Clear and recreate selected_rules dict
-                    self.selected_rules = {}
-                    
-                    with self.rules_selection_container:
-                        with ui.column().classes('w-full'):
-                            for rule in available_rules:
-                                is_selected = rule.id in selected_rule_ids
+                with ui.row().classes('w-full items-center gap-2 mt-2'):
+                    self.ruleset_rules_heading = ui.label().classes('text-subtitle1')
+                    ui.label(self.RULESET_PRECEDENCE_NOTE).classes('text-caption text-grey-7')
+                    ui.space()
+                    ui.button('Add rules', icon='add', on_click=self._open_ruleset_add_dialog) \
+                        .props('dense no-caps').mark(self.MARKER_RULESET_ADD)
 
-                                with ui.card().classes('w-full p-1 mb-1'):
-                                    with ui.row().classes('w-full items-center gap-1'):
-                                        rule_checkbox = ui.checkbox(
-                                            text='',
-                                            value=is_selected
-                                        ).props('dense')
-                                        ui.label(f'{rule.name}').classes('font-medium text-sm flex-1')
-                                        toggle_btn = ui.button(icon='expand_more').props('flat dense size=sm')
-                                    details_container = ui.column().classes('w-full pl-8').style('display: none')
+                self.ruleset_rules_container = ui.column().classes('w-full gap-1') \
+                    .style('flex: 1; overflow-y: auto')
 
-                                    def make_toggle(btn, container):
-                                        def toggle():
-                                            visible = container._style.get('display', 'none') != 'none'
-                                            container._style['display'] = 'none' if visible else ''
-                                            btn._props['icon'] = 'expand_more' if visible else 'expand_less'
-                                            container.update()
-                                            btn.update()
-                                        return toggle
-                                    toggle_btn.on('click', make_toggle(toggle_btn, details_container))
+                # The modal's SHELL is built once with this dialog. Building it inside the
+                # "Add rules" handler instead would leak a fresh dialog tree into the page
+                # on every click, and a ruleset is opened and added to repeatedly. Its
+                # CONTENTS depend on the current list and subtype, so they are rendered
+                # into ``ruleset_candidates_container`` each time the modal opens.
+                self._build_ruleset_add_dialog()
+                self._render_ruleset_rules()
 
-                                    with details_container:
-                                        ui.label(f'Subtype: {rule.subtype.value.replace("_", " ").title()}').classes('text-xs text-grey-6')
-                                        ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-xs text-grey-6')
-                                        if rule.triggers:
-                                            trigger_parts = []
-                                            for k, v in rule.triggers.items():
-                                                event_type = v.get('event_type', v.get('type', 'unknown'))
-                                                detail = event_type
-                                                if is_numeric_event(event_type):
-                                                    op = v.get('operator', '')
-                                                    val = v.get('value', '')
-                                                    if op or val:
-                                                        detail += f' {op} {val}'
-                                                trigger_parts.append(f"{k}: {detail}")
-                                            ui.label(f'Triggers: {", ".join(trigger_parts)}').classes('text-xs text-grey-6')
-                                        if rule.actions:
-                                            action_parts = []
-                                            for k, v in rule.actions.items():
-                                                action_type = v.get('action_type', v.get('type', 'unknown'))
-                                                label = get_action_type_display_label(action_type)
-                                                if is_adjustment_action(action_type):
-                                                    val = v.get('value', '')
-                                                    ref = v.get('reference_value', '')
-                                                    if val:
-                                                        label += f' {val}%'
-                                                    if ref:
-                                                        label += f' of {ref.replace("_", " ")}'
-                                                elif is_share_adjustment_action(action_type):
-                                                    pct = v.get('target_percent', '')
-                                                    if pct:
-                                                        label += f' to {pct}%'
-                                                action_parts.append(f"{k}: {label}")
-                                            ui.label(f'Actions: {", ".join(action_parts)}').classes('text-xs text-grey-6')
-
-                                self.selected_rules[rule.id] = rule_checkbox
-                
-                # Initial load of rules
-                update_available_rules()
-                
-                # Update rules when subtype changes
-                self.ruleset_subtype_select.on('update:model-value', lambda: update_available_rules())
-                
-                # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
                     ui.button('Cancel', on_click=self.rulesets_dialog.close).props('flat')
                     ui.button('Save', on_click=lambda: self._save_ruleset(ruleset))
-        
+
+        # A subtype change can leave rules behind that can no longer fire here; the handler
+        # drops them and SAYS which, rather than saving a rule that looks live and is not.
+        self.ruleset_subtype_select.on('update:model-value',
+                                       lambda: self._on_ruleset_subtype_change())
+
         self.rulesets_dialog.open()
-    
+
+    def _ruleset_rules(self):
+        """The rule rows behind ``self.ruleset_rule_ids``, in that order.
+
+        An id that no longer resolves is a rule deleted from the Rules tab while this
+        dialog sat open. It is dropped AND reported: carrying a dead id into the save
+        would write a link to a row that is not there, and dropping it in silence is a
+        ruleset that lost a rule between opening and saving with nothing to show for it.
+        """
+        from ...core.db import InstanceNotFound
+
+        rules, missing = [], []
+        for rule_id in self.ruleset_rule_ids:
+            try:
+                rules.append(get_instance(EventAction, rule_id))
+            except InstanceNotFound:
+                # NAMED, not ``except Exception``: "the row is gone" is the one condition
+                # this loop may absorb, and a broad handler here would report a database
+                # that went away as a rule the operator deleted.
+                missing.append(rule_id)
+        if missing:
+            self.ruleset_rule_ids = [rule.id for rule in rules]
+            # IDS, not names, and deliberately so: these rows are GONE. There is nothing
+            # left to read a name off -- unlike the stranded ticks in
+            # ``_add_ruleset_candidates``, where the row still exists and the name is
+            # printed. An id an operator can match against the Rules tab's id column beats
+            # "1 rule" with nothing to identify it.
+            ui.notify(f'{len(missing)} rule(s) in this ruleset no longer exist and were '
+                      f'removed from the list: {missing}', type='warning')
+        return rules
+
+    def _render_ruleset_rules(self) -> None:
+        """The list of cards. All unfolded: the list is short, and a rule folded shut is
+        a rule the operator has to click before they can tell whether it is the one they
+        meant -- which is the hunting this whole dialog was rebuilt to end."""
+        from ..utils.ruleset_view import build_rule_views, render_clause
+
+        rules = self._ruleset_rules()
+        self.ruleset_rules_heading.text = f'Rules in this ruleset ({len(rules)})'
+        self.ruleset_rules_container.clear()
+        with self.ruleset_rules_container:
+            if not rules:
+                ui.label('No rules yet — "Add rules" offers the rules that match this '
+                         "ruleset's subtype.").classes('text-grey-7 text-sm p-2') \
+                    .mark(self.MARKER_RULESET_EMPTY)
+                return
+            for position, (rule, view) in enumerate(zip(rules, build_rule_views(rules))):
+                with ui.card().classes('w-full q-pa-sm').mark(
+                        self.MARKER_RULESET_RULE, f'{self.MARKER_RULESET_RULE}-{rule.id}'):
+                    with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                        # The position, printed: it is the rule's PRECEDENCE, and a list
+                        # whose order decides what fires must number itself.
+                        ui.label(str(position + 1)).classes(
+                            'text-caption text-grey-6 w-6 text-right')
+                        ui.label(view.name).classes('text-body2 text-weight-bold') \
+                            .mark(self.MARKER_RULESET_RULE_NAME)
+                        if view.continues:
+                            with ui.badge('continues', color='orange'):
+                                ui.tooltip('Evaluation carries on to the next rule even '
+                                           'after this one matches.')
+                        ui.space()
+                        ui.button(icon='arrow_upward',
+                                  on_click=partial(self._move_ruleset_rule, position, -1)) \
+                            .props('flat dense size=sm').mark(self.MARKER_RULESET_UP) \
+                            .set_enabled(position > 0)
+                        ui.button(icon='arrow_downward',
+                                  on_click=partial(self._move_ruleset_rule, position, 1)) \
+                            .props('flat dense size=sm').mark(self.MARKER_RULESET_DOWN) \
+                            .set_enabled(position < len(rules) - 1)
+                        ui.button(icon='close',
+                                  on_click=partial(self._remove_ruleset_rule, rule.id)) \
+                            .props('flat dense size=sm color=red') \
+                            .tooltip(self.RULESET_REMOVE_TOOLTIP) \
+                            .mark(self.MARKER_RULESET_REMOVE)
+                    render_clause('WHEN', 'AND', view.when)
+                    render_clause('THEN', 'AND', view.then)
+
+    def _move_ruleset_rule(self, index: int, delta: int, _event=None) -> None:
+        """Swap a rule with its neighbour. THE ONLY thing in this dialog that re-ranks.
+
+        Nothing is written until Save; ``_save_ruleset`` rewrites ``order_index`` from
+        this list, so precedence changes here and at no other moment.
+        """
+        from ..utils.ruleset_picker import moved
+
+        self.ruleset_rule_ids = moved(self.ruleset_rule_ids, index, delta)
+        self._render_ruleset_rules()
+
+    def _remove_ruleset_rule(self, rule_id: int, _event=None) -> None:
+        """UNLINK, never delete. The ``EventAction`` row is shared by every ruleset that
+        links it, so deleting it from here could gut a ruleset nobody in this dialog is
+        looking at. The link goes on Save; the rule itself keeps existing."""
+        self.ruleset_rule_ids = [rid for rid in self.ruleset_rule_ids if rid != rule_id]
+        self._render_ruleset_rules()
+
+    def _drop_rules_not_matching(self, subtype, message: str) -> None:
+        """Drop the listed rules that cannot fire under ``subtype``, and NAME them.
+
+        Three moments need this and they must not drift apart: opening a ruleset whose
+        links point at rules of another subtype (the Rules tab lets a rule's subtype be
+        edited after it was linked, and an import can write any link at all), changing the
+        Subtype select under a list chosen for the previous one, and the save that writes
+        the links. A rule of another use case can never fire here: kept, it looks live and
+        never runs; dropped in silence, the ruleset loses a rule between opening and saving
+        and nothing says so. The old dialog took the silent half -- it simply never drew
+        such a rule, and the save rewrote the links without it.
+
+        ``message`` IS THE CALLER'S TO CHOOSE, and it is not decoration. This method never
+        writes, but two of its callers do not write either and the third writes
+        immediately afterwards, so only the caller knows whether the drop is a proposal or
+        a deletion. Spelled as one constant it said "Nothing is written until you Save."
+        on the save path too -- one line above "Ruleset saved successfully!", about a link
+        that had just been deleted for good. See ``DROPPED_FOR_SUBTYPE_PENDING`` and
+        ``DROPPED_FOR_SUBTYPE_APPLIED``.
+
+        This method does not redraw either: it runs on open BEFORE the card container
+        exists. The callers that have one redraw after calling it.
+        """
+        from ..utils.ruleset_picker import partition_by_subtype, subtype_label
+
+        kept, dropped = partition_by_subtype(self._ruleset_rules(), subtype)
+        if not dropped:
+            return
+        self.ruleset_rule_ids = [rule.id for rule in kept]
+        ui.notify(message.format(
+            count=len(dropped), subtype=subtype_label(subtype),
+            names=', '.join(rule.name for rule in dropped)), type='warning')
+
+    def _on_ruleset_subtype_change(self) -> None:
+        """The subtype changed under a list chosen for the previous one."""
+        from ..utils.ruleset_picker import DROPPED_FOR_SUBTYPE_PENDING
+
+        self._drop_rules_not_matching(self.ruleset_subtype_select.value,
+                                      DROPPED_FOR_SUBTYPE_PENDING)
+        self._render_ruleset_rules()
+
+    def _build_ruleset_add_dialog(self) -> None:
+        """The Add-rules modal's shell: a search box, a tick per candidate, one confirm."""
+        with ui.dialog().props('no-backdrop-dismiss').mark(
+                self.MARKER_RULESET_ADD_DIALOG) as self.ruleset_add_dialog:
+            with ui.card().classes('w-full').style('max-width: 720px; max-height: 80vh; '
+                                                   'display: flex; flex-direction: column'):
+                ui.label('Add rules to this ruleset').classes('text-subtitle1')
+                ui.label("Only rules matching this ruleset's subtype, and only ones it "
+                         'does not already hold.').classes('text-caption text-grey-7')
+                self.ruleset_candidate_search = (
+                    ui.input(placeholder='Search name, gate or action…')
+                    .props('dense outlined clearable autofocus').classes('w-full')
+                    .mark(self.MARKER_RULESET_ADD_SEARCH))
+                self.ruleset_candidate_search.on_value_change(
+                    lambda _event=None: self._render_ruleset_candidates())
+                self.ruleset_candidates_container = ui.column().classes('w-full gap-1') \
+                    .style('flex: 1; overflow-y: auto')
+                with ui.row().classes('w-full justify-end gap-2 mt-2'):
+                    ui.button('Cancel', on_click=self.ruleset_add_dialog.close).props('flat')
+                    ui.button('Add selected', on_click=self._add_ruleset_candidates) \
+                        .props('color=primary').mark(self.MARKER_RULESET_ADD_CONFIRM)
+
+    def _open_ruleset_add_dialog(self, _event=None) -> None:
+        # The ticks are cleared FIRST: they belong to one trip through the modal, and
+        # clearing the search box fires ``on_value_change`` -> a re-render that would
+        # otherwise draw the PREVIOUS trip's ticks.
+        self.ruleset_candidate_checked = set()
+        # A query left over from the last open would show a short list that reads as a
+        # short CATALOG -- the same trap the trigger picker clears its search for.
+        self.ruleset_candidate_search.value = ''
+        self._render_ruleset_candidates()
+        self.ruleset_add_dialog.open()
+
+    def _render_ruleset_candidates(self) -> None:
+        """The rules on offer: matching subtype, not already listed, matching the search."""
+        from ..utils.ruleset_picker import addable_rules, search_rules
+        from ..utils.ruleset_view import build_rule_views, render_clause
+
+        query = self.ruleset_candidate_search.value or ''
+        offered = addable_rules(get_all_instances(EventAction),
+                                self.ruleset_subtype_select.value, self.ruleset_rule_ids)
+        candidates = search_rules(offered, query)
+
+        self.ruleset_candidates_container.clear()
+        with self.ruleset_candidates_container:
+            if not candidates:
+                # The two empty states say DIFFERENT things, and telling an operator
+                # "no rule matches" when they have simply added them all sends them
+                # hunting for a rule that is already on the other side of the screen.
+                ui.label('No rule matches that search.' if query else
+                         'Every rule with this subtype is already in this ruleset.') \
+                    .classes('text-xs text-grey-6 p-2').mark(self.MARKER_RULESET_ADD_EMPTY)
+                return
+            for rule, view in zip(candidates, build_rule_views(candidates)):
+                with ui.card().classes('w-full p-2 gap-0').mark(self.MARKER_RULESET_CANDIDATE):
+                    with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                        # The tick is held in ``ruleset_candidate_checked``, not in the
+                        # widget: typing in the search box REBUILDS this list, and a tick
+                        # that lived only in the checkbox was thrown away by the next
+                        # keystroke -- in a multi-select whose whole purpose is to collect
+                        # several rules before confirming.
+                        tick = ui.checkbox(
+                            value=rule.id in self.ruleset_candidate_checked).props('dense') \
+                            .mark(f'{self.MARKER_RULESET_CANDIDATE}-{rule.id}')
+                        tick.on_value_change(partial(self._tick_ruleset_candidate, rule.id))
+                        ui.label(view.name).classes('text-sm font-medium') \
+                            .mark(self.MARKER_RULESET_CANDIDATE_NAME)
+                    with ui.column().classes('gap-0 pl-8'):
+                        render_clause('WHEN', 'AND', view.when)
+                        render_clause('THEN', 'AND', view.then)
+
+    def _tick_ruleset_candidate(self, rule_id: int, event) -> None:
+        """Remember a tick OUTSIDE the checkbox, which the next search keystroke deletes."""
+        if event.value:
+            self.ruleset_candidate_checked.add(rule_id)
+        else:
+            self.ruleset_candidate_checked.discard(rule_id)
+
+    def _add_ruleset_candidates(self, _event=None) -> None:
+        """Every ticked rule, added in one confirm -- the reason this is a modal.
+
+        They land at the END of the list: a rule joining the bottom of the precedence
+        cannot pre-empt a rule that already works, and the arrows move it up deliberately.
+        Among themselves they keep the order the MODAL listed them in -- iterating the set
+        of ticks would hand the ruleset a precedence decided by Python's hashing.
+        """
+        from ..utils.ruleset_picker import addable_rules
+
+        all_rules = get_all_instances(EventAction)
+        offered = addable_rules(all_rules, self.ruleset_subtype_select.value,
+                                self.ruleset_rule_ids)
+        chosen = [rule.id for rule in offered if rule.id in self.ruleset_candidate_checked]
+        stranded = self.ruleset_candidate_checked - set(chosen)
+        if stranded:
+            # A tick the modal can no longer honour -- the rule was deleted, or the
+            # subtype changed under it. Said out loud: the operator ticked it, and a
+            # confirm that quietly adds fewer rules than were ticked is a ruleset that
+            # goes live missing a rule nobody knows is missing.
+            #
+            # BY NAME. The usual cause is a re-subtyped rule, whose row is still there, and
+            # "rule 47" tells the operator nothing about which of the rules they ticked did
+            # not make it in. ``all_rules`` is the list already loaded above, so naming them
+            # costs no query. The fallback is for the OTHER cause -- a deleted rule, which
+            # has no name left anywhere -- and it keeps the count honest either way.
+            names = {rule.id: rule.name for rule in all_rules}
+            stranded_names = ', '.join(names[rule_id] if rule_id in names else f'#{rule_id}'
+                                       for rule_id in sorted(stranded))
+            ui.notify(f'{len(stranded)} ticked rule(s) no longer match this ruleset and '
+                      f'were not added: {stranded_names}', type='warning')
+        if not chosen:
+            if not stranded:
+                # Said only when the modal has nothing else to explain: telling someone
+                # who DID tick a rule that they ticked nothing contradicts the line above.
+                ui.notify('No rule was ticked, so nothing was added.', type='warning')
+            return
+        self.ruleset_rule_ids = self.ruleset_rule_ids + chosen
+        self.ruleset_add_dialog.close()
+        self._render_ruleset_rules()
+        ui.notify(f'{len(chosen)} rule(s) added at the end of the ruleset. '
+                  f'Save to keep them.', type='positive')
+
     def _refuse_market_gates_on_exit_ruleset(self, subtype_value, selected_rule_ids) -> None:
         """Refuse a market-condition gate on a ruleset destined for the OPEN-POSITIONS slot.
 
@@ -6396,67 +6643,105 @@ class TradeSettingsTab:
         assert_no_market_fields(used, f"ruleset {self.ruleset_name_input.value!r}")
 
     def _save_ruleset(self, ruleset=None):
-        """Save the ruleset."""
+        """Save the ruleset, and its rules IN THE ORDER THE DIALOG SHOWS THEM.
+
+        Every link is deleted and rewritten, so ``order_index`` is decided here on every
+        save -- which is why the order this reads from matters as much as the ids do.
+
+        THE ROW AND ITS LINKS GO IN ONE TRANSACTION. They used to be two: the subtype was
+        committed by ``update_instance`` and the links rewritten on a second connection
+        afterwards. Flip a ruleset to open_positions, have the drop empty the list, and
+        let the link rewrite fail -- SQLite "database is locked" from JobManager is the
+        realistic way, and the raw link write carries no ``@retry_on_lock`` -- and what is
+        left is a ruleset labelled open_positions still linked to enter_market rules: a
+        live exit ruleset that can never fire. "The subtype and the links agree" is an
+        invariant of this design, so it is written as one commit or not at all.
+        """
+        from ..utils.ruleset_picker import DROPPED_FOR_SUBTYPE_APPLIED
+
         try:
             is_edit = ruleset is not None
-            
-            # Collect selected rules
-            selected_rule_ids = []
-            for rule_id, checkbox in self.selected_rules.items():
-                if checkbox.value:
-                    selected_rule_ids.append(rule_id)
-            
+
+            # THE LIST'S OWN ORDER, which is what ``order_index`` is written from below.
+            # It used to be collected by walking ``self.selected_rules``, a dict built in
+            # the order of ``get_all_instances(EventAction)`` -- id order -- so a ruleset
+            # ranked by hand came back re-ranked from an untouched Save. The evaluator is
+            # first-match, so that silently changed which rule fires.
+            #
+            # Re-read from the DATABASE here rather than trusted from the last redraw,
+            # because the dialog can sit open while the Rules tab DELETES a rule or
+            # changes its SUBTYPE, and this is the moment the links are written. Both
+            # drops say so. Note what this does NOT do: a link ADDED under the dialog --
+            # by the rules importer, say -- is discarded without a word, because the
+            # rewrite below is a delete-then-insert of the list on screen. Merging the two
+            # would need this no-backdrop-dismiss dialog to be open in two tabs at once.
+            self._drop_rules_not_matching(self.ruleset_subtype_select.value,
+                                          DROPPED_FOR_SUBTYPE_APPLIED)
+            selected_rule_ids = [rule.id for rule in self._ruleset_rules()]
+            # REDRAWN, because those drops shortened the list the cards were built from.
+            # Invisible on a save that succeeds (the dialog closes), but a save can be
+            # REFUSED below and the dialog stays open -- and ``_move_ruleset_rule`` acts on
+            # the position captured when the card was drawn, so an untouched screen over a
+            # shorter list means the up arrow on the card showing one rule moves another.
+            # It cannot live inside ``_drop_rules_not_matching``: that also runs on open,
+            # before the container exists.
+            self._render_ruleset_rules()
 
             # BEFORE any write: a market gate may not ride an open-positions ruleset.
             self._refuse_market_gates_on_exit_ruleset(
                 self.ruleset_subtype_select.value, selected_rule_ids)
 
-            if is_edit:
-                # Update existing ruleset
-                ruleset.name = self.ruleset_name_input.value
-                ruleset.description = self.ruleset_description_input.value or None
-                ruleset.subtype = AnalysisUseCase(self.ruleset_subtype_select.value) if self.ruleset_subtype_select.value else None
-                
-                update_instance(ruleset)
-                
-                # Update rule associations
-                session = get_db()
-                # Clear existing associations
-                from sqlmodel import delete
-                from ...core.models import RulesetEventActionLink
-                stmt = delete(RulesetEventActionLink).where(RulesetEventActionLink.ruleset_id == ruleset.id)
-                session.exec(stmt)
-                
-                # Add new associations with proper ordering
-                for order_index, rule_id in enumerate(selected_rule_ids):
-                    link = RulesetEventActionLink(ruleset_id=ruleset.id, eventaction_id=rule_id, order_index=order_index)
-                    session.add(link)
-                
-                session.commit()
-                session.close()
-                
-                logger.info(f"Updated ruleset: {ruleset.id}")
-            else:
-                # Create new ruleset
-                new_ruleset = Ruleset(
-                    name=self.ruleset_name_input.value,
-                    description=self.ruleset_description_input.value or None,
-                    subtype=AnalysisUseCase(self.ruleset_subtype_select.value) if self.ruleset_subtype_select.value else None
-                )
-                
-                ruleset_id = add_instance(new_ruleset)
-                
-                # Add rule associations with proper ordering
-                if selected_rule_ids:
-                    session = get_db()
+            from sqlmodel import delete
+            from ...core.models import RulesetEventActionLink
+
+            subtype = (AnalysisUseCase(self.ruleset_subtype_select.value)
+                       if self.ruleset_subtype_select.value else None)
+
+            # ``with``, not ``session = get_db()`` + ``session.close()``: an exception
+            # between the two leaked a connection still holding an open write transaction
+            # on a WAL database, and every later writer then waited out its busy_timeout.
+            with get_db() as session:
+                if is_edit:
+                    stmt = delete(RulesetEventActionLink).where(
+                        RulesetEventActionLink.ruleset_id == ruleset.id)
+                    session.exec(stmt)
                     for order_index, rule_id in enumerate(selected_rule_ids):
-                        from ...core.models import RulesetEventActionLink
-                        link = RulesetEventActionLink(ruleset_id=ruleset_id, eventaction_id=rule_id, order_index=order_index)
-                        session.add(link)
+                        session.add(RulesetEventActionLink(
+                            ruleset_id=ruleset.id, eventaction_id=rule_id,
+                            order_index=order_index))
+
+                    # LAST, and it is what commits: ``update_instance`` commits the session
+                    # it is handed (db.py), so the delete, the inserts and the row itself
+                    # land in one transaction. The row is written last so that a failure
+                    # while building the links leaves the stored subtype alone rather than
+                    # stranding it out of step with them.
+                    ruleset.name = self.ruleset_name_input.value
+                    ruleset.description = self.ruleset_description_input.value or None
+                    ruleset.subtype = subtype
+                    update_instance(ruleset, session=session)
+
+                    logger.info(f"Updated ruleset: {ruleset.id}")
+                else:
+                    new_ruleset = Ruleset(
+                        name=self.ruleset_name_input.value,
+                        description=self.ruleset_description_input.value or None,
+                        subtype=subtype,
+                    )
+                    # The same one-transaction shape as the edit path, reached the other
+                    # way round: the links need the ruleset's id, and ``flush`` hands that
+                    # out WITHOUT committing. So a failure while building them rolls the
+                    # ruleset back too, instead of leaving an empty ruleset in the table
+                    # under the name the operator thinks they saved their rules under.
+                    session.add(new_ruleset)
+                    session.flush()
+                    ruleset_id = new_ruleset.id
+                    for order_index, rule_id in enumerate(selected_rule_ids):
+                        session.add(RulesetEventActionLink(
+                            ruleset_id=ruleset_id, eventaction_id=rule_id,
+                            order_index=order_index))
                     session.commit()
-                    session.close()
-                
-                logger.info(f"Created new ruleset: {ruleset_id}")
+
+                    logger.info(f"Created new ruleset: {ruleset_id}")
             
             self.rulesets_dialog.close()
             self._update_rulesets_table()
@@ -6798,118 +7083,6 @@ class TradeSettingsTab:
         finally:
             session.close()
     
-    def _on_ruleset_reorder_click(self, msg):
-        """Handle reorder button click for rulesets."""
-        logger.debug(f'Reorder ruleset table click: {msg}')
-        row = msg.args['row']
-        ruleset_id = row['id']
-        self.show_reorder_dialog(ruleset_id)
-    
-    def show_reorder_dialog(self, ruleset_id):
-        """Show the ruleset reorder dialog."""
-        logger.debug(f'Showing reorder dialog for ruleset: {ruleset_id}')
-        
-        # Get the ruleset and its rules with ordering
-        ruleset = get_instance(Ruleset, ruleset_id)
-        if not ruleset:
-            ui.notify('Ruleset not found', type='error')
-            return
-        
-        # Get rules ordered by order_index
-        session = get_db()
-        from sqlmodel import select
-        from sqlalchemy.orm import selectinload
-        from ...core.models import RulesetEventActionLink
-        
-        # Get the link table entries with their order
-        links_stmt = select(RulesetEventActionLink).where(
-            RulesetEventActionLink.ruleset_id == ruleset_id
-        ).order_by(RulesetEventActionLink.order_index)
-        links = session.exec(links_stmt).all()
-        
-        # Get the corresponding EventActions
-        rules = []
-        for link in links:
-            rule = get_instance(EventAction, link.eventaction_id)
-            if rule:
-                rules.append({
-                    'id': rule.id,
-                    'name': rule.name,
-                    'description': f"{rule.type.value} - {rule.subtype}" if rule.type else rule.subtype,
-                    'order_index': link.order_index
-                })
-        
-        session.close()
-        
-        with self.reorder_dialog:
-            self.reorder_dialog.clear()
-            
-            with ui.card().classes('w-96'):
-                ui.label(f'Reorder Rules for: {ruleset.name}').classes('text-h6 mb-4')
-                ui.label('Use the up/down arrows to reorder the rules.').classes('text-grey-7 mb-4')
-                
-                # Create a container for the rule list
-                rule_list_container = ui.column().classes('w-full')
-                
-                def update_rule_list():
-                    """Update the rule list display."""
-                    rule_list_container.clear()
-                    
-                    for i, rule in enumerate(rules):
-                        with rule_list_container:
-                            with ui.row().classes('w-full items-center mb-2'):
-                                with ui.column().classes('flex-grow'):
-                                    ui.label(rule['name']).classes('font-bold')
-                                    ui.label(rule['description']).classes('text-sm text-grey-7')
-                                
-                                with ui.row().classes('gap-1'):
-                                    ui.button('↑', on_click=lambda idx=i: move_rule_up(idx)).props('dense flat').classes('w-8 h-8').set_enabled(i > 0)
-                                    ui.button('↓', on_click=lambda idx=i: move_rule_down(idx)).props('dense flat').classes('w-8 h-8').set_enabled(i < len(rules) - 1)
-                
-                def move_rule_up(index):
-                    """Move rule up in the list."""
-                    if index > 0:
-                        rules[index], rules[index - 1] = rules[index - 1], rules[index]
-                        update_rule_list()
-                
-                def move_rule_down(index):
-                    """Move rule down in the list."""
-                    if index < len(rules) - 1:
-                        rules[index], rules[index + 1] = rules[index + 1], rules[index]
-                        update_rule_list()
-                
-                def save_order():
-                    """Save the new rule order to the database."""
-                    try:
-                        # Create the new order list (just the rule IDs)
-                        new_order = [rule['id'] for rule in rules]
-                        
-                        # Import and use the reordering function
-                        from ...core.db import reorder_ruleset_rules
-                        success = reorder_ruleset_rules(ruleset_id, new_order)
-                        
-                        if success:
-                            ui.notify('Rule order updated successfully', type='positive')
-                            self.reorder_dialog.close()
-                            # Refresh the rulesets table (rules count might change display)
-                            self._update_rulesets_table()
-                        else:
-                            ui.notify('Failed to update rule order', type='negative')
-                            
-                    except Exception as e:
-                        logger.error(f'Error saving rule order: {e}', exc_info=True)
-                        ui.notify(f'Error saving order: {e}', type='negative')
-                
-                # Initial population of the list
-                update_rule_list()
-                
-                # Dialog buttons
-                with ui.row().classes('justify-end gap-2 mt-4'):
-                    ui.button('Cancel', on_click=self.reorder_dialog.close).props('flat')
-                    ui.button('Save Order', on_click=save_order, color='primary')
-        
-        self.reorder_dialog.open()
-
 
 class BatchCleanupTab:
     """Tab for batch cleanup operations across multiple experts."""
