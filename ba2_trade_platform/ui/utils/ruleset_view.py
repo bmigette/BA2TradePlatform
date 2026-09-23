@@ -1,8 +1,11 @@
-"""Read-only rendering of a ruleset: what each rule fires ON, and what it DOES.
+"""Rendering a ruleset: what each rule fires ON, and what it DOES.
 
-Pure. The dialog that shows it (``ui/pages/live_trades.py``) walks the views this
-returns and draws them; every "is this a flag or a threshold", "can this be printed at
-all" decision is made here, once, where it can be tested.
+Everything above ``render_clause`` is pure except ``ruleset_rule_views``, which loads a
+stored ruleset's rules from the database, and that is where every "is this a flag or a
+threshold", "can this be printed at all" decision is made -- once, where it can be tested
+without a browser. ``render_clause`` at the foot is the single piece of NiceGUI markup,
+shared because TWO screens draw these views: the read-only transaction-details dialog
+(``ui/pages/live_trades.py``) and the ruleset editor (``ui/pages/settings.py``).
 
 **The sentences are the test platform's.** ``testplatform/frontend/src/pages/
 Backtesting.tsx`` prints a rule as WHEN <gate> THEN <action>, and an operator reading a
@@ -229,3 +232,27 @@ def ruleset_rule_views(ruleset_id: Optional[int]) -> Sequence[RuleView]:
     from ...core.db import ruleset_event_actions
 
     return tuple(build_rule_views(ruleset_event_actions(ruleset_id)))
+
+
+# ---------------------------------------------------------------------------
+# The one drawing helper. Everything above is pure; this is here because TWO screens
+# draw a RuleView -- the transaction-details dialog (``ui/pages/live_trades.py``) and the
+# ruleset editor (``ui/pages/settings.py``) -- and a second copy of the markup is how the
+# two screens start disagreeing about what a rule says.
+# ---------------------------------------------------------------------------
+
+def render_clause(label: str, joiner: str, lines: Optional[Iterable[str]]) -> None:
+    """One clause of a rule sentence, one line per item, the joining word in the gutter.
+
+    The gutter is a fixed width so WHEN/THEN and the ANDs beneath them share a right edge
+    and every clause body starts at the same x -- which is what lets the eye read DOWN a
+    column of rules instead of across each one. In the ruleset editor that column is the
+    precedence order, so the alignment is doing real work there.
+    """
+    from nicegui import ui
+
+    for index, line in enumerate(lines or ()):
+        with ui.row().classes('items-baseline gap-2 no-wrap'):
+            ui.label(label if index == 0 else joiner) \
+                .classes('text-caption text-grey-7 w-12 text-right')
+            ui.label(line).classes('text-body2 font-mono')
