@@ -31,5 +31,8 @@ def topmenu() -> None:
     """Top bar navigation actions"""
     with ui.row().classes('items-center gap-2'):
         # GitHub link
-        with ui.link(target='https://github.com/bmigette/BA2TradePlatform').classes('max-[365px]:hidden').tooltip('GitHub'):
+        # ``phone-hidden`` (styles.css), not an inline Tailwind breakpoint: the header's
+        # phone layout is decided in ONE place, and this link was the item that pushed
+        # the account selector onto a third header row below 640px.
+        with ui.link(target='https://github.com/bmigette/BA2TradePlatform').classes('phone-hidden').tooltip('GitHub'):
             svg.github().classes('fill-white scale-125 m-1')

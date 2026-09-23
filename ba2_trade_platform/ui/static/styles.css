@@ -542,6 +542,19 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 /* Tabs */
 .q-tabs {
     background: transparent !important;
+    /* A TAB STRIP MUST NEVER WIDEN THE PAGE. QTabs decides whether to scroll by
+     * comparing its content with its own width -- but it sits in a flex column, whose
+     * children default to `min-width: auto`, so the strip grew to fit its tabs, QTabs
+     * measured a container exactly as wide as its content, declared itself
+     * `q-tabs--not-scrollable`, and laid out at full natural width. On a 390px phone
+     * that was 667px (Overview), 668px (Market Analysis) and 836px (Settings); the
+     * browser widened the layout viewport to hold it and every page opened panned
+     * sideways, the strip and the first card both cut off. Held to its container, the
+     * strip overflows, QTabs switches itself to scrollable mode, and the page keeps
+     * the width of the screen. Not inside a media query: this is a correctness rule,
+     * and a narrow desktop window has the same problem as a phone. */
+    max-width: 100%;
+    min-width: 0;
 }
 .q-tab {
     color: #a0aec0 !important;
@@ -1025,8 +1038,41 @@ div[class*="disconnect"] * {
         row-gap: 0.25rem;
     }
 
+    /* THE HEADER FITS ON TWO ROWS, not three. The balance and the account selector
+     * each carried `mr-4`, and with the GitHub link beside them the right-hand group
+     * was ~16px too wide for a 390px screen -- so it broke again, and the header took
+     * a quarter of the screen before any content. The link hides (`phone-hidden`,
+     * menus.py) and the margins go; the group's own `gap` still separates its items. */
+    .phone-hidden {
+        display: none !important;
+    }
+
+    .q-header .mr-4 {
+        margin-right: 0 !important;
+    }
+
     /* Page padding: 1rem each side of a 390px screen is 8% of it. */
     .nicegui-content {
+        padding: 0.5rem !important;
+    }
+
+    /* THE PADDING CASCADE. Every layer is reasonable alone and together they were not:
+     * page column `p-6` (24px) + tab panel (16px) + card (12px) + a card inside the card
+     * (12px) left filter fields on Live Trades about 250px wide on a 390px screen.
+     * The two outermost layers carry no border or background, so on a phone their
+     * padding is pure loss; the cards keep theirs, because their edge is visible. */
+    .ba2-page {
+        padding: 0.25rem !important;
+    }
+
+    .q-tab-panel {
+        padding: 0.25rem !important;
+    }
+
+    /* A card INSIDE a card needs less than a card on the page: the outer one already
+     * frames it. Half the outer padding keeps the two edges distinguishable. */
+    .q-card .q-card,
+    .nicegui-card .nicegui-card {
         padding: 0.5rem !important;
     }
 

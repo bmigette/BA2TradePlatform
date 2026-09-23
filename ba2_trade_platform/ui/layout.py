@@ -25,6 +25,19 @@ from ..logger import logger
 
 from nicegui import ui, app
 
+# EVERY TAB STRIP SHOWS ITS SCROLL ARROWS ON A PHONE. Quasar shows them on desktop by
+# itself once a strip overflows, but hides them on touch devices unless asked -- and a
+# strip that scrolls with no arrows just looks clipped ("ACCOU", mid-word, at the screen
+# edge), which reads as broken rather than as "there is more". Set once here, as the
+# class default, so the eleven ``ui.tabs`` call sites do not each have to remember it.
+#
+# OUTSIDE the scroll area, not over it. The theme makes ``.q-tabs`` transparent, so
+# Quasar's default inside arrows had nothing behind them and were drawn straight on top
+# of the last visible label ("E>PE"). Beside the strip they cannot cover a label.
+# Harmless where a strip fits -- every desktop strip today: Quasar draws arrows only
+# when there is somewhere to scroll to.
+ui.tabs.default_props('mobile-arrows outside-arrows')
+
 
 # ---------------------------------------------------------------------------
 # THE HEADER'S ACCOUNT BALANCE
@@ -734,7 +747,10 @@ def layout_render(navigation_title: str):
             topmenu()
     
     # Main content area with padding
-    with ui.column().classes('w-full p-6 text-white'):
+    # ``ba2-page`` is the stylesheet's handle on this column: its ``p-6`` is right on a
+    # desktop and, stacked under the tab panel's and each card's own padding, left cards
+    # about 250px wide on a 390px phone. See the <640px block in styles.css.
+    with ui.column().classes('ba2-page w-full p-6 text-white'):
         # Drawn (hidden) before the page body so the warning, if it fires, is the
         # first thing on the page rather than something below the fold.
         _render_db_size_banner()
