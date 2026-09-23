@@ -92,7 +92,10 @@ def classic_run_detail_columns() -> list:
          'align': 'left', 'style': 'width: 120px'},
         {'name': 'weight', 'label': 'Weight', 'field': 'weight',
          'align': 'right', 'style': 'width: 70px'},
-        {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
+        # A FLOOR, not a width: on a narrow screen the table scrolls sideways inside the
+        # card rather than squeezing the one column written in sentences.
+        {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left',
+         'style': 'min-width: 320px', 'headerStyle': 'min-width: 320px'},
     ]
 
 
@@ -1203,7 +1206,10 @@ class JobMonitoringTab:
             ui.notify(f"Risk manager run {run_id} not found", type='negative')
             return
 
-        with ui.dialog() as dialog, ui.card().classes('w-full max-w-5xl'):
+        # WIDE, like the other working dialogs (Settings' 90vw). Ten fixed-width columns
+        # add up to 1000px, so at the old max-w-5xl (1024px) REASON -- the column the
+        # refusals are explained in -- got the ~70px left over and wrapped a word per line.
+        with ui.dialog() as dialog, ui.card().classes('w-full').style('width: 95vw; max-width: 1600px'):
             with ui.row().classes('w-full justify-between items-center'):
                 ui.label(f'{"Classic" if run.mode == "classic" else "Options"} Risk Manager '
                          f'— run {run.id}').classes('text-h6')
