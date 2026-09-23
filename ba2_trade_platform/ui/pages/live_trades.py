@@ -23,6 +23,7 @@ from ..account_filter_context import get_selected_account_id
 from ..components.account_scope import scope_transactions_to_account
 from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
+from ..components.refresh_button import refresh_button
 
 #: The Live Trades tabs, IN ORDER. Stocks first and DEFAULT, so the page's existing view is
 #: what you get before touching anything.
@@ -154,7 +155,7 @@ class LiveTradesTab:
         STOCKS table, which is why they belong in this row and not above both tabs.
         """
         # Filter controls
-        with ui.row().classes('gap-2'):
+        with ui.row().classes('gap-2 items-center'):
             # Multi-select status filter with all except CLOSED selected by default
             self.status_filter = ui.select(
                 label='Status Filter',
@@ -162,7 +163,7 @@ class LiveTradesTab:
                 value=['Waiting', 'Open', 'Closing'],  # Default: all except Closed
                 multiple=True,
                 on_change=lambda: self._refresh_transactions()
-            ).classes('w-48')
+            ).classes('w-56')
 
             # Expert filter - populated with all experts
             self.expert_filter = ui.select(
@@ -184,7 +185,7 @@ class LiveTradesTab:
                 on_change=lambda: self._refresh_transactions()
             ).props('stack-label').classes('w-48')
 
-            ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
+            refresh_button(lambda: self._refresh_transactions())
 
             ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
 
@@ -882,6 +883,8 @@ class LiveTradesTab:
                 page_size=20,
                 table_name="LiveTradesTable",
                 show_global_filter=True,
+                # The filter row's Refresh does this AND repopulates the expert filter.
+                show_refresh=False,
                 show_selection=True,
                 dense=True,
                 auto_refresh_interval=30,

@@ -42,6 +42,7 @@ from ...logger import logger
 from ..account_filter_context import get_selected_account_id
 from ..components.LiveTradesTable import LiveTradesTable, LiveTradesTableConfig
 from ..components.account_scope import scope_transactions_to_account
+from ..components.refresh_button import refresh_button
 
 #: Columns whose sort is computed per row (money, DTE, leg count) and therefore sorted in
 #: memory, exactly as the equity tab does for its P&L columns.
@@ -155,7 +156,7 @@ class OptionTradesTab:
                     value=['Waiting', 'Open', 'Closing'],
                     multiple=True,
                     on_change=lambda: self._refresh(),
-                ).classes('w-48')
+                ).classes('w-56')
 
                 resolved = get_expert_options_for_ui()
                 expert_options, self.expert_id_map = (
@@ -176,7 +177,7 @@ class OptionTradesTab:
                     on_change=lambda: self._refresh(),
                 ).props('stack-label').classes('w-40')
 
-                ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh()).props('outline')
+                refresh_button(lambda: self._refresh())
 
             ui.label(
                 'One row per option structure: the transaction is the intent (keyed on the '
@@ -200,6 +201,8 @@ class OptionTradesTab:
                 page_size=20,
                 table_name='OptionTradesTable',
                 show_global_filter=True,
+                # The filter row's Refresh calls this same table's refresh().
+                show_refresh=False,
                 show_selection=True,
                 dense=True,
                 auto_refresh_interval=30,

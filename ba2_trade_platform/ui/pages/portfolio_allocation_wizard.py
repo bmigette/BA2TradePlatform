@@ -115,6 +115,7 @@ from ...core.portfolio_allocation_service import (
     OUTCOME_WASHTRADE_LOCKED,
 )
 from ...logger import logger
+from ..components.refresh_button import refresh_button
 
 #: Shown above the dry-run table whenever any row will be sent as a FRACTIONAL
 #: order. Both brokers refuse a fractional equity LIMIT order (TastyTrade
@@ -1032,9 +1033,8 @@ class AllocationWizard:
                 # Held, because a submit in flight must be able to disable it: a
                 # refresh re-renders every row and would throw away the Result cells
                 # the run is writing into.
-                self._refresh_button = ui.button(
-                    'Refresh',
-                    on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
+                self._refresh_button = refresh_button(
+                    lambda: self._refresh(self.allow_fractional))
                 # TEST THE PLAN BEFORE SENDING IT. See ``_validate``: the broker's
                 # own dry run where it has one, the locally knowable rejections
                 # everywhere else. Never sends an order.
@@ -2301,7 +2301,7 @@ def render_income_panel(events: List[Dict], open_total: float,
             ui.label('Income (last 30 days)').classes('text-lg font-bold')
             with ui.row().classes('gap-2 items-center'):
                 _label(f'Unallocated: {open_total:,.2f}', 'font-bold text-green-500')
-                ui.button('Refresh', on_click=on_sync).props('outline dense')
+                refresh_button(on_sync, dense=True)
                 # Nothing to invest is not a run worth opening the wizard for.
                 ui.button('Invest', on_click=lambda: on_invest(open_total)) \
                     .props('color=primary dense').set_enabled(open_total > 0)

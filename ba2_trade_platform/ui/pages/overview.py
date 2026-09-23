@@ -33,6 +33,7 @@ from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.account_scope import scope_transactions_to_account
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .llm_usage import LLMUsagePage
+from ..components.refresh_button import refresh_button
 
 # The Trade Performance widget's empty states. An account that has never traded must
 # say so IN WORDS: a row of '0' and '$0.00' is a MEASUREMENT -- it claims the account
@@ -460,7 +461,7 @@ class OverviewTab:
         with self.container:
             # Add refresh button at the top
             with ui.row().classes('w-full justify-end mb-2'):
-                ui.button('🔄 Refresh', on_click=lambda: self.render()).props('flat color=primary')
+                refresh_button(lambda: self.render())
 
             # Alert banners - async containers
             self.error_orders_container = ui.column().classes('w-full')
@@ -1407,7 +1408,7 @@ class AccountOverviewTab:
         with self.container:
             # Add refresh button at the top
             with ui.row().classes('w-full justify-end mb-2'):
-                ui.button('🔄 Refresh', on_click=lambda: self.render()).props('flat color=primary')
+                refresh_button(lambda: self.render())
             
             # Get selected account filter
             selected_account_id = get_selected_account_id()
@@ -1487,7 +1488,7 @@ class AccountOverviewTab:
                 ui.label('Open Positions Across All Accounts').classes('text-h6 mb-4')
                 
                 # Add built-in filter before the table
-                with ui.row().classes('w-full gap-2 mb-4'):
+                with ui.row().classes('w-full gap-2 mb-4 items-center'):
                     filter_input = ui.input(label='Filter table', placeholder='Type to filter across all columns...').props('stack-label').classes('flex-grow')
                     ui.button('Clear', on_click=lambda: filter_input.set_value('')).props('flat')
 
@@ -3164,7 +3165,7 @@ class TransactionsTab:
                 ui.label('💼 Transactions').classes('text-h6')
                 
                 # Filter controls
-                with ui.row().classes('gap-2'):
+                with ui.row().classes('gap-2 items-center'):
                     # Multi-select status filter with all except CLOSED selected by default
                     self.status_filter = ui.select(
                         label='Status Filter',
@@ -3172,7 +3173,7 @@ class TransactionsTab:
                         value=['Waiting', 'Open', 'Closing'],  # Default: all except Closed
                         multiple=True,
                         on_change=lambda: self._refresh_transactions()
-                    ).classes('w-48')
+                    ).classes('w-56')
                     
                     # Expert filter - populated with all experts
                     self.expert_filter = ui.select(
@@ -3194,7 +3195,7 @@ class TransactionsTab:
                         on_change=lambda: self._refresh_transactions()
                     ).classes('w-48')
                     
-                    ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
+                    refresh_button(lambda: self._refresh_transactions())
                     
                     ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
                     

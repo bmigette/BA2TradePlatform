@@ -64,7 +64,7 @@ class FMPSenateTradeTab:
             with ui.card().classes('w-full mb-4'):
                 ui.label('Filters').classes('text-md font-semibold mb-2')
                 
-                with ui.row().classes('w-full gap-4 flex-wrap items-end'):
+                with ui.row().classes('w-full gap-4 flex-wrap items-center'):
                     # Symbol filter
                     self.symbol_input = ui.input(
                         label='Symbol',
@@ -508,7 +508,7 @@ class AnalystRatingsTab:
             with ui.card().classes('w-full mb-4'):
                 ui.label('Search Symbol').classes('text-md font-semibold mb-2')
                 
-                with ui.row().classes('w-full gap-4 items-end'):
+                with ui.row().classes('w-full gap-4 items-center'):
                     self.symbol_input = ui.input(
                         label='Symbol',
                         placeholder='e.g., AAPL, MSFT, NVDA'
@@ -884,7 +884,7 @@ class PennyScreenerTab:
             with ui.card().classes('w-full mb-4'):
                 ui.label('Filters').classes('text-md font-semibold mb-2')
 
-                with ui.row().classes('w-full gap-4 flex-wrap items-end'):
+                with ui.row().classes('w-full gap-4 flex-wrap items-center'):
                     self.price_min_input = ui.number(
                         label='Price Min', value=self._price_min, format='%.2f', step=0.01
                     ).classes('w-28')

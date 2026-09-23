@@ -109,6 +109,12 @@ class LazyTableConfig:
     selection_mode: Literal['none', 'single', 'multi'] = 'none'
     row_key: str = 'id'
     show_global_filter: bool = True
+    # THE TABLE'S OWN REFRESH ICON. Off where the page already has a Refresh button:
+    # Activity Monitor drew "Refresh Now" AND this icon, both calling the same
+    # ``refresh()`` on the same table, and Live Trades drew its Refresh (which also
+    # repopulates the expert filter) beside this icon (which does not). Two buttons
+    # for one action, one of them doing less, is how a reader learns neither.
+    show_refresh: bool = True
     show_column_filters: bool = True
     show_loading_overlay: bool = True
     dense: bool = False
@@ -570,11 +576,13 @@ class LazyTable:
                         lambda e: asyncio.create_task(self._on_global_filter_change(e.sender.value))
                     )
                 
-                # Refresh button
-                ui.button(
-                    icon='refresh',
-                    on_click=lambda: asyncio.create_task(self.refresh())
-                ).props('flat')
+                # Refresh button -- unless the page already draws one. See
+                # ``LazyTableConfig.show_refresh``.
+                if self.config.show_refresh:
+                    ui.button(
+                        icon='refresh',
+                        on_click=lambda: asyncio.create_task(self.refresh())
+                    ).props('flat')
                 
                 # Loading spinner
                 self._loading_spinner = ui.spinner('dots').set_visibility(False)
@@ -589,11 +597,11 @@ class LazyTable:
                     ui.button(
                         'Select All Page',
                         on_click=self.select_all
-                    ).props('flat dense size=sm')
+                    ).props('flat dense')  # size=sm made these ~9px; see LiveTradesTable
                     ui.button(
                         'Clear Selection',
                         on_click=self.clear_selection
-                    ).props('flat dense size=sm')
+                    ).props('flat dense')  # size=sm made these ~9px; see LiveTradesTable
                     ui.label().bind_text_from(
                         self._selected_ids, '__len__',
                         backward=lambda: f'{len(self._selected_ids)} selected'

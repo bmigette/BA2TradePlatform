@@ -200,7 +200,7 @@ class Symbol360Tab:
             ui.label("SYMBOL360").classes("text-lg font-bold")
             ui.label("Every metric the platform's experts compute for one symbol").classes(
                 "text-sm mb-4").style("color: #a0aec0;")
-            with ui.row().classes("w-full gap-4 items-end"):
+            with ui.row().classes("w-full gap-4 items-center"):
                 self.symbol_input = ui.input(label="Symbol", placeholder="e.g., AAPL").props(
                     "stack-label").classes("w-48")
                 self.symbol_input.on("keydown.enter", lambda: self._search())

@@ -2,6 +2,7 @@
 Market Analysis Detail Dialog Component
 
 A full-screen dialog that displays market analysis details without navigating away
+from .refresh_button import refresh_button
 from the current page, preserving filters and state.
 """
 
@@ -194,7 +195,7 @@ class MarketAnalysisDetailDialog:
             ui.label('Please check back in a few minutes.').style('color: #a0aec0;')
             
             # Refresh button instead of auto-reload (preserves parent page state)
-            ui.button('Refresh', icon='refresh', on_click=lambda: self._load_content(market_analysis.id)).classes('mt-4')
+            refresh_button(lambda: self._load_content(market_analysis.id)).classes('mt-4')
     
     def _render_error_state(self, market_analysis: MarketAnalysis):
         """Render UI for error analysis."""
