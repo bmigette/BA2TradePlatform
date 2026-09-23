@@ -46,6 +46,7 @@ from ba2_common.core.trigger_catalog import (
     trigger_catalog,
 )
 from functools import partial
+from ..components.refresh_button import refresh_button
 
 
 class TriggerTypePicker:
@@ -345,7 +346,7 @@ class InstrumentSettingsTab:
         logger.debug('Rendering InstrumentSettingsTab UI')
         with ui.card().classes('w-full'):
             ui.label('Instrument Management')
-            with ui.row():
+            with ui.row().classes('items-center'):
                 filter_input = ui.input(label='Filter') #, on_change=self.on_filter_change)
                 self.fetch_info_btn = ui.button('Fetch Info', on_click=self.fetch_info)
                 self.fetch_missing_btn = ui.button('Fetch Missing', on_click=self.fetch_missing_info).props('color=warning')
@@ -5176,7 +5177,7 @@ class TradeSettingsTab:
                             ui.label('Rules define triggers and actions for automated trading decisions.').classes('text-grey-7')
                         
                         # Help button for rules documentation
-                        ui.button('📚 Help & Documentation', on_click=self._show_rules_help, icon='help_outline').props('color=info').tooltip('View comprehensive rules documentation with examples')
+                        ui.button('Help & Documentation', on_click=self._show_rules_help, icon='help_outline').props('color=info').tooltip('View comprehensive rules documentation with examples')
                     
                     with ui.row().classes('w-full justify-end gap-2 mb-4'):
                         ui.button('Import Rules', on_click=self.rules_export_import_ui.show_import_dialog, icon='upload_file').props('flat')
@@ -7117,8 +7118,8 @@ class BatchCleanupTab:
                 ui.label('Choose which experts to clean up. Each selected expert will have its old analyses removed.').classes('text-body2 mb-4')
                 
                 with ui.row().classes('w-full gap-2 mb-2'):
-                    ui.button('Select All', on_click=self._select_all_experts, icon='select_all').props('outlined dense')
-                    ui.button('Deselect All', on_click=self._deselect_all_experts, icon='deselect').props('outlined dense')
+                    ui.button('Select All', on_click=self._select_all_experts, icon='select_all').props('outline dense')
+                    ui.button('Deselect All', on_click=self._deselect_all_experts, icon='deselect').props('outline dense')
                 
                 # Get all expert instances
                 with get_db() as session:
@@ -7148,11 +7149,7 @@ class BatchCleanupTab:
                 with self.cleanup_stats_container:
                     ui.label('Select experts and click "Refresh Statistics" to see current data.').classes('text-body2 text-grey')
                 
-                ui.button(
-                    'Refresh Statistics',
-                    icon='refresh',
-                    on_click=self._refresh_batch_statistics
-                ).props('outlined').classes('mt-2')
+                refresh_button(self._refresh_batch_statistics, label='Refresh Statistics').classes('mt-2')
             
             # Cleanup configuration
             with ui.card().classes('w-full mb-4'):
@@ -7212,11 +7209,7 @@ class BatchCleanupTab:
                 with self.activity_log_stats_container:
                     ui.label('Click "Refresh Activity Log Stats" to see current data.').classes('text-body2 text-grey')
                 
-                ui.button(
-                    'Refresh Activity Log Stats',
-                    icon='refresh',
-                    on_click=self._refresh_activity_log_stats
-                ).props('outlined').classes('mb-4')
+                refresh_button(self._refresh_activity_log_stats, label='Refresh Activity Log Stats').classes('mb-4')
                 
                 # Days to keep input for activity logs
                 ui.label('Delete activity logs older than:').classes('text-body2 mb-2')
@@ -7235,7 +7228,7 @@ class BatchCleanupTab:
                         'Clean Activity Logs',
                         icon='delete',
                         on_click=self._execute_activity_log_cleanup
-                    ).props('color=warning outlined')
+                    ).props('color=warning outline')
 
             self._render_trade_action_result_retention()
 
@@ -7252,7 +7245,7 @@ class BatchCleanupTab:
                     'Preview Cleanup',
                     icon='visibility',
                     on_click=self._preview_batch_cleanup
-                ).props('outlined')
+                ).props('outline')
                 
                 self.cleanup_execute_button = ui.button(
                     'Execute Cleanup',
@@ -7729,7 +7722,7 @@ class BatchCleanupTab:
 
             with ui.row().classes('w-full gap-2 justify-end mt-2'):
                 ui.button('Preview Retention', icon='visibility',
-                          on_click=self._preview_trade_action_result_retention).props('outlined')
+                          on_click=self._preview_trade_action_result_retention).props('outline')
                 ui.button('Apply Retention', icon='cleaning_services',
                           on_click=self._confirm_trade_action_result_retention
                           ).props('color=warning')

@@ -462,15 +462,20 @@ class LiveTradesTable(LazyTable):
                 
                 # Selection controls
                 if self._config.show_selection:
-                    ui.button('Select All', on_click=self.select_all_visible).props('flat dense size=sm')
-                    ui.button('Clear Selection', on_click=self.clear_selection).props('flat dense size=sm')
+                    # ``dense`` alone. ``size=sm`` on top of it rendered these at ~9px, which
+                    # made the two controls that change what a batch action hits the
+                    # hardest things on the page to read.
+                    ui.button('Select All', on_click=self.select_all_visible).props('flat dense')
+                    ui.button('Clear Selection', on_click=self.clear_selection).props('flat dense')
                     self._selection_label = ui.label('0 selected').classes('text-sm text-gray-600')
                 
-                # Refresh button
-                ui.button(
-                    icon='refresh',
-                    on_click=lambda: asyncio.create_task(self.refresh())
-                ).props('flat')
+                # Refresh button -- unless the page already draws one. See
+                # ``LazyTableConfig.show_refresh``.
+                if self.config.show_refresh:
+                    ui.button(
+                        icon='refresh',
+                        on_click=lambda: asyncio.create_task(self.refresh())
+                    ).props('flat')
                 
                 # Loading spinner
                 self._loading_spinner = ui.spinner('dots').set_visibility(False)

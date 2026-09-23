@@ -95,6 +95,7 @@ runs, which is exactly why the pure logic lives in ``ui/utils/`` instead. It onl
 keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
+from ..components.refresh_button import refresh_button
 import asyncio
 import threading
 from datetime import date, datetime, timezone
@@ -4028,7 +4029,7 @@ async def content() -> None:
                 .props('dense outlined hide-bottom-space').classes('w-44')
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
-            ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
+            refresh_button(_refresh)
             # The what-if control sits in the TOOLBAR, beside Valuation: both change
             # how every number below is computed, and neither is a number itself.
             ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
