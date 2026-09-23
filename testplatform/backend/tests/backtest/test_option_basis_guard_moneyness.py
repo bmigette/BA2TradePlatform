@@ -17,9 +17,21 @@ import numpy as np
 import pytest
 
 
+
+def _in_this_checkout(module_file) -> bool:
+    """The module under test is THIS checkout's copy, not a stale editable install elsewhere
+    (the venv's editable installs point at the main checkout; a worktree must not test that)."""
+    from pathlib import Path as _P
+    repo_root = _P(__file__).resolve().parents[4]
+    try:
+        _P(module_file).resolve().relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
 def test_the_guard_under_test_is_the_worktree_copy():
     import app.services.backtest.option_basis_guard as g
-    assert "BA2-optparity" in g.__file__
+    assert _in_this_checkout(g.__file__), g.__file__
     assert g.WINDOW == 5 and g.TOLERANCE == 0.05 and g.MAX_STRIKE_DISTANCE == 0.10
 
 
