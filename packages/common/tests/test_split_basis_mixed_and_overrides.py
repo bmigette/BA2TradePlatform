@@ -28,12 +28,24 @@ from ba2_common.core.split_basis import (
     needs_full_refetch, resolve_symbol_split_basis,
 )
 
+
+def _in_this_checkout(module_file) -> bool:
+    """The module under test is THIS checkout's copy, not a stale editable install elsewhere
+    (the venv's editable installs point at the main checkout; a worktree must not test that)."""
+    from pathlib import Path as _P
+    repo_root = _P(__file__).resolve().parents[2]
+    try:
+        _P(module_file).resolve().relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
 FIXTURE = Path(__file__).parent / "fixtures" / "fmp_daily_mixed_basis_slices.csv"
 
 
 def test_the_modules_under_test_are_the_worktree_copies():
     import ba2_common.core.split_basis as m
-    assert "BA2-optparity" in m.__file__ and "BA2-optparity" in ovr.__file__
+    assert _in_this_checkout(m.__file__) and _in_this_checkout(ovr.__file__), (m.__file__, ovr.__file__)
 
 
 def _slice(sym, through=None):

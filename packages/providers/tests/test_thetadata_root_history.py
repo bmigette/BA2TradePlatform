@@ -17,12 +17,24 @@ from ba2_common.core.interfaces import OptionContractMeta
 from ba2_providers.options import thetadata as T
 from ba2_providers.options.thetadata import ThetaDataOptionsProvider, _occ_symbol, _root_segments
 
+
+def _in_this_checkout(module_file) -> bool:
+    """The module under test is THIS checkout's copy, not a stale editable install elsewhere
+    (the venv's editable installs point at the main checkout; a worktree must not test that)."""
+    from pathlib import Path as _P
+    repo_root = _P(__file__).resolve().parents[2]
+    try:
+        _P(module_file).resolve().relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
 CUT = date(2022, 6, 9)
 EXP = date(2022, 8, 19)          # listed before the rename, expires after it
 
 
 def test_the_provider_under_test_is_the_worktree_copy():
-    assert "BA2-optparity" in T.__file__
+    assert _in_this_checkout(T.__file__), T.__file__
     assert T.ROOT_HISTORY["META"] == ((CUT, "FB"),)
 
 

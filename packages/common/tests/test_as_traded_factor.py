@@ -15,6 +15,18 @@ from ba2_common.core.split_basis import (
     resolve_symbol_split_basis,
 )
 
+
+def _in_this_checkout(module_file) -> bool:
+    """The module under test is THIS checkout's copy, not a stale editable install elsewhere
+    (the venv's editable installs point at the main checkout; a worktree must not test that)."""
+    from pathlib import Path as _P
+    repo_root = _P(__file__).resolve().parents[2]
+    try:
+        _P(module_file).resolve().relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
 NFLX = [CalendarSplit(date(2004, 2, 12), 2.0), CalendarSplit(date(2015, 7, 15), 7.0),
         CalendarSplit(date(2025, 11, 17), 10.0)]
 NVDA = [CalendarSplit(date(2007, 9, 11), 1.5), CalendarSplit(date(2021, 7, 20), 4.0),
@@ -27,7 +39,7 @@ BASIS = date(2026, 9, 21)
 
 def test_the_module_under_test_is_the_worktree_copy():
     import ba2_common.core.split_basis as m
-    assert "BA2-optparity" in m.__file__, m.__file__
+    assert _in_this_checkout(m.__file__), m.__file__
 
 
 def test_nflx_2024_is_ten():

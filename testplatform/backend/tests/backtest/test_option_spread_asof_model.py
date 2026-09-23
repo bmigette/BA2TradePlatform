@@ -20,6 +20,18 @@ from app.services.backtest.backtest_account import BacktestAccount
 from ba2_common.core import option_spread_model as M
 from ba2_common.core.types import OptionRight, OrderDirection, OrderType
 
+
+def _in_this_checkout(module_file) -> bool:
+    """The module under test is THIS checkout's copy, not a stale editable install elsewhere
+    (the venv's editable installs point at the main checkout; a worktree must not test that)."""
+    from pathlib import Path as _P
+    repo_root = _P(__file__).resolve().parents[4]
+    try:
+        _P(module_file).resolve().relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
 _OCC = "AAPL240315C00180000"
 _AS_OF_DAY = date(2024, 3, 5)
 _FILL_DAY = date(2024, 3, 6)
@@ -29,7 +41,7 @@ _SPOT = 170.0                 # OTM vs strike 180: every premium here is arb-con
 
 def test_the_worktree_module_is_the_one_under_test():
     import ba2_common.core.option_spread_model as mod
-    assert "BA2-optparity" in mod.__file__
+    assert _in_this_checkout(mod.__file__), mod.__file__
 
 
 class _StubOptions:

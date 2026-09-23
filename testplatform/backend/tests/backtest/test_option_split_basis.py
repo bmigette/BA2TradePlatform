@@ -21,6 +21,18 @@ import pytest
 from ba2_common.core.split_basis import CalendarSplit, SplitBasisRefused, SymbolSplitBasis
 from ba2_common.core.types import OptionRight, OrderDirection
 
+
+def _in_this_checkout(module_file) -> bool:
+    """The module under test is THIS checkout's copy, not a stale editable install elsewhere
+    (the venv's editable installs point at the main checkout; a worktree must not test that)."""
+    from pathlib import Path as _P
+    repo_root = _P(__file__).resolve().parents[4]
+    try:
+        _P(module_file).resolve().relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
 FIXTURE = Path(__file__).parent / "fixtures" / "nflx_chain_20240424_20240501.csv"
 
 #: The real FMP NFLX closes (adjusted) for the fixture window.
@@ -46,7 +58,7 @@ CFG = {**_LEGACY_ZERO_SPREAD, "starting_cash": 1_000_000.0, "commission_per_trad
 def test_the_backend_under_test_is_the_worktree_copy():
     import app.services.backtest.option_split_basis as m
     import ba2_common.core.split_basis as sb
-    assert "BA2-optparity" in m.__file__ and "BA2-optparity" in sb.__file__
+    assert _in_this_checkout(m.__file__) and _in_this_checkout(sb.__file__), (m.__file__, sb.__file__)
 
 
 # ---- fixtures -----------------------------------------------------------------------------------
