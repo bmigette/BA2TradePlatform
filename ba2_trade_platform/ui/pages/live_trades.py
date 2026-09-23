@@ -1910,6 +1910,13 @@ class LiveTradesTab:
                         ui.label('Expert').classes('text-caption text-grey-7')
                         ui.label(expert_name).classes('text-body1 font-bold')
 
+                # WHAT WILL CLOSE THIS POSITION, directly under the numbers describing
+                # it. The dialog could say which expert opened a trade and not one word
+                # about the rules that will exit it -- the question an open position
+                # actually raises -- so the answer was a trip to Settings, into the
+                # expert, into its ruleset, with the transaction no longer on screen.
+                self._render_expert_strategy_section(expert)
+
                 # Transaction Meta Data
                 if txn.meta_data and txn.meta_data:
                     with ui.card().classes('w-full mb-4'):
@@ -2020,6 +2027,164 @@ class LiveTradesTab:
                         ui.label('No orders found for this transaction').classes('text-grey-6 text-center q-pa-md')
 
         dialog.open()
+
+    # --------------------------------------------------------------- strategy ---
+
+    #: Entry blue, exit amber -- the test platform's two tones, so the same rule in the
+    #: two UIs is the same colour. Both are ``/10`` over the dark card beneath them.
+    _RULE_TONES = {'entry': 'bg-blue/10', 'exit': 'bg-orange/10'}
+
+    def _render_expert_strategy_section(self, expert) -> None:
+        """The expert's entry rules, exit conditions and screener filter. Read-only.
+
+        Drawn as the test platform's Strategy tab draws them -- WHEN <gate> THEN
+        <action>, one line per clause, the joining word in the gutter -- through the
+        same formatter (``ui.utils.ruleset_view``). An operator reading a live position
+        is almost always holding it against the backtest it was deployed from, and two
+        wordings for one rule engine is a translation step in their head.
+
+        Nothing here edits: the rules belong to a RULESET, which several experts may
+        share, so an edit made from a single transaction would silently reach every
+        position the ruleset governs. The section names the rulesets so the Settings
+        page can be found.
+
+        A transaction with no expert (allocator- or hand-created) draws nothing at all
+        rather than an empty card promising rules that do not exist.
+        """
+        from ..utils.ruleset_view import ruleset_rule_views, screener_criteria
+
+        if expert is None:
+            return
+
+        # SMART MODE BYPASSES THE RULESETS. ``WorkerQueue._process_expert_recommendations``
+        # hands a smart-mode expert to the SmartRiskManager instead of the TradeManager,
+        # and it is the TradeManager that evaluates these rules -- so printing them
+        # without saying so would describe a mechanism that is not running.
+        settings, risk_mode = {}, 'classic'
+        try:
+            from ...core.utils import get_risk_manager_mode
+            interface = get_expert_instance_from_id(expert.id)
+            if interface:
+                settings = interface.settings or {}
+                risk_mode = get_risk_manager_mode(settings)
+        except Exception as e:
+            # The rules still render: they are read from the DB, not from the interface.
+            logger.warning(f'Could not load settings for expert {expert.id}: {e}')
+
+        entry = ruleset_rule_views(expert.enter_market_ruleset_id)
+        exits = ruleset_rule_views(expert.open_positions_ruleset_id)
+        criteria = (screener_criteria(settings, self._screener_definitions())
+                    if settings.get('instrument_selection_method') == 'screener' else [])
+        if not entry and not exits and not criteria:
+            return
+
+        with ui.card().classes('w-full mb-4'):
+            with ui.row().classes('w-full items-center gap-2 mb-3'):
+                ui.label('🎯 Expert Strategy').classes('text-h6')
+                if risk_mode == 'smart':
+                    with ui.badge('Smart risk manager', color='purple'):
+                        ui.tooltip('This expert is in Smart mode: the Smart Risk Manager '
+                                   'decides entries and exits, and these rules are not '
+                                   'what closes the position.')
+            self._render_rule_group('Entry Rules', entry, tone='entry', color='blue',
+                                    ruleset_id=expert.enter_market_ruleset_id)
+            self._render_rule_group('Exit Conditions', exits, tone='exit', color='orange',
+                                    ruleset_id=expert.open_positions_ruleset_id)
+            if criteria:
+                self._render_screener_criteria(criteria)
+
+    def _render_rule_group(self, title: str, views, *, tone: str, color: str,
+                           ruleset_id) -> None:
+        """One side of the strategy: a heading, the ruleset's name, and its rules.
+
+        The clause markup is ``ruleset_view.render_clause``, shared with the RULESET
+        EDITOR: two copies of it is how the read-only view and the editable one start
+        describing one rule in two different shapes.
+        """
+        from ..utils.ruleset_view import render_clause
+
+        if not views:
+            return
+        with ui.row().classes('w-full items-baseline gap-2 mt-2'):
+            ui.label(f'{title} ({len(views)})').classes(f'text-subtitle2 text-{color}')
+            name = self._ruleset_name(ruleset_id)
+            if name:
+                ui.label(name).classes('text-caption text-grey-7')
+            if len(views) > 1:
+                # THE PRECEDENCE, said out loud. ``TradeActionEvaluator`` breaks after
+                # the first rule whose conditions pass unless that rule is marked
+                # ``continue_processing``, so a reader who takes this list as "all of
+                # these apply" has the mechanism backwards.
+                ui.label('— in order; the first match wins') \
+                    .classes('text-caption text-grey-7')
+        for view in views:
+            with ui.card().classes(f'w-full q-pa-sm q-mb-xs {self._RULE_TONES[tone]}'):
+                with ui.row().classes('items-baseline gap-2'):
+                    ui.label(view.name).classes('text-body2 text-weight-bold')
+                    if view.continues:
+                        with ui.badge('continues', color='orange'):
+                            ui.tooltip('Evaluation carries on to the next rule even '
+                                       'after this one matches.')
+                render_clause('WHEN', 'AND', view.when)
+                render_clause('THEN', 'AND', view.then)
+
+    @staticmethod
+    def _screener_definitions():
+        """``MarketExpertInterface``'s built-in setting metadata, or ``{}``.
+
+        The source of truth for what a screener setting is called and what it falls
+        back to -- the same dict the Settings dialog builds its editors from, so the
+        read-only view and the editable one can never disagree about a label.
+        """
+        try:
+            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+            MarketExpertInterface._ensure_builtin_settings()
+            return MarketExpertInterface._builtin_settings or {}
+        except Exception as e:
+            logger.warning(f'Could not load built-in expert settings: {e}')
+            return {}
+
+    def _render_screener_criteria(self, criteria) -> None:
+        """The filter that decides which instruments this expert may even look at.
+
+        Each row carries the raw setting KEY beside its description. That is not
+        clutter: ``screener_market_cap_max`` at 0 means no ceiling, and the deploy that
+        read it as "admits nothing" is why the key is on screen (see the deploy-parity
+        note in the settings export tooling).
+        """
+        with ui.row().classes('w-full items-baseline gap-2 mt-3'):
+            ui.label(f'Screener ({len(criteria)})').classes('text-subtitle2 text-teal')
+            ui.label('— the universe this expert selects from') \
+                .classes('text-caption text-grey-7')
+        with ui.grid(columns=2).classes('w-full gap-x-6 gap-y-1'):
+            for criterion in criteria:
+                with ui.row().classes('w-full items-baseline justify-between no-wrap gap-2'):
+                    with ui.column().classes('gap-0 min-w-0'):
+                        ui.label(criterion.label).classes('text-body2 truncate')
+                        ui.label(criterion.key).classes('text-caption text-grey-7 font-mono')
+                    # A value the user CHOSE and one that merely defaulted are different
+                    # facts about a filter, and only the first was a decision.
+                    value = ui.label(criterion.value).classes('text-body2 font-mono')
+                    if criterion.is_default:
+                        value.classes('text-grey-7')
+                        value.tooltip('Not set on this expert — the platform default applies.')
+
+    def _ruleset_name(self, ruleset_id) -> str:
+        """The ruleset's name, or a stated absence. Never raises into the dialog.
+
+        A dangling id -- the ruleset was deleted while an expert still pointed at it --
+        is a real state, and it must show as one rather than collapsing the section
+        that was about to explain what closes this position.
+        """
+        if not ruleset_id:
+            return ''
+        try:
+            from ...core.models import Ruleset
+            ruleset = get_instance(Ruleset, ruleset_id)
+            return ruleset.name if ruleset else '(not found)'
+        except Exception:
+            logger.warning(f'Transaction details reference missing ruleset {ruleset_id}')
+            return '(not found)'
 
     # ------------------------------------------------------------------ options ---
     #: Fewer stored ATM-IV samples than this and a "rank" would be a percentile of noise.

@@ -361,20 +361,20 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:4056":
+    "ba2_trade_platform/ui/pages/settings.py:4239":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
         "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
         "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
-        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016)",
-    "ba2_trade_platform/ui/pages/settings.py:4106":
+        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239)",
+    "ba2_trade_platform/ui/pages/settings.py:4289":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
         "continuation line 3795, one past the outer .get(...)'s opening line 3794; plan "
         "Task 12's widget + guard then moved the pair to :3850/:3898, then :3889/:3939; the "
-        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066)",
+        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289)",
     "ba2_trade_platform/ui/components/performance_charts.py:475":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
         "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging)",

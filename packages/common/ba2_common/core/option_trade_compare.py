@@ -662,7 +662,9 @@ def _match_legs(live_legs, bt_legs):
         for leg in legs:
             g.setdefault((leg["right"], leg["side"]), []).append(leg)
         for v in g.values():
-            v.sort(key=lambda x: (x["strike"] is None, x["strike"] or 0.0, x["expiry"] or ""))
+            # Legs with no strike sort last; the key never substitutes a number for a missing one.
+            v.sort(key=lambda x: ((1,) if x["strike"] is None else (0, x["strike"]),
+                                  x["expiry"] or ""))
         return g
     gl, gb = groups(live_legs), groups(bt_legs)
     out = []

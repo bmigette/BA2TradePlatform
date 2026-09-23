@@ -994,12 +994,14 @@ class PortfolioAllocationLabel(SQLModel, table=True):
     before a REBALANCE run may be submitted; what is left over is deliberate free
     buying power.
 
-    ``previous_target_pct`` is the target this label RAN WITH before the current
-    one -- one generation, shifted by ``save_allocation_targets`` and by nothing
-    else. It is NULLABLE and is never back-filled: NULL means "there is no last",
-    which is a different answer from a stored 0.0 ("the last run allocated nothing
-    to this"), and it is what makes the wizard's Load-last button's disabled state
-    a fact rather than a guess.
+    ``previous_target_pct`` is the target the last RUN went out with, stamped by
+    ``save_allocation_targets`` and by nothing else. ``target_pct`` moves with each
+    inline edit on the page; this one holds still until the next run, so the gap
+    between them is how far the label has drifted from what was deployed. NULLABLE
+    and never back-filled: NULL means "no run has ever been launched against this
+    label", which is a different answer from a stored 0.0 ("the last run allocated
+    nothing to it"), and it is what makes the Load-last button's disabled state a
+    fact rather than a guess.
 
     ``color`` is the label's swatch, one of the seven hexes in
     ``ba2_trade_platform.ui.utils.portfolio_allocation_view.LABEL_COLOR_PALETTE``
@@ -1036,13 +1038,13 @@ class PortfolioAllocationSymbol(SQLModel, table=True):
     may legitimately appear under several labels (its targets then SUM; the page
     shows a warning icon).
 
-    ``previous_weight_pct`` is the weight this symbol RAN WITH before the current
-    one, shifted only by ``save_allocation_targets``. NULLABLE and never
-    back-filled, for the same reason as ``PortfolioAllocationLabel``: NULL is "there
-    is no last", 0.0 is "last time this got nothing". Emphatically NOT written by
-    ``set_symbol_weight`` -- the comment-save path re-writes ``weight_pct`` on every
-    debounced keystroke, so a shift there would destroy the real previous weight
-    one character at a time.
+    ``previous_weight_pct`` is the weight the last RUN went out with, stamped only
+    by ``save_allocation_targets`` -- the page's Last % column. NULLABLE and never
+    back-filled, for the same reason as ``PortfolioAllocationLabel``: NULL is "never
+    allocated with", 0.0 is "last time this got nothing". Emphatically NOT written
+    by ``set_symbol_weight``: the inline boxes and the comment-save path both
+    re-write ``weight_pct`` as the user types, and a value that followed them would
+    be a keystroke's history rather than a run's.
     """
     __tablename__ = "portfolio_allocation_symbol"
     __table_args__ = (
@@ -1055,7 +1057,7 @@ class PortfolioAllocationSymbol(SQLModel, table=True):
     label: str = Field(index=True)
     symbol: str = Field(index=True, description="Normalised (.strip().upper()) instrument symbol")
     weight_pct: float = Field(default=0.0, description="Weight % WITHIN the label (1-100)")
-    previous_weight_pct: float | None = Field(default=None, description="The weight this symbol ran with before the current one; None means there is no last")
+    previous_weight_pct: float | None = Field(default=None, description="The weight the last allocation run went out with; None means no run has used this symbol")
     comment: str | None = Field(default=None, description="Free-text note shown on the symbol row")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 

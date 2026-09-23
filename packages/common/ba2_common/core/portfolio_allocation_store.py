@@ -295,9 +295,10 @@ def save_allocation_targets(account_id: int, labels, *,
     last chose, and the fractional switch has been persisted from exactly that
     point since it shipped (``remember_fractional_choice``).
 
-    **A SEPARATE WRITER, deliberately, and this is where the shift lives.** The
+    **A SEPARATE WRITER, deliberately, and this is where "last" is stamped.** The
     previous generation -- ``previous_target_pct`` / ``previous_weight_pct``, what
-    the wizard's Load-last button reads -- is written HERE and by nothing else.
+    the page's Last % column and the Load-last button read -- is written HERE and
+    by nothing else.
     ``set_managed_label`` and ``set_symbol_weight`` are untouched by this and must
     stay that way: the comment-save path
     (``ui/pages/portfolio_allocation.py::_write_symbol_comment``) re-writes
@@ -308,12 +309,26 @@ def save_allocation_targets(account_id: int, labels, *,
     at a time; keeping it here makes that impossible by construction rather than by
     a flag someone has to remember not to pass.
 
-    **The shift fires only on a CHANGE.** Pressing Continue twice with the same
-    numbers leaves the previous generation exactly where it was: one generation per
-    change, not per click. A row created BY this call keeps ``NULL`` -- there is no
-    value it held before. The first save of an existing row records the 0.0 the
-    label picker created it with, which is a real prior state (the engine reads 0 as
-    "hold none of this"), so NULL is reserved for "never saved through the wizard".
+    **"Last" is what THIS run went out with**, stamped on every row the run
+    touches, whatever the row happened to hold a moment earlier. NULL is reserved
+    for a label or symbol no run has ever been launched against -- "never
+    allocated" stays a different fact from "allocated nothing", which is 0.0.
+
+    It used to be a SHIFT, firing only when this call found the stored number
+    different from the incoming one, and it never fired once: the page writes each
+    inline edit to the row as it is typed (``set_symbol_weight`` /
+    ``set_managed_label``), so by the time a run saves, the row already holds the
+    number the run is launching with. The comparison was against the page's own
+    write. Live evidence, 2026-09-22: 76 symbol rows of 76 and 12 labels of 12 on
+    the prod account, every one of them NULL, and a Last % column blank on every
+    line of a page that had been allocated from for weeks.
+
+    Stamping instead of shifting is also what makes the figure mean something now
+    that the weights are typed on the page rather than in the wizard. "The
+    generation before this one" was a useful answer while every change arrived
+    through this call; with inline edits it would mean "before your last
+    keystroke". What the reader wants beside a share they are editing is the share
+    the money was actually deployed at, and that only this call knows.
 
     **Never resurrects a label.** ``set_managed_label`` creates the row it cannot
     find, at ``target_pct=0``. A wizard opened before a label was unmanaged (in
@@ -389,24 +404,26 @@ def save_allocation_targets(account_id: int, labels, *,
                     f"future rebalance")
                 continue
             if save_label_targets:
-                if float(label_row.target_pct or 0.0) != target_pct:
-                    label_row.previous_target_pct = float(label_row.target_pct or 0.0)
+                # BOTH columns, to the number THIS run is going out with. See the
+                # docstring: the old "shift only on a change" could not fire,
+                # because the page writes every inline edit to this row before the
+                # run ever reaches here.
                 label_row.target_pct = target_pct
+                label_row.previous_target_pct = target_pct
                 session.add(label_row)
             written_labels += 1
             for symbol, weight_pct in weights:
                 row = symbol_rows.get((label, symbol))
                 if row is None:
-                    # Brand new row: there is no value it held before, so its
-                    # ``previous_weight_pct`` stays NULL. Recording the even-split
-                    # default it was notionally taking would put a number behind
-                    # Load last that the user never allocated with.
+                    # A symbol that was silently taking the even split gets its row
+                    # HERE -- and it gets a "last" with it, because the user has
+                    # just allocated real money with that number. NULL is reserved
+                    # for a symbol no run has ever gone out with.
                     row = PortfolioAllocationSymbol(
                         account_id=account_id, label=label, symbol=symbol)
                     symbol_rows[(label, symbol)] = row
-                elif float(row.weight_pct or 0.0) != weight_pct:
-                    row.previous_weight_pct = float(row.weight_pct or 0.0)
                 row.weight_pct = weight_pct
+                row.previous_weight_pct = weight_pct
                 session.add(row)
                 written_symbols += 1
 
