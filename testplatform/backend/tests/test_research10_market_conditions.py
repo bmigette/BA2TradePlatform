@@ -122,7 +122,10 @@ def test_or_tree_is_wrapped_and_management_actions_are_not_changed():
     assert job["strategy"]["entry_rules"][0]["actions"] == original["strategy"]["entry_rules"][0]["actions"]
 
 
-SESSIONS = [date(2024, 3, 25), date(2024, 3, 26), date(2024, 3, 27)]
+#: The rows the job's 2024-03-26..2024-03-28 BARS read. BT/live parity (plan 2026-09-22 A3):
+#: bar D reads D itself (the live decision it stands for is labelled the NEXT session). Before
+#: the fix this was 03-25..03-27, the session BEFORE each bar.
+SESSIONS = [date(2024, 3, 26), date(2024, 3, 27), date(2024, 3, 28)]
 
 
 def publish(root, profile="ohlcv-v1", sessions=SESSIONS, status=None, source="fmp-daily-split-adjusted-v1",
@@ -167,7 +170,8 @@ def test_preflight_verifies_and_reports_the_entire_window(tmp_path, monkeypatch)
     monkeypatch.setattr(R, "code_signature", lambda: "test-source")
     ready = R.preflight(job, root / "FMPOHLCVProvider")
     report = ready["preflight"]["market_conditions"]["ohlcv-v1"]
-    assert report["sessions"] == 3 and report["first_session"] == "2024-03-25"
+    assert report["sessions"] == 3 and report["first_session"] == "2024-03-26"
+    assert report["last_session"] == "2024-03-28"
     assert report["status_counts"]["underlying_adx_14"][STATUS_VALID] == 3
     assert job == original
     assert "preflight" not in job
@@ -175,7 +179,7 @@ def test_preflight_verifies_and_reports_the_entire_window(tmp_path, monkeypatch)
     from app.services.strategy_optimization_handler import _build_daily_trial_config
     decoded = decode_params(SimpleNamespace(**ready["strategy"]),
                             {g: "off" for g in space(ready) if g.endswith(":mode")})
-    trial = _build_daily_trial_config(ready["optimization_config"]["backtest"], decoded)
+    trial = _build_daily_trial_config(ready["optimization_config"]["backtest"], decoded, option_trade_records=False)
     assert trial["market_condition_manifests"] == job["optimization_config"]["backtest"]["market_condition_manifests"]
     assert trial["experts"][0]["settings"]["market_condition_profile"] == "ohlcv-v1"
 
@@ -183,7 +187,7 @@ def test_preflight_verifies_and_reports_the_entire_window(tmp_path, monkeypatch)
 @pytest.mark.parametrize("sessions", [[date(2023, 3, 27)], [SESSIONS[0], SESSIONS[-1]]])
 def test_wrong_window_and_internal_holes_are_refused(tmp_path, sessions):
     job, root, _, _ = cache_job(tmp_path, sessions=sessions)
-    with pytest.raises(ValueError, match="missing required prior-session"):
+    with pytest.raises(ValueError, match="missing required bar-session"):
         MC.preflight(job["optimization_config"]["backtest"], root)
 
 
@@ -215,8 +219,10 @@ def test_initial_history_is_reported_but_zero_usable_symbol_is_refused(tmp_path)
 
 
 def test_explicit_prior_listing_row_is_allowed_when_other_sessions_are_usable(tmp_path):
+    # The source starts one session AFTER the first required row (was 03-26 vs row 03-25; both
+    # moved by one with the parity clock), so that row's missing_session is a listing boundary.
     job, root, _, _ = cache_job(tmp_path, status=lambda d: STATUS_MISSING_SESSION if d == SESSIONS[0] else STATUS_VALID)
-    pd.DataFrame({"Date": pd.bdate_range("2024-03-26", "2024-03-28")}).to_parquet(root / "FMPOHLCVProvider/AAA_1d.parquet")
+    pd.DataFrame({"Date": pd.bdate_range("2024-03-27", "2024-03-28")}).to_parquet(root / "FMPOHLCVProvider/AAA_1d.parquet")
     report = MC.preflight(job["optimization_config"]["backtest"], root)
     assert report["ohlcv-v1"]["initial_history_sessions"]["AAA"] == 3
 
@@ -272,7 +278,7 @@ def test_real_equity_engine_all_off_parity_and_active_entry_veto(tmp_path, monke
             adx = next(g for g in params if "-market-adx:" in g)
             params[adx] = "below" if arm == "pass" else "above"
             params[adx.removesuffix("mode") + "value"] = 25.0
-        config = _build_daily_trial_config(bt, decode_params(SimpleNamespace(**job["strategy"]), params))
+        config = _build_daily_trial_config(bt, decode_params(SimpleNamespace(**job["strategy"]), params), option_trade_records=False)
         before = logging.root.manager.disable
         try:
             logging.disable(logging.INFO)

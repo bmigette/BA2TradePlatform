@@ -3563,7 +3563,7 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
 # fill model makes the NEXT bar's open cross that stale quote. And the quote is a MID, not a
 # touch: the historical option store carries `bid == ask` on every row it fills in at all (the
 # parquet store has no bid/ask column whatsoever), so `contract.ask` and `contract.bid` are both
-# just the close, while the tradeable spread is MODELLED at fill time by --option-spread-pct.
+# just the close, while the tradeable spread is MODELLED at fill time (--option-spread-model).
 # A seller therefore fills only if the premium RISES by a whole modelled half-spread overnight
 # -- which for decaying OTM premium is the wrong way round, so the DAY order expires unfilled
 # and premium sellers structurally almost never trade. Measured head-to-head on INTC Feb-Dec
@@ -4575,6 +4575,59 @@ for _ern_kind in sorted(_EVENT_ENTRY_MEMBERS):
 # PER-STRATEGY, not a CLI flag. The switch is a property of what the ruleset does, not an
 # operator preference -- a flag would let an O_CSP grid hold stock nothing in it can sell, which
 # is the orphaned-stock blow-up the liquidation exists to prevent. Keeping the set here means
+# --- the OPTION SPREAD MODEL (plan Part F) --------------------------------------------------
+#
+# The spread an option fill pays is the DECISION bar's real NBBO when it has one, else a power
+# law calibrated on 2020-2023 ThetaData EOD quotes (ba2_common.core.option_spread_model, whose
+# SPREAD_MODEL_VERSION names it). The old percent-of-premium formula stays reachable, but only
+# EXPLICITLY: passing --option-spread-pct and/or --option-spread-min-tick selects it (with the
+# other knob at its old default), as does --option-spread-model legacy-pct.
+_LEGACY_OPTION_SPREAD_PCT = 5.0
+_LEGACY_OPTION_SPREAD_MIN_TICK = 0.02
+
+
+def _add_option_spread_args(p) -> None:
+    """``--option-spread-model`` and the legacy ``--option-spread-pct/--min-tick`` overrides,
+    shared by ``optimize`` and ``optimize-batch`` so the two cannot drift apart."""
+    from ba2_common.core.option_spread_model import SPREAD_MODEL_VERSION, SPREAD_MODELS
+    p.add_argument("--option-spread-model", default=SPREAD_MODEL_VERSION, choices=SPREAD_MODELS,
+                   help="How an option fill's bid-ask spread is charged. Default "
+                        f"{SPREAD_MODEL_VERSION}: the decision bar's real NBBO half-spread when "
+                        "it has a valid quote, else a premium**0.6 x volume**-0.14 power law "
+                        "fitted on ThetaData EOD quotes -- neither ever reads the fill day. "
+                        "'legacy-pct' is the pre-2026-09-22 percent-of-premium model. Recorded "
+                        "in the run config and results; results are NOT comparable across it.")
+    p.add_argument("--option-spread-pct", type=float, default=None,
+                   help="LEGACY override: option spread as a PERCENT OF PREMIUM (full width; "
+                        "half charged per fill), doubled under 100 contracts/day on the fill "
+                        "bar. Setting it (or --option-spread-min-tick) selects the legacy model "
+                        f"instead of the calibrated one; unset knobs take the old defaults "
+                        f"({_LEGACY_OPTION_SPREAD_PCT} / {_LEGACY_OPTION_SPREAD_MIN_TICK}).")
+    p.add_argument("--option-spread-min-tick", type=float, default=None,
+                   help="LEGACY override: absolute floor on the percent-of-premium spread in "
+                        "premium dollars (full width). Setting it selects the legacy model.")
+
+
+def _option_spread_account_settings(args) -> Dict[str, Any]:
+    """The ``account_settings`` slice that tells ``BacktestAccount`` how to charge option spreads.
+
+    Always names the model explicitly. Under the calibrated model the legacy knobs are OMITTED,
+    never written as 0.0: the account refuses a model/knob mix, and a stored 0.0 knob would read
+    as a zero-spread run to anything that re-runs the row. The legacy model always carries both
+    knobs (an explicit 0 is how a zero-spread run is asked for).
+    """
+    from ba2_common.core.option_spread_model import LEGACY_PCT_MODEL
+    pct = getattr(args, "option_spread_pct", None)
+    tick = getattr(args, "option_spread_min_tick", None)
+    model = getattr(args, "option_spread_model")
+    if pct is not None or tick is not None or model == LEGACY_PCT_MODEL:
+        return {"option_spread_model": LEGACY_PCT_MODEL,
+                "option_spread_pct": float(_LEGACY_OPTION_SPREAD_PCT if pct is None else pct),
+                "option_spread_min_tick": float(_LEGACY_OPTION_SPREAD_MIN_TICK
+                                                if tick is None else tick)}
+    return {"option_spread_model": model}
+
+
 # adding a stock-managing structure later is one line, next to the reason.
 _HOLDS_ASSIGNED_STOCK = {"O_WHEEL"}
 
@@ -5955,8 +6008,9 @@ def _cmd_optimize(args) -> int:
                 "commission_per_trade": float(args.commission),
                 "slippage_bps": float(args.slippage),
                 "spread_bps": float(getattr(args, "spread_bps", 0.0)),
-                "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
-                "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
+                # The option spread model + its legacy knobs (plan Part F): see
+                # _option_spread_account_settings.
+                **_option_spread_account_settings(args),
                 "fill_model": args.fill_model,
                 # RUN-LEVEL, never a gene (see --equity-cap): every individual in the
                 # population must face the same capital, or they are scored against
@@ -6319,8 +6373,8 @@ def _cmd_optimize_batch(args) -> int:
                     "commission_per_trade": float(args.commission),
                     "slippage_bps": float(args.slippage),
                     "spread_bps": float(getattr(args, "spread_bps", 0.0)),
-                    "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
-                    "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
+                    # The option spread model + its legacy knobs (plan Part F).
+                    **_option_spread_account_settings(args),
                     "fill_model": args.fill_model,
                     # RUN-LEVEL, never a gene (see --equity-cap). None = off.
                     "equity_cap": getattr(args, "equity_cap", None),
@@ -6730,7 +6784,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         specs = []  # (rank, trial_cfg, strategy_params) -- must be re-run (existing path)
         for rank, (params, trial_key_, ga_fitness_) in enumerate(ranked, start=1):
             decoded = decode_params(strat, params)
-            trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
+            trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
+                                                  option_trade_records=True)  # persisted top-N
             trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
             # Persist this top-N run's trading DB (orders/transactions/recommendations) to disk
             # for post-mortem inspection — the GA trials run RAM-only for speed. The path is keyed
@@ -7495,19 +7550,7 @@ def main(argv: "list | None" = None) -> int:
                          "fill-engine level (widens LIMIT/TP trigger thresholds + degrades "
                          "MARKET/STOP fill prices) -- see BacktestAccount._slip/"
                          "_limit_trigger_price. Default 0.0 (off).")
-    op.add_argument("--option-spread-pct", type=float, default=5.0,
-                    help="Modeled OPTION bid-ask spread as a PERCENT OF PREMIUM (full width; "
-                         "half charged per fill, adverse direction), widened x2 for contracts "
-                         "under 100 contracts/day. Separate from --spread-bps because bps-of-price "
-                         "is the wrong shape for a premium (5 bps of a $1.00 option is $0.0005). "
-                         "The cached chain has NO real quotes (every row is bid==ask or NULL), so "
-                         "without this an option round trip costs ~nothing and multi-leg credit "
-                         "structures are systematically overstated. Default 5.0; pass 0 to "
-                         "reproduce pre-2026-07-25 results.")
-    op.add_argument("--option-spread-min-tick", type=float, default=0.02,
-                    help="Absolute floor on the modeled option spread in premium dollars (full "
-                         "width). Percent-of-premium alone under-charges cheap contracts, which "
-                         "is where fabricated edge concentrates. Default 0.02.")
+    _add_option_spread_args(op)
     op.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
                     help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "
                          "The fill engine caps an order at 10%% of a bar's volume, so a contract "
@@ -7669,19 +7712,7 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points (see optimize --spread-bps).")
-    ob.add_argument("--option-spread-pct", type=float, default=5.0,
-                    help="Modeled OPTION bid-ask spread as a PERCENT OF PREMIUM (full width; "
-                         "half charged per fill, adverse direction), widened x2 for contracts "
-                         "under 100 contracts/day. Separate from --spread-bps because bps-of-price "
-                         "is the wrong shape for a premium (5 bps of a $1.00 option is $0.0005). "
-                         "The cached chain has NO real quotes (every row is bid==ask or NULL), so "
-                         "without this an option round trip costs ~nothing and multi-leg credit "
-                         "structures are systematically overstated. Default 5.0; pass 0 to "
-                         "reproduce pre-2026-07-25 results.")
-    ob.add_argument("--option-spread-min-tick", type=float, default=0.02,
-                    help="Absolute floor on the modeled option spread in premium dollars (full "
-                         "width). Percent-of-premium alone under-charges cheap contracts, which "
-                         "is where fabricated edge concentrates. Default 0.02.")
+    _add_option_spread_args(ob)
     ob.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
                     help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "
                          "The fill engine caps an order at 10%% of a bar's volume, so a contract "

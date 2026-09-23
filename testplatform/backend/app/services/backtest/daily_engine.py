@@ -76,6 +76,21 @@ from app.services.backtest.seam_wiring import make_indicator_provider, make_atr_
 # ---------------------------------------------------------------------------
 # Clock + universe hooks
 # ---------------------------------------------------------------------------
+def _reraise_option_basis_refusal(e: BaseException) -> None:
+    """Re-raise the option path's split-basis refusals out of the engine's per-symbol /
+    per-expiry ``except Exception`` handlers (plan Part E).
+
+    Those handlers turn a failure into a log line so one bad symbol cannot abort a bar. A
+    basis refusal is not that: it means every strike, greek and intrinsic value the run
+    would produce is in the wrong basis, so it must END the run loudly -- exactly like the
+    hermetic cache misses those handlers already re-raise. Only the option path can raise
+    these, so an equity run never reaches this."""
+    from ba2_common.core.split_basis import SplitBasisRefused
+    from app.services.backtest.option_basis_guard import OptionSpotBasisMismatch
+    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch)):
+        raise e
+
+
 def trading_days(start: datetime, end: datetime, price_source) -> List[Any]:
     """The backtest clock = the union of dataset bar keys in ``[start, end]``.
 
@@ -1061,6 +1076,7 @@ class DailyBacktestEngine:
             equity_candidates.append((candidate, evaluator, symbol, recommendation))
             return False
         except Exception as e:  # noqa: BLE001
+            _reraise_option_basis_refusal(e)
             self._log(f"ruleset eval/execute failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
             return False
 
@@ -1284,6 +1300,7 @@ class DailyBacktestEngine:
                 if any(r.get("success") and (r.get("data") or {}).get("order_id") for r in results):
                     created_any = True
             except Exception as e:  # noqa: BLE001
+                _reraise_option_basis_refusal(e)
                 self._log(f"open-pos eval/execute failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
 
@@ -1506,6 +1523,7 @@ class DailyBacktestEngine:
                 if self.account.process_pending_assignment_liquidations():
                     settled = True
             except Exception as e:  # noqa: BLE001 — cleanup failure must not abort the run
+                _reraise_option_basis_refusal(e)
                 self._log(f"assignment liquidation failed @ {as_of_dt}: {e}")
 
         # 4a. resolve any option positions reaching expiry on THIS bar (no-orphaned-stock
@@ -1539,6 +1557,7 @@ class DailyBacktestEngine:
                     settled = True
                     self.account.invalidate_order_cache()
             except Exception as e:  # noqa: BLE001 — a liquidation failure must not abort the run
+                _reraise_option_basis_refusal(e)
                 self._log(f"margin-call liquidation failed @ {as_of_dt}: {e}")
 
         # 4b. (removed) The engine no longer attaches a baseline "Position protection" TP/SL
@@ -1620,9 +1639,12 @@ class DailyBacktestEngine:
                         f"(combo {legs[0].contract_symbol}) @ {as_of_date} — skipped"
                     )
                     continue
+                # The strikes are AS TRADED; the close is split-adjusted (plan Part E2).
+                spot = self.account.option_basis_price(legs[0].underlying, spot)
                 if self.account.settle_defined_risk_combo_expiry(legs, float(spot)):
                     settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
+                _reraise_option_basis_refusal(e)
                 self._log(f"combo option expiry failed @ {as_of_date}: {e}")
 
         for pos in per_leg:
@@ -1638,9 +1660,11 @@ class DailyBacktestEngine:
                 # sell-to-close, never exercise / short ITM -> physical assignment with the
                 # stock liquidated at the next bar's open) — see
                 # BacktestAccount.settle_single_leg_expiry.
+                spot = self.account.option_basis_price(pos.underlying, spot)  # as traded
                 if self.account.settle_single_leg_expiry(pos, float(spot)):
                     settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
+                _reraise_option_basis_refusal(e)
                 self._log(
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
                 )
@@ -1666,6 +1690,7 @@ class DailyBacktestEngine:
                 update_sleeve_breaker(expert=expert, account=self.account,
                                       expert_instance_id=expert_id)
             except Exception as e:  # noqa: BLE001 — see the docstring
+                _reraise_option_basis_refusal(e)
                 self._log(f"option breaker update failed for expert {expert_id}: {e}")
 
     def _size_and_submit(self, expert_id: int, indicator_provider: Any,
@@ -1688,6 +1713,7 @@ class DailyBacktestEngine:
         try:
             updated_orders = rm.review_and_prioritize_pending_orders(expert_id)
         except Exception as e:  # noqa: BLE001 — RM failure for one expert must not kill the run
+            _reraise_option_basis_refusal(e)
             self._log(f"risk manager failed for expert {expert_id}: {e}")
             return
 
@@ -1705,6 +1731,7 @@ class DailyBacktestEngine:
                         is_long=(order.side == OrderDirection.BUY))
                     self.account.submit_order(order, sl_price=sl_price)
                 except Exception as e:  # noqa: BLE001
+                    _reraise_option_basis_refusal(e)
                     self._log(f"submit_order failed for order {order.id}: {e}")
 
     def _size_and_submit_candidates(self, expert_id: int, candidates: List[Any],
@@ -1728,6 +1755,7 @@ class DailyBacktestEngine:
         try:
             funded = rm.size_candidate_orders(expert_id, [(c[0], c[3]) for c in candidates])
         except Exception as e:  # noqa: BLE001 — RM failure for one expert must not kill the run
+            _reraise_option_basis_refusal(e)
             self._log(f"candidate risk manager failed for expert {expert_id}: {e}")
             return False
 
@@ -1760,6 +1788,7 @@ class DailyBacktestEngine:
                 self.account.submit_order(order, sl_price=sl_price)
                 created_any = True
             except Exception as e:  # noqa: BLE001
+                _reraise_option_basis_refusal(e)
                 self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
         return created_any

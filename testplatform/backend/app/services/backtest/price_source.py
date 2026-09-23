@@ -1045,6 +1045,27 @@ class AsOfPriceSource:
         i = bisect.bisect_right(k, _key64(as_of, self._interval)) - 1
         return float(self._c[symbol][i]) if i >= 0 else None
 
+    def close_asof_dated(self, symbol: str, as_of: Optional[datetime] = None):
+        """``(close, bar date)`` of the bar ``close_asof`` would answer, or None.
+
+        ADDITIVE, read-only, and used only by the OPTION path (plan Part E): converting a
+        split-adjusted close into the as-traded basis needs the date the close is FROM, which
+        a forward-filled read does not otherwise say (a symbol with no bar on its own split
+        ex-date would take the wrong side's factor). Same lookup as ``close_asof``."""
+        k = self._keys.get(symbol)
+        if k is None or not len(k):
+            return None
+        if as_of is None:
+            if self._clock is None:
+                return None
+            i = self._cursor_at_clock(symbol)
+        else:
+            i = bisect.bisect_right(k, _key64(as_of, self._interval)) - 1
+        if i < 0:
+            return None
+        when = _from_key64(k[i], self._intraday)
+        return float(self._c[symbol][i]), (when.date() if isinstance(when, datetime) else when)
+
     def next_bar(self, symbol: str, after: datetime) -> Optional[Dict[str, float]]:
         """The NEXT trading bar strictly after ``after`` (for next-bar fills)."""
         k = self._keys.get(symbol)

@@ -232,7 +232,8 @@ def persist_top(db, opt, job):
             ids.append(bt.id)
             continue
         decoded = decode_params(SimpleNamespace(**job["strategy"]), result["params"])
-        trial = _build_daily_trial_config(block, decoded, hoisted)
+        trial = _build_daily_trial_config(block, decoded, hoisted,
+                                          option_trade_records=True)  # persisted TOP rows
         params = {**result["params"], "expertFixedSettings": block["experts"][0]["settings"],
                   "entryRules": decoded["entry_rules"], "exitRules": decoded["exit_rules"],
                   "equityCap": block["account_settings"]["equity_cap"]}

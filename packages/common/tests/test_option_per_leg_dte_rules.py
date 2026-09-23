@@ -142,6 +142,11 @@ def _setup_db(tmp_path):
 class _FakeAccount:
     id = 1
 
+    def decision_label(self):
+        # DaysToExpiryCondition counts from the account's decision label (the date the entry
+        # counted from), pinned here to the sim date.
+        return SIM_TODAY
+
 
 def _rec(as_of=SIM_AS_OF):
     return SimpleNamespace(created_at=as_of, instance_id=1, symbol="AAPL")

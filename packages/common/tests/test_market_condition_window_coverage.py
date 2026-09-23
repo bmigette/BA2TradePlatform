@@ -68,10 +68,21 @@ def _coverage(sessions, statuses):
             "last_session": sessions[-1].isoformat() if sessions else None}
 
 
+def _warm_rows(decisions_from, decisions_to):
+    """The row sessions the warmup builds for a window (``warmup.plan``, parity plan A3):
+    ``[prior(first decision), last decision]`` -- the live rule reads the prior session of each
+    decision date, the backtest rule reads each bar itself, and this range serves both."""
+    decisions = regular_session_dates(decisions_from, decisions_to)
+    return regular_session_dates(prior_regular_session(decisions[0]), decisions[-1])
+
+
 def _publish(root, *, decisions_from=SNAP_FIRST, decisions_to=SNAP_LAST,
-             symbols=("AAA", "BBB"), statuses=None, drop=()):
+             symbols=("AAA", "BBB"), statuses=None, drop=(), sessions=None):
     """A snapshot with a row for EVERY feature session of its decision window, as the warmup
     writes one (an uncomputable row is an explicit negative observation, never an absence).
+
+    ``sessions``: override the row sessions (default :func:`_warm_rows`) -- how a snapshot
+    warmed under an older row rule looks.
 
     ``statuses``: ``{symbol: {session: status}}`` overriding the default ``valid``.
     ``drop``: ``{symbol: (session, ...)}`` -- rows that are genuinely ABSENT, which is what a
@@ -79,8 +90,8 @@ def _publish(root, *, decisions_from=SNAP_FIRST, decisions_to=SNAP_LAST,
     """
     store = MarketConditionStore(root)
     decisions = regular_session_dates(decisions_from, decisions_to)
-    sessions = regular_session_dates(prior_regular_session(decisions[0]),
-                                     prior_regular_session(decisions[-1]))
+    if sessions is None:
+        sessions = _warm_rows(decisions_from, decisions_to)
     objects, coverage = [], {}
     for symbol in symbols:
         by_symbol = (statuses or {}).get(symbol, {})
@@ -122,7 +133,7 @@ def test_a_snapshot_for_another_window_is_refused_although_every_symbol_is_prese
     # WHAT THE OLD CHECK SAW, pinned so the regression cannot come back as "it was always fine":
     # the 2024-03 snapshot covers every symbol of the 2025 run, and that was the whole preflight.
     assert missing_coverage(reader, ["AAA", "BBB"]) == []
-    assert reader.observe("AAA", prior_regular_session(RUN_FIRST)) is None
+    assert reader.observe("AAA", RUN_FIRST) is None      # the row the run's first bar reads
 
     problems = window_coverage_problems(reader, ["AAA", "BBB"], RUN_FIRST, RUN_LAST)
     assert len(problems) == 1, problems
@@ -138,18 +149,43 @@ def test_the_window_that_the_snapshot_was_built_for_is_accepted(tmp_path):
                                     SNAP_FIRST, SNAP_LAST) == []
 
 
-def test_one_decision_date_earlier_needs_one_feature_session_earlier(tmp_path):
-    """The timing policy is part of the question: a decision on D reads the session BEFORE D.
-
-    A run starting one session earlier than the snapshot's own window needs a row the snapshot
-    does not have, and an off-by-one pin is refused like any other wrong window.
+def test_a_run_starting_before_the_snapshot_s_window_is_refused(tmp_path):
+    """``window_start``/``window_end`` are the dates the snapshot was warmed FOR. A run whose
+    bars start earlier is refused as a wrong window, even by ONE session -- although the warm
+    rows' superset happens to hold that bar's row (``[prior(first), last]``): the pin was not
+    built for that experiment, and an off-by-one pin is refused like any other wrong window.
     """
     store, digest = _publish(tmp_path / "cache")
     reader = _reader(store, digest)
-    earlier = regular_session_dates(date(2024, 2, 20), SNAP_LAST)[0]
-    assert earlier < SNAP_FIRST
-    assert window_coverage_problems(reader, ["AAA"], earlier, SNAP_LAST)
+    first_bar = regular_session_dates(SNAP_FIRST, SNAP_LAST)[0]
+    one_earlier = prior_regular_session(first_bar)
+    assert reader.observe("AAA", one_earlier) is not None     # the superset's extra row
+    assert window_coverage_problems(reader, ["AAA"], one_earlier, SNAP_LAST)
+    far_earlier = regular_session_dates(date(2024, 2, 20), SNAP_LAST)[0]
+    assert window_coverage_problems(reader, ["AAA"], far_earlier, SNAP_LAST)
     assert window_coverage_problems(reader, ["AAA"], SNAP_FIRST, SNAP_LAST) == []
+
+
+def test_a_backtest_bar_reads_its_own_session_so_the_last_bar_needs_its_own_row(tmp_path):
+    """BT/live parity (plan 2026-09-22 A3): bar D is the live decision labelled N(D), which
+    reads D. So the rows a backtest window needs are ITS OWN sessions -- through the last bar,
+    not through the session before it. A snapshot warmed under the OLD rule (rows
+    ``prior(first)..prior(last)``, one session short at the end) no longer serves its own
+    window, and says so per symbol rather than serving ``missing_session`` on the last bar.
+    """
+    decisions = regular_session_dates(SNAP_FIRST, SNAP_LAST)
+    old_rows = regular_session_dates(prior_regular_session(decisions[0]),
+                                     prior_regular_session(decisions[-1]))
+    store, digest = _publish(tmp_path / "cache", sessions=old_rows)
+    problems = window_coverage_problems(_reader(store, digest), ["AAA", "BBB"],
+                                        SNAP_FIRST, SNAP_LAST)
+    assert len(problems) == 2, problems
+    for symbol, problem in zip(("AAA", "BBB"), problems):
+        assert problem.startswith(f"{symbol}:") and "does not reach" in problem
+        assert f"{decisions[0]}..{decisions[-1]} feature sessions" in problem
+    # ... while one bar SHORTER is served by the same old snapshot (its last row IS there).
+    assert window_coverage_problems(_reader(store, digest), ["AAA", "BBB"], SNAP_FIRST,
+                                    prior_regular_session(decisions[-1])) == []
 
 
 def test_a_hole_inside_the_window_is_refused_naming_the_month(tmp_path):
@@ -180,8 +216,7 @@ def test_a_symbol_that_lists_part_way_through_the_window_is_accepted(tmp_path):
     missing_session rows followed by the warm-up prefix. There is no price history to have
     computed anything from, and the strategy could not have traded the symbol then either --
     refusing the run would refuse the universe for telling the truth."""
-    sessions = regular_session_dates(prior_regular_session(SNAP_FIRST),
-                                     prior_regular_session(SNAP_LAST))
+    sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
     listed_at = len(sessions) // 2
     statuses = {"BBB": {**{s: STATUS_MISSING_SESSION for s in sessions[:listed_at]},
                         **{s: STATUS_INSUFFICIENT_HISTORY for s in sessions[listed_at:-2]}}}
@@ -195,8 +230,7 @@ def test_an_insufficient_history_field_is_never_a_snapshot_fault(tmp_path):
     yet, an undefined swing state. The gate reads unknown and refuses that entry -- the designed
     meaning. Downloading more history does not repair an undefined level, so a snapshot full of
     them is correct, not broken."""
-    sessions = regular_session_dates(prior_regular_session(SNAP_FIRST),
-                                     prior_regular_session(SNAP_LAST))
+    sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
     statuses = {"AAA": {s: STATUS_INSUFFICIENT_HISTORY for s in sessions}}
     store, digest = _publish(tmp_path / "cache", statuses=statuses)
     assert window_coverage_problems(_reader(store, digest), ["AAA"], SNAP_FIRST, SNAP_LAST) == []
@@ -207,8 +241,7 @@ def test_a_symbol_with_no_usable_row_anywhere_in_the_window_is_refused(tmp_path)
     """SPCX: 1,508 missing_session rows over 2020-2025 because its daily cache starts in 2026.
     That is not a listing date inside the window -- it is a symbol the snapshot cannot serve at
     all, and a gated run would silently never enter it."""
-    sessions = regular_session_dates(prior_regular_session(SNAP_FIRST),
-                                     prior_regular_session(SNAP_LAST))
+    sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
     statuses = {"BBB": {s: STATUS_MISSING_SESSION for s in sessions}}
     store, digest = _publish(tmp_path / "cache", statuses=statuses)
     problems = window_coverage_problems(_reader(store, digest), ["AAA", "BBB"],
@@ -223,8 +256,7 @@ def test_a_symbol_with_no_usable_row_anywhere_in_the_window_is_refused(tmp_path)
 def test_a_trailing_run_of_missing_sessions_is_refused(tmp_path):
     """A delisting, or a source cache that stops before the window does. The last decision dates
     would read missing_session, and nothing about the symbol's listing explains it."""
-    sessions = regular_session_dates(prior_regular_session(SNAP_FIRST),
-                                     prior_regular_session(SNAP_LAST))
+    sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
     statuses = {"BBB": {s: STATUS_MISSING_SESSION for s in sessions[-5:]}}
     store, digest = _publish(tmp_path / "cache", statuses=statuses)
     problems = window_coverage_problems(_reader(store, digest), ["BBB"], SNAP_FIRST, SNAP_LAST)
@@ -234,8 +266,7 @@ def test_a_trailing_run_of_missing_sessions_is_refused(tmp_path):
 def test_an_interior_run_of_missing_sessions_is_refused(tmp_path):
     """Rows exist and say "no data" in the MIDDLE of the window: neither a listing date nor an
     undefined level explains it, so it is a source problem to fix, not a strategy result."""
-    sessions = regular_session_dates(prior_regular_session(SNAP_FIRST),
-                                     prior_regular_session(SNAP_LAST))
+    sessions = _warm_rows(SNAP_FIRST, SNAP_LAST)
     statuses = {"BBB": {s: STATUS_MISSING_SESSION for s in sessions[5:8]}}
     store, digest = _publish(tmp_path / "cache", statuses=statuses)
     problems = window_coverage_problems(_reader(store, digest), ["BBB"], SNAP_FIRST, SNAP_LAST)

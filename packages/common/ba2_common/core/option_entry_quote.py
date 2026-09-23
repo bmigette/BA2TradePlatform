@@ -4,12 +4,17 @@ THE DEFECT THIS EXISTS FOR
 --------------------------
 An option entry is quoted from the ANALYSIS bar (the builders take ``contract.ask`` for a buy
 and ``contract.bid`` for a sell), but the backtest's default ``next_bar_open`` fill model makes
-the NEXT day's open cross that quote before anything fills. In the historical option store the
-chain carries NO usable quote -- every cached row has ``bid == ask`` (measured: 701,849 of
-958,024 chain rows equal, the other 256,175 both NULL; the parquet store has no bid/ask column
-at all) -- so ``contract.ask`` and ``contract.bid`` are BOTH just the analysis day's close, i.e.
-the MID. The tradeable spread is then modelled at fill time by ``option_spread_pct`` /
-``option_spread_min_tick`` (``BacktestAccount._option_half_spread`` / ``_option_cross``).
+the NEXT day's open cross that quote before anything fills. In the sqlite and TastyTrade option
+stores the chain carries NO usable quote -- every cached row has ``bid == ask`` (measured:
+701,849 of 958,024 chain rows equal, the other 256,175 both NULL; the TastyTrade parquet tree
+has no bid/ask column at all) -- so ``contract.ask`` and ``contract.bid`` are BOTH just the
+analysis day's close, i.e. the MID. (The ThetaData store carries real NBBO, and there the
+builders' quote is already at the touch.) The tradeable spread is charged at fill time by the
+run's spread model (``option_spread_model``; ``BacktestAccount._option_half_spread`` /
+``_option_cross``): by default the DECISION bar's real quote when it has a valid one, else the
+calibrated fallback in ``ba2_common.core.option_spread_model``. The pre-2026-09-22
+percent-of-premium model (``option_spread_pct`` / ``option_spread_min_tick``) survives only as
+the explicit ``legacy-pct`` model.
 
 The two halves do not meet. A seller quoting the analysis mid ``c`` fills only if the next
 bar's crossed bid clears it -- ``o - half >= c`` -- i.e. only if the premium RISES by the whole

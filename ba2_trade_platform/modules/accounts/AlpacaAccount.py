@@ -191,6 +191,106 @@ def plan_fractional_submission(symbol: str, quantity: float, order_type_value: s
         fractionable=fractionable, reason=reason)
 
 
+# ======================================================================
+# Raw option snapshots (BT/live option parity B3)
+# ======================================================================
+# WHY RAW. alpaca-py's ``OptionsSnapshot`` model (0.43.4, and 0.44.0) keeps only
+# latest_quote / latest_trade / implied_volatility / greeks and DROPS ``dailyBar`` and
+# ``prevDailyBar`` although the REST response carries them -- and those two bars are the only
+# place a snapshot says how much a contract TRADED. Without them the live chain had no volume,
+# so the grid's ``option_min_volume`` gate refused every live chain
+# (``OptionLiquidityDataUnavailable``) and a grid option strategy deployed live never traded.
+# The account therefore reads the ``raw_data=True`` client and parses the documented REST shape:
+#   {latestQuote:{t,ax,ap,as,bx,bp,bs,c}, latestTrade:{t,x,p,s,c}, minuteBar, dailyBar,
+#    prevDailyBar (option_bar: t,o,h,l,c,v,n,vw -- all required),
+#    greeks:{delta,gamma,rho,theta,vega}, impliedVolatility}
+
+def _parse_alpaca_timestamp(value: Any, where: str) -> datetime:
+    """An Alpaca RFC-3339 timestamp as an AWARE datetime (nanoseconds truncated to micros).
+    A value without a zone is refused: which day it belongs to would be a guess."""
+    if not isinstance(value, str):
+        raise ValueError(f"Alpaca option snapshot {where}.t is not a timestamp string: {value!r}")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"Alpaca option snapshot {where}.t has no timezone: {value!r}")
+    return parsed
+
+
+def _parse_alpaca_option_bar(bar: Any, where: str) -> Tuple[Any, Any]:
+    """``(New York date, volume)`` of a present daily bar; a bar without ``t`` or ``v`` is a
+    parse bug (Alpaca's option_bar requires both) and raises.
+
+    Alpaca stamps a daily bar at New York MIDNIGHT (04:00Z under EDT, 05:00Z under EST), so the
+    bar's session is its America/New_York calendar date -- never its UTC date."""
+    from ba2_common.core.market_calendar import NY_TZ
+
+    if not isinstance(bar, dict):
+        raise ValueError(f"Alpaca option snapshot {where} is not an object: {bar!r}")
+    for key in ("t", "v"):
+        if bar.get(key) is None:
+            raise ValueError(f"Alpaca option snapshot {where} has no '{key}': {bar!r}")
+    return (_parse_alpaca_timestamp(bar["t"], where).astimezone(NY_TZ).date(), bar["v"])
+
+
+def parse_alpaca_option_bars(raw: Dict[str, Any]) -> List[Tuple[Any, Any]]:
+    """``[(ny_date, volume)]`` from a raw snapshot's ``dailyBar`` and ``prevDailyBar``,
+    whichever are present. Raises ValueError on a present bar without ``t``/``v`` (an empty
+    ``{}`` bar included) or a timestamp without a zone. Split out so the QUOTE path can
+    degrade only the volume when the bars are malformed (``get_option_quote``)."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"Alpaca option snapshot is not an object: {raw!r}")
+    return [_parse_alpaca_option_bar(raw[key], key)
+            for key in ("dailyBar", "prevDailyBar") if raw.get(key) is not None]
+
+
+def parse_alpaca_option_quote_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """The quote / trade / greeks fields of a raw snapshot (everything but the bars).
+
+    Each is ``None`` when Alpaca did not send it -- a missing field stays MISSING. Raises
+    ValueError on a snapshot that is not an object or a quote/trade timestamp without a zone.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"Alpaca option snapshot is not an object: {raw!r}")
+    quote = raw.get("latestQuote") or {}
+    trade = raw.get("latestTrade") or {}
+    greeks = raw.get("greeks") or {}
+    return {
+        "bid": quote.get("bp"),
+        "ask": quote.get("ap"),
+        "bid_size": quote.get("bs"),
+        "ask_size": quote.get("as"),
+        "quote_time": (_parse_alpaca_timestamp(quote["t"], "latestQuote")
+                       if quote.get("t") is not None else None),
+        "last": trade.get("p"),
+        "last_time": (_parse_alpaca_timestamp(trade["t"], "latestTrade")
+                      if trade.get("t") is not None else None),
+        "iv": raw.get("impliedVolatility"),
+        "delta": greeks.get("delta"),
+        "gamma": greeks.get("gamma"),
+        "theta": greeks.get("theta"),
+        "vega": greeks.get("vega"),
+        "rho": greeks.get("rho"),
+    }
+
+
+def parse_alpaca_option_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """One raw Alpaca option snapshot -> the flat fields the live chain uses.
+
+    Returns ``bid, ask, bid_size, ask_size, quote_time, last, last_time, iv, delta, gamma,
+    theta, vega, rho`` (each ``None`` when Alpaca did not send it -- a missing field stays
+    MISSING, the liquidity checks report it) and ``bars``: ``[(ny_date, volume)]`` from
+    ``dailyBar`` and ``prevDailyBar``, whichever are present. The volume is left as sent;
+    ``option_session.session_volume`` validates the one bar a decision may read. ``minuteBar``
+    and unknown keys are ignored.
+
+    Raises ValueError on a snapshot that is not an object (e.g. ``None``), a present bar
+    without ``t``/``v`` (an empty ``{}`` bar included) or a timestamp without a zone.
+    """
+    fields = parse_alpaca_option_quote_fields(raw)
+    fields["bars"] = parse_alpaca_option_bars(raw)
+    return fields
+
+
 def alpaca_api_retry(func):
     """
     Decorator to retry Alpaca API calls with exponential backoff on rate limit errors.
@@ -242,6 +342,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     Also implements OptionsAccountInterface (option chain/quote/ATM-IV market data;
     positions / order submission / close / IV-rank land in later tasks).
     """
+
+    #: Where this account's option greeks come from (OptionsAccountInterface; recorded on
+    #: every leg of an option entry_record): Alpaca's own snapshot greeks.
+    OPTION_GREEKS_SOURCE = "broker"
 
     # Lifetime of one _margin_info_cache entry. A CLASS attribute so that a bare
     # instance built with object.__new__ (the test idiom) still has it.
@@ -5926,21 +6030,34 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     # ======================================================================
     # OptionsAccountInterface — market data (chain / quote / ATM-IV)
     # ======================================================================
-    def _get_option_data_client(self):
-        """Lazily create & cache an OptionHistoricalDataClient.
+    def _get_option_data_client_raw(self):
+        """Lazily create & cache a ``raw_data=True`` OptionHistoricalDataClient.
 
-        Uses getattr so that a pre-set/monkeypatched ``self._option_data_client``
-        (e.g. in tests) is honored instead of being overwritten.
+        The chain and quote read snapshots through this client because the SDK's typed
+        ``OptionsSnapshot`` drops ``dailyBar``/``prevDailyBar`` (see
+        ``parse_alpaca_option_snapshot``); it is the account's only option market-data client.
+        A pre-set/monkeypatched ``self._option_data_client_raw`` is honored.
         """
-        client = getattr(self, "_option_data_client", None)
+        client = getattr(self, "_option_data_client_raw", None)
         if client is None:
             from alpaca.data.historical.option import OptionHistoricalDataClient
             client = OptionHistoricalDataClient(
                 api_key=self.settings["api_key"],
                 secret_key=self.settings["api_secret"],
+                raw_data=True,
             )
-            self._option_data_client = client
+            self._option_data_client_raw = client
         return client
+
+    def _option_data_session(self):
+        """The completed session a live option read takes its VOLUME from:
+        ``decision_data_session(self.decision_label())`` -- the label of the live decision
+        instant (``OptionsAccountInterface.decision_label``, the same clock the action's DTE
+        window uses), and ``prior_session_v1``: the regular session before that New York
+        date, even after today's close. A backtest bar D reads D, and bar D is the live
+        decision made during the next session -- the same bar either way."""
+        from ba2_common.core.market_calendar import decision_data_session
+        return decision_data_session(self.decision_label())
 
     def _options_feed(self):
         """Return the OptionsFeed to use. Defaults to INDICATIVE unless an OPRA
@@ -6068,13 +6185,23 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """Return option-chain rows (quote + Greeks + liquidity) for the underlying
         within the given expiry / strike / type filters.
 
-        Joins live snapshot data (OptionHistoricalDataClient.get_option_chain) with
-        contract metadata (TradingClient.get_option_contracts) on the OCC symbol.
+        Joins live snapshot data (the RAW OptionHistoricalDataClient.get_option_chain, parsed
+        by ``parse_alpaca_option_snapshot``) with contract metadata
+        (TradingClient.get_option_contracts) on the OCC symbol. The raw client returns ONE
+        dict keyed by OCC symbol: the SDK's ``_get_marketdata`` follows ``next_page_token``
+        and merges every page's ``snapshots`` itself.
+
+        ``volume`` is what the contract traded in the decision's data session
+        (``_option_data_session``, computed ONCE per call; ``option_session.session_volume``
+        of the snapshot's daily bars): the same session a backtest bar reads (BT/live
+        option parity B3). A contract whose snapshot is MALFORMED is excluded with an ERROR
+        naming it (plus one summary line per call); the rest of the chain is kept.
 
         Contracts whose DELIVERABLE is not the standard 100 shares are dropped — see
         ``_is_standard_deliverable`` (OPT-L7).
         """
         from alpaca.data.requests import OptionChainRequest
+        from ba2_common.core.option_session import session_volume
         from ...core.option_types import OptionContract
         from ...core.types import OptionRight
 
@@ -6090,13 +6217,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             expiration_date_lte=expiry_max,
         )
 
-        snapshots = self._get_option_data_client().get_option_chain(request) or {}
+        data_session = self._option_data_session()
+        snapshots = self._get_option_data_client_raw().get_option_chain(request) or {}
         meta_by_symbol = self._get_option_contracts_meta(
             underlying, expiry_min, expiry_max,
             option_type=option_type, strike_min=strike_min, strike_max=strike_max,
         )
 
         chain: List[OptionContract] = []
+        excluded: List[str] = []
         for occ_symbol, snapshot in snapshots.items():
             meta = meta_by_symbol.get(occ_symbol)
             if meta is None:
@@ -6155,21 +6284,20 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 except (TypeError, ValueError):
                     open_interest = None
 
-            # --- Snapshot quote / trade / greeks (guard every field) ---
-            quote = getattr(snapshot, "latest_quote", None)
-            bid = getattr(quote, "bid_price", None) if quote is not None else None
-            ask = getattr(quote, "ask_price", None) if quote is not None else None
-
-            trade = getattr(snapshot, "latest_trade", None)
-            last = getattr(trade, "price", None) if trade is not None else None
-
-            iv = getattr(snapshot, "implied_volatility", None)
-
-            greeks = getattr(snapshot, "greeks", None)
-            delta = getattr(greeks, "delta", None) if greeks is not None else None
-            gamma = getattr(greeks, "gamma", None) if greeks is not None else None
-            theta = getattr(greeks, "theta", None) if greeks is not None else None
-            vega = getattr(greeks, "vega", None) if greeks is not None else None
+            # --- Snapshot quote / trade / greeks / session volume ---
+            # A MALFORMED snapshot (a present bar without t/v, a zoneless timestamp, a
+            # non-count volume on the session's bar) excludes THAT contract, loudly -- one bad
+            # row must not take the whole underlying's chain down with it. Never a default:
+            # the contract is absent, not priced or sized from a guess.
+            try:
+                snap = parse_alpaca_option_snapshot(snapshot)
+                volume = session_volume(snap["bars"], data_session)
+            except (ValueError, TypeError) as e:
+                excluded.append(occ_symbol)
+                logger.error(
+                    f"Excluding option contract {occ_symbol} from the {underlying} chain: "
+                    f"its Alpaca snapshot is malformed ({e}).")
+                continue
 
             chain.append(OptionContract(
                 symbol=occ_symbol,
@@ -6177,62 +6305,79 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 option_type=row_type,
                 strike=strike,
                 expiry=expiry,
-                bid=bid,
-                ask=ask,
-                last=last,
-                implied_volatility=iv,
-                delta=delta,
-                gamma=gamma,
-                theta=theta,
-                vega=vega,
+                bid=snap["bid"],
+                ask=snap["ask"],
+                last=snap["last"],
+                implied_volatility=snap["iv"],
+                delta=snap["delta"],
+                gamma=snap["gamma"],
+                theta=snap["theta"],
+                vega=snap["vega"],
                 open_interest=open_interest,
+                volume=volume,
+                rho=snap["rho"],
+                quote_time=snap["quote_time"],
+                greeks_source=self.OPTION_GREEKS_SOURCE,
             ))
 
+        if excluded:
+            logger.error(
+                f"{underlying} option chain: excluded {len(excluded)} of {len(snapshots)} "
+                f"contract(s) with a malformed Alpaca snapshot "
+                f"(data session {data_session}): {', '.join(excluded[:10])}"
+                f"{' ...' if len(excluded) > 10 else ''}")
         return chain
 
     @alpaca_api_retry
     def get_option_quote(self, contract_symbol: str) -> Optional[Any]:
         """Return the latest quote + Greeks for a single OCC option contract, or
-        None if no snapshot is available."""
+        None if no snapshot is available.
+
+        Read from the RAW snapshot like ``get_option_chain`` (the typed SDK model drops the
+        daily bars), so the quote carries the data session's ``volume`` and ``rho`` too.
+
+        ONLY THE VOLUME DEGRADES. Closes price off this quote (``CloseOptionAction``, the
+        exit seams), so a malformed daily bar -- or a market calendar that cannot answer the
+        data session -- must not fail a live close: it is logged at ERROR naming the contract
+        and the defect, and the quote is returned with ``volume=None`` (MISSING, never 0) and
+        its bid/ask/greeks intact. A malformed QUOTE itself (not an object, a zoneless quote
+        or trade time) still raises: that is the price the close would be sent at."""
         from alpaca.data.requests import OptionSnapshotRequest
+        from ba2_common.core.market_calendar import MarketCalendarUnavailable
+        from ba2_common.core.option_session import session_volume
         from ...core.option_types import OptionQuote
 
         request = OptionSnapshotRequest(
             symbol_or_symbols=contract_symbol,
             feed=self._options_feed(),
         )
-        snapshots = self._get_option_data_client().get_option_snapshot(request) or {}
+        snapshots = self._get_option_data_client_raw().get_option_snapshot(request) or {}
         snapshot = snapshots.get(contract_symbol)
         if snapshot is None:
             return None
 
-        quote = getattr(snapshot, "latest_quote", None)
-        bid = getattr(quote, "bid_price", None) if quote is not None else None
-        ask = getattr(quote, "ask_price", None) if quote is not None else None
-        timestamp = getattr(quote, "timestamp", None) if quote is not None else None
-
-        trade = getattr(snapshot, "latest_trade", None)
-        last = getattr(trade, "price", None) if trade is not None else None
-
-        iv = getattr(snapshot, "implied_volatility", None)
-
-        greeks = getattr(snapshot, "greeks", None)
-        delta = getattr(greeks, "delta", None) if greeks is not None else None
-        gamma = getattr(greeks, "gamma", None) if greeks is not None else None
-        theta = getattr(greeks, "theta", None) if greeks is not None else None
-        vega = getattr(greeks, "vega", None) if greeks is not None else None
-
+        snap = parse_alpaca_option_quote_fields(snapshot)
+        try:
+            volume = session_volume(parse_alpaca_option_bars(snapshot),
+                                    self._option_data_session())
+        except (ValueError, TypeError, MarketCalendarUnavailable) as e:
+            logger.error(
+                f"Option quote for {contract_symbol}: its session volume is unavailable "
+                f"({type(e).__name__}: {e}); returning the quote with volume=None.")
+            volume = None
         return OptionQuote(
             symbol=contract_symbol,
-            bid=bid,
-            ask=ask,
-            last=last,
-            implied_volatility=iv,
-            delta=delta,
-            gamma=gamma,
-            theta=theta,
-            vega=vega,
-            timestamp=timestamp,
+            bid=snap["bid"],
+            ask=snap["ask"],
+            last=snap["last"],
+            implied_volatility=snap["iv"],
+            delta=snap["delta"],
+            gamma=snap["gamma"],
+            theta=snap["theta"],
+            vega=snap["vega"],
+            timestamp=snap["quote_time"],
+            rho=snap["rho"],
+            volume=volume,
         )
 
     def get_atm_implied_volatility(self, underlying: str) -> Optional[float]:
@@ -6658,8 +6803,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
           ``_find_open_equity_long``); close the short-call option Transaction
           (close_reason="assigned"). If no equity long is found, record result
           "called_away_no_long" (still closes the option leg).
-        - OPEXP (expiry): close the option Transaction (close_reason="expired",
+        - OPEXP (expiry): close the option Transaction (close_reason="expired_otm",
           close_price=0.0).
+
+        Every option ``close_reason`` above is an ``OptionCloseReason`` value -- the SAME
+        vocabulary the backtest's expiry settlement writes (BT/live option parity, plan Part
+        C3) -- and each settled leg's synthetic closing order carries it as the ``trigger`` of
+        its ``exit_record`` (``_record_option_settlement_order``).
         - OPEXC (exercise): close the option Transaction (close_reason=
           "exercised"). Equity-leg reconciliation is best-effort/logged for now.
         - Anything else (e.g. OPCSH) or any malformed/unmappable activity:
@@ -6798,8 +6948,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         the Transaction ledger. Returns a result string. Raises on truly
         unexpected errors (caught by the caller). Returns an "unhandled: ..."
         string for expected-but-unmappable inputs (malformed symbol, etc.)."""
-        from ...core.types import (AssetClass, OptionRight, OrderDirection, TransactionStatus,
-                                   TXN_ORIGIN_CSP_ASSIGNMENT)
+        from ...core.types import (AssetClass, OptionCloseReason, OptionRight, OrderDirection,
+                                   TransactionStatus, TXN_ORIGIN_CSP_ASSIGNMENT)
 
         # NOT ``qty if qty is not None else 0.0``. A missing quantity is not an
         # assignment of nothing — see the OPASN guard below, which refuses BEFORE any
@@ -6875,7 +7025,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     origin=TXN_ORIGIN_CSP_ASSIGNMENT)
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="assigned", activity_id=activity_id,
+                    close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed short put txn",
                     open_note="settled the short put LEG; structure still OPEN")
@@ -6889,7 +7039,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 held = self._find_open_equity_long(underlying, expert_id)
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="assigned", activity_id=activity_id,
+                    close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed short call txn",
                     open_note="settled the short call LEG; structure still OPEN")
@@ -6914,7 +7064,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if opt_txn is not None:
                 return "expired: " + self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="expired", close_price=0.0, activity_id=activity_id,
+                    close_reason=OptionCloseReason.EXPIRED_OTM.value, close_price=0.0,
+                    activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed option txn",
                     open_note="settled the expiring LEG; structure still OPEN")
@@ -6926,7 +7077,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # Equity-leg handling for exercise is best-effort/minimal for now.
                 return "exercised: " + self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="exercised", activity_id=activity_id,
+                    close_reason=OptionCloseReason.EXERCISED.value, activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed option txn (equity leg not reconciled)",
                     open_note=("settled the exercised LEG; structure still OPEN "
@@ -7029,7 +7180,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                                      else -settled)
 
         if every_option_contract_is_flat(contract_net):
-            self._close_txn(opt_txn, close_reason=close_reason, close_price=close_price)
+            # WHICH settlement names the structure: the most consequential one recorded on it
+            # (assigned > exercised > expired_otm, ``settlement_close_reason``) -- the SAME rule
+            # the backtest's expiry settlement applies, so the reason does not depend on the
+            # order the OCC happens to report the legs in. A single leg closes under its own.
+            from ba2_common.core.option_trade_record import (
+                SETTLEMENT_CLOSE_PRECEDENCE, settlement_close_reason)
+            settled = {r.value for r in SETTLEMENT_CLOSE_PRECEDENCE}
+            earlier = [((o.data or {}).get("exit_record") or {}).get("trigger")
+                       for o in orders if o.open_type == OrderOpenType.EXTERNAL]
+            reason = settlement_close_reason(
+                [close_reason] + [t for t in earlier if t in settled])
+            self._close_txn(opt_txn, close_reason=reason, close_price=close_price)
             return closed_note
 
         still_open = sorted(c for c, v in contract_net.items()
@@ -7072,7 +7234,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         raised — one bad row must not abort the reconcile batch).
         """
         from ...core.interfaces.OptionsAccountInterface import DEFAULT_OPTION_MULTIPLIER
+        from ba2_common.core.option_trade_record import (
+            OPTION_TRADE_RECORD_VERSION, exit_record as option_exit_record)
 
+        # WHY the leg closed, in the shared record shape (plan Part C3): the OCC event is the
+        # trigger; a settlement prices from no quote, so the leg is named, not snapshotted.
+        # A reason outside OptionCloseReason is a caller bug: logged and recorded as an error,
+        # never allowed to stop the settlement row (the ledger matters more than the label).
+        try:
+            record = option_exit_record(close_reason, legs_without_quote=[contract])
+        except ValueError as e:
+            logger.error(f"[Account {self.id}] settlement of {contract}: {e}")
+            record = {"version": OPTION_TRADE_RECORD_VERSION, "trigger": None,
+                      "error": f"ValueError: {e}"}
         try:
             return add_instance(TradingOrder(
                 account_id=self.id,
@@ -7098,6 +7272,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                          f"(activity {activity_id}) — synthetic fill, no broker order "
                          f"exists"),
                 created_at=datetime.now(timezone.utc),
+                data={"exit_record": record},
             ))
         except Exception as e:
             logger.error(

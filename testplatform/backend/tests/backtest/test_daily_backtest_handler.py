@@ -113,13 +113,10 @@ def test_build_config_assembles_account_settings():
         "slippage_bps": 0.0,
         "fill_model": "next_bar_open",
         "spread_bps": 0.0,  # optional, defaults to 0.0 (exact no-op) when absent from payload
-        # OPTION spread model (2026-07-25) — also optional and also 0.0-by-default, so an
-        # existing payload reproduces pre-model fills bit-for-bit. The grid CLI passes real
-        # values (--option-spread-pct defaults to 5.0 there); the handler itself never
-        # invents one. Percent OF PREMIUM, not bps of price — see
-        # BacktestAccount._option_half_spread for why options cannot share spread_bps.
-        "option_spread_pct": 0.0,
-        "option_spread_min_tick": 0.0,
+        # OPTION spread (plan Part F, 2026-09-22): NO keys when the payload states none. The
+        # handler never invents a spread -- the old 0.0 default was a silent zero-spread run.
+        # An OPTIONS run with no stated model is refused by the account
+        # (BacktestAccount._resolve_spread_model); this equity payload needs none.
         # Optional FIXED-notional equity ceiling (2026-08-25). None = OFF, which is what an
         # absent payload key means — never 0.0, which would make every position unaffordable.
         # See app/services/backtest/equity_cap.py.

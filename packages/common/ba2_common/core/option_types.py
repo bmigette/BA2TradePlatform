@@ -1,5 +1,5 @@
 """Broker-agnostic option value objects (pure dataclasses, no DB/SDK deps)."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional
 
@@ -23,7 +23,23 @@ class OptionContract:
     theta: Optional[float] = None
     vega: Optional[float] = None
     open_interest: Optional[int] = None
+    #: Contracts traded IN the decision's data session (``option_session.session_volume``):
+    #: the bar dated exactly that session, else 0. Never an older session's volume.
     volume: Optional[int] = None
+    #: Price change per 1 percentage point of the risk-free rate (the vega-per-vol-point
+    #: convention). Appended LAST so positional constructions keep their meaning.
+    rho: Optional[float] = None
+    #: The instant the source stamped this row's QUOTE (zone-aware), when it publishes one:
+    #: Alpaca's ``latestQuote.t`` live. None in a backtest -- the as-of bar is an end-of-session
+    #: record with no quote instant, and inventing its close time would read as a measurement.
+    #: Appended LAST (positional constructions unchanged). Read by the option trade record.
+    quote_time: Optional[datetime] = None
+    #: Where THIS ROW's iv/greeks were read from, when the source says: ``"broker"`` (the
+    #: live Alpaca snapshot), ``"bs_from_close"`` (Black-Scholes inverted from the as-of bar's
+    #: close), ``"chain_snapshot"`` (the sqlite store's build-time chain row, used when the bar
+    #: has no computed iv). None = the row does not say; the option trade record then uses the
+    #: account's declared ``OPTION_GREEKS_SOURCE``. Appended LAST.
+    greeks_source: Optional[str] = None
 
     @property
     def mid(self) -> Optional[float]:
@@ -54,6 +70,9 @@ class OptionQuote:
     theta: Optional[float] = None
     vega: Optional[float] = None
     timestamp: Optional[datetime] = None
+    #: Appended LAST (positional constructions unchanged). Same meaning as on OptionContract.
+    rho: Optional[float] = None
+    volume: Optional[int] = None
 
     @property
     def mid(self) -> Optional[float]:
@@ -73,6 +92,12 @@ class OptionLeg:
     strike: Optional[float] = None
     expiry: Optional[date] = None
     underlying: Optional[str] = None
+    #: The chain contract this leg was CHOSEN from, when a builder chose one -- the quote and
+    #: greeks the decision saw, which ``_submit_option_order`` writes into the order's
+    #: ``entry_record`` (``option_trade_record``). IN-MEMORY ONLY: never persisted, never sent
+    #: to a broker, excluded from equality and repr so a leg compares exactly as before. None
+    #: for a leg built without a chain contract (closes, a roll's buy-back leg).
+    quote: Optional[OptionContract] = field(default=None, compare=False, repr=False)
 
 
 @dataclass

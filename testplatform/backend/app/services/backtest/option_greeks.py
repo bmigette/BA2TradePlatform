@@ -102,28 +102,33 @@ def greeks(S: float, K: float, T: float, r: float, sigma: float,
            option_type: OptionRight, q: float = 0.0) -> Optional[dict]:
     """Analytic Black-Scholes Greeks given a known sigma (call AFTER implied_volatility).
 
-    Returns {"delta","gamma","theta","vega"} or None if inputs are degenerate. Theta is
+    Returns {"delta","gamma","theta","vega","rho"} or None if inputs are degenerate. Theta is
     PER-DAY (annual theta / 365, the conventionally quoted figure); vega is PER 1-VOL-POINT
-    (i.e. per 1% absolute change in IV, the conventionally quoted figure) — both divided down
-    from the raw per-unit Black-Scholes derivatives so callers get broker-familiar numbers."""
+    (i.e. per 1% absolute change in IV, the conventionally quoted figure); rho is PER
+    1-RATE-POINT (per 1 percentage point of ``r``, i.e. raw dV/dr / 100, the figure brokers
+    quote) — all divided down from the raw per-unit Black-Scholes derivatives so callers get
+    broker-familiar numbers. rho uses the SAME ``r`` (the run's risk_free_rate), ``T`` and
+    sigma as the other greeks."""
     out = _shared(S, K, T, r, sigma, option_type, q)
     if out is None:
         return None
     # The shared pricer already publishes both under this module's conventions:
-    # ``theta_per_day`` is annual/365 and ``vega_per_point`` is raw/100. Renaming rather than
-    # recomputing is the whole point -- a second division here would be a second convention.
+    # ``theta_per_day`` is annual/365, ``vega_per_point`` is raw/100 and ``rho_per_1pct`` is
+    # raw/100. Renaming rather than recomputing is the whole point -- a second division here
+    # would be a second convention.
     return {"delta": out["delta"], "gamma": out["gamma"],
-            "theta": out["theta_per_day"], "vega": out["vega_per_point"]}
+            "theta": out["theta_per_day"], "vega": out["vega_per_point"],
+            "rho": out["rho_per_1pct"]}
 
 
 def compute_iv_and_greeks(price: Optional[float], S: Optional[float], K: float, T: float,
                           r: float, option_type: OptionRight, q: float = 0.0) -> dict:
     """Convenience one-shot: solve IV from `price` then derive Greeks from it.
 
-    Returns a dict with keys iv/delta/gamma/theta/vega, each None where computation was not
+    Returns a dict with keys iv/delta/gamma/theta/vega/rho, each None where computation was not
     possible (missing price/underlying, expired, or price outside no-arbitrage bounds) — safe
     to splat directly into a chain/bar row without the caller re-checking every input."""
-    out = {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+    out = {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None, "rho": None}
     if price is None or S is None:
         return out
     iv = implied_volatility(price, S, K, T, r, option_type, q)

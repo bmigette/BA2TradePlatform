@@ -112,6 +112,11 @@ class FakeAccount(OptionsAccountInterface):
             # that models no spread and concedes nothing.
             self.option_modelled_half_spread = lambda symbol: half_spread
 
+    def decision_label(self):
+        # The option action's DTE label (OptionsAccountInterface.decision_label,
+        # read by _OptionEntryAction._today): pinned to this fake's simulated date.
+        return self._as_of_date()
+
     def _as_of_date(self):
         return TODAY
 

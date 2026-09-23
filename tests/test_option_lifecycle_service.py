@@ -590,6 +590,27 @@ def test_the_close_is_a_market_order_tagged_close_on_the_same_transaction(wired)
     assert order.transaction_id == txn.id
 
 
+def test_the_close_order_records_WHY_the_pass_closed_it(wired):
+    """BT/live option parity, plan Part C3: the lifecycle's closing decision is written onto
+    the close order's ``exit_record`` in the shared ``OptionCloseReason`` vocabulary
+    (``LIFECYCLE_CLOSE_TRIGGERS``). A market close priced from no quote, so every leg is
+    named rather than snapshotted -- and no extra price read is taken for it."""
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import TradingOrder
+    from ba2_common.core.option_lifecycle import LIFECYCLE_CLOSE_TRIGGERS
+
+    account, expert, expert_row = wired
+    txn, *_ = open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
+
+    submitted = run(expert_row).submitted[0]
+    record = get_instance(TradingOrder, submitted.order.id).data["exit_record"]
+    assert record["trigger"] == LIFECYCLE_CLOSE_TRIGGERS[submitted.reason].value
+    assert record["legs"] == []
+    assert sorted(record["legs_without_quote"]) == sorted(l.contract_symbol
+                                                          for l in submitted.legs)
+
+
 def test_an_executed_fill_with_no_price_makes_the_pnl_unknown_not_optimistic(wired):
     """A fill we cannot price makes the realised cash unknowable — not 0.0.
 
@@ -1555,3 +1576,28 @@ def test_a_single_expiry_short_at_the_roll_window_is_left_to_the_RULE(wired):
     assert [d.reason for d in result.decisions] == [LIFECYCLE_HOLD]
     assert result.roll_due == []
     assert close_orders(txn.id) == []
+
+
+# ---------------------------------------------------------------------------
+# THE CLOCK: decide() counts DTE from the New York decision label (BT/live option parity)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("instant,label", [
+    (datetime(2026, 3, 17, 13, 35, tzinfo=timezone.utc), date(2026, 3, 17)),   # 09:35 ET
+    (datetime(2026, 3, 18, 1, 0, tzinfo=timezone.utc), date(2026, 3, 17)),     # 21:00 ET
+], ids=["morning_et", "evening_et_utc_next_day"])
+def test_decide_counts_from_the_new_york_decision_label(monkeypatch, wired, instant, label):
+    """The pass hands decide() the NEW YORK date of the live decision instant -- the same
+    reference the rule-level DTE conditions and the option entry count from. It used to be
+    the UTC date of datetime.now(), the next calendar day for any evening pass."""
+    from ba2_common.core import option_session
+
+    account, expert, expert_row = wired
+    open_credit_spread(account, expert_row)
+    quote_spread(account)
+    seen = []
+    monkeypatch.setattr(option_session, "live_decision_time", lambda: instant)
+    monkeypatch.setattr(svc, "decide", lambda structures, chain, settings, as_of, **k:
+                        seen.append(as_of) or [])
+    result = svc.run_option_lifecycle_pass(expert_row.id)
+    assert seen == [label]
+    assert result.as_of == instant

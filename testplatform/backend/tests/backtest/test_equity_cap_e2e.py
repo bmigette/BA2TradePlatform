@@ -547,7 +547,7 @@ def test_a_ga_run_completes_with_the_cap_and_scores_every_individual_the_same_wa
     seen_caps: List[Any] = []
 
     def _stub_trial(backtest_cfg, decoded, *a, **kw):
-        cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+        cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
         seen_caps.append(cfg["account_settings"]["equity_cap"])
         return {"total_trades": 3, "sharpe_ratio": 1.0, "max_drawdown": 5.0,
                 "total_return": 1.0, "profit_factor": 1.5, "win_rate": 55.0}

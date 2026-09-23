@@ -17,9 +17,10 @@ measurement. The two failure modes this file exists to prevent:
 
 Both are pinned below, in both operator directions.
 
-Every test freezes the clock by construction: the evaluation instant is the
-recommendation's ``created_at`` (2024 sim dates), and the wall clock is 2026, so any
-implementation that reads ``date.today()`` produces a wildly different number.
+Every test freezes the clock by construction: the evaluation DATE is the account's decision
+session label (``OptionsAccountInterface.decision_label`` -- the date the option ENTRY counted
+its DTE from, BT/live option parity), pinned to a 2024 sim date, and the wall clock is 2026,
+so any implementation that reads ``date.today()`` produces a wildly different number.
 """
 
 from datetime import date, datetime, timedelta, timezone
@@ -42,7 +43,18 @@ def _setup_db(tmp_path):
 
 
 class _FakeAccount:
-    """Minimal stand-in: the condition never asks the account anything."""
+    """Minimal stand-in: the condition asks the account only for its decision label."""
+    id = 1
+
+    def __init__(self, label=SIM_TODAY):
+        self._label = label
+
+    def decision_label(self):
+        return self._label
+
+
+class _NoLabelAccount:
+    """An account that cannot trade options: it has no decision label."""
     id = 1
 
 
@@ -104,10 +116,10 @@ def _leg(db, txn_id, contract, *, side, expiry, symbol="AAPL", status=None, qty=
     return leg
 
 
-def _cond(order, *, op="<=", value=21, rec=None):
+def _cond(order, *, op="<=", value=21, rec=None, account=None):
     from ba2_common.core.TradeConditions import DaysToExpiryCondition
     return DaysToExpiryCondition(
-        account=_FakeAccount(), instrument_name="AAPL",
+        account=account or _FakeAccount(), instrument_name="AAPL",
         expert_recommendation=rec or _rec(), operator_str=op, value=value,
         existing_order=order,
     )
@@ -488,16 +500,16 @@ def test_equity_order_is_unevaluable(tmp_path):
 
 
 def test_missing_evaluation_date_is_unevaluable(tmp_path):
-    """No as-of means no "today" — and substituting the wall clock in a backtest is the
-    lookahead bug ``DaysOpenedCondition``'s docstring was written about."""
+    """An account with no decision label means no "today" — and substituting the wall clock
+    in a backtest is the lookahead bug ``DaysOpenedCondition``'s docstring was written about."""
     db = _setup_db(tmp_path)
     txn_id = _option_txn(db, expiry=SIM_TODAY + timedelta(days=3))
     parent = _parent_order(db, txn_id)
 
-    cond = _cond(parent, op="<=", value=21, rec=SimpleNamespace(instance_id=1,
-                                                                created_at=None))
+    cond = _cond(parent, op="<=", value=21, account=_NoLabelAccount())
     assert cond.evaluate() is False
     assert cond.get_calculated_value() is None
+    assert "decision session label" in cond.get_actual_value_display()
 
 
 # ---------------------------------------------------------------------------
@@ -528,29 +540,17 @@ def test_uses_the_evaluation_bar_not_the_wall_clock(tmp_path):
     assert cond.get_calculated_value() == 45
 
 
-def test_a_naive_as_of_is_handled(tmp_path):
-    """Rows round-trip through naive DateTime columns; a naive as-of must still work."""
+def test_the_recommendation_timestamp_is_not_the_reference_point(tmp_path):
+    """The exit counts from the account's decision label -- the date the ENTRY counted from --
+    not from the recommendation's ``created_at`` (a UTC date: one session behind the entry
+    in a backtest, the next calendar day for a live evening decision)."""
     db = _setup_db(tmp_path)
     txn_id = _option_txn(db, expiry=SIM_TODAY + timedelta(days=6))
     parent = _parent_order(db, txn_id)
 
-    cond = _cond(parent, rec=_rec(as_of=datetime(2024, 6, 15, 15, 30)))
+    cond = _cond(parent, rec=_rec(as_of=datetime(2024, 6, 1, 15, 30, tzinfo=timezone.utc)))
     assert cond.evaluate() is True
     assert cond.get_calculated_value() == 6
-
-
-def test_a_naive_as_of_is_read_as_utc_not_as_local_time(tmp_path):
-    """Naive datetimes in this codebase are UTC by convention (the DB columns strip
-    tzinfo). Letting ``astimezone()`` reinterpret them in the MACHINE's local zone shifts
-    an early-morning bar onto the previous calendar day and the DTE off by one — and the
-    same backtest then measures a different quantity on a different developer's laptop."""
-    db = _setup_db(tmp_path)
-    txn_id = _option_txn(db, expiry=date(2024, 6, 22))
-    parent = _parent_order(db, txn_id)
-
-    cond = _cond(parent, rec=_rec(as_of=datetime(2024, 6, 15, 0, 30)))
-    cond.evaluate()
-    assert cond.get_calculated_value() == 7
 
 
 def test_expiry_stored_as_a_datetime_is_handled(tmp_path):
@@ -604,18 +604,29 @@ def test_expiry_day_itself_is_zero_dte_not_one(tmp_path):
     assert cond.get_calculated_value() == 0
 
 
-def test_time_of_day_does_not_shift_the_day_count(tmp_path):
-    """Calendar days, from the evaluation DATE. A 23:59 bar and a 00:01 bar on the same
-    session must report the same DTE, or the exit fires a day early on late bars."""
+@pytest.mark.parametrize("instant", [
+    datetime(2024, 6, 15, 13, 35, tzinfo=timezone.utc),    # 09:35 ET
+    datetime(2024, 6, 16, 1, 0, tzinfo=timezone.utc),      # 21:00 ET: UTC is already the 16th
+], ids=["morning_et", "evening_et_utc_next_day"])
+def test_live_counts_from_the_new_york_date_of_the_decision(tmp_path, monkeypatch, instant):
+    """A LIVE account's label is the New York date of the decision instant (the interface
+    default), so an evening decision -- already the next day in UTC -- still counts from
+    the New York date. The recommendation's created_at (UTC) would have said the 16th."""
+    from ba2_common.core import option_session
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+    class _Live:
+        id = 1
+        decision_label = OptionsAccountInterface.decision_label
+
+    monkeypatch.setattr(option_session, "live_decision_time", lambda: instant)
     db = _setup_db(tmp_path)
     txn_id = _option_txn(db, expiry=SIM_TODAY + timedelta(days=7))
     parent = _parent_order(db, txn_id)
 
-    early = _cond(parent, rec=_rec(as_of=datetime(2024, 6, 15, 0, 1, tzinfo=timezone.utc)))
-    late = _cond(parent, rec=_rec(as_of=datetime(2024, 6, 15, 23, 59, tzinfo=timezone.utc)))
-    early.evaluate()
-    late.evaluate()
-    assert early.get_calculated_value() == late.get_calculated_value() == 7
+    cond = _cond(parent, account=_Live(), rec=_rec(as_of=instant))
+    cond.evaluate()
+    assert cond.get_calculated_value() == 7
 
 
 def test_past_expiry_reports_a_negative_dte_not_zero(tmp_path):

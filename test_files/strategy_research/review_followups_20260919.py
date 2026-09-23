@@ -102,7 +102,7 @@ def run():
         bt = job["optimization_config"]["backtest"]
         driver_report = MC.preflight(bt, cache_root)
         bt["backtest_id"] = "review-preflight"
-        trial = _build_daily_trial_config(bt, decode_params(SimpleNamespace(**job["strategy"]), {}))
+        trial = _build_daily_trial_config(bt, decode_params(SimpleNamespace(**job["strategy"]), {}), option_trade_records=False)
         mapped = MappedMarketConditionReader(cache_root, bt["market_condition_manifests"]["ohlcv-v1"], "ohlcv-v1")
         try:
             check_market_condition_window(trial, SimpleNamespace(mapped_reader=mapped))

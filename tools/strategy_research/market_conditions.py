@@ -100,22 +100,26 @@ def preflight(backtest, cache_root):
 
     This may prepare local mapped arrays. It never downloads or calculates indicators.
     Inspection uses all regular sessions, a conservative superset of the entry schedule.
+
+    ``start_date``/``end_date`` are BACKTEST BARS; each reads its own session's row (the rule
+    ``BacktestMarketConditionResolver`` applies).
     """
     if "market_condition_profiles" not in backtest:
         return None
     import numpy as np
     import pyarrow.parquet as pq
-    from ba2_common.core.market_calendar import nyse_regular_sessions, prior_regular_session, NY_TZ
+    from ba2_common.core.market_calendar import (
+        NY_TZ, backtest_decision_label, decision_data_session, nyse_regular_sessions)
     from ba2_common.core.market_condition_reader import MappedMarketConditionReader, prepare_host
     from ba2_common.core.market_condition_store import calendar_version
     from ba2_common.core.market_conditions import (
         PROFILES, STATUSES, STATUS_VALID, STATUS_MISSING_SESSION, STATUS_INSUFFICIENT_HISTORY, WINDOW)
 
     start, end = (date.fromisoformat(backtest[k]) for k in ("start_date", "end_date"))
-    decisions = [o.astimezone(NY_TZ).date() for o, _ in nyse_regular_sessions(start, end)]
-    if not decisions:
+    bars = [o.astimezone(NY_TZ).date() for o, _ in nyse_regular_sessions(start, end)]
+    if not bars:
         raise ValueError("Market-condition window contains no regular sessions")
-    sessions = [prior_regular_session(d) for d in decisions]
+    sessions = [decision_data_session(backtest_decision_label(d)) for d in bars]  # == bars, by the rule
     days = np.asarray(sessions, dtype="datetime64[D]")
     symbols = backtest["enabled_instruments"]
     raw_dates = {}
@@ -144,7 +148,7 @@ def preflight(backtest, cache_root):
             present, statuses = reader.statuses_for_sessions(symbol, sessions)
             if not present.all():
                 missing = [str(d) for d in days[~present][:5]]
-                raise ValueError(f"{profile}/{symbol}: missing required prior-session rows {missing}; rewarm the window")
+                raise ValueError(f"{profile}/{symbol}: missing required bar-session rows {missing}; rewarm the window")
             # The first cached bar is an availability boundary, not a claim of a verified IPO.
             dates = raw_dates[symbol]
             before_source = days < dates[0]

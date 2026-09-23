@@ -250,6 +250,6 @@ def test_the_store_survives_into_the_per_trial_config(monkeypatch):
 
     decoded = {"tp": 8.0, "sl": 3.0, "expert_overrides": {}, "buy_tree": None,
                "sell_tree": None, "exit_rules": []}
-    trial = _build_daily_trial_config(_across_the_wire(block), decoded)
+    trial = _build_daily_trial_config(_across_the_wire(block), decoded, option_trade_records=False)
     assert trial["options_store"] == TASTYTRADE
     assert resolve_options_store(_across_the_wire(trial)) == TASTYTRADE

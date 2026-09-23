@@ -11,7 +11,8 @@ from ba2_common.core.TradeActions import TradeAction, create_action, AdjustTakeP
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from ba2_common.core.types import (
-    OrderRecommendation, ExpertEventType, ExpertActionType, get_option_action_values,
+    OrderRecommendation, ExpertEventType, ExpertActionType, OptionCloseReason,
+    get_option_action_values,
     get_option_entry_action_values,
 )
 from ba2_common.core.db import get_db, get_instance, InstanceNotFound
@@ -187,6 +188,73 @@ def forced_option_exit(event_action) -> bool:
         if loss_side is not None and trigger.get("operator") in loss_side:
             return True
     return False
+
+
+#: CLOSE-TRIGGER CLASSES by event type (plan Part C3), consulted by ``option_close_trigger``.
+#: Remaining-life triggers are a DTE exit; elapsed-time triggers a time exit.
+_DTE_EXIT_EVENT_TYPES = frozenset({
+    ExpertEventType.N_DAYS_TO_EXPIRY.value,
+    ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY.value,
+    ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY.value,
+})
+_TIME_EXIT_EVENT_TYPES = frozenset({
+    ExpertEventType.N_DAYS_OPENED.value,
+    ExpertEventType.N_DAYS_AFTER_EVENT.value,
+})
+#: PROFIT-SIDE thresholds, keyed like ``_LOSS_SIDE_STOP_OPERATORS``: the operators that make
+#: the trigger fire as the position gets BETTER. ``loss_pct_of_max_loss`` has no entry -- it
+#: has no take-profit reading (see its note above).
+_PROFIT_SIDE_OPERATORS = {
+    ExpertEventType.N_PROFIT_LOSS_PERCENT.value: frozenset({">", ">="}),
+    ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: frozenset({">", ">="}),
+    ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value: frozenset({">", ">="}),
+    # the share of the entry credit already decayed away: bigger == more of it captured.
+    ExpertEventType.N_CREDIT_DECAYED_PCT.value: frozenset({">", ">="}),
+}
+#: When a rule ANDs triggers of several classes, the one recorded is the first of these the
+#: rule carries: a risk reading outranks a schedule, a schedule outranks a profit target.
+_CLOSE_TRIGGER_PRECEDENCE = (
+    OptionCloseReason.STOP_LOSS, OptionCloseReason.DTE_EXIT, OptionCloseReason.TIME_EXIT,
+    OptionCloseReason.TAKE_PROFIT,
+)
+
+
+def option_close_trigger(event_action) -> OptionCloseReason:
+    """WHY this rule's CLOSE_OPTION closes the position -- recorded, never decided on.
+
+    Classified from the rule's TRIGGER SEMANTICS, the same reading ``forced_option_exit``
+    takes (never the rule's name, which is free text):
+
+      * a loss-side numeric trigger (``_LOSS_SIDE_STOP_OPERATORS``) -> ``stop_loss``;
+      * a remaining-life trigger (``_DTE_EXIT_EVENT_TYPES``) -> ``dte_exit``;
+      * an elapsed-time trigger (``_TIME_EXIT_EVENT_TYPES``) -> ``time_exit``;
+      * a profit-side numeric trigger (``_PROFIT_SIDE_OPERATORS``) -> ``take_profit``;
+      * anything else, or no trigger at all -> ``rule_exit``.
+
+    Triggers inside one rule are ANDed, so a rule carrying two classes fired on both; the one
+    recorded is the first in ``_CLOSE_TRIGGER_PRECEDENCE``. The result is written into the
+    close order's ``exit_record`` and read back only by reporting: nothing about WHETHER or
+    HOW the close happens depends on it (that is ``forced_option_exit``'s job, unchanged).
+    """
+    found = set()
+    for trigger in (getattr(event_action, "triggers", None) or {}).values():
+        if not isinstance(trigger, dict):
+            continue
+        event_type = trigger.get("event_type")
+        op = trigger.get("operator")
+        loss_side = _LOSS_SIDE_STOP_OPERATORS.get(event_type)
+        if loss_side is not None and op in loss_side:
+            found.add(OptionCloseReason.STOP_LOSS)
+        elif event_type in _DTE_EXIT_EVENT_TYPES:
+            found.add(OptionCloseReason.DTE_EXIT)
+        elif event_type in _TIME_EXIT_EVENT_TYPES:
+            found.add(OptionCloseReason.TIME_EXIT)
+        elif op in _PROFIT_SIDE_OPERATORS.get(event_type, ()):
+            found.add(OptionCloseReason.TAKE_PROFIT)
+    for reason in _CLOSE_TRIGGER_PRECEDENCE:
+        if reason in found:
+            return reason
+    return OptionCloseReason.RULE_EXIT
 
 
 def _sanitize_for_json(obj):
@@ -1167,6 +1235,11 @@ class TradeActionEvaluator:
                 # whether to cross the modelled spread fully (SL/DTE) or concede the
                 # entry's fraction. Inert in live (no modelled spread).
                 kwargs['forced_exit'] = forced_option_exit(event_action)
+                # WHY it closes, and WHICH rule fired it -- RECORDED on the close order's
+                # exit_record (plan Part C3), never read by the close decision itself.
+                kwargs['close_trigger'] = option_close_trigger(event_action)
+                kwargs['rule_id'] = getattr(event_action, 'id', None)
+                kwargs['rule_name'] = getattr(event_action, 'name', None)
                 # WHICH option to close. Absent on every pre-existing rule (unchanged
                 # behaviour: the evaluated order, else its transaction's option entry).
                 # Present only on the equity-entry overlay keys, whose evaluated order is

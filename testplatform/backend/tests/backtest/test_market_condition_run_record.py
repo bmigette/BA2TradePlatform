@@ -65,7 +65,10 @@ class _Resolver:
             calc_version=SPEC.calc_version, reader=self.reader)
 
 
-SESSION, PRIOR = date(2024, 3, 5), date(2024, 3, 4)
+#: The parity clock (plan 2026-09-22 A2): the decision on BAR 2024-03-05 is labelled with the
+#: NEXT session and reads the bar's own row, exactly what ``BacktestMarketConditionResolver``
+#: builds. (Before the fix this fixture was label 03-05 / prior 03-04: the bar read D-1.)
+SESSION, PRIOR = date(2024, 3, 6), date(2024, 3, 5)
 
 
 @pytest.fixture
@@ -216,6 +219,20 @@ def test_a_same_session_fill_records_a_zero_gap_and_no_ambiguity():
     assert trades[0]["entry_state"]["gap_days"] == 0
 
 
+def test_the_binding_keys_on_the_decision_BAR_not_the_next_session_label():
+    """Plan 2026-09-22 A2. A record's ``session`` is N(D) and its ``prior_session`` is the bar D;
+    the engine stamps a next_bar_open fill with D. Keyed on the label, that fill would sit one
+    session BEFORE its own decision and bind to nothing (the all-off golden attached 0 of 1)."""
+    states = [{"symbol": "AAA", "session": "2024-03-06", "prior_session": "2024-03-05",
+               "values": {}}]
+    trades = [{"underlying_symbol": "AAA", "entry_time": "2024-03-05T00:00:00"}]
+    assert attach_entry_states(trades, states) == {"attached": 1, "same_session": 1,
+                                                   "with_gap": 0, "ambiguous": 0}
+    assert trades[0]["entry_state"]["session"] == "2024-03-06"
+    assert trades[0]["entry_state"]["prior_session"] == "2024-03-05"
+    assert trades[0]["entry_state"]["gap_days"] == 0
+
+
 def test_two_decisions_in_one_week_make_the_binding_AMBIGUOUS_and_say_so():
     """THE CASE THE BOUND ALONE CANNOT SETTLE. ``note_entry`` records a state whenever an entry
     RULE fires -- including Monday's decision, which the dup-position or equity gate then
@@ -337,8 +354,10 @@ def test_a_profile_less_run_gets_NO_key_at_all(record):
 def test_the_block_lands_on_the_results_and_the_states_land_on_the_trades(record):
     record.note_eligible()
     record.note_entry(object(), "AAA", object())
-    results = {"trades": [{"symbol": "AAA", "entry_time": f"{SESSION.isoformat()}T15:00:00"},
-                          {"symbol": "ZZZ", "entry_time": f"{SESSION.isoformat()}T15:00:00"}]}
+    # The engine stamps a next_bar_open fill with the DECISION BAR (``_fill_dates[...] = as_of``),
+    # which under the parity clock is the record's ``prior_session``: bound with no gap.
+    results = {"trades": [{"symbol": "AAA", "entry_time": f"{PRIOR.isoformat()}T15:00:00"},
+                          {"symbol": "ZZZ", "entry_time": f"{PRIOR.isoformat()}T15:00:00"}]}
     apply_market_condition_block(results, record)
     block = results["market_condition"]
     assert block["stats"]["structures_with_entry_state"] == 1

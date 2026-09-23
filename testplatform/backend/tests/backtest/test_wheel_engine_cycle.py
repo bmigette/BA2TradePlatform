@@ -30,6 +30,7 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 import importlib.util
 import os
 import sys
@@ -80,7 +81,7 @@ CALL = f"WHLX{CALL_EXPIRY:%y%m%d}C00019000"
 CC_DTE_FLOOR = 7
 
 CFG = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": 0.0,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",
@@ -234,9 +235,12 @@ def _rules(m):
     # still be EMITTED and EVALUATED — that is exactly what the M7 pins measure — so pinning
     # them non-firing is the only way to observe reachability without the put being closed
     # first. Each value is a point a real genome can occupy (the PMCC engine test pins its two
-    # searched thresholds the same way, for the same reason).
+    # searched thresholds the same way, for the same reason) -- EXCEPT opt_dte = -1, which is
+    # deliberately OUTSIDE its searched band (it starts at 0). Since DTE exits count from the
+    # decision session label N(D), 0 fires on the bar before expiry and closes the put before it
+    # can be assigned; that is correct and matches live, so the harness needs a never-firing -1.
     exits = list(strat.exit_rules or [])
-    for rid, value in (("opt_tp", 75.0), ("opt_time", 200.0), ("opt_dte", 0.0),
+    for rid, value in (("opt_tp", 75.0), ("opt_time", 200.0), ("opt_dte", -1.0),
                        ("opt_sl", -500.0), ("opt_sl_ml", 500.0)):
         rule = next((r for r in exits if r.get("id") == rid), None)
         assert rule is not None, f"the wheel stopped emitting {rid}; the M7 pins go vacuous"

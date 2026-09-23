@@ -26,6 +26,7 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 from datetime import datetime, timezone
 
 import pytest
@@ -35,7 +36,7 @@ from ba2_common.core.types import OrderRecommendation, Recommendation
 
 # No slippage / no commission so price/quantity assertions are exact.
 CFG = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": 0.0,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",
@@ -219,7 +220,7 @@ def _precedence_setup(account_id: int, expert_id: int, ruleset_sl_price: "float 
     from ba2_common.core.db import add_instance, get_instance, update_instance
 
     cfg = {
-        "starting_cash": 100_000.0,
+        **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
         "commission_per_trade": 0.0,
         "slippage_bps": 0.0,
         "fill_model": "next_bar_open",

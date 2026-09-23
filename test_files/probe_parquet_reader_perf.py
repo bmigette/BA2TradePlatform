@@ -98,7 +98,7 @@ def measure_hot_path(n_contracts=300, passes=50):
     # Warm every memo first (greeks, bar dicts, occ->underlying).
     for occ in picked:
         p.get_bar(occ, as_of)
-        p.get_quote(occ, as_of)
+        p.get_quote(occ, as_of, data_session=as_of)
 
     gc.collect()
     t0 = time.perf_counter()
@@ -111,7 +111,7 @@ def measure_hot_path(n_contracts=300, passes=50):
     t0 = time.perf_counter()
     for _ in range(passes):
         for occ in picked:
-            p.get_quote(occ, as_of)
+            p.get_quote(occ, as_of, data_session=as_of)
     quote_us = (time.perf_counter() - t0) / (passes * len(picked)) * 1e6
 
     # bar_dict standalone (no dispatch / occ parse), and greeks on a memo hit.
@@ -137,7 +137,7 @@ def measure_hot_path(n_contracts=300, passes=50):
     t0 = time.perf_counter()
     for _ in range(20):
         chain = p.get_chain("GOOG", as_of, expiry_min=date(2023, 1, 1),
-                            expiry_max=date(2023, 12, 31))
+                            expiry_max=date(2023, 12, 31), data_session=as_of)
     chain_ms = (time.perf_counter() - t0) / 20 * 1e3
 
     print(f"  get_chain        {chain_ms:6.2f} ms/call  (warm, {len(chain)} contracts)")
@@ -159,7 +159,7 @@ def fingerprint():
     for sym in ["GOOG", "BAC", "INTC", "F", "T"]:
         for d in (date(2023, 1, 17), date(2023, 2, 15), date(2023, 3, 10)):
             chain = p.get_chain(sym, d, expiry_min=date(2023, 1, 1),
-                                expiry_max=date(2023, 12, 31))
+                                expiry_max=date(2023, 12, 31), data_session=d)
             out[f"chain:{sym}:{d}"] = [
                 [c.symbol, c.strike, str(c.expiry), str(c.option_type), c.bid, c.ask, c.last,
                  c.implied_volatility, c.delta, c.gamma, c.theta, c.vega,
@@ -172,7 +172,7 @@ def fingerprint():
                 if b is not None:
                     bars[c.symbol] = {k: (str(v) if isinstance(v, date) else v)
                                       for k, v in sorted(b.items())}
-                q = p.get_quote(c.symbol, d)
+                q = p.get_quote(c.symbol, d, data_session=d)
                 if q is not None:
                     bars.setdefault(c.symbol, {})["__quote"] = [q.bid, q.ask, q.last]
             out[f"bars:{sym}:{d}"] = bars

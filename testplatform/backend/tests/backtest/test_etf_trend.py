@@ -160,7 +160,7 @@ def test_real_engine_opens_selected_fund_through_shared_rules(monkeypatch):
     bt["experts"][0]["settings"].update(universe_symbols=["AAPL", "MSFT"], momentum_bars=5,
                                          trend_bars=5, top_n=1)
     decoded = decode_params(SimpleNamespace(**job["strategy"]), {})
-    config = _build_daily_trial_config(bt, decoded)
+    config = _build_daily_trial_config(bt, decoded, option_trade_records=False)
     before = logging.root.manager.disable
     try:
         logging.disable(logging.INFO)

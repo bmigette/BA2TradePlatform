@@ -165,6 +165,23 @@ class _Account:
         return self.day
 
 
+def test_a_bar_reads_its_own_session_and_is_labelled_the_next_one(ps):
+    """BT/live parity (plan 2026-09-22 A2). Bar D decides with data through D's close and fills
+    on D+1, so it IS the live decision made during the next session: label N(D), data session
+    D. Before the fix the bar was its own label and read D-1 -- one session staler than live."""
+    from app.services.backtest.market_condition_bt import BacktestMarketConditionResolver
+
+    resolver = BacktestMarketConditionResolver(_reader(ps))
+    ctx = resolver(_Account(date(2025, 6, 3)), "AAA", None)     # a Tuesday
+    assert ctx.prior_session == date(2025, 6, 3)
+    assert ctx.session_label == date(2025, 6, 4)
+    # A Friday bar is Monday's decision; a bar before a holiday skips it.
+    fri = resolver(_Account(date(2025, 6, 6)), "AAA", None)
+    assert (fri.prior_session, fri.session_label) == (date(2025, 6, 6), date(2025, 6, 9))
+    pre = resolver(_Account(date(2025, 7, 3)), "AAA", None)      # half-day before July 4th
+    assert (pre.prior_session, pre.session_label) == (date(2025, 7, 3), date(2025, 7, 7))
+
+
 def test_resolver_builds_one_context_per_session(ps):
     from app.services.backtest.market_condition_bt import BacktestMarketConditionResolver
 
@@ -172,8 +189,9 @@ def test_resolver_builds_one_context_per_session(ps):
     account = _Account(date(2025, 7, 1))
     a, b, c = (resolver(account, "AAA", None) for _ in range(3))
     assert a is b is c
-    assert a.session_label == date(2025, 7, 1)
-    assert a.prior_session == SESSION
+    assert a.session_label == date(2025, 7, 2)
+    assert a.prior_session == date(2025, 7, 1)
+    # The instant the backtest decides: the BAR's close (data through it is complete).
     assert a.decision_time == datetime(2025, 7, 1, 20, 0, tzinfo=timezone.utc)
     assert a.calc_version == OHLCV_V1.calc_version
     assert a.source_profile == "fmp-daily-split-adjusted-v1"
@@ -181,7 +199,8 @@ def test_resolver_builds_one_context_per_session(ps):
 
     account.day = date(2025, 7, 2)
     d = resolver(account, "AAA", None)
-    assert d is not a and d.prior_session == date(2025, 7, 1)
+    assert d is not a and d.prior_session == date(2025, 7, 2)
+    assert d.session_label == date(2025, 7, 3)
     assert resolver(account, "BBB", None) is d
 
 
@@ -192,12 +211,47 @@ def test_resolver_non_session_date_is_no_context(ps):
     assert resolver(_Account(date(2025, 7, 4)), "AAA", None) is None
 
 
+def test_the_resolver_never_calls_the_calendar_schedule_once_the_table_is_built(ps, monkeypatch):
+    """Per-bar cost: every session question is answered from the session table (O(log n)).
+    A per-bar ``schedule()`` (~10 ms) would add seconds to every GA trial."""
+    from ba2_common.core import market_calendar
+    from ba2_common.core.market_calendar import regular_session_dates
+    from app.services.backtest.market_condition_bt import BacktestMarketConditionResolver
+
+    resolver = BacktestMarketConditionResolver(_reader(ps))
+    resolver(_Account(date(2025, 6, 2)), "AAA", None)                 # table built
+    bars = regular_session_dates(date(2024, 1, 2), date(2025, 7, 31))  # before the spy
+    cal = market_calendar._nyse_calendar()
+    calls = []
+    real = cal.schedule
+    monkeypatch.setattr(cal, "schedule", lambda *a, **k: calls.append(k) or real(*a, **k))
+    for bar in bars + [date(2025, 7, 4), date(2025, 6, 7)]:       # plus two non-session bars
+        resolver(_Account(bar), "AAA", None)
+    assert calls == []
+
+
+def test_a_calendar_edge_failure_on_a_session_bar_propagates_not_no_context(ps, monkeypatch):
+    """Only a NON-session bar maps to no_context. On a real session, a calendar failure (no later
+    session in the table, a table that does not reach) is a fault and must surface."""
+    from app.services.backtest import market_condition_bt as bt
+
+    def edge(bar):
+        raise ValueError(f"no regular NYSE session after {bar}")
+
+    monkeypatch.setattr(bt, "backtest_decision_label", edge)
+    resolver = bt.BacktestMarketConditionResolver(_reader(ps))
+    with pytest.raises(ValueError, match="no regular NYSE session after"):
+        resolver(_Account(date(2025, 7, 1)), "AAA", None)
+    assert resolver._not_a_session is None
+
+
 def test_a_market_leaf_evaluates_through_the_installed_resolver(ps):
     seam_wiring.install_backtest_market_conditions({"market_condition_profile": "ohlcv-v1"}, ps)
     from ba2_common.core.types import ExpertEventType
 
     account = SimpleNamespace(_as_of_date=lambda: date(2025, 7, 1))
-    row = _reader(ps).observe("AAA", SESSION)
+    # Bar 2025-07-01 reads its OWN session's row (the next session's live decision would too).
+    row = _reader(ps).observe("AAA", date(2025, 7, 1))
     adx = row.by_field()["underlying_adx_14"].value
     leaf = TradeConditions.create_condition(ExpertEventType.N_UNDERLYING_ADX, account, "AAA", None,
                                             operator_str=">", value=adx - 1.0)
@@ -631,7 +685,7 @@ def test_the_setting_survives_the_trial_config_whitelist():
         {"backtest_id": "mc", "start_date": "2024-02-01", "end_date": "2024-06-01",
          "enabled_instruments": ["AAA"], "experts": [_spec("ohlcv-v1")],
          "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
-         "market_condition_manifests": {"ohlcv-v1": "d1"}}, {})
+         "market_condition_manifests": {"ohlcv-v1": "d1"}}, {}, option_trade_records=False)
     assert cfg["experts"][0]["settings"]["market_condition_profile"] == "ohlcv-v1"
     # ... and the derived keys are written out too, so every stored-config consumer still reads
     # a resolved list (and the two are checked against each other on the way back in).

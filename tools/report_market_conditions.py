@@ -668,7 +668,7 @@ def _render_run(out: List[str], run: Dict[str, Any], block: Dict[str, Any]) -> N
     gaps = data["gap_days"]
     _line(out, f"  units {data['units']}, without a recorded entry state {data['unattributed']}, "
                f"legs disagreeing on their state {data['inconsistent']}")
-    _line(out, f"  bound on the decision's own session {sum(1 for g in gaps if g == 0)}, "
+    _line(out, f"  bound on the decision's own bar {sum(1 for g in gaps if g == 0)}, "
                f"across a gap {sum(1 for g in gaps if g > 0)} "
                f"(max {max(gaps) if gaps else 0} days), AMBIGUOUS {data['ambiguous']}")
     for key, label in (("bound_same_session", "same session"), ("bound_with_gap", "with a gap"),

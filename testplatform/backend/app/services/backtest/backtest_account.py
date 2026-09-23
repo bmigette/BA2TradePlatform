@@ -70,10 +70,16 @@ from ba2_common.core.types import (
     TransactionStatus,
     AssetClass,
     OptionRight,
+    OptionCloseReason,
 )
 from ba2_common.core.option_types import OptionPosition
+from ba2_common.core.option_trade_record import (
+    exit_record as option_exit_record, settlement_close_reason,
+)
+from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.option_bs import bs_price
+from ba2_common.core import option_spread_model as _osm
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
 from ba2_common.core.trade_store import orders_where, transactions_where
 
@@ -83,6 +89,109 @@ from .options_provider import HistoricalOptionsProvider
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _expiry_trigger(side: OrderDirection, itm: bool) -> OptionCloseReason:
+    """The OCC event an expiring leg resolves by: OTM -> expired; ITM short -> assigned;
+    ITM long -> exercised (the live OPEXP / OPASN / OPEXC)."""
+    if not itm:
+        return OptionCloseReason.EXPIRED_OTM
+    return (OptionCloseReason.ASSIGNED if side == OrderDirection.SELL
+            else OptionCloseReason.EXERCISED)
+
+
+def _is_option_row(opening) -> bool:
+    """True for an OPTION leg round-trip (the opening order trades a contract)."""
+    return (getattr(opening, "asset_class", None) == AssetClass.OPTION
+            and bool(getattr(opening, "contract_symbol", None)))
+
+
+def _record_carrier(order, key: str, by_id: Dict[int, Any]):
+    """The order whose ``data`` carries ``key`` for ``order``'s fill: the order itself (a
+    single-leg ticket, a synthetic settlement close), else its multi-leg PARENT (whose leg
+    children are what fills). None when neither carries one."""
+    seen = 0
+    while order is not None and seen < 2:
+        if key in (getattr(order, "data", None) or {}):
+            return order
+        parent_id = getattr(order, "parent_order_id", None)
+        order = by_id.get(parent_id) if parent_id is not None else None
+        seen += 1
+    return None
+
+
+def _recorded_trigger(carrier) -> Optional[str]:
+    """The ``exit_record`` trigger on ``carrier`` (None when there is no record)."""
+    if carrier is None:
+        return None
+    record = (carrier.data or {}).get("exit_record")
+    return record.get("trigger") if isinstance(record, dict) else None
+
+
+def _record_leg(record: Dict[str, Any], contract_symbol: str) -> Optional[Dict[str, Any]]:
+    """The leg snapshot of ``contract_symbol`` in ``record`` (None when it had no quote)."""
+    for leg in record.get("legs") or ():
+        if leg.get("contract_symbol") == contract_symbol:
+            return leg
+    return None
+
+
+def _recommendation_confidence(carrier) -> Optional[float]:
+    """The confidence (1-100) of the expert recommendation that opened ``carrier``'s entry,
+    or None when the entry names none (a roll, a direct submit) or it cannot be found."""
+    rec_id = getattr(carrier, "expert_recommendation_id", None)
+    if rec_id is None:
+        return None
+    from ba2_common.core.models import ExpertRecommendation
+    from ba2_common.core.trade_store import get_or_none
+    rec = get_or_none(ExpertRecommendation, rec_id)
+    conf = getattr(rec, "confidence", None) if rec is not None else None
+    return float(conf) if conf is not None else None
+
+
+def _attach_option_records(trades: List[Dict[str, Any]], carriers: Dict[int, tuple]) -> None:
+    """Add the option trade record to each OPTION row, in place (plan Part C4).
+
+    PER LEG ROW: ``entry_record = {"leg": <its entry snapshot>}`` and ``exit_record =
+    {"trigger", "rule_id", "rule_name", "leg": <its exit snapshot>}`` (None for a row still
+    open at run end). A leg is its own round trip and its own close, so its snapshots and its
+    trigger ride its own row.
+
+    ONCE PER RECORD, on the FIRST row that reads it (the ``attach_entry_states`` convention --
+    the same structure-level dict on four condor legs is three copies of nothing):
+    ``option_strategy``, ``recommendation_confidence``, and the entry record's ``version`` /
+    ``structure`` / ``legs_without_quote`` (and its ``error`` when it is an error record). An
+    entry with no record at all reads ``entry_record = None`` -- absent, never invented."""
+    seen_entries = set()
+    for row in trades:
+        info = carriers.get(id(row))
+        if info is None:
+            continue
+        entry_carrier, exit_carrier = info
+        contract = row.get("contract_symbol")
+        entry = (entry_carrier.data or {}).get("entry_record") if entry_carrier is not None else None
+        entry_view = None
+        if isinstance(entry, dict):
+            entry_view = {"leg": _record_leg(entry, contract)}
+            if id(entry_carrier) not in seen_entries:
+                seen_entries.add(id(entry_carrier))
+                row["option_strategy"] = getattr(entry_carrier, "option_strategy", None)
+                row["recommendation_confidence"] = _recommendation_confidence(entry_carrier)
+                entry_view = {"version": entry.get("version"),
+                              "structure": entry.get("structure"),
+                              "legs_without_quote": entry.get("legs_without_quote"),
+                              **({"error": entry["error"]} if "error" in entry else {}),
+                              "leg": entry_view["leg"]}
+        row["entry_record"] = entry_view
+        exit_rec = (exit_carrier.data or {}).get("exit_record") if exit_carrier is not None else None
+        if isinstance(exit_rec, dict):
+            row["exit_record"] = {
+                "trigger": exit_rec.get("trigger"), "rule_id": exit_rec.get("rule_id"),
+                "rule_name": exit_rec.get("rule_name"),
+                **({"error": exit_rec["error"]} if "error" in exit_rec else {}),
+                "leg": _record_leg(exit_rec, contract)}
+        else:
+            row["exit_record"] = None
 
 
 class StaleMarkToMarket(RuntimeError):
@@ -204,8 +313,18 @@ _BS_IV_STALENESS_DAYS = 5
 _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 
 # ---------------------------------------------------------------------------
-# OPTION BID-ASK SPREAD MODEL (2026-07-25)
+# OPTION BID-ASK SPREAD MODEL (2026-07-25) -- NOW THE ``legacy-pct`` MODEL ONLY
 # ---------------------------------------------------------------------------
+# Since plan 2026-09-22 Part F the DEFAULT option spread is the calibrated model
+# (``option_spread_model = SPREAD_MODEL_VERSION``, ``ba2_common.core.option_spread_model``):
+# the decision bar's real NBBO when valid, else a power law fitted on ThetaData EOD quotes;
+# see ``_option_half_spread``. Everything in THIS block -- percent of premium, the min-tick
+# floor, and the FILL-day thin-volume doubling below -- describes ``legacy-pct`` only, which a
+# run gets solely by asking for it (``--option-spread-pct``/``--option-spread-min-tick`` or
+# ``option_spread_model='legacy-pct'``) or by being a stored pre-Part-F config (5.0/0.02).
+# The measurement that retired it: too cheap under $2 of premium (0.3-0.7x), too expensive
+# above $10 (1.4-3x), and the doubling read the fill day's volume (a small look-ahead).
+#
 # WHY A SEPARATE MODEL FROM ``spread_bps``: the equity ``spread_bps`` knob is basis points OF
 # PRICE, which is the right SHAPE for a stock and the wrong shape for an option. On a $100
 # stock, 5 bps = $0.05 — realistic. On a $1.00 option premium, 5 bps = $0.0005 — about two
@@ -250,6 +369,13 @@ _OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
 _NET_LIMIT_TOLERANCE = 1e-9
 
 
+class SpreadModelConfigError(ValueError):
+    """An options run config that does not state a usable spread model
+    (``BacktestAccount._resolve_spread_model``). A ``ValueError`` so existing catches still
+    see it; NAMED because it is deterministic -- every GA trial of the run refuses the same
+    way -- so ``strategy_optimization_handler`` treats it as FATAL instead of scoring 0."""
+
+
 class BacktestAccount(AccountInterface, OptionsAccountInterface):
     """Simulated broker for daily multi-asset backtests.
 
@@ -270,13 +396,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         price_source: AsOfPriceSource,
         settings: Dict[str, Any],
         options_provider: Optional[HistoricalOptionsProvider] = None,
+        split_basis: Any = None,
+        option_trade_records: bool = True,
     ):
         # ReadOnlyAccountInterface.__init__ registers self.id in the _GLOBAL_PRICE_CACHE.
         super().__init__(id)
+        # WHETHER option actions build the full trade record (``records_option_trades``).
+        # ``run_daily_backtest`` ALWAYS passes the run's STATED ``option_trade_records`` (an
+        # options run that does not state it is refused before this is built). The True
+        # default serves only accounts built directly -- fixtures and harnesses, which are not
+        # runs -- and records fully, exactly as every live account does.
+        if not isinstance(option_trade_records, bool):
+            raise TypeError(f"option_trade_records must be True or False, got "
+                            f"{option_trade_records!r}")
+        self._option_trade_records = option_trade_records
         self._price = price_source
         # OPTIONAL as-of-clamped options reader. None on the equity-only path (existing
         # equity callers pass no provider, so options reads degrade to empty/None).
         self._options = options_provider
+        # The run's verified split basis (``option_split_basis.RunSplitBasis``): the option
+        # path's conversion from this book's split-ADJUSTED closes/shares to the AS-TRADED
+        # basis option strikes are quoted in (plan Part E). ``run_daily_backtest`` ALWAYS
+        # passes one on an options run (``options_store.build_options_run``). ``None`` is the
+        # identity -- the equity-only path, and fixture accounts whose symbols never split --
+        # so no equity code path reads it.
+        self._split_basis = split_basis
         # Resolved config dict (validated fail-early by the engine before the run):
         #   starting_cash, commission_per_trade, slippage_bps, fill_model.
         self._cfg = settings
@@ -286,6 +430,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # ``.get`` is correct rather than a hidden default: absence IS the off state, and 0.0
         # would be a very different (and catastrophic) instruction — see equity_cap.py.
         self._equity_cap: Optional[float] = settings.get("equity_cap")
+        # WHICH option spread model prices every option fill (plan Part F; see
+        # ``_option_half_spread`` and ``_resolve_spread_model``). Resolved HERE, before the first
+        # bar, on every OPTIONS run (a provider is injected), so an unstated or zero spread
+        # refuses the run instead of silently pricing it. An equity-only account never resolves
+        # it (``_spread_model`` is lazy), so equity configs need no spread keys at all.
+        self._spread_model_cache: Optional[str] = None
+        if options_provider is not None:
+            self._spread_model_cache = self._resolve_spread_model(settings)
+        # Where each option fill's half spread came from under the calibrated model (the as-of
+        # real quote vs the fallback formula) -- reported in the run's results so a run priced
+        # almost entirely by the fallback is visible as such. Stays zero under the legacy model.
+        self._spread_sources: Dict[str, int] = {_osm.SOURCE_QUOTE: 0,
+                                                _osm.SOURCE_MODEL: 0}
         # symbol -> signed-position ledger.
         self._positions: Dict[str, _Position] = {}
         # The equity curve: one snapshot per simulated bar (engine appends via snapshot_equity).
@@ -440,13 +597,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             "option_spread_pct": {
                 "type": "float",
                 "required": False,
-                "description": "Modeled option bid-ask spread as a PERCENT OF PREMIUM (full "
-                               "width; half is charged per fill in the adverse direction). "
-                               "Options need this instead of spread_bps, which is bps of "
-                               "price and ~2 orders of magnitude too small for a premium. "
-                               "Widened for thin contracts and floored at "
-                               "option_spread_min_tick. Defaults to 0.0 (exact no-op, "
-                               "pre-2026-07-25 behaviour); the grid passes a real value.",
+                "description": "LEGACY-PCT MODEL ONLY: option bid-ask spread as a PERCENT OF "
+                               "PREMIUM (full width; half charged per fill in the adverse "
+                               "direction), doubled when the FILL bar's volume is under 100 and "
+                               "floored at option_spread_min_tick. Read only when "
+                               "option_spread_model is 'legacy-pct' (or absent on a stored "
+                               "pre-Part-F config, which must then carry non-zero values). "
+                               "Must be ABSENT under the calibrated model. 0.0 is a zero-spread "
+                               "run and is accepted only with option_spread_model='legacy-pct' "
+                               "stated explicitly.",
+            },
+            "option_spread_model": {
+                "type": "str",
+                "required": False,
+                "description": "How option fills pay the bid-ask spread (plan 2026-09-22 Part "
+                               "F). SPREAD_MODEL_VERSION (e.g. 'pow-2026-09-22', the launcher "
+                               "default): the DECISION bar's real NBBO half-spread when it has a "
+                               "valid quote (bid > 0, ask > bid; floored at half a tick), else "
+                               "the calibrated premium/volume power law on that bar -- the fill "
+                               "day is never read. 'legacy-pct': the old percent-of-premium "
+                               "formula from option_spread_pct/option_spread_min_tick (both "
+                               "required). An OPTIONS run must state one; see "
+                               "_resolve_spread_model. Recorded in the run's results.",
             },
             "hold_assigned_stock": {
                 "type": "bool",
@@ -469,9 +641,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             "option_spread_min_tick": {
                 "type": "float",
                 "required": False,
-                "description": "Absolute floor on the modeled option spread, in premium "
-                               "dollars (full width). Percent-of-premium alone under-charges "
-                               "cheap contracts, which is where fabricated edge concentrates.",
+                "description": "LEGACY-PCT MODEL ONLY: absolute floor on the percent-of-"
+                               "premium spread, in premium dollars (full width). Same rules as "
+                               "option_spread_pct: absent under the calibrated model, 0.0 only "
+                               "with option_spread_model='legacy-pct' stated explicitly.",
             },
             "spread_bps": {
                 "type": "float",
@@ -771,9 +944,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if o is None or o.option_type is None:
             return None
         underlying = getattr(o, "underlying_symbol", None) or o.symbol
-        spot = self._price.close_at(underlying)
-        if spot is None:
-            spot = self._price.close_asof(underlying)
+        spot = self._option_spot_asof(underlying)
         if spot is None:
             return None
         if o.option_type == OptionRight.CALL:
@@ -1164,9 +1335,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return None, None, None
         spot = None
         if o.underlying_symbol:
-            spot = self._price.close_at(o.underlying_symbol)
-            if spot is None:
-                spot = self._price.close_asof(o.underlying_symbol)
+            spot = self._option_spot_asof(o.underlying_symbol)
         return float(o.strike), (float(spot) if spot is not None else None), o.option_type
 
     @staticmethod
@@ -1318,8 +1487,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for underlying, lots in by_underlying.items():
             pos = self._positions.get(underlying)
             available = float(pos.qty) if (pos is not None and pos.qty > 0) else 0.0
+            # A contract delivers 100 AS-TRADED shares; ``available`` counts this book's
+            # split-adjusted shares (plan Part E3). 1.0 without a split in the window.
+            k = self._as_traded_factor(underlying) if available > 0 else 1.0
             for lot in sorted(lots, key=lambda l: abs(l.qty), reverse=True):
                 needed = abs(lot.qty) * float(lot.multiplier or 100)
+                if k != 1.0:
+                    needed *= k
                 if needed <= available:
                     covered.add(lot.contract_symbol)
                     available -= needed
@@ -1586,6 +1760,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return 0.0
         if pledged <= 0:
             return qty  # MEASURED zero: nothing has a claim, path unchanged
+        # The pledge is AS-TRADED shares (contracts x 100); ``held`` is this book's
+        # split-adjusted unit (plan Part E3). Identity without a split in the window.
+        pledged = self.option_shares_in_equity_units(symbol, pledged)
 
         # Round the holding DOWN against a pledge rounded UP: a fractional share cannot
         # cover a contract, so both roundings point at "less free inventory".
@@ -1711,7 +1888,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # spread fully (a buyback lifts the ask, ``close + half``) exactly like every
             # other risk exit, THEN clamps into the no-arb bounds (review 2026-08-30 F7).
             # With no spread model configured ``_option_cross`` is the identity.
-            premium = self._option_cross(float(bar["close"]), True, bar)
+            # ``bar`` is the as-of bar here (the liquidation prices at today's close), so it
+            # is also the decision bar the calibrated model reads its quote from.
+            premium = self._option_cross(float(bar["close"]), True, bar, bar)
+            if self._spread_model != _osm.LEGACY_PCT_MODEL:
+                # A forced buyback is an option fill too: count where its spread came from.
+                self._spread_sources[_osm.as_of_half_spread(bar, float(bar["close"]))[1]] += 1
             if bounds is not None:
                 premium = min(max(premium, bounds[0]), bounds[1])
         else:
@@ -1742,7 +1924,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # settlement (synthetic FILLED closing order for round-trip pairing).
             pos = self._option_position_for_lot(lot, txn)
             if pos is not None:
-                self._record_option_expiry_close(txn, pos, float(premium))
+                self._record_option_expiry_close(
+                    txn, pos, float(premium), trigger=OptionCloseReason.FORCED_LIQUIDATION)
         self._zero_option_lot(lot)
         if txn is not None and self._all_legs_resolved(txn):
             from ba2_common.core.utils import close_transaction_with_logging
@@ -1751,7 +1934,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if not txn.close_date:
                 txn.close_date = self._price.now()
             close_transaction_with_logging(
-                txn, account_id=self.id, close_reason="margin_call_liquidation",
+                txn, account_id=self.id,
+                close_reason=OptionCloseReason.FORCED_LIQUIDATION.value,
                 additional_data={"contract_symbol": lot.contract_symbol},
             )
             update_instance(txn)
@@ -2465,6 +2649,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if px is None:
             return None
         px = float(px)
+        # The DECISION bar the spread is read from (calibrated model only -- the legacy model
+        # reads nothing extra, so a legacy run makes exactly the provider calls it always did).
+        # Under same_bar_close the decision bar IS the fill bar (its closing quote is causal).
+        as_of_bar = None
+        if self._spread_model != _osm.LEGACY_PCT_MODEL:
+            if same_bar:
+                as_of_bar = bar
+            else:
+                as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
+                as_of_bar = self._options.get_bar(order.contract_symbol, as_of_day)
         limit = getattr(order, "limit_price", None)
         ot = order.order_type
         if limit is not None and ot == OrderType.BUY_LIMIT:
@@ -2472,11 +2666,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # mid); a buy actually lifts the ASK. Testing the limit against the raw ``px``
             # let every single-leg option order — and they ALL carry a limit_price, unlike
             # multi-leg children — fill without paying the spread on either end.
-            fill_px = self._option_cross(px, True, bar)
+            fill_px = self._option_cross(px, True, bar, as_of_bar)
             if fill_px > float(limit):
                 return None
         elif limit is not None and ot == OrderType.SELL_LIMIT:
-            fill_px = self._option_cross(px, False, bar)   # a sell hits the BID
+            fill_px = self._option_cross(px, False, bar, as_of_bar)   # a sell hits the BID
             if fill_px < float(limit):
                 return None
         else:
@@ -2484,7 +2678,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # combo CHILDREN are LIMIT-typed but carry no limit_price (the parent holds the net
             # limit), so they fall through to here — meaning iron condors / strangles / spreads
             # DO get charged the spread on every leg, which is the point.
-            fill_px = self._option_slip(px, order.side == OrderDirection.BUY, bar)
+            fill_px = self._option_slip(px, order.side == OrderDirection.BUY, bar, as_of_bar)
         reason = self._arb_fill_reject_reason(order, fill_px, fill_day, same_bar, bar)
         if reason is not None:
             self.rejected_arb_fills += 1
@@ -2506,15 +2700,86 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 getattr(order, "quantity", None), reason, self.rejected_illiquid_fills,
             )
             return None
+        if self._spread_model != _osm.LEGACY_PCT_MODEL:
+            self._spread_sources[_osm.as_of_half_spread(as_of_bar, px)[1]] += 1
         return fill_px
 
-    def _option_half_spread(self, premium: float, bar: dict) -> float:
-        """Half the modeled bid-ask spread, in premium dollars per share (>= 0).
+    @property
+    def _spread_model(self) -> str:
+        """The resolved option spread model (lazy: an equity-only account never asks)."""
+        if self._spread_model_cache is None:
+            self._spread_model_cache = self._resolve_spread_model(self._cfg)
+        return self._spread_model_cache
 
-        See the _OPTION_SPREAD_* block for why options need a percent-of-premium model rather
-        than the equity ``spread_bps``. Returns 0.0 when ``option_spread_pct`` is unset/0 and
-        ``option_spread_min_tick`` is 0 — an exact no-op reproducing pre-2026-07-25 fills.
+    @staticmethod
+    def _resolve_spread_model(settings: Dict[str, Any]) -> str:
+        """The run's option spread model, from ``settings``. NO SILENT ZERO SPREAD.
+
+        Every refusal is a ``SpreadModelConfigError`` (a ValueError): the run config is
+        wrong, so every GA trial refuses identically and the optimizer aborts on it.
+
+        * ``option_spread_model`` PRESENT:
+            - the calibrated model (``SPREAD_MODEL_VERSION``): the legacy knobs must be absent
+              (None) -- a percent the run would silently ignore is refused, not dropped;
+            - ``legacy-pct``: BOTH legacy knobs must be present; 0.0 is allowed here and only
+              here, because this is the explicit way to ask for a zero-spread run
+              (``--option-spread-model legacy-pct --option-spread-pct 0 ...``);
+            - anything else is refused.
+        * ``option_spread_model`` ABSENT (a run config stored before plan Part F): legacy, but
+          ONLY when both knobs are present and non-zero (the launcher stored 5.0/0.02) -- that
+          reproduces the stored run's fills exactly. No knobs, one knob, or a 0.0 knob is
+          refused: none of those can be told apart from a key dropped on the way, which would
+          price every option fill at zero spread.
         """
+        pct = settings.get("option_spread_pct")
+        tick = settings.get("option_spread_min_tick")
+        model = settings.get("option_spread_model")
+        if model is not None:
+            if model == _osm.LEGACY_PCT_MODEL:
+                if pct is None or tick is None:
+                    raise SpreadModelConfigError(
+                        "option_spread_model='legacy-pct' needs BOTH option_spread_pct and "
+                        f"option_spread_min_tick (got {pct!r} / {tick!r}).")
+                return model
+            if model in _osm.SPREAD_MODELS:
+                if pct is not None or tick is not None:
+                    raise SpreadModelConfigError(
+                        f"option_spread_model={model!r} ignores the legacy "
+                        f"option_spread_pct/option_spread_min_tick, but they are set "
+                        f"({pct!r} / {tick!r}). Drop them, or select 'legacy-pct' explicitly.")
+                return model
+            raise SpreadModelConfigError(
+                f"option_spread_model={model!r} is not a known spread model; expected one of "
+                f"{_osm.SPREAD_MODELS}")
+        if pct is None or tick is None or float(pct) == 0.0 or float(tick) == 0.0:
+            raise SpreadModelConfigError(
+                "an OPTIONS run must state its spread model: option_spread_model is absent and "
+                f"the legacy knobs (option_spread_pct={pct!r}, option_spread_min_tick={tick!r}) "
+                "do not identify a stored pre-Part-F run. Set option_spread_model (the launcher "
+                f"default is {_osm.SPREAD_MODEL_VERSION!r}); a zero-spread run must say "
+                "option_spread_model='legacy-pct' with the knobs at 0 explicitly.")
+        return _osm.LEGACY_PCT_MODEL
+
+    def _option_half_spread(self, premium: float, bar: dict,
+                            as_of_bar: Optional[dict] = None) -> float:
+        """Half the bid-ask spread one option fill pays, in premium dollars per share (>= 0).
+
+        TWO MODELS, chosen per run (``option_spread_model``):
+
+        * the CALIBRATED model (``ba2_common.core.option_spread_model``, plan Part F): the
+          DECISION bar's real quote ``(ask - bid) / 2`` when ``as_of_bar`` carries a valid one,
+          else the fitted power law on the as-of close and volume. ``bar`` (the FILL bar) is
+          NOT READ AT ALL on this path -- neither its quote nor its volume -- which is what
+          makes the charge causal. ``as_of_bar`` None (the contract has no bar on the decision
+          day) models ``premium`` as a thin contract.
+        * the LEGACY model (``legacy-pct``: explicit ``--option-spread-pct`` /
+          ``--option-spread-min-tick``, or a pre-Part-F config): see the _OPTION_SPREAD_*
+          block. It reads the FILL bar's volume for its thin-doubling and ignores
+          ``as_of_bar``; returns 0.0 when ``option_spread_pct`` is unset/0 and
+          ``option_spread_min_tick`` is 0 -- the exact no-op reproducing pre-2026-07-25 fills.
+        """
+        if self._spread_model != _osm.LEGACY_PCT_MODEL:
+            return _osm.as_of_half_spread(as_of_bar, premium)[0]
         pct = float(self._cfg.get("option_spread_pct", 0.0) or 0.0)
         min_tick = float(self._cfg.get("option_spread_min_tick", 0.0) or 0.0)
         if pct <= 0 and min_tick <= 0:
@@ -2527,7 +2792,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             full *= _OPTION_SPREAD_THIN_MULT
         return full / 2.0
 
-    def _option_cross(self, px: float, side_is_buy: bool, bar: dict) -> float:
+    def option_spread_record(self) -> Dict[str, Any]:
+        """The run-results record of how option fills were priced: the model, and (calibrated
+        model only) how many fills were charged the as-of real quote vs the fallback."""
+        return {"option_spread_model": self._spread_model,
+                "option_spread_fill_sources": dict(self._spread_sources)}
+
+    def _option_cross(self, px: float, side_is_buy: bool, bar: dict,
+                      as_of_bar: Optional[dict] = None) -> float:
         """Premium after CROSSING the modeled bid-ask spread — the LIMIT-fill cost.
 
         A buy lifts the ask (``px + half``), a sell hits the bid (``px - half``). This is
@@ -2542,7 +2814,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Floored at zero on the sell side for the same reason as ``_option_slip``: a modeled
         spread wider than the premium must not pay the account to sell.
         """
-        half = self._option_half_spread(px, bar)
+        half = self._option_half_spread(px, bar, as_of_bar)
         return px + half if side_is_buy else max(0.0, px - half)
 
     def option_modelled_half_spread(self, contract_symbol: str) -> Optional[float]:
@@ -2559,23 +2831,40 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         AS-OF, NOT FILL-DAY, and that is the hermetic point: this answers with the bar the
         action can already see (the one it selected the contract from), never the bar the
-        order will fill on. The fill-day spread may differ (a different day's volume can flip
-        the thin-widening); a quote set from the fill day's spread would be look-ahead.
+        order will fill on; a quote set from the fill day's spread would be look-ahead.
 
-        None when there is no options provider, no as-of bar for the contract, or no close on
-        it — the caller then leaves the quote exactly as the builder priced it.
+        WHAT IT RETURNS is exactly the half spread ``_option_fill_price`` will charge when it
+        prices the fill from this same as-of bar: under the calibrated model the bar's valid
+        NBBO half-spread (even on a quote-only row with no close), else the fallback on its
+        close and volume; under ``legacy-pct`` the percent-of-premium formula on its close (whose
+        thin-widening then reads the FILL bar at fill time, so the two can differ there -- a
+        known property of the legacy model only). A limit that does not fill and retries is
+        re-priced from ITS new as-of bar, so the concession and a later fill can differ by a
+        day's quote.
+
+        None when there is no options provider, no as-of bar for the contract, or neither a
+        valid quote (calibrated model) nor a close on it -- the caller then leaves the quote
+        exactly as the builder priced it.
         """
         if self._options is None:
             return None
         bar = self._options.get_bar(contract_symbol, self._as_of_date())
         if not bar:
             return None
+        if self._spread_model != _osm.LEGACY_PCT_MODEL:
+            # The calibrated model answers from this SAME as-of bar the fill will read: its
+            # real quote when valid (even on a quote-only row with no close), else the fallback
+            # on its close -- exactly ``_option_half_spread(..., as_of_bar=bar)`` at fill time.
+            q = _osm.quoted_half_spread(bar.get("bid"), bar.get("ask"))
+            if q is not None:
+                return q
         px = bar.get("close")
         if px is None:
             return None
-        return self._option_half_spread(float(px), bar)
+        return self._option_half_spread(float(px), bar, bar)
 
-    def _option_slip(self, px: float, side_is_buy: bool, bar: dict) -> float:
+    def _option_slip(self, px: float, side_is_buy: bool, bar: dict,
+                     as_of_bar: Optional[dict] = None) -> float:
         """Option fill price after execution slippage + the modeled half bid-ask spread.
 
         Deliberately NOT ``_slip``: that adds the equity ``spread_bps`` (bps of price), whose
@@ -2586,7 +2875,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         credit at worst zero rather than paying the account to sell.
         """
         bps = float(self._cfg["slippage_bps"]) / 10_000.0
-        half = self._option_half_spread(px, bar)
+        half = self._option_half_spread(px, bar, as_of_bar)
         return px * (1.0 + bps) + half if side_is_buy else max(0.0, px * (1.0 - bps) - half)
 
     def _volume_cap_reject_reason(self, order, bar: dict) -> Optional[str]:
@@ -2605,6 +2894,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         remains the backstop for exits, so a position cannot be stranded forever).
         Applies to entries AND non-expiry exits alike.
         """
+        # TODO(plan 2026-09-22 bt-live-option-parity, Part F follow-ups): this cap reads the
+        # FILL day's full-session volume -- the same small look-ahead Part F removed from the
+        # spread charge. Left as is on purpose (behaviour unchanged); the causal alternative is
+        # the decision bar's volume, and switching moves which fills happen, so it needs its
+        # own measured change and re-pin.
         required = abs(float(order.quantity or 0.0))
         if required <= 0:
             return None
@@ -2680,6 +2974,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         spot = None
         if spot_bar is not None:
             spot = float(spot_bar["close"] if same_bar else spot_bar["open"])
+            # The premium is AS TRADED; the bar is split-adjusted (plan Part E2).
+            spot = self.option_basis_price(underlying, spot, fill_day)
         if spot is None:
             logger.debug(
                 "[backtest] arb check skipped for %s: no %s bar on %s (fail-open).",
@@ -3183,7 +3479,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             trades.append(self._order_to_trade(o, qty))
         return trades
 
-    def get_round_trip_trades(self) -> List[Dict[str, Any]]:
+    def get_round_trip_trades(self, *, option_records: bool = True) -> List[Dict[str, Any]]:
         """Pair opening fills with their closing fills into round-trip trades with realised P&L.
 
         ``get_filled_trades`` returns one row per FILLED order (opens AND closers separately),
@@ -3210,6 +3506,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         sell (no limit/stop), and ``take_profit``/``stop_loss`` for an OCO/TP/SL leg by the
         nearest price level. This is an APPROXIMATION for scaled add/reduce (one weighted-avg
         round-trip row per transaction) and EXACT for the dominant buy-once / sell-once case.
+        That guess is for EQUITY rows only: an OPTION row's ``exit_reason`` is the ``trigger``
+        recorded on its latest exit fill's ``exit_record`` (``OptionCloseReason``, plan Part
+        C3), and ``"unrecorded"`` -- logged at ERROR -- when a close reached the book without
+        one. Option rows also carry the option trade record (``_attach_option_records``) --
+        unless ``option_records`` is False (a GA fitness trial, see
+        ``results.require_option_trade_records``), in which case they keep exactly the
+        pre-record keys. The records never feed a number in the row, so P&L, dates and
+        ``exit_reason`` are identical either way.
 
         Rows carry the field names ``results._trade_row`` maps (entry_time/exit_time/direction/
         entry_price/exit_price/size/pnl/pnl_pct/bars_held/exit_reason).
@@ -3239,7 +3543,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # (asset_class OPTION, NO contract_symbol, net-only) lands alone under ``(txn, None)`` and
         # is dropped below (it moves no cash; its legs carry the real P&L).
         by_group: Dict[tuple, List[Any]] = {}
-        for o in self.get_orders():
+        all_orders = self.get_orders()
+        for o in all_orders:
             if o.transaction_id is None:
                 continue
             if o.status not in executed or not (o.filled_qty or o.quantity):
@@ -3254,6 +3559,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             by_group.setdefault(key, []).append(o)
 
         trades: List[Dict[str, Any]] = []
+        #: id(trade row) -> (entry-record carrier, exit-record carrier) for OPTION rows only;
+        #: resolved into row keys after the final sort (see ``_attach_option_records``).
+        option_carriers: Dict[int, tuple] = {}
+        # The parent lookup the record carriers need -- built only when an option order is in
+        # the book, so an equity run pays nothing for it.
+        by_id = ({o.id: o for o in all_orders if o.id is not None}
+                 if any(getattr(o, "asset_class", None) == AssetClass.OPTION for o in all_orders)
+                 else {})
+        unrecorded_exits: List[str] = []
         for (txn_id, _grp_contract), orders in by_group.items():
             if not orders:
                 continue
@@ -3306,7 +3620,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     (self._fill_dates.get(o.id) for o in exits if self._fill_dates.get(o.id) is not None),
                     default=None,
                 )
-                exit_reason = self._exit_reason(last_exit_fill, exit_px)
+                if _is_option_row(opening):
+                    # OPTION ROWS READ THE RECORDED TRIGGER (plan Part C3), never the price-
+                    # proximity guess below -- which labelled a single-leg stop-loss close
+                    # "take_profit" (it had only a limit price) and a DTE exit likewise.
+                    exit_carrier = _record_carrier(last_exit_fill, "exit_record", by_id)
+                    exit_reason = _recorded_trigger(exit_carrier)
+                    if exit_reason is None:
+                        exit_reason = "unrecorded"
+                        unrecorded_exits.append(str(opening.contract_symbol))
+                else:
+                    exit_reason = self._exit_reason(last_exit_fill, exit_px)
             else:
                 # Still open at run end: mark-to-market at the last available price.
                 size = entry_qty
@@ -3337,7 +3661,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         intr = upper = None
                         if opening.strike is not None and opening.option_type is not None:
                             und = getattr(opening, "underlying_symbol", None) or opening.symbol
-                            spot = self._price.close_asof(und)
+                            spot = self._option_spot_asof(und)
                             if spot is not None:
                                 intr, upper = self._no_arb_premium_bounds(
                                     opening.strike,
@@ -3371,6 +3695,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         exit_px = entry_px  # never priced after entry -> flat (near-zero trade)
                 exit_dt = self._price.now()
                 exit_reason = "open_at_end"
+                exit_carrier = None
 
             # ONE commission PER FILL -- exactly what the cash ledger charged (``_apply_fill`` /
             # ``_apply_option_fill``: ``self._cash -= commission`` once per fill). The old flat
@@ -3404,8 +3729,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             equity_at_entry = self._equity_at(entry_dt)
             pnl_pct = (pnl / equity_at_entry * 100.0) if equity_at_entry else 0.0
             bars_held = self._bars_between(entry_dt, exit_dt)
-            trades.append(
-                {
+            row = {
                     "symbol": opening.symbol,
                     "entry_time": entry_dt,
                     "exit_time": exit_dt,
@@ -3419,7 +3743,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # for an option -- which is exactly what the results profit cap and the
                     # monte-carlo spread-stress notional were doing. No consumer should have to
                     # re-derive it from asset_class.
-                    "multiplier": float(mult),
+                    #
+                    # ONE key, carrying the EXACT multiplier ``pnl`` above was computed with.
+                    # This literal used to list "multiplier" twice (``float(mult)`` here and
+                    # ``mult`` at the end); a dict literal keeps the FIRST key's POSITION and
+                    # the LAST value, so the row always held ``mult`` in this slot -- which is
+                    # what it holds now, byte for byte.
+                    "multiplier": mult,
                     "pnl": pnl,
                     "pnl_pct": pnl_pct,
                     "bars_held": bars_held,
@@ -3446,19 +3776,30 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # against its NET cost, not leg-by-leg (which capped the winning leg while
                     # leaving the losing one, scoring a max-profit condor NEGATIVE).
                     "transaction_id": txn_id,
-                    # The EXACT multiplier ``pnl`` above was computed with (1 for equity, the
-                    # contract multiplier for an option). Recorded rather than re-derived so a
-                    # consumer's cost basis (entry_price x size x multiplier) can never fall
-                    # out of step with the P&L it is compared against.
-                    "multiplier": mult,
-                }
-            )
+            }
+            trades.append(row)
+            if option_records and _is_option_row(opening):
+                option_carriers[id(row)] = (
+                    _record_carrier(opening, "entry_record", by_id), exit_carrier)
         # Deterministic order: by entry time then symbol.
         trades.sort(key=lambda t: (str(t["entry_time"]), t["symbol"]))
+        if option_carriers and option_records:
+            _attach_option_records(trades, option_carriers)
+        if unrecorded_exits:
+            # Never silent: an option close that reached the book without an exit_record is
+            # a close path that bypassed the shared record, and its row says so.
+            logger.error(
+                "[backtest] round-trip recorder: %d option leg exit(s) carry no exit_record "
+                "(exit_reason='unrecorded'): %s", len(unrecorded_exits),
+                ", ".join(sorted(set(unrecorded_exits))[:20]))
         return trades
 
     def _exit_reason(self, exit_order, fill_px: float) -> str:
-        """Classify an OCO/TP/SL exit fill as take_profit / stop_loss by nearest price level."""
+        """Classify an OCO/TP/SL exit fill as take_profit / stop_loss by nearest price level.
+
+        EQUITY ROWS ONLY. Option rows read their recorded ``exit_record`` trigger instead: a
+        close_option ticket is a limit order with no stop, so this guess labelled every option
+        close -- stop-loss and DTE exits included -- ``take_profit``."""
         tp = exit_order.limit_price
         sl = exit_order.stop_price
         if tp is not None and sl is not None:
@@ -3521,6 +3862,70 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return self._get_instrument_current_price_impl(symbol_or_symbols, price_type=price_type)
 
     # ======================================================================
+    # Option basis: split-ADJUSTED book -> AS-TRADED option path (plan Part E)
+    #
+    # Every option store holds strikes and premiums as traded; this account's closes and
+    # share counts are FMP split-adjusted (the equity book is untouched by any of this).
+    # The option path converts through the methods below and nowhere else.
+    # ======================================================================
+    #: Class default so a double built with ``__new__`` (no ``__init__``) is the identity too.
+    _split_basis = None
+    #: Same, for ``records_option_trades``: a ``__new__`` double records fully, like a fixture.
+    _option_trade_records = True
+
+    #: Where this account's option greeks come from (OptionsAccountInterface; recorded on every
+    #: leg of an option entry_record): Black-Scholes inverted from the as-of bar's close
+    #: (``option_greeks`` in the stores' build / the parquet reader's ``greeks_tuple``).
+    OPTION_GREEKS_SOURCE = "bs_from_close"
+
+    def _as_traded_factor(self, symbol: str, day=None) -> float:
+        """``as_traded_factor(symbol, day)`` of the run's split basis (day = the bar's date
+        by default). 1.0 with no basis (equity-only / fixture accounts)."""
+        if self._split_basis is None:
+            return 1.0
+        return float(self._split_basis.factor(symbol, self._as_of_date() if day is None else day))
+
+    def option_basis_price(self, symbol: str, adjusted_price, day=None):
+        """An adjusted price of ``day`` (default: this bar) in the as-traded basis. None stays
+        None; a factor of 1 returns the very same value."""
+        if adjusted_price is None:
+            return None
+        k = self._as_traded_factor(symbol, day)
+        return adjusted_price if k == 1.0 else float(adjusted_price) * k
+
+    def records_option_trades(self) -> bool:
+        """OVERRIDE (OptionsAccountInterface): the run's stated ``option_trade_records``."""
+        return self._option_trade_records
+
+    def get_option_underlying_price(self, symbol: str, price_type: Optional[str] = None):
+        """OVERRIDE (OptionsAccountInterface, plan Part E2): the bar's close x the as-traded
+        factor -- the spot the option builders select strikes against."""
+        if price_type is None:
+            px = self.get_instrument_current_price(symbol)
+        else:
+            px = self.get_instrument_current_price(symbol, price_type)
+        return self.option_basis_price(symbol, px)
+
+    def equity_shares_per_option_share(self, underlying: str) -> float:
+        """OVERRIDE (plan Part E3): adjusted book shares per as-traded share on this bar."""
+        return self._as_traded_factor(underlying)
+
+    def _option_spot_asof(self, underlying: str) -> Optional[float]:
+        """The underlying's close on this bar -- or its last known close -- in the AS-TRADED
+        basis: the option path's valuation spot (intrinsic marks, no-arb bounds, naked
+        margin, the run-end intrinsic floor). A forward-filled close is converted with the
+        factor of ITS OWN date. Without a split basis it is the old read, unchanged."""
+        spot = self._price.close_at(underlying)
+        if self._split_basis is None:
+            return spot if spot is not None else self._price.close_asof(underlying)
+        if spot is not None:
+            return self.option_basis_price(underlying, spot)
+        dated = self._price.close_asof_dated(underlying)
+        if dated is None:
+            return None
+        return self.option_basis_price(underlying, dated[0], dated[1])
+
+    # ======================================================================
     # OptionsAccountInterface — READ methods (Task 4)
     #
     # All option reads delegate to the injected as-of-clamped provider, snapping the
@@ -3536,17 +3941,98 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """The simulated bar's calendar date (the provider's as-of clamp boundary)."""
         return self._price.now().date()
 
+    @property
+    def has_options_provider(self) -> bool:
+        """True when this run was built with an option reader (an options run), False on the
+        equity-only path. ``supports_options`` is the CLASS capability and is always True."""
+        return self._options is not None
+
+    def option_basis_guard_stats(self) -> Optional[Dict[str, Any]]:
+        """The run's E4 split-basis guard counters (``option_basis_guard.BasisGuard.stats``),
+        or None when this run's reader carries no guard (sqlite store / fixture readers).
+        Like ``option_chain_staleness``, meaningful only on an options run."""
+        if self._options is None:
+            raise RuntimeError("option_basis_guard_stats() on an account with no options provider")
+        fn = getattr(self._options, "basis_guard_stats", None)
+        return fn() if callable(fn) else None
+
+    def option_chain_staleness(self) -> Dict[str, Any]:
+        """This run's stale-price chain-row counts from its option reader
+        (``option_read_common.ChainStaleness``). Only meaningful on an options run: calling it
+        on the equity path is a caller bug and raises rather than inventing zeros."""
+        if self._options is None:
+            raise RuntimeError("option_chain_staleness() on an account with no options provider")
+        return self._options.chain_staleness()
+
+    #: ``(bar date, its data session)`` of the last ``_option_data_session`` call. A class
+    #: default so an account built without ``__init__`` (test doubles) still starts empty.
+    _option_data_session_memo = None
+
+    def _option_data_session(self) -> date:
+        """The session whose bar an option read on this bar may take its VOLUME from.
+
+        THE LIVE RULE, NOT A BACKTEST CONVENTION (BT/live option parity B2): bar D decides with
+        data through D's close and fills on the next bar, i.e. it is the live decision made
+        during ``backtest_decision_label(D)``, whose data session is D. Computed through the
+        shared ``market_calendar`` functions rather than returned as ``D`` so the two paths
+        cannot drift, and MEMOISED per bar: get_chain is called many times a bar in a GA trial.
+
+        A bar on a date that is not a regular NYSE session is REFUSED (ValueError). Measured
+        2026-09-22: none of the 856 underlyings in the ThetaData option tree has an FMP daily
+        bar on a non-session date from 2020 on, so the clock (the union of those bars) does not
+        produce one; a run that does has a broken price store, and an option chain for a day
+        the exchange was shut is not something to answer quietly.
+        """
+        as_of = self._as_of_date()
+        memo = self._option_data_session_memo
+        if memo is not None and memo[0] == as_of:
+            return memo[1]
+        session = decision_data_session(self.decision_label())
+        self._option_data_session_memo = (as_of, session)
+        return session
+
+    #: ``(bar date, its decision label)`` of the last ``decision_label`` call (class default for
+    #: accounts built without ``__init__``).
+    _decision_label_memo = None
+
+    def decision_label(self) -> date:
+        """The live session bar D's decision is: ``backtest_decision_label(D)`` = N(D).
+
+        Overrides the live default of ``OptionsAccountInterface.decision_label``: bar D decides
+        with data through D's close and its orders fill on the next bar, so it is the live
+        decision made during N(D) -- the date an option entry's DTE window is anchored on in
+        both paths. Memoised per bar (every option action on a bar asks).
+
+        A bar that is not a regular NYSE session is REFUSED (ValueError), see
+        ``_option_data_session``.
+        """
+        as_of = self._as_of_date()
+        memo = self._decision_label_memo
+        if memo is not None and memo[0] == as_of:
+            return memo[1]
+        try:
+            label = backtest_decision_label(as_of)
+        except ValueError as e:
+            # type(e): keep NotARegularSession NAMED (the GA's fatal-trial list matches it).
+            raise type(e)(
+                f"option decision on simulated date {as_of}, which is not a regular session "
+                f"and so has no decision label and no data session: {e}. The backtest clock "
+                f"should only ever step on regular NYSE sessions") from e
+        self._decision_label_memo = (as_of, label)
+        return label
+
     def get_option_chain(self, underlying, expiry_min, expiry_max, option_type=None,
                          strike_min=None, strike_max=None):
         if self._options is None:
             return []
         return self._options.get_chain(
             underlying, self._as_of_date(), expiry_min=expiry_min, expiry_max=expiry_max,
+            data_session=self._option_data_session(),
             option_type=option_type, strike_min=strike_min, strike_max=strike_max)
 
     def get_option_quote(self, contract_symbol):
         return None if self._options is None else self._options.get_quote(
-            contract_symbol, self._as_of_date())
+            contract_symbol, self._as_of_date(), data_session=self._option_data_session())
 
     def get_atm_implied_volatility(self, underlying):
         return None if self._options is None else self._options.get_atm_iv(
@@ -3836,8 +4322,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         share_side: Optional[OrderDirection] = None,
         shares: int = 0,
         share_price: Optional[float] = None,
+        trigger: OptionCloseReason,
     ) -> bool:
         """Settle a held single-leg option position at expiry (Task 7).
+
+        ``trigger`` is WHY the leg resolved (``expired_otm`` / ``assigned`` / ``exercised``,
+        decided by the caller's policy): it is recorded on the synthetic closing order's
+        ``exit_record`` and, when this settlement flattens the transaction, is its
+        ``close_reason`` -- the same values the live OCC-activity reconciler writes.
 
         Closes the option leg's OPENED transaction at ``close_premium`` (per-share intrinsic
         value, or 0 for worthless) and zeroes its lot in the option ledger, then — for an
@@ -3868,7 +4360,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         #    premium was already settled at entry and the exercise/assignment cash is the share leg
         #    (step 3). Without this closing order the option round-trip is missing (single-leg) or
         #    mis-paired (the reported entry~0 / pnl=-market*100*qty defect in Backtest id=299).
-        self._record_option_expiry_close(txn, position, float(close_premium))
+        self._record_option_expiry_close(txn, position, float(close_premium), trigger=trigger)
 
         # 2. Remove THIS leg's option lot from the option ledger (its cash was settled at entry; the
         #    conversion below moves the share-leg cash). Worthless simply zeroes it out.
@@ -3885,8 +4377,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if share_side is not None and shares and share_price is not None:
             signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
             self._cash -= signed * float(share_price)  # buy debits, sell credits — at strike.
+            # THE OPTION -> STOCK BOUNDARY (plan Part E3). ``shares`` and the strike are AS
+            # TRADED (100 x contracts at the contract's strike); this book is split-ADJUSTED.
+            # Book ``shares x k`` at ``strike / k``: the cash above is unchanged (moved at the
+            # as-traded numbers, exactly), and the lot marks against the adjusted closes like
+            # every other share in the book. k == 1 books the originals untouched.
+            k = self._as_traded_factor(position.underlying)
+            book_qty, book_px = signed, float(share_price)
+            if k != 1.0:
+                book_qty, book_px = signed * k, float(share_price) / k
             self._book_assignment_share_leg(
-                position.underlying, signed, float(share_price), expert_id=txn.expert_id)
+                position.underlying, book_qty, book_px, expert_id=txn.expert_id)
 
         # 4. Close the SHARED transaction only once every option leg on it has resolved. For a
         #    single-leg option this is immediate; for a multi-leg spread the transaction stays
@@ -3898,7 +4399,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             close_transaction_with_logging(
                 txn,
                 account_id=self.id,
-                close_reason="option_expiry",
+                # A structure whose legs settled one by one (a strangle) closes under the
+                # most consequential of its settlements -- the live reconciler's rule
+                # (``settlement_close_reason``); a single leg closes under its own.
+                close_reason=settlement_close_reason(
+                    [trigger] + self._settled_leg_triggers(txn)),
                 additional_data={"contract_symbol": position.contract_symbol},
             )
             update_instance(txn)
@@ -4058,7 +4563,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         is_call = position.option_type == OptionRight.CALL
         itm = (spot > strike) if is_call else (spot < strike)
         if not itm:
-            return self.settle_option_expiry(position, close_premium=0.0)
+            return self.settle_option_expiry(position, close_premium=0.0,
+                                             trigger=OptionCloseReason.EXPIRED_OTM)
 
         contracts = float(position.quantity)
         multiplier = float(position.multiplier or 100)
@@ -4071,6 +4577,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             ok = self.settle_option_expiry(
                 position, close_premium=intrinsic,
                 share_side=share_side, shares=shares, share_price=strike,
+                trigger=OptionCloseReason.ASSIGNED,
             )
             if ok:
                 # The stock the assignment ORPHANS (long from a short put, short from a naked
@@ -4115,7 +4622,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             "exercise; intrinsic %.4f).",
             "call" if is_call else "put", position.contract_symbol, premium, intrinsic,
         )
-        return self.settle_option_expiry(position, close_premium=premium)
+        # The EVENT is the live OPEXC (an ITM long resolved at expiry); only the settlement
+        # differs (premium, no shares) -- see OptionCloseReason.EXERCISED.
+        return self.settle_option_expiry(position, close_premium=premium,
+                                         trigger=OptionCloseReason.EXERCISED)
 
     def process_pending_assignment_liquidations(self) -> bool:
         """Broker-style liquidation of stock orphaned by a short-option assignment.
@@ -4267,10 +4777,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         # Apply the net payoff to cash and book each leg's synthetic close (moves no extra cash).
         self._cash += net_payoff
+        # Per leg, the event the OCC would report for it (OTM -> expired, ITM short ->
+        # assigned, ITM long -> exercised); the transaction's close_reason is the most
+        # consequential of them (``settlement_close_reason``: assigned > exercised >
+        # expired_otm) -- the SAME rule the live reconciler applies, independent of leg order.
+        leg_triggers = []
         for pos in positions:
             is_call = pos.option_type == OptionRight.CALL
             intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
-            self._record_option_expiry_close(txn, pos, float(intrinsic))
+            trigger = _expiry_trigger(pos.side, intrinsic > 0.0)
+            leg_triggers.append(trigger)
+            self._record_option_expiry_close(txn, pos, float(intrinsic), trigger=trigger)
             lot = self._option_positions.get(pos.contract_symbol)
             if lot is not None:
                 self._zero_option_lot(lot)
@@ -4283,7 +4800,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if not txn.close_date:
                 txn.close_date = self._price.now()
             close_transaction_with_logging(
-                txn, account_id=self.id, close_reason="option_expiry_combo",
+                txn, account_id=self.id,
+                close_reason=settlement_close_reason(
+                    leg_triggers + self._settled_leg_triggers(txn)),
                 additional_data={"strategy": self.defined_risk_combo_strategy(positions[0])},
             )
             update_instance(txn)
@@ -4331,7 +4850,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return structures
 
     def _record_option_expiry_close(
-        self, txn: Transaction, position: OptionPosition, close_premium: float
+        self, txn: Transaction, position: OptionPosition, close_premium: float, *,
+        trigger: OptionCloseReason,
     ) -> None:
         """Persist a synthetic FILLED closing order for an expiring option leg.
 
@@ -4341,7 +4861,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         order only: it records the round-trip close so ``get_round_trip_trades`` pairs the option's
         open and close with the correct realised premium P&L. It moves NO cash (the premium was
         settled at entry; the exercise/assignment share leg carries the intrinsic value).
+
+        It carries the leg's ``exit_record`` (``option_trade_record.exit_record``) with
+        ``trigger`` -- the SAME record every option close writes, so the trade row reads WHY
+        the leg closed instead of guessing it. A settlement prices from no quote, so the leg
+        is named in ``legs_without_quote``.
         """
+        record = option_exit_record(trigger, legs_without_quote=[position.contract_symbol])
         close_side = (
             OrderDirection.BUY if position.side == OrderDirection.SELL else OrderDirection.SELL
         )
@@ -4374,11 +4900,25 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment="option_expiry_close",
             created_at=as_of,
+            data={"exit_record": record},
         )
         new_id = add_instance(order)
         if new_id is not None:
             self._fill_dates[new_id] = as_of
         self.invalidate_order_cache()
+
+    def _settled_leg_triggers(self, txn: Transaction) -> List[str]:
+        """The settlement triggers already recorded on ``txn``'s synthetic expiry closes (an
+        earlier leg that settled on its own), for ``settlement_close_reason``."""
+        out: List[str] = []
+        for o in self.get_orders():
+            if o.transaction_id != txn.id or o.comment != "option_expiry_close":
+                continue
+            rec = (o.data or {}).get("exit_record")
+            trig = rec.get("trigger") if isinstance(rec, dict) else None
+            if trig in ("assigned", "exercised", "expired_otm"):
+                out.append(trig)
+        return out
 
     def _all_legs_resolved(self, txn: Transaction) -> bool:
         """True when every FILLED option leg on ``txn`` now has a matching closing fill.

@@ -37,12 +37,11 @@ ADJUSTED = "AAPL1260116C00150000"       # corporate-action adjusted root
 
 
 def _snapshot():
-    return SimpleNamespace(
-        latest_quote=SimpleNamespace(bid_price=5.0, ask_price=5.4),
-        latest_trade=SimpleNamespace(price=5.2),
-        implied_volatility=0.32,
-        greeks=SimpleNamespace(delta=0.55, gamma=0.02, theta=-0.04, vega=0.1),
-    )
+    """A RAW REST snapshot: the account reads the raw_data client (the typed SDK model drops
+    the daily bars -- see ``parse_alpaca_option_snapshot``)."""
+    return {"latestQuote": {"bp": 5.0, "ap": 5.4}, "latestTrade": {"p": 5.2},
+            "impliedVolatility": 0.32,
+            "greeks": {"delta": 0.55, "gamma": 0.02, "theta": -0.04, "vega": 0.1}}
 
 
 def _meta(symbol, *, size="100", root="AAPL", underlying="AAPL"):
@@ -70,7 +69,7 @@ def _account(monkeypatch, metas):
         def get_option_chain(self, req):
             return snapshots
 
-    acct._option_data_client = FakeOptClient()
+    acct._option_data_client_raw = FakeOptClient()
     monkeypatch.setattr(acct, "_get_option_contracts_meta",
                         lambda *a, **k: {m.symbol: m for m in metas}, raising=False)
     return acct

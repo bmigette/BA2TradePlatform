@@ -162,7 +162,7 @@ def build_trial_config(m, kind: str, symbols, start, end, capital, seed, gates_o
         "entry_action": entry_action,
     }
     m._apply_options_seam(spec, backtest_cfg)
-    cfg = _build_daily_trial_config(backtest_cfg, decoded, None)
+    cfg = _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
     return cfg
 
 

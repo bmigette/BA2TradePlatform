@@ -70,7 +70,7 @@ def _trial_settings_for(setting: str, value) -> dict:
         "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
         "options_store": "parquet",
     }
-    trial = _build_daily_trial_config(backtest_cfg, decoded, None)
+    trial = _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
     return trial["experts"][0]["settings"]
 
 

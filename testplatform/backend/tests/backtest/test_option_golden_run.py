@@ -265,6 +265,25 @@ def test_option_golden_run_matches_pinned_fingerprint():
                     "identity with pre-branch option results -- the branch's "
                     "results-comparability note records a baseline split on the BS mark "
                     "fallback. Regenerate only with a written justification.",
+            # Every deliberate re-pin, oldest first: what moved, and why.
+            "rebaselines": [{
+                "date": "2026-09-22",
+                "reason": "DTE exits count from the decision session label N(D), same as live "
+                          "(2026-09-22 BT/live option parity plan, Task 4): the opt_dte "
+                          "exit crosses its floor one session earlier than when it counted "
+                          "from the bar date D.",
+                "before": {"exit_time": "2024-04-29", "pnl": "692.30",
+                           "sha256": "a28a414be4d1e0c9e5cd9b5ce9b393ce987c9004cb1bd39eb3d28382839e73e5"},
+                "after": {"exit_time": "2024-04-26", "pnl": "461.54",
+                          "sha256": "fe8dfb4415b8ab9fd98ef9f1d101bc147120fcacd0933a7cca5e536b979cacc6"},
+            }, {
+                "date": "2026-09-23",
+                "reason": "Option trade rows take exit_reason from the RECORDED close trigger (OptionCloseReason, 2026-09-22 BT/live option parity plan, Task 8 / Part C3), not the price-proximity guess: the opt_dte close had only a limit price and was labelled take_profit; it is dte_exit. No price, P&L, date or curve value moved.",
+                "before": {"exit_reason": "take_profit",
+                           "sha256": "fe8dfb4415b8ab9fd98ef9f1d101bc147120fcacd0933a7cca5e536b979cacc6"},
+                "after": {"exit_reason": "dte_exit",
+                          "sha256": "75ab066b694e9acecfbc0ff4473b7675d17467a2169fa523a34d34cb456cd323"},
+            }],
         })
         return
 

@@ -55,6 +55,11 @@ class _FakeAccount:
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
     has_pending_closing_order = ReadOnlyAccountInterface.has_pending_closing_order
 
+    def decision_label(self):
+        # Every DTE condition counts from the account's decision session label (the date the
+        # option entry counted from, BT/live option parity), pinned here to the sim date.
+        return SIM_TODAY
+
     #: The one price the re-anchor measurement needs: what a share is worth right now. A
     #: number, not a stub that refuses — the point of that test is that the wrong subject
     #: produces a confident number rather than an unevaluable.

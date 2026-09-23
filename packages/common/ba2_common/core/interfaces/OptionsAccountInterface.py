@@ -190,6 +190,85 @@ class OptionsAccountInterface(ABC):
 
     supports_options: bool = True
 
+    #: WHERE THIS ACCOUNT'S CHAIN GREEKS COME FROM, recorded verbatim on every leg of an option
+    #: ``entry_record`` (``option_trade_record``, BT/live parity Part C) so a live-vs-backtest
+    #: comparison knows whether two deltas were measured the same way. Declared per account
+    #: class: ``"broker"`` (AlpacaAccount: the snapshot's own greeks), ``"bs_from_close"``
+    #: (BacktestAccount: Black-Scholes from the as-of bar's close). A chain row that states its
+    #: own ``OptionContract.greeks_source`` overrides this per leg. None = UNDECLARED: building
+    #: an entry record then raises ``TradeActions.OptionGreeksSourceUndeclared``, which the
+    #: submit path logs at ERROR and stores as an ``error`` record -- never a guessed tag
+    #: (production declarations pinned by test_option_entry_record_parity).
+    OPTION_GREEKS_SOURCE: Optional[str] = None
+
+    def records_option_trades(self) -> bool:
+        """Whether option actions on this account build the FULL option trade record (entry
+        and exit leg snapshots, payoff structure) or only the close TRIGGER.
+
+        LIVE: always True -- a live decision is never a fitness trial, and its record is what
+        the live-vs-backtest comparison reads. Stated here once for every broker account.
+        ``BacktestAccount`` overrides it with its run's STATED ``option_trade_records``
+        (False on a GA fitness trial, where the record would be built and thrown away).
+        The decision itself never depends on it."""
+        return True
+
+    # --- Decision clock ----------------------------------------------------
+    def decision_label(self) -> date:
+        """The session label of the decision being made NOW: the session its orders execute in.
+
+        THE one date an option entry's DTE/expiry window is anchored on
+        (``TradeActions._OptionEntryAction._today``), in both paths (BT/live option parity):
+
+        * LIVE (this default, every broker account): ``live_decision_label`` of the live
+          decision instant (``option_session.live_decision_time``: the decision pass's frozen
+          time, else the replay-aware clock) -- its America/New_York calendar date. A weekend
+          instant labels that weekend day; nothing rolls it to a session.
+        * BACKTEST (``BacktestAccount`` overrides): ``backtest_decision_label(bar D)`` = N(D),
+          the next regular session, because bar D's orders fill on the next bar.
+
+        DTE is counted in CALENDAR days from this label (``expiry - label``), so live at
+        N(D) and the backtest's bar D see the same DTE for the same contract.
+        """
+        from ba2_common.core.option_session import live_decision_label_now
+        return live_decision_label_now()
+
+    # --- Option basis (BT/live option parity, plan Part E) -------------------
+    # The option path works in the AS-TRADED basis on both paths: strikes, premiums and the
+    # 100-share deliverable are what traded on the day. Live every price is already as
+    # traded, so both methods below are identities here. The backtest's equity book is
+    # SPLIT-ADJUSTED (the FMP cache), so ``BacktestAccount`` overrides both with the
+    # ``as_traded_factor`` of the bar (``ba2_common.core.split_basis``).
+    def get_option_underlying_price(self, symbol: str, price_type: Optional[str] = None):
+        """The underlying's price IN THE BASIS ITS OPTION STRIKES ARE QUOTED IN.
+
+        The ONE spot read of the option path: strike selection by % OTM / delta / moneyness,
+        the stock-cover value and the naked-margin spot all ask this, never
+        ``get_instrument_current_price`` directly. Live (this default) delegates to
+        ``get_instrument_current_price`` unchanged -- with ``price_type`` passed only when
+        given, exactly as the callers did before."""
+        if price_type is None:
+            return self.get_instrument_current_price(symbol)
+        return self.get_instrument_current_price(symbol, price_type)
+
+    def equity_shares_per_option_share(self, underlying: str) -> float:
+        """How many shares of THIS ACCOUNT'S equity book one as-traded (option) share is.
+
+        The conversion at the option <-> stock boundary: a contract delivers 100 AS-TRADED
+        shares, the equity book counts in its own unit. Live the two are the same share (1.0,
+        this default). A backtest on NFLX in 2024 holds FMP-adjusted shares, ten of which are
+        one share of the day, so covered-call cover is ``floor(held / 10 / 100)``."""
+        return 1.0
+
+    def option_shares_in_equity_units(self, underlying: str, shares) -> int:
+        """``shares`` AS-TRADED (a contract count x 100) expressed in equity-book shares,
+        rounded UP -- an obligation under-stated by one share is the direction that uncovers
+        a call. The identity (and the very same int) whenever the factor is 1, i.e. always
+        live and on every backtest symbol without a split in its window."""
+        k = self.equity_shares_per_option_share(underlying)
+        if k == 1.0:
+            return shares
+        return int(math.ceil(round(float(shares) * float(k), 6)))
+
     # --- Market data -------------------------------------------------------
     @abstractmethod
     def get_option_chain(
@@ -696,8 +775,14 @@ class OptionsAccountInterface(ABC):
             need = int(math.ceil(round(required[underlying], 6)))
             if need <= 0:
                 continue
+            # The requirement and the pledge are AS-TRADED shares (contracts x 100); the
+            # holding is in the equity book's unit. Compared in the book's unit -- identical
+            # live, and on a split-adjusted backtest book the contract's real deliverable.
+            need = self.option_shares_in_equity_units(underlying, need)
             held = self.held_shares_for_cover(underlying)
             pledged = self.shares_pledged_to_short_calls(underlying)
+            if pledged is not None:
+                pledged = self.option_shares_in_equity_units(underlying, pledged)
             if held is None:
                 return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: how many {underlying} shares this account holds "

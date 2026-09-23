@@ -193,6 +193,14 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
     def get_settings_definitions(cls):
         return {}
 
+    def decision_label(self):
+        # The option DTE label (OptionsAccountInterface.decision_label, read by option entries
+        # and the DTE exit conditions): pinned to ``date.today()``, the date these tests build
+        # expiries from, rather than the interface's New York-date default -- which differs
+        # from the machine's local date for part of every day and would move DTE by one.
+        from datetime import date
+        return date.today()
+
     def get_balance(self):
         return self._balance
 
@@ -452,3 +460,13 @@ def sample_recommendation(mock_expert_instance):
     """Create and persist a sample ExpertRecommendation."""
     from tests.factories import create_recommendation
     return create_recommendation(instance_id=mock_expert_instance.id)
+
+
+@pytest.fixture(autouse=True)
+def _test_fakes_declare_a_greeks_source(monkeypatch):
+    """Options-account fakes here declare one greeks source, once (see the same fixture in
+    packages/common/tests/conftest.py). Building an option entry record on an account with no
+    ``OPTION_GREEKS_SOURCE`` raises; production classes declare their own and are unaffected."""
+    from ba2_common.core.interfaces.OptionsAccountInterface import (
+        OptionsAccountInterface as _OAI)
+    monkeypatch.setattr(_OAI, "OPTION_GREEKS_SOURCE", "test_fake")

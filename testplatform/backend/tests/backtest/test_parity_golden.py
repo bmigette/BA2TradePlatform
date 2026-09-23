@@ -115,6 +115,10 @@ def _parity_account(with_clock: bool):
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 
     class _Acct(OptionsAccountInterface):
+        #: Every options account declares where its greeks come from (the option entry
+        #: record refuses an undeclared one, BT/live parity Part C).
+        OPTION_GREEKS_SOURCE = "test_fake"
+
         def __init__(self):
             self.id = 1
             self.submitted = []

@@ -244,7 +244,7 @@ def test_optimizer_forwards_the_store_keys_per_trial():
     cfg = _build_daily_trial_config(
         _backtest_cfg(options_store="parquet", options_parquet_root="/tmp/root",
                       options_risk_free_rate=0.03),
-        _DECODED)
+        _DECODED, option_trade_records=False)
     # NORMALISED, not echoed: the run asked for the superseded name "parquet" and the trial
     # config carries the canonical "tastytrade". That is the point of resolving here rather than
     # forwarding a raw string -- the worker receives a store name that names its VENDOR, which is
@@ -290,7 +290,7 @@ def test_trial_config_records_the_resolved_store_not_the_raw_key(monkeypatch):
     from app.services.strategy_optimization_handler import _build_daily_trial_config
 
     monkeypatch.setenv("BACKTEST_OPTIONS_STORE", "parquet")
-    cfg = _build_daily_trial_config(_backtest_cfg(), _DECODED)
+    cfg = _build_daily_trial_config(_backtest_cfg(), _DECODED, option_trade_records=False)
     assert cfg["options_store"] == TASTYTRADE
 
     on_the_worker = _across_the_wire(cfg)
@@ -314,7 +314,7 @@ def test_an_unflagged_run_still_says_sqlite_explicitly(monkeypatch):
 
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
     assert H._build_config(_payload())["options_store"] == SQLITE
-    assert _build_daily_trial_config(_backtest_cfg(), _DECODED)["options_store"] == SQLITE
+    assert _build_daily_trial_config(_backtest_cfg(), _DECODED, option_trade_records=False)["options_store"] == SQLITE
 
 
 def test_a_typo_in_the_store_is_refused_at_config_build_time(monkeypatch):
@@ -326,4 +326,4 @@ def test_a_typo_in_the_store_is_refused_at_config_build_time(monkeypatch):
     with pytest.raises(ValueError, match="Unknown options store"):
         H._build_config(_payload(options_store="parqet"))
     with pytest.raises(ValueError, match="Unknown options store"):
-        _build_daily_trial_config(_backtest_cfg(options_store="parqet"), _DECODED)
+        _build_daily_trial_config(_backtest_cfg(options_store="parqet"), _DECODED, option_trade_records=False)

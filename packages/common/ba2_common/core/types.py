@@ -298,6 +298,60 @@ class BrokerOrderErrorReason(str, Enum):
     UNAUTHORIZED = "unauthorized"
     UNKNOWN = "unknown"                              # unmapped — broker message kept verbatim
 
+class OptionCloseReason(str, Enum):
+    """WHY an option leg / structure was closed -- the ONE vocabulary both runtimes record
+    (BT/live option parity, plan Part C3).
+
+    Written into ``TradingOrder.data["exit_record"]["trigger"]`` on every option closing order
+    and into ``Transaction.close_reason`` wherever an OPTION-specific path closes the
+    transaction (expiry / assignment / exercise / forced liquidation), identically in the
+    backtest and live. The backtest's option trade rows take their ``exit_reason`` from it
+    (never from a price-proximity guess).
+
+    Rule-fired closes (``CloseOptionAction``) are classified from the firing rule's TRIGGER
+    SEMANTICS by ``TradeActionEvaluator.option_close_trigger`` -- never from the rule's name.
+    """
+    #: A profit-side rule threshold (``profit_loss_* >``, ``profit_multiple_of_premium >=``,
+    #: ``credit_decayed_pct >=``), or the live lifecycle's ``profit_capture``.
+    TAKE_PROFIT = "take_profit"
+    #: A loss-side rule threshold (the ``_LOSS_SIDE_STOP_OPERATORS`` table), or the live
+    #: lifecycle's ``credit_stop``.
+    STOP_LOSS = "stop_loss"
+    #: An ELAPSED-time rule (``days_opened``, ``days_after_event``).
+    TIME_EXIT = "time_exit"
+    #: A REMAINING-life rule (``days_to_expiry`` / ``short_leg_days_to_expiry`` /
+    #: ``covered_call_days_to_expiry``).
+    DTE_EXIT = "dte_exit"
+    #: A rule whose triggers are none of the above (sentiment, rating, delta, ...). This
+    #: includes the PMCC's ``pmcc_delta_floor`` (``long_leg_delta <``): a PROTECTIVE exit that
+    #: flattens the structure once the long leg stops behaving like stock -- not a P&L stop and
+    #: not a schedule, so it is deliberately not folded into ``stop_loss``. The launcher's
+    #: emitted close rules are pinned to their reasons by
+    #: ``testplatform/backend/tests/test_option_close_trigger_classifier_covers_grid_rules.py``.
+    RULE_EXIT = "rule_exit"
+    #: The leg was bought back by an overlay ROLL (``roll_pmcc_short``).
+    ROLL = "roll"
+    #: Expired out of the money (live: the OCC's OPEXP activity).
+    EXPIRED_OTM = "expired_otm"
+    #: A SHORT leg assigned at expiry (live: OPASN).
+    ASSIGNED = "assigned"
+    #: A LONG leg in the money at expiry (live: OPEXC). The backtest settles it at its
+    #: premium / intrinsic instead of delivering shares (its documented no-orphaned-stock
+    #: policy, ``BacktestAccount.settle_single_leg_expiry``); the EVENT is the same.
+    EXERCISED = "exercised"
+    #: Bought back by the account's margin-call liquidation.
+    FORCED_LIQUIDATION = "forced_liquidation"
+    #: A close no rule fired: ``CloseOptionAction`` constructed outside the rule evaluator
+    #: (an operator script, a manual action).
+    MANUAL = "manual"
+    #: LIVE lifecycle pass only (``option_lifecycle.decide``), each its own risk mechanism
+    #: rather than a rule threshold: the tested short, the sleeve circuit breaker, and a
+    #: covered call whose shares are gone.
+    TESTED = "tested"
+    CIRCUIT_BREAKER = "circuit_breaker"
+    COVER_LOST = "cover_lost"
+
+
 class OrderOpenType(str, Enum):
     MANUAL = "manual"
     AUTOMATIC = "automatic"

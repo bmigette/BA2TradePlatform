@@ -378,7 +378,7 @@ def main() -> int:
         "entry_rules": entry_rules,
         "exit_rules": exit_rules,
     }
-    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
+    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted, option_trade_records=False)
     run_name = f"VAR-{args.variant}-S4TOP1{args.suffix}"
     trial_cfg["name"] = run_name
 

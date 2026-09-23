@@ -126,7 +126,7 @@ class TestTheStoredGenomePathIsPinnedToo:
                                         "risk_per_trade_pct": 2.5},
                    "screener_overrides": {}, "schedule_days": None,
                    "entry_rules": None, "exit_rules": None}
-        cfg = _build_daily_trial_config(backtest_cfg, decoded, None)
+        cfg = _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
         settings = cfg["experts"][0]["settings"]
         assert settings["use_atr_stop"] is False
         assert settings["regime_overlay_enabled"] is False

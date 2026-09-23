@@ -151,7 +151,7 @@ def test_cold_then_identical_warmup_is_free_and_same_manifest(root):
     src = FakeSource(root)
     p1, r1 = _warm(root, src)
     assert r1.ok and r1.exit_code == 0, r1
-    n = p1.decision_sessions * len(UNIVERSE)
+    n = p1.row_sessions * len(UNIVERSE)
     assert r1.counters["rows_computed"] == n and r1.counters["rows_reused"] == 0
     assert r1.counters["provider_calls"] == 0 and src.fetches == []
     assert W.verify(r1.manifest_digest, root).ok
@@ -171,10 +171,72 @@ def test_cold_then_identical_warmup_is_free_and_same_manifest(root):
     m = store.read_manifest(r1.manifest_digest)
     reader = FMPCacheMarketConditionReader(PROFILE, root)
     rows = list(store.iter_rows(m, "BBB"))
-    assert len(rows) == p1.decision_sessions
+    assert len(rows) == p1.row_sessions
     for session, row in rows[::37]:
         assert dict(row.by_field()) == dict(reader.observe("BBB", session).by_field())
     assert all(o.status == STATUS_VALID for _s, r in rows for o in r.by_field().values())
+
+
+def test_the_rows_serve_both_the_live_and_the_backtest_rule_over_the_window(root):
+    """BT/live parity (plan 2026-09-22 A3). A live decision on session S reads ``prior(S)``; a
+    backtest bar D (the live decision labelled N(D)) reads D itself. One snapshot for
+    ``[START, END]`` must serve both, so the rows are ``[prior(first decision), last decision]``
+    -- one more than the decision count. Before the fix the rows stopped at ``prior(last)``, so
+    a backtest's last bar read ``missing_session``.
+
+    ``window_start``/``window_end`` stay the dates the snapshot was built FOR (the reader's
+    window check compares a run's bars against them); the rows are what coverage records."""
+    from ba2_common.core.market_calendar import (
+        backtest_decision_label, decision_data_session, live_decision_label,
+        prior_regular_session,
+    )
+    from datetime import datetime as _dt
+
+    src = FakeSource(root)
+    p, rep = _warm(root, src)
+    assert rep.ok, rep
+    decisions = _sessions(START, END)
+    assert p.decision_sessions == len(decisions)
+    assert p.row_sessions == len(decisions) + 1
+    assert p.first_row_session == prior_regular_session(decisions[0]).isoformat()
+    assert p.last_row_session == decisions[-1].isoformat()
+
+    m = MarketConditionStore(root).read_manifest(rep.manifest_digest)
+    assert (m["window_start"], m["window_end"]) == (START.isoformat(), END.isoformat())
+    rows = [s for s, _r in MarketConditionStore(root).iter_rows(m, "AAA")]
+    assert rows == _sessions(prior_regular_session(decisions[0]), decisions[-1])
+    assert m["coverage"]["AAA"]["first_session"] == rows[0].isoformat()
+    assert m["coverage"]["AAA"]["last_session"] == rows[-1].isoformat()
+    held = set(rows)
+    for day in decisions:
+        live_at = _dt(day.year, day.month, day.day, 9, 35, tzinfo=NY_TZ)
+        assert decision_data_session(live_decision_label(live_at)) in held      # live on S
+        assert decision_data_session(backtest_decision_label(day)) in held      # BT bar D
+
+
+def test_an_end_session_that_has_not_closed_yet_is_refused(root, monkeypatch):
+    """The last row IS the end session, so its bar must exist. END 2025-06-27 closes 20:00 UTC:
+    planning it at 19:59 UTC that day is refused loudly; at 20:01 it is a completed session."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    src = FakeSource(root)
+    monkeypatch.setattr(W, "_now_utc", lambda: _dt(2025, 6, 27, 19, 59, tzinfo=_tz.utc))
+    with pytest.raises(W.WarmupConfigError, match="COMPLETED session"):
+        W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    # A window ending on a future session is the same refusal.
+    with pytest.raises(W.WarmupConfigError, match="has not happened yet"):
+        W.plan(PROFILE, UNIVERSE, START, date(2025, 6, 30), cache_root=root, source=src)
+
+    monkeypatch.setattr(W, "_now_utc", lambda: _dt(2025, 6, 28, 9, 0, tzinfo=_tz.utc))
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    assert p.last_row_session == END.isoformat()
+
+
+def test_a_version_1_plan_file_is_refused():
+    """Version 1 plans carried rows ``prior(first)..prior(last)``; built today they would come
+    out one row short at the end, so ``from_dict`` refuses them instead of guessing."""
+    with pytest.raises(W.WarmupConfigError, match="plan version 1"):
+        W.MarketConditionWarmPlan.from_dict({"plan_version": 1, "symbols": []})
 
 
 def test_extend_end_by_one_session_builds_one_row_per_symbol(root):
@@ -280,7 +342,7 @@ def test_two_concurrent_builders_coalesce_on_one_manifest(root):
         t.join()
     a, b = reports
     assert a.ok and b.ok and a.manifest_digest == b.manifest_digest
-    total = p.decision_sessions * len(UNIVERSE)
+    total = p.row_sessions * len(UNIVERSE)
     # EXACTLY one builder does the work: the other waits on every symbol's claim and then finds
     # each row already published (through the winner's progress records), computing nothing.
     winner, waiter = (a, b) if a.counters["rows_computed"] else (b, a)
@@ -440,7 +502,7 @@ def test_unreadable_split_calendar_fails_loudly_and_is_only_waived_explicitly(ro
     m = MarketConditionStore(root).read_manifest(rep.manifest_digest)
     assert m["coverage"]["BBB"]["rows"] == 0
     assert m["coverage"]["BBB"]["exceptions"][0]["kind"] == "split_calendar_unavailable"
-    assert m["coverage"]["AAA"]["rows"] == p.decision_sessions
+    assert m["coverage"]["AAA"]["rows"] == p.row_sessions
     assert not list(MarketConditionStore(root).iter_rows(m, "BBB"))
 
 
@@ -467,7 +529,7 @@ def test_a_calc_version_bump_recomputes_every_row(root, monkeypatch):
 
     src = FakeSource(root)
     p1, r1 = _warm(root, src)
-    total = p1.decision_sessions * len(UNIVERSE)
+    total = p1.row_sessions * len(UNIVERSE)
     assert r1.counters["rows_computed"] == total
 
     bumped = dc_replace(MC.PROFILES[PROFILE], calc_version="ohlcv-v1/calc-2")
@@ -486,7 +548,7 @@ def test_a_calc_version_bump_recomputes_every_row(root, monkeypatch):
     # The old manifest is untouched and still readable at its own version.
     old = store.read_manifest(r1.manifest_digest)
     assert old["calc_version"] == "ohlcv-v1/calc-1" and store.verify(old, r1.manifest_digest).ok
-    assert len(list(store.iter_rows(old, "AAA"))) == p1.decision_sessions
+    assert len(list(store.iter_rows(old, "AAA"))) == p1.row_sessions
 
     # Back at the original version (the bump undone), the original rows are reused again and the
     # original manifest is re-opened: nothing was destroyed or rewritten.
@@ -560,7 +622,7 @@ def test_a_builder_that_lost_its_claim_does_not_prune_the_new_owner_s_records(ro
     index = W._ManifestIndex(store, PROFILE, UNIVERSE)
     inv = p.symbol("AAA")
     cal = W._calendar_span(date.fromisoformat(p.first_row_session), date.fromisoformat(p.last_row_session),
-                           p.decision_sessions)
+                           p.row_sessions)
     foreign = W._progress_dir(root, PROFILE, "AAA") / ("f" * 64 + ".json")
     payload = {"path": store.object_rel(PROFILE, "f" * 64), "sha256": "f" * 64, "symbol": "AAA",
                "month": "2025-06", "rows": 1, "calc_version": p.calc_version, "schema_version": 2}
@@ -652,13 +714,13 @@ def test_the_ta_structure_profile_builds_through_the_batch_and_matches_the_windo
     rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())),
                   fetch_missing=False, concurrency=1, source=src)
     assert rep.ok and rep.exit_code == 0, rep
-    assert rep.counters["rows_computed"] == p.decision_sessions * len(UNIVERSE)
+    assert rep.counters["rows_computed"] == p.row_sessions * len(UNIVERSE)
 
     store = MarketConditionStore(root)
     manifest = store.read_manifest(rep.manifest_digest)
     reader = FMPCacheMarketConditionReader("ta-structure-v1", root)
     rows = list(store.iter_rows(manifest, "BBB"))
-    assert len(rows) == p.decision_sessions
+    assert len(rows) == p.row_sessions
     for session, row in rows[::17]:
         want = reader.observe("BBB", session).by_field()
         got = row.by_field()
@@ -700,3 +762,32 @@ def test_the_batch_serves_only_windows_that_really_span_the_full_window():
     # back to the per-window calculator.
     assert W._batch_rows(None, snap, full) == {}
     assert W._batch_rows(BATCH_BY_PROFILE["ta-structure-v1"], snap, full[:1]) == {}
+
+
+def test_a_file_adjusted_on_the_wrong_day_is_mixed_basis_and_refetched(root):
+    """Plan Part G1a (the CRWD case): the vendor divided the bars appended after some day by
+    the split factor 12 sessions BEFORE the calendar ex-date. The ex-date bar alone looks
+    adjusted ('consistent'), but every earlier bar is 2x too high -- as wrong for the
+    market-condition features as for option strikes. The preflight must require the same full
+    re-fetch as for drift, and the re-fetched (one-basis) file must then pass."""
+    split_day = date(2025, 2, 3)
+    early = date(2025, 1, 15)
+    truth = dict(TRUTH)
+    truth["MIX"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=91)
+    _write(root, "MIX", _unadjust(truth["MIX"], early, 2.0))
+    src = FakeSource(root, truth=truth, splits={"MIX": [CalendarSplit(split_day, 2.0)]})
+    p = W.plan(PROFILE, ("MIX",), START, END, cache_root=root, source=src)
+    mix = p.symbol("MIX")
+    assert mix.refetch_required
+    assert [c["verdict"] for c in mix.split_checks] == ["mixed_basis"]
+    assert mix.split_checks[0]["checked_bar"] == early.isoformat()
+
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src)
+    assert rep.exit_code == 1 and [i["kind"] for i in rep.inventory] == ["refetch_required"]
+
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=True, source=src)
+    assert rep.ok, rep
+    assert src.full_refetches == ["MIX"]
+    p2 = W.plan(PROFILE, ("MIX",), START, END, cache_root=root, source=src)
+    assert not p2.symbol("MIX").refetch_required
+    assert [c["verdict"] for c in p2.symbol("MIX").split_checks] == ["refetched"]

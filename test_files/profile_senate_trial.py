@@ -68,7 +68,7 @@ def build_config(strategy_kind, universe, start, end, interval):
     # applies no gene substitution, i.e. the strategy's authored BASELINE -- the fair
     # like-for-like comparison point.
     decoded = decode_params(strat, {})
-    return _build_daily_trial_config(backtest_block, decoded, {"backtest_cfg": backtest_block})
+    return _build_daily_trial_config(backtest_block, decoded, {"backtest_cfg": backtest_block}, option_trade_records=False)
 
 
 def main():

@@ -29,6 +29,7 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 import importlib.util
 import os
 import sys
@@ -58,7 +59,7 @@ def _launcher():
 
 
 CFG = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": 0.0,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",
@@ -552,9 +553,32 @@ def test_o_leapc_dte_floor_exit_fires_inside_the_grid_window():
     engine, account, ctx = _run_leap(dte_floor=320, account_id=774)
     try:
         engine.run()
-        assert not account.get_option_positions(), (
-            "days_to_expiry <= 320 should have closed the LEAPS call partway through the "
-            "run; the position is still open")
+        # THE FIRST POSITION IS CLOSED BY THE FLOOR, not "the account ends flat". The entry
+        # rule re-arms on has_no_position, so after the exit the run cycles entry -> exit
+        # until the window ends, and whether the LAST cycle happens to be closed by the final
+        # bar is timing, not the property. Since BT/live option parity B2 (2026-09-22) the
+        # chain's volume is the decision session's, so a re-entry can only be decided on a day
+        # the contract traded (option_min_volume=25): the cycle's phase moved and the run now
+        # ends one re-entry in.
+        #
+        # THE RULE (BT/live option parity Task 4, 2026-09-22): days_to_expiry counts from the
+        # bar's DECISION LABEL, backtest_decision_label(D) = N(D) -- the session its orders
+        # execute in, the date live counts from. So the floor is crossed on the FIRST bar D
+        # whose label reaches floor_day: here Fri 2024-03-01 (label Mon 03-04 >= Sat 03-02).
+        # Before, DTE counted from the bar date D itself and the first SELL was 2024-03-04.
+        from ba2_common.core.market_calendar import backtest_decision_label
+
+        floor_day = _LEAP_EXPIRY - timedelta(days=320)
+        fills = [(t["side"], t["date"].date()) for t in account.get_filled_trades()]
+        assert fills and fills[0][0] == "BUY", f"the entry never filled: {fills}"
+        first_sell = next((d for side, d in fills if side == "SELL"), None)
+        assert first_sell is not None and first_sell <= _LEAP_END.date(), (
+            f"days_to_expiry <= 320 should have closed the LEAPS call partway through the "
+            f"run (floor crossed on {floor_day}); fills were {fills}")
+        # Crossed on this bar, by its label...
+        assert backtest_decision_label(first_sell) >= floor_day, (first_sell, floor_day)
+        # ...and not one bar late: the previous bar's label (== first_sell) had not crossed.
+        assert first_sell < floor_day, (first_sell, floor_day)
         from ba2_common.core.trade_store import orders_where
         assert [o for o in orders_where(account_id=774) if o.contract_symbol], (
             "no option order at all -- the entry never fired, so this proves nothing "
