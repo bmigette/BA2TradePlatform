@@ -187,6 +187,8 @@ class LazyTable:
         self._loading_spinner: Optional[ui.spinner] = None
         self._pagination_label: Optional[ui.label] = None
         self._global_filter_input: Optional[ui.input] = None
+        # Between the table and its pagination controls; see ``footer``.
+        self._footer: Optional[ui.column] = None
         
         # Auto refresh task
         self._refresh_task: Optional[asyncio.Task] = None
@@ -668,6 +670,8 @@ class LazyTable:
             # Handle sort change from Quasar table (server-side mode)
             self._table.on('request', self._handle_sort_request)
             
+            self._footer = ui.column().classes('w-full gap-0')
+
             # Pagination controls
             self._render_pagination_controls()
         
@@ -721,6 +725,16 @@ class LazyTable:
         """Get total record count."""
         return self._total_count
     
+    @property
+    def footer(self) -> Optional[ui.column]:
+        """Container directly under the table rows, ABOVE the pagination controls.
+
+        For a page's summary strip (e.g. Live Trades' totals): under the pagination bar it
+        read as belonging to the page, not the table, and sat a scroll further away. Created
+        by ``render()``; ``None`` before it.
+        """
+        return self._footer
+
     def add_slot(self, name: str, template: str):
         """
         Add a custom slot to the table.

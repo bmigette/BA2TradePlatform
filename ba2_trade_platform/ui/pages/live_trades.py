@@ -901,13 +901,13 @@ class LiveTradesTab:
         # Render the table
         await self.live_trades_table.render()
 
-        # Totals strip, under the table and matching the Overview page's shape (cost ->
-        # unrealised P/L -> market value). Created AFTER render() so it sits below the
-        # pagination controls; the data loader has usually already run by now, so paint it
-        # immediately from whatever it stored and let later loads repaint it.
-        ui.separator().classes('my-2')
-        self._totals_row = ui.row().classes(
-            'w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-t border-white/10')
+        # Totals strip, matching the Overview page's shape (cost -> unrealised P/L -> market
+        # value), in the table's footer: right under the rows, above the pagination controls.
+        # The data loader has usually already run by now, so paint it immediately from
+        # whatever it stored and let later loads repaint it.
+        with self.live_trades_table.footer:
+            self._totals_row = ui.row().classes(
+                'w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-b border-white/10')
         self._refresh_totals_row()
 
         logger.debug("[RENDER] _render_transactions_table_async() - END")

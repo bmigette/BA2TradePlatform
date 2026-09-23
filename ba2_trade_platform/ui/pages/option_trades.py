@@ -189,9 +189,10 @@ class OptionTradesTab:
             with self.container:
                 await self._render_table()
 
-            ui.separator().classes('my-2')
-            self._totals_row = ui.row().classes(
-                'w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-t border-white/10')
+            # In the table's footer: right under the rows, above the pagination controls.
+            with self.table.footer:
+                self._totals_row = ui.row().classes(
+                    'w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-b border-white/10')
             self._refresh_totals()
 
     async def _render_table(self):

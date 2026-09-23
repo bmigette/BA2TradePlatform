@@ -520,6 +520,9 @@ class LiveTradesTable(LazyTable):
             # Setup event handlers
             self._setup_event_handlers()
             
+            # See ``LazyTable.footer``.
+            self._footer = ui.column().classes('w-full gap-0')
+
             # Pagination controls
             self._render_pagination_controls()
         
