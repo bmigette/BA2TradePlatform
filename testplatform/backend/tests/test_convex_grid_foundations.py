@@ -74,7 +74,7 @@ def _decoded(m, genome, expert="FMPRating"):
         "entry_action": getattr(strat, "entry_action", None),
         "options_store": "parquet",
     }
-    return _build_daily_trial_config(backtest_cfg, decoded, None)
+    return _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
 
 
 def _entry_rule(trial, rid):

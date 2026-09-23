@@ -258,4 +258,9 @@ def test_the_recorded_states_attach_to_the_executed_trades(arms):
     assert bound, out
     for trade in bound:
         assert trade["entry_state"]["values"]["underlying_adx_14"]["value"] == pytest.approx(10.0)
-        assert trade["entry_state"]["gap_days"] >= 0
+        # BT/live parity (plan 2026-09-22 A2): the recorded session is the decision LABEL N(D),
+        # the session the next-bar fill lands in, so a next-bar fill binds with NO gap. Under
+        # the old bar-as-label clock this was 1 (or 3 over a weekend).
+        assert trade["entry_state"]["gap_days"] == 0
+        # ... and the row read was the bar's own session, the one before the label.
+        assert trade["entry_state"]["prior_session"] < trade["entry_state"]["session"]

@@ -233,7 +233,8 @@ def test_the_structure_exit_reader_gives_the_pre_task_answer(legacy_db):
     from ba2_common.core.TradeConditions import DaysToExpiryCondition
 
     cond = DaysToExpiryCondition(
-        account=SimpleNamespace(id=1), instrument_name="AAPL",
+        # The exit counts from the account's decision label (the date the entry counted from).
+        account=SimpleNamespace(id=1, decision_label=lambda: SIM_TODAY), instrument_name="AAPL",
         expert_recommendation=SimpleNamespace(created_at=SIM_AS_OF, instance_id=1,
                                               symbol="AAPL"),
         operator_str="<=", value=21, existing_order=legacy_db.parent)

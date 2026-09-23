@@ -65,7 +65,20 @@ jobs:
         # denominator). Strict means an XPASS FAILS this gate on purpose: either blocker becoming
         # true silently would move historical backtest numbers, so it must be a separately
         # versioned, reviewed correction rather than a quiet green build.
-        run: python -m pytest tests/backtest/test_parity_golden.py tests/backtest/test_margin_live_backtest_parity.py -v -p no:cacheprovider
+        #
+        # test_market_condition_bt_live_session_parity.py pins that a backtest bar and the live
+        # decision it stands for (the NEXT session) read the same market-condition row
+        # (docs/plans/2026-09-22-bt-live-option-parity.md A4).
+        #
+        # test_option_liquidity_bt_live_parity.py pins that the grid's option volume gate
+        # (option_min_volume=25) sees the same per-contract volume, and the grid long call picks
+        # the same contract, from a backtest parquet chain at bar D and from the live Alpaca
+        # chain at the next session's open (same plan, B5).
+        #
+        # test_option_entry_record_parity.py pins that a backtest option entry and the live entry
+        # it stands for produce the same comparable trade record (same plan). --junitxml feeds the
+        # annotation step below, so a red parity gate is readable by non-admins too.
+        run: python -m pytest tests/backtest/test_parity_golden.py tests/backtest/test_margin_live_backtest_parity.py tests/backtest/test_market_condition_bt_live_session_parity.py tests/backtest/test_option_liquidity_bt_live_parity.py tests/backtest/test_option_entry_record_parity.py -v -p no:cacheprovider --junitxml=junit-parity.xml
 
       - name: Backtest engine + shared decision suite (blocking)
         working-directory: testplatform/backend
@@ -78,7 +91,7 @@ jobs:
         # the only channel a non-admin can read.
         if: failure()
         working-directory: testplatform/backend
-        run: python "$GITHUB_WORKSPACE/.github/scripts/annotate_junit_failures.py" junit-backtest.xml
+        run: python "$GITHUB_WORKSPACE/.github/scripts/annotate_junit_failures.py" junit-parity.xml junit-backtest.xml
       - name: Shared decision-path branch coverage (artifact, non-blocking)
         working-directory: testplatform/backend
         continue-on-error: true
@@ -105,6 +118,7 @@ jobs:
         with:
           name: failure-diagnostics
           path: |
+            testplatform/backend/junit-parity.xml
             testplatform/backend/junit-backtest.xml
             pip-freeze.txt
           if-no-files-found: ignore

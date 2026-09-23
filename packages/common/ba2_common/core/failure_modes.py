@@ -91,6 +91,16 @@ _MODE_ENV = "BA2_ERROR_MODE"
 # this module refuses to make on the caller's behalf. Pass them per-site when they are expected.
 _BENIGN_DEFAULT: tuple = (OSError,)
 
+# NEVER absorbed, in ANY mode (legacy and observe included) and whatever a call site names as
+# benign: refusals whose whole meaning is "this run's numbers would be wrong -- stop". Matched
+# by class NAME across the MRO so this module imports neither definer (one lives in
+# ``split_basis``, the other in the backtest engine). BT/live option parity, plan Part E.
+_NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch"})
+
+
+def is_never_absorbed(exc: BaseException) -> bool:
+    return any(k.__name__ in _NEVER_ABSORB_NAMES for k in type(exc).__mro__)
+
 
 def _mode() -> str:
     return (os.environ.get(_MODE_ENV) or "enforce").strip().lower()
@@ -132,6 +142,8 @@ def absorb_if_benign(exc: BaseException, *also_benign: type) -> None:
     Re-raises the exception being handled, so the ORIGINAL traceback survives and points at the
     real failure site rather than at this function.
     """
+    if is_never_absorbed(exc):
+        raise exc
     if is_benign(exc, *also_benign):
         return
     mode = _mode()

@@ -2020,6 +2020,10 @@ class AccountInterface(ReadOnlyAccountInterface):
                 f"this is NOT a shortfall and closing a position will not clear it.")
         if pledged <= 0:
             return None
+        # AS-TRADED shares (contracts x 100) -> this account's equity-book unit, which is
+        # what ``held``/``working``/``quantity`` below count in (identity live; a
+        # split-adjusted backtest book, see OptionsAccountInterface.equity_shares_per_option_share).
+        pledged = self.option_shares_in_equity_units(symbol, pledged)
 
         held = self.held_shares_for_cover(symbol)
         if held is None:

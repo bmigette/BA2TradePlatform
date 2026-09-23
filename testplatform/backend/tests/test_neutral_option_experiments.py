@@ -58,7 +58,7 @@ def test_cli_policy_survives_trial_config_and_export(mode, monkeypatch):
     base = config["backtest"]
     assert base["experts"][0]["settings"]["evaluate_entry_rules_on_hold"] is True
     strategy = L._build_strategy("O_IC", "trial", "FMPRating", neutral_entry_mode=mode)
-    trial = _build_daily_trial_config(base, decode_params(strategy, {}))
+    trial = _build_daily_trial_config(base, decode_params(strategy, {}), option_trade_records=False)
     assert trial["experts"][0]["settings"]["evaluate_entry_rules_on_hold"] is True
     from tests.test_backtest_export_fixed_settings import _backtest
     from app.api.backtests import _derive_export_payload
@@ -102,7 +102,7 @@ def test_joint_gene_reaches_trial_and_saved_backtest_export(mode, monkeypatch):
              for arm in ("hold", "low_confidence")}
     assert all(key in space for key in genes)
     decoded = decode_params(strategy, genes)
-    trial = _build_daily_trial_config(config["backtest"], decoded)
+    trial = _build_daily_trial_config(config["backtest"], decoded, option_trade_records=False)
     assert trial["experts"][0]["settings"]["evaluate_entry_rules_on_hold"] is True
     assert decoded["expert_overrides"] == {}
     saved = _backtest(strategy_params={**genes,

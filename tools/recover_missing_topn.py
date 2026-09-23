@@ -107,7 +107,8 @@ def build_spec(db, opt_id, rank):
         assert len(ranked) == rank, f"opt {opt_id}: only {len(ranked)} distinct-fitness individuals, no rank {rank}"
         params, _key, ga_fitness = ranked[rank - 1]
     decoded = decode_params(strat, params)
-    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
+    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
+                                          option_trade_records=True)  # persisted top-N
     trial_cfg["name"] = name
     trial_cfg["persist_trading_db"] = True
     trial_cfg["ga_fitness"] = ga_fitness

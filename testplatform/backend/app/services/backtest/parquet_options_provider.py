@@ -8,9 +8,10 @@ reads the Alpaca-built ``OptionsHistoryCache`` sqlite. This class reads
 methods with the SAME signatures and the SAME as-of clamp, so ``BacktestAccount`` cannot tell
 them apart. The engine's contract is exactly:
 
-    get_chain(underlying, as_of, *, expiry_min, expiry_max,
+    get_chain(underlying, as_of, *, expiry_min, expiry_max, data_session,
               option_type=None, strike_min=None, strike_max=None) -> List[OptionContract]
-    get_quote(occ_symbol, as_of)  -> Optional[OptionQuote]
+    get_quote(occ_symbol, as_of, *, data_session)  -> Optional[OptionQuote]
+    chain_staleness() -> dict                          # per-run measurement, see below
     get_bar(occ_symbol, as_of)    -> Optional[dict]   # EXACT bar on as_of, else None
     get_atm_iv(underlying, as_of) -> Optional[float]
     delta_at_entry(underlying, occ_symbol, when) -> Optional[float]   # results.py refinement
@@ -36,22 +37,27 @@ WHAT THE PARQUET HAS THAT THE SQLITE DOES NOT
     GREEKS below.
 
 WHAT IT DOES NOT HAVE, AND WHY THAT IS NOT A REGRESSION
-  * greeks (delta/gamma/theta/vega) are ABSENT. They are derived exactly the way the sqlite
+  * greeks (delta/gamma/theta/vega/rho) are ABSENT. They are derived exactly the way the sqlite
     store's own bars were derived at BUILD time: one call to
     ``option_greeks.compute_iv_and_greeks`` per (contract, bar), Black-Scholes-inverting THAT
     bar's own close against the underlying's close on THAT date. Same function, same model,
-    same convention (theta per calendar day, vega per vol point) — there is deliberately no
+    same convention (theta per calendar day, vega per vol point, rho per rate point) — there
+    is deliberately no
     second greeks path in this file.
     Consequence worth stating: ``implied_volatility`` reported here is the INVERTED iv, not
     the vendor's, so that it and ``delta`` are the same number's consequences. Measured on
     GOOG's 25,864 comparable rows the two differ by a median 0.034 / mean 0.060 / p90 0.117
     of a vol unit — close in kind, not equal. ``vendor_iv`` is preserved on the bar dict so a
     later change can prefer it without re-reading 205 MB.
-  * bid/ask are ABSENT (dxfeed serves no historical NBBO for dead contracts) and no worse
-    than sqlite, where ``bid == ask`` on every quoted row (0 of 1,083,571 have ask > bid;
-    the other 357,211 of 1,440,782 chain rows carry no quote at all): both stores are a
-    ZERO-SPREAD premium proxy and the tradeable spread is MODELLED downstream by
-    ``option_spread_pct``. CONSEQUENCE FOR RANKING, since it reads backwards at a glance:
+  * bid/ask are ABSENT in the TastyTrade tree (dxfeed serves no historical NBBO for dead
+    contracts) and no worse than sqlite, where ``bid == ask`` on every quoted row (0 of
+    1,083,571 have ask > bid; the other 357,211 of 1,440,782 chain rows carry no quote at
+    all): both are a ZERO-SPREAD premium proxy. (A ThetaData tree DOES carry real NBBO; see
+    the REAL QUOTES branch in ``contract``.) The spread a FILL pays is charged downstream by
+    the run's ``option_spread_model`` (``BacktestAccount._option_half_spread``): the decision
+    bar's real quote from ``bar_dict``'s ``bid``/``ask`` when valid, else the calibrated
+    fallback of ``ba2_common.core.option_spread_model`` -- which is what every fill on an
+    unquoted tree gets. CONSEQUENCE FOR RANKING, since it reads backwards at a glance:
     a constant 0.0 spread is not "no signal", it is the BEST possible score --
     ``option_selection_policy._minimise`` maps a degenerate column to 0.0 and inverts it to
     1.0 for every candidate. ``w_spread`` therefore fails OPEN uniformly here, which is why
@@ -88,6 +94,18 @@ bar is after D is not in the chain at all. That is the same shape as the sqlite 
 (``latest_as_of`` snapshot + per-contract ``latest_on_or_before`` overlay) with the snapshot
 derived instead of stored, and like it, a stale-but-clamped bar is preferred to no row — the
 fill engine still requires an EXACT bar on the fill day, so an untraded contract cannot fill.
+
+VOLUME IS THE DATA SESSION'S, NOT THE CLAMPED ROW'S (BT/live option parity, 2026-09-22,
+``docs/plans/2026-09-22-bt-live-option-parity.md`` B2). The clamped row above prices the
+contract; its VOLUME is only the liquidity of the day it was printed. A contract that last
+traded on D-3 used to report D-3's volume on D, and ``option_min_volume`` passed it, while live
+reads the session's own bar. So ``get_chain``/``get_quote`` take the caller's ``data_session``
+and report ``option_session.session_volume`` of the bar dated exactly that session (0 when
+there is none). A stored row with NaN volume is this store's documented known zero (a no-trade
+row that still carries quotes) and is turned into 0 BEFORE the shared rule, which refuses NaN.
+Prices and greeks still come from the clamped row (user decision); how often that row is older
+than the data session is COUNTED per provider, i.e. per run, and reported by
+``chain_staleness`` into the run's results (``results.build_results``).
 
 DELTA-AT-ENTRY IS A NAMED SEAM METHOD, NOT AN INCIDENTAL ATTRIBUTE.
 ``results._build_refine_drawdown_fn`` needs one option-specific fact — the delta a contract
@@ -147,7 +165,7 @@ Columnar (numpy) rather than dict-per-bar because the cap has to clear a realist
 the OHLCV memo. Measured on GOOG (27,974 rows / 1,374 contracts): 2.36 MB for the raw
 (1.53 MB of numpy plus 0.43 MB of the python projections the hot paths index and
 0.26 MB of the contract symbol list/index). The greeks are no longer per-row at all -- they
-are a bounded row->tuple memo (``_GREEKS_MEMO_MAX``, 6.3 MB at the default cap however big
+are a bounded row->tuple memo (``_GREEKS_MEMO_MAX``, ~6.9 MB at the default cap however big
 the underlying is); see ``_Underlying._fresh_run_fill`` for why the five dense float64
 columns they replace could not be made to follow what a trial reads. The per-ROW
 projection is an ``array('i')`` rather than a list precisely because that 0.43 MB is the part
@@ -168,11 +186,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.option_session import _normalise_volume, session_volume
 from ba2_common.core.option_types import OptionContract, OptionQuote
 from ba2_common.core.types import OptionRight
 from ba2_providers.options.tastytrade import parse_occ
 
 from .option_greeks import compute_iv_and_greeks
+from .option_read_common import ChainStaleness, require_data_session
 from .options_cache import OptionsCacheMiss
 
 logger = logging.getLogger(__name__)
@@ -210,10 +230,10 @@ def _cap_from_env(name: str, default: int) -> int:
     return max(0, int(os.getenv(name, str(default))))
 
 
-#: Greeks memoised per OVERLAY, as row index -> the finished 5-tuple. THE NUMBER THAT SIZES
-#: A WORKER: at a measured 315 B/entry this is 6.3 MB per underlying, so the 98-symbol
-#: stage-1 option universe holds ~617 MB where the five dense float64 columns it replaces
-#: held 7.1 GB. The cap is chosen from the WIDEST read pattern the seam admits (1-730 DTE,
+#: Greeks memoised per OVERLAY, as row index -> the finished 6-tuple. THE NUMBER THAT SIZES
+#: A WORKER: at ~347 B/entry (315 B measured for the old 5-tuple, +32 B derived for rho) this
+#: is 6.9 MB per underlying, so the 98-symbol stage-1 option universe holds ~680 MB where the
+#: five dense float64 columns it replaces held 7.1 GB. The cap is chosen from the WIDEST read pattern the seam admits (1-730 DTE,
 #: every contract every bar: 751 new rows and 1,326 calls per bar on AAPL) — at 20,000 it
 #: gives up 0.4% of the hits an unbounded memo gets and 98.5% of the residency. Lower it on a
 #: memory-tight worker before touching anything else here; 5,000 still holds 41.1% of 43.6%.
@@ -234,11 +254,13 @@ _BAR_MEMO_MAX = _cap_from_env("BT_OPTION_BAR_MEMO_MAX", 5000)
 #: ~40%, which is exactly the kind of number that makes a worker look healthy while it is not.
 _BAR_MEMO_BYTES_PER_ENTRY = 821
 #: Likewise for ``_g_memo``: 500,000 real greek tuples moved the working set by 150.2 MB —
-#: 315 B for a 5-tuple, its five float objects and the dict slot holding it. Neither constant
-#: counts the 8 B/entry the eviction-order deque adds (a pointer to the int the dict already
+#: 315 B for a 5-tuple, its five float objects and the dict slot holding it. The tuple gained
+#: rho on 2026-09-22 (a 6-tuple): +8 B of tuple slot and +24 B for one more float object,
+#: so 347 B -- DERIVED from the measurement, not re-measured. Neither constant counts the
+#: 8 B/entry the eviction-order deque adds (a pointer to the int the dict already
 #: holds as its key); it is 2.5% of a greeks entry and 1% of a bar entry, inside the noise of
 #: the RSS deltas these were measured from.
-_GREEKS_MEMO_BYTES_PER_ENTRY = 315
+_GREEKS_MEMO_BYTES_PER_ENTRY = 347
 
 #: SCOPE-INDEPENDENT. The parquet bytes and everything derived from them alone. See CACHING.
 _WORKER_RAW_CACHE: "OrderedDict[Tuple[str, str], _RawUnderlying]" = OrderedDict()
@@ -256,8 +278,8 @@ _MISSING = object()
 _ATM_DTE_MIN = 20
 _ATM_DTE_MAX = 45
 
-#: greeks_tuple's shape, for readers of the hot paths. (iv, delta, gamma, theta, vega).
-_NO_GREEKS: Tuple[Optional[float], ...] = (None, None, None, None, None)
+#: greeks_tuple's shape, for readers of the hot paths. (iv, delta, gamma, theta, vega, rho).
+_NO_GREEKS: Tuple[Optional[float], ...] = (None, None, None, None, None, None)
 
 #: ``bar_ord_l``'s buffer type. 'i' is C ``int`` — 4 bytes on every platform BA2 runs on, and
 #: the same width as the ``bar_ord`` int32 whose bytes are copied straight into it. Checked at
@@ -349,7 +371,7 @@ def reset_run_overlays() -> Dict[str, Any]:
 
     WHAT IT DROPS — and all four are pure memoisation of pure functions of this run's spot
     source and rate, which is the only reason dropping them per trial is safe:
-      * ``_g_memo`` — the greeks, 315 B/entry;
+      * ``_g_memo`` — the greeks, ~347 B/entry;
       * ``_bar_memo`` — the materialised bar dicts, 821 B/entry;
       * ``_spot_cache`` — one float per bar DATE, small, but it is run-scoped like the rest;
       * ``_WORKER_ATM_IV_CACHE`` — a run-scoped RESULT memo, and pointless to keep once the
@@ -395,6 +417,9 @@ def clear_worker_parquet_options_cache() -> None:
     _WORKER_UNDERLYING_CACHE.clear()
     _WORKER_ATM_IV_CACHE.clear()
     _underlying_of.cache_clear()
+    # The E4 guard's per-underlying index is derived from these raws; it goes with them.
+    from .option_basis_guard import clear_basis_guard_cache
+    clear_basis_guard_cache()
 
 
 def _iso_to_ordinal_array(series) -> np.ndarray:
@@ -730,7 +755,7 @@ class _Underlying:
         40 B/row nominal. One trial, and the columns are already all there.
 
         SO THE MEMO IS BOUNDED AND SPARSE INSTEAD: ``_g_memo`` maps row index -> the finished
-        5-tuple, capped at ``_GREEKS_MEMO_MAX``. The cap works because the REUSE IS LOCAL —
+        6-tuple (5 greeks + iv), capped at ``_GREEKS_MEMO_MAX``. The cap works because the REUSE IS LOCAL —
         a bar's chain read, its ``get_atm_iv`` and its held-lot ``get_bar`` calls all land on
         the same few hundred rows, and the next bar moves on. Measured on the same AAPL walk,
         and on the WIDEST read pattern the seam admits (1-730 DTE, i.e. every contract every
@@ -741,9 +766,9 @@ class _Underlying:
             memo, cap 20,000           43.4%    686,097     0 MB ( 0.6 B/row)   139 s
             memo, cap  5,000           41.1%    713,820     2 MB ( 2.2 B/row)   137 s
 
-        i.e. the cap buys back 98.5% of the residency for 0.4% of the hits. At 315 B/entry
-        (measured) the cap is 6.3 MB per underlying, so a 98-symbol universe holds ~617 MB
-        where the columns held 7.1 GB.
+        i.e. the cap buys back 98.5% of the residency for 0.4% of the hits. At ~347 B/entry
+        (315 B measured for the pre-rho 5-tuple, +32 B derived for rho) the cap is ~6.9 MB per
+        underlying, so a 98-symbol universe holds ~680 MB where the columns held 7.1 GB.
 
         FIFO, NOT LRU. A backtest walks its window forward; the row read longest ago is the
         one that will not be asked for again, and a FIFO order keeps the HIT path free of the
@@ -810,7 +835,7 @@ class _Underlying:
         return v
 
     def greeks_tuple(self, i: int, ci: int, spot_source) -> Tuple[Optional[float], ...]:
-        """(iv, delta, gamma, theta, vega) for row ``i``, inverted from its own close.
+        """(iv, delta, gamma, theta, vega, rho) for row ``i``, inverted from its own close.
 
         Memoised per row in a BOUNDED dict (``_GREEKS_MEMO_MAX``), because the reuse this
         memo exists for is LOCAL: a bar's chain read, its ``get_atm_iv`` DTE-band rescan and
@@ -847,13 +872,49 @@ class _Underlying:
             # (rather than None) was reported as None too. Storing the raw dict values would
             # quietly start returning that NaN. 5 x 0.019 us against an 11.2 us compute.
             t = (_f(out["iv"]), _f(out["delta"]), _f(out["gamma"]),
-                 _f(out["theta"]), _f(out["vega"]))
+                 _f(out["theta"]), _f(out["vega"]), _f(out["rho"]))
             memo[i] = t
             order = self._g_order
             order.append(i)
             while len(memo) > _GREEKS_MEMO_MAX:
                 del memo[order.popleft()]
         return t
+
+    def session_volume_of_row(self, j: int, data_session: date,
+                              ds_ord: Optional[int] = None) -> int:
+        """``option_session.session_volume`` for the data session, given its EXACT row ``j``.
+
+        ``j`` is the contract's row dated exactly ``data_session`` (``exact_row``), or -1 when
+        it has none -- then the contract did not trade that session and the shared rule says 0.
+        A present row with NaN volume is this store's documented KNOWN ZERO (a no-trade row
+        that still carries a quote; a stored row exists only for a traded or quoted day) and is
+        turned into 0 HERE, before the shared rule, which refuses NaN as a parse bug.
+
+        HOT PATH (perf gate 2026-09-23: 1.2-1.6% of a trial). With ``ds_ord`` (the caller's
+        ``data_session.toordinal()``, the caller having validated ``data_session`` as a plain
+        date via ``require_data_session``) and row ``j`` dated exactly that session, the shared
+        rule reduces to: NaN -> 0, else the value as a non-negative integral ``int`` -- inlined
+        here, with ``_normalise_volume``'s refusals kept (non-integral / negative raise the same
+        ValueError). Anything else (no ``ds_ord``, a row of another date) takes the generic path.
+        Pinned equal to the generic path by ``test_option_session_volume``.
+        """
+        if j < 0:
+            if ds_ord is not None:
+                return 0
+            return session_volume((), data_session)
+        v = self.volume[j]
+        if ds_ord is not None and self.bar_ord_l[j] == ds_ord:
+            if v != v:
+                return 0
+            try:
+                iv = int(v)
+            except (TypeError, ValueError, OverflowError):
+                iv = None
+            if iv is None or iv != v or iv < 0:
+                return _normalise_volume(v, data_session)   # raises the shared rule's error
+            return iv
+        return session_volume(((self.raw.date_of_ord[self.bar_ord_l[j]], 0 if v != v else v),),
+                              data_session)
 
     def delta_iv_of_row(self, i: int, ci: int, spot_source
                         ) -> Tuple[Optional[float], Optional[float]]:
@@ -867,7 +928,9 @@ class _Underlying:
 
         Keys ``open/high/low/close/volume/underlying/option_type/strike/expiry/date`` plus the
         computed ``iv/delta/gamma/theta/vega`` are exactly ``options_cache._BAR_COLS``; the
-        parquet-only ``open_interest`` and ``vendor_iv`` are additions nothing reads yet.
+        parquet-only ``open_interest`` and ``vendor_iv`` are additions nothing reads yet, and
+        ``bid``/``ask`` are the row's real NBBO (None when absent) -- the fill engine's as-of
+        spread source (plan Part F1).
 
         MEMOISED PER ROW, and the memo is what makes this affordable: ``get_bar`` is called
         for every held lot on every bar (MTM, liquidation, fill, expiry settlement) and a row
@@ -900,7 +963,7 @@ class _Underlying:
         d = self._bar_memo.get(i)
         if d is None:
             raw = self.raw
-            iv, delta, gamma, theta, vega = self.greeks_tuple(i, ci, spot_source)
+            iv, delta, gamma, theta, vega, _rho = self.greeks_tuple(i, ci, spot_source)
             d = {
                 "iv": iv, "delta": delta, "gamma": gamma, "theta": theta, "vega": vega,
                 "occ_symbol": raw.c_occ[ci],
@@ -914,6 +977,11 @@ class _Underlying:
                 "expiry": raw.c_expiry_iso[ci],
                 "open_interest": _i(self.open_interest[i]),
                 "vendor_iv": _f(self.vendor_iv[i]),
+                # The row's own NBBO (plan Part F1): what the fill's spread is charged from
+                # when this row is the DECISION bar. None when the store has no quote columns
+                # (the TastyTrade tree) or the row has none -- NEVER the close proxy
+                # ``contract`` substitutes, which would read as a zero spread.
+                "bid": _f(self.bid[i]), "ask": _f(self.ask[i]),
             }
             memo = self._bar_memo
             memo[i] = d
@@ -923,9 +991,11 @@ class _Underlying:
                 del memo[order.popleft()]
         return d.copy()
 
-    def contract(self, i: int, ci: int, spot_source) -> OptionContract:
+    def contract(self, i: int, ci: int, spot_source, volume: int) -> OptionContract:
+        """Chain row priced from row ``i``; ``volume`` is the DATA SESSION's, supplied by the
+        caller (``session_volume_of_row``), never row ``i``'s own -- see the module docstring."""
         raw = self.raw
-        iv, delta, gamma, theta, vega = self.greeks_tuple(i, ci, spot_source)
+        iv, delta, gamma, theta, vega, rho = self.greeks_tuple(i, ci, spot_source)
         close = _f(self.close[i])
         bid, ask = _f(self.bid[i]), _f(self.ask[i])
         if bid is None and ask is None:
@@ -945,7 +1015,6 @@ class _Underlying:
             # normalises to the BEST rank -- turning a correctly-handled "unknown" into a
             # top-ranked fabrication, the exact fail-open _minimise's docstring exists to stop.
             bid = ask = close
-        vol = _i(self.volume[i])
         return OptionContract(
             symbol=raw.c_occ[ci], underlying=self.underlying,
             option_type=raw.c_right[ci],
@@ -958,10 +1027,9 @@ class _Underlying:
             bid=bid, ask=ask, last=close,
             implied_volatility=iv, delta=delta, gamma=gamma, theta=theta, vega=vega,
             open_interest=_i(self.open_interest[i]),
-            # NO BAR => impossible here (a clamped row is always a bar), but an absent volume
-            # is still a KNOWN zero: a bar exists only for a contract that traded. Same rule
-            # as options_provider._bar_volume.
-            volume=0 if vol is None else vol)
+            volume=volume, rho=rho,
+            # Every parquet row's greeks come from ``greeks_tuple`` (BS from this row's close).
+            greeks_source="bs_from_close")
 
 
 def _f(v) -> Optional[float]:
@@ -1116,7 +1184,8 @@ class ParquetOptionsProvider:
     """The parquet backend of the option-reader seam. See the module docstring."""
 
     def __init__(self, root: str, *, spot_source: Callable[[str, date], Optional[float]],
-                 risk_free_rate: float, spot_scope: str):
+                 risk_free_rate: float, spot_scope: str, basis_guard: bool = False,
+                 basis_guard_split_dates: Optional[Callable[[str], Any]] = None):
         """``spot_scope`` — the identity of what ``spot_source`` will answer.
 
         REQUIRED, and it is the one non-obvious argument. The worker-level cache holds the
@@ -1154,15 +1223,49 @@ class ParquetOptionsProvider:
         #: Parallel to HistoricalOptionsProvider.db_path: the identity this store's worker
         #: caches are keyed on.
         self.store_path = root
+        #: Per-run (the provider is built once per run, and never cached): see
+        #: ``option_read_common.ChainStaleness``.
+        self._staleness = ChainStaleness()
+        #: The E4 split-basis guard (``option_basis_guard``): on for every real options run
+        #: (``options_store.build_options_provider`` sets it whenever the run has a split
+        #: basis), off for fixture readers whose synthetic chains imply no spot. Per run.
+        self._basis_guard = None
+        if basis_guard:
+            from .option_basis_guard import BasisGuard
+            self._basis_guard = BasisGuard(spot_source, split_dates=basis_guard_split_dates)
+
+    def basis_guard_stats(self) -> Optional[Dict[str, Any]]:
+        """This run's E4 guard counters and time spent (None when the guard is off)."""
+        return None if self._basis_guard is None else self._basis_guard.stats()
+
+    def chain_staleness(self) -> Dict[str, Any]:
+        """This run's stale-price chain-row counts (``ChainStaleness.snapshot``)."""
+        return self._staleness.snapshot()
 
     # -- the engine-facing methods --------------------------------------
     def get_chain(self, underlying: str, as_of: date, *, expiry_min: date, expiry_max: date,
-                  option_type: Optional[OptionRight] = None, strike_min: Optional[float] = None,
+                  data_session: date, option_type: Optional[OptionRight] = None,
+                  strike_min: Optional[float] = None,
                   strike_max: Optional[float] = None) -> List[OptionContract]:
+        """The chain as of ``as_of``: each contract priced from its latest row on or before the
+        clock, with VOLUME from its row dated exactly ``data_session`` (0 without one).
+
+        ``data_session`` is resolved ONCE by the caller (``BacktestAccount``), so the per-row
+        cost here is integer compares: the exact row is the clamped row itself whenever that
+        row is dated ``data_session`` (every backtest call has data_session == as_of), it
+        cannot exist when the clamped row is older, and only a clamped row NEWER than the
+        session (a caller reading an earlier session than its clock) needs a second bisect.
+        """
+        require_data_session(as_of, data_session)
         u = self._u(underlying)
         if not u.n_rows:
             return []
+        if self._basis_guard is not None:
+            # REFUSES (OptionSpotBasisMismatch) before a single strike is priced off a spot
+            # that is not in the chain's own basis -- see option_basis_guard.
+            self._basis_guard.check(u, underlying, as_of)
         as_of_ord = as_of.toordinal()
+        ds_ord = data_session.toordinal()
         keep = ((u.c_expiry_ord >= expiry_min.toordinal())
                 & (u.c_expiry_ord <= expiry_max.toordinal()))
         if option_type is not None:
@@ -1172,21 +1275,38 @@ class ParquetOptionsProvider:
         if strike_max is not None:
             keep &= (u.c_strike <= strike_max)
         spot_source = self.spot_source
+        bar_ord_l = u.bar_ord_l
+        staleness = self._staleness
         out: List[OptionContract] = []
         for ci in np.flatnonzero(keep):
             ci = int(ci)
             i = u.latest_row_on_or_before(ci, as_of_ord)
             if i < 0:
                 continue  # the contract had not traded yet on/before the clock: not in the chain
-            out.append(u.contract(i, ci, spot_source))
+            row_ord = bar_ord_l[i]
+            if row_ord == ds_ord:
+                j = i
+            elif row_ord < ds_ord:
+                j = -1  # no row on the session, and the PRICE below is an older session's
+                staleness.note_stale(ds_ord - row_ord)
+            else:
+                j = u.exact_row(ci, ds_ord)
+            out.append(u.contract(i, ci, spot_source,
+                                  u.session_volume_of_row(j, data_session, ds_ord)))
+        staleness.chain_rows += len(out)
         return out
 
-    def get_quote(self, occ_symbol: str, as_of: date) -> Optional[OptionQuote]:
+    def get_quote(self, occ_symbol: str, as_of: date, *,
+                  data_session: date) -> Optional[OptionQuote]:
+        """The EXACT ``as_of`` row's quote (None without one); ``volume`` is ``data_session``'s,
+        by the same rule and the same helper as ``get_chain``."""
+        require_data_session(as_of, data_session)
         u = self._u(_underlying_of(occ_symbol))
         ci = u.c_index.get(occ_symbol)
         if ci is None:
             return None
-        i = u.exact_row(ci, as_of.toordinal())
+        as_of_ord = as_of.toordinal()
+        i = u.exact_row(ci, as_of_ord)
         if i < 0:
             return None
         close = _f(u.close[i])
@@ -1202,9 +1322,12 @@ class ParquetOptionsProvider:
         # sqlite reader's twin change, and it must be a twin or a rule that reads a held
         # contract's delta answers differently on the two backends. Memoised per row by
         # ``greeks_tuple``, so a quote costs no extra inversion once the chain has priced it.
-        delta, iv = u.delta_iv_of_row(i, ci, self.spot_source)
+        g = u.greeks_tuple(i, ci, self.spot_source)
+        ds_ord = data_session.toordinal()
+        j = i if ds_ord == as_of_ord else u.exact_row(ci, ds_ord)
         return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=close,
-                           delta=delta, implied_volatility=iv)
+                           delta=g[1], implied_volatility=g[0], rho=g[5],
+                           volume=u.session_volume_of_row(j, data_session, ds_ord))
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         u = self._u(_underlying_of(occ_symbol))

@@ -726,11 +726,13 @@ def _publish_manifest(root, symbols=("AAA", "BBB")):
 
     profile = PROFILES["ohlcv-v1"]
     fields = [f.name for f in profile.fields]
-    # FEATURE sessions. The manifest's window is the DECISION window they serve: a decision on
-    # session D reads the row of the session before D (``prior_session_v1``), so these two rows
-    # serve exactly the decisions MC_START..MC_END below -- which is the window every test here
-    # launches over, because a pin is now validated against the run's sessions too (F1).
-    sessions = [date(2025, 6, 27), date(2025, 6, 30)]
+    # FEATURE sessions, built the way the warmup builds them for the window MC_START..MC_END:
+    # ``[prior(first decision), last decision]`` (BT/live parity plan 2026-09-22 A3) -- a live
+    # decision on S reads prior(S), a backtest BAR D reads D itself, and these three rows serve
+    # both over the window every test here launches over (a pin is validated against the run's
+    # sessions too, F1). Before the parity fix the fixture was the two rows 06-27, 06-30: the
+    # backtest's last bar 07-01 then read 06-30.
+    sessions = [date(2025, 6, 27), date(2025, 6, 30), date(2025, 7, 1)]
     store = MarketConditionStore(root)
     objects = []
     for symbol in symbols:
@@ -739,8 +741,12 @@ def _publish_manifest(root, symbols=("AAA", "BBB")):
                  "reasons": ["published row"] * len(fields),
                  "window_digest": "sha256:" + "0" * 64, "raw_shard_ref": "",
                  "raw_row_lo": 0, "raw_row_hi": 0} for s in sessions]
-        entry, _ = store.write_feature_object(profile, symbol, rows)
-        objects.append(entry)
+        # One feature object per (symbol, calendar month) -- the store's sharding rule.
+        for month in sorted({(r["session"].year, r["session"].month) for r in rows}):
+            entry, _ = store.write_feature_object(
+                profile, symbol,
+                [r for r in rows if (r["session"].year, r["session"].month) == month])
+            objects.append(entry)
     manifest = store.make_manifest(
         profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
         objects=objects, raw_objects=[],
@@ -945,7 +951,7 @@ def test_the_persisted_digest_round_trips_into_a_trial_config(profile_on, snapsh
     mod._apply_market_conditions("optimize", backtest_cfg, strat)
     # Round-trip through JSON: the persisted optimization_config is a JSON column.
     backtest_cfg = json.loads(json.dumps(backtest_cfg, default=str))
-    trial = _build_daily_trial_config(backtest_cfg, decode_params(strat, {}), None)
+    trial = _build_daily_trial_config(backtest_cfg, decode_params(strat, {}), None, option_trade_records=False)
     assert trial["market_condition_profiles"] == ["ohlcv-v1"]
     assert trial["market_condition_manifests"] == {"ohlcv-v1": snapshot}
     assert trial["_ga_trial"] is True
@@ -961,7 +967,7 @@ def test_a_pre_task10_persisted_config_still_round_trips_into_a_trial_config():
               "enabled_instruments": ["AAA"], "experts": [{"class": "FMPRating", "settings": {}}],
               "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
               "market_condition_profile": "ohlcv-v1", "market_condition_manifest": "e" * 64}
-    trial = _build_daily_trial_config(json.loads(json.dumps(legacy)), {})
+    trial = _build_daily_trial_config(json.loads(json.dumps(legacy)), {}, option_trade_records=False)
     assert trial["market_condition_profiles"] == ["ohlcv-v1"]
     assert trial["market_condition_manifests"] == {"ohlcv-v1": "e" * 64}
     assert trial["_ga_trial"] is True

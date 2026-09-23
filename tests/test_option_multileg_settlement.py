@@ -201,7 +201,9 @@ def test_the_settled_leg_is_recorded_as_a_closing_row(
 def test_the_LAST_leg_settling_DOES_close_the_structure(
         mock_account_def, mock_expert_instance):
     """THE INVERSE, and the proof this is not a freeze. Both contracts accounted for
-    means the structure is flat, and it closes with the LAST settlement's reason."""
+    means the structure is flat, and it closes under the MOST CONSEQUENTIAL settlement
+    (``settlement_close_reason``: assigned > exercised > expired_otm -- the backtest's rule
+    too), not whichever the OCC happened to report last."""
     acct = _make_alpaca(mock_account_def.id)
     txn_id, _ = _seed_structure(mock_account_def.id, mock_expert_instance.id, STRANGLE)
 
@@ -212,9 +214,23 @@ def test_the_LAST_leg_settling_DOES_close_the_structure(
 
     txn = get_instance(Transaction, txn_id)
     assert txn.status == TransactionStatus.CLOSED
-    assert txn.close_reason == "expired"
+    assert txn.close_reason == "assigned"
     assert txn.close_price == 0.0
     assert _net_for(txn_id) == {PUT_OCC: 0.0, CALL_OCC: 0.0}
+
+
+def test_the_close_reason_does_not_depend_on_the_report_order(
+        mock_account_def, mock_expert_instance):
+    """The same two settlements reported the other way round close under the same reason."""
+    acct = _make_alpaca(mock_account_def.id)
+    txn_id, _ = _seed_structure(mock_account_def.id, mock_expert_instance.id, STRANGLE)
+
+    acct.reconcile_option_assignments([_activity("mls-rev-call", "OPEXP", CALL_OCC)])
+    acct.reconcile_option_assignments([_activity("mls-rev-put", "OPASN", PUT_OCC)])
+
+    txn = get_instance(Transaction, txn_id)
+    assert txn.status == TransactionStatus.CLOSED
+    assert txn.close_reason == "assigned"
 
 
 def test_the_equity_side_of_the_assignment_still_happens(
@@ -380,7 +396,7 @@ def test_a_SINGLE_LEG_expiry_and_exercise_still_close_their_transaction(
          "qty": None, "price": "0"}])
     txn = get_instance(Transaction, expired)
     assert txn.status == TransactionStatus.CLOSED
-    assert txn.close_reason == "expired" and txn.close_price == 0.0
+    assert txn.close_reason == "expired_otm" and txn.close_price == 0.0
 
     exercised = _seed_single_leg(mock_account_def.id, mock_expert_instance.id, CALL_OCC,
                                  OptionRight.CALL, 160.0, OrderDirection.BUY)

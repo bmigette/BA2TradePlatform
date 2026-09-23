@@ -7,9 +7,14 @@ Design: ``docs/plans/2026-09-15-option-market-condition-genes-design.md`` sectio
   ``window_before`` (no DataFrame), assembles and computes through the shared
   ``WindowMarketConditionReader`` core (bounded memo, calc-version check).
 * :class:`BacktestMarketConditionResolver` builds ONE frozen ``MarketConditionContext`` per
-  simulated session and returns that same object for every leaf evaluated on the session:
-  ``session_label = account._as_of_date()``, ``prior_session = prior_regular_session(label)``,
-  ``decision_time`` = the label's regular close in UTC (deterministic, tz-aware).
+  simulated bar and returns that same object for every leaf evaluated on the bar. THE SESSION
+  CLOCK IS THE LIVE ONE (BT/live parity, ``docs/plans/2026-09-22-bt-live-option-parity.md`` §0):
+  bar D decides with data through D's close and fills on the next bar, so it is the live
+  decision made during the next regular session N(D). Hence
+  ``session_label = backtest_decision_label(D)`` (= N(D)),
+  ``prior_session = decision_data_session(session_label)`` (= D itself), and
+  ``decision_time`` = D's regular close in UTC -- the instant the backtest actually decides
+  (deterministic, tz-aware).
 
 Imported only when a run's config carries a profile other than ``none`` (see
 ``seam_wiring.install_backtest_market_conditions``); a profile-less run never loads this module.
@@ -30,7 +35,12 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
-from ba2_common.core.market_calendar import prior_regular_session, regular_session_close_utc
+from ba2_common.core.market_calendar import (
+    backtest_decision_label,
+    decision_data_session,
+    regular_session_close_utc,
+    is_regular_session,
+)
 from ba2_common.core.market_condition_context import (
     TIMING_POLICY_PRIOR_SESSION_V1,
     MarketConditionContext,
@@ -87,43 +97,53 @@ class BacktestMarketConditionReader(WindowMarketConditionReader):
 
 
 class BacktestMarketConditionResolver:
-    """The per-run resolver: one context per simulated session, same object on repeat calls."""
+    """The per-run resolver: one context per simulated bar, same object on repeat calls.
+
+    The context is the one a LIVE decision during ``backtest_decision_label(bar)`` builds (see
+    the module docstring): same ``prior_session``, same row, same gate answer. Pinned against
+    the live ``DecisionState`` by ``test_market_condition_bt_live_session_parity``.
+    """
 
     def __init__(self, reader: Any, *, source_profile: str = SOURCE_PROFILE_FMP_DAILY):
         self.reader = reader
         self.source_profile = source_profile
         self._ctx: Optional[MarketConditionContext] = None
+        #: The BAR the cached context was built for. Compared instead of ``ctx.session_label``,
+        #: which is the NEXT session and never equals the bar.
+        self._ctx_bar: Optional[date] = None
         self._not_a_session: Optional[date] = None
 
     def __call__(self, account: Any, instrument_name: str,
                  expert_recommendation: Any) -> Optional[MarketConditionContext]:
-        label = account._as_of_date()
+        bar = account._as_of_date()
         ctx = self._ctx
-        if ctx is not None and ctx.session_label == label:
+        if ctx is not None and self._ctx_bar == bar:
             return ctx
-        if self._not_a_session == label:
+        if self._not_a_session == bar:
             return None
-        try:
-            decision_time = regular_session_close_utc(label)
-        except ValueError:
+        if not is_regular_session(bar):
             # A bar on a non-session date (a vendor glitch in the trading clock). The gate is
             # unknown for that date -- reported as no_context by the condition, never a pass.
-            self._not_a_session = label
-            _log.warning(f"market-condition gates: simulated date {label} is not a regular NYSE "
+            self._not_a_session = bar
+            _log.warning(f"market-condition gates: simulated date {bar} is not a regular NYSE "
                          f"session; gates report no_context for it")
             return None
+        # Outside any handler: on a session bar, a calendar-edge failure (no later session, a
+        # table that does not reach) is a fault to surface, not a "not a session" no_context.
+        session_label = backtest_decision_label(bar)
         ctx = MarketConditionContext(
-            decision_time=decision_time,
-            session_label=label,
-            prior_session=prior_regular_session(label),
+            decision_time=regular_session_close_utc(bar),
+            session_label=session_label,
+            prior_session=decision_data_session(session_label),
             source_profile=self.source_profile,
             timing_policy=TIMING_POLICY_PRIOR_SESSION_V1,
             calc_version=self.reader.calc_version,
             reader=self.reader,
             recorder=None,
         )
-        self._ctx = ctx
+        self._ctx, self._ctx_bar = ctx, bar
         return ctx
+
 
 class MarketConditionRunRecord:
     """Per-run market-condition telemetry: the D§6 counters and the per-entry state.
@@ -150,11 +170,14 @@ class MarketConditionRunRecord:
     memoised lookup of a row the gate has just read. It is recorded here rather than scraped out
     of the condition evaluations because attribution needs the measurement of the fields whose
     gate was OFF too (with every mode off there are no market leaves at all, and the run still
-    has an entry state worth attributing to). Keyed ``(symbol, session_label)``;
-    :func:`attach_entry_states` matches each executed STRUCTURE to the LATEST recorded session
-    at or before its entry, so a resting entry that fills after the decision bar still carries
-    the state its decision was made on -- and records the gap, and whether the choice was
-    ambiguous, because this is date proximity and not identity.
+    has an entry state worth attributing to). Keyed ``(symbol, session_label)``: the decision
+    LABEL, which for bar D is N(D), the next regular session (``backtest_decision_label``) and
+    the session a live run of the same decision records. ``prior_session`` is the bar D itself.
+    :func:`attach_entry_states` matches each executed STRUCTURE to the LATEST recorded decision
+    BAR at or before its entry (see there for why the bar and not the label), so a next-bar fill
+    binds with gap 0 and a resting entry that fills later still carries the state its decision
+    was made on -- and records the gap, and whether the choice was ambiguous, because this is
+    date proximity and not identity.
     """
 
     def __init__(self, resolver: Any, *, profiles: Sequence[str],
@@ -236,7 +259,11 @@ class MarketConditionRunRecord:
 
     # -- entry state ------------------------------------------------------------
     def note_entry(self, account: Any, symbol: str, recommendation: Any) -> None:
-        """Record the market-condition measurement behind ONE fired entry rule."""
+        """Record the market-condition measurement behind ONE fired entry rule.
+
+        ``session`` is the decision label N(bar) (the session the fill executes in) and
+        ``prior_session`` the bar itself, whose row the gate read and which the binding keys on.
+        """
         self.entries_staged += 1
         try:
             ctx = self.resolver(account, symbol, recommendation)
@@ -342,8 +369,9 @@ class MarketConditionRunRecord:
 #: measured regime for a trade that no measurement produced.
 #:
 #: WHY SEVEN. An entry order in this engine is DAY time-in-force (``backtest_account``
-#: re-submits or expires it; live forces the same), so a fill lands on the decision bar or the
-#: next one, and a re-submission on a later bar fires the rule again and records its own state.
+#: re-submits or expires it; live forces the same), so a fill is stamped with the decision bar
+#: or the next one (gap 0 or one session), and a re-submission on a later bar fires the rule
+#: again and records its own state.
 #: A week is generous for a long holiday weekend and still far short of the interval at which
 #: a stale attribution could look plausible.
 ENTRY_STATE_MAX_GAP_DAYS = 7
@@ -380,11 +408,17 @@ def attach_entry_states(trades: Any, entry_states: Any,
     being wrong.
 
     A structure is matched on its UNDERLYING (an option leg's ``underlying_symbol``, else
-    ``symbol``) and on the LATEST recorded session at or before its entry date, provided that
-    session is within ``max_gap_days`` of it (see ``ENTRY_STATE_MAX_GAP_DAYS``). A resting entry
-    that fills a day or two after the decision still carries the state the decision was made on;
-    a position opened by something other than a gated entry rule is left UNTOUCHED. An absent
-    key is honest; an inherited one would be a fabricated observation.
+    ``symbol``) and on the LATEST recorded decision BAR at or before its entry date, provided
+    that bar is within ``max_gap_days`` of it (see ``ENTRY_STATE_MAX_GAP_DAYS``).
+
+    THE KEY IS THE BAR (``prior_session``), NOT THE LABEL (``session``): a record's ``session``
+    is N(D) and its ``prior_session`` is the bar D, and the engine stamps a ``next_bar_open``
+    fill with D (``BacktestAccount._apply_fill``/``_apply_option_fill`` record ``as_of``), so
+    ``entry_time`` is D. Keyed on the label, every such fill would precede its own decision.
+
+    A resting entry that fills a day or two after the decision still carries the state the
+    decision was made on; a position opened by something other than a gated entry rule is left
+    UNTOUCHED. An absent key is honest; an inherited one would be a fabricated observation.
 
     THE BINDING IS DATE PROXIMITY, NOT IDENTITY, AND IT SAYS SO IN THE DATA. The trade blob
     carries no recommendation id, and ``note_entry`` records a state whenever an entry RULE
@@ -408,8 +442,8 @@ def attach_entry_states(trades: Any, entry_states: Any,
         by_symbol.setdefault(str(record["symbol"]).upper(), []).append(record)
     index = {}
     for sym, recs in by_symbol.items():
-        recs.sort(key=lambda r: r["session"])          # sorted ONCE, in place
-        index[sym] = ([r["session"] for r in recs], recs)
+        recs.sort(key=lambda r: r["prior_session"])    # sorted ONCE, in place, on the BAR
+        index[sym] = ([r["prior_session"] for r in recs], recs)
 
     out = {"attached": 0, "same_session": 0, "with_gap": 0, "ambiguous": 0}
     for group in _structure_groups(trades):
@@ -427,7 +461,7 @@ def attach_entry_states(trades: Any, entry_states: Any,
             continue
         chosen = records[pos - 1]
         try:
-            gap = (_date.fromisoformat(entry) - _date.fromisoformat(chosen["session"])).days
+            gap = (_date.fromisoformat(entry) - _date.fromisoformat(chosen["prior_session"])).days
         except ValueError:
             continue                       # an unparseable date is not a match, and not a guess
         if gap > max_gap_days:

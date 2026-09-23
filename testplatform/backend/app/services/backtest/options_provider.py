@@ -32,8 +32,10 @@ from datetime import date, timedelta
 import os
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
+from ba2_common.core.option_session import session_volume
 from ba2_common.core.option_types import OptionContract, OptionQuote
 from ba2_common.core.types import OptionRight
+from .option_read_common import ChainStaleness, require_data_session
 from .options_cache import OptionsHistoryCache
 
 _CHAIN_CACHE_MAX = int(os.getenv("BT_OPTION_CHAIN_CACHE_MAX", "300"))
@@ -208,16 +210,20 @@ def _pit_quotes(chain_row: Optional[dict],
     return close - half_spread, close + half_spread, close
 
 
-def _bar_volume(chain_row: dict, bar: Optional[dict]) -> int:
-    """Contracts traded on the as-of date: the bar's volume, else the chain column, else 0
-    ("no bar" == "did not trade" == a known zero). See the note at the call site."""
-    if bar is not None and bar.get("volume") is not None:
-        return bar["volume"]
-    v = chain_row.get("volume")
-    return v if v is not None else 0
+def _exact_session_volume(bars: _BarHistory, data_session: date) -> int:
+    """``session_volume`` of the contract's bar dated exactly ``data_session`` (0 without one).
+
+    A present bar with no volume is REFUSED (ValueError from ``session_volume``): every bar
+    this store holds carries one (19,484,995 of 19,484,995, measured 2026-08-31), so a missing
+    one is a build bug, not a zero. The chain row's own ``volume`` column is never read: it is
+    the build-start snapshot's (and NULL on every fetch_options-built row), i.e. not the data
+    session's.
+    """
+    bar = bars.by_date.get(data_session.isoformat())
+    return session_volume(() if bar is None else ((data_session, bar["volume"]),), data_session)
 
 
-def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
+def _to_contract(r: dict, greeks_row: Optional[dict], volume: int) -> OptionContract:
     # greeks_row (the AS-OF-CLAMPED daily bar for this contract, when available) carries the
     # POINT-IN-TIME iv/greeks computed by fetch_options.py's Black-Scholes inversion of that
     # day's close (see option_greeks.py) — preferred over the chain row's, which is a single
@@ -226,6 +232,9 @@ def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
     # iv/greeks still None (missing underlying close that day, or a pre-existing cache built
     # before this feature), in which case fall back to the chain row rather than lose greeks.
     g = greeks_row if (greeks_row and greeks_row.get("iv") is not None) else r
+    # Recorded per row on the option trade record: the two branches above are different
+    # measurements (BS of the as-of close vs the build-start chain snapshot).
+    greeks_source = "bs_from_close" if g is greeks_row else "chain_snapshot"
     # Quotes (bug B4): the chain row's bid/ask/last are the build's START-DATE snapshot and go
     # stale as the clock advances — when this contract has a bar on/before the as-of date,
     # derive point-in-time quotes from the bar close (see _pit_quotes). With no bar (or a
@@ -241,19 +250,20 @@ def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
         last=last, implied_volatility=g.get("iv"), delta=g.get("delta"),
         gamma=g.get("gamma"), theta=g.get("theta"), vega=g.get("vega"),
         open_interest=r.get("open_interest"),
-        # VOLUME comes from the BAR, not the chain row. option_chain.volume is NULL for every
-        # row a fetch_options build writes (re-measured 2026-08-31: 0 of 1,440,782 populated) —
-        # Alpaca exposes no as-of volume for a past date, so the chain snapshot never gets one.
-        # option_bar.volume IS populated for every bar (19,484,995 of 19,484,995), because a
-        # bar only exists for a contract that actually traded that day. THIS IS WHY "volume is
-        # NULL in the cache" is a claim about the CHAIN TABLE ONLY: what the selector sees is
-        # the bar's volume, so a volume-ranked weight is live here even though the chain
-        # column is empty. Reading the chain
-        # column left OptionContract.volume permanently None, so any selector-side liquidity
-        # gate keyed on volume silently passed EVERYTHING while the fill engine's
-        # participation cap (_OPTION_FILL_MAX_VOLUME_PARTICIPATION) — which reads the bar
-        # directly — rejected the resulting orders. Prefer the bar; fall back to the chain
-        # column so a differently-built cache that does populate it still works.
+        # VOLUME comes from the BAR DATED EXACTLY THE DATA SESSION (``_exact_session_volume``,
+        # 2026-09-22 BT/live parity B2), not the chain row and not the clamped greeks bar.
+        # option_chain.volume is NULL for every row a fetch_options build writes (re-measured
+        # 2026-08-31: 0 of 1,440,782 populated) -- Alpaca exposes no as-of volume for a past
+        # date. option_bar.volume IS populated for every bar (19,484,995 of 19,484,995),
+        # because a bar only exists for a contract that actually traded that day. Reading the
+        # chain column left OptionContract.volume permanently None, so any selector-side
+        # liquidity gate keyed on volume silently passed EVERYTHING while the fill engine's
+        # participation cap (_OPTION_FILL_MAX_VOLUME_PARTICIPATION) rejected the orders.
+        #
+        # EXACT SESSION, NOT LATEST-ON-OR-BEFORE (2026-09-22). This used to be the clamped
+        # bar's volume, so a contract that last traded on D-3 reported D-3's volume on D and
+        # cleared option_min_volume; live reads the session's own bar. The chain-column
+        # fallback went with it: that column is a build-start snapshot, never the session's.
         #
         # NO BAR => VOLUME 0, NOT None (2026-08-23). A bar exists only for a contract that
         # actually traded, so "no bar on or before the as-of date" is a KNOWN zero, not an
@@ -266,20 +276,36 @@ def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
         # min_volume has been doing: no-bar rows are exactly the ones still carrying the cache
         # build's start-date quotes (weeks stale), so gating them out is deliberate.
         # Selection is unchanged — any min_volume >= 1 rejects 0 exactly as it rejected None.
-        volume=_bar_volume(r, greeks_row))
+        volume=volume, greeks_source=greeks_source)
 
 class HistoricalOptionsProvider:
     def __init__(self, cache_db: str):
         self.cache = OptionsHistoryCache(cache_db)
         self.db_path = self.cache.db_path
+        #: Per-run (the provider is built once per run): see ``ChainStaleness``.
+        self._staleness = ChainStaleness()
+
+    def chain_staleness(self) -> Dict[str, Any]:
+        """This run's stale-price chain-row counts (``ChainStaleness.snapshot``)."""
+        return self._staleness.snapshot()
 
     def get_chain(self, underlying: str, as_of: date, *, expiry_min: date, expiry_max: date,
-                  option_type: Optional[OptionRight] = None, strike_min: Optional[float] = None,
+                  data_session: date, option_type: Optional[OptionRight] = None,
+                  strike_min: Optional[float] = None,
                   strike_max: Optional[float] = None) -> List[OptionContract]:
+        """The chain as of ``as_of``; each row's VOLUME is ``data_session``'s (see _to_contract).
+
+        Prices/greeks: the contract's latest bar on or before ``as_of`` (else the snapshot row).
+        A row whose price comes from a date before ``data_session`` is counted as stale.
+        """
+        require_data_session(as_of, data_session)
         hist = _chain_history(self.db_path, underlying)
-        snap = hist.latest_as_of(as_of.isoformat())
+        as_of_iso = as_of.isoformat()
+        snap = hist.latest_as_of(as_of_iso)
         if snap is None:
             return []
+        ds_iso = data_session.isoformat()
+        staleness = self._staleness
         out: List[OptionContract] = []
         for r in hist.by_asof[snap]:
             r = {**r, "underlying": underlying}
@@ -292,12 +318,28 @@ class HistoricalOptionsProvider:
                 continue
             if strike_max is not None and r["strike"] > strike_max:
                 continue
-            greeks_row = _bar_history(self.db_path, r["occ_symbol"]).latest_on_or_before(as_of.isoformat())
-            out.append(_to_contract(r, greeks_row))
+            bars = _bar_history(self.db_path, r["occ_symbol"])
+            greeks_row = bars.latest_on_or_before(as_of_iso)
+            out.append(_to_contract(r, greeks_row, _exact_session_volume(bars, data_session)))
+            # The date the row's PRICE comes from: the clamped bar when it has a close (what
+            # _to_contract prices from), else the chain snapshot.
+            price_iso = (greeks_row["date"] if greeks_row is not None
+                         and greeks_row.get("close") is not None else snap)
+            if price_iso < ds_iso:
+                staleness.note_stale((data_session - date.fromisoformat(price_iso)).days)
+        staleness.chain_rows += len(out)
         return out
 
-    def get_quote(self, occ_symbol: str, as_of: date) -> Optional[OptionQuote]:
-        bar = _bar_history(self.db_path, occ_symbol).by_date.get(as_of.isoformat())
+    def get_quote(self, occ_symbol: str, as_of: date, *,
+                  data_session: date) -> Optional[OptionQuote]:
+        """The EXACT ``as_of`` bar's quote (None without one); ``volume`` is ``data_session``'s.
+
+        ``rho`` stays None: this store never recorded it (its greeks were inverted at build
+        time and ``option_bar`` has no rho column), and an unknown greek is None, never 0.
+        """
+        require_data_session(as_of, data_session)
+        bars = _bar_history(self.db_path, occ_symbol)
+        bar = bars.by_date.get(as_of.isoformat())
         if bar is None:
             return None
         # Synthesize bid/ask the same way get_chain does (bug B4): entry actions price off
@@ -318,7 +360,8 @@ class HistoricalOptionsProvider:
         # ``LongLegDeltaCondition`` declines to evaluate on it rather than reading it as zero.
         return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=last,
                            delta=bar.get("delta"),
-                           implied_volatility=bar.get("iv"))
+                           implied_volatility=bar.get("iv"),
+                           volume=_exact_session_volume(bars, data_session))
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         return _bar_history(self.db_path, occ_symbol).by_date.get(as_of.isoformat())

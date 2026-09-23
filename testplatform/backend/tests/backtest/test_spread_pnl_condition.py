@@ -14,12 +14,13 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 from datetime import datetime
 
 import pytest
 
 CFG = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": 0.0,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",

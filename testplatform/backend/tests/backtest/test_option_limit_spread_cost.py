@@ -31,6 +31,7 @@ charged on NEITHER limit path — on both asset classes it is a market/stop cost
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -86,7 +87,7 @@ class _StubPrice:
 
 
 def _acct(px=_PX, volume=_VOL, spot=_SPOT, **cfg):
-    base = {"starting_cash": 100_000.0, "commission_per_trade": 0.0, "slippage_bps": 0.0,
+    base = {**_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0, "commission_per_trade": 0.0, "slippage_bps": 0.0,
             "fill_model": "next_bar_open"}
     base.update(cfg)
     a = BacktestAccount(id=1, price_source=_StubPrice(spot=spot), settings=base)
@@ -228,7 +229,7 @@ def test_a_market_single_leg_is_unchanged_too():
 # 5. EQUITY fills are byte-identical
 # =========================================================================== #
 def _eq_acct(**cfg):
-    base = {"starting_cash": 100_000.0, "commission_per_trade": 0.0, "slippage_bps": 12.5,
+    base = {**_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0, "commission_per_trade": 0.0, "slippage_bps": 12.5,
             "fill_model": "next_bar_open", "spread_bps": 20.0}
     base.update(cfg)
     return BacktestAccount(id=1, price_source=SimpleNamespace(), settings=base)
@@ -367,7 +368,7 @@ def test_the_crossed_price_is_what_the_no_arbitrage_guard_checks():
 # 7. a round trip pays the spread TWICE — end to end, through cash
 # =========================================================================== #
 CFG_E2E = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": 0.0,   # isolate the spread in the cash delta
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",

@@ -334,6 +334,9 @@ class _ChainAccount(OptionsAccountInterface):
     """Options account serving ONE hand-built chain in the historical store's degenerate
     bid==ask shape. ``spec`` rows: (strike, px, {field overrides})."""
 
+    #: The option entry record refuses an account with no declared greeks source.
+    OPTION_GREEKS_SOURCE = "test_fake"
+
     def __init__(self, spec, spot=100.0, balance=50_000_000.0):
         self.id = 1
         self.spot = spot
@@ -419,7 +422,7 @@ def _picked_strikes(kind, gene, value):
 
     # THE WHITELIST HOP. The per-trial config is rebuilt key by key; a knob that does not
     # survive into it is inert while every upstream log claims it works.
-    trial = _build_daily_trial_config(_minimal_backtest_cfg(strat), decoded)
+    trial = _build_daily_trial_config(_minimal_backtest_cfg(strat), decoded, option_trade_records=False)
     acts = [a for r in trial["entry_rules"] for a in (r.get("actions") or [])]
     assert len(acts) == 1
     weight_key = "option_" + gene.split(":")[-1]

@@ -189,6 +189,10 @@ def _maybe_mark_want_full(config: Dict[str, Any], is_last_gen: bool) -> Dict[str
         return config
     tagged = dict(config)
     tagged["_want_full_results"] = True
+    # The final generation's full results ARE persisted (``_persist_top_backtests`` reuses them
+    # as top-N rows without a re-run), so those rows carry the option trade record like every
+    # other persisted run. Output shape only: the fitness is identical either way.
+    tagged["option_trade_records"] = True
     return tagged
 
 
@@ -415,9 +419,21 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # chosen among whichever genomes were not unlucky enough to land on a starved worker.
         # Matched by NAME, like the others, so this module does not import ba2_common just to
         # classify an error (see ba2_common.core.shared_arrays.SharedArrayFdExhausted).
+        # SplitBasisRefused / OptionSpotBasisMismatch (plan Part E) are FATAL too: the option
+        # path's spot is not (or cannot be put) in the basis its strikes are quoted in. The
+        # first is deterministic -- every trial refuses identically; scored as 0 fitness the
+        # GA would "finish" on nothing. The second is data-driven -- a trial that never reads
+        # the bad symbol's chain survives, so scoring it would let the GA silently SELECT AWAY
+        # from the broken symbol and report a winner shaped by a data bug.
+        # The four run-config / calendar refusals below (BT/live option parity review) are
+        # DETERMINISTIC: the run config (spread model, option_trade_records) or the market
+        # calendar is wrong, or the clock stepped on a non-session date -- every trial refuses
+        # identically, so scoring them 0 lets the GA "finish" on nothing.
         fatal = type(e).__name__ in (
             "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
-            "SharedArrayFdExhausted")
+            "SharedArrayFdExhausted", "SplitBasisRefused", "OptionSpotBasisMismatch",
+            "SpreadModelConfigError", "OptionTradeRecordsFlagMissing",
+            "MarketCalendarUnavailable", "NotARegularSession")
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
@@ -493,6 +509,7 @@ def _worker_release_memory() -> Dict[str, Any]:
     # resolves is now a loud notice through _worker_log (the pool child's logging is globally
     # disabled — see _worker_init — so this is the only channel that survives in there).
     for mod, fn in (("app.services.backtest.options_provider", "clear_worker_options_cache"),
+                    ("app.services.backtest.option_basis_guard", "clear_basis_guard_cache"),
                     ("app.services.backtest.results", "clear_worker_5m_bars_cache")):
         try:
             m = importlib.import_module(mod)
@@ -1773,7 +1790,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         _report_trial_result(on_result, i, cached)
                         continue
                     config = _build_daily_trial_config(
-                        backtest_cfg, decode_params(strategy, flat), hoisted
+                        backtest_cfg, decode_params(strategy, flat), hoisted,
+                        option_trade_records=False,
                     )
                     config = _maybe_mark_want_full(config, is_last_gen)
                     jobs.append((i, flat, key, config))
@@ -2405,7 +2423,9 @@ def _run_trial_backtest(
     if engine == "daily":
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
 
-        config = _build_daily_trial_config(backtest_cfg, decoded, hoisted)
+        # The serial GA path: a FITNESS trial, never persisted from here.
+        config = _build_daily_trial_config(backtest_cfg, decoded, hoisted,
+                                           option_trade_records=False)
         return run_daily_backtest(config)
 
     if engine == "ml":
@@ -2439,9 +2459,19 @@ def _build_daily_trial_config(
     backtest_cfg: Dict[str, Any],
     decoded: Dict[str, Any],
     hoisted: Optional[Dict[str, Any]] = None,
+    *,
+    option_trade_records: bool,
 ) -> Dict[str, Any]:
     """Assemble the ``run_daily_backtest`` config for one trial from the run-level
     backtest_cfg + the decoded trial params.
+
+    ``option_trade_records`` (REQUIRED, keyword, no default -- every caller states it): whether
+    an OPTION run's trade rows carry the option trade record (entry/exit snapshots, BT/live
+    parity plan Part C4). ``False`` for a GA FITNESS trial -- the rows stay the pre-record shape
+    (plus the recorded ``exit_reason``) so nothing grows on the hot path; ``True`` for anything
+    whose rows are PERSISTED (top-N, re-runs, the final generation whose full results become
+    top-N rows). It changes the output SHAPE only -- never a decision, a fill or the fitness
+    (pinned by test) -- and is not part of any job or trial identity.
 
     The expert settings the engine feeds to ``_process`` are merged with the decoded
     expert_overrides (model:* numeric decision settings). RM sizing is part of that set:
@@ -2595,6 +2625,10 @@ def _build_daily_trial_config(
             except Exception:  # noqa: BLE001 — never break a trial on the optimization; fall back to full band
                 screener_candidate = None
 
+    if not isinstance(option_trade_records, bool):
+        raise TypeError(f"option_trade_records must be True or False, got "
+                        f"{option_trade_records!r}")
+
     # UNIQUE per-trial id: parallel trials each name their OWN per-run sqlite, so they never
     # collide on the same file (WinError 32 / cross-thread session). The run-level id is a base.
     import uuid as _uuid
@@ -2709,6 +2743,10 @@ def _build_daily_trial_config(
         # top-N persist), not by the single-backtest path. The market-condition seam reads it to
         # tell "a research run may compute on a miss" from "a search may not".
         "_ga_trial": True,
+        # OUTPUT SHAPE (see the docstring): whether option trade rows carry the trade record.
+        # In the whitelist because a knob missing here is dead; read by run_daily_backtest,
+        # which REFUSES an options run that does not state it.
+        "option_trade_records": option_trade_records,
     }
 
 

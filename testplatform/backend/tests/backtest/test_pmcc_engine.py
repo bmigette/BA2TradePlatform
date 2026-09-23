@@ -37,6 +37,7 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 import importlib.util
 import os
 import sys
@@ -66,7 +67,7 @@ def _launcher():
 
 
 CFG = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": 0.0,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",
@@ -519,6 +520,38 @@ def test_the_structure_exit_reads_the_LONG_leg_and_closes_BOTH_legs(run_result):
         f"the closing order named {sorted(close_legs)}; it must flatten the LEAPS AND the "
         f"ROLLED overlay, and must not re-reverse the already-flat first overlay")
     assert not account.get_option_positions(), "the structure is still open after its exit"
+
+
+def test_each_leg_row_records_WHY_it_closed_and_the_roll_is_ROLL(run_result):
+    """BT/live option parity, plan Part C3/C4, on the rows this run actually produced: the
+    first overlay was bought back by the ROLL ticket -- its row says ``roll`` (the price
+    guess called it ``take_profit``) -- and the LEAPS and the rolled overlay were closed by
+    the LONG-leg DTE floor, so both say ``dte_exit``. The roll ticket carries the old
+    overlay's exit snapshot (priced from the quote the buy-back used) beside the new
+    overlay's entry record, and the new overlay's row reads that record's structure."""
+    account, _ = run_result
+    rows = {t["contract_symbol"]: t for t in account.get_round_trip_trades()
+            if t.get("contract_symbol")}
+    assert set(rows) == {LEAPS, OVERLAY1, OVERLAY2}
+    assert rows[OVERLAY1]["exit_reason"] == "roll"
+    assert rows[LEAPS]["exit_reason"] == "dte_exit"
+    assert rows[OVERLAY2]["exit_reason"] == "dte_exit"
+
+    roll = next(o for o in _orders(781) if o.option_strategy == "pmcc_roll")
+    exit_rec = roll.data["exit_record"]
+    assert exit_rec["trigger"] == "roll"
+    (leg,) = exit_rec["legs"]
+    assert leg["contract_symbol"] == OVERLAY1 and leg["position_intent"] == "buy_to_close"
+    assert roll.data["entry_record"]["structure"]["strategy"] == "pmcc_roll"
+    assert rows[OVERLAY1]["exit_record"]["leg"] == leg
+    # The new overlay opened on the ROLL ticket: its row carries THAT record's structure,
+    # once, and the LEAPS row (first leg of the entry) carries the entry's.
+    assert rows[OVERLAY2]["option_strategy"] == "pmcc_roll"
+    assert rows[OVERLAY2]["entry_record"]["structure"]["strategy"] == "pmcc_roll"
+    assert rows[OVERLAY2]["entry_record"]["leg"]["contract_symbol"] == OVERLAY2
+    head = min((rows[LEAPS], rows[OVERLAY1]), key=lambda r: (str(r["entry_time"]), r["symbol"]))
+    assert head["option_strategy"] == "pmcc"
+    assert head["entry_record"]["structure"]["strategy"] == "pmcc"
 
 
 def test_the_engine_NEVER_held_the_short_without_the_long(run_result):

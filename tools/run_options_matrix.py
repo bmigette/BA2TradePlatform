@@ -78,6 +78,8 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import cap_passthrough  # noqa: E402
+from ba2_common.core.option_spread_model import (  # noqa: E402
+    LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
 
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "options_universe_top100.txt")
@@ -218,6 +220,21 @@ def _newest_optimization_id() -> Optional[int]:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def _spread_name_tag(model: str) -> str:
+    """The job-NAME token for an option spread model: '' for legacy-pct, else e.g. '-spow0922'.
+
+    Matrix-mode job names carry no identity digest and ARE the completion/checkpoint key, so
+    without this a relaunch under the calibrated model would skip (or resume) every job a
+    legacy-priced campaign already completed under the same name. legacy-pct keeps today's
+    names exactly, so existing legacy completions still match themselves.
+    """
+    if model == LEGACY_PCT_MODEL:
+        return ""
+    import re
+    m = re.fullmatch(r"([a-z]+)-\d{4}-(\d{2})-(\d{2})", model)
+    return "-s" + (m.group(1) + m.group(2) + m.group(3) if m else re.sub(r"[^a-z0-9]", "", model))
+
+
 def _jobs(experts, strategies, name_suffix=""):
     """Yield (name, expert, strategy) in priority order (per expert: groups then equity)."""
     for expert in experts:
@@ -297,6 +314,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Options store serving the run, forwarded to the launcher per job "
                          "(default thetadata -- floor 2018-09-14, the only vendor reaching a "
                          "2020 start; tastytrade floors at 2022-10-01, alpaca at 2024-01-18).")
+    ap.add_argument("--option-spread-model", default=SPREAD_MODEL_VERSION, choices=SPREAD_MODELS,
+                    help="Option fill spread model, forwarded to the launcher per job (default "
+                         f"{SPREAD_MODEL_VERSION}: the decision bar's real quote, else the "
+                         "calibrated fallback). ALWAYS passed, so it is part of the discovery "
+                         "identity digest: a job priced by a different spread model can neither "
+                         "skip against nor resume from one priced by this one. Matrix-mode job "
+                         "names carry no digest, so the model is folded into the NAME instead "
+                         "(e.g. -spow0922; nothing for legacy-pct).")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
@@ -518,7 +543,11 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
         # a store chosen via env is a decision the master made that the worker cannot see, and
         # the worker would silently re-resolve to the sqlite default. That is how a whole grid
         # once scored against the wrong vendor's history while every log said otherwise.
-        "--options-store", args.options_store]
+        "--options-store", args.options_store,
+        # EXPLICIT per job for the same reason, and so the spread model is in the job identity
+        # (discovery_name digests these args): the launcher's own default is a code constant
+        # that a later model version would change silently under an unchanged job name.
+        "--option-spread-model", args.option_spread_model]
     if args.labels:
         # The STRUCTURE is appended per job, because one --labels string cannot vary across
         # the 16 jobs a campaign launches and the structure is the one thing that does. The
@@ -587,7 +616,8 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
 
 def planned_jobs(args, launcher, experts, strategies, universe):
     """Separate neutral arms without changing any other job/checkpoint identity."""
-    for name, expert, strategy in _jobs(experts, strategies, args.name_suffix):
+    suffix = _spread_name_tag(args.option_spread_model) + args.name_suffix
+    for name, expert, strategy in _jobs(experts, strategies, suffix):
         modes = args.neutral_entry_modes.split(",") if strategy in _NEUTRAL_STRUCTURES else ["legacy"]
         for mode in modes:
             arm_name = name if mode == "legacy" else name + "-" + mode + "-rules1"

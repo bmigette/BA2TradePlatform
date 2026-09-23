@@ -27,6 +27,7 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 import math
 from datetime import datetime
 from types import SimpleNamespace
@@ -48,7 +49,7 @@ from tests.backtest.test_round_trip_trades import (
 COMMISSION = 1.30
 
 CFG_COMM = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": COMMISSION,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",
@@ -176,7 +177,7 @@ def _refine_config(commission):
         "start_date": D1,
         "end_date": D4,
         "account_settings": {
-            "starting_cash": 20_000.0,
+            **_LEGACY_ZERO_SPREAD, "starting_cash": 20_000.0,
             "commission_per_trade": commission,
             "slippage_bps": 0.0,
             "fill_model": "next_bar_open",
@@ -223,7 +224,7 @@ def test_account_settings_present_but_commission_key_missing_still_raises(monkey
     monkeypatch.setattr(ba2_providers, "get_provider",
                         lambda *a, **k: SimpleNamespace(get_ohlcv_data=lambda *a, **k: None))
     acct = _RefineAccountStub([_snap(D1, 20_000.0)], [], refine_cache)
-    cfg = {"initial_capital": 20_000.0, "account_settings": {"starting_cash": 20_000.0}}
+    cfg = {"initial_capital": 20_000.0, "account_settings": {**_LEGACY_ZERO_SPREAD, "starting_cash": 20_000.0}}
     with pytest.raises(KeyError):
         _build_refine_drawdown_fn(acct, cfg)
 

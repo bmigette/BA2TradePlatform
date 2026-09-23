@@ -51,11 +51,12 @@ def test_get_positions_returns_empty_list_for_real_flat_account():
 
 def test_get_option_chain_maps_snapshot(monkeypatch):
     acct = _make_alpaca()
-    greeks = SimpleNamespace(delta=0.55, gamma=0.02, theta=-0.04, vega=0.1, rho=0.01)
-    quote = SimpleNamespace(bid_price=5.0, ask_price=5.4, bid_size=10, ask_size=12, timestamp=None)
-    trade = SimpleNamespace(price=5.2, timestamp=None)
-    snap = SimpleNamespace(symbol="AAPL260116C00150000", latest_quote=quote, latest_trade=trade,
-                           implied_volatility=0.32, greeks=greeks)
+    # The RAW REST snapshot (the account reads the raw_data client: the typed SDK model drops
+    # the daily bars -- see parse_alpaca_option_snapshot).
+    snap = {"latestQuote": {"bp": 5.0, "ap": 5.4, "bs": 10, "as": 12},
+            "latestTrade": {"p": 5.2},
+            "impliedVolatility": 0.32,
+            "greeks": {"delta": 0.55, "gamma": 0.02, "theta": -0.04, "vega": 0.1, "rho": 0.01}}
     snapshots = {"AAPL260116C00150000": snap}
 
     class FakeOptClient:
@@ -67,7 +68,7 @@ def test_get_option_chain_maps_snapshot(monkeypatch):
     occ_meta = SimpleNamespace(symbol="AAPL260116C00150000", underlying_symbol="AAPL",
                                type=SimpleNamespace(value="call"), strike_price=150.0,
                                expiration_date=date(2026, 1, 16), open_interest="1200")
-    acct._option_data_client = FakeOptClient()
+    acct._option_data_client_raw = FakeOptClient()
     monkeypatch.setattr(acct, "_get_option_contracts_meta",
                         lambda *a, **k: {"AAPL260116C00150000": occ_meta}, raising=False)
 
@@ -86,16 +87,15 @@ def test_get_option_chain_maps_snapshot(monkeypatch):
 
 def test_get_option_quote_maps_snapshot(monkeypatch):
     acct = _make_alpaca()
-    greeks = SimpleNamespace(delta=0.4, gamma=0.01, theta=-0.02, vega=0.05, rho=0.0)
-    quote = SimpleNamespace(bid_price=2.0, ask_price=2.2, bid_size=5, ask_size=7, timestamp=None)
-    trade = SimpleNamespace(price=2.1, timestamp=None)
-    snap = SimpleNamespace(symbol="AAPL260116C00150000", latest_quote=quote, latest_trade=trade,
-                           implied_volatility=0.30, greeks=greeks)
+    snap = {"latestQuote": {"bp": 2.0, "ap": 2.2, "bs": 5, "as": 7},
+            "latestTrade": {"p": 2.1},
+            "impliedVolatility": 0.30,
+            "greeks": {"delta": 0.4, "gamma": 0.01, "theta": -0.02, "vega": 0.05, "rho": 0.0}}
 
     class FakeOptClient:
         def get_option_snapshot(self, req):
             return {"AAPL260116C00150000": snap}
-    acct._option_data_client = FakeOptClient()
+    acct._option_data_client_raw = FakeOptClient()
 
     q = acct.get_option_quote("AAPL260116C00150000")
     assert q is not None
@@ -125,14 +125,13 @@ def test_get_atm_iv_picks_nearest_strike(monkeypatch):
 
 def test_get_option_chain_none_guards(monkeypatch):
     acct = _make_alpaca()
-    snap = SimpleNamespace(symbol="AAPL260116C00150000", latest_quote=None,
-                           latest_trade=None, implied_volatility=None, greeks=None)
+    snap = {}     # a raw snapshot with no quote / trade / greeks / bars at all
     class FakeOptClient:
         def get_option_chain(self, req): return {"AAPL260116C00150000": snap}
     occ_meta = SimpleNamespace(symbol="AAPL260116C00150000", underlying_symbol="AAPL",
                                type=SimpleNamespace(value="call"), strike_price=150.0,
                                expiration_date=date(2026, 1, 16), open_interest=None)
-    acct._option_data_client = FakeOptClient()
+    acct._option_data_client_raw = FakeOptClient()
     monkeypatch.setattr(acct, "_get_option_contracts_meta",
                         lambda *a, **k: {"AAPL260116C00150000": occ_meta}, raising=False)
     chain = acct.get_option_chain("AAPL", date(2026,1,1), date(2026,3,1), OptionRight.CALL)
@@ -148,11 +147,10 @@ def test_get_option_chain_none_guards(monkeypatch):
 def test_get_option_chain_join_asymmetry(monkeypatch):
     acct = _make_alpaca()
     def mk_snap(sym):
-        return SimpleNamespace(symbol=sym,
-            latest_quote=SimpleNamespace(bid_price=1.0, ask_price=1.2, bid_size=1, ask_size=1, timestamp=None),
-            latest_trade=SimpleNamespace(price=1.1, timestamp=None),
-            implied_volatility=0.3,
-            greeks=SimpleNamespace(delta=0.5, gamma=0.0, theta=0.0, vega=0.0, rho=0.0))
+        return {"latestQuote": {"bp": 1.0, "ap": 1.2, "bs": 1, "as": 1},
+                "latestTrade": {"p": 1.1},
+                "impliedVolatility": 0.3,
+                "greeks": {"delta": 0.5, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0}}
     class FakeOptClient:
         def get_option_chain(self, req):
             return {"AAPL260116C00150000": mk_snap("AAPL260116C00150000"),
@@ -160,7 +158,7 @@ def test_get_option_chain_join_asymmetry(monkeypatch):
     occ_meta = SimpleNamespace(symbol="AAPL260116C00150000", underlying_symbol="AAPL",
                                type=SimpleNamespace(value="call"), strike_price=150.0,
                                expiration_date=date(2026,1,16), open_interest="5")
-    acct._option_data_client = FakeOptClient()
+    acct._option_data_client_raw = FakeOptClient()
     monkeypatch.setattr(acct, "_get_option_contracts_meta",
                         lambda *a, **k: {"AAPL260116C00150000": occ_meta}, raising=False)  # no ...160000
     chain = acct.get_option_chain("AAPL", date(2026,1,1), date(2026,3,1), OptionRight.CALL)

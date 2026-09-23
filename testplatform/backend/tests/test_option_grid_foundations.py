@@ -897,7 +897,7 @@ def test_a_spec_that_names_classic_options_reaches_the_TRIAL_config():
         "warmup_days": 0,
         "seed": 1,
     }
-    trial = _build_daily_trial_config(backtest_cfg, {}, None)
+    trial = _build_daily_trial_config(backtest_cfg, {}, None, option_trade_records=False)
     assert trial["experts"][0]["settings"]["risk_manager_mode"] == "classic_options"
 
 
@@ -1072,7 +1072,7 @@ def _decoded_entry_action(m, key, genome, expert="FMPRating"):
         "entry_action": getattr(strat, "entry_action", None),
         "options_store": "parquet",
     }
-    trial = _build_daily_trial_config(backtest_cfg, decoded, None)
+    trial = _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
     # A GROUP key emits one entry rule per member, so pick THIS member's rule by id rather
     # than taking rule 0 (which would silently audit the call arm for every put-arm genome).
     rule = next(r for r in trial["entry_rules"] if r["id"] == f"{key.lower()}-entry")
@@ -1169,7 +1169,7 @@ def test_the_event_timing_genes_reach_the_seeded_rules():
          "experts": [{"class": "FMPRating", "settings": {}}], "initial_capital": 20_000.0,
          "account_settings": {}, "warmup_days": 0, "seed": 1,
          "entry_action": getattr(strat, "entry_action", None), "options_store": "parquet"},
-        decoded, None)
+        decoded, None, option_trade_records=False)
 
     entry_leaf = next(c for c in trial["entry_rules"][0]["conditions"]["conditions"]
                       if c["field"] == "rec_days_to_earnings")
@@ -1427,7 +1427,7 @@ def test_the_trade_floor_survives_the_trial_config_WHITELIST():
         "account_settings": {}, "warmup_days": 0, "seed": 1, "options_store": "parquet",
     }
     m._apply_option_trade_floor("O_LEAP", backtest_cfg)
-    trial = _build_daily_trial_config(backtest_cfg, {}, None)
+    trial = _build_daily_trial_config(backtest_cfg, {}, None, option_trade_records=False)
     assert trial["car_hard_min_trades_per_year"] == 3.0
     assert trial["car_min_trades_per_year"] == 8.0
 
@@ -1546,7 +1546,7 @@ def _decoded_trial(m, key, genome, expert="FMPRating"):
         "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
         "entry_action": getattr(strat, "entry_action", None), "options_store": "parquet",
     }
-    return _build_daily_trial_config(backtest_cfg, decoded, None)
+    return _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
 
 
 # THE EFFECT, NOT THE AUTHORED KEY (reviewer finding, 2026-09-02). ``rule["enabled"] is False``

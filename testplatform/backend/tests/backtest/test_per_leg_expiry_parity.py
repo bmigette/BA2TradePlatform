@@ -135,7 +135,7 @@ def test_both_dte_readers_resolve_through_the_one_shared_accessor(monkeypatch, w
     option_lifecycle._dte(structure, SIM_TODAY)
 
     DaysToExpiryCondition(
-        account=SimpleNamespace(id=1), instrument_name="AAPL",
+        account=SimpleNamespace(id=1, decision_label=lambda: SIM_TODAY), instrument_name="AAPL",
         expert_recommendation=SimpleNamespace(created_at=SIM_AS_OF, instance_id=1,
                                               symbol="AAPL"),
         operator_str="<=", value=21, existing_order=written_pmcc.parent).evaluate()
@@ -264,7 +264,7 @@ def test_the_structure_exit_reader_answers_from_the_LONG_LEG_not_the_legacy_colu
     from ba2_common.core.TradeConditions import DaysToExpiryCondition
 
     cond = DaysToExpiryCondition(
-        account=SimpleNamespace(id=1), instrument_name="AAPL",
+        account=SimpleNamespace(id=1, decision_label=lambda: SIM_TODAY), instrument_name="AAPL",
         expert_recommendation=SimpleNamespace(created_at=SIM_AS_OF, instance_id=1,
                                               symbol="AAPL"),
         operator_str="<=", value=21, existing_order=written_pmcc.parent)
@@ -286,7 +286,7 @@ def test_the_two_readers_disagree_on_the_same_stored_position(written_pmcc):
     roll_dte, _ = _dte(structure, SIM_TODAY)
 
     cond = DaysToExpiryCondition(
-        account=SimpleNamespace(id=1), instrument_name="AAPL",
+        account=SimpleNamespace(id=1, decision_label=lambda: SIM_TODAY), instrument_name="AAPL",
         expert_recommendation=SimpleNamespace(created_at=SIM_AS_OF, instance_id=1,
                                               symbol="AAPL"),
         operator_str="<=", value=21, existing_order=written_pmcc.parent)

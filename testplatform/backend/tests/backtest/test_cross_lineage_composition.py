@@ -54,6 +54,7 @@ Run from the backend dir (with the worktree on PYTHONPATH):
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 import os
 import tempfile
 from datetime import date, datetime
@@ -120,7 +121,7 @@ RAILS: Dict[str, Any] = {
 }
 
 CFG = {
-    "starting_cash": CASH,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": CASH,
     "commission_per_trade": 0.0,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",
@@ -411,7 +412,7 @@ BREAKER_BARS = [
 ]
 
 BREAKER_CFG = {
-    "starting_cash": BREAKER_CAP,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": BREAKER_CAP,
     "commission_per_trade": 0.0,
     "slippage_bps": 0.0,
     "fill_model": "next_bar_open",

@@ -32,6 +32,7 @@ from app.services.backtest.daily_backtest_handler import (
     _build_config,
     _fail,
     _persist_results,
+    record_option_spread_model,
     run_daily_backtest,
 )
 
@@ -117,7 +118,8 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
     decoded = decode_params(strat, _gene_params(bt.strategy_params))
     # hoisted applies the screener (genes + store) exactly as the GA did; None for non-screener opts.
     hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
-    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
+    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
+                                          option_trade_records=True)  # a persisted re-run
     # Overwrite the SAME row; persist the trial sub-DB for post-mortem (matches _persist_top_backtests).
     trial_cfg["backtest_id"] = bt.id
     trial_cfg["name"] = bt.name
@@ -154,6 +156,10 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
     }
     if sp.get("runScheduleOverride") is not None:
         payload["run_schedule_override"] = sp["runScheduleOverride"]
+    # The option spread model the row recorded (plan Part F). Absent on a row created before
+    # Part F: _build_config then applies the current model explicitly and the re-run records it.
+    if sp.get("optionSpreadModel") is not None:
+        payload["option_spread_model"] = sp["optionSpreadModel"]
     # Universe: static -> explicit symbols; screener -> the metric_store block.
     if universe.get("mode") == "screener":
         payload["universe"] = universe
@@ -233,6 +239,7 @@ def handle_rerun_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
         except (KeyError, ValueError) as e:
             _fail(db, bt, str(e))
             return {"status": "failed", "error": str(e)}
+        record_option_spread_model(db, bt, config)
 
         def progress(pct: float, msg: str) -> None:
             if tq.is_task_paused(task_id):

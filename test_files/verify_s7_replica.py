@@ -80,7 +80,7 @@ def main() -> int:
         "entry_rules": converted["entry_rules"],
         "exit_rules": converted["exit_rules"],
     }
-    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
+    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted, option_trade_records=False)
     trial_cfg["name"] = "verify-s7-replica"
 
     results = run_daily_backtest(trial_cfg)

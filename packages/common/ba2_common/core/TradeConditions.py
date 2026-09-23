@@ -348,8 +348,8 @@ class TradeCondition(ABC):
     # it fabricates signal: the simulated bar can be years before ``date.today()``, and a
     # historical fetch left unclamped returns the whole run window, so a "recent high" or
     # a "days to earnings" is computed from the simulated FUTURE. Both helpers below are
-    # duck-typed on the account exactly as ``TradeActions._today()`` is, so LIVE behaviour
-    # is byte-identical (no ``_as_of_date`` -> nothing changes).
+    # duck-typed on the account's ``_as_of_date``, so LIVE behaviour is byte-identical (no
+    # ``_as_of_date`` -> nothing changes).
 
     def _simulated_as_of_date(self) -> Any:
         """The BACKTEST bar's calendar date, ``None`` in live, or ``AS_OF_UNAVAILABLE``.
@@ -357,9 +357,8 @@ class TradeCondition(ABC):
         ``BacktestAccount`` exposes its simulated bar via ``_as_of_date()``; a live account
         has no such attribute and its wall clock IS the right answer.
 
-        Unlike ``TradeActions._today()`` this deliberately does NOT fall back to
-        ``date.today()`` when the accessor exists but fails or returns None. For an action
-        the wall clock is a degraded answer; for a CONDITION it is the lookahead bug itself,
+        This deliberately does NOT fall back to ``date.today()`` when the accessor exists
+        but fails or returns None: for a CONDITION the wall clock is the lookahead bug itself,
         so the caller must treat the condition as unevaluable rather than measure against a
         date the simulation never reached.
         """
@@ -3446,10 +3445,10 @@ class DaysToExpiryCondition(CompareCondition):
     rule is never exercised. Pre-existing rows that disagree stay unevaluable, because their
     strategy is not declared.
 
-    The "today" is the recommendation's ``created_at`` — the simulated as-of bar in a
-    backtest, wall-clock in live — never ``date.today()``, so the value is deterministic
-    under a frozen clock and correct in backtest. The comparison is by DATE, so every bar
-    of one session reports the same DTE.
+    The "today" is the account's decision session label (``_as_of_date`` below) -- the
+    date the option ENTRY counted its DTE from -- never ``date.today()``, so the value is
+    deterministic under a frozen clock and correct in backtest. The comparison is by DATE,
+    so every bar of one session reports the same DTE.
     """
 
     #: Rendered instead of a number when the measurement could not be made.
@@ -3463,11 +3462,28 @@ class DaysToExpiryCondition(CompareCondition):
         return value
 
     def _as_of_date(self):
-        """The evaluation DATE, or None when there is no as-of to evaluate against."""
-        as_of = getattr(self.expert_recommendation, "created_at", None)
-        if as_of is None:
+        """The evaluation DATE: the account's decision session label, or None when the account
+        cannot give one.
+
+        ``OptionsAccountInterface.decision_label`` -- the SAME date an option entry anchors its
+        DTE window on (``TradeActions._OptionEntryAction._today``), so the exit measures the
+        remaining life on the clock the entry was selected on (BT/live option parity): N(D)
+        for backtest bar D, the New York date of the decision instant live. Before, this read
+        the recommendation's ``created_at`` as a UTC date: D in a backtest (one session
+        behind the entry), and the NEXT day for a live evening decision. An account with no
+        ``decision_label`` (not an options account) has no reference point: unevaluable,
+        never the wall clock."""
+        return self.decision_label_of(self.account)
+
+    @staticmethod
+    def decision_label_of(account):
+        """``account.decision_label()``, or None for an account that has none. The ONE
+        reference date every DTE condition counts from (this one, the short-leg roll window,
+        the covered-call floor)."""
+        label_of = getattr(account, "decision_label", None)
+        if not callable(label_of):
             return None
-        return self._as_of_to_date(as_of)
+        return label_of()
 
     @staticmethod
     def _as_of_to_date(as_of):
@@ -3601,7 +3617,7 @@ class DaysToExpiryCondition(CompareCondition):
             if as_of is None:
                 # Substituting the wall clock here is the lookahead bug DaysOpenedCondition's
                 # docstring was written about; refusing is the only honest option.
-                self.unknown_reason = ("no evaluation date on the recommendation — "
+                self.unknown_reason = ("the account has no decision session label — "
                                        "'days remaining' has no reference point")
                 logger.warning(f"days_to_expiry for {self.instrument_name} is unevaluable: "
                                f"{self.unknown_reason}")
@@ -3748,13 +3764,12 @@ class ShortLegDaysToExpiryCondition(_TwoExpiryLegCondition):
             self.unknown_reason = None
             from ba2_common.core.option_lifecycle import roll_window_dte
 
-            as_of = DaysToExpiryCondition._as_of_to_date(
-                getattr(self.expert_recommendation, "created_at", None)) \
-                if getattr(self.expert_recommendation, "created_at", None) is not None else None
+            # The account's decision session label, as DaysToExpiryCondition (BT/live parity).
+            as_of = DaysToExpiryCondition.decision_label_of(self.account)
             if as_of is None:
                 return self._unevaluable(
                     "short_leg_days_to_expiry",
-                    "no evaluation date on the recommendation — 'days remaining' has no "
+                    "the account has no decision session label — 'days remaining' has no "
                     "reference point")
             structure, blind = self._structure()
             if structure is None:
@@ -3981,12 +3996,11 @@ class CoveredCallDaysToExpiryCondition(CompareCondition):
         try:
             self.calculated_value = None
             self.unknown_reason = None
-            as_of = DaysToExpiryCondition._as_of_to_date(
-                getattr(self.expert_recommendation, "created_at", None)) \
-                if getattr(self.expert_recommendation, "created_at", None) is not None else None
+            # The account's decision session label, as DaysToExpiryCondition (BT/live parity).
+            as_of = DaysToExpiryCondition.decision_label_of(self.account)
             if as_of is None:
                 return self._unevaluable(
-                    "no evaluation date on the recommendation — 'days remaining' has no "
+                    "the account has no decision session label — 'days remaining' has no "
                     "reference point")
 
             from ba2_common.core.failure_modes import UnmeasuredValue

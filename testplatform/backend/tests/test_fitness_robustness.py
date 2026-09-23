@@ -266,7 +266,7 @@ def test_robust_flag_survives_the_trial_config_whitelist():
          "experts": [{"class": "FMPRating", "settings": {}}],
          "enabled_instruments": ["AAPL"], "account_settings": {},
          "warmup_days": 30, "seed": 42},
-        {}, {})
+        {}, {}, option_trade_records=False)
     assert cfg.get("robust_fitness") is True
 
 

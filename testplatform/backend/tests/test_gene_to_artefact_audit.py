@@ -283,7 +283,7 @@ def _trial(m, strat, expert, genome, screener=False):
 
     decoded = decode_params(strat, genome)
     return decoded, _build_daily_trial_config(_backtest_cfg(strat, expert), decoded,
-                                              _hoisted(screener))
+                                              _hoisted(screener), option_trade_records=False)
 
 
 def _export(entry_rules, exit_rules):

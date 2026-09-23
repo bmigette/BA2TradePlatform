@@ -68,7 +68,7 @@ def test_trial_config_carries_screener_runtime(tmp_path):
         "screener_overrides": {"screener_market_cap_min": 2.5e9, "screener_relative_volume_min": 1.5},
         "buy_tree": None, "sell_tree": None, "exit_rules": [],
     }
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)
     rt = cfg["screener_runtime"]
     assert rt["store"] == store
     assert rt["cadence_days"] == 7
@@ -83,7 +83,7 @@ def test_trial_config_carries_screener_runtime(tmp_path):
     # A run WITHOUT screener_opt -> hoisted has no store -> screener_runtime is None (no-op).
     plain = {k: v for k, v in backtest_cfg.items() if k != "screener_opt"}
     plain_hoisted = H._build_hoisted_state(plain)
-    plain_cfg = H._build_daily_trial_config(plain, decoded, plain_hoisted)
+    plain_cfg = H._build_daily_trial_config(plain, decoded, plain_hoisted, option_trade_records=False)
     assert plain_cfg["screener_runtime"] is None
 
 
@@ -132,7 +132,7 @@ def test_trial_config_gate_only_keeps_static_universe(tmp_path):
     hoisted = H._build_hoisted_state(backtest_cfg)
     assert hoisted["screener_gate_only"] is True
 
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)
     rt = cfg["screener_runtime"]
     assert rt["store"] == store
     assert rt["settings"]["price_max"] == 5.0          # normalized, carried to the engine gate
@@ -145,5 +145,5 @@ def test_trial_config_gate_only_keeps_static_universe(tmp_path):
     }
     hoisted2 = H._build_hoisted_state(backtest_cfg)
     assert hoisted2["screener_gate_only"] is False
-    cfg2 = H._build_daily_trial_config(backtest_cfg, decoded, hoisted2)
+    cfg2 = H._build_daily_trial_config(backtest_cfg, decoded, hoisted2, option_trade_records=False)
     assert cfg2["enabled_instruments"] == []

@@ -6,8 +6,14 @@ pre-analysis preparation; entry points contribute arguments and reporting only.
 PHASES
 
 1. :func:`plan` -- inventory, no feature computation. Decision sessions are every regular session
-   in ``[start, end]``; the feature rows they need are their PRIOR sessions (``prior_session_v1``);
-   each row needs the 128 sessions ending at it, so the earliest raw bar is 127 sessions before the
+   in ``[start, end]``. The feature rows built are ``[prior(first decision), last decision]``
+   (BT/live parity plan 2026-09-22 A3): a LIVE decision on session S reads ``prior(S)``
+   (``prior_session_v1``) and a BACKTEST bar D -- the live decision labelled
+   ``backtest_decision_label(D)`` -- reads D itself, so this range is the superset serving both
+   rules over the same dates, one row more than either alone. ``window_start``/``window_end``
+   in the manifest stay the decision/bar dates (``start``/``end``); the rows actually built are
+   ``first_row_session``..``last_row_session`` here and each symbol's coverage record there.
+   Each row needs the 128 sessions ending at it, so the earliest raw bar is 127 sessions before the
    first row. Per symbol: the FMP daily cache file versus that span (``missing_file`` /
    ``stale_tail`` / internal holes / a listing younger than the window / conflicting duplicate
    bars), the rows already published under the same (symbol, session, window digest) by any
@@ -64,7 +70,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Proto
 import numpy as np
 
 from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions, prior_regular_session, \
-    regular_sessions_ending_at
+    regular_session_close_utc, regular_sessions_ending_at
 from ba2_common.core.market_condition_context import TIMING_POLICY_PRIOR_SESSION_V1
 from ba2_common.core.market_condition_source import (
     SOURCE_PROFILE_FMP_DAILY,
@@ -113,7 +119,10 @@ __all__ = [
     "local_build_dir",
 ]
 
-MC_PLAN_VERSION = 1
+#: 2 (2026-09-22, BT/live parity): rows are ``[prior(first decision), last decision]`` and the
+#: plan carries ``row_sessions`` separately from ``decision_sessions`` (one more). A version-1
+#: plan file is refused rather than built one row short at the end.
+MC_PLAN_VERSION = 2
 
 RAW_PRESENT = "present"
 RAW_MISSING_FILE = "missing_file"
@@ -152,6 +161,11 @@ class WarmupSource(Protocol):
 def local_build_dir(cache_root: os.PathLike) -> Path:
     from ba2_common.core.shared_arrays import DERIVED_DIRNAME
     return Path(cache_root) / DERIVED_DIRNAME / _BUILD_DIRNAME
+
+
+def _now_utc() -> datetime:
+    """The wall clock :func:`plan` checks ``end`` against (a seam: tests patch it)."""
+    return datetime.now(timezone.utc)
 
 
 def _log_noop(_msg: str) -> None:
@@ -225,6 +239,8 @@ class MarketConditionWarmPlan:
     start: str
     end: str
     decision_sessions: int
+    #: Rows built per symbol: ``decision_sessions + 1`` (the superset, see the module docstring).
+    row_sessions: int
     first_row_session: str
     last_row_session: str
     earliest_raw_bar: str
@@ -261,7 +277,9 @@ class MarketConditionWarmPlan:
     def summary(self) -> Dict[str, Any]:
         return {
             "profile": self.profile, "universe": len(self.universe), "start": self.start, "end": self.end,
-            "decision_sessions": self.decision_sessions, "rows_required": sum(s.rows_required for s in self.symbols),
+            "decision_sessions": self.decision_sessions, "row_sessions": self.row_sessions,
+            "first_row_session": self.first_row_session, "last_row_session": self.last_row_session,
+            "rows_required": sum(s.rows_required for s in self.symbols),
             "rows_reusable": sum(s.rows_reusable for s in self.symbols),
             "rows_missing": sum(s.rows_missing for s in self.symbols),
             "earliest_raw_bar": self.earliest_raw_bar, "preflight_ok": not self.preflight_errors,
@@ -618,8 +636,20 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     decisions = _decision_sessions(start, end)
     if not decisions:
         raise WarmupConfigError(f"no regular session in [{start}, {end}]")
-    first_row, last_row = prior_regular_session(decisions[0]), prior_regular_session(decisions[-1])
-    n_rows = len(decisions)
+    # The last row IS the last decision session, so its bar must exist: refuse an unclosed end
+    # rather than publish a row that can only read raw_unavailable.
+    last_close = regular_session_close_utc(decisions[-1])
+    if last_close > _now_utc():
+        raise WarmupConfigError(
+            f"end {end}: the last session in the window ({decisions[-1]}) closes at "
+            f"{last_close.isoformat()}, which has not happened yet. end must be a COMPLETED "
+            f"session: the snapshot's last row is that session itself (a backtest bar reads its "
+            f"own session). Live only needs rows through the PREVIOUS session, so warm through "
+            f"the last completed session.")
+    # The superset of the live rows (prior of each decision) and the backtest rows (each bar):
+    # ONE extra row at the front. See the module docstring.
+    first_row, last_row = prior_regular_session(decisions[0]), decisions[-1]
+    n_rows = len(decisions) + 1
     cal = _calendar_span(first_row, last_row, n_rows)
     if source is None:
         from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
@@ -660,7 +690,8 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     return MarketConditionWarmPlan(
         profile=profile, calc_version=PROFILES[profile].calc_version, source_profile=source_profile,
         timing_policy=TIMING_POLICY_PRIOR_SESSION_V1, cache_root=cache_root, universe=symbols,
-        start=start.isoformat(), end=end.isoformat(), decision_sessions=n_rows,
+        start=start.isoformat(), end=end.isoformat(), decision_sessions=len(decisions),
+        row_sessions=n_rows,
         first_row_session=first_row.isoformat(), last_row_session=last_row.isoformat(),
         earliest_raw_bar=str(cal[0]), certification=cert_dict, preflight_errors=preflight,
         symbols=inventories, created_at=datetime.now(timezone.utc).isoformat(),
@@ -997,7 +1028,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
     compute = COMPUTE_BY_PROFILE[plan_.profile]
     batch = BATCH_BY_PROFILE.get(plan_.profile)
     sym = inv.symbol
-    n_rows = plan_.decision_sessions
+    n_rows = plan_.row_sessions
 
     snap, retries = _read_snapshot(plan_.cache_root, sym)
     counters.add("snapshot_retries", retries)
@@ -1156,7 +1187,7 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     bytes0 = source.bytes if source is not None else 0
     first_row = date.fromisoformat(plan_.first_row_session)
     last_row = date.fromisoformat(plan_.last_row_session)
-    cal = _calendar_span(first_row, last_row, plan_.decision_sessions)
+    cal = _calendar_span(first_row, last_row, plan_.row_sessions)
 
     # -- fetch
     t_fetch = time.monotonic()

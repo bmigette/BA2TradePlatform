@@ -368,7 +368,16 @@ def run_option_lifecycle_pass(expert_instance_id: int,
     from .db import get_instance
     from .models import ExpertInstance
 
-    as_of = as_of or datetime.now(timezone.utc)
+    from ba2_common.core.market_calendar import live_decision_label
+    from ba2_common.core.option_session import live_decision_time
+
+    # The live decision instant (the decision pass's frozen time, else the replay-aware clock)
+    # and its New York date: the SAME reference the rule-level DTE conditions and the option
+    # entry count from (``OptionsAccountInterface.decision_label``, BT/live option parity).
+    # ``decide`` used to take the UTC date of ``datetime.now``, the next calendar day for any
+    # evening pass.
+    as_of = as_of or live_decision_time()
+    decision_label = live_decision_label(as_of)
     result = LifecyclePassResult(expert_instance_id, as_of)
 
     expert = _resolve_expert(expert_instance_id)
@@ -470,7 +479,7 @@ def run_option_lifecycle_pass(expert_instance_id: int,
     decide_settings = dict(settings)
     decide_settings.update(breaker_signal(result.breaker))
     try:
-        result.decisions = decide(structures, chain_by_symbol, decide_settings, as_of,
+        result.decisions = decide(structures, chain_by_symbol, decide_settings, decision_label,
                                   cover_shares_required=cover_required,
                                   cover_shares_held=cover_held)
     except KeyError as e:
@@ -969,6 +978,11 @@ def _close(account, txn, structure: OptionStructure, decision: LifecycleDecision
     the risk rules have decided on must actually execute.
     """
     try:
+        # Looked up BEFORE anything is submitted: the table is total over the closing reasons
+        # (pinned by test), so a miss here is a code bug to raise, never a close whose record
+        # fails after it is already at the broker.
+        from ba2_common.core.option_lifecycle import LIFECYCLE_CLOSE_TRIGGERS
+        trigger = LIFECYCLE_CLOSE_TRIGGERS[decision.reason]
         if account.has_pending_closing_order(txn.id):
             result.skipped_pending_close.append(txn.id)
             logger.info(f"Option lifecycle: transaction {txn.id} decided "
@@ -996,6 +1010,16 @@ def _close(account, txn, structure: OptionStructure, decision: LifecycleDecision
                 f"{decision.detail}) was NOT accepted by the broker — the position is still "
                 f"open and unmanaged for this pass")
             return
+        # WHY it closed, on the close order (plan Part C3): the decision's reason in the
+        # shared OptionCloseReason vocabulary. A market close priced from no quote, so the
+        # legs are named rather than snapshotted. Recording never blocks the close.
+        from ba2_common.core.TradeActions import build_exit_record, stamp_order_data
+        stamp_order_data(
+            getattr(order, "id", None),
+            {"exit_record": build_exit_record(
+                account, trigger, legs=list(legs),
+                quotes={}, underlying=structure.underlying)},
+            f"the exit_record of the lifecycle close of transaction {txn.id}")
         result.submitted.append(SubmittedClose(txn.id, decision.reason, legs, order))
         logger.info(f"Option lifecycle: submitted a close for transaction {txn.id} "
                     f"({txn.symbol}) — {decision.reason}: {decision.detail}")

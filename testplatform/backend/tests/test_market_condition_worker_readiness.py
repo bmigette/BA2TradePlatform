@@ -413,13 +413,13 @@ def test_the_ga_trial_config_carries_the_digest_and_the_profile():
         "initial_capital": 100000.0, "account_settings": {}, "warmup_days": 60, "seed": 7,
         "market_condition_profile": "ohlcv-v1", "market_condition_manifest": "f" * 64,
     }
-    cfg = _build_daily_trial_config(backtest_cfg, {})
+    cfg = _build_daily_trial_config(backtest_cfg, {}, option_trade_records=False)
     assert cfg["market_condition_profiles"] == ["ohlcv-v1"]
     assert cfg["market_condition_manifests"] == {"ohlcv-v1": "f" * 64}
     assert cfg["_ga_trial"] is True
 
     plain = _build_daily_trial_config({**backtest_cfg, "market_condition_profile": None,
-                                       "market_condition_manifest": None}, {})
+                                       "market_condition_manifest": None}, {}, option_trade_records=False)
     assert plain["market_condition_profiles"] == []
     assert plain["market_condition_manifests"] == {}
 
@@ -567,7 +567,7 @@ def test_the_pinned_digest_round_trips_through_the_persisted_backtest_config():
     }
     # The round trip a re-run tool performs: persist as JSON, read back, rebuild the trial config.
     restored = json.loads(json.dumps({"backtest": persisted}))["backtest"]
-    cfg = _build_daily_trial_config(restored, {})
+    cfg = _build_daily_trial_config(restored, {}, option_trade_records=False)
     assert cfg["market_condition_manifests"] == {"ohlcv-v1": "e" * 64}
     assert cfg["market_condition_profiles"] == ["ohlcv-v1"]
     assert cfg["_ga_trial"] is True

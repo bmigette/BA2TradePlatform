@@ -35,6 +35,9 @@ def annotate(path: str) -> int:
         for bad in list(case.findall("failure")) + list(case.findall("error")):
             found += 1
             where = f"{case.get('classname')}::{case.get('name')}"
+            # A parametrised test id can carry a newline that would end the
+            # workflow command early; flatten it the same way as the body.
+            where = where.replace("\r", " ").replace("\n", " ")
             body = (bad.text or bad.get("message") or "").strip()
             for i, chunk in enumerate(textwrap.wrap(body[-_TAIL_CHARS:], _CHUNK)):
                 flat = chunk.replace("\r", " ").replace("\n", " ")

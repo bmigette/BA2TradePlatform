@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
-from ba2_common.core.market_calendar import NY_TZ, prior_regular_session
+from ba2_common.core.market_calendar import decision_data_session, live_decision_label
 from ba2_common.core.market_condition_context import (
     TIMING_POLICY_PRIOR_SESSION_V1,
     MarketConditionContext,
@@ -331,7 +331,10 @@ class DecisionState:
 
     @property
     def session_label(self) -> date:
-        return self.decision_time.astimezone(NY_TZ).date()
+        """The America/New_York date of the decision (``live_decision_label``): the ONE label
+        rule the backtest mirrors with ``backtest_decision_label`` (BT/live parity plan
+        2026-09-22). A naive ``decision_time`` is refused, as ``prior_regular_session`` always did."""
+        return live_decision_label(self.decision_time)
 
     def context(self) -> MarketConditionContext:
         ctx = self._context
@@ -342,7 +345,7 @@ class DecisionState:
                 self._context = MarketConditionContext(
                     decision_time=self.decision_time,
                     session_label=self.session_label,
-                    prior_session=prior_regular_session(self.decision_time),
+                    prior_session=decision_data_session(self.session_label),
                     source_profile=self.resolver.source_profile,
                     timing_policy=TIMING_POLICY_PRIOR_SESSION_V1,
                     calc_version=self.resolver.calc_version,

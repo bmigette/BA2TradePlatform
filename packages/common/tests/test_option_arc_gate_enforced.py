@@ -88,6 +88,11 @@ class FakeAccount(OptionsAccountInterface):
         return AccountSnapshot(cash=self._balance, equity=self._balance,
                                net_liquidation=self._balance)
 
+    def decision_label(self):
+        # The option action's DTE label (OptionsAccountInterface.decision_label,
+        # read by _OptionEntryAction._today): pinned to this fake's simulated date.
+        return self._as_of_date()
+
     def _as_of_date(self):
         return TODAY
 

@@ -99,7 +99,8 @@ def main() -> int:
         print(f"window override -> {bt_block['start_date']} .. {bt_block['end_date']}", flush=True)
 
     decoded = decode_params(strat, trial["params"])
-    trial_cfg = _build_daily_trial_config(bt_block, decoded, {"backtest_cfg": bt_block})
+    trial_cfg = _build_daily_trial_config(bt_block, decoded, {"backtest_cfg": bt_block},
+                                          option_trade_records=False)  # a probe, not persisted
     trial_cfg["name"] = f"DETERMINISM-{label}"
     # 4th arg "persistdb" reproduces the ONE thing _persist_top_backtests sets that a GA trial
     # does not: an on-disk trading DB instead of the RAM-only store.

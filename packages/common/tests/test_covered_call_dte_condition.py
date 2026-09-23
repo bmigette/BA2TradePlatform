@@ -53,6 +53,11 @@ class _FakeAccount:
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
     has_pending_closing_order = ReadOnlyAccountInterface.has_pending_closing_order
 
+    def decision_label(self):
+        # Every DTE condition counts from the account's decision session label (the date the
+        # option entry counted from, BT/live option parity), pinned here to the sim date.
+        return SIM_TODAY
+
 
 def _rec(as_of=SIM_AS_OF, symbol="AAPL", instance_id=1):
     return SimpleNamespace(created_at=as_of, instance_id=instance_id, symbol=symbol)
@@ -123,10 +128,10 @@ def _written_call(db, *, expiry, expert_id=1):
     return stock, call_txn
 
 
-def _cond(order, *, op="<=", value=7, rec=None):
+def _cond(order, *, op="<=", value=7, rec=None, account=None):
     from ba2_common.core.TradeConditions import CoveredCallDaysToExpiryCondition
     return CoveredCallDaysToExpiryCondition(
-        account=_FakeAccount(), instrument_name="AAPL",
+        account=account or _FakeAccount(), instrument_name="AAPL",
         expert_recommendation=rec or _rec(), operator_str=op, value=value,
         existing_order=order)
 
@@ -143,6 +148,27 @@ def test_the_written_call_is_measured_from_the_STOCK_position(tmp_path):
 
     assert cond.evaluate() is True
     assert cond.get_calculated_value() == 5
+
+
+def test_the_reference_is_the_accounts_decision_label_not_the_recommendation(tmp_path):
+    """BT/live option parity: the floor counts from the account's decision session label
+    (the date the entry counted from), not from the recommendation's created_at (a UTC
+    date: one session behind the entry in a backtest, the next day for a live evening)."""
+    db = _setup_db(tmp_path)
+    stock, _ = _written_call(db, expiry=SIM_TODAY + timedelta(days=5))
+    far_rec = _rec(as_of=datetime(2024, 6, 1, 15, 30, tzinfo=timezone.utc))
+    cond = _cond(stock, rec=far_rec)
+    assert cond.evaluate() is True
+    assert cond.get_calculated_value() == 5
+
+
+def test_an_account_with_no_decision_label_is_unevaluable(tmp_path):
+    db = _setup_db(tmp_path)
+    stock, _ = _written_call(db, expiry=SIM_TODAY + timedelta(days=5))
+    cond = _cond(stock, account=SimpleNamespace(id=1))
+    assert cond.evaluate() is False
+    assert cond.get_calculated_value() is None
+    assert "decision session label" in cond.get_actual_value_display()
 
 
 def test_the_transaction_anchored_reader_sees_NOTHING_on_the_same_book(tmp_path):

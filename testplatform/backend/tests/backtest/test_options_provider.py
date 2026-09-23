@@ -23,7 +23,7 @@ def _seed(db):
 def test_chain_filtered_by_type_and_asof_clamp(tmp_path):
     db = str(tmp_path / "opt.db"); _seed(db)
     p = HistoricalOptionsProvider(db)
-    calls = p.get_chain("AAPL", date(2024, 3, 7), expiry_min=date(2024,3,1),
+    calls = p.get_chain("AAPL", date(2024, 3, 7), data_session=date(2024, 3, 7), expiry_min=date(2024,3,1),
                         expiry_max=date(2024,3,31), option_type=OptionRight.CALL)
     assert len(calls) == 1 and calls[0].option_type == OptionRight.CALL
     assert calls[0].delta == 0.5
@@ -31,7 +31,7 @@ def test_chain_filtered_by_type_and_asof_clamp(tmp_path):
 def test_chain_before_any_snapshot_is_empty(tmp_path):
     db = str(tmp_path / "opt.db"); _seed(db)
     p = HistoricalOptionsProvider(db)
-    assert p.get_chain("AAPL", date(2024,2,1), expiry_min=date(2024,3,1),
+    assert p.get_chain("AAPL", date(2024,2,1), data_session=date(2024,2,1), expiry_min=date(2024,3,1),
                        expiry_max=date(2024,3,31)) == []
 
 def test_get_bar_asof(tmp_path):
@@ -66,7 +66,7 @@ def test_second_provider_reuses_worker_cache_no_reload(monkeypatch, tmp_path):
     monkeypatch.setattr(op, "_load_bar_history", counting_load_bar)
 
     p1 = HistoricalOptionsProvider(db)
-    p1.get_chain("AAPL", date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
+    p1.get_chain("AAPL", date(2024, 3, 7), data_session=date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
     assert calls["chain"] == 1
     assert calls["bar"] >= 1  # loaded the as-of greeks bar history for each contract in the chain
 
@@ -75,7 +75,7 @@ def test_second_provider_reuses_worker_cache_no_reload(monkeypatch, tmp_path):
     # rather than reload from disk.
     calls_before = dict(calls)
     p2 = HistoricalOptionsProvider(db)
-    p2.get_chain("AAPL", date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
+    p2.get_chain("AAPL", date(2024, 3, 7), data_session=date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
     p2.get_bar("AAPL240315C00180000", date(2024, 3, 5))
     p2.get_atm_iv("AAPL", date(2024, 3, 7))
     assert calls == calls_before, (
@@ -97,11 +97,11 @@ def test_clear_worker_options_cache_forces_reload(monkeypatch, tmp_path):
     monkeypatch.setattr(op, "_load_chain_history", counting_load_chain)
 
     p = HistoricalOptionsProvider(db)
-    p.get_chain("AAPL", date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
+    p.get_chain("AAPL", date(2024, 3, 7), data_session=date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
     assert calls["chain"] == 1
 
     op.clear_worker_options_cache()
-    p.get_chain("AAPL", date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
+    p.get_chain("AAPL", date(2024, 3, 7), data_session=date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
     assert calls["chain"] == 2, "clear_worker_options_cache() should force a fresh reload"
 
 
@@ -129,7 +129,7 @@ def test_chain_and_bar_cache_are_lru_bounded(monkeypatch, tmp_path):
 
     p = HistoricalOptionsProvider(db)
     for underlying in ["AAA", "BBB", "CCC"]:
-        p.get_chain(underlying, date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
+        p.get_chain(underlying, date(2024, 3, 7), data_session=date(2024, 3, 7), expiry_min=date(2024, 3, 1), expiry_max=date(2024, 3, 31))
 
     assert len(op._WORKER_CHAIN_CACHE) == 2, "chain cache exceeded its configured LRU cap"
     assert len(op._WORKER_BAR_CACHE) == 2, "bar cache exceeded its configured LRU cap"
@@ -166,7 +166,7 @@ def test_chain_quotes_derived_from_bar_close(tmp_path):
     op.clear_worker_options_cache()
     db = str(tmp_path / "opt.db"); _seed_b4(db)
     p = HistoricalOptionsProvider(db)
-    chain = p.get_chain("AAPL", date(2024,3,7), expiry_min=date(2024,3,1),
+    chain = p.get_chain("AAPL", date(2024,3,7), data_session=date(2024,3,7), expiry_min=date(2024,3,1),
                         expiry_max=date(2024,5,31), option_type=OptionRight.CALL)
     assert len(chain) == 1
     ct = chain[0]
@@ -179,7 +179,7 @@ def test_get_quote_synthesizes_same_spread_as_chain(tmp_path):
     op.clear_worker_options_cache()
     db = str(tmp_path / "opt.db"); _seed_b4(db)
     p = HistoricalOptionsProvider(db)
-    q = p.get_quote("AAPL240419C00180000", date(2024,3,5))
+    q = p.get_quote("AAPL240419C00180000", date(2024,3,5), data_session=date(2024,3,5))
     assert q is not None
     assert q.last == 3.0
     assert q.bid == pytest.approx(2.9) and q.ask == pytest.approx(3.1)
@@ -189,7 +189,7 @@ def test_chain_quotes_keep_snapshot_when_no_bar(tmp_path):
     op.clear_worker_options_cache()
     db = str(tmp_path / "opt.db"); _seed_b4(db)
     p = HistoricalOptionsProvider(db)
-    chain = p.get_chain("AAPL", date(2024,3,3), expiry_min=date(2024,3,1),
+    chain = p.get_chain("AAPL", date(2024,3,3), data_session=date(2024,3,3), expiry_min=date(2024,3,1),
                         expiry_max=date(2024,5,31), option_type=OptionRight.CALL)
     assert len(chain) == 1
     assert chain[0].bid == 2.0 and chain[0].ask == 2.2 and chain[0].last == 2.1
@@ -199,11 +199,11 @@ def test_chain_quotes_bar_close_only_when_snapshot_lacks_spread(tmp_path):
     op.clear_worker_options_cache()
     db = str(tmp_path / "opt.db"); _seed_b4(db)
     p = HistoricalOptionsProvider(db)
-    chain = p.get_chain("AAPL", date(2024,3,7), expiry_min=date(2024,3,1),
+    chain = p.get_chain("AAPL", date(2024,3,7), data_session=date(2024,3,7), expiry_min=date(2024,3,1),
                         expiry_max=date(2024,5,31), option_type=OptionRight.PUT)
     assert len(chain) == 1
     assert chain[0].last == 1.5 and chain[0].bid is None and chain[0].ask is None
-    q = p.get_quote("AAPL240419P00180000", date(2024,3,5))
+    q = p.get_quote("AAPL240419P00180000", date(2024,3,5), data_session=date(2024,3,5))
     assert q.last == 1.5 and q.bid is None and q.ask is None
 
 
