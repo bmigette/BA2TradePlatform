@@ -1411,6 +1411,7 @@ RULESET_SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
 RULESET_STOP_KEPT_REASONS = frozenset((
     "ratchet",                  # setting off: a looser request is refused (today's behaviour)
     "floor_would_loosen",       # setting on, the rule tightened; only the min-distance floor loosened
+    "floor_exceeds_rule",       # setting on, the floor pushed a loosen past the rule's own price
     "no_max_loss_stop",         # setting on, but no bound was recorded: never loosen blind
     "existing_beyond_bound",    # setting on, existing already at/looser than the bound
     "bound_too_close",          # setting on, the clamped stop would break the min distance
@@ -1477,6 +1478,10 @@ def ruleset_stop_policy(transaction, requested: float, is_long: bool,
       further away; applied to a tighten or a trailing request it would turn it into a loosen,
       and a profit lock would unwind bar by bar down to the bound as the market falls. The
       loosen setting permits a RULE to loosen, not the floor.
+    - LOOSER request, setting True, and the floor pushed it LOOSER than the rule's own price
+      (``rule_price``) -> existing (``floor_exceeds_rule``). A loosen never goes past what the
+      rule asked for: the rule's price sat too close to the market, and the floor's answer to
+      that is not a licence to loosen further.
     - LOOSER request, setting True -> clamped at ``max_loss_stop_of(transaction)``: long
       ``max(requested, bound)``, short ``min(requested, bound)``, so the result is never looser
       than the bound and never looser than requested. Then:
@@ -1531,6 +1536,16 @@ def ruleset_stop_policy(transaction, requested: float, is_long: bool,
             f"(applied={ex_s})"
         )
         return existing, "floor_would_loosen"
+
+    if rule_price is not None and ((requested < rule_price) if is_long else (requested > rule_price)):
+        rule_s, _ = _stop_price_pair(rule_price, requested)
+        logger.info(
+            f"SL floor exceeds rule: keeping existing stop {ex_s} for transaction {txn_id} — the "
+            f"rule asked to loosen the {direction} stop to {rule_s}, which is too close to the "
+            f"market; the SL min-distance floor moved it to {req_s}, past the rule's own price, "
+            f"and a loosen never goes past what the rule asked for (applied={ex_s})"
+        )
+        return existing, "floor_exceeds_rule"
 
     from ba2_common.core.position_sizing import max_loss_stop_of
     bound = max_loss_stop_of(transaction)

@@ -251,9 +251,23 @@ class TestTheFloorNeverLoosens:
             105.0, "floor_would_loosen")
 
     def test_long_a_rule_that_itself_loosens_is_still_a_loosen(self):
-        assert ruleset_stop_policy(_txn(105.0, bound=92.0), 101.0, True, _ON,
-                                   price_getter=_px(107.0), rule_price=104.0) == (
-            101.0, "loosen_within_bound")
+        """The floor left it alone (rule price == requested): a genuine rule loosen."""
+        assert ruleset_stop_policy(_txn(105.0, bound=92.0), 104.0, True, _ON,
+                                   price_getter=_px(110.0), rule_price=104.0) == (
+            104.0, "loosen_within_bound")
+
+    def test_long_a_floor_pushed_past_the_rules_own_loosen_keeps_the_stop(self, info_log):
+        """105 lock, rule asks 104 with the market at 105.10 (too close), floor gives ~101.95."""
+        assert ruleset_stop_policy(_txn(105.0, bound=92.0), 101.947, True, _ON,
+                                   price_getter=_px(105.1), rule_price=104.049) == (
+            105.0, "floor_exceeds_rule")
+        assert "SL floor exceeds rule: keeping existing stop $105.00" in _text(info_log)
+
+    def test_long_a_floor_past_the_rule_is_kept_even_where_the_bound_would_clamp(self):
+        """Bound 103: the old rule would clamp at 103, which is still past the rule's 104."""
+        assert ruleset_stop_policy(_txn(105.0, bound=103.0), 101.947, True, _ON,
+                                   price_getter=_px(110.0), rule_price=104.049) == (
+            105.0, "floor_exceeds_rule")
 
     def test_short_a_tightening_rule_floored_looser_keeps_the_stop(self):
         assert ruleset_stop_policy(_txn(95.0, long=False, bound=108.0), 95.79, False, _ON,
@@ -261,9 +275,18 @@ class TestTheFloorNeverLoosens:
             95.0, "floor_would_loosen")
 
     def test_short_a_rule_that_itself_loosens_is_still_a_loosen(self):
-        assert ruleset_stop_policy(_txn(95.0, long=False, bound=108.0), 99.0, False, _ON,
-                                   price_getter=_px(93.0), rule_price=96.0) == (
-            99.0, "loosen_within_bound")
+        assert ruleset_stop_policy(_txn(95.0, long=False, bound=108.0), 96.0, False, _ON,
+                                   price_getter=_px(90.0), rule_price=96.0) == (
+            96.0, "loosen_within_bound")
+
+    def test_short_a_floor_pushed_past_the_rules_own_loosen_keeps_the_stop(self):
+        """95 lock, rule asks 95.85 with the market at 94.90, floor gives ~97.75."""
+        assert ruleset_stop_policy(_txn(95.0, long=False, bound=108.0), 97.747, False, _ON,
+                                   price_getter=_px(94.9), rule_price=95.849) == (
+            95.0, "floor_exceeds_rule")
+
+    def test_both_floor_reasons_are_kept_reasons(self):
+        assert {"floor_would_loosen", "floor_exceeds_rule"} <= RULESET_STOP_KEPT_REASONS
 
     def test_setting_off_the_log_stays_the_ratchet_line(self, info_log):
         """The floor check sits after the ratchet, so the default-off log is unchanged."""
@@ -612,6 +635,39 @@ def _trail(merged, *, long):
             sl.execute()
         stops.append(get_instance(Transaction, txn_id).stop_loss)
     return stops
+
+
+class TestAFloorPastTheRulesOwnLoosenKeepsTheStop:
+    """"current -1%" with the market just past the lock: the rule itself loosens (105 -> ~104.05
+    long, 95 -> ~95.85 short), but only by less than the 3% floor allows, so the floor would take
+    it to ~101.95 / ~97.75 -- past the rule's own price. The stop stays, on both paths."""
+
+    @pytest.mark.parametrize("merged", [False, True], ids=["sl-only", "merged-tp-sl"])
+    @pytest.mark.parametrize("long, lock, bound, market", [
+        (True, 105.0, 92.0, 105.1), (False, 95.0, 108.0, 94.9)], ids=["long", "short"])
+    def test_the_stop_is_kept(self, resolver, merged, long, lock, bound, market):
+        resolver(_on())
+        account = _PersistingAccount(current_price=market)
+        txn_id, order_id, rec_id = _position(account.id, long=long, stop=lock, bound=bound)
+        order = get_instance(TradingOrder, order_id)
+        rec = get_instance(ExpertRecommendation, rec_id)
+        sl = AdjustStopLossAction(
+            "AAPL", account, OrderRecommendation.BUY if long else OrderRecommendation.SELL,
+            existing_order=order, expert_recommendation=rec,
+            reference_value="current_price", percent=-1.0)
+        if merged:
+            evaluator = TradeActionEvaluator(account=account, instrument_name="AAPL",
+                                             existing_transactions=[get_instance(Transaction, txn_id)])
+            evaluator.expert_recommendation = rec
+            evaluator.trade_actions = [_tp_action(account, order, rec, long=long), sl]
+            results = evaluator.execute()
+            merged_result, = [r for r in results if (r.get("data") or {}).get("sl_policy")]
+            assert merged_result["data"]["sl_policy"] == "floor_exceeds_rule"
+            assert account.adjust_tp_sl_calls[0][2] is None, "the SL half must not be sent"
+        else:
+            sl.execute()
+            assert account.adjust_sl_calls == []
+        assert get_instance(Transaction, txn_id).stop_loss == lock
 
 
 class TestATrailingRuleNeverLoosensOnTheFloor:
