@@ -381,3 +381,80 @@ def test_decoded_instance_of_each_rule_is_resolved_and_exportable(sps, direction
     export = trade_rules_to_live_export(exit_rules=rules)
     (ruleset,) = export["rulesets"]
     assert [r["continue_processing"] for r in ruleset["rules"]] == [False, False, True, True]
+    _assert_exported_triggers_match_leaves(rules, ruleset["rules"])
+
+
+def _assert_exported_triggers_match_leaves(rules, exported):
+    """EVERY leaf became exactly one trigger with its own event type, operator and value: a rule
+    with fewer triggers than leaves runs with a gate missing, and one with none is always true."""
+    assert [r["name"] for r in exported] == [r["id"] for r in rules]
+    for rule, live in zip(rules, exported):
+        leaves = _leaves(rule)
+        triggers = list(live["triggers"].values())
+        assert len(triggers) == len(leaves), rule["id"]
+        for leaf, trig in zip(leaves, triggers):
+            assert trig == {"event_type": leaf["field"], "operator": leaf["op"],
+                            "value": leaf["value"]}, rule["id"]
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_exported_triggers_are_exact(sps, direction):
+    """Pinned values for one decoded genome (every toggle on, every gene at its band minimum)."""
+    template = _all(direction)
+    space = sps.collect_param_space(_strategy(template))
+    flat = {k: (1 if k.endswith(":enabled") else r["min"]) for k, r in space.items()}
+    rules = sps.decode_params(_strategy(template), flat)["exit_rules"]
+    (ruleset,) = trade_rules_to_live_export(exit_rules=rules)["rulesets"]
+    _assert_exported_triggers_match_leaves(rules, ruleset["rules"])
+    against = STRUCTURE_STATE_CODES["bear" if direction == "long" else "bull"]
+    slope_close = ("<", -0.30) if direction == "long" else (">", 0.0)
+    slope_with = (">", 0.0) if direction == "long" else ("<", -0.30)
+    got = {r["name"]: [(t["event_type"], t["operator"], t["value"]) for t in r["triggers"].values()]
+           for r in ruleset["rules"]}
+    assert got == {
+        f"{PREFIX}-mkt-exit-structure": [(FIELD_STRUCTURE_STATE, "==", float(against))],
+        f"{PREFIX}-mkt-exit-slope": [(FIELD_TREND_SLOPE, *slope_close)],
+        f"{PREFIX}-mkt-stop": [(FIELD_STRUCTURE_STATE, "==", float(against))],
+        f"{PREFIX}-mkt-tp": [(FIELD_TREND_SLOPE, *slope_with), (FIELD_ADX, ">", 10.0)],
+    }
+
+
+def test_normalize_then_decode(sps):
+    """The canonical normaliser (every save/load boundary) keeps the templates decodable the same
+    way: off by default, and an enabled decode gives the same triggers as the raw template."""
+    ordinary = _ordinary_exit_rules()
+    raw = copy.deepcopy(ordinary) + _all()
+    normalized = normalize_trade_rules(raw)
+    space = sps.collect_param_space(_strategy(normalized))
+    assert space == sps.collect_param_space(_strategy(raw))
+    off = sps.decode_params(_strategy(normalized), _midpoint_genome(space, enabled=0))
+    assert off["exit_rules"] == normalize_trade_rules(ordinary)
+    on_genome = _midpoint_genome(space, enabled=1)
+    on_norm = sps.decode_params(_strategy(normalized), on_genome)["exit_rules"]
+    on_raw = sps.decode_params(_strategy(raw), on_genome)["exit_rules"]
+    export_norm = trade_rules_to_live_export(exit_rules=on_norm)["rulesets"][0]["rules"]
+    export_raw = trade_rules_to_live_export(exit_rules=on_raw)["rulesets"][0]["rules"]
+    assert export_norm == export_raw
+    _assert_exported_triggers_match_leaves(on_norm[len(ordinary):], export_norm[len(ordinary):])
+
+
+def test_a_colliding_toggle_gene_cannot_empty_a_close_rule(sps):
+    """Reviewer's collision: an ENTRY leaf with the exit leaf's id and toggle_optimize makes the
+    collector emit ``cond:<that id>:enabled``. Genes are keyed by id across the strategy, so a 0
+    used to drop the EXIT leaf too, leaving the close rule an empty AND (always true: close every
+    position). The toggle now applies only to a node that declares toggle_optimize."""
+    exits = market_exit_rules(PREFIX, [STRUCT], "long", ("exit",))
+    leaf_id = f"{PREFIX}-mkt-exit-structure-state"
+    entry = [{"id": "e", "conditions": {"type": "AND", "conditions": [
+        {"id": "e-bull", "field": "bullish", "op": "is_true"},
+        {"id": leaf_id, "field": "days_opened", "op": ">", "value": 1, "toggle_optimize": True}]},
+        "actions": [{"action_type": "buy"}]}]
+    strategy = SimpleNamespace(entry_rules=entry, exit_rules=exits)
+    assert f"cond:{leaf_id}:enabled" in sps.collect_param_space(strategy)
+    decoded = sps.decode_params(strategy, {f"exit:{PREFIX}-mkt-exit-structure:enabled": 1,
+                                           f"cond:{leaf_id}:enabled": 0})
+    # The entry leaf that declared the toggle is dropped, as before.
+    assert [c["id"] for c in decoded["entry_rules"][0]["conditions"]["conditions"]] == ["e-bull"]
+    # The exit leaf, which declares none, stays.
+    (rule,) = decoded["exit_rules"]
+    assert _leaves(rule) == _leaves(exits[0])

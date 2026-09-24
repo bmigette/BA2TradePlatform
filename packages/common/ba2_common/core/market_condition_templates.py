@@ -1,4 +1,9 @@
-"""Registry-derived entry genes shared by option and equity research drivers."""
+"""Registry-derived market-condition rule pieces shared by option and equity research drivers.
+
+* :func:`market_condition_leaves` -- optional ENTRY-gate leaves (one mode gene each).
+* :func:`market_exit_rules` -- EXIT rules (market close / stop / take-profit), each off by
+  default behind a rule-level toggle gene, with fixed leaves that can never be switched off.
+"""
 from __future__ import annotations
 
 
@@ -80,6 +85,7 @@ def _exit_rule(rule_id: str, leaves: list, actions: list, continue_processing: b
     ._decode_rule_list``), and ``rules_convert.live_actions_from_trade_rule`` drops a rule that
     still carries ``enabled: False``, on the backtest seeder and the live export alike."""
     return {"id": rule_id,
+            "name": rule_id,
             "conditions": {"type": "AND", "conditions": leaves},
             "actions": actions,
             "continue_processing": continue_processing,
@@ -131,6 +137,17 @@ def market_exit_rules(prefix: str, profiles, direction: str, kinds=MARKET_EXIT_K
     ``ref * (1 + p/100)``, short ``ref * (1 - p/100)``), so the SAME numbers serve both sides: a
     negative stop percent is on the adverse side and a positive TP percent on the profit side,
     for a long and a short alike.
+
+    SCOPE: an open_positions rule runs on EVERY open position of the expert, whatever its side.
+    The ``direction`` baked into these rules is therefore right only when every position the
+    expert holds has that direction: the templates are valid for SINGLE-DIRECTION jobs only (a
+    long template on a short position would close it on a BEAR structure, i.e. while it wins).
+    The caller (B6) must enforce that.
+
+    THE TP BAND is measured from the OPEN price, not from the current TP. The rule moves the TP
+    to open +10..+30% whatever the TP was, so it can LOWER a TP that sits further out (e.g. an
+    entry bracket at +40% becomes +20% once the rule fires). Whether it raises or lowers the
+    target depends only on where the TP sat.
 
     No leaf carries a mode gene: mode ``off`` would empty a rule's AND and make it always true
     (close every position). Leaves are fixed and resolved; only thresholds are searched.

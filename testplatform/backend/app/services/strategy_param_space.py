@@ -568,8 +568,15 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
             kept = []
             for child in kids:
                 ccid = child.get("id") if isinstance(child, dict) else None
-                # ON/OFF toggle: a child whose 'enabled' gene decoded to 0 is dropped.
-                if ccid and by_id.get(ccid, {}).get("enabled") == 0:
+                # ON/OFF toggle: a child whose 'enabled' gene decoded to 0 is dropped -- but ONLY
+                # a child that itself declares toggle_optimize. Genes are keyed by node id across
+                # the whole strategy, so a toggle gene collected for SOME OTHER node with the same
+                # id (an entry leaf colliding with an exit leaf) must not remove this one: removing
+                # the only leaf of a close rule leaves an empty AND, which is always true. The
+                # collector emits cond:<id>:enabled only for toggle_optimize nodes
+                # (_walk_condition_nodes), so every genome it produced decodes identically.
+                if (ccid and (child.get("toggle_optimize") or child.get("toggleOptimize"))
+                        and by_id.get(ccid, {}).get("enabled") == 0):
                     continue
                 # MODE off: removed exactly like a toggle-off -- never evaluated, even when
                 # its data is missing.

@@ -545,11 +545,22 @@ def test_an_unknown_NON_market_field_is_still_dropped_with_a_warning(monkeypatch
     warnings: list = []
     monkeypatch.setattr(rule_builders.logger, "warning",
                         lambda msg, *a: warnings.append(msg % a if a else msg))
+    weird = {"id": "weird", "field": "not_a_registered_field", "op": ">", "value": 1}
     export = trade_rules_to_live_export(
-        _entry_rule({"id": "weird", "field": "not_a_registered_field", "op": ">", "value": 1}), [])
+        _entry_rule({"id": "bull", "field": "bullish", "op": "is_true"}, weird), [])
     rule, = export["rulesets"][0]["rules"]
-    assert rule["triggers"] == {}
+    assert rule["triggers"] == {"cond_0": {"event_type": "bullish"}}
     assert any("DROPPED" in w for w in warnings)
+
+
+def test_a_rule_whose_every_leaf_drops_is_refused_not_exported_always_true():
+    """Plan 2026-09-24 B5 review (I1c): when EVERY leaf drops, the export used to carry a rule
+    with empty triggers -- always true, here a buy on every recommendation. Refused now; the
+    partial drop above is unchanged."""
+    with pytest.raises(ValueError, match="o_lc-entry.*ALWAYS TRUE"):
+        trade_rules_to_live_export(
+            _entry_rule({"id": "weird", "field": "not_a_registered_field", "op": ">",
+                         "value": 1}), [])
 
 
 # ------------------------------------------------- the profile setting travels with the payload
