@@ -802,3 +802,44 @@ def test_opening_a_ruleset_with_no_stored_subtype_says_it_is_being_read_as_enter
     _open(editor, nicegui_client, _ruleset('has-one', [rule.id]))
     assert [m for m, _ in editor.notifications
             if ruleset_picker.SUBTYPE_MISSING in m] == [], editor.notifications
+
+
+# ---- nothing_to_add_message ------------------------------------------------------------
+from types import SimpleNamespace as _NS
+
+
+def _r(rule_id, subtype):
+    return _NS(id=rule_id, subtype=subtype, name=f'r{rule_id}')
+
+
+def test_nothing_to_add_counts_the_rules_and_names_those_left_out_on_purpose():
+    """The 2026-09-24 report: an options instance with ONE entry rule (already in the
+    ruleset) and four exit rules. The old text was true and still read as a broken modal."""
+    rules = [_r(1, 'enter_market')] + [_r(i, 'open_positions') for i in (2, 3, 4, 5)]
+    text = ruleset_picker.nothing_to_add_message(rules, 'enter_market', [1], '')
+    assert text.startswith('The only Enter Market rule is already in this ruleset.')
+    assert '4 Open Positions rules' in text
+    assert 'Rules tab' in text
+
+
+def test_nothing_to_add_says_when_no_rule_of_the_subtype_exists_at_all():
+    rules = [_r(2, 'open_positions')]
+    text = ruleset_picker.nothing_to_add_message(rules, 'enter_market', [], '')
+    assert text.startswith('There is no Enter Market rule yet.')
+    many = [_r(1, 'enter_market'), _r(2, 'enter_market')]
+    assert ruleset_picker.nothing_to_add_message(many, 'enter_market', [1, 2], '')         == 'All 2 Enter Market rules are already in this ruleset.'
+
+
+def test_nothing_to_add_blames_the_search_only_when_the_search_hid_something():
+    rules = [_r(1, 'enter_market'), _r(2, 'enter_market')]
+    assert ruleset_picker.nothing_to_add_message(rules, 'enter_market', [1], 'zzz')         == 'No rule matches that search.'
+    # Everything is already held: a search cannot be what emptied the list.
+    assert 'already in this ruleset' in ruleset_picker.nothing_to_add_message(
+        rules, 'enter_market', [1, 2], 'zzz')
+
+
+def test_nothing_to_add_reads_enum_subtypes_like_the_filter_does():
+    """DB rows carry an AnalysisUseCase, not a string (see subtype_of)."""
+    rules = [_r(1, AnalysisUseCase.ENTER_MARKET), _r(2, AnalysisUseCase.OPEN_POSITIONS)]
+    text = ruleset_picker.nothing_to_add_message(rules, 'enter_market', [1], '')
+    assert 'The only Enter Market rule' in text and '1 Open Positions rule,' in text

@@ -103,6 +103,43 @@ def addable_rules(rules: Iterable[Any], subtype: Optional[str],
             if matches_subtype(rule, subtype) and rule.id not in held]
 
 
+def _count(n: int, noun: str) -> str:
+    return f'{n} {noun}' if n == 1 else f'{n} {noun}s'
+
+
+def nothing_to_add_message(rules: Iterable[Any], subtype: Optional[str],
+                           already: Sequence[int], query: Optional[str]) -> str:
+    """What the Add-rules modal says when it has no candidate to show.
+
+    "Every rule with this subtype is already in this ruleset" was TRUE on an instance
+    holding one entry rule and four exit rules -- and read as a broken modal, because it
+    gave no count and never mentioned the four rules the operator could see in the Rules
+    tab. So this says how many rules of the subtype exist, and names the ones of other
+    subtypes that are left out on purpose (a rule of another subtype cannot fire here).
+    """
+    rules = list(rules or ())
+    if str(query or '').strip() and addable_rules(rules, subtype, already):
+        return 'No rule matches that search.'
+    label = subtype_label(subtype)
+    same = sum(1 for rule in rules if matches_subtype(rule, subtype))
+    if same == 0:
+        text = f'There is no {label} rule yet.'
+    elif same == 1:
+        text = f'The only {label} rule is already in this ruleset.'
+    else:
+        text = f'All {same} {label} rules are already in this ruleset.'
+    others: dict = {}
+    for rule in rules:
+        if not matches_subtype(rule, subtype):
+            other = subtype_label(subtype_of(rule)) or 'no-subtype'
+            others[other] = others.get(other, 0) + 1
+    if others:
+        listed = ', '.join(_count(n, f'{name} rule') for name, n in sorted(others.items()))
+        text += (f' Not offered: {listed}, because this ruleset only evaluates {label} rules.'
+                 f' To add another, create one with the {label} subtype in the Rules tab.')
+    return text
+
+
 def _haystack(rule: Any) -> str:
     """Everything about a rule an operator might type: its name and its sentences.
 

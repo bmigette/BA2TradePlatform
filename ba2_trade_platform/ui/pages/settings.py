@@ -6531,22 +6531,23 @@ class TradeSettingsTab:
 
     def _render_ruleset_candidates(self) -> None:
         """The rules on offer: matching subtype, not already listed, matching the search."""
-        from ..utils.ruleset_picker import addable_rules, search_rules
+        from ..utils.ruleset_picker import addable_rules, nothing_to_add_message, search_rules
         from ..utils.ruleset_view import build_rule_views, render_clause
 
         query = self.ruleset_candidate_search.value or ''
-        offered = addable_rules(get_all_instances(EventAction),
-                                self.ruleset_subtype_select.value, self.ruleset_rule_ids)
+        all_rules = get_all_instances(EventAction)
+        offered = addable_rules(all_rules, self.ruleset_subtype_select.value,
+                                self.ruleset_rule_ids)
         candidates = search_rules(offered, query)
 
         self.ruleset_candidates_container.clear()
         with self.ruleset_candidates_container:
             if not candidates:
-                # The two empty states say DIFFERENT things, and telling an operator
-                # "no rule matches" when they have simply added them all sends them
-                # hunting for a rule that is already on the other side of the screen.
-                ui.label('No rule matches that search.' if query else
-                         'Every rule with this subtype is already in this ruleset.') \
+                # The empty states say DIFFERENT things (see nothing_to_add_message):
+                # "no rule matches" when they have simply added them all sends an
+                # operator hunting for a rule already on the other side of the screen.
+                ui.label(nothing_to_add_message(all_rules, self.ruleset_subtype_select.value,
+                                                self.ruleset_rule_ids, query)) \
                     .classes('text-xs text-grey-6 p-2').mark(self.MARKER_RULESET_ADD_EMPTY)
                 return
             for rule, view in zip(candidates, build_rule_views(candidates)):
