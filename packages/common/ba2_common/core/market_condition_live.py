@@ -657,13 +657,15 @@ class LiveMarketConditionResolver:
         if replay_reader is not None:
             raise ValueError("replay_reader given outside a replay capture context")
         if capture is not None:
-            from ba2_common.core.market_condition_readers import CapturingMarketConditionReader
+            from ba2_common.core.market_condition_readers import capturing_reader_for
 
-            capturing = CapturingMarketConditionReader(
+            # Per-profile capture for a multi-profile (composite) reader -- see
+            # capturing_reader_for; one wrapper around the composite aborted the entry pass.
+            capturing, recorder = capturing_reader_for(
                 self.reader, capture, source_profile=self.source_profile,
                 timing_policy=TIMING_POLICY_PRIOR_SESSION_V1)
             return DecisionState(resolver=self, decision_time=decision_time, reader=capturing,
-                                 recorder=capturing.record)
+                                 recorder=recorder)
         return DecisionState(resolver=self, decision_time=decision_time, reader=self.reader)
 
     @property

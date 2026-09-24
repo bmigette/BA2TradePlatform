@@ -646,6 +646,36 @@ class CompositeMarketConditionReader:
         return merged
 
 
+def capturing_reader_for(reader: Any, capture: Any, *, source_profile: str,
+                         timing_policy: str) -> Tuple[Any, Any]:
+    """``(reader, recorder)`` that serve ``reader``'s rows AND record every window into ``capture``.
+
+    A single-profile reader gets one :class:`CapturingMarketConditionReader`. A
+    :class:`CompositeMarketConditionReader` (an expert gating on several profiles) is wrapped
+    PER PROFILE and re-composed: each profile's window reader is what retains the raw window and
+    each profile's window is its own recording (its own identity, digest and bytes), so replay
+    rebuilds each profile from its own recording. Wrapping the composite itself cannot work -- it
+    has no single window to retain -- and used to abort the whole live entry pass with an
+    ``AttributeError`` (8082, 2026-09-24).
+
+    The recorder has the ``MarketConditionContext.recorder`` signature and forwards to every
+    profile's capturer; each one dedupes on its own key, so a repeat read records nothing.
+    """
+    if isinstance(reader, CompositeMarketConditionReader):
+        capturers = [CapturingMarketConditionReader(r, capture, source_profile=source_profile,
+                                                    timing_policy=timing_policy)
+                     for r in reader.readers]
+
+        def record(symbol: str, session: date, row: Any = None) -> None:
+            for capturer in capturers:
+                capturer.record(symbol, session, row)
+
+        return CompositeMarketConditionReader(capturers), record
+    capturer = CapturingMarketConditionReader(reader, capture, source_profile=source_profile,
+                                              timing_policy=timing_policy)
+    return capturer, capturer.record
+
+
 def market_condition_reader_for(readers: Sequence[Any]) -> Any:
     """The reader a run installs for ``readers``: the reader itself when there is exactly one
     profile (no wrapper, no merge, no second memo -- a single-profile run is unchanged by this
