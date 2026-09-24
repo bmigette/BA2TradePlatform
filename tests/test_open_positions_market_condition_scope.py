@@ -479,7 +479,10 @@ def test_a_market_leaf_after_a_failed_scope_reads_no_context(world, dispatcher, 
     dispatcher._environ = {live.MANIFEST_ENV: "no-such-profile=abc"}
     got = _adx_leaf(object(), SYMBOL, _rec_for(world["expert_id"]))
     assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
-    assert got["reason"] == live.no_scope_open_reason(world["expert_id"])
+    assert got["reason"].startswith(f"expert instance {world['expert_id']} names a ")
+    assert "no market-condition decision scope is open" in got["reason"]
+    # I1: the CAUSE is in the reason, not only the fact that something failed.
+    assert "ValueError" in got["reason"] and "no-such-profile" in got["reason"]
     assert clock == []
 
 
@@ -503,7 +506,7 @@ def test_no_scope_and_a_failing_build_reads_no_context_and_never_raises(dispatch
     assert dispatcher(object(), SYMBOL, _rec_for(5)) is None
     got = _adx_leaf(object(), SYMBOL, _rec_for(5))
     assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
-    assert got["reason"] == live.no_scope_open_reason(5)
+    assert got["reason"] == live.no_scope_open_reason(5, f"{type(boom).__name__}: {boom}")
     assert "no market-condition decision scope is open" in got["reason"]
     assert clock == []
 
@@ -523,7 +526,8 @@ def test_no_scope_and_a_broken_settings_read_reads_no_context_and_never_raises(d
     monkeypatch.setattr(ir, "get_instance_resolver", lambda: _Broken())
     got = _adx_leaf(object(), SYMBOL, _rec_for(6))
     assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
-    assert got["reason"] == live.no_scope_open_reason(6)
+    assert got["reason"] == live.no_scope_open_reason(
+        6, "AttributeError: resolver seam returned the wrong shape")
 
 
 def test_no_scope_and_a_healthy_profile_keeps_todays_reason(dispatcher, instances, clock):
@@ -678,3 +682,250 @@ def test_an_exception_in_the_pass_body_still_propagates(world, activities, monke
     assert len(activities) == (0 if scope_opens else 1)
     lock = tm._processing_locks[f"expert_{world['expert_id']}_usecase_open_positions"]
     assert not lock.locked()
+
+
+# =========================================================================== hardening (I1/I2/M1/M2)
+@pytest.fixture(autouse=True)
+def _fresh_exit_scope_failure_reports(monkeypatch):
+    """The guard's once-per-cause ERROR memory is process-wide by design; each test starts clean
+    (expert ids restart at 1 with every fresh test DB, so keys would collide across tests)."""
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    monkeypatch.setattr(TradeManager, "_exit_scope_failures_reported", set())
+
+
+class _PkgLogSpy:
+    """Stands in for ``ba2_common.logger.logger`` (propagate=False: caplog never sees it)."""
+
+    def __init__(self):
+        self.records = []
+
+    def error(self, msg, *a, **k):
+        self.records.append(("ERROR", str(msg)))
+
+    def warning(self, msg, *a, **k):
+        self.records.append(("WARNING", str(msg)))
+
+    def info(self, msg, *a, **k):
+        self.records.append(("INFO", str(msg)))
+
+    def debug(self, msg, *a, **k):
+        self.records.append(("DEBUG", str(msg)))
+
+    def levels(self, needle):
+        return [lvl for lvl, msg in self.records if needle in msg]
+
+
+def _counting_failing_build(dispatcher, monkeypatch, exc):
+    calls = []
+
+    def _build(profiles):
+        calls.append(profiles)
+        raise exc
+
+    monkeypatch.setattr(dispatcher, "_build", _build)
+    return calls
+
+
+def test_after_a_failed_scope_leaves_answer_with_the_guards_cause_and_never_rebuild(
+        world, dispatcher, instances, clock, activities, monkeypatch):
+    """I2: the guard's failed attempt is the ONLY resolver build of the pass. Every leaf of that
+    expert then reads no_context with the guard's cause, without retrying the lookup."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    instances[world["expert_id"]] = "ohlcv-v1"
+    builds = _counting_failing_build(dispatcher, monkeypatch, RuntimeError("reader build failed"))
+
+    def _two_leaves(account, symbol, rec):
+        return [_adx_leaf(account, symbol, rec), _adx_leaf(account, symbol, rec)]
+
+    world["recorder"].leaf = _two_leaves
+    result = _run_with(world["expert_id"], _LogSpy())
+
+    assert len(builds) == 1                                  # the guard's attempt, nothing more
+    (call,) = world["recorder"].calls
+    expected = live.no_scope_open_reason(world["expert_id"], "RuntimeError: reader build failed",
+                                         live.UNRESOLVED_SCOPE_FAILED)
+    for got in call["leaf"]:
+        assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+        assert got["reason"] == expected
+    assert "could not open its market-condition decision scope" in expected
+    assert result == [{"success": True, "symbol": SYMBOL, "submit_to_broker": True}]
+    # The pass is over: its exit-pass mark is gone.
+    assert live.current_exit_pass() is None
+
+
+def test_a_resolver_rebuild_failure_inside_the_exit_scope_reads_no_context(
+        world, dispatcher, instances, clock, monkeypatch):
+    """M1, exit side: the scope opened, then (e.g. after a mid-pass /api/reload) the expert's
+    resolver cannot be rebuilt. The leaf reads no_context with the cause; the pass carries on."""
+    import ba2_common.logger as bl
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    pkg_log = _PkgLogSpy()
+    monkeypatch.setattr(bl, "logger", pkg_log)
+    instances[world["expert_id"]] = "ohlcv-v1"
+
+    def _reload_then_leaf(account, symbol, rec):
+        assert live.current_decision() is not None and live.current_exit_pass() is not None
+        dispatcher.clear_cache()
+        _counting_failing_build(dispatcher, monkeypatch, RuntimeError("rebuild failed"))
+        return _adx_leaf(account, symbol, rec)
+
+    world["recorder"].leaf = _reload_then_leaf
+    result = _run(world["expert_id"])
+
+    (call,) = world["recorder"].calls
+    got = call["leaf"]
+    assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+    assert got["reason"] == live.no_scope_open_reason(
+        world["expert_id"], "RuntimeError: rebuild failed", live.UNRESOLVED_EXIT_SCOPE)
+    # _adx_leaf dispatches twice (the explicit resolve + the leaf): WARNING once, then DEBUG.
+    levels = pkg_log.levels("rebuild failed")
+    assert levels[0] == "WARNING" and set(levels[1:]) <= {"DEBUG"} and len(levels) == 2
+    assert result == [{"success": True, "symbol": SYMBOL, "submit_to_broker": True}]
+
+
+def test_a_resolver_rebuild_failure_inside_the_entry_scope_still_raises(
+        dispatcher, instances, clock, monkeypatch):
+    """M1, entry side: the same mid-pass rebuild failure inside the ENTER-MARKET pass propagates
+    out of the leaf, exactly as before."""
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    instances[4] = "ohlcv-v1"
+    raised = []
+
+    def _inner(self, expert_id, lookback_days=1):
+        assert live.current_decision() is not None and live.current_exit_pass() is None
+        dispatcher.clear_cache()
+        _counting_failing_build(dispatcher, monkeypatch, RuntimeError("rebuild failed"))
+        leaf = TC.create_condition(ExpertEventType.N_UNDERLYING_ADX, object(), SYMBOL,
+                                   _rec_for(4), operator_str=">", value=-1e9)
+        try:
+            leaf.evaluate()
+        except RuntimeError as e:
+            raised.append(e)
+            raise
+        return []
+
+    monkeypatch.setattr(TradeManager, "_process_expert_recommendations_after_analysis", _inner)
+    with pytest.raises(RuntimeError, match="rebuild failed"):
+        TradeManager().process_expert_recommendations_after_analysis(4)
+    assert len(raised) == 1
+
+
+def test_the_guard_logs_error_once_then_warning_but_records_every_pass(world, activities,
+                                                                       monkeypatch):
+    """M2: a persistent fault logs its traceback once per (expert, exception type) per process,
+    then WARNING without a traceback; the FAILURE activity row is written EVERY pass."""
+    monkeypatch.setattr(live, "market_condition_decision_scope",
+                        _raising_scope(ValueError("bad manifest")))
+    first, second = _LogSpy(), _LogSpy()
+    _run_with(world["expert_id"], first)
+    _run_with(world["expert_id"], second)
+
+    def scope_lines(spy):
+        return [(lvl, exc) for lvl, msg, exc in spy.records
+                if "decision scope could not be opened" in msg]
+
+    assert scope_lines(first) == [("ERROR", True)]
+    assert scope_lines(second) == [("WARNING", False)]
+    assert len(activities) == 2
+    # A DIFFERENT exception type for the same expert is a new cause: ERROR again.
+    monkeypatch.setattr(live, "market_condition_decision_scope",
+                        _raising_scope(TypeError("seam defect")))
+    third = _LogSpy()
+    _run_with(world["expert_id"], third)
+    assert scope_lines(third) == [("ERROR", True)]
+
+
+def test_the_dispatcher_warns_once_per_cause_then_debug(dispatcher, instances, clock,
+                                                       monkeypatch):
+    """I1: an absorbed dispatch failure warns once per (expert, exception type), then DEBUG."""
+    import ba2_common.logger as bl
+
+    pkg_log = _PkgLogSpy()
+    monkeypatch.setattr(bl, "logger", pkg_log)
+    instances[5] = "ohlcv-v1"
+    _counting_failing_build(dispatcher, monkeypatch, RuntimeError("reader build failed"))
+    for _ in range(3):
+        leaf = TC.create_condition(ExpertEventType.N_UNDERLYING_ADX, object(), SYMBOL,
+                                   _rec_for(5), operator_str=">", value=-1e9)
+        assert leaf.evaluate() is False and leaf.last_status == STATUS_NO_CONTEXT
+    assert pkg_log.levels("reader build failed") == ["WARNING", "DEBUG", "DEBUG"]
+
+
+def test_exit_pass_state_and_last_dispatch_do_not_cross_threads(dispatcher, instances, clock):
+    """Two concurrent passes on two threads: each sees only its own exit-pass mark and its own
+    last dispatch, so neither reads the other's reason."""
+    import threading
+
+    instances[1] = "ohlcv-v1"
+    instances[8] = ""
+    barrier = threading.Barrier(2, timeout=10)
+    seen = {}
+    errors = []
+
+    def exit_thread():
+        try:
+            end = live.begin_exit_pass(1)
+            try:
+                live.record_exit_pass_scope_failure(ValueError("bad manifest"))
+                seen["a_leaf"] = _adx_leaf(object(), SYMBOL, _rec_for(1))
+                barrier.wait()          # B dispatches now, on its own thread
+                barrier.wait()
+                seen["a_reason_after"] = dispatcher.no_context_reason_for(SYMBOL)
+                seen["a_exit"] = live.current_exit_pass()
+            finally:
+                end()
+        except Exception as e:  # noqa: BLE001 -- surfaced by the assertion below
+            errors.append(e)
+
+    def plain_thread():
+        try:
+            barrier.wait()
+            seen["b_exit"] = live.current_exit_pass()
+            seen["b_last_before"] = live._LAST_DISPATCH.get()
+            seen["b_leaf"] = _adx_leaf(object(), SYMBOL, _rec_for(8))
+            barrier.wait()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=exit_thread), threading.Thread(target=plain_thread)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert errors == []
+
+    scope_failed = live.no_scope_open_reason(1, "ValueError: bad manifest",
+                                             live.UNRESOLVED_SCOPE_FAILED)
+    assert seen["a_leaf"]["reason"] == scope_failed
+    assert seen["a_reason_after"] == scope_failed          # B's dispatch did not overwrite A's
+    assert seen["a_exit"].expert_instance_id == 1
+    assert seen["b_exit"] is None and seen["b_last_before"] is None
+    assert "expert instance 8 has an empty market_condition_profile" in seen["b_leaf"]["reason"]
+    # And nothing leaked into the test's own thread.
+    assert live.current_exit_pass() is None
+
+
+def test_run_in_decision_context_carries_the_exit_pass_to_a_pool_thread(dispatcher, instances,
+                                                                        clock):
+    """A pool thread of an exit pass absorbs like the coordinating thread (the wrapper carries
+    the exit-pass mark with the decision state)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    instances[1] = "ohlcv-v1"
+    end = live.begin_exit_pass(1)
+    try:
+        live.record_exit_pass_scope_failure(ValueError("bad manifest"))
+        wrapped = live.run_in_decision_context(
+            lambda: (live.current_exit_pass(), _adx_leaf(object(), SYMBOL, _rec_for(1))))
+    finally:
+        end()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        exit_state, got = pool.submit(wrapped).result(timeout=20)
+        assert pool.submit(live.current_exit_pass).result(timeout=20) is None
+    assert exit_state is not None and exit_state.expert_instance_id == 1
+    assert got["reason"] == live.no_scope_open_reason(1, "ValueError: bad manifest",
+                                                      live.UNRESOLVED_SCOPE_FAILED)

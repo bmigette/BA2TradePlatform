@@ -68,6 +68,11 @@ __all__ = [
     "market_condition_decision_scope",
     "run_in_decision_context",
     "submit_in_decision_context",
+    "ExitPassState",
+    "begin_exit_pass",
+    "record_exit_pass_scope_failure",
+    "current_exit_pass",
+    "no_scope_open_reason",
     "assert_profile_env_retired",
     "manifest_digests_from_env",
     "resolver_for_profiles",
@@ -118,19 +123,42 @@ NO_DECISION_SCOPE_REASON = (
     "and never passes")
 
 
-def no_scope_open_reason(instance_id: Any) -> str:
-    """Why a GATED expert's leaf got no context when no decision scope was open AND its resolver
-    could not even be looked up (the settings read or the resolver build raised). The scope's
-    own failure was already reported by the pass that tried to open it."""
-    return (f"expert instance {instance_id} names a market_condition_profile, but no "
-            f"market-condition decision scope is open for this evaluation (the pass's scope "
-            f"failed to open, or the caller never opened one) and its resolver could not be "
-            f"resolved: the gate is unknown and never passes")
+#: Where an absorbed resolver failure happened; selects the wording of the reason.
+UNRESOLVED_SCOPE_FAILED = "scope_failed"      # the exit pass could not open its decision scope
+UNRESOLVED_NO_SCOPE = "no_scope"              # no decision scope open, and the lookup failed
+UNRESOLVED_EXIT_SCOPE = "exit_scope"          # inside an open EXIT scope, the lookup failed
 
 
-#: ``_LAST_DISPATCH``'s resolver slot when a no-scope dispatch could not resolve the expert's
-#: resolver at all. Distinct from ``None`` (which means "empty setting").
-_UNRESOLVED_OUTSIDE_SCOPE = object()
+def no_scope_open_reason(instance_id: Any, cause: str,
+                         situation: str = UNRESOLVED_NO_SCOPE) -> str:
+    """Why a GATED expert's leaf got no context because its resolver could not be resolved.
+
+    ``cause`` is the failure (``"<ExceptionType>: <message>"``) so the evaluation record says what
+    broke, not only that something did. The failure itself was logged where it happened: by the
+    open-positions pass guard for a scope that failed to open, by the dispatcher otherwise.
+    """
+    if situation == UNRESOLVED_SCOPE_FAILED:
+        where = (f"the open-positions pass could not open its market-condition decision scope "
+                 f"({cause}), so no decision scope is open for this evaluation")
+    elif situation == UNRESOLVED_EXIT_SCOPE:
+        where = (f"its market-condition resolver could not be resolved inside the open-positions "
+                 f"decision scope ({cause})")
+    elif situation == UNRESOLVED_NO_SCOPE:
+        where = (f"no market-condition decision scope is open for this evaluation and its "
+                 f"resolver could not be resolved ({cause})")
+    else:
+        raise ValueError(f"unknown unresolved-resolver situation {situation!r}")
+    return (f"expert instance {instance_id} names a market_condition_profile, but {where}: the "
+            f"gate is unknown and never passes")
+
+
+@dataclass(frozen=True)
+class _UnresolvedOutsideScope:
+    """``_LAST_DISPATCH``'s resolver slot when the dispatcher ABSORBED a failure to resolve the
+    expert's resolver. Distinct from ``None`` (which means "empty setting"); carries the cause."""
+
+    cause: str
+    situation: str
 
 
 class SourceCertificationError(RuntimeError):
@@ -800,15 +828,20 @@ def run_in_decision_context(fn: Callable) -> Callable:
     wrapper inside the scope, on the coordinating thread. Safe to reuse concurrently: it
     re-installs this one ContextVar rather than sharing a ``contextvars.Context`` object."""
     state = _DECISION.get()
+    # The exit-pass marker travels with the decision state: a pool thread of an exit pass must
+    # absorb resolver failures exactly like the coordinating thread.
+    exit_pass = _EXIT_PASS.get()
 
     @functools.wraps(fn)
     def _runner(*args, **kwargs):
-        if state is None:
+        if state is None and exit_pass is None:
             return fn(*args, **kwargs)
         token = _DECISION.set(state)
+        exit_token = _EXIT_PASS.set(exit_pass)
         try:
             return fn(*args, **kwargs)
         finally:
+            _EXIT_PASS.reset(exit_token)
             _DECISION.reset(token)
 
     return _runner
@@ -918,6 +951,51 @@ _LAST_DISPATCH: contextvars.ContextVar[Optional[Tuple[Any, Any]]] = contextvars.
     "ba2_market_condition_last_dispatch", default=None)
 
 
+@dataclass
+class ExitPassState:
+    """One live OPEN-POSITIONS (exit) pass, for the dispatcher. ``scope_failure`` is the cause
+    (``"<ExceptionType>: <message>"``) when the pass could not open its decision scope."""
+
+    expert_instance_id: Any
+    scope_failure: Optional[str] = None
+
+
+#: Set for the duration of an exit pass by ``TradeManager._open_exit_pass_market_condition_scope``
+#: (via :func:`begin_exit_pass`). WHY the dispatcher needs to know: an ENTRY pass lets a resolver
+#: failure propagate (refusing entries is the safe reading), but an exit pass must never be
+#: stopped by the market-condition machinery -- one raising leaf aborts the ruleset evaluation
+#: for its symbol and skips every other exit rule. A ContextVar, like ``_DECISION``, so two
+#: concurrent passes on different threads cannot see each other's.
+_EXIT_PASS: contextvars.ContextVar[Optional[ExitPassState]] = contextvars.ContextVar(
+    "ba2_market_condition_exit_pass", default=None)
+
+
+def begin_exit_pass(expert_instance_id: Any) -> Callable[[], None]:
+    """Mark the current context as ``expert_instance_id``'s exit pass; returns the callable that
+    ends it (reset the ContextVar). Call and end it on the same thread, e.g. through an
+    ``ExitStack.callback``."""
+    token = _EXIT_PASS.set(ExitPassState(expert_instance_id))
+
+    def _end() -> None:
+        _EXIT_PASS.reset(token)
+
+    return _end
+
+
+def record_exit_pass_scope_failure(exc: BaseException) -> None:
+    """Record that the current exit pass could not open its decision scope. Leaves of that
+    expert then read ``no_context`` with this cause straight away, without retrying the resolver
+    lookup that just failed. A no-op outside an exit pass: it is called from an error handler and
+    must never raise itself."""
+    state = _EXIT_PASS.get()
+    if state is not None:
+        state.scope_failure = f"{type(exc).__name__}: {exc}"
+
+
+def current_exit_pass() -> Optional[ExitPassState]:
+    return _EXIT_PASS.get()
+
+
 class PerInstanceMarketConditionResolver:
     """The live ``TradeConditions`` resolver: one :class:`LiveMarketConditionResolver` per EXPERT
     INSTANCE that names a ``market_condition_profile`` (plan Task 12).
@@ -946,6 +1024,10 @@ class PerInstanceMarketConditionResolver:
         self._resolvers: Dict[Any, Any] = {}
         self._lock = threading.Lock()
         self._settings_errors: set = set()
+        #: ``(instance id, exception type name)`` already reported at WARNING by an absorbed
+        #: dispatch failure. Per PROCESS on purpose (not cleared by ``clear_cache``): a broken
+        #: resolver warns once, then says the rest at DEBUG instead of once per leaf.
+        self._unresolved_reported: set = set()
 
     # -- settings ---------------------------------------------------------------------------
     def profiles_for(self, expert_instance_id: Any) -> Tuple[str, ...]:
@@ -1003,7 +1085,8 @@ class PerInstanceMarketConditionResolver:
         error propagate (refusing entries is the safe reading), and the open-positions pass
         guards the scope's OPENING (``TradeManager._open_exit_pass_market_condition_scope``):
         it logs the failure and runs without the scope, so its market-condition leaves read
-        ``no_context`` while every other exit and protective rule still runs.
+        ``no_context`` while every other exit and protective rule still runs. A leaf's own
+        lookup (``__call__``) likewise never raises during an exit pass or outside any scope.
         """
         profiles = self.profiles_for(expert_instance_id)
         if not profiles:
@@ -1098,39 +1181,63 @@ class PerInstanceMarketConditionResolver:
         if instance_id is None:
             _LAST_DISPATCH.set((None, None))
             return None
-        if _DECISION.get() is not None:
-            # A decision pass is open: exactly the path the entry pass has always taken,
-            # including a resolver build error PROPAGATING (refusing entries is the safe reading).
-            resolver = self.resolver_for(instance_id)
-            _LAST_DISPATCH.set((instance_id, resolver))
-            if resolver is None:
-                return None
-            return resolver(account, instrument_name, expert_recommendation)
-        # NO decision state is open, so no resolver can serve a context whatever happens below:
-        # this path returns None and NEVER RAISES. It is reached by an exit pass whose scope
-        # failed to open (TradeManager._open_exit_pass_market_condition_scope logged that ERROR)
-        # and by callers that never open one; raising here would abort the whole ruleset
-        # evaluation for the symbol and skip every other exit rule. The lookup below runs only
-        # to keep the specific reasons (empty setting, failed certification, uncovered symbol).
-        try:
-            resolver = self.resolver_for(instance_id)
-            _LAST_DISPATCH.set((instance_id, resolver))
-            if resolver is None:
-                return None
-            return resolver(account, instrument_name, expert_recommendation)
-        except Exception as e:
-            # DELIBERATELY broad, named so it survives BA2_ERROR_MODE=enforce: with no scope open
-            # the answer is "no context" whatever failed, and the failure itself was reported by
-            # the pass that could not open its scope. The refusals failure_modes never absorbs
-            # still propagate.
-            absorb_if_benign(e, Exception)
-            from ba2_common.logger import logger
-
-            logger.debug(f"market-condition leaf for expert instance {instance_id} "
-                         f"({instrument_name}) outside a decision scope: resolver lookup failed "
-                         f"({type(e).__name__}: {e}); reading no_context")
-            _LAST_DISPATCH.set((instance_id, _UNRESOLVED_OUTSIDE_SCOPE))
+        exit_pass = _EXIT_PASS.get()
+        scope_open = _DECISION.get() is not None
+        if scope_open and exit_pass is None:
+            # An ENTRY decision pass is open: exactly the path it has always taken, including a
+            # resolver build error PROPAGATING (refusing entries is the safe reading).
+            return self._dispatch(instance_id, account, instrument_name, expert_recommendation)
+        # EVERY OTHER CASE RETURNS NONE OR A CONTEXT AND NEVER RAISES: an exit pass (scope open
+        # or not) and any caller that never opened a scope. Raising here would abort the whole
+        # ruleset evaluation for the symbol and skip every other exit rule.
+        if (exit_pass is not None and exit_pass.scope_failure is not None
+                and exit_pass.expert_instance_id == instance_id):
+            # The pass's guard already tried to open this expert's scope and failed (and logged
+            # it): answer with that cause at once instead of rebuilding per leaf.
+            _LAST_DISPATCH.set((instance_id, _UnresolvedOutsideScope(
+                exit_pass.scope_failure, UNRESOLVED_SCOPE_FAILED)))
             return None
+        # The lookup still runs so the specific reasons survive (empty setting, failed
+        # certification, uncovered symbol); only its failure is absorbed.
+        try:
+            return self._dispatch(instance_id, account, instrument_name, expert_recommendation)
+        except Exception as e:
+            # DELIBERATELY broad, named so it survives BA2_ERROR_MODE=enforce: on these paths
+            # the answer is "no context" whatever failed. The refusals failure_modes never
+            # absorbs still propagate.
+            absorb_if_benign(e, Exception)
+            situation = UNRESOLVED_EXIT_SCOPE if scope_open else UNRESOLVED_NO_SCOPE
+            cause = f"{type(e).__name__}: {e}"
+            self._report_unresolved(instance_id, instrument_name, e, cause, situation)
+            _LAST_DISPATCH.set((instance_id, _UnresolvedOutsideScope(cause, situation)))
+            return None
+
+    def _dispatch(self, instance_id: Any, account: Any, instrument_name: str,
+                  expert_recommendation: Any) -> Optional[MarketConditionContext]:
+        """Look up this expert's resolver, record the dispatch for the reason accessors, and ask
+        it. Raises whatever the lookup raises; the caller decides whether that is absorbed."""
+        resolver = self.resolver_for(instance_id)
+        _LAST_DISPATCH.set((instance_id, resolver))
+        if resolver is None:
+            return None
+        return resolver(account, instrument_name, expert_recommendation)
+
+    def _report_unresolved(self, instance_id: Any, instrument_name: str, exc: BaseException,
+                           cause: str, situation: str) -> None:
+        """WARNING once per (expert, exception type) per process, DEBUG afterwards."""
+        from ba2_common.logger import logger
+
+        key = (instance_id, type(exc).__name__)
+        with self._lock:
+            first = key not in self._unresolved_reported
+            self._unresolved_reported.add(key)
+        message = (f"market-condition leaf for expert instance {instance_id} "
+                   f"({instrument_name}): {no_scope_open_reason(instance_id, cause, situation)}")
+        if first:
+            logger.warning(message + " (further failures of this kind for this expert are "
+                                     "logged at DEBUG)")
+        else:
+            logger.debug(message)
 
     def no_context_reason_for(self, symbol: Any) -> Optional[str]:
         """Why THIS symbol got no context, for the expert the last dispatch selected.
@@ -1143,8 +1250,8 @@ class PerInstanceMarketConditionResolver:
         instance_id, resolver = _LAST_DISPATCH.get() or (None, None)
         if instance_id is None:
             return None
-        if resolver is _UNRESOLVED_OUTSIDE_SCOPE:
-            return no_scope_open_reason(instance_id)
+        if isinstance(resolver, _UnresolvedOutsideScope):
+            return no_scope_open_reason(instance_id, resolver.cause, resolver.situation)
         if resolver is None:
             return (f"expert instance {instance_id} has an empty {PROFILE_SETTING} setting: no "
                     f"market-condition data is served for it, so this gate is unknown and never "

@@ -3146,12 +3146,22 @@ class TradeManager:
                 'errors': [str(e)]
             }
 
+    #: ``(expert instance id, exception type name)`` whose exit-pass scope failure was already
+    #: logged at ERROR with a traceback. Process-wide (a class attribute: TradeManager is a
+    #: singleton), so a persistent fault logs its traceback once and WARNING lines afterwards.
+    _exit_scope_failures_reported: set = set()
+    _exit_scope_failures_lock = threading.Lock()
+
     def _open_exit_pass_market_condition_scope(self, expert_instance_id: int,
                                                account_id: Optional[int]):
         """Open the market-condition decision scope for ONE open-positions (exit) pass.
 
         Returns an entered ``ExitStack`` for the caller's ``with``: it closes the scope when the
-        pass ends, and it is EMPTY when the scope could not be opened.
+        pass ends, and it is EMPTY of a scope when the scope could not be opened. Either way it
+        also marks the pass as an EXIT pass for the market-condition dispatcher
+        (``begin_exit_pass``) until the pass ends, so a leaf's own resolver lookup never raises
+        during it, and -- after a failed opening -- answers with the guard's cause at once
+        instead of retrying the lookup per leaf.
 
         EXITS ARE NEVER BLOCKED BY THE MARKET-CONDITION MACHINERY. Opening the scope can raise
         for a gated expert -- a malformed manifest environment variable, a resolver build or
@@ -3168,46 +3178,74 @@ class TradeManager:
         from contextlib import ExitStack
 
         from ba2_common.core.failure_modes import absorb_if_benign
-        from ba2_common.core.market_condition_live import market_condition_decision_scope
+        from ba2_common.core.market_condition_live import (
+            begin_exit_pass,
+            market_condition_decision_scope,
+            record_exit_pass_scope_failure,
+        )
 
         stack = ExitStack()
+        # Registered FIRST, so it is unwound LAST: the scope closes, then the exit-pass mark.
+        stack.callback(begin_exit_pass(expert_instance_id))
         try:
             stack.enter_context(market_condition_decision_scope(expert_instance_id=expert_instance_id))
         except Exception as e:
             # DELIBERATELY broad, and named as such so it survives BA2_ERROR_MODE=enforce: the
             # scope can fail in ways this site cannot enumerate (manifest config, reader build,
             # an injected settings seam), and whatever it is must not stop the exits. Refusals
-            # that failure_modes never absorbs still propagate.
-            absorb_if_benign(e, Exception)
-            self.logger.error(
-                f"Expert instance {expert_instance_id}: the market-condition decision scope could "
-                f"not be opened for the open-positions pass ({type(e).__name__}: {e}). Its "
-                f"market-condition exit rules read no_context this pass and will not fire; every "
-                f"other exit and protective rule still runs.",
-                exc_info=True)
+            # that failure_modes never absorbs still propagate (after unwinding the mark).
             try:
-                from .db import log_activity
-                from .types import ActivityLogSeverity, ActivityLogType
-
-                log_activity(
-                    severity=ActivityLogSeverity.FAILURE,
-                    activity_type=ActivityLogType.RISK_MANAGER_RAN,
-                    description=(f"Market-condition scope failed for the open-positions pass "
-                                 f"({type(e).__name__}: {e}); market-condition exit rules read "
-                                 f"no_context this pass, all other exit rules ran"),
-                    data={
-                        "mode": "classic",
-                        "use_case": "open_positions",
-                        "stage": "market_condition_scope",
-                        "error_type": type(e).__name__,
-                        "error": str(e),
-                    },
-                    source_expert_id=expert_instance_id,
-                    source_account_id=account_id,
-                )
-            except Exception as log_error:
-                self.logger.warning(f"Failed to log market-condition scope failure activity: {log_error}")
+                absorb_if_benign(e, Exception)
+            except BaseException:
+                stack.close()
+                raise
+            record_exit_pass_scope_failure(e)
+            self._report_exit_scope_failure(expert_instance_id, account_id, e)
+        except BaseException:
+            stack.close()
+            raise
         return stack
+
+    def _report_exit_scope_failure(self, expert_instance_id: int, account_id: Optional[int],
+                                   e: BaseException) -> None:
+        """ERROR with the traceback once per (expert, exception type) per process, WARNING on
+        repeats; and a FAILURE activity row EVERY pass, so operators see each degraded pass."""
+        message = (
+            f"Expert instance {expert_instance_id}: the market-condition decision scope could "
+            f"not be opened for the open-positions pass ({type(e).__name__}: {e}). Its "
+            f"market-condition exit rules read no_context this pass and will not fire; every "
+            f"other exit and protective rule still runs.")
+        key = (expert_instance_id, type(e).__name__)
+        with TradeManager._exit_scope_failures_lock:
+            first = key not in TradeManager._exit_scope_failures_reported
+            TradeManager._exit_scope_failures_reported.add(key)
+        if first:
+            self.logger.error(message, exc_info=e)
+        else:
+            self.logger.warning(message + " (repeat of an error already logged with its "
+                                          "traceback)")
+        try:
+            from .db import log_activity
+            from .types import ActivityLogSeverity, ActivityLogType
+
+            log_activity(
+                severity=ActivityLogSeverity.FAILURE,
+                activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                description=(f"Market-condition scope failed for the open-positions pass "
+                             f"({type(e).__name__}: {e}); market-condition exit rules read "
+                             f"no_context this pass, all other exit rules ran"),
+                data={
+                    "mode": "classic",
+                    "use_case": "open_positions",
+                    "stage": "market_condition_scope",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+                source_expert_id=expert_instance_id,
+                source_account_id=account_id,
+            )
+        except Exception as log_error:
+            self.logger.warning(f"Failed to log market-condition scope failure activity: {log_error}")
 
     def process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
