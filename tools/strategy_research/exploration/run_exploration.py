@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.strategy_research.exploration.profiles import FAMILIES, build_manifest, fingerprint
+from tools.strategy_research.exploration.profiles import (
+    ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, build_manifest, fingerprint)
 from tools.strategy_research.exploration.runtime import (
     check_database, execute_ready, job_lock, preflight, resolve_universe, write_json)
 
@@ -30,7 +31,9 @@ def parser():
     mode.add_argument("--run", action="store_true", help="Execute jobs and save results in the test database.")
     mode.add_argument("--export-universe", type=Path,
                       help="Write the full selected symbol union for warmup; no price fetch or job creation.")
-    ap.add_argument("--families", nargs="+", choices=FAMILIES, default=list(FAMILIES))
+    ap.add_argument("--families", nargs="+", choices=ALL_FAMILIES, default=list(FAMILIES),
+                    help="Default: the ten campaign families. Opt-in (never in the default): "
+                         + ", ".join(EXTENSION_FAMILIES) + ".")
     ap.add_argument("--variants", nargs="+", help="Optional subset, e.g. control timeout.")
     ap.add_argument("--equity", type=float, default=10000.0, help="Starting account equity per independent job.")
     ap.add_argument("--equity-cap", type=float, default=10000.0, help="Sizing cap; 0 enables uncapped compounding.")

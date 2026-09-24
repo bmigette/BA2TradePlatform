@@ -112,6 +112,16 @@ def resolve_universe(bt):
     return symbols, store_files
 
 
+#: Daily histories an expert reads on every decision besides the traded symbol's own:
+#: PullbackReversion checks each symbol's sessions against SPY (and its SPY gate reads it), and
+#: aborts the run without it. Not traded, so not added to the universe.
+REFERENCE_DAILY_SYMBOLS = {"PullbackReversion": ("SPY",)}
+
+
+def reference_symbols(bt):
+    return sorted({s for expert in bt["experts"] for s in REFERENCE_DAILY_SYMBOLS.get(expert["class"], ())})
+
+
 def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     """Check price coverage and pinned features without fetching any market data.
 
@@ -122,6 +132,14 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
 
     ready = deepcopy(job)
     bt = ready["optimization_config"]["backtest"]
+    if bt.get("enable_short"):
+        # enable_short reaches the trial and the RM's enable_sell gate, but the `sell` ACTION
+        # itself refuses a flat book (ba2_common TradeActions.SellAction: "No long position to
+        # sell"), so the entry could never open a short: every trial would score a strategy
+        # that never traded. Refused here, before any run, rather than searched silently.
+        raise ValueError(
+            f"{job['name']}: equity short entries cannot open yet (SellAction only sells an "
+            "existing long), so this short job would never trade; select the long variants")
     cache_dir = Path(cache_dir).resolve()
     start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
     if not cache_dir.is_dir():
@@ -129,9 +147,24 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     symbols, store_files = resolve_universe(bt)
     intervals = tuple(dict.fromkeys(("1d", bt["execution_interval"])))
     files = [cache_dir / f"{symbol}_{interval}.parquet" for symbol in symbols for interval in intervals]
+    references = reference_symbols(bt)
+    reference_files = [cache_dir / f"{symbol}_1d.parquet" for symbol in references]
+    files += [p for p in reference_files if p not in files]
     missing = [str(p) for p in files if not p.is_file()]
     if missing:
         raise ValueError(f"{len(missing)} missing OHLCV files; no symbols silently removed: {missing[:12]}")
+    reference_coverage = {}
+    for symbol, path in zip(references, reference_files):
+        # Read on EVERY decision, so its whole window is required, not a sampled share.
+        dates = pd.to_datetime(pd.read_parquet(path, columns=["Date"])["Date"], utc=True)
+        if dates.empty or dates.isna().any():
+            raise ValueError(f"Empty/invalid dates: {symbol} 1d (reference)")
+        lo, hi = dates.min().date(), dates.max().date()
+        needed = start - timedelta(days=bt["warmup_days"])
+        if lo > needed + timedelta(days=30) or hi < end - timedelta(days=30):
+            raise ValueError(f"Reference {symbol} 1d covers {lo} to {hi}; every decision reads it, "
+                             f"so it must cover {needed} to {end}")
+        reference_coverage[symbol] = {"first": str(lo), "last": str(hi)}
     sampled = random.Random(bt["seed"]).sample(symbols, min(sample, len(symbols)))
     coverage = {interval: {"covered": 0, "eligible": 0, "late_listing": 0, "failures": []}
                 for interval in intervals}
@@ -174,6 +207,8 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
                 "code_signature": code_signature(),
                 "cache_signature": fingerprint([(str(p), p.stat().st_size, p.stat().st_mtime_ns)
                                                  for p in sorted(files + store_files)])}
+    if reference_coverage:  # absent for every default family: their evidence is unchanged
+        evidence["reference_coverage"] = reference_coverage
     from tools.strategy_research.exploration.market_conditions import preflight as condition_preflight
     conditions = condition_preflight(bt, cache_dir.parent)
     if conditions is not None:

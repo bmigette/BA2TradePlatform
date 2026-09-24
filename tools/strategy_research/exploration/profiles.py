@@ -16,6 +16,22 @@ DEPLOYED_FAMILIES = ("large_ds", "mid_insider", "small_earnings", "mid_ds",
                      "mid_earnings", "small_rating")
 NEW_FAMILIES = ("quality_momentum", "pullback", "analyst_targets", "etf_trend")
 FAMILIES = DEPLOYED_FAMILIES + NEW_FAMILIES
+#: Opt-in families: selectable by name, never part of the default campaign (whose manifest
+#: fingerprint is pinned), so adding one cannot change the default 35 jobs.
+EXTENSION_FAMILIES = ("pullback_rsi",)
+ALL_FAMILIES = FAMILIES + EXTENSION_FAMILIES
+#: The large_ds settings a replacement expert keeps: the interface's permission, schedule,
+#: sizing and RM keys (plus every ``screener_*`` key). DeterministicScorer's own decision
+#: settings are dropped, since the new expert does not declare them.
+INTERFACE_SETTING_KEYS = (
+    "enable_buy", "enable_sell", "allow_hedging", "allow_automated_trade_opening",
+    "allow_automated_trade_modification", "execution_schedule_enter_market",
+    "execution_schedule_open_positions", "instrument_selection_method",
+    "min_available_balance_pct", "max_virtual_equity_per_instrument_percent",
+    "diversification_factor", "sizing_mode", "risk_per_trade_pct", "atr_risk_budget_pct",
+    "atr_multiplier", "atr_period", "min_stop_loss_pct", "use_atr_stop", "min_take_profit_pct",
+    "regime_overlay_enabled", "regime_risk_scale", "regime_stop_scale", "regime_tp_scale",
+    "risk_manager_mode")
 SNAPSHOT = Path(__file__).with_name("baselines_20260907.json")
 SCHEMA_VERSION = 1
 
@@ -61,6 +77,13 @@ def time_exit():
             "actions": [{"action_type": "close"}], "continue_processing": False}
 
 
+def signal_close(field):
+    """Close a held position when the expert's recommendation flips (``bearish``/``bullish``)."""
+    return {"id": f"research_{field}", "conditions": {"type": "AND", "conditions": [
+                {"id": f"research_{field}_flag", "field": field, "op": "is_true"}]},
+            "actions": [{"action_type": "close"}], "continue_processing": False}
+
+
 def new_idea_baseline(family, reference):
     baseline = deepcopy(reference)
     baseline["source"] = {"memo": "reports/expert_strategy_ideas_2026-09-07.md",
@@ -93,7 +116,7 @@ def new_idea_baseline(family, reference):
                         {"action_type": "adjust_take_profit", "reference_value": "order_open_price", "action_value": 20.0}],
             "continue_processing": False}],
         "exit_rules": [time_exit()]}
-    if family in ("pullback", "etf_trend"):
+    if family in ("pullback", "etf_trend", "pullback_rsi"):
         bt["run_schedule_override"] = deepcopy(bt["manage_schedule_override"])
         bt["screener_opt"]["cadence_days"] = 1
     if family == "analyst_targets":
@@ -119,7 +142,50 @@ def new_idea_baseline(family, reference):
             "id": "research_unselected", "conditions": {"type": "AND", "conditions": [
                 {"id": "research_unselected_flag", "field": "bearish", "op": "is_true"}]},
             "actions": [{"action_type": "close"}], "continue_processing": False}]
+    if family == "pullback_rsi":
+        # The literal RSI pullback expert on the same point-in-time large-cap screen. Long by
+        # default; variants() flips a short job's direction, rules and short permission.
+        settings = {k: v for k, v in settings.items()
+                    if k in INTERFACE_SETTING_KEYS or k.startswith("screener_")}
+        settings.update(direction="long", trend_gate="sma200", rsi_period=2,
+                        entry_threshold=5.0, exit_mode="sma5", rsi_exit=70.0)
+        bt["experts"] = [{"class": "PullbackReversion", "settings": settings}]
+        # A long's SELL recommendation is its EXIT signal, so the entry never sells, and the
+        # expert's exit (or the time limit) replaces a profit target.
+        baseline["strategy"]["entry_rules"][0]["actions"] = [
+            {"action_type": "buy"},
+            {"action_type": "adjust_stop_loss", "reference_value": "order_open_price", "action_value": -8.0}]
+        baseline["strategy"]["exit_rules"] = [signal_close("bearish"), time_exit()]
     return baseline
+
+
+def pullback_rsi_short(job):
+    """Mirror a long pullback_rsi job: SELL on the expert's bearish (entry) recommendation with
+    a stop 8% above the entry, close on its bullish (exit) one, and enable shorts in the engine."""
+    entry = job["strategy"]["entry_rules"][0]
+    entry["id"] = "research_short"
+    flags = [n for n in walk(entry["conditions"]) if n.get("field") == "bullish"]
+    if len(flags) != 1:
+        raise ValueError(f"pullback_rsi entry must have one bullish condition, found {len(flags)}")
+    flags[0].update(id="research_bear", field="bearish")
+    # The stop keeps action_value -8.0: TradeActions reads the percent in the POSITION's
+    # direction (a short's level is reference * (1 - pct/100)), so -8 puts it 8% ABOVE the
+    # short entry. +8.0 would place it 8% below, i.e. on the profit side.
+    entry["actions"] = [
+        {"action_type": "sell"},
+        {"action_type": "adjust_stop_loss", "reference_value": "order_open_price", "action_value": -8.0}]
+    exits = job["strategy"]["exit_rules"]
+    if exits[0] != signal_close("bearish"):
+        raise ValueError("pullback_rsi exit rules must start with the reverse-signal close")
+    exits[0] = signal_close("bullish")
+    bt = job["backtest"]
+    # enable_short reaches the trial config (_build_daily_trial_config) and forces the RM's
+    # enable_sell gate (deploy_parity: enable_sell follows enable_short); the expert setting
+    # states the same permission for a deployed instance. NOT SUFFICIENT TODAY: the `sell`
+    # action refuses a flat book (TradeActions.SellAction), so runtime.preflight refuses short
+    # jobs until equity short entries exist.
+    bt["enable_short"] = True
+    bt["experts"][0]["settings"].update(direction="short", enable_sell=True)
 
 
 def variants(family, baseline):
@@ -170,10 +236,7 @@ def variants(family, baseline):
         condition_range(job["strategy"]["exit_rules"], "days_opened", 15, 30, 5)
         out.append(job)
         job = fresh("signal_reversal", "Add a bearish close, retaining the control's 25-day timeout.")
-        job["strategy"]["exit_rules"].insert(0, {
-            "id": "research_bearish", "conditions": {"type": "AND", "conditions": [
-                {"id": "research_bearish_flag", "field": "bearish", "op": "is_true"}]},
-            "actions": [{"action_type": "close"}], "continue_processing": False})
+        job["strategy"]["exit_rules"].insert(0, signal_close("bearish"))
         out.append(job)
     elif family == "mid_earnings":
         job = fresh("target_offset", "First-tier target offsets -14/-12/-10/-8%; signal, stop and timeout fixed.")
@@ -224,6 +287,30 @@ def variants(family, baseline):
                 max_virtual_equity_per_instrument_percent=90.0 / top_n)
             job["expert_params"]["momentum_bars"] = numeric_range(126, 252, 126, "int")
             out.append(job)
+    elif family == "pullback_rsi":
+        for label, direction, gate, exit_mode, hypothesis in (
+                ("long_sma5", "long", "sma200", "sma5",
+                 "Buy an RSI dip above SMA200; exit on a close above SMA5."),
+                ("long_choch", "long", "sma200", "sma5_or_choch",
+                 "As long_sma5, also exiting on a bearish swing-structure CHoCH."),
+                ("long_rsi", "long", "sma200", "rsi",
+                 "Buy an RSI dip above SMA200; exit when RSI recovers above 60/70."),
+                ("short_sma5", "short", "sma200", "sma5",
+                 "Short an RSI rally below SMA200; cover on a close below SMA5."),
+                ("short_spy", "short", "sma200_and_spy", "sma5",
+                 "As short_sma5, only while SPY is also below its SMA200.")):
+            job = fresh(label, hypothesis)
+            job["backtest"]["experts"][0]["settings"].update(
+                direction=direction, trend_gate=gate, exit_mode=exit_mode,
+                rsi_exit=60.0 if exit_mode == "rsi" else 70.0)
+            if direction == "short":
+                pullback_rsi_short(job)
+            job["expert_params"] = {"rsi_period": numeric_range(2, 3, 1, "int"),
+                                    "entry_threshold": numeric_range(5.0, 15.0, 5.0)}
+            if exit_mode == "rsi":
+                job["expert_params"]["rsi_exit"] = numeric_range(60.0, 70.0, 10.0)
+            condition_range(job["strategy"]["exit_rules"], "days_opened", 5, 10, 5)
+            out.append(job)
     else:
         raise ValueError(f"Unknown strategy family: {family}")
     return out
@@ -236,7 +323,7 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                    market_condition_profile="none", market_condition_manifest=None,
                    market_condition_mode="search"):
     """Build a portable manifest. No data access; --preflight resolves the actual universe."""
-    if not families or len(set(families)) != len(families) or not set(families) <= set(FAMILIES):
+    if not families or len(set(families)) != len(families) or not set(families) <= set(ALL_FAMILIES):
         raise ValueError("Select distinct, known strategy families")
     if equity <= 0 or (equity_cap is not None and equity_cap <= 0):
         raise ValueError("Equity and the optional equity cap must be positive")
