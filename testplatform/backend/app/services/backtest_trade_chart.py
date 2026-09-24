@@ -69,6 +69,15 @@ class TradeChartRowNotFound(LookupError):
     """The requested ``trade_id`` is not a row of this backtest's saved array."""
 
 
+class ContractDetailRefused(Exception):
+    """A reader KNOWS it cannot give this contract's detail faithfully, and says why.
+
+    Distinct from a read failure: the message is the whole ``reason`` (e.g. the run's spot
+    basis cannot be rebuilt), not "option cache unreadable", and nothing is logged as an
+    error. Raised by ``parquet_contract_detail.ParquetContractReader``.
+    """
+
+
 @dataclass(frozen=True)
 class OptionStoreProvenance:
     """Which option store the RUN read, as persisted -- or nothing, if it is not recorded.
@@ -81,6 +90,14 @@ class OptionStoreProvenance:
     store: Optional[str] = None
     db_path: Optional[str] = None
     source: Optional[str] = None
+    #: The rest of what ``options_store.build_options_provider`` reads for a PARQUET-backed
+    #: store, from the SAME config block the store was recorded in (never mixed across
+    #: blobs). ``None`` = not recorded; the parquet reader decides what that means for each
+    #: (see ``parquet_contract_detail.parquet_run_inputs``) -- nothing is defaulted here.
+    parquet_root: Optional[str] = None
+    risk_free_rate: Any = None
+    execution_interval: Optional[str] = None
+    warmup_days: Any = None
 
     @property
     def resolved(self) -> bool:
@@ -89,6 +106,12 @@ class OptionStoreProvenance:
     @property
     def is_sqlite(self) -> bool:
         return (self.store or '').strip().lower() == 'sqlite'
+
+    @property
+    def is_parquet(self) -> bool:
+        """A parquet-backed store: its greeks are not stored, the run inverted them at read
+        time. ``parquet`` is the superseded name of ``tastytrade`` (options_store.STORE_ALIASES)."""
+        return (self.store or '').strip().lower() in ('parquet', 'tastytrade', 'thetadata')
 
 
 def _store_keys(node: Any, found: Dict[str, str]) -> None:
@@ -101,6 +124,45 @@ def _store_keys(node: Any, found: Dict[str, str]) -> None:
     elif isinstance(node, list):
         for value in node:
             _store_keys(value, found)
+
+
+#: Run-config keys the parquet reader needs, read from the block that carries
+#: ``options_store`` (snake_case as the run config / optimization ``backtest`` block spells
+#: them; camelCase as a standalone run's ``strategy_params`` does).
+_RUN_KEYS = {
+    'options_parquet_root': 'parquet_root',
+    'options_risk_free_rate': 'risk_free_rate',
+    'execution_interval': 'execution_interval', 'executionInterval': 'execution_interval',
+    'warmup_days': 'warmup_days', 'warmupDays': 'warmup_days',
+}
+
+
+def _store_block(node: Any) -> Optional[Dict[str, Any]]:
+    """The first dict (depth-first, the same walk as ``_store_keys``) that records
+    ``options_store`` -- the block whose other keys describe the same run."""
+    if isinstance(node, dict):
+        if node.get('options_store'):
+            return node
+        for value in node.values():
+            found = _store_block(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _store_block(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _run_keys(blob: Any) -> Dict[str, Any]:
+    block = _store_block(blob) or {}
+    out: Dict[str, Any] = {}
+    for key, field in _RUN_KEYS.items():
+        value = block.get(key)
+        if value is not None and value != '':
+            out.setdefault(field, value)
+    return out
 
 
 def _json_blob(value: Any) -> Any:
@@ -126,15 +188,21 @@ def option_store_provenance(backtest: Any, session: Any = None) -> OptionStorePr
 
     ``options_store`` decides WHICH reader is legitimate (sqlite vs parquet vs a vendor
     store); the path alone does not prove that SQLite supplied the data.
+
+    For a parquet-backed store the same block's ``options_parquet_root``,
+    ``options_risk_free_rate``, ``execution_interval`` and ``warmup_days`` are carried too:
+    those stores hold no greeks, so reproducing them needs the run's own reader inputs.
     """
     found: Dict[str, str] = {}
     source = None
+    run_keys: Dict[str, Any] = {}
 
     blob = _json_blob(getattr(backtest, 'strategy_params', None))
     if blob:
         _store_keys(blob, found)
         if found:
             source = 'strategy_params'
+            run_keys = _run_keys(blob)
 
     optimization_id = getattr(backtest, 'optimization_id', None)
     if not found and optimization_id is not None and session is not None:
@@ -164,6 +232,7 @@ def option_store_provenance(backtest: Any, session: Any = None) -> OptionStorePr
                 _store_keys(config, found)
                 if found:
                     source = f'optimization_config#{optimization_id}'
+                    run_keys = _run_keys(config)
 
     if not found:
         return OptionStoreProvenance()
@@ -172,6 +241,7 @@ def option_store_provenance(backtest: Any, session: Any = None) -> OptionStorePr
         store=found.get('options_store'),
         db_path=found.get('options_cache_db') or found.get('options_db_path'),
         source=source,
+        **run_keys,
     )
 
 
@@ -207,6 +277,8 @@ def contract_detail(reader: Any, occ_symbol: Optional[str], event: Optional[date
 
     try:
         row = reader.latest_bar_on_or_before(occ_symbol, lookup_day.isoformat())
+    except ContractDetailRefused as exc:
+        return {**blank, 'source': getattr(reader, 'db_path', None), 'reason': str(exc)}
     except Exception as exc:  # an unreadable cache is a data error, not an invented price
         logger.warning(f"option cache read failed for {occ_symbol}: {exc}")
         return {**blank, 'reason': f'option cache unreadable: {exc}'}
@@ -221,7 +293,9 @@ def contract_detail(reader: Any, occ_symbol: Optional[str], event: Optional[date
     # Every caveat travels with the value, rather than one replacing another.
     notes: List[str] = []
     if not has_greeks:
-        notes.append('iv/greeks were never fetched for this bar')
+        # A reader that DERIVES greeks (the parquet stores) says why a bar has none; the sqlite
+        # store's reason is that they were never fetched.
+        notes.append(row.get('missing_greeks_note') or 'iv/greeks were never fetched for this bar')
     if quality == 'approximate_prior_session':
         notes.append(
             'daily bars are known only at their session close, so this is the last completed '
@@ -232,6 +306,8 @@ def contract_detail(reader: Any, occ_symbol: Optional[str], event: Optional[date
         # per-build snapshot): say so rather than leaving a bare null that reads as zero or as
         # a bug. No unrelated snapshot is substituted for it.
         notes.append("open interest is not part of this store's daily contract bars")
+    # How the reader obtained these values (e.g. derived at read time exactly as the run did).
+    notes.extend(row.get('notes') or ())
     reason = '; '.join(notes) or None
     return {
         **values,
@@ -547,11 +623,16 @@ def build_trade_chart_context(backtest: Any, trade_id: int, session: Any = None)
         except Exception as exc:
             store_problem = f"the run's option store could not be opened read-only: {exc}"
             logger.warning(f"could not open the option store at {provenance.db_path}: {exc}")
+    elif provenance.resolved and provenance.is_parquet:
+        # Parquet stores hold NO greeks: the run inverted them at read time. They are rebuilt
+        # through the run's own reader factory and inputs, or refused with the reason.
+        from app.services.parquet_contract_detail import open_parquet_contract_reader
+        contract_reader, store_problem = open_parquet_contract_reader(provenance, backtest)
     elif provenance.resolved:
         store_problem = (
             f"the run read a '{provenance.store}' option store; this popup's read-only reader "
-            f"covers the sqlite store only, and reading a different store would put another "
-            f"dataset's greeks beside these prices"
+            f"covers the sqlite and parquet stores only, and reading a different store would "
+            f"put another dataset's greeks beside these prices"
         )
 
     engine_type = _text(getattr(backtest, "engine_type", None)) or ""
