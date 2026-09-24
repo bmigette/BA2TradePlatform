@@ -112,14 +112,60 @@ def resolve_universe(bt):
     return symbols, store_files
 
 
-#: Daily histories an expert reads on every decision besides the traded symbol's own:
-#: PullbackReversion checks each symbol's sessions against SPY (and its SPY gate reads it), and
-#: aborts the run without it. Not traded, so not added to the universe.
-REFERENCE_DAILY_SYMBOLS = {"PullbackReversion": ("SPY",)}
+def expert_class(name):
+    """The class the daily backtest handler runs for ``name``, via its registry
+    (``_SUPPORTED_EXPERTS``: class name -> module)."""
+    add_source_paths()
+    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
+    return getattr(importlib.import_module(_SUPPORTED_EXPERTS[name]), name)
 
 
-def reference_symbols(bt):
-    return sorted({s for expert in bt["experts"] for s in REFERENCE_DAILY_SYMBOLS.get(expert["class"], ())})
+def reference_requirements(bt):
+    """``{symbol: end_slack_days}`` for the daily histories this run's experts read on every
+    decision besides the traded symbols' own: each expert's ``REFERENCE_DAILY_SYMBOLS`` (an
+    expert without the attribute requires nothing extra). The history must reach within the
+    expert module's ``MAX_STALE_DAYS`` of the window end, the staleness the expert itself
+    refuses. Reference symbols are never added to the traded universe."""
+    out = {}
+    for spec in bt["experts"]:
+        cls = expert_class(spec["class"])
+        symbols = getattr(cls, "REFERENCE_DAILY_SYMBOLS", ())
+        if not symbols:
+            continue
+        module = sys.modules[cls.__module__]
+        if not hasattr(module, "MAX_STALE_DAYS"):
+            raise ValueError(f"{cls.__name__} declares REFERENCE_DAILY_SYMBOLS but its module has "
+                             "no MAX_STALE_DAYS: the reference history's end bound is unknown")
+        for symbol in symbols:
+            out[symbol] = min(out.get(symbol, module.MAX_STALE_DAYS), module.MAX_STALE_DAYS)
+    return dict(sorted(out.items()))
+
+
+def opens_equity_short(job):
+    """True when a job depends on a `sell` ENTRY opening a short (``enable_short`` plus an entry
+    rule with a `sell` action). The engine cannot do that yet: ba2_common's
+    ``TradeActions.SellAction`` only sells an existing long ("No long position to sell"), so the
+    RM's enable_sell gate, which ``enable_short`` forces on, is never reached."""
+    bt = job["optimization_config"]["backtest"]
+    return bool(bt.get("enable_short")) and any(
+        action["action_type"] == "sell"
+        for rule in job["strategy"]["entry_rules"] for action in rule["actions"])
+
+
+def refuse_unrunnable(jobs):
+    """Refuse the whole selection, before any job starts, when a job could never trade: every
+    trial would score a strategy that never opened a position."""
+    bad = [job["name"] for job in jobs if opens_equity_short(job)]
+    if bad:
+        raise ValueError(
+            f"equity short entries cannot open yet (SellAction only sells an existing long), so "
+            f"{len(bad)} selected job(s) would never trade: {bad}; select the long variants")
+
+
+def _covers(lo, hi, needed, end, end_slack_days):
+    """History ``lo..hi`` covers ``needed..end``: 30 days of start slack (listing/holiday
+    alignment), ``end_slack_days`` at the end."""
+    return lo <= needed + timedelta(days=30) and hi >= end - timedelta(days=end_slack_days)
 
 
 def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
@@ -132,14 +178,7 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
 
     ready = deepcopy(job)
     bt = ready["optimization_config"]["backtest"]
-    if bt.get("enable_short"):
-        # enable_short reaches the trial and the RM's enable_sell gate, but the `sell` ACTION
-        # itself refuses a flat book (ba2_common TradeActions.SellAction: "No long position to
-        # sell"), so the entry could never open a short: every trial would score a strategy
-        # that never traded. Refused here, before any run, rather than searched silently.
-        raise ValueError(
-            f"{job['name']}: equity short entries cannot open yet (SellAction only sells an "
-            "existing long), so this short job would never trade; select the long variants")
+    refuse_unrunnable([job])  # also a child's own check; main() refuses the selection first
     cache_dir = Path(cache_dir).resolve()
     start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
     if not cache_dir.is_dir():
@@ -147,23 +186,25 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     symbols, store_files = resolve_universe(bt)
     intervals = tuple(dict.fromkeys(("1d", bt["execution_interval"])))
     files = [cache_dir / f"{symbol}_{interval}.parquet" for symbol in symbols for interval in intervals]
-    references = reference_symbols(bt)
+    references = reference_requirements(bt)
     reference_files = [cache_dir / f"{symbol}_1d.parquet" for symbol in references]
     files += [p for p in reference_files if p not in files]
     missing = [str(p) for p in files if not p.is_file()]
     if missing:
         raise ValueError(f"{len(missing)} missing OHLCV files; no symbols silently removed: {missing[:12]}")
     reference_coverage = {}
-    for symbol, path in zip(references, reference_files):
-        # Read on EVERY decision, so its whole window is required, not a sampled share.
+    for (symbol, end_slack), path in zip(references.items(), reference_files):
+        # Every decision reads it: checked in full, not sampled, and it must reach the window
+        # end within the expert's own staleness bound (a stale reference aborts the run).
         dates = pd.to_datetime(pd.read_parquet(path, columns=["Date"])["Date"], utc=True)
         if dates.empty or dates.isna().any():
             raise ValueError(f"Empty/invalid dates: {symbol} 1d (reference)")
         lo, hi = dates.min().date(), dates.max().date()
         needed = start - timedelta(days=bt["warmup_days"])
-        if lo > needed + timedelta(days=30) or hi < end - timedelta(days=30):
+        if not _covers(lo, hi, needed, end, end_slack):
             raise ValueError(f"Reference {symbol} 1d covers {lo} to {hi}; every decision reads it, "
-                             f"so it must cover {needed} to {end}")
+                             f"so it must start by {needed + timedelta(days=30)} and end by "
+                             f"{end - timedelta(days=end_slack)}")
         reference_coverage[symbol] = {"first": str(lo), "last": str(hi)}
     sampled = random.Random(bt["seed"]).sample(symbols, min(sample, len(symbols)))
     coverage = {interval: {"covered": 0, "eligible": 0, "late_listing": 0, "failures": []}
@@ -192,7 +233,7 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
                 record["late_listing"] += 1
                 continue
             record["eligible"] += 1
-            if overlaps and lo <= needed + timedelta(days=30) and hi >= end - timedelta(days=30):
+            if overlaps and _covers(lo, hi, needed, end, 30):
                 record["covered"] += 1
             else:
                 record["failures"].append(symbol)

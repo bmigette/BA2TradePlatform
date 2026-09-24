@@ -20,18 +20,6 @@ FAMILIES = DEPLOYED_FAMILIES + NEW_FAMILIES
 #: fingerprint is pinned), so adding one cannot change the default 35 jobs.
 EXTENSION_FAMILIES = ("pullback_rsi",)
 ALL_FAMILIES = FAMILIES + EXTENSION_FAMILIES
-#: The large_ds settings a replacement expert keeps: the interface's permission, schedule,
-#: sizing and RM keys (plus every ``screener_*`` key). DeterministicScorer's own decision
-#: settings are dropped, since the new expert does not declare them.
-INTERFACE_SETTING_KEYS = (
-    "enable_buy", "enable_sell", "allow_hedging", "allow_automated_trade_opening",
-    "allow_automated_trade_modification", "execution_schedule_enter_market",
-    "execution_schedule_open_positions", "instrument_selection_method",
-    "min_available_balance_pct", "max_virtual_equity_per_instrument_percent",
-    "diversification_factor", "sizing_mode", "risk_per_trade_pct", "atr_risk_budget_pct",
-    "atr_multiplier", "atr_period", "min_stop_loss_pct", "use_atr_stop", "min_take_profit_pct",
-    "regime_overlay_enabled", "regime_risk_scale", "regime_stop_scale", "regime_tp_scale",
-    "risk_manager_mode")
 SNAPSHOT = Path(__file__).with_name("baselines_20260907.json")
 SCHEMA_VERSION = 1
 
@@ -82,6 +70,23 @@ def signal_close(field):
     return {"id": f"research_{field}", "conditions": {"type": "AND", "conditions": [
                 {"id": f"research_{field}_flag", "field": field, "op": "is_true"}]},
             "actions": [{"action_type": "close"}], "continue_processing": False}
+
+
+def interface_settings(settings, expert_cls):
+    """The ``settings`` a replacement expert inherits: the keys its interface declares
+    (permissions, schedules, sizing, RM, screener), without the ones the expert declares itself,
+    which the caller sets. The source expert's own decision settings are dropped."""
+    declared = expert_cls.get_merged_settings_definitions()
+    own = expert_cls.get_settings_definitions()
+    return {k: v for k, v in settings.items() if k in declared and k not in own}
+
+
+def pullback_reversion_class():
+    """Imported only when the opt-in family is selected: the default campaign stays stdlib-only."""
+    from tools.strategy_research.exploration.runtime import add_source_paths
+    add_source_paths()
+    from ba2_experts.PullbackReversion import PullbackReversion
+    return PullbackReversion
 
 
 def new_idea_baseline(family, reference):
@@ -145,8 +150,7 @@ def new_idea_baseline(family, reference):
     if family == "pullback_rsi":
         # The literal RSI pullback expert on the same point-in-time large-cap screen. Long by
         # default; variants() flips a short job's direction, rules and short permission.
-        settings = {k: v for k, v in settings.items()
-                    if k in INTERFACE_SETTING_KEYS or k.startswith("screener_")}
+        settings = interface_settings(settings, pullback_reversion_class())
         settings.update(direction="long", trend_gate="sma200", rsi_period=2,
                         entry_threshold=5.0, exit_mode="sma5", rsi_exit=70.0)
         bt["experts"] = [{"class": "PullbackReversion", "settings": settings}]
@@ -182,8 +186,8 @@ def pullback_rsi_short(job):
     # enable_short reaches the trial config (_build_daily_trial_config) and forces the RM's
     # enable_sell gate (deploy_parity: enable_sell follows enable_short); the expert setting
     # states the same permission for a deployed instance. NOT SUFFICIENT TODAY: the `sell`
-    # action refuses a flat book (TradeActions.SellAction), so runtime.preflight refuses short
-    # jobs until equity short entries exist.
+    # action refuses a flat book (TradeActions.SellAction), so runtime.refuse_unrunnable
+    # refuses short jobs until equity short entries exist.
     bt["enable_short"] = True
     bt["experts"][0]["settings"].update(direction="short", enable_sell=True)
 

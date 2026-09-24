@@ -437,6 +437,9 @@ class PullbackReversion(MarketExpertInterface):
     while SPY is current. Every other data problem aborts."""
 
     BACKTEST_WARMUP_BARS = BACKTEST_WARMUP_BARS
+    #: Daily histories every decision reads besides the symbol's own (the gap/listing/stale
+    #: reference and the SPY gate). Research preflight requires them; they are never traded.
+    REFERENCE_DAILY_SYMBOLS = (SPY_SYMBOL,)
 
     #: ``(data session, provider, SPY completed bars)``: SPY is the same for every symbol of a
     #: bar, so it is fetched and converted once per session and provider object (compared with

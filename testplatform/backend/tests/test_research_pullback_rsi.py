@@ -3,6 +3,7 @@
 The default campaign must stay byte-identical; the extension is selected by name only.
 No broker, provider request, live database or grid run.
 """
+from copy import deepcopy
 from datetime import date
 import itertools
 import json
@@ -21,7 +22,8 @@ from tools.strategy_research.exploration import profiles as P, runtime as R
 from tools.strategy_research.exploration import run_exploration as D
 from app.services.strategy_param_space import collect_param_space, decode_params
 
-# Pinned by test_research10_market_conditions.test_disabled_default_is_the_exact_original_manifest.
+# The default campaign's pin, the one test_research10_market_conditions pins inline (that test
+# stays unmodified); test_the_default_pin_is_test_research10s keeps the two from drifting.
 DEFAULT_FINGERPRINT = "798c8787f90a6e1215f964edc453d3c58a29138fec845cefab1f7d2873bb2fa9"
 PINS = {"ta-structure-v1": "b" * 64}
 
@@ -68,6 +70,11 @@ def test_default_campaign_is_unchanged_and_excludes_the_extension():
     assert P.ALL_FAMILIES == P.FAMILIES + P.EXTENSION_FAMILIES == P.FAMILIES + ("pullback_rsi",)
 
 
+def test_the_default_pin_is_test_research10s():
+    source = Path(__file__).with_name("test_research10_market_conditions.py").read_text(encoding="utf-8")
+    assert f'== "{DEFAULT_FINGERPRINT}"' in source
+
+
 def test_unknown_family_and_variant_fail():
     with pytest.raises(ValueError, match="known strategy families"):
         P.build_manifest(families=("pullback_rsx",))
@@ -110,6 +117,22 @@ def test_settings_genes_and_backtest_contract():
         short = variant.startswith("short")
         assert bt.get("enable_short", False) is short
         assert settings["enable_sell"] is short
+
+
+def test_inherited_settings_are_derived_from_the_expert():
+    """Kept = every large_ds setting the expert's interface declares that the expert does not
+    declare itself; then exactly the expert's own settings are added."""
+    from ba2_experts.PullbackReversion import PullbackReversion
+    declared = PullbackReversion.get_merged_settings_definitions()
+    own = set(PullbackReversion.get_settings_definitions())
+    assert own == {"direction", "trend_gate", "rsi_period", "entry_threshold", "exit_mode", "rsi_exit"}
+    source = P.load_baselines()["large_ds"]["backtest"]["experts"][0]["settings"]
+    inherited = {k for k in source if k in declared and k not in own}
+    assert {"risk_per_trade_pct", "sizing_mode", "enable_sell", "screener_market_cap_min"} <= inherited
+    assert not inherited & {"w_technical", "theta_buy", "index_symbol"}  # DeterministicScorer's own
+    for job in jobs().values():
+        settings = job["optimization_config"]["backtest"]["experts"][0]["settings"]
+        assert set(settings) == inherited | own
 
 
 def test_long_rule_shapes():
@@ -195,11 +218,56 @@ def test_cli_rejects_an_unknown_family():
         D.parser().parse_args(["--families", "pullback_rsx"])
 
 
+# --------------------------------------------------------------------------- refusing short jobs
+def test_refusal_is_keyed_on_a_sell_entry_with_enable_short():
+    short, long_ = jobs()["short_sma5"], jobs()["long_sma5"]
+    assert R.opens_equity_short(short) and R.opens_equity_short(jobs()["short_spy"])
+    assert not R.opens_equity_short(long_)
+    no_flag = deepcopy(short)
+    del no_flag["optimization_config"]["backtest"]["enable_short"]
+    assert not R.opens_equity_short(no_flag)  # a `sell` entry without shorts only ever closes a long
+    flag_only = deepcopy(long_)
+    flag_only["optimization_config"]["backtest"]["enable_short"] = True
+    assert not R.opens_equity_short(flag_only)  # enable_short alone opens nothing through `buy`
+    R.refuse_unrunnable([long_, flag_only])
+    with pytest.raises(ValueError, match=r"equity short entries cannot open yet .* 1 selected job"):
+        R.refuse_unrunnable([long_, short])
+
+
+def test_preflight_refuses_short_jobs_loudly(tmp_path):
+    for variant in ("short_sma5", "short_spy"):
+        with pytest.raises(ValueError, match="equity short entries cannot open yet"):
+            R.preflight(jobs()[variant], tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["--preflight", "--run"])
+def test_cli_refuses_a_selection_with_a_short_job_before_any_job(monkeypatch, tmp_path, capsys, mode):
+    def forbidden(*args, **kwargs):
+        pytest.fail("a job was prepared or started before the selection was refused")
+    for name in ("preflight", "run_jobs", "check_database"):
+        monkeypatch.setattr(D, name, forbidden)
+    # The long job comes first: it must not run before the short one is found.
+    argv = ["--families", "pullback_rsi", "--variants", "long_sma5", "short_spy", mode,
+            "--output-dir", str(tmp_path)]
+    assert D.main(argv) == 1
+    assert "equity short entries cannot open yet" in capsys.readouterr().err
+
+    started = []
+    monkeypatch.setattr(D, "preflight", lambda job, cache_dir: started.append(job["variant"])
+                        or {**job, "preflight": {"symbols": 1}})
+    monkeypatch.setattr(D, "run_jobs", lambda selected, output, args: started.extend(
+        j["variant"] for j in selected) or 0)
+    argv = ["--families", "pullback_rsi", "--variants", "long_sma5", "long_choch", "long_rsi", mode,
+            "--output-dir", str(tmp_path)]
+    assert D.main(argv) == 0
+    assert started == ["long_sma5", "long_choch", "long_rsi"]
+
+
 # --------------------------------------------------------------------------- preflight
-def _cache(tmp_path, symbols, intervals=("1d", "5min"), first="2018-01-01"):
+def _cache(tmp_path, symbols, intervals=("1d", "5min"), first="2018-01-01", last="2025-12-31"):
     for symbol in symbols:
         for interval in intervals:
-            pd.DataFrame({"Date": pd.to_datetime([first, "2020-01-02", "2025-12-31"], utc=True)}).to_parquet(
+            pd.DataFrame({"Date": pd.to_datetime([first, "2020-01-02", last], utc=True)}).to_parquet(
                 tmp_path / f"{symbol}_{interval}.parquet")
 
 
@@ -210,6 +278,17 @@ def _screen_one(monkeypatch, tmp_path, job):
     monkeypatch.setattr(ms, "screened_symbol_union", lambda *args: ["AAA"])
     monkeypatch.setattr(R, "code_signature", lambda: "source-version")
     return job
+
+
+def test_reference_symbols_come_from_the_expert_through_the_backtest_registry():
+    import importlib
+    module = importlib.import_module("ba2_experts.PullbackReversion")
+    assert R.expert_class("PullbackReversion") is module.PullbackReversion
+    assert module.PullbackReversion.REFERENCE_DAILY_SYMBOLS == (module.SPY_SYMBOL,) == ("SPY",)
+    bt = jobs()["long_sma5"]["optimization_config"]["backtest"]
+    assert R.reference_requirements(bt) == {"SPY": module.MAX_STALE_DAYS}
+    for job in P.build_manifest()["jobs"]:  # no default family's expert declares any
+        assert R.reference_requirements(job["optimization_config"]["backtest"]) == {}
 
 
 def test_preflight_requires_spy_daily_for_pullback_rsi_only(monkeypatch, tmp_path):
@@ -230,15 +309,22 @@ def test_preflight_requires_spy_daily_for_pullback_rsi_only(monkeypatch, tmp_pat
     (tmp_path / "SPY_1d.parquet").unlink()
     ready = R.preflight(default, tmp_path)
     assert "reference_coverage" not in ready["preflight"]
-    assert R.reference_symbols(default["optimization_config"]["backtest"]) == []
 
 
-def test_preflight_refuses_a_spy_history_short_of_the_warmup(monkeypatch, tmp_path):
+@pytest.mark.parametrize("first,last,error", [
+    ("2019-06-01", "2025-12-31", "must start by 2018-06-10"),  # 600-day warmup from 2020-01-01
+    ("2018-01-01", "2025-12-20", "end by 2025-12-24"),         # MAX_STALE_DAYS (7), not 30
+    ("2018-01-01", "2025-12-24", None),
+])
+def test_preflight_bounds_the_spy_history(monkeypatch, tmp_path, first, last, error):
     job = _screen_one(monkeypatch, tmp_path, jobs()["long_rsi"])
     _cache(tmp_path, ["AAA"])
-    _cache(tmp_path, ["SPY"], intervals=("1d",), first="2019-06-01")  # needs 2018-05-11 (600-day warmup)
-    with pytest.raises(ValueError, match="Reference SPY 1d covers 2019-06-01"):
-        R.preflight(job, tmp_path)
+    _cache(tmp_path, ["SPY"], intervals=("1d",), first=first, last=last)
+    if error is None:
+        assert R.preflight(job, tmp_path)["preflight"]["reference_coverage"]["SPY"]["last"] == last
+    else:
+        with pytest.raises(ValueError, match=f"Reference SPY 1d covers {first} to {last}.*{error}"):
+            R.preflight(job, tmp_path)
 
 
 # --------------------------------------------------------------------------- trial config and real engine
@@ -274,32 +360,70 @@ def test_enable_short_survives_the_trial_config_whitelist():
         assert entry["actions"][0]["action_type"] == ("sell" if short else "buy")
 
 
+SIGNAL = date(2024, 3, 6)
+
+
+def _sessions():
+    from ba2_common.core.market_calendar import regular_sessions_ending_at
+    return regular_sessions_ending_at(date(2024, 3, 28), 420)
+
+
 def _series(sessions, closes):
     return [{"Date": d, "Open": round(c, 4), "High": round(c * 1.01, 4), "Low": round(c * 0.99, 4),
              "Close": round(c, 4), "Volume": 1_000_000} for d, c in zip(sessions, closes)]
 
 
-SIGNAL = date(2024, 3, 6)
+def _wiggle(lo, hi, n):
+    return np.linspace(lo, hi, n) + 0.2 * (-1.0) ** np.arange(n)
+
+
+def _dip(after):
+    """An uptrend with a three-day dip ending at bar ``i`` (RSI2 near 0, far above SMA200)."""
+    def closes_for(n, i):
+        closes = _wiggle(100.0, 200.0, n)
+        closes[i - 2:i + 1] = closes[i - 3] - np.array([3.0, 6.0, 9.0])
+        rest = np.arange(1, n - i)
+        closes[i + 1:] = (closes[i - 3] + 2.0 + 0.4 * rest if after == "recovers"
+                          else closes[i] * (1 - 0.02 * rest))
+        return closes
+    return closes_for
+
+
+def _rally(n, i):
+    """A downtrend with a three-day rally ending at bar ``i`` (RSI2 near 100, below SMA200)."""
+    closes = _wiggle(200.0, 100.0, n)
+    closes[i - 2:i + 1] = closes[i - 3] + np.array([3.0, 6.0, 9.0])
+    closes[i + 1:] = closes[i] - 4.0 - 0.4 * np.arange(1, n - i)
+    return closes
+
+
+@pytest.fixture
+def engine_caches():
+    """The engine memoizes each symbol's series per process: no other test's AAA may leak in,
+    and this module's fixture series must not leak out."""
+    from app.services.backtest import price_source
+
+    def clear():
+        price_source.clear_ohlcv_memo()
+        price_source.clear_worker_bar_cache()
+    clear()
+    yield
+    clear()
 
 
 def _run(monkeypatch, tmp_path, variants, closes_for):
     """Run each variant through the real daily engine on hermetic AAA/SPY daily bars."""
     import logging
     import ba2_common.config as bc
-    from app.services.backtest import price_source
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
     from tests.backtest.fixtures.e2e_support import hermetic_providers
     from tests.backtest.fixtures import hermetic_providers as fixtures
-    from ba2_common.core.market_calendar import regular_sessions_ending_at
 
-    sessions = regular_sessions_ending_at(date(2024, 3, 28), 420)
+    sessions = _sessions()
     closes = closes_for(len(sessions), sessions.index(SIGNAL))
-    spy = np.linspace(300.0, 400.0, len(sessions)) + 0.2 * (-1.0) ** np.arange(len(sessions))
+    spy = _wiggle(300.0, 400.0, len(sessions))
     monkeypatch.setattr(fixtures, "_PRICE_ROWS", {"AAA": _series(sessions, closes), "SPY": _series(sessions, spy)})
     monkeypatch.setattr(bc, "CACHE_FOLDER", str(tmp_path))
-    # The engine memoizes each symbol's series per process: another test's AAA must not leak in.
-    price_source.clear_ohlcv_memo()
-    price_source.clear_worker_bar_cache()
     results = {}
     for variant in variants:
         config = _trial(variant, start_date="2024-03-01", end_date="2024-03-28", execution_interval="1d",
@@ -311,25 +435,31 @@ def _run(monkeypatch, tmp_path, variants, closes_for):
                 results[variant] = run_daily_backtest(config)
         finally:
             logging.disable(before)
-    return sessions, closes, results
+    return results
 
 
-def _wiggle(lo, hi, n):
-    return np.linspace(lo, hi, n) + 0.2 * (-1.0) ** np.arange(n)
+@pytest.mark.parametrize("closes_for,entering,idle", [
+    (_dip("recovers"), "long_sma5", "short_sma5"), (_rally, "short_sma5", "long_sma5")])
+def test_the_engine_fixtures_are_entry_signals(closes_for, entering, idle):
+    """Outside the engine: at SIGNAL the expert's own decision is an entry for the job the
+    fixture is built for, and not for the other. So the xfail below can only fail because the
+    engine refused the short, never because the fixture gave no short signal."""
+    from ba2_experts.PullbackReversion import completed_bars, pullback_signal
+    sessions = _sessions()
+    frame = pd.DataFrame(_series(sessions, closes_for(len(sessions), sessions.index(SIGNAL))))
+    bars = completed_bars(frame, SIGNAL, "AAA")
+    for variant in (entering, idle):
+        settings = dict(jobs()[variant]["optimization_config"]["backtest"]["experts"][0]["settings"])
+        settings.update(rsi_period=VALUES["model:rsi_period"], entry_threshold=VALUES["model:entry_threshold"])
+        action = pullback_signal(bars, settings)["action"]
+        assert (action == "entry") is (variant == entering), (variant, action)
 
 
 @pytest.mark.parametrize("after", ["recovers", "keeps_falling"])
-def test_long_job_trades_in_the_real_engine(monkeypatch, tmp_path, after):
+def test_long_job_trades_in_the_real_engine(monkeypatch, tmp_path, engine_caches, after):
     """Positive control for the harness: a dip in an uptrend opens a LONG. Recovering above
     SMA5, the bearish reverse-signal rule closes it at a profit; falling on, the -8% stop does."""
-    def dip(n, i):
-        closes = _wiggle(100.0, 200.0, n)
-        closes[i - 2:i + 1] = closes[i - 3] - np.array([3.0, 6.0, 9.0])  # RSI2 near 0, above SMA200
-        rest = np.arange(1, n - i)
-        closes[i + 1:] = (closes[i - 3] + 2.0 + 0.4 * rest if after == "recovers"
-                          else closes[i] * (1 - 0.02 * rest))
-        return closes
-    _, _, results = _run(monkeypatch, tmp_path, ["long_sma5", "short_sma5"], dip)
+    results = _run(monkeypatch, tmp_path, ["long_sma5", "short_sma5"], _dip(after))
     assert results["short_sma5"]["total_trades"] == 0
     trades = results["long_sma5"]["trades"]
     assert trades and all(t["direction"] == "buy" and t["symbol"] == "AAA" for t in trades)
@@ -343,22 +473,11 @@ def test_long_job_trades_in_the_real_engine(monkeypatch, tmp_path, after):
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
     "Equity shorts cannot open: TradeActions.SellAction refuses a flat book ('No long position "
-    "to sell'), whatever enable_short/enable_sell say, so runtime.preflight refuses short jobs. "
-    "When this XPASSes, drop that refusal."))
-def test_short_job_opens_a_short_in_the_real_engine(monkeypatch, tmp_path):
-    def rally(n, i):
-        closes = _wiggle(200.0, 100.0, n)
-        closes[i - 2:i + 1] = closes[i - 3] + np.array([3.0, 6.0, 9.0])  # RSI2 near 100, below SMA200
-        closes[i + 1:] = closes[i] - 4.0 - 0.4 * np.arange(1, n - i)
-        return closes
-    _, _, results = _run(monkeypatch, tmp_path, ["short_sma5", "long_sma5"], rally)
+    "to sell'), whatever enable_short/enable_sell say, so runtime.refuse_unrunnable refuses short "
+    "jobs. When this XPASSes, drop that refusal."))
+def test_short_job_opens_a_short_in_the_real_engine(monkeypatch, tmp_path, engine_caches):
+    results = _run(monkeypatch, tmp_path, ["short_sma5", "long_sma5"], _rally)
     assert results["long_sma5"]["total_trades"] == 0
     trades = results["short_sma5"]["trades"]
     assert len(trades) == 1, "the short job placed no trade"
     assert trades[0]["direction"] == "sell" and trades[0]["pnl"] > 0
-
-
-def test_preflight_refuses_short_jobs_loudly(tmp_path):
-    for variant in ("short_sma5", "short_spy"):
-        with pytest.raises(ValueError, match="equity short entries cannot open yet"):
-            R.preflight(jobs()[variant], tmp_path)

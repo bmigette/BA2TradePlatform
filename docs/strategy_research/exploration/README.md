@@ -39,7 +39,7 @@ configured remote workers. Jobs run sequentially in separate processes.
 | `pullback` | RSI period 2/3/5 and hold 3/5/10 days in separate jobs; buy threshold 0.15/0.25/0.35. Daily entry, fixed stop and costs. | 9 | 27 |
 | `analyst_targets` | Hold 15/30/60 days; target window 30/60/90 days; minimum 3/5 observations. Analyst/technical blend fixed at 80/20. | 3 | 18 |
 | `etf_trend` | Prior-month momentum 126/252 bars, positive return and above SMA200; top 1/2 eligible funds. | 2 | 4 |
-| `pullback_rsi` | **Opt-in extension, not in the default 35 jobs.** The literal [PullbackReversion](../../../packages/experts/ba2_experts/PullbackReversion.py) expert on the new-idea large-cap screen, daily entry: `long_sma5`, `long_choch`, `long_rsi` (SMA200 trend; exit on SMA5, SMA5 or a bearish CHoCH, or RSI 60/70), `short_sma5`, `short_spy` (SMA200, plus SPY below its SMA200). RSI period 2/3, entry threshold 5/10/15, max hold 5/10 days. Stop −8% (a short's sits 8% above), no profit target; the reverse signal closes first, then the time limit. **Short jobs are refused at `--preflight`/`--run`**: the `sell` action only sells an existing long, so no rule can open an equity short yet. | 5 | 72 |
+| `pullback_rsi` | **Opt-in extension, not in the default 35 jobs.** The literal [PullbackReversion](../../../packages/experts/ba2_experts/PullbackReversion.py) expert on the new-idea large-cap screen, daily entry: `long_sma5`, `long_choch`, `long_rsi` (SMA200 trend; exit on SMA5, SMA5 or a bearish CHoCH, or RSI 60/70), `short_sma5`, `short_spy` (SMA200, plus SPY below its SMA200). RSI period 2/3, entry threshold 5/10/15, max hold 5/10 days. Stop −8% (a short's sits 8% above), no profit target; the reverse signal closes first, then the time limit. **Only the 3 long jobs (48 of the 72 combinations) are runnable today.** The two short jobs are placeholders until equity shorts can open: the `sell` action only sells an existing long, so `--preflight`/`--run` refuse any selection that includes one, before its first job starts. | 5 | 72 |
 
 Six explicit controls preserve the original rule semantics. Other fixed settings are
 snapshotted in [baselines_20260907.json](../../../tools/strategy_research/exploration/baselines_20260907.json),
@@ -131,7 +131,8 @@ python tools/strategy_research/exploration/run_exploration.py --preflight
 python tools/strategy_research/exploration/run_exploration.py --run
 ```
 
-Preview is the default and uses only the standard library. It opens no database and starts
+Preview is the default and uses only the standard library (selecting `pullback_rsi` also imports
+its expert class, to derive the settings it inherits). It opens no database and starts
 no backtest. It writes the full manifest under `reports/strategy_research/<campaign hash>/`.
 `--output-dir` can place artifacts elsewhere; the repository root itself is rejected.
 
@@ -216,8 +217,8 @@ results before considering a shared-account allocation.
 ```powershell
 cd testplatform/backend
 python -m pytest tests/test_research6_driver.py tests/test_research10_market_conditions.py `
-  tests/test_research_pullback_rsi.py tests/test_launcher_market_condition_profile.py -q
-python -m pytest tests/backtest/test_etf_trend.py -q
+  tests/test_research_pullback_rsi.py tests/test_launcher_market_condition_profile.py `
+  tests/backtest/test_etf_trend.py -q
 ```
 
 Tests cover exact search dimensions, source rules, settings recognition, schedules, caps,
