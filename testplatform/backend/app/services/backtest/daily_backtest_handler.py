@@ -283,7 +283,9 @@ _EXPERT_WARMUP_BARS = {
     "FMPSenateTraderCopy": 10,
     "DeterministicScorer": 260,   # 12-1 momentum (252) + SMA200 trend inputs
     "ETFTrend": 274,              # 252-bar momentum + previous-month anchor buffer
-    "PullbackReversion": 274,     # SMA200 (+ the 128-bar calculator window) with holiday slack
+    # = PullbackReversion.BACKTEST_WARMUP_BARS (must agree, pinned by its tests): covers the
+    # expert's 427-day fetch window (420-day lookback + 7-day listing slack) at 1.45 days/bar.
+    "PullbackReversion": 295,
     # 620 = the class's own BACKTEST_WARMUP_BARS. Its features are computed over PAST earnings
     # events (min_hist_events of them), and events are quarterly: 4+ quarters of history plus
     # the earnings-day move measured off OHLCV needs ~2.5 years of bars. The table and the

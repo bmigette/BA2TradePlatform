@@ -16,25 +16,26 @@ exit become BUY/SELL recommendations that the ordinary rules and RM act on.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 import json
 import math
 from numbers import Real
 from typing import Mapping, Optional
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 from ba2_common.core.db import add_instance, update_instance
 from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.market_calendar import (
+    MarketCalendarUnavailable, backtest_decision_label, decision_data_session, live_decision_label)
 from ba2_common.core.market_conditions import (
     STATUS_INVALID_PRICES, STATUS_VALID, STRUCTURE_STATE_CODES, STRUCTURE_STATE_NONE_CODE, WINDOW,
     compute_chart_structure, compute_market_conditions)
 from ba2_common.core.models import ExpertRecommendation
 from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon)
-from ba2_common.logger import get_expert_logger
+from ba2_common.logger import get_expert_logger, logger
 
 DIRECTIONS = ("long", "short")
 TREND_GATES = ("sma200", "slope_ohlcv_v1", "sma200_and_spy")
@@ -244,25 +245,63 @@ def pullback_signal(bars: pd.DataFrame, settings: Mapping,
 # ---------------------------------------------------------------------------
 # Expert
 # ---------------------------------------------------------------------------
-#: Calendar days of daily bars each decision reads: about 289 sessions, enough for SMA200 and
-#: the 128-bar calculator window with holiday slack. Both paths trim the frame to this window,
-#: so live (which fetches exactly this) and the backtest (whose memoised provider can return
-#: more) decide on the same bars.
+#: Calendar days of daily bars each decision reads, ending on its data session: about 289
+#: sessions, enough for SMA200 and the 128-bar calculator window with holiday slack. Both paths
+#: trim the frame to this window, so a provider serving more history decides identically.
 LOOKBACK_DAYS = 420
-#: A completed history whose last session is older than this is stale (ETFTrend's bound).
+#: A symbol whose last completed session is more than this many days before the data session
+#: is stale (ETFTrend's bound).
 MAX_STALE_DAYS = 7
 #: The market benchmark read by ``trend_gate == "sma200_and_spy"``, and the reference that
-#: tells a recent listing from missing data.
+#: tells a recent listing or a stopped symbol from missing data.
 SPY_SYMBOL = "SPY"
 #: A history whose first row lies within this many days of the lookback window's start covers
 #: the window (weekends, holidays): it was not listed inside it.
 LISTING_SLACK_DAYS = MAX_STALE_DAYS
+#: Days fetched before the data session: the window plus the listing slack, so an old
+#: symbol's first row lands before ``window start + slack`` and never looks newly listed.
+FETCH_DAYS = LOOKBACK_DAYS + LISTING_SLACK_DAYS
+#: How far back the rare "no rows in the fetch window" case looks for an older history, to
+#: tell a symbol that stopped trading long ago (held by a backtest) from one never cached.
+STOPPED_PROBE_DAYS = 3650
+#: A symbol with fewer than this share of SPY's sessions in the window is logged as gappy.
+GAP_WARN_RATIO = 0.9
+#: Trading bars of backtest warmup covering ``FETCH_DAYS`` calendar days: the daily backtest
+#: handler converts bars to calendar days at 1.45 per bar (then adds 10), so a derived warmup
+#: always serves the whole fetch window from the first bar (the listing check depends on it).
+BACKTEST_WARMUP_BARS = math.ceil(FETCH_DAYS / 1.45)
+
+SKIP_INSUFFICIENT_HISTORY = "insufficient_history"
+SKIP_STOPPED_TRADING = "symbol_stopped_trading"
 
 
-def _decision_date(as_of: datetime):
-    """The New York calendar date of the decision (ETFTrend's reading of ``as_of``)."""
-    local = as_of.astimezone(ZoneInfo("America/New_York")) if as_of.tzinfo else as_of
-    return local.date()
+def _utc_now() -> datetime:
+    """The live decision instant (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+def decision_session(as_of: datetime, backtest: bool):
+    """The last completed session a decision at ``as_of`` may read: the platform's BT/live
+    parity rule (``market_calendar``: ``decision_data_session`` of the decision label).
+
+    * Live, and a backtest on an intraday clock: ``live_decision_label(as_of)`` (the New York
+      date), whose data session is the prior regular session. The decision day's own candle is
+      still forming and never enters.
+    * A backtest on the DAILY clock stamps bar D at D 00:00 UTC (``DailyBacktestEngine.run``
+      turns a date key into midnight UTC). Bar D decides with D's close and fills on the next
+      bar, i.e. it is the live decision of ``backtest_decision_label(D)``, whose data session
+      is D itself. No intraday stamp is at 00:00 UTC (20:00/19:00 New York).
+
+    A naive ``as_of`` is refused, as ``live_decision_label`` refuses it: its timezone would be
+    a guess that moves the session boundary."""
+    if not isinstance(as_of, datetime):
+        raise ValueError(f"as_of must be a timezone-aware datetime, got {type(as_of).__name__}")
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError(f"as_of must be timezone-aware, got naive {as_of!r}")
+    utc = as_of.astimezone(timezone.utc)
+    if backtest and utc.time() == time(0):
+        return decision_data_session(backtest_decision_label(utc.date()))
+    return decision_data_session(live_decision_label(as_of))
 
 
 def _session_stamps(frame, name: str) -> np.ndarray:
@@ -281,50 +320,49 @@ def _session_stamps(frame, name: str) -> np.ndarray:
     return stamps
 
 
-def completed_bars(frame, as_of: datetime, name: str) -> pd.DataFrame:
-    """Provider frame (``Date`` column on a RangeIndex) -> the completed daily sessions of the
-    last ``LOOKBACK_DAYS`` before ``as_of``, on an ascending UTC DatetimeIndex.
-
-    The session exclusion is ETFTrend's: daily candles are date-labelled, so even at 09:30 the
-    decision day's own candle (still forming live, already final in a backtest cache) must never
-    enter the decision; only earlier dates (New York calendar date of ``as_of``) are kept.
-    Missing, empty or stale histories raise ``ValueError``."""
+def _validate_frame(frame, name: str) -> None:
     if frame is None or len(frame) == 0:
         raise ValueError(f"Missing OHLCV history: {name}")
     missing = [k for k in ("Date",) + _OHLCV if k not in frame.columns]
     if missing:
         raise ValueError(f"OHLCV history for {name} is missing columns {missing}")
-    today = _decision_date(as_of)
+
+
+def completed_bars(frame, session, name: str) -> pd.DataFrame:
+    """Provider frame (``Date`` column on a RangeIndex) -> its sessions from
+    ``session - LOOKBACK_DAYS`` through ``session`` (the decision's data session, see
+    ``decision_session``), on an ascending UTC DatetimeIndex. May be empty; staleness and
+    length are the caller's verdicts. A candle is placed on its UTC calendar date."""
+    _validate_frame(frame, name)
     stamps = _session_stamps(frame, name)
-    # For UTC instants, ``ts.date() < today`` is exactly ``ts < today 00:00 UTC``.
-    end = np.datetime64(today, "D")
-    keep = (stamps < end) & (stamps >= end - np.timedelta64(LOOKBACK_DAYS, "D"))
-    if not keep.any():
-        raise ValueError(f"No completed sessions for {name} before {today}")
+    # For UTC instants, ``ts.date() <= session`` is exactly ``ts < (session + 1) 00:00 UTC``.
+    end = np.datetime64(session, "D") + np.timedelta64(1, "D")
+    keep = (stamps < end) & (stamps >= end - np.timedelta64(LOOKBACK_DAYS + 1, "D"))
     index = pd.DatetimeIndex(stamps[keep], name="Date").tz_localize("UTC")
     bars = pd.DataFrame({k: frame[k].to_numpy()[keep] for k in _OHLCV}, index=index)
     if not index.is_monotonic_increasing:
         bars = bars.sort_index(kind="stable")
-    last = bars.index[-1].date()
-    if (today - last).days > MAX_STALE_DAYS:
-        raise ValueError(f"Stale OHLCV history for {name}: last completed session {last}, "
-                         f"analysis date {today}")
     return bars
 
 
-def _check_recent_listing(frame, bars, as_of: datetime, name: str, reference_bars) -> None:
-    """Return quietly only when a short completed history (under ``MIN_BARS``) is a genuine
-    recent listing, which the expert skips; raise ``ValueError`` (the run aborts) otherwise.
+def _span(bars) -> str:
+    if len(bars) == 0:
+        return "no sessions"
+    return f"{bars.index[0].date()}..{bars.index[-1].date()} ({len(bars)} sessions)"
 
-    A recent listing is a valid history whose EARLIEST row, before any cut, lies inside the
-    lookback window: a history reaching back to the window start but still short has a gap.
-    "Inside" is only meaningful if the provider serves the whole window, which a backtest does
-    not when its warmup is shorter than ``LOOKBACK_DAYS``: every symbol would then look newly
-    listed and the run would skip silently. ``reference_bars()`` returns SPY's completed bars
-    (fetched only here, off the hot path); SPY always has history, so a short SPY, or one that
-    also starts inside the window, is a data problem and aborts."""
-    today = _decision_date(as_of)
-    window_start = today - timedelta(days=LOOKBACK_DAYS)
+
+def _check_recent_listing(frame, bars, session, name: str, spy_bars) -> None:
+    """Return quietly only when a short completed history (under ``MIN_BARS``, possibly empty on
+    the listing day itself) is a genuine recent listing, which the expert skips; raise
+    ``ValueError`` (the run aborts) otherwise.
+
+    A recent listing is a valid history whose EARLIEST row lies inside the lookback window: a
+    history reaching back to the window start but still short has a gap. "Inside" is only
+    meaningful if the provider serves the whole window, which a backtest does not when its
+    warmup is shorter than the fetch window: every symbol would then look newly listed and the
+    run would skip them all. ``spy_bars()`` returns SPY's completed bars; SPY always has
+    history, so a short SPY, or one that also starts inside the window, aborts."""
+    window_start = session - timedelta(days=LOOKBACK_DAYS)
     covered_by = window_start + timedelta(days=LISTING_SLACK_DAYS)
     earliest = pd.Timestamp(_session_stamps(frame, name).min()).date()
     if earliest <= covered_by:
@@ -338,7 +376,7 @@ def _check_recent_listing(frame, bars, as_of: datetime, name: str, reference_bar
         raise ValueError(f"Non-numeric close in {name}: {exc}") from exc
     if not (np.isfinite(close) & (close > 0)).all() or not bars.index.is_unique:
         raise ValueError(f"Corrupt OHLCV history for {name}: invalid close or duplicate session")
-    reference = reference_bars()
+    reference = spy_bars()
     if len(reference) < MIN_BARS:
         raise ValueError(f"Insufficient history in {SPY_SYMBOL}: {len(reference)} completed bars, "
                          f"need {MIN_BARS}; the benchmark always has history, so this is a data "
@@ -352,6 +390,21 @@ def _check_recent_listing(frame, bars, as_of: datetime, name: str, reference_bar
             "told apart from missing data")
 
 
+def _check_stopped_trading(name: str, last, session, spy_bars) -> None:
+    """Return quietly only when ``name``'s stale history means it stopped trading (delisted,
+    or halted for over ``MAX_STALE_DAYS``): SPY, read on the same decision, is current. A
+    backtest keeps a delisted position and its manage pass analyses it every bar; aborting
+    the run there would make any long backtest fail on the first delisting. When SPY is stale
+    too, the provider is missing data and the run aborts."""
+    reference = spy_bars()
+    spy_last = reference.index[-1].date() if len(reference) else None
+    if spy_last != session:
+        raise ValueError(
+            f"Stale OHLCV history for {name}: last completed session {last}, data session "
+            f"{session}, and {SPY_SYMBOL}'s last completed session is {spy_last}: missing data, "
+            "not a symbol that stopped trading")
+
+
 class PullbackReversion(MarketExpertInterface):
     """Backtest-registered (research) expert over ``pullback_signal``.
 
@@ -359,7 +412,18 @@ class PullbackReversion(MarketExpertInterface):
     entry -> BUY (long) / SELL (short), confidence 50..100 by how far RSI is past the entry
     threshold; exit -> SELL (long) / BUY (short), confidence 100; none -> HOLD.
     A long expert's SELL is an EXIT signal: it only acts through a ruleset that closes an open
-    position, never by itself opening a short."""
+    position, never by itself opening a short.
+
+    Skips (DeterministicScorer's fields, logged at WARNING since the backtest drops them):
+    ``insufficient_history`` for a recent listing, ``symbol_stopped_trading`` for a stale symbol
+    while SPY is current. Every other data problem aborts."""
+
+    BACKTEST_WARMUP_BARS = BACKTEST_WARMUP_BARS
+
+    #: ``((data session, provider id), SPY completed bars)``: SPY is the same for every symbol
+    #: of a bar, so it is fetched and converted once per session (class default for instances
+    #: built without ``__init__``).
+    _spy_memo = None
 
     @classmethod
     def description(cls):
@@ -400,30 +464,82 @@ class PullbackReversion(MarketExpertInterface):
         self._load_expert_instance(id)
         self.logger = get_expert_logger("PullbackReversion", id)
 
-    def _analyze(self, symbol, providers, settings, as_of):
+    @staticmethod
+    def _fetch(provider, name, session, as_of, days=FETCH_DAYS):
+        start = datetime.combine(session - timedelta(days=days), time(0), tzinfo=timezone.utc)
+        return provider.get_ohlcv_data(name, start_date=start, end_date=as_of,
+                                       lookback_days=days, interval="1d")
+
+    def _spy_bars(self, provider, session, as_of):
+        key = (session, id(provider))
+        memo = self._spy_memo
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        bars = completed_bars(self._fetch(provider, SPY_SYMBOL, session, as_of), session,
+                              SPY_SYMBOL)
+        self._spy_memo = (key, bars)  # replaces the previous session's entry
+        return bars
+
+    def _skip(self, symbol, reason, message, current_price, first, last, spy):
+        logger.warning(
+            f"PullbackReversion skip {symbol}: {reason}; {symbol} sessions {first}..{last}; "
+            f"{SPY_SYMBOL} sessions {_span(spy)}. {message}")
+        return Recommendation(
+            signal=OrderRecommendation.HOLD, confidence=0.0, current_price=current_price,
+            details=message, expected_profit_percent=0.0, skip=True, skip_reason=reason)
+
+    def _analyze(self, symbol, providers, settings, as_of, backtest):
+        session = decision_session(as_of, backtest)
         provider = providers.ohlcv()
 
-        def fetch(name):
-            return provider.get_ohlcv_data(name, end_date=as_of, lookback_days=LOOKBACK_DAYS,
-                                           interval="1d")
+        def spy():
+            return self._spy_bars(provider, session, as_of)
 
-        def history(name):
-            return completed_bars(fetch(name), as_of, name)
+        frame = self._fetch(provider, symbol, session, as_of)
+        if frame is not None and len(frame) == 0:
+            # Nothing in the fetch window: a symbol that stopped trading long ago (a backtest
+            # still holds it) has an older history; one never cached has none and aborts.
+            older = self._fetch(provider, symbol, session, as_of, days=STOPPED_PROBE_DAYS)
+            if older is not None and len(older):
+                frame = older
+        bars = completed_bars(frame, session, symbol)
+        stamps = _session_stamps(frame, symbol)
+        raw_first = pd.Timestamp(stamps.min()).date()
+        raw_last = pd.Timestamp(stamps.max()).date()
+        last = bars.index[-1].date() if len(bars) else None
+        window_start = session - timedelta(days=LOOKBACK_DAYS)
+        close = float(bars["Close"].iloc[-1]) if len(bars) else None
 
-        frame = fetch(symbol)
-        bars = completed_bars(frame, as_of, symbol)
-        if len(bars) < MIN_BARS:
-            _check_recent_listing(frame, bars, as_of, symbol, lambda: history(SPY_SYMBOL))
-            # The recent listing is skipped exactly as DeterministicScorer skips a thin history.
-            return Recommendation(
-                signal=OrderRecommendation.HOLD, confidence=0.0,
-                current_price=float(bars["Close"].iloc[-1]),
-                details=f"Insufficient OHLCV history ({len(bars)} < {MIN_BARS}): {symbol} listed "
-                        f"on {bars.index[0].date()}, inside the {LOOKBACK_DAYS}-day lookback",
-                expected_profit_percent=0.0, skip=True,
-                skip_reason="insufficient_history")
-        spy = history(SPY_SYMBOL) if settings["trend_gate"] == "sma200_and_spy" else None
-        result = pullback_signal(bars, settings, spy)  # validates every setting it reads
+        stopped = ((last is not None and (session - last).days > MAX_STALE_DAYS)
+                   or (last is None and raw_last < window_start))
+        if stopped:
+            last_seen = last or raw_last
+            _check_stopped_trading(symbol, last_seen, session, spy)
+            if close is None:
+                close = float(frame["Close"].to_numpy(dtype=float)[np.argmax(stamps)])
+            return self._skip(
+                symbol, SKIP_STOPPED_TRADING,
+                f"{symbol} stopped trading: last completed session {last_seen}, data session "
+                f"{session}, while {SPY_SYMBOL} is current",
+                close, raw_first, last_seen, spy())
+        if last is None and raw_first <= session:
+            raise ValueError(f"No completed sessions for {symbol} in the {LOOKBACK_DAYS}-day window "
+                             f"ending {session}, although it has rows from {raw_first}")
+        if len(bars) < MIN_BARS:  # possibly empty: the listing day's own candle only
+            _check_recent_listing(frame, bars, session, symbol, spy)
+            return self._skip(
+                symbol, SKIP_INSUFFICIENT_HISTORY,
+                f"Insufficient OHLCV history ({len(bars)} < {MIN_BARS}): {symbol} listed on "
+                f"{raw_first}, inside the {LOOKBACK_DAYS}-day lookback ending {session}",
+                0.0 if close is None else close, raw_first, last, spy())
+
+        spy_bars = spy() if settings["trend_gate"] == "sma200_and_spy" else None
+        if spy_bars is not None and len(bars) < GAP_WARN_RATIO * len(spy_bars):
+            logger.warning(
+                f"PullbackReversion: {symbol} has {len(bars)} sessions in the {LOOKBACK_DAYS}-day "
+                f"window ending {session}, under {GAP_WARN_RATIO:.0%} of {SPY_SYMBOL}'s "
+                f"{len(spy_bars)} (gaps or halts); evaluated anyway")
+        result = pullback_signal(bars, settings, spy_bars)  # validates every setting it reads
         long = settings["direction"] == "long"
         action = result["action"]
         if action == "entry":
@@ -439,25 +555,25 @@ class PullbackReversion(MarketExpertInterface):
             signal, confidence = OrderRecommendation.HOLD, 50.0
         else:
             raise ValueError(f"Unknown pullback_signal action {action!r}")
-        session = bars.index[-1].date().isoformat()
         return Recommendation(
-            signal=signal, confidence=confidence, current_price=float(bars["Close"].iloc[-1]),
+            signal=signal, confidence=confidence, current_price=close,
             expected_profit_percent=0.0,  # no price target or return forecast
-            details=f"{symbol} {settings['direction']} pullback on session {session}: "
+            details=f"{symbol} {settings['direction']} pullback on session {last}: "
                     f"{result['reason']}. Confidence denotes a satisfied rule, not a "
                     "probability of profit.",
-            raw_outputs={**result, "session": session})
+            raw_outputs={**result, "session": last.isoformat()})
 
     def analyze_as_of(self, as_of, context):
         # The daily engine's entry pass sets _gather_symbol; its management pass
         # and the newer context callers also carry extra['symbol'].
         symbol = context.extra["symbol"] if "symbol" in context.extra else self._gather_symbol
         try:
-            return self._analyze(symbol, context.providers, context.settings, as_of)
-        except (ValueError, KeyError) as exc:
+            return self._analyze(symbol, context.providers, context.settings, as_of, backtest=True)
+        except (ValueError, KeyError, MarketCalendarUnavailable) as exc:
             # The engine logs and skips an ordinary ValueError per symbol; missing, short or
             # corrupt history must instead abort the run (as ETFTrend's basket does), never
             # turn into a plausible-looking backtest that silently never evaluated the symbol.
+            # An unavailable session calendar is the same: no decision session, no decision.
             from ba2_providers.fmp_common import FMPHistoryCacheMiss
             raise FMPHistoryCacheMiss(f"PullbackReversion cannot evaluate {symbol}: {exc}") from exc
 
@@ -466,7 +582,8 @@ class PullbackReversion(MarketExpertInterface):
             market_analysis.status = MarketAnalysisStatus.RUNNING
             update_instance(market_analysis)
             rec = self._analyze(symbol, self._live_providers(),
-                                self._resolve_settings(self._SETTING_KEYS), datetime.now(timezone.utc))
+                                self._resolve_settings(self._SETTING_KEYS),
+                                _utc_now(), backtest=False)
             if rec.skip:  # DeterministicScorer's live skip: no recommendation row
                 market_analysis.state = {"skipped": True, "skip_reason": rec.skip_reason,
                                          "skip_message": rec.details}
