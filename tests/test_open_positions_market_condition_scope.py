@@ -929,3 +929,110 @@ def test_run_in_decision_context_carries_the_exit_pass_to_a_pool_thread(dispatch
     assert exit_state is not None and exit_state.expert_instance_id == 1
     assert got["reason"] == live.no_scope_open_reason(1, "ValueError: bad manifest",
                                                       live.UNRESOLVED_SCOPE_FAILED)
+
+
+# ======================================= leaf evaluation errors: unknown on EXIT, raise on ENTRY
+@pytest.fixture(autouse=True)
+def _fresh_leaf_error_reports(monkeypatch):
+    monkeypatch.setattr(TC, "_exit_pass_leaf_errors_reported", set())
+
+
+class _RowWithoutFields:
+    """A feature row that carries none of the requested fields (a reader/profile mismatch)."""
+
+    def by_field(self):
+        return {}
+
+
+def _break_reader(monkeypatch, mode):
+    """Break the OPEN decision state's reader: ``raise`` from observe, or return a row missing
+    every field (the ``LookupError`` wiring defect)."""
+    state = live.current_decision()
+    assert state is not None
+
+    def observe(symbol, session):
+        if mode == "raise":
+            raise RuntimeError("reader exploded")
+        return _RowWithoutFields()
+
+    monkeypatch.setattr(state.reader, "observe", observe)
+
+
+def _eval_leaf(event, rec, symbol=SYMBOL):
+    leaf = TC.create_condition(event, object(), symbol, rec, operator_str=">", value=-1e9)
+    passed = leaf.evaluate()
+    return {"passed": passed, "status": leaf.last_status, "reason": leaf.last_reason}
+
+
+@pytest.mark.parametrize("mode,exc_name,needle", [
+    ("raise", "RuntimeError", "reader exploded"),
+    ("missing_field", "LookupError", "carries no 'underlying_adx_14'"),
+], ids=["observe-raises", "missing-field"])
+def test_on_the_exit_pass_a_leaf_evaluation_error_reads_unknown_loudly(
+        world, dispatcher, instances, clock, monkeypatch, mode, exc_name, needle):
+    """The scope opened fine; the leaf's own evaluation hits a wiring defect. On the EXIT pass it
+    reads unknown with the cause, the pass carries on, and it is LOUD: ERROR with the traceback
+    once per (expert, field, exception type), WARNING afterwards; a new field is a new ERROR."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    spy = _LogSpy()
+    monkeypatch.setattr(TC, "logger", spy)
+    instances[world["expert_id"]] = "ohlcv-v1"
+
+    def _leaves(account, symbol, rec):
+        _break_reader(monkeypatch, mode)
+        return [_eval_leaf(ExpertEventType.N_UNDERLYING_ADX, rec),
+                _eval_leaf(ExpertEventType.N_UNDERLYING_ADX, rec),
+                _eval_leaf(ExpertEventType.N_UNDERLYING_TREND_SLOPE, rec)]
+
+    world["recorder"].leaf = _leaves
+    result = _run(world["expert_id"])
+
+    (call,) = world["recorder"].calls
+    adx1, adx2, slope = call["leaf"]
+    for got in (adx1, adx2, slope):
+        assert got["passed"] is False and got["status"] == STATUS_NO_CONTEXT
+        assert exc_name in got["reason"]
+        assert f"open-positions pass of expert instance {world['expert_id']}" in got["reason"]
+    assert needle in adx1["reason"]
+    loud = [(lvl, exc) for lvl, msg, exc in spy.records if "could not be evaluated" in msg]
+    # ADX: ERROR+traceback, then WARNING without; the slope field is a new key: ERROR again.
+    assert loud == [("ERROR", True), ("WARNING", False), ("ERROR", True)]
+    assert result == [{"success": True, "symbol": SYMBOL, "submit_to_broker": True}]
+
+
+@pytest.mark.parametrize("mode,exc_type", [("raise", RuntimeError),
+                                           ("missing_field", LookupError)],
+                         ids=["observe-raises", "missing-field"])
+def test_on_the_entry_pass_a_leaf_evaluation_error_still_raises(dispatcher, instances, clock,
+                                                               monkeypatch, mode, exc_type):
+    """ENTRY PASS UNCHANGED, through the real TradeManager entry method: both defects raise out
+    of the leaf and out of the pass."""
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    spy = _LogSpy()
+    monkeypatch.setattr(TC, "logger", spy)
+    instances[4] = "ohlcv-v1"
+
+    def _inner(self, expert_id, lookback_days=1):
+        assert live.current_exit_pass() is None
+        _break_reader(monkeypatch, mode)
+        _eval_leaf(ExpertEventType.N_UNDERLYING_ADX, _rec_for(4))
+        return []
+
+    monkeypatch.setattr(TradeManager, "_process_expert_recommendations_after_analysis", _inner)
+    with pytest.raises(exc_type):
+        TradeManager().process_expert_recommendations_after_analysis(4)
+    assert not [r for r in spy.records if "could not be evaluated" in r[1]]
+    assert TC._exit_pass_leaf_errors_reported == set()
+
+
+def test_a_leaf_evaluation_error_in_a_bare_scope_still_raises(dispatcher, instances, clock,
+                                                             monkeypatch):
+    """Any caller that is not an exit pass (a bare scope: the backtest-style direct use, the
+    ruleset test page) keeps the raise."""
+    instances[4] = "ohlcv-v1"
+    with live.market_condition_decision_scope(expert_instance_id=4):
+        _break_reader(monkeypatch, "raise")
+        with pytest.raises(RuntimeError, match="reader exploded"):
+            _eval_leaf(ExpertEventType.N_UNDERLYING_ADX, _rec_for(4))
