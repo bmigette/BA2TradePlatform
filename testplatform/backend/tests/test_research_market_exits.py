@@ -4,8 +4,8 @@ Pinned here:
 
 * without the flags both default manifests are byte-identical (default + pullback_rsi);
 * with ``--market-exit`` every job's exit rules end with the off-by-default templates, built for
-  the job's own single direction; a job that could hold both sides, or whose floor stop shadows
-  every later exit rule, is refused;
+  the job's own single direction, or immediately before a terminal catch-all stop rule (which
+  would shadow them); a job that could hold both sides is refused;
 * ids are unique across all entry and exit rule nodes (colliding ids share genes);
 * the REAL decoder: an all-off genome gives exactly the job's original exit rules, and an all-on
   genome exports one trigger per template leaf;
@@ -38,13 +38,13 @@ PULLBACK_RSI_FINGERPRINT = "b9524f745111e7ecfd4f17c7cbbc8c952df545879612e1359456
 PINS = {"ohlcv-v1": "a" * 64, "ta-structure-v1": "b" * 64}
 BOTH = "ohlcv-v1,ta-structure-v1"
 KINDS = ("exit", "stop", "tp")
-#: Families whose exit list ends with an always-matching stop-processing floor stop.
-SHADOWED = ("mid_insider", "small_earnings", "small_rating", "mid_earnings")
-SUPPORTED = tuple(f for f in P.ALL_FAMILIES if f not in SHADOWED)
+#: Families whose exit list ends with a terminal catch-all (the has_position floor stop).
+CATCH_ALL = {"mid_insider": "s1_sl_hold", "small_earnings": "exit_stoploss",
+             "small_rating": "s1_sl_hold", "mid_earnings": "s1_sl_hold"}
 SETTING = "allow_ruleset_sl_loosen"
 
 
-def manifest(profile=BOTH, families=SUPPORTED, **kwargs):
+def manifest(profile=BOTH, families=P.ALL_FAMILIES, **kwargs):
     kwargs.setdefault("search", "genetic")
     if profile != "none":
         kwargs.update(market_condition_profile=profile,
@@ -83,8 +83,8 @@ def test_each_flag_changes_the_job_identity_and_name():
     exits = by_key(manifest(market_exit=KINDS))
     loose = by_key(manifest(allow_sl_loosen=True))
     both = by_key(manifest(market_exit=KINDS, allow_sl_loosen=True))
-    ungated_loose = by_key(P.build_manifest(families=SUPPORTED, allow_sl_loosen=True))
-    ungated = by_key(P.build_manifest(families=SUPPORTED))
+    ungated_loose = by_key(P.build_manifest(families=P.ALL_FAMILIES, allow_sl_loosen=True))
+    ungated = by_key(P.build_manifest(families=P.ALL_FAMILIES))
     for key, job in plain.items():
         prints = {m[key]["fingerprint"] for m in (plain, exits, loose, both)}
         assert len(prints) == 4, key
@@ -110,7 +110,11 @@ def test_kind_order_is_canonical():
 
 
 # --------------------------------------------------------------------------- placement and templates
-def test_each_job_ends_with_the_templates_for_its_direction():
+def _catch_all_index(rules):
+    return next((i for i, r in enumerate(rules) if MC.terminal_catch_all(r)), len(rules))
+
+
+def test_each_job_gets_the_templates_for_its_direction_at_the_right_place():
     plain = by_key(manifest())
     for key, job in by_key(manifest(market_exit=KINDS)).items():
         family = key[0]
@@ -118,7 +122,10 @@ def test_each_job_ends_with_the_templates_for_its_direction():
         direction = "short" if key[1].startswith("short") else "long"
         templates = market_exit_rules(f"research-{family}-exit", ("ohlcv-v1", "ta-structure-v1"), direction)
         original = plain[key]["strategy"]["exit_rules"]
-        assert job["strategy"]["exit_rules"] == original + templates, key
+        at = _catch_all_index(original)
+        assert (at < len(original)) == (family in CATCH_ALL), key
+        assert bt["market_exit"]["insert_index"] == at
+        assert job["strategy"]["exit_rules"] == original[:at] + templates + original[at:], key
         assert job["strategy"]["entry_rules"] == plain[key]["strategy"]["entry_rules"]
         assert [r["id"].rsplit("-mkt-", 1)[1] for r in templates] == [
             "exit-structure", "exit-slope", "stop", "tp"]
@@ -199,10 +206,52 @@ def test_unknown_or_repeated_kinds_are_refused(kinds):
         manifest(market_exit=kinds)
 
 
-@pytest.mark.parametrize("family", SHADOWED)
-def test_a_floor_stop_that_shadows_every_later_rule_is_refused(family):
-    with pytest.raises(ValueError, match="match every held position and stop processing"):
-        manifest(families=(family,), market_exit=("exit",))
+@pytest.mark.parametrize("family", sorted(CATCH_ALL))
+def test_templates_sit_immediately_before_the_terminal_catch_all(family):
+    jobs = manifest(families=(family,), market_exit=KINDS)["jobs"]
+    assert jobs
+    for job in jobs:
+        exits = job["strategy"]["exit_rules"]
+        record = job["optimization_config"]["backtest"]["market_exit"]
+        at, n = record["insert_index"], len(record["rules"])
+        assert [r["id"] for r in exits[at:at + n]] == record["rules"]
+        # The catch-all follows directly, still last, still stopping processing.
+        assert exits[at + n]["id"] == CATCH_ALL[family] and exits[at + n] is exits[-1]
+        assert MC.terminal_catch_all(exits[at + n])
+        assert not any(MC.terminal_catch_all(r) for r in exits[:at + n])
+
+
+_HELD = {"id": "h", "field": "has_position", "op": "is_true"}
+
+
+@pytest.mark.parametrize("rule,expected", [
+    ({"conditions": {"type": "AND", "conditions": [_HELD]}}, True),
+    ({"conditions": {"type": "AND", "conditions": [_HELD]}, "continue_processing": False}, True),
+    ({"conditions": {"type": "AND", "conditions": []}}, True),
+    ({"conditions": {}}, True),
+    ({}, True),
+    ({"conditions": {"type": "OR", "conditions": [_HELD, {"type": "AND", "conditions": [_HELD]}]}}, True),
+    ({"conditions": {"type": "AND", "conditions": [_HELD]}, "continue_processing": True}, False),
+    ({"conditions": {"type": "AND", "conditions": [
+        _HELD, {"id": "d", "field": "days_opened", "op": ">", "value": 5}]}}, False),
+    ({"conditions": {"type": "AND", "conditions": [{**_HELD, "op": "is_false"}]}}, False),
+    ({"conditions": {"type": "NOT", "conditions": [_HELD]}}, False),
+    ({"conditions": {"type": "AND", "conditions": [{"id": "b", "field": "bearish", "op": "is_true"}]}}, False),
+])
+def test_terminal_catch_all_is_exact(rule, expected):
+    assert MC.terminal_catch_all({"id": "r", "actions": [{"action_type": "adjust_stop_loss"}], **rule}) is expected
+
+
+def test_a_gated_stop_rule_is_not_a_catch_all_and_templates_go_after_it():
+    job, bt = _job([["buy"]])
+    gated = {"id": "gated_stop", "conditions": {"type": "AND", "conditions": [
+        _HELD, {"id": "g", "field": "days_opened", "op": ">", "value": 3}]},
+        "actions": [{"action_type": "adjust_stop_loss", "action_value": -5.0}], "continue_processing": False}
+    job["strategy"]["exit_rules"].append(gated)
+    MC.attach_exits(job, bt, ("ta-structure-v1",), ("exit",))
+    assert [r["id"] for r in job["strategy"]["exit_rules"]] == [
+        "research_timeout", "gated_stop", "research-mid_ds-exit-mkt-exit-structure"]
+    assert bt["market_exit"]["insert_index"] == 2
 
 
 def _job(actions, family="mid_ds", direction=None):
@@ -260,7 +309,7 @@ def test_colliding_ids_are_refused():
 
 
 def test_every_generated_job_has_unique_ids():
-    for job in manifest(market_exit=KINDS, families=SUPPORTED)["jobs"]:
+    for job in manifest(market_exit=KINDS)["jobs"]:
         MC.assert_unique_ids(job["strategy"], job["name"])
 
 
@@ -290,7 +339,8 @@ def test_all_off_genome_decodes_to_the_original_exit_rules():
         assert decode_params(strategy(job), {})["exit_rules"] == plain[key]["strategy"]["exit_rules"]
 
 
-def test_all_on_genome_exports_one_trigger_per_template_leaf():
+def test_all_on_genome_exports_one_trigger_per_template_leaf_in_the_intended_order():
+    plain = by_key(manifest())
     for key, job in by_key(manifest(market_exit=KINDS)).items():
         rule_ids = job["optimization_config"]["backtest"]["market_exit"]["rules"]
         exits = decode_params(strategy(job), _genome(job, 1))["exit_rules"]
@@ -298,6 +348,20 @@ def test_all_on_genome_exports_one_trigger_per_template_leaf():
         assert [r["id"] for r in market] == rule_ids, key
         assert all("enabled" not in r for r in market)
         (ruleset,) = trade_rules_to_live_export(exit_rules=exits)["rulesets"]
+        # Live order is the intended one: original rules before the insert point, the market
+        # rules, then the rest (a catch-all stays last).
+        original = [r["id"] for r in plain[key]["strategy"]["exit_rules"]]
+        at = job["optimization_config"]["backtest"]["market_exit"]["insert_index"]
+        assert [r["id"] for r in exits] == original[:at] + rule_ids + original[at:], key
+        # One live rule per decoded rule, in that order (unnamed rules get the positional name).
+        assert [r["name"] for r in ruleset["rules"]] == [
+            r.get("name") or f"backtest-strategy-open_positions-{i}" for i, r in enumerate(exits)], key
+        assert [r["order_index"] for r in ruleset["rules"]] == list(range(len(exits)))
+        if key[0] in CATCH_ALL:
+            assert exits[-1]["id"] == CATCH_ALL[key[0]]
+            last = ruleset["rules"][-1]
+            assert last["continue_processing"] is False
+            assert {t["event_type"] for t in last["triggers"].values()} == {"has_position"}
         live = {r["name"]: r for r in ruleset["rules"]}
         for rule in market:
             leaves = rule["conditions"]["conditions"]
@@ -325,7 +389,7 @@ def test_interface_settings_keeps_the_setting():
 
 
 @pytest.mark.parametrize("family,variant", [("pullback_rsi", "long_sma5"), ("mid_ds", "control"),
-                                            ("etf_trend", "top1")])
+                                            ("etf_trend", "top1"), ("mid_insider", "control")])
 def test_sl_loosen_survives_the_trial_config(family, variant):
     from app.services.backtest.daily_backtest_handler import _expert_decision_settings, _run_facts
     from app.services.strategy_optimization_handler import _build_daily_trial_config
@@ -345,7 +409,8 @@ def test_sl_loosen_survives_the_trial_config(family, variant):
     cls = R.expert_class(job["expert"])
     assert _expert_decision_settings(cls, expert["settings"])[SETTING] is True
     # The decoded (all-on) templates are the trial's exit rules.
-    assert [r["id"] for r in config["exit_rules"]][-1] == bt["market_exit"]["rules"][-1]
+    at, rules = bt["market_exit"]["insert_index"], bt["market_exit"]["rules"]
+    assert [r["id"] for r in config["exit_rules"]][at:at + len(rules)] == rules
 
 
 # --------------------------------------------------------------------------- CLI

@@ -158,7 +158,8 @@ def main(argv=None):
             if "market_exit" in bt:
                 mx = bt["market_exit"]
                 print(f"    market_exit={','.join(mx['kinds'])} direction={mx['direction']} "
-                      f"rules={','.join(mx['rules'])} (off by default) added_genes={mx['gene_count']}")
+                      f"rules={','.join(mx['rules'])} at_exit_index={mx['insert_index']} (off by default) "
+                      f"added_genes={mx['gene_count']}")
         market_exit = manifest["jobs"][0]["optimization_config"]["backtest"].get("market_exit") if manifest["jobs"] else None
         print(f"Market exits: {','.join(market_exit['kinds']) if market_exit else 'none'}; "
               f"ruleset SL loosen: {'on' if args.allow_sl_loosen else 'off'}")

@@ -75,8 +75,9 @@ The driver implementation now does the following:
 5. `--export-universe PATH` writes the union of selected screen symbols and the ETF basket to a
    research subdirectory so the existing warmup tool can prepare one central cache. It does not
    open the database or start jobs.
-6. `--market-exit exit,stop,tp` (a comma list, any order) appends the shared market
-   exit/stop/TP templates **after** each job's existing exit rules. Every template rule is **off by
+6. `--market-exit exit,stop,tp` (a comma list, any order) adds the shared market
+   exit/stop/TP templates **after** each job's existing exit rules, or immediately **before** its
+   first terminal catch-all (see below). Every template rule is **off by
    default** behind a searched toggle gene: an all-off genome decodes to the job's original exit
    rules exactly, and only its thresholds and percents are searched (the leaves never switch off).
    The flag requires a profile, `--search genetic` and `--market-condition-mode search`.
@@ -89,9 +90,14 @@ The driver implementation now does the following:
      driver derives one direction per job: `pullback_rsi` from its `direction` setting (checked
      against its entry action), every other family must open only with `buy` (long). A job that
      both buys and sells, or whose direction cannot be determined, is refused.
-   - A job whose exit list has a rule that matches every held position and stops processing (the
-     `has_position` floor stops of mid_insider, small_earnings, small_rating and mid_earnings)
-     is refused: templates after it could never run.
+   - A **terminal catch-all** is an exit rule that matches every held position (its tree is empty,
+     or has only `has_position is_true` leaves in AND/OR groups) and does not continue processing:
+     the `has_position` floor stops of mid_insider, small_earnings, small_rating and mid_earnings.
+     Templates after it could never run, so they go immediately before the first one; the index is
+     recorded as `market_exit.insert_index`. This is safe: the market stop/TP adjustments continue
+     processing, so the catch-all still runs after them, and a market close pre-empts it only on a
+     bar where it closes the position. Anything else (e.g. a stop rule gated on another condition)
+     is not a catch-all, and the templates go after it.
    - Condition ids must be unique across all entry and exit rules (ids share genes).
 7. `--allow-sl-loosen` sets the expert setting `allow_ruleset_sl_loosen=True` on every job's
    experts: a ruleset stop may loosen down to the trade's recorded max-loss stop, never past it.

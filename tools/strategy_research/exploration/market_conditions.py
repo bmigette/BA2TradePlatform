@@ -150,13 +150,25 @@ def job_direction(job, backtest):
     return implied
 
 
-def _always_matching_stop(rule):
-    """True for a rule that matches every held position and stops processing (the floor
-    stops: ``has_position is_true`` only). Nothing after it can ever run."""
-    if rule.get("continue_processing"):
+def terminal_catch_all(rule):
+    """True for a TERMINAL CATCH-ALL exit rule: it matches every held position and stops
+    processing, so no rule after it ever runs (the ``has_position`` floor stops).
+
+    "Matches every held position" is exact: the tree is empty, or every leaf is
+    ``has_position is_true`` and every group is AND/OR. Anything else (another leaf, another
+    operator, a NOT group, a truthy ``continue_processing``) is not a catch-all."""
+    if rule.get("continue_processing") or rule.get("continueProcessing"):
         return False
-    leaves = [n for n in _walk(rule.get("conditions")) if "field" in n]
-    return all(n["field"] == "has_position" and n.get("op") == "is_true" for n in leaves)
+
+    def matches_all(node):
+        if not node:
+            return True  # no conditions at all
+        if "conditions" in node:
+            return (node.get("type", "AND") in ("AND", "OR")
+                    and all(matches_all(c) for c in node["conditions"]))
+        return node.get("field") == "has_position" and node.get("op") == "is_true"
+
+    return matches_all(rule.get("conditions"))
 
 
 def _walk(value):
@@ -187,11 +199,13 @@ def assert_unique_ids(strategy, where):
 
 
 def attach_exits(job, backtest, profiles, kinds, direction=None):
-    """Append the off-by-default market exit/stop/TP templates AFTER the job's exit rules.
+    """Add the off-by-default market exit/stop/TP templates to the job's exit rules.
 
-    ``direction`` defaults to :func:`job_direction`; a given one must equal it. Refuses a job
-    whose exit list has an always-matching stop-processing rule (the floor stops), because the
-    appended templates could never run there."""
+    They go AFTER the existing exit rules, except that they go immediately BEFORE the first
+    :func:`terminal_catch_all` rule, which would otherwise shadow them. That is safe: the market
+    adjustments continue processing, so the catch-all still runs after them, and a market close
+    pre-empts it only on a bar where it closes the position (a skipped stop update is then moot).
+    ``direction`` defaults to :func:`job_direction`; a given one must equal it."""
     if not kinds:
         return
     _shared_paths()
@@ -202,16 +216,12 @@ def attach_exits(job, backtest, profiles, kinds, direction=None):
     if direction is not None and direction != derived:
         raise ValueError(f"{job['family']}/{job['variant']}: direction {direction!r} but the job is {derived}")
     exits = job["strategy"]["exit_rules"]
-    blocked = [r.get("id") for r in exits if _always_matching_stop(r)]
-    if blocked:
-        raise ValueError(
-            f"{job['family']}/{job['variant']}: exit rule(s) {blocked} match every held position and "
-            f"stop processing, so market exits appended after them would never run; deselect this family")
+    at = next((i for i, r in enumerate(exits) if terminal_catch_all(r)), len(exits))
     prefix = f"research-{job['family']}-exit"
     rules = market_exit_rules(prefix, profiles, derived, kinds)
     if not rules:
         raise ValueError(f"{job['family']}: the selected profiles serve none of {list(kinds)}")
-    exits.extend(rules)
+    exits[at:at] = rules
     assert_unique_ids(job["strategy"], f"{job['family']}/{job['variant']}")
     assert_market_rule_actions(exits, f"{job['family']}/{job['variant']} exit rules")
     genes = []
@@ -221,7 +231,7 @@ def attach_exits(job, backtest, profiles, kinds, direction=None):
         genes += [f"exit:{rule['id']}:a{i}:action_value"
                   for i, a in enumerate(rule["actions"]) if a.get("action_value_optimize")]
     backtest["market_exit"] = {"kinds": list(kinds), "direction": derived,
-                               "rules": [r["id"] for r in rules], "default": "off",
+                               "rules": [r["id"] for r in rules], "default": "off", "insert_index": at,
                                "genes": sorted(genes), "gene_count": len(genes)}
 
 
