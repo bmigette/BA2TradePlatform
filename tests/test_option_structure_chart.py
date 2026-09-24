@@ -231,3 +231,19 @@ def test_the_chart_blends_into_the_popup_and_has_no_zoom_toolbar():
     assert figure.layout.plot_bgcolor == 'rgba(0,0,0,0)'
     assert figure.layout.xaxis.fixedrange and figure.layout.yaxis.fixedrange
     assert PLOTLY_CONFIG['displayModeBar'] is False
+
+
+def test_a_non_leg_order_on_the_transaction_gets_no_leg_marker():
+    """The options instance's GILD entry also carried an equity SELL_STOP (no contract, no
+    strike, no right); it was drawn as a leg marker labelled 'S 0P'."""
+    stop = _order(id=2, contract_symbol=None, strike=None, option_type=None,
+                  side=SimpleNamespace(value='SELL'), open_price=None)
+    _, strike_lines, markers = chart_inputs_from(_txn(), [_order(), stop], BARS)
+    legs = [m for m in markers if m['kind'] == 'leg']
+    assert len(legs) == 1 and legs[0]['short'] == 'L 100C'
+    assert len(strike_lines) == 1
+
+
+def test_the_hover_box_is_dark():
+    figure = build_option_structure_figure(bars=BARS, payoff=build_payoff_chart([_leg()]))
+    assert figure.layout.hoverlabel.bgcolor == '#0f172a'

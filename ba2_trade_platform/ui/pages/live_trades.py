@@ -2291,8 +2291,14 @@ class LiveTradesTab:
         stamps += [getattr(txn, 'open_date', None), getattr(txn, 'close_date', None)]
         stamps = [stamp for stamp in stamps if stamp is not None]
         if stamps:
-            start = min(stamps) - timedelta(days=20)
-            end = max(stamps) + timedelta(days=20)
+            # ~60 sessions of history before the first event: with 20 days a position opened
+            # today showed about a dozen candles, too few to read a trend. The window runs to
+            # today for an open position and a little past the exit for a closed one.
+            start = min(stamps) - timedelta(days=90)
+            if getattr(txn, 'close_date', None) is not None:
+                end = max(stamps) + timedelta(days=10)
+            else:
+                end = datetime.now(timezone.utc)
         else:
             end = datetime.now(timezone.utc)
             start = end - timedelta(days=60)

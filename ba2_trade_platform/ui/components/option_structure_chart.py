@@ -199,6 +199,11 @@ def chart_inputs_from(txn: Any, orders: Sequence[Any], bars: Any
         created = getattr(order, 'created_at', None)
         if created is None:
             continue
+        # A LEG marker is for an order on an option contract. A transaction can also carry
+        # non-leg orders (e.g. an equity stop staged on it): no contract, no strike, no right,
+        # and it was drawn as "S 0P". (A contract whose strike is unrecorded keeps its marker.)
+        if not getattr(order, 'contract_symbol', None):
+            continue
         side = getattr(order, 'side', None)
         side = getattr(side, 'value', side)
         right = getattr(order, 'option_type', None)
@@ -206,13 +211,17 @@ def chart_inputs_from(txn: Any, orders: Sequence[Any], bars: Any
         premium = _as_float(getattr(order, 'open_price', None))
         is_long = str(side).upper().endswith('BUY')
         is_call = str(right).lower().startswith('call')
+        strike = _as_float(getattr(order, 'strike', None))
+        # An unrecorded strike is "?", not "0": a $0 strike is a real (and very different) thing.
+        strike_long = '?' if strike is None else f'{strike:.2f}'
+        strike_short = '?' if strike is None else f'{strike:.0f}'
         marker = _marker(
             created.strftime('%Y-%m-%d'), 'leg',
             f"{'Long' if is_long else 'Short'} "
-            f"{str(right).capitalize()} ${_as_float(getattr(order, 'strike', None)) or 0:.2f} "
+            f"{str(right).capitalize()} ${strike_long} "
             f"order placed" + ('' if premium is None else f' @ ${premium:.2f}/share'),
             True,
-            short=f"{'L' if is_long else 'S'} {_as_float(getattr(order, 'strike', None)) or 0:.0f}"
+            short=f"{'L' if is_long else 'S'} {strike_short}"
                   f"{'C' if is_call else 'P'}",
         )
         if marker:
@@ -340,6 +349,9 @@ def build_option_structure_figure(
                    gridcolor=GRID_COLOR, linecolor=GRID_COLOR, zeroline=False),
         legend=dict(orientation='h', y=-0.12, bgcolor='rgba(0,0,0,0)'),
         hovermode='x unified',
+        # Dark hover box: the default is a white card with pale grey text.
+        hoverlabel=dict(bgcolor='#0f172a', bordercolor='#334155',
+                        font=dict(color='#e2e8f0', size=11)),
     )
     return figure
 
