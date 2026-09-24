@@ -75,6 +75,30 @@ The driver implementation now does the following:
 5. `--export-universe PATH` writes the union of selected screen symbols and the ETF basket to a
    research subdirectory so the existing warmup tool can prepare one central cache. It does not
    open the database or start jobs.
+6. `--market-exit exit,stop,tp` (a comma list, any order) appends the shared market
+   exit/stop/TP templates **after** each job's existing exit rules. Every template rule is **off by
+   default** behind a searched toggle gene: an all-off genome decodes to the job's original exit
+   rules exactly, and only its thresholds and percents are searched (the leaves never switch off).
+   The flag requires a profile, `--search genetic` and `--market-condition-mode search`.
+   - `exit`: a structure close (ta-structure-v1) and a slope close (ohlcv-v1), two independent
+     rules. With one profile only that profile's variant is emitted; the job's
+     `market_exit.rules` lists the rules actually added.
+   - `stop` needs ta-structure-v1 and `tp` needs ohlcv-v1. A kind that none of the selected
+     profiles serves is refused.
+   - **Single direction only.** The templates run on every open position of the expert, so the
+     driver derives one direction per job: `pullback_rsi` from its `direction` setting (checked
+     against its entry action), every other family must open only with `buy` (long). A job that
+     both buys and sells, or whose direction cannot be determined, is refused.
+   - A job whose exit list has a rule that matches every held position and stops processing (the
+     `has_position` floor stops of mid_insider, small_earnings, small_rating and mid_earnings)
+     is refused: templates after it could never run.
+   - Condition ids must be unique across all entry and exit rules (ids share genes).
+7. `--allow-sl-loosen` sets the expert setting `allow_ruleset_sl_loosen=True` on every job's
+   experts: a ruleset stop may loosen down to the trade's recorded max-loss stop, never past it.
+   It is independent of `--market-exit` and of the profiles; off, stops only tighten.
+
+Both flags enter a job's fingerprint, name (`-mx_<kinds>`, `-slloosen`) and labels only when set,
+so the default manifests are byte-identical. The launch preview prints both.
 
 The live resolver now selects the subset of a host manifest needed by each expert, so different
 profile sets can coexist on one host. Keep the mixed-profile resolver checks in the deployment

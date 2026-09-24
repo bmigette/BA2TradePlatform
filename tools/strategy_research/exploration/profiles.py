@@ -325,8 +325,13 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                    population=24, generations=4, parallel=1, seed=42,
                    workers=(), save_top=5, store=None, spread_bps=None, etf_symbols=None,
                    market_condition_profile="none", market_condition_manifest=None,
-                   market_condition_mode="search"):
-    """Build a portable manifest. No data access; --preflight resolves the actual universe."""
+                   market_condition_mode="search", market_exit=(), allow_sl_loosen=False):
+    """Build a portable manifest. No data access; --preflight resolves the actual universe.
+
+    ``market_exit`` (kinds from exit/stop/tp) appends the off-by-default market exit templates to
+    every job's exit rules; ``allow_sl_loosen`` sets the expert setting
+    ``allow_ruleset_sl_loosen``. Both enter the job identity only when set, so the default
+    manifests are byte-identical."""
     if not families or len(set(families)) != len(families) or not set(families) <= set(ALL_FAMILIES):
         raise ValueError("Select distinct, known strategy families")
     if equity <= 0 or (equity_cap is not None and equity_cap <= 0):
@@ -337,10 +342,12 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
         raise ValueError("Invalid search budget")
     if search == "grid" and workers:
         raise ValueError("The existing exhaustive-grid handler is local/serial; use --search genetic for remote workers")
-    from tools.strategy_research.exploration.market_conditions import selection, attach
+    from tools.strategy_research.exploration.market_conditions import (
+        selection, attach, attach_exits, exit_selection)
     profiles, pins = selection(market_condition_profile, market_condition_manifest, market_condition_mode)
     if profiles and market_condition_mode == "search" and search != "genetic":
         raise ValueError("Market-condition gene search requires --search genetic; exhaustive grids are too large")
+    market_exit = exit_selection(tuple(market_exit), profiles, market_condition_mode, search)
     if parallel == 0 and not workers:
         raise ValueError("--parallel 0 requires named remote workers")
     if spread_bps is not None and spread_bps < 0:
@@ -372,9 +379,13 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
             settings["execution_schedule_enter_market"] = deepcopy(bt["run_schedule_override"])
             settings["execution_schedule_open_positions"] = deepcopy(bt["manage_schedule_override"])
             attach(job, bt, profiles, pins, market_condition_mode)
+            attach_exits(job, bt, profiles, market_exit)
+            if allow_sl_loosen:
+                for expert in bt["experts"]:
+                    expert["settings"]["allow_ruleset_sl_loosen"] = True
             expert_params = job.pop("expert_params")
             has_rule_gene = any(n.get("optimize") or n.get("action_value_optimize") or n.get("mode_optimize")
-                                for n in walk(job["strategy"]))
+                                or n.get("toggle_optimize") for n in walk(job["strategy"]))
             fixed = not expert_params and not has_rule_gene
             if fixed:
                 # The shared optimizer requires a nonempty parameter space. A one-point
@@ -392,9 +403,18 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                            "parallelIndividuals": parallel, "seed": seed,
                            "expert_params": expert_params, "backtest": bt})
             digest = fingerprint(job)[:12]
-            job["name"] = f"research10-{family}-{job['variant']}-eq{equity:g}-{digest}"
+            options = ""  # only when set: the default names are unchanged
+            if market_exit:
+                options += "-mx_" + "_".join(market_exit)
+            if allow_sl_loosen:
+                options += "-slloosen"
+            job["name"] = f"research10-{family}-{job['variant']}{options}-eq{equity:g}-{digest}"
             bt["name"] = job["name"]
             bt["labels"] = ["research10", "goal2020-followup", family, job["variant"], f"equity-{equity:g}"]
+            if market_exit:
+                bt["labels"].append("market-exit")
+            if allow_sl_loosen:
+                bt["labels"].append("sl-loosen")
             job["fingerprint"] = fingerprint(job)
             jobs.append(job)
     return {"schema_version": SCHEMA_VERSION, "jobs": jobs,

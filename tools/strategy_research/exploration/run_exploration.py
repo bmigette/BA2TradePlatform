@@ -53,6 +53,12 @@ def parser():
                     help="Pinned digest, or profile=digest pairs for multiple profiles.")
     ap.add_argument("--market-condition-mode", choices=("search", "all-off"), default="search",
                     help="Search entry genes, or retain original rules with pinned condition diagnostics.")
+    ap.add_argument("--market-exit", default="", metavar="exit,stop,tp",
+                    help="Comma list: append market exit/stop/TP rules, each off by default behind a "
+                         "searched toggle. Needs a profile and --search genetic; single-direction jobs only.")
+    ap.add_argument("--allow-sl-loosen", action="store_true",
+                    help="Set allow_ruleset_sl_loosen on every job's experts: ruleset stops may loosen "
+                         "down to the trade's max-loss stop (default: tighten only).")
     ap.add_argument("--spread-bps", type=float, help="Override every family's spread; 0 is preserved.")
     ap.add_argument("--store", help="Override the snapshot's metric-store directory.")
     ap.add_argument("--etf-symbols", nargs="+", help="Fixed ETF research universe; default SPY IEF TLT GLD.")
@@ -126,7 +132,9 @@ def main(argv=None):
             save_top=args.save_top, store=args.store, spread_bps=args.spread_bps, etf_symbols=args.etf_symbols,
             market_condition_profile=args.market_condition_profile,
             market_condition_manifest=args.market_condition_manifest,
-            market_condition_mode=args.market_condition_mode)
+            market_condition_mode=args.market_condition_mode,
+            market_exit=tuple(s.strip() for s in args.market_exit.split(",") if s.strip()),
+            allow_sl_loosen=args.allow_sl_loosen)
         if args.variants is not None:
             available = {j["variant"] for j in manifest["jobs"]}
             unknown = set(args.variants) - available
@@ -147,6 +155,13 @@ def main(argv=None):
                 mc = bt["market_condition"]
                 print(f"    conditions={','.join(mc['profiles'])} mode={mc['mode']} "
                       f"added_genes={mc['gene_count']}; budget={args.population}x{args.generations}")
+            if "market_exit" in bt:
+                mx = bt["market_exit"]
+                print(f"    market_exit={','.join(mx['kinds'])} direction={mx['direction']} "
+                      f"rules={','.join(mx['rules'])} (off by default) added_genes={mx['gene_count']}")
+        market_exit = manifest["jobs"][0]["optimization_config"]["backtest"].get("market_exit") if manifest["jobs"] else None
+        print(f"Market exits: {','.join(market_exit['kinds']) if market_exit else 'none'}; "
+              f"ruleset SL loosen: {'on' if args.allow_sl_loosen else 'off'}")
         print(f"{len(manifest['jobs'])} jobs. Each is an independent account.", flush=True)
         if args.export_universe is not None:
             path = args.export_universe.resolve()

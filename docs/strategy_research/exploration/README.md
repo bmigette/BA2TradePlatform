@@ -8,7 +8,7 @@ every job its own $10,000 account. Option grids are separate
 | Page | Contents |
 |---|---|
 | this README | families, capital/execution contract, preview/launch runbook, ETF semantics |
-| [market_conditions.md](market_conditions.md) | the opt-in market-condition ENTRY-gate campaign (ohlcv-v1 / ta-structure-v1) |
+| [market_conditions.md](market_conditions.md) | the opt-in market-condition campaign: ENTRY gates, and `--market-exit` exits (ohlcv-v1 / ta-structure-v1) |
 | [pullback_and_market_exits.md](pullback_and_market_exits.md) | planned: literal pullback expert (long/short) and market-condition EXITS |
 
 Code: [tools/strategy_research/exploration/](../../../tools/strategy_research/exploration/).
@@ -162,6 +162,21 @@ python tools/strategy_research/exploration/run_exploration.py --families pullbac
 python tools/strategy_research/exploration/run_exploration.py --search genetic --population 24 --generations 4 --workers remote227 --parallel 0 --run
 ```
 
+Market exits and stop loosening (both opt-in; see [market_conditions.md](market_conditions.md)):
+
+```powershell
+python tools/strategy_research/exploration/run_exploration.py --families pullback_rsi mid_ds --search genetic `
+  --market-condition-profile ohlcv-v1,ta-structure-v1 --market-condition-manifest ohlcv-v1=<digest>,ta-structure-v1=<digest> `
+  --market-exit exit,stop,tp --allow-sl-loosen --dry-run
+```
+
+`--market-exit` appends market exit/stop/TP rules after each job's exit rules, each off by
+default behind a searched toggle. It needs a profile and `--search genetic`, and it is valid
+only for single-direction jobs (a job that buys and sells is refused). Families whose floor stop
+matches every position (mid_insider, small_earnings, small_rating, mid_earnings) are refused.
+`--allow-sl-loosen` lets ruleset stops loosen down to the trade's max-loss stop. Neither flag
+changes the default manifest.
+
 Worker names must exist in the test application's worker settings. Remote hosts must have
 this code, including `ETFTrend`, and matching prewarmed data installed before launch. The
 existing optimizer's remote synchronization remains responsible for its worker lifecycle.
@@ -217,8 +232,9 @@ results before considering a shared-account allocation.
 ```powershell
 cd testplatform/backend
 python -m pytest tests/test_research6_driver.py tests/test_research10_market_conditions.py `
-  tests/test_research_pullback_rsi.py tests/test_launcher_market_condition_profile.py `
-  tests/backtest/test_etf_trend.py -q
+  tests/test_research_pullback_rsi.py tests/test_research_market_exits.py `
+  tests/test_launcher_market_condition_profile.py -q
+python -m pytest tests/backtest/test_etf_trend.py -q
 ```
 
 Tests cover exact search dimensions, source rules, settings recognition, schedules, caps,
