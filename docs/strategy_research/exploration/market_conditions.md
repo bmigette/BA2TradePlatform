@@ -17,6 +17,9 @@ remains pinned: these shared entry conditions are separate from that older overl
 **Current implementation boundary:** the follow-up driver now exposes both profiles for its
 equity and ETF entry rules. It remains opt-in and requires a pinned manifest for every selected
 profile. Option stage 1 is unchanged. Stage 2 is outside the current review.
+Market-condition **exits** and TP/SL adjustments (`--market-exit`, driver item 6) and
+`--allow-sl-loosen` (item 7) are implemented on feat/pullback-market-exits; the rule contract,
+max-loss stop and stop-loss policy are in [pullback_and_market_exits.md](pullback_and_market_exits.md).
 
 ## Conditions to reuse
 
@@ -59,8 +62,9 @@ For earnings drift, these gates do not introduce a new earnings-calendar entry/e
 The driver implementation now does the following:
 
 1. It factors the registry-derived market-leaf builder into the shared package and appends gates
-   to **each opening rule/tier**, preserving existing OR groups and first-match behavior. Exits,
-   reductions, stop updates and protective actions are never gated.
+   to **each opening rule/tier**, preserving existing OR groups and first-match behavior. Entry
+   gates never gate exits, reductions, stop updates or protective actions; market-driven exits are
+   separate, added rules (item 6).
 2. `run_exploration.py` accepts `--market-condition-profile none|ohlcv-v1|ta-structure-v1|ohlcv-v1,ta-structure-v1`,
    `--market-condition-manifest`, and `--market-condition-mode search|all-off`. `none` remains
    the default and a profile-less manifest is refused. `search` requires the genetic path;

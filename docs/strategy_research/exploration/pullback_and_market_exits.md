@@ -1,15 +1,17 @@
 # Pullback (long/short) and market-condition exits and TP/SL adjustments — design
 
-Status: **proposed 2026-09-24, not implemented.** Part of the
-[strategy exploration grid](README.md).
+Status: **implemented on feat/pullback-market-exits (2026-09-24).** Part of the
+[strategy exploration grid](README.md). Implementation plan:
+[2026-09-24-pullback-and-market-exits.md](../../plans/2026-09-24-pullback-and-market-exits.md).
 
-Two additions, in delivery order:
+Two additions:
 
 - **A. A literal pullback expert:** long and short, with its own trend, structure and SMA5 exit.
   It needs no platform change.
-- **B. Market-condition exits and TP/SL adjustments at the rule level:** a platform change that lets open-position rules use the
-  `ohlcv-v1` / `ta-structure-v1` fields that entry rules already use. After that, every family in
-  this grid, and later the option grids, can search them.
+- **B. Market-condition exits and TP/SL adjustments at the rule level:** a platform change that
+  lets open-position rules use the `ohlcv-v1` / `ta-structure-v1` fields that entry rules already
+  use, plus one stop-loss policy for every ruleset path. Every family in this grid can search
+  them; the option grids still need their own profile wiring.
 
 ## Why: the 2026-09-24 probe
 
@@ -54,9 +56,9 @@ The expert never submits orders and never loops over prices checking whether to 
 | `direction` | `long` / `short` | One direction per instance, so BUY and SELL keep one meaning each. In a `short` job, a BUY is the exit signal and long entries are disabled. |
 | `trend_gate` | `sma200` / `slope_ohlcv_v1` / `sma200_and_spy` | Entry trend filter. `sma200_and_spy` also requires SPY below/above its own SMA200 (short side). |
 | `rsi_period` | 2–5 | Wilder RSI. |
-| `entry_threshold` | 3–20 | Long: RSI below it. Short: RSI above 100 minus it. |
+| `entry_threshold` | 1–30 | Long: RSI below it. Short: RSI above 100 minus it. |
 | `exit_mode` | `sma5` / `rsi` / `sma5_or_choch` / `time` | When to send the exit signal. |
-| `rsi_exit` | 50–80 | Used only by `exit_mode=rsi`, mirrored for shorts. |
+| `rsi_exit` | 50–90 | Used only by `exit_mode=rsi`, mirrored for shorts. |
 
 - **Entry:** a BUY (long) or SELL (short) recommendation with a set confidence, and an expected
   profit of 0: the rule has no price target.
@@ -66,8 +68,8 @@ The expert never submits orders and never loops over prices checking whether to 
 - **`sma5_or_choch`:** calls the platform's own `compute_chart_structure` over the same
   prior-session 128-bar window that the entry gates read. It does not use a separate
   implementation, so backtest and live share one function.
-- **Stop:** a resting ATR stop, set by the entry rule's `adjust_stop_loss` action, as a rule
-  parameter.
+- **Stop:** a resting stop set by the entry rule's `adjust_stop_loss` action (−8% from the open
+  price in `pullback_rsi`), as a rule parameter.
 - **Maximum hold:** the ordinary `days_opened` close rule.
 
 ### Family `pullback_rsi`
@@ -86,106 +88,125 @@ The expert never submits orders and never loops over prices checking whether to 
 | `short_sma5` | short, sma200 gate | rsi 2/3, threshold 5/10/15, max hold 5/10 |
 | `short_spy` | short, sma200_and_spy gate | same |
 
-- **Size:** 5 jobs and about 72 candidates, small enough to run as an exhaustive grid.
-- **The short jobs test whether the probe's failure survives a point-in-time universe.** The
-  probe's null result is the expectation.
+- **Size:** 5 jobs and 72 combinations, small enough to run as an exhaustive grid.
+- **Only the 3 long jobs (48 combinations) run today.** Equity shorts cannot open: the `sell`
+  action only sells an existing long. `runtime.refuse_unrunnable` therefore refuses any selection
+  that includes `short_sma5` or `short_spy` before its first job starts. Both jobs are fully
+  specified (direction, rules, stop 8% above entry, `enable_short`) for when shorts exist.
 - **Long and short in one account is a portfolio question.** It comes after both sides are
   measured separately, not before.
 
-Tests:
+Tests (`packages/experts/tests/test_pullback_reversion.py`,
+`testplatform/backend/tests/backtest/test_pullback_reversion_expert.py`,
+`testplatform/backend/tests/test_research_pullback_rsi.py`):
 - the causal function is pure (bar t+1 cannot change the signal at t);
 - a short-job BUY only ever closes;
 - `sma5_or_choch` equals the platform calculator on the same window;
-- the controls reproduce the probe's trade count on a fixed symbol set, within documented
-  execution differences (5-minute fills against the probe's next-open fills).
+- the live expert registry does not list PullbackReversion.
 
 ## B. Market-condition exits and TP/SL adjustments at the rule level (platform)
 
-### Why exits are refused today
+### What changed
 
-Exits are refused at three points:
-- `assert_no_market_conditions` (`ba2_common/core/market_condition_rules.py`), called by
-  `rules_convert.py` on every deploy/export;
-- `testplatform/backend/app/api/backtests.py`;
-- `testplatform/backend/app/api/strategies.py`.
+Before this work, every exit rule with a market leaf was refused, because the live open-positions
+pass had no market-condition context (a leaf read `no_context` there) while the backtest would
+have evaluated it. Lifting the refusal alone would have broken backtest/live parity.
 
-The stated reason is correct but narrow. **Live**, the market-condition context exists only
-inside `market_condition_decision_scope`. `TradeManager.process_expert_recommendations_after_analysis`
-opens that scope, but `process_open_positions_recommendations` does not, so an exit leaf would
-read `no_context` and never fire. **The backtest resolver** has no such boundary: it would evaluate
-the leaf. Lifting the refusal alone would therefore make backtests trade exits that live never
-fires, which the backtest/live parity rule forbids.
+1. **Live scope.** `TradeManager.process_open_positions_recommendations` opens
+   `market_condition_decision_scope(expert_instance_id=...)` per instance, as the entry pass does.
+   Without a `market_condition_profile` it is a no-op.
+2. **Action allow-list instead of the blanket refusal.** A rule that carries a market leaf may
+   only exit or adjust TP/SL:
+   - **tree form** (`assert_market_rule_actions`, applied by `rules_convert`, `backtests.py` and
+     `strategies.py`): `close`, `close_option`, `adjust_stop_loss`, `adjust_take_profit`;
+   - **live EventAction form** (`assert_market_rule_actions_live`, applied by the settings UI and
+     `rules_export_import`): the same, plus `decrease_instrument_share`. The tree form refuses a
+     reduce because the tree-to-live converter (`rule_builders.action_from_rule`) cannot carry it
+     and would silently drop the rule at deploy.
 
-The design doc's other argument is that a gate could delay an exit. That argument applies only to
-**adding** a market leaf to an existing exit rule: under AND, an unknown observation silences
-that exit. A rule that exists *only* to exit on a market condition can only add exits.
+   Everything else is refused with a message naming the rule, the offending actions and the
+   allowed set: opening actions, `stop_processing`, rolls, option lifecycle and overlays.
+   `assert_market_conditions_resolved` also runs on exit rules, so an unresolved template never
+   leaves for live.
+3. **Nesting.** A market leaf may sit only under AND groups, all the way up. A nested OR is
+   flattened to AND on the live export, and a NOT would turn "unknown, does not fire" into
+   "unknown, fires". Both are refused. Ordinary leaves may share the AND group.
+4. **No fail-open rule.** `rule_builders.rule_triggers_from_tree` (used by the backtest seeder and
+   the live export) refuses a rule whose leaves produce no trigger, since an empty trigger set is
+   always true and a close rule would close every position. It also refuses a rule that lost a
+   market leaf in conversion.
+5. **Exit-pass guarantees.** A failure to open the market-condition scope never blocks the exit
+   pass: the other exit rules still run. A leaf whose evaluation fails, or that is read outside an
+   open scope, reads unknown (`no_context`, with its cause) and never raises. Unknown never fires.
+6. **Max-loss stop.** At every equity market entry, live and backtest,
+   `trade_cycle.record_max_loss_stop` records the stop the position was sized on as
+   `Transaction.meta_data["max_loss_stop"]`: the RM safeguard stop when there is one, otherwise
+   the ruleset stop. It is written once, as a single-column write, and never changes an order,
+   price, size or fill. `position_sizing.max_loss_stop_of(transaction)` returns None when absent
+   (older transactions, options), and None means "no bound known".
+7. **One stop-loss policy on every ruleset path.** `TradeActions.ruleset_stop_policy` decides
+   every ruleset stop, whatever condition fired it. Both the SL-only `AdjustStopLossAction` and
+   the combined TP+SL branch of `TradeActionEvaluator` call it, so **the combined path now
+   ratchets too** (it used to skip the ratchet). The TP half of a combined call is unaffected.
+   - A tighter (or equal) request applies. A looser request keeps the existing stop.
+   - The expert setting `allow_ruleset_sl_loosen` (bool, **default off**) lets a looser request
+     apply, clamped at the recorded max-loss stop. Without a recorded bound nothing loosens.
+     Two protections stop the SL min-distance floor from creating a loosen:
+     `floor_would_loosen` (the rule tightened; only the floor loosened) and `floor_exceeds_rule`
+     (the floor pushed past the rule's own price). Both keep the existing stop.
+   - Manual UI edits and the SmartRM call the account directly and are outside this policy.
 
-### Change
+### Templates (`market_condition_templates.market_exit_rules`)
 
-1. **Live scope.** Wrap `process_open_positions_recommendations`' per-instance evaluation in
-   `market_condition_decision_scope(expert_instance_id=...)`, the same call the entry pass uses,
-   with one decision clock per pass.
-2. **Narrow the refusal.** Replace the blanket exit refusal with a *market rule* contract. A rule
-   with market leaves may carry these actions:
-   - `close` / `reduce`: a market-driven exit.
-   - `adjust_stop_loss`: safe because ruleset stops are already **ratchet-only**
-     (`AdjustStopLossAction._call_broker`: a ruleset stop may only tighten, and a looser request is a
-     logged no-op). A market condition can move a stop closer, for example to breakeven when the
-     structure turns bear. It cannot widen one or remove one.
-   - `adjust_take_profit`: moves in both directions. Widening a TP delays a profit exit but leaves the
-     stop in place; that is the intended use, letting a winner run while the trend is strong.
+Up to four rules per job, each emitted only when its profile is selected:
 
-   Still refused:
-   - lifecycle/roll/overlay actions: PMCC roll, buyback, delta floor and the option lifecycle. A
-     skipped roll can leave a short leg to expire or be assigned, and the market-condition design
-     already requires expiry-driven management to run whatever the market does;
-   - market leaves in the ENTRY rule's bracket actions beyond today's entry gate.
+| Rule | Profile | Leaves (AND) | Action | Continues |
+|---|---|---|---|---|
+| `<prefix>-mkt-exit-structure` | ta-structure-v1 | `structure_state` == against | `close` | no |
+| `<prefix>-mkt-exit-slope` | ohlcv-v1 | trend slope against, threshold searched | `close` | no |
+| `<prefix>-mkt-stop` | ta-structure-v1 | `structure_state` == against | `adjust_stop_loss` from open, −2..0% (0 = breakeven) | yes |
+| `<prefix>-mkt-tp` | ohlcv-v1 | slope with the position AND ADX above, both searched | `adjust_take_profit` from open, +10..+30% | yes |
 
-   `assert_no_market_conditions` becomes `assert_market_rule_actions`, one allow-list and one
-   refusal message. All three call sites apply it.
-3. **Unknown means "does not fire".** It is never a pass, and never a failure of the other exits.
-   Every other exit rule still runs, because the market exit is its own rule. Unknown-by-reason
-   counts are reported, as for entry gates.
-4. **Placement and precedence.** Generated market rules are separate rules, never leaves ANDed
-   into an existing rule, and never a nested OR group, since a nested OR flattens to AND. First
-   match wins, so:
-   - a market **exit** goes after the stop-loss and floor rules;
-   - a market **adjustment** gets `continue_processing=True`, so it can never pre-empt a later
-     exit.
-5. **Genes.** At most three rules per job, each off by default:
+- Leaves are fixed and resolved: no mode gene, so no leaf can be "off" (an empty close rule would
+  close every position). Only thresholds and percents are searched.
+- Every rule is **off by default** behind a toggle gene. An all-off genome decodes to the job's
+  original exit rules exactly.
+- Direction is baked in (long: against = bear, slope below 0; short mirrors it), so the templates
+  are valid for single-direction jobs only.
+- Placement: after the job's exit rules, or immediately **before** the first terminal catch-all
+  (a rule that matches every held position and stops processing), which would otherwise shadow
+  them.
+- The market **stop** is omitted before a catch-all that adjusts the stop-loss: a rule pass keeps
+  only its last SL action, so the market stop would always be discarded.
 
-   | Rule | Mode gene | Action |
-   |---|---|---|
-   | Market exit | `structure_against` / `slope_against` / `channel_far_side`, plus a threshold | `close` |
-   | Market stop | `structure_against` / `slope_against` | stop to breakeven, or tighten to k×ATR (k searched) |
-   | Market TP | `trend_strong` (ADX and slope above thresholds) / `near_resistance` (`dist_resistance` below x ATR) | widen TP by a searched %, or pull it in toward resistance |
+### Exploration driver
 
-   That is about 3 genes per rule and about 9 per family with all three on. A frozen all-off
-   control must be byte-identical to today's rules, the no-impact gate the entry profile already
-   passes.
-6. **Churn guard for TP.** A two-way TP driven by a daily condition can flap: widen one day, pull
-   in the next, with a cancel and replace of the live OCO pair each time. The `adjust_take_profit`
-   path must skip a change smaller than a set step (for example 0.25×ATR). A backtest must count
-   TP changes per trade so flapping shows up in the report. Stops don't need this: the ratchet
-   already makes them monotonic.
-7. **Parity.** One test replays the same bars through the live pass and the backtest pass and
-   asserts the same exit fires on the same session. It extends the existing
-   `test_research10_market_conditions.py` real-engine parity test to cover exits.
+- `--market-exit exit,stop,tp` attaches the templates. It requires a profile, `--search genetic`
+  and `--market-condition-mode search`, and refuses a job that is not single-direction.
+- `--allow-sl-loosen` sets `allow_ruleset_sl_loosen=True` on every job's experts, independent of
+  `--market-exit`.
+- Both enter the fingerprint, name and labels only when set, so the default manifests are
+  byte-identical. Details: [market_conditions.md](market_conditions.md), driver items 6 and 7.
+- **GA budget (A4):** in genetic mode each job is sized from its own gene count: population
+  clamp(4 × genes, 24, 120), 25 generations (30 above 20 genes), early stop 8. `--population`,
+  `--generations` and `--early-stop` override it. Grid mode is unchanged.
 
-### Where it applies first
+### Parity
 
-- **Exploration grid:** a `--market-exit` flag beside `--market-condition-profile`, searched per
-  family with matched seeds against the ungated control, as the market-condition page's comparison
-  rules require.
-- **Then the option follow-ups** (`run_options2_matrix.py` O_LEAP/O_PMCC first). They hold for
-  months and their exits look only at option P&L, time and days to expiry. That grid's driver
-  still needs its own profile wiring first.
+`testplatform/backend/tests/backtest/test_market_exit_parity_engine.py` (real backtest engine) and
+`tests/test_market_exit_live_parity.py` (live pass) check that a market exit fires on the same
+session in both, and that all-off templates are byte-identical to no templates.
 
-## Open questions
+## Known gaps (operator)
 
-1. Can a short-side job rely on the existing `bullish` flag in the close rule, or does the rule
-   vocabulary need an explicit mirror? This must be checked in `TradeConditions` before Part A.
-2. Should the market exit also be allowed to `reduce` (partial exit)? The proposal allows it;
-   dropping it keeps the contract to a single action.
-3. Should Part B ship behind an AppSetting kill-switch for live (default on only after the
-   parity test passes on replay)?
+- **Equity shorts cannot open**, so the `pullback_rsi` short jobs are refused.
+- **UI reduce rules store `target_percent`, but the evaluator reads `value`.** A reduce authored in
+  the settings UI does not carry its percent to `decrease_instrument_share`.
+- **`TradeActionEvaluator` treats a trigger with an unknown `event_type` as passing.** The
+  converters now refuse a rule that loses all its triggers or a market trigger, but the evaluator
+  itself still fails open.
+- **"The last SL action in a pass wins"** is platform behaviour (`TradeActionEvaluator.execute`).
+  The driver works around it by omitting the market stop; the behaviour itself is unchanged.
+- **The TP churn guard was not built.** `adjust_take_profit` has no minimum step, and backtests do
+  not count TP changes per trade. Check for flapping before trusting a `tp` gene live.
+- **A `tests/backtest` test leaks the in-memory store flag** into later tests in the same process.

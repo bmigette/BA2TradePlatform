@@ -671,7 +671,10 @@ Placement: the leaves are appended to the **initial-entry AND tree of each
 equity strategy's entry rule** (the trees `ba2test_launcher.py` builds for
 S1–S7), never to the open-positions or exit rules, so no gate can prevent an
 exit or a protective-order adjustment. Per-strategy IDs as in section 5, e.g.
-`s1-structure-dist-support`.
+`s1-structure-dist-support`. Separately, exit rules may now carry market-condition
+leaves, as their own added rules, when every action is on the exit allow-list
+(close, close_option, adjust_stop_loss, adjust_take_profit): see
+[pullback_and_market_exits.md](../strategy_research/exploration/pullback_and_market_exits.md).
 
 The profile flag is the same one, on the equity drivers:
 `--market-condition-profile none|ohlcv-v1|ta-structure-v1|ohlcv-v1,ta-structure-v1`.
