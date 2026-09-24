@@ -130,7 +130,11 @@ def warnings(recorder):
 
 
 def analyze(frames, settings, symbol="AAA", as_of=AS_OF, honour=False, expert=None,
-            subtype=None):
+            subtype=None, default_spy=True):
+    """``default_spy`` adds a sound SPY when the test gives none: every evaluation reads SPY
+    for the gap check."""
+    if default_spy and "SPY" not in frames:
+        frames = {**frames, "SPY": provider_frame(uptrend())}
     provider = FakeOHLCV(frames, honour=honour)
     bundle = SimpleNamespace(ohlcv=lambda: provider)
     expert = expert or object.__new__(PullbackReversion)
@@ -252,6 +256,18 @@ def test_daily_clock_reads_bar_d_itself_not_d_minus_2():
                                                 datetime(2024, 6, 18, tzinfo=timezone.utc))
 
 
+@pytest.mark.parametrize("hh, mm", [(9, 30), (12, 0), (15, 55)])
+def test_engine_intraday_stamp_reads_d_minus_1(hh, mm):
+    """The engine's 5-minute stamps are New York wall-clock times labelled UTC (09:30-15:55):
+    the data session is D-1 and D's forming candle never enters."""
+    stamp = datetime(2024, 6, 18, hh, mm, tzinfo=timezone.utc)
+    assert decision_session(stamp, backtest=True) == date(2024, 6, 17)
+    frame = with_today(provider_frame(long_dip(), end="2024-06-17"), 999.0, day="2024-06-18")
+    rec, _ = analyze({"AAA": frame}, settings_for(), as_of=stamp, honour=True)
+    assert rec.raw_outputs["session"] == "2024-06-17"
+    assert rec.signal == OrderRecommendation.BUY
+
+
 def test_five_minute_stamp_reads_the_prior_session():
     frame = with_today(provider_frame(long_dip(), end="2024-06-17"), 999.0, day="2024-06-18")
     rec, _ = analyze({"AAA": frame}, settings_for(),
@@ -277,7 +293,8 @@ def test_decision_day_candle_cannot_change_the_decision(as_of):
     assert rec.signal == OrderRecommendation.BUY
     assert rec.raw_outputs == base.raw_outputs
     assert rec.current_price == base.current_price == pytest.approx(long_dip()[-1])
-    assert provider.calls == [("AAA", fetch_kwargs(SESSION, as_of))]
+    assert provider.calls == [("AAA", fetch_kwargs(SESSION, as_of)),
+                              ("SPY", fetch_kwargs(SESSION, as_of))]
 
 
 def test_naive_as_of_is_refused():
@@ -334,9 +351,10 @@ def test_spy_is_fetched_with_the_same_as_of_and_cut_only_for_the_spy_gate():
     # A bear SPY blocks the same long entry.
     frames["SPY"] = provider_frame(downtrend())
     assert analyze(frames, settings)[0].signal != OrderRecommendation.BUY
-    # Other gates never read SPY.
+    # Other gates read SPY too (the gap check), with the same arguments.
     _, provider = analyze(frames, settings_for())
-    assert [c[0] for c in provider.calls] == ["AAA"]
+    assert [c[0] for c in provider.calls] == ["AAA", "SPY"]
+    assert all(c[1] == fetch_kwargs(SESSION, AS_OF) for c in provider.calls)
 
 
 def test_spy_is_read_once_per_session_across_symbols():
@@ -360,6 +378,13 @@ def test_spy_is_read_once_per_session_across_symbols():
     frames["SPY"] = with_today(provider_frame(uptrend()), 150.0)
     run("AAA", as_of=datetime(2024, 6, 18, 13, 35, tzinfo=timezone.utc))
     assert [c[0] for c in provider.calls] == ["AAA", "SPY", "BBB", "AAA", "SPY"]
+    # Another provider object (another run) on the same session reads its own SPY.
+    other = FakeOHLCV(frames)
+    expert.analyze_as_of(datetime(2024, 6, 18, 13, 35, tzinfo=timezone.utc), BacktestContext(
+        providers=SimpleNamespace(ohlcv=lambda: other), settings=settings,
+        extra={"symbol": "AAA"}))
+    assert [c[0] for c in other.calls] == ["AAA", "SPY"]
+    assert expert._spy_memo[1] is other
 
 
 @pytest.mark.parametrize("spy", [
@@ -371,7 +396,7 @@ def test_misaligned_or_missing_spy_aborts(spy):
     if spy is not None:
         frames["SPY"] = spy
     with pytest.raises(FMPHistoryCacheMiss, match="PullbackReversion cannot evaluate AAA"):
-        analyze(frames, settings_for(trend_gate="sma200_and_spy"))
+        analyze(frames, settings_for(trend_gate="sma200_and_spy"), default_spy=False)
 
 
 def test_short_spy_under_the_spy_gate_aborts():
@@ -380,18 +405,25 @@ def test_short_spy_under_the_spy_gate_aborts():
         analyze(frames, settings_for(trend_gate="sma200_and_spy"))
 
 
-def test_gappy_history_is_logged_when_spy_is_read_anyway(warnings):
-    """M1: under 90% of SPY's sessions -> WARNING, still evaluated; not checked without SPY."""
+@pytest.mark.parametrize("gate", ["sma200", "sma200_and_spy", "slope_ohlcv_v1"])
+def test_gappy_history_is_logged_whatever_the_gate(gate, recorder):
+    """M1/M4: under 90% of SPY's sessions -> WARNING (once per symbol per instance, DEBUG
+    after), still evaluated. SPY is read through the per-session cache."""
     frame = provider_frame(long_dip())
     drop = [i for i in range(40, 240) if i % 4 == 0]  # 50 missing sessions mid-window
     frame = frame.drop(index=drop).reset_index(drop=True)
     frames = {"AAA": frame, "SPY": provider_frame(uptrend())}
-    rec, _ = analyze(frames, settings_for(trend_gate="sma200_and_spy"))
+    expert = object.__new__(PullbackReversion)
+    rec, provider = analyze(frames, settings_for(trend_gate=gate), expert=expert)
     assert rec.skip is False and rec.raw_outputs["action"] in ("entry", "exit", "none")
-    assert len(warnings) == 1 and "AAA has 250 sessions" in warnings[0] and "SPY" in warnings[0]
-    warnings.clear()
-    _, provider = analyze(frames, settings_for())
-    assert warnings == [] and [c[0] for c in provider.calls] == ["AAA"]
+    assert [c[0] for c in provider.calls] == ["AAA", "SPY"]
+    assert len(recorder.warnings) == 1
+    assert "AAA has 250 sessions" in recorder.warnings[0] and "SPY" in recorder.warnings[0]
+    analyze(frames, settings_for(trend_gate=gate), expert=expert)
+    assert len(recorder.warnings) == 1 and len(recorder.debugs) == 1
+    # A complete history is not reported.
+    analyze({"AAA": provider_frame(long_dip())}, settings_for(trend_gate=gate))
+    assert len(recorder.warnings) == 1
 
 
 # --------------------------------------------------------------------------- fail loud
@@ -470,7 +502,8 @@ def test_symbol_delisted_before_the_whole_window_is_still_skipped(warnings):
     """A position held for over a year after its last candle: nothing in the fetch window, but
     an older history exists (probe), so it stopped trading rather than never being cached."""
     frames = {"AAA": provider_frame(long_dip(), end="2023-01-31"), "SPY": provider_frame(uptrend())}
-    rec, provider = analyze(frames, settings_for(), honour=True)
+    rec, provider = analyze(frames, settings_for(), honour=True,
+                            subtype=AnalysisUseCase.OPEN_POSITIONS)
     assert rec.skip_reason == "symbol_stopped_trading"
     assert [c[0] for c in provider.calls] == ["AAA", "AAA", "SPY"]
     assert "2023-01-31" in warnings[0]
@@ -482,6 +515,18 @@ def test_stale_symbol_with_stale_spy_aborts(spy_end):
               "SPY": provider_frame(uptrend(), end=spy_end)}
     with pytest.raises(FMPHistoryCacheMiss, match="missing data, not a symbol that stopped"):
         analyze(frames, settings_for(), subtype=AnalysisUseCase.OPEN_POSITIONS)
+
+
+@pytest.mark.parametrize("subtype", [None, AnalysisUseCase.ENTER_MARKET])
+@pytest.mark.parametrize("end", ["2024-05-31", "2023-01-31"])
+def test_stale_symbol_in_the_entry_pass_aborts_even_with_spy_current(subtype, end):
+    """The entry universe only holds symbols with a bar today, so a stale daily history there
+    is a stale cache: only the open-positions pass may skip a symbol that stopped trading."""
+    frames = {"AAA": provider_frame(long_dip(), end=end), "SPY": provider_frame(uptrend())}
+    with pytest.raises(FMPHistoryCacheMiss, match="only the open-positions pass may skip"):
+        analyze(frames, settings_for(), subtype=subtype, honour=True)
+    rec, _ = analyze(frames, settings_for(), subtype=AnalysisUseCase.OPEN_POSITIONS, honour=True)
+    assert rec.skip_reason == "symbol_stopped_trading"
 
 
 # --------------------------------------------------------------------------- recent listings
@@ -506,8 +551,9 @@ def test_recent_listing_is_skipped_like_deterministic_scorer(gate, warnings):
     assert rec.expected_profit_percent == 0.0
     assert rec.current_price == pytest.approx(long_dip()[-1])
     assert "Insufficient OHLCV history (120 < 200)" in rec.details
-    # SPY is read once, as the reference: the listing is decided before any gate.
-    assert [c[0] for c in provider.calls] == ["AAA", "SPY"]
+    # The long probe (any row before the window?), then SPY once as the reference: the
+    # listing is decided before any gate.
+    assert [c[0] for c in provider.calls] == ["AAA", "AAA", "SPY"]
     assert all(c[1]["end_date"] == AS_OF for c in provider.calls)
     # I3: logged, since the backtest drops skips.
     assert len(warnings) == 1
@@ -521,12 +567,12 @@ def test_listing_day_itself_is_a_recent_listing(warnings):
     frame = provider_frame([50.0], end="2024-06-17")
     rec, _ = analyze({"AAA": frame, "SPY": spy_full()}, settings_for())
     assert rec.skip is True and rec.skip_reason == "insufficient_history"
-    assert rec.current_price == 0.0
+    assert rec.current_price == 50.0  # the listing-day candle's OPEN, known at 09:30
     assert "(0 < 200)" in rec.details and "listed on 2024-06-17" in rec.details
     assert len(warnings) == 1
     # Without a sound SPY reference it still aborts.
     with pytest.raises(FMPHistoryCacheMiss, match="Missing OHLCV history: SPY"):
-        analyze({"AAA": frame}, settings_for())
+        analyze({"AAA": frame}, settings_for(), default_spy=False)
 
 
 def test_each_skip_reason_warns_once_per_symbol_per_instance(recorder):
@@ -544,8 +590,9 @@ def test_each_skip_reason_warns_once_per_symbol_per_instance(recorder):
     assert "AAA" in recorder.debugs[0] and "insufficient_history" in recorder.debugs[0]
     analyze(frames, settings_for(), symbol="BBB", expert=expert)            # another symbol
     stopped = {"AAA": provider_frame(long_dip(), end="2024-05-31"), "SPY": spy_full()}
-    analyze(stopped, settings_for(), expert=expert)                         # another reason
-    analyze(stopped, settings_for(), expert=expert)
+    held = AnalysisUseCase.OPEN_POSITIONS
+    analyze(stopped, settings_for(), expert=expert, subtype=held)          # another reason
+    analyze(stopped, settings_for(), expert=expert, subtype=held)
     analyze(frames, settings_for())                                         # another instance
     assert len(recorder.warnings) == 4 and len(recorder.debugs) == 2
     assert PullbackReversion._skips_logged is None  # never shared through the class
@@ -568,7 +615,22 @@ def test_recent_listing_needs_a_sound_spy_reference(spy, match):
     if spy is not None:
         frames["SPY"] = spy
     with pytest.raises(FMPHistoryCacheMiss, match=match):
-        analyze(frames, settings_for())
+        analyze(frames, settings_for(), default_spy=False)
+
+
+@pytest.mark.parametrize("honour", [False, True])
+def test_gap_from_before_the_window_deep_into_it_aborts(honour):
+    """History until 2023-03-31, nothing again until 2023-10-02: a provider honouring
+    start_date only shows the part that resumes deep inside the window, which alone looks
+    like a listing. The long probe finds the older rows, so it is a gap and aborts."""
+    old = provider_frame(_wiggle(80, 100, 300), end="2023-03-31")
+    resumed = provider_frame(long_dip()[-185:])
+    assert resumed["Date"].iloc[0].date() == date(2023, 10, 2)
+    frames = {"AAA": pd.concat([old, resumed], ignore_index=True), "SPY": spy_full()}
+    # Honouring start_date, only the probe can see it; serving everything, the fetch does.
+    match = "before the window start" if honour else "history starts on 2022"
+    with pytest.raises(FMPHistoryCacheMiss, match=match):
+        analyze(frames, settings_for(), honour=honour)
 
 
 def test_recent_listing_with_corrupt_closes_aborts():
@@ -596,7 +658,7 @@ def test_settings_definitions_defaults_and_choices():
 
 
 # --------------------------------------------------------------------------- live == backtest
-def _live_expert(monkeypatch, frames):
+def _live_expert(monkeypatch, frames, subtype=None):
     monkeypatch.setattr(MODULE, "_utc_now", lambda: AS_OF)
     captured, statuses = [], []
     monkeypatch.setattr(MODULE, "add_instance", lambda row: captured.append(row))
@@ -607,13 +669,13 @@ def _live_expert(monkeypatch, frames):
     expert.logger = SimpleNamespace(error=lambda *a, **kw: pytest.fail(str(a)))
     expert._live_providers = lambda: bundle
     expert._resolve_settings = lambda keys: settings_for()
-    analysis = SimpleNamespace(id=10, subtype=None, status=None, state={})
+    analysis = SimpleNamespace(id=10, subtype=subtype, status=None, state={})
     expert.run_analysis("AAA", analysis)
     return analysis, captured, statuses
 
 
 def test_live_run_analysis_persists_the_backtest_decision(monkeypatch):
-    frames = {"AAA": with_today(provider_frame(long_dip()), 500.0)}
+    frames = {"AAA": with_today(provider_frame(long_dip()), 500.0), "SPY": spy_full()}
     analysis, captured, _ = _live_expert(monkeypatch, frames)
     rec, _ = analyze(frames, settings_for())
     row = captured[0]
@@ -633,21 +695,39 @@ def test_live_bar_d_reads_the_same_session_as_the_backtest_bar_d():
     assert bt.raw_outputs == live.raw_outputs
 
 
-@pytest.mark.parametrize("frames, reason", [
+@pytest.mark.parametrize("frames, reason, subtype", [
     ({"AAA": provider_frame(long_dip()[-120:]), "SPY": provider_frame(_wiggle(100, 200))},
-     "insufficient_history"),
+     "insufficient_history", AnalysisUseCase.ENTER_MARKET),
     ({"AAA": provider_frame(long_dip(), end="2024-05-31"), "SPY": provider_frame(_wiggle(100, 200))},
-     "symbol_stopped_trading"),
+     "symbol_stopped_trading", AnalysisUseCase.OPEN_POSITIONS),
 ])
-def test_live_run_analysis_skips_like_deterministic_scorer(monkeypatch, frames, reason):
+def test_live_run_analysis_skips_like_deterministic_scorer(monkeypatch, frames, reason, subtype):
     from ba2_common.core.types import MarketAnalysisStatus
-    analysis, captured, statuses = _live_expert(monkeypatch, frames)
-    rec, _ = analyze(frames, settings_for())
+    analysis, captured, statuses = _live_expert(monkeypatch, frames, subtype=subtype)
+    rec, _ = analyze(frames, settings_for(), subtype=subtype)
     assert captured == []  # no recommendation row, as DeterministicScorer
     assert analysis.status == MarketAnalysisStatus.SKIPPED
     assert statuses[-1] == MarketAnalysisStatus.SKIPPED
     assert analysis.state == {"skipped": True, "skip_reason": reason,
                               "skip_message": rec.details}
+
+
+def test_live_entry_analysis_of_a_stale_symbol_fails_instead_of_skipping(monkeypatch):
+    from ba2_common.core.types import MarketAnalysisStatus
+    frames = {"AAA": provider_frame(long_dip(), end="2024-05-31"), "SPY": spy_full()}
+    monkeypatch.setattr(MODULE, "_utc_now", lambda: AS_OF)
+    monkeypatch.setattr(MODULE, "add_instance", lambda row: pytest.fail("no row expected"))
+    monkeypatch.setattr(MODULE, "update_instance", lambda row: None)
+    expert = object.__new__(PullbackReversion)
+    expert.id = 1
+    errors = []
+    expert.logger = SimpleNamespace(error=lambda *a, **kw: errors.append(a))
+    expert._live_providers = lambda: SimpleNamespace(ohlcv=lambda: FakeOHLCV(frames))
+    expert._resolve_settings = lambda keys: settings_for()
+    analysis = SimpleNamespace(id=10, subtype=AnalysisUseCase.ENTER_MARKET, status=None, state={})
+    expert.run_analysis("AAA", analysis)
+    assert analysis.status == MarketAnalysisStatus.FAILED and errors
+    assert "only the open-positions pass may skip" in analysis.state["error"]
 
 
 # --------------------------------------------------------------------------- registration
