@@ -467,6 +467,49 @@ class FMPSenateTradeTab:
         return rows
 
 
+#: How many individual analyst price targets the Analyst Ratings browser lists.
+ANALYST_TARGETS_LIMIT = 20
+
+
+def analyst_price_target_rows(news: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Table rows for FMP ``price-target-news``: one per published target, newest first.
+
+    A missing figure is shown as a dash, never as $0 (a $0 target reads as "sell to zero").
+    ``adjPriceTarget`` (split-adjusted) is preferred so an old target sits on today's share
+    basis. ``priceWhenPosted`` is not adjusted, so the upside is computed only when the
+    target was not split-adjusted away from it.
+    """
+    def number(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    rows = []
+    for index, item in enumerate(news or []):
+        if not isinstance(item, dict):
+            continue
+        raw_target = number(item.get('priceTarget'))
+        adj_target = number(item.get('adjPriceTarget'))
+        target = adj_target or raw_target
+        posted = number(item.get('priceWhenPosted'))
+        same_basis = adj_target is None or raw_target is None or abs(adj_target - raw_target) < 1e-9
+        upside = ((raw_target or target) / posted - 1.0) * 100 if (target and posted and same_basis) else None
+        firm = (item.get('analystCompany') or '').strip() or (item.get('newsPublisher') or '').strip()
+        rows.append({
+            'key': index,
+            'date': str(item.get('publishedDate') or '')[:10] or '—',
+            'firm': firm or '—',
+            'analyst': (item.get('analystName') or '').strip() or '—',
+            'target': f'${target:,.2f}' if target else '—',
+            'posted': f'${posted:,.2f}' if posted else '—',
+            'upside': f'{upside:+.1f}%' if upside is not None else '—',
+            'upside_pct': upside,
+        })
+    return rows
+
+
 class AnalystRatingsTab:
     """
     Tab for viewing analyst ratings from multiple sources.
@@ -551,7 +594,8 @@ class AnalystRatingsTab:
             fmp_grades_data = None
             fmp_target_data = None
             fmp_consensus_data = None
-            
+            fmp_target_news = None
+
             if self._finnhub_api_key:
                 finnhub_data = await asyncio.to_thread(self._fetch_finnhub_ratings, symbol)
             
@@ -559,7 +603,8 @@ class AnalystRatingsTab:
                 fmp_grades_data = await asyncio.to_thread(self._fetch_fmp_grades, symbol)
                 fmp_target_data = await asyncio.to_thread(self._fetch_fmp_price_target, symbol)
                 fmp_consensus_data = await asyncio.to_thread(self._fetch_fmp_grades_consensus, symbol)
-            
+                fmp_target_news = await asyncio.to_thread(self._fetch_fmp_price_target_news, symbol)
+
             # Hide loading
             self.loading_spinner.classes(add='hidden')
             
@@ -572,7 +617,8 @@ class AnalystRatingsTab:
                     self._render_finnhub_section(finnhub_data, symbol)
                     
                     # FMP section
-                    self._render_fmp_section(fmp_grades_data, fmp_target_data, fmp_consensus_data, symbol)
+                    self._render_fmp_section(fmp_grades_data, fmp_target_data, fmp_consensus_data, symbol,
+                                             target_news=fmp_target_news)
                     
         except RuntimeError as e:
             if "client" in str(e).lower() and "deleted" in str(e).lower():
@@ -627,6 +673,24 @@ class AnalystRatingsTab:
             logger.error(f"Error fetching FMP price target for {symbol}: {e}", exc_info=True)
             return None
     
+    def _fetch_fmp_price_target_news(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
+        """Each analyst's published price target (newest first) from FMP ``price-target-news``.
+
+        The consensus endpoint gives only aggregates over roughly the last quarter; this is
+        the per-firm list behind them.
+        """
+        try:
+            url = "https://financialmodelingprep.com/stable/price-target-news"
+            params = {"symbol": symbol, "page": 0, "limit": ANALYST_TARGETS_LIMIT,
+                      "apikey": self._fmp_api_key}
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, list) else None
+        except Exception as e:
+            logger.error(f"Error fetching FMP price target news for {symbol}: {e}", exc_info=True)
+            return None
+
     def _fetch_fmp_grades_consensus(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Fetch grades consensus summary from FMP API."""
         try:
@@ -730,7 +794,8 @@ class AnalystRatingsTab:
     def _render_fmp_section(self, grades_data: Optional[List[Dict[str, Any]]], 
                            target_data: Optional[Dict[str, Any]],
                            consensus_data: Optional[Dict[str, Any]],
-                           symbol: str):
+                           symbol: str,
+                           target_news: Optional[List[Dict[str, Any]]] = None):
         """Render FMP ratings section."""
         with ui.card().classes('min-w-[400px] flex-1'):
             with ui.row().classes('items-center gap-2 mb-2'):
@@ -765,7 +830,34 @@ class AnalystRatingsTab:
                         ui.label(f'${target_low:.2f}').classes('text-lg font-bold').style('color: #ff6b6b;')
             else:
                 ui.label('Price target data not available').classes('italic text-sm').style('color: #a0aec0;')
-            
+
+            # Each analyst's own target: the list the consensus above is built from.
+            ui.label('Analyst Price Targets').classes('text-md font-semibold mb-1 mt-2')
+            target_rows = analyst_price_target_rows(target_news)
+            if target_rows:
+                targets_table = ui.table(
+                    columns=[
+                        {'name': 'date', 'label': 'Date', 'field': 'date', 'align': 'left'},
+                        {'name': 'firm', 'label': 'Firm', 'field': 'firm', 'align': 'left'},
+                        {'name': 'analyst', 'label': 'Analyst', 'field': 'analyst', 'align': 'left'},
+                        {'name': 'target', 'label': 'Target', 'field': 'target', 'align': 'right'},
+                        {'name': 'posted', 'label': 'Price then', 'field': 'posted', 'align': 'right'},
+                        {'name': 'upside', 'label': 'Upside then', 'field': 'upside', 'align': 'right'},
+                    ],
+                    rows=target_rows, row_key='key',
+                ).classes('w-full').props('dense')
+                targets_table.add_slot('body-cell-upside', '''
+                    <q-td :props="props"
+                          :class="props.row.upside_pct == null ? '' : (props.row.upside_pct >= 0 ? 'text-positive' : 'text-negative')">
+                        {{ props.value }}
+                    </q-td>
+                ''')
+                ui.label('Upside is measured from the price when the target was published, '
+                         "not from today's price.").classes('text-xs').style('color: #a0aec0;')
+            else:
+                ui.label('No individual price targets available').classes('italic text-sm') \
+                    .style('color: #a0aec0;')
+
             ui.separator().classes('my-2')
             
             # Grades Consensus section
@@ -810,8 +902,9 @@ class AnalystRatingsTab:
                 
                 # Format rows
                 formatted_grades = []
-                for grade in grades_data[:10]:
+                for index, grade in enumerate(grades_data[:10]):
                     formatted_grades.append({
+                        'key': index,
                         'date': grade.get('date', '')[:10] if grade.get('date') else '',
                         'gradingCompany': grade.get('gradingCompany', 'Unknown'),
                         'previousGrade': grade.get('previousGrade', '-'),
@@ -820,8 +913,10 @@ class AnalystRatingsTab:
                 
                 grades_table = ui.table(
                     columns=grades_columns, 
-                    rows=formatted_grades, 
-                    row_key='date'
+                    rows=formatted_grades,
+                    # Not the date: several firms act on the same day (five on 2026-01-29 for
+                    # META), and duplicate row keys make Quasar drop or merge rows.
+                    row_key='key'
                 ).classes('w-full').props('dense')
                 
                 # Add slot for grade coloring
