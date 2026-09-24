@@ -2694,9 +2694,23 @@ class TradeManager:
                             )
                             continue
                         
-                        if allow_hold and all(is_option_action(s['action_type']) for s in action_summaries):
-                            # Option actions already size and submit through their shared
-                            # risk/capacity guards, matching the backtest option path.
+                        option_flags = [is_option_action(s['action_type']) for s in action_summaries]
+                        if any(option_flags) and not all(option_flags):
+                            # Neither path can size both halves: the equity RM would stamp a
+                            # share count + stock stop onto the option order, and the option
+                            # path would submit the equity action unsized. Refuse loudly.
+                            self.logger.error(
+                                f"Refusing recommendation {recommendation.id} for {recommendation.symbol}: "
+                                f"its entry rule mixes option and equity actions "
+                                f"{[s['action_type'] for s in action_summaries]}")
+                            continue
+                        if all(option_flags):
+                            # Option actions size and submit themselves through their shared
+                            # risk/capacity guards, matching the backtest option path
+                            # (daily_engine._entry_is_option), whatever the signal. They must
+                            # never reach the equity RM below: it re-labels the contracts as
+                            # shares and stages a STOCK safeguard stop at the broker (8082,
+                            # 2026-09-24: SELL 9 GILD @ 138.56 behind a 2-contract call).
                             for result in evaluator.execute(submit_to_broker=True):
                                 if result.get("success"):
                                     oid = (result.get("data") or {}).get("order_id")
