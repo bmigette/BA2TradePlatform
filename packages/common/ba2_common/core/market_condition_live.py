@@ -113,9 +113,24 @@ UNIVERSE_SENTINELS = frozenset({"EXPERT", "DYNAMIC", "SCREENER"})
 
 #: Why a live leaf got no context: read by ``TradeConditions`` for its once-per-field WARNING.
 NO_DECISION_SCOPE_REASON = (
-    "market-condition leaf evaluated OUTSIDE a market_condition_decision_scope (only the "
-    "enter-market pass opens one; open-positions/exit rulesets and the ruleset test page do not): "
-    "the gate is unknown and never passes")
+    "market-condition leaf evaluated OUTSIDE a market_condition_decision_scope (the enter-market "
+    "and open-positions passes open one; the ruleset test page does not): the gate is unknown "
+    "and never passes")
+
+
+def no_scope_open_reason(instance_id: Any) -> str:
+    """Why a GATED expert's leaf got no context when no decision scope was open AND its resolver
+    could not even be looked up (the settings read or the resolver build raised). The scope's
+    own failure was already reported by the pass that tried to open it."""
+    return (f"expert instance {instance_id} names a market_condition_profile, but no "
+            f"market-condition decision scope is open for this evaluation (the pass's scope "
+            f"failed to open, or the caller never opened one) and its resolver could not be "
+            f"resolved: the gate is unknown and never passes")
+
+
+#: ``_LAST_DISPATCH``'s resolver slot when a no-scope dispatch could not resolve the expert's
+#: resolver at all. Distinct from ``None`` (which means "empty setting").
+_UNRESOLVED_OUTSIDE_SCOPE = object()
 
 
 class SourceCertificationError(RuntimeError):
@@ -1083,11 +1098,39 @@ class PerInstanceMarketConditionResolver:
         if instance_id is None:
             _LAST_DISPATCH.set((None, None))
             return None
-        resolver = self.resolver_for(instance_id)
-        _LAST_DISPATCH.set((instance_id, resolver))
-        if resolver is None:
+        if _DECISION.get() is not None:
+            # A decision pass is open: exactly the path the entry pass has always taken,
+            # including a resolver build error PROPAGATING (refusing entries is the safe reading).
+            resolver = self.resolver_for(instance_id)
+            _LAST_DISPATCH.set((instance_id, resolver))
+            if resolver is None:
+                return None
+            return resolver(account, instrument_name, expert_recommendation)
+        # NO decision state is open, so no resolver can serve a context whatever happens below:
+        # this path returns None and NEVER RAISES. It is reached by an exit pass whose scope
+        # failed to open (TradeManager._open_exit_pass_market_condition_scope logged that ERROR)
+        # and by callers that never open one; raising here would abort the whole ruleset
+        # evaluation for the symbol and skip every other exit rule. The lookup below runs only
+        # to keep the specific reasons (empty setting, failed certification, uncovered symbol).
+        try:
+            resolver = self.resolver_for(instance_id)
+            _LAST_DISPATCH.set((instance_id, resolver))
+            if resolver is None:
+                return None
+            return resolver(account, instrument_name, expert_recommendation)
+        except Exception as e:
+            # DELIBERATELY broad, named so it survives BA2_ERROR_MODE=enforce: with no scope open
+            # the answer is "no context" whatever failed, and the failure itself was reported by
+            # the pass that could not open its scope. The refusals failure_modes never absorbs
+            # still propagate.
+            absorb_if_benign(e, Exception)
+            from ba2_common.logger import logger
+
+            logger.debug(f"market-condition leaf for expert instance {instance_id} "
+                         f"({instrument_name}) outside a decision scope: resolver lookup failed "
+                         f"({type(e).__name__}: {e}); reading no_context")
+            _LAST_DISPATCH.set((instance_id, _UNRESOLVED_OUTSIDE_SCOPE))
             return None
-        return resolver(account, instrument_name, expert_recommendation)
 
     def no_context_reason_for(self, symbol: Any) -> Optional[str]:
         """Why THIS symbol got no context, for the expert the last dispatch selected.
@@ -1100,6 +1143,8 @@ class PerInstanceMarketConditionResolver:
         instance_id, resolver = _LAST_DISPATCH.get() or (None, None)
         if instance_id is None:
             return None
+        if resolver is _UNRESOLVED_OUTSIDE_SCOPE:
+            return no_scope_open_reason(instance_id)
         if resolver is None:
             return (f"expert instance {instance_id} has an empty {PROFILE_SETTING} setting: no "
                     f"market-condition data is served for it, so this gate is unknown and never "

@@ -469,22 +469,167 @@ def test_a_real_malformed_manifest_does_not_stop_the_exit_pass(world, dispatcher
     assert clock == [] and live.current_decision() is None
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError, reason=(
-    "OPEN GAP, awaiting a decision: the scope guard covers the scope's OPENING only. A market "
-    "leaf evaluated afterwards resolves its context through PerInstanceMarketConditionResolver."
-    "__call__, which calls resolver_for() again and re-raises the malformed-manifest ValueError. "
-    "Under BA2_ERROR_MODE=enforce neither TradeActionEvaluator handler absorbs it, so a real "
-    "exit ruleset containing a market leaf still fails to evaluate for that symbol."))
 def test_a_market_leaf_after_a_failed_scope_reads_no_context(world, dispatcher, instances, clock,
                                                             monkeypatch):
+    """Was the strict xfail pinning the gap: after the pass guard absorbed the scope failure, the
+    leaf's own dispatch re-raised the malformed-manifest ValueError. With NO decision state open
+    the dispatcher now answers "no context" whatever fails, with a reason saying so."""
     monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
     instances[world["expert_id"]] = "ohlcv-v1"
     dispatcher._environ = {live.MANIFEST_ENV: "no-such-profile=abc"}
-    rec = type("Rec", (), {"instance_id": world["expert_id"], "symbol": SYMBOL})()
-    # What the pass does after the guard absorbed the scope failure: evaluate the leaf with no
-    # decision state. The desired outcome is "unknown, never passes", not an exception.
-    got = _adx_leaf(object(), SYMBOL, rec)
+    got = _adx_leaf(object(), SYMBOL, _rec_for(world["expert_id"]))
     assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+    assert got["reason"] == live.no_scope_open_reason(world["expert_id"])
+    assert clock == []
+
+
+# ------------------------------------------- the dispatcher outside a decision scope (contract)
+def _rec_for(instance_id):
+    return type("Rec", (), {"instance_id": instance_id, "symbol": SYMBOL})()
+
+
+@pytest.mark.parametrize("boom", [RuntimeError("reader build failed"), ValueError("bad manifest"),
+                                  TypeError("seam defect")], ids=lambda e: type(e).__name__)
+def test_no_scope_and_a_failing_build_reads_no_context_and_never_raises(dispatcher, instances,
+                                                                       clock, monkeypatch, boom):
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    instances[5] = "ohlcv-v1"
+
+    def _build(profiles):
+        raise boom
+
+    monkeypatch.setattr(dispatcher, "_build", _build)
+    assert live.current_decision() is None
+    assert dispatcher(object(), SYMBOL, _rec_for(5)) is None
+    got = _adx_leaf(object(), SYMBOL, _rec_for(5))
+    assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+    assert got["reason"] == live.no_scope_open_reason(5)
+    assert "no market-condition decision scope is open" in got["reason"]
+    assert clock == []
+
+
+def test_no_scope_and_a_broken_settings_read_reads_no_context_and_never_raises(dispatcher, clock,
+                                                                              monkeypatch):
+    """``profiles_for`` lets a TypeError/AttributeError from the instance resolver propagate (a
+    defect must not read as "no profile"). Outside a scope that still must not raise here."""
+    import ba2_common.core.instance_resolver as ir
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+
+    class _Broken:
+        def get_expert_instance(self, expert_id):
+            raise AttributeError("resolver seam returned the wrong shape")
+
+    monkeypatch.setattr(ir, "get_instance_resolver", lambda: _Broken())
+    got = _adx_leaf(object(), SYMBOL, _rec_for(6))
+    assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+    assert got["reason"] == live.no_scope_open_reason(6)
+
+
+def test_no_scope_and_a_healthy_profile_keeps_todays_reason(dispatcher, instances, clock):
+    """Nothing failed, the caller just has no scope open: today's reason, unchanged."""
+    instances[7] = "ohlcv-v1"
+    got = _adx_leaf(object(), SYMBOL, _rec_for(7))
+    assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+    assert got["reason"] == live.NO_DECISION_SCOPE_REASON
+    assert "OUTSIDE a market_condition_decision_scope" in got["reason"]
+
+
+def test_no_scope_and_no_profile_keeps_the_empty_setting_reason(dispatcher, instances, clock):
+    instances[8] = ""
+    got = _adx_leaf(object(), SYMBOL, _rec_for(8))
+    assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+    assert "expert instance 8 has an empty market_condition_profile setting" in got["reason"]
+
+
+def test_inside_an_open_scope_a_build_error_still_propagates(dispatcher, instances, clock,
+                                                           monkeypatch):
+    """ENTRY-PATH SEMANTICS UNCHANGED: with a decision state open, a resolver build error raises
+    out of the leaf exactly as before (here: expert 1's pass is open, a leaf for expert 2 whose
+    resolver cannot be built)."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    instances[1] = "ohlcv-v1"
+    instances[2] = "ta-structure-v1"
+    real_build = dispatcher._build
+
+    def _build(profiles):
+        if profiles == ("ta-structure-v1",):
+            raise RuntimeError("reader build failed")
+        return real_build(profiles)
+
+    monkeypatch.setattr(dispatcher, "_build", _build)
+    with live.market_condition_decision_scope(expert_instance_id=1) as state:
+        assert state is not None
+        assert _adx_leaf(object(), SYMBOL, _rec_for(1))["status"] == STATUS_VALID
+        leaf = TC.create_condition(ExpertEventType.N_UNDERLYING_ADX, object(), SYMBOL,
+                                   _rec_for(2), operator_str=">", value=-1e9)
+        with pytest.raises(RuntimeError, match="reader build failed"):
+            leaf.evaluate()
+
+
+def test_the_entry_pass_still_propagates_a_malformed_manifest(dispatcher, instances, clock,
+                                                             monkeypatch):
+    """The entry pass is NOT guarded: refusing entries is the safe reading of a broken manifest."""
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    instances[3] = "ohlcv-v1"
+    dispatcher._environ = {live.MANIFEST_ENV: "no-such-profile=abc"}
+    ran = []
+    monkeypatch.setattr(TradeManager, "_process_expert_recommendations_after_analysis",
+                        lambda self, expert_id, lookback_days=1: ran.append(expert_id) or [])
+    with pytest.raises(ValueError, match="no-such-profile"):
+        TradeManager().process_expert_recommendations_after_analysis(3)
+    assert ran == []
+
+
+def test_real_evaluator_other_exit_rules_still_fire_after_a_failed_scope(dispatcher, instances,
+                                                                         clock, monkeypatch):
+    """End to end through the REAL ``TradeActionEvaluator`` with no decision scope open and a
+    malformed manifest: rule 1 (a market leaf) reads no_context and does not fire, rule 2 (a
+    plain account condition) still fires. Before the fix the leaf raised and the whole ruleset
+    evaluation for the symbol raised with it."""
+    from ba2_trade_platform.core.TradeActionEvaluator import TradeActionEvaluator
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import EventAction, Ruleset
+    from ba2_trade_platform.core.types import ExpertActionType, ExpertEventRuleType
+    from tests.conftest import MockAccount
+    from tests.factories import link_rule_to_ruleset
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    account_def = create_account_definition()
+    expert_instance = create_expert_instance(account_id=account_def.id)
+    rec = create_recommendation(instance_id=expert_instance.id, symbol="AAPL",
+                                recommended_action=OrderRecommendation.BUY)
+    instances[expert_instance.id] = "ohlcv-v1"
+    dispatcher._environ = {live.MANIFEST_ENV: "no-such-profile=abc"}
+
+    rs_id = add_instance(Ruleset(name="exits",
+                                 type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE))
+    rules = [
+        ("market leaf", {"event_type": ExpertEventType.N_UNDERLYING_ADX.value,
+                         "operator": ">", "value": -1e9}),
+        ("plain rule", {"event_type": ExpertEventType.F_HAS_NO_POSITION_ACCOUNT.value}),
+    ]
+    for i, (name, trigger) in enumerate(rules):
+        ea_id = add_instance(EventAction(
+            name=name, type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+            triggers={"trigger_0": trigger},
+            actions={"action_0": {"action_type": ExpertActionType.BUY.value}},
+            continue_processing=True))
+        link_rule_to_ruleset(rs_id, ea_id, order_index=i)
+    account = MockAccount(account_def.id)
+    account._positions = []                       # confirmed flat: the plain rule is TRUE
+
+    evaluator = TradeActionEvaluator(account=account)
+    results = evaluator.evaluate("AAPL", rec, rs_id)
+
+    assert results and not any("error" in r for r in results), results
+    by_rule = {r["rule_name"]: r for r in evaluator.rule_evaluations}
+    assert by_rule["plain rule"]["executed"] is True
+    assert by_rule["market leaf"]["executed"] is False
+    assert "error" not in by_rule["market leaf"]
+    assert clock == []
 
 
 def test_a_never_absorbed_refusal_still_propagates(world, activities, monkeypatch):

@@ -4238,7 +4238,7 @@ class MarketConditionCompare(CompareCondition):
             resolver = _market_condition_context_resolver
             if resolver is not None:
                 # A resolver IS installed but has no context for this evaluation (live: a leaf
-                # outside the enter-market decision scope). Never raise -- exit rulesets must keep
+                # outside a market-condition decision scope). Never raise -- exit rulesets must keep
                 # running -- but say so ONCE per cause instead of a DEBUG line per evaluation.
                 reason = getattr(resolver, "no_context_reason", None) or \
                     "the installed market-condition resolver has no context for this evaluation"
