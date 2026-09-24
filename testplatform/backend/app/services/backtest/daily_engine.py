@@ -824,6 +824,15 @@ class DailyBacktestEngine:
                 return True
         except Exception:  # noqa: BLE001 — be conservative: unknown -> step densely
             return True
+        # A HELD OPTION LOT is activity too. ``get_positions()`` is the equity ledger only, so an
+        # option-only book with no working order used to read as flat and the loop jumped from
+        # entry day to entry day: the manage pass never ran in between (exits late), the curve
+        # was sampled on entry days only, and expiry settled on the next VISITED bar at that
+        # bar's spot. Live manages open positions on its own daily cadence, so stepping every
+        # bar while a lot is open is the parity behaviour (findings 2026-09-24 §5.1 bug 3).
+        # An equity run never holds a lot, so its visited-bar sequence is unchanged.
+        if self.account.has_open_option_positions():
+            return True
         try:
             from ba2_common.core.types import OrderStatus
             active = set(OrderStatus.get_active_statuses())

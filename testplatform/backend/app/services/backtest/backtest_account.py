@@ -4145,6 +4145,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                   for d in self._iv_rank_sample_dates(as_of, lookback_days)]
         return self._iv_rank_from_series(series, current, min_samples)
 
+    def has_open_option_positions(self) -> bool:
+        """True while the option ledger holds any lot with non-zero contracts (long or short).
+
+        The engine's advance step asks this so a held option counts as ACTIVITY: the equity
+        ``get_positions()`` never lists option lots, so without it an option-only book looked
+        flat and the loop jumped from entry day to entry day -- exits unevaluated, the curve
+        unsampled and expiry settled on the next visited bar at THAT bar's spot (findings
+        2026-09-24 section 5.1, bug 3).
+
+        Reads the in-memory ledger rather than ``get_option_positions()``: this is asked once
+        per bar, and that view is a transaction query. Lots settled or netted to zero stay in
+        the dict (``_zero_option_lot`` keeps the object), so ``qty != 0`` is what "open" means.
+        """
+        return any(lot.qty != 0 for lot in self._option_positions.values())
+
     def get_option_positions(self):
         """Held option positions, derived from OPENED transactions whose entry is an OPTION.
 
