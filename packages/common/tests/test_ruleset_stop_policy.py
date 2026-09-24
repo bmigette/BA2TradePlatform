@@ -28,14 +28,14 @@ from types import SimpleNamespace
 import pytest
 
 TA = importlib.import_module("ba2_common.core.TradeActions")
-from ba2_common.core.db import add_instance, get_instance
+from ba2_common.core.db import add_instance, get_instance, update_instance
 from ba2_common.core.instance_resolver import get_instance_resolver, set_instance_resolver
 from ba2_common.core.models import ExpertRecommendation, Transaction, TradingOrder
 from ba2_common.core.position_sizing import MAX_LOSS_STOP_KEY
 from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
 from ba2_common.core.TradeActions import (
     RULESET_SL_LOOSEN_SETTING, RULESET_STOP_KEPT_REASONS, AdjustStopLossAction,
-    AdjustTakeProfitAction, ruleset_sl_loosen_allowed, ruleset_stop_policy,
+    AdjustTakeProfitAction, ruleset_sl_loosen_allowed, ruleset_stop_policy, stop_is_long_position,
 )
 from ba2_common.core.types import (
     OrderDirection, OrderRecommendation, OrderStatus, OrderType, RiskLevel, TimeHorizon,
@@ -84,6 +84,16 @@ def _text(messages):
     return " | ".join(messages)
 
 
+#: Expert GETTERS, the shape ruleset_stop_policy takes.
+_ON = lambda: _on()      # noqa: E731
+_OFF = lambda: _off()    # noqa: E731
+
+
+def _px(price):
+    """A price getter returning ``price``."""
+    return lambda: price
+
+
 def _must_not_resolve():
     raise AssertionError("the expert/price must only be resolved on a LOOSENING request")
 
@@ -97,7 +107,7 @@ class TestLongPolicy:
 
     def test_a_tighter_request_applies_without_resolving_the_expert(self):
         assert ruleset_stop_policy(_txn(97.0, bound=92.0), 99.0, True, _must_not_resolve,
-                                   current_price=_must_not_resolve) == (99.0, "tighter_or_equal")
+                                   price_getter=_must_not_resolve) == (99.0, "tighter_or_equal")
 
     def test_an_equal_request_is_applied_not_kept(self):
         """Before the policy an equal request reached ``adjust_sl`` (the account treats it as
@@ -107,42 +117,42 @@ class TestLongPolicy:
         assert reason not in RULESET_STOP_KEPT_REASONS
 
     def test_setting_off_a_looser_request_is_the_ratchet_with_todays_log_line(self, info_log):
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _off()) == (97.0, "ratchet")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _OFF) == (97.0, "ratchet")
         assert ("SL ratchet: keeping existing stop $97.00 for transaction 7 — ruleset asked for "
                 "$85.00, which would LOOSEN the long stop") in _text(info_log)
 
     def test_setting_on_loosening_within_the_bound_is_applied(self, info_log):
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 94.0, True, _on(),
-                                   current_price=110.0) == (94.0, "loosen_within_bound")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 94.0, True, _ON,
+                                   price_getter=_px(110.0)) == (94.0, "loosen_within_bound")
         assert "$92.0000" in _text(info_log), "the log must name the bound"
 
     def test_setting_on_loosening_past_the_bound_is_clamped_at_it(self, info_log):
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _on(),
-                                   current_price=110.0) == (92.0, "loosen_clamped")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _ON,
+                                   price_getter=_px(110.0)) == (92.0, "loosen_clamped")
         for needle in ("$97.00", "$85.00", "$92.0000", "applied=$92.0000"):
             assert needle in _text(info_log)
 
     def test_setting_on_with_no_bound_recorded_is_refused_and_logged(self, info_log):
-        assert ruleset_stop_policy(_txn(97.0), 85.0, True, _on(),
-                                   current_price=110.0) == (97.0, "no_max_loss_stop")
+        assert ruleset_stop_policy(_txn(97.0), 85.0, True, _ON,
+                                   price_getter=_px(110.0)) == (97.0, "no_max_loss_stop")
         assert "no max-loss stop is recorded" in _text(info_log)
 
     def test_setting_on_with_an_invalid_bound_is_refused(self):
         """``max_loss_stop_of`` reads an unusable stored value as None: never loosen on it."""
         txn = _txn(97.0)
         txn.meta_data[MAX_LOSS_STOP_KEY] = "garbage"
-        assert ruleset_stop_policy(txn, 85.0, True, _on(), current_price=110.0)[1] == "no_max_loss_stop"
+        assert ruleset_stop_policy(txn, 85.0, True, _ON, price_getter=_px(110.0))[1] == "no_max_loss_stop"
 
     def test_setting_on_an_existing_stop_already_looser_than_the_bound_is_kept(self):
         """Clamping to 92 would move a 90 stop CLOSER to the market -- a tightening performed
         as a side effect of a loosen request. The stop stays at 90."""
-        assert ruleset_stop_policy(_txn(90.0, bound=92.0), 85.0, True, _on(),
-                                   current_price=110.0) == (90.0, "existing_beyond_bound")
+        assert ruleset_stop_policy(_txn(90.0, bound=92.0), 85.0, True, _ON,
+                                   price_getter=_px(110.0)) == (90.0, "existing_beyond_bound")
 
     def test_the_result_is_never_looser_than_the_bound_nor_than_requested(self):
         for requested in (96.5, 94.0, 92.0, 91.99, 85.0, 1.0):
-            price, _ = ruleset_stop_policy(_txn(97.0, bound=92.0), requested, True, _on(),
-                                           current_price=200.0)
+            price, _ = ruleset_stop_policy(_txn(97.0, bound=92.0), requested, True, _ON,
+                                           price_getter=_px(200.0))
             assert price >= 92.0 and price >= requested, requested
 
 
@@ -159,34 +169,34 @@ class TestShortPolicy:
 
     def test_setting_off_a_looser_request_is_the_ratchet_with_todays_log_line(self, info_log):
         assert ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), 115.0, False,
-                                   _off()) == (103.0, "ratchet")
+                                   _OFF) == (103.0, "ratchet")
         assert "which would LOOSEN the short stop" in _text(info_log)
 
     def test_setting_on_loosening_within_the_bound_is_applied(self):
-        assert ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), 106.0, False, _on(),
-                                   current_price=90.0) == (106.0, "loosen_within_bound")
+        assert ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), 106.0, False, _ON,
+                                   price_getter=_px(90.0)) == (106.0, "loosen_within_bound")
 
     def test_setting_on_loosening_past_the_bound_is_clamped_at_it(self):
-        assert ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), 115.0, False, _on(),
-                                   current_price=90.0) == (108.0, "loosen_clamped")
+        assert ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), 115.0, False, _ON,
+                                   price_getter=_px(90.0)) == (108.0, "loosen_clamped")
 
     def test_setting_on_with_no_bound_recorded_is_refused(self):
-        assert ruleset_stop_policy(_txn(103.0, long=False), 115.0, False, _on(),
-                                   current_price=90.0) == (103.0, "no_max_loss_stop")
+        assert ruleset_stop_policy(_txn(103.0, long=False), 115.0, False, _ON,
+                                   price_getter=_px(90.0)) == (103.0, "no_max_loss_stop")
 
     def test_setting_on_an_existing_stop_already_looser_than_the_bound_is_kept(self):
-        assert ruleset_stop_policy(_txn(110.0, long=False, bound=108.0), 115.0, False, _on(),
-                                   current_price=90.0) == (110.0, "existing_beyond_bound")
+        assert ruleset_stop_policy(_txn(110.0, long=False, bound=108.0), 115.0, False, _ON,
+                                   price_getter=_px(90.0)) == (110.0, "existing_beyond_bound")
 
     def test_a_clamp_too_close_to_the_market_is_refused(self):
         # 108 is 1.89% above 106: below the 3% minimum.
-        assert ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), 115.0, False, _on(),
-                                   current_price=106.0) == (103.0, "bound_too_close")
+        assert ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), 115.0, False, _ON,
+                                   price_getter=_px(106.0)) == (103.0, "bound_too_close")
 
     def test_the_result_is_never_looser_than_the_bound_nor_than_requested(self):
         for requested in (103.5, 106.0, 108.0, 108.01, 115.0, 1000.0):
             price, _ = ruleset_stop_policy(_txn(103.0, long=False, bound=108.0), requested, False,
-                                           _on(), current_price=50.0)
+                                           _ON, price_getter=_px(50.0))
             assert price <= 108.0 and price <= requested, requested
 
 
@@ -200,31 +210,76 @@ class TestMinDistanceAfterAClamp:
 
     def test_a_clamped_stop_within_the_minimum_distance_is_refused(self, info_log):
         # bound 92 is 2.13% under 94.
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _on(),
-                                   current_price=94.0) == (97.0, "bound_too_close")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _ON,
+                                   price_getter=_px(94.0)) == (97.0, "bound_too_close")
         assert "below the 3.0% minimum" in _text(info_log)
 
     def test_a_clamped_stop_through_the_market_is_refused(self):
         """Price has fallen under the bound (the 97 stop has not fired yet): placing a 92 stop
         above a 91 market is the "never a stop above market" trap."""
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _on(),
-                                   current_price=91.0) == (97.0, "bound_too_close")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _ON,
+                                   price_getter=_px(91.0)) == (97.0, "bound_too_close")
 
     def test_a_clamp_with_no_current_price_is_refused(self):
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _on(),
-                                   current_price=lambda: None) == (97.0, "bound_unverifiable")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _ON,
+                                   price_getter=lambda: None) == (97.0, "bound_unverifiable")
 
     def test_a_clamp_exactly_at_the_minimum_distance_is_applied(self):
         price = 92.0 / 0.97   # bound sits exactly 3% under the market
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _on(),
-                                   current_price=price) == (92.0, "loosen_clamped")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, _ON,
+                                   price_getter=_px(price)) == (92.0, "loosen_clamped")
+
+
+# =============================================================================================
+# The min-distance floor can never turn a tighten into a loosen (review I1)
+# =============================================================================================
+class TestTheFloorNeverLoosens:
+    """The floor runs BEFORE the policy. A lock at 105 with the market at 107 and a
+    "current -1%" rule: the rule asks 105.93 (a tighten), the 3% floor makes it 103.79 (a
+    loosen). With the setting on that used to read as a rule loosening within the bound."""
+
+    def test_long_a_tightening_rule_floored_looser_keeps_the_stop(self, info_log):
+        assert ruleset_stop_policy(_txn(105.0, bound=92.0), 103.79, True, _ON,
+                                   price_getter=_px(107.0), rule_price=105.93) == (
+            105.0, "floor_would_loosen")
+        assert "SL floor would loosen: keeping existing stop $105.00" in _text(info_log)
+        assert "$105.93" in _text(info_log) and "$103.79" in _text(info_log)
+
+    def test_long_a_rule_equal_to_the_stop_floored_looser_keeps_the_stop(self):
+        assert ruleset_stop_policy(_txn(105.0, bound=92.0), 103.79, True, _ON,
+                                   price_getter=_px(107.0), rule_price=105.0) == (
+            105.0, "floor_would_loosen")
+
+    def test_long_a_rule_that_itself_loosens_is_still_a_loosen(self):
+        assert ruleset_stop_policy(_txn(105.0, bound=92.0), 101.0, True, _ON,
+                                   price_getter=_px(107.0), rule_price=104.0) == (
+            101.0, "loosen_within_bound")
+
+    def test_short_a_tightening_rule_floored_looser_keeps_the_stop(self):
+        assert ruleset_stop_policy(_txn(95.0, long=False, bound=108.0), 95.79, False, _ON,
+                                   price_getter=_px(93.0), rule_price=93.93) == (
+            95.0, "floor_would_loosen")
+
+    def test_short_a_rule_that_itself_loosens_is_still_a_loosen(self):
+        assert ruleset_stop_policy(_txn(95.0, long=False, bound=108.0), 99.0, False, _ON,
+                                   price_getter=_px(93.0), rule_price=96.0) == (
+            99.0, "loosen_within_bound")
+
+    def test_setting_off_the_log_stays_the_ratchet_line(self, info_log):
+        """The floor check sits after the ratchet, so the default-off log is unchanged."""
+        assert ruleset_stop_policy(_txn(105.0, bound=92.0), 103.79, True, _OFF,
+                                   rule_price=105.93) == (105.0, "ratchet")
+        assert "SL ratchet: keeping existing stop $105.00" in _text(info_log)
+
+    def test_the_reason_is_a_kept_reason(self):
+        assert "floor_would_loosen" in RULESET_STOP_KEPT_REASONS
 
 
 # =============================================================================================
 # The display fix
 # =============================================================================================
 def test_two_prices_that_round_to_the_same_cents_are_logged_at_four_decimals(info_log):
-    ruleset_stop_policy(_txn(97.0012), 97.0001, True, _off())
+    ruleset_stop_policy(_txn(97.0012), 97.0001, True, _OFF)
     assert "keeping existing stop $97.0012" in _text(info_log)
     assert "ruleset asked for $97.0001" in _text(info_log)
 
@@ -254,8 +309,8 @@ class TestTheSetting:
 
     def test_the_policy_reads_a_string_one_as_on(self):
         expert = _Expert(**{RULESET_SL_LOOSEN_SETTING: "1"})
-        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, expert,
-                                   current_price=110.0) == (92.0, "loosen_clamped")
+        assert ruleset_stop_policy(_txn(97.0, bound=92.0), 85.0, True, lambda: expert,
+                                   price_getter=_px(110.0)) == (92.0, "loosen_clamped")
 
     def test_every_expert_declares_it_off_by_default(self):
         from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
@@ -504,6 +559,99 @@ class TestCombinedPath:
         assert on.adjust_tp_sl_calls == [(txn_id, pytest.approx(80.0), pytest.approx(108.0), "ruleset")]
 
 
+class _PersistingAccount(_RecordingAccount):
+    """Like _RecordingAccount, but a stop it is sent is WRITTEN to the transaction, so a
+    multi-bar test sees each bar's result as the next bar's existing stop."""
+
+    def _write(self, transaction, sl):
+        if sl is not None:
+            row = get_instance(Transaction, transaction.id)
+            row.stop_loss = sl
+            update_instance(row)
+
+    def adjust_sl(self, transaction, new_sl_price, source=""):
+        super().adjust_sl(transaction, new_sl_price, source)
+        self._write(transaction, new_sl_price)
+        return True
+
+    def adjust_tp_sl(self, transaction, new_tp_price=None, new_sl_price=None, source=""):
+        super().adjust_tp_sl(transaction, new_tp_price, new_sl_price, source)
+        self._write(transaction, new_sl_price)
+        return True
+
+
+#: A falling (long) / rising (short) market that stays on the right side of the 105 / 95 lock,
+#: with the rule's own "current -1%" price never looser than the lock -- every loosening the
+#: stop could suffer here would come from the floor alone.
+_FALLING = (107.0, 106.8, 106.5, 106.2, 106.1)
+_RISING_SHORT = (93.0, 93.2, 93.5, 93.8, 93.9)
+
+
+def _trail(merged, *, long):
+    """Run a "current -1%" trailing rule bar by bar with the setting ON; return the stop after
+    each bar. Entry $100; lock 105 (long) / 95 (short); max-loss 92 / 108."""
+    account = _PersistingAccount()
+    lock, bound = (105.0, 92.0) if long else (95.0, 108.0)
+    txn_id, order_id, rec_id = _position(account.id, long=long, stop=lock, bound=bound)
+    stops = []
+    for price in (_FALLING if long else _RISING_SHORT):
+        account.current_price = price
+        order = get_instance(TradingOrder, order_id)
+        rec = get_instance(ExpertRecommendation, rec_id)
+        sl = AdjustStopLossAction(
+            "AAPL", account, OrderRecommendation.BUY if long else OrderRecommendation.SELL,
+            existing_order=order, expert_recommendation=rec,
+            reference_value="current_price", percent=-1.0)
+        if merged:
+            evaluator = TradeActionEvaluator(account=account, instrument_name="AAPL",
+                                             existing_transactions=[get_instance(Transaction, txn_id)])
+            evaluator.expert_recommendation = rec
+            evaluator.trade_actions = [_tp_action(account, order, rec, long=long), sl]
+            evaluator.execute()
+        else:
+            sl.execute()
+        stops.append(get_instance(Transaction, txn_id).stop_loss)
+    return stops
+
+
+class TestATrailingRuleNeverLoosensOnTheFloor:
+    """Review I1 end to end: the pre-floor price reaches the policy on both paths."""
+
+    @pytest.mark.parametrize("merged", [False, True], ids=["sl-only", "merged-tp-sl"])
+    def test_long(self, resolver, merged):
+        resolver(_on())
+        assert _trail(merged, long=True) == [105.0] * len(_FALLING)
+
+    @pytest.mark.parametrize("merged", [False, True], ids=["sl-only", "merged-tp-sl"])
+    def test_short(self, resolver, merged):
+        resolver(_on())
+        assert _trail(merged, long=False) == [95.0] * len(_RISING_SHORT)
+
+
+# =============================================================================================
+# The side a stop protects (review M4)
+# =============================================================================================
+class TestStopSide:
+    @pytest.mark.parametrize("side, expected", [
+        (OrderDirection.BUY, True), (OrderDirection.SELL, False), ("buy", True), ("SELL", False)])
+    def test_a_known_side(self, side, expected):
+        assert stop_is_long_position(SimpleNamespace(id=1, side=side)) is expected
+
+    def test_the_order_side_is_the_fallback(self):
+        order = SimpleNamespace(side=OrderDirection.SELL)
+        assert stop_is_long_position(SimpleNamespace(id=1, side=None), order) is False
+
+    @pytest.mark.parametrize("side", [None, "", "HOLD", "LONG"])
+    def test_an_unknown_side_raises_instead_of_reading_as_short(self, side):
+        with pytest.raises(ValueError, match="neither BUY nor SELL"):
+            stop_is_long_position(SimpleNamespace(id=1, side=side),
+                                  SimpleNamespace(side=None))
+
+    def test_every_real_caller_has_a_side(self):
+        """Both call sites pass a DB Transaction, whose side is a REQUIRED column."""
+        assert Transaction.model_fields["side"].is_required()
+
+
 def test_both_call_sites_use_the_one_policy():
     """A second copy of the ratchet is how the gap happened. Pin that neither site grows one."""
     import inspect
@@ -511,3 +659,6 @@ def test_both_call_sites_use_the_one_policy():
     assert "ruleset_stop_policy(" in inspect.getsource(TA.AdjustStopLossAction._call_broker)
     assert "ruleset_stop_policy(" in inspect.getsource(TAE.TradeActionEvaluator.execute)
     assert "LOOSEN" not in inspect.getsource(TA.AdjustStopLossAction._call_broker)
+    # ...and both hand it the rule's pre-floor price (review I1).
+    assert "rule_price=" in inspect.getsource(TA.AdjustStopLossAction._call_broker)
+    assert "rule_price=last_sl_action.rule_price" in inspect.getsource(TAE.TradeActionEvaluator.execute)

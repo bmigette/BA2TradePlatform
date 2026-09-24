@@ -409,10 +409,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Let ruleset rules move a stop-loss further away (up to the "
                                    "trade's max-loss stop). Off: stops only tighten.",
                     "tooltip": "Off (default): a ruleset adjust_stop_loss may only tighten an "
-                               "existing stop. On: it may also loosen it, but never past the "
-                               "max-loss stop recorded at entry (the stop the position was sized "
-                               "on); a trade with no recorded max-loss stop is never loosened. "
-                               "Manual edits and the Smart Risk Manager are unaffected."
+                               "existing stop. On: it may also loosen it, down to (up to, for "
+                               "shorts) the max-loss stop recorded at entry (the stop the "
+                               "position was sized on) and never past it. Trades with no "
+                               "recorded max-loss stop are never loosened, and the SL "
+                               "minimum-distance floor never turns a tightening rule into a "
+                               "loosen. Manual edits and the Smart Risk Manager are unaffected."
                 },
                 # AI Model Settings
                 "risk_manager_model": {

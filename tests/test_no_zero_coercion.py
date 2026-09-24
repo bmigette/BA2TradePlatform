@@ -388,7 +388,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:1751":
+    "packages/common/ba2_common/core/TradeActions.py:1791":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
@@ -410,7 +410,9 @@ ALLOWLIST: dict = {
         "9 import lines at the top (option_payoff_chart, option_trade_record, "
         "decision_data_session, DEFAULT_OPTION_MULTIPLIER) and 14 lines in BuyAction above it "
         "(+23 from :1576); :1751 after plan 2026-09-24 Task B4 added ruleset_stop_policy and "
-        "its helpers just above AdjustStopLossAction (+152)",
+        "its helpers just above AdjustStopLossAction (+152); :1791 after the B4 review fixes "
+        "(floor_would_loosen, the resolve_expert alias, a strict stop side, rule_price) added "
+        "40 more above it",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",

@@ -720,8 +720,10 @@ class TradeActionEvaluator:
                                     sl_price, sl_reason = ruleset_stop_policy(
                                         transaction, requested_sl,
                                         stop_is_long_position(transaction, order),
-                                        last_sl_action._regime_expert,
-                                        current_price=last_sl_action.get_current_price)
+                                        last_sl_action.resolve_expert,
+                                        price_getter=last_sl_action.get_current_price,
+                                        # compute_price above recorded the rule's pre-floor stop
+                                        rule_price=last_sl_action.rule_price)
                                     sl_kept = sl_reason in RULESET_STOP_KEPT_REASONS
                                     sl_to_send = None if sl_kept else sl_price
                                     logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}"

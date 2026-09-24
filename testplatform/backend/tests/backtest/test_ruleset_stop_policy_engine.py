@@ -6,6 +6,15 @@
     fixture exercises both branches: its entry bracket carries TP+SL (the merged branch, on a
     transaction with no stop yet -- the live common case) and an open-positions rule keeps asking
     for a looser stop (the SL-only ratchet).
+
+    THE ONE INTENDED CHANGE is deliberately NOT in this fixture: a pass where a TP rule and a
+    LOOSER SL rule fire together on an open position that already has a stop. Pre-B4 the merged
+    branch sent that looser SL straight to ``adjust_tp_sl``; now the ratchet refuses it (the SL
+    argument is None) and only the TP is applied. That change is pinned, not excluded, by
+    ``test_a_loosening_rule_stops_at_the_max_loss_stop[unset-merged-tp-sl-*]`` below and by the
+    TestCombinedPath tests in packages/common/tests/test_ruleset_stop_policy.py. The prod log
+    audit of 2026-09-24 found 57 merged calls (53 entry brackets, 4 on open positions) and none
+    that loosened a stop.
   * Setting on: a rule loosening the stop moves it to AT MOST the recorded max-loss stop, through
     the SL-only branch and through the merged branch; with the setting off both branches keep the
     tighter stop and the merged branch still applies its take-profit (the backtest account's
@@ -159,6 +168,9 @@ def test_default_setting_changes_no_trade(monkeypatch, inmem):
     _store_mode(monkeypatch, inmem)
     run_id = 610 + (100 if inmem == "0" else 0)
     entry = [_adjust("adjust_take_profit", 30.0), _adjust("adjust_stop_loss", -3.0)]
+    # An SL-ONLY loosening exit rule: the ratchet refuses it both before and after B4. A TP
+    # action on this same rule would route it through the merged branch, where B4 INTENDS a
+    # change (the looser SL is now refused there too) -- see the module docstring.
     exits = [_exit_rule(_adjust("adjust_stop_loss", -15.0))]    # always asks to LOOSEN
 
     seen = []
