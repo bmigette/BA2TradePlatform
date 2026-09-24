@@ -9,19 +9,32 @@ Missing, short or corrupt inputs raise ``ValueError``: the function never answer
 bar it could not evaluate.
 
 The core runs on numpy arrays and Python floats: it is called per symbol per bar in the GA.
+
+``PullbackReversion`` wraps it as an expert registered in ba2_experts and the daily backtest
+handler only. Like ETFTrend it is NOT in the live registry. It never submits orders: entry and
+exit become BUY/SELL recommendations that the ordinary rules and RM act on.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 import math
 from numbers import Real
 from typing import Mapping, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+from ba2_common.core.db import add_instance, update_instance
+from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.market_conditions import (
     STATUS_INVALID_PRICES, STATUS_VALID, STRUCTURE_STATE_CODES, STRUCTURE_STATE_NONE_CODE, WINDOW,
     compute_chart_structure, compute_market_conditions)
+from ba2_common.core.models import ExpertRecommendation
+from ba2_common.core.types import (
+    MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon)
+from ba2_common.logger import get_expert_logger
 
 DIRECTIONS = ("long", "short")
 TREND_GATES = ("sma200", "slope_ohlcv_v1", "sma200_and_spy")
@@ -226,3 +239,177 @@ def pullback_signal(bars: pd.DataFrame, settings: Mapping,
     return {"action": action, "rsi": rsi, "sma200": sma200, "sma5": sma5,
             "trend_ok": bool(trend_ok), "structure_state": structure_state,
             "reason": f"{action}: " + "; ".join(notes)}
+
+
+# ---------------------------------------------------------------------------
+# Expert
+# ---------------------------------------------------------------------------
+#: Calendar days of daily bars each decision reads: about 289 sessions, enough for SMA200 and
+#: the 128-bar calculator window with holiday slack. Both paths trim the frame to this window,
+#: so live (which fetches exactly this) and the backtest (whose memoised provider can return
+#: more) decide on the same bars.
+LOOKBACK_DAYS = 420
+#: A completed history whose last session is older than this is stale (ETFTrend's bound).
+MAX_STALE_DAYS = 7
+#: The market benchmark read by ``trend_gate == "sma200_and_spy"``.
+SPY_SYMBOL = "SPY"
+
+
+def completed_bars(frame, as_of: datetime, name: str) -> pd.DataFrame:
+    """Provider frame (``Date`` column on a RangeIndex) -> the completed daily sessions of the
+    last ``LOOKBACK_DAYS`` before ``as_of``, on an ascending UTC DatetimeIndex.
+
+    The session exclusion is ETFTrend's: daily candles are date-labelled, so even at 09:30 the
+    decision day's own candle (still forming live, already final in a backtest cache) must never
+    enter the decision; only earlier dates (New York calendar date of ``as_of``) are kept.
+    Missing, empty or stale histories raise ``ValueError``."""
+    if frame is None or len(frame) == 0:
+        raise ValueError(f"Missing OHLCV history: {name}")
+    missing = [k for k in ("Date",) + _OHLCV if k not in frame.columns]
+    if missing:
+        raise ValueError(f"OHLCV history for {name} is missing columns {missing}")
+    local = as_of.astimezone(ZoneInfo("America/New_York")) if as_of.tzinfo else as_of
+    today = local.date()
+    # ETFTrend reads the dates as ``pd.to_datetime(Date, utc=True)``: tz-aware stamps become UTC
+    # instants, naive ones are taken as UTC. A datetime64 column's ``.values`` is exactly those
+    # UTC instants (naive), so the conversion is only paid for object/string columns. This
+    # function runs per symbol per bar in the GA; the pandas path cost ~1 ms a call.
+    column = frame["Date"]
+    stamps = (column.values if column.dtype.kind == "M"
+              else pd.to_datetime(column, utc=True).values)
+    # For UTC instants, ``ts.date() < today`` is exactly ``ts < today 00:00 UTC``.
+    end = np.datetime64(today, "D")
+    keep = (stamps < end) & (stamps >= end - np.timedelta64(LOOKBACK_DAYS, "D"))
+    if not keep.any():
+        raise ValueError(f"No completed sessions for {name} before {today}")
+    index = pd.DatetimeIndex(stamps[keep], name="Date").tz_localize("UTC")
+    bars = pd.DataFrame({k: frame[k].to_numpy()[keep] for k in _OHLCV}, index=index)
+    if not index.is_monotonic_increasing:
+        bars = bars.sort_index(kind="stable")
+    last = bars.index[-1].date()
+    if (today - last).days > MAX_STALE_DAYS:
+        raise ValueError(f"Stale OHLCV history for {name}: last completed session {last}, "
+                         f"analysis date {today}")
+    return bars
+
+
+class PullbackReversion(MarketExpertInterface):
+    """Backtest-registered (research) expert over ``pullback_signal``.
+
+    Recommendation mapping (``expected_profit_percent`` is always 0.0: no price target):
+    entry -> BUY (long) / SELL (short), confidence 50..100 by how far RSI is past the entry
+    threshold; exit -> SELL (long) / BUY (short), confidence 100; none -> HOLD.
+    A long expert's SELL is an EXIT signal: it only acts through a ruleset that closes an open
+    position, never by itself opening a short."""
+
+    @classmethod
+    def description(cls):
+        return ("Short-horizon RSI pullback reversion inside the prevailing trend "
+                "(long dips in uptrends or short rallies in downtrends)")
+
+    @classmethod
+    def get_settings_definitions(cls):
+        return {
+            "direction": {"type": "str", "required": True, "default": "long",
+                          "valid_values": list(DIRECTIONS),
+                          "description": "long buys oversold dips in an uptrend; short sells "
+                                         "overbought rallies in a downtrend"},
+            "trend_gate": {"type": "str", "required": True, "default": "sma200",
+                           "valid_values": list(TREND_GATES),
+                           "description": "Trend filter: close vs SMA200, the ohlcv-v1 trend "
+                                          "slope sign, or SMA200 plus SPY vs its own SMA200"},
+            "rsi_period": {"type": "int", "required": True, "default": 2,
+                           "description": "Wilder RSI period in bars (2-5)"},
+            "entry_threshold": {"type": "float", "required": True, "default": 5.0,
+                                "description": "Entry when RSI < threshold (long) or "
+                                               "> 100 - threshold (short); 1-30"},
+            "exit_mode": {"type": "str", "required": True, "default": "sma5",
+                          "valid_values": list(EXIT_MODES),
+                          "description": "Exit signal: close beyond SMA5, RSI beyond rsi_exit, "
+                                         "SMA5 or a swing-structure CHoCH, or time (the "
+                                         "max-hold rule owns the exit)"},
+            "rsi_exit": {"type": "float", "required": True, "default": 70.0,
+                         "description": "RSI exit level for exit_mode=rsi: long exits above it, "
+                                        "short below 100 - rsi_exit; 50-90"},
+        }
+
+    _SETTING_KEYS = ("direction", "trend_gate", "rsi_period", "entry_threshold",
+                     "exit_mode", "rsi_exit")
+
+    def __init__(self, id):
+        super().__init__(id)
+        self._load_expert_instance(id)
+        self.logger = get_expert_logger("PullbackReversion", id)
+
+    def _analyze(self, symbol, providers, settings, as_of):
+        provider = providers.ohlcv()
+
+        def history(name):
+            frame = provider.get_ohlcv_data(name, end_date=as_of, lookback_days=LOOKBACK_DAYS,
+                                            interval="1d")
+            return completed_bars(frame, as_of, name)
+
+        bars = history(symbol)
+        spy = history(SPY_SYMBOL) if settings["trend_gate"] == "sma200_and_spy" else None
+        result = pullback_signal(bars, settings, spy)  # validates every setting it reads
+        long = settings["direction"] == "long"
+        action = result["action"]
+        if action == "entry":
+            threshold = float(settings["entry_threshold"])
+            depth = ((threshold - result["rsi"]) if long
+                     else (result["rsi"] - (100.0 - threshold))) / threshold
+            signal = OrderRecommendation.BUY if long else OrderRecommendation.SELL
+            confidence = 50.0 + 50.0 * min(max(depth, 0.0), 1.0)
+        elif action == "exit":
+            signal = OrderRecommendation.SELL if long else OrderRecommendation.BUY
+            confidence = 100.0
+        elif action == "none":
+            signal, confidence = OrderRecommendation.HOLD, 50.0
+        else:
+            raise ValueError(f"Unknown pullback_signal action {action!r}")
+        session = bars.index[-1].date().isoformat()
+        return Recommendation(
+            signal=signal, confidence=confidence, current_price=float(bars["Close"].iloc[-1]),
+            expected_profit_percent=0.0,  # no price target or return forecast
+            details=f"{symbol} {settings['direction']} pullback on session {session}: "
+                    f"{result['reason']}. Confidence denotes a satisfied rule, not a "
+                    "probability of profit.",
+            raw_outputs={**result, "session": session})
+
+    def analyze_as_of(self, as_of, context):
+        # The daily engine's entry pass sets _gather_symbol; its management pass
+        # and the newer context callers also carry extra['symbol'].
+        symbol = context.extra["symbol"] if "symbol" in context.extra else self._gather_symbol
+        try:
+            return self._analyze(symbol, context.providers, context.settings, as_of)
+        except (ValueError, KeyError) as exc:
+            # The engine logs and skips an ordinary ValueError per symbol; missing, short or
+            # corrupt history must instead abort the run (as ETFTrend's basket does), never
+            # turn into a plausible-looking backtest that silently never evaluated the symbol.
+            from ba2_providers.fmp_common import FMPHistoryCacheMiss
+            raise FMPHistoryCacheMiss(f"PullbackReversion cannot evaluate {symbol}: {exc}") from exc
+
+    def run_analysis(self, symbol, market_analysis):
+        try:
+            market_analysis.status = MarketAnalysisStatus.RUNNING
+            update_instance(market_analysis)
+            rec = self._analyze(symbol, self._live_providers(),
+                                self._resolve_settings(self._SETTING_KEYS), datetime.now(timezone.utc))
+            add_instance(ExpertRecommendation(
+                instance_id=self.id, symbol=symbol, market_analysis_id=market_analysis.id,
+                recommended_action=rec.signal, expected_profit_percent=0.0,
+                price_at_date=rec.current_price, confidence=rec.confidence, details=rec.details,
+                risk_level=RiskLevel.MEDIUM, time_horizon=TimeHorizon.SHORT_TERM,
+                subtype=market_analysis.subtype, data={"PullbackReversion": rec.raw_outputs}))
+            market_analysis.state = {"PullbackReversion": rec.raw_outputs}
+            market_analysis.status = MarketAnalysisStatus.COMPLETED
+            update_instance(market_analysis)
+        except Exception as exc:
+            self.logger.error("PullbackReversion analysis failed for %s: %s", symbol, exc,
+                              exc_info=True)
+            market_analysis.status = MarketAnalysisStatus.FAILED
+            market_analysis.state = {"error": str(exc)}
+            update_instance(market_analysis)
+
+    def render_market_analysis(self, market_analysis):
+        return json.dumps(market_analysis.state, indent=2)

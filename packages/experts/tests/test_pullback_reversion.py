@@ -5,6 +5,7 @@ returns the decision for the last bar. The series are hand-built so each test st
 market shape it needs, and every precondition that depends on a platform calculator
 (trend slope, swing structure) is asserted against that calculator rather than hard-coded.
 """
+import importlib
 import math
 
 import numpy as np
@@ -141,7 +142,8 @@ def test_slope_gate_with_unmeasurable_slope_is_not_trend_ok(monkeypatch):
     today) reads as "trend not ok", never as passing."""
     import dataclasses
 
-    import ba2_experts.PullbackReversion as mod
+    # The package binds the CLASS under this name (registry import); take the module itself.
+    mod = importlib.import_module("ba2_experts.PullbackReversion")
     from ba2_common.core.market_conditions import STATUS_INSUFFICIENT_HISTORY, Observation
 
     real = mod.compute_market_conditions
@@ -242,7 +244,8 @@ def test_choch_mode_on_corrupt_bars_raises():
 def test_choch_mode_reports_unmeasurable_structure_as_None_and_no_choch(monkeypatch):
     import dataclasses
 
-    import ba2_experts.PullbackReversion as mod
+    # The package binds the CLASS under this name (registry import); take the module itself.
+    mod = importlib.import_module("ba2_experts.PullbackReversion")
     from ba2_common.core.market_conditions import STATUS_INSUFFICIENT_HISTORY, Observation
 
     real = mod.compute_chart_structure
