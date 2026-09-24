@@ -250,8 +250,8 @@ def _defect(kind):
         return None
     if kind == "empty":
         return frame.iloc[0:0]
-    if kind == "short":
-        return frame.iloc[-150:].reset_index(drop=True)
+    if kind == "gap":  # history reaches back to the window start, the middle is missing
+        return pd.concat([frame.iloc[:50], frame.iloc[-100:]], ignore_index=True)
     if kind == "stale":
         return provider_frame(long_dip(), end="2024-05-31")
     if kind == "nan":
@@ -264,11 +264,86 @@ def _defect(kind):
     raise AssertionError(kind)
 
 
-@pytest.mark.parametrize("kind", ["missing", "empty", "short", "stale", "nan", "duplicate",
+@pytest.mark.parametrize("kind", ["missing", "empty", "gap", "stale", "nan", "duplicate",
                                   "no_close"])
 def test_bad_history_aborts_the_backtest(kind):
+    # SPY is present and sound: a skip would be possible, so an abort is the defect's own.
+    frames = {"AAA": _defect(kind), "SPY": provider_frame(uptrend())}
     with pytest.raises(FMPHistoryCacheMiss):
-        analyze({"AAA": _defect(kind)}, settings_for())
+        analyze(frames, settings_for())
+
+
+def test_a_gap_is_not_mistaken_for_a_new_listing():
+    frames = {"AAA": _defect("gap"), "SPY": provider_frame(uptrend())}
+    with pytest.raises(FMPHistoryCacheMiss, match="a gap in the data, not a new listing"):
+        analyze(frames, settings_for())
+
+
+# --------------------------------------------------------------------------- recent listings
+def recent_listing():
+    """120 sessions ending on the decision session: listed around Dec 2023, well inside the
+    420-day window that starts 2023-04-24."""
+    return provider_frame(long_dip()[-120:])
+
+
+def spy_full():
+    return provider_frame(uptrend())
+
+
+@pytest.mark.parametrize("gate", ["sma200", "sma200_and_spy"])
+def test_recent_listing_is_skipped_like_deterministic_scorer(gate):
+    rec, provider = analyze({"AAA": recent_listing(), "SPY": spy_full()},
+                            settings_for(trend_gate=gate))
+    assert rec.skip is True
+    assert rec.skip_reason == "insufficient_history"
+    assert rec.signal == OrderRecommendation.HOLD
+    assert rec.confidence == 0.0
+    assert rec.expected_profit_percent == 0.0
+    assert rec.current_price == pytest.approx(long_dip()[-1])
+    assert "Insufficient OHLCV history (120 < 200)" in rec.details
+    # SPY is read once, as the reference: the listing is decided before any gate.
+    assert [c[0] for c in provider.calls] == ["AAA", "SPY"]
+    assert all(c[1]["end_date"] == AS_OF for c in provider.calls)
+
+
+def test_a_skip_leaves_the_backtest_ledger_untouched():
+    from app.services.backtest.daily_engine import _recommendation_to_expert_recommendation
+    rec, _ = analyze({"AAA": recent_listing(), "SPY": spy_full()}, settings_for())
+    assert _recommendation_to_expert_recommendation(
+        rec, expert_instance_id=1, symbol="AAA", as_of=AS_OF, allow_hold=True) is None
+
+
+@pytest.mark.parametrize("spy, match", [
+    (provider_frame(uptrend()[-150:]), "benchmark always has history"),        # SPY short
+    (provider_frame(uptrend()[-250:]), "provider does not cover the window"),  # warmup short
+    (None, "Missing OHLCV history: SPY"),
+])
+def test_recent_listing_needs_a_sound_spy_reference(spy, match):
+    frames = {"AAA": recent_listing()}
+    if spy is not None:
+        frames["SPY"] = spy
+    with pytest.raises(FMPHistoryCacheMiss, match=match):
+        analyze(frames, settings_for())
+
+
+def test_recent_listing_with_corrupt_closes_aborts():
+    frame = recent_listing()
+    frame.loc[10, "Close"] = float("nan")
+    with pytest.raises(FMPHistoryCacheMiss, match="Corrupt OHLCV history"):
+        analyze({"AAA": frame, "SPY": spy_full()}, settings_for())
+
+
+def test_short_spy_under_the_spy_gate_aborts():
+    frames = {"AAA": provider_frame(long_dip()), "SPY": provider_frame(uptrend()[-150:])}
+    with pytest.raises(FMPHistoryCacheMiss, match="Insufficient history in spy_bars"):
+        analyze(frames, settings_for(trend_gate="sma200_and_spy"))
+
+
+def test_a_missing_session_date_aborts():
+    frame = provider_frame(long_dip())
+    frame.loc[5, "Date"] = pd.NaT
+    with pytest.raises(FMPHistoryCacheMiss, match="Missing session date"):
+        analyze({"AAA": frame}, settings_for())
 
 
 @pytest.mark.parametrize("bad", [{"direction": "sideways"}, {"rsi_period": 9},
@@ -333,6 +408,36 @@ def test_live_run_analysis_persists_the_backtest_decision(monkeypatch):
     assert row.expected_profit_percent == 0.0
     assert row.data["PullbackReversion"] == rec.raw_outputs
     assert analysis.state == {"PullbackReversion": rec.raw_outputs}
+
+
+def test_live_run_analysis_skips_a_recent_listing_like_deterministic_scorer(monkeypatch):
+    from ba2_common.core.types import MarketAnalysisStatus
+    module = importlib.import_module("ba2_experts.PullbackReversion")
+
+    class Clock:
+        @staticmethod
+        def now(tz):
+            return AS_OF
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    captured, statuses = [], []
+    monkeypatch.setattr(module, "add_instance", lambda row: captured.append(row))
+    monkeypatch.setattr(module, "update_instance", lambda row: statuses.append(row.status))
+    frames = {"AAA": recent_listing(), "SPY": spy_full()}
+    bundle = SimpleNamespace(ohlcv=lambda: FakeOHLCV(frames))
+    expert = object.__new__(PullbackReversion)
+    expert.id = 1
+    expert.logger = SimpleNamespace(error=lambda *a, **kw: pytest.fail(str(a)))
+    expert._live_providers = lambda: bundle
+    expert._resolve_settings = lambda keys: settings_for()
+    analysis = SimpleNamespace(id=10, subtype=None, status=None, state={})
+    expert.run_analysis("AAA", analysis)
+    rec, _ = analyze(frames, settings_for())
+    assert captured == []  # no recommendation row, as DeterministicScorer
+    assert analysis.status == MarketAnalysisStatus.SKIPPED
+    assert statuses[-1] == MarketAnalysisStatus.SKIPPED
+    assert analysis.state == {"skipped": True, "skip_reason": "insufficient_history",
+                              "skip_message": rec.details}
 
 
 # --------------------------------------------------------------------------- registration

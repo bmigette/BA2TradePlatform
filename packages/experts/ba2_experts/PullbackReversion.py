@@ -16,7 +16,7 @@ exit become BUY/SELL recommendations that the ordinary rules and RM act on.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 from numbers import Real
@@ -251,8 +251,34 @@ def pullback_signal(bars: pd.DataFrame, settings: Mapping,
 LOOKBACK_DAYS = 420
 #: A completed history whose last session is older than this is stale (ETFTrend's bound).
 MAX_STALE_DAYS = 7
-#: The market benchmark read by ``trend_gate == "sma200_and_spy"``.
+#: The market benchmark read by ``trend_gate == "sma200_and_spy"``, and the reference that
+#: tells a recent listing from missing data.
 SPY_SYMBOL = "SPY"
+#: A history whose first row lies within this many days of the lookback window's start covers
+#: the window (weekends, holidays): it was not listed inside it.
+LISTING_SLACK_DAYS = MAX_STALE_DAYS
+
+
+def _decision_date(as_of: datetime):
+    """The New York calendar date of the decision (ETFTrend's reading of ``as_of``)."""
+    local = as_of.astimezone(ZoneInfo("America/New_York")) if as_of.tzinfo else as_of
+    return local.date()
+
+
+def _session_stamps(frame, name: str) -> np.ndarray:
+    """The provider frame's ``Date`` column as naive UTC datetime64 instants.
+
+    ETFTrend reads the dates as ``pd.to_datetime(Date, utc=True)``: tz-aware stamps become UTC
+    instants, naive ones are taken as UTC. A datetime64 column's ``.values`` is exactly those
+    UTC instants, so the conversion is only paid for object/string columns (this runs per
+    symbol per bar in the GA; the pandas path cost ~1 ms a call). A missing date is corrupt
+    data: it would otherwise drop out of every comparison silently."""
+    column = frame["Date"]
+    stamps = (column.values if column.dtype.kind == "M"
+              else pd.to_datetime(column, utc=True).values)
+    if np.isnat(stamps).any():
+        raise ValueError(f"Missing session date in the OHLCV history of {name}")
+    return stamps
 
 
 def completed_bars(frame, as_of: datetime, name: str) -> pd.DataFrame:
@@ -268,15 +294,8 @@ def completed_bars(frame, as_of: datetime, name: str) -> pd.DataFrame:
     missing = [k for k in ("Date",) + _OHLCV if k not in frame.columns]
     if missing:
         raise ValueError(f"OHLCV history for {name} is missing columns {missing}")
-    local = as_of.astimezone(ZoneInfo("America/New_York")) if as_of.tzinfo else as_of
-    today = local.date()
-    # ETFTrend reads the dates as ``pd.to_datetime(Date, utc=True)``: tz-aware stamps become UTC
-    # instants, naive ones are taken as UTC. A datetime64 column's ``.values`` is exactly those
-    # UTC instants (naive), so the conversion is only paid for object/string columns. This
-    # function runs per symbol per bar in the GA; the pandas path cost ~1 ms a call.
-    column = frame["Date"]
-    stamps = (column.values if column.dtype.kind == "M"
-              else pd.to_datetime(column, utc=True).values)
+    today = _decision_date(as_of)
+    stamps = _session_stamps(frame, name)
     # For UTC instants, ``ts.date() < today`` is exactly ``ts < today 00:00 UTC``.
     end = np.datetime64(today, "D")
     keep = (stamps < end) & (stamps >= end - np.timedelta64(LOOKBACK_DAYS, "D"))
@@ -291,6 +310,46 @@ def completed_bars(frame, as_of: datetime, name: str) -> pd.DataFrame:
         raise ValueError(f"Stale OHLCV history for {name}: last completed session {last}, "
                          f"analysis date {today}")
     return bars
+
+
+def _check_recent_listing(frame, bars, as_of: datetime, name: str, reference_bars) -> None:
+    """Return quietly only when a short completed history (under ``MIN_BARS``) is a genuine
+    recent listing, which the expert skips; raise ``ValueError`` (the run aborts) otherwise.
+
+    A recent listing is a valid history whose EARLIEST row, before any cut, lies inside the
+    lookback window: a history reaching back to the window start but still short has a gap.
+    "Inside" is only meaningful if the provider serves the whole window, which a backtest does
+    not when its warmup is shorter than ``LOOKBACK_DAYS``: every symbol would then look newly
+    listed and the run would skip silently. ``reference_bars()`` returns SPY's completed bars
+    (fetched only here, off the hot path); SPY always has history, so a short SPY, or one that
+    also starts inside the window, is a data problem and aborts."""
+    today = _decision_date(as_of)
+    window_start = today - timedelta(days=LOOKBACK_DAYS)
+    covered_by = window_start + timedelta(days=LISTING_SLACK_DAYS)
+    earliest = pd.Timestamp(_session_stamps(frame, name).min()).date()
+    if earliest <= covered_by:
+        raise ValueError(
+            f"Insufficient history in {name}: {len(bars)} completed bars in the {LOOKBACK_DAYS}-day "
+            f"window, need {MIN_BARS}, although its history starts on {earliest}: a gap in the "
+            "data, not a new listing")
+    try:
+        close = bars["Close"].to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Non-numeric close in {name}: {exc}") from exc
+    if not (np.isfinite(close) & (close > 0)).all() or not bars.index.is_unique:
+        raise ValueError(f"Corrupt OHLCV history for {name}: invalid close or duplicate session")
+    reference = reference_bars()
+    if len(reference) < MIN_BARS:
+        raise ValueError(f"Insufficient history in {SPY_SYMBOL}: {len(reference)} completed bars, "
+                         f"need {MIN_BARS}; the benchmark always has history, so this is a data "
+                         "problem")
+    served_from = reference.index[0].date()
+    if served_from > covered_by:
+        raise ValueError(
+            f"The OHLCV history served for {SPY_SYMBOL} starts on {served_from}, inside the "
+            f"{LOOKBACK_DAYS}-day window from {window_start}: the provider does not cover the "
+            f"window (backtest warmup too short?), so {name} starting on {earliest} cannot be "
+            "told apart from missing data")
 
 
 class PullbackReversion(MarketExpertInterface):
@@ -344,12 +403,25 @@ class PullbackReversion(MarketExpertInterface):
     def _analyze(self, symbol, providers, settings, as_of):
         provider = providers.ohlcv()
 
-        def history(name):
-            frame = provider.get_ohlcv_data(name, end_date=as_of, lookback_days=LOOKBACK_DAYS,
-                                            interval="1d")
-            return completed_bars(frame, as_of, name)
+        def fetch(name):
+            return provider.get_ohlcv_data(name, end_date=as_of, lookback_days=LOOKBACK_DAYS,
+                                           interval="1d")
 
-        bars = history(symbol)
+        def history(name):
+            return completed_bars(fetch(name), as_of, name)
+
+        frame = fetch(symbol)
+        bars = completed_bars(frame, as_of, symbol)
+        if len(bars) < MIN_BARS:
+            _check_recent_listing(frame, bars, as_of, symbol, lambda: history(SPY_SYMBOL))
+            # The recent listing is skipped exactly as DeterministicScorer skips a thin history.
+            return Recommendation(
+                signal=OrderRecommendation.HOLD, confidence=0.0,
+                current_price=float(bars["Close"].iloc[-1]),
+                details=f"Insufficient OHLCV history ({len(bars)} < {MIN_BARS}): {symbol} listed "
+                        f"on {bars.index[0].date()}, inside the {LOOKBACK_DAYS}-day lookback",
+                expected_profit_percent=0.0, skip=True,
+                skip_reason="insufficient_history")
         spy = history(SPY_SYMBOL) if settings["trend_gate"] == "sma200_and_spy" else None
         result = pullback_signal(bars, settings, spy)  # validates every setting it reads
         long = settings["direction"] == "long"
@@ -395,6 +467,12 @@ class PullbackReversion(MarketExpertInterface):
             update_instance(market_analysis)
             rec = self._analyze(symbol, self._live_providers(),
                                 self._resolve_settings(self._SETTING_KEYS), datetime.now(timezone.utc))
+            if rec.skip:  # DeterministicScorer's live skip: no recommendation row
+                market_analysis.state = {"skipped": True, "skip_reason": rec.skip_reason,
+                                         "skip_message": rec.details}
+                market_analysis.status = MarketAnalysisStatus.SKIPPED
+                update_instance(market_analysis)
+                return
             add_instance(ExpertRecommendation(
                 instance_id=self.id, symbol=symbol, market_analysis_id=market_analysis.id,
                 recommended_action=rec.signal, expected_profit_percent=0.0,
