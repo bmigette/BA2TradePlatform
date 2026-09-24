@@ -2022,8 +2022,9 @@ class AccountInterface(ReadOnlyAccountInterface):
             return None
         # AS-TRADED shares (contracts x 100) -> this account's equity-book unit, which is
         # what ``held``/``working``/``quantity`` below count in (identity live; a
-        # split-adjusted backtest book, see OptionsAccountInterface.equity_shares_per_option_share).
-        pledged = self.option_shares_in_equity_units(symbol, pledged)
+        # split-adjusted backtest book, see OptionsAccountInterface.equity_shares_per_option_share;
+        # a call written before a split counts in ITS basis: pledged_shares_in_equity_units).
+        pledged = self.pledged_shares_in_equity_units(symbol, pledged)
 
         held = self.held_shares_for_cover(symbol)
         if held is None:

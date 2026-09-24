@@ -269,6 +269,16 @@ class OptionsAccountInterface(ABC):
             return shares
         return int(math.ceil(round(float(shares) * float(k), 6)))
 
+    def pledged_shares_in_equity_units(self, underlying: str, pledged) -> int:
+        """``pledged`` -- what ``shares_pledged_to_short_calls`` measured, AS-TRADED shares --
+        in equity-book shares. The conversion of an EXISTING pledge, kept apart from
+        ``option_shares_in_equity_units`` (the conversion of a NEW contract, which trades in
+        today's basis) because a backtest book can hold a call written before a split, whose
+        delivery stays in the basis it was written in (``BacktestAccount`` overrides this).
+        This default IS that conversion, so live (factor 1) it is the identity and returns
+        the very same int."""
+        return self.option_shares_in_equity_units(underlying, pledged)
+
     # --- Market data -------------------------------------------------------
     @abstractmethod
     def get_option_chain(
@@ -782,7 +792,7 @@ class OptionsAccountInterface(ABC):
             held = self.held_shares_for_cover(underlying)
             pledged = self.shares_pledged_to_short_calls(underlying)
             if pledged is not None:
-                pledged = self.option_shares_in_equity_units(underlying, pledged)
+                pledged = self.pledged_shares_in_equity_units(underlying, pledged)
             if held is None:
                 return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: how many {underlying} shares this account holds "

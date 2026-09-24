@@ -314,7 +314,8 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     # entry close and every 5-minute bar must be in the as-traded basis too, or on a split
     # symbol the move is 1/k of the real one (NFLX 2024: 10x too small). Converted through the
     # account's own ``option_basis_price`` -- the run's split basis, the identity without one
-    # -- each price with the factor of ITS OWN date. The FMP 5-minute cache is back-adjusted
+    # -- with the factor of the trade's ENTRY date (the basis its strike and delta are in;
+    # see ``_bars_5m_between``). The FMP 5-minute cache is back-adjusted
     # like the daily one (measured: NFLX 5m close 2024-05-01 55.155 vs daily 55.17; NVDA 5m
     # 2024-06-06 120.94, adjusted for the 2024-06-10 split).
     from app.services.backtest.backtest_account import BacktestAccount
@@ -349,8 +350,12 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
         window = df[(df["Date"] >= entry) & (df["Date"] <= exit_)]
         if window.empty:
             return []
-        return [{"Low": _as_traded(symbol, row["Low"], row["Date"]),
-                 "High": _as_traded(symbol, row["High"], row["Date"])}
+        # Every bar in the basis of the trade's ENTRY day (Task 1a), not its own date's: the
+        # contract's strike and delta stay in the basis it was traded in, so on a trade held
+        # across a split the post-split bars would otherwise read as a fake k-fold move.
+        # Without a split inside the trade the two factors are the same number.
+        return [{"Low": _as_traded(symbol, row["Low"], entry),
+                 "High": _as_traded(symbol, row["High"], entry)}
                 for _, row in window.iterrows()]
 
     def _refine(trades: List[Dict[str, Any]], max_drawdown: float) -> float:

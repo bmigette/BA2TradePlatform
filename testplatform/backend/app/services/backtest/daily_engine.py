@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import bisect
 import random
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dtime, timezone
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
@@ -1594,7 +1594,9 @@ class DailyBacktestEngine:
         the transaction-roll change signal (review 2026-08-30 F8).
 
         For each held option whose ``expiry <= as_of.date()`` the engine reads the
-        underlying's bar CLOSE; defined-risk combos unit-settle as a group, everything else
+        underlying's close OF THE EXPIRY DATE (``_expiry_close``), converted into the basis
+        the lot was traded in (``BacktestAccount.lot_basis_price``, Task 1a); defined-risk
+        combos unit-settle as a group, everything else
         settles per leg via ``BacktestAccount.settle_single_leg_expiry`` (the
         no-orphaned-stock backtest policy):
 
@@ -1642,15 +1644,25 @@ class DailyBacktestEngine:
         # Unit-settle each defined-risk combo once.
         for legs in combo_groups.values():
             try:
-                spot = self.price.close_at(legs[0].underlying)
-                if spot is None:
+                dated = self._expiry_close(legs[0].underlying, legs[0].expiry, as_of_date)
+                if dated is None:
                     self._log(
                         f"option expiry: no underlying close for {legs[0].underlying} "
                         f"(combo {legs[0].contract_symbol}) @ {as_of_date} — skipped"
                     )
                     continue
-                # The strikes are AS TRADED; the close is split-adjusted (plan Part E2).
-                spot = self.account.option_basis_price(legs[0].underlying, spot)
+                # The strikes are AS TRADED; the close is split-adjusted (plan Part E2) -- and
+                # converted into the basis each leg was TRADED in (Task 1a), which for one
+                # combo must be a single basis: its legs fill together, all-or-none.
+                spots = {float(self.account.lot_basis_price(
+                    leg.contract_symbol, leg.underlying, dated[0], dated[1])) for leg in legs}
+                if len(spots) != 1:
+                    from ba2_common.core.split_basis import SplitBasisRefused
+                    raise SplitBasisRefused(
+                        f"defined-risk combo {[leg.contract_symbol for leg in legs]} on "
+                        f"{legs[0].underlying} holds legs in different share bases (expiry "
+                        f"spots {sorted(spots)}): one net payoff cannot be stated for it")
+                spot = spots.pop()
                 if self.account.settle_defined_risk_combo_expiry(legs, float(spot)):
                     settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
@@ -1659,8 +1671,8 @@ class DailyBacktestEngine:
 
         for pos in per_leg:
             try:
-                spot = self.price.close_at(pos.underlying)
-                if spot is None:
+                dated = self._expiry_close(pos.underlying, pos.expiry, as_of_date)
+                if dated is None:
                     self._log(
                         f"option expiry: no underlying close for {pos.underlying} "
                         f"({pos.contract_symbol}) @ {as_of_date} — skipped"
@@ -1669,8 +1681,10 @@ class DailyBacktestEngine:
                 # The account applies the no-orphaned-stock backtest policy (long ITM ->
                 # sell-to-close, never exercise / short ITM -> physical assignment with the
                 # stock liquidated at the next bar's open) — see
-                # BacktestAccount.settle_single_leg_expiry.
-                spot = self.account.option_basis_price(pos.underlying, spot)  # as traded
+                # BacktestAccount.settle_single_leg_expiry. The spot is AS TRADED in the
+                # basis the lot was traded in (Task 1a), not the settlement bar's.
+                spot = self.account.lot_basis_price(
+                    pos.contract_symbol, pos.underlying, dated[0], dated[1])
                 if self.account.settle_single_leg_expiry(pos, float(spot)):
                     settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
@@ -1679,6 +1693,22 @@ class DailyBacktestEngine:
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
                 )
         return settled_any
+
+    def _expiry_close(self, underlying: str, expiry, as_of_date):
+        """``(adjusted close, its date)`` the expiry of ``expiry`` settles against, or None.
+
+        The EXPIRY DATE's close (Task 1a), not the settlement bar's: the engine can reach an
+        expiry on a later bar (an expiry on a day the underlying has no bar), and the payoff
+        is fixed by the market at expiry. On the expiry bar itself this is the bar's own close
+        -- the read this pass always made -- forward-filled when the underlying has no bar on
+        it; for an expiry already past, the last close ON OR BEFORE the expiry date. Never a
+        close after the clock: on an intraday clock the expiry day's later bars are future."""
+        if expiry is None or expiry >= as_of_date:
+            close = self.price.close_at(underlying)
+            if close is not None:
+                return close, as_of_date
+            return self.price.close_asof_dated(underlying)
+        return self.price.close_asof_dated(underlying, datetime.combine(expiry, dtime.max))
 
     def _update_option_breakers(self) -> None:
         """Transition every ``classic_options`` sleeve's drawdown breaker for this bar.
