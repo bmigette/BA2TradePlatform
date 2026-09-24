@@ -312,7 +312,7 @@ Some pre-split OCC strings are REUSED by unrelated contracts after the split. Fo
 symbols are reused this way; for AAPL 4:1, 44 of 1,064. A held lot on such a symbol would be marked, filled
 and settled against a different contract.
 
-**Execution order:** 2 → 1a → 1b → 3 → 4 → 5 → 8 → 9 → 10 → 6 → 7.
+**Execution order:** 2 → 1a → 1b → 3 → 4 → 5 → 8 → 9 → 10 → 11 → 12 → 6 → 7.
 
 **Backward-compatibility acceptance** (user, 2026-09-24). This is a Task 6 gate.
 
@@ -366,8 +366,21 @@ and settled against a different contract.
   - The launcher sets `"mirror"` as a FIXED setting for the stage-1 relaunch (not a gene).
   - Proof of no impact: the DeterministicScorer equity goldens are byte-identical under the default.
 - **Not in scope:** the Altman-Z exemption for financials.
-- **Pending the user:** "size within fill volume" and "narrow gate ranges" (explained to the user; they
-  answered "not sure what these are about").
+- **Task 11 — size within fill volume (APPROVED 2026-09-24).**
+  - The backtest fill engine caps an option fill at 10% of the contract's bar volume
+    (`backtest_account.py:313/2907`), so an order larger than that expires unfilled. In the O_LP diagnosis
+    that was about half of the expired entries.
+  - At ORDER time, cap the backtest option order's contract count at the fillable amount:
+    `floor(bar_volume × cap)` of the bar the fill will use, which in practice is the decision bar's volume.
+    It must be the same number the fill engine will allow.
+  - BACKTEST-ONLY: live Alpaca fills small orders against the quote whatever the day's volume, so live
+    sizing is unchanged. It is behind a run-config flag, default off, so older option runs reproduce. The
+    launcher sets it on for stage 1.
+  - If the cap rounds to 0, the order is not placed and the reason is logged. Never a silent 0.
+- **Task 12 — narrow gate ranges (APPROVED 2026-09-24).** Launcher gene ranges only; new grid runs only.
+  - `_RELATIVE_VOLUME_GATE` max 3.0 → 1.5 (`ba2test_launcher.py` ~:4399).
+  - Debit `_IV_RV` range floor 0.8 → 1.0. The credit half keeps its range. If `_IV_RV_RANGE` is shared
+    between the halves, split it so only the DEBIT floor moves.
 
 ## Decisions for the user (original list; see the revisions above for what was decided)
 
