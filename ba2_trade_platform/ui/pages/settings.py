@@ -2310,11 +2310,16 @@ class ExpertSettingsTab:
                             # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
                             # (MarketExpertInterface), and this dialog's Expert Settings tab
                             # renders only expert-SPECIFIC definitions, so it needs its own widget.
+                            # MULTI-select: the setting is a comma list and a strategy may gate on
+                            # fields from several profiles at once (e.g. ohlcv-v1 + ta-structure-v1).
+                            # Nothing selected = MARKET_CONDITION_PROFILE_OFF (no data served).
                             self.market_condition_profile_select = ui.select(
                                 options=self._market_condition_profile_options(),
-                                label='Market-Condition Profile',
-                                value=MARKET_CONDITION_PROFILE_OFF,
-                            ).classes('w-full')
+                                label='Market-Condition Profile(s)',
+                                value=[],
+                                multiple=True,
+                                clearable=True,
+                            ).classes('w-full').props('use-chips')
                             # A NEW instance has no stored value to read, so the widget IS the
                             # operator's input and is saveable from the start. The edit branch
                             # below clears this if it cannot read what is stored.
@@ -4427,37 +4432,67 @@ class ExpertSettingsTab:
     
     # ----------------------------------------------------------------- market-condition profile
     def _market_condition_profile_options(self) -> list:
-        """The select's options: "" (off) plus every profile registered in THIS build.
+        """The multi-select's options: every profile registered in THIS build.
 
         Read from the interface's own settings definition rather than from the registry, so the
-        dialog and the setting can never offer different lists.
+        dialog and the setting can never offer different lists. The definition's ``""`` (off)
+        choice is NOT an option here: in a multi-select, "off" is simply nothing selected.
         """
         from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 
         MarketExpertInterface._ensure_builtin_settings()
-        return list(MarketExpertInterface._builtin_settings[
-            MARKET_CONDITION_PROFILE_SETTING]["valid_values"])
+        return [v for v in MarketExpertInterface._builtin_settings[
+            MARKET_CONDITION_PROFILE_SETTING]["valid_values"] if v != MARKET_CONDITION_PROFILE_OFF]
+
+    @staticmethod
+    def _split_market_condition_profile(value) -> list:
+        """The profile names in a stored setting value, in stored order, blanks dropped.
+
+        Deliberately NOT ``parse_profile_setting``: the dialog must SHOW whatever is stored --
+        including a name this build no longer registers -- so the operator can see and fix it.
+        Validation stays where it belongs: the save guard (``_refuse_unserved_market_gates``)
+        and every runtime reader parse the saved string strictly.
+        """
+        if value is None:
+            return []
+        return [t for t in (part.strip() for part in str(value).split(",")) if t]
 
     def _fill_market_condition_profile(self, value) -> None:
-        """Show a stored value, INCLUDING one the select's options do not contain.
+        """Show a stored value -- one profile, several (comma list), or none.
 
-        A comma list (two profiles at once) and a profile this build no longer registers are both
-        storable -- a deploy payload can carry either -- and a select that silently snapped them
-        back to "" would show an ungated expert whose rules are gated. So the value is added to
-        the options rather than dropped, and the save path writes back what is shown.
+        A profile this build no longer registers is ADDED to the options rather than dropped: a
+        select that silently lost it would show a different gating than the stored one, and the
+        save path writes back exactly what is shown.
         """
-        shown = '' if value is None else str(value)
+        names = self._split_market_condition_profile(value)
         options = self._market_condition_profile_options()
-        if shown not in options:
-            options = [*options, shown]
+        extra = [n for n in names if n not in options]
+        if extra:
+            options = [*options, *extra]
             self.market_condition_profile_select.options = options
-        self.market_condition_profile_select.value = shown
+        self.market_condition_profile_select.value = names
 
     def _market_condition_profile_value(self) -> str:
-        """The profile setting shown in the dialog (``''`` when the widget is absent)."""
+        """The setting value for what is selected: a comma list, ``''`` when nothing is.
+
+        Joined in OPTION order (registered profiles first, then any preserved unknown name), not
+        in click order, so the same selection always saves the same string -- the form the
+        launcher and the deploy payloads write (``ohlcv-v1,ta-structure-v1``).
+        """
         if not hasattr(self, 'market_condition_profile_select'):
             return MARKET_CONDITION_PROFILE_OFF
-        return str(self.market_condition_profile_select.value or MARKET_CONDITION_PROFILE_OFF)
+        selected = self.market_condition_profile_select.value
+        if selected is None or selected == MARKET_CONDITION_PROFILE_OFF:
+            return MARKET_CONDITION_PROFILE_OFF
+        if isinstance(selected, str):
+            # A single string can only come from a caller that set the widget directly; treat
+            # it as the stored comma form rather than guessing.
+            selected = self._split_market_condition_profile(selected)
+        chosen = set(selected)
+        options = list(self.market_condition_profile_select.options or [])
+        ordered = [o for o in options if o in chosen]
+        ordered += [s for s in selected if s not in options and s not in ordered]
+        return ','.join(ordered)
 
     def _market_condition_profile_savable(self) -> bool:
         """Whether this dialog may WRITE the profile setting.
