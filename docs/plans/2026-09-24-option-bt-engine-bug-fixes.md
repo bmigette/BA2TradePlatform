@@ -303,7 +303,56 @@ them touches the export or deploy path, keep the genes and only fix the repair.
 
 ---
 
-## Decisions for the user (NOT in this plan unless approved)
+## Revisions after Task 0 and the user's decisions (2026-09-24)
+
+**Task 0 finding.** A pre-split option symbol has NO bars after the split. The adjusted contract trades
+under a NEW symbol: strike ÷ k, quantity × k, premium ÷ k.
+
+Some pre-split OCC strings are REUSED by unrelated contracts after the split. For PANW 2:1, 356 of 1,124
+symbols are reused this way; for AAPL 4:1, 44 of 1,064. A held lot on such a symbol would be marked, filled
+and settled against a different contract.
+
+**Execution order:** 2 → 1a → 1b → 3 → 4 → 5 → 8 → 9 → 10 → 6 → 7.
+
+- **Task 1a — lot basis + collision guard.**
+  - Record `k_lot` (the as-traded factor on the fill day) when a lot opens.
+  - Every held-lot spot is `adjusted_close × k_lot`: marks, BS fallback, no-arb bounds, margin,
+    maintenance, liquidation, the run-end intrinsic floor, single-leg and combo expiry settlement, the
+    assignment share leg, covered-call cover, pledged-cover conversions, and the per-trade factor in the
+    `results.py` intraday refinement.
+  - A bar read for a held lot on a day whose factor differs from `k_lot` counts as "no bar". That applies
+    to marks, quotes, close fills, settlement and the recorder.
+  - Expiry settlement reads the EXPIRY date's close.
+  - Where the change touches shared live code, it must be a no-op when there is no split basis (live).
+- **Task 1b — re-key onto the adjusted contract on the ex-date.**
+  - Applies to integer forward splits, when the store has the adjusted symbol with bars from the ex-date.
+  - The re-key: strike ÷ k (OCC 3-decimal strike string), qty × k, avg_price ÷ k, and the lot and order
+    linkage moves with it. Exits then fill on real bars, which is what live does.
+  - Non-integer and reverse splits stay on 1a and ride to expiry, LOUDLY logged.
+
+**User decisions (2026-09-24):**
+
+- **Run the bearish jobs** (O_LP, O_BEARCS) with the signal-mode gene free. All 16 jobs.
+- **Task 8 — 1-contract sizing floor, behind a flag.** Option action param `min_one_contract` (default
+  False, so every existing run reproduces). When the cost-based size rounds to 0 but ONE contract fits
+  under the per-instrument cap (and the risk budget), buy 1. It lives in the shared `TradeActions` sizing
+  (`_size_by_cost` ~:2712 / the refusal ~:3526), so live and backtest behave the same. The launcher sets
+  it True for the stage-1 relaunch.
+- **Task 9 — `option_entry_cross` gene range 0.75-1.0** in the launcher, for new grid runs only.
+- **Task 10 — direction-aware DeterministicScorer macro, behind a setting.**
+  - New expert setting `macro_short_side`: `"same"` is the default (today's behaviour: the multiplier
+    scales negative scores too); `"mirror"` scales a negative score by `exposure_multiplier(-regime)`, so
+    a bearish regime AMPLIFIES SELL conviction instead of muting it.
+  - The default reproduces every existing result: stock and option backtests, and live experts. It must be
+    registered in the expert's settings and in `_build_daily_trial_config`'s whitelist (see the memory note
+    "trial-config whitelist drops new knobs").
+  - The launcher sets `"mirror"` as a FIXED setting for the stage-1 relaunch (not a gene).
+  - Proof of no impact: the DeterministicScorer equity goldens are byte-identical under the default.
+- **Not in scope:** the Altman-Z exemption for financials.
+- **Pending the user:** "size within fill volume" and "narrow gate ranges" (explained to the user; they
+  answered "not sure what these are about").
+
+## Decisions for the user (original list; see the revisions above for what was decided)
 
 Diagnosis recommendations that change strategy economics for EVERY structure, or reverse a deliberate
 design:
