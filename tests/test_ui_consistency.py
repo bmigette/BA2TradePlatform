@@ -218,3 +218,24 @@ def test_a_tooltip_separates_from_the_page(css):
     assert 'box-shadow' in rule
     match = re.search(r'border:\s*1px solid rgba\(255, 255, 255, ([0-9.]+)\)', rule)
     assert match and float(match.group(1)) >= 0.2, 'the edge must be visible'
+
+
+# ---- trades tables: one status palette, LONG reads as a long -------------------------------
+def test_every_trades_table_paints_a_status_the_same_colour():
+    """The option rows set no status colour (WAITING rendered in the default teal that OPENED
+    uses) and the transaction dialog painted WAITING blue while the table painted it orange."""
+    from ba2_trade_platform.core.types import TransactionStatus
+    from ba2_trade_platform.ui.components.LiveTradesTable import transaction_status_color
+
+    assert transaction_status_color(TransactionStatus.WAITING) == 'orange'
+    assert transaction_status_color('WAITING') == 'orange'          # the value works too
+    assert transaction_status_color(TransactionStatus.OPENED) == 'green'
+    assert transaction_status_color(TransactionStatus.FAILED) == 'red'
+    assert transaction_status_color('not-a-status') == 'grey'
+
+
+def test_a_long_option_structure_is_not_painted_as_a_sell():
+    """The direction badge was keyed on 'BUY' alone; option rows say LONG/SHORT."""
+    from ba2_trade_platform.ui.components.LiveTradesTable import LiveTradesTable
+
+    assert "['BUY', 'LONG'].includes(col.value) ? 'positive' : 'negative'" in LiveTradesTable.BODY_TEMPLATE

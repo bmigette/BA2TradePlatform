@@ -40,7 +40,7 @@ from ...core.option_positions import opening_legs
 from ...core.utils import get_account_instance_from_id, get_expert_options_for_ui
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
-from ..components.LiveTradesTable import LiveTradesTable, LiveTradesTableConfig
+from ..components.LiveTradesTable import LiveTradesTable, LiveTradesTableConfig, transaction_status_color
 from ..components.account_scope import scope_transactions_to_account
 from ..components.refresh_button import refresh_button
 
@@ -463,6 +463,7 @@ class OptionTradesTab:
                 'closed_pnl': _pnl_text(closed.amount, closed.percent) if closed else '—',
                 'closed_pnl_numeric': closed.percent if closed else None,
                 'status': getattr(txn.status, 'value', '') or '—',
+                'status_color': transaction_status_color(txn.status),
                 'order_count': len(orders),
                 'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '—',
                 'closed_at': txn.close_date.strftime('%Y-%m-%d %H:%M') if txn.close_date else '—',

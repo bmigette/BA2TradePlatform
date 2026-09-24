@@ -33,6 +33,28 @@ from ...logger import logger
 from ..utils.perf_logger import PerfLogger
 
 
+def transaction_status_color(status: Any) -> str:
+    """The Quasar colour of a transaction's STATUS badge -- one map for every trades table.
+
+    The stock rows, the option rows and the transaction dialog each kept their own map (or
+    none: the option rows set no colour, so WAITING rendered in Quasar's default teal, the
+    colour OPENED uses, and the dialog painted WAITING blue while the table painted it
+    orange). Accepts the enum or its value.
+    """
+    from ...core.types import TransactionStatus
+    try:
+        status = TransactionStatus(getattr(status, 'value', status))
+    except ValueError:
+        return 'grey'
+    return {
+        TransactionStatus.WAITING: 'orange',
+        TransactionStatus.OPENED: 'green',
+        TransactionStatus.CLOSING: 'orange',
+        TransactionStatus.CLOSED: 'grey',
+        TransactionStatus.FAILED: 'red',
+    }.get(status, 'grey')
+
+
 @dataclass
 class LiveTradesTableConfig(LazyTableConfig):
     """Configuration for LiveTradesTable."""
@@ -141,7 +163,9 @@ class LiveTradesTable(LazyTable):
                     />
                 </template>
                 <template v-else-if="col.name === 'direction'">
-                    <q-badge :color="col.value === 'BUY' ? 'positive' : 'negative'" :label="col.value" />
+                    <!-- The option rows say LONG/SHORT, the stock rows BUY/SELL: keyed on 'BUY'
+                         alone, every LONG option structure rendered red. -->
+                    <q-badge :color="['BUY', 'LONG'].includes(col.value) ? 'positive' : 'negative'" :label="col.value" />
                 </template>
                 <template v-else-if="col.name === 'status'">
                     <q-badge :color="props.row.status_color" :label="col.value" />

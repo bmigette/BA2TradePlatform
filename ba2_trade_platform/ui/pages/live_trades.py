@@ -14,6 +14,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
+from ..components.LiveTradesTable import transaction_status_color
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.option_structure_chart import (
     fetch_underlying_bars, render_option_structure_chart,
@@ -586,12 +587,7 @@ class LiveTradesTab:
                 closed_pnl_numeric = pnl_closed_pct
 
             # Status styling
-            status_color = {
-                TransactionStatus.OPENED: 'green',
-                TransactionStatus.CLOSING: 'orange',
-                TransactionStatus.CLOSED: 'gray',
-                TransactionStatus.WAITING: 'orange'
-            }.get(txn.status, 'gray')
+            status_color = transaction_status_color(txn.status)
 
             # Expert shortname
             expert = transaction_experts.get(txn.id)
@@ -2494,17 +2490,8 @@ class LiveTradesTab:
             ).classes('text-xs text-secondary-custom')
 
     def _get_transaction_status_color(self, status):
-        """Get color for transaction status badge."""
-        from ...core.types import TransactionStatus
-        
-        status_colors = {
-            TransactionStatus.WAITING: 'blue',
-            TransactionStatus.OPENED: 'green',
-            TransactionStatus.CLOSING: 'orange',
-            TransactionStatus.CLOSED: 'grey',
-            TransactionStatus.FAILED: 'red',
-        }
-        return status_colors.get(status, 'grey')
+        """Get color for transaction status badge (the one map the tables use too)."""
+        return transaction_status_color(status)
 
     def _select_all_transactions(self):
         """Select all visible transactions."""
