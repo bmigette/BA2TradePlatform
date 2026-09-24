@@ -194,6 +194,14 @@ def _attach_option_records(trades: List[Dict[str, Any]], carriers: Dict[int, tup
             row["exit_record"] = None
 
 
+class OptionLotBasisMismatch(RuntimeError):
+    """An option fill would change a held lot that was opened in ANOTHER share basis (a split
+    lies between them). A lot cannot hold two bases -- no single strike/spot pair values it --
+    so the fill is refused by raising, never averaged in. The fill engine refuses such a bar
+    first (``BacktestAccount._crossed_held_lot``), so reaching this is an engine defect; the
+    named type lets an aborted trial be classified rather than read as a generic crash."""
+
+
 class StaleMarkToMarket(RuntimeError):
     """The mark-to-market memo served a value the current book no longer produces.
 
@@ -558,6 +566,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Task 1a: (contract_symbol, basis_date) of every lot already reported as held across
         # a split -- the crossing is checked on every bar the lot is read, and logged ONCE.
         self._split_crossed_lots: set = set()
+        # Task 1a review: order ids whose fill was refused because the underlying SPLIT between
+        # the order's decision day and its fill day (logged once per order), and the as-traded
+        # factor of every option fill's own day by order id -- the basis a round-trip row's
+        # entry is in (``option_basis_factor`` on the row; results.py's intraday refinement).
+        self._split_refused_orders: set = set()
+        self._option_fill_basis: Dict[int, float] = {}
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
         # and is therefore useless for ageing in a backtest. Read only by
@@ -2579,6 +2593,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
             if o.order_type not in day_limits:
+                # A MARKET option order is never aged -- EXCEPT once its underlying has split
+                # since it was decided (Task 1a review): its OCC string now names a different
+                # (or no) contract and ``_option_fill_price`` refuses it for good, so left
+                # working it would stay open (and reserve buying power) forever. A broker
+                # cancels it; so does this.
+                if self._market_order_across_split(o, today):
+                    o.status = OrderStatus.CANCELED
+                    o.comment = (f"{(o.comment or '')} | canceled: {o.underlying_symbol} split "
+                                 f"since the order was decided").strip(" |")
+                    update_instance(o)
+                    self._option_order_day.pop(o.id, None)
+                    expired_any = True
                 continue
             placed = self._option_order_day.get(o.id)
             if placed is None or placed >= today:
@@ -2599,6 +2625,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self.invalidate_order_cache()
             self._bump_option_memo()
         return expired_any
+
+    def _market_order_across_split(self, order, today) -> bool:
+        """A working option order whose underlying's share basis on ``today`` differs from
+        the one on the day it was staged (see ``_expire_stale_option_limits``)."""
+        if self._split_basis is None:
+            return False
+        placed = self._option_order_day.get(order.id)
+        underlying = getattr(order, "underlying_symbol", None)
+        if placed is None or placed >= today or not underlying:
+            return False
+        if self._as_traded_factor(underlying, placed) == self._as_traded_factor(underlying, today):
+            return False
+        logger.warning(
+            "[backtest] option MARKET order CANCELED: %s %s decided %s; %s split before %s, "
+            "so its OCC string no longer names the contract it was decided on.",
+            getattr(order, "side", None), getattr(order, "contract_symbol", None), placed,
+            underlying, today)
+        return True
 
     def _is_single_leg_option(self, order) -> bool:
         """True for an OPTION order that fills *independently* against a premium bar.
@@ -2632,6 +2676,46 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if hasattr(fill_day, "date"):
             fill_day = fill_day.date()
         return fill_day
+
+    def _order_decision_day(self, order, as_of) -> date:
+        """The simulated day the order was DECIDED (staged) on -- ``_option_order_day`` -- or
+        the current bar's date for an order with no recorded staging day."""
+        placed = self._option_order_day.get(getattr(order, "id", None))
+        if placed is not None:
+            return placed
+        return as_of.date() if hasattr(as_of, "date") else as_of
+
+    def _split_between_decision_and_fill(self, order, as_of, fill_day) -> bool:
+        """True (and the fill must be REFUSED) when the order's underlying split between the
+        day the order was decided and its fill day.
+
+        The order names an OCC string chosen in the DECISION day's share basis. On and after
+        the ex-date that string is either absent or REUSED by a different contract (Task 0:
+        AAPL201016P00250000 0.49 on 08-28, 120.40 on 08-31), so a fill there is a different
+        trade -- a BUY decided 2020-08-28 under next_bar_open filled on 08-31 at the reused
+        contract's 300.5, and a limit does not protect because the reused bar clears it. A
+        broker cancels open orders on adjusted contracts, so refusing is parity-safe: a DAY
+        limit then expires through ``_expire_stale_option_limits``, and a MARKET order (which
+        that sweep otherwise never ages) is cancelled there for the same reason."""
+        underlying = getattr(order, "underlying_symbol", None)
+        if not underlying:
+            return False
+        decided = self._order_decision_day(order, as_of)
+        k_decided = self._as_traded_factor(underlying, decided)
+        k_fill = self._as_traded_factor(underlying, fill_day)
+        if k_decided == k_fill:
+            return False
+        key = getattr(order, "id", None)
+        if key not in self._split_refused_orders:
+            self._split_refused_orders.add(key)
+            logger.warning(
+                "[backtest] option fill REFUSED: %s %s was decided on %s (share basis x%g) but "
+                "would fill on %s (basis x%g) -- %s split %g:1 between them, so the OCC string "
+                "now names a different (or no) contract. Brokers cancel open orders on "
+                "adjusted contracts; the order does not fill and is left to expire.",
+                getattr(order, "side", None), order.contract_symbol, decided, k_decided,
+                fill_day, k_fill, underlying, k_decided / k_fill)
+        return True
 
     def _option_fill_price(self, order, as_of) -> Optional[float]:
         """Premium per share for an option order on its fill bar, per ``fill_model``.
@@ -2674,6 +2758,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         same_bar = self._cfg["fill_model"] == "same_bar_close"
         fill_day = self._option_fill_day(order, as_of)
         if fill_day is None:
+            return None
+        if self._split_basis is not None and self._split_between_decision_and_fill(
+                order, as_of, fill_day):
             return None
         # A HELD lot's contract fills only on a bar in the lot's own share basis: after a split
         # a bar under the same OCC string is another contract reusing it (Task 1a), so a close
@@ -3815,6 +3902,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # leaving the losing one, scoring a max-profit condor NEGATIVE).
                     "transaction_id": txn_id,
             }
+            # The share basis the ENTRY traded in (the opening fill's day) -- only on option rows
+            # of a run with a split basis, so equity rows and basis-less runs keep their exact
+            # shape. results.py's intraday refinement prices the trade's 5m path in it.
+            basis_k = self._option_fill_basis.get(getattr(opening, "id", None))
+            if basis_k is not None:
+                row["option_basis_factor"] = basis_k
             trades.append(row)
             if option_records and _is_option_row(opening):
                 option_carriers[id(row)] = (
@@ -3973,46 +4066,69 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # another basis is not its bar at all (the string is reused by another contract after
     # the split, Task 0: AAPL201016P00250000 0.49 on 08-28, 120.40 on 08-31).
     # ----------------------------------------------------------------------
+    def _lot_has_basis(self, lot: Optional[_OptionLot]) -> bool:
+        """``lot`` is HELD and carries a recorded basis, on a run with a split basis."""
+        return (self._split_basis is not None and lot is not None and lot.qty != 0
+                and lot.basis_factor is not None)
+
     def _held_lot_with_basis(self, contract_symbol: str) -> Optional[_OptionLot]:
         """The HELD lot for ``contract_symbol`` when it carries a recorded basis on a run
         with a split basis -- else None (the caller then keeps the bar's own factor)."""
-        if self._split_basis is None:
-            return None
         lot = self._option_positions.get(contract_symbol)
-        if lot is None or lot.qty == 0 or lot.basis_factor is None:
-            return None
-        return lot
+        return lot if self._lot_has_basis(lot) else None
 
-    def _lot_crossed_split(self, lot: _OptionLot, day=None) -> bool:
-        """True when ``day`` (default: this bar) is in another share basis than the one
-        ``lot`` traded in -- a split lies between them. Logged ONCE per lot at WARNING."""
+    def _lot_basis_differs(self, lot: _OptionLot, day) -> bool:
+        """PURE: ``day`` is in another share basis than the one ``lot`` traded in."""
         if self._split_basis is None or lot.basis_factor is None or not lot.underlying:
             return False
-        day = self._as_of_date() if day is None else day
-        k = self._as_traded_factor(lot.underlying, day)
-        if k == lot.basis_factor:
-            return False
-        key = (lot.contract_symbol, lot.basis_date)
-        if key not in self._split_crossed_lots:
-            self._split_crossed_lots.add(key)
-            basis_of = getattr(self._split_basis, "basis_of", None)
-            sb = basis_of(lot.underlying) if callable(basis_of) else None
-            # The splits between the lot's basis day and ``day`` (either order: a lot filled on
-            # the next bar can carry a basis day AHEAD of the clock).
-            ends = sorted(d for d in (lot.basis_date, day) if d is not None)
-            splits = [f"{s.date.isoformat()} ratio {float(s.ratio):g}"
-                      for s in (sb.splits if sb is not None else ())
-                      if (len(ends) < 2 or ends[0] < s.date) and s.date <= ends[-1]]
-            logger.warning(
-                "[backtest] option lot %s (%+g contract(s) on %s) is held ACROSS A SPLIT: "
-                "opened %s in share basis x%g, today %s is basis x%g (split(s): %s). It is "
-                "valued in its OWN basis (adjusted close x %g) from now on, and any bar under "
-                "its OCC string in the new basis belongs to ANOTHER contract reusing the "
-                "string -- it is not used to mark, quote, fill or settle this lot, which "
-                "therefore cannot be exited by an order and rides to expiry settlement.",
-                lot.contract_symbol, lot.qty, lot.underlying, lot.basis_date,
-                lot.basis_factor, day, k, ", ".join(splits) or "not in the calendar",
+        return self._as_traded_factor(lot.underlying, day) != lot.basis_factor
+
+    def _report_split_crossing(self, lot: _OptionLot, day) -> None:
+        """Log -- ONCE per lot, at WARNING -- that ``lot`` is held across a split.
+
+        Only a ``day`` AFTER the lot's basis day is a crossing. A day BEFORE it (a lot whose
+        premium was read on the NEXT bar while the fill is booked at the clock's) is not
+        this lot's bar either, but nothing about the lot has crossed anything: DEBUG only."""
+        if lot.basis_date is not None and day < lot.basis_date:
+            logger.debug(
+                "[backtest] option lot %s: %s precedes its basis day %s (basis x%g); that "
+                "day's bar is not this lot's.", lot.contract_symbol, day, lot.basis_date,
                 lot.basis_factor)
+            return
+        key = (lot.contract_symbol, lot.basis_date)
+        if key in self._split_crossed_lots:
+            return
+        self._split_crossed_lots.add(key)
+        k = self._as_traded_factor(lot.underlying, day)
+        basis_of = getattr(self._split_basis, "basis_of", None)
+        sb = basis_of(lot.underlying) if callable(basis_of) else None
+        splits = [f"{sp.date.isoformat()} ratio {float(sp.ratio):g}"
+                  for sp in (sb.splits if sb is not None else ())
+                  if (lot.basis_date is None or lot.basis_date < sp.date) and sp.date <= day]
+        logger.warning(
+            "[backtest] option lot %s (%+g contract(s) on %s) is held ACROSS A SPLIT: "
+            "opened %s in share basis x%g, today %s is basis x%g (split(s): %s). It is "
+            "valued in its OWN basis (adjusted close x %g) from now on, and any bar under "
+            "its OCC string in the new basis belongs to ANOTHER contract reusing the "
+            "string -- it is not used to mark, quote, fill or settle this lot, which "
+            "therefore cannot be exited by an order and rides to expiry settlement.",
+            lot.contract_symbol, lot.qty, lot.underlying, lot.basis_date,
+            lot.basis_factor, day, k, ", ".join(splits) or "not in the calendar",
+            lot.basis_factor)
+
+    def _crossed_held_lot(self, contract_symbol: str, day=None) -> bool:
+        """True when a HELD lot on ``contract_symbol`` is in another share basis than
+        ``day``'s (default: this bar): that day's store rows under the OCC string belong to a
+        different contract reusing it after a split. Reports the crossing (once per lot)."""
+        if self._split_basis is None:
+            return False
+        lot = self._option_positions.get(contract_symbol)
+        if lot is None or lot.qty == 0:
+            return False
+        day = self._as_of_date() if day is None else day
+        if not self._lot_basis_differs(lot, day):
+            return False
+        self._report_split_crossing(lot, day)
         return True
 
     def _option_bar(self, contract_symbol: str, day=None) -> Optional[Dict[str, Any]]:
@@ -4021,12 +4137,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         bar then belongs to a different contract reusing the OCC string after a split). A
         contract not held, and every day in the lot's own basis, reads the store unchanged."""
         day = self._as_of_date() if day is None else day
-        bar = self._options.get_bar(contract_symbol, day)
-        if self._split_basis is not None:
-            lot = self._option_positions.get(contract_symbol)
-            if lot is not None and lot.qty != 0 and self._lot_crossed_split(lot, day):
-                return None
-        return bar
+        if self._crossed_held_lot(contract_symbol, day):
+            return None
+        return self._options.get_bar(contract_symbol, day)
 
     def _lot_spot(self, contract_symbol: str, underlying: str) -> Optional[float]:
         """The valuation spot of a HELD lot in the basis it traded in: this bar's close (or
@@ -4050,9 +4163,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     def _lot_equity_factor(self, lot: _OptionLot, k_bar: float) -> float:
         """Adjusted book shares per share the HELD ``lot`` delivers: its own basis factor, or
         ``k_bar`` (the bar's) for a lot with no recorded basis / on a run without one."""
-        if self._split_basis is None or lot.qty == 0 or lot.basis_factor is None:
-            return k_bar
-        return lot.basis_factor
+        return lot.basis_factor if self._lot_has_basis(lot) else k_bar
 
     def lot_basis_price(self, contract_symbol: str, underlying: str, adjusted_price,
                         price_day) -> Optional[float]:
@@ -4065,7 +4176,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         lot = self._held_lot_with_basis(contract_symbol)
         if lot is None:
             return self.option_basis_price(underlying, adjusted_price, price_day)
-        self._lot_crossed_split(lot, price_day)
+        if self._lot_basis_differs(lot, price_day):
+            self._report_split_crossing(lot, price_day)
         k = lot.basis_factor
         return adjusted_price if k == 1.0 else float(adjusted_price) * k
 
@@ -4215,10 +4327,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # A HELD lot on a day in another share basis has no quote: the store's row under its
         # OCC string is another contract reusing the string after a split (Task 1a), and an
         # exit rule must not read -- or price a close off -- that contract's premium.
-        if self._split_basis is not None:
-            lot = self._option_positions.get(contract_symbol)
-            if lot is not None and lot.qty != 0 and self._lot_crossed_split(lot):
-                return None
+        if self._crossed_held_lot(contract_symbol):
+            return None
         return self._options.get_quote(
             contract_symbol, self._as_of_date(), data_session=self._option_data_session())
 
@@ -4570,8 +4680,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         lot = self._option_positions.get(position.contract_symbol)
         # The share basis the contract was traded in, read BEFORE the lot is zeroed: an
         # assignment delivers shares of THAT basis (Task 1a). None -> the bar's own factor.
-        lot_k = (lot.basis_factor if lot is not None and lot.qty != 0
-                 and self._split_basis is not None else None)
+        lot_k = lot.basis_factor if self._lot_has_basis(lot) else None
         if lot is not None:
             self._zero_option_lot(lot)
 
@@ -5627,6 +5736,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             fill_day = as_of.date() if hasattr(as_of, "date") else as_of
         self._update_option_position(order.contract_symbol, signed, fill_px, multiplier,
                                      underlying=underlying, fill_day=fill_day)
+        if self._split_basis is not None and underlying and order.id is not None:
+            self._option_fill_basis[order.id] = self._as_traded_factor(underlying, fill_day)
         order.filled_qty = qty
         order.open_price = fill_px
         order.status = OrderStatus.FILLED
@@ -5673,12 +5784,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 lot.basis_factor = k_fill
                 lot.basis_date = fill_day
             elif lot.basis_factor is not None and k_fill != lot.basis_factor:
-                raise RuntimeError(
+                raise OptionLotBasisMismatch(
                     f"[backtest] option fill on {contract_symbol} ({signed_qty:+g} contracts on "
                     f"{fill_day}) is in share basis x{k_fill:g}, but the lot it would change "
                     f"({old_qty:+g} contracts) was opened on {lot.basis_date} in basis "
                     f"x{lot.basis_factor:g}: a split lies between them. A lot cannot hold two "
-                    f"bases; the fill engine should have refused this bar (_option_bar).")
+                    f"bases; the fill engine should have refused this bar (_crossed_held_lot).")
         # Task 3: seed/refresh last_iv at FILL time too, not only from a later equity-mark
         # bar lookup — a position that opens and then immediately hits a missing-bar day
         # (before any snapshot has run at the entry bar) must not lose the entry bar's iv

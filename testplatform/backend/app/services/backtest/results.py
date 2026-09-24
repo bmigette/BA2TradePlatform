@@ -314,21 +314,38 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     # entry close and every 5-minute bar must be in the as-traded basis too, or on a split
     # symbol the move is 1/k of the real one (NFLX 2024: 10x too small). Converted through the
     # account's own ``option_basis_price`` -- the run's split basis, the identity without one
-    # -- with the factor of the trade's ENTRY date (the basis its strike and delta are in;
-    # see ``_bars_5m_between``). The FMP 5-minute cache is back-adjusted
+    # -- in the basis the trade's ENTRY traded in (its strike and delta are in it): the row's
+    # recorded ``option_basis_factor`` when present, else the entry date's factor. ONE factor
+    # per trade, for the entry close and every 5-minute bar alike (Task 1a: per-bar factors
+    # read a trade held across a split as a fake k-fold move). The FMP 5-minute cache is back-adjusted
     # like the daily one (measured: NFLX 5m close 2024-05-01 55.155 vs daily 55.17; NVDA 5m
     # 2024-06-06 120.94, adjusted for the 2024-06-10 split).
     from app.services.backtest.backtest_account import BacktestAccount
     to_option_basis = account.option_basis_price if isinstance(account, BacktestAccount) else None
 
-    def _as_traded(symbol: str, px: Any, dt: Any) -> Optional[float]:
-        if px is None or to_option_basis is None:
+    #: (underlying, parsed entry_time) -> the entry basis recorded on the trade row; filled
+    #: by ``_refine`` before the refinement runs. Every call the refinement makes for a trade
+    #: passes that trade's own (underlying, entry_time), so this is the per-trade key.
+    recorded_basis: Dict[Any, float] = {}
+
+    def _entry_factor(symbol: str, entry: Any) -> Optional[float]:
+        """The trade's ONE factor (None: no basis at all -> prices pass through)."""
+        if to_option_basis is None:
+            return None
+        k = recorded_basis.get((symbol, entry))
+        if k is not None:
+            return k
+        day = entry.date() if hasattr(entry, "date") else entry
+        return account._as_traded_factor(symbol, day)
+
+    def _in_basis(px: Any, k: Optional[float]) -> Optional[float]:
+        # Same arithmetic as ``option_basis_price``: a factor of 1 returns the very value.
+        if px is None or k is None or k == 1.0:
             return px
-        day = dt.date() if hasattr(dt, "date") else dt
-        return to_option_basis(symbol, px, day)
+        return float(px) * k
 
     def _underlying_price_at(symbol: str, dt: Any) -> Optional[float]:
-        return _as_traded(symbol, price.close_at(symbol, dt), dt)
+        return _in_basis(price.close_at(symbol, dt), _entry_factor(symbol, dt))
 
     def _delta_at_entry(underlying: str, contract: str, dt: Any) -> Optional[float]:
         # The seam, whichever reader is behind it. Each backend answers it over its OWN
@@ -350,12 +367,12 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
         window = df[(df["Date"] >= entry) & (df["Date"] <= exit_)]
         if window.empty:
             return []
-        # Every bar in the basis of the trade's ENTRY day (Task 1a), not its own date's: the
-        # contract's strike and delta stay in the basis it was traded in, so on a trade held
-        # across a split the post-split bars would otherwise read as a fake k-fold move.
-        # Without a split inside the trade the two factors are the same number.
-        return [{"Low": _as_traded(symbol, row["Low"], entry),
-                 "High": _as_traded(symbol, row["High"], entry)}
+        # Every bar in the basis the trade's ENTRY traded in (Task 1a), not its own date's: the
+        # contract's strike and delta stay in that basis, so on a trade held across a split
+        # the post-split bars would otherwise read as a fake k-fold move. Without a split
+        # inside the trade the two factors are the same number.
+        k = _entry_factor(symbol, entry)
+        return [{"Low": _in_basis(row["Low"], k), "High": _in_basis(row["High"], k)}
                 for _, row in window.iterrows()]
 
     def _refine(trades: List[Dict[str, Any]], max_drawdown: float) -> float:
@@ -368,6 +385,11 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
             {**t, "entry_time": _parse_date(t.get("entry_time")), "exit_time": _parse_date(t.get("exit_time"))}
             for t in trades
         ]
+        recorded_basis.clear()
+        for t in parsed_trades:
+            if t.get("option_basis_factor") is not None and t.get("underlying_symbol"):
+                recorded_basis[(t["underlying_symbol"], t["entry_time"])] = float(
+                    t["option_basis_factor"])
         return refine_max_drawdown(
             parsed_trades,
             max_drawdown,
@@ -503,6 +525,11 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
                 row[key] = trade[key]
         row["entry_record"] = trade["entry_record"]
         row["exit_record"] = trade["exit_record"]
+    # The share basis the option ENTRY traded in (Task 1a): set by the recorder only on option
+    # rows of a run with a split basis, so every other row keeps exactly the keys above.
+    if "option_basis_factor" in trade:
+        row["option_basis_factor"] = _finite(trade["option_basis_factor"],
+                                             "trade.option_basis_factor")
     return row
 
 

@@ -107,7 +107,7 @@ def _dt(d):
 
 
 @contextmanager
-def _harness(opt_bars, closes):
+def _harness(opt_bars, closes, cfg=CFG):
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import backtest_trading_db, seed_account_definition
     from app.services.backtest.daily_engine import DailyBacktestEngine
@@ -118,18 +118,18 @@ def _harness(opt_bars, closes):
     ctx = backtest_trading_db("optsplitcross")
     ctx.__enter__()
     try:
-        seed_account_definition(1, CFG)
+        seed_account_definition(1, cfg)
         ps = AsOfPriceSource(ohlcv_provider=None)
         ps.load_bars("AAPL", [{"Date": _dt(d), "Open": c, "High": c, "Low": c, "Close": c,
                                "Volume": 1e6} for d, c in closes])
         ps.set_clock(_dt(OPEN_DAY))
-        acct = BacktestAccount(1, ps, CFG, options_provider=_Chain(opt_bars),
+        acct = BacktestAccount(1, ps, cfg, options_provider=_Chain(opt_bars),
                                split_basis=_basis())
         wire_backtest_seams().register_account(1, acct)
         engine = DailyBacktestEngine.__new__(DailyBacktestEngine)
         engine.account = acct
         engine.price = ps
-        engine.config = CFG
+        engine.config = cfg
         yield engine, acct, ps
     finally:
         ctx.__exit__(None, None, None)
@@ -445,3 +445,194 @@ def test_a_lot_that_never_crosses_a_split_keeps_the_pre_fix_numbers():
         _expire(engine, acct, ps, day=PRE_SPLIT_EXPIRY)
         assert _expiry_close(acct, CONTROL_PUT).open_price == pytest.approx(6.0)
         assert acct._cash == pytest.approx(CFG["starting_cash"] - 1500.0 + 600.0)
+
+
+# =============================================================================================
+# Review follow-ups: the GA default fill model (next_bar_open) -- a decision on bar D fills on
+# D+1's open, so an order decided the session before the ex-date fills ON the ex-date.
+# =============================================================================================
+NBO = {**CFG, "fill_model": "next_bar_open"}
+POST_PUT = "AAPL200918P00100000"          # the adjusted contract's own post-split string
+
+
+def _order_rows(acct, contract):
+    return [o for o in acct.get_orders() if o.contract_symbol == contract]
+
+
+def test_nbo_a_close_decided_pre_split_does_not_fill_on_the_ex_date():
+    """(a) Close decided 08-28 would fill on 08-31 (the ex-date) against the reused string's
+    120.40: no raise, no fill, the lot unchanged. On 08-31 the MARKET close -- which the DAY
+    sweep never ages -- is cancelled (its OCC string no longer names the contract)."""
+    with _harness(_collision_bars(), _closes(), cfg=NBO) as (engine, acct, ps):
+        ps.set_clock(_dt(date(2020, 8, 21)))
+        pos = _open(acct, PUT, OptionRight.PUT, 410.0, EXPIRY, OrderDirection.BUY, "long_put")
+        lot = acct._option_positions[PUT]
+        assert (lot.basis_factor, lot.basis_date) == (4.0, OPEN_DAY)
+        ps.set_clock(_dt(LAST_PRE))
+        cash = acct._cash
+        acct.close_option_position(pos, order_type="market")
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert lot.qty == 1 and acct._cash == pytest.approx(cash)
+        closing = [o for o in _order_rows(acct, PUT) if o.side == OrderDirection.SELL]
+        assert len(closing) == 1 and closing[0].status != OrderStatus.FILLED
+
+        ps.set_clock(_dt(SPLIT))
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert lot.qty == 1 and acct._cash == pytest.approx(cash)
+        closing = [o for o in _order_rows(acct, PUT) if o.side == OrderDirection.SELL]
+        assert closing[0].status == OrderStatus.CANCELED
+
+
+def test_nbo_an_ex_date_entry_takes_the_fill_days_basis_and_is_not_a_crossing(caplog):
+    """(b) Decided ON the ex-date, filled the next session: basis = k(fill day) = 1, and the
+    lot is marked from its own bars with no crossing warning."""
+    import logging
+    bars = {(POST_PUT, date(2020, 9, 1)): _bar(3.0), (POST_PUT, date(2020, 9, 2)): _bar(3.5)}
+    with _harness(bars, _closes(), cfg=NBO) as (engine, acct, ps):
+        ps.set_clock(_dt(SPLIT))
+        with caplog.at_level(logging.WARNING):
+            _open(acct, POST_PUT, OptionRight.PUT, 100.0, EXPIRY, OrderDirection.BUY, "long_put")
+            lot = acct._option_positions[POST_PUT]
+            assert (lot.basis_factor, lot.basis_date) == (1.0, date(2020, 9, 1))
+            acct.equity()
+            ps.set_clock(_dt(date(2020, 9, 2)))
+            assert _lot_mark(acct, POST_PUT) == pytest.approx(3.5)
+        assert not [r for r in caplog.records if "ACROSS A SPLIT" in r.getMessage()]
+
+
+def test_a_day_before_the_lots_basis_day_is_not_its_bar_and_is_not_a_crossing(caplog):
+    """(b, defensive) A lot whose basis day is AHEAD of the clock in another basis (booked at
+    the clock, premium read on the next bar): that day's bar is not the lot's, but nothing has
+    crossed -- no WARNING."""
+    import logging
+    from app.services.backtest.backtest_account import _OptionLot
+    bars = {(POST_PUT, LAST_PRE): _bar(9.0)}
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        ps.set_clock(_dt(LAST_PRE))
+        acct._option_positions[POST_PUT] = _OptionLot(
+            POST_PUT, qty=1, avg_price=3.0, underlying="AAPL", basis_factor=1.0, basis_date=SPLIT)
+        with caplog.at_level(logging.WARNING):
+            assert acct._option_bar(POST_PUT) is None
+            assert acct.get_option_quote(POST_PUT) is None
+        assert not [r for r in caplog.records if "ACROSS A SPLIT" in r.getMessage()]
+
+
+def test_nbo_an_open_decided_before_the_split_is_refused_on_the_ex_date(caplog):
+    """(c) A BUY decided 08-28 would fill on 08-31 at the REUSED string's 300.50 -- a
+    different trade -- and a generous limit does not protect. Refused loudly, left pending,
+    then expired by the DAY sweep."""
+    import logging
+    bars = {(PUT, d): _bar(300.5) for d in _sessions() if d >= SPLIT}
+    with _harness(bars, _closes(), cfg=NBO) as (engine, acct, ps):
+        ps.set_clock(_dt(LAST_PRE))
+        leg = OptionLeg(contract_symbol=PUT, side=OrderDirection.BUY, position_intent="buy_to_open",
+                        option_type=OptionRight.PUT, strike=410.0, expiry=EXPIRY, underlying="AAPL")
+        cash = acct._cash
+        with caplog.at_level(logging.WARNING):
+            acct.submit_option_order(legs=[leg], quantity=1, order_type="limit", limit_price=400.0,
+                                     option_strategy="long_put")
+            acct.refresh_orders()
+        refused = [r.getMessage() for r in caplog.records if "fill REFUSED" in r.getMessage()]
+        assert len(refused) == 1, refused
+        assert PUT in refused[0] and "2020-08-28" in refused[0] and "2020-08-31" in refused[0]
+        assert "4:1" in refused[0]
+        assert PUT not in acct._option_positions and acct._cash == pytest.approx(cash)
+        (order,) = _order_rows(acct, PUT)
+        assert order.status in OrderStatus.get_active_statuses()
+
+        ps.set_clock(_dt(SPLIT))
+        acct.refresh_orders()
+        (order,) = _order_rows(acct, PUT)
+        assert order.status == OrderStatus.EXPIRED
+        assert PUT not in acct._option_positions
+
+
+def test_a_fill_that_would_mix_two_bases_in_one_lot_raises_a_named_error():
+    """(d) The ledger invariant, behind the fill engine's own refusal."""
+    from app.services.backtest.backtest_account import OptionLotBasisMismatch
+    bars = _pre_split_bars(PUT, {OPEN_DAY: 15.0})
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        _open(acct, PUT, OptionRight.PUT, 410.0, EXPIRY, OrderDirection.BUY, "long_put")
+        with pytest.raises(OptionLotBasisMismatch, match="a split lies between them"):
+            acct._update_option_position(PUT, 1.0, 1.0, 100.0, underlying="AAPL",
+                                         fill_day=SPLIT)
+        assert issubclass(OptionLotBasisMismatch, RuntimeError)
+        assert acct._option_positions[PUT].qty == 1
+
+
+def test_a_combo_whose_legs_are_in_different_bases_refuses_the_run():
+    """(e) One net payoff cannot be stated for such a combo: SplitBasisRefused, which the
+    engine re-raises out of its per-expiry handler."""
+    from ba2_common.core.split_basis import SplitBasisRefused
+    long_leg = "AAPL200918P00400000"
+    bars = {(PUT, OPEN_DAY): _bar(15.0), (long_leg, OPEN_DAY): _bar(10.0)}
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        short = OptionLeg(contract_symbol=PUT, side=OrderDirection.SELL,
+                          position_intent="sell_to_open", option_type=OptionRight.PUT,
+                          strike=410.0, expiry=EXPIRY, underlying="AAPL")
+        long_ = OptionLeg(contract_symbol=long_leg, side=OrderDirection.BUY,
+                          position_intent="buy_to_open", option_type=OptionRight.PUT,
+                          strike=400.0, expiry=EXPIRY, underlying="AAPL")
+        acct.submit_option_order(legs=[short, long_], quantity=1, order_type="market",
+                                 option_strategy="bull_put_spread")
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert acct._option_positions[PUT].qty == -1 and acct._option_positions[long_leg].qty == 1
+        acct._option_positions[long_leg].basis_factor = 1.0      # corrupt ONE leg's basis
+        ps.set_clock(_dt(EXPIRY))
+        with pytest.raises(SplitBasisRefused, match="different share bases"):
+            engine._apply_option_expiry(_dt(EXPIRY))
+
+
+def test_an_underlying_with_no_bar_on_the_expiry_date_settles_on_the_forward_filled_close():
+    """(f) The underlying has no bar ON the expiry date: settle on its last close (09-17:
+    95 adjusted = 380 in the lot's basis, P410 intrinsic 30) instead of skipping the expiry."""
+    bars = _pre_split_bars(PUT, {OPEN_DAY: 15.0, LAST_PRE: 12.0})
+    closes = [(d, c) for d, c in _closes(overrides={date(2020, 9, 17): 95.0}) if d != EXPIRY]
+    with _harness(bars, closes) as (engine, acct, ps):
+        _open(acct, PUT, OptionRight.PUT, 410.0, EXPIRY, OrderDirection.BUY, "long_put")
+        cash_after_entry = acct._cash
+        _expire(engine, acct, ps)
+        assert _expiry_close(acct, PUT).open_price == pytest.approx(30.0)
+        assert acct._cash == pytest.approx(cash_after_entry + 30.0 * 100)
+
+
+def test_the_round_trip_row_carries_the_entry_basis_and_the_refinement_uses_it(monkeypatch):
+    """Review item 4: the row publishes the basis its entry traded in, and the intraday
+    refinement prices the entry close and every 5m bar with THAT one factor, even when the
+    row's entry date is in another basis."""
+    import pandas as pd
+    import app.services.backtest.intraday_drawdown as I
+    import app.services.backtest.results as R
+
+    bars = _pre_split_bars(PUT, {OPEN_DAY: 15.0, LAST_PRE: 12.0})
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        _open(acct, PUT, OptionRight.PUT, 410.0, EXPIRY, OrderDirection.BUY, "long_put")
+        ps.set_clock(_dt(date(2020, 9, 1)))
+        (row,) = [t for t in acct.get_round_trip_trades() if t.get("contract_symbol") == PUT]
+        assert row["option_basis_factor"] == 4.0
+        assert R._trade_row(row)["option_basis_factor"] == 4.0
+
+        df = pd.DataFrame({"Date": [pd.Timestamp("2020-09-01 10:00")],
+                           "Low": [105.0], "High": [111.0]})
+        monkeypatch.setattr(R, "_get_5m_bars_cached", lambda *a, **k: df)
+        seen = {}
+
+        def spy(trades, max_dd, **kw):
+            t = trades[0]
+            seen["entry"] = kw["underlying_price_at"]("AAPL", t["entry_time"])
+            seen["bars"] = kw["bars_5m_between"]("AAPL", t["entry_time"], t["exit_time"])
+            return max_dd
+
+        monkeypatch.setattr(I, "refine_max_drawdown", spy)
+        fn = R._build_refine_drawdown_fn(
+            acct, {"account_settings": {"commission_per_trade": 0.0},
+                   "start_date": date(2020, 8, 17), "end_date": date(2020, 9, 25)})
+        # An entry DATED on the ex-date (factor 1) whose recorded basis is 4: the basis wins.
+        fn([{"contract_symbol": PUT, "underlying_symbol": "AAPL",
+             "entry_time": "2020-08-31T00:00:00", "exit_time": "2020-09-02T00:00:00",
+             "option_basis_factor": 4.0}], 0.1)
+        assert seen["entry"] == pytest.approx(110.0 * 4)
+        assert seen["bars"] == [{"Low": pytest.approx(420.0), "High": pytest.approx(444.0)}]
