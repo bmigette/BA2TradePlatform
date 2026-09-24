@@ -10,6 +10,13 @@ on the live export, and a NOT would turn "unknown -> does not fire" into "unknow
 Pinned here, for the tree form (``assert_market_rule_actions``), the live EventAction form
 (``assert_market_rule_actions_live``) and the shared deploy converter
 (``trade_rules_to_live_export``) that every deploy goes through.
+
+THE TWO FORMS ALLOW DIFFERENT SETS. The live form allows the reduce
+(``decrease_instrument_share``): ``TradeActionEvaluator`` runs it from the EventAction directly.
+The tree form does not, yet: its deploy converter (``rule_builders.action_from_rule``) has no
+mapping for it and would DROP the rule from the export -- a market exit that silently does not
+exist live. ``test_every_tree_allowed_action_survives_the_deploy_converter`` keeps the tree set
+and the converter in step.
 """
 from __future__ import annotations
 
@@ -17,6 +24,7 @@ import pytest
 
 from ba2_common.core.market_condition_rules import (
     MARKET_RULE_ACTIONS,
+    MARKET_RULE_ACTIONS_TREE,
     assert_market_rule_actions,
     assert_market_rule_actions_live,
     assert_no_market_conditions,
@@ -26,8 +34,10 @@ from ba2_common.core.types import ExpertActionType
 
 ADX = "underlying_adx_14"
 ROLL = ExpertActionType.ROLL_PMCC_SHORT.value
-ALLOWED = ("close", "close_option", "decrease_instrument_share", "adjust_stop_loss",
-           "adjust_take_profit")
+#: Tree form (deploy-convertible). ``close_option`` is a close (the option position).
+ALLOWED = ("close", "close_option", "adjust_stop_loss", "adjust_take_profit")
+#: Live EventAction form: the tree set plus the reduce.
+LIVE_ALLOWED = ALLOWED + ("decrease_instrument_share",)
 
 
 def _leaf(**over):
@@ -68,11 +78,47 @@ def _refused(rules, *needles):
 
 
 # ------------------------------------------------------------------------ the allow-list
-def test_the_allow_list_is_exactly_close_reduce_and_adjust_tp_sl():
-    """``close_option`` counts as a close (the option position the rule runs on)."""
-    assert MARKET_RULE_ACTIONS == frozenset(ALLOWED)
-    for name in ALLOWED:
+def test_the_allow_lists_are_exactly_close_reduce_and_adjust_tp_sl_per_form():
+    """``close_option`` counts as a close (the option position the rule runs on); the reduce is
+    live-form only."""
+    assert MARKET_RULE_ACTIONS == frozenset(LIVE_ALLOWED)
+    assert MARKET_RULE_ACTIONS_TREE == frozenset(ALLOWED)
+    for name in LIVE_ALLOWED:
         assert name in {m.value for m in ExpertActionType}, name
+
+
+def test_a_tree_form_reduce_is_refused_because_the_converter_cannot_carry_it():
+    msg = _refused([_rule("decrease_instrument_share")], "mkt-exit",
+                   "'decrease_instrument_share'", "cannot carry a reduce action yet")
+    assert "decrease_instrument_share" not in msg.split("Allowed here:")[1]
+
+
+def test_an_action_type_given_as_an_enum_member_is_unwrapped():
+    ok = _rule()
+    ok["actions"] = [{"action_type": ExpertActionType.CLOSE}]
+    assert assert_market_rule_actions([ok], "exit_rules") is None
+    bad = _rule()
+    bad["actions"] = [{"action_type": ExpertActionType.BUY}]
+    msg = _refused([bad], "['buy']")
+    assert "ExpertActionType" not in msg
+
+
+@pytest.mark.parametrize("alias", ["adjust_tp", "adjust_sl"])
+def test_a_legacy_alias_is_judged_on_what_it_means(alias):
+    """``rule_builders.EXIT_ACTION`` maps ``adjust_tp``/``adjust_sl`` to the TP/SL adjustments,
+    and the converter exports them as such -- so an old row carrying one is a TP/SL adjustment."""
+    rule = _rule()
+    rule["actions"] = [{"action": alias, "reference_value": "order_open_price", "value": 5.0}]
+    assert assert_market_rule_actions([rule], "exit_rules") is None
+    legacy = {"id": "old", "conditions": {"operator": "AND", "conditions": [_leaf()]},
+              "action": alias, "reference_value": "order_open_price", "value": 5.0}
+    assert assert_market_rule_actions([legacy], "exit_rules") is None
+    export = trade_rules_to_live_export([], [rule])
+    exported, = export["rulesets"][0]["rules"]
+    assert [a["action_type"] for a in exported["actions"].values()] == [
+        "adjust_take_profit" if alias == "adjust_tp" else "adjust_stop_loss"]
+    # ...and an alias that MEANS an open is still refused (``sell`` maps to itself).
+    _refused([dict(legacy, action="sell")], "'sell'")
 
 
 @pytest.mark.parametrize("action_type", ALLOWED)
@@ -219,7 +265,7 @@ def _live(action_types, *, triggers=None, alias="action_type"):
     return ("mkt exit", trig, {f"a{i}": {alias: at} for i, at in enumerate(action_types)})
 
 
-@pytest.mark.parametrize("action_type", ALLOWED)
+@pytest.mark.parametrize("action_type", LIVE_ALLOWED)
 def test_live_each_allowed_action_is_accepted(action_type):
     assert assert_market_rule_actions_live([_live([action_type])], "ruleset 'x'") is None
 
@@ -230,7 +276,7 @@ def test_live_a_disallowed_action_is_refused(bad):
         assert_market_rule_actions_live([_live([bad])], "ruleset 'x'")
     msg = str(e.value)
     assert "mkt exit" in msg and repr(bad) in msg and "cond_1" in msg
-    for name in ALLOWED:
+    for name in LIVE_ALLOWED:
         assert name in msg
 
 
@@ -284,11 +330,25 @@ def test_the_deploy_converter_refuses_an_unresolved_template_on_an_exit_rule():
     assert "open_positions ruleset" in msg and "mode_optimize" in msg and "mkt-adx" in msg
 
 
-def test_the_deploy_converter_exports_a_gated_close_option_rule():
-    export = trade_rules_to_live_export([], [_rule("close_option")], name="mx")
-    rule, = export["rulesets"][0]["rules"]
-    assert [a["action_type"] for a in rule["actions"].values()] == ["close_option"]
-    assert any(t["event_type"] == ADX for t in rule["triggers"].values())
+@pytest.mark.parametrize("action_type", sorted(MARKET_RULE_ACTIONS_TREE))
+def test_every_tree_allowed_action_survives_the_deploy_converter(action_type):
+    """Parametrized over the LIVE constant, not a copy: adding an action to the tree allow-list
+    that ``trade_rules_to_live_export`` cannot carry fails here instead of dropping a market exit
+    from a deploy without a word."""
+    export = trade_rules_to_live_export([], [_rule(action_type)], name="mx")
+    ruleset, = export["rulesets"]
+    assert ruleset["subtype"] == "open_positions"
+    rule, = ruleset["rules"]
+    assert [a["action_type"] for a in rule["actions"].values()] == [action_type]
+    assert {"event_type": ADX, "operator": "<", "value": 20.0} in rule["triggers"].values()
+
+
+def test_the_reduce_really_is_dropped_by_the_converter():
+    """Why the tree set excludes it (if this starts failing, the converter learned the reduce:
+    move it into MARKET_RULE_ACTIONS_TREE)."""
+    rule = _rule("decrease_instrument_share", conditions={"operator": "AND",
+                                                           "conditions": [_ordinary()]})
+    assert trade_rules_to_live_export([], [rule])["rulesets"] == []
 
 
 def test_the_deploy_converter_leaves_an_ordinary_exit_ruleset_alone():

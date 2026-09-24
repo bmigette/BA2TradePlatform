@@ -7,7 +7,8 @@ Three refusals live here, each closing a failure that is SILENT without it:
   may do. Since plan 2026-09-24 Task B1 the live open-positions pass opens a decision scope, so
   an exit leaf evaluates live exactly as in the backtest, and a failed read is UNKNOWN (the rule
   does not fire, exits are never aborted). That is safe only for a rule that CLOSES, REDUCES or
-  ADJUSTS TP/SL (:data:`MARKET_RULE_ACTIONS`), and only when every market leaf sits in a
+  ADJUSTS TP/SL (:data:`MARKET_RULE_ACTIONS`; the tree form, which must survive the deploy
+  converter, :data:`MARKET_RULE_ACTIONS_TREE`), and only when every market leaf sits in a
   top-level AND. Before B2 the leaf was refused on any exit rule
   (:func:`assert_no_market_conditions`, still defined for importers, no longer called by the
   exit doors).
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Iterator, List, Mapping, Sequence, Tuple
 
+from ba2_common.core.rule_builders import EXIT_ACTION
 from ba2_common.core.rule_models import MODE_OFF
 
 #: The expert setting that names the market-condition profile(s) an expert's entry rules may gate
@@ -140,6 +142,10 @@ def assert_no_market_conditions(rules: Any, where: str) -> None:
 #: BELOW it; a roll / lifecycle / overlay action skipped on an unknown read can leave a short leg
 #: to be assigned. ``close_option`` (``ExpertActionType.CLOSE_OPTION``) is a close too: it closes
 #: the option position the rule runs on.
+#:
+#: This is the LIVE-FORM set (``EventAction`` rules, :func:`assert_market_rule_actions_live`):
+#: ``TradeActionEvaluator`` builds a ``DecreaseInstrumentShareAction`` from an EventAction whose
+#: ``action_type`` is ``decrease_instrument_share`` and runs it in its share-adjustment phase.
 MARKET_RULE_ACTIONS = frozenset({
     "close",
     "close_option",
@@ -147,6 +153,23 @@ MARKET_RULE_ACTIONS = frozenset({
     "adjust_stop_loss",
     "adjust_take_profit",
 })
+
+#: The TREE-FORM set (:func:`assert_market_rule_actions`): :data:`MARKET_RULE_ACTIONS` minus the
+#: reduce. A tree-form rule reaches live through ``rules_convert.trade_rules_to_live_export``,
+#: whose per-action converter (``rule_builders.action_from_rule``) has no mapping for
+#: ``decrease_instrument_share`` -- it returns None and the rule is DROPPED from the export, so a
+#: market exit would vanish silently at deploy. Refused here until that converter carries it
+#: (``test_every_tree_allowed_action_survives_the_deploy_converter`` pins the two together).
+MARKET_RULE_ACTIONS_TREE = MARKET_RULE_ACTIONS - {"decrease_instrument_share"}
+
+#: Why a tree-form action outside :data:`MARKET_RULE_ACTIONS_TREE` but inside
+#: :data:`MARKET_RULE_ACTIONS` is refused -- said in the message, not left to the reader.
+_TREE_ONLY_REFUSAL = {
+    "decrease_instrument_share": (
+        "the tree-form deploy converter (rules_convert.trade_rules_to_live_export via "
+        "rule_builders.action_from_rule) cannot carry a reduce action yet: the rule would be "
+        "dropped from the live export and the market exit would silently not exist live"),
+}
 
 #: The only boolean group a market leaf may sit under. A nested OR is flattened to AND on the
 #: live export (``rule_builders.tree_leaves``), and a NOT -- or any other operator -- would turn
@@ -200,10 +223,18 @@ def _tree_rule_action_types(rule: Mapping) -> List[str]:
     ``actionType``, the ``rule_models.ActionCfg`` aliases, in its order). Legacy single-action
     rows carry the same keys at the rule's top level (``rule_models._lift_legacy_rule``).
     An action whose type cannot be read is reported as ``'<missing>'`` -- refused, never skipped.
+
+    An ``ExpertActionType`` member is unwrapped to its value, and a legacy alias
+    (``adjust_tp`` / ``adjust_sl``) is normalised through ``rule_builders.EXIT_ACTION`` -- the
+    same map the converter uses -- so an old row is judged on what it MEANS.
     """
     def one(cfg: Mapping) -> str:
         at = cfg.get("action_type") or cfg.get("action") or cfg.get("actionType")
-        return str(at) if at else "<missing>"
+        if not at:
+            return "<missing>"
+        at = str(getattr(at, "value", at))
+        spec = EXIT_ACTION.get(at)
+        return spec[0].value if spec is not None else at
 
     actions = rule.get("actions")
     if isinstance(actions, list):
@@ -225,16 +256,24 @@ def _live_action_types(actions: Any) -> List[str]:
 
 
 def _refuse_market_rule_actions(where: str, rule_label: str, leaves: Sequence[str],
-                                action_types: Sequence[str]) -> None:
-    offending = [at for at in action_types if at not in MARKET_RULE_ACTIONS]
+                                action_types: Sequence[str],
+                                allowed: frozenset = MARKET_RULE_ACTIONS) -> None:
+    offending = [at for at in action_types if at not in allowed]
     if not action_types:
         offending = ["<no action>"]
     if offending:
+        form_only = [f"{at!r}: {_TREE_ONLY_REFUSAL[at]}" for at in offending
+                     if at in _TREE_ONLY_REFUSAL and at in MARKET_RULE_ACTIONS]
+        if form_only:
+            raise ValueError(
+                f"{where}: rule {rule_label!r} carries market-condition leaves {list(leaves)!r} "
+                f"and action(s) {offending!r}, which a market-gated TREE-FORM rule may not use -- "
+                + "; ".join(form_only) + f". Allowed here: {sorted(allowed)!r}.")
         raise ValueError(
             f"{where}: rule {rule_label!r} carries market-condition leaves {list(leaves)!r} and "
             f"action(s) {offending!r}, which a market-gated rule may not use. A rule gated on "
             f"market conditions may only CLOSE, REDUCE or ADJUST TP/SL -- allowed actions: "
-            f"{sorted(MARKET_RULE_ACTIONS)!r}. When a market condition cannot be read on the "
+            f"{sorted(allowed)!r}. When a market condition cannot be read on the "
             f"exit pass it reads unknown and the rule does not fire, which is safe only for those "
             f"actions: an open, a stop_processing, or a roll/lifecycle/overlay action skipped on "
             f"an unknown read changes the position (a skipped roll can leave a short leg to be "
@@ -243,6 +282,9 @@ def _refuse_market_rule_actions(where: str, rule_label: str, leaves: Sequence[st
 
 def assert_market_rule_actions(rules: Any, where: str) -> None:
     """Every rule that carries a market-condition leaf may only CLOSE, REDUCE, or ADJUST TP/SL.
+
+    TREE FORM: the allowed set is :data:`MARKET_RULE_ACTIONS_TREE`, which today excludes
+    ``decrease_instrument_share`` -- the deploy converter would drop such a rule (see there).
 
     Refuses (ValueError) a market leaf in a rule with any other action (open, roll, lifecycle,
     overlay, stop_processing...), and a market leaf nested under OR/NOT (only a top-level AND tree
@@ -274,7 +316,7 @@ def assert_market_rule_actions(rules: Any, where: str) -> None:
                 f"other operator) would turn 'unknown -> does not fire' into 'unknown -> fires'. "
                 f"Write each OR branch as its own rule.")
         _refuse_market_rule_actions(where, rule_label, [label for label, _l, _o in found],
-                                    _tree_rule_action_types(rule))
+                                    _tree_rule_action_types(rule), MARKET_RULE_ACTIONS_TREE)
 
 
 def assert_market_rule_actions_live(rules: Iterable[Tuple[str, Any, Any]], where: str) -> None:
@@ -283,8 +325,9 @@ def assert_market_rule_actions_live(rules: Iterable[Tuple[str, Any, Any]], where
     A persisted rule is an ``EventAction`` -- ``triggers`` ``{"cond_0": {"event_type": ...}}``
     (always ANDed: the format has no groups, so the OR/NOT half of the tree check has nothing to
     look at) and ``actions`` ``{"a0": {"action_type": ...}}``. Market leaves are the triggers
-    whose ``event_type`` is a market field (the ``EventType`` value IS the field name). Same
-    allow-list, same message, as the tree form.
+    whose ``event_type`` is a market field (the ``EventType`` value IS the field name). The
+    allowed set is the full :data:`MARKET_RULE_ACTIONS`, reduce included: an EventAction is run
+    by ``TradeActionEvaluator`` directly, with no tree converter in between to drop it.
     """
     fields = market_condition_fields()
     for rule_label, triggers, actions in rules:

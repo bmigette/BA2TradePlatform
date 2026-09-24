@@ -305,7 +305,7 @@ class RulesExporter:
 _OPEN_POSITIONS = "open_positions"
 
 
-def _assert_no_market_gates_on_exit_ruleset(ruleset_info: Dict[str, Any]) -> None:
+def _assert_market_gates_on_exit_ruleset_allowed(ruleset_info: Dict[str, Any]) -> None:
     """Refuse a market-condition gate arriving inside an OPEN-POSITIONS ruleset payload on a rule
     that does anything but CLOSE, REDUCE or ADJUST TP/SL (plan 2026-09-24 Task B2).
 
@@ -336,7 +336,7 @@ def _assert_no_market_gates_on_exit_ruleset(ruleset_info: Dict[str, Any]) -> Non
         f"imported ruleset {ruleset_info.get('name')!r}")
 
 
-def _assert_no_market_gates_on_exit_rule(rule_data: Dict[str, Any]) -> None:
+def _assert_market_gates_on_exit_rule_allowed(rule_data: Dict[str, Any]) -> None:
     """Refuse a gate on a rule whose OWN subtype is open_positions, unless the rule only
     closes, reduces or adjusts TP/SL (plan 2026-09-24 Task B2).
 
@@ -393,7 +393,7 @@ class RulesImporter:
                 ruleset_info = ruleset_data["ruleset"]
 
                 # BEFORE anything is created: a market gate may not ride an exit ruleset.
-                _assert_no_market_gates_on_exit_ruleset(ruleset_info)
+                _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                 
                 # Preserve original name, but handle duplicates
                 base_name = ruleset_info['name']
@@ -480,7 +480,7 @@ class RulesImporter:
             with get_db() as session:
                 for ruleset_data in rulesets_data["rulesets"]:
                     ruleset_info = ruleset_data
-                    _assert_no_market_gates_on_exit_ruleset(ruleset_info)
+                    _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                     warnings = []
                     
                     # Preserve original name, but handle duplicates
@@ -578,7 +578,7 @@ class RulesImporter:
                     # Before the existing ruleset's links are dropped below: refusing after that
                     # would leave a live exit ruleset with NO rules, which is the same silence
                     # from the other side.
-                    _assert_no_market_gates_on_exit_ruleset(ruleset_info)
+                    _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                     warnings: List[str] = []
                     name = ruleset_info["name"]
 
@@ -666,7 +666,7 @@ class RulesImporter:
     def _import_rule_to_session(session: Session, rule_data: Dict[str, Any], name_suffix: str = "") -> Tuple[int, List[str]]:
         """Import a rule within an existing session. Returns (rule_id, warnings)."""
         warnings = []
-        _assert_no_market_gates_on_exit_rule(rule_data)
+        _assert_market_gates_on_exit_rule_allowed(rule_data)
 
         try:
             # Check if rule with same name already exists

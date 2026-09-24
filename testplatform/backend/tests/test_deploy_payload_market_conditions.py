@@ -291,10 +291,19 @@ def test_a_market_leaf_on_a_close_exit_rule_is_accepted_and_exported():
     assert any(t["event_type"] == "underlying_adx_14" for t in triggers)
 
 
-@pytest.mark.parametrize("action", ["close", "decrease_instrument_share",
+@pytest.mark.parametrize("action", ["close", "close_option",
                                     "adjust_stop_loss", "adjust_take_profit"])
 def test_each_allowed_action_carries_a_market_leaf(action):
     assert_market_rule_actions(_exit_rule(_resolved_leaf(), action=action), "exit_rules")
+
+
+def test_a_tree_form_reduce_is_refused_at_every_tree_door():
+    """The deploy converter would drop a ``decrease_instrument_share`` rule; refused instead."""
+    exits = _exit_rule(_resolved_leaf(), action="decrease_instrument_share")
+    for door in (lambda: assert_market_rule_actions(exits, "exit_rules"),
+                 lambda: trade_rules_to_live_export([], exits)):
+        with pytest.raises(ValueError, match="cannot carry a reduce action yet"):
+            door()
 
 
 @pytest.mark.parametrize("action", ["buy", "stop_processing", _ROLL])
@@ -310,7 +319,7 @@ def test_a_market_leaf_in_an_exit_ruleset_is_refused_only_with_a_disallowed_acti
             door()
         msg = str(e.value)
         assert repr(action) in msg and "'x'" in msg and "may not use" in msg
-        assert "adjust_stop_loss" in msg and "decrease_instrument_share" in msg
+        assert "adjust_stop_loss" in msg and "close_option" in msg
 
 
 def test_a_market_leaf_under_OR_on_an_exit_rule_is_refused():
@@ -409,7 +418,7 @@ def test_the_deploy_importer_checks_exit_leaves_are_served_too():
     anything is written (read from source: running the tool needs a live DB)."""
     from ba2_common.core.market_condition_rules import assert_market_fields_served
 
-    tools =os.path.normpath(os.path.join(_ROOT, "..", "..", "tools"))
+    tools = os.path.normpath(os.path.join(_ROOT, "..", "..", "tools"))
     importer = open(os.path.join(tools, "import_deploy_payload.py"), encoding="utf-8").read()
     check = importer.index("assert_market_fields_served(exit_rules, mc_profiles")
     assert check < importer.index("add_instance(inst)")
@@ -419,6 +428,58 @@ def test_the_deploy_importer_checks_exit_leaves_are_served_too():
     with pytest.raises(ValueError, match="empty"):
         assert_market_fields_served(exits, (), where="label: exit rules")
     assert_market_fields_served(exits, ("ohlcv-v1",), where="label: exit rules")
+
+
+def _run_import_tool(tmp_path, exit_rules, entry_rules=()):
+    """Run ``tools/import_deploy_payload.py`` for real, in a SUBPROCESS, against a throwaway
+    SQLite file with the live schema. The tool configures the process-global DB at import time
+    from ``BA2_LIVE_DB`` (defaulting to the real live DB), so it is never imported in-process and
+    the env var is always set here. Returns (returncode, stdout, ExpertInstance row count)."""
+    import json
+    import subprocess
+
+    from sqlalchemy import create_engine, text
+    from sqlmodel import SQLModel
+
+    import ba2_common.core.models  # noqa: F401 -- registers the tables
+
+    worktree = os.path.normpath(os.path.join(_ROOT, "..", ".."))
+    db_file = str(tmp_path / "throwaway_live.sqlite")
+    engine = create_engine(f"sqlite:///{db_file}")
+    SQLModel.metadata.create_all(engine)
+    payload = [{
+        "target_instance_id": None, "account_id": 1, "label": "refused-deploy",
+        "backtest_id": 1, "expert_name": "FMPRating",
+        "ruleset": {"entry_rules": list(entry_rules), "exit_rules": exit_rules},
+        "settings": {"settings": {"expert_params": {"market_condition_profile": "ohlcv-v1"}}},
+    }]
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    env = dict(os.environ, BA2_LIVE_DB=db_file, BA2_REPO=worktree, PYTHONPATH=os.pathsep.join(
+        os.path.join(worktree, "packages", p) for p in ("common", "providers", "experts")))
+    proc = subprocess.run([sys.executable, os.path.join(worktree, "tools",
+                                                        "import_deploy_payload.py"),
+                           str(payload_file)],
+                          env=env, capture_output=True, text=True, timeout=300, cwd=str(tmp_path))
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT COUNT(*) FROM expertinstance")).scalar()
+    engine.dispose()
+    return proc.returncode, proc.stdout + proc.stderr, rows
+
+
+@pytest.mark.parametrize("bad", ["buy", "decrease_instrument_share", "template"])
+def test_a_refused_payload_writes_no_expert_instance(tmp_path, bad):
+    """The refusals run BEFORE ``add_instance``. Were they left to ``trade_rules_to_live_export``
+    (which runs after the instance is created for a null ``target_instance_id``), a refused
+    payload would leave an enabled ExpertInstance with no rulesets behind."""
+    if bad == "template":
+        exits = _exit_rule(_template_leaf())
+    else:
+        exits = _exit_rule(_resolved_leaf(), action=bad)
+    code, out, rows = _run_import_tool(tmp_path, exits)
+    assert code == 1, out
+    assert "FATAL: refused-deploy" in out, out
+    assert rows == 0, out
 
 
 def test_the_save_path_still_accepts_the_optimizer_template_on_an_exit_rule():
