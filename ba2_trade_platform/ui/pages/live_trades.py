@@ -14,7 +14,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
-from ..components.LiveTradesTable import transaction_status_color
+from ..components.LiveTradesTable import related_order_rows, transaction_status_color
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.option_structure_chart import (
     fetch_underlying_bars, render_option_structure_chart,
@@ -610,38 +610,7 @@ class LiveTradesTab:
                         TradingOrder.transaction_id == txn.id
                     ).order_by(TradingOrder.created_at)
                     txn_orders = list(session.exec(orders_statement).all())
-
-                    for order in txn_orders:
-                        order_type_display = order.order_type.value if hasattr(order.order_type, 'value') else str(order.order_type)
-                        order_side_display = order.side.value if hasattr(order.side, 'value') else str(order.side)
-                        order_status_display = order.status.value if hasattr(order.status, 'value') else str(order.status)
-
-                        order_category = 'Entry'
-                        if TransactionHelper.is_tpsl_order(order):
-                            if TransactionHelper.is_tp_order(order):
-                                order_category = 'Take Profit'
-                            elif TransactionHelper.is_sl_order(order):
-                                order_category = 'Stop Loss'
-                            else:
-                                order_category = 'Dependent'
-
-                        orders_data.append({
-                            'id': order.id,
-                            'type': order_type_display,
-                            'side': order_side_display,
-                            'category': order_category,
-                            'quantity': f"{order.quantity:.2f}" if order.quantity else '0.00',
-                            'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '0.00',
-                            'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
-                            'stop_price': f"${order.stop_price:.2f}" if order.stop_price else '',
-                            'status': order_status_display,
-                            'status_color': self._get_order_status_color(order.status),
-                            'broker_order_id': order.broker_order_id or '',
-                            'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else '',
-                            'comment': order.comment or '',
-                            'expert_recommendation_id': order.expert_recommendation_id,
-                            'has_recommendation': order.expert_recommendation_id is not None
-                        })
+                    orders_data = related_order_rows(txn_orders)
                 except Exception as e:
                     logger.error(f"Error loading orders for transaction {txn.id}: {e}")
 
