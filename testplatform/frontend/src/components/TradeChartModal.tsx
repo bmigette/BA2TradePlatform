@@ -37,6 +37,10 @@ const CHART_HEIGHT = 380;
  *  once, and its $0 line read as a date. It now has its own strip, sharing only the price
  *  axis (the one thing the two genuinely have in common). */
 const PAYOFF_PANEL_WIDTH = 200;
+// (The panel itself was removed on 2026-09-24 as more confusing than the overlay it replaced:
+// the chart now shows the payoff only as the breakeven line and the faint profit/loss zones,
+// and the numbers live in the "Expiration payoff" section under the chart. The panel geometry
+// below is still computed for the zones' band rectangles.)
 
 /**
  * A load, keyed by WHAT WAS ASKED FOR.
@@ -192,6 +196,10 @@ const TradeChartModal: React.FC<{
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#16a34a', downColor: '#dc2626', borderVisible: false,
       wickUpColor: '#16a34a', wickDownColor: '#dc2626',
+      // No "last price" line: a dotted line at the window's final close read as a level
+      // (a target, a stop) on a chart whose other horizontal lines all mean something.
+      priceLineVisible: false,
+      lastValueVisible: false,
     });
     series.setData(data);
     seriesRef.current = series;
@@ -509,10 +517,10 @@ const TradeChartModal: React.FC<{
               Expiry payoff
             </label>
             <span className="text-[11px] text-gray-500 dark:text-gray-400">
-              Right panel: the structure's P&amp;L if held to expiration, at each underlying price
-              (same price axis). Green/red zones mark where that is a profit or a loss. An early
-              exit is priced off the option's premium (time value included), so it can profit
-              in the red zone. Markers are labels on the bar, not price levels.
+              Yellow line: breakeven at expiration. Green/red: where holding to expiration would
+              end in profit/loss. An early exit is priced off the option's premium (time value
+              included), so it can profit in the red zone. Markers are labels on the bar, not
+              price levels.
             </span>
           </div>
         )}
@@ -529,7 +537,7 @@ const TradeChartModal: React.FC<{
                   <div className="flex items-stretch">
                   <div className="relative flex-1 min-w-0">
                     <div ref={containerRef} />
-                    {isOptionView && overlay && (
+                    {isOptionView && overlay && showOverlay && (
                       <svg
                         className="absolute left-0 top-0 pointer-events-none"
                         width={overlay.width} height={overlay.height}
@@ -547,42 +555,6 @@ const TradeChartModal: React.FC<{
                       </svg>
                     )}
                   </div>
-                  {isOptionView && overlay && showOverlay && (
-                    <div className="shrink-0 border-l border-gray-200 dark:border-gray-700"
-                         style={{ width: overlay.panelWidth }}>
-                      <svg width={overlay.panelWidth} height={overlay.height}
-                           viewBox={`0 0 ${overlay.panelWidth} ${overlay.height}`}
-                           role="img" aria-label="Profit or loss at expiration by underlying price">
-                        {overlay.bandRects.map((band, index) => (
-                          band.sign === 'neutral' ? null : (
-                            <rect key={`pband-${index}`} x={0} y={band.y}
-                                  width={overlay.panelWidth} height={band.height}
-                                  fill={band.sign === 'profit' ? '#16a34a' : '#dc2626'}
-                                  fillOpacity={0.06} />
-                          )
-                        ))}
-                        {overlay.fills.map((fill, index) => (
-                          <path key={`fill-${index}`} d={fill.path}
-                                fill={fill.sign === 'profit' ? '#16a34a' : '#dc2626'}
-                                fillOpacity={0.18} stroke="none" />
-                        ))}
-                        <line x1={overlay.zeroX} y1={30} x2={overlay.zeroX} y2={overlay.height - 20}
-                              stroke="#94a3b8" strokeWidth={1} strokeDasharray="4 4" />
-                        <path d={overlay.curve} fill="none" stroke="#22d3ee" strokeWidth={2} />
-                        <text x={overlay.panelWidth / 2} y={11} textAnchor="middle" fontSize={10}
-                              fontWeight={600} fill="#cbd5e1">P&amp;L at expiry</text>
-                        {overlay.ticks.map(tick => (
-                          <g key={`tick-${tick.label}`}>
-                            <line x1={tick.x} y1={24} x2={tick.x} y2={29} stroke="#94a3b8" strokeWidth={1} />
-                            <text x={tick.x} y={22} textAnchor="middle" fontSize={9} fill="#94a3b8">{tick.label}</text>
-                          </g>
-                        ))}
-                        <text x={overlay.zeroX} y={22} textAnchor="middle" fontSize={9} fill="#cbd5e1">$0</text>
-                        <text x={overlay.zeroX - 4} y={overlay.height - 8} textAnchor="end" fontSize={9} fill="#f87171">loss</text>
-                        <text x={overlay.zeroX + 4} y={overlay.height - 8} textAnchor="start" fontSize={9} fill="#4ade80">profit</text>
-                      </svg>
-                    </div>
-                  )}
                   </div>
                 )}
 

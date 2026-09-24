@@ -531,6 +531,50 @@ def _bars_from_cache(
     return bars, "complete", None
 
 
+class _OneFile:
+    """The ``cached_path`` seam ``build_run_split_basis`` verifies a basis through, answering
+    with the one FMP daily file this popup already read its bars from."""
+
+    def __init__(self, path: Optional[str]):
+        self._path = path
+
+    def cached_path(self, symbol: str, interval: str) -> Optional[str]:
+        return self._path
+
+
+def as_traded_bars(
+    bars: List[Dict[str, Any]], provider: Optional[str], symbol: Optional[str]
+) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    """``bars`` in the AS-TRADED basis of option strikes: ``(bars, refusal, converted)``.
+
+    Every option store holds strikes and premiums as traded, while the FMP daily cache is
+    split-ADJUSTED (see ``option_split_basis``). Charted raw, NVDA's May-2023 candles sat at
+    $28-42 under a $305 strike, the whole chart read as the loss zone, and the leg table
+    called a deep in-the-money exit OTM. The factor is the run's own verified one (same FMP
+    file, same split calendar, same overrides). When it cannot be verified the bars are
+    returned UNCONVERTED with the reason -- never multiplied by an assumed 1 in silence.
+    """
+    if not bars or provider is None or symbol is None:
+        return bars, None, False
+    from ba2_common.core.split_basis import SplitBasisRefused
+    from app.services.backtest.option_split_basis import build_run_split_basis
+
+    path = native_cache.find_timeseries_path(provider, symbol, INTERVAL)
+    try:
+        basis = build_run_split_basis([symbol], _OneFile(path), interval=INTERVAL)
+        factors = [basis.factor(symbol, date.fromisoformat(bar["date"])) for bar in bars]
+    except SplitBasisRefused as exc:
+        return bars, str(exc), False
+    converted = []
+    for bar, factor in zip(bars, factors):
+        converted.append({
+            **bar,
+            **{key: (None if bar[key] is None else bar[key] * factor)
+               for key in ("open", "high", "low", "close")},
+        })
+    return converted, None, any(abs(factor - 1.0) > 1e-9 for factor in factors)
+
+
 def _reference(
     bars: List[Dict[str, Any]], event: Optional[datetime], provider: Optional[str]
 ) -> Dict[str, Any]:
@@ -697,6 +741,29 @@ def build_trade_chart_context(backtest: Any, trade_id: int, session: Any = None)
                 "code": "cache_empty",
                 "message": f"The cached series for {underlying_symbol} holds no bars.",
             })
+        # Option legs are priced AS TRADED; the cached bars are split-adjusted. Put the
+        # underlying on the strikes' scale before anything (chart, references, moneyness)
+        # compares the two.
+        if bars and any(leg["optionType"] for leg in legs):
+            bars, refusal, converted = as_traded_bars(bars, provider, underlying_symbol)
+            if refusal:
+                notices.append({
+                    "code": "split_basis_unresolved",
+                    "message": (
+                        f"Strikes and premiums are as traded, but the {underlying_symbol} "
+                        "bars are split-adjusted and could not be converted, so across a "
+                        f"split they sit on a different scale from the strikes: {refusal}"
+                    ),
+                })
+            elif converted:
+                notices.append({
+                    "code": "bars_as_traded",
+                    "message": (
+                        f"{underlying_symbol} prices are shown as traded (converted from the "
+                        "split-adjusted cache with the verified split calendar), the scale "
+                        "the strikes and premiums are on."
+                    ),
+                })
 
     for leg, candidate in zip(legs, rows):
         entry_event = _parse_event(candidate.get("entry_time"))
