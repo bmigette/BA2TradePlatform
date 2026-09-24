@@ -33,6 +33,34 @@ from ...logger import logger
 from ..utils.perf_logger import PerfLogger
 
 
+def bracket_level_cell(level: Any, open_price: Any, quantity: Any, side: Any,
+                       multiplier: Any = 1) -> str:
+    """A TP/SL cell: ``"$9.01 ($-35.10)"`` -- the level, then the P/L if it is hit.
+
+    The P/L is ``(level - open) x quantity x multiplier`` for a long, sign flipped for a short
+    (``side`` BUY/LONG is long). ``multiplier`` is 1 for shares and the contract multiplier for
+    an option, whose levels are PREMIUMS. Without an open price, quantity or multiplier only
+    the level is shown: a P/L computed from a missing input would be a made-up number.
+    """
+    try:
+        level = float(level) if level is not None else None
+    except (TypeError, ValueError):
+        level = None
+    if not level:
+        return ''
+    text = f"${level:.2f}"
+    try:
+        open_value, qty, mult = float(open_price), abs(float(quantity)), float(multiplier)
+    except (TypeError, ValueError):
+        return text
+    if not open_value or not qty or not mult:
+        return text
+    side_value = str(getattr(side, 'value', side) or '').upper()
+    sign = -1.0 if side_value in ('SELL', 'SHORT') else 1.0
+    pnl = sign * (level - open_value) * qty * mult
+    return f"{text} (${pnl:+.2f})"
+
+
 def transaction_status_color(status: Any) -> str:
     """The Quasar colour of a transaction's STATUS badge -- one map for every trades table.
 
@@ -141,10 +169,12 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='current_price', label='Current', field='current_price', align='right'),
         ColumnDef(name='value', label='Value / CapReq', field='value', align='right', sortable=True),
         ColumnDef(name='close_price', label='Close Price', field='close_price', align='right'),
-        ColumnDef(name='take_profit', label='TP', field='take_profit', align='right'),
+        # SL before TP (asked 2026-09-24), each as "level (P/L if hit)".
         ColumnDef(name='stop_loss', label='SL', field='stop_loss', align='right'),
-        ColumnDef(name='current_pnl', label='Current P/L', field='current_pnl_numeric', align='right', sortable=True),
-        ColumnDef(name='closed_pnl', label='Closed P/L', field='closed_pnl_numeric', align='right', sortable=True),
+        ColumnDef(name='take_profit', label='TP', field='take_profit', align='right'),
+        # ONE P/L column (asked 2026-09-24): the unrealised P/L while the trade is open, the
+        # realised one once it is closed -- two half-empty columns said the same thing twice.
+        ColumnDef(name='pnl', label='P/L', field='pnl_numeric', align='right', sortable=True),
         ColumnDef(name='status', label='Status', field='status', align='center', sortable=True),
         ColumnDef(name='order_count', label='Orders', field='order_count', align='center'),
         ColumnDef(name='created_at', label='Created', field='created_at', align='left', sortable=True),
@@ -174,10 +204,11 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='current_price', label='Current Prem.', field='current_price', align='right'),
         ColumnDef(name='value', label='Value / CapReq', field='value', align='right', sortable=True),
         ColumnDef(name='close_price', label='Close Premium', field='close_price', align='right'),
-        ColumnDef(name='take_profit', label='TP (prem.)', field='take_profit', align='right'),
         ColumnDef(name='stop_loss', label='SL (prem.)', field='stop_loss', align='right'),
-        ColumnDef(name='current_pnl', label='Current P/L', field='current_pnl_numeric', align='right', sortable=True),
-        ColumnDef(name='closed_pnl', label='Closed P/L', field='closed_pnl_numeric', align='right', sortable=True),
+        ColumnDef(name='take_profit', label='TP (prem.)', field='take_profit', align='right'),
+        # ONE P/L column (asked 2026-09-24): the unrealised P/L while the trade is open, the
+        # realised one once it is closed -- two half-empty columns said the same thing twice.
+        ColumnDef(name='pnl', label='P/L', field='pnl_numeric', align='right', sortable=True),
         ColumnDef(name='status', label='Status', field='status', align='center', sortable=True),
         ColumnDef(name='order_count', label='Orders', field='order_count', align='center'),
         ColumnDef(name='created_at', label='Created', field='created_at', align='left', sortable=True),
@@ -226,6 +257,14 @@ class LiveTradesTable(LazyTable):
                 <template v-else-if="col.name === 'current_pnl'">
                     <span :class="props.row.current_pnl_numeric > 0 ? 'number-positive font-bold' : props.row.current_pnl_numeric < 0 ? 'number-negative font-bold' : ''">
                         {{ props.row.current_pnl }}
+                    </span>
+                    <q-icon v-if="props.row.pnl_reason" name="info_outline" class="q-ml-xs">
+                        <q-tooltip>{{ props.row.pnl_reason }}</q-tooltip>
+                    </q-icon>
+                </template>
+                <template v-else-if="col.name === 'pnl'">
+                    <span :class="props.row.pnl_numeric > 0 ? 'number-positive font-bold' : props.row.pnl_numeric < 0 ? 'number-negative font-bold' : ''">
+                        {{ props.row.pnl }}
                     </span>
                     <q-icon v-if="props.row.pnl_reason" name="info_outline" class="q-ml-xs">
                         <q-tooltip>{{ props.row.pnl_reason }}</q-tooltip>

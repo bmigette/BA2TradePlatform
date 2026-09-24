@@ -14,7 +14,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
-from ..components.LiveTradesTable import related_order_rows, transaction_status_color
+from ..components.LiveTradesTable import bracket_level_cell, related_order_rows, transaction_status_color
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.option_structure_chart import (
     fetch_underlying_bars, render_option_structure_chart,
@@ -405,7 +405,9 @@ class LiveTradesTab:
             # Apply sorting
             # Keys are column NAMES (Quasar sends column name as sortBy, not field)
             # Computed fields (current_pnl) require in-memory sorting after price fetch
-            IN_MEMORY_SORT_FIELDS = {'current_pnl': 'current_pnl_numeric'}  # column name -> row data key
+            # column name -> row data key. 'pnl' mixes realised (closed) and unrealised (open)
+            # rows, so it can only be ordered once the rows are built.
+            IN_MEMORY_SORT_FIELDS = {'current_pnl': 'current_pnl_numeric', 'pnl': 'pnl_numeric'}
             SORT_MAP = {
                 'direction': Transaction.side,
                 'closed_at': Transaction.close_date,
@@ -653,12 +655,18 @@ class LiveTradesTab:
                 'current_price_zone': current_price_zone,
                 'value': value_str,
                 'close_price': f"${txn.close_price:.2f}" if txn.close_price else '',
-                'take_profit': f"${txn.take_profit:.2f}" if txn.take_profit else '',
-                'stop_loss': f"${txn.stop_loss:.2f}" if txn.stop_loss else '',
+                'take_profit': bracket_level_cell(txn.take_profit, txn.open_price,
+                                                  txn.quantity, txn.side),
+                'stop_loss': bracket_level_cell(txn.stop_loss, txn.open_price,
+                                                txn.quantity, txn.side),
                 'current_pnl': current_pnl,
                 'current_pnl_numeric': current_pnl_numeric,
                 'closed_pnl': closed_pnl,
                 'closed_pnl_numeric': closed_pnl_numeric,
+                # The P/L column: realised once CLOSED, unrealised otherwise.
+                'pnl': closed_pnl if txn.status == TransactionStatus.CLOSED else current_pnl,
+                'pnl_numeric': (closed_pnl_numeric if txn.status == TransactionStatus.CLOSED
+                                else current_pnl_numeric),
                 'status': txn.status.value,
                 'status_color': status_color,
                 'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
