@@ -334,6 +334,8 @@ def persist_top(db, opt, job):
             params["market_condition"] = deepcopy(block["market_condition"])
             params["market_condition_profiles"] = list(block["market_condition_profiles"])
             params["market_condition_manifests"] = dict(block["market_condition_manifests"])
+        if "market_exit" in block:
+            params["market_exit"] = deepcopy(block["market_exit"])
         if bt is None:
             bt = Backtest(name=name, model_id=None, engine_type="daily_expert", expert_name=job["expert"],
                           optimization_id=opt.id, labels=block["labels"], strategy_params=params,

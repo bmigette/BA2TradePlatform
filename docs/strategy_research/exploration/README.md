@@ -173,8 +173,9 @@ python tools/strategy_research/exploration/run_exploration.py --families pullbac
 `--market-exit` adds market exit/stop/TP rules after each job's exit rules, each off by
 default behind a searched toggle. When a job ends with a floor stop that matches every position
 and stops processing (mid_insider, small_earnings, small_rating, mid_earnings), the rules go
-immediately before it instead. It needs a profile and `--search genetic`, and it is valid only
-for single-direction jobs (a job that buys and sells is refused).
+immediately before it instead, and the `stop` rule is omitted there: that floor stop's own
+stop-loss would replace it on every bar. It needs a profile and `--search genetic`, and it is
+valid only for single-direction jobs (a job that buys and sells is refused).
 `--allow-sl-loosen` lets ruleset stops loosen down to the trade's max-loss stop. Neither flag
 changes the default manifest.
 

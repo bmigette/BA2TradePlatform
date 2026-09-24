@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.strategy_research.exploration.market_conditions import refuse_inert_market_exit
 from tools.strategy_research.exploration.profiles import (
     ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, build_manifest, fingerprint)
 from tools.strategy_research.exploration.runtime import (
@@ -141,6 +142,7 @@ def main(argv=None):
             if unknown:
                 raise ValueError(f"Variants unavailable for selected families: {sorted(unknown)}")
             manifest["jobs"] = [j for j in manifest["jobs"] if j["variant"] in args.variants]
+            refuse_inert_market_exit(manifest["jobs"])
         output = args.output_dir.resolve() if args.output_dir else ROOT / "reports/strategy_research" / fingerprint(manifest)[:12]
         if output == ROOT:
             raise ValueError("Use an output subdirectory, not the repository root")
@@ -160,6 +162,8 @@ def main(argv=None):
                 print(f"    market_exit={','.join(mx['kinds'])} direction={mx['direction']} "
                       f"rules={','.join(mx['rules'])} at_exit_index={mx['insert_index']} (off by default) "
                       f"added_genes={mx['gene_count']}")
+                for kind, reason in mx["omitted"].items():
+                    print(f"    market_exit {kind} OMITTED: {reason}")
         market_exit = manifest["jobs"][0]["optimization_config"]["backtest"].get("market_exit") if manifest["jobs"] else None
         print(f"Market exits: {','.join(market_exit['kinds']) if market_exit else 'none'}; "
               f"ruleset SL loosen: {'on' if args.allow_sl_loosen else 'off'}")

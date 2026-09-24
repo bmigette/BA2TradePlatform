@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 from datetime import date
+import logging
 from pathlib import Path
 import re
 import sys
+
+from tools.strategy_research.exploration.profiles import walk
+
+log = logging.getLogger(__name__)
 
 
 def _shared_paths():
@@ -141,6 +146,9 @@ def job_direction(job, backtest):
         raise ValueError(f"{where}: no buy or sell entry action, so the position direction is unknown")
     implied = "long" if opens == {"buy"} else "short"
     if job["family"] == "pullback_rsi":
+        if "direction" in job["expert_params"]:
+            raise ValueError(f"{where}: direction is searched (expert_params); it must be a fixed "
+                             f"setting for the market exits' single direction")
         declared = {e["settings"]["direction"] for e in backtest["experts"]}
         if declared != {implied}:
             raise ValueError(f"{where}: expert direction {sorted(declared)} disagrees with its "
@@ -156,7 +164,9 @@ def terminal_catch_all(rule):
 
     "Matches every held position" is exact: the tree is empty, or every leaf is
     ``has_position is_true`` and every group is AND/OR. Anything else (another leaf, another
-    operator, a NOT group, a truthy ``continue_processing``) is not a catch-all."""
+    operator, a NOT group, a truthy ``continue_processing``) is not a catch-all. Both spellings
+    the shared rule models accept are read: a group's ``operator``/``type``, a leaf's
+    ``op``/``comparison``."""
     if rule.get("continue_processing") or rule.get("continueProcessing"):
         return False
 
@@ -164,21 +174,26 @@ def terminal_catch_all(rule):
         if not node:
             return True  # no conditions at all
         if "conditions" in node:
-            return (node.get("type", "AND") in ("AND", "OR")
-                    and all(matches_all(c) for c in node["conditions"]))
-        return node.get("field") == "has_position" and node.get("op") == "is_true"
+            group = node.get("operator") or node.get("type") or "AND"
+            return group in ("AND", "OR") and all(matches_all(c) for c in node["conditions"])
+        return (node.get("field") == "has_position"
+                and (node.get("op") or node.get("comparison")) == "is_true")
 
     return matches_all(rule.get("conditions"))
 
 
-def _walk(value):
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _walk(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _walk(child)
+def _adjusts_stop_loss(rule):
+    return any((a.get("action_type") or a.get("action")) == "adjust_stop_loss" for a in rule["actions"])
+
+
+def refuse_inert_market_exit(jobs):
+    """A selection whose every job omitted every requested market-exit rule would search nothing."""
+    records = [j["optimization_config"]["backtest"]["market_exit"] for j in jobs
+               if "market_exit" in j["optimization_config"]["backtest"]]
+    if records and not any(r["rules"] for r in records):
+        reasons = sorted({reason for r in records for reason in r["omitted"].values()})
+        raise ValueError(f"--market-exit {','.join(records[0]['kinds'])} adds no rule to any selected "
+                         f"job: {reasons}; request exit or tp too, or select other families")
 
 
 def assert_unique_ids(strategy, where):
@@ -187,7 +202,7 @@ def assert_unique_ids(strategy, where):
     must be unique across ALL entry and exit trees, and rule ids unique within each list."""
     seen, dup = set(), set()
     for rule in strategy["entry_rules"] + strategy["exit_rules"]:
-        for node in _walk(rule.get("conditions")):
+        for node in walk(rule.get("conditions")):
             cid = node.get("id")
             if cid is not None:
                 (dup if cid in seen else seen).add(cid)
@@ -202,10 +217,15 @@ def attach_exits(job, backtest, profiles, kinds, direction=None):
     """Add the off-by-default market exit/stop/TP templates to the job's exit rules.
 
     They go AFTER the existing exit rules, except that they go immediately BEFORE the first
-    :func:`terminal_catch_all` rule, which would otherwise shadow them. That is safe: the market
-    adjustments continue processing, so the catch-all still runs after them, and a market close
-    pre-empts it only on a bar where it closes the position (a skipped stop update is then moot).
-    ``direction`` defaults to :func:`job_direction`; a given one must equal it."""
+    :func:`terminal_catch_all` rule, which would otherwise shadow them. The catch-all still runs
+    after them: the market adjustments continue processing, and a market close pre-empts it only
+    on a bar where it closes the position (a skipped stop update is then moot).
+
+    THE STOP TEMPLATE IS OMITTED before a catch-all that itself adjusts the stop-loss:
+    ``TradeActionEvaluator.execute`` keeps only the LAST stop-loss action of a pass, and the
+    catch-all runs after the market stop on every bar, so the market stop would always be
+    discarded (its genes searched but dead). ``market_exit.omitted`` records why; exit and tp
+    still attach. ``direction`` defaults to :func:`job_direction`; a given one must equal it."""
     if not kinds:
         return
     _shared_paths()
@@ -217,9 +237,15 @@ def attach_exits(job, backtest, profiles, kinds, direction=None):
         raise ValueError(f"{job['family']}/{job['variant']}: direction {direction!r} but the job is {derived}")
     exits = job["strategy"]["exit_rules"]
     at = next((i for i, r in enumerate(exits) if terminal_catch_all(r)), len(exits))
+    omitted = {}
+    if "stop" in kinds and at < len(exits) and _adjusts_stop_loss(exits[at]):
+        omitted["stop"] = (f"catch-all exit rule {exits[at].get('id')!r} adjusts the stop-loss after it "
+                           f"on every bar, and a pass keeps only its last stop-loss action")
+        log.info("%s/%s: market stop omitted: %s", job["family"], job["variant"], omitted["stop"])
     prefix = f"research-{job['family']}-exit"
-    rules = market_exit_rules(prefix, profiles, derived, kinds)
-    if not rules:
+    kept = tuple(k for k in kinds if k not in omitted)
+    rules = market_exit_rules(prefix, profiles, derived, kept) if kept else []
+    if not rules and not omitted:
         raise ValueError(f"{job['family']}: the selected profiles serve none of {list(kinds)}")
     exits[at:at] = rules
     assert_unique_ids(job["strategy"], f"{job['family']}/{job['variant']}")
@@ -232,6 +258,7 @@ def attach_exits(job, backtest, profiles, kinds, direction=None):
                   for i, a in enumerate(rule["actions"]) if a.get("action_value_optimize")]
     backtest["market_exit"] = {"kinds": list(kinds), "direction": derived,
                                "rules": [r["id"] for r in rules], "default": "off", "insert_index": at,
+                               "omitted": omitted,
                                "genes": sorted(genes), "gene_count": len(genes)}
 
 

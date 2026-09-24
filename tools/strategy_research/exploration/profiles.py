@@ -343,7 +343,7 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
     if search == "grid" and workers:
         raise ValueError("The existing exhaustive-grid handler is local/serial; use --search genetic for remote workers")
     from tools.strategy_research.exploration.market_conditions import (
-        selection, attach, attach_exits, exit_selection)
+        selection, attach, attach_exits, exit_selection, refuse_inert_market_exit)
     profiles, pins = selection(market_condition_profile, market_condition_manifest, market_condition_mode)
     if profiles and market_condition_mode == "search" and search != "genetic":
         raise ValueError("Market-condition gene search requires --search genetic; exhaustive grids are too large")
@@ -417,6 +417,7 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                 bt["labels"].append("sl-loosen")
             job["fingerprint"] = fingerprint(job)
             jobs.append(job)
+    refuse_inert_market_exit(jobs)
     return {"schema_version": SCHEMA_VERSION, "jobs": jobs,
             "scope": "Six deployed-strategy follow-ups and four new ideas; each job is a standalone account, not a joint portfolio.",
             "validation": "2020-2025 is previously searched history, not an untouched holdout."}

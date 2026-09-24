@@ -88,16 +88,25 @@ The driver implementation now does the following:
      profiles serves is refused.
    - **Single direction only.** The templates run on every open position of the expert, so the
      driver derives one direction per job: `pullback_rsi` from its `direction` setting (checked
-     against its entry action), every other family must open only with `buy` (long). A job that
-     both buys and sells, or whose direction cannot be determined, is refused.
+     against its entry action; a searched `direction` is refused), every other family must open
+     only with `buy` (long). A job that both buys and sells, or whose direction cannot be
+     determined, is refused.
    - A **terminal catch-all** is an exit rule that matches every held position (its tree is empty,
-     or has only `has_position is_true` leaves in AND/OR groups) and does not continue processing:
-     the `has_position` floor stops of mid_insider, small_earnings, small_rating and mid_earnings.
-     Templates after it could never run, so they go immediately before the first one; the index is
-     recorded as `market_exit.insert_index`. This is safe: the market stop/TP adjustments continue
-     processing, so the catch-all still runs after them, and a market close pre-empts it only on a
-     bar where it closes the position. Anything else (e.g. a stop rule gated on another condition)
-     is not a catch-all, and the templates go after it.
+     or has only `has_position is_true` leaves in AND/OR groups; both the `type`/`operator` and
+     `op`/`comparison` spellings are read) and does not continue processing: the `has_position`
+     floor stops of mid_insider, small_earnings, small_rating and mid_earnings. Templates after it
+     could never run, so they go immediately before the first one; the index is recorded as
+     `market_exit.insert_index`. The catch-all still runs after them (the market adjustments
+     continue processing), and a market close pre-empts it only on a bar where it closes the
+     position. Anything else (e.g. a stop rule gated on another condition) is not a catch-all,
+     and the templates go after it.
+   - **`stop` is omitted before a catch-all that adjusts the stop-loss** (all four families above).
+     A rule pass keeps only its LAST stop-loss action (`TradeActionEvaluator.execute`), and that
+     catch-all fires after the market stop on every bar, so the market stop would always be
+     discarded: its genes searched but dead. In those families `stop` adds nothing; the job's
+     `market_exit.omitted` says why, the preview prints it, and `exit`/`tp` still attach. A
+     selection in which every job omits every requested rule (for example `--market-exit stop`
+     on those families alone) is refused. A catch-all that only closes keeps the stop template.
    - Condition ids must be unique across all entry and exit rules (ids share genes).
 7. `--allow-sl-loosen` sets the expert setting `allow_ruleset_sl_loosen=True` on every job's
    experts: a ruleset stop may loosen down to the trade's recorded max-loss stop, never past it.

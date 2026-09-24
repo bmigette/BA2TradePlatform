@@ -7,6 +7,8 @@ Pinned here:
   the job's own single direction, or immediately before a terminal catch-all stop rule (which
   would shadow them); a job that could hold both sides is refused;
 * ids are unique across all entry and exit rule nodes (colliding ids share genes);
+* the stop template is omitted before a catch-all that adjusts the stop-loss (a pass keeps only
+  its last stop-loss action, so it would be dead), and recorded as omitted;
 * the REAL decoder: an all-off genome gives exactly the job's original exit rules, and an all-on
   genome exports one trigger per template leaf;
 * ``--allow-sl-loosen`` reaches the experts and survives the trial-config whitelist.
@@ -120,21 +122,25 @@ def test_each_job_gets_the_templates_for_its_direction_at_the_right_place():
         family = key[0]
         bt = job["optimization_config"]["backtest"]
         direction = "short" if key[1].startswith("short") else "long"
-        templates = market_exit_rules(f"research-{family}-exit", ("ohlcv-v1", "ta-structure-v1"), direction)
+        kinds = tuple(k for k in KINDS if not (k == "stop" and family in CATCH_ALL))
+        templates = market_exit_rules(f"research-{family}-exit", ("ohlcv-v1", "ta-structure-v1"),
+                                      direction, kinds)
         original = plain[key]["strategy"]["exit_rules"]
         at = _catch_all_index(original)
         assert (at < len(original)) == (family in CATCH_ALL), key
         assert bt["market_exit"]["insert_index"] == at
         assert job["strategy"]["exit_rules"] == original[:at] + templates + original[at:], key
         assert job["strategy"]["entry_rules"] == plain[key]["strategy"]["entry_rules"]
-        assert [r["id"].rsplit("-mkt-", 1)[1] for r in templates] == [
-            "exit-structure", "exit-slope", "stop", "tp"]
+        assert [r["id"].rsplit("-mkt-", 1)[1] for r in templates] == (
+            ["exit-structure", "exit-slope", "tp"] if family in CATCH_ALL
+            else ["exit-structure", "exit-slope", "stop", "tp"])
         assert all(r["enabled"] is False and r["toggle_optimize"] for r in templates)
         record = bt["market_exit"]
         assert record["kinds"] == list(KINDS) and record["direction"] == direction
         assert record["rules"] == [r["id"] for r in templates] and record["default"] == "off"
         extra = sorted(set(space(job)) - set(space(plain[key])))
-        assert record["genes"] == extra and record["gene_count"] == 9
+        # The omitted stop rule's two genes (toggle, percent) are not counted.
+        assert record["genes"] == extra and record["gene_count"] == (7 if family in CATCH_ALL else 9)
         # Everything else about the job is untouched.
         old = plain[key]["optimization_config"]
         assert job["optimization_config"]["expert_params"] == old["expert_params"]
@@ -149,7 +155,11 @@ def test_every_generated_exit_rule_passes_the_market_action_check():
         for job in manifest(profile, market_exit=kinds)["jobs"]:
             exits = job["strategy"]["exit_rules"]
             assert_market_rule_actions(exits, job["name"])
-            for rule in exits[-len(job["optimization_config"]["backtest"]["market_exit"]["rules"]):]:
+            record = job["optimization_config"]["backtest"]["market_exit"]
+            at = record["insert_index"]
+            added = exits[at:at + len(record["rules"])]
+            assert [r["id"] for r in added] == record["rules"]
+            for rule in added:
                 assert_market_rule_actions([rule], rule["id"])
 
 
@@ -237,6 +247,15 @@ _HELD = {"id": "h", "field": "has_position", "op": "is_true"}
     ({"conditions": {"type": "AND", "conditions": [{**_HELD, "op": "is_false"}]}}, False),
     ({"conditions": {"type": "NOT", "conditions": [_HELD]}}, False),
     ({"conditions": {"type": "AND", "conditions": [{"id": "b", "field": "bearish", "op": "is_true"}]}}, False),
+    # The other spellings the shared rule models accept: group "operator", leaf "comparison".
+    ({"conditions": {"operator": "AND", "conditions": [
+        {"id": "h", "field": "has_position", "comparison": "is_true"}]}}, True),
+    ({"conditions": {"operator": "OR", "conditions": [_HELD]}}, True),
+    ({"conditions": {"operator": "NOT", "conditions": [_HELD]}}, False),
+    ({"conditions": {"operator": "NOT", "type": "AND", "conditions": [_HELD]}}, False),
+    ({"conditions": {"operator": "AND", "conditions": [
+        {"id": "h", "field": "has_position", "comparison": "is_false"}]}}, False),
+    ({"conditions": {"type": "AND", "conditions": [_HELD]}, "continueProcessing": True}, False),
 ])
 def test_terminal_catch_all_is_exact(rule, expected):
     assert MC.terminal_catch_all({"id": "r", "actions": [{"action_type": "adjust_stop_loss"}], **rule}) is expected
@@ -256,7 +275,7 @@ def test_a_gated_stop_rule_is_not_a_catch_all_and_templates_go_after_it():
 
 def _job(actions, family="mid_ds", direction=None):
     settings = {} if direction is None else {"direction": direction}
-    return ({"family": family, "variant": "v",
+    return ({"family": family, "variant": "v", "expert_params": {},
              "strategy": {"entry_rules": [{"id": f"e{i}", "conditions": {"type": "AND", "conditions": [
                  {"id": f"e{i}-bull", "field": "bullish", "op": "is_true"}]},
                  "actions": [{"action_type": a} for a in group]} for i, group in enumerate(actions)],
@@ -278,6 +297,13 @@ def test_mixed_or_unknown_direction_is_refused(actions, family, direction, error
         MC.job_direction(job, bt)
     with pytest.raises(ValueError, match=error):
         MC.attach_exits(job, bt, ("ta-structure-v1",), ("exit",))
+
+
+def test_a_searched_pullback_rsi_direction_is_refused():
+    job, bt = _job([["buy"]], "pullback_rsi", "long")
+    job["expert_params"]["direction"] = {"optimize": True, "type": "choice", "choices": ["long", "short"]}
+    with pytest.raises(ValueError, match="direction is searched"):
+        MC.job_direction(job, bt)
 
 
 def test_direction_is_derived_and_a_wrong_one_is_refused():
@@ -476,3 +502,78 @@ def test_building_and_preflighting_with_the_flags_never_imports_the_backend(tmp_
                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stderr[-4000:]
     assert "BACKEND: []" in done.stdout, done.stdout[-2000:]
+
+
+# --------------------------------------------------------------------------- the omitted market stop
+def test_a_pass_keeps_only_the_last_stop_loss_action(monkeypatch):
+    """WHY the stop template is omitted before an SL-adjusting catch-all. The REAL
+    ``TradeActionEvaluator.execute`` keeps only the LAST stop-loss action of a pass; actions are
+    generated in rule order (the market stop continues processing, the catch-all comes after it),
+    so the catch-all's stop is the one applied and the market stop is discarded on every bar."""
+    from ba2_common.core import utils as U
+    from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+    from ba2_common.core.TradeActions import AdjustStopLossAction
+    from ba2_common.core.TransactionHelper import TransactionHelper
+    from ba2_common.core.types import OrderRecommendation
+
+    order = SimpleNamespace(id=1, transaction_id=7)
+    monkeypatch.setattr(TransactionHelper, "get_entry_order", staticmethod(lambda transaction: order))
+    monkeypatch.setattr(U, "log_trade_action_activity", lambda **kwargs: None)
+    account = SimpleNamespace(id=91)
+    applied = []
+
+    def stop(percent):
+        action = AdjustStopLossAction("AAPL", account, OrderRecommendation.BUY, existing_order=order,
+                                      reference_value="order_open_price", percent=percent)
+        action.execute = lambda: applied.append(percent) or {"success": True, "message": "", "data": {}}
+        return action
+
+    evaluator = TradeActionEvaluator(account=account, instrument_name="AAPL",
+                                     existing_transactions=[SimpleNamespace(id=7, symbol="AAPL")])
+    market_stop, catch_all = stop(0.0), stop(-12.0)  # mkt-stop (breakeven), then s1_sl_hold
+    evaluator.trade_actions = [market_stop, catch_all]
+    evaluator.execute()
+    assert applied == [-12.0]
+
+
+def test_the_stop_template_is_omitted_before_an_sl_catch_all_and_kept_elsewhere():
+    for key, job in by_key(manifest(market_exit=KINDS)).items():
+        record = job["optimization_config"]["backtest"]["market_exit"]
+        stops = [r for r in record["rules"] if r.endswith("-mkt-stop")]
+        if key[0] in CATCH_ALL:
+            assert not stops, key
+            assert list(record["omitted"]) == ["stop"]
+            assert repr(CATCH_ALL[key[0]]) in record["omitted"]["stop"]
+            assert record["kinds"] == list(KINDS)  # what was requested; `rules` is what was added
+            assert all(not r["id"].endswith("-mkt-stop") for r in job["strategy"]["exit_rules"])
+        else:
+            assert stops == [f"research-{key[0]}-exit-mkt-stop"], key
+            assert record["omitted"] == {}
+
+
+def test_a_catch_all_that_only_closes_keeps_the_stop_template():
+    job, bt = _job([["buy"]])
+    job["strategy"]["exit_rules"].append({"id": "close_all", "conditions": {"type": "AND", "conditions": [_HELD]},
+                                          "actions": [{"action_type": "close"}], "continue_processing": False})
+    MC.attach_exits(job, bt, ("ta-structure-v1",), ("exit", "stop"))
+    assert bt["market_exit"]["omitted"] == {}
+    assert [r["id"] for r in job["strategy"]["exit_rules"]] == [
+        "research_timeout", "research-mid_ds-exit-mkt-exit-structure", "research-mid_ds-exit-mkt-stop", "close_all"]
+
+
+def test_stop_only_is_refused_when_every_job_omits_it(monkeypatch, tmp_path, capsys):
+    with pytest.raises(ValueError, match="adds no rule to any selected job.*s1_sl_hold"):
+        manifest("ta-structure-v1", families=("mid_insider", "small_rating"), market_exit=("stop",))
+    # A selection with one job that keeps it is accepted; the other job records the omission.
+    jobs = by_key(manifest("ta-structure-v1", families=("mid_insider", "mid_ds"), market_exit=("stop",)))
+    assert jobs[("mid_insider", "control")]["optimization_config"]["backtest"]["market_exit"]["rules"] == []
+    assert jobs[("mid_ds", "control")]["optimization_config"]["backtest"]["market_exit"]["rules"]
+    # --variants can leave only omitting jobs: refused after the selection too.
+    argv = ["--families", "mid_insider", "mid_ds", "--search", "genetic",
+            "--market-condition-profile", "ta-structure-v1", "--market-condition-manifest", PINS["ta-structure-v1"],
+            "--market-exit", "stop", "--dry-run", "--output-dir", str(tmp_path)]
+    assert D.main(argv + ["--variants", "signal_freshness"]) == 1
+    assert "adds no rule to any selected job" in capsys.readouterr().err
+    assert D.main(argv + ["--variants", "control"]) == 0
+    out = capsys.readouterr().out
+    assert "market_exit stop OMITTED: catch-all exit rule 's1_sl_hold'" in out
