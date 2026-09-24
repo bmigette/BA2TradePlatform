@@ -312,7 +312,7 @@ Some pre-split OCC strings are REUSED by unrelated contracts after the split. Fo
 symbols are reused this way; for AAPL 4:1, 44 of 1,064. A held lot on such a symbol would be marked, filled
 and settled against a different contract.
 
-**Execution order:** 2 → 1a → 1b → 3 → 4 → 5 → 8 → 9 → 10 → 11 → 12 → 6 → 7.
+**Execution order:** 2 → 1a → 1b → 3 → 4 → 5 → 13 → 8 → 9 → 10 → 11 → 12 → 6 → 7.
 
 **Backward-compatibility acceptance** (user, 2026-09-24). This is a Task 6 gate.
 
@@ -377,6 +377,26 @@ and settled against a different contract.
     sizing is unchanged. It is behind a run-config flag, default off, so older option runs reproduce. The
     launcher sets it on for stage 1.
   - If the cap rounds to 0, the order is not placed and the reason is logged. Never a silent 0.
+- **Task 13 — option ledger consistency check** (from the Task 2 code review; must land before the
+  relaunch).
+  - **Why:** the lot ledger (`_option_positions`) can drift from the transaction view. The known route is
+    `_liquidate_option_lot` (a margin-call buy-back), which books the whole lot's close on ONE transaction
+    when two OPENED transactions share a contract, found through `_option_transaction_for_contract`. An
+    orphaned lot then corrupts equity:
+    - its mark falls back to BS or the entry premium, floored at intrinsic;
+    - it carries maintenance margin;
+    - it takes covered-call cover;
+    - a margin call can buy it back.
+  - **Detect it:** at every expiry pass and at run end, compare each non-zero lot with
+    `get_option_positions()` summed per contract, and log an ERROR on any mismatch.
+  - **Fix the known route:** make the margin-call buy-back distribute the close across ALL OPENED
+    transactions that hold the contract.
+  - **Test it:** a regression test with two same-contract transactions plus a margin call.
+  - **Reusable audit plugin:** the scratchpad `plug/orphan_plug.py`.
+- **Logged, out of scope:** the test platform UI deploy/import
+  (`testplatform/frontend/src/pages/Backtesting.tsx:1381-1384`) sets `execution_schedule_open_positions` to
+  the ENTRY days. A UI re-run of an exported GA backtest therefore manages exits only on entry days, while GA
+  trials and `tools/import_deploy_payload.py` manage every weekday.
 - **Task 12 — narrow gate ranges (APPROVED 2026-09-24).** Launcher gene ranges only; new grid runs only.
   - `_RELATIVE_VOLUME_GATE` max 3.0 → 1.5 (`ba2test_launcher.py` ~:4399).
   - Debit `_IV_RV` range floor 0.8 → 1.0. The credit half keeps its range. If `_IV_RV_RANGE` is shared
