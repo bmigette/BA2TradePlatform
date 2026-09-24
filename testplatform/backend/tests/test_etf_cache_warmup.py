@@ -12,7 +12,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-from tools.strategy_research import warm_etf_cache as W
+from tools.strategy_research.exploration import warm_etf_cache as W
 
 
 @pytest.fixture

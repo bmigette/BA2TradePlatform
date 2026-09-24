@@ -246,7 +246,7 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
         raise ValueError("Invalid search budget")
     if search == "grid" and workers:
         raise ValueError("The existing exhaustive-grid handler is local/serial; use --search genetic for remote workers")
-    from tools.strategy_research.market_conditions import selection, attach
+    from tools.strategy_research.exploration.market_conditions import selection, attach
     profiles, pins = selection(market_condition_profile, market_condition_manifest, market_condition_mode)
     if profiles and market_condition_mode == "search" and search != "genetic":
         raise ValueError("Market-condition gene search requires --search genetic; exhaustive grids are too large")

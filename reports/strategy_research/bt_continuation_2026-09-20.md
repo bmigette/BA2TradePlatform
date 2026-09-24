@@ -19,7 +19,7 @@ APP `2026.09.1174`, TEST `2026.09.0061`.
 - Discovery identities differ, and checkpoint metadata prevents mixing soft30 with
   old scores under the same name.
 
-See [scoring and launch specification](../../docs/strategy_research/option_stage1_soft30.md).
+See [scoring and launch specification](../../docs/strategy_research/options/option_stage1_soft30.md).
 The focused checks passed: 1,107 tests, including legacy metrics and golden parity.
 One Windows shell test first selected unavailable WSL; it passed with Git Bash.
 

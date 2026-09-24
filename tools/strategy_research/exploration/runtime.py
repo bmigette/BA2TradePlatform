@@ -13,9 +13,9 @@ import random
 import sqlite3
 import sys
 
-from tools.strategy_research.profiles import fingerprint
+from tools.strategy_research.exploration.profiles import fingerprint
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def add_source_paths():
@@ -174,7 +174,7 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
                 "code_signature": code_signature(),
                 "cache_signature": fingerprint([(str(p), p.stat().st_size, p.stat().st_mtime_ns)
                                                  for p in sorted(files + store_files)])}
-    from tools.strategy_research.market_conditions import preflight as condition_preflight
+    from tools.strategy_research.exploration.market_conditions import preflight as condition_preflight
     conditions = condition_preflight(bt, cache_dir.parent)
     if conditions is not None:
         evidence["market_conditions"] = conditions

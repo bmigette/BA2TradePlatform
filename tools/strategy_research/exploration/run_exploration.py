@@ -13,12 +13,12 @@ from pathlib import Path
 import subprocess
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.strategy_research.profiles import FAMILIES, build_manifest, fingerprint
-from tools.strategy_research.runtime import (
+from tools.strategy_research.exploration.profiles import FAMILIES, build_manifest, fingerprint
+from tools.strategy_research.exploration.runtime import (
     check_database, execute_ready, job_lock, preflight, resolve_universe, write_json)
 
 

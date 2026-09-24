@@ -12,8 +12,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-from tools.strategy_research import profiles as P, runtime as R
-from tools.strategy_research import run_goal2020_followups as D
+from tools.strategy_research.exploration import profiles as P, runtime as R
+from tools.strategy_research.exploration import run_exploration as D
 from app.services.strategy_param_space import collect_param_space, decode_params
 
 

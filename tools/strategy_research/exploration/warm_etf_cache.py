@@ -14,12 +14,12 @@ import re
 import sqlite3
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.strategy_research.profiles import build_manifest
-from tools.strategy_research.runtime import add_source_paths, job_lock, write_json
+from tools.strategy_research.exploration.profiles import build_manifest
+from tools.strategy_research.exploration.runtime import add_source_paths, job_lock, write_json
 
 
 def build_plan(start, end, symbols):

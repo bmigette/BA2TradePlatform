@@ -1,16 +1,31 @@
-# Ten strategy experiments at $10,000
+# Strategy exploration grid
 
-Driver: [run_goal2020_followups.py](../../tools/strategy_research/run_goal2020_followups.py).
-Profiles: [profiles.py](../../tools/strategy_research/profiles.py).
-Sources: [six deployed-strategy reviews](../../reports/deployed_strategy_review_2026-09-07.md)
-and [four new ideas](../../reports/expert_strategy_ideas_2026-09-07.md).
+The grid for exploring **additional strategies** beyond the goal2020 matrix: variants of the
+deployed recipes plus new strategy ideas, each as a small exhaustive grid (or an optional GA),
+every job its own $10,000 account. Option grids are separate
+(see [../options/](../options/)).
+
+| Page | Contents |
+|---|---|
+| this README | families, capital/execution contract, preview/launch runbook, ETF semantics |
+| [market_conditions.md](market_conditions.md) | the opt-in market-condition ENTRY-gate campaign (ohlcv-v1 / ta-structure-v1) |
+| [pullback_and_market_exits.md](pullback_and_market_exits.md) | planned: literal pullback expert (long/short) and market-condition EXITS |
+
+Code: [tools/strategy_research/exploration/](../../../tools/strategy_research/exploration/).
+
+## The original ten experiments at $10,000
+
+Driver: [run_exploration.py](../../../tools/strategy_research/exploration/run_exploration.py).
+Profiles: [profiles.py](../../../tools/strategy_research/exploration/profiles.py).
+Sources: [six deployed-strategy reviews](../../../reports/deployed_strategy_review_2026-09-07.md)
+and [four new ideas](../../../reports/expert_strategy_ideas_2026-09-07.md).
 
 The default campaign contains **ten families, 35 jobs and 193 parameter combinations**.
 It evaluates the complete small grids rather than relying on a genetic search to visit
 their neighbours. An optional genetic mode uses the existing goal2020 optimizer and
 configured remote workers. Jobs run sequentially in separate processes.
 
-## Experiments
+### Families
 
 | Family / CLI selector | Changes searched | Jobs | Grid candidates |
 |---|---|---:|---:|
@@ -26,7 +41,7 @@ configured remote workers. Jobs run sequentially in separate processes.
 | `etf_trend` | Prior-month momentum 126/252 bars, positive return and above SMA200; top 1/2 eligible funds. | 2 | 4 |
 
 Six explicit controls preserve the original rule semantics. Other fixed settings are
-snapshotted in [baselines_20260907.json](../../tools/strategy_research/baselines_20260907.json),
+snapshotted in [baselines_20260907.json](../../../tools/strategy_research/exploration/baselines_20260907.json),
 with original and capped backtest IDs. The two quality/momentum families answer different
 questions: a narrow modification of the deployed recipe, and a separately defined new recipe.
 Candidate totals include controls and deliberate repetitions of a control value within a grid.
@@ -69,16 +84,16 @@ action values have been removed from the concrete rules before new ranges are ad
 
 ### ETFTrend cache warmup
 
-[warm_etf_cache.py](../../tools/strategy_research/warm_etf_cache.py) prepares the
+[warm_etf_cache.py](../../../tools/strategy_research/exploration/warm_etf_cache.py) prepares the
 fixed ETF basket independently of the stock/fundamental warmup tools. ETFTrend
 uses only OHLCV data: prior-month momentum (126/252 trading bars), SMA200, and
 current completed daily prices. The research grid selects at most one or two
 eligible funds from SPY, IEF, TLT and GLD; unfilled slots remain cash.
 
 ```powershell
-python tools/strategy_research/warm_etf_cache.py --dry-run
-python tools/strategy_research/warm_etf_cache.py --check
-python tools/strategy_research/warm_etf_cache.py --run
+python tools/strategy_research/exploration/warm_etf_cache.py --dry-run
+python tools/strategy_research/exploration/warm_etf_cache.py --check
+python tools/strategy_research/exploration/warm_etf_cache.py --run
 ```
 
 The default 2020–2025 campaign needs **2018-05-11 through 2025-12-31**, including
@@ -110,9 +125,9 @@ EarningsDrift `BID_5min.parquet` gap.
 Run from the monorepo using the **test application's Python environment**:
 
 ```powershell
-python tools/strategy_research/run_goal2020_followups.py --dry-run
-python tools/strategy_research/run_goal2020_followups.py --preflight
-python tools/strategy_research/run_goal2020_followups.py --run
+python tools/strategy_research/exploration/run_exploration.py --dry-run
+python tools/strategy_research/exploration/run_exploration.py --preflight
+python tools/strategy_research/exploration/run_exploration.py --run
 ```
 
 Preview is the default and uses only the standard library. It opens no database and starts
@@ -136,10 +151,10 @@ selects the `FMPOHLCVProvider` directory; `--store` overrides the metric store.
 Useful subsets and optional genetic mode:
 
 ```powershell
-python tools/strategy_research/run_goal2020_followups.py --families mid_ds small_earnings --dry-run
-python tools/strategy_research/run_goal2020_followups.py --families mid_ds --variants control --run
-python tools/strategy_research/run_goal2020_followups.py --families etf_trend --etf-symbols SPY IEF TLT GLD --preflight
-python tools/strategy_research/run_goal2020_followups.py --search genetic --population 24 --generations 4 --workers remote227 --parallel 0 --run
+python tools/strategy_research/exploration/run_exploration.py --families mid_ds small_earnings --dry-run
+python tools/strategy_research/exploration/run_exploration.py --families mid_ds --variants control --run
+python tools/strategy_research/exploration/run_exploration.py --families etf_trend --etf-symbols SPY IEF TLT GLD --preflight
+python tools/strategy_research/exploration/run_exploration.py --search genetic --population 24 --generations 4 --workers remote227 --parallel 0 --run
 ```
 
 Worker names must exist in the test application's worker settings. Remote hosts must have
@@ -163,7 +178,7 @@ history after a checkpoint resume can omit pre-resume neighbours, a limitation o
 
 ## ETF and signal semantics
 
-[ETFTrend](../../packages/experts/ba2_experts/ETFTrend.py) is a new shared expert. Its illustrative
+[ETFTrend](../../../packages/experts/ba2_experts/ETFTrend.py) is a new shared expert. Its illustrative
 research universe is SPY, IEF, TLT and GLD; override it with `--etf-symbols`. Instrument choices
 are inputs for backtesting, not a completed broker-eligibility or affordability assessment.
 
@@ -191,143 +206,6 @@ experiment start no earlier than **2022-01-01**. Other families default to 2020-
 2025-12-31. Those years have already been searched and are not a fresh holdout. Compare
 neighbours, losses, holding time and capital use, then use genuinely unused or forward paper
 results before considering a shared-account allocation.
-
-## Market-condition extension — driver ready, reviewed 2026-09-17
-
-Review: [market-condition implementation and option stage 1](../../reports/strategy_research/market_conditions_review_2026-09-16.md).
-Shared design: [condition genes](../plans/2026-09-15-option-market-condition-genes-design.md),
-especially the equity placement contract in section 6.0.
-
-The ten experiments above remain the original **35 jobs / 193 combinations at $10,000**.
-The following is an additional, opt-in research campaign; it does not change those controls,
-their saved IDs, or their backtest results. The `regime_overlay_enabled=False` setting above
-remains pinned: these shared entry conditions are separate from that older overlay.
-
-**Current implementation boundary:** the follow-up driver now exposes both profiles for its
-equity and ETF entry rules. It remains opt-in and requires a pinned manifest for every selected
-profile. Option stage 1 is unchanged. Stage 2 is outside the current review.
-
-### Conditions to reuse
-
-| Profile | Fields searched by the implemented option profile | Extra genes per entry tree |
-|---|---|---:|
-| `ohlcv-v1` | EMA50 slope normalized by ATR14; ADX14; 5/20-session realized-volatility ratio | 6 |
-| `ta-structure-v1` | Distance to confirmed support; distance to confirmed resistance; channel position; close relative to prior 20-session high; bull/bear swing structure | 9 |
-| Both | The eight optional gates above | 15 |
-
-Numeric modes are off/below/above with a threshold; swing structure is off/bull/bear.
-Reuse registry definitions, ranges, calculator versions and `prior_session_v1` timing.
-These are conditions on the **traded stock or ETF**, not an additional benchmark regime.
-The other seven calculated structure fields remain diagnostics for the first campaign.
-
-### Questions for all ten families
-
-These are hypotheses for the new comparisons, not predetermined winning thresholds. Preserve
-the selected expert recipe, screen, direction, schedule, exits, costs and capital while testing
-entry gates. The GA can leave any gate off or choose either numerical comparison direction.
-
-| Family | Useful condition question | What to inspect beyond CAR |
-|---|---|---|
-| `large_ds` | Does a positive underlying trend or confirmed bullish structure improve the quality/momentum blend? Does resistance distance distinguish useful entries from late entries? | Redundancy with the expert's momentum signal; lost large winners; capital use. |
-| `mid_insider` | Are insider signals more useful with trend confirmation, or during weak-trend conditions near support? | Preserve insider lookback and timeout; separate fewer opportunities from better selection. |
-| `small_earnings` | Does post-signal continuation benefit from trend/breakout confirmation, or from avoiding exceptionally expanded realized volatility? | Gap losses, missed earnings winners, initial-history coverage and concentration. |
-| `mid_ds` | Does the short holding period work better on pullbacks within an uptrend or on expanding momentum? | Holding time, trade frequency and overlap with `large_ds`. |
-| `mid_earnings` | Does trend/structure confirmation improve the selected target-offset recipe? | Keep profit tiers fixed in this comparison; measure profit and average/peak capital together. |
-| `small_rating` | Do positive ratings work better near support, with available resistance distance, or after trend confirmation? | Preserve asymmetric brackets; watch the top-five contribution after filtering. |
-| `quality_momentum` | Is a slope/ADX gate useful beyond the expert's existing momentum terms? | Incremental improvement over the identical blend; turnover and robustness across seeds. |
-| `pullback` | Can positive trend plus lower channel position/support proximity distinguish recoverable pullbacks from continued declines? | Oversold recommendations rejected, stop frequency, fewer trades versus better expectancy. |
-| `analyst_targets` | Does prior-session price confirmation help target revisions, or remove profitable early entries? | Keep target-window/observation settings fixed; preserve the 2022 data floor. |
-| `etf_trend` | Does short-term trend/volatility or structure improve the timing of opening an already selected fund? | Time in cash, missed trend starts, turnover and CAR; membership remains the existing monthly decision. |
-
-For ETFTrend, a failed gate leaves an eligible slot in cash. It must not select an alternative
-fund, alter monthly membership, change slot sizing, or prevent the normal deselection close.
-For earnings drift, these gates do not introduce a new earnings-calendar entry/exit policy.
-
-### Driver implementation and launch contract
-
-The driver implementation now does the following:
-
-1. It factors the registry-derived market-leaf builder into the shared package and appends gates
-   to **each opening rule/tier**, preserving existing OR groups and first-match behavior. Exits,
-   reductions, stop updates and protective actions are never gated.
-2. `run_goal2020_followups.py` accepts `--market-condition-profile none|ohlcv-v1|ta-structure-v1|ohlcv-v1,ta-structure-v1`,
-   `--market-condition-manifest`, and `--market-condition-mode search|all-off`. `none` remains
-   the default and a profile-less manifest is refused. `search` requires the genetic path;
-   `all-off` is a pinned installation/parity arm with the original decoded rules.
-3. Profile selection, gene layout, manifest digests, calculator/source/timing identities and the
-   recipe are included in the job fingerprint. New names cannot resume an existing ungated job.
-   Pins are copied into every trial and saved-top-result configuration.
-4. `--preflight` verifies published objects, source/timing/calendar/calculator identity and
-   every required prior-session row before a trial. It reports legitimate initial-history and
-   undefined-structure observations separately and refuses wrong-window, interior-hole,
-   trailing-hole and all-unusable snapshots. It never fetches data.
-5. `--export-universe PATH` writes the union of selected screen symbols and the ETF basket to a
-   research subdirectory so the existing warmup tool can prepare one central cache. It does not
-   open the database or start jobs.
-
-The live resolver now selects the subset of a host manifest needed by each expert, so different
-profile sets can coexist on one host. Keep the mixed-profile resolver checks in the deployment
-gate. The driver can prepare and replay a single profile or a combined pin.
-
-### Warmup and central-cache preparation
-
-Resolve the **union of possible symbols** from all selected fixed stock screens and the ETF
-basket, over their research dates, before optimization. The option grid's 98-symbol universe
-is not sufficient for the small/mid-cap follow-ups. Do not warm only the eventual winners.
-
-Use the existing `tools/warm_market_conditions.py` sequence for each requested profile:
-
-```powershell
-# After producing the resolved union file; run from the repository root.
-$research = "reports/strategy_research/goal2020_market_conditions"
-New-Item -ItemType Directory -Force $research | Out-Null
-python tools/warm_market_conditions.py plan --profile ohlcv-v1 `
-  --universe-file "$research/universe.txt" --start 2020-01-01 --end 2025-12-31 `
-  --out "$research/ohlcv-v1-plan.json"
-python tools/warm_market_conditions.py build --plan "$research/ohlcv-v1-plan.json" --cache-only
-# Repeat plan/build for ta-structure-v1. Retain each returned digest separately.
-python tools/warm_market_conditions.py verify --manifest <digest>
-python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile <profile>
-```
-
-The placeholders above must be replaced with the actual digest/profile. The union file is created
-by the driver's `--export-universe` command and is intentionally not checked into the repository.
-Dates passed to `plan` are decision dates: it handles prior regular sessions and the required
-128-bar prefix. Retain the ETF expert's longer warmup and existing daily/five-minute execution data,
-screener, analyst, ratings, insider and earnings caches; condition features replace none of them.
-
-`plan` also checks source/split metadata and can request missing split-calendar data.
-`build --cache-only` does not fetch missing price history. Review its inventory before using
-the explicit `--fetch-missing` repair path; do not assume live refresh automatically repairs
-split history. Inspect negative-status coverage as well as symbol counts. Undefined support
-or resistance is a legitimate unknown observation and is not solved by another download.
-
-Reuse central content-addressed feature/raw objects for overlapping windows and symbols.
-Changing a threshold, expert or fitness does not require rebuilding identical features.
-Pin the resulting manifest(s), sync them to participating workers, and require successful
-verification/preparation before dispatch. Read-only mapped arrays are per host, while every
-trial carries the same portable digests. No price download or feature calculation belongs
-inside a GA trial. A repeated unchanged build should reuse its feature computations.
-
-### Comparison and selection
-
-Keep the original small exhaustive grids as the first step. For each family, choose and
-record a control recipe before searching gates, then compare **ungated / OHLCV / structure**
-with matched seeds and fixed economic settings. Test both profiles together only where the
-single-profile results justify the extra search dimensions. Do not multiply all 193 original
-combinations by every threshold combination; use separate condition-focused GA jobs.
-
-Record the added gene count and explicit search budget; the option defaults do not establish
-adequate search depth for this new campaign. Explicitly evaluate the frozen all-off control;
-random initialization is not a guarantee that the optimizer visits it.
-
-Compare profit, CAR, maximum drawdown, trade count/frequency, average and peak capital usage,
-top-five winner contribution, and trade overlap with the control and alternate sleeve.
-Report which eligible recommendations were rejected by measured conditions versus unknown
-data, and whether rare large winners disappeared. Prefer improved CAR at comparable capital
-use with tolerable drawdown/concentration, rather than fewer trades alone. Keep $10,000
-initial equity and sizing cap, existing costs, schedules and fitness throughout each comparison.
-The already searched 2020–2025 window is research data; preserve unused/forward evaluation.
 
 ## Verification
 

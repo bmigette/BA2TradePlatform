@@ -11,8 +11,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-from tools.strategy_research import profiles as P, runtime as R, market_conditions as MC
-from tools.strategy_research import run_goal2020_followups as D
+from tools.strategy_research.exploration import profiles as P, runtime as R, market_conditions as MC
+from tools.strategy_research.exploration import run_exploration as D
 from app.services.strategy_param_space import collect_param_space, decode_params
 from ba2_common.core.market_conditions import PROFILES, STATUS_VALID, STATUS_MISSING_SESSION, STATUS_INSUFFICIENT_HISTORY
 from ba2_common.core.market_condition_store import MarketConditionStore

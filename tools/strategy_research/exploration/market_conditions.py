@@ -8,7 +8,7 @@ import sys
 
 
 def _shared_paths():
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[3]
     path = str(root / "packages/common")
     if path not in sys.path:
         sys.path.insert(0, path)

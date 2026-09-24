@@ -216,6 +216,15 @@ Rule engine and evaluation.
 
 ---
 
+### 🔬 Strategy Research (grids)
+- `strategy_research/exploration/README.md` - Strategy exploration grid: additional strategies beyond goal2020 (driver `tools/strategy_research/exploration/run_exploration.py`)
+- `strategy_research/exploration/market_conditions.md` - Market-condition entry gates for the exploration grid
+- `strategy_research/exploration/pullback_and_market_exits.md` - Proposed: pullback expert (long/short) and market-condition exits
+- `strategy_research/options/` - Option grid experiment contracts (stage 1 soft30, neutral entry)
+- `RUNBOOK-goal2020-grid.md` - goal2020 grid runbook
+
+---
+
 ## 📦 Archive
 
 Superseded and historical documents are preserved in `docs/archive/`.

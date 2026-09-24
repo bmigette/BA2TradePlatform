@@ -71,7 +71,7 @@ the narrowed completed/failed-only transaction succeeded.
 ## Initial experiment change (superseded below)
 
 Explore HOLD and low-confidence BUY/SELL independently for straddles, strangles
-and iron condors. See [the experiment contract](../../docs/strategy_research/option_neutral_entry_experiments.md).
+and iron condors. See [the experiment contract](../../docs/strategy_research/options/option_neutral_entry_experiments.md).
 The default remains legacy; no live expert is opted in. The discovery plan becomes
 19 jobs for DeterministicScorer, with distinct arm names and inherited Top-N names.
 The 13 other structures keep their job/checkpoint identities.
@@ -174,7 +174,7 @@ option sizing/submission flow already used by backtests. Missing/null/false
 settings retain the original entry behavior. Existing live settings are untouched.
 
 The three neutral job names now include `rules1`; other job/checkpoint identities
-remain unchanged. See the [current contract](../../docs/strategy_research/option_neutral_entry_experiments.md).
+remain unchanged. See the [current contract](../../docs/strategy_research/options/option_neutral_entry_experiments.md).
 The earlier mode-based descriptions and test counts above describe historical
 implementations, not this replacement.
 
