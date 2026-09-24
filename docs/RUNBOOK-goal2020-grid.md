@@ -53,6 +53,18 @@ the equity grids):
    (options), the 683c7379 stress restatement (return / total_return / calmar fitness), O_CC and
    O_WHEEL after `cc_dte` + `wheel_stock_guard`. Never compare across a split.
 6. **Agents' test suites compete with the grid for RAM**: targeted files, one pytest at a time.
+7. **TOP-N is fitness-distinct, not behaviour-distinct.** A converged job's end-of-job TOP-N can
+   be several inert-gene variants of ONE strategy. For the best N that actually trade differently
+   run `tools/persist_distinct_topn.py --opt-id <id> --dry-run` (selection table: clones and
+   near-duplicates per pick), then without `--dry-run` (add `--skip-already-persisted`) to re-run
+   and save them as `DTOP<rank>-<job>` rows labelled `TopNDistinct`, with per-year returns and
+   top-1/top-5 concentration printed next to fitness. Run it from a separate checkout, never the
+   grid's own repo (item 1). **Its re-runs run OUTSIDE the grid's cgroup / memory governor**: beside
+   a live grid check `free -g`, wrap it in `systemd-run --user --scope -p MemoryMax=16G ...`, and
+   never pass `--parallel` > 1. The tool itself refuses to re-run when `MemAvailable` is below
+   `--min-free-gb` (default 20; `--force-memory` overrides). Its trade floor
+   (`--min-trade-rows`, default 30) counts round-trip ROWS (one per leg on options), not
+   structures. Usage in the tool's docstring.
 
 ---
 
