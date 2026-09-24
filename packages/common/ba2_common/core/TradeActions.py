@@ -7,7 +7,7 @@ based on expert recommendations and market conditions.
 
 import math
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Callable, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, date, timedelta
 
 from ba2_common.core.interfaces import AccountInterface
@@ -853,7 +853,7 @@ class _AdjustPriceLevelAction(TradeAction):
         if stressed is not True:
             return self.percent
 
-        expert = self._regime_expert()
+        expert = self.resolve_expert()
         scale = regime_scale(expert, self._regime_scale_setting, stressed)
         if scale == 1.0:
             return self.percent          # exact no-op: do not even log
@@ -863,8 +863,12 @@ class _AdjustPriceLevelAction(TradeAction):
             f"={scale:g}, offset {self.percent:+.2f}% -> {scaled:+.2f}%")
         return scaled
 
-    def _regime_expert(self):
-        """The expert instance whose genome carries the regime settings, or None.
+    def resolve_expert(self):
+        """The expert instance whose genome carries this action's settings, or None.
+
+        Read by the regime overlay (the regime_* scales) and by ``ruleset_stop_policy``
+        (allow_ruleset_sl_loosen), from this action and from TradeActionEvaluator's merged
+        TP+SL branch.
 
         TP/SL actions are usually constructed WITHOUT an expert_recommendation (the ruleset
         adjusts an order that already exists -- see _create_order's "copy from existing_order"
@@ -890,6 +894,10 @@ class _AdjustPriceLevelAction(TradeAction):
             absorb_if_benign(e, InstanceNotFound, InstanceResolverNotConfigured)
             logger.debug(f"{self._label} regime overlay: no expert resolved ({e}); using neutral scale")
             return None
+
+    def _regime_expert(self):
+        """Former name of :meth:`resolve_expert`, kept as an alias."""
+        return self.resolve_expert()
 
     # --- Hooks that subclasses override ---
 
@@ -1393,6 +1401,206 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
         return enforced_price if enforced_price is not None else price
 
 
+#: The expert setting that lets a RULESET move a stop further away, down to the trade's
+#: max-loss stop. Declared on MarketExpertInterface (default False).
+RULESET_SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
+
+#: ``ruleset_stop_policy`` reasons meaning "the existing stop stands; send nothing". Every other
+#: reason means "apply the returned price". A request EQUAL to the existing stop is NOT in here:
+#: it is applied, exactly as before the policy existed (the account treats it as unchanged).
+RULESET_STOP_KEPT_REASONS = frozenset((
+    "ratchet",                  # setting off: a looser request is refused (today's behaviour)
+    "floor_would_loosen",       # setting on, the rule tightened; only the min-distance floor loosened
+    "floor_exceeds_rule",       # setting on, the floor pushed a loosen past the rule's own price
+    "no_max_loss_stop",         # setting on, but no bound was recorded: never loosen blind
+    "existing_beyond_bound",    # setting on, existing already at/looser than the bound
+    "bound_too_close",          # setting on, the clamped stop would break the min distance
+    "bound_unverifiable",       # setting on, clamped, but no current price to check it against
+))
+
+
+def _stop_price_pair(a: float, b: float) -> Tuple[str, str]:
+    """``$a``/``$b`` at 2 dp, or at 4 dp when they round to the same cents -- otherwise a log
+    line reads "keeping $97.00 ... asked for $97.00, which would LOOSEN" and looks like a bug."""
+    digits = 4 if round(a, 2) == round(b, 2) else 2
+    return f"${a:.{digits}f}", f"${b:.{digits}f}"
+
+
+def stop_is_long_position(transaction, fallback_order=None) -> bool:
+    """The position direction a stop protects: the transaction's side, else the order's.
+
+    Raises ValueError when neither names BUY or SELL. Reading an unknown side as SHORT (the
+    old behaviour) inverts which way "looser" points, so the ratchet would let a long's stop
+    fall. ``Transaction.side`` is a required column, so every real caller has one."""
+    side = getattr(transaction, "side", None) or (
+        fallback_order.side if fallback_order is not None else None)
+    side_str = str(side.value if hasattr(side, "value") else side or "").upper()
+    if side_str == "BUY":
+        return True
+    if side_str == "SELL":
+        return False
+    raise ValueError(
+        f"cannot tell which way a stop protects transaction {getattr(transaction, 'id', None)}: "
+        f"side {side!r} is neither BUY nor SELL")
+
+
+def ruleset_sl_loosen_allowed(expert) -> bool:
+    """``allow_ruleset_sl_loosen`` on ``expert``. No expert, or the setting absent -> False.
+
+    Read through ``coerce_bool``: the GA writes bool genes as integers and older rows hold the
+    JSON string "1", which must read True. A spelling ``coerce_bool`` cannot mean raises -- a
+    garbled bool setting is a bug to surface, not a value to guess."""
+    if expert is None:
+        return False
+    raw = expert.get_setting_with_interface_default(RULESET_SL_LOOSEN_SETTING, log_warning=False)
+    if raw is None:
+        return False
+    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+    return coerce_bool(raw)
+
+
+def ruleset_stop_policy(transaction, requested: float, is_long: bool,
+                        expert_getter: Callable[[], Any],
+                        *, price_getter: Optional[Callable[[], Optional[float]]] = None,
+                        rule_price: Optional[float] = None) -> Tuple[float, str]:
+    """The stop a RULESET may set. Returns ``(price_to_apply, reason)``.
+
+    THE ONE PLACE a ruleset stop-loss is decided, whatever kind of condition fired it and
+    whichever evaluator branch carries it (the SL-only ``AdjustStopLossAction`` and the merged
+    TP+SL ``adjust_tp_sl`` call both come through here).
+
+    - no existing stop, or a TIGHTER (or equal) request -> ``requested``
+    - LOOSER request, expert setting ``allow_ruleset_sl_loosen`` False (default) -> existing
+      (the ratchet, exactly the behaviour before this policy existed)
+    - LOOSER request, setting True, but the RULE's own price (``rule_price``, before the SL
+      min-distance floor) was TIGHTER than or equal to the existing stop -> existing
+      (``floor_would_loosen``). The floor pushes a stop that sits too close to the market
+      further away; applied to a tighten or a trailing request it would turn it into a loosen,
+      and a profit lock would unwind bar by bar down to the bound as the market falls. The
+      loosen setting permits a RULE to loosen, not the floor.
+    - LOOSER request, setting True, and the floor pushed it LOOSER than the rule's own price
+      (``rule_price``) -> existing (``floor_exceeds_rule``). A loosen never goes past what the
+      rule asked for: the rule's price sat too close to the market, and the floor's answer to
+      that is not a licence to loosen further.
+    - LOOSER request, setting True -> clamped at ``max_loss_stop_of(transaction)``: long
+      ``max(requested, bound)``, short ``min(requested, bound)``, so the result is never looser
+      than the bound and never looser than requested. Then:
+        * bound ABSENT -> existing (never loosen without a recorded bound);
+        * existing ALREADY at or looser than the bound -> existing. Clamping would move the stop
+          CLOSER to the market -- a tightening nobody asked for, performed as a side effect of a
+          request to loosen. The stop stays where it is instead;
+        * the clamp moved the price (bound used instead of ``requested``) -> the bound must
+          still pass the SL min-distance rule against the current price, which the caller
+          applied to ``requested`` but which nobody applied to the bound. A bound that fails it
+          (or sits through the market), or that cannot be checked for want of a price, is
+          refused and the existing stop stands. It is never pushed further away to pass: that
+          would break the max-loss bound.
+
+    Every non-trivial outcome is logged at INFO naming existing / requested / bound / applied.
+    The ratchet line keeps its historical text ("SL ratchet: keeping existing stop ...");
+    operators grep for it.
+
+    ``expert_getter`` and ``price_getter`` are zero-arg callables, called only on a loosening
+    request, so the common tighten path does no expert lookup and no price fetch. A missing
+    ``price_getter`` reads as "no current price". ``rule_price`` is the stop the rule itself
+    computed, before the min-distance floor; None when the caller has no separate pre-floor
+    price (then ``requested`` is taken to be the rule's price).
+
+    Reasons listed in ``RULESET_STOP_KEPT_REASONS`` mean "the existing stop stands, send
+    nothing"; the returned price is then the existing stop.
+    """
+    existing = getattr(transaction, "stop_loss", None)
+    txn_id = getattr(transaction, "id", None)
+    if not (existing and existing > 0) or not requested:
+        return requested, "no_existing_stop"
+    loosens = (requested < existing) if is_long else (requested > existing)
+    if not loosens:
+        return requested, "tighter_or_equal"
+
+    direction = "long" if is_long else "short"
+    ex_s, req_s = _stop_price_pair(existing, requested)
+    if not ruleset_sl_loosen_allowed(expert_getter()):
+        logger.info(
+            f"SL ratchet: keeping existing stop {ex_s} for transaction {txn_id} "
+            f"— ruleset asked for {req_s}, which would LOOSEN the {direction} stop"
+        )
+        return existing, "ratchet"
+
+    # Checked AFTER the ratchet so the default-off log stays the historical "SL ratchet" line.
+    if rule_price is not None and ((rule_price >= existing) if is_long else (rule_price <= existing)):
+        rule_s, _ = _stop_price_pair(rule_price, existing)
+        logger.info(
+            f"SL floor would loosen: keeping existing stop {ex_s} for transaction {txn_id} — the "
+            f"rule asked for {rule_s} (not looser than the {direction} stop), and only the SL "
+            f"min-distance floor moved it to {req_s}; the floor may not loosen a stop "
+            f"(applied={ex_s})"
+        )
+        return existing, "floor_would_loosen"
+
+    if rule_price is not None and ((requested < rule_price) if is_long else (requested > rule_price)):
+        rule_s, _ = _stop_price_pair(rule_price, requested)
+        logger.info(
+            f"SL floor exceeds rule: keeping existing stop {ex_s} for transaction {txn_id} — the "
+            f"rule asked to loosen the {direction} stop to {rule_s}, which is too close to the "
+            f"market; the SL min-distance floor moved it to {req_s}, past the rule's own price, "
+            f"and a loosen never goes past what the rule asked for (applied={ex_s})"
+        )
+        return existing, "floor_exceeds_rule"
+
+    from ba2_common.core.position_sizing import max_loss_stop_of
+    bound = max_loss_stop_of(transaction)
+    if bound is None:
+        logger.info(
+            f"SL loosen refused: keeping existing stop {ex_s} for transaction {txn_id} — ruleset "
+            f"asked for {req_s} ({direction}), {RULESET_SL_LOOSEN_SETTING} is on but no max-loss "
+            f"stop is recorded, so there is no bound to loosen to (bound=None, applied={ex_s})"
+        )
+        return existing, "no_max_loss_stop"
+
+    beyond = (existing <= bound) if is_long else (existing >= bound)
+    if beyond:
+        logger.info(
+            f"SL loosen: keeping existing stop {ex_s} for transaction {txn_id} — it is already at "
+            f"or beyond the max-loss stop ${bound:.4f} ({direction}); ruleset asked for {req_s}. "
+            f"Clamping would TIGHTEN it, which a loosen request must not do (applied={ex_s})"
+        )
+        return existing, "existing_beyond_bound"
+
+    applied = max(requested, bound) if is_long else min(requested, bound)
+    if applied == requested:
+        logger.info(
+            f"SL loosen: transaction {txn_id} {direction} stop {ex_s} -> {req_s} as the ruleset "
+            f"asked; within the max-loss stop ${bound:.4f} (applied={req_s})"
+        )
+        return requested, "loosen_within_bound"
+
+    # Clamped to the bound: the caller's min-distance check covered `requested`, not this.
+    price = price_getter() if price_getter is not None else None
+    if not price:
+        logger.info(
+            f"SL loosen refused: keeping existing stop {ex_s} for transaction {txn_id} — ruleset "
+            f"asked for {req_s} ({direction}), clamped to the max-loss stop ${bound:.4f}, but no "
+            f"current price is available to check its distance from the market (applied={ex_s})"
+        )
+        return existing, "bound_unverifiable"
+    from ba2_common.config import get_min_tp_sl_percent
+    min_pct = get_min_tp_sl_percent()
+    distance_pct = ((price - bound) / price * 100) if is_long else ((bound - price) / price * 100)
+    if distance_pct < min_pct:
+        logger.info(
+            f"SL loosen refused: keeping existing stop {ex_s} for transaction {txn_id} — ruleset "
+            f"asked for {req_s} ({direction}), clamped to the max-loss stop ${bound:.4f}, which is "
+            f"{distance_pct:.2f}% from the current price ${price:.2f}, below the {min_pct}% minimum "
+            f"(applied={ex_s})"
+        )
+        return existing, "bound_too_close"
+    logger.info(
+        f"SL loosen clamped: transaction {txn_id} {direction} stop {ex_s} -> ${bound:.4f} — "
+        f"ruleset asked for {req_s}, past the max-loss stop ${bound:.4f} (applied=${bound:.4f})"
+    )
+    return bound, "loosen_clamped"
+
+
 class AdjustStopLossAction(_AdjustPriceLevelAction):
     """Adjust stop loss level for an existing order."""
 
@@ -1412,33 +1620,30 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
                          expert_recommendation, target_price=stop_loss_price,
                          reference_value=reference_value, percent=percent)
         self.stop_loss_price = self.target_price  # backward-compat alias
+        #: The stop the RULE computed, before the SL min-distance floor moved it. Recorded by
+        #: _enforce_minimum_distance (SL-only path) and compute_price (merged TP+SL path) and
+        #: handed to ruleset_stop_policy, so the floor can never turn a tighten into a loosen.
+        self.rule_price: Optional[float] = None
 
     def _call_broker(self, transaction) -> bool:
-        # RATCHET-ONLY: a ruleset-driven stop-loss may only TIGHTEN, never loosen. Without this,
-        # an always-true SL rule (e.g. condition `has_position`) re-fires every management run and
-        # (a) REPLACES the risk manager's safeguard stop with a looser one — the position was
-        # SIZED off the safeguard distance, so the realized loss at stop exceeds risk_per_trade_pct
-        # — and (b) UN-TRAILS profit-lock tiers: when price falls back under a tier threshold the
-        # tier rule stops firing but the base SL rule still does, dropping the stop back below the
-        # locked level. Long: never move the stop DOWN once set; short: never UP. Scope is the
-        # ruleset path only — manual UI edits and the SmartRM call account.adjust_sl directly with
-        # their own source and stay free to loosen deliberately.
-        existing = getattr(transaction, "stop_loss", None)
-        if existing and existing > 0 and self.target_price:
-            side = getattr(transaction, "side", None) or (
-                self.existing_order.side if self.existing_order else None)
-            side_str = str(side.value if hasattr(side, "value") else side or "").upper()
-            is_long = side_str == "BUY"
-            loosens = (self.target_price < existing) if is_long else (self.target_price > existing)
-            if loosens:
-                logger.info(
-                    f"SL ratchet: keeping existing stop ${existing:.2f} for transaction "
-                    f"{transaction.id} — ruleset asked for ${self.target_price:.2f}, which would "
-                    f"LOOSEN the {'long' if is_long else 'short'} stop"
-                )
-                self.target_price = existing  # result/data reflect the kept (tighter) stop
-                self.stop_loss_price = existing
-                return True  # no-op success: the tighter stop stands
+        # RATCHET BY DEFAULT: a ruleset-driven stop-loss may only TIGHTEN, never loosen. Without
+        # this, an always-true SL rule (e.g. condition `has_position`) re-fires every management
+        # run and (a) REPLACES the risk manager's safeguard stop with a looser one — the position
+        # was SIZED off the safeguard distance, so the realized loss at stop exceeds
+        # risk_per_trade_pct — and (b) UN-TRAILS profit-lock tiers: when price falls back under a
+        # tier threshold the tier rule stops firing but the base SL rule still does, dropping the
+        # stop back below the locked level. The expert setting allow_ruleset_sl_loosen opts into
+        # loosening down to the trade's max-loss stop (the stop it was sized on) and no further.
+        # The decision lives in ruleset_stop_policy, shared with the merged TP+SL branch of
+        # TradeActionEvaluator. Scope is the ruleset path only — manual UI edits and the SmartRM
+        # call account.adjust_sl directly with their own source and stay free to loosen.
+        applied, reason = ruleset_stop_policy(
+            transaction, self.target_price, stop_is_long_position(transaction, self.existing_order),
+            self.resolve_expert, price_getter=self.get_current_price, rule_price=self.rule_price)
+        self.target_price = applied  # result/data reflect the stop that stands
+        self.stop_loss_price = applied
+        if reason in RULESET_STOP_KEPT_REASONS:
+            return True  # no-op success: the existing stop stands
         return self.account.adjust_sl(transaction, self.target_price, source="ruleset")
 
     def _post_broker_hook(self, transaction) -> None:
@@ -1464,6 +1669,7 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
         shrinking as price rallies even though its distance from CURRENT price never changes
         -- so it kept getting clobbered back down to a guaranteed loss the moment it moved
         above entry.)"""
+        self.rule_price = self.target_price    # before the floor: see ruleset_stop_policy
         if self.existing_order and self.target_price:
             current_price = self.get_current_price()
             if not current_price:
@@ -1499,6 +1705,7 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
         Same current-price-relative guard as _enforce_minimum_distance above (see its
         docstring for why open-price-relative was wrong for profit-locking stops)."""
         price = super().compute_price(order)
+        self.rule_price = price    # before the floor: the merged branch hands it to the policy
 
         # Enforce minimum SL distance from current price
         if price is not None:

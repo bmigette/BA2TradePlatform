@@ -585,9 +585,9 @@ def test_a_linked_rule_whose_subtype_no_longer_matches_is_dropped_on_open_and_re
 def test_a_market_gate_on_an_open_positions_ruleset_is_still_refused(editor,
                                                                     nicegui_client):
     """UNCHANGED BY THIS REWRITE, and checked against the rules the save actually links.
-    Outside the entry decision pass the live resolver has no context, the gate reads
-    ``no_context``, the rule NEVER fires, and the position's exit silently stops
-    happening."""
+    The gated rule here OPENS (the factory's default ``buy``): since plan 2026-09-24 Task B2 a
+    market gate on an exit rule may only close, reduce or adjust TP/SL, because a failed read
+    on the exit pass is unknown and the rule does not fire."""
     from ba2_common.core.market_condition_rules import market_condition_fields
 
     field = sorted(market_condition_fields())[0]
@@ -610,6 +610,116 @@ def test_a_market_gate_on_an_open_positions_ruleset_is_still_refused(editor,
     assert _stored_order(ruleset.id) == [gate.id], 'the links were rewritten by a refusal'
     assert get_instance(Ruleset, ruleset.id).name == 'exit-rs', (
         'the ruleset row was written by a refusal')
+
+
+def test_a_market_gate_on_an_open_positions_close_rule_is_accepted(editor, nicegui_client):
+    """Plan 2026-09-24 Task B2, against stored rules: the same gate on an exit rule that only
+    CLOSES is a market exit, and the ruleset door lets it through."""
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
+    field = sorted(market_condition_fields())[0]
+    gate = _rule('market-close', EXIT,
+                 triggers={'t0': {'event_type': field, 'operator': '>', 'value': 20.0}},
+                 actions={'action_0': {'action_type': 'close'}})
+    ruleset = _ruleset('market-exit-rs', [gate.id], subtype=EXIT)
+
+    _open(editor, nicegui_client, ruleset)
+    assert editor._refuse_market_gates_on_exit_ruleset(EXIT, editor.ruleset_rule_ids) is None
+    # ...and, with its id, still accepted: the ruleset is linked to no expert.
+    assert editor._refuse_market_gates_on_exit_ruleset(EXIT, editor.ruleset_rule_ids,
+                                                       ruleset.id) is None
+
+
+# -------------------------------------------- the experts ALREADY using the ruleset being saved
+
+@pytest.fixture
+def expert_profiles(monkeypatch):
+    """``instance id -> market_condition_profile``, served through the instance-resolver seam
+    the check reads (the live host backs it with ``get_expert_instance_from_id``)."""
+    from types import SimpleNamespace
+
+    from ba2_common.core import instance_resolver
+
+    table: dict = {}
+    previous = instance_resolver.get_instance_resolver()
+    instance_resolver.set_instance_resolver(SimpleNamespace(
+        get_expert_instance=lambda iid: SimpleNamespace(
+            settings={'market_condition_profile': table[iid]})))
+    yield table
+    instance_resolver.set_instance_resolver(previous)
+
+
+def _market_close_exit_ruleset(name):
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
+    field = 'underlying_adx_14'
+    assert field in market_condition_fields()
+    gate = _rule(f'{name}-close', EXIT,
+                 triggers={'t0': {'event_type': field, 'operator': '>', 'value': 20.0}},
+                 actions={'action_0': {'action_type': 'close'}})
+    return gate, _ruleset(name, [gate.id], subtype=EXIT)
+
+
+def _link_expert(ruleset, profiles, profile, *, enabled=True):
+    from ba2_trade_platform.core.models import ExpertInstance
+
+    instance_id = add_instance(ExpertInstance(account_id=1, expert='MockExpert', enabled=enabled,
+                                              open_positions_ruleset_id=ruleset.id))
+    profiles[instance_id] = profile
+    return instance_id
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_a_market_exit_saved_into_a_ruleset_an_unprofiled_expert_uses_is_refused(
+        editor, nicegui_client, expert_profiles, enabled):
+    """The expert dialog checks the profile when a ruleset is ATTACHED; editing a ruleset an
+    expert already runs passed through no such check, and the new exit read no_context for
+    ever. Disabled experts count: enabling one passes through no ruleset door."""
+    _gate, ruleset = _market_close_exit_ruleset(f'linked-unserved-{enabled}')
+    instance_id = _link_expert(ruleset, expert_profiles, '', enabled=enabled)
+
+    _open(editor, nicegui_client, ruleset)
+    with pytest.raises(ValueError) as e:
+        editor._refuse_market_gates_on_exit_ruleset(EXIT, editor.ruleset_rule_ids, ruleset.id)
+    msg = str(e.value)
+    assert f'expert instance {instance_id}' in msg and 'underlying_adx_14' in msg
+
+    # ...and the real save refuses it before writing anything.
+    editor.ruleset_name_input.value = 'renamed-by-a-refused-save'
+    with nicegui_client:
+        editor._save_ruleset(ruleset)
+    assert editor.notifications[-1][1] == 'negative', editor.notifications
+    assert get_instance(Ruleset, ruleset.id).name == f'linked-unserved-{enabled}'
+
+
+def test_a_market_exit_saved_into_a_ruleset_its_expert_serves_is_accepted(
+        editor, nicegui_client, expert_profiles):
+    _gate, ruleset = _market_close_exit_ruleset('linked-served')
+    _link_expert(ruleset, expert_profiles, 'ohlcv-v1')
+
+    _open(editor, nicegui_client, ruleset)
+    assert editor._refuse_market_gates_on_exit_ruleset(EXIT, editor.ruleset_rule_ids,
+                                                       ruleset.id) is None
+
+
+def test_an_ordinary_exit_ruleset_save_asks_about_no_expert(editor, nicegui_client,
+                                                           expert_profiles, monkeypatch):
+    import ba2_common.core.market_condition_live as live
+
+    looked_up = []
+    monkeypatch.setattr(live, 'experts_linked_to_rulesets',
+                        lambda *a, **k: looked_up.append(a) or ())
+    rule = _rule('plain-stop', EXIT,
+                 triggers={'t0': {'event_type': 'profit_loss_percent', 'operator': '<',
+                                  'value': -5.0}},
+                 actions={'action_0': {'action_type': 'close'}})
+    ruleset = _ruleset('plain-exit-rs', [rule.id], subtype=EXIT)
+    _link_expert(ruleset, expert_profiles, '')
+
+    _open(editor, nicegui_client, ruleset)
+    assert editor._refuse_market_gates_on_exit_ruleset(EXIT, editor.ruleset_rule_ids,
+                                                       ruleset.id) is None
+    assert looked_up == []
 
 
 # =========================================================================================

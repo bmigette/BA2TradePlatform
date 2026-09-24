@@ -33,7 +33,7 @@ from ba2_common.core.market_condition_rules import (
     PROFILE_SETTING as MARKET_CONDITION_PROFILE_SETTING,
     PROFILE_SETTING_OFF as MARKET_CONDITION_PROFILE_OFF,
     assert_fields_served,
-    assert_no_market_fields,
+    assert_market_rule_actions_live,
     market_condition_fields,
     parse_profile_setting,
 )
@@ -62,8 +62,8 @@ class TriggerTypePicker:
       offered here like any other trigger, each carrying the name of the profile the expert
       needs -- a message the operator can act on instead of an absence they cannot see. The
       refusals are untouched: ``_refuse_market_gates_on_exit_rule`` and
-      ``_refuse_market_gates_on_exit_ruleset`` still stop a gate reaching an exit, and the
-      deploy importer still checks every leaf against the expert's profile setting.
+      ``_refuse_market_gates_on_exit_ruleset`` still refuse a gate on an exit rule beyond
+      close/reduce/adjust TP-SL (plan 2026-09-24 B2); the deploy importer checks every leaf.
     * ``_trigger_type_options`` existed only because NiceGUI refuses a select value outside
       its options (``choice_element``: ``ValueError: Invalid value: ...``) and
       ``show_rule_dialog`` wraps nothing, so a persisted trigger the menu did not offer raised
@@ -2310,11 +2310,16 @@ class ExpertSettingsTab:
                             # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
                             # (MarketExpertInterface), and this dialog's Expert Settings tab
                             # renders only expert-SPECIFIC definitions, so it needs its own widget.
+                            # MULTI-select: the setting is a comma list and a strategy may gate on
+                            # fields from several profiles at once (e.g. ohlcv-v1 + ta-structure-v1).
+                            # Nothing selected = MARKET_CONDITION_PROFILE_OFF (no data served).
                             self.market_condition_profile_select = ui.select(
                                 options=self._market_condition_profile_options(),
-                                label='Market-Condition Profile',
-                                value=MARKET_CONDITION_PROFILE_OFF,
-                            ).classes('w-full')
+                                label='Market-Condition Profile(s)',
+                                value=[],
+                                multiple=True,
+                                clearable=True,
+                            ).classes('w-full').props('use-chips')
                             # A NEW instance has no stored value to read, so the widget IS the
                             # operator's input and is saveable from the start. The edit branch
                             # below clears this if it cannot read what is stored.
@@ -4427,37 +4432,67 @@ class ExpertSettingsTab:
     
     # ----------------------------------------------------------------- market-condition profile
     def _market_condition_profile_options(self) -> list:
-        """The select's options: "" (off) plus every profile registered in THIS build.
+        """The multi-select's options: every profile registered in THIS build.
 
         Read from the interface's own settings definition rather than from the registry, so the
-        dialog and the setting can never offer different lists.
+        dialog and the setting can never offer different lists. The definition's ``""`` (off)
+        choice is NOT an option here: in a multi-select, "off" is simply nothing selected.
         """
         from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 
         MarketExpertInterface._ensure_builtin_settings()
-        return list(MarketExpertInterface._builtin_settings[
-            MARKET_CONDITION_PROFILE_SETTING]["valid_values"])
+        return [v for v in MarketExpertInterface._builtin_settings[
+            MARKET_CONDITION_PROFILE_SETTING]["valid_values"] if v != MARKET_CONDITION_PROFILE_OFF]
+
+    @staticmethod
+    def _split_market_condition_profile(value) -> list:
+        """The profile names in a stored setting value, in stored order, blanks dropped.
+
+        Deliberately NOT ``parse_profile_setting``: the dialog must SHOW whatever is stored --
+        including a name this build no longer registers -- so the operator can see and fix it.
+        Validation stays where it belongs: the save guard (``_refuse_unserved_market_gates``)
+        and every runtime reader parse the saved string strictly.
+        """
+        if value is None:
+            return []
+        return [t for t in (part.strip() for part in str(value).split(",")) if t]
 
     def _fill_market_condition_profile(self, value) -> None:
-        """Show a stored value, INCLUDING one the select's options do not contain.
+        """Show a stored value -- one profile, several (comma list), or none.
 
-        A comma list (two profiles at once) and a profile this build no longer registers are both
-        storable -- a deploy payload can carry either -- and a select that silently snapped them
-        back to "" would show an ungated expert whose rules are gated. So the value is added to
-        the options rather than dropped, and the save path writes back what is shown.
+        A profile this build no longer registers is ADDED to the options rather than dropped: a
+        select that silently lost it would show a different gating than the stored one, and the
+        save path writes back exactly what is shown.
         """
-        shown = '' if value is None else str(value)
+        names = self._split_market_condition_profile(value)
         options = self._market_condition_profile_options()
-        if shown not in options:
-            options = [*options, shown]
+        extra = [n for n in names if n not in options]
+        if extra:
+            options = [*options, *extra]
             self.market_condition_profile_select.options = options
-        self.market_condition_profile_select.value = shown
+        self.market_condition_profile_select.value = names
 
     def _market_condition_profile_value(self) -> str:
-        """The profile setting shown in the dialog (``''`` when the widget is absent)."""
+        """The setting value for what is selected: a comma list, ``''`` when nothing is.
+
+        Joined in OPTION order (registered profiles first, then any preserved unknown name), not
+        in click order, so the same selection always saves the same string -- the form the
+        launcher and the deploy payloads write (``ohlcv-v1,ta-structure-v1``).
+        """
         if not hasattr(self, 'market_condition_profile_select'):
             return MARKET_CONDITION_PROFILE_OFF
-        return str(self.market_condition_profile_select.value or MARKET_CONDITION_PROFILE_OFF)
+        selected = self.market_condition_profile_select.value
+        if selected is None or selected == MARKET_CONDITION_PROFILE_OFF:
+            return MARKET_CONDITION_PROFILE_OFF
+        if isinstance(selected, str):
+            # A single string can only come from a caller that set the widget directly; treat
+            # it as the stored comma form rather than guessing.
+            selected = self._split_market_condition_profile(selected)
+        chosen = set(selected)
+        options = list(self.market_condition_profile_select.options or [])
+        ordered = [o for o in options if o in chosen]
+        ordered += [s for s in selected if s not in options and s not in ordered]
+        return ','.join(ordered)
 
     def _market_condition_profile_savable(self) -> bool:
         """Whether this dialog may WRITE the profile setting.
@@ -4503,28 +4538,38 @@ class ExpertSettingsTab:
         up enabled, scheduled and correct-looking, and every gated entry is refused for ever:
         indistinguishable from a strategy that found no setup.
 
-        BOTH DOORS, and they refuse different things. The open-positions slot may carry NO market
-        leaf at all, whatever the profile says: outside the entry decision pass the live resolver
-        has no context, so such a leaf reads ``no_context`` and its rule never fires -- an exit or
-        protective-order adjustment that silently stops happening. The deploy importer gets that
-        refusal from ``trade_rules_to_live_export``; this dialog can attach an EXISTING gated
-        ruleset to that slot without converting anything, so it needs its own.
+        BOTH DOORS. The open-positions slot may carry a market leaf only on a rule that CLOSES,
+        REDUCES or ADJUSTS TP/SL (plan 2026-09-24 Task B2): on the exit pass a failed read is
+        unknown and the rule does not fire, which is safe for those actions and for no other
+        (``assert_market_rule_actions_live``). Checked FIRST, whatever the profile says. The
+        deploy importer gets that refusal from ``trade_rules_to_live_export``; this dialog can
+        attach an EXISTING gated ruleset to that slot without converting anything, so it needs its
+        own. An exit leaf must ALSO be served by the profile setting, exactly like an entry leaf:
+        unserved, it reads unknown for ever and the exit it guards silently never happens.
 
         Raises ValueError, which ``_save_expert``'s handler turns into a red notification naming
         the leaf, the field and the setting.
         """
-        from ba2_common.core.market_condition_live import market_condition_fields_in_ruleset
+        from ba2_common.core.market_condition_live import (
+            market_condition_fields_in_ruleset,
+            ruleset_rule_contents,
+        )
 
-        on_exit = market_condition_fields_in_ruleset(open_positions_ruleset_id)
-        assert_no_market_fields(on_exit, f"open-positions ruleset {open_positions_ruleset_id}")
+        exit_where = f"open-positions ruleset {open_positions_ruleset_id}"
+        assert_market_rule_actions_live(ruleset_rule_contents(open_positions_ruleset_id),
+                                        exit_where)
 
         used = market_condition_fields_in_ruleset(enter_market_ruleset_id)
-        if not used:
+        on_exit = market_condition_fields_in_ruleset(open_positions_ruleset_id)
+        if not used and not on_exit:
             return          # no market leaf: any profile setting is fine, including empty
         profiles = parse_profile_setting(
             self._effective_market_condition_profile(expert_instance_id))
-        assert_fields_served(used, profiles,
-                             where=f"enter-market ruleset {enter_market_ruleset_id}")
+        if used:
+            assert_fields_served(used, profiles,
+                                 where=f"enter-market ruleset {enter_market_ruleset_id}")
+        if on_exit:
+            assert_fields_served(on_exit, profiles, where=exit_where)
 
     def _validated_priority(self):
         from ...core.ExpertPriority import validate_expert_priority
@@ -5978,13 +6023,16 @@ class TradeSettingsTab:
         if action_id in self.actions:
             del self.actions[action_id]
     
-    def _refuse_market_gates_on_exit_rule(self, subtype_value, triggers_data, rule_id=None) -> None:
-        """Refuse a market-condition gate on a rule that runs on the OPEN-POSITIONS pass.
+    def _refuse_market_gates_on_exit_rule(self, subtype_value, triggers_data, actions_data,
+                                          rule_id=None) -> None:
+        """Refuse a market-condition gate on a rule that runs on the OPEN-POSITIONS pass, unless
+        the rule only CLOSES, REDUCES or ADJUSTS TP/SL (plan 2026-09-24 Task B2).
 
-        The same failure ``_refuse_market_gates_on_exit_ruleset`` names, caught one door
-        earlier: outside the entry decision pass the live resolver has no context, so the gate
-        reads ``no_context``, the rule NEVER FIRES, and the position's exit or protective-order
-        adjustment silently stops happening.
+        The same check ``_refuse_market_gates_on_exit_ruleset`` makes, one door earlier. On the
+        exit pass a market read that fails is unknown and the rule does not fire: safe for a
+        close, a reduction or a TP/SL adjustment, never for an open, a ``stop_processing`` or a
+        roll/lifecycle action -- so the rule's ACTIONS (``actions_data``, exactly as this save
+        will write them) are part of the question.
 
         TWO QUESTIONS, BECAUSE THE RULE'S OWN SUBTYPE IS ONLY A PROXY.
 
@@ -6005,30 +6053,42 @@ class TradeSettingsTab:
         The link table is consulted only when a gate is actually present, so an ordinary save
         pays for no query.
 
-        The message comes from ``assert_no_market_fields``, the same function the ruleset door
-        and the deploy importer use. One failure, one vocabulary: two wordings would read as two
-        different problems and send the operator looking for two different fixes. The linked
+        AND THE EXPERTS BEHIND THOSE LINKS. A gate this rule carries must be SERVED by the
+        ``market_condition_profile`` of every expert instance (enabled or not, either slot)
+        using a ruleset the rule is linked into -- otherwise it reads ``no_context`` for ever and
+        the exit (or entry) it guards never happens. The expert dialog checks this when a
+        ruleset is attached; this door checks it when a linked rule CHANGES. A rule linked
+        nowhere (a new one) passes.
+
+        The message comes from ``assert_market_rule_actions_live``, the same function the ruleset
+        door and the rules importer use (the deploy importer uses its tree-form twin). One
+        failure, one vocabulary: two wordings would read as two different problems and send the
+        operator looking for two different fixes. The linked
         ruleset is NAMED in it, because "somewhere" is not a place the operator can go and fix.
         """
+        from ba2_common.core.market_condition_live import (
+            assert_market_leaves_served_by_linked_experts,
+        )
+
         fields = market_condition_fields()
-        used = [(key, str(config["event_type"]))
-                for key, config in (triggers_data or {}).items()
+        used = [(key, str(config["event_type"])) for key, config in (triggers_data or {}).items()
                 if config["event_type"] in fields]
         if not used:
             return
 
-        where = f"rule {self.rule_name_input.value!r}"
-        if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value:
-            # A rule being CREATED has no id and no links; its Subtype is all there is.
-            linked = rulesets_for_event_action(rule_id) if rule_id is not None else []
-            exit_rulesets = [rs.name for rs in linked
-                             if rs.subtype is not None
-                             and str(rs.subtype.value) == AnalysisUseCase.OPEN_POSITIONS.value]
-            if not exit_rulesets:
-                return
-            where = (f"{where}, which is linked into open-positions ruleset(s) "
-                     f"{exit_rulesets!r},")
-        assert_no_market_fields(used, where)
+        # A rule being CREATED has no id and no links; its Subtype is all there is.
+        linked = rulesets_for_event_action(rule_id) if rule_id is not None else []
+        where = "open-positions rule"
+        exit_rulesets = [rs.name for rs in linked
+                         if rs.subtype is not None
+                         and str(rs.subtype.value) == AnalysisUseCase.OPEN_POSITIONS.value]
+        if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value and exit_rulesets:
+            where = f"rule linked into open-positions ruleset(s) {exit_rulesets!r}"
+        if str(subtype_value or "") == AnalysisUseCase.OPEN_POSITIONS.value or exit_rulesets:
+            assert_market_rule_actions_live(
+                [(self.rule_name_input.value, triggers_data, actions_data)], where)
+        assert_market_leaves_served_by_linked_experts(
+            used, [rs.id for rs in linked], where=f"rule {self.rule_name_input.value!r}")
 
     def _save_rule(self, rule=None):
         """Save the rule (EventAction)."""
@@ -6057,12 +6117,6 @@ class TradeSettingsTab:
                             return
                 
                 triggers_data[trigger_id] = trigger_config
-
-            # BEFORE any write: a market gate may not ride a rule that runs on the
-            # open-positions pass -- by its own subtype, or by the ruleset it is linked into.
-            self._refuse_market_gates_on_exit_rule(
-                self.rule_subtype_select.value, triggers_data,
-                rule.id if rule is not None else None)
 
             # Collect actions
             actions_data = {}
@@ -6214,6 +6268,14 @@ class TradeSettingsTab:
                         # A field whose every value is an error is worse than no field.
 
                 actions_data[action_id] = action_config
+
+            # BEFORE any write, and AFTER the actions are collected (what the rule DOES is half
+            # the question): a market gate on a rule that runs on the open-positions pass -- by
+            # its own subtype, or by the ruleset it is linked into -- may only close, reduce or
+            # adjust TP/SL.
+            self._refuse_market_gates_on_exit_rule(
+                self.rule_subtype_select.value, triggers_data, actions_data,
+                rule.id if rule is not None else None)
             
             if is_edit:
                 # Update existing rule
@@ -6618,31 +6680,46 @@ class TradeSettingsTab:
         ui.notify(f'{len(chosen)} rule(s) added at the end of the ruleset. '
                   f'Save to keep them.', type='positive')
 
-    def _refuse_market_gates_on_exit_ruleset(self, subtype_value, selected_rule_ids) -> None:
-        """Refuse a market-condition gate on a ruleset destined for the OPEN-POSITIONS slot.
+    def _refuse_market_gates_on_exit_ruleset(self, subtype_value, selected_rule_ids,
+                                             ruleset_id=None) -> None:
+        """Refuse a market-condition gate on a ruleset destined for the OPEN-POSITIONS slot,
+        on any rule that does anything but CLOSE, REDUCE or ADJUST TP/SL (plan 2026-09-24 B2).
 
-        THE WORST OUTCOME IN THIS DESIGN, in ``market_condition_rules``' own words. Outside the
-        entry decision pass the live resolver has no context, so the gate reads ``no_context``,
-        the rule NEVER FIRES, and the position's exit or protective-order adjustment silently
-        stops happening.
+        On the exit pass a market read that fails is unknown and the rule does not fire. That is
+        safe for those actions only; an open, a ``stop_processing`` or a roll/lifecycle action
+        gated on an unknown read changes the position (``assert_market_rule_actions_live``).
 
         The deploy importer gets this refusal from ``trade_rules_to_live_export`` and the expert
         dialog got it in Task 12 -- but the RULES editor is a third door: editing a ruleset that
         is ALREADY assigned to the open-positions slot passes through neither. Checked before
         anything is written, against the rules THIS save selects.
+
+        The gates must also be SERVED by every expert instance already using this ruleset
+        (``ruleset_id``; enabled or not, either slot): the expert dialog checks that on attach,
+        and an edit of a ruleset an unprofiled expert already runs would otherwise add a market
+        exit that reads ``no_context`` for ever. A new ruleset (no id) is linked to nobody. No
+        market leaf, no expert query.
         """
+        from ba2_common.core.market_condition_live import (
+            assert_market_leaves_served_by_linked_experts,
+        )
+
         if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value:
             return
-        fields = market_condition_fields()
-        used = []
+        rules = []
         for rule_id in selected_rule_ids:
             rule = get_instance(EventAction, rule_id)
             if rule is None:
                 continue
-            for key, trigger in (rule.triggers or {}).items():
-                if isinstance(trigger, dict) and trigger.get("event_type") in fields:
-                    used.append((f"{rule.name}.{key}", str(trigger["event_type"])))
-        assert_no_market_fields(used, f"ruleset {self.ruleset_name_input.value!r}")
+            rules.append((rule.name, rule.triggers or {}, rule.actions or {}))
+        where = f"ruleset {self.ruleset_name_input.value!r}"
+        assert_market_rule_actions_live(rules, where)
+        fields = market_condition_fields()
+        used = [(f"{name}.{key}", str(trigger["event_type"]))
+                for name, triggers, _actions in rules for key, trigger in triggers.items()
+                if isinstance(trigger, dict) and trigger.get("event_type") in fields]
+        if used and ruleset_id is not None:
+            assert_market_leaves_served_by_linked_experts(used, [ruleset_id], where=where)
 
     def _save_ruleset(self, ruleset=None):
         """Save the ruleset, and its rules IN THE ORDER THE DIALOG SHOWS THEM.
@@ -6691,7 +6768,8 @@ class TradeSettingsTab:
 
             # BEFORE any write: a market gate may not ride an open-positions ruleset.
             self._refuse_market_gates_on_exit_ruleset(
-                self.ruleset_subtype_select.value, selected_rule_ids)
+                self.ruleset_subtype_select.value, selected_rule_ids,
+                ruleset.id if ruleset is not None else None)
 
             from sqlmodel import delete
             from ...core.models import RulesetEventActionLink

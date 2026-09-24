@@ -8,6 +8,7 @@ and execute appropriate trading actions based on the evaluation results.
 from typing import List, Dict, Any, Optional, Tuple
 from ba2_common.core.TradeConditions import TradeCondition, create_condition
 from ba2_common.core.TradeActions import TradeAction, create_action, AdjustTakeProfitAction, AdjustStopLossAction, IncreaseInstrumentShareAction, DecreaseInstrumentShareAction
+from ba2_common.core.TradeActions import RULESET_STOP_KEPT_REASONS, ruleset_stop_policy, stop_is_long_position
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from ba2_common.core.types import (
@@ -708,14 +709,37 @@ class TradeActionEvaluator:
                                 from ba2_common.core.models import Transaction
                                 transaction = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
                                 if transaction:
-                                    logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}")
-                                    success = self.account.adjust_tp_sl(transaction, tp_price, sl_price, source="ruleset")
-                                    desc = f"Adjusted TP=${tp_price:.2f} and SL=${sl_price:.2f} for {self.instrument_name}"
+                                    # The SAME stop policy the SL-only path applies (ratchet by
+                                    # default; opt-in loosening to the max-loss stop). When the
+                                    # existing stop stands, pass None -- "don't adjust SL" to both
+                                    # AlpacaAccount._adjust_tpsl_internal and
+                                    # BacktestAccount.adjust_tp_sl -- so the TP half still applies
+                                    # and the SL is neither rewritten nor re-sent. The TP is
+                                    # unaffected by the policy.
+                                    requested_sl = sl_price
+                                    sl_price, sl_reason = ruleset_stop_policy(
+                                        transaction, requested_sl,
+                                        stop_is_long_position(transaction, order),
+                                        last_sl_action.resolve_expert,
+                                        price_getter=last_sl_action.get_current_price,
+                                        # compute_price above recorded the rule's pre-floor stop
+                                        rule_price=last_sl_action.rule_price)
+                                    sl_kept = sl_reason in RULESET_STOP_KEPT_REASONS
+                                    sl_to_send = None if sl_kept else sl_price
+                                    logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}"
+                                                + (f" (kept: {sl_reason}; ruleset asked ${requested_sl:.2f})" if sl_kept else ""))
+                                    success = self.account.adjust_tp_sl(transaction, tp_price, sl_to_send, source="ruleset")
+                                    if sl_kept:
+                                        desc = (f"Adjusted TP=${tp_price:.2f} for {self.instrument_name}; "
+                                                f"SL kept at ${sl_price:.2f} ({sl_reason})")
+                                    else:
+                                        desc = f"Adjusted TP=${tp_price:.2f} and SL=${sl_price:.2f} for {self.instrument_name}"
                                     result_dict = {
                                         "action_type": ExpertActionType.ADJUST_TAKE_PROFIT,
                                         "success": success,
                                         "message": desc if success else f"Failed to adjust TP/SL for {self.instrument_name}",
-                                        "data": {"order_id": order.id, "tp_price": tp_price, "sl_price": sl_price},
+                                        "data": {"order_id": order.id, "tp_price": tp_price, "sl_price": sl_price,
+                                                 "sl_requested": requested_sl, "sl_policy": sl_reason},
                                         "description": desc
                                     }
                                     action_results.append(result_dict)

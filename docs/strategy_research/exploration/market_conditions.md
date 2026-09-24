@@ -17,6 +17,9 @@ remains pinned: these shared entry conditions are separate from that older overl
 **Current implementation boundary:** the follow-up driver now exposes both profiles for its
 equity and ETF entry rules. It remains opt-in and requires a pinned manifest for every selected
 profile. Option stage 1 is unchanged. Stage 2 is outside the current review.
+Market-condition **exits** and TP/SL adjustments (`--market-exit`, driver item 6) and
+`--allow-sl-loosen` (item 7) are implemented on feat/pullback-market-exits; the rule contract,
+max-loss stop and stop-loss policy are in [pullback_and_market_exits.md](pullback_and_market_exits.md).
 
 ## Conditions to reuse
 
@@ -59,8 +62,9 @@ For earnings drift, these gates do not introduce a new earnings-calendar entry/e
 The driver implementation now does the following:
 
 1. It factors the registry-derived market-leaf builder into the shared package and appends gates
-   to **each opening rule/tier**, preserving existing OR groups and first-match behavior. Exits,
-   reductions, stop updates and protective actions are never gated.
+   to **each opening rule/tier**, preserving existing OR groups and first-match behavior. Entry
+   gates never gate exits, reductions, stop updates or protective actions; market-driven exits are
+   separate, added rules (item 6).
 2. `run_exploration.py` accepts `--market-condition-profile none|ohlcv-v1|ta-structure-v1|ohlcv-v1,ta-structure-v1`,
    `--market-condition-manifest`, and `--market-condition-mode search|all-off`. `none` remains
    the default and a profile-less manifest is refused. `search` requires the genetic path;
@@ -75,6 +79,45 @@ The driver implementation now does the following:
 5. `--export-universe PATH` writes the union of selected screen symbols and the ETF basket to a
    research subdirectory so the existing warmup tool can prepare one central cache. It does not
    open the database or start jobs.
+6. `--market-exit exit,stop,tp` (a comma list, any order) adds the shared market
+   exit/stop/TP templates **after** each job's existing exit rules, or immediately **before** its
+   first terminal catch-all (see below). Every template rule is **off by
+   default** behind a searched toggle gene: an all-off genome decodes to the job's original exit
+   rules exactly, and only its thresholds and percents are searched (the leaves never switch off).
+   The flag requires a profile, `--search genetic` and `--market-condition-mode search`.
+   - `exit`: a structure close (ta-structure-v1) and a slope close (ohlcv-v1), two independent
+     rules. With one profile only that profile's variant is emitted; the job's
+     `market_exit.rules` lists the rules actually added.
+   - `stop` needs ta-structure-v1 and `tp` needs ohlcv-v1. A kind that none of the selected
+     profiles serves is refused.
+   - **Single direction only.** The templates run on every open position of the expert, so the
+     driver derives one direction per job: `pullback_rsi` from its `direction` setting (checked
+     against its entry action; a searched `direction` is refused), every other family must open
+     only with `buy` (long). A job that both buys and sells, or whose direction cannot be
+     determined, is refused.
+   - A **terminal catch-all** is an exit rule that matches every held position (its tree is empty,
+     or has only `has_position is_true` leaves in AND/OR groups; both the `type`/`operator` and
+     `op`/`comparison` spellings are read) and does not continue processing: the `has_position`
+     floor stops of mid_insider, small_earnings, small_rating and mid_earnings. Templates after it
+     could never run, so they go immediately before the first one; the index is recorded as
+     `market_exit.insert_index`. The catch-all still runs after them (the market adjustments
+     continue processing), and a market close pre-empts it only on a bar where it closes the
+     position. Anything else (e.g. a stop rule gated on another condition) is not a catch-all,
+     and the templates go after it.
+   - **`stop` is omitted before a catch-all that adjusts the stop-loss** (all four families above).
+     A rule pass keeps only its LAST stop-loss action (`TradeActionEvaluator.execute`), and that
+     catch-all fires after the market stop on every bar, so the market stop would always be
+     discarded: its genes searched but dead. In those families `stop` adds nothing; the job's
+     `market_exit.omitted` says why, the preview prints it, and `exit`/`tp` still attach. A
+     selection in which every job omits every requested rule (for example `--market-exit stop`
+     on those families alone) is refused. A catch-all that only closes keeps the stop template.
+   - Condition ids must be unique across all entry and exit rules (ids share genes).
+7. `--allow-sl-loosen` sets the expert setting `allow_ruleset_sl_loosen=True` on every job's
+   experts: a ruleset stop may loosen down to the trade's recorded max-loss stop, never past it.
+   It is independent of `--market-exit` and of the profiles; off, stops only tighten.
+
+Both flags enter a job's fingerprint, name (`-mx_<kinds>`, `-slloosen`) and labels only when set,
+so the default manifests are byte-identical. The launch preview prints both.
 
 The live resolver now selects the subset of a host manifest needed by each expert, so different
 profile sets can coexist on one host. Keep the mixed-profile resolver checks in the deployment
@@ -128,8 +171,11 @@ with matched seeds and fixed economic settings. Test both profiles together only
 single-profile results justify the extra search dimensions. Do not multiply all 193 original
 combinations by every threshold combination; use separate condition-focused GA jobs.
 
-Record the added gene count and explicit search budget; the option defaults do not establish
-adequate search depth for this new campaign. Explicitly evaluate the frozen all-off control;
+Record the added gene count and the search budget. The driver sizes each genetic job from its
+final gene count (population clamp(4 x genes, 24, 120); 25 generations, or 30 above 20 genes;
+early stop 8) and prints it; each profile adds its genes per opening rule (15 per rule with both),
+and market exits add up to 9. Pass `--population`/`--generations`/`--early-stop` to override;
+the option defaults do not establish adequate search depth for this campaign. Explicitly evaluate the frozen all-off control;
 random initialization is not a guarantee that the optimizer visits it.
 
 Compare profit, CAR, maximum drawdown, trade count/frequency, average and peak capital usage,

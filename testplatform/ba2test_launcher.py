@@ -6707,10 +6707,28 @@ def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
 
 
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
-                            last_gen_full_results: Optional[Dict[str, Any]] = None) -> int:
+                            last_gen_full_results: Optional[Dict[str, Any]] = None, *,
+                            candidates: Optional[List[tuple]] = None,
+                            ranks: Optional[List[int]] = None,
+                            name_prefix: str = "TOP",
+                            extra_labels: Optional[List[str]] = None,
+                            use_remote_workers: bool = True,
+                            persisted_ids: Optional[List[tuple]] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
     saved Backtest (best params + their metrics) so the top performers are kept for
     comparison and to warm-start future optimizations. Returns how many were persisted.
+
+    The keyword-only arguments let another SELECTION reuse this exact re-run + persist path
+    (tools/persist_distinct_topn.py, the behaviour-distinct TOP-N). All default to the end-of-job
+    behaviour, so the grid's own call is unchanged:
+      * ``candidates`` -- ``(params, key, ga_fitness)`` tuples to persist INSTEAD of
+        ``_rank_measured_candidates``' fitness-distinct top ``n``;
+      * ``ranks`` -- the rank shown in each row's name, parallel to ``candidates`` (default
+        1..len); ``name_prefix`` -- the name prefix (``TOP`` -> ``TOP3-<opt name>``);
+      * ``extra_labels`` -- appended to the optimization's own labels on every persisted row;
+      * ``use_remote_workers=False`` -- re-run on the local pool only, even when the
+        optimization used remote workers;
+      * ``persisted_ids`` -- a list this appends ``(rank, backtest_id)`` to per persisted row.
 
     The re-runs are the slow post-GA phase (~minutes each at 5min/multi-year). They are
     INDEPENDENT, so with ``parallel`` > 1 they fan out across a bounded local process pool
@@ -6766,8 +6784,17 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         # The selection itself lives in _rank_measured_candidates so that excluding
         # non-measurements (stalled records) is unit-testable -- see the 2026-09-21 review, G1.
         last_gen_full_results = last_gen_full_results or {}
-        ranked, _skipped_non_measured = _rank_measured_candidates(
-            opt.all_results, n, opt.best_params, opt.best_fitness)
+        if candidates is not None:
+            ranked, _skipped_non_measured = list(candidates), 0
+        else:
+            ranked, _skipped_non_measured = _rank_measured_candidates(
+                opt.all_results, n, opt.best_params, opt.best_fitness)
+        if ranks is not None and len(ranks) != len(ranked):
+            raise ValueError(f"ranks ({len(ranks)}) must match the candidates ({len(ranked)})")
+        _labels = list(bt_block.get("labels") or [])
+        for _lab in extra_labels or []:
+            if _lab not in _labels:
+                _labels.append(_lab)
         if _skipped_non_measured:
             print(f"    top-N: skipped {_skipped_non_measured} non-measured (stalled) record(s) "
                   f"-- a stall is a diagnostic, not a candidate")
@@ -6782,11 +6809,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         #    restore the optimized conditions directly. Keys mirror what _derive_export_payload reads.
         ready = []  # (rank, trial_cfg, strategy_params, full_results) -- no re-run needed
         specs = []  # (rank, trial_cfg, strategy_params) -- must be re-run (existing path)
-        for rank, (params, trial_key_, ga_fitness_) in enumerate(ranked, start=1):
+        for _i, (params, trial_key_, ga_fitness_) in enumerate(ranked):
+            rank = ranks[_i] if ranks is not None else _i + 1
             decoded = decode_params(strat, params)
             trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
                                                   option_trade_records=True)  # persisted top-N
-            trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
+            trial_cfg["name"] = f"{name_prefix}{rank}-{opt.name or expert}"
             # Persist this top-N run's trading DB (orders/transactions/recommendations) to disk
             # for post-mortem inspection — the GA trials run RAM-only for speed. The path is keyed
             # by the trial's UNIQUE backtest_id, so concurrent re-runs never collide.
@@ -6829,12 +6857,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
 
         def _persist_one(rank, trial_cfg, strategy_params, out) -> bool:
             if not out or not out.get("ok"):
-                print(f"    TOP{rank} re-run failed: {(out or {}).get('error', 'no result')}")
+                print(f"    {name_prefix}{rank} re-run failed: {(out or {}).get('error', 'no result')}")
                 return False
             bt = Backtest(
                 name=trial_cfg["name"], model_id=None, engine_type="daily_expert",
                 expert_name=expert, optimization_id=opt_id,
-                labels=bt_block.get("labels") or None,
+                labels=_labels or None,
                 strategy_params=strategy_params,
                 start_date=_dt.fromisoformat(str(bt_block["start_date"])),
                 end_date=_dt.fromisoformat(str(bt_block["end_date"])),
@@ -6863,7 +6891,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 _div = rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit)
                 if _div is not None:
                     _pct = "n/a" if _div["pct"] is None else f"{_div['pct']:+.1f}%"
-                    print(f"    !! TOP{rank} RE-RUN DIVERGED from its GA score: "
+                    print(f"    !! {name_prefix}{rank} RE-RUN DIVERGED from its GA score: "
                           f"ga={_div['ga_fitness']:.6g} rerun={_div['rerun_fitness']:.6g} "
                           f"({_pct}). This row is NOT the strategy that earned that rank -- "
                           f"the stored optimization_config or the re-derived screener state has "
@@ -6873,7 +6901,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                     out["results"]["rerun_fitness"] = _div["rerun_fitness"]
                     out["results"]["ga_fitness_divergence"] = _div["delta"]
             except Exception as _e:  # noqa: BLE001 -- never lose a persisted row over telemetry
-                print(f"    TOP{rank} fitness annotation failed: {_e!r}")
+                print(f"    {name_prefix}{rank} fitness annotation failed: {_e!r}")
             _persist_results(db, bt, out["results"])
             # The GA's composite score for this genome (migration 030). It comes from the
             # OPTIMIZER, not the engine, so _persist_results (which maps `results`) cannot
@@ -6884,15 +6912,18 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             bt.is_saved = True  # top performers of a job are kept
             db.commit()
             push_backtest(bt, db)
+            if persisted_ids is not None:
+                persisted_ids.append((rank, bt.id))
             return True
 
         persisted = 0
         for rank, trial_cfg, strategy_params, full_results in ready:
             if _persist_one(rank, trial_cfg, strategy_params, {"ok": True, "results": full_results}):
                 persisted += 1
-                print(f"    persisted TOP{rank} ({persisted}/{len(ranked)}) [no re-run]")
+                print(f"    persisted {name_prefix}{rank} ({persisted}/{len(ranked)}) [no re-run]")
         n_local = max(1, min(int(parallel or 1), len(specs)))
-        remote_workers = _resolve_workers(db, getattr(opt, "worker_ids", None))
+        remote_workers = (_resolve_workers(db, getattr(opt, "worker_ids", None))
+                          if use_remote_workers else [])
         if remote_workers:
             from app.services.self_update import get_version_info
             from app.services.worker_client import ensure_synced
@@ -6943,14 +6974,14 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                     try:
                         out = fut.result()
                     except Exception as exc:  # noqa: BLE001 — a dead remote/local worker must not abort the rest
-                        print(f"    TOP{rk} re-run raised: {exc!r}")
+                        print(f"    {name_prefix}{rk} re-run raised: {exc!r}")
                         continue
                     if _persist_one(rk, tc, sp2, out):
                         persisted += 1
-                        print(f"    persisted TOP{rk} ({persisted}/{len(ranked)})")
+                        print(f"    persisted {name_prefix}{rk} ({persisted}/{len(ranked)})")
             except _FutureTimeout:
                 stuck = [rk for f, (rk, _, _) in futs.items() if not f.done()]
-                print(f"    TOP-N export exceeded {export_timeout:.0f}s -- DROPPING TOP{stuck} "
+                print(f"    TOP-N export exceeded {export_timeout:.0f}s -- DROPPING {name_prefix}{stuck} "
                       f"(persisted {persisted}/{len(ranked)}). A hung re-run must not stop the "
                       f"matrix; the pool is killed rather than waited on.")
         finally:

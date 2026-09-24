@@ -1,10 +1,15 @@
-"""Opt-in equity entry gates and cache-only readiness for the follow-up campaign."""
+"""Opt-in equity entry gates, market exits and cache-only readiness for the follow-up campaign."""
 from __future__ import annotations
 
 from datetime import date
+import logging
 from pathlib import Path
 import re
 import sys
+
+from tools.strategy_research.exploration.profiles import walk
+
+log = logging.getLogger(__name__)
 
 
 def _shared_paths():
@@ -93,6 +98,168 @@ def attach(job, backtest, profiles, pins, mode):
         "fields": [f.to_dict() for p in profiles for f in PROFILES[p].fields],
         "genes": sorted(gene_names), "gene_count": len(gene_names),
     }
+
+
+def exit_selection(kinds, profiles, mode, search):
+    """Validate ``--market-exit`` kinds before any job is built; returns them in canonical order.
+
+    Each requested kind must be served by the selected profiles (refused otherwise). A
+    one-profile selection serves ``exit`` only partly: ta-structure-v1 alone emits only the
+    structure close and ohlcv-v1 alone only the slope close. That is accepted, and the job's
+    ``market_exit.rules`` list names the rules actually emitted."""
+    if not kinds:
+        return ()
+    _shared_paths()
+    from ba2_common.core.market_condition_templates import MARKET_EXIT_KINDS, market_exit_rules
+
+    unknown = [k for k in kinds if k not in MARKET_EXIT_KINDS]
+    if unknown or len(set(kinds)) != len(kinds):
+        raise ValueError(f"--market-exit takes distinct kinds from {','.join(MARKET_EXIT_KINDS)}; got {list(kinds)}")
+    if not profiles:
+        raise ValueError("--market-exit requires --market-condition-profile (the rules read market conditions)")
+    if search != "genetic":
+        raise ValueError("--market-exit searches rule toggles and thresholds: it requires --search genetic")
+    if mode != "search":
+        raise ValueError("--market-exit adds searched genes; --market-condition-mode all-off is the "
+                         "no-impact control and cannot carry them")
+    served_by = {"exit": "ohlcv-v1 (slope close) or ta-structure-v1 (structure close)",
+                 "stop": "ta-structure-v1", "tp": "ohlcv-v1"}
+    for kind in kinds:
+        if not market_exit_rules("probe", profiles, "long", (kind,)):
+            raise ValueError(f"--market-exit {kind}: no rule of this kind reads the selected profile(s) "
+                             f"{','.join(profiles)}; it needs {served_by[kind]}")
+    return tuple(k for k in MARKET_EXIT_KINDS if k in kinds)
+
+
+def job_direction(job, backtest):
+    """The ONE direction every position of this job has: the templates apply to every open
+    position of the expert, so a job that could hold both sides is refused.
+
+    ``pullback_rsi`` declares it in the expert setting ``direction`` (checked against its entry
+    actions); every other family is long-only and must open only with ``buy``."""
+    opens = {a["action_type"] for rule in job["strategy"]["entry_rules"]
+             for a in rule["actions"]} & {"buy", "sell"}
+    where = f"{job['family']}/{job['variant']}"
+    if opens == {"buy", "sell"}:
+        raise ValueError(f"{where}: entry rules both buy and sell; market exits need a single-direction job")
+    if not opens:
+        raise ValueError(f"{where}: no buy or sell entry action, so the position direction is unknown")
+    implied = "long" if opens == {"buy"} else "short"
+    if job["family"] == "pullback_rsi":
+        if "direction" in job["expert_params"]:
+            raise ValueError(f"{where}: direction is searched (expert_params); it must be a fixed "
+                             f"setting for the market exits' single direction")
+        declared = {e["settings"]["direction"] for e in backtest["experts"]}
+        if declared != {implied}:
+            raise ValueError(f"{where}: expert direction {sorted(declared)} disagrees with its "
+                             f"{'/'.join(sorted(opens))} entry actions")
+    elif implied != "long":
+        raise ValueError(f"{where}: {job['family']} is a long-only family but its entry sells")
+    return implied
+
+
+def terminal_catch_all(rule):
+    """True for a TERMINAL CATCH-ALL exit rule: it matches every held position and stops
+    processing, so no rule after it ever runs (the ``has_position`` floor stops).
+
+    "Matches every held position" is exact: the tree is empty, or every leaf is
+    ``has_position is_true`` and every group is AND/OR. Anything else (another leaf, another
+    operator, a NOT group, a truthy ``continue_processing``) is not a catch-all. Both spellings
+    the shared rule models accept are read: a group's ``operator``/``type``, a leaf's
+    ``op``/``comparison``."""
+    if rule.get("continue_processing") or rule.get("continueProcessing"):
+        return False
+
+    def matches_all(node):
+        if not node:
+            return True  # no conditions at all
+        if "conditions" in node:
+            group = node.get("operator") or node.get("type") or "AND"
+            return group in ("AND", "OR") and all(matches_all(c) for c in node["conditions"])
+        return (node.get("field") == "has_position"
+                and (node.get("op") or node.get("comparison")) == "is_true")
+
+    return matches_all(rule.get("conditions"))
+
+
+def _adjusts_stop_loss(rule):
+    return any((a.get("action_type") or a.get("action")) == "adjust_stop_loss" for a in rule["actions"])
+
+
+def refuse_inert_market_exit(jobs):
+    """A selection whose every job omitted every requested market-exit rule would search nothing."""
+    records = [j["optimization_config"]["backtest"]["market_exit"] for j in jobs
+               if "market_exit" in j["optimization_config"]["backtest"]]
+    if records and not any(r["rules"] for r in records):
+        reasons = sorted({reason for r in records for reason in r["omitted"].values()})
+        raise ValueError(f"--market-exit {','.join(records[0]['kinds'])} adds no rule to any selected "
+                         f"job: {reasons}; request exit or tp too, or select other families")
+
+
+def assert_unique_ids(strategy, where):
+    """Genes are keyed by id across the whole strategy: two condition nodes sharing an id share
+    their genes (a B5 review found an entry toggle emptying an exit rule that way). Condition ids
+    must be unique across ALL entry and exit trees, and rule ids unique within each list."""
+    seen, dup = set(), set()
+    for rule in strategy["entry_rules"] + strategy["exit_rules"]:
+        for node in walk(rule.get("conditions")):
+            cid = node.get("id")
+            if cid is not None:
+                (dup if cid in seen else seen).add(cid)
+    for key in ("entry_rules", "exit_rules"):
+        ids = [r["id"] for r in strategy[key] if r.get("id") is not None]
+        dup |= {f"{key}:{i}" for i in ids if ids.count(i) > 1}
+    if dup:
+        raise ValueError(f"{where}: duplicate rule/condition ids {sorted(dup)}; they would share genes")
+
+
+def attach_exits(job, backtest, profiles, kinds, direction=None):
+    """Add the off-by-default market exit/stop/TP templates to the job's exit rules.
+
+    They go AFTER the existing exit rules, except that they go immediately BEFORE the first
+    :func:`terminal_catch_all` rule, which would otherwise shadow them. The catch-all still runs
+    after them: the market adjustments continue processing, and a market close pre-empts it only
+    on a bar where it closes the position (a skipped stop update is then moot).
+
+    THE STOP TEMPLATE IS OMITTED before a catch-all that itself adjusts the stop-loss:
+    ``TradeActionEvaluator.execute`` keeps only the LAST stop-loss action of a pass, and the
+    catch-all runs after the market stop on every bar, so the market stop would always be
+    discarded (its genes searched but dead). ``market_exit.omitted`` records why; exit and tp
+    still attach. ``direction`` defaults to :func:`job_direction`; a given one must equal it."""
+    if not kinds:
+        return
+    _shared_paths()
+    from ba2_common.core.market_condition_rules import assert_market_rule_actions
+    from ba2_common.core.market_condition_templates import market_exit_rules
+
+    derived = job_direction(job, backtest)
+    if direction is not None and direction != derived:
+        raise ValueError(f"{job['family']}/{job['variant']}: direction {direction!r} but the job is {derived}")
+    exits = job["strategy"]["exit_rules"]
+    at = next((i for i, r in enumerate(exits) if terminal_catch_all(r)), len(exits))
+    omitted = {}
+    if "stop" in kinds and at < len(exits) and _adjusts_stop_loss(exits[at]):
+        omitted["stop"] = (f"catch-all exit rule {exits[at].get('id')!r} adjusts the stop-loss after it "
+                           f"on every bar, and a pass keeps only its last stop-loss action")
+        log.info("%s/%s: market stop omitted: %s", job["family"], job["variant"], omitted["stop"])
+    prefix = f"research-{job['family']}-exit"
+    kept = tuple(k for k in kinds if k not in omitted)
+    rules = market_exit_rules(prefix, profiles, derived, kept) if kept else []
+    if not rules and not omitted:
+        raise ValueError(f"{job['family']}: the selected profiles serve none of {list(kinds)}")
+    exits[at:at] = rules
+    assert_unique_ids(job["strategy"], f"{job['family']}/{job['variant']}")
+    assert_market_rule_actions(exits, f"{job['family']}/{job['variant']} exit rules")
+    genes = []
+    for rule in rules:
+        genes.append(f"exit:{rule['id']}:enabled")
+        genes += [f"cond:{leaf['id']}:value" for leaf in rule["conditions"]["conditions"] if leaf.get("optimize")]
+        genes += [f"exit:{rule['id']}:a{i}:action_value"
+                  for i, a in enumerate(rule["actions"]) if a.get("action_value_optimize")]
+    backtest["market_exit"] = {"kinds": list(kinds), "direction": derived,
+                               "rules": [r["id"] for r in rules], "default": "off", "insert_index": at,
+                               "omitted": omitted,
+                               "genes": sorted(genes), "gene_count": len(genes)}
 
 
 def preflight(backtest, cache_root):

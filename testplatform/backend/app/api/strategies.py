@@ -144,17 +144,19 @@ def _resolve_rule_lists(payload) -> tuple:
     """(entry_rules, exit_rules) from a create/update payload: the unified lists when given
     (normalized), else the legacy trio converted via the shared trade_rules_from_legacy.
 
-    THE canonical save path, and therefore where a market-condition gate on an exit ruleset is
-    refused (design 2026-09-15 section 6): such a leaf can only ever prevent an exit, a reduction
-    or a protective-order adjustment, and live it would read ``no_context`` and never pass at all
-    -- a stop-loss rule that silently cannot fire. Entry rules are unrestricted here: a SAVED
-    strategy is allowed to carry the optimizer template (``mode_optimize``); it is the EXPORT and
-    the DEPLOY that require a resolved one.
+    THE canonical save path, and therefore where a market-condition gate on an exit rule is
+    checked (plan 2026-09-24 Task B2): it may only CLOSE, REDUCE or ADJUST TP/SL, and only from a
+    top-level AND of leaves -- on the exit pass a failed read is unknown and the rule does not
+    fire, which is safe for those actions and for nothing else. Neither side is checked for
+    RESOLVED leaves here: a SAVED strategy is allowed to carry the optimizer template
+    (``mode_optimize``) on entry and exit rules alike; it is the EXPORT and the DEPLOY that
+    require a resolved one.
     """
-    from ba2_common.core.market_condition_rules import assert_no_market_conditions
+    from ba2_common.core.market_condition_rules import assert_market_rule_actions
     from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
 
     if payload.entry_rules is not None or payload.exit_rules is not None:
+        raw_exits = payload.exit_rules
         entry, exits = (normalize_trade_rules(payload.entry_rules or []),
                         normalize_trade_rules(payload.exit_rules or []))
     elif any(getattr(payload, f, None) is not None for f in
@@ -166,11 +168,16 @@ def _resolve_rule_lists(payload) -> tuple:
             entry_actions=payload.entry_actions,
             exit_conditions=payload.exit_conditions,
         )
+        raw_exits = payload.exit_conditions
         entry, exits = converted["entry_rules"], converted["exit_rules"]
     else:
         return None, None
     try:
-        assert_no_market_conditions(exits, "exit_rules")
+        # The list as SENT as well: normalizing coerces an unknown group operator (a NOT) to AND,
+        # which would hide exactly the nesting the check refuses.
+        if isinstance(raw_exits, list):
+            assert_market_rule_actions(raw_exits, "exit_rules")
+        assert_market_rule_actions(exits, "exit_rules")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return entry, exits

@@ -400,6 +400,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "volatility awareness the take-profit has; the stop is already "
                                "ATR-scaled. 1.0 = no change. Requires regime_overlay_enabled."
                 },
+                # Ruleset stop policy (TradeActions.ruleset_stop_policy). Off = the ratchet every
+                # expert has always had: a ruleset stop only tightens. Deliberately NOT a forced
+                # backtest setting (deploy_parity) nor an inert toggle: a genome may set it, and
+                # it travels with the other expert settings on export/deploy.
+                "allow_ruleset_sl_loosen": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Let ruleset rules move a stop-loss further away (up to the "
+                                   "trade's max-loss stop). Off: stops only tighten.",
+                    "tooltip": "Off (default): a ruleset adjust_stop_loss may only tighten an "
+                               "existing stop. On: it may also loosen it, down to (up to, for "
+                               "shorts) the max-loss stop recorded at entry (the stop the "
+                               "position was sized on) and never past it. Trades with no "
+                               "recorded max-loss stop are never loosened, and the SL "
+                               "minimum-distance floor never turns a tightening rule into a "
+                               "loosen. Manual edits and the Smart Risk Manager are unaffected."
+                },
                 # AI Model Settings
                 "risk_manager_model": {
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",

@@ -322,6 +322,45 @@ def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     return triggers
 
 
+def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
+    """:func:`triggers_from_condition_tree` for ONE enabled TradeRule, refusing the two drops
+    that turn a rule fail-OPEN. Used where a TradeRule list becomes EventActions: the backtest
+    seeder (``default_rulesets.seed_ruleset_from_rules``) and the live export
+    (``rules_convert.trade_rules_to_live_export``), so both refuse the same rules.
+
+    * The tree has at least one leaf but ZERO triggers came out. Empty triggers are ALWAYS TRUE:
+      an exit rule would close every position on every pass. No author means that.
+    * A MARKET-CONDITION leaf was dropped (fewer market triggers than market leaves). The rule
+      would run without its gate: a different strategy under the same name.
+
+    A partial drop of ordinary (non-market) leaves is NOT refused. That is the long-standing
+    behaviour of :func:`triggers_from_condition_tree` (logged at WARNING), and existing rulesets
+    rely on it. A tree with no leaf at all (``None``, or an empty group) is not refused either:
+    that rule was authored with no condition, or a decode removed every leaf, and this function
+    cannot tell which.
+    """
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
+    triggers = triggers_from_condition_tree(tree) if tree else {}
+    leaves = list(tree_leaves(tree))
+    if leaves and not triggers:
+        raise ValueError(
+            f"{where}: none of the rule's {len(leaves)} condition leaf/leaves "
+            f"{[leaf.get('id') or leaf.get('field') for leaf in leaves]!r} produced a trigger "
+            f"(unknown field or missing value). A rule with no trigger is ALWAYS TRUE: it would "
+            f"fire on every position. Fix or remove the leaves.")
+    fields = market_condition_fields()
+    market_leaves = [leaf for leaf in leaves if leaf.get("field") in fields]
+    market_triggers = [t for t in triggers.values() if t.get("event_type") in fields]
+    if len(market_triggers) < len(market_leaves):
+        raise ValueError(
+            f"{where}: {len(market_leaves) - len(market_triggers)} of the rule's "
+            f"{len(market_leaves)} market-condition leaf/leaves "
+            f"{[leaf.get('id') or leaf.get('field') for leaf in market_leaves]!r} produced no "
+            f"trigger. The rule would run without its market gate.")
+    return triggers
+
+
 # Strategy rule option_* field -> the action-config key the ``TradeActionEvaluator`` reads
 # when constructing an option ``TradeAction`` (see TradeActionEvaluator._create_trade_action:
 # it forwards strike_method/strike_param/dte_min/dte_max/sizing/min_open_interest/max_spread_pct

@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict, Callable, Type
 from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
+import threading
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation
@@ -4193,6 +4194,14 @@ class MarketConditionCompare(CompareCondition):
     a resolver returning a non-context (``TypeError``), a feature row that does not carry
     ``FIELD`` (``LookupError`` -- leaves are placed by profile, so this is a launcher/reader
     bug), and any exception from the reader or recorder.
+
+    EXCEPT ON A LIVE EXIT PASS (``market_condition_live.current_exit_pass()`` is set): there an
+    exception from ``reader.observe`` and the missing-field ``LookupError`` read UNKNOWN
+    (``no_context``, the cause in the reason) instead of raising, because one raising leaf
+    aborts the whole ruleset evaluation for the symbol and skips every stop, take-profit and
+    close rule of the position. They are still defects, so they stay LOUD: an ERROR with the
+    traceback once per (expert, field, exception type) per process, then a WARNING each time.
+    The entry pass and the backtest are unchanged: both still raise.
     """
 
     #: Canonical market-condition field name (== ExpertEventType value). Set by the factory.
@@ -4224,6 +4233,34 @@ class MarketConditionCompare(CompareCondition):
                      self.FIELD, self.instrument_name, status, reason)
         return False
 
+    def _unknown_on_exit_pass(self, exc: BaseException) -> bool:
+        """Call ONLY from an ``except`` block handling ``exc``. Outside a live exit pass,
+        re-raise it unchanged (entry pass, backtest, ruleset test page). On an exit pass, read
+        unknown with the cause in the reason, loudly (see the class docstring)."""
+        from ba2_common.core.market_condition_live import current_exit_pass
+
+        exit_pass = current_exit_pass()
+        if exit_pass is None:
+            raise
+        # DELIBERATELY broad, named so it survives BA2_ERROR_MODE=enforce: on an exit pass no
+        # market-condition defect may stop the position's other exit rules. The refusals
+        # failure_modes never absorbs still propagate.
+        absorb_if_benign(exc, Exception)
+        expert_id = exit_pass.expert_instance_id
+        reason = (f"market-condition leaf {self.FIELD} for {self.instrument_name} could not be "
+                  f"evaluated on the open-positions pass of expert instance {expert_id} "
+                  f"({type(exc).__name__}: {exc}): a market-condition wiring defect; the gate is "
+                  f"unknown and never passes, every other exit rule still runs")
+        key = (expert_id, self.FIELD, type(exc).__name__)
+        with _exit_pass_leaf_errors_lock:
+            first = key not in _exit_pass_leaf_errors_reported
+            _exit_pass_leaf_errors_reported.add(key)
+        if first:
+            logger.error(reason, exc_info=exc)
+        else:
+            logger.warning(reason + " (repeat of an error already logged with its traceback)")
+        return self._unknown(_MC_STATUS_NO_CONTEXT, reason)
+
     def evaluate(self) -> bool:
         global _warned_no_market_condition_resolver
         ctx = resolve_market_condition_context(self.account, self.instrument_name,
@@ -4238,7 +4275,7 @@ class MarketConditionCompare(CompareCondition):
             resolver = _market_condition_context_resolver
             if resolver is not None:
                 # A resolver IS installed but has no context for this evaluation (live: a leaf
-                # outside the enter-market decision scope). Never raise -- exit rulesets must keep
+                # outside a market-condition decision scope). Never raise -- exit rulesets must keep
                 # running -- but say so ONCE per cause instead of a DEBUG line per evaluation.
                 reason = getattr(resolver, "no_context_reason", None) or \
                     "the installed market-condition resolver has no context for this evaluation"
@@ -4262,17 +4299,23 @@ class MarketConditionCompare(CompareCondition):
                 return self._unknown(_MC_STATUS_NO_CONTEXT, reason)
             return self._unknown(_MC_STATUS_NO_CONTEXT, NO_MARKET_CONDITION_CONTEXT_REASON)
         session = ctx.prior_session
-        values = ctx.reader.observe(self.instrument_name, session)
+        try:
+            values = ctx.reader.observe(self.instrument_name, session)
+        except Exception as e:
+            return self._unknown_on_exit_pass(e)   # re-raises unless on a live exit pass
         if values is None:
             return self._unknown(_MC_STATUS_MISSING_SESSION,
                                  f"no feature row for {self.instrument_name} at {session}")
         by_field = values.by_field()
         obs = by_field.get(self.FIELD)
         if obs is None:
-            raise LookupError(
-                f"feature row for {self.instrument_name} at {session} carries no {self.FIELD!r} "
-                f"(row fields: {sorted(by_field)!r}) -- the reader was not built for this "
-                f"field's profile")
+            try:
+                raise LookupError(
+                    f"feature row for {self.instrument_name} at {session} carries no "
+                    f"{self.FIELD!r} (row fields: {sorted(by_field)!r}) -- the reader was not "
+                    f"built for this field's profile")
+            except LookupError as e:
+                return self._unknown_on_exit_pass(e)   # re-raises unless on a live exit pass
         if obs.status != _MC_STATUS_VALID:
             return self._unknown(obs.status, obs.reason)
         self.calculated_value = obs.value
@@ -4312,6 +4355,12 @@ _warned_no_market_condition_resolver = False
 #: one WARNING per distinct CAUSE per process, not per field -- a per-symbol coverage
 #: reason is a different failure from "no decision scope is open".
 _warned_no_market_condition_context_fields: set = set()
+
+#: ``(expert instance id, field, exception type name)`` whose exit-pass leaf evaluation error was
+#: already logged at ERROR with its traceback (``MarketConditionCompare._unknown_on_exit_pass``).
+#: Per PROCESS: a persistent wiring defect logs its traceback once, then WARNING lines.
+_exit_pass_leaf_errors_reported: set = set()
+_exit_pass_leaf_errors_lock = threading.Lock()
 
 #: Re-exported, not re-typed. The table lives beside ``FieldSpec`` in ``market_conditions``
 #: because the rule EDITOR has to offer exactly what this class accepts: a second copy here is a

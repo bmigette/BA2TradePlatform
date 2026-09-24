@@ -112,6 +112,79 @@ def resolve_universe(bt):
     return symbols, store_files
 
 
+def expert_class(name):
+    """The expert class ``name`` from ``ba2_experts.<name>``, as ``execute_ready`` resolves it.
+
+    Never through the backtest handler's registry: importing ``app.*`` imports
+    ``app.models.database``, which binds its engine to ``DATABASE_URL`` AT IMPORT, so a
+    preflight doing it before ``execute_ready`` sets ``--db-file`` would send every row of the
+    run to the default test database."""
+    add_source_paths()
+    module_name = "ba2_experts." + name
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            raise  # the expert exists but one of ITS imports is missing: not an unknown name
+        raise ValueError(f"Unknown expert class {name!r}: there is no module {module_name}") from exc
+    if not isinstance(getattr(module, name, None), type):
+        raise ValueError(f"Unknown expert class {name!r}: {module_name} defines no class {name}")
+    return getattr(module, name)
+
+
+def database_url(database):
+    """The ``DATABASE_URL`` the backend binds to for a checked ``--db-file`` path."""
+    return "sqlite:///" + Path(database).as_posix()
+
+
+def reference_requirements(bt):
+    """``{symbol: end_slack_days}`` for the daily histories this run's experts read on every
+    decision besides the traded symbols' own: each expert's ``REFERENCE_DAILY_SYMBOLS`` (an
+    expert without the attribute requires nothing extra). The history must reach within the
+    expert module's ``MAX_STALE_DAYS`` of the window end, the staleness the expert itself
+    refuses. Reference symbols are never added to the traded universe."""
+    out = {}
+    for spec in bt["experts"]:
+        cls = expert_class(spec["class"])
+        symbols = getattr(cls, "REFERENCE_DAILY_SYMBOLS", ())
+        if not symbols:
+            continue
+        module = sys.modules[cls.__module__]
+        if not hasattr(module, "MAX_STALE_DAYS"):
+            raise ValueError(f"{cls.__name__} declares REFERENCE_DAILY_SYMBOLS but its module has "
+                             "no MAX_STALE_DAYS: the reference history's end bound is unknown")
+        for symbol in symbols:
+            out[symbol] = min(out.get(symbol, module.MAX_STALE_DAYS), module.MAX_STALE_DAYS)
+    return dict(sorted(out.items()))
+
+
+def opens_equity_short(job):
+    """True when a job depends on a `sell` ENTRY opening a short (``enable_short`` plus an entry
+    rule with a `sell` action). The engine cannot do that yet: ba2_common's
+    ``TradeActions.SellAction`` only sells an existing long ("No long position to sell"), so the
+    RM's enable_sell gate, which ``enable_short`` forces on, is never reached."""
+    bt = job["optimization_config"]["backtest"]
+    return bool(bt.get("enable_short")) and any(
+        action["action_type"] == "sell"
+        for rule in job["strategy"]["entry_rules"] for action in rule["actions"])
+
+
+def refuse_unrunnable(jobs):
+    """Refuse the whole selection, before any job starts, when a job could never trade: every
+    trial would score a strategy that never opened a position."""
+    bad = [job["name"] for job in jobs if opens_equity_short(job)]
+    if bad:
+        raise ValueError(
+            f"equity short entries cannot open yet (SellAction only sells an existing long), so "
+            f"{len(bad)} selected job(s) would never trade: {bad}; select the long variants")
+
+
+def _covers(lo, hi, needed, end, end_slack_days):
+    """History ``lo..hi`` covers ``needed..end``: 30 days of start slack (listing/holiday
+    alignment), ``end_slack_days`` at the end."""
+    return lo <= needed + timedelta(days=30) and hi >= end - timedelta(days=end_slack_days)
+
+
 def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     """Check price coverage and pinned features without fetching any market data.
 
@@ -122,6 +195,7 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
 
     ready = deepcopy(job)
     bt = ready["optimization_config"]["backtest"]
+    refuse_unrunnable([job])  # also a child's own check; main() refuses the selection first
     cache_dir = Path(cache_dir).resolve()
     start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
     if not cache_dir.is_dir():
@@ -129,9 +203,26 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
     symbols, store_files = resolve_universe(bt)
     intervals = tuple(dict.fromkeys(("1d", bt["execution_interval"])))
     files = [cache_dir / f"{symbol}_{interval}.parquet" for symbol in symbols for interval in intervals]
+    references = reference_requirements(bt)
+    reference_files = [cache_dir / f"{symbol}_1d.parquet" for symbol in references]
+    files += [p for p in reference_files if p not in files]
     missing = [str(p) for p in files if not p.is_file()]
     if missing:
         raise ValueError(f"{len(missing)} missing OHLCV files; no symbols silently removed: {missing[:12]}")
+    reference_coverage = {}
+    for (symbol, end_slack), path in zip(references.items(), reference_files):
+        # Every decision reads it: checked in full, not sampled, and it must reach the window
+        # end within the expert's own staleness bound (a stale reference aborts the run).
+        dates = pd.to_datetime(pd.read_parquet(path, columns=["Date"])["Date"], utc=True)
+        if dates.empty or dates.isna().any():
+            raise ValueError(f"Empty/invalid dates: {symbol} 1d (reference)")
+        lo, hi = dates.min().date(), dates.max().date()
+        needed = start - timedelta(days=bt["warmup_days"])
+        if not _covers(lo, hi, needed, end, end_slack):
+            raise ValueError(f"Reference {symbol} 1d covers {lo} to {hi}; every decision reads it, "
+                             f"so it must start by {needed + timedelta(days=30)} and end by "
+                             f"{end - timedelta(days=end_slack)}")
+        reference_coverage[symbol] = {"first": str(lo), "last": str(hi)}
     sampled = random.Random(bt["seed"]).sample(symbols, min(sample, len(symbols)))
     coverage = {interval: {"covered": 0, "eligible": 0, "late_listing": 0, "failures": []}
                 for interval in intervals}
@@ -159,7 +250,7 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
                 record["late_listing"] += 1
                 continue
             record["eligible"] += 1
-            if overlaps and lo <= needed + timedelta(days=30) and hi >= end - timedelta(days=30):
+            if overlaps and _covers(lo, hi, needed, end, 30):
                 record["covered"] += 1
             else:
                 record["failures"].append(symbol)
@@ -174,6 +265,8 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
                 "code_signature": code_signature(),
                 "cache_signature": fingerprint([(str(p), p.stat().st_size, p.stat().st_mtime_ns)
                                                  for p in sorted(files + store_files)])}
+    if reference_coverage:  # absent for every default family: their evidence is unchanged
+        evidence["reference_coverage"] = reference_coverage
     from tools.strategy_research.exploration.market_conditions import preflight as condition_preflight
     conditions = condition_preflight(bt, cache_dir.parent)
     if conditions is not None:
@@ -241,6 +334,8 @@ def persist_top(db, opt, job):
             params["market_condition"] = deepcopy(block["market_condition"])
             params["market_condition_profiles"] = list(block["market_condition_profiles"])
             params["market_condition_manifests"] = dict(block["market_condition_manifests"])
+        if "market_exit" in block:
+            params["market_exit"] = deepcopy(block["market_exit"])
         if bt is None:
             bt = Backtest(name=name, model_id=None, engine_type="daily_expert", expert_name=job["expert"],
                           optimization_id=opt.id, labels=block["labels"], strategy_params=params,
@@ -277,7 +372,7 @@ def persist_top(db, opt, job):
 def execute_ready(job, database, *, resume=False):
     """Only called after explicit --run and successful cache preflight."""
     database = check_database(database)
-    os.environ["DATABASE_URL"] = "sqlite:///" + database.as_posix()
+    os.environ["DATABASE_URL"] = database_url(database)
     add_source_paths()
     import ba2test_launcher as launcher
     launcher._enter_backend()
@@ -288,7 +383,7 @@ def execute_ready(job, database, *, resume=False):
     from app.services.strategy_param_space import collect_param_space
     from types import SimpleNamespace
 
-    expert_cls = getattr(importlib.import_module("ba2_experts." + job["expert"]), job["expert"])
+    expert_cls = expert_class(job["expert"])
     definitions = expert_cls.get_merged_settings_definitions()
     settings = job["optimization_config"]["backtest"]["experts"][0]["settings"]
     unknown = (set(settings) | set(job["optimization_config"]["expert_params"])) - set(definitions)

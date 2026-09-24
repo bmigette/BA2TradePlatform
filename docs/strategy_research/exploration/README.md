@@ -8,7 +8,7 @@ every job its own $10,000 account. Option grids are separate
 | Page | Contents |
 |---|---|
 | this README | families, capital/execution contract, preview/launch runbook, ETF semantics |
-| [market_conditions.md](market_conditions.md) | the opt-in market-condition ENTRY-gate campaign (ohlcv-v1 / ta-structure-v1) |
+| [market_conditions.md](market_conditions.md) | the opt-in market-condition campaign: ENTRY gates, and `--market-exit` exits (ohlcv-v1 / ta-structure-v1) |
 | [pullback_and_market_exits.md](pullback_and_market_exits.md) | planned: literal pullback expert (long/short) and market-condition EXITS |
 
 Code: [tools/strategy_research/exploration/](../../../tools/strategy_research/exploration/).
@@ -39,6 +39,7 @@ configured remote workers. Jobs run sequentially in separate processes.
 | `pullback` | RSI period 2/3/5 and hold 3/5/10 days in separate jobs; buy threshold 0.15/0.25/0.35. Daily entry, fixed stop and costs. | 9 | 27 |
 | `analyst_targets` | Hold 15/30/60 days; target window 30/60/90 days; minimum 3/5 observations. Analyst/technical blend fixed at 80/20. | 3 | 18 |
 | `etf_trend` | Prior-month momentum 126/252 bars, positive return and above SMA200; top 1/2 eligible funds. | 2 | 4 |
+| `pullback_rsi` | **Opt-in extension, not in the default 35 jobs.** The literal [PullbackReversion](../../../packages/experts/ba2_experts/PullbackReversion.py) expert on the new-idea large-cap screen, daily entry: `long_sma5`, `long_choch`, `long_rsi` (SMA200 trend; exit on SMA5, SMA5 or a bearish CHoCH, or RSI 60/70), `short_sma5`, `short_spy` (SMA200, plus SPY below its SMA200). RSI period 2/3, entry threshold 5/10/15, max hold 5/10 days. Stop −8% (a short's sits 8% above), no profit target; the reverse signal closes first, then the time limit. **Only the 3 long jobs (48 of the 72 combinations) are runnable today.** The two short jobs are placeholders until equity shorts can open: the `sell` action only sells an existing long, so `--preflight`/`--run` refuse any selection that includes one, before its first job starts. | 5 | 72 |
 
 Six explicit controls preserve the original rule semantics. Other fixed settings are
 snapshotted in [baselines_20260907.json](../../../tools/strategy_research/exploration/baselines_20260907.json),
@@ -130,13 +131,16 @@ python tools/strategy_research/exploration/run_exploration.py --preflight
 python tools/strategy_research/exploration/run_exploration.py --run
 ```
 
-Preview is the default and uses only the standard library. It opens no database and starts
+Preview is the default and uses only the standard library (selecting `pullback_rsi` also imports
+its expert class, to derive the settings it inherits). It opens no database and starts
 no backtest. It writes the full manifest under `reports/strategy_research/<campaign hash>/`.
 `--output-dir` can place artifacts elsewhere; the repository root itself is rejected.
 
 `--preflight` reads the existing screener/OHLCV caches. It resolves the actual fixed-screen
 union, requires all selected symbols' daily and execution-interval files, and samples up
-to 150 symbols for warmup/start/end coverage. The default gate is 75% of eligible symbols;
+to 150 symbols for warmup/start/end coverage. `pullback_rsi` jobs also require `SPY_1d.parquet`
+over the whole warmup-to-end window: PullbackReversion reads SPY on every decision (it is not
+added to the traded universe). The default gate is 75% of eligible symbols;
 late listing dates are reported separately using daily history as an existence proxy.
 This is an early coverage gate, not a complete audit of every intraday gap or fundamental
 record. It never fetches missing data. The engine still requires prewarmed fundamental,
@@ -154,8 +158,37 @@ Useful subsets and optional genetic mode:
 python tools/strategy_research/exploration/run_exploration.py --families mid_ds small_earnings --dry-run
 python tools/strategy_research/exploration/run_exploration.py --families mid_ds --variants control --run
 python tools/strategy_research/exploration/run_exploration.py --families etf_trend --etf-symbols SPY IEF TLT GLD --preflight
-python tools/strategy_research/exploration/run_exploration.py --search genetic --population 24 --generations 4 --workers remote227 --parallel 0 --run
+python tools/strategy_research/exploration/run_exploration.py --families pullback_rsi --variants long_sma5 long_choch long_rsi --preflight
+python tools/strategy_research/exploration/run_exploration.py --search genetic --workers remote227 --parallel 0 --run
 ```
+
+In genetic mode each job's budget scales with the genes its final manifest searches (counted by
+the GA's own collector, after the market entry gates and market exits are attached; one-point
+ranges are not genes): 25 generations, or 30 above 20 genes; early stop after 8 generations
+without improvement; population 4 x genes, within 24..120. The preview and launch lines print
+each job's gene count and budget, and `optimization_config` records `geneCount` and
+`budgetSource`. `--population`, `--generations` and `--early-stop` override the derived values
+for every job; an early stop outside 1..generations is refused. A base family has 1-4 genes (24
+population, 25 generations); with both profiles and `--market-exit exit,stop,tp` a job has 22-38
+(88-120 population, 30 generations). Grid mode is unchanged (24 x 4, ignored by the exhaustive
+handler) and rejects `--early-stop`.
+
+Market exits and stop loosening (both opt-in; see [market_conditions.md](market_conditions.md)):
+
+```powershell
+python tools/strategy_research/exploration/run_exploration.py --families pullback_rsi mid_ds --search genetic `
+  --market-condition-profile ohlcv-v1,ta-structure-v1 --market-condition-manifest ohlcv-v1=<digest>,ta-structure-v1=<digest> `
+  --market-exit exit,stop,tp --allow-sl-loosen --dry-run
+```
+
+`--market-exit` adds market exit/stop/TP rules after each job's exit rules, each off by
+default behind a searched toggle. When a job ends with a floor stop that matches every position
+and stops processing (mid_insider, small_earnings, small_rating, mid_earnings), the rules go
+immediately before it instead, and the `stop` rule is omitted there: that floor stop's own
+stop-loss would replace it on every bar. It needs a profile and `--search genetic`, and it is
+valid only for single-direction jobs (a job that buys and sells is refused).
+`--allow-sl-loosen` lets ruleset stops loosen down to the trade's max-loss stop. Neither flag
+changes the default manifest.
 
 Worker names must exist in the test application's worker settings. Remote hosts must have
 this code, including `ETFTrend`, and matching prewarmed data installed before launch. The
@@ -200,7 +233,7 @@ deterministic rule membership, not a probability of earning a profit; expected p
 because the expert does not forecast a price target.
 
 Pullbacks use an RSI-weighted **blended score**, not a literal `RSI < 20 AND close > SMA200`
-rule. Analyst-target scoring retains the existing fixed blend of target drift and implied
+rule; the opt-in `pullback_rsi` family is the literal version. Analyst-target scoring retains the existing fixed blend of target drift and implied
 upside; it is not a pure analyst-upgrade event measure. Both FMPRating and the analyst-target
 experiment start no earlier than **2022-01-01**. Other families default to 2020-01-01 through
 2025-12-31. Those years have already been searched and are not a fresh holdout. Compare
@@ -212,7 +245,9 @@ results before considering a shared-account allocation.
 ```powershell
 cd testplatform/backend
 python -m pytest tests/test_research6_driver.py tests/test_research10_market_conditions.py `
-  tests/test_launcher_market_condition_profile.py tests/backtest/test_etf_trend.py -q
+  tests/test_research_pullback_rsi.py tests/test_research_market_exits.py `
+  tests/test_launcher_market_condition_profile.py -q
+python -m pytest tests/backtest/test_etf_trend.py -q
 ```
 
 Tests cover exact search dimensions, source rules, settings recognition, schedules, caps,

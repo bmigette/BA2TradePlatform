@@ -65,7 +65,8 @@ _ba2_db.configure_db(LIVE_DB)
 
 from ba2_common.core.db import add_instance, get_instance, update_instance  # noqa: E402
 from ba2_common.core.market_condition_rules import (  # noqa: E402
-    PROFILE_SETTING, assert_market_fields_served, parse_profile_setting,
+    PROFILE_SETTING, assert_market_conditions_resolved, assert_market_fields_served,
+    assert_market_rule_actions, parse_profile_setting,
 )
 from ba2_common.core.deploy_parity import (  # noqa: E402
     SCREENER_UNIVERSE_SETTING, live_settings_from_universe, unmapped_screener_keys,
@@ -181,17 +182,26 @@ def main() -> int:
         # profile key (the universe block, the RM toggles, the forced instrument-selection method
         # and the schedule all write other names), so checking it here checks what gets saved.
         #
-        # The exit ruleset is not checked: ``trade_rules_to_live_export`` below already refuses a
-        # market leaf anywhere on it (``assert_no_market_conditions``).
+        # The EXIT rules too (plan 2026-09-24 Task B2), for the same reason and in the same place:
+        #   * an unserved exit leaf reads unknown for ever -- the exit it guards never happens;
+        #   * a market leaf on an exit rule that does more than close or adjust TP/SL, or that
+        #     sits under OR/NOT, is refused (``assert_market_rule_actions``);
+        #   * an unresolved optimizer template on EITHER side is refused.
+        # ``trade_rules_to_live_export`` below runs the last two again, but only AFTER a new
+        # instance has been created -- a refusal there would leave that instance behind.
         try:
             mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
             assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
+            assert_market_fields_served(exit_rules, mc_profiles, where=f"{label}: exit rules")
+            assert_market_rule_actions(exit_rules, f"{label}: exit rules")
+            assert_market_conditions_resolved(entry_rules, f"{label}: entry rules")
+            assert_market_conditions_resolved(exit_rules, f"{label}: exit rules")
         except ValueError as e:
             print(f"FATAL: {label}: {e}")
             return 1
         if mc_profiles:
             print(f"market-condition profile(s): {list(mc_profiles)} (every market gate in the "
-                  f"entry rules is served)")
+                  f"entry and exit rules is served)")
 
         created = False
         if inst_id is None:
@@ -221,9 +231,11 @@ def main() -> int:
         print(f"current rulesets: enter={old_enter} open={old_open}")
 
         # The converter REFUSES a payload this platform must not run: an unresolved optimizer
-        # mode gene, a market-condition gate on an open-positions ruleset, or a market field this
-        # installation has no event type for (older than the payload -- importing would drop the
-        # gate and trade the strategy ungated). Nothing is written for this entry.
+        # mode gene, a market-condition gate on an exit rule that does more than close or adjust
+        # TP/SL (both already refused above, before anything was written), or a market field
+        # this installation has no event type for (older than the payload -- importing would drop
+        # the gate and trade the strategy ungated). No RULESET is written for this entry; an
+        # instance created above for it (``target_instance_id`` null) is not rolled back.
         try:
             live_export = trade_rules_to_live_export(entry_rules, exit_rules, name=label)
         except ValueError as e:

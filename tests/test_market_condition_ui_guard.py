@@ -10,11 +10,13 @@ Three things are pinned here:
 
 * the refusal fires in BOTH directions (a gated ruleset attached under an empty setting; the
   setting cleared under a ruleset that is already gated);
-* the OPEN-POSITIONS slot refuses a market leaf outright, whatever the profile says. Outside the
-  entry decision pass the live resolver has no context, so such a leaf reads ``no_context`` and
-  its rule never fires -- an exit or protective-order adjustment that silently stops happening.
-  The importer gets that refusal from ``trade_rules_to_live_export``; the dialog can attach an
-  EXISTING gated ruleset to that slot without converting anything, so it needs its own;
+* the OPEN-POSITIONS slot refuses a market leaf on any rule that does more than CLOSE, REDUCE or
+  ADJUST TP/SL, whatever the profile says (plan 2026-09-24 Task B2 -- before it, any market leaf
+  there was refused). On the exit pass a failed read is unknown and the rule does not fire,
+  which is safe for those actions only. The importer gets that refusal from
+  ``trade_rules_to_live_export``; the dialog can attach an EXISTING gated ruleset to that slot
+  without converting anything, so it needs its own. An allowed exit leaf must also be SERVED by
+  the profile setting, like an entry leaf;
 * a profile the dialog could not READ is never written back as the widget's empty default, and a
   save that repoints a ruleset while the setting is unknowable is refused rather than unjudged.
 
@@ -36,21 +38,38 @@ STATE = "structure_state"
 #: What ``market_condition_fields_in_ruleset`` returns for a gated ruleset.
 GATED = (("entry.cond_1", ADX),)
 
+#: What a gated open-positions rule may and may not DO (plan 2026-09-24 Task B2).
+BUY = {"a0": {"action_type": "buy"}}
+CLOSE = {"a0": {"action_type": "close"}}
+REFUSED = "may not use"
+
 
 @pytest.fixture
 def tab(monkeypatch):
-    """An ExpertSettingsTab with a working profile select and a stubbed ruleset reader."""
+    """An ExpertSettingsTab with a working profile select and stubbed ruleset readers: the
+    ``(label, field)`` pairs, and the ``(name, triggers, actions)`` rule contents."""
     import ba2_common.core.market_condition_live as live
 
     rulesets: dict = {}
+    contents: dict = {}
     monkeypatch.setattr(live, "market_condition_fields_in_ruleset",
                         lambda rid: rulesets.get(rid, ()))
+    monkeypatch.setattr(live, "ruleset_rule_contents", lambda rid: contents.get(rid, ()))
 
     t = object.__new__(ExpertSettingsTab)
     t.market_condition_profile_select = SimpleNamespace(value="", options=[])
     t._market_condition_profile_loaded = True
     t.rulesets = rulesets
+    t.contents = contents
     return t
+
+
+def _gated_exit_ruleset(tab, rid, actions):
+    """Ruleset ``rid``: one rule ``entry`` gated on ADX (trigger ``cond_1``) doing ``actions``."""
+    tab.rulesets[rid] = GATED
+    tab.contents[rid] = (("entry", {"cond_0": {"event_type": "profit_loss_percent"},
+                                    "cond_1": {"event_type": ADX, "operator": "<",
+                                               "value": 20.0}}, actions),)
 
 
 def _set_profile(tab, value):
@@ -103,21 +122,41 @@ def test_a_comma_list_serving_the_leaf_passes(tab):
 
 
 # --------------------------------------------------------------------------- the exit door (M7)
-def test_a_market_leaf_on_the_open_positions_ruleset_is_refused_whatever_the_profile(tab):
-    """No profile makes this legal: outside the entry pass the resolver has no context, the rule
-    never fires, and the position's exit or protective-order adjustment silently stops."""
-    tab.rulesets[9] = GATED
+def test_a_market_leaf_on_an_open_positions_buy_rule_is_refused_whatever_the_profile(tab):
+    """No profile makes this legal: on the exit pass a failed read is unknown and the rule does
+    not fire, which is safe for a close/reduce/TP-SL adjustment and never for an open."""
+    _gated_exit_ruleset(tab, 9, BUY)
     for profile in ("", "ohlcv-v1", "ohlcv-v1,ta-structure-v1"):
         _set_profile(tab, profile)
         with pytest.raises(ValueError) as e:
             tab._refuse_unserved_market_gates(None, 9)
-        assert "open-positions" in str(e.value) and "entry.cond_1" in str(e.value)
+        msg = str(e.value)
+        assert "open-positions" in msg and "entry" in msg and "cond_1" in msg
+        assert REFUSED in msg and "'buy'" in msg
+
+
+def test_a_market_leaf_on_an_open_positions_close_rule_passes_when_served(tab):
+    """Plan 2026-09-24 B2: a market EXIT may be attached to the open-positions slot."""
+    _gated_exit_ruleset(tab, 9, CLOSE)
+    _set_profile(tab, "ohlcv-v1")
+    assert tab._refuse_unserved_market_gates(None, 9) is None
+
+
+def test_an_allowed_exit_leaf_no_profile_serves_is_refused(tab):
+    """Unserved, the exit leaf reads unknown for ever and the exit it guards never happens --
+    the same silence the entry half of this check exists to prevent."""
+    _gated_exit_ruleset(tab, 9, CLOSE)
+    for profile in ("", "ta-structure-v1"):
+        _set_profile(tab, profile)
+        with pytest.raises(ValueError) as e:
+            tab._refuse_unserved_market_gates(7, 9)
+        assert "open-positions ruleset 9" in str(e.value) and ADX in str(e.value)
 
 
 def test_the_exit_door_is_checked_even_when_the_entry_ruleset_is_ungated(tab):
     """It is checked FIRST, so an ungated entry ruleset cannot short-circuit past it."""
     tab.rulesets[7] = ()
-    tab.rulesets[9] = GATED
+    _gated_exit_ruleset(tab, 9, BUY)
     with pytest.raises(ValueError, match="open-positions"):
         tab._refuse_unserved_market_gates(7, 9)
 
@@ -238,23 +277,38 @@ def rules_tab(monkeypatch):
     return store
 
 
-def _rule(rid, name, event_type):
+def _rule(rid, name, event_type, actions=BUY):
     return SimpleNamespace(id=rid, name=name,
-                           triggers={"cond_0": {"event_type": event_type}})
+                           triggers={"cond_0": {"event_type": event_type}}, actions=actions)
 
 
-def test_a_market_gate_on_an_open_positions_ruleset_is_refused(rules_tab):
-    """market_condition_rules calls this the worst outcome in the whole design: outside the entry
-    pass the gate reads no_context, the rule never fires, and the position's exit or protective
-    order adjustment silently stops happening."""
+def test_a_market_gate_on_an_open_positions_buy_rule_is_refused(rules_tab):
+    """On the exit pass a failed market read is unknown and the rule does not fire: safe for a
+    close, a reduction or a TP/SL adjustment (plan 2026-09-24 B2), never for an open."""
     rules_tab[1] = _rule(1, "stop-loss", "profit_loss_percent")
     rules_tab[2] = _rule(2, "gated", ADX)
     tab = _RulesTab(rules_tab)
     with pytest.raises(ValueError) as e:
         tab._refuse("open_positions", [1, 2])
     msg = str(e.value)
-    assert "gated.cond_0" in msg and "open-positions / exit ruleset" in msg
+    assert "'gated'" in msg and "cond_0" in msg and REFUSED in msg and "'buy'" in msg
     assert "stop-loss" not in msg
+
+
+@pytest.mark.parametrize("action", ["close", "decrease_instrument_share",
+                                    "adjust_stop_loss", "adjust_take_profit"])
+def test_a_market_gate_on_an_open_positions_rule_that_closes_reduces_or_adjusts_saves(
+        rules_tab, action):
+    rules_tab[1] = _rule(1, "stop-loss", "profit_loss_percent")
+    rules_tab[2] = _rule(2, "market exit", ADX, actions={"a0": {"action_type": action}})
+    assert _RulesTab(rules_tab)._refuse("open_positions", [1, 2]) is None
+
+
+def test_a_market_gate_beside_a_roll_is_refused_on_an_open_positions_ruleset(rules_tab):
+    rules_tab[2] = _rule(2, "gated roll", ADX, actions={"a0": {"action_type": "close"},
+                                                        "a1": {"action_type": "roll_pmcc_short"}})
+    with pytest.raises(ValueError, match="'roll_pmcc_short'"):
+        _RulesTab(rules_tab)._refuse("open_positions", [2])
 
 
 def test_an_ordinary_open_positions_ruleset_saves(rules_tab):
@@ -301,8 +355,8 @@ def test_the_refusal_runs_before_any_write_in_save_ruleset():
 
 
 def test_both_halves_of_the_exit_refusal_still_hold(rules_tab):
-    """N1 relaxed the MENU only. The exit-slot refusal is what actually stops a gate reaching an
-    open-positions ruleset, and it is unchanged."""
+    """N1 relaxed the MENU only. The exit-slot refusal is what actually stops a gated OPEN (or any
+    action beyond close/reduce/adjust) reaching an open-positions ruleset."""
     rules_tab[2] = _rule(2, "gated", ADX)
-    with pytest.raises(ValueError, match="open-positions / exit ruleset"):
+    with pytest.raises(ValueError, match=REFUSED):
         _RulesTab(rules_tab)._refuse("open_positions", [2])

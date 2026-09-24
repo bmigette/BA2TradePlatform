@@ -300,6 +300,32 @@ class TestSettingsSurviveTheRoundTripUnchanged:
         apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
         assert self._settings(inst.id)["enable_buy"] is False
 
+    @pytest.mark.parametrize("stored", [True, 1], ids=["bool", "ga-int-gene"])
+    def test_the_ruleset_sl_loosen_setting_survives_and_still_reads_on(self, seeded, stored):
+        """allow_ruleset_sl_loosen (plan 2026-09-24 Task B4) is an ordinary bool setting: it
+        must travel with the expert, and the value the stop policy READS must come back True --
+        including from the GA's integer 1, the spelling that used to read back False."""
+        from ba2_trade_platform.core.TradeActions import ruleset_sl_loosen_allowed
+
+        inst = seeded["instance"]
+        get_expert_instance_from_id(inst.id).save_settings({"allow_ruleset_sl_loosen": (stored, None)})
+        payload = build_batch_export([inst.id])
+        assert payload["experts"][0]["expert_settings"]["allow_ruleset_sl_loosen"] is True
+        apply_batch_import(plan_batch_import(payload))
+        assert self._settings(inst.id)["allow_ruleset_sl_loosen"] is True
+        expert = get_expert_instance_from_id(inst.id)
+        expert._invalidate_settings_cache()
+        assert ruleset_sl_loosen_allowed(expert) is True
+
+    def test_the_ruleset_sl_loosen_setting_defaults_off_after_a_round_trip(self, seeded):
+        from ba2_trade_platform.core.TradeActions import ruleset_sl_loosen_allowed
+
+        inst = seeded["instance"]
+        apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
+        expert = get_expert_instance_from_id(inst.id)
+        expert._invalidate_settings_cache()
+        assert ruleset_sl_loosen_allowed(expert) is False
+
     def test_a_zero_is_not_lost_as_if_unset(self, seeded):
         inst = seeded["instance"]
         get_expert_instance_from_id(inst.id).save_settings({"min_analysts": (0, None)})
