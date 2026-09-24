@@ -33,7 +33,7 @@ from nicegui import ui
 
 from ...core.db import get_db
 from ...core.option_pnl_display import (
-    UNAVAILABLE_INCOMPLETE, option_closed_pnl, option_transaction_pnl, quote_caching_account,
+    UNAVAILABLE_INCOMPLETE, open_structure_pnl, option_closed_pnl, quote_caching_account,
     unavailable_pnl,
 )
 from ...core.option_positions import opening_legs
@@ -399,25 +399,15 @@ class OptionTradesTab:
                 current_pnl = unavailable_pnl(
                     f'{UNAVAILABLE_INCOMPLETE}: ' + '; '.join(leg_set.incomplete_reasons))
             elif is_open:
-                # The representative: for a STRUCTURE it is the parent (the seam resolves the
-                # legs itself), for a single contract it is that contract's own order. The
-                # count is passed too, so the seam is chosen by the structure (review R1).
-                if leg_set.is_multi_leg:
-                    representative = leg_set.representative_order()
-                else:
-                    # The real ORDER, not the normalised leg: the seam resolves the
-                    # transaction from the order it is handed.
-                    representative = leg_set.legs[0].order if leg_set.legs else first_order
-                if representative is not None and account_id:
+                if account_id:
                     account_inst = get_account_instance_from_id(account_id, session=session)
                     if account_inst is not None:
                         # One quote per (account, contract) for the whole refresh, shared by
                         # the pricing seam and the Current column (second review, N5).
                         account_inst = quote_caching_account(
                             account_inst, self._quote_snapshot, account_id)
-                        priced = option_transaction_pnl(
-                            account_inst, representative, opening_legs=leg_set.count,
-                        )
+                        # The one display rule, shared with the Floating P/L cards.
+                        priced = open_structure_pnl(account_inst, txn, orders, leg_set=leg_set)
                         current_pnl = priced
                         if leg_set.count == 1:
                             quote = self._contract_quote(account_inst, leg_set.legs[0])

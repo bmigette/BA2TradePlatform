@@ -430,10 +430,21 @@ class _FloatingPLWidgetBase:
 
         pl_by_name: Dict[str, float] = {name: 0.0 for name in names}
         unpriced_by_name: Dict[str, List[str]] = {name: [] for name in names}
+        # One quote per option contract for this whole refresh.
+        option_quotes: Dict = {}
 
         for trans, display_name in trans_list:
             try:
-                measured = self._transaction_pl(trans, prices, session)
+                orders = session.exec(
+                    select(TradingOrder)
+                    .where(TradingOrder.transaction_id == trans.id)
+                    .order_by(TradingOrder.created_at)
+                ).all()
+                if any(getattr(order, 'contract_symbol', None) for order in orders):
+                    measured = self._option_transaction_pl(
+                        trans, orders, account, account_id, option_quotes)
+                else:
+                    measured = self._transaction_pl(trans, prices, session)
             except Exception as e:
                 logger.error(f"Error calculating P/L for transaction {trans.id}: {e}",
                              exc_info=True)
@@ -453,6 +464,30 @@ class _FloatingPLWidgetBase:
                       unpriced=tuple(unpriced_by_name[name]),
                       tradable=tradable, broker_bp=broker_bp)
                 for name in names]
+
+    @staticmethod
+    def _option_transaction_pl(trans: Transaction, orders, account, account_id,
+                               quotes: Dict) -> Optional[float]:
+        """An OPTION transaction's floating P/L, or ``None`` if it holds but is unquoted.
+
+        Through ``open_structure_pnl`` -- the Options tab's own rule (option premium, contract
+        multiplier, spreads at their net premium) -- never the equity formula below, which
+        looks the transaction's UNDERLYING up in the broker's book: an option book holds the
+        contract, so every structure read "no broker price for GILD". A structure whose entry
+        has not executed holds nothing and contributes a measured zero, like a resting equity
+        order.
+        """
+        from ...core.option_pnl_display import (
+            UNAVAILABLE_FLAT, UNAVAILABLE_NO_FILLS, open_structure_pnl, quote_caching_account,
+        )
+        priced = open_structure_pnl(quote_caching_account(account, quotes, account_id),
+                                    trans, orders)
+        if priced.available:
+            return priced.amount
+        if priced.reason in (UNAVAILABLE_NO_FILLS, UNAVAILABLE_FLAT):
+            return 0.0
+        logger.warning(f"Option transaction {trans.id} ({trans.symbol}) not priced: {priced.reason}")
+        return None
 
     def _transaction_pl(self, trans: Transaction, prices: Dict[str, float],
                         session: Session) -> Optional[float]:
