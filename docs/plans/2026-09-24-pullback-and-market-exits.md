@@ -459,3 +459,30 @@ A1 → A2 → A3 → B1 → B2 → B3 → B4 → B5 → B6 → B7 → B8.
 
 A and B are independent up to B6. B6 needs A3 only for its exploration tests. Run tasks strictly
 in sequence: one implementer at a time.
+
+### Task A4 (added 2026-09-24, operator): GA budget for the exploration grid
+
+**Decision:** "20/30 generations with early stop is a better approach; fitness keeps climbing
+after gen 20 on the option grid."
+
+**Today:** `run_exploration.py` defaults to `--population 24 --generations 4`, and
+`profiles.build_manifest` sets `earlyStoppingGenerations = generations`, so early stopping never
+fires. The option grid uses `--early-stop 8` (`tools/stage1_run.sh`).
+
+**Change:**
+- **New flag:** `--early-stop N` (patience in generations).
+- **Genetic mode only:** when `--search genetic` and the user passed neither `--generations` nor
+  `--early-stop`, default to generations=25 and early_stop=8. Explicit values always win. Record the
+  resolved values in `optimization_config.earlyStoppingGenerations` and in the job fingerprint.
+- **Grid mode:** keeps today's config values, so the default (grid) campaign's manifest fingerprint
+  stays byte-identical (`test_research10_market_conditions.py:36`).
+- **Validation:** `early_stop >= 1` and `early_stop <= generations`.
+- **Launch line:** print the resolved budget (population x generations, early stop).
+- **Docs:** update README's genetic example and market_conditions.md's search-budget note.
+
+**Tests:**
+- genetic defaults resolve to 25/8;
+- explicit flags win;
+- grid-mode fingerprint unchanged;
+- `early_stop > generations` is refused;
+- the value reaches `optimization_config`.
