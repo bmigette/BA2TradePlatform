@@ -347,8 +347,7 @@ def test_preflight_never_imports_the_backend_database_module(tmp_path):
 
 
 def test_run_child_binds_the_db_file_before_preflight(monkeypatch, tmp_path):
-    monkeypatch.delenv("DATABASE_URL", raising=False)  # restored after the test either way
-    monkeypatch.delenv("CACHE_FOLDER", raising=False)
+    from unittest import mock
     database = (tmp_path / "chosen.db").resolve()
     job = jobs()["long_sma5"]
     job_file = tmp_path / "job.json"
@@ -364,8 +363,15 @@ def test_run_child_binds_the_db_file_before_preflight(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "check_database", lambda path: Path(path).resolve())
     monkeypatch.setattr(D, "preflight", capture)
     monkeypatch.setattr(D, "execute_ready", forbidden)
-    assert D.main(["--job-file", str(job_file), "--db-file", str(database),
-                   "--cache-dir", str(tmp_path / "FMPOHLCVProvider")]) == 1
+    before = dict(os.environ)
+    # run_child writes DATABASE_URL and CACHE_FOLDER into os.environ; patch.dict snapshots the
+    # whole environment and restores it on exit, removing variables that were absent before.
+    with mock.patch.dict(os.environ):
+        os.environ.pop("DATABASE_URL", None)  # so the captured value can only be run_child's
+        os.environ.pop("CACHE_FOLDER", None)
+        assert D.main(["--job-file", str(job_file), "--db-file", str(database),
+                       "--cache-dir", str(tmp_path / "FMPOHLCVProvider")]) == 1
+    assert dict(os.environ) == before
     assert seen["url"] == R.database_url(database) == "sqlite:///" + database.as_posix()
 
 
