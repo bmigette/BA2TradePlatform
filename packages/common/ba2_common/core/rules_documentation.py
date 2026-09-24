@@ -683,11 +683,11 @@ def get_action_type_documentation() -> dict:
         },
         ExpertActionType.ADJUST_STOP_LOSS.value: {
             "name": "Adjust Stop Loss",
-            "description": "Modify the stop-loss price for an existing open position. Used to protect profits or limit losses based on price movement and market conditions.",
+            "description": "Modify the stop-loss price for an existing open position. Used to protect profits or limit losses based on price movement and market conditions. A rule only TIGHTENS an existing stop; a looser request keeps the current stop, unless the expert setting allow_ruleset_sl_loosen is on, which lets it loosen down to the trade's max-loss stop (the stop it was sized on) and no further.",
             "use_cases": [
                 "Raise stop-loss as price moves up (trailing stop)",
                 "Tighten stop-loss when approaching target",
-                "Loosen stop-loss if conviction increases",
+                "Loosen stop-loss if conviction increases (requires allow_ruleset_sl_loosen; never past the max-loss stop)",
                 "Move stop-loss to breakeven after certain profit threshold"
             ],
             "parameters": "Requires reference value (order_open_price, current_price, expert_target_price) and percentage/amount adjustment",
