@@ -159,8 +159,19 @@ python tools/strategy_research/exploration/run_exploration.py --families mid_ds 
 python tools/strategy_research/exploration/run_exploration.py --families mid_ds --variants control --run
 python tools/strategy_research/exploration/run_exploration.py --families etf_trend --etf-symbols SPY IEF TLT GLD --preflight
 python tools/strategy_research/exploration/run_exploration.py --families pullback_rsi --variants long_sma5 long_choch long_rsi --preflight
-python tools/strategy_research/exploration/run_exploration.py --search genetic --population 24 --generations 4 --workers remote227 --parallel 0 --run
+python tools/strategy_research/exploration/run_exploration.py --search genetic --workers remote227 --parallel 0 --run
 ```
+
+In genetic mode each job's budget scales with the genes its final manifest searches (counted by
+the GA's own collector, after the market entry gates and market exits are attached; one-point
+ranges are not genes): 25 generations, or 30 above 20 genes; early stop after 8 generations
+without improvement; population 4 x genes, within 24..120. The preview and launch lines print
+each job's gene count and budget, and `optimization_config` records `geneCount` and
+`budgetSource`. `--population`, `--generations` and `--early-stop` override the derived values
+for every job; an early stop outside 1..generations is refused. A base family has 1-4 genes (24
+population, 25 generations); with both profiles and `--market-exit exit,stop,tp` a job has 22-38
+(88-120 population, 30 generations). Grid mode is unchanged (24 x 4, ignored by the exhaustive
+handler) and rejects `--early-stop`.
 
 Market exits and stop loosening (both opt-in; see [market_conditions.md](market_conditions.md)):
 

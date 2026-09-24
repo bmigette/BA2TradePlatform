@@ -167,8 +167,11 @@ with matched seeds and fixed economic settings. Test both profiles together only
 single-profile results justify the extra search dimensions. Do not multiply all 193 original
 combinations by every threshold combination; use separate condition-focused GA jobs.
 
-Record the added gene count and explicit search budget; the option defaults do not establish
-adequate search depth for this new campaign. Explicitly evaluate the frozen all-off control;
+Record the added gene count and the search budget. The driver sizes each genetic job from its
+final gene count (population clamp(4 x genes, 24, 120); 25 generations, or 30 above 20 genes;
+early stop 8) and prints it; each profile adds its genes per opening rule (15 per rule with both),
+and market exits add up to 9. Pass `--population`/`--generations`/`--early-stop` to override;
+the option defaults do not establish adequate search depth for this campaign. Explicitly evaluate the frozen all-off control;
 random initialization is not a guarantee that the optimizer visits it.
 
 Compare profit, CAR, maximum drawdown, trade count/frequency, average and peak capital usage,

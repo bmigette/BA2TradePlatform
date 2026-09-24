@@ -7,10 +7,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
+import functools
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
+from types import SimpleNamespace
 
 DEPLOYED_FAMILIES = ("large_ds", "mid_insider", "small_earnings", "mid_ds",
                      "mid_earnings", "small_rating")
@@ -22,6 +25,17 @@ EXTENSION_FAMILIES = ("pullback_rsi",)
 ALL_FAMILIES = FAMILIES + EXTENSION_FAMILIES
 SNAPSHOT = Path(__file__).with_name("baselines_20260907.json")
 SCHEMA_VERSION = 1
+
+#: Grid mode's budget, written unchanged (the default manifest's fingerprint is pinned). The
+#: exhaustive grid handler ignores it.
+GRID_POPULATION, GRID_GENERATIONS = 24, 4
+#: Genetic mode (plan 2026-09-24, Task A4): the budget scales with the job's searched genes.
+GA_GENERATIONS, GA_GENERATIONS_LARGE, GA_LARGE_ABOVE_GENES = 25, 30, 20
+GA_EARLY_STOP = 8
+GA_POPULATION_PER_GENE, GA_POPULATION_MIN, GA_POPULATION_MAX = 4, 24, 120
+#: The GA's own gene collector. It imports only ba2_common and the stdlib, so it is loaded by
+#: path and the backend ``app`` package is never imported (preflight must not import it).
+COLLECTOR = Path(__file__).resolve().parents[3] / "testplatform/backend/app/services/strategy_param_space.py"
 
 
 def fingerprint(value):
@@ -79,6 +93,74 @@ def interface_settings(settings, expert_cls):
     declared = expert_cls.get_merged_settings_definitions()
     own = expert_cls.get_settings_definitions()
     return {k: v for k, v in settings.items() if k in declared and k not in own}
+
+
+@functools.lru_cache(maxsize=None)
+def param_space_module():
+    """``strategy_param_space`` loaded by file path under a private name (never ``app.*``)."""
+    from tools.strategy_research.exploration.market_conditions import _shared_paths
+    _shared_paths()
+    spec = importlib.util.spec_from_file_location("_research10_strategy_param_space", COLLECTOR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def searched_genes(strategy, expert_params):
+    """The genes the GA searches for this job, by the GA's own collector.
+
+    ``expert_params`` is split exactly as ``strategy_optimization_handler`` splits it
+    (``screener:``/``schedule:`` prefixes go to their own namespaces). One-point ranges
+    (min == max, e.g. a fixed control's sizing placeholder) search nothing and are dropped.
+    No exploration family uses a bypass expert (FactorRanker), for which the handler would
+    drop the rule genes; a test pins that."""
+    model = {k: v for k, v in expert_params.items() if not k.startswith(("screener:", "schedule:"))}
+    screener = {k[len("screener:"):]: v for k, v in expert_params.items() if k.startswith("screener:")}
+    schedule = {k[len("schedule:"):]: v for k, v in expert_params.items() if k.startswith("schedule:")}
+    space = param_space_module().collect_param_space(
+        SimpleNamespace(**strategy), expert_cfg=model or None,
+        screener_cfg=screener or None, schedule_cfg=schedule or None)
+    return sorted(name for name, spec in space.items() if spec["min"] != spec["max"])
+
+
+def ga_budget(genes, population=None, generations=None, early_stop=None):
+    """Genetic-mode budget for a job with ``genes`` searched genes; explicit values win.
+
+    Returns ``(budget, source)``: the three optimization_config values, and for each whether it
+    was derived ("auto") or passed ("explicit"). Generations: 25, or 30 above 20 genes.
+    Population: clamp(4 x genes, 24, 120). Early stop: 8, capped at the generations when only
+    ``generations`` was passed below 8; an explicit early stop above the generations is refused."""
+    auto_generations = GA_GENERATIONS_LARGE if genes > GA_LARGE_ABOVE_GENES else GA_GENERATIONS
+    budget = {
+        "populationSize": population if population is not None else min(
+            max(GA_POPULATION_PER_GENE * genes, GA_POPULATION_MIN), GA_POPULATION_MAX),
+        "generations": generations if generations is not None else auto_generations,
+    }
+    budget["earlyStoppingGenerations"] = (early_stop if early_stop is not None
+                                          else min(GA_EARLY_STOP, budget["generations"]))
+    if not 1 <= budget["earlyStoppingGenerations"] <= budget["generations"]:
+        raise ValueError(f"early stop {budget['earlyStoppingGenerations']} must be between 1 and "
+                         f"the generations ({budget['generations']})")
+    passed = {"populationSize": population, "generations": generations,
+              "earlyStoppingGenerations": early_stop}
+    return budget, {k: "auto" if v is None else "explicit" for k, v in passed.items()}
+
+
+def budget_text(job):
+    """One line for the preview and launch output: a genetic job's genes and resolved budget."""
+    oc = job["optimization_config"]
+    if "geneCount" not in oc:
+        return ""
+    if job["fixed"]:
+        return "budget: none; a fixed recipe evaluated once (0 searched genes)"
+    bt = oc["backtest"]
+    parts = [f"{name} {bt[key]['gene_count']}" for key, name in
+             (("market_condition", "market entry"), ("market_exit", "market exit")) if key in bt]
+    explicit = [k for k, v in oc["budgetSource"].items() if v == "explicit"]
+    return (f"budget: genes={oc['geneCount']}" + (f" (incl. {', '.join(parts)})" if parts else "")
+            + f" population={oc['populationSize']} generations={oc['generations']}"
+            + f" early_stop={oc['earlyStoppingGenerations']}"
+            + (f" explicit={','.join(explicit)}" if explicit else ""))
 
 
 def pullback_reversion_class():
@@ -322,7 +404,7 @@ def variants(family, baseline):
 
 def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                    start="2020-01-01", end="2025-12-31", search="grid",
-                   population=24, generations=4, parallel=1, seed=42,
+                   population=None, generations=None, early_stop=None, parallel=1, seed=42,
                    workers=(), save_top=5, store=None, spread_bps=None, etf_symbols=None,
                    market_condition_profile="none", market_condition_manifest=None,
                    market_condition_mode="search", market_exit=(), allow_sl_loosen=False):
@@ -331,15 +413,26 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
     ``market_exit`` (kinds from exit/stop/tp) appends the off-by-default market exit templates to
     every job's exit rules; ``allow_sl_loosen`` sets the expert setting
     ``allow_ruleset_sl_loosen``. Both enter the job identity only when set, so the default
-    manifests are byte-identical."""
+    manifests are byte-identical.
+
+    Search budget: grid mode writes population 24 / generations 4 (or the explicit values) with
+    ``earlyStoppingGenerations = generations``, exactly as before. Genetic mode sizes each job
+    from its searched genes in the FINAL manifest (:func:`searched_genes`, :func:`ga_budget`)
+    and also records ``geneCount`` and ``budgetSource``; explicit values always win."""
     if not families or len(set(families)) != len(families) or not set(families) <= set(ALL_FAMILIES):
         raise ValueError("Select distinct, known strategy families")
     if equity <= 0 or (equity_cap is not None and equity_cap <= 0):
         raise ValueError("Equity and the optional equity cap must be positive")
     if date.fromisoformat(start) > date.fromisoformat(end):
         raise ValueError("Start must be on or before end")
-    if search not in ("grid", "genetic") or population < 2 or generations < 1 or parallel < 0 or save_top < 1:
+    if (search not in ("grid", "genetic") or (population is not None and population < 2)
+            or (generations is not None and generations < 1) or parallel < 0 or save_top < 1):
         raise ValueError("Invalid search budget")
+    if early_stop is not None:
+        if search != "genetic":
+            raise ValueError("--early-stop applies to --search genetic only (an exhaustive grid has no generations)")
+        if early_stop < 1 or (generations is not None and early_stop > generations):
+            raise ValueError(f"Early stop must be between 1 and the generations; got {early_stop}")
     if search == "grid" and workers:
         raise ValueError("The existing exhaustive-grid handler is local/serial; use --search genetic for remote workers")
     from tools.strategy_research.exploration.market_conditions import (
@@ -392,16 +485,34 @@ def build_manifest(*, families=FAMILIES, equity=10000.0, equity_cap=10000.0,
                 # range preserves the actual sizing value and evaluates the control once.
                 value = settings["risk_per_trade_pct"]
                 expert_params["risk_per_trade_pct"] = numeric_range(value, value, 1)
+            if search == "genetic":
+                genes = searched_genes(job["strategy"], expert_params)
+                # B5/B6 record the market genes they add; they must be genes the GA searches.
+                recorded = {g for key in ("market_condition", "market_exit") if key in bt
+                            for g in bt[key]["genes"]}
+                if not recorded <= set(genes):
+                    raise ValueError(f"{family}/{job['variant']}: recorded market genes the GA would not "
+                                     f"search: {sorted(recorded - set(genes))}")
+                try:
+                    budget, source = ga_budget(len(genes), population, generations, early_stop)
+                except ValueError as exc:
+                    raise ValueError(f"{family}/{job['variant']} ({len(genes)} genes): {exc}") from None
+            else:
+                budget = {"populationSize": GRID_POPULATION if population is None else population,
+                          "generations": GRID_GENERATIONS if generations is None else generations}
+                budget["earlyStoppingGenerations"] = budget["generations"]
             job.update(source=deepcopy(baseline["source"]), fixed=fixed,
                        expert=bt["experts"][0]["class"], fitness_metric="consistent_annual_return",
                        optimization_type="brute_force" if fixed or search == "grid" else "genetic",
                        worker_names=list(workers), save_top=1 if fixed else save_top,
                        optimization_config={
-                           "populationSize": population, "generations": generations,
+                           "populationSize": budget["populationSize"], "generations": budget["generations"],
                            "crossoverProb": 0.6, "mutationProb": 0.3,
-                           "earlyStoppingGenerations": generations, "elitismPercent": 10,
+                           "earlyStoppingGenerations": budget["earlyStoppingGenerations"], "elitismPercent": 10,
                            "parallelIndividuals": parallel, "seed": seed,
                            "expert_params": expert_params, "backtest": bt})
+            if search == "genetic":  # only here: grid manifests stay byte-identical
+                job["optimization_config"].update(geneCount=len(genes), budgetSource=source)
             digest = fingerprint(job)[:12]
             options = ""  # only when set: the default names are unchanged
             if market_exit:

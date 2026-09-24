@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 from tools.strategy_research.exploration.market_conditions import refuse_inert_market_exit
 from tools.strategy_research.exploration.profiles import (
-    ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, build_manifest, fingerprint)
+    ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, budget_text, build_manifest, fingerprint)
 from tools.strategy_research.exploration.runtime import (
     check_database, database_url, execute_ready, job_lock, preflight, refuse_unrunnable,
     resolve_universe, write_json)
@@ -42,8 +42,15 @@ def parser():
     ap.add_argument("--start", default="2020-01-01")
     ap.add_argument("--end", default="2025-12-31")
     ap.add_argument("--search", choices=("grid", "genetic"), default="grid")
-    ap.add_argument("--population", type=int, default=24)
-    ap.add_argument("--generations", type=int, default=4)
+    # None = not passed. Genetic mode then sizes each job from its searched genes (population
+    # clamp(4 x genes, 24, 120); 25 generations, 30 above 20 genes; early stop 8); grid mode
+    # writes 24 x 4 as before.
+    ap.add_argument("--population", type=int, default=None,
+                    help="GA population. Default: genetic 4 x the job's genes within 24..120; grid 24.")
+    ap.add_argument("--generations", type=int, default=None,
+                    help="GA generations. Default: genetic 25, or 30 above 20 genes; grid 4.")
+    ap.add_argument("--early-stop", type=int, default=None,
+                    help="Genetic only: stop after N generations without improvement. Default 8.")
     ap.add_argument("--parallel", type=int, default=1, help="Local GA individuals; grid and saved reruns are serial.")
     ap.add_argument("--workers", default="", help="Comma-separated configured worker names (genetic search only).")
     ap.add_argument("--seed", type=int, default=42)
@@ -110,7 +117,8 @@ def run_jobs(jobs, output, args):
                    "--db-file", str(database), "--cache-dir", str(args.cache_dir.resolve())]
         if args.resume:
             command.append("--resume")
-        print(f"[{index}/{len(jobs)}] {job['name']}\n  Log: {log_path}", flush=True)
+        budget = f"\n  {budget_text(job)}" if budget_text(job) else ""
+        print(f"[{index}/{len(jobs)}] {job['name']}{budget}\n  Log: {log_path}", flush=True)
         with log_path.open("a", encoding="utf-8") as log:
             result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=False)
         if result.returncode:
@@ -128,7 +136,7 @@ def main(argv=None):
             families=args.families, equity=args.equity,
             equity_cap=None if args.equity_cap == 0 else args.equity_cap,
             start=args.start, end=args.end, search=args.search, population=args.population,
-            generations=args.generations, parallel=args.parallel, seed=args.seed,
+            generations=args.generations, early_stop=args.early_stop, parallel=args.parallel, seed=args.seed,
             workers=[s.strip() for s in args.workers.split(",") if s.strip()],
             save_top=args.save_top, store=args.store, spread_bps=args.spread_bps, etf_symbols=args.etf_symbols,
             market_condition_profile=args.market_condition_profile,
@@ -156,7 +164,7 @@ def main(argv=None):
             if "market_condition" in bt:
                 mc = bt["market_condition"]
                 print(f"    conditions={','.join(mc['profiles'])} mode={mc['mode']} "
-                      f"added_genes={mc['gene_count']}; budget={args.population}x{args.generations}")
+                      f"added_genes={mc['gene_count']}")
             if "market_exit" in bt:
                 mx = bt["market_exit"]
                 print(f"    market_exit={','.join(mx['kinds'])} direction={mx['direction']} "
@@ -164,6 +172,8 @@ def main(argv=None):
                       f"added_genes={mx['gene_count']}")
                 for kind, reason in mx["omitted"].items():
                     print(f"    market_exit {kind} OMITTED: {reason}")
+            if budget_text(job):
+                print(f"    {budget_text(job)}")
         market_exit = manifest["jobs"][0]["optimization_config"]["backtest"].get("market_exit") if manifest["jobs"] else None
         print(f"Market exits: {','.join(market_exit['kinds']) if market_exit else 'none'}; "
               f"ruleset SL loosen: {'on' if args.allow_sl_loosen else 'off'}")
