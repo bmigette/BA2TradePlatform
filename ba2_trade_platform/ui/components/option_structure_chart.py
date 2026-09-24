@@ -1,12 +1,14 @@
-"""The live option popup's price chart: candles, strikes, markers, rotated payoff overlay.
+"""The live option popup's price chart: candles, strikes, breakeven, zones, markers.
 
-Spec 2026-09-20, steps 9 and 10, decisions 1a and 2c.
+Spec 2026-09-20, steps 9 and 10, decision 2c. Redesigned 2026-09-24 to match the test
+platform's trade popup.
 
-**Why Plotly makes decision 1a easy here.** The React popup needs a custom overlay layer to
-draw the payoff rotated onto the price axis. Plotly has a native form of it: the payoff is a
-trace with ``x = position P&L`` and ``y = underlying price`` on a SECOND x-axis that overlays
-the time axis (``xaxis2``, side ``top``), and each sign run is filled to the zero line with
-``fill='tozerox'``. No fake dates, no custom JavaScript.
+**No rotated payoff curve.** It used to be drawn on a second x-axis overlaying the time axis
+(P&L across, price up), so the horizontal axis meant dates for the candles and dollars for the
+curve at once, its $0 line read as a date, and the operator could not tell what the diagonal
+line was. What the chart keeps is what a TIME chart can say about the payoff: the strike
+lines, a labelled "Breakeven at expiry" line, and faint profit/loss zones either side of it.
+The figures (breakeven, max profit, max loss) stay in the popup's payoff section.
 
 The figure is built by a PURE function so it can be asserted trace-by-trace in a test --
 the alternative (only checking it by eye in a browser) is how a chart ends up drawing the
@@ -32,7 +34,17 @@ logger = logging.getLogger(__name__)
 CHART_HEIGHT = 420
 PROFIT_COLOR = '#16a34a'
 LOSS_COLOR = '#dc2626'
-CURVE_COLOR = '#0e7490'
+BREAKEVEN_COLOR = '#eab308'
+GRID_COLOR = '#1f2937'
+AXIS_TEXT_COLOR = '#cbd5e1'
+#: Plotly's own toolbar (zoom, pan, lasso, download) off: none of it is useful on this popup.
+PLOTLY_CONFIG = {'displayModeBar': False, 'scrollZoom': False, 'doubleClick': False}
+#: What the zones and the breakeven line mean, shown under the chart (same words as the test
+#: platform's popup).
+CHART_LEGEND = ('Yellow line: breakeven at expiration. Green/red: where holding to '
+                'expiration would end in profit/loss. An early exit is priced off the '
+                "option's premium (time value included), so it can profit in the red zone. "
+                'Markers are labels on the bar, not price levels.')
 STRUCTURE_MARKER_COLOR = '#7c3aed'
 LEG_MARKER_COLOR = '#0891b2'
 
@@ -139,6 +151,8 @@ def chart_inputs_from(txn: Any, orders: Sequence[Any], bars: Any
         return (bar['low'] if entry else bar['high']), session
 
     slots: Dict[Any, int] = {}
+    chart_span = (max(bar['high'] for bar in normalised) - min(bar['low'] for bar in normalised)
+                  if normalised else 0.0)
 
     def _marker(day: str, kind: str, text: str, entry: bool,
                 short: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -155,7 +169,9 @@ def chart_inputs_from(txn: Any, orders: Sequence[Any], bars: Any
             bar = by_date.get(day) or next(
                 (candidate for candidate in reversed(normalised) if candidate['date'] < day), None)
             span = (bar['high'] - bar['low']) if bar else 0.0
-            step = span * 0.16 if span > 0 else max(abs(price) * 0.005, 0.05)
+            # At least 6% of the chart's own price range: a step sized off the candle alone
+            # is invisible on a narrow bar, and "Entry" printed over the leg label.
+            step = max(span * 0.5, chart_span * 0.06, abs(price) * 0.005, 0.05)
             price = price - slot * step if entry else price + slot * step
 
         return {
@@ -243,41 +259,42 @@ def build_option_structure_figure(
     for line in strike_lines:
         figure.add_hline(
             y=line['price'], line_dash='dash', line_width=1, line_color='#64748b',
-            annotation_text=line.get('label', ''), annotation_position='right',
+            # Inside the plot, above the line's right end: outside it, the label was cut off
+            # by the figure edge ("Long 2" of "Long 2 Call · K $165.00").
+            annotation_text=line.get('label', ''), annotation_position='top right',
             annotation_font_size=10,
         )
 
     chart = payoff if isinstance(payoff, PayoffChart) else None
 
-    # Sign-only bands: the same reading as the overlay, at low opacity. They are what
-    # remains when the curve cannot be drawn (or the toggle is off).
-    if chart is not None:
-        for sign, low, high in zone_bands(chart):
+    # Sign-only zones either side of the breakeven, at low opacity, and the breakeven itself
+    # as a labelled line. Both follow the "Expiry payoff" toggle.
+    price_bounds = _price_bounds(bars, strike_lines, chart)
+    if show_overlay and chart is not None:
+        bands = list(zone_bands(chart))
+        for index, (sign, low, high) in enumerate(bands):
+            # The outermost zones run to the edge of what is on screen (as the test platform's
+            # do): clipped at the payoff's own sample range, "loss below breakeven" shaded a
+            # thin strip by the strike and left the candles beneath it unshaded.
+            if price_bounds is not None:
+                if index == 0:
+                    low = min(low, price_bounds[0])
+                if index == len(bands) - 1:
+                    high = max(high, price_bounds[1])
             figure.add_hrect(
                 y0=low, y1=high, line_width=0,
                 fillcolor=PROFIT_COLOR if sign == 'profit' else LOSS_COLOR,
-                opacity=0.06 if show_overlay else 0.10,
+                opacity=0.06,
             )
-
-    if show_overlay and chart is not None:
-        samples = sample_curve(chart)
-        # Each sign run, filled back to the zero line of the P&L axis.
-        for sign, points in sign_segments(samples):
-            figure.add_trace(go.Scatter(
-                x=[point[1] for point in points], y=[point[0] for point in points],
-                xaxis='x2', yaxis='y', mode='lines',
-                line=dict(color=PROFIT_COLOR if sign == 'profit' else LOSS_COLOR, width=1),
-                fill='tozerox',
-                fillcolor=(PROFIT_COLOR if sign == 'profit' else LOSS_COLOR),
-                opacity=0.16, hoverinfo='skip', showlegend=False,
-            ))
-        figure.add_trace(go.Scatter(
-            x=[point[1] for point in samples], y=[point[0] for point in samples],
-            xaxis='x2', yaxis='y', mode='lines', name='Expiration payoff',
-            line=dict(color=CURVE_COLOR, width=2),
-            hovertemplate='underlying %{y:.2f} → P&L %{x:+.2f}<extra></extra>',
-        ))
-        figure.add_vline(x=0, xref='x2', line_dash='dot', line_width=1, line_color='#94a3b8')
+        for breakeven in chart.breakevens:
+            if breakeven is None:
+                continue
+            figure.add_hline(
+                y=breakeven, line_dash='dot', line_width=1.5, line_color=BREAKEVEN_COLOR,
+                annotation_text=f'Breakeven at expiry ${breakeven:.2f}',
+                annotation_position='top left', annotation_font_size=10,
+                annotation_font_color=BREAKEVEN_COLOR,
+            )
 
     for kind, enabled, colour in (
         ('structure', show_structure_markers, STRUCTURE_MARKER_COLOR),
@@ -289,8 +306,11 @@ def build_option_structure_figure(
         figure.add_trace(go.Scatter(
             x=[m['date'] for m in selected], y=[m.get('price') for m in selected],
             mode='markers+text', name='Structure' if kind == 'structure' else 'Leg orders',
-            marker=dict(symbol='diamond' if kind == 'structure' else 'circle',
-                        size=10 if kind == 'structure' else 7, color=colour),
+            # Arrows like the test platform: up under the bar for an entry, down over it for
+            # an exit.
+            marker=dict(symbol=['triangle-up' if m.get('anchor') == 'event_bar_low'
+                                else 'triangle-down' for m in selected],
+                        size=12 if kind == 'structure' else 9, color=colour),
             # Short label on the canvas (long labels overlap into an unreadable smear),
             # full sentence on hover.
             text=[m.get('short') or m.get('text', '') for m in selected],
@@ -299,25 +319,26 @@ def build_option_structure_figure(
             hovertext=[m.get('text', '') for m in selected], hoverinfo='text',
         ))
 
-    axis2: Dict[str, Any] = {
-        'overlaying': 'x', 'side': 'top', 'showgrid': False,
-        'title': {'text': 'Position P&L at expiration ($)', 'font': {'size': 11}},
-        'zeroline': False,
-    }
-    if chart is not None and show_overlay:
-        reach = max((abs(point[1]) for point in sample_curve(chart)), default=1.0) or 1.0
-        axis2['range'] = [-reach * 1.05, reach * 1.05]
-
-    price_bounds = _price_bounds(bars, strike_lines, chart)
     figure.update_layout(
         height=height,
         template='plotly_dark',
-        margin=dict(l=40, r=40, t=40, b=30),
-        xaxis=dict(title={'text': 'Date', 'font': {'size': 11}}, rangeslider=dict(visible=False)),
-        xaxis2=axis2,
+        # Transparent: the popup's card shows through, instead of plotly_dark's own near-black
+        # panel sitting inside it (the test platform's chart does the same).
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color=AXIS_TEXT_COLOR),
+        margin=dict(l=40, r=40, t=20, b=30),
+        # A fixed view: drag-to-zoom on a popup chart mostly happens by accident, and the
+        # window already spans the position's life. (The toolbar is hidden in PLOTLY_CONFIG.)
+        dragmode=False,
+        # Weekends skipped: daily bars have none, and the gaps read as missing data.
+        xaxis=dict(title={'text': 'Date', 'font': {'size': 11}}, rangeslider=dict(visible=False),
+                   rangebreaks=[dict(bounds=['sat', 'mon'])], fixedrange=True,
+                   gridcolor=GRID_COLOR, linecolor=GRID_COLOR),
         yaxis=dict(title={'text': 'Underlying price', 'font': {'size': 11}},
-                   range=list(price_bounds) if price_bounds else None),
-        legend=dict(orientation='h', y=-0.12),
+                   range=list(price_bounds) if price_bounds else None, fixedrange=True,
+                   gridcolor=GRID_COLOR, linecolor=GRID_COLOR, zeroline=False),
+        legend=dict(orientation='h', y=-0.12, bgcolor='rgba(0,0,0,0)'),
         hovermode='x unified',
     )
     return figure
@@ -364,7 +385,9 @@ def render_option_structure_chart(container, *, txn, orders, payoff,
         underlying=underlying,
     )
     with container:
-        ui.plotly(figure).classes('w-full').style(f'height: {CHART_HEIGHT}px;')
+        ui.plotly({**figure.to_plotly_json(), 'config': PLOTLY_CONFIG})             .classes('w-full').style(f'height: {CHART_HEIGHT}px;')
+        if isinstance(payoff, PayoffChart):
+            ui.label(CHART_LEGEND).classes('text-xs text-secondary-custom')
         if not normalised:
             ui.label(
                 'No daily bars available for this underlying — the strikes and the payoff '

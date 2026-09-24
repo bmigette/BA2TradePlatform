@@ -101,56 +101,46 @@ class TestStrikeLines:
         assert any('K $105' in text for text in labels)
 
 
-class TestPayoffOverlay:
-    def test_the_curve_is_on_the_second_x_axis_with_pnl_on_x(self):
-        curve = build_payoff_chart([_leg()])
-        figure = build_option_structure_figure(bars=BARS, payoff=curve)
+class TestPayoffOnTheTimeChart:
+    """2026-09-24: the rotated payoff curve is gone (it put dollars on the time axis). What a
+    time chart keeps is the breakeven line and the profit/loss zones either side of it."""
 
-        overlay = _traces(figure)
-        assert overlay, 'the payoff must be drawn on xaxis2'
-        named = [t for t in overlay if t.name == 'Expiration payoff']
-        assert len(named) == 1
-        # Rotated: x is P&L, y is the underlying price the candles use.
-        assert max(named[0].y) <= max(bar['high'] for bar in BARS) + 1e-6
-        assert any(value < 0 for value in named[0].x) and any(value > 0 for value in named[0].x)
-
-    def test_each_sign_run_is_filled_to_the_zero_line(self):
-        curve = build_payoff_chart([_leg()])
-        figure = build_option_structure_figure(bars=BARS, payoff=curve)
-        fills = [t for t in _traces(figure) if t.fill == 'tozerox']
-        assert len(fills) == 2                      # one loss run, one profit run
-        assert {t.line.color for t in fills} == {'#16a34a', '#dc2626'}
-
-    def test_a_straddle_fills_three_runs(self):
-        curve = build_payoff_chart([_leg(),
-                              _leg(kind='put', premium=4)])
-        figure = build_option_structure_figure(bars=BARS, payoff=curve)
-        assert len([t for t in _traces(figure) if t.fill == 'tozerox']) == 3
-
-    def test_the_zero_line_is_vertical_on_the_pnl_axis(self):
+    def test_no_payoff_curve_and_no_second_x_axis(self):
         figure = build_option_structure_figure(bars=BARS, payoff=build_payoff_chart([_leg()]))
-        vertical = [s for s in figure.layout.shapes if getattr(s, 'xref', None) == 'x2']
-        assert any(s.x0 == 0 and s.x1 == 0 for s in vertical)
-
-    def test_the_pnl_axis_sits_on_top_and_is_symmetric(self):
-        figure = build_option_structure_figure(bars=BARS, payoff=build_payoff_chart([_leg()]))
-        assert figure.layout.xaxis2.side == 'top'
-        low, high = figure.layout.xaxis2.range
-        assert low == pytest.approx(-high)
-
-    def test_overlay_off_keeps_the_bands_but_draws_no_curve(self):
-        curve = build_payoff_chart([_leg()])
-        figure = build_option_structure_figure(bars=BARS, payoff=curve, show_overlay=False)
         assert not _traces(figure)
+        assert not [t for t in figure.data if t.name == 'Expiration payoff']
         assert not [s for s in figure.layout.shapes if getattr(s, 'xref', None) == 'x2']
-        bands = [s for s in figure.layout.shapes if getattr(s, 'fillcolor', None) in ('#16a34a', '#dc2626')]
-        assert bands, 'the sign-only bands are what remains'
 
-    def test_an_unavailable_payoff_draws_no_curve_and_no_bands(self):
+    def test_the_breakeven_is_a_labelled_horizontal_line(self):
+        figure = build_option_structure_figure(bars=BARS, payoff=build_payoff_chart([_leg()]))
+        lines = [s for s in figure.layout.shapes if getattr(s.line, 'color', None) == '#eab308']
+        assert [round(s.y0, 2) for s in lines] == [105.0]           # strike 100 + premium 5
+        labels = [a.text for a in figure.layout.annotations]
+        assert 'Breakeven at expiry $105.00' in labels
+
+    def test_a_straddle_draws_both_breakevens(self):
+        curve = build_payoff_chart([_leg(), _leg(kind='put', premium=4)])
+        figure = build_option_structure_figure(bars=BARS, payoff=curve)
+        lines = [s for s in figure.layout.shapes if getattr(s.line, 'color', None) == '#eab308']
+        assert len(lines) == 2
+
+    def test_zones_are_drawn_and_follow_the_toggle(self):
+        curve = build_payoff_chart([_leg()])
+        on = build_option_structure_figure(bars=BARS, payoff=curve)
+        off = build_option_structure_figure(bars=BARS, payoff=curve, show_overlay=False)
+        colour = lambda fig: [s for s in fig.layout.shapes
+                              if getattr(s, 'fillcolor', None) in ('#16a34a', '#dc2626')]
+        assert colour(on) and not colour(off)
+
+    def test_an_unavailable_payoff_draws_no_breakeven_and_no_zones(self):
         figure = build_option_structure_figure(
             bars=BARS, payoff=PayoffUnavailable('leg 2: contract multiplier not recorded'))
-        assert not _traces(figure)
         assert not [s for s in figure.layout.shapes if getattr(s, 'fillcolor', None) in ('#16a34a', '#dc2626')]
+        assert not [s for s in figure.layout.shapes if getattr(s.line, 'color', None) == '#eab308']
+
+    def test_weekends_are_skipped_on_the_time_axis(self):
+        figure = build_option_structure_figure(bars=BARS, payoff=build_payoff_chart([_leg()]))
+        assert list(figure.layout.xaxis.rangebreaks[0].bounds) == ['sat', 'mon']
 
     def test_the_price_axis_never_goes_negative(self):
         curve = build_payoff_chart([_leg(kind='put')])
@@ -215,3 +205,29 @@ class TestChartInputs:
         leg_marker = [m for m in markers if m['kind'] == 'leg'][0]
         assert leg_marker['date'] == '2026-09-08'
         assert 'order placed' in leg_marker['text']
+
+
+def test_same_bar_markers_are_spaced_by_the_chart_range_not_the_candle():
+    """On a narrow candle the old step (16% of the bar) was invisible: 'Entry' printed over
+    the leg label. Two markers on one bar now sit at least 6% of the chart's range apart."""
+    bars = BARS + [{'date': '2026-09-11', 'open': 108.0, 'high': 108.2, 'low': 107.9,
+                    'close': 108.1}]
+    txn = _txn(open_date=datetime(2026, 9, 11, 13, 30, tzinfo=timezone.utc))
+    order = _order(created_at=datetime(2026, 9, 11, 13, 30, tzinfo=timezone.utc))
+    _, _, markers = chart_inputs_from(txn, [order], bars)
+    same_day = sorted(m['price'] for m in markers if m['date'] == '2026-09-11')
+    assert len(same_day) == 2
+    chart_range = max(b['high'] for b in bars) - min(b['low'] for b in bars)
+    assert same_day[1] - same_day[0] >= 0.06 * chart_range - 1e-9
+
+
+def test_the_chart_blends_into_the_popup_and_has_no_zoom_toolbar():
+    """2026-09-24: plotly_dark's near-black panel inside the card, and a zoom/pan toolbar
+    nobody needs on a popup."""
+    from ba2_trade_platform.ui.components.option_structure_chart import PLOTLY_CONFIG
+
+    figure = build_option_structure_figure(bars=BARS, payoff=build_payoff_chart([_leg()]))
+    assert figure.layout.paper_bgcolor == 'rgba(0,0,0,0)'
+    assert figure.layout.plot_bgcolor == 'rgba(0,0,0,0)'
+    assert figure.layout.xaxis.fixedrange and figure.layout.yaxis.fixedrange
+    assert PLOTLY_CONFIG['displayModeBar'] is False
