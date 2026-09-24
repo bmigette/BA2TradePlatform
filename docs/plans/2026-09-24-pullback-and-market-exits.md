@@ -486,3 +486,17 @@ fires. The option grid uses `--early-stop 8` (`tools/stage1_run.sh`).
 - grid-mode fingerprint unchanged;
 - `early_stop > generations` is refused;
 - the value reaches `optimization_config`.
+
+**A4 revision (operator-approved 2026-09-24): size the budget from each job's actual gene count.**
+It replaces the fixed 25/8 default above.
+- **Scope:** genetic mode only; grid mode is unchanged.
+- **Gene count:** the searched genes in the job's final manifest, after market-condition entry
+  gates and exits are attached. Count optimized expert_params (skip one-point ranges), plus
+  optimize / action_value_optimize / toggle_optimize / mode_optimize flags in the strategy.
+- **Generations:** 25, or 30 when the job has more than 20 genes. Early stop: 8.
+- **Population:** clamp(4 × genes, 24, 120).
+- **Overrides:** explicit `--population` / `--generations` / `--early-stop` always win.
+- **Visibility:** the launch line and `optimization_config` record each job's gene count and resolved
+  budget.
+- **Reference counts:** base families have 1–4 genes; with both market profiles, +15 per entry rule
+  (3 families have 2 entry rules); market exits add ~9. The maximum is ~40.
