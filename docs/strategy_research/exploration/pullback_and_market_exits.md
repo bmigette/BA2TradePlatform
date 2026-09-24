@@ -1,4 +1,4 @@
-# Pullback (long/short) and market-condition exits — design
+# Pullback (long/short) and market-condition exits and TP/SL adjustments — design
 
 Status: **proposed 2026-09-24, not implemented.** Part of the
 [strategy exploration grid](README.md).
@@ -7,7 +7,7 @@ Two additions, in delivery order:
 
 - **A. A literal pullback expert:** long and short, with its own trend, structure and SMA5 exit.
   It needs no platform change.
-- **B. Market-condition exits at the rule level:** a platform change that lets exit rules use the
+- **B. Market-condition exits and TP/SL adjustments at the rule level:** a platform change that lets open-position rules use the
   `ohlcv-v1` / `ta-structure-v1` fields that entry rules already use. After that, every family in
   this grid, and later the option grids, can search them.
 
@@ -99,7 +99,7 @@ Tests:
 - the controls reproduce the probe's trade count on a fixed symbol set, within documented
   execution differences (5-minute fills against the probe's next-open fills).
 
-## B. Market-condition exits at the rule level (platform)
+## B. Market-condition exits and TP/SL adjustments at the rule level (platform)
 
 ### Why exits are refused today
 
@@ -125,28 +125,50 @@ that exit. A rule that exists *only* to exit on a market condition can only add 
 1. **Live scope.** Wrap `process_open_positions_recommendations`' per-instance evaluation in
    `market_condition_decision_scope(expert_instance_id=...)`, the same call the entry pass uses,
    with one decision clock per pass.
-2. **Narrow the refusal.** Replace the blanket exit refusal with a *market-exit rule* contract:
-   - A rule may contain market leaves only if every action is `close` (or `reduce`).
-   - It may never adjust a take-profit or stop-loss, or carry a lifecycle/roll/overlay action.
-   - `assert_no_market_conditions` stays as it is for protective and lifecycle rules, and gains
-     one sibling `assert_market_exit_rule_shape`.
-   - All three entry points apply the same pair.
+2. **Narrow the refusal.** Replace the blanket exit refusal with a *market rule* contract. A rule
+   with market leaves may carry these actions:
+   - `close` / `reduce`: a market-driven exit.
+   - `adjust_stop_loss`: safe because ruleset stops are already **ratchet-only**
+     (`AdjustStopLossAction._call_broker`: a ruleset stop may only tighten, and a looser request is a
+     logged no-op). A market condition can move a stop closer, for example to breakeven when the
+     structure turns bear. It cannot widen one or remove one.
+   - `adjust_take_profit`: moves in both directions. Widening a TP delays a profit exit but leaves the
+     stop in place; that is the intended use, letting a winner run while the trend is strong.
+
+   Still refused:
+   - lifecycle/roll/overlay actions: PMCC roll, buyback, delta floor and the option lifecycle. A
+     skipped roll can leave a short leg to expire or be assigned, and the market-condition design
+     already requires expiry-driven management to run whatever the market does;
+   - market leaves in the ENTRY rule's bracket actions beyond today's entry gate.
+
+   `assert_no_market_conditions` becomes `assert_market_rule_actions`, one allow-list and one
+   refusal message. All three call sites apply it.
 3. **Unknown means "does not fire".** It is never a pass, and never a failure of the other exits.
    Every other exit rule still runs, because the market exit is its own rule. Unknown-by-reason
    counts are reported, as for entry gates.
-4. **Placement and precedence.** A generated market-exit rule is inserted **after** the stop-loss
-   and floor rules, because first match wins, so it can never pre-empt a protective rule. It is
-   not a nested OR group, since a nested OR flattens to AND.
-5. **Genes.** One rule per job:
-   - a toggle, off by default;
-   - a field mode: `structure_against` (swing state flips against the position),
-     `slope_against` (EMA50 slope past a threshold against it), or `channel_far_side`
-     (`channel_pos` beyond a threshold, which is profit-taking);
-   - a threshold where the field needs one.
+4. **Placement and precedence.** Generated market rules are separate rules, never leaves ANDed
+   into an existing rule, and never a nested OR group, since a nested OR flattens to AND. First
+   match wins, so:
+   - a market **exit** goes after the stop-loss and floor rules;
+   - a market **adjustment** gets `continue_processing=True`, so it can never pre-empt a later
+     exit.
+5. **Genes.** At most three rules per job, each off by default:
 
-   That is 2–3 genes per family. A frozen all-off control must be byte-identical to today's rules
-   (the no-impact gate the entry profile already passes).
-6. **Parity.** One test replays the same bars through the live pass and the backtest pass and
+   | Rule | Mode gene | Action |
+   |---|---|---|
+   | Market exit | `structure_against` / `slope_against` / `channel_far_side`, plus a threshold | `close` |
+   | Market stop | `structure_against` / `slope_against` | stop to breakeven, or tighten to k×ATR (k searched) |
+   | Market TP | `trend_strong` (ADX and slope above thresholds) / `near_resistance` (`dist_resistance` below x ATR) | widen TP by a searched %, or pull it in toward resistance |
+
+   That is about 3 genes per rule and about 9 per family with all three on. A frozen all-off
+   control must be byte-identical to today's rules, the no-impact gate the entry profile already
+   passes.
+6. **Churn guard for TP.** A two-way TP driven by a daily condition can flap: widen one day, pull
+   in the next, with a cancel and replace of the live OCO pair each time. The `adjust_take_profit`
+   path must skip a change smaller than a set step (for example 0.25×ATR). A backtest must count
+   TP changes per trade so flapping shows up in the report. Stops don't need this: the ratchet
+   already makes them monotonic.
+7. **Parity.** One test replays the same bars through the live pass and the backtest pass and
    asserts the same exit fires on the same session. It extends the existing
    `test_research10_market_conditions.py` real-engine parity test to cover exits.
 
