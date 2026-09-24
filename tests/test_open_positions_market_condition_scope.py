@@ -336,3 +336,200 @@ def test_with_a_profile_but_no_scope_the_same_leaf_reads_no_context(world, dispa
     assert call["leaf"]["status"] == STATUS_NO_CONTEXT
     assert call["leaf"]["passed"] is False
     assert clock == []
+
+
+# --------------------------------------------------------------------------- a failed opening
+class _LogSpy:
+    """Stands in for ``TradeManager.logger`` (the ba2 loggers do not propagate to caplog)."""
+
+    def __init__(self, raise_on_info=None):
+        self.records = []
+        self._raise_on_info = raise_on_info
+
+    def _add(self, level, msg, kwargs):
+        self.records.append((level, str(msg), bool(kwargs.get("exc_info"))))
+
+    def error(self, msg, *a, **k):
+        self._add("ERROR", msg, k)
+
+    def warning(self, msg, *a, **k):
+        self._add("WARNING", msg, k)
+
+    def info(self, msg, *a, **k):
+        self._add("INFO", msg, k)
+        if self._raise_on_info is not None and "unique instruments" in str(msg):
+            raise self._raise_on_info
+
+    def debug(self, msg, *a, **k):
+        self._add("DEBUG", msg, k)
+
+    def errors(self):
+        return [r for r in self.records if r[0] == "ERROR"]
+
+
+@pytest.fixture
+def activities(monkeypatch):
+    """Captures ``log_activity`` (asynchronous in production) where TradeManager imports it."""
+    import ba2_trade_platform.core.db as core_db
+
+    seen = []
+    monkeypatch.setattr(core_db, "log_activity", lambda **kw: seen.append(kw))
+    return seen
+
+
+def _run_with(expert_id, spy):
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    tm = TradeManager()
+    tm.logger = spy
+    return tm.process_open_positions_recommendations(expert_id)
+
+
+def _raising_scope(exc):
+    class _Scope:
+        def __init__(self, *, expert_instance_id=None, replay_reader=None):
+            pass
+
+        def __enter__(self):
+            raise exc
+
+        def __exit__(self, *a):
+            raise AssertionError("a scope that never opened must never be exited")
+
+    return _Scope
+
+
+def _no_scope_run(world, monkeypatch):
+    @contextmanager
+    def _no_scope(*, expert_instance_id=None, replay_reader=None):
+        yield None
+
+    monkeypatch.setattr(live, "market_condition_decision_scope", _no_scope)
+    world["recorder"].calls.clear()
+    result = _run(world["expert_id"])
+    return result, list(world["recorder"].calls)
+
+
+@pytest.mark.parametrize("exc", [
+    ValueError("malformed BA2_MARKET_CONDITION_MANIFEST"),
+    TypeError("resolver seam returned the wrong shape"),
+    AttributeError("'NoneType' object has no attribute 'settings'"),
+    RuntimeError("reader build failed"),
+], ids=lambda e: type(e).__name__)
+def test_a_scope_that_fails_to_open_does_not_stop_the_exit_pass(world, activities, monkeypatch,
+                                                                exc):
+    """Exits are never blocked by the market-condition machinery -- under the enforce error mode
+    the platform runs with, whatever the scope raises."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    monkeypatch.setattr(live, "market_condition_decision_scope", _raising_scope(exc))
+    spy = _LogSpy()
+
+    result = _run_with(world["expert_id"], spy)
+    calls = list(world["recorder"].calls)
+
+    # The exit rules were still evaluated AND executed, with no decision state.
+    assert len(calls) == 1 and calls[0]["decision"] is None
+    assert result == [{"success": True, "symbol": SYMBOL, "submit_to_broker": True}]
+    # ERROR, with the traceback, naming the expert and what it means for this pass.
+    (err,) = spy.errors()
+    assert err[2] is True
+    assert f"Expert instance {world['expert_id']}" in err[1]
+    assert "no_context this pass" in err[1] and type(exc).__name__ in err[1]
+    # ...and where operators look: one FAILURE activity row for this expert.
+    from ba2_trade_platform.core.types import ActivityLogSeverity, ActivityLogType
+
+    (act,) = activities
+    assert act["severity"] == ActivityLogSeverity.FAILURE
+    assert act["activity_type"] == ActivityLogType.RISK_MANAGER_RAN
+    assert act["source_expert_id"] == world["expert_id"]
+    assert act["data"]["error_type"] == type(exc).__name__
+
+    # Same return value and same evaluation as a pass with no scope at all.
+    assert (result, calls) == _no_scope_run(world, monkeypatch)
+
+
+def test_a_real_malformed_manifest_does_not_stop_the_exit_pass(world, dispatcher, instances,
+                                                              clock, activities, monkeypatch):
+    """The concrete case from the resolver's docstring, through the REAL scope and dispatcher: a
+    gated expert with a malformed manifest env var raises when its resolver is built. The exit
+    rules (here: no market leaf) are still evaluated and executed."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    instances[world["expert_id"]] = "ohlcv-v1"
+    dispatcher._environ = {live.MANIFEST_ENV: "no-such-profile=abc"}
+    spy = _LogSpy()
+
+    result = _run_with(world["expert_id"], spy)
+
+    (call,) = world["recorder"].calls
+    assert call["decision"] is None
+    assert result == [{"success": True, "symbol": SYMBOL, "submit_to_broker": True}]
+    (err,) = spy.errors()
+    assert "ValueError" in err[1] and "no_context this pass" in err[1]
+    assert len(activities) == 1
+    assert clock == [] and live.current_decision() is None
+
+
+@pytest.mark.xfail(strict=True, raises=ValueError, reason=(
+    "OPEN GAP, awaiting a decision: the scope guard covers the scope's OPENING only. A market "
+    "leaf evaluated afterwards resolves its context through PerInstanceMarketConditionResolver."
+    "__call__, which calls resolver_for() again and re-raises the malformed-manifest ValueError. "
+    "Under BA2_ERROR_MODE=enforce neither TradeActionEvaluator handler absorbs it, so a real "
+    "exit ruleset containing a market leaf still fails to evaluate for that symbol."))
+def test_a_market_leaf_after_a_failed_scope_reads_no_context(world, dispatcher, instances, clock,
+                                                            monkeypatch):
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    instances[world["expert_id"]] = "ohlcv-v1"
+    dispatcher._environ = {live.MANIFEST_ENV: "no-such-profile=abc"}
+    rec = type("Rec", (), {"instance_id": world["expert_id"], "symbol": SYMBOL})()
+    # What the pass does after the guard absorbed the scope failure: evaluate the leaf with no
+    # decision state. The desired outcome is "unknown, never passes", not an exception.
+    got = _adx_leaf(object(), SYMBOL, rec)
+    assert got["status"] == STATUS_NO_CONTEXT and got["passed"] is False
+
+
+def test_a_never_absorbed_refusal_still_propagates(world, activities, monkeypatch):
+    """The guard uses the sanctioned ``absorb_if_benign(e, Exception)``, so the refusals
+    ``failure_modes`` never absorbs in any mode (matched by class name) keep their meaning."""
+    class SplitBasisRefused(Exception):
+        pass
+
+    monkeypatch.setattr(live, "market_condition_decision_scope",
+                        _raising_scope(SplitBasisRefused("stop")))
+    with pytest.raises(SplitBasisRefused):
+        _run_with(world["expert_id"], _LogSpy())
+    assert world["recorder"].calls == [] and activities == []
+
+
+class _BodyBoom(Exception):
+    pass
+
+
+@pytest.mark.parametrize("scope_opens", [True, False], ids=["scope-open", "scope-failed"])
+def test_an_exception_in_the_pass_body_still_propagates(world, activities, monkeypatch,
+                                                        scope_opens):
+    """The guard covers the scope's OPENING only. An exception raised by the pass body -- here
+    from the log line between loading the recommendations and evaluating them, outside the
+    per-recommendation handler -- propagates as it did before, the scope is closed on the way
+    out, and the processing lock is released."""
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    opened = []
+    if scope_opens:
+        monkeypatch.setattr(live, "market_condition_decision_scope",
+                            _recording_scope(world, opened))
+    else:
+        monkeypatch.setattr(live, "market_condition_decision_scope",
+                            _raising_scope(RuntimeError("scope")))
+    tm = TradeManager()
+    tm.logger = _LogSpy(raise_on_info=_BodyBoom("body"))
+
+    with pytest.raises(_BodyBoom):
+        tm.process_open_positions_recommendations(world["expert_id"])
+
+    assert world["recorder"].calls == []
+    assert world["state"]["scope_depth"] == 0
+    assert opened == ([world["expert_id"]] if scope_opens else [])
+    assert len(activities) == (0 if scope_opens else 1)
+    lock = tm._processing_locks[f"expert_{world['expert_id']}_usecase_open_positions"]
+    assert not lock.locked()

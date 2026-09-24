@@ -3146,6 +3146,69 @@ class TradeManager:
                 'errors': [str(e)]
             }
 
+    def _open_exit_pass_market_condition_scope(self, expert_instance_id: int,
+                                               account_id: Optional[int]):
+        """Open the market-condition decision scope for ONE open-positions (exit) pass.
+
+        Returns an entered ``ExitStack`` for the caller's ``with``: it closes the scope when the
+        pass ends, and it is EMPTY when the scope could not be opened.
+
+        EXITS ARE NEVER BLOCKED BY THE MARKET-CONDITION MACHINERY. Opening the scope can raise
+        for a gated expert -- a malformed manifest environment variable, a resolver build or
+        coverage refresh failing, a defect in the settings path (TypeError/AttributeError). The
+        entry pass lets that propagate: refusing entries is the safe reading. For exits it is
+        not, because the same exception would skip every stop, take-profit and close rule of
+        this expert for the pass. So a failure here is reported (ERROR + a FAILURE activity row)
+        and the pass runs WITHOUT the scope: its market-condition leaves read ``no_context`` and
+        never pass, and every other exit and protective rule runs as usual.
+
+        ONLY THE OPENING IS GUARDED. The stack is returned to the caller's ``with``, so an
+        exception raised by the pass body propagates exactly as before.
+        """
+        from contextlib import ExitStack
+
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.core.market_condition_live import market_condition_decision_scope
+
+        stack = ExitStack()
+        try:
+            stack.enter_context(market_condition_decision_scope(expert_instance_id=expert_instance_id))
+        except Exception as e:
+            # DELIBERATELY broad, and named as such so it survives BA2_ERROR_MODE=enforce: the
+            # scope can fail in ways this site cannot enumerate (manifest config, reader build,
+            # an injected settings seam), and whatever it is must not stop the exits. Refusals
+            # that failure_modes never absorbs still propagate.
+            absorb_if_benign(e, Exception)
+            self.logger.error(
+                f"Expert instance {expert_instance_id}: the market-condition decision scope could "
+                f"not be opened for the open-positions pass ({type(e).__name__}: {e}). Its "
+                f"market-condition exit rules read no_context this pass and will not fire; every "
+                f"other exit and protective rule still runs.",
+                exc_info=True)
+            try:
+                from .db import log_activity
+                from .types import ActivityLogSeverity, ActivityLogType
+
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                    description=(f"Market-condition scope failed for the open-positions pass "
+                                 f"({type(e).__name__}: {e}); market-condition exit rules read "
+                                 f"no_context this pass, all other exit rules ran"),
+                    data={
+                        "mode": "classic",
+                        "use_case": "open_positions",
+                        "stage": "market_condition_scope",
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    },
+                    source_expert_id=expert_instance_id,
+                    source_account_id=account_id,
+                )
+            except Exception as log_error:
+                self.logger.warning(f"Failed to log market-condition scope failure activity: {log_error}")
+        return stack
+
     def process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations for OPEN_POSITIONS analysis.
@@ -3195,8 +3258,6 @@ class TradeManager:
             from datetime import timedelta
             from .TradeActionEvaluator import TradeActionEvaluator
             from ..modules.accounts import get_account_class
-            from ba2_common.core.market_condition_live import market_condition_decision_scope
-
             # Get the expert instance (with loaded settings)
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
@@ -3245,8 +3306,9 @@ class TradeManager:
             # around the evaluation only -- so an expert with trade modification off or no
             # open_positions ruleset never reads its profile. With no market_condition_profile
             # setting the scope yields None at once (no clock read, no state): a strict no-op.
-            # No replay-capture scope: the open-positions pass never had one.
-            with market_condition_decision_scope(expert_instance_id=expert_instance_id), get_db() as session:
+            # No replay-capture scope: the open-positions pass never had one. A failure to OPEN
+            # the scope never stops the exits: see _open_exit_pass_market_condition_scope.
+            with self._open_exit_pass_market_condition_scope(expert_instance_id, account_def.id), get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,

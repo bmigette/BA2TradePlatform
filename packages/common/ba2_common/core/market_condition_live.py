@@ -29,7 +29,7 @@ NO context for every leaf, its
 WARNING), and one ERROR naming the failing symbols is logged when that expert's resolver is first
 built (certification is paid lazily, on the first expert whose setting names a profile, so a
 platform with the gates off everywhere never opens the cache at all). Every gated entry is
-refused loudly; nothing else changes.
+refused loudly and a market-condition exit leaf never fires; nothing else changes.
 
 Capture/replay: if a replay capture context is active when the scope opens, the reader records
 every served window (``CapturingMarketConditionReader``); in replay mode the scope must be given
@@ -984,8 +984,11 @@ class PerInstanceMarketConditionResolver:
         A manifest is the host's ops configuration, not a strategy's preference, and the quiet
         readings of a broken one are both unacceptable: ignoring it computes the indicators live
         per decision (design 4.5 forbids that silently) and guessing a mapping serves one
-        profile's snapshot for another. Only the ENTRY pass reaches here, so exits and
-        protective-order handling keep running either way.
+        profile's snapshot for another. BOTH live passes reach here: the entry pass lets the
+        error propagate (refusing entries is the safe reading), and the open-positions pass
+        guards the scope's OPENING (``TradeManager._open_exit_pass_market_condition_scope``):
+        it logs the failure and runs without the scope, so its market-condition leaves read
+        ``no_context`` while every other exit and protective rule still runs.
         """
         profiles = self.profiles_for(expert_instance_id)
         if not profiles:
