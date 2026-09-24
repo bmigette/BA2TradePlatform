@@ -1726,15 +1726,18 @@ class DailyBacktestEngine:
                     # what the position was SIZED off). See position_sizing.reconcile_protective_stop.
                     from ba2_common.core.position_sizing import reconcile_protective_stop
                     txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+                    # Captured ONCE: the reconcile and the max-loss record read the same value,
+                    # whatever submit_order does to the order in between.
+                    safeguard = order.stop_price or None
                     sl_price = reconcile_protective_stop(
                         ruleset_sl=(txn.stop_loss if txn else None),
-                        safeguard_sl=(order.stop_price or None),
+                        safeguard_sl=safeguard,
                         is_long=(order.side == OrderDirection.BUY))
                     submitted = self.account.submit_order(order, sl_price=sl_price)
                     # Additive metadata: the stop the size was keyed off, written once as the
                     # transaction's max-loss stop (never raises; see record_max_loss_stop).
                     if submitted:
-                        record_max_loss_stop(order, order.stop_price or None)
+                        record_max_loss_stop(order, safeguard)
                 except Exception as e:  # noqa: BLE001
                     _reraise_option_basis_refusal(e)
                     self._log(f"submit_order failed for order {order.id}: {e}")
@@ -1786,17 +1789,19 @@ class DailyBacktestEngine:
                 # was keyed off) vs the ruleset entry-bracket SL (on the transaction).
                 from ba2_common.core.position_sizing import reconcile_protective_stop
                 txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+                # Captured ONCE, as at the other submit tail.
+                safeguard = cand.stop_price or None
                 sl_price = reconcile_protective_stop(
                     ruleset_sl=(txn.stop_loss if txn else None),
-                    safeguard_sl=(cand.stop_price or None),
+                    safeguard_sl=safeguard,
                     is_long=(order.side == OrderDirection.BUY))
                 submitted = self.account.submit_order(order, sl_price=sl_price)
                 created_any = True
-                # Additive metadata: the stop the size was keyed off (cand.stop_price, the RM
-                # safeguard), written once as the transaction's max-loss stop. Same shared
-                # helper as the live funded loop; it never raises.
+                # Additive metadata: the stop the size was keyed off (the RM safeguard), written
+                # once as the transaction's max-loss stop. Same shared helper as the live funded
+                # loop; it never raises.
                 if submitted:
-                    record_max_loss_stop(order, cand.stop_price or None)
+                    record_max_loss_stop(order, safeguard)
             except Exception as e:  # noqa: BLE001
                 _reraise_option_basis_refusal(e)
                 self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")

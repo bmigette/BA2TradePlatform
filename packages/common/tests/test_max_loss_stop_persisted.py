@@ -107,6 +107,11 @@ def test_the_value_is_written_once_and_never_replaced():
     assert with_max_loss_stop({MAX_LOSS_STOP_KEY: None}, 97.0) is None
 
 
+@pytest.mark.parametrize("not_a_dict", ["legacy-string", ["a", "list"], 7])
+def test_meta_data_that_is_not_a_dict_is_never_replaced(not_a_dict):
+    assert with_max_loss_stop(not_a_dict, 92.0) is None
+
+
 def test_no_usable_stop_means_nothing_to_write():
     assert with_max_loss_stop({}, None) is None
     assert with_max_loss_stop({}, 0.0) is None
@@ -224,7 +229,7 @@ def test_record_never_raises_into_the_entry_path(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("database is locked")
 
-    monkeypatch.setattr(_db, "update_instance", _boom)
+    monkeypatch.setattr(_db, "get_db", _boom)
     monkeypatch.setattr(trade_cycle.logger, "error", lambda msg, *a, **k: errors.append(msg))
     assert record_max_loss_stop(order, 92.0) is None
     assert len(errors) == 1 and "max-loss stop" in errors[0], "the failure must be loud"
@@ -244,3 +249,74 @@ def test_record_is_visible_on_the_same_object_in_the_backtest_trade_store():
         assert record_max_loss_stop(order, 92.0) == 92.0
         assert max_loss_stop_of(held) == 92.0
         assert held.meta_data == {"k": "v", MAX_LOSS_STOP_KEY: 92.0}
+
+
+def test_record_leaves_non_dict_meta_data_alone_and_warns(monkeypatch):
+    from ba2_common.core import trade_cycle
+    from ba2_common.core.trade_cycle import record_max_loss_stop
+
+    order, txn_id = _entry(meta_data=["legacy", "list"])
+    warnings = []
+    monkeypatch.setattr(trade_cycle.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    assert record_max_loss_stop(order, 92.0) is None
+    assert _meta(txn_id) == ["legacy", "list"], "non-dict meta_data was replaced"
+    assert len(warnings) == 1 and "not a dict" in warnings[0]
+
+
+def test_record_re_raises_the_never_absorbed_exceptions(monkeypatch):
+    """The broad catch swallows metadata failures, but never the exceptions the repo marks as
+    must-propagate (a split-basis refusal must still abort a backtest trial)."""
+    from ba2_common.core import db as _db
+    from ba2_common.core.trade_cycle import record_max_loss_stop
+
+    class SplitBasisRefused(Exception):
+        pass
+
+    def _refuse(*a, **k):
+        raise SplitBasisRefused("basis")
+
+    order, _ = _entry()
+    monkeypatch.setattr(_db, "get_db", _refuse)
+    with pytest.raises(SplitBasisRefused):
+        record_max_loss_stop(order, 92.0)
+
+
+def test_record_does_not_clobber_a_concurrent_commit(monkeypatch):
+    """REGRESSION (B3 review C1), the lost-TP class of
+    test_recalculate_transaction_quantity_no_clobber.py. Another session commits stop_loss,
+    take_profit and status after the recorder read the row and before it wrote. The first
+    version saved its read copy through ``update_instance``, which copies EVERY attribute back
+    and reverted all three. The write must touch ``meta_data`` only, under the DB write lock."""
+    from sqlmodel import Session
+
+    from ba2_common.core import db as _db
+    from ba2_common.core import trade_cycle
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.trade_cycle import record_max_loss_stop
+    from ba2_common.core.types import TransactionStatus
+
+    order, txn_id = _entry(stop_loss=None, meta_data={"k": "v"})
+    real = trade_cycle.with_max_loss_stop
+    seen = {}
+
+    def _concurrent_commit_then_decide(meta, stop):
+        # Runs after the recorder's read and before its write -- the race window.
+        seen["lock_held"] = _db._db_write_lock._lock.locked()
+        with Session(_db.get_engine()) as other:
+            row = other.get(Transaction, txn_id)
+            row.stop_loss = 91.5
+            row.take_profit = 130.0
+            row.status = TransactionStatus.OPENED
+            other.commit()
+        return real(meta, stop)
+
+    monkeypatch.setattr(trade_cycle, "with_max_loss_stop", _concurrent_commit_then_decide)
+    assert record_max_loss_stop(order, 92.0) == 92.0
+
+    from ba2_common.core.db import get_instance
+    row = get_instance(Transaction, txn_id)
+    assert row.stop_loss == 91.5, "a concurrent stop_loss commit was reverted"
+    assert row.take_profit == 130.0, "a concurrent take_profit commit was reverted"
+    assert row.status == TransactionStatus.OPENED, "a concurrent status commit was reverted"
+    assert row.meta_data == {"k": "v", MAX_LOSS_STOP_KEY: 92.0}
+    assert seen["lock_held"], "the meta_data write must hold db._db_write_lock"

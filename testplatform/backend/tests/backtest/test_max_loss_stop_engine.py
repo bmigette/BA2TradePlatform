@@ -116,7 +116,21 @@ class _MaxLossStubExpert(MarketExpertInterface):
         )
 
 
-def _run(bars, *, run_id, entry_sl_pct=None, buy_on=None):
+def _store_mode(monkeypatch, inmem: str) -> None:
+    """Select the trade-store mode for this test, and make it TRUE on this thread.
+
+    ``BT_INMEM_TRADES=0`` only stops ``backtest_trading_db`` from ENTERING the in-memory store;
+    it does not leave one. Measured 2026-09-24: in a full tests/backtest run an earlier test
+    leaves the store flag active on the main thread, so a "sqlite" run silently kept writing to
+    that leaked, never-reset store. The flag is therefore forced off here (monkeypatch restores
+    it), and ``_run`` asserts the mode it actually got."""
+    from ba2_common.core import trade_store
+    monkeypatch.setenv("BT_INMEM_TRADES", inmem)
+    if inmem == "0":
+        monkeypatch.setattr(trade_store._tls, "active", False, raising=False)
+
+
+def _run(bars, *, run_id, inmem, entry_sl_pct=None, buy_on=None):
     """Full engine.run() over ``bars`` with deterministic risk_atr sizing (ATR off, 8% risk and
     8% floor -> the safeguard is exactly 8% under the signal close). ``entry_sl_pct`` adds a
     ruleset entry stop (``adjust_stop_loss`` off ``order_open_price``). Returns the account's
@@ -137,6 +151,8 @@ def _run(bars, *, run_id, entry_sl_pct=None, buy_on=None):
     ctx = backtest_trading_db(f"max-loss-stop-{run_id}")
     ctx.__enter__()
     try:
+        from ba2_common.core import trade_store
+        assert trade_store.inmem_trades_active() == (inmem == "1"), "store mode is not the one asked for"
         seed_account_definition(account_id, CFG)
         if entry_sl_pct is None:
             ruleset_id = seed_enter_long_ruleset()
@@ -197,28 +213,36 @@ def _run(bars, *, run_id, entry_sl_pct=None, buy_on=None):
     (-15.0, 92.0),   # looser ruleset stop: the safeguard wins the reconcile too
 ])
 def test_engine_entry_records_the_sized_on_stop(monkeypatch, inmem, entry_sl_pct, submitted_sl):
-    monkeypatch.setenv("BT_INMEM_TRADES", inmem)
+    _store_mode(monkeypatch, inmem)
     run_id = 410 + (0 if entry_sl_pct is None else int(-entry_sl_pct)) + (100 if inmem == "0" else 0)
-    _, stops = _run(RISING, run_id=run_id, entry_sl_pct=entry_sl_pct, buy_on={date(2024, 1, 2)})
+    _, stops = _run(RISING, run_id=run_id, inmem=inmem, entry_sl_pct=entry_sl_pct, buy_on={date(2024, 1, 2)})
     assert len(stops) == 1, "exactly one entry expected"
     stop_loss, max_loss = stops[0]
     assert stop_loss == pytest.approx(submitted_sl), "the protective stop the engine attached moved"
     assert max_loss == pytest.approx(92.0), "the recorded max-loss stop is not the sized-on safeguard"
 
 
+@pytest.mark.parametrize("inmem", ["1", "0"], ids=["inmem-store", "sqlite"])
 @pytest.mark.parametrize("entry_sl_pct", [None, -3.0], ids=["safeguard-only", "ruleset-tighter"])
-def test_recording_the_max_loss_stop_changes_no_trade(monkeypatch, entry_sl_pct):
-    """The same fixed run with and without the write: identical orders, fills, trades, equity."""
+def test_recording_the_max_loss_stop_changes_no_trade(monkeypatch, inmem, entry_sl_pct):
+    """The same fixed run with and without the write: identical orders, fills, trades, equity.
+
+    This guards the write's SIDE EFFECTS only. Nothing reads ``max_loss_stop`` until B4, so the
+    only way this key could move a trade today is through the write itself -- a clobbered
+    transaction column, a changed order, an exception on the submit tail. Both store modes are
+    covered because they persist differently: the in-memory store mutates the one object, the
+    SQLite path commits a single-column update in its own session."""
     from app.services.backtest import daily_engine
 
-    run_id = 440 if entry_sl_pct is None else 450
-    with_write, stops = _run(CHOPPY, run_id=run_id, entry_sl_pct=entry_sl_pct)
+    _store_mode(monkeypatch, inmem)
+    run_id = (440 if entry_sl_pct is None else 450) + (100 if inmem == "0" else 0)
+    with_write, stops = _run(CHOPPY, run_id=run_id, inmem=inmem, entry_sl_pct=entry_sl_pct)
     assert len(stops) >= 2, "the fixture must re-enter after a stop-out to be a real comparison"
     assert all(m is not None for _, m in stops), "every entry should carry a max-loss stop"
     assert len(with_write["trades"]) >= 2
 
     monkeypatch.setattr(daily_engine, "record_max_loss_stop", lambda *a, **k: None)
-    without_write, stops_off = _run(CHOPPY, run_id=run_id + 1, entry_sl_pct=entry_sl_pct)
+    without_write, stops_off = _run(CHOPPY, run_id=run_id + 1, inmem=inmem, entry_sl_pct=entry_sl_pct)
     assert all(m is None for _, m in stops_off), "the patch did not disable the write"
 
     assert with_write["orders"] == without_write["orders"]

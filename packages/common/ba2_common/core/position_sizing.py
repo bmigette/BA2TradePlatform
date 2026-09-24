@@ -370,17 +370,20 @@ def sized_on_stop(ruleset_sl: Optional[float], safeguard_sl: Optional[float]) ->
 def with_max_loss_stop(meta_data: Optional[dict], stop: Optional[float]) -> Optional[dict]:
     """A NEW ``meta_data`` dict carrying ``max_loss_stop``, or None when nothing is to be written.
 
-    Nothing is written when ``stop`` is not a usable price, or when the key is ALREADY present:
-    the max-loss stop is written exactly once, at entry, and nothing later (a stop adjustment, a
-    wash-trade re-submit, a retry) may replace it. The input dict is never mutated: a JSON column
-    only persists a change SQLModel can see, which is a new object assigned to the attribute."""
+    Nothing is written when ``stop`` is not a usable price, when the key is ALREADY present (the
+    max-loss stop is written exactly once, at entry, and nothing later -- a stop adjustment, a
+    wash-trade re-submit, a retry -- may replace it), or when ``meta_data`` is something other
+    than None or a dict: whatever that is, it is not this function's to overwrite. The input
+    dict is never mutated: a JSON column only persists a change SQLModel can see, which is a new
+    object assigned to the attribute."""
     value = _usable_stop_price(stop)
     if value is None:
         return None
-    existing = meta_data if isinstance(meta_data, dict) else {}
-    if MAX_LOSS_STOP_KEY in existing:
+    if meta_data is None:
+        return {MAX_LOSS_STOP_KEY: value}
+    if not isinstance(meta_data, dict) or MAX_LOSS_STOP_KEY in meta_data:
         return None
-    return {**existing, MAX_LOSS_STOP_KEY: value}
+    return {**meta_data, MAX_LOSS_STOP_KEY: value}
 
 
 def max_loss_stop_of(transaction: Any) -> Optional[float]:
