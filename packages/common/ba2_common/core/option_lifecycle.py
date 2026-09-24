@@ -114,7 +114,7 @@ from ba2_common.core.option_expiry import (
     resolve_structure_expiry,
 )
 from ba2_common.core.option_types import OptionContract, OptionLeg
-from ba2_common.core.types import OptionRight, OrderDirection
+from ba2_common.core.types import OptionCloseReason, OptionRight, OrderDirection
 
 LIFECYCLE_HOLD = "hold"
 LIFECYCLE_PROFIT_CAPTURE = "profit_capture"
@@ -146,6 +146,18 @@ LIFECYCLE_UNKNOWN = "unknown"
 
 LIFECYCLE_CLOSING_REASONS = (LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_CREDIT_STOP,
                              LIFECYCLE_TESTED, LIFECYCLE_BREAKER, LIFECYCLE_COVER_LOST)
+
+#: The ``OptionCloseReason`` each CLOSING decision is recorded under (the close order's
+#: ``exit_record`` trigger, BT/live option parity plan Part C3). Total over
+#: ``LIFECYCLE_CLOSING_REASONS`` -- pinned by test, so a new closing reason cannot ship
+#: without saying what it is.
+LIFECYCLE_CLOSE_TRIGGERS = {
+    LIFECYCLE_PROFIT_CAPTURE: OptionCloseReason.TAKE_PROFIT,
+    LIFECYCLE_CREDIT_STOP: OptionCloseReason.STOP_LOSS,
+    LIFECYCLE_TESTED: OptionCloseReason.TESTED,
+    LIFECYCLE_BREAKER: OptionCloseReason.CIRCUIT_BREAKER,
+    LIFECYCLE_COVER_LOST: OptionCloseReason.COVER_LOST,
+}
 
 #: The ONE strategy tag that promises SHARE cover, and so the only one ``cover_lost``
 #: polices. It must stay equal to ``OptionsAccountInterface.COVERED_CALL_STRATEGY`` --

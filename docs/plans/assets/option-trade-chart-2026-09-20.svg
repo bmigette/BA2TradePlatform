@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1370" viewBox="0 0 1200 1370" role="img" aria-labelledby="title desc">
+  <title id="title">Option trade popup design</title>
+  <desc id="desc">Illustrative call debit spread: underlying chart with strikes 95 and 105 and breakeven 101; entry spot 100 and exit spot 108. Green and red show hypothetical expiration profit and loss. Actual gross profit 370 differs from expiration payoff 400 at spot 108.</desc>
+  <defs>
+    <style>
+      text { font-family: 'Segoe UI', Arial, sans-serif; fill: #e5edf8; }
+      .muted { fill: #a0aec2; }
+      .label { font-size: 13px; }
+      .small { font-size: 12px; }
+      .body { font-size: 15px; }
+      .heading { font-size: 19px; font-weight: 600; }
+      .green { fill: #77dfae; }
+      .red { fill: #ff9ca5; }
+      .blue { fill: #8bb9ff; }
+      .violet { fill: #ccb1ff; }
+      .grid { stroke: #2a3547; stroke-width: 1; }
+    </style>
+    <clipPath id="historyClip"><rect x="80" y="294" width="960" height="256"/></clipPath>
+  </defs>
+  <rect width="1200" height="1370" rx="20" fill="#0b1220"/>
+  <rect x="20" y="20" width="1160" height="1330" rx="16" fill="#121c2d" stroke="#334155"/>
+  <text x="48" y="55" class="small muted">DESIGN MOCKUP · ILLUSTRATIVE VALUES · NO APPLICATION CHANGES</text>
+  <text x="48" y="95" font-size="28" font-weight="650">XYZ · Call debit spread</text>
+  <rect x="412" y="72" width="77" height="28" rx="14" fill="#29354a"/>
+  <text x="426" y="91" class="label">Closed</text>
+  <text x="48" y="123" class="body muted">Long 95 call / Short 105 call · Expiry 18 Sep 2026 · 1 contract per leg × 100</text>
+  <text x="1130" y="91" font-size="29" class="muted">×</text>
+  <rect x="48" y="147" width="346" height="84" rx="9" fill="#1b283d"/>
+  <text x="64" y="172" class="label muted">ENTRY · 08 SEP, 09:30 ET</text>
+  <text x="64" y="203" font-size="23" font-weight="600">$600 debit</text>
+  <text x="217" y="201" class="small muted">average premiums</text>
+  <rect x="407" y="147" width="346" height="84" rx="9" fill="#1b283d"/>
+  <text x="423" y="172" class="label muted">EXIT · 11 SEP, 15:45 ET</text>
+  <text x="423" y="203" font-size="23" font-weight="600">$970 received</text>
+  <rect x="766" y="147" width="386" height="84" rx="9" fill="#163b31" stroke="#32654e"/>
+  <text x="782" y="172" class="label green">RECORDED P&amp;L · FEES $0 IN THIS EXAMPLE</text>
+  <text x="782" y="204" font-size="26" font-weight="650" class="green">+$370.00</text>
+
+  <text x="48" y="271" class="heading">Underlying history</text>
+  <text x="750" y="270" class="label muted">Daily candles</text>
+  <rect x="878" y="251" width="274" height="29" rx="7" fill="#263952"/>
+  <text x="891" y="271" class="label">✓ Zones at expiry · Whole structure</text>
+  <rect x="80" y="294" width="960" height="256" fill="#101927" stroke="#344155"/>
+  <!-- Price scale: S=112 at y294, S=92 at y550. Breakeven 101 at y434.8. -->
+  <rect x="430" y="294" width="330" height="140.8" fill="#1e6247" opacity="0.34"/>
+  <rect x="430" y="434.8" width="330" height="115.2" fill="#792f3d" opacity="0.34"/>
+  <path d="M80 319.6 H1040 M80 383.6 H1040 M80 447.6 H1040 M80 511.6 H1040" class="grid"/>
+  <path d="M430 294 V550" stroke="#82b4ff" stroke-dasharray="4 4"/>
+  <path d="M760 294 V550" stroke="#ccb1ff" stroke-dasharray="4 4"/>
+  <path d="M80 383.6 H1040 M80 511.6 H1040" stroke="#9aacc3" stroke-dasharray="6 5"/>
+  <path d="M80 434.8 H1040" stroke="#d7e4f4" stroke-dasharray="3 3"/>
+  <g clip-path="url(#historyClip)" stroke-width="2">
+    <g stroke="#48b78c" fill="#48b78c">
+      <path d="M140 465 V510"/><rect x="128" y="478" width="24" height="18"/>
+      <path d="M250 432 V486"/><rect x="238" y="444" width="24" height="31"/>
+      <path d="M430 409 V466"/><rect x="418" y="423" width="24" height="25"/>
+      <path d="M540 384 V439"/><rect x="528" y="399" width="24" height="27"/>
+      <path d="M650 350 V414"/><rect x="638" y="368" width="24" height="33"/>
+      <path d="M760 326 V379"/><rect x="748" y="345" width="24" height="25"/>
+      <path d="M940 323 V364"/><rect x="928" y="334" width="24" height="18"/>
+    </g>
+    <g stroke="#ed7d88" fill="#ed7d88">
+      <path d="M340 427 V470"/><rect x="328" y="442" width="24" height="13"/>
+      <path d="M850 326 V369"/><rect x="838" y="341" width="24" height="14"/>
+    </g>
+  </g>
+  <circle cx="430" cy="447.6" r="5" fill="#8bb9ff" stroke="#142239" stroke-width="2"/>
+  <circle cx="760" cy="345.2" r="5" fill="#ccb1ff" stroke="#142239" stroke-width="2"/>
+  <text x="1054" y="324" class="label muted">$110</text>
+  <text x="1054" y="379" class="label">K $105</text>
+  <text x="1054" y="397" class="small muted">Short call</text>
+  <text x="1054" y="439" class="label">BE $101</text>
+  <text x="1054" y="508" class="label">K $95</text>
+  <text x="1054" y="526" class="small muted">Long call</text>
+  <text x="442" y="317" class="small green">PROFIT AT EXPIRATION</text>
+  <text x="442" y="539" class="small red">LOSS AT EXPIRATION</text>
+  <text x="120" y="573" class="small muted">04 Sep</text>
+  <text x="382" y="573" class="small blue">08 Sep · Entry $100</text>
+  <text x="703" y="573" class="small violet">11 Sep · Exit $108</text>
+  <text x="909" y="573" class="small muted">15 Sep</text>
+  <text x="48" y="602" class="label muted">Shading shows profit/loss if held to expiration; it is not historical option P&amp;L.</text>
+  <text x="48" y="624" class="small muted">Spot markers are illustrative snapshots. Real cached estimates show their observation time and approximation label.</text>
+
+  <text x="48" y="669" class="heading">Expiration payoff</text>
+  <rect x="870" y="647" width="282" height="30" rx="7" fill="#263952"/>
+  <text x="887" y="668" class="label">Whole structure                         ▾</text>
+  <!-- Price 85..115 maps x100..1040, P/L +500..-700 maps y707..923. -->
+  <rect x="100" y="707" width="940" height="90" fill="#173d31"/>
+  <rect x="100" y="797" width="940" height="126" fill="#40232e"/>
+  <path d="M100 725 H1040 M100 905 H1040" class="grid"/>
+  <path d="M100 797 H1040" stroke="#b0bfd1"/>
+  <path d="M413.33 707 V923 M726.67 707 V923" stroke="#899ab3" stroke-dasharray="5 5"/>
+  <path d="M601.33 707 V923" stroke="#d7e4f4" stroke-dasharray="3 3"/>
+  <path d="M570 707 V923" stroke="#8bb9ff" stroke-dasharray="3 5"/>
+  <path d="M820.67 707 V923" stroke="#ccb1ff" stroke-dasharray="3 5"/>
+  <path d="M100 797 V905 H413.33 L601.33 797 Z" fill="#d46076" opacity="0.30"/>
+  <path d="M601.33 797 L726.67 725 H1040 V797 Z" fill="#45c28e" opacity="0.30"/>
+  <path d="M100 905 H413.33 L726.67 725 H1040" fill="none" stroke="#e1ecfa" stroke-width="3"/>
+  <text x="42" y="730" class="small green">+$400</text>
+  <text x="62" y="801" class="small muted">$0</text>
+  <text x="43" y="910" class="small red">−$600</text>
+  <text x="112" y="743" class="small green">PROFIT</text>
+  <text x="112" y="829" class="small red">LOSS</text>
+  <text x="849" y="746" class="label green">+$400 at S=$108</text>
+  <text x="92" y="945" class="small muted">$85</text>
+  <text x="397" y="945" class="small muted">K95</text>
+  <text x="585" y="945" class="small">BE101</text>
+  <text x="711" y="945" class="small muted">K105</text>
+  <text x="1014" y="945" class="small muted">$115</text>
+  <text x="474" y="969" class="small muted">Underlying price at expiration ($)</text>
+  <text x="48" y="1000" class="body">Breakeven $101</text>
+  <text x="359" y="1000" class="body green">Max profit $400</text>
+  <text x="702" y="1000" class="body red">Max loss $600</text>
+  <text x="48" y="1025" class="small muted">Recorded quantities / average entry premiums · Before fees · Vanilla payoff, no early exercise or assignment</text>
+
+  <text x="48" y="1067" class="heading">Legs and moneyness</text>
+  <rect x="48" y="1084" width="1104" height="34" rx="4" fill="#253248"/>
+  <text x="64" y="1106" class="label muted">LEG / STRIKE</text>
+  <text x="248" y="1106" class="label muted">QTY × MULT.</text>
+  <text x="391" y="1106" class="label muted">ENTRY PREM.</text>
+  <text x="561" y="1106" class="label muted">EXIT PREM.</text>
+  <text x="727" y="1106" class="label muted">ENTRY</text>
+  <text x="867" y="1106" class="label muted">EXIT</text>
+  <text x="1013" y="1106" class="label muted">P&amp;L</text>
+  <text x="64" y="1153" class="body">Long call · 95</text>
+  <text x="248" y="1153" class="body">1 × 100</text>
+  <text x="391" y="1153" class="body">$8.00/share</text>
+  <text x="561" y="1153" class="body">$13.30/share</text>
+  <text x="727" y="1153" class="body blue">ITM</text>
+  <text x="867" y="1153" class="body violet">ITM</text>
+  <text x="1013" y="1153" class="body green">+$530</text>
+  <path d="M48 1170 H1152" class="grid"/>
+  <text x="64" y="1204" class="body">Short call · 105</text>
+  <text x="248" y="1204" class="body">1 × 100</text>
+  <text x="391" y="1204" class="body">$2.00/share</text>
+  <text x="561" y="1204" class="body">$3.60/share</text>
+  <text x="727" y="1204" class="body blue">OTM</text>
+  <text x="867" y="1204" class="body violet">ITM</text>
+  <text x="1013" y="1204" class="body red">−$160</text>
+  <path d="M48 1224 H1152" class="grid"/>
+  <text x="48" y="1251" class="label muted">ITM / OTM describes spot vs strike. It does not describe the trade's profit or loss.</text>
+  <text x="48" y="1286" class="small muted">Expanded leg details: contract symbol, timestamps, historical spot source, expiry, and exit reason.</text>
+  <text x="48" y="1318" class="small muted">Same trade popup · Cache-only history · Existing backtest results remain unchanged</text>
+</svg>

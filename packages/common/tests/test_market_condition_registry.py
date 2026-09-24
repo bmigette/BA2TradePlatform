@@ -103,7 +103,7 @@ def test_field_spec_to_dict_round_trips(spec):
     d = spec.to_dict()
     assert "_code_pairs" not in d
     assert list(d) == ["name", "kind", "short", "searched", "value_min", "value_max", "value_step",
-                       "anchor_op", "anchor_value", "codes", "ui_name"]
+                       "anchor_op", "anchor_value", "codes", "ui_name", "unit"]
     assert d["codes"] is None or type(d["codes"]) is dict
     assert FieldSpec(**d) == spec
     if spec.kind == "categorical":

@@ -5,6 +5,7 @@ Provides comprehensive charts and statistics for monitoring LLM API usage across
 all experts, accounts, and use cases.
 """
 
+from ..components.refresh_button import refresh_button
 from nicegui import ui
 from datetime import datetime
 import asyncio
@@ -562,11 +563,7 @@ class LLMUsagePage:
             
             ui.space()
             
-            ui.button(
-                'Refresh',
-                icon='refresh',
-                on_click=lambda: asyncio.create_task(self.load_data())
-            ).props('flat color=primary')
+            refresh_button(lambda: asyncio.create_task(self.load_data()))
         
         # Summary cards
         with ui.row().classes('w-full mb-4 gap-4'):

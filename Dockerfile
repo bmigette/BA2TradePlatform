@@ -18,11 +18,20 @@ WORKDIR /build
 # Install uv
 RUN pip install --no-cache-dir uv
 
-# Copy requirements
+# Copy requirements + the in-repo shared packages (ba2trade-common/-providers/-experts).
+# requirements.txt deliberately does not list the packages, so they are installed explicitly
+# from the build context, in the same resolve as the third-party deps. Non-editable on purpose:
+# only site-packages is carried into the final stage.
 COPY requirements.txt .
+COPY packages/common packages/common
+COPY packages/providers packages/providers
+COPY packages/experts packages/experts
 
-# Install dependencies with uv (much faster than pip)
-RUN uv pip install --no-cache-dir --system -r requirements.txt
+# Install dependencies with uv (much faster than pip). --no-sources: install exactly the copies
+# above, rather than letting uv follow the packages' [tool.uv.sources] paths to each other.
+RUN uv pip install --no-cache --system --no-sources \
+        ./packages/common ./packages/providers "./packages/experts[ui]" \
+        -r requirements.txt
 
 
 FROM python:3.11-slim

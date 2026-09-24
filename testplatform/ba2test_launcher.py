@@ -1297,8 +1297,18 @@ _EXPERT_OPT = {
     # stay fixed in v1 — widen the space only after this first grid reports OOS.
     "DeterministicScorer": {
         "expert_params": {
-            "w_technical": {"optimize": True, "min": 0.2, "max": 0.8, "step": 0.1, "type": "float"},
-            "w_fundamental": {"optimize": True, "min": 0.1, "max": 0.7, "step": 0.1, "type": "float"},
+            # FLOORS DROPPED TO 0.0 (2026-09-19). The old floors (0.2 / 0.1) made the two
+            # core sections permanently mixed: "technical only" needs w_fundamental == 0 and
+            # "fundamental only" needs w_technical == 0, and neither was reachable, so the
+            # grid could never answer which section carries the signal. Nothing downstream
+            # objects -- combine.normalize_weights renormalises over the POSITIVE weights, a
+            # single surviving section gets weight 1.0, and no guard rejects a one-section
+            # config (n_sections is recorded, never consulted as a floor). The degenerate
+            # all-zero genome scores 0.0 everywhere, emits HOLD, trades nothing and is
+            # disqualified by the trade gate like any other dead genome -- a handful of wasted
+            # trials, which is cheaper than a search space that cannot express the question.
+            "w_technical": {"optimize": True, "min": 0.0, "max": 0.8, "step": 0.1, "type": "float"},
+            "w_fundamental": {"optimize": True, "min": 0.0, "max": 0.7, "step": 0.1, "type": "float"},
             "w_analyst": {"optimize": True, "min": 0.0, "max": 0.4, "step": 0.1, "type": "float"},
             # Same bias question as w_analyst, for the PEAD section: FMPEarningsDrift
             # already trades this signal standalone, so the grid — not the default —
@@ -2669,13 +2679,14 @@ _OPTION_STRATS = {
         "option_dte_min": 300, "option_dte_max": 420,
         "option_dte_optimize": True, "option_dte_min_range": 240,
         "option_dte_max_range": 480, "option_dte_step": 40,
-        # PER-TICKET PREMIUM SIZING 0.5-2.0% of sleeve (design §2). ``option_sizing`` (% of
+        # PER-TICKET PREMIUM SIZING 0.5-5.0% of sleeve (design §2, ceiling widened 2026-09-20).
+        # ``option_sizing`` (% of
         # equity committed per structure) IS the existing "percent of sleeve" mechanism -- and
         # combined with the FIXED 1-ticket-per-underlying rule (``has_no_position``,
         # unconditional on every option entry rule -- see _option_entry_rule), a structure's
         # sizing % already reads as its per-ticket cap: "many small tickets, no single ticket
-        # dominates ex-ante" is exactly what a low option_sizing ceiling enforces. Authored 1.0
-        # is a NEW row in _OPTION_SIZING_BANDS (band 0.5-2.0 step 0.25, 7 levels) -- no existing
+        # dominates ex-ante" is what the low floor plus that rule enforce. Authored 1.0 is its
+        # own row in _OPTION_SIZING_BANDS (band 0.5-5.0 step 0.5, 10 levels) -- no existing
         # authored value covers a sub-5% debit band.
         "option_sizing": 1.0},
     "O_CONVEXP": {  # convex-harvest PUT arm -- the tail-hedge twin; same genes, kind=put.
@@ -2781,28 +2792,72 @@ def _build_strategy_phase_gated(kind: str):
     raise RuntimeError(f"{kind} is phase-gated")  # unreachable: the line above exits
 
 
-# Directional entry gate per pure-option strategy: which signal flag the entry rule requires.
+# Entry gate per pure-option strategy. THE VALUE IS A DIRECTION WORD for every directional
+# member -- "bullish"/"bearish" name which way the expert must be leaning, NOT a field: since
+# 2026-09-19 those members gate on the NUMERIC ``rec_direction`` leaf and the word is mapped
+# to the leaf's authored MODE through ``_ENTRY_GATE_MODE`` below. Only the non-directional
+# members (``_NEUTRAL_ENTRY_MEMBERS``) still hold a flag FIELD NAME here, because
+# "== HOLD" is not an ordering and cannot be said with off/below/above.
+#
 # Every original O_* key fires on the expert's BULLISH signal (including O_VERT — a bearish
 # STRUCTURE opened on a bullish signal as a hedge-shaped premium play, the original grid
 # semantics, kept unchanged). O_LP and O_BEARCS (both bearish structures) are the true
 # bearish-signal entries. O_STRD/O_STRG (non-directional vol plays) keep the "bullish"
-# default here too, but the gate condition is toggle_optimize=True in _option_entry_rule, so
-# the GA can turn direction-gating off entirely and let them fire on either signal.
+# default here too, but the direction is a MODE gene in _option_entry_rule, so the GA can
+# turn direction-gating off entirely -- or FLIP it, which the old flag leaf could not do.
 _OPTION_ENTRY_GATE = {k: "bullish" for k in _OPTION_STRATS}
 _OPTION_ENTRY_GATE["O_LP"] = "bearish"
 _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
+# NON-DIRECTIONAL members (2026-09-19): a straddle, a strangle and an iron condor are bets on
+# the size of the move, not its sign, so gating them on the expert's BULLISH flag was a
+# category error inherited from the "every original key is bullish" default. They now gate on
+# the NEUTRAL reading -- `current_rating_neutral` is the HOLD bucket
+# (CurrentRatingNeutralCondition: recommended_action == OrderRecommendation.HOLD), which is
+# the expert saying "no directional view", i.e. exactly the precondition for a no-movement
+# structure. Measured supply on the stage-1 universe (97 large caps, 313 Mondays, 2020-2025):
+# BUY 78.5%, HOLD 15.6%, SELL 2.3% -- so HOLD is ~7x the sell signal and is a real, tradeable
+# population rather than the 11-symbol rump that makes the bearish arms untestable.
+# STILL toggle_optimize=True like every other signal leaf, so the GA can drop the direction
+# filter entirely and let the structure fire on any reading; this widens the search space, it
+# does not impose a thesis. See also _low_confidence_gate, the other half of the pair.
+_NEUTRAL_ENTRY_MEMBERS = {"O_STRD", "O_STRG", "O_IC"}
+for _neutral_kind in sorted(_NEUTRAL_ENTRY_MEMBERS):
+    if _neutral_kind in _OPTION_ENTRY_GATE:
+        _OPTION_ENTRY_GATE[_neutral_kind] = "current_rating_neutral"
 # GRID 2: O_LEAPP is the grid's only bearish long-dated arm (design §2, "the bearish twin"),
 # so it gates on the expert's SELL signal exactly as O_LP does. O_LEAPC is bullish; O_CBS
 # (upside convexity) is bullish; O_PBS is the crash hedge and is the family's other bearish
 # structure. O_ERN is non-directional and keeps the "bullish" default like O_STRD/O_STRG --
-# that leaf is toggle_optimize=True in _option_entry_rule, so the GA can drop the direction
-# gate entirely and let the straddle fire on either signal, which is what a vol bet wants.
+# that leaf carries the direction MODE gene in _option_entry_rule, so the GA can drop the
+# direction gate entirely (mode ``off``) and let the straddle fire on either signal, which is
+# what a vol bet wants -- or flip it to the SELL side if that scores better.
 _OPTION_ENTRY_GATE["O_LEAPP"] = "bearish"
 _OPTION_ENTRY_GATE["O_PBS"] = "bearish"
 # CONVEX-HARVEST GRID (plan Task 13): O_CONVEXP is the put/tail-hedge arm of the O_CONVEX
 # group, so it gates on the expert's SELL signal exactly as O_LP/O_LEAPP do. O_CONVEXC keeps
 # the "bullish" default like every call arm above.
 _OPTION_ENTRY_GATE["O_CONVEXP"] = "bearish"
+
+# Direction word -> the numeric leaf's AUTHORED mode (design 2026-09-19). ``rec_direction`` is
+# the expert's grade centred on HOLD (SELL -2 .. BUY +2), so against the pinned threshold 0
+# ``above`` (``> 0``) IS the old ``bullish`` flag and ``below`` (``< 0``) IS the old
+# ``bearish`` one -- the authored default therefore reproduces today's behaviour exactly. What
+# is NEW is that the mode is a GENE with three choices (off/below/above), so the GA can also
+# pick the OPPOSITE direction: a long call entered on a SELL signal, the contrarian arm that
+# was unreachable while the field itself was hard-coded. It costs nothing: ConditionLeaf
+# forbids ``mode_optimize`` beside ``toggle_optimize`` (the ``off`` choice already removes the
+# leaf), so the one ``cond:<id>:mode`` gene REPLACES the one ``cond:<id>:enabled`` gene the
+# flag leaf used to emit.
+_ENTRY_GATE_MODE = {"bullish": "above", "bearish": "below"}
+#: The authored operator each mode means on a leaf whose threshold is 0.
+_ENTRY_GATE_OP = {"above": ">", "below": "<"}
+_undirected = sorted(k for k, v in _OPTION_ENTRY_GATE.items()
+                     if k not in _NEUTRAL_ENTRY_MEMBERS and v not in _ENTRY_GATE_MODE)
+if _undirected:
+    raise RuntimeError(
+        f"_OPTION_ENTRY_GATE holds no direction word for directional member(s) {_undirected}: "
+        f"a member that is not in _NEUTRAL_ENTRY_MEMBERS must map to one of "
+        f"{sorted(_ENTRY_GATE_MODE)}")
 
 # FULL-NOTIONAL structures: those whose per-contract buying-power reserve scales with the
 # STRIKE (cash-secured / un-netted naked notional) rather than with a defined-risk spread
@@ -3407,11 +3462,17 @@ _OPTION_SIZING_BANDS = {
     # _OPTION_RM_OVERRIDE have to move together or neither moves anything.
     20.0: (5.0, 50.0, 5.0),
     # CONVEX-HARVEST (plan Task 13, design 2026-08-31-convex-harvest-grid-design.md §2):
-    # "per-ticket premium sizing 0.5-2.0% of sleeve -- many small tickets, no single ticket may
-    # dominate ex-ante". A NEW row: no existing authored value's band reaches below 1.0% (the
-    # 5.0 row's floor), and the design's own ceiling (2.0%) sits BELOW that row's floor entirely
-    # -- sharing it would either refuse the whole band or silently widen it past the design.
-    1.0: (0.5, 2.0, 0.25),
+    # "many small tickets, no single ticket may dominate ex-ante". A NEW row: no existing
+    # authored value's band reaches below 1.0% (the 5.0 row's floor), so sharing the 5.0 row
+    # would refuse the whole small-ticket band.
+    # CEILING WIDENED 2.0% -> 5.0% (2026-09-20, operator decision; grid not yet run): on the
+    # grid's $20k account a 2% ticket is $400, and 180-540 DTE premiums are expensive enough
+    # that the old ceiling effectively restricted the arm to cheap underlyings / deeper-OTM
+    # contracts. The FLOOR stays 0.5% and the step coarsens to 0.5 (10 levels) because the
+    # convex grid is small (pop 40 / gen 6) and a 19-level band would be barely searchable
+    # there. Breadth is still the thesis: the FIXED one-ticket-per-underlying rule is what
+    # keeps a single ticket from dominating, not the ceiling alone.
+    1.0: (0.5, 5.0, 0.5),
 }
 _missing_sizings = sorted({cfg["option_sizing"] for cfg in _OPTION_STRATS.values()
                            if cfg.get("option_sizing") is not None}
@@ -3502,7 +3563,7 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
 # fill model makes the NEXT bar's open cross that stale quote. And the quote is a MID, not a
 # touch: the historical option store carries `bid == ask` on every row it fills in at all (the
 # parquet store has no bid/ask column whatsoever), so `contract.ask` and `contract.bid` are both
-# just the close, while the tradeable spread is MODELLED at fill time by --option-spread-pct.
+# just the close, while the tradeable spread is MODELLED at fill time (--option-spread-model).
 # A seller therefore fills only if the premium RISES by a whole modelled half-spread overnight
 # -- which for decaying OTM premium is the wrong way round, so the DAY order expires unfilled
 # and premium sellers structurally almost never trade. Measured head-to-head on INTC Feb-Dec
@@ -4429,6 +4490,43 @@ def _days_to_earnings_gate(m: str) -> dict:
             "optimize": True, **_EVENT_ENTRY_DAYS}
 
 
+def _low_confidence_gate(m: str) -> dict:
+    """The LOW-conviction entry gate leaf for the non-directional members (``m`` = prefix).
+
+    The mirror of ``shared-gate_confidence``, which is hardcoded ``confidence > X`` at every
+    call site because the GA's gene space searches a condition's threshold and its enabled
+    flag but NEVER its operator. That fixed operator is why "enter only when conviction is
+    LOW" was unreachable: there was no leaf spelling ``<=``. This is that leaf.
+
+    WHY IT IS THE RIGHT GATE FOR A NO-MOVEMENT STRUCTURE. DeterministicScorer's confidence is
+    not an independent axis -- ``confidence_from_score`` is ``max(5, 100*min(1,|final|))``, a
+    pure function of the composite score's MAGNITUDE. So low confidence IS "the composite sits
+    near zero", i.e. the model sees no move in either direction. That is the precondition a
+    straddle/strangle seller wants, and no other gate in the vocabulary expresses it: the
+    neutral FLAG says the action bucket was HOLD, this says the conviction behind it was
+    small, and they are not the same statement.
+
+    NOT ``shared-``: unlike conviction-above-a-bar, which means the same thing to every
+    structure, this leaf only exists for the members in ``_NEUTRAL_ENTRY_MEMBERS``, so a
+    shared id would create a gene that most members never carry.
+
+    RANGE 10-70 (operator call 2026-09-19, widened from 5-30). The floor is 10 rather than
+    ``confidence_from_score``'s own floor of 5 because a threshold AT the floor admits nothing
+    a directional action can produce; the ceiling is 70 so the search can also express a LOOSE
+    "anything but high conviction" gate, not only a strict one. Note the interaction with
+    ``_clamp_confidence_genes``: for DeterministicScorer the ceiling is clamped to 50 (its
+    confidence tops out near 56), so this gene searches 10-50 under that expert and the full
+    10-70 under one that can reach 100. That clamp is what stops the loose end of the range
+    becoming a gate that admits everything.
+
+    ``toggle_optimize=True`` like every optional gate: the GA decides whether low conviction
+    is actually a precondition, rather than the launcher asserting it.
+    """
+    return {"id": f"{m}-low_confidence", "field": "confidence", "op": "<=", "value": 30,
+            "optimize": True, "value_min": 10, "value_max": 70, "value_step": 5,
+            "toggle_optimize": True}
+
+
 def _assert_option_expiry_clears_event_window(kind: str) -> None:
     """The straddle's expiry must land AFTER the print (amendment 2).
 
@@ -4477,6 +4575,59 @@ for _ern_kind in sorted(_EVENT_ENTRY_MEMBERS):
 # PER-STRATEGY, not a CLI flag. The switch is a property of what the ruleset does, not an
 # operator preference -- a flag would let an O_CSP grid hold stock nothing in it can sell, which
 # is the orphaned-stock blow-up the liquidation exists to prevent. Keeping the set here means
+# --- the OPTION SPREAD MODEL (plan Part F) --------------------------------------------------
+#
+# The spread an option fill pays is the DECISION bar's real NBBO when it has one, else a power
+# law calibrated on 2020-2023 ThetaData EOD quotes (ba2_common.core.option_spread_model, whose
+# SPREAD_MODEL_VERSION names it). The old percent-of-premium formula stays reachable, but only
+# EXPLICITLY: passing --option-spread-pct and/or --option-spread-min-tick selects it (with the
+# other knob at its old default), as does --option-spread-model legacy-pct.
+_LEGACY_OPTION_SPREAD_PCT = 5.0
+_LEGACY_OPTION_SPREAD_MIN_TICK = 0.02
+
+
+def _add_option_spread_args(p) -> None:
+    """``--option-spread-model`` and the legacy ``--option-spread-pct/--min-tick`` overrides,
+    shared by ``optimize`` and ``optimize-batch`` so the two cannot drift apart."""
+    from ba2_common.core.option_spread_model import SPREAD_MODEL_VERSION, SPREAD_MODELS
+    p.add_argument("--option-spread-model", default=SPREAD_MODEL_VERSION, choices=SPREAD_MODELS,
+                   help="How an option fill's bid-ask spread is charged. Default "
+                        f"{SPREAD_MODEL_VERSION}: the decision bar's real NBBO half-spread when "
+                        "it has a valid quote, else a premium**0.6 x volume**-0.14 power law "
+                        "fitted on ThetaData EOD quotes -- neither ever reads the fill day. "
+                        "'legacy-pct' is the pre-2026-09-22 percent-of-premium model. Recorded "
+                        "in the run config and results; results are NOT comparable across it.")
+    p.add_argument("--option-spread-pct", type=float, default=None,
+                   help="LEGACY override: option spread as a PERCENT OF PREMIUM (full width; "
+                        "half charged per fill), doubled under 100 contracts/day on the fill "
+                        "bar. Setting it (or --option-spread-min-tick) selects the legacy model "
+                        f"instead of the calibrated one; unset knobs take the old defaults "
+                        f"({_LEGACY_OPTION_SPREAD_PCT} / {_LEGACY_OPTION_SPREAD_MIN_TICK}).")
+    p.add_argument("--option-spread-min-tick", type=float, default=None,
+                   help="LEGACY override: absolute floor on the percent-of-premium spread in "
+                        "premium dollars (full width). Setting it selects the legacy model.")
+
+
+def _option_spread_account_settings(args) -> Dict[str, Any]:
+    """The ``account_settings`` slice that tells ``BacktestAccount`` how to charge option spreads.
+
+    Always names the model explicitly. Under the calibrated model the legacy knobs are OMITTED,
+    never written as 0.0: the account refuses a model/knob mix, and a stored 0.0 knob would read
+    as a zero-spread run to anything that re-runs the row. The legacy model always carries both
+    knobs (an explicit 0 is how a zero-spread run is asked for).
+    """
+    from ba2_common.core.option_spread_model import LEGACY_PCT_MODEL
+    pct = getattr(args, "option_spread_pct", None)
+    tick = getattr(args, "option_spread_min_tick", None)
+    model = getattr(args, "option_spread_model")
+    if pct is not None or tick is not None or model == LEGACY_PCT_MODEL:
+        return {"option_spread_model": LEGACY_PCT_MODEL,
+                "option_spread_pct": float(_LEGACY_OPTION_SPREAD_PCT if pct is None else pct),
+                "option_spread_min_tick": float(_LEGACY_OPTION_SPREAD_MIN_TICK
+                                                if tick is None else tick)}
+    return {"option_spread_model": model}
+
+
 # adding a stock-managing structure later is one line, next to the reason.
 _HOLDS_ASSIGNED_STOCK = {"O_WHEEL"}
 
@@ -4988,10 +5139,51 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     return recorded
 
 
+def _option_signal_gate(m: str, member: str) -> dict:
+    """The entry rule's DIRECTION leaf for one structure (id ``<m>-signal``, unchanged).
+
+    DIRECTIONAL members get a NUMERIC leaf on ``rec_direction`` -- the expert's grade centred
+    on HOLD (SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2) -- with the threshold
+    PINNED at 0 and a MODE gene over ``off``/``below``/``above``. Against a 0 threshold those
+    three are exactly "no direction filter", "enter on the SELL signal" and "enter on the BUY
+    signal", so the GA now chooses the DIRECTION and not merely whether to require one. The
+    authored mode is the member's historical direction (``_ENTRY_GATE_MODE``), so the default
+    genome is the flag leaf this replaced.
+
+    ZERO NET GENES, which is the reason this is a mode leaf and not a second rule: the model
+    forbids ``mode_optimize`` beside ``toggle_optimize`` (``off`` already removes the leaf),
+    so the single ``cond:<id>:mode`` gene stands exactly where ``cond:<id>:enabled`` stood.
+    ``optimize`` is False on purpose -- the threshold is the fixed point of a signed scale,
+    not a quantity to search, and searching it would add the gene back. The degenerate
+    ``value_min``/``value_max``/``value_step`` are NOT a search range: a mode leaf is
+    classified NUMERIC (``rule_models.leaf_mode_kind``) precisely by carrying a threshold
+    range, and a leaf classified CATEGORICAL may not offer ``below``/``above`` at all.
+
+    NON-DIRECTIONAL members (``_NEUTRAL_ENTRY_MEMBERS``: the straddle, the strangle and the
+    iron condor) KEEP the ``current_rating_neutral`` FLAG leaf with its ON/OFF toggle. Two
+    reasons, both hard. (1) ``off``/``below``/``above`` cannot express ``== HOLD``: that is an
+    equality on the interior of the scale, not an ordering, and ``below`` OR ``above`` is its
+    complement rather than the thing itself. (2) They do not want a direction anyway -- they
+    are bets on the SIZE of the move, so "the expert has no view" is the gate, and flipping it
+    to a direction would be the category error the neutral override exists to undo.
+    """
+    if member in _NEUTRAL_ENTRY_MEMBERS:
+        return {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member],
+                "field_type": "flag", "toggle_optimize": True}
+    from ba2_common.core.rule_models import NUMERIC_MODE_CHOICES
+
+    mode = _ENTRY_GATE_MODE[_OPTION_ENTRY_GATE[member]]
+    return {"id": f"{m}-signal", "field": "rec_direction", "field_type": "numeric",
+            "op": _ENTRY_GATE_OP[mode], "value": 0.0, "optimize": False,
+            "value_min": 0.0, "value_max": 0.0, "value_step": 1.0,
+            "mode_optimize": True, "mode_choices": list(NUMERIC_MODE_CHOICES)}
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False,
                        gates_off: "bool | None" = None) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
-    (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
+    (a ``rec_direction`` MODE gene authored to the member's historical direction -- bullish
+    for every original key, bearish for O_LP; see _option_signal_gate) + flat +
     optimizable confidence gate + the iv_rank / relative-volume / iv-vs-realised-vol gates +
     ONE expected-profit gate, action = the member's option action config. Rule/condition ids
     are prefixed with the member key so a GROUP of these rules yields uniquely-keyed genes per
@@ -5005,9 +5197,10 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
     silently). ``toggleable`` adds the rule-level enabled gene (group members only — a
     single-strategy job keeps its one entry always-on).
 
-    Every gate except ``-flat`` is independently ``toggle_optimize=True``: ``-flat``
-    (``has_no_position``) is a correctness guard, not a strategy opinion, so the GA may not
-    switch it off. Op is fixed per gate — the GA's gene space only ever searches a condition's
+    Every gate except ``-flat`` is independently switchable off by the GA -- via
+    ``toggle_optimize=True``, or (the ``-signal`` leaf) via its mode gene's ``off`` choice:
+    ``-flat`` (``has_no_position``) is a correctness guard, not a strategy opinion, so the GA
+    may not switch it off. Op is fixed per gate — the GA's gene space only ever searches a condition's
     threshold value and its enabled flag, never its operator (see
     docs/plans/2026-07-21-options-price-target-conditions.md's "Design reference"). That is why
     ``_iv_rank_gate`` and ``_iv_rv_gate`` are built PER MEMBER: their direction flips between
@@ -5025,12 +5218,22 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
         "id": f"{m}-entry",
         "name": f"{member}-entry",
         "conditions": {"id": f"{m}-root", "type": "AND", "conditions": [
-            {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member], "field_type": "flag",
-             "toggle_optimize": True},
+            _option_signal_gate(m, member),
             {"id": f"{m}-flat", "field": "has_no_position", "field_type": "flag"},
-            {"id": "shared-gate_confidence", "field": "confidence", "op": ">", "value": 50,
-             "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
-             "toggle_optimize": True},
+            # HIGH-conviction gate, for DIRECTIONAL members only. The non-directional members
+            # get the `<=` mirror instead (below), a SWAP rather than an addition: it keeps
+            # their genome at the same width -- the 31-gene grid-1 budget pinned by
+            # test_option_grid_foundations::test_grid1_genomes_did_not_move -- and it drops a
+            # gate that is close to arithmetically dead for them. A neutral-gated member only
+            # fires when the action is HOLD, and on a scorer whose confidence is
+            # 100*|composite| a HOLD by definition sits below the buy/sell threshold, so
+            # `confidence > 40..75` and `current_rating_neutral` are nearly unsatisfiable
+            # together. Asking a structure that wants NO view to also want STRONG conviction
+            # is a contradiction, not a search dimension.
+            *([] if member in _NEUTRAL_ENTRY_MEMBERS else [
+                {"id": "shared-gate_confidence", "field": "confidence", "op": ">", "value": 50,
+                 "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
+                 "toggle_optimize": True}]),
             _iv_rank_gate(m, member),
             _relative_volume_gate(),
             _iv_rv_gate(m, member),
@@ -5039,6 +5242,13 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
             # rather than folded into an existing leaf so it keeps its own threshold gene,
             # and NOT toggle_optimize -- see _days_to_earnings_gate.
             *([_days_to_earnings_gate(m)] if member in _EVENT_ENTRY_MEMBERS else []),
+            # NON-DIRECTIONAL members only (O_STRD/O_STRG/O_IC): the low-conviction gate, the
+            # `<=` mirror of shared-gate_confidence that a no-movement thesis needs and the
+            # fixed-operator shared leaf cannot express. Appended like the earnings gate, and
+            # its own id keeps its threshold gene separate from the shared high-conviction
+            # one -- a member can now search BOTH bounds and the GA may enable either, both
+            # or neither. See _low_confidence_gate.
+            *([_low_confidence_gate(m)] if member in _NEUTRAL_ENTRY_MEMBERS else []),
             # MARKET-CONDITION gates (--market-condition-profile; [] by default). LAST in the
             # AND list on purpose: appending keeps every existing leaf at its current index, so
             # profile `none` emits a byte-identical rule and an older gene key still names the
@@ -5589,7 +5799,7 @@ def _clamp_confidence_genes(strat, expert: str):
     return strat
 
 
-def _build_strategy(kind: str, name: str, expert: str):
+def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="legacy"):
     """Dispatch to the right strategy builder.
 
     Every S-strategy is EXPERT-AGNOSTIC (2026-08-17): S1 used to load a per-expert live/default
@@ -5605,7 +5815,64 @@ def _build_strategy(kind: str, name: str, expert: str):
         if builder is None:
             sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
         strat = builder(name)
+    if neutral_entry_mode != "legacy":
+        _configure_neutral_entry(strat, kind, neutral_entry_mode)
     return _clamp_confidence_genes(strat, expert)
+
+
+def _configure_neutral_entry(strategy, kind, mode):
+    """Fixed or joint HOLD/low-confidence experiments; never an impossible AND."""
+    if kind not in _NEUTRAL_ENTRY_MEMBERS or mode not in ("hold", "low_confidence", "joint"):
+        raise ValueError("--neutral-entry-mode requires O_STRD, O_STRG or O_IC")
+    if _OPTION_GATES_OFF:
+        raise ValueError("--neutral-entry-mode cannot be combined with --gates-off")
+    if mode == "joint":
+        # Two ordinary rules with the existing rule-enabled genes. No new
+        # expert mode, condition class or decoder behavior is needed.
+        from copy import deepcopy
+        rules = []
+        for arm in ("hold", "low_confidence"):
+            branch = deepcopy(strategy)
+            _configure_neutral_entry(branch, kind, arm)
+            for rule in branch.entry_rules:
+                rule["id"] += "-" + arm
+                rule["name"] += "-" + arm
+                rule["toggle_optimize"] = True
+                rule["toggleOptimize"] = True
+                rules.append(rule)
+        strategy.entry_rules = rules
+        return
+    m = kind.lower()
+    for rule in strategy.entry_rules:
+        leaves = rule["conditions"]["conditions"]
+        if mode == "low_confidence":
+            # Confidence alone also accepts HOLD. Make the directional arm explicit
+            # using the existing condition, rather than filtering expert outputs.
+            leaves.append({"id": f"{m}-directional", "field": "rec_direction",
+                           "op": "!=", "value": 0})
+        if mode == "hold":
+            # HOLD has no directional price target. Requiring expected_profit > N
+            # would silently make this arm untradeable even after admitting HOLD.
+            leaves = [c for c in leaves if c["id"] not in
+                      (f"{m}-low_confidence", f"{m}-exp_profit")]
+            for c in leaves:
+                if c["id"] == f"{m}-signal":
+                    c["toggle_optimize"] = False
+                    c["toggleOptimize"] = False
+        else:
+            leaves = [c for c in leaves if c["id"] != f"{m}-signal"]
+            for c in leaves:
+                if c["id"] == f"{m}-low_confidence":
+                    c["toggle_optimize"] = False
+                    c["toggleOptimize"] = False
+        rule["conditions"]["conditions"] = leaves
+
+
+def _apply_neutral_entry_setting(backtest_block, mode):
+    if mode != "legacy":
+        for expert in backtest_block["experts"]:
+            # Admission only, fixed for the experiment. The rules choose signals.
+            expert["settings"]["evaluate_entry_rules_on_hold"] = True
 
 
 def _cmd_optimize(args) -> int:
@@ -5718,7 +5985,11 @@ def _cmd_optimize(args) -> int:
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
-        strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(args.strategy, _sname, expert)
+        neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
+        if bypass and neutral_mode != "legacy":
+            raise ValueError("Neutral option entry experiments require a ruleset expert")
+        strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(
+            args.strategy, _sname, expert, neutral_entry_mode=neutral_mode)
         # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
         # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
         # affect it, then thread it into the run config below so the handler's _build_experts (and
@@ -5737,8 +6008,9 @@ def _cmd_optimize(args) -> int:
                 "commission_per_trade": float(args.commission),
                 "slippage_bps": float(args.slippage),
                 "spread_bps": float(getattr(args, "spread_bps", 0.0)),
-                "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
-                "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
+                # The option spread model + its legacy knobs (plan Part F): see
+                # _option_spread_account_settings.
+                **_option_spread_account_settings(args),
                 "fill_model": args.fill_model,
                 # RUN-LEVEL, never a gene (see --equity-cap): every individual in the
                 # population must face the same capital, or they are scored against
@@ -5779,6 +6051,7 @@ def _cmd_optimize(args) -> int:
         _apply_options_store(args, backtest_block)
         # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
         _apply_option_trade_floor(None if bypass else args.strategy, backtest_block)
+        _apply_neutral_entry_setting(backtest_block, neutral_mode)
 
         # Screener-settings optimization: when --screener, attach a screener_opt block to the
         # backtest config (store + base settings + scan cadence — an OPTIMIZATION config option,
@@ -5970,6 +6243,14 @@ def _cmd_optimize(args) -> int:
         return 0
 
     res = handle_strategy_optimization("cli-optimize", {"optimization_id": opt_id})
+    if res.get("failure_kind") == "no_measurements" or res.get("status") == "no_measurements":
+        # Stall-only search (2026-09-21 review, G2): nothing was measured, so there is no winner to
+        # export (and _persist_top_backtests would find no candidate anyway). The row is `failed`
+        # with a marker that tools/run_options_matrix.py reads to SKIP this job rather than stop the
+        # campaign; its checkpoint was preserved for a retry.
+        print(f"ba2-test: optimization {opt_id} produced NO measured trials (every trial stalled or "
+              f"failed). Checkpoint PRESERVED; the matrix skips this job and continues.")
+        sys.exit(1)
     if res.get("status") != "completed":
         print(json.dumps(res, indent=2, default=str))
         sys.exit(f"ba2-test: optimization {opt_id} did not complete")
@@ -6073,7 +6354,11 @@ def _cmd_optimize_batch(args) -> int:
         name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
         db = SessionLocal()
         try:
-            strat = _build_strategy_minimal(name) if bypass else _build_strategy(strat_kind, name, expert)
+            neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
+            if bypass and neutral_mode != "legacy":
+                raise ValueError("Neutral option entry experiments require a ruleset expert")
+            strat = _build_strategy_minimal(name) if bypass else _build_strategy(
+                strat_kind, name, expert, neutral_entry_mode=neutral_mode)
             # Pure-option kinds carry a transient `entry_action`; capture before commit/refresh.
             strat_entry_action = getattr(strat, "entry_action", None)
             db.add(strat); db.commit(); db.refresh(strat)
@@ -6088,8 +6373,8 @@ def _cmd_optimize_batch(args) -> int:
                     "commission_per_trade": float(args.commission),
                     "slippage_bps": float(args.slippage),
                     "spread_bps": float(getattr(args, "spread_bps", 0.0)),
-                    "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
-                    "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
+                    # The option spread model + its legacy knobs (plan Part F).
+                    **_option_spread_account_settings(args),
                     "fill_model": args.fill_model,
                     # RUN-LEVEL, never a gene (see --equity-cap). None = off.
                     "equity_cap": getattr(args, "equity_cap", None),
@@ -6125,6 +6410,7 @@ def _cmd_optimize_batch(args) -> int:
             _apply_options_store(args, backtest_block)
             # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
             _apply_option_trade_floor(None if bypass else strat_kind, backtest_block)
+            _apply_neutral_entry_setting(backtest_block, neutral_mode)
             # Target-anchored variants (S4): the TP-on-target anchoring lives on the Strategy row
             # itself (strat.entry_actions, seeded by _build_strategy_S4) — nothing to thread onto
             # the run config here.
@@ -6223,7 +6509,8 @@ def _cmd_optimize_batch(args) -> int:
 _REMOTE_RETRY_BACKOFF_S = 5.0
 
 
-def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]:
+def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitness_metric: str,
+                       deadline: Optional[float] = None) -> Dict[str, Any]:
     """Try *worker* for a top-N re-run, retrying once after a short backoff, then fall back to
     running the trial directly (the same path a "local" slot uses) rather than permanently
     losing this rank.
@@ -6234,26 +6521,214 @@ def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitnes
     by hand. Both were transient -- a retry a few seconds later, or falling back to a box that's
     definitely not restarting, gets the row on the first attempt instead."""
     import time
-    from app.services.strategy_optimization_handler import _persist_trial_worker
     from app.services.worker_client import run_trial_full
     last_exc: Optional[Exception] = None
+
+    def _past_deadline() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
     for attempt in range(2):
+        if _past_deadline():
+            # The caller has already dropped this rank. Starting anything now would run a backtest
+            # nobody is waiting for (2026-09-21 recheck, H1).
+            raise TimeoutError(
+                f"export deadline passed before the remote attempt to {worker.get('name')} finished")
         try:
             return run_trial_full(worker, trial_cfg, fitness_metric)
         except Exception as e:  # noqa: BLE001 -- transient remote failure; retry/fallback below
             last_exc = e
             if attempt == 0:
                 print(f"    remote {worker.get('name')} failed ({e!r}); retrying once...")
+                if deadline is not None and time.monotonic() + _REMOTE_RETRY_BACKOFF_S >= deadline:
+                    print(f"    no budget left for the retry (export deadline) -- going straight to "
+                          f"the fallback decision")
+                    break
                 time.sleep(_REMOTE_RETRY_BACKOFF_S)
+    if _past_deadline():
+        raise TimeoutError(
+            f"export deadline passed after {worker.get('name')} failed twice ({last_exc!r}) -- "
+            f"NOT starting a local fallback")
     print(f"    remote {worker.get('name')} failed twice ({last_exc!r}); falling back to local")
-    return _persist_trial_worker(trial_cfg)
+    return _run_local_fallback_bounded(trial_cfg, deadline)
+
+
+def _new_local_pool(max_workers: int = 1):
+    """A spawn-based local pool built EXACTLY like the export phase's.
+
+    Shared so the remote fallback runs the same way a `local` slot does: same interpreter, same
+    worker env, same backend dir. (2026-09-21 recheck, H1.)
+    """
+    # Self-contained imports: the export block reaches these through LOCAL aliases of its own
+    # (`_os`, `_mp`, and a local `from ... import _WORKER_ENV_KEYS`), which do not exist at module
+    # scope. A helper that borrowed them raised NameError the moment it was called from anywhere
+    # else -- caught by the persist-top tests, which exercise the fallback path directly.
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    from app.services.strategy_optimization_handler import _WORKER_ENV_KEYS, _worker_init
+    env = {k: os.environ[k] for k in _WORKER_ENV_KEYS if os.environ.get(k)}
+    return ProcessPoolExecutor(
+        max_workers=max_workers, mp_context=mp.get_context("spawn"),
+        initializer=_worker_init, initargs=(_BACKEND_DIR, env),
+    )
+
+
+def _submit_daemon(fn, *args, **kwargs):
+    """Run one attempt in a DAEMON thread and return a real ``Future`` for it.
+
+    WHY NOT A ThreadPoolExecutor (2026-09-21 recheck, H1): Python 3.9+ registers an atexit hook
+    that JOINS a ThreadPoolExecutor's threads. `shutdown(wait=False, cancel_futures=True)` cannot
+    stop a thread that is already running, so a remote call that never returns kept the WHOLE
+    launcher alive at interpreter exit -- the export deadline dropped the rank and the process
+    still hung. Daemon threads are abandoned at exit, which is the only behaviour that makes a
+    bounded export actually bounded. The Future is a plain one, so `as_completed(futs, timeout=...)`
+    and `fut.done()` keep working unchanged.
+    """
+    import threading
+    from concurrent.futures import Future
+    fut: Future = Future()
+
+    def _run() -> None:
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 -- handed to the caller through the Future
+            fut.set_exception(exc)
+
+    threading.Thread(target=_run, name=f"remote-{getattr(fn, '__name__', 'attempt')}",
+                     daemon=True).start()
+    return fut
+
+
+def _run_local_fallback_bounded(trial_cfg: Dict[str, Any], deadline: Optional[float] = None) -> Dict[str, Any]:
+    """Run the remote fallback in a KILLABLE process pool, bounded by what is left of the export.
+
+    Inline -- what this used to do -- a wedged fallback ran in a thread that cannot be terminated
+    and, worse, STARTED FRESH WORK after the export deadline had already dropped the rank: nobody
+    was waiting for that backtest any more (2026-09-21 recheck, H1). Now it runs where it can be
+    killed, its wait is bounded, and past the deadline it refuses to start at all.
+    """
+    import time
+    from concurrent.futures import TimeoutError as _FutureTimeout
+    from app.services.strategy_optimization_handler import _persist_trial_worker
+
+    budget = None if deadline is None else deadline - time.monotonic()
+    if budget is not None and budget <= 0:
+        raise TimeoutError(
+            "the export deadline passed before the local fallback could start -- not starting a "
+            "backtest that nothing is waiting for")
+    pool = _new_local_pool(1)
+    try:
+        fut = pool.submit(_persist_trial_worker, trial_cfg)
+        return fut.result(timeout=budget)
+    except _FutureTimeout:
+        raise TimeoutError("the local fallback exceeded the remaining export budget") from None
+    finally:
+        # Terminate then kill, never wait: the whole point is that a wedged worker cannot hold
+        # this process open.
+        _kill_executor(pool)
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001 -- teardown must never mask the export result
+            pass
+
+
+def _kill_executor(ex) -> None:
+    """Terminate a ProcessPoolExecutor's workers WITHOUT waiting for their work (best effort).
+
+    Mirrors the GA's stall recovery: ``shutdown(wait=True)`` -- what a ``with`` block does -- blocks
+    on a wedged worker, which is exactly the thing being walked away from. SIGTERM first, a bounded
+    grace period, then SIGKILL (uncatchable), so a worker that ignores SIGTERM still cannot hold the
+    process open.
+    """
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    import time  # local, like the rest of this module's stdlib use
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and any(p.is_alive() for p in procs):
+        time.sleep(0.05)
+    for p in procs:
+        if p.is_alive():
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
+    """Top-N candidates by DISTINCT fitness, EXCLUDING non-measurements (stalled records).
+
+    Returns ``(ranked, skipped)``: ``ranked`` is a list of ``(params, key, fitness)`` and
+    ``skipped`` counts the diagnostic records that were dropped.
+
+    Dedup is on fitness, not raw params: a converged GA yields many param sets that differ only in
+    INERT genes (e.g. ``exit:<id>:action_value`` while ``exit:<id>:enabled=0``) yet score the same
+    and produce identical backtests -- keying on params would persist N behaviourally-identical rows.
+
+    WHY NON-MEASUREMENTS ARE EXCLUDED (2026-09-21 review, G1): a stalled record carries a sentinel
+    score and has NO buffered result, so selecting it here makes the export RE-RUN -- with no
+    timeout of its own -- the very trial the stall guard just abandoned. That can hang the grid
+    again AFTER a successful recovery. Diagnostics stay in ``all_results`` so the frequency stays
+    countable; they are not candidates. Fewer saved backtests is the correct answer when the search
+    is thin.
+    """
+    from app.services.strategy_fitness import is_measured_result
+    seen, ranked, skipped = set(), [], 0
+    measured = []
+    for record in all_results or []:
+        if is_measured_result(record) and isinstance(record.get("params"), dict):
+            measured.append(record)
+        else:
+            skipped += 1
+    # Filter before sorting: malformed diagnostic records must never enter comparisons.
+    for r in sorted(measured, key=lambda record: record["fitness"], reverse=True):
+        fit = r["fitness"]
+        dedup_key = round(fit, 6)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        # Carry the FITNESS, not just the params. It is the only record of how the GA actually
+        # ranked these rows -- the persisted metric columns are its inputs, and re-deriving the
+        # order from any one of them drops the other three terms.
+        ranked.append((r["params"], r.get("key"), fit))
+        if len(ranked) >= n:
+            break
+    if (not ranked and isinstance(best_params, dict) and best_params
+            and is_measured_result({"fitness": best_fitness})):
+        # No trial key known -> always falls back to re-run. best_fitness is the score of exactly
+        # this genome (it is what made it `best`), so it is the right value here -- UNLESS the
+        # search never measured anything, in which case there is no winner to export at all.
+        ranked = [(best_params, None, best_fitness)]
+    return ranked, skipped
 
 
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
-                            last_gen_full_results: Optional[Dict[str, Any]] = None) -> int:
+                            last_gen_full_results: Optional[Dict[str, Any]] = None, *,
+                            candidates: Optional[List[tuple]] = None,
+                            ranks: Optional[List[int]] = None,
+                            name_prefix: str = "TOP",
+                            extra_labels: Optional[List[str]] = None,
+                            use_remote_workers: bool = True,
+                            persisted_ids: Optional[List[tuple]] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
     saved Backtest (best params + their metrics) so the top performers are kept for
     comparison and to warm-start future optimizations. Returns how many were persisted.
+
+    The keyword-only arguments let another SELECTION reuse this exact re-run + persist path
+    (tools/persist_distinct_topn.py, the behaviour-distinct TOP-N). All default to the end-of-job
+    behaviour, so the grid's own call is unchanged:
+      * ``candidates`` -- ``(params, key, ga_fitness)`` tuples to persist INSTEAD of
+        ``_rank_measured_candidates``' fitness-distinct top ``n``;
+      * ``ranks`` -- the rank shown in each row's name, parallel to ``candidates`` (default
+        1..len); ``name_prefix`` -- the name prefix (``TOP`` -> ``TOP3-<opt name>``);
+      * ``extra_labels`` -- appended to the optimization's own labels on every persisted row;
+      * ``use_remote_workers=False`` -- re-run on the local pool only, even when the
+        optimization used remote workers;
+      * ``persisted_ids`` -- a list this appends ``(rank, backtest_id)`` to per persisted row.
 
     The re-runs are the slow post-GA phase (~minutes each at 5min/multi-year). They are
     INDEPENDENT, so with ``parallel`` > 1 they fan out across a bounded local process pool
@@ -6306,28 +6781,27 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 break
 
         # Top-N param sets by DISTINCT fitness (fall back to best_params if all_results is thin).
-        # Dedup on fitness, not raw params: a converged GA yields many param sets that differ only
-        # in INERT genes (e.g. exit:<id>:action_value while exit:<id>:enabled=0) yet score the same
-        # and produce identical backtests — keying on params would persist N behaviourally-identical
-        # rows. Distinct fitness gives genuinely different performers across the search landscape.
+        # The selection itself lives in _rank_measured_candidates so that excluding
+        # non-measurements (stalled records) is unit-testable -- see the 2026-09-21 review, G1.
         last_gen_full_results = last_gen_full_results or {}
-        seen, ranked = set(), []
-        for r in sorted(opt.all_results or [], key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9), reverse=True):
-            fit = r.get("fitness")
-            dedup_key = round(fit, 6) if isinstance(fit, (int, float)) else _json.dumps(r.get("params"), sort_keys=True, default=str)
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            # Carry the FITNESS, not just the params. It is the only record of how the GA
-            # actually ranked these rows -- the persisted metric columns are its inputs, and
-            # re-deriving the order from any one of them drops the other three terms.
-            ranked.append((r["params"], r.get("key"), fit))
-            if len(ranked) >= n:
-                break
-        if not ranked and opt.best_params:
-            # No trial key known -> always falls back to re-run. best_fitness is the score of
-            # exactly this genome (it is what made it `best`), so it is the right value here.
-            ranked = [(opt.best_params, None, opt.best_fitness)]
+        if candidates is not None:
+            ranked, _skipped_non_measured = list(candidates), 0
+        else:
+            ranked, _skipped_non_measured = _rank_measured_candidates(
+                opt.all_results, n, opt.best_params, opt.best_fitness)
+        if ranks is not None and len(ranks) != len(ranked):
+            raise ValueError(f"ranks ({len(ranks)}) must match the candidates ({len(ranked)})")
+        _labels = list(bt_block.get("labels") or [])
+        for _lab in extra_labels or []:
+            if _lab not in _labels:
+                _labels.append(_lab)
+        if _skipped_non_measured:
+            print(f"    top-N: skipped {_skipped_non_measured} non-measured (stalled) record(s) "
+                  f"-- a stall is a diagnostic, not a candidate")
+        if not ranked:
+            print("    top-N: nothing to persist -- no MEASURED candidate (every trial stalled or "
+                  "failed). No backtest was exported; the optimization row carries the reason.")
+            return 0
 
         # 1) Build every re-run's spec in the MASTER (cheap: decode + config + display params).
         #    Store the raw optimized genes (for the "Optimized Parameters" display) AND the CONCRETE
@@ -6335,10 +6809,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         #    restore the optimized conditions directly. Keys mirror what _derive_export_payload reads.
         ready = []  # (rank, trial_cfg, strategy_params, full_results) -- no re-run needed
         specs = []  # (rank, trial_cfg, strategy_params) -- must be re-run (existing path)
-        for rank, (params, trial_key_, ga_fitness_) in enumerate(ranked, start=1):
+        for _i, (params, trial_key_, ga_fitness_) in enumerate(ranked):
+            rank = ranks[_i] if ranks is not None else _i + 1
             decoded = decode_params(strat, params)
-            trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
-            trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
+            trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
+                                                  option_trade_records=True)  # persisted top-N
+            trial_cfg["name"] = f"{name_prefix}{rank}-{opt.name or expert}"
             # Persist this top-N run's trading DB (orders/transactions/recommendations) to disk
             # for post-mortem inspection — the GA trials run RAM-only for speed. The path is keyed
             # by the trial's UNIQUE backtest_id, so concurrent re-runs never collide.
@@ -6381,12 +6857,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
 
         def _persist_one(rank, trial_cfg, strategy_params, out) -> bool:
             if not out or not out.get("ok"):
-                print(f"    TOP{rank} re-run failed: {(out or {}).get('error', 'no result')}")
+                print(f"    {name_prefix}{rank} re-run failed: {(out or {}).get('error', 'no result')}")
                 return False
             bt = Backtest(
                 name=trial_cfg["name"], model_id=None, engine_type="daily_expert",
                 expert_name=expert, optimization_id=opt_id,
-                labels=bt_block.get("labels") or None,
+                labels=_labels or None,
                 strategy_params=strategy_params,
                 start_date=_dt.fromisoformat(str(bt_block["start_date"])),
                 end_date=_dt.fromisoformat(str(bt_block["end_date"])),
@@ -6415,7 +6891,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 _div = rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit)
                 if _div is not None:
                     _pct = "n/a" if _div["pct"] is None else f"{_div['pct']:+.1f}%"
-                    print(f"    !! TOP{rank} RE-RUN DIVERGED from its GA score: "
+                    print(f"    !! {name_prefix}{rank} RE-RUN DIVERGED from its GA score: "
                           f"ga={_div['ga_fitness']:.6g} rerun={_div['rerun_fitness']:.6g} "
                           f"({_pct}). This row is NOT the strategy that earned that rank -- "
                           f"the stored optimization_config or the re-derived screener state has "
@@ -6425,7 +6901,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                     out["results"]["rerun_fitness"] = _div["rerun_fitness"]
                     out["results"]["ga_fitness_divergence"] = _div["delta"]
             except Exception as _e:  # noqa: BLE001 -- never lose a persisted row over telemetry
-                print(f"    TOP{rank} fitness annotation failed: {_e!r}")
+                print(f"    {name_prefix}{rank} fitness annotation failed: {_e!r}")
             _persist_results(db, bt, out["results"])
             # The GA's composite score for this genome (migration 030). It comes from the
             # OPTIMIZER, not the engine, so _persist_results (which maps `results`) cannot
@@ -6436,61 +6912,84 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             bt.is_saved = True  # top performers of a job are kept
             db.commit()
             push_backtest(bt, db)
+            if persisted_ids is not None:
+                persisted_ids.append((rank, bt.id))
             return True
 
         persisted = 0
         for rank, trial_cfg, strategy_params, full_results in ready:
             if _persist_one(rank, trial_cfg, strategy_params, {"ok": True, "results": full_results}):
                 persisted += 1
-                print(f"    persisted TOP{rank} ({persisted}/{len(ranked)}) [no re-run]")
+                print(f"    persisted {name_prefix}{rank} ({persisted}/{len(ranked)}) [no re-run]")
         n_local = max(1, min(int(parallel or 1), len(specs)))
-        remote_workers = _resolve_workers(db, getattr(opt, "worker_ids", None))
+        remote_workers = (_resolve_workers(db, getattr(opt, "worker_ids", None))
+                          if use_remote_workers else [])
         if remote_workers:
             from app.services.self_update import get_version_info
             from app.services.worker_client import ensure_synced
             master_version = get_version_info().get("app_version")
             remote_workers = [w for w in remote_workers if ensure_synced(w, master_version, log=print)]
 
-        if (n_local > 1 or remote_workers) and len(specs) > 1:
-            import multiprocessing as _mp
-            import os as _os
-            from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-            from app.services.strategy_optimization_handler import (
-                _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
-            )
-            env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
-            fitness_metric = opt.fitness_metric or "consistent_annual_return"
-            print(f"    persisting top {len(specs)} across {n_local} local + "
-                  f"{len(remote_workers)} remote worker(s)...")
-            with ProcessPoolExecutor(
-                max_workers=n_local, mp_context=_mp.get_context("spawn"),
-                initializer=_worker_init, initargs=(_BACKEND_DIR, env),
-            ) as local_ex, ThreadPoolExecutor(max_workers=max(1, len(remote_workers))) as remote_ex:
-                # Round-robin each spec across every available slot (n_local local + one per
-                # remote worker) -- with n <= save-top (default 5) this just spreads a handful of
-                # re-runs across whatever capacity is on hand, no need for real load balancing.
-                slots = (["local"] * n_local) + remote_workers
-                futs = {}
-                for idx, (rk, tc, sp2) in enumerate(specs):
-                    slot = slots[idx % len(slots)]
-                    fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
-                           else remote_ex.submit(_remote_then_local, slot, tc, fitness_metric))
-                    futs[fut] = (rk, tc, sp2)
-                for fut in as_completed(futs):
+        if not specs:
+            return persisted
+        import multiprocessing as _mp
+        import os as _os
+        from concurrent.futures import as_completed
+        from concurrent.futures import TimeoutError as _FutureTimeout
+        from app.services.strategy_optimization_handler import (
+            _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
+        )
+        env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
+        fitness_metric = opt.fitness_metric or "consistent_annual_return"
+        # BOUND THE EXPORT (2026-09-21 review, G1). A re-run of an otherwise VALID candidate can
+        # hang exactly like a GA trial, and this phase used to wait on it FOREVER: as_completed had
+        # no timeout, and the `with` block's shutdown(wait=True) would block on the hung worker even
+        # if the loop had returned. Same policy as the GA's stall recovery -- bounded window, drop
+        # what has not finished, kill the pool rather than wait on it. This also removes the old
+        # synchronous single-candidate branch, which had no bound at all.
+        export_timeout = float(_os.environ.get("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
+        print(f"    persisting top {len(specs)} across {n_local} local + "
+              f"{len(remote_workers)} remote worker(s) (export bound {export_timeout:.0f}s)...")
+        local_ex = _new_local_pool(n_local)
+        # NO ThreadPoolExecutor for the remote attempts: its threads cannot be killed and Python
+        # joins them at exit, which is how a timed-out remote call kept this launcher alive
+        # (2026-09-21 recheck, H1). Daemon threads are abandoned instead.
+        import time as _time
+        export_deadline = _time.monotonic() + export_timeout
+        try:
+            # Round-robin each spec across every available slot (n_local local + one per remote
+            # worker) -- with n <= save-top (default 5) this just spreads a handful of re-runs
+            # across whatever capacity is on hand, no need for real load balancing.
+            slots = (["local"] * n_local) + remote_workers
+            futs = {}
+            for idx, (rk, tc, sp2) in enumerate(specs):
+                slot = slots[idx % len(slots)]
+                fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
+                       else _submit_daemon(_remote_then_local, slot, tc, fitness_metric,
+                                           export_deadline))
+                futs[fut] = (rk, tc, sp2)
+            try:
+                for fut in as_completed(futs, timeout=export_timeout):
                     rk, tc, sp2 = futs[fut]
                     try:
                         out = fut.result()
                     except Exception as exc:  # noqa: BLE001 — a dead remote/local worker must not abort the rest
-                        print(f"    TOP{rk} re-run raised: {exc!r}")
+                        print(f"    {name_prefix}{rk} re-run raised: {exc!r}")
                         continue
                     if _persist_one(rk, tc, sp2, out):
                         persisted += 1
-                        print(f"    persisted TOP{rk} ({persisted}/{len(ranked)})")
-        else:
-            for rk, cfg, sp2 in specs:
-                if _persist_one(rk, cfg, sp2, _persist_trial_worker(cfg)):
-                    persisted += 1
-                    print(f"    persisted TOP{rk} ({persisted}/{len(ranked)})")
+                        print(f"    persisted {name_prefix}{rk} ({persisted}/{len(ranked)})")
+            except _FutureTimeout:
+                stuck = [rk for f, (rk, _, _) in futs.items() if not f.done()]
+                print(f"    TOP-N export exceeded {export_timeout:.0f}s -- DROPPING {name_prefix}{stuck} "
+                      f"(persisted {persisted}/{len(ranked)}). A hung re-run must not stop the "
+                      f"matrix; the pool is killed rather than waited on.")
+        finally:
+            _kill_executor(local_ex)
+            try:
+                local_ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001 — teardown must never mask the export result
+                pass
         return persisted
     finally:
         db.close()
@@ -6980,7 +7479,10 @@ def main(argv: "list | None" = None) -> int:
                          "'option_car_over_risk' divides by sqrt(dd) and scores a 40%%/40%% "
                          "genome and a 20%%/10%% one identically. Never a default, name it "
                          "explicitly, and its scores are NOT comparable with either other "
-                         "option metric's. 'option_convex' is the "
+                         "option metric's. 'option_car_target_soft30' replaces its annual "
+                         "trade floor/ramp with min(completed structures / 30, 1) across "
+                         "the whole backtest, keeping positive-count runs scoreable. "
+                         "Use a new job name when changing objectives. 'option_convex' is the "
                          "CONVEX-HARVEST metric (end-of-window total return, drawdown free "
                          "below 50%%, breadth floor >=30 tickets/yr AND >=20 underlyings, hit "
                          "rate/concentration recorded not scored) -- never a default, name it "
@@ -7032,6 +7534,10 @@ def main(argv: "list | None" = None) -> int:
                          "(default). NOTE: a non-zero value RESCALES fitness, so scores "
                          "are not comparable with runs made at a different level.")
     _add_robust_fitness_args(op)
+    op.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence", "joint"),
+                    default="legacy", help="Separate neutral-option experiment; HOLD-only or "
+                    "low-confidence directional signals, or joint to evolve the choice in one job. "
+                    "Requires O_STRD/O_STRG/O_IC and a new job name.")
     op.add_argument("--fitness-trade-scale", action="store_true",
                     help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
                          "statistically thin (few-trade) configs are down-weighted (~target trades/yr "
@@ -7075,19 +7581,7 @@ def main(argv: "list | None" = None) -> int:
                          "fill-engine level (widens LIMIT/TP trigger thresholds + degrades "
                          "MARKET/STOP fill prices) -- see BacktestAccount._slip/"
                          "_limit_trigger_price. Default 0.0 (off).")
-    op.add_argument("--option-spread-pct", type=float, default=5.0,
-                    help="Modeled OPTION bid-ask spread as a PERCENT OF PREMIUM (full width; "
-                         "half charged per fill, adverse direction), widened x2 for contracts "
-                         "under 100 contracts/day. Separate from --spread-bps because bps-of-price "
-                         "is the wrong shape for a premium (5 bps of a $1.00 option is $0.0005). "
-                         "The cached chain has NO real quotes (every row is bid==ask or NULL), so "
-                         "without this an option round trip costs ~nothing and multi-leg credit "
-                         "structures are systematically overstated. Default 5.0; pass 0 to "
-                         "reproduce pre-2026-07-25 results.")
-    op.add_argument("--option-spread-min-tick", type=float, default=0.02,
-                    help="Absolute floor on the modeled option spread in premium dollars (full "
-                         "width). Percent-of-premium alone under-charges cheap contracts, which "
-                         "is where fabricated edge concentrates. Default 0.02.")
+    _add_option_spread_args(op)
     op.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
                     help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "
                          "The fill engine caps an order at 10%% of a bar's volume, so a contract "
@@ -7240,6 +7734,8 @@ def main(argv: "list | None" = None) -> int:
                     help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
                          "fitness/return (25). Default-on; see `optimize --profit-share-cap-pct`.")
     _add_robust_fitness_args(ob)
+    ob.add_argument("--neutral-entry-mode", choices=("legacy", "hold", "low_confidence", "joint"),
+                    default="legacy", help="Neutral option experiment (O_STRD/O_STRG/O_IC only).")
     ob.add_argument("--commission", type=float, default=0.1,
                     help="Flat $ commission per FILL (see optimize --commission; default lowered "
                          "from 1.0 on 2026-08-16). Kept in step with the optimize default so a "
@@ -7247,19 +7743,7 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points (see optimize --spread-bps).")
-    ob.add_argument("--option-spread-pct", type=float, default=5.0,
-                    help="Modeled OPTION bid-ask spread as a PERCENT OF PREMIUM (full width; "
-                         "half charged per fill, adverse direction), widened x2 for contracts "
-                         "under 100 contracts/day. Separate from --spread-bps because bps-of-price "
-                         "is the wrong shape for a premium (5 bps of a $1.00 option is $0.0005). "
-                         "The cached chain has NO real quotes (every row is bid==ask or NULL), so "
-                         "without this an option round trip costs ~nothing and multi-leg credit "
-                         "structures are systematically overstated. Default 5.0; pass 0 to "
-                         "reproduce pre-2026-07-25 results.")
-    ob.add_argument("--option-spread-min-tick", type=float, default=0.02,
-                    help="Absolute floor on the modeled option spread in premium dollars (full "
-                         "width). Percent-of-premium alone under-charges cheap contracts, which "
-                         "is where fabricated edge concentrates. Default 0.02.")
+    _add_option_spread_args(ob)
     ob.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
                     help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "
                          "The fill engine caps an order at 10%% of a bar's volume, so a contract "

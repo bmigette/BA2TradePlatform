@@ -63,6 +63,16 @@ class MarketCalendarUnavailable(RuntimeError):
     """
 
 
+class NotARegularSession(ValueError):
+    """A date that must be a regular NYSE session is not one (a weekend, a holiday).
+
+    A ``ValueError`` so every existing ``except ValueError`` still sees it; NAMED so a caller
+    that must treat it as a data/config defect rather than a bad input -- the GA's fatal-trial
+    list: a backtest bar on a non-session date refuses identically in every trial -- can match
+    it by name.
+    """
+
+
 def _nyse_calendar() -> Any:
     """The memoised NYSE calendar.
 
@@ -330,7 +340,7 @@ def _session_index(table: _SessionTable, session: date) -> int:
     d64 = np.datetime64(session, "D")
     i = int(np.searchsorted(table.days, d64, side="left"))
     if i >= len(table.days) or table.days[i] != d64:
-        raise ValueError(f"{session} is not a regular NYSE session")
+        raise NotARegularSession(f"{session} is not a regular NYSE session")
     return i
 
 
@@ -423,3 +433,120 @@ def regular_session_dates(first_day: date, last_day: date) -> List[date]:
         return []
     return [open_utc.astimezone(NY_TZ).date()
             for open_utc, _close in _nyse_sessions_memo(first_day, last_day)]
+
+
+def is_regular_session(day: date) -> bool:
+    """Whether ``day`` is a regular NYSE session (a half day counts), answered from the session
+    table in O(log n) -- no ``schedule()`` call once the table spans ``day``.
+
+    ``False`` means exactly "not a session" (weekend, holiday). Every other failure propagates.
+
+    Raises:
+        TypeError: ``day`` is a datetime or not a date.
+        ValueError: ``day`` precedes the calendar table (its answer would be a guess).
+        MarketCalendarUnavailable: see ``_nyse_calendar``.
+    """
+    _require_session_date(day)
+    table = _session_table(day)
+    if day < table.first_day:
+        raise ValueError(f"{day} precedes the NYSE session table (first day {table.first_day})")
+    try:
+        _session_index(table, day)
+    except ValueError:
+        return False
+    return True
+
+
+def next_regular_session(day: date) -> date:
+    """The first regular NYSE session STRICTLY AFTER ``day`` (``day`` need not be a session).
+
+    Answered from the session table like :func:`prior_regular_session`; the table always spans
+    at least ``_TABLE_FUTURE_DAYS`` past the day it was grown for, so asking it to cover
+    ``day + LOOKAHEAD_DAYS`` is enough to contain the answer. A ``day`` before the table's
+    first day (below ``_TABLE_MIN_DAY``) is refused: the table's first session is not the
+    session after a day it never saw.
+
+    Raises:
+        TypeError: ``day`` is a datetime or not a date (a session label is a calendar day).
+        ValueError: ``day`` precedes the calendar table, or no session follows it.
+        MarketCalendarUnavailable: see ``_nyse_calendar``.
+    """
+    _require_session_date(day)
+    table = _session_table(day + timedelta(days=LOOKAHEAD_DAYS), day)
+    if day < table.first_day:
+        raise ValueError(
+            f"{day} precedes the NYSE session table (first day {table.first_day})")
+    i = int(np.searchsorted(table.days, np.datetime64(day, "D"), side="right"))
+    if i >= len(table.days):
+        raise ValueError(f"no regular NYSE session after {day}")
+    return table.days[i].astype(object)
+
+
+# ---------------------------------------------------------------------------
+# The ONE decision-session rule shared by the backtest and live (BT/live option parity).
+#
+#   data_session = decision_data_session(label) = prior_regular_session(label)
+#   live label   = live_decision_label(instant)  = America/New_York date of the instant
+#   BT label     = backtest_decision_label(bar)  = next_regular_session(bar_date)
+#
+# A backtest decides on bar D with data through D's close and fills on the NEXT bar, so bar D
+# is the same decision a live run makes during the next regular session N(D) -- which may read
+# data through D. Labelling the BT decision N(D) makes data_session == D on every session, and
+# makes a BT bar and the live session it stands for read the same completed session.
+# ---------------------------------------------------------------------------
+
+
+def backtest_decision_label(bar_date: date) -> date:
+    """The live session label a backtest decision on session ``bar_date`` is equivalent to.
+
+    The backtest evaluates bar D using data through D's close and FILLS on the next bar:
+    MARKET orders at the next bar's open (``BacktestAccount.refresh_orders``, the per-bar fill
+    engine, in ``testplatform/backend/app/services/backtest/backtest_account.py``) and option
+    orders staged for the next bar (``BacktestAccount._submit_option_order_impl``, same file).
+    So bar D is a live decision made during ``next_regular_session(D)``, and
+    ``decision_data_session(backtest_decision_label(D)) == D`` for every session D. Using the
+    bar date itself as the label reads D-1: one session staler than live.
+
+    ``bar_date`` must be a regular session: a backtest bar on a weekend or holiday is a data
+    bug, so it is refused rather than silently mapped to the following session.
+
+    Raises:
+        TypeError: ``bar_date`` is a datetime or not a date.
+        ValueError: ``bar_date`` is not a regular NYSE session.
+        MarketCalendarUnavailable: see ``_nyse_calendar``.
+    """
+    _require_session_date(bar_date)
+    _session_index(_session_table(bar_date), bar_date)
+    return next_regular_session(bar_date)
+
+
+def live_decision_label(moment: datetime) -> date:
+    """The session label of a live decision at ``moment``: its America/New_York calendar date.
+
+    Only a tz-aware datetime is accepted. A plain ``date`` is refused because a live caller
+    holding a date has already chosen a label somewhere else (possibly UTC's date, which is the
+    next day every ET evening); a naive datetime is refused because its timezone would be a guess.
+
+    Raises:
+        TypeError: ``moment`` is not a datetime (including a plain ``date``).
+        ValueError: ``moment`` is naive.
+    """
+    if not isinstance(moment, datetime):
+        raise TypeError(f"live decision moment must be a tz-aware datetime, got {type(moment).__name__}")
+    return _decision_local_date(moment)
+
+
+def decision_data_session(label: date) -> date:
+    """The completed regular session a decision labelled ``label`` may read (``prior_session_v1``).
+
+    THE name every caller uses for "which session's data does this decision see"; build
+    ``label`` with :func:`live_decision_label` or :func:`backtest_decision_label`.
+
+    Raises:
+        TypeError: ``label`` is a datetime or not a date (convert an instant with
+            :func:`live_decision_label` first).
+        ValueError: no session before ``label``.
+        MarketCalendarUnavailable: see ``_nyse_calendar``.
+    """
+    _require_session_date(label)
+    return prior_regular_session(label)

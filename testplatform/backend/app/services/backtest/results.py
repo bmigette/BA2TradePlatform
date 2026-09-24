@@ -111,6 +111,35 @@ def _get_5m_bars_cached(provider: Any, symbol: str, start_date: Any, end_date: A
     return df
 
 
+#: The run-config key that says whether an OPTION run's trade rows carry the option trade
+#: record (BT/live option parity plan Part C4). Output SHAPE only: it never changes a decision,
+#: a fill, a P&L or the fitness, and it is not part of any job/trial identity.
+OPTION_TRADE_RECORDS_KEY = "option_trade_records"
+
+
+class OptionTradeRecordsFlagMissing(ValueError):
+    """An options run config that does not STATE ``option_trade_records`` as a bool
+    (``require_option_trade_records``). A ``ValueError`` so existing catches still see it;
+    NAMED because it is deterministic -- every GA trial of the run refuses the same way --
+    so ``strategy_optimization_handler`` treats it as FATAL instead of scoring 0."""
+
+
+def require_option_trade_records(config: Dict[str, Any]) -> bool:
+    """The caller-STATED ``option_trade_records`` of an options run. REFUSED (``OptionTradeRecordsFlagMissing``, a ValueError) when
+    absent or not a bool: there is no default, because the two answers cost very differently
+    -- ~1.5 KB per option row on a GA fitness trial that is never persisted, versus a persisted
+    row that silently lacks the record the live-vs-backtest comparison reads. Equity runs never
+    ask."""
+    if OPTION_TRADE_RECORDS_KEY not in config:
+        raise OptionTradeRecordsFlagMissing(
+            "an OPTIONS run must state 'option_trade_records' (True for a run whose results "
+            "are persisted, False for a GA fitness trial); it is absent from this run config")
+    value = config[OPTION_TRADE_RECORDS_KEY]
+    if not isinstance(value, bool):
+        raise OptionTradeRecordsFlagMissing(f"'option_trade_records' must be True or False, got {value!r}")
+    return value
+
+
 def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     """Build the full results dict for a finished daily-engine run.
 
@@ -168,7 +197,12 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     # them — that's what makes win_rate/profit_factor/expectancy meaningful. Fall back to the
     # per-fill rows for accounts/stubs that don't implement the pairing.
     if hasattr(account, "get_round_trip_trades"):
-        raw_trades = account.get_round_trip_trades()
+        if getattr(account, "has_options_provider", False) is True:
+            # An OPTIONS run: the caller states whether the rows carry the trade record.
+            raw_trades = account.get_round_trip_trades(
+                option_records=require_option_trade_records(config))
+        else:
+            raw_trades = account.get_round_trip_trades()
     else:
         raw_trades = account.get_filled_trades()
     trades = [_trade_row(t) for t in raw_trades]
@@ -192,6 +226,15 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     # buy-and-hold (no exit rule) shows 0 trades while equity still moves (entry commission +
     # the held position's mark-to-market). Surfacing these explains "0 trades but P&L changed".
     metrics["open_positions"] = _open_positions(account)
+    # OPTION RUNS ONLY, RECORDED NOT SCORED: how many option-chain rows this run priced from a
+    # row older than the decision's data session (volume is exact-session, prices are not --
+    # see option_read_common.ChainStaleness). An equity run has no option reader and gains no
+    # key. ``getattr(...) is True`` only for account stubs (no accessor, or a Mock) in tests.
+    if getattr(account, "has_options_provider", False) is True:
+        metrics["option_chain_staleness"] = account.option_chain_staleness()
+        # The E4 split-basis guard's counters (plan Part E4): None when the run's reader has
+        # no guard (the sqlite store, or a guard-less fixture reader). Recorded, not scored.
+        metrics["option_basis_guard"] = account.option_basis_guard_stats()
     return metrics
 
 
@@ -266,8 +309,25 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
         bar = price.prev_bar(symbol, dt)
         return bar.get("low") if bar else None
 
+    # THE OPTION BASIS (plan Part E). The refinement re-prices a premium as
+    # ``entry_premium + delta * (px - entry_px)``: delta is per AS-TRADED share, so both the
+    # entry close and every 5-minute bar must be in the as-traded basis too, or on a split
+    # symbol the move is 1/k of the real one (NFLX 2024: 10x too small). Converted through the
+    # account's own ``option_basis_price`` -- the run's split basis, the identity without one
+    # -- each price with the factor of ITS OWN date. The FMP 5-minute cache is back-adjusted
+    # like the daily one (measured: NFLX 5m close 2024-05-01 55.155 vs daily 55.17; NVDA 5m
+    # 2024-06-06 120.94, adjusted for the 2024-06-10 split).
+    from app.services.backtest.backtest_account import BacktestAccount
+    to_option_basis = account.option_basis_price if isinstance(account, BacktestAccount) else None
+
+    def _as_traded(symbol: str, px: Any, dt: Any) -> Optional[float]:
+        if px is None or to_option_basis is None:
+            return px
+        day = dt.date() if hasattr(dt, "date") else dt
+        return to_option_basis(symbol, px, day)
+
     def _underlying_price_at(symbol: str, dt: Any) -> Optional[float]:
-        return price.close_at(symbol, dt)
+        return _as_traded(symbol, price.close_at(symbol, dt), dt)
 
     def _delta_at_entry(underlying: str, contract: str, dt: Any) -> Optional[float]:
         # The seam, whichever reader is behind it. Each backend answers it over its OWN
@@ -289,7 +349,9 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
         window = df[(df["Date"] >= entry) & (df["Date"] <= exit_)]
         if window.empty:
             return []
-        return [{"Low": row["Low"], "High": row["High"]} for _, row in window.iterrows()]
+        return [{"Low": _as_traded(symbol, row["Low"], row["Date"]),
+                 "High": _as_traded(symbol, row["High"], row["Date"])}
+                for _, row in window.iterrows()]
 
     def _refine(trades: List[Dict[str, Any]], max_drawdown: float) -> float:
         from app.services.backtest.intraday_drawdown import refine_max_drawdown
@@ -383,7 +445,7 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
     # (a real scratch) and a genuine negative are legitimate and still pass. ``default=0.0`` is
     # kept ONLY for the fields the per-FILL fallback rows legitimately do not carry (a filled
     # order has no exit/pnl yet); the presence of a NON-FINITE value always raises.
-    return {
+    row = {
         "symbol": trade.get("symbol"),
         "entry_time": _iso(entry_time),
         "exit_time": _iso(trade.get("exit_time")),
@@ -425,6 +487,18 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         "transaction_id": trade.get("transaction_id"),
         "multiplier": _finite(trade.get("multiplier"), "trade.multiplier", default=1.0),
     }
+    # THE OPTION TRADE RECORD (BT/live option parity, plan Part C4), OPTION ROWS ONLY and only
+    # when the recorder attached it: every equity row -- and every per-FILL fallback row --
+    # keeps exactly the keys above. ``option_strategy`` / ``recommendation_confidence`` ride
+    # the FIRST row of each record (``BacktestAccount._attach_option_records``), so they are
+    # copied only where present; the two records are on every option row.
+    if _is_option_leg(trade) and "entry_record" in trade:
+        for key in ("option_strategy", "recommendation_confidence"):
+            if key in trade:
+                row[key] = trade[key]
+        row["entry_record"] = trade["entry_record"]
+        row["exit_record"] = trade["exit_record"]
+    return row
 
 
 def _is_option_leg(trade: Dict[str, Any]) -> bool:

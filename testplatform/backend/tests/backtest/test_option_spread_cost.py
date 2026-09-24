@@ -10,6 +10,7 @@ The model is an ASSUMPTION replacing an indefensible zero, so these tests pin it
 percent-of-premium, adverse direction, tick floor, thin-volume widening, no-op default -- not
 a specific vendor's quotes.
 """
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,7 @@ from ba2_common.core.types import OrderDirection
 
 
 def _acct(**cfg):
-    base = {"starting_cash": 20_000.0, "commission_per_trade": 0.0, "slippage_bps": 0.0,
+    base = {**_LEGACY_ZERO_SPREAD, "starting_cash": 20_000.0, "commission_per_trade": 0.0, "slippage_bps": 0.0,
             "fill_model": "next_bar_open"}
     base.update(cfg)
     return BacktestAccount(id=1, price_source=SimpleNamespace(), settings=base)

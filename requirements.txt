@@ -56,15 +56,13 @@ google-generativeai
 
 tzlocal
 
-# --- Extracted BA2 packages (Phase 6 migration) ---
-# Implementation of core interfaces/providers/clean-experts now lives in these
-# three sibling packages; the in-tree ba2_trade_platform.* modules become thin
-# re-export shims. Installed editable into the live venv during development
-# (BA2TradeCommon/install.sh --editable); pinned here to the git/SSH form that
-# install.sh uses for non-editable deploys.
-ba2trade-common @ git+ssh://git@github.com/bmigette/BA2TradeCommon.git@dev
-ba2trade-providers @ git+ssh://git@github.com/bmigette/BA2TradeProviders.git@dev
-ba2trade-experts[ui] @ git+ssh://git@github.com/bmigette/BA2TradeExperts.git@dev
+# --- Shared BA2 packages (in-repo: packages/common, packages/providers, packages/experts) ---
+# ba2trade-common / ba2trade-providers / ba2trade-experts are NOT listed here: pip and uv resolve
+# relative paths in a requirements file against the current directory (not this file), and uv would
+# also follow the packages' leftover [tool.uv.sources] git pins unless given --no-sources. Install
+# them from the repo root BEFORE this file (install.ps1 / install.sh do this for you):
+#   pip install -e packages/common -e packages/providers -e "packages/experts[ui]"
+#   (uv: uv pip install --no-sources -e packages/common -e packages/providers -e "packages/experts[ui]")
 
 # Testing
 pytest>=8.0

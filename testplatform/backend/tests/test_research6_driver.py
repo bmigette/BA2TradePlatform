@@ -12,8 +12,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-from tools.strategy_research import profiles as P, runtime as R
-from tools.strategy_research import run_goal2020_followups as D
+from tools.strategy_research.exploration import profiles as P, runtime as R
+from tools.strategy_research.exploration import run_exploration as D
 from app.services.strategy_param_space import collect_param_space, decode_params
 
 
@@ -210,7 +210,8 @@ def test_preflight_reads_actual_screen_and_refuses_missing_files(monkeypatch, tm
     assert ready["name"] != job["name"]
 
 
-def test_execution_persists_once_and_recovers_partial_top_rows(monkeypatch, gate_engine):
+@pytest.mark.parametrize("market_conditions", [False, True])
+def test_execution_persists_once_and_recovers_partial_top_rows(monkeypatch, gate_engine, market_conditions):
     """Use the real ORM and config decoder; replace only the expensive backtest work."""
     from sqlalchemy.orm import sessionmaker
     from app.models import database as database_module
@@ -226,6 +227,9 @@ def test_execution_persists_once_and_recovers_partial_top_rows(monkeypatch, gate
     monkeypatch.setattr(handler, "_build_hoisted_state", lambda block: {})
     searches, reruns = [], []
     job = one("mid_ds", "timeout")
+    if market_conditions:
+        job = next(j for j in P.build_manifest(families=["mid_ds"], market_condition_profile="ohlcv-v1",
+            market_condition_manifest="a" * 64, market_condition_mode="all-off")["jobs"] if j["variant"] == "timeout")
     job["name"] += "-isolated-persistence"
     block = job["optimization_config"]["backtest"]
     block["backtest_id"] = "isolated"
@@ -259,8 +263,14 @@ def test_execution_persists_once_and_recovers_partial_top_rows(monkeypatch, gate
     assert len(searches) == 1 and len(reruns) == 2
     assert all(c["account_settings"]["equity_cap"] == 10000 for c in reruns)
     assert all(c["run_schedule_override"] == block["run_schedule_override"] for c in reruns)
+    if market_conditions:
+        assert all(c["market_condition_manifests"] == block["market_condition_manifests"] for c in reruns)
     with factory() as db:
         bt = db.get(Backtest, first["backtest_ids"][1])
+        if market_conditions:
+            assert bt.strategy_params["market_condition_manifests"] == block["market_condition_manifests"]
+            assert bt.strategy_params["market_condition"] == block["market_condition"]
+            assert bt.strategy_params["expertFixedSettings"]["market_condition_profile"] == "ohlcv-v1"
         bt.status = "failed"
         db.commit()
     recovered = R.execute_ready(job, path)

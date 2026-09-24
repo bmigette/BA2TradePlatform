@@ -1,27 +1,37 @@
-# BA2MLTestPlatform Backend - Claude Code Instructions
+# BA2 Test Platform (`ba2-test`) Backend - Claude Code Instructions
+
+This is the backend of the BA2 Test Platform: the backtesting and genetic-optimization
+platform for the BA2 Trade Platform's experts, which also carries a deep-learning forecasting
+module (datasets, model training, model library). See `../README.md` for the overview.
 
 ## Python Environment
 
-**IMPORTANT**: Always use Python from the virtual environment located in the backend folder:
+**IMPORTANT**: Always use Python from the test venv built by the repo-root install script
+(`install.ps1 -TestOnly` / `install.sh --test-only`), located at `~/ba2-venvs/test`:
 
 ```bash
-./venv/bin/python <script>
+~/ba2-venvs/test/bin/python <script>            # Windows: ~/ba2-venvs/test/Scripts/python.exe
 # or
-./venv/bin/pip install <package>
+~/ba2-venvs/test/bin/python -m pip install <package>
 ```
 
-Do NOT use system Python or `python` directly. Always use `./venv/bin/python`.
+Do NOT use system Python or `python` directly. Always use the test venv's Python.
 
 ## Running Tests
 
 ```bash
-./venv/bin/python scripts/test_dataset_generation.py
+~/ba2-venvs/test/bin/python -m pytest tests                  # from testplatform/backend
+~/ba2-venvs/test/bin/python tests_scripts/test_dataset_generation.py   # ad-hoc script
 ```
+
+See `../tests/README.md` for the full test layout.
 
 ## Running the API Server
 
 ```bash
-./venv/bin/python -m uvicorn app.main:app --reload
+ba2-test serve --mode back --reload
+# or, from testplatform/backend
+~/ba2-venvs/test/bin/python -m uvicorn app.main:app --reload
 ```
 
 ## Versioning — bump `testplatform/version.py`, NOT the trade app's
@@ -40,9 +50,10 @@ converge on an uncommitted or unpushed version.
 ## Key Directories
 
 - `app/` - FastAPI application and services
-- `dataproviders/` - Data provider implementations (yfinance, FMP, FRED, etc.)
-- `scripts/` - Utility scripts for testing and data processing
-- `datasets/` - Generated datasets and cache
+- `scripts/` - Utility scripts (DB migrations, backtest runners, data processing)
+- `tests/` - pytest suite; `tests_scripts/` - ad-hoc scripts, not collected
+- Data providers come from the shared `ba2_providers` package (`packages/providers`), not from this folder
+- Generated datasets, trained models and caches live under `BA2_HOME/test/` (see `app/paths.py`), not in the repo
 
 ## CRITICAL: No Default Values in Job Configuration
 

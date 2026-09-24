@@ -8,10 +8,12 @@ and execute appropriate trading actions based on the evaluation results.
 from typing import List, Dict, Any, Optional, Tuple
 from ba2_common.core.TradeConditions import TradeCondition, create_condition
 from ba2_common.core.TradeActions import TradeAction, create_action, AdjustTakeProfitAction, AdjustStopLossAction, IncreaseInstrumentShareAction, DecreaseInstrumentShareAction
+from ba2_common.core.TradeActions import RULESET_STOP_KEPT_REASONS, ruleset_stop_policy, stop_is_long_position
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from ba2_common.core.types import (
-    OrderRecommendation, ExpertEventType, ExpertActionType, get_option_action_values,
+    OrderRecommendation, ExpertEventType, ExpertActionType, OptionCloseReason,
+    get_option_action_values,
     get_option_entry_action_values,
 )
 from ba2_common.core.db import get_db, get_instance, InstanceNotFound
@@ -187,6 +189,73 @@ def forced_option_exit(event_action) -> bool:
         if loss_side is not None and trigger.get("operator") in loss_side:
             return True
     return False
+
+
+#: CLOSE-TRIGGER CLASSES by event type (plan Part C3), consulted by ``option_close_trigger``.
+#: Remaining-life triggers are a DTE exit; elapsed-time triggers a time exit.
+_DTE_EXIT_EVENT_TYPES = frozenset({
+    ExpertEventType.N_DAYS_TO_EXPIRY.value,
+    ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY.value,
+    ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY.value,
+})
+_TIME_EXIT_EVENT_TYPES = frozenset({
+    ExpertEventType.N_DAYS_OPENED.value,
+    ExpertEventType.N_DAYS_AFTER_EVENT.value,
+})
+#: PROFIT-SIDE thresholds, keyed like ``_LOSS_SIDE_STOP_OPERATORS``: the operators that make
+#: the trigger fire as the position gets BETTER. ``loss_pct_of_max_loss`` has no entry -- it
+#: has no take-profit reading (see its note above).
+_PROFIT_SIDE_OPERATORS = {
+    ExpertEventType.N_PROFIT_LOSS_PERCENT.value: frozenset({">", ">="}),
+    ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: frozenset({">", ">="}),
+    ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value: frozenset({">", ">="}),
+    # the share of the entry credit already decayed away: bigger == more of it captured.
+    ExpertEventType.N_CREDIT_DECAYED_PCT.value: frozenset({">", ">="}),
+}
+#: When a rule ANDs triggers of several classes, the one recorded is the first of these the
+#: rule carries: a risk reading outranks a schedule, a schedule outranks a profit target.
+_CLOSE_TRIGGER_PRECEDENCE = (
+    OptionCloseReason.STOP_LOSS, OptionCloseReason.DTE_EXIT, OptionCloseReason.TIME_EXIT,
+    OptionCloseReason.TAKE_PROFIT,
+)
+
+
+def option_close_trigger(event_action) -> OptionCloseReason:
+    """WHY this rule's CLOSE_OPTION closes the position -- recorded, never decided on.
+
+    Classified from the rule's TRIGGER SEMANTICS, the same reading ``forced_option_exit``
+    takes (never the rule's name, which is free text):
+
+      * a loss-side numeric trigger (``_LOSS_SIDE_STOP_OPERATORS``) -> ``stop_loss``;
+      * a remaining-life trigger (``_DTE_EXIT_EVENT_TYPES``) -> ``dte_exit``;
+      * an elapsed-time trigger (``_TIME_EXIT_EVENT_TYPES``) -> ``time_exit``;
+      * a profit-side numeric trigger (``_PROFIT_SIDE_OPERATORS``) -> ``take_profit``;
+      * anything else, or no trigger at all -> ``rule_exit``.
+
+    Triggers inside one rule are ANDed, so a rule carrying two classes fired on both; the one
+    recorded is the first in ``_CLOSE_TRIGGER_PRECEDENCE``. The result is written into the
+    close order's ``exit_record`` and read back only by reporting: nothing about WHETHER or
+    HOW the close happens depends on it (that is ``forced_option_exit``'s job, unchanged).
+    """
+    found = set()
+    for trigger in (getattr(event_action, "triggers", None) or {}).values():
+        if not isinstance(trigger, dict):
+            continue
+        event_type = trigger.get("event_type")
+        op = trigger.get("operator")
+        loss_side = _LOSS_SIDE_STOP_OPERATORS.get(event_type)
+        if loss_side is not None and op in loss_side:
+            found.add(OptionCloseReason.STOP_LOSS)
+        elif event_type in _DTE_EXIT_EVENT_TYPES:
+            found.add(OptionCloseReason.DTE_EXIT)
+        elif event_type in _TIME_EXIT_EVENT_TYPES:
+            found.add(OptionCloseReason.TIME_EXIT)
+        elif op in _PROFIT_SIDE_OPERATORS.get(event_type, ()):
+            found.add(OptionCloseReason.TAKE_PROFIT)
+    for reason in _CLOSE_TRIGGER_PRECEDENCE:
+        if reason in found:
+            return reason
+    return OptionCloseReason.RULE_EXIT
 
 
 def _sanitize_for_json(obj):
@@ -640,14 +709,37 @@ class TradeActionEvaluator:
                                 from ba2_common.core.models import Transaction
                                 transaction = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
                                 if transaction:
-                                    logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}")
-                                    success = self.account.adjust_tp_sl(transaction, tp_price, sl_price, source="ruleset")
-                                    desc = f"Adjusted TP=${tp_price:.2f} and SL=${sl_price:.2f} for {self.instrument_name}"
+                                    # The SAME stop policy the SL-only path applies (ratchet by
+                                    # default; opt-in loosening to the max-loss stop). When the
+                                    # existing stop stands, pass None -- "don't adjust SL" to both
+                                    # AlpacaAccount._adjust_tpsl_internal and
+                                    # BacktestAccount.adjust_tp_sl -- so the TP half still applies
+                                    # and the SL is neither rewritten nor re-sent. The TP is
+                                    # unaffected by the policy.
+                                    requested_sl = sl_price
+                                    sl_price, sl_reason = ruleset_stop_policy(
+                                        transaction, requested_sl,
+                                        stop_is_long_position(transaction, order),
+                                        last_sl_action.resolve_expert,
+                                        price_getter=last_sl_action.get_current_price,
+                                        # compute_price above recorded the rule's pre-floor stop
+                                        rule_price=last_sl_action.rule_price)
+                                    sl_kept = sl_reason in RULESET_STOP_KEPT_REASONS
+                                    sl_to_send = None if sl_kept else sl_price
+                                    logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}"
+                                                + (f" (kept: {sl_reason}; ruleset asked ${requested_sl:.2f})" if sl_kept else ""))
+                                    success = self.account.adjust_tp_sl(transaction, tp_price, sl_to_send, source="ruleset")
+                                    if sl_kept:
+                                        desc = (f"Adjusted TP=${tp_price:.2f} for {self.instrument_name}; "
+                                                f"SL kept at ${sl_price:.2f} ({sl_reason})")
+                                    else:
+                                        desc = f"Adjusted TP=${tp_price:.2f} and SL=${sl_price:.2f} for {self.instrument_name}"
                                     result_dict = {
                                         "action_type": ExpertActionType.ADJUST_TAKE_PROFIT,
                                         "success": success,
                                         "message": desc if success else f"Failed to adjust TP/SL for {self.instrument_name}",
-                                        "data": {"order_id": order.id, "tp_price": tp_price, "sl_price": sl_price},
+                                        "data": {"order_id": order.id, "tp_price": tp_price, "sl_price": sl_price,
+                                                 "sl_requested": requested_sl, "sl_policy": sl_reason},
                                         "description": desc
                                     }
                                     action_results.append(result_dict)
@@ -1167,6 +1259,11 @@ class TradeActionEvaluator:
                 # whether to cross the modelled spread fully (SL/DTE) or concede the
                 # entry's fraction. Inert in live (no modelled spread).
                 kwargs['forced_exit'] = forced_option_exit(event_action)
+                # WHY it closes, and WHICH rule fired it -- RECORDED on the close order's
+                # exit_record (plan Part C3), never read by the close decision itself.
+                kwargs['close_trigger'] = option_close_trigger(event_action)
+                kwargs['rule_id'] = getattr(event_action, 'id', None)
+                kwargs['rule_name'] = getattr(event_action, 'name', None)
                 # WHICH option to close. Absent on every pre-existing rule (unchanged
                 # behaviour: the evaluated order, else its transaction's option entry).
                 # Present only on the equity-entry overlay keys, whose evaluated order is

@@ -565,8 +565,8 @@ def check_market_condition_window(config: Dict[str, Any], reader: Any) -> List[s
         return []
     message = (
         f"market-condition manifest {mapped.manifest_digest} does not serve the feature rows "
-        f"this run's {start}..{end} decision window needs: " + "; ".join(problems) + ". "
-        f"Each of those decision dates would read missing_session, so the gated entries would "
+        f"this run's {start}..{end} backtest window needs: " + "; ".join(problems) + ". "
+        f"Each of those bars would read missing_session, so the gated entries would "
         f"be refused for a cache reason and the search would score that as strategy behaviour. "
         f"This is a job configuration fault, not a result.")
     if config.get("_ga_trial"):

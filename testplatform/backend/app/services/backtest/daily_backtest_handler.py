@@ -260,6 +260,8 @@ _SUPPORTED_EXPERTS = {
     # index-trend input when FRED is not wired into the backtest bundle.
     "DeterministicScorer": "ba2_experts.DeterministicScorer",
     "ETFTrend": "ba2_experts.ETFTrend",
+    # Research-only RSI pullback reversion (like ETFTrend: backtest-registered, not live).
+    "PullbackReversion": "ba2_experts.PullbackReversion",
     # Earnings-EVENT ranker (grid 2's O_ERN chain, design 2026-08-31 §9). Ranks upcoming
     # earnings events from the FMP disk cache (past_earnings_quarterly x OHLCV) and stamps
     # the event date + days-to-earnings onto its recommendations, which is what the strategy's
@@ -281,6 +283,9 @@ _EXPERT_WARMUP_BARS = {
     "FMPSenateTraderCopy": 10,
     "DeterministicScorer": 260,   # 12-1 momentum (252) + SMA200 trend inputs
     "ETFTrend": 274,              # 252-bar momentum + previous-month anchor buffer
+    # = PullbackReversion.BACKTEST_WARMUP_BARS (must agree, pinned by its tests): covers the
+    # expert's 427-day fetch window (420-day lookback + 7-day listing slack) at 1.45 days/bar.
+    "PullbackReversion": 295,
     # 620 = the class's own BACKTEST_WARMUP_BARS. Its features are computed over PAST earnings
     # events (min_hist_events of them), and events are quarterly: 4+ quarters of history plus
     # the earnings-day move measured off OHLCV needs ~2.5 years of bars. The table and the
@@ -347,6 +352,7 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
         except (KeyError, ValueError) as e:
             _fail(db, bt, str(e))
             return {"status": "failed", "error": str(e)}
+        record_option_spread_model(db, bt, config)
 
         def progress(pct: float, msg: str) -> None:
             if tq.is_task_paused(task_id):
@@ -487,11 +493,9 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # ALREADY-decided trades, robustness.py's apply_spread_cost) -- this one can change
         # WHICH exit a trade takes, not just its realized pnl.
         "spread_bps": float(payload.get("spread_bps") or 0.0),
-        # Optional (default 0.0 = exact no-op): OPTION bid-ask spread modeled as a percent
-        # of PREMIUM. Separate from spread_bps because bps-of-price is the wrong shape for
-        # an option premium -- see BacktestAccount._option_half_spread.
-        "option_spread_pct": float(payload.get("option_spread_pct") or 0.0),
-        "option_spread_min_tick": float(payload.get("option_spread_min_tick") or 0.0),
+        # OPTION bid-ask spread: the model key (plan Part F) plus the legacy percent-of-premium
+        # knobs -- see _option_spread_settings and BacktestAccount._option_half_spread.
+        **_option_spread_settings(payload),
         # Optional (default False = exact no-op): keep stock delivered by a short-option
         # assignment instead of liquidating it at the next bar's open. Only a strategy whose
         # own rules manage that stock may set it -- the WHEEL. The launcher decides this
@@ -528,6 +532,8 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     uses_options = strategy_uses_options(payload)
     if uses_options and not options_cache_db:
         options_cache_db = default_options_cache_db()
+    if options_cache_db:
+        _default_option_spread_model(account_settings, payload.get("backtest_id"))
     validate_options_window(start_date, uses_options or bool(options_cache_db),
                             backtest_options_provider(payload))
 
@@ -590,6 +596,9 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Screener (universe.mode=='screener'): per-bar metric_store entry gate (point-in-time,
         # cached) — same mechanism the optimizer uses. None for static runs (engine gate no-op).
         "screener_runtime": _build_screener_runtime(payload),
+        # A standalone (API/CLI) backtest is PERSISTED: its option trade rows carry the option
+        # trade record (see results.require_option_trade_records).
+        "option_trade_records": True,
     }
 
 
@@ -703,6 +712,79 @@ def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
     return cal
 
 
+_SPREAD_KEYS = ("option_spread_model", "option_spread_pct", "option_spread_min_tick")
+#: Where a STANDALONE row records its option spread model (``Backtest.strategy_params``, the
+#: camelCase shape ``_build_standalone_rerun_config`` reads back).
+STORED_SPREAD_MODEL_KEY = "optionSpreadModel"
+
+
+def _default_option_spread_model(account_settings: Dict[str, Any], backtest_id: Any) -> None:
+    """An OPTIONS run from the API/UI that states no spread at all gets the CURRENT model,
+    explicitly.
+
+    The frontend sends no spread keys, and the account refuses an options run whose model is
+    unstated (no silent zero spread). So the create path -- and a standalone re-run of a row
+    that never recorded one -- names ``SPREAD_MODEL_VERSION`` here, in the config itself, logs
+    that it did, and the caller writes it onto the row (``record_option_spread_model``) so the
+    choice is visible and a later re-run reproduces it. A payload that states ANY spread key is
+    left exactly as stated (and the account validates it).
+    """
+    if any(k in account_settings for k in _SPREAD_KEYS):
+        return
+    from ba2_common.core.option_spread_model import SPREAD_MODEL_VERSION
+    account_settings["option_spread_model"] = SPREAD_MODEL_VERSION
+    logger.info(
+        "Backtest %s: options run states no spread model; applying the current model %r "
+        "(recorded on the row).", backtest_id, SPREAD_MODEL_VERSION)
+
+
+def record_option_spread_model(db: Any, bt: Any, config: Dict[str, Any]) -> None:
+    """Write the run's option spread model onto a STANDALONE row's ``strategy_params``.
+
+    Only when the row does not already record one and the run config names one (an options
+    run). Optimization-derived rows are skipped: their config lives on the optimization and
+    already carries the launcher's explicit model.
+    """
+    if getattr(bt, "optimization_id", None):
+        return
+    model = (config.get("account_settings") or {}).get("option_spread_model")
+    sp = dict(bt.strategy_params or {})
+    if model is None or sp.get(STORED_SPREAD_MODEL_KEY) == model:
+        return
+    sp[STORED_SPREAD_MODEL_KEY] = model
+    bt.strategy_params = sp
+    db.commit()
+
+
+def _option_spread_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The option-spread slice of ``account_settings`` from an API/CLI payload.
+
+    Passes through ONLY what the payload states -- ``option_spread_model`` and the legacy
+    ``option_spread_pct``/``option_spread_min_tick`` -- and invents nothing. In particular an
+    absent knob is NOT written as 0.0: that would be a silent zero-spread run. An options run
+    whose payload states no spread keys at all gets the current model written explicitly (and
+    recorded) by ``_build_config``; one that states an incomplete set is refused by
+    ``BacktestAccount._resolve_spread_model``. An equity run needs none of these keys.
+    """
+    out: Dict[str, Any] = {}
+    if payload.get("option_spread_model") is not None:
+        out["option_spread_model"] = str(payload["option_spread_model"])
+    for key in ("option_spread_pct", "option_spread_min_tick"):
+        if payload.get(key) is not None:
+            out[key] = float(payload[key])
+    return out
+
+
+def apply_option_spread_record(results: Dict[str, Any], account: Any) -> None:
+    """Stamp the run's option spread model (and quote-vs-fallback fill counts) on ``results``.
+
+    Only for an OPTIONS run (the account carries an option reader): an equity run's results
+    stay byte-identical.
+    """
+    if getattr(account, "has_options_provider", False):
+        results.update(account.option_spread_record())
+
+
 def run_daily_backtest(
     config: Dict[str, Any],
     progress_cb: Optional[Callable[[float, str], None]] = None,
@@ -751,7 +833,7 @@ def run_daily_backtest(
         AsOfPriceSource,
         MemoizedOHLCVProvider,
     )
-    from app.services.backtest.results import build_results
+    from app.services.backtest.results import build_results, require_option_trade_records
     from app.services.backtest.seam_wiring import (
         clear_backtest_market_conditions,
         install_backtest_market_conditions,
@@ -814,6 +896,10 @@ def run_daily_backtest(
     uses_options = bool(options_cache_db)
     validate_options_window(config["start_date"], uses_options,
                             backtest_options_provider(config))
+    # OUTPUT SHAPE, stated by the caller: an options run must say whether its trade rows carry
+    # the option trade record -- refused HERE, before the run, rather than after hours of it.
+    if uses_options:
+        require_option_trade_records(config)
 
     resolver = wire_backtest_seams()
     account_id = 1
@@ -871,12 +957,23 @@ def run_daily_backtest(
         # from ``ps``'s underlying closes; for the sqlite backend this is the same
         # ``HistoricalOptionsProvider(options_cache_db)`` construction as before, and for an
         # equity-only run it is still None.
-        from app.services.backtest.options_store import build_options_provider
+        #
+        # An options run ALSO gets the verified split basis of its universe (plan Part E:
+        # option strikes are as traded, these closes are split-adjusted); building it refuses
+        # the run here, before the first bar, when any symbol's basis cannot be stated. An
+        # equity-only run gets (None, None) and reads nothing extra.
+        from app.services.backtest.options_store import build_options_run
 
-        options_provider = build_options_provider(config, price_source=ps)
+        options_provider, split_basis = build_options_run(
+            config, price_source=ps, ohlcv_provider=ohlcv)
 
         account = BacktestAccount(
-            account_id, ps, config["account_settings"], options_provider=options_provider
+            account_id, ps, config["account_settings"], options_provider=options_provider,
+            split_basis=split_basis,
+            # The STATED value on an options run (refused above when absent); an equity run
+            # never builds an option record, so True there changes nothing.
+            option_trade_records=(require_option_trade_records(config) if uses_options
+                                  else True),
         )
         resolver.register_account(account_id, account)
 
@@ -925,6 +1022,9 @@ def run_daily_backtest(
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            # How option fills were priced (plan Part F). Options runs only, so an equity
+            # run's results are exactly what they were.
+            apply_option_spread_record(results, account)
             if market_condition_record is not None:
                 # RESEARCH METADATA, added after the metrics are computed so it cannot reach
                 # any of them: the per-run counters, and the entry state attached to the trades

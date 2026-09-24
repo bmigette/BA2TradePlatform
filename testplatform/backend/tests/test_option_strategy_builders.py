@@ -83,13 +83,32 @@ def test_pure_option_keys_all_carry_entry_action():
         assert "action_type" in ea
 
 
+# --- the direction gate, since 2026-09-19 -------------------------------------------------
+# The gate was a FLAG leaf (``bullish``/``bearish``). It is now a NUMERIC leaf on
+# ``rec_direction`` -- the expert's grade centred on HOLD (SELL -2 .. BUY +2) -- with the
+# threshold pinned at 0 and a mode gene over off/below/above, so the GA can also pick the
+# CONTRARIAN direction. Against a 0 threshold ``> 0`` IS the old ``bullish`` flag and ``< 0``
+# IS ``bearish``, so the tests below still assert the DIRECTION each structure is authored to
+# trade -- they just read it off the operator instead of the field name.
+def _authored_direction(strat, rule_id=None):
+    """The authored direction of a built strategy's entry gate: "bullish" / "bearish"."""
+    rule = (strat.entry_rules[0] if rule_id is None
+            else next(r for r in strat.entry_rules if r["id"] == rule_id))
+    leaves = rule["conditions"]["conditions"]
+    fields = [c.get("field") for c in leaves]
+    assert "bullish" not in fields and "bearish" not in fields, fields
+    signal = next(c for c in leaves if c.get("field") == "rec_direction")
+    assert signal["field_type"] == "numeric" and signal["value"] == 0.0, signal
+    assert signal["mode_optimize"] is True, signal
+    return {">": "bullish", "<": "bearish"}[signal["op"]]
+
+
 # --- Long put (O_LP) + grouped families (OS1/OS2/OS3) ------------------------------------
 def test_long_put_registered_and_gates_bearish():
     strat = mod._build_strategy("O_LP", "O_LP", "FMPRating")
     ea = getattr(strat, "entry_action", None)
     assert ea is not None and ea["action_type"] == "buy_put"
-    fields = [c.get("field") for c in strat.entry_rules[0]["conditions"]["conditions"]]
-    assert "bearish" in fields, f"O_LP entry must gate on the bearish signal; got {fields}"
+    assert _authored_direction(strat) == "bearish", "O_LP must gate on the bearish signal"
 
 
 def test_option_groups_registered_and_build():
@@ -166,8 +185,7 @@ def test_bear_call_spread_gates_bearish():
     """O_BEARCS is a directional-bearish credit structure -- must gate like O_LP, not the
     default bullish gate every other original key uses."""
     strat = mod._build_strategy("O_BEARCS", "O_BEARCS", "FMPRating")
-    fields = [c.get("field") for c in strat.entry_rules[0]["conditions"]["conditions"]]
-    assert "bearish" in fields, f"O_BEARCS entry must gate on the bearish signal; got {fields}"
+    assert _authored_direction(strat) == "bearish", "O_BEARCS must gate on the bearish signal"
 
 
 def test_protective_put_registered_and_has_overlay_rule():

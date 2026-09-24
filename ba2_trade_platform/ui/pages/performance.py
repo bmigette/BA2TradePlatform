@@ -518,8 +518,8 @@ class PerformanceTab:
                         ui.select(
                             options=expert_options,
                             multiple=True,
-                            label="Filter by expert instance (empty = all)"
-                        ).style('min-width: 250px').bind_value_to(self, 'selected_experts').on_value_change(
+                            label="Experts (empty = all)"
+                        ).style('min-width: 280px').bind_value_to(self, 'selected_experts').on_value_change(
                             lambda e: update_expert_filter(e.value)
                         )
                 finally:

@@ -22,13 +22,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ba2_common.core.market_condition_rules import (
     assert_market_conditions_resolved,
-    assert_no_market_conditions,
+    assert_market_rule_actions,
 )
 from ba2_common.core.rule_builders import (
     FIELD_EVENT,
     FLAG_FIELD_EVENT,
     action_from_rule,
     assert_market_fields_mappable,
+    rule_triggers_from_tree,
     triggers_from_condition_tree,
 )
 from ba2_common.core.types import (
@@ -497,9 +498,13 @@ def trade_rules_to_live_export(
     # DEPLOY-PATH REFUSALS for market-condition gates (design sections 5/6, plan Task 8). This is
     # the ONE converter both the deploy importer and the live-export path go through, so it is
     # where a payload that must not reach a live instance is stopped: an unresolved optimizer
-    # template, a gate on an exit ruleset (it could only ever block an exit), and a field this
-    # server cannot map (importing would drop the gate and trade the strategy ungated).
-    assert_no_market_conditions(exit_rules or [], "open_positions ruleset")
+    # template (on EITHER side), a market gate on an exit rule that does anything but close,
+    # reduce or adjust TP/SL -- or that sits under OR/NOT (plan 2026-09-24 Task B2) -- and a field
+    # this server cannot map (importing would drop the gate and trade the strategy ungated).
+    # Per rule, ``rule_triggers_from_tree`` also refuses a rule whose leaves produce no trigger
+    # (always true) or that loses a market leaf -- the check the backtest seeder runs too.
+    assert_market_rule_actions(exit_rules or [], "open_positions ruleset")
+    assert_market_conditions_resolved(exit_rules or [], "open_positions ruleset")
     assert_market_conditions_resolved(entry_rules or [], "enter_market ruleset")
 
     def _rules_for(rules: Optional[List[dict]], subtype: str) -> List[dict]:
@@ -511,9 +516,10 @@ def trade_rules_to_live_export(
             if not actions:
                 continue
             conds = rule.get("conditions")
+            where = f"{subtype} rule {rule.get('id') or i!r}"
             if conds:
-                assert_market_fields_mappable(conds, f"{subtype} rule {rule.get('id') or i!r}")
-            triggers = triggers_from_condition_tree(conds) if conds else {}
+                assert_market_fields_mappable(conds, where)
+            triggers = rule_triggers_from_tree(conds, where)
             out.append({
                 "name": rule.get("name") or f"{name}-{subtype}-{i}",
                 "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,

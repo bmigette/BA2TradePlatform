@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict, Callable, Type
 from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
+import threading
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation
@@ -37,6 +38,7 @@ from ba2_common.core.market_conditions import (
     STATUS_VALID as _MC_STATUS_VALID,
     field_codes as _mc_field_codes,
     field_spec as _mc_field_spec,
+    OPERATORS_BY_KIND as _mc_operators_by_kind,
 )
 from ba2_common.core.market_condition_context import MarketConditionContext
 
@@ -347,8 +349,8 @@ class TradeCondition(ABC):
     # it fabricates signal: the simulated bar can be years before ``date.today()``, and a
     # historical fetch left unclamped returns the whole run window, so a "recent high" or
     # a "days to earnings" is computed from the simulated FUTURE. Both helpers below are
-    # duck-typed on the account exactly as ``TradeActions._today()`` is, so LIVE behaviour
-    # is byte-identical (no ``_as_of_date`` -> nothing changes).
+    # duck-typed on the account's ``_as_of_date``, so LIVE behaviour is byte-identical (no
+    # ``_as_of_date`` -> nothing changes).
 
     def _simulated_as_of_date(self) -> Any:
         """The BACKTEST bar's calendar date, ``None`` in live, or ``AS_OF_UNAVAILABLE``.
@@ -356,9 +358,8 @@ class TradeCondition(ABC):
         ``BacktestAccount`` exposes its simulated bar via ``_as_of_date()``; a live account
         has no such attribute and its wall clock IS the right answer.
 
-        Unlike ``TradeActions._today()`` this deliberately does NOT fall back to
-        ``date.today()`` when the accessor exists but fails or returns None. For an action
-        the wall clock is a degraded answer; for a CONDITION it is the lookahead bug itself,
+        This deliberately does NOT fall back to ``date.today()`` when the accessor exists
+        but fails or returns None: for a CONDITION the wall clock is the lookahead bug itself,
         so the caller must treat the condition as unevaluable rather than measure against a
         date the simulation never reached.
         """
@@ -1297,6 +1298,85 @@ class RatingDowngradedCondition(RatingDirectionCondition):
 
     def get_description(self) -> str:
         return f"Check if rating was downgraded (rank decreased) for {self.instrument_name}"
+
+
+# The 5-grade scale RE-CENTRED ON HOLD, which is what makes it comparable against a fixed
+# threshold of 0: SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2. DERIVED from
+# ``_RATING_RANK`` rather than retyped, so the two orderings cannot drift apart -- and ERROR
+# stays absent here for the same reason it is absent there: a grade the scale does not know
+# yields NO signal, never a plausible-looking zero.
+_REC_DIRECTION_CODE = {
+    grade: rank - _RATING_RANK[OrderRecommendation.HOLD]
+    for grade, rank in _RATING_RANK.items()
+}
+
+
+class RecommendationDirectionCondition(CompareCondition):
+    """The expert's direction call AS A SIGNED NUMBER -- ``rec_direction``.
+
+    ``calculated_value`` is the recommendation's grade on the 5-grade scale re-centred on
+    HOLD (``_REC_DIRECTION_CODE``): SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2.
+
+    WHY THIS EXISTS BESIDE ``BullishCondition`` / ``BearishCondition``
+    -----------------------------------------------------------------
+    Those are FLAG conditions: the field is authored into the leaf, so a rule can only switch
+    the gate off, never flip it. A pure-option strategy's entry direction was therefore fixed
+    at build time -- a long call could be tested on the BUY signal or on no signal at all, but
+    never on the SELL signal, so the contrarian arm of every structure was unreachable by
+    construction. As a NUMBER the same question becomes an ordering against a fixed threshold
+    of 0, and the optimizer's three-way mode gene (``off`` / ``below`` / ``above``) spans
+    exactly "no direction filter", "bearish only" and "bullish only" -- one gene where the
+    flag needed one gene to say strictly less.
+
+    EQUIVALENCE AT THE THRESHOLD 0. ``> 0`` is true for BUY and OVERWEIGHT, ``< 0`` for SELL
+    and UNDERWEIGHT, and both are false for HOLD. On the 3-grade experts (DeterministicScorer,
+    FMPRating) that is exactly ``bullish`` / ``bearish``. On a 5-grade expert (FactorRanker,
+    FinnHubRating) it is DELIBERATELY WIDER: the question this field answers is "which way is
+    the expert leaning", and an OVERWEIGHT that read as "not bullish" would have to read as
+    HOLD instead -- claiming the expert has no view when it has a weak one. The two flags stay
+    exactly as they are for anyone who wants the strict ``== BUY`` reading.
+
+    UNEVALUABLE, NOT ZERO. ERROR -- and any grade the scale does not carry -- leaves
+    ``calculated_value`` at None and makes ``evaluate()`` return False for EVERY operator,
+    the ``RecommendationDaysToEarningsCondition`` / ``DaysToExpiryCondition`` discipline. 0 is
+    already a meaningful reading here (it IS HOLD), so an unevaluable grade folded into it
+    would be indistinguishable from a real neutral call, and a failed analysis would gate the
+    same way a considered "no view" does.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            action = getattr(self.expert_recommendation, 'recommended_action', None)
+            code = _REC_DIRECTION_CODE.get(action)
+            if code is None:
+                # WARNING, not debug: unlike rec_days_to_earnings (absent on every
+                # non-event expert, so a per-symbol-per-bar warning would be noise), every
+                # recommendation carries a graded action. Getting here means ERROR or a
+                # grade outside the 5-grade scale, which is an expert that failed.
+                logger.warning(
+                    f"rec_direction for {self.instrument_name} is unevaluable: recommended "
+                    f"action {action!r} is not one of the 5 trading grades")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = code
+            return self.operator_func(code, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating rec_direction condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the expert's direction call for {self.instrument_name} "
+                f"(SELL -2 .. BUY +2) is {self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        if self.calculated_value is None:
+            return None
+        return f"{action.value} ({int(self.calculated_value):+d})"
 
 
 # Numeric Condition Implementations
@@ -3366,10 +3446,10 @@ class DaysToExpiryCondition(CompareCondition):
     rule is never exercised. Pre-existing rows that disagree stay unevaluable, because their
     strategy is not declared.
 
-    The "today" is the recommendation's ``created_at`` — the simulated as-of bar in a
-    backtest, wall-clock in live — never ``date.today()``, so the value is deterministic
-    under a frozen clock and correct in backtest. The comparison is by DATE, so every bar
-    of one session reports the same DTE.
+    The "today" is the account's decision session label (``_as_of_date`` below) -- the
+    date the option ENTRY counted its DTE from -- never ``date.today()``, so the value is
+    deterministic under a frozen clock and correct in backtest. The comparison is by DATE,
+    so every bar of one session reports the same DTE.
     """
 
     #: Rendered instead of a number when the measurement could not be made.
@@ -3383,11 +3463,28 @@ class DaysToExpiryCondition(CompareCondition):
         return value
 
     def _as_of_date(self):
-        """The evaluation DATE, or None when there is no as-of to evaluate against."""
-        as_of = getattr(self.expert_recommendation, "created_at", None)
-        if as_of is None:
+        """The evaluation DATE: the account's decision session label, or None when the account
+        cannot give one.
+
+        ``OptionsAccountInterface.decision_label`` -- the SAME date an option entry anchors its
+        DTE window on (``TradeActions._OptionEntryAction._today``), so the exit measures the
+        remaining life on the clock the entry was selected on (BT/live option parity): N(D)
+        for backtest bar D, the New York date of the decision instant live. Before, this read
+        the recommendation's ``created_at`` as a UTC date: D in a backtest (one session
+        behind the entry), and the NEXT day for a live evening decision. An account with no
+        ``decision_label`` (not an options account) has no reference point: unevaluable,
+        never the wall clock."""
+        return self.decision_label_of(self.account)
+
+    @staticmethod
+    def decision_label_of(account):
+        """``account.decision_label()``, or None for an account that has none. The ONE
+        reference date every DTE condition counts from (this one, the short-leg roll window,
+        the covered-call floor)."""
+        label_of = getattr(account, "decision_label", None)
+        if not callable(label_of):
             return None
-        return self._as_of_to_date(as_of)
+        return label_of()
 
     @staticmethod
     def _as_of_to_date(as_of):
@@ -3521,7 +3618,7 @@ class DaysToExpiryCondition(CompareCondition):
             if as_of is None:
                 # Substituting the wall clock here is the lookahead bug DaysOpenedCondition's
                 # docstring was written about; refusing is the only honest option.
-                self.unknown_reason = ("no evaluation date on the recommendation — "
+                self.unknown_reason = ("the account has no decision session label — "
                                        "'days remaining' has no reference point")
                 logger.warning(f"days_to_expiry for {self.instrument_name} is unevaluable: "
                                f"{self.unknown_reason}")
@@ -3668,13 +3765,12 @@ class ShortLegDaysToExpiryCondition(_TwoExpiryLegCondition):
             self.unknown_reason = None
             from ba2_common.core.option_lifecycle import roll_window_dte
 
-            as_of = DaysToExpiryCondition._as_of_to_date(
-                getattr(self.expert_recommendation, "created_at", None)) \
-                if getattr(self.expert_recommendation, "created_at", None) is not None else None
+            # The account's decision session label, as DaysToExpiryCondition (BT/live parity).
+            as_of = DaysToExpiryCondition.decision_label_of(self.account)
             if as_of is None:
                 return self._unevaluable(
                     "short_leg_days_to_expiry",
-                    "no evaluation date on the recommendation — 'days remaining' has no "
+                    "the account has no decision session label — 'days remaining' has no "
                     "reference point")
             structure, blind = self._structure()
             if structure is None:
@@ -3901,12 +3997,11 @@ class CoveredCallDaysToExpiryCondition(CompareCondition):
         try:
             self.calculated_value = None
             self.unknown_reason = None
-            as_of = DaysToExpiryCondition._as_of_to_date(
-                getattr(self.expert_recommendation, "created_at", None)) \
-                if getattr(self.expert_recommendation, "created_at", None) is not None else None
+            # The account's decision session label, as DaysToExpiryCondition (BT/live parity).
+            as_of = DaysToExpiryCondition.decision_label_of(self.account)
             if as_of is None:
                 return self._unevaluable(
-                    "no evaluation date on the recommendation — 'days remaining' has no "
+                    "the account has no decision session label — 'days remaining' has no "
                     "reference point")
 
             from ba2_common.core.failure_modes import UnmeasuredValue
@@ -4099,6 +4194,14 @@ class MarketConditionCompare(CompareCondition):
     a resolver returning a non-context (``TypeError``), a feature row that does not carry
     ``FIELD`` (``LookupError`` -- leaves are placed by profile, so this is a launcher/reader
     bug), and any exception from the reader or recorder.
+
+    EXCEPT ON A LIVE EXIT PASS (``market_condition_live.current_exit_pass()`` is set): there an
+    exception from ``reader.observe`` and the missing-field ``LookupError`` read UNKNOWN
+    (``no_context``, the cause in the reason) instead of raising, because one raising leaf
+    aborts the whole ruleset evaluation for the symbol and skips every stop, take-profit and
+    close rule of the position. They are still defects, so they stay LOUD: an ERROR with the
+    traceback once per (expert, field, exception type) per process, then a WARNING each time.
+    The entry pass and the backtest are unchanged: both still raise.
     """
 
     #: Canonical market-condition field name (== ExpertEventType value). Set by the factory.
@@ -4130,6 +4233,34 @@ class MarketConditionCompare(CompareCondition):
                      self.FIELD, self.instrument_name, status, reason)
         return False
 
+    def _unknown_on_exit_pass(self, exc: BaseException) -> bool:
+        """Call ONLY from an ``except`` block handling ``exc``. Outside a live exit pass,
+        re-raise it unchanged (entry pass, backtest, ruleset test page). On an exit pass, read
+        unknown with the cause in the reason, loudly (see the class docstring)."""
+        from ba2_common.core.market_condition_live import current_exit_pass
+
+        exit_pass = current_exit_pass()
+        if exit_pass is None:
+            raise
+        # DELIBERATELY broad, named so it survives BA2_ERROR_MODE=enforce: on an exit pass no
+        # market-condition defect may stop the position's other exit rules. The refusals
+        # failure_modes never absorbs still propagate.
+        absorb_if_benign(exc, Exception)
+        expert_id = exit_pass.expert_instance_id
+        reason = (f"market-condition leaf {self.FIELD} for {self.instrument_name} could not be "
+                  f"evaluated on the open-positions pass of expert instance {expert_id} "
+                  f"({type(exc).__name__}: {exc}): a market-condition wiring defect; the gate is "
+                  f"unknown and never passes, every other exit rule still runs")
+        key = (expert_id, self.FIELD, type(exc).__name__)
+        with _exit_pass_leaf_errors_lock:
+            first = key not in _exit_pass_leaf_errors_reported
+            _exit_pass_leaf_errors_reported.add(key)
+        if first:
+            logger.error(reason, exc_info=exc)
+        else:
+            logger.warning(reason + " (repeat of an error already logged with its traceback)")
+        return self._unknown(_MC_STATUS_NO_CONTEXT, reason)
+
     def evaluate(self) -> bool:
         global _warned_no_market_condition_resolver
         ctx = resolve_market_condition_context(self.account, self.instrument_name,
@@ -4144,7 +4275,7 @@ class MarketConditionCompare(CompareCondition):
             resolver = _market_condition_context_resolver
             if resolver is not None:
                 # A resolver IS installed but has no context for this evaluation (live: a leaf
-                # outside the enter-market decision scope). Never raise -- exit rulesets must keep
+                # outside a market-condition decision scope). Never raise -- exit rulesets must keep
                 # running -- but say so ONCE per cause instead of a DEBUG line per evaluation.
                 reason = getattr(resolver, "no_context_reason", None) or \
                     "the installed market-condition resolver has no context for this evaluation"
@@ -4168,17 +4299,23 @@ class MarketConditionCompare(CompareCondition):
                 return self._unknown(_MC_STATUS_NO_CONTEXT, reason)
             return self._unknown(_MC_STATUS_NO_CONTEXT, NO_MARKET_CONDITION_CONTEXT_REASON)
         session = ctx.prior_session
-        values = ctx.reader.observe(self.instrument_name, session)
+        try:
+            values = ctx.reader.observe(self.instrument_name, session)
+        except Exception as e:
+            return self._unknown_on_exit_pass(e)   # re-raises unless on a live exit pass
         if values is None:
             return self._unknown(_MC_STATUS_MISSING_SESSION,
                                  f"no feature row for {self.instrument_name} at {session}")
         by_field = values.by_field()
         obs = by_field.get(self.FIELD)
         if obs is None:
-            raise LookupError(
-                f"feature row for {self.instrument_name} at {session} carries no {self.FIELD!r} "
-                f"(row fields: {sorted(by_field)!r}) -- the reader was not built for this "
-                f"field's profile")
+            try:
+                raise LookupError(
+                    f"feature row for {self.instrument_name} at {session} carries no "
+                    f"{self.FIELD!r} (row fields: {sorted(by_field)!r}) -- the reader was not "
+                    f"built for this field's profile")
+            except LookupError as e:
+                return self._unknown_on_exit_pass(e)   # re-raises unless on a live exit pass
         if obs.status != _MC_STATUS_VALID:
             return self._unknown(obs.status, obs.reason)
         self.calculated_value = obs.value
@@ -4219,10 +4356,17 @@ _warned_no_market_condition_resolver = False
 #: reason is a different failure from "no decision scope is open".
 _warned_no_market_condition_context_fields: set = set()
 
-_OPERATORS_BY_KIND = {
-    "numeric": frozenset({"<", ">"}),
-    "categorical": frozenset({"=="}),
-}
+#: ``(expert instance id, field, exception type name)`` whose exit-pass leaf evaluation error was
+#: already logged at ERROR with its traceback (``MarketConditionCompare._unknown_on_exit_pass``).
+#: Per PROCESS: a persistent wiring defect logs its traceback once, then WARNING lines.
+_exit_pass_leaf_errors_reported: set = set()
+_exit_pass_leaf_errors_lock = threading.Lock()
+
+#: Re-exported, not re-typed. The table lives beside ``FieldSpec`` in ``market_conditions``
+#: because the rule EDITOR has to offer exactly what this class accepts: a second copy here is a
+#: list that drifts, and the drift is invisible until a deployed rule raises at condition
+#: construction on a Monday morning.
+_OPERATORS_BY_KIND = _mc_operators_by_kind
 
 #: Memo keyed by the FieldSpec itself, so a field re-registered with a different spec (e.g. a
 #: different kind) never gets a stale class back.
@@ -4303,6 +4447,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
     ExpertEventType.F_SHORT_TERM: ShortTermCondition,
     ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
+    ExpertEventType.N_REC_DIRECTION: RecommendationDirectionCondition,
     ExpertEventType.F_CURRENT_RATING_OVERWEIGHT: CurrentRatingOverweightCondition,
     ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
     ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,

@@ -13,6 +13,7 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 from datetime import date, datetime
 
 import pytest
@@ -20,7 +21,7 @@ import pytest
 from ba2_common.core.types import OptionRight
 
 CFG = {
-    "starting_cash": 100_000.0,
+    **_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0,
     "commission_per_trade": 1.0,
     "slippage_bps": 5.0,
     "fill_model": "next_bar_open",
@@ -221,6 +222,67 @@ def test_get_option_chain_empty_without_provider(backtest_account_no_options):
 def test_get_option_quote_reads_provider(options_account):
     # No option bar seeded -> provider returns None (quote path is wired, just no bar).
     assert options_account.get_option_quote("AAPL240315C00180000") is None
+
+
+def test_option_reads_pass_the_bars_data_session(options_account, monkeypatch):
+    """BT/live parity B2: bar D's data session is D itself
+    (``decision_data_session(backtest_decision_label(D))``), and it reaches the provider so the
+    chain's VOLUME is D's. The clock is 2024-03-05 (a Tuesday session)."""
+    seen = {}
+    real_chain, real_quote = options_account._options.get_chain, options_account._options.get_quote
+
+    def chain(*a, **k):
+        seen["chain"] = k["data_session"]
+        return real_chain(*a, **k)
+
+    def quote(*a, **k):
+        seen["quote"] = k["data_session"]
+        return real_quote(*a, **k)
+
+    monkeypatch.setattr(options_account._options, "get_chain", chain)
+    monkeypatch.setattr(options_account._options, "get_quote", quote)
+    options_account.get_option_chain("AAPL", date(2024, 3, 1), date(2024, 3, 31))
+    options_account.get_option_quote("AAPL240315C00180000")
+    assert seen == {"chain": date(2024, 3, 5), "quote": date(2024, 3, 5)}
+
+
+def test_option_chain_on_a_non_session_clock_is_refused(options_account):
+    """A Saturday bar has no data session: refused loudly rather than answered."""
+    options_account._price.set_clock(datetime(2024, 3, 9))
+    with pytest.raises(ValueError, match="no data session"):
+        options_account.get_option_chain("AAPL", date(2024, 3, 1), date(2024, 3, 31))
+
+
+def _results_config():
+    return {"initial_capital": CFG["starting_cash"], "account_settings": dict(CFG)}
+
+
+def test_build_results_records_chain_staleness_on_an_options_run(options_account):
+    """The per-run measurement reaches the persisted results -- through the account's public
+    accessor, not a private attribute."""
+    from app.services.backtest.results import build_results
+
+    assert options_account.has_options_provider is True
+    options_account.get_option_chain("AAPL", date(2024, 3, 1), date(2024, 3, 31))
+    options_account.snapshot_equity(datetime(2024, 3, 5))
+    out = build_results(options_account, {**_results_config(), "option_trade_records": True})
+    s = out["option_chain_staleness"]
+    assert s == options_account.option_chain_staleness()
+    assert s["chain_rows"] == 2          # the seeded 2024-03-15 call + put
+    # Both rows price from the 2024-03-01 snapshot (no bar on/before 03-05): 4 days stale.
+    assert s["stale_rows"] == 2 and s["stale_age_days"]["4-7"] == 2
+
+
+def test_build_results_has_no_chain_staleness_on_an_equity_run(backtest_account_no_options):
+    """An equity run gains no key at all: its results are what they always were."""
+    from app.services.backtest.results import build_results
+
+    assert backtest_account_no_options.has_options_provider is False
+    backtest_account_no_options.snapshot_equity(datetime(2024, 3, 5))
+    out = build_results(backtest_account_no_options, _results_config())
+    assert "option_chain_staleness" not in out
+    with pytest.raises(RuntimeError):
+        backtest_account_no_options.option_chain_staleness()
 
 
 def test_get_atm_implied_volatility_reads_provider(options_account):

@@ -1,0 +1,51 @@
+{
+  "checked_at_utc": "2026-09-21T11:24:07.509253+00:00",
+  "checkout": "/home/debian/ba2-grid/repo",
+  "files": {
+    "testplatform/ba2test_launcher.py": {
+      "sha256_normalized": "a0d5cf7ad034322d0a8fddd00f324224ef079ceffb74418f1de3fe2eca134ef1",
+      "features": {
+        "def _submit_daemon": false,
+        "def _run_local_fallback_bounded": false,
+        "def _new_local_pool": false,
+        "is_measured_result": false
+      }
+    },
+    "testplatform/backend/app/services/strategy_optimization_handler.py": {
+      "sha256_normalized": "8ca0a341c251945f4597232f164bddd4ad6c073ea60cc21c8c15866cd66ede7b",
+      "features": {
+        "NO_MEASUREMENT_KIND": false,
+        "is_measured_result": false
+      }
+    },
+    "tools/run_options_matrix.py": {
+      "sha256_normalized": "8128b887164ff6f46d22306522dac9c8a33153d228073c96d1c91bc021ff913b",
+      "features": {
+        "created_after": false,
+        "_newest_optimization_id": false
+      }
+    }
+  },
+  "running_processes": [
+    {
+      "pid": 1369,
+      "cwd": "/proc/1369/cwd",
+      "script": "/opt/ba2worker/BA2TradePlatform/testplatform/ba2test_launcher.py"
+    },
+    {
+      "pid": 653399,
+      "cwd": "/proc/653399/cwd",
+      "script": "/opt/ba2worker/BA2TradePlatform/testplatform/ba2test_launcher.py"
+    },
+    {
+      "pid": 746315,
+      "cwd": "/home/debian/ba2-grid/repo",
+      "script": "tools/run_options_matrix.py"
+    },
+    {
+      "pid": 746465,
+      "cwd": "/home/debian/ba2-grid/repo/testplatform/backend",
+      "script": "/home/debian/ba2-grid/repo/testplatform/ba2test_launcher.py"
+    }
+  ]
+}

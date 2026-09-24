@@ -169,6 +169,11 @@ class _Acct:
     def get_instrument_current_price(self, symbol, price_type=None):
         return 100.0
 
+    def decision_label(self):
+        # The option action's DTE label (OptionsAccountInterface.decision_label): pinned to
+        # the date these tests build expiries from (``date.today()``), not the New York date.
+        return date.today()
+
     def get_balance(self):
         return 100_000.0
 

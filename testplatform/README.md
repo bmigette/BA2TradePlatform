@@ -1,389 +1,357 @@
-# BA2ML - Deep Learning Financial Forecasting Platform
+# BA2 Test Platform (`ba2-test`)
 
-A comprehensive platform for training and evaluating deep learning models for financial forecasting using genetic optimization and strategy backtesting.
+The backtesting and genetic-optimization platform for the
+[BA2 Trade Platform](../README.md)'s market experts. It replays the same expert and
+risk-manager code the live platform runs, day by day over historical data. It then searches
+expert settings, rulesets and exit parameters with a genetic algorithm, stress-tests the
+winners, and hands them back to the live platform for deployment. A FastAPI backend with a
+React/Vite UI, a `ba2-test` console command, and optional remote workers that share the GA load.
 
 ![Dashboard](docs/screenshots/01-dashboard.png)
 
-## Overview
+## How it relates to the trade platform
 
-This platform provides three main components:
+Both apps live in one monorepo and share three installable packages:
 
-1. **Dataset Builder** - Fetch and prepare financial data with technical indicators, sentiment, and fundamentals
-2. **Model Trainer** - Uses genetic optimization to build best-fit deep learning models for financial time series prediction
-3. **Strategy Backtester** - Build and test trading strategies with visual condition builders and comprehensive analytics
+| Package | Import | Provides |
+|---|---|---|
+| `packages/common` (`ba2trade-common`) | `ba2_common` | models, types, interfaces, rulesets/TradeConditions, risk manager, market calendar, market-condition profiles, BA2 paths config |
+| `packages/providers` (`ba2trade-providers`) | `ba2_providers` | market data providers (OHLCV, FMP history, news, FRED, option history vendors) |
+| `packages/experts` (`ba2trade-experts`) | `ba2_experts` | the non-LLM experts (FMPRating, FMPEarningsDrift, FactorRanker, ...) |
+
+The backtest engine imports these packages directly. A strategy's fitness is therefore
+computed by the same expert, ruleset and risk-manager code that trades live. The two apps keep
+separate DBs (see [Data and cache layout](#data-and-cache-layout)) but share the raw provider
+cache.
 
 ## Screenshots
 
 ### Dashboard
-Overview of optimization jobs, recent activity, and quick access to all features.
+Optimization job counts by status, recent activity, system resources and the worker fleet.
 
 ![Dashboard](docs/screenshots/01-dashboard.png)
 
-### Dataset Management
-Create and manage datasets with multi-source data integration.
+### Backtest results
+A daily expert backtest over 2020–2025: headline metrics, and tabs for the equity curve,
+drawdown, capital used, trade list, strategy and yearly breakdown. The history list on the left
+filters, sorts and pages through every run.
 
-![Datasets](docs/screenshots/02-datasets.png)
+![Backtest result](docs/screenshots/08-backtest-result.png)
 
-### Dataset Details & Charting
-Interactive TradingView-style charts with technical indicators, prediction targets configuration, and data exploration.
+### Strategy view
+The entry rules and exit conditions a backtest ran with, rendered the way the live platform
+shows them.
 
-![Dataset Details](docs/screenshots/03-dataset-details.png)
+![Backtest strategy](docs/screenshots/09-backtest-strategy.png)
 
-### Model Training
-Configure and monitor genetic optimization jobs with real-time progress tracking.
+### Optimization jobs
+A GA optimization job: its genetic config, the parameter ranges it searched (expert settings,
+risk manager, screener and schedule genes) and its top individuals.
 
-![Training](docs/screenshots/04-training.png)
+![Optimization job](docs/screenshots/10-optimization-job.png)
 
-### Model Library
-Browse trained models, view performance metrics, confusion matrices, and run predictions.
+### New backtest
+Pick an expert (or an ML model), a static or screener universe, the fill model, schedule, dates
+and strategy; or import settings from an optimization individual or a live expert.
 
-![Models](docs/screenshots/05-models.png)
-
-### Strategy Backtesting
-Build complex trading strategies with visual condition builders and analyze performance.
-
-![Backtesting](docs/screenshots/06-backtesting.png)
+![New backtest](docs/screenshots/06-backtesting.png)
 
 ### Tools
-Utility tools for data management, indicator calculation, and exports.
+Provider testers (news, fundamentals, macro), the OHLCV cache tool, news batch fetch and
+maintenance.
 
 ![Tools](docs/screenshots/07-tools.png)
 
-## Features
+### Deep-learning module
+Datasets, dataset charting, model training and the model library (screenshots from an earlier
+release).
 
-### Dataset Preparation
-- **Multi-provider data fetching**: Yahoo Finance, Alpha Vantage, Polygon.io, EODHD
-- **Multiple timeframes**: 1m, 5m, 15m, 1h, 4h, daily
-- **50+ technical indicators**: RSI, MACD, Bollinger Bands, ATR, ZigZag, and more
-- **Fundamental data integration**: Earnings, financials via Financial Modeling Prep
-- **Macro-economic data**: FRED integration for economic indicators
-- **News sentiment analysis**: Multi-source sentiment with ML models
-- **Interactive visualization**: TradingView-style charts with indicator overlays
-- **Prediction targets**: Configurable directional, trend-based, and custom targets
+![Datasets](docs/screenshots/02-datasets.png)
+![Dataset Details](docs/screenshots/03-dataset-details.png)
+![Training](docs/screenshots/04-training.png)
+![Models](docs/screenshots/05-models.png)
 
-### Model Training
-- **11+ Deep Learning Architectures**:
-  - **LSTM** - Long Short-Term Memory
-  - **GRU** - Gated Recurrent Unit
-  - **TCN** - Temporal Convolutional Network
-  - **InceptionTime** - Inception-based time series
-  - **ResNet** - Residual networks for time series
-  - **XceptionTime** - Xception for time series
-  - **OmniScale CNN** - Multi-scale convolutional
-  - **MiniRocket** - Fast random convolutional kernels
-  - **PatchTST** - Patch-based Transformer
-  - **TST** - Time Series Transformer
-  - **LSTM-FCN** - LSTM with Fully Convolutional
-  - **N-BEATS** - Neural Basis Expansion
+## Pages
 
-- **Genetic Algorithm Optimization**:
-  - Population-based hyperparameter search
-  - Elitism preservation
-  - Crossover and mutation operators
-  - Early stopping with configurable patience
-  - Real-time progress monitoring
+Routes are defined in `frontend/src/App.tsx`. The sidebar is in `components/layout/Sidebar.tsx`.
 
-- **Training Features**:
-  - Multiple prediction modes (shift, multistep)
-  - Multiple loss functions (focal, cross-entropy, weighted)
-  - Threshold optimization
-  - Sequence length optimization
-  - GPU-accelerated training with PyTorch
-  - Checkpoint saving and recovery
+| Page | Route | What it does |
+|---|---|---|
+| Dashboard | `/` | job counts by status, recent activity, and the worker fleet (online/total, busy slots) |
+| Backtesting | `/backtesting` | the main workspace, described in the next section |
+| Datasets | `/datasets`, `/datasets/:id` | DL module: build and chart datasets, prediction targets |
+| Training | `/training`, `/training/:id` | DL module: GA model-training jobs, logs, generations |
+| Models | `/models`, `/models/:id` | DL module: trained-model library, metrics, confusion matrix, predictions |
+| Tools | `/tools` | news, fundamentals and macro (FRED) provider testers, OHLCV cache tool, news batch fetch, maintenance |
+| Saved Data | `/saved-data` | saved backtest strategies and indicator collections |
+| Cache | `/cache` | disk usage per cache type, clearing, data builds (OHLCV, screener metrics, option chains, pre-warm), option chain viewer |
+| Settings | `/settings` | provider API keys (with a copy-from-trade-platform action), app settings, remote workers (add, health check, push cache, update, import/export) |
 
-### Model Management
-- **Model Inventory**: Save, browse, and manage trained models
-- **Performance Metrics**: Accuracy, precision, recall, F1, AUC-ROC, MCC
-- **Confusion Matrix**: Visual classification performance analysis
-- **Training History**: Epoch-by-epoch loss and metric curves
-- **View Predictions**: Run inference on datasets and visualize results
-- **Model Export**: Export models for deployment
-- **Retrain**: Continue training existing models
+The Backtesting page has these tabs: **New Backtest**, **BT History** (paginated, with
+label filters), **Opt History** (optimization jobs and their TOP-N individuals), **Saved**,
+and **Running** (the live job queue). A selected backtest shows its equity curve,
+drawdown, capital used, trade list (with per-trade charts and option trade details),
+strategy (resolved ruleset) and yearly breakdown.
 
-### Strategy Backtesting
-- **Visual Condition Builder**:
-  - AND/OR logic groups
-  - Model prediction conditions
-  - Price and position conditions
-  - Time-based conditions
-  - Nested condition trees
+## Backtesting and optimization
 
-- **Entry/Exit Conditions**:
-  - Multiple condition types
-  - Confirmation bars
-  - Optimization ranges per condition
+### Daily expert backtests
+The `daily_expert` engine runs one expert over a multi-symbol universe on a daily or intraday
+fill clock (`--interval`, e.g. `5min`, for intraday TP/SL). It uses as-of data only.
+Supported experts are listed in `_SUPPORTED_EXPERTS` in
+`backend/app/services/backtest/daily_backtest_handler.py`. Today they are FMPRating,
+FMPEarningsDrift, FMPEarningsEvent, FMPInsiderClusterBuy, FMPSenateTraderWeight,
+FMPSenateTraderCopy, FinnHubRating, FactorRanker, DeterministicScorer and ETFTrend.
+Classic-RM experts use enter/exit rulesets. Bypass experts such as FactorRanker rebalance to
+target weights. The Smart (agentic) risk manager is not modelled, and a run that asks for it is
+refused.
 
-- **Risk Management**:
-  - Take profit / Stop loss (fixed or %)
-  - Trailing stops
-  - Position sizing (fixed, percent, Kelly)
-  - Max positions limit
+A run is configured with:
+- the expert and its settings (the form is built from the expert's own settings definitions)
+- the universe: a symbol list, or a point-in-time **screener** fed by a prebuilt parquet
+  metric store (market cap, price, volume and price-drop filters; each can get a GA range)
+- the entry schedule (weekday and time), warm-up, capital, commission, slippage and spread
+- the enter/exit **rulesets**, built in the condition builder or taken from exit presets
 
-- **Performance Analytics**:
-  - Sharpe ratio, max drawdown, win rate
-  - Profit factor, average trade duration
-  - Equity curves and drawdown charts
-  - Trade-by-trade analysis
+After a run you can rerun it in place, run a what-if with selected trades excluded (the curves
+are recomputed without re-running), compare runs, export them, and label them.
 
-- **Dual Dataset Support**:
-  - Separate prediction dataset (e.g., 1h for signals)
-  - Separate execution dataset (e.g., 1m for precise entries)
+### Genetic optimization
+An optimization job evolves one population over expert settings, risk-manager and TP/SL
+parameters, ruleset condition toggles and thresholds, screener ranges, and the entry weekday.
+Each job records its generation history and persists its best **TOP-N individuals** as
+backtests. Any individual can be re-run as a backtest from Opt History, and a job can
+warm-start from an earlier job's population.
 
-## Quick Start
+The fitness metrics come from `GET /api/optimization/fitness-options` (`services/strategy_fitness.py`).
+They include Sharpe, Sortino, Calmar, return, profit factor, SQN, max drawdown, consistent
+annual return (CAR), and option-specific CAR variants. Optional knobs are per-trade profit caps,
+a trade-count scale, a win-rate factor, and a robustness-adjusted fitness. The
+robustness-adjusted fitness is on by default. See
+[docs/grid-and-fitness-guide.md](docs/grid-and-fitness-guide.md).
 
-### 1. Backend Setup
+### Robustness tests
+Launch these from a saved backtest (`POST /api/backtests/robustness`). **Monte Carlo** resamples
+the persisted trades in under a second, without a re-run, and reports percentile bands and a
+drop-K table. **Schedule perturbation** re-runs the backtest once per variant entry weekday or
+time shift. See [docs/robustness-suite.md](docs/robustness-suite.md).
 
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-```
+### Options backtests
+A strategy whose rules name an option action becomes an options run. Built-in structures
+include long call, bear-put vertical, iron condor, jade lizard, butterfly, ratio spread and
+covered call; unbounded-risk structures are refused. You choose one of three option history
+stores, and each one's history floor is enforced:
 
-#### GPU/CUDA Support (Recommended)
+| Store | Vendor | Floor |
+|---|---|---|
+| `sqlite` (default) | Alpaca | 2024-01-18 |
+| `tastytrade` (alias `parquet`) | dxfeed | 2022-10 |
+| `thetadata` | ThetaData | set by the provider |
 
-For GPU-accelerated training, install PyTorch with CUDA support **before** installing other requirements:
+Build the Alpaca cache with `ba2-test fetch-options`. Build the parquet stores with
+`tools/warm_options_history.py --provider tastytrade|thetadata` (repo root). Underlying prices
+come from the OHLCV cache.
 
-```bash
-# Example for CUDA 12.4 (check pytorch.org for your CUDA version)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-```
+### Market-condition genes (options)
+`--market-condition-profile` adds entry gates from registered profiles in
+`ba2_common.core.market_conditions`, such as `ohlcv-v1` and `ta-structure-v1`, to every option
+structure's entry tree. The genes decide whether each gate is off, above or below, and set its
+threshold. A profile requires a prepared snapshot (`--market-condition-manifest`) built with
+`tools/warm_market_conditions.py`, so that every worker reads identical indicator values.
+Profiles are off by default.
 
-Then install the remaining dependencies:
-```bash
-pip install -r requirements.txt
-```
+### Rulesets and the live platform
+- Import and export a strategy's rules as JSON: `POST /api/strategies/import-rules` and
+  `GET /api/strategies/{id}/export-rules`. The UI does this through `RuleIO`.
+- Convert a live-platform ruleset export file: `POST /api/ruleset/convert-live`.
+- With `BA2_LIVE_DB` pointing at the live DB, an expert's live rulesets can be read
+  **read-only** (`GET /api/experts/{id}/open-positions-ruleset` and `.../enter-market-ruleset`).
+- To deploy a backtest into a live ExpertInstance, use `tools/export_deploy_payload.py` (reads
+  the test DB) and then `tools/import_deploy_payload.py` (writes the live DB). Both are at the
+  repo root.
 
-#### CPU Only
+## Distributed workers
 
-If you don't have a CUDA-capable GPU:
-```bash
-pip install -r requirements.txt
-```
+The master (the serve process) pushes GA trials to remote worker servers over HTTP. Each trial
+is hermetic and seeded, so its fitness does not depend on which host ran it.
 
-### 2. Configure API Keys (Optional)
+- **Worker**: run `ba2-test worker --port 8100 --password <secret> [--workers N]` on the worker
+  host (`app/worker_server.py`). It needs no DB, runs trials in its own process pool, and
+  requires a bearer password on every call. It defaults to CPU count - 1 slots. To provision a
+  Debian host as a systemd service, see [deploy/README.md](deploy/README.md).
+- **Master**: add each worker (name, URL, password) on **Settings -> Workers**, then pass
+  `--worker NAME` (repeatable) or `--workers A,B` to `ba2-test optimize` or `optimize-batch`.
+- **Pre-flight** (`services/distributed_eval.py`): for each selected worker, the master calls
+  `ensure_synced` (`services/worker_client.py`). This compares the worker's `TEST_APP_VERSION`
+  with the master's and triggers `/update` (git pull, package reinstall, restart) on a
+  mismatch. The master then pushes missing cache files as a tar stream, and prepares the
+  market-condition snapshot if the run pins one. A worker that fails pre-flight is dropped.
+  The master re-checks dropped workers during the run and re-admits any that recover.
+- **During a run**: the master's local consumer threads and the remote dispatcher threads all
+  claim trials from one per-job queue (`services/trial_broker.py`), so no trial runs twice. A
+  failed trial is requeued.
+- Result rows are replicated to workers with sync enabled (`services/sync_client.py`), so a
+  worker host can browse past runs.
 
-Copy and edit the environment file:
-```bash
-cp .env.example .env
-```
+## Deep-learning forecasting module
 
-API keys for enhanced data:
-- `FMP_API_KEY` - Financial Modeling Prep (fundamentals)
-- `FRED_API_KEY` - FRED (macro data)
-- `NEWS_API_KEY` - News sentiment
+This module is the original feature set, and it is still in the app (Datasets, Training and
+Models pages; `/api/datasets`, `/api/jobs`, `/api/models`, `/api/ml`). It builds datasets
+with indicators, fundamentals, macro and news sentiment. It trains tsai and Darts models
+(LSTM, GRU, TCN, InceptionTime, ResNet, XceptionTime, OmniScaleCNN, MiniRocket, PatchTST, TST,
+N-BEATS) with a GA hyperparameter search, and keeps a model library. The ML backtest engine
+(`engine_type` `ml`) runs model-driven strategies. The backtest workflow above does not depend
+on this module.
 
-### 3. Initialize Database
+## Install and first run
 
-For a fresh installation:
-```bash
-cd backend
-./venv/bin/python -c "from app.models.database import init_db; init_db()"
-```
-
-For an existing database, run migrations to apply schema updates:
-```bash
-cd backend
-./venv/bin/python scripts/migrate_db.py
-```
-
-Check migration status:
-```bash
-./venv/bin/python scripts/migrate_db.py --status
-```
-
-### 4. Start Backend
-
-```bash
-cd backend
-./venv/bin/python -m uvicorn app.main:app --reload --port 8000
-```
-
-Backend available at: http://localhost:8000
-API docs: http://localhost:8000/docs
-
-### 5. Start Frontend
+From the monorepo root, build the test venv. It installs the `common -> providers -> experts`
+chain, `backend/requirements.txt`, the `ba2-test` command, and the frontend `npm install`,
+then migrates the test DB:
 
 ```bash
-cd frontend
-npm install
-npm run dev
+./install.sh --test-only --editable          # Linux/macOS -> ~/ba2-venvs/test
+.\install.ps1 -TestOnly -Editable            # Windows
 ```
 
-Frontend available at: http://localhost:5173
+Then start the app:
 
-## Project Structure
-
-```
-BA2MLTestPlatform/
-├── backend/                 # FastAPI backend
-│   ├── app/
-│   │   ├── api/            # REST API endpoints
-│   │   ├── models/         # SQLAlchemy database models
-│   │   └── services/       # Business logic (training, backtesting)
-│   ├── dataproviders/      # Data source integrations
-│   ├── datasets/           # Cached datasets and models
-│   └── tests/              # Backend tests
-│
-├── frontend/               # React + TypeScript frontend
-│   ├── src/
-│   │   ├── components/     # Reusable UI components
-│   │   └── pages/          # Main application pages
-│   └── public/
-│
-├── docs/                   # Documentation
-│   ├── screenshots/        # Application screenshots
-│   ├── plans/              # Implementation plans
-│   └── spec/               # Specifications
-│
-└── scripts/                # Utility scripts
+```bash
+ba2-test serve                 # API on :8000 + Vite UI on :5173
+ba2-test serve --mode back     # API only (add --reload for development)
 ```
 
-## Technology Stack
+`start.bat` / `start.sh` in this folder are thin wrappers around the same command
+(`start.bat backend|frontend|all [serve flags]`); they find `ba2-test` on `PATH` or in the
+installer's default `~/ba2-venvs/test`.
 
-### Backend
-- **FastAPI** - Modern Python web framework
-- **SQLAlchemy** - Database ORM with SQLite
-- **PyTorch** - Deep learning framework
-- **tsai** - Time series deep learning library
-- **Darts** - Forecasting library
-- **pandas** - Data manipulation
-- **TA-Lib** - Technical analysis indicators
-- **backtesting.py** - Strategy backtesting
+- UI: http://localhost:5173. API: http://localhost:8000. OpenAPI docs: http://localhost:8000/docs.
+- The frontend reads `VITE_API_BASE` (default `http://localhost:8000/api`, see
+  `frontend/src/lib/config.ts`).
+- On startup the backend creates its tables and runs `backend/scripts/migrate_db.py`.
+- Set provider API keys (FMP, Alpaca, Finnhub, ...) in **Settings -> API Keys**, or copy them from
+  the trade platform's DB.
+- Set `BA2_ADMIN_TOKEN` to enable the token-protected admin endpoints (`/api/admin/*`:
+  version, update, logs, DB cleanup).
 
-### Frontend
-- **React 18** - UI framework
-- **TypeScript** - Type-safe JavaScript
-- **Vite** - Fast build tool
-- **Tailwind CSS** - Utility-first styling
-- **Recharts** - Charting library
-- **Lucide** - Icon library
-- **React Router** - Navigation
+## Command-line tools
 
-## API Documentation
+**`ba2-test`** (`ba2test_launcher.py`) runs in-process against `backend/`. Run
+`ba2-test <cmd> -h` for per-command help.
 
-The backend provides a comprehensive REST API:
+| Command | Purpose |
+|---|---|
+| `serve` | start the API and/or UI |
+| `backtest ...` | run one daily expert backtest; arguments pass through to `run_daily_backtest` (`--track`/`--save` to persist) |
+| `optimize` | one GA job (`--expert --strategy --universe --start --end --fitness ...`); `--submit` queues it on the running serve |
+| `optimize-batch` | run several experts and strategies one after another; each job's TOP-N is persisted |
+| `worker`, `sync-cache` | run a worker server; push the cache to a configured worker |
+| `fetch-cache`, `prewarm` | fill the as-of OHLCV cache; pre-build per-expert FMP history caches |
+| `build-screener-metrics`, `recompute-screener-drops` | build or refresh the screener metric store |
+| `fetch-options` | build the Alpaca options-history cache |
+| `cache-usage`, `cache-clear` | inspect or clear the cache |
+| `runs list/save/delete/clear-unsaved/prune/stats`, `report` | manage tracked runs; write an HTML summary |
+| `replay ...` | replay a recorded live-session bundle offline (inventory, experts, gather, historical, warm-plan, warm) |
 
-### Datasets
-- `GET /api/datasets` - List all datasets
-- `POST /api/datasets` - Create a new dataset
-- `GET /api/datasets/{id}` - Get dataset details
-- `POST /api/datasets/{id}/regenerate` - Regenerate dataset
+**`ba2cli.py`** is a thin HTTP client for the REST API, used for scripting and LLM agents.
+Its global options are `--host <server> --port 8000 [--token $BA2_ADMIN_TOKEN] [--human]`. It
+has resources for datasets, targets, indicators, jobs, profiles, models, strategies,
+backtests, cache, workers, tasks, settings, server, ml, dashboard, logs and help. Run
+`python ba2cli.py help` for the manual.
 
-### Training Jobs
-- `GET /api/jobs` - List all training jobs
-- `POST /api/jobs` - Create a new training job
-- `GET /api/jobs/{id}` - Get job status and progress
-- `POST /api/jobs/{id}/elite-models/{rank}/save-to-inventory` - Save trained model
+## API overview
 
-### Models
-- `GET /api/models` - List all trained models
-- `GET /api/models/{id}` - Get model details
-- `POST /api/models/{id}/run-predictions` - Run inference on dataset
-- `GET /api/models/{id}/confusion-matrix` - Get confusion matrix
+All routers are mounted in `backend/app/main.py`. The full reference is at `/docs`.
 
-### Strategies
-- `GET /api/strategies` - List saved strategies
-- `POST /api/strategies` - Create a new strategy
-- `GET /api/strategies/compatible/{model_id}` - Find compatible strategies
+| Prefix | Area |
+|---|---|
+| `/api/backtests` | run (`/daily`), list, rerun, what-if, yearly, trade chart, compare, export, save, robustness, screener stores |
+| `/api/strategies` | strategies, optimizations (`/optimizations`, `/running`, `/{id}/export`, individual -> backtest), `/{id}/optimize`, `/optimize-batch`, rule import/export |
+| `/api/optimization/fitness-options` | fitness metric catalog and knob defaults |
+| `/api/experts` | backtestable experts and their settings definitions; live-ruleset read (`BA2_LIVE_DB`) |
+| `/api/ruleset` | condition/action vocabulary, exit presets, live-export conversion |
+| `/api/workers` | worker CRUD, status, health check, sync-cache, update, import/export |
+| `/api/cache`, `/api/data` | cache usage/clear, option chain browsing; data builds (OHLCV, screener metrics, options, prewarm) |
+| `/api/tasks`, `/api/dashboard`, `/api/ws/...` | task queue, dashboard stats, job WebSockets |
+| `/api/settings`, `/api/admin` | settings and API keys; version, update, logs, DB cleanup (token) |
+| `/api/datasets`, `/api/jobs`, `/api/models`, `/api/ml`, `/api/target-sets`, `/api/indicator-collections`, `/api/tools` | DL module and data tools |
 
-### Backtests
-- `GET /api/backtests` - List all backtests
-- `POST /api/backtests` - Run a new backtest
-- `GET /api/backtests/{id}` - Get backtest results
+## Data and cache layout
 
-Full interactive API documentation available at http://localhost:8000/docs
+The repo holds no data. Everything lives under **`BA2_HOME`** (default `~/Documents/ba2`,
+defined in `packages/common/ba2_common/config.py`):
+
+```
+BA2_HOME
+├── common/cache/          # shared with the live platform            (CACHE_FOLDER)
+│   ├── <Provider>/, ohlcv/, fmp_history/, fred/, news/
+│   ├── screener/          # metric_store/ (parquet) + screener_history.sqlite
+│   ├── options/           # Alpaca options_history.sqlite
+│   ├── TastyTradeOptionsProvider/, ThetaDataOptionsProvider/   # option parquet stores
+│   └── market_conditions/, replay/
+├── test/                  # this app's data
+│   ├── dl_forecasting.db  # the single test DB: app data + appsetting keys (DATABASE_URL)
+│   ├── datasets/, trained_models/, cache/jobs/, cache/news/, news_exports/
+│   └── logs/              # (LOG_FOLDER)
+└── trade/                 # live trade platform DB(s)
+```
+
+`BA2_HOME` relocates everything. The per-path overrides are `CACHE_FOLDER`, `DATABASE_URL`,
+`LOG_FOLDER`, `BA2_DATASETS_DIR`, `BA2_MODELS_DIR`, `BA2_JOBS_CACHE_DIR`,
+`BA2_NEWS_CACHE_DIR` and `BA2_NEWS_EXPORTS_DIR` (`backend/app/paths.py`). To migrate the
+pre-`BA2_HOME` layout, run `scripts/migrate_cache_layout.py`. It is a dry run by default;
+pass `--apply` to move files, and restart running instances afterwards.
+
+## Versioning
+
+`version.py` holds `TEST_APP_VERSION` (`YYYY.MM.NNNNN`). Increment the build number before
+every push that touches `testplatform/` **or `packages/`**. Changes confined to
+`ba2_trade_platform/` bump `ba2_trade_platform/version.py` instead. Workers compare
+`TEST_APP_VERSION` only, not the git commit. An unbumped shared-package change would leave
+workers running different code while they report themselves as synced. Commit and push the
+bump: the master refuses to sync workers to a version that a `git pull` cannot reach
+(`self_update.unsyncable_reason`).
 
 ## Testing
 
-Run backend tests:
 ```bash
-cd backend
-./venv/bin/python -m pytest tests/ -v
+# backend (from testplatform/backend; pytest.ini puts packages/* and testplatform/ on the path)
+~/ba2-venvs/test/bin/python -m pytest tests            # Windows: ~/ba2-venvs/test/Scripts/python.exe
+~/ba2-venvs/test/bin/python -m pytest tests -m "not slow"
+
+# frontend (vitest)
+cd frontend && npm test
 ```
 
-## Contributing
+The shared packages have their own suites (`packages/*/tests`). Run them separately.
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+## Project structure
+
+```
+testplatform/
+├── ba2test_launcher.py   # `ba2-test` console command
+├── ba2cli.py             # REST API client
+├── version.py            # TEST_APP_VERSION
+├── backend/
+│   ├── app/api/          # FastAPI routers
+│   ├── app/services/     # backtest engine (services/backtest/), GA, fitness, robustness,
+│   │                     #   distributed eval + worker client, caches, DL training
+│   ├── app/worker_server.py
+│   ├── scripts/          # migrate_db.py, run_daily_backtest.py, ...
+│   └── tests/
+├── frontend/src/         # React 19 + TypeScript + Vite + Tailwind (pages/, components/, lib/)
+├── deploy/               # worker host provisioning (systemd, fail2ban)
+└── docs/                 # guides, plans, specs, screenshots
+```
+
+Useful docs: [grid & fitness guide](docs/grid-and-fitness-guide.md),
+[robustness suite](docs/robustness-suite.md),
+[daily expert backtest scope](docs/daily-expert-backtest-scope.md),
+[exit ruleset UI](docs/exit-ruleset-ui-requirements.md), `docs/superpowers/` (backtest, options
+and screener designs).
 
 ## License
 
-For educational and research purposes.
-
-## Acknowledgments
-
-- [tsai](https://github.com/timeseriesAI/tsai) - State-of-the-art time series deep learning
-- [Darts](https://github.com/unit8co/darts) - Forecasting library
-- [backtesting.py](https://github.com/kernc/backtesting.py) - Backtesting framework
-- [yfinance](https://github.com/ranaroussi/yfinance) - Yahoo Finance data
-- [TA-Lib](https://github.com/mrjbq7/ta-lib) - Technical analysis library
-
-## Install / first run
-
-Two virtualenvs are used:
-
-- **`backend/venv`** — the FastAPI backend + scripts. Always use
-  `./venv/bin/python` (see `backend/CLAUDE.md`):
-  ```bash
-  cd backend
-  ./venv/bin/pip install -e ../../BA2TradeCommon -e ../../BA2TradeProviders -e ../../BA2TradeExperts
-  ./venv/bin/pip install -r requirements.txt
-  ./venv/bin/python -m uvicorn app.main:app --reload
-  ```
-- **`~/ba2-venvs/test`** — the headless `ba2-test` CLI (`ba2test_launcher.py`):
-  ```bash
-  ~/ba2-venvs/test/bin/python ba2test_launcher.py --help
-  ```
-
-On startup the backend creates its data dirs under `BA2_HOME` (see below), not
-inside the repo.
-
-## Data & cache layout
-
-Nothing is cached inside the repo anymore. All artifacts live under a single
-root, **`BA2_HOME`** (env-overridable, default `~/Documents/ba2`):
-
-```
-BA2_HOME  (default ~/Documents/ba2)
-├── common/                 # shared with the live trader
-│   ├── cache/              # raw provider cache: OHLCV parquet, as_of cache, fmp_history   (CACHE_FOLDER)
-│   ├── db.sqlite           # shared app-settings / API-keys DB (FMP, Finnhub, ...)         (DB_FILE)
-│   └── options/            # options-history cache
-├── test/                   # THIS app's artifacts (were inside backend/ — the bug)
-│   ├── datasets/           # generated dataset CSVs
-│   ├── trained_models/     # saved model artifacts
-│   ├── cache/jobs/         # per-job cache
-│   ├── cache/news/         # news content files
-│   └── news_exports/       # exported news JSON
-└── trade/
-    └── screener/           # metric_store/ (parquet) + screener_history.sqlite
-```
-
-Paths are centralized in `backend/app/paths.py` (test bucket) and
-`ba2_common/config.py` (common/trade buckets). Each is env-overridable:
-
-- `BA2_HOME` relocates everything.
-- `CACHE_FOLDER`, `DB_FILE`, and the per-dir vars
-  `BA2_DATASETS_DIR` / `BA2_MODELS_DIR` / `BA2_JOBS_CACHE_DIR` /
-  `BA2_NEWS_CACHE_DIR` / `BA2_NEWS_EXPORTS_DIR` still win when set
-  (backward-compatible).
-
-### Migrating from the old layout
-
-The old layout cached under `~/Documents/ba2_trade_platform` and inside
-`backend/`. Migrate with:
-
-```bash
-# dry-run: prints the planned moves + sizes (default)
-backend/venv/bin/python scripts/migrate_cache_layout.py
-# perform the moves
-backend/venv/bin/python scripts/migrate_cache_layout.py --apply
-```
-
-The script is idempotent (skips missing sources / non-empty destinations) and
-never deletes a source if its move fails. **Restart any running instances after
-migrating** so they pick up the new locations (the shared app-settings DB with
-your API keys moves to `common/db.sqlite`).
+Part of the BA2 Trade Platform monorepo and covered by its [license](../LICENSE): PolyForm
+Noncommercial 1.0.0, with an added permission to run it on your own personal accounts.
+Commercial use is not licensed.

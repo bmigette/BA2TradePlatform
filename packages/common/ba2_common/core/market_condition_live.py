@@ -29,7 +29,7 @@ NO context for every leaf, its
 WARNING), and one ERROR naming the failing symbols is logged when that expert's resolver is first
 built (certification is paid lazily, on the first expert whose setting names a profile, so a
 platform with the gates off everywhere never opens the cache at all). Every gated entry is
-refused loudly; nothing else changes.
+refused loudly and a market-condition exit leaf never fires; nothing else changes.
 
 Capture/replay: if a replay capture context is active when the scope opens, the reader records
 every served window (``CapturingMarketConditionReader``); in replay mode the scope must be given
@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
-from ba2_common.core.market_calendar import NY_TZ, prior_regular_session
+from ba2_common.core.market_calendar import decision_data_session, live_decision_label
 from ba2_common.core.market_condition_context import (
     TIMING_POLICY_PRIOR_SESSION_V1,
     MarketConditionContext,
@@ -68,6 +68,11 @@ __all__ = [
     "market_condition_decision_scope",
     "run_in_decision_context",
     "submit_in_decision_context",
+    "ExitPassState",
+    "begin_exit_pass",
+    "record_exit_pass_scope_failure",
+    "current_exit_pass",
+    "no_scope_open_reason",
     "assert_profile_env_retired",
     "manifest_digests_from_env",
     "resolver_for_profiles",
@@ -79,6 +84,10 @@ __all__ = [
     "UNIVERSE_SENTINELS",
     "gated_expert_instances",
     "market_condition_fields_in_ruleset",
+    "ruleset_rule_contents",
+    "experts_linked_to_rulesets",
+    "expert_market_condition_profiles",
+    "assert_market_leaves_served_by_linked_experts",
     "gated_live_universe",
 ]
 
@@ -113,9 +122,47 @@ UNIVERSE_SENTINELS = frozenset({"EXPERT", "DYNAMIC", "SCREENER"})
 
 #: Why a live leaf got no context: read by ``TradeConditions`` for its once-per-field WARNING.
 NO_DECISION_SCOPE_REASON = (
-    "market-condition leaf evaluated OUTSIDE a market_condition_decision_scope (only the "
-    "enter-market pass opens one; open-positions/exit rulesets and the ruleset test page do not): "
-    "the gate is unknown and never passes")
+    "market-condition leaf evaluated OUTSIDE a market_condition_decision_scope (the enter-market "
+    "and open-positions passes open one; the ruleset test page does not): the gate is unknown "
+    "and never passes")
+
+
+#: Where an absorbed resolver failure happened; selects the wording of the reason.
+UNRESOLVED_SCOPE_FAILED = "scope_failed"      # the exit pass could not open its decision scope
+UNRESOLVED_NO_SCOPE = "no_scope"              # no decision scope open, and the lookup failed
+UNRESOLVED_EXIT_SCOPE = "exit_scope"          # inside an open EXIT scope, the lookup failed
+
+
+def no_scope_open_reason(instance_id: Any, cause: str,
+                         situation: str = UNRESOLVED_NO_SCOPE) -> str:
+    """Why a GATED expert's leaf got no context because its resolver could not be resolved.
+
+    ``cause`` is the failure (``"<ExceptionType>: <message>"``) so the evaluation record says what
+    broke, not only that something did. The failure itself was logged where it happened: by the
+    open-positions pass guard for a scope that failed to open, by the dispatcher otherwise.
+    """
+    if situation == UNRESOLVED_SCOPE_FAILED:
+        where = (f"the open-positions pass could not open its market-condition decision scope "
+                 f"({cause}), so no decision scope is open for this evaluation")
+    elif situation == UNRESOLVED_EXIT_SCOPE:
+        where = (f"its market-condition resolver could not be resolved inside the open-positions "
+                 f"decision scope ({cause})")
+    elif situation == UNRESOLVED_NO_SCOPE:
+        where = (f"no market-condition decision scope is open for this evaluation and its "
+                 f"resolver could not be resolved ({cause})")
+    else:
+        raise ValueError(f"unknown unresolved-resolver situation {situation!r}")
+    return (f"expert instance {instance_id} names a market_condition_profile, but {where}: the "
+            f"gate is unknown and never passes")
+
+
+@dataclass(frozen=True)
+class _UnresolvedOutsideScope:
+    """``_LAST_DISPATCH``'s resolver slot when the dispatcher ABSORBED a failure to resolve the
+    expert's resolver. Distinct from ``None`` (which means "empty setting"); carries the cause."""
+
+    cause: str
+    situation: str
 
 
 class SourceCertificationError(RuntimeError):
@@ -331,7 +378,10 @@ class DecisionState:
 
     @property
     def session_label(self) -> date:
-        return self.decision_time.astimezone(NY_TZ).date()
+        """The America/New_York date of the decision (``live_decision_label``): the ONE label
+        rule the backtest mirrors with ``backtest_decision_label`` (BT/live parity plan
+        2026-09-22). A naive ``decision_time`` is refused, as ``prior_regular_session`` always did."""
+        return live_decision_label(self.decision_time)
 
     def context(self) -> MarketConditionContext:
         ctx = self._context
@@ -342,7 +392,7 @@ class DecisionState:
                 self._context = MarketConditionContext(
                     decision_time=self.decision_time,
                     session_label=self.session_label,
-                    prior_session=prior_regular_session(self.decision_time),
+                    prior_session=decision_data_session(self.session_label),
                     source_profile=self.resolver.source_profile,
                     timing_policy=TIMING_POLICY_PRIOR_SESSION_V1,
                     calc_version=self.resolver.calc_version,
@@ -378,13 +428,118 @@ def market_condition_fields_in_ruleset(ruleset_id: Any) -> Tuple[Tuple[str, str]
     return tuple(found)
 
 
-def gated_expert_instances() -> Tuple[int, ...]:
-    """Ids of the ENABLED expert instances whose ENTER-MARKET ruleset carries a market leaf.
+def experts_linked_to_rulesets(ruleset_ids: Sequence[Any], *,
+                               session: Any = None) -> Tuple[Tuple[int, str, int], ...]:
+    """``(instance_id, slot, ruleset_id)`` for EVERY expert instance -- enabled or not -- whose
+    enter-market or open-positions slot holds one of ``ruleset_ids``.
 
-    Only the enter-market ruleset is scanned because that is the only ruleset a market leaf may
-    live on (``market_condition_rules.assert_no_market_conditions`` refuses one on an exit /
-    open-positions ruleset, and the whole point of that refusal is that the live resolver has no
-    context outside the entry decision pass).
+    ``slot`` is ``"enter-market"`` or ``"open-positions"``. Disabled instances are included on
+    purpose: enabling one does not pass through any ruleset door, so a ruleset edited under it
+    must already be servable. ``session`` lets a caller that holds an open write session (the
+    rules importer) read through it. An empty ``ruleset_ids`` issues no query.
+    """
+    from sqlmodel import or_, select
+
+    from ba2_common.core.db import get_db
+    from ba2_common.core.models import ExpertInstance
+
+    ids = sorted({int(r) for r in ruleset_ids if r is not None})
+    if not ids:
+        return ()
+    statement = select(ExpertInstance).where(or_(ExpertInstance.enter_market_ruleset_id.in_(ids),
+                                                 ExpertInstance.open_positions_ruleset_id.in_(ids)))
+
+    def rows(s):
+        found = []
+        for inst in s.exec(statement).all():
+            for slot, rid in (("enter-market", inst.enter_market_ruleset_id),
+                              ("open-positions", inst.open_positions_ruleset_id)):
+                if rid in ids:
+                    found.append((int(inst.id), slot, int(rid)))
+        return tuple(found)
+
+    if session is not None:
+        return rows(session)
+    with get_db() as own:
+        return rows(own)
+
+
+def expert_market_condition_profiles(instance_id: Any) -> Tuple[str, ...]:
+    """The profiles expert instance ``instance_id``'s ``market_condition_profile`` names.
+
+    Read through the instance-resolver seam, as :func:`gated_live_universe` and the live
+    resolver read it. A setting that cannot be READ is not "no profile" here -- this answers a
+    save that is about to be judged on it, so it raises ``ValueError`` naming the instance and
+    the cause, and the save is refused rather than judged on a guess.
+    """
+    from ba2_common.core.instance_resolver import get_instance_resolver
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING, parse_profile_setting
+
+    try:
+        expert = get_instance_resolver().get_expert_instance(int(instance_id))
+        value = expert.settings.get(PROFILE_SETTING)
+    except Exception as e:  # noqa: BLE001 -- re-raised as a refusal, never absorbed
+        raise ValueError(
+            f"cannot verify the market-condition gates: {PROFILE_SETTING} of expert instance "
+            f"{instance_id} could not be read ({type(e).__name__}: {e}). Fix the instance before "
+            f"saving a market-gated rule into a ruleset it uses.") from e
+    return parse_profile_setting(value, setting=f"{PROFILE_SETTING} of expert instance "
+                                                f"{instance_id}")
+
+
+def assert_market_leaves_served_by_linked_experts(used: Sequence[Tuple[str, str]],
+                                                  ruleset_ids: Sequence[Any], *, where: str,
+                                                  session: Any = None) -> None:
+    """Refuse ``(label, field)`` market leaves that an expert USING one of ``ruleset_ids`` does not
+    serve.
+
+    The editors and the replace-in-place importer change a ruleset that may already be linked to
+    experts. The expert dialog checks the served fields when a ruleset is ATTACHED; nothing
+    checked them when a linked ruleset's rules CHANGE -- so a market exit added to a ruleset an
+    unprofiled expert already runs reads ``no_context`` for ever and the exit it guards never
+    fires. Every linked instance (either slot, enabled or not) must serve every leaf. A ruleset
+    linked to no expert passes: the dialog checks it when it is attached. No leaves, no query.
+    """
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING, assert_fields_served
+
+    used = tuple(used)
+    if not used:
+        return
+    for instance_id, slot, ruleset_id in experts_linked_to_rulesets(ruleset_ids, session=session):
+        assert_fields_served(
+            used, expert_market_condition_profiles(instance_id),
+            where=f"{where} (ruleset {ruleset_id} is expert instance {instance_id}'s {slot} "
+                  f"ruleset)",
+            setting=f"{PROFILE_SETTING} of expert instance {instance_id}")
+
+
+def ruleset_rule_contents(ruleset_id: Any) -> Tuple[Tuple[str, Any, Any], ...]:
+    """``(name, triggers, actions)`` for every rule of a PERSISTED live ruleset, in link order.
+
+    The input ``market_condition_rules.assert_market_rule_actions_live`` takes: a market leaf on
+    an open-positions rule is judged together with what that rule DOES (plan 2026-09-24 Task
+    B2), so the pairs :func:`market_condition_fields_in_ruleset` returns are not enough. Read by
+    the link table (``db.ruleset_event_actions``), like every other live read of a ruleset.
+    ``ruleset_id`` of ``None`` yields nothing (no ruleset assigned).
+    """
+    from ba2_common.core.db import ruleset_event_actions
+
+    if ruleset_id is None:
+        return ()
+    return tuple((str(action.name), action.triggers or {}, action.actions or {})
+                 for action in ruleset_event_actions(ruleset_id))
+
+
+def gated_expert_instances() -> Tuple[int, ...]:
+    """Ids of the ENABLED expert instances whose ENTER-MARKET or OPEN-POSITIONS ruleset carries a
+    market leaf.
+
+    Both rulesets are scanned. Since plan 2026-09-24 Task B2 a market leaf may sit on an
+    open-positions rule that only closes, reduces or adjusts TP/SL
+    (``market_condition_rules.assert_market_rule_actions``), and an expert gated ONLY on its exits
+    needs the same startup coverage check as an entry-gated one: an uncovered symbol's exit leaf
+    reads unknown on every pass and the exit it guards silently never happens. A ruleset slot
+    that is ``None`` (no ruleset assigned) is skipped; an expert with neither is not gated.
 
     The leaf walk itself is :func:`market_condition_fields_in_ruleset` (persisted rules speak
     ``EventAction.triggers``, not condition trees).
@@ -394,9 +549,11 @@ def gated_expert_instances() -> Tuple[int, ...]:
 
     found: list = []
     for instance in get_all_instances(ExpertInstance):
-        if not instance.enabled or not instance.enter_market_ruleset_id:
+        if not instance.enabled:
             continue
-        if market_condition_fields_in_ruleset(instance.enter_market_ruleset_id):
+        rulesets = [rid for rid in (instance.enter_market_ruleset_id,
+                                    instance.open_positions_ruleset_id) if rid]
+        if any(market_condition_fields_in_ruleset(rid) for rid in rulesets):
             found.append(int(instance.id))
     return tuple(found)
 
@@ -404,6 +561,7 @@ def gated_expert_instances() -> Tuple[int, ...]:
 def gated_live_universe() -> Tuple[Tuple[str, ...], Tuple[Tuple[int, str], ...]]:
     """``(symbols, deferred)`` for every gated instance: the union of their enabled instruments,
     and the ``(instance_id, sentinel)`` pairs whose universe is only known at analysis time.
+    "Gated" is :func:`gated_expert_instances`: a market leaf on the entry OR the exit ruleset.
 
     Built from the same accessor ``JobManager._schedule_expert_jobs`` schedules from -- the
     expert's own ``get_enabled_instruments()`` -- not a second reading of the settings rows.
@@ -782,15 +940,20 @@ def run_in_decision_context(fn: Callable) -> Callable:
     wrapper inside the scope, on the coordinating thread. Safe to reuse concurrently: it
     re-installs this one ContextVar rather than sharing a ``contextvars.Context`` object."""
     state = _DECISION.get()
+    # The exit-pass marker travels with the decision state: a pool thread of an exit pass must
+    # absorb resolver failures exactly like the coordinating thread.
+    exit_pass = _EXIT_PASS.get()
 
     @functools.wraps(fn)
     def _runner(*args, **kwargs):
-        if state is None:
+        if state is None and exit_pass is None:
             return fn(*args, **kwargs)
         token = _DECISION.set(state)
+        exit_token = _EXIT_PASS.set(exit_pass)
         try:
             return fn(*args, **kwargs)
         finally:
+            _EXIT_PASS.reset(exit_token)
             _DECISION.reset(token)
 
     return _runner
@@ -900,6 +1063,51 @@ _LAST_DISPATCH: contextvars.ContextVar[Optional[Tuple[Any, Any]]] = contextvars.
     "ba2_market_condition_last_dispatch", default=None)
 
 
+@dataclass
+class ExitPassState:
+    """One live OPEN-POSITIONS (exit) pass, for the dispatcher. ``scope_failure`` is the cause
+    (``"<ExceptionType>: <message>"``) when the pass could not open its decision scope."""
+
+    expert_instance_id: Any
+    scope_failure: Optional[str] = None
+
+
+#: Set for the duration of an exit pass by ``TradeManager._open_exit_pass_market_condition_scope``
+#: (via :func:`begin_exit_pass`). WHY the dispatcher needs to know: an ENTRY pass lets a resolver
+#: failure propagate (refusing entries is the safe reading), but an exit pass must never be
+#: stopped by the market-condition machinery -- one raising leaf aborts the ruleset evaluation
+#: for its symbol and skips every other exit rule. A ContextVar, like ``_DECISION``, so two
+#: concurrent passes on different threads cannot see each other's.
+_EXIT_PASS: contextvars.ContextVar[Optional[ExitPassState]] = contextvars.ContextVar(
+    "ba2_market_condition_exit_pass", default=None)
+
+
+def begin_exit_pass(expert_instance_id: Any) -> Callable[[], None]:
+    """Mark the current context as ``expert_instance_id``'s exit pass; returns the callable that
+    ends it (reset the ContextVar). Call and end it on the same thread, e.g. through an
+    ``ExitStack.callback``."""
+    token = _EXIT_PASS.set(ExitPassState(expert_instance_id))
+
+    def _end() -> None:
+        _EXIT_PASS.reset(token)
+
+    return _end
+
+
+def record_exit_pass_scope_failure(exc: BaseException) -> None:
+    """Record that the current exit pass could not open its decision scope. Leaves of that
+    expert then read ``no_context`` with this cause straight away, without retrying the resolver
+    lookup that just failed. A no-op outside an exit pass: it is called from an error handler and
+    must never raise itself."""
+    state = _EXIT_PASS.get()
+    if state is not None:
+        state.scope_failure = f"{type(exc).__name__}: {exc}"
+
+
+def current_exit_pass() -> Optional[ExitPassState]:
+    return _EXIT_PASS.get()
+
+
 class PerInstanceMarketConditionResolver:
     """The live ``TradeConditions`` resolver: one :class:`LiveMarketConditionResolver` per EXPERT
     INSTANCE that names a ``market_condition_profile`` (plan Task 12).
@@ -928,6 +1136,10 @@ class PerInstanceMarketConditionResolver:
         self._resolvers: Dict[Any, Any] = {}
         self._lock = threading.Lock()
         self._settings_errors: set = set()
+        #: ``(instance id, exception type name)`` already reported at WARNING by an absorbed
+        #: dispatch failure. Per PROCESS on purpose (not cleared by ``clear_cache``): a broken
+        #: resolver warns once, then says the rest at DEBUG instead of once per leaf.
+        self._unresolved_reported: set = set()
 
     # -- settings ---------------------------------------------------------------------------
     def profiles_for(self, expert_instance_id: Any) -> Tuple[str, ...]:
@@ -981,8 +1193,12 @@ class PerInstanceMarketConditionResolver:
         A manifest is the host's ops configuration, not a strategy's preference, and the quiet
         readings of a broken one are both unacceptable: ignoring it computes the indicators live
         per decision (design 4.5 forbids that silently) and guessing a mapping serves one
-        profile's snapshot for another. Only the ENTRY pass reaches here, so exits and
-        protective-order handling keep running either way.
+        profile's snapshot for another. BOTH live passes reach here: the entry pass lets the
+        error propagate (refusing entries is the safe reading), and the open-positions pass
+        guards the scope's OPENING (``TradeManager._open_exit_pass_market_condition_scope``):
+        it logs the failure and runs without the scope, so its market-condition leaves read
+        ``no_context`` while every other exit and protective rule still runs. A leaf's own
+        lookup (``__call__``) likewise never raises during an exit pass or outside any scope.
         """
         profiles = self.profiles_for(expert_instance_id)
         if not profiles:
@@ -1077,11 +1293,63 @@ class PerInstanceMarketConditionResolver:
         if instance_id is None:
             _LAST_DISPATCH.set((None, None))
             return None
+        exit_pass = _EXIT_PASS.get()
+        scope_open = _DECISION.get() is not None
+        if scope_open and exit_pass is None:
+            # An ENTRY decision pass is open: exactly the path it has always taken, including a
+            # resolver build error PROPAGATING (refusing entries is the safe reading).
+            return self._dispatch(instance_id, account, instrument_name, expert_recommendation)
+        # EVERY OTHER CASE RETURNS NONE OR A CONTEXT AND NEVER RAISES: an exit pass (scope open
+        # or not) and any caller that never opened a scope. Raising here would abort the whole
+        # ruleset evaluation for the symbol and skip every other exit rule.
+        if (exit_pass is not None and exit_pass.scope_failure is not None
+                and exit_pass.expert_instance_id == instance_id):
+            # The pass's guard already tried to open this expert's scope and failed (and logged
+            # it): answer with that cause at once instead of rebuilding per leaf.
+            _LAST_DISPATCH.set((instance_id, _UnresolvedOutsideScope(
+                exit_pass.scope_failure, UNRESOLVED_SCOPE_FAILED)))
+            return None
+        # The lookup still runs so the specific reasons survive (empty setting, failed
+        # certification, uncovered symbol); only its failure is absorbed.
+        try:
+            return self._dispatch(instance_id, account, instrument_name, expert_recommendation)
+        except Exception as e:
+            # DELIBERATELY broad, named so it survives BA2_ERROR_MODE=enforce: on these paths
+            # the answer is "no context" whatever failed. The refusals failure_modes never
+            # absorbs still propagate.
+            absorb_if_benign(e, Exception)
+            situation = UNRESOLVED_EXIT_SCOPE if scope_open else UNRESOLVED_NO_SCOPE
+            cause = f"{type(e).__name__}: {e}"
+            self._report_unresolved(instance_id, instrument_name, e, cause, situation)
+            _LAST_DISPATCH.set((instance_id, _UnresolvedOutsideScope(cause, situation)))
+            return None
+
+    def _dispatch(self, instance_id: Any, account: Any, instrument_name: str,
+                  expert_recommendation: Any) -> Optional[MarketConditionContext]:
+        """Look up this expert's resolver, record the dispatch for the reason accessors, and ask
+        it. Raises whatever the lookup raises; the caller decides whether that is absorbed."""
         resolver = self.resolver_for(instance_id)
         _LAST_DISPATCH.set((instance_id, resolver))
         if resolver is None:
             return None
         return resolver(account, instrument_name, expert_recommendation)
+
+    def _report_unresolved(self, instance_id: Any, instrument_name: str, exc: BaseException,
+                           cause: str, situation: str) -> None:
+        """WARNING once per (expert, exception type) per process, DEBUG afterwards."""
+        from ba2_common.logger import logger
+
+        key = (instance_id, type(exc).__name__)
+        with self._lock:
+            first = key not in self._unresolved_reported
+            self._unresolved_reported.add(key)
+        message = (f"market-condition leaf for expert instance {instance_id} "
+                   f"({instrument_name}): {no_scope_open_reason(instance_id, cause, situation)}")
+        if first:
+            logger.warning(message + " (further failures of this kind for this expert are "
+                                     "logged at DEBUG)")
+        else:
+            logger.debug(message)
 
     def no_context_reason_for(self, symbol: Any) -> Optional[str]:
         """Why THIS symbol got no context, for the expert the last dispatch selected.
@@ -1094,6 +1362,8 @@ class PerInstanceMarketConditionResolver:
         instance_id, resolver = _LAST_DISPATCH.get() or (None, None)
         if instance_id is None:
             return None
+        if isinstance(resolver, _UnresolvedOutsideScope):
+            return no_scope_open_reason(instance_id, resolver.cause, resolver.situation)
         if resolver is None:
             return (f"expert instance {instance_id} has an empty {PROFILE_SETTING} setting: no "
                     f"market-condition data is served for it, so this gate is unknown and never "

@@ -1,0 +1,11 @@
+{
+  "commit": "441771e852de4cb08f4196f1f0563da5614ca181",
+  "focused_tests_passed": 48,
+  "checks": [
+    {"legacy_stall_final_status": "completed", "legacy_stall_export_candidates": 0, "new_stall_final_status": "no_measurements"},
+    {"missing_fitness_export": "name '_json' is not defined"},
+    {"queued_no_measurements_status": "completed", "queued_error_message": null},
+    {"stale_failure_marker_masks_new_launch_failure": true, "jobs_launched": ["job-A", "job-B"], "matrix_exit_code": 0, "note": "New failed launch writes no optimization row; only an old marker exists."},
+    {"export_bound_seconds": 1, "export_returned": true, "persisted": 1, "launcher_still_alive_after_seconds": 5, "cause": "remote fallback thread survives wait=False shutdown"}
+  ]
+}

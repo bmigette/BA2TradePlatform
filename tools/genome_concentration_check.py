@@ -76,7 +76,8 @@ def main() -> int:
         print(f"window override -> {bt_block['start_date']} .. {bt_block['end_date']}", flush=True)
 
     decoded = decode_params(strat, trial["params"])
-    trial_cfg = _build_daily_trial_config(bt_block, decoded, {"backtest_cfg": bt_block})
+    trial_cfg = _build_daily_trial_config(bt_block, decoded, {"backtest_cfg": bt_block},
+                                          option_trade_records=False)  # a report, not persisted
     trial_cfg["name"] = f"CONCENTRATION-{label}"
 
     _t0 = time.perf_counter()

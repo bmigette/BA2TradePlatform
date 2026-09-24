@@ -16,6 +16,13 @@ probe fire spuriously on a thin underlying whose whole DTE window happens to be 
 those no-bar rows are precisely the ones still carrying the cache build's start-date quotes.
 
 Selection is UNCHANGED by this: any ``min_volume >= 1`` rejects 0 exactly as it rejected None.
+
+EXACT SESSION SINCE 2026-09-22 (BT/live option parity B2). The volume is no longer derived
+inside ``_to_contract`` from the clamped greeks bar; the reader computes it with
+``_exact_session_volume`` (the shared ``option_session.session_volume`` rule) from the bar dated
+EXACTLY the decision's data session and hands it in. The known-zero property above is unchanged
+and is now pinned at that seam; the one deliberate change is that a bar from an EARLIER session
+no longer counts (yesterday's volume is not today's liquidity).
 """
 import os
 import sys
@@ -23,7 +30,9 @@ from datetime import date
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from app.services.backtest.options_provider import _to_contract          # noqa: E402
+from app.services.backtest.options_provider import (                    # noqa: E402
+    _BarHistory, _exact_session_volume, _to_contract,
+)
 from ba2_common.core.option_selector import (                            # noqa: E402
     check_liquidity_data_available, passes_liquidity,
 )
@@ -36,31 +45,47 @@ CHAIN_ROW = {
 }
 
 
-def _bar(volume):
-    return {"close": 0.75, "volume": volume, "iv": 0.26, "delta": 0.41,
-            "gamma": None, "theta": None, "vega": None}
+SESSION = date(2024, 3, 7)
+
+
+def _bar(volume, on=SESSION):
+    return {"date": on.isoformat(), "close": 0.75, "volume": volume, "iv": 0.26,
+            "delta": 0.41, "gamma": None, "theta": None, "vega": None}
+
+
+def _contract(bar):
+    """What ``HistoricalOptionsProvider.get_chain`` builds for one row on ``SESSION``: prices
+    from the clamped bar, volume from the session's exact bar."""
+    bars = _BarHistory({} if bar is None else {bar["date"]: bar})
+    return _to_contract(dict(CHAIN_ROW), bars.latest_on_or_before(SESSION.isoformat()),
+                        _exact_session_volume(bars, SESSION))
 
 
 def test_a_contract_with_no_bar_reports_zero_volume_not_unknown():
-    c = _to_contract(dict(CHAIN_ROW), None)
-    assert c.volume == 0
+    assert _contract(None).volume == 0
 
 
 def test_a_contract_with_a_bar_reports_the_bars_volume():
-    c = _to_contract(dict(CHAIN_ROW), _bar(1234))
-    assert c.volume == 1234
+    assert _contract(_bar(1234)).volume == 1234
+
+
+def test_a_bar_from_an_earlier_session_is_not_this_sessions_volume():
+    """The 2026-09-22 change: before, the clamped bar's 1234 was reported here."""
+    c = _contract(_bar(1234, on=date(2024, 3, 4)))
+    assert c.volume == 0
+    assert c.last == 0.75            # prices still come from that clamped bar
 
 
 def test_open_interest_stays_unknown_because_the_cache_truly_has_none():
     """Do NOT paper over open_interest the same way: there is no column to read it from, so
     a rule that gates on it must get the loud error, not a fabricated 0 that rejects
     everything just as silently."""
-    assert _to_contract(dict(CHAIN_ROW), None).open_interest is None
-    assert _to_contract(dict(CHAIN_ROW), _bar(1234)).open_interest is None
+    assert _contract(None).open_interest is None
+    assert _contract(_bar(1234)).open_interest is None
 
 
 def test_selection_is_unchanged_a_zero_volume_contract_is_still_rejected():
-    c = _to_contract(dict(CHAIN_ROW), None)
+    c = _contract(None)
     assert passes_liquidity(c, None, None, 25) is False
     assert passes_liquidity(c, None, None, None) is True      # gate off -> unaffected
 
@@ -68,6 +93,7 @@ def test_selection_is_unchanged_a_zero_volume_contract_is_still_rejected():
 def test_the_volume_gate_stays_evaluable_on_an_entirely_untraded_window():
     """The whole point: an all-untraded chain is a real (and correct) 100% rejection, not a
     'the source does not publish volume' configuration error."""
-    chain = [_to_contract(dict(CHAIN_ROW, occ_symbol=f"X{i}"), None) for i in range(5)]
+    chain = [_to_contract(dict(CHAIN_ROW, occ_symbol=f"X{i}"), None,
+                          _exact_session_volume(_BarHistory({}), SESSION)) for i in range(5)]
     check_liquidity_data_available(chain, min_volume=25, underlying="BAC")   # no raise
     assert all(not passes_liquidity(c, None, None, 25) for c in chain)

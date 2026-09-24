@@ -653,7 +653,7 @@ def test_build_daily_trial_config_maps_rm_and_overrides():
         "exit_rules": [],
         "entry_rules": [],
     }
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
     settings = cfg["experts"][0]["settings"]
     assert settings["surprise_min_pct"] == 12.0  # override wins
     assert settings["risk_per_trade_pct"] == 2.5
@@ -693,7 +693,7 @@ def test_build_daily_trial_config_schedule_days_override_static_days_keep_static
         "schedule_days": {"monday": False, "tuesday": False, "wednesday": True,
                           "thursday": True, "friday": False, "saturday": False, "sunday": False},
     }
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
     assert cfg["run_schedule_override"]["days"] == decoded["schedule_days"]
     assert cfg["run_schedule_override"]["times"] == ["09:30"]  # static, unaffected by the genes
 
@@ -713,7 +713,7 @@ def test_build_daily_trial_config_no_schedule_genes_keeps_static_override():
         "expert_overrides": {}, "buy_tree": None, "sell_tree": None,
         "exit_rules": [], "entry_rules": [], "schedule_days": None,
     }
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
     assert cfg["run_schedule_override"] == backtest_cfg["run_schedule_override"]
 
 
@@ -740,7 +740,7 @@ def test_build_daily_trial_config_forwards_entry_rules():
     ]
     decoded = {"tp": 8.0, "sl": 3.0, "expert_overrides": {},
                "buy_tree": None, "sell_tree": None, "exit_rules": [], "entry_rules": entry_rules}
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
     assert cfg["entry_rules"] == entry_rules
 
 
@@ -759,7 +759,7 @@ def test_build_daily_trial_config_entry_rules_absent_is_none():
     }
     decoded = {"tp": 8.0, "sl": 3.0, "expert_overrides": {},
                "buy_tree": None, "sell_tree": None, "exit_rules": []}
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
     assert cfg.get("entry_rules") is None
 
 
@@ -852,7 +852,7 @@ def test_build_daily_trial_config_bypass_drops_rm_tp_sl():
         "expert_overrides": {"top_n": 10, "winsorize_pct": 0.05},
         "buy_tree": None, "sell_tree": None, "exit_rules": [],
     }
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
     settings = cfg["experts"][0]["settings"]
     # The expert's own params ARE forwarded (override wins over the base spec).
     assert settings["top_n"] == 10
@@ -909,7 +909,7 @@ def test_build_daily_trial_config_bypass_screener_applies_to_expert_settings():
         },
         "buy_tree": None, "sell_tree": None, "exit_rules": [],
     }
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)
     settings = cfg["experts"][0]["settings"]
     # FactorRanker now reads the metric_store dynamic-universe path off its OWN settings.
     assert settings["universe_source"] == "screener"
@@ -961,7 +961,7 @@ def test_build_daily_trial_config_non_bypass_screener_untouched():
         "screener_overrides": {"screener_market_cap_min": 5e9},
         "buy_tree": None, "sell_tree": None, "exit_rules": [],
     }
-    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted)
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)
     settings = cfg["experts"][0]["settings"]
     assert "universe_source" not in settings
     assert "screener_store" not in settings
@@ -1005,7 +1005,7 @@ def test_build_daily_trial_config_screener_gate_applies_all_criteria():
         },
         "buy_tree": None, "sell_tree": None, "exit_rules": [],
     }
-    gate = H._build_daily_trial_config(backtest_cfg, decoded, hoisted)["screener_runtime"]["settings"]
+    gate = H._build_daily_trial_config(backtest_cfg, decoded, hoisted, option_trade_records=False)["screener_runtime"]["settings"]
     assert gate == {
         "market_cap_max": 1e10, "market_cap_min": 6e9,
         "relative_volume_min": 1.9, "price_drop_pct": 12.0, "max_stocks": 20,

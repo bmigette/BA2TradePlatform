@@ -2,13 +2,13 @@
 # Build two venvs — one for the trade app (ba2-trade), one for the test app (ba2-test) —
 # each with the common -> providers -> experts chain + that app's requirements.txt.
 #   ./install.sh [--editable] [--ui] [--upgrade] [--trade-only|--test-only] \
-#                [--branch dev|main] [--base PATH] [--python PY] [--no-db]
-#     --editable/-e : install the sibling clones editable (default: git install over SSH @branch)
+#                [--base PATH] [--python PY] [--no-db]
+#     --editable/-e : install the in-repo packages/ editable (default: a built, non-editable copy)
 #     --ui          : include the experts [ui] extra (nicegui) in the chain
 #     --upgrade     : pass --upgrade so an existing install is re-resolved/updated
 #     --trade-only  : only build the trade venv ; --test-only : only build the test venv
-#     --branch      : git branch to install from in non-editable mode (default: dev)
-#     --base        : base folder for the venvs (default: $HOME). Venvs live OUTSIDE the git repos.
+#     --branch      : ignored (kept so older command lines still parse); packages/ always ships in-repo
+#     --base        : base folder for the venvs (default: $HOME). Venvs live OUTSIDE the repo.
 #     --no-db       : skip the DB step (copy old DB -> new location + run migrations)
 # Venvs: <base>/ba2-venvs/{trade,test}. Uses uv (bootstrapped into each venv).
 #
@@ -26,7 +26,6 @@ while [ $# -gt 0 ]; do case "$1" in
   --trade-only) TRADE_ONLY=1 ;; --test-only) TEST_ONLY=1 ;; --no-db) NO_DB=1 ;;
   --branch) shift; BRANCH="$1" ;; --base) shift; BASE="$1" ;; --python) shift; BASE_PY="$1" ;;
   *) echo "unknown arg: $1" >&2; exit 2 ;; esac; shift; done
-OWNER="bmigette"
 HERE="$(cd "$(dirname "$0")" && pwd)"               # the BA2TradePlatform monorepo root
 BASE="${BASE:-$HOME}"
 VENV_ROOT="$BASE/ba2-venvs"
@@ -65,13 +64,9 @@ install_chain() {  # $1=uv $2=vpy ; in-repo packages ONLY (self-contained monore
   "$UV" pip install --python "$VPY" --no-sources ${UP[@]+"${UP[@]}"} ${ef[@]+"${ef[@]}"} "$exp"
 }
 
-install_reqs() {  # $1=uv $2=vpy $3=reqpath ; strip ba2trade-* (installed via the chain) to avoid conflicts
+install_reqs() {  # $1=uv $2=vpy $3=reqpath ; third-party deps only (the chain is NOT listed there)
   local UV="$1" VPY="$2" REQ="$3"; [ -f "$REQ" ] || return 0
-  # Drop any chain reference (`ba2trade-*`, git/path to the repos, `-e ../..`) — the chain
-  # is installed explicitly above; keep everything else.
-  local tmp; tmp="$(mktemp)"
-  grep -v -i -E 'ba2trade-|BA2TradeCommon|BA2TradeProviders|BA2TradeExperts' "$REQ" > "$tmp" || true
-  "$UV" pip install --python "$VPY" ${UP[@]+"${UP[@]}"} -r "$tmp"; rm -f "$tmp"
+  "$UV" pip install --python "$VPY" ${UP[@]+"${UP[@]}"} -r "$REQ"
 }
 
 new_app_venv() {  # $1=venv $2=appdir $3=reqpath $4=torch_cpu(0/1) $5=verify_import $6=base_py

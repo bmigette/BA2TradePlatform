@@ -37,6 +37,7 @@ from ba2_common.core.rule_builders import (
     tree_leaves,
     triggers_from_condition_tree,
     action_from_rule,
+    rule_triggers_from_tree,
 )
 from ba2_common.core.types import (
     AnalysisUseCase,
@@ -103,7 +104,9 @@ def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
     semantics with explicit fall-through, exactly the live ``TradeActionEvaluator`` contract.
 
     A rule with no convertible action is skipped. Returns the ruleset id (possibly with no
-    event actions if every rule was skipped).
+    event actions if every rule was skipped). A rule whose leaves produce no trigger at all, or
+    that loses a market-condition leaf, is REFUSED (``rule_builders.rule_triggers_from_tree``,
+    the same check the live export runs): its triggers would be always true or ungated.
     """
     from ba2_common.core.rules_convert import live_actions_from_trade_rule
 
@@ -122,8 +125,8 @@ def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
         actions = live_actions_from_trade_rule(rule)
         if not actions:
             continue
-        conds = rule.get("conditions")
-        triggers = triggers_from_condition_tree(conds) if conds else {}
+        triggers = rule_triggers_from_tree(
+            rule.get("conditions"), f"{name}: {getattr(subtype, 'value', subtype)} rule {rule.get('id') or idx!r}")
         ea_ids.append(
             _make_event_action(
                 name=rule.get("name") or f"{name}-rule-{idx}",

@@ -1394,3 +1394,32 @@ def get_setting_safe(settings: dict, key: str, default, as_type=None):
                 value = as_type(value) if default is not None else None
     
     return value
+
+
+def as_utc_key(moment: "datetime | None", *, default: "datetime | None" = None) -> datetime:
+    """A datetime coerced to tz-aware UTC, safe to use as a SORT KEY.
+
+    Naive input is treated as UTC rather than rejected: the rows this orders come from SQLite
+    through SQLAlchemy, which returns a stored timestamp naive or aware depending on how it was
+    written and on the driver -- so a column can legitimately hold both shapes, and the caller
+    ordering them cannot know which it has.
+
+    WHY A HELPER AND NOT AN INLINE ``or``. The idiom this replaces was
+
+        min(rows, key=lambda t: t.open_date or t.created_at or datetime.max.replace(tzinfo=utc))
+
+    which mixes an AWARE fallback with values that may be NAIVE. Python refuses to compare the
+    two, so the expression raises ``TypeError: can't compare offset-naive and offset-aware
+    datetimes`` -- but ONLY when a particular run happens to hold both shapes at once. That made
+    it invisible on developer machines and a hard CI failure on 2026-09-22, with no code change
+    between the green and red builds. Normalising every candidate, fallback included, removes
+    the class of bug rather than the one instance.
+
+    ``default`` is returned (also normalised) when ``moment`` is None; with no default that is
+    ``datetime.max``, i.e. "unknown sorts last".
+    """
+    if moment is None:
+        moment = default if default is not None else datetime.max
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)

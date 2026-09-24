@@ -94,6 +94,18 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 .q-table td, .q-table th {
     border-color: rgba(255, 255, 255, 0.05) !important;
 }
+
+/* A SORTABLE HEADER STAYS ON ONE LINE. Quasar puts an invisible sort arrow after every
+ * sortable label; a table with `wrap-cells` (so long DESCRIPTIONS can wrap) lets that
+ * arrow wrap too, and in a narrow column it drops onto a line of its own. The cell is
+ * then two lines tall and its label rides up: Activity Monitor's SEVERITY and ACCOUNT
+ * (both 102px) sat 9px above their neighbours, with nothing visible to say why.
+ * Deliberately NOT !important: the phone rule below still lets headers wrap under
+ * 640px, and a header that asks to wrap in its own inline style ("Share of label %")
+ * keeps asking. */
+.q-table thead th.sortable {
+    white-space: nowrap;
+}
 .q-table tbody td {
     color: #ffffff !important;
 }
@@ -168,6 +180,17 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     margin-bottom: 12px !important;
     margin-right: 12px !important;
 }
+
+/* ...EXCEPT A FIELD IN A ROW. The margins above space out fields STACKED in a form,
+ * which is what they were for. In a row they were invisible offsets: flexbox aligns
+ * MARGIN boxes, so a button beside a field sat 6px low in a centred row and 12px+ low
+ * in a bottom-aligned one, and fields stood 20px apart where the buttons beside them
+ * stood 8px apart. Measured on every tab: 17 of 17 rows holding a field and a button
+ * were off. A row's own `gap` already spaces its children. */
+.nicegui-row > .q-field {
+    margin-bottom: 0 !important;
+    margin-right: 0 !important;
+}
 .q-field .q-field__control {
     background: rgba(26, 31, 46, 0.6) !important;
     border-color: rgba(255, 255, 255, 0.1) !important;
@@ -209,10 +232,16 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     padding-right: 0 !important;
 }
 
-/* Select dropdown text padding */
+/* Select dropdown text padding.
+ *
+ * NO right padding. This used to reserve 20px "for the dropdown icon" -- but the icon
+ * is not inside `.q-field__native`, it sits in `.q-field__append`, a sibling that
+ * already takes its own width. So every select in the app reserved the arrow's room
+ * twice, and a 128px select showed 36px of its value: "25 per page" cut to "25 p...",
+ * "30 days" to "30 ...". Measured, not guessed -- see test_ui_responsive_layer. */
 .q-select .q-field__native {
     padding-left: 0 !important;
-    padding-right: 20px !important; /* Space for dropdown icon */
+    padding-right: 0 !important;
 }
 
 /* Control container padding */
@@ -220,10 +249,18 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     padding-left: 0 !important;
 }
 
-/* Input field marginal (the bottom border indicator) */
-.q-field__marginal {
-    padding-left: 12px !important;
+/* Field icon slots (prepend/append). A `q-field__marginal` is the ICON slot beside
+ * the text, not a border indicator, and forcing 12px on BOTH its sides added a gap on
+ * the OUTER side too -- between the icon and the field's edge, where the control's own
+ * 12px padding already is. On a select that turned a 36px arrow slot into 48px. Only
+ * the INNER side is padded now, which is Quasar's own spacing. */
+.q-field__prepend.q-field__marginal {
+    padding-left: 0 !important;
     padding-right: 12px !important;
+}
+.q-field__append.q-field__marginal {
+    padding-left: 12px !important;
+    padding-right: 0 !important;
 }
 .q-field .q-field__label {
     color: #a0aec0 !important;
@@ -539,9 +576,39 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
 }
 
+/* NOTHING IN A COLUMN OR A CARD IS WIDER THAN THAT COLUMN OR CARD.
+ *
+ * Both are flex columns that size their children to CONTENT (`align-items: flex-start`,
+ * overflow visible), so a wide table widened everything around it: Account Overview's
+ * "Open Positions" card measured 1739px inside a 1028px column, "Recent Orders" 1444px,
+ * and every column past CURRENT PRICE sat beyond the tab panel with its only scrollbar
+ * at the foot of a page-tall panel. Capping the CARD alone was tried and is not enough:
+ * the table then spilled past the card's edge instead (measured 2798px in a 980px card
+ * on a reproduction). Capped at every level, each box has a definite width, and
+ * `.q-table__middle` -- which already scrolls -- scrolls sideways inside the card, where
+ * the reader is looking. Found by measuring every card and table on every tab against
+ * its container; those two were the only offenders. */
+.nicegui-column > *,
+.nicegui-card > * {
+    max-width: 100%;
+}
+
 /* Tabs */
 .q-tabs {
     background: transparent !important;
+    /* A TAB STRIP MUST NEVER WIDEN THE PAGE. QTabs decides whether to scroll by
+     * comparing its content with its own width -- but it sits in a flex column, whose
+     * children default to `min-width: auto`, so the strip grew to fit its tabs, QTabs
+     * measured a container exactly as wide as its content, declared itself
+     * `q-tabs--not-scrollable`, and laid out at full natural width. On a 390px phone
+     * that was 667px (Overview), 668px (Market Analysis) and 836px (Settings); the
+     * browser widened the layout viewport to hold it and every page opened panned
+     * sideways, the strip and the first card both cut off. Held to its container, the
+     * strip overflows, QTabs switches itself to scrollable mode, and the page keeps
+     * the width of the screen. Not inside a media query: this is a correctness rule,
+     * and a narrow desktop window has the same problem as a phone. */
+    max-width: 100%;
+    min-width: 0;
 }
 .q-tab {
     color: #a0aec0 !important;
@@ -608,11 +675,26 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 }
 
 /* Tooltip */
+/* TOOLTIPS: READABLE SIZE, AND A BOX THAT SEPARATES FROM THE PAGE.
+ *
+ * Two measured problems, one rule. (1) No font size was set here, so Quasar's default
+ * of 10px applied to every tooltip -- and the codebase shows it being patched one call
+ * site at a time (`font-size: 14px`, `text-sm`, local *_TOOLTIP_STYLE constants) while
+ * the other ~70 stayed at 10px. 14px is the size those patches had already settled on.
+ * (2) The background was the page's own colour at 95% opacity: tooltip-vs-page contrast
+ * measured 1.13:1, so the box melted into whatever it opened over and its text read as
+ * stray words on top of the page's text. A lighter surface, an edge you can see and a
+ * shadow lift it off. Text contrast stays above 10:1. */
 .q-tooltip {
-    background: rgba(26, 31, 46, 0.95) !important;
-    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    background: #374151 !important;
+    border: 1px solid rgba(255, 255, 255, 0.28) !important;
     border-radius: 8px !important;
-    color: #ffffff !important;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6) !important;
+    color: #f7fafc !important;
+    font-size: 0.875rem !important;
+    line-height: 1.45 !important;
+    padding: 8px 12px !important;
+    max-width: 420px;
 }
 
 /* Expansion items */
@@ -1025,8 +1107,41 @@ div[class*="disconnect"] * {
         row-gap: 0.25rem;
     }
 
+    /* THE HEADER FITS ON TWO ROWS, not three. The balance and the account selector
+     * each carried `mr-4`, and with the GitHub link beside them the right-hand group
+     * was ~16px too wide for a 390px screen -- so it broke again, and the header took
+     * a quarter of the screen before any content. The link hides (`phone-hidden`,
+     * menus.py) and the margins go; the group's own `gap` still separates its items. */
+    .phone-hidden {
+        display: none !important;
+    }
+
+    .q-header .mr-4 {
+        margin-right: 0 !important;
+    }
+
     /* Page padding: 1rem each side of a 390px screen is 8% of it. */
     .nicegui-content {
+        padding: 0.5rem !important;
+    }
+
+    /* THE PADDING CASCADE. Every layer is reasonable alone and together they were not:
+     * page column `p-6` (24px) + tab panel (16px) + card (12px) + a card inside the card
+     * (12px) left filter fields on Live Trades about 250px wide on a 390px screen.
+     * The two outermost layers carry no border or background, so on a phone their
+     * padding is pure loss; the cards keep theirs, because their edge is visible. */
+    .ba2-page {
+        padding: 0.25rem !important;
+    }
+
+    .q-tab-panel {
+        padding: 0.25rem !important;
+    }
+
+    /* A card INSIDE a card needs less than a card on the page: the outer one already
+     * frames it. Half the outer padding keeps the two edges distinguishable. */
+    .q-card .q-card,
+    .nicegui-card .nicegui-card {
         padding: 0.5rem !important;
     }
 

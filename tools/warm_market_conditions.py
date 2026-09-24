@@ -199,7 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", required=True)
     p.add_argument("--universe-file", required=True)
     p.add_argument("--start", required=True, type=_date, help="first DECISION session (ISO date)")
-    p.add_argument("--end", required=True, type=_date, help="last DECISION session (ISO date)")
+    p.add_argument("--end", required=True, type=_date,
+                   help="last DECISION/backtest-bar session (ISO date). Must be a COMPLETED "
+                        "session: the snapshot's last row is that session itself, so an unclosed "
+                        "end is refused (live needs rows only through the previous session)")
     p.add_argument("--source-profile", default=None)
     p.add_argument("--cache-root", default=None)
     p.add_argument("--out", default=None, help="where to write the plan JSON")

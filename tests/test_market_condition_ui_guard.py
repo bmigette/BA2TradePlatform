@@ -10,11 +10,13 @@ Three things are pinned here:
 
 * the refusal fires in BOTH directions (a gated ruleset attached under an empty setting; the
   setting cleared under a ruleset that is already gated);
-* the OPEN-POSITIONS slot refuses a market leaf outright, whatever the profile says. Outside the
-  entry decision pass the live resolver has no context, so such a leaf reads ``no_context`` and
-  its rule never fires -- an exit or protective-order adjustment that silently stops happening.
-  The importer gets that refusal from ``trade_rules_to_live_export``; the dialog can attach an
-  EXISTING gated ruleset to that slot without converting anything, so it needs its own;
+* the OPEN-POSITIONS slot refuses a market leaf on any rule that does more than CLOSE, REDUCE or
+  ADJUST TP/SL, whatever the profile says (plan 2026-09-24 Task B2 -- before it, any market leaf
+  there was refused). On the exit pass a failed read is unknown and the rule does not fire,
+  which is safe for those actions only. The importer gets that refusal from
+  ``trade_rules_to_live_export``; the dialog can attach an EXISTING gated ruleset to that slot
+  without converting anything, so it needs its own. An allowed exit leaf must also be SERVED by
+  the profile setting, like an entry leaf;
 * a profile the dialog could not READ is never written back as the widget's empty default, and a
   save that repoints a ruleset while the setting is unknowable is refused rather than unjudged.
 
@@ -36,21 +38,38 @@ STATE = "structure_state"
 #: What ``market_condition_fields_in_ruleset`` returns for a gated ruleset.
 GATED = (("entry.cond_1", ADX),)
 
+#: What a gated open-positions rule may and may not DO (plan 2026-09-24 Task B2).
+BUY = {"a0": {"action_type": "buy"}}
+CLOSE = {"a0": {"action_type": "close"}}
+REFUSED = "may not use"
+
 
 @pytest.fixture
 def tab(monkeypatch):
-    """An ExpertSettingsTab with a working profile select and a stubbed ruleset reader."""
+    """An ExpertSettingsTab with a working profile select and stubbed ruleset readers: the
+    ``(label, field)`` pairs, and the ``(name, triggers, actions)`` rule contents."""
     import ba2_common.core.market_condition_live as live
 
     rulesets: dict = {}
+    contents: dict = {}
     monkeypatch.setattr(live, "market_condition_fields_in_ruleset",
                         lambda rid: rulesets.get(rid, ()))
+    monkeypatch.setattr(live, "ruleset_rule_contents", lambda rid: contents.get(rid, ()))
 
     t = object.__new__(ExpertSettingsTab)
     t.market_condition_profile_select = SimpleNamespace(value="", options=[])
     t._market_condition_profile_loaded = True
     t.rulesets = rulesets
+    t.contents = contents
     return t
+
+
+def _gated_exit_ruleset(tab, rid, actions):
+    """Ruleset ``rid``: one rule ``entry`` gated on ADX (trigger ``cond_1``) doing ``actions``."""
+    tab.rulesets[rid] = GATED
+    tab.contents[rid] = (("entry", {"cond_0": {"event_type": "profit_loss_percent"},
+                                    "cond_1": {"event_type": ADX, "operator": "<",
+                                               "value": 20.0}}, actions),)
 
 
 def _set_profile(tab, value):
@@ -103,21 +122,41 @@ def test_a_comma_list_serving_the_leaf_passes(tab):
 
 
 # --------------------------------------------------------------------------- the exit door (M7)
-def test_a_market_leaf_on_the_open_positions_ruleset_is_refused_whatever_the_profile(tab):
-    """No profile makes this legal: outside the entry pass the resolver has no context, the rule
-    never fires, and the position's exit or protective-order adjustment silently stops."""
-    tab.rulesets[9] = GATED
+def test_a_market_leaf_on_an_open_positions_buy_rule_is_refused_whatever_the_profile(tab):
+    """No profile makes this legal: on the exit pass a failed read is unknown and the rule does
+    not fire, which is safe for a close/reduce/TP-SL adjustment and never for an open."""
+    _gated_exit_ruleset(tab, 9, BUY)
     for profile in ("", "ohlcv-v1", "ohlcv-v1,ta-structure-v1"):
         _set_profile(tab, profile)
         with pytest.raises(ValueError) as e:
             tab._refuse_unserved_market_gates(None, 9)
-        assert "open-positions" in str(e.value) and "entry.cond_1" in str(e.value)
+        msg = str(e.value)
+        assert "open-positions" in msg and "entry" in msg and "cond_1" in msg
+        assert REFUSED in msg and "'buy'" in msg
+
+
+def test_a_market_leaf_on_an_open_positions_close_rule_passes_when_served(tab):
+    """Plan 2026-09-24 B2: a market EXIT may be attached to the open-positions slot."""
+    _gated_exit_ruleset(tab, 9, CLOSE)
+    _set_profile(tab, "ohlcv-v1")
+    assert tab._refuse_unserved_market_gates(None, 9) is None
+
+
+def test_an_allowed_exit_leaf_no_profile_serves_is_refused(tab):
+    """Unserved, the exit leaf reads unknown for ever and the exit it guards never happens --
+    the same silence the entry half of this check exists to prevent."""
+    _gated_exit_ruleset(tab, 9, CLOSE)
+    for profile in ("", "ta-structure-v1"):
+        _set_profile(tab, profile)
+        with pytest.raises(ValueError) as e:
+            tab._refuse_unserved_market_gates(7, 9)
+        assert "open-positions ruleset 9" in str(e.value) and ADX in str(e.value)
 
 
 def test_the_exit_door_is_checked_even_when_the_entry_ruleset_is_ungated(tab):
     """It is checked FIRST, so an ungated entry ruleset cannot short-circuit past it."""
     tab.rulesets[7] = ()
-    tab.rulesets[9] = GATED
+    _gated_exit_ruleset(tab, 9, BUY)
     with pytest.raises(ValueError, match="open-positions"):
         tab._refuse_unserved_market_gates(7, 9)
 
@@ -208,23 +247,14 @@ def test_the_save_path_reads_the_guard_and_the_savable_flag():
 
 
 # ------------------------------------------- the RULES editor, the third door (final review I2)
-def test_the_rules_editor_does_not_offer_the_market_condition_fields():
-    """Those fifteen field names are ``ExpertEventType`` values like any other, so the editor's
-    ``[t.value for t in ExpertEventType]`` silently started offering them. A gate is searched by
-    the optimizer and arrives by deploy import, which checks it against the expert's profile
-    setting; authored here it would carry no profile and simply never pass."""
-    from ba2_common.core.market_condition_rules import market_condition_fields
-    from ba2_trade_platform.core.types import ExpertEventType
-    from ba2_trade_platform.ui.pages.settings import _authorable_trigger_types
-
-    offered = _authorable_trigger_types()
-    fields = market_condition_fields()
-    assert offered, "the editor must still offer every ORDINARY trigger type"
-    assert not (set(offered) & fields)
-    assert set(offered) == {t.value for t in ExpertEventType} - fields
-    # The fields really ARE event types -- which is why the filter is needed at all.
-    assert {t.value for t in ExpertEventType} & fields
-
+#
+# The MENU half of this section moved out on 2026-09-22. ``_authorable_trigger_types`` filtered
+# the fifteen market fields out of the Trigger Type list and ``_trigger_type_options`` added a
+# persisted one back so a deployed rule could still be opened; both are gone, replaced by the
+# categorised picker, which offers every field with the profile it needs named beside it. What
+# those tests pinned -- an unknown key renders instead of raising, the persisted value survives
+# every stored shape -- is pinned in tests/test_rule_trigger_picker.py, against the picker.
+# The REFUSAL half stays here: it is what actually stops a gate reaching an exit ruleset.
 
 class _RulesTab:
     """Just enough of the rules editor to exercise the refusal: the real method, bound."""
@@ -247,23 +277,38 @@ def rules_tab(monkeypatch):
     return store
 
 
-def _rule(rid, name, event_type):
+def _rule(rid, name, event_type, actions=BUY):
     return SimpleNamespace(id=rid, name=name,
-                           triggers={"cond_0": {"event_type": event_type}})
+                           triggers={"cond_0": {"event_type": event_type}}, actions=actions)
 
 
-def test_a_market_gate_on_an_open_positions_ruleset_is_refused(rules_tab):
-    """market_condition_rules calls this the worst outcome in the whole design: outside the entry
-    pass the gate reads no_context, the rule never fires, and the position's exit or protective
-    order adjustment silently stops happening."""
+def test_a_market_gate_on_an_open_positions_buy_rule_is_refused(rules_tab):
+    """On the exit pass a failed market read is unknown and the rule does not fire: safe for a
+    close, a reduction or a TP/SL adjustment (plan 2026-09-24 B2), never for an open."""
     rules_tab[1] = _rule(1, "stop-loss", "profit_loss_percent")
     rules_tab[2] = _rule(2, "gated", ADX)
     tab = _RulesTab(rules_tab)
     with pytest.raises(ValueError) as e:
         tab._refuse("open_positions", [1, 2])
     msg = str(e.value)
-    assert "gated.cond_0" in msg and "open-positions / exit ruleset" in msg
+    assert "'gated'" in msg and "cond_0" in msg and REFUSED in msg and "'buy'" in msg
     assert "stop-loss" not in msg
+
+
+@pytest.mark.parametrize("action", ["close", "decrease_instrument_share",
+                                    "adjust_stop_loss", "adjust_take_profit"])
+def test_a_market_gate_on_an_open_positions_rule_that_closes_reduces_or_adjusts_saves(
+        rules_tab, action):
+    rules_tab[1] = _rule(1, "stop-loss", "profit_loss_percent")
+    rules_tab[2] = _rule(2, "market exit", ADX, actions={"a0": {"action_type": action}})
+    assert _RulesTab(rules_tab)._refuse("open_positions", [1, 2]) is None
+
+
+def test_a_market_gate_beside_a_roll_is_refused_on_an_open_positions_ruleset(rules_tab):
+    rules_tab[2] = _rule(2, "gated roll", ADX, actions={"a0": {"action_type": "close"},
+                                                        "a1": {"action_type": "roll_pmcc_short"}})
+    with pytest.raises(ValueError, match="'roll_pmcc_short'"):
+        _RulesTab(rules_tab)._refuse("open_positions", [2])
 
 
 def test_an_ordinary_open_positions_ruleset_saves(rules_tab):
@@ -287,121 +332,31 @@ def test_a_selected_rule_that_no_longer_exists_does_not_break_the_save(rules_tab
 
 
 def test_the_refusal_runs_before_any_write_in_save_ruleset():
-    """Read from the source: a refusal after ``update_instance``/``add_instance`` would leave the
-    ruleset repointed at rules it just refused."""
+    """Read from the source: a refusal after the row or the links are written would leave the
+    ruleset repointed at rules it just refused.
+
+    The markers are every statement that can reach the database in ``_save_ruleset``, and the
+    save now does all of them inside ONE ``with get_db()`` transaction: the link delete, the
+    link inserts, and the ruleset row itself (``session.add`` on the create path,
+    ``update_instance(..., session=session)`` -- which commits that session -- on the edit
+    path). A spelling that disappears from the source fails this test loudly rather than
+    quietly checking nothing, so keep the list in step with the save."""
     import inspect
 
     from ba2_trade_platform.ui.pages.settings import TradeSettingsTab
 
     src = inspect.getsource(TradeSettingsTab._save_ruleset)
     guard = src.index("_refuse_market_gates_on_exit_ruleset(")
-    writes = [src.index(c) for c in ("update_instance(ruleset)", "add_instance(new_ruleset)")]
+    writes = [src.index(c) for c in ("with get_db() as session:",
+                                     "delete(RulesetEventActionLink)",
+                                     "session.add(new_ruleset)",
+                                     "update_instance(ruleset, session=session)")]
     assert guard < min(writes)
 
 
-# ------------------------- a DEPLOYED gate must stay viewable in the rules editor (re-review N1)
-def test_a_deployed_gated_trigger_can_still_be_opened_in_the_rules_editor():
-    """THE FAILURE THIS PREVENTS. NiceGUI refuses a select value outside its options
-    (``choice_element``: ``ValueError: Invalid value: underlying_adx_14``) and
-    ``show_rule_dialog`` wraps nothing, so filtering the market fields out of the menu made
-    Edit Rule on a DEPLOYED gated rule raise mid-build and leave a half-rendered dialog: the
-    gate became impossible even to LOOK at, on the live platform this feature exists to run on.
-
-    Constructed through the REAL ``ui.select``, because the bug lived in the widget's own
-    validation -- asserting on the options list alone is exactly the gap that let this through.
-
-    The explicit ``Client`` context is not decoration. NiceGUI resolves a widget's parent from a
-    per-task slot stack, and building one with that stack empty raises "The current slot cannot be
-    determined". Without it this test PASSED ALONE -- an earlier import happens to leave a slot
-    behind -- and FAILED in a full suite run, so it would have read as a flake rather than as this
-    test's own missing setup. A bare ``with ui.element():`` does not fix it: that container needs a
-    slot to be created in too. In the real editor the dialog supplies the slot.
-    """
-    from nicegui import ui
-    from nicegui.client import Client
-
-    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
-
-    value, options = _trigger_type_options({"event_type": ADX})
-    assert value == ADX and ADX in options
-    with Client(lambda: None, request=None):
-        select = ui.select(options=options, label="Trigger Type", value=value)
-    assert select.value == ADX
-
-
-def test_the_extra_option_appears_only_on_the_row_that_holds_it():
-    """Adding the value back is not a hole in the filter: a NEW trigger, and any trigger whose
-    persisted type is ordinary, is still offered no market field at all."""
-    from ba2_common.core.market_condition_rules import market_condition_fields
-    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
-
-    fields = market_condition_fields()
-    for config in (None, {}, {"event_type": "confidence"}, {"type": "has_position"}):
-        _value, options = _trigger_type_options(config)
-        assert not (set(options) & fields), config
-
-    # ... and the gated row gets exactly ONE extra option, its own.
-    _value, gated = _trigger_type_options({"event_type": ADX})
-    _value, plain = _trigger_type_options(None)
-    assert set(gated) - set(plain) == {ADX}
-
-
-@pytest.mark.parametrize("config,expected", [
-    (None, "has_position"),
-    ({}, "has_position"),
-    ({"event_type": "confidence"}, "confidence"),
-    ({"type": "days_opened"}, "days_opened"),          # the legacy spelling
-    # A malformed row (event_type present but null) displayed an EMPTY select before this fix
-    # and still does -- the fix is about the options, not about which value is shown.
-    ({"event_type": None, "type": "confidence"}, None),
-])
-def test_the_persisted_trigger_value_survives_every_shape(config, expected):
-    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
-
-    value, options = _trigger_type_options(config)
-    assert value == expected
-    assert value is None or value in options
-
-
-def test_the_value_expression_is_the_one_the_editor_always_had():
-    """Pinned against the pre-fix behaviour: only the OPTIONS changed. A value fallback that
-    quietly turned a null event_type into has_position would relabel a broken rule as a
-    position check -- a second change wearing this one's justification."""
-    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
-
-    def before(trigger_config):
-        from ba2_trade_platform.core.types import ExpertEventType as E
-        return (trigger_config.get('event_type',
-                                   trigger_config.get('type', E.F_HAS_POSITION.value))
-                if trigger_config else E.F_HAS_POSITION.value)
-
-    for config in (None, {}, {"event_type": "confidence"}, {"type": "days_opened"},
-                   {"event_type": None, "type": "confidence"}, {"event_type": ADX}):
-        assert _trigger_type_options(config)[0] == before(config), config
-
-
-def test_a_new_trigger_still_defaults_to_has_position():
-    from ba2_trade_platform.core.types import ExpertEventType
-    from ba2_trade_platform.ui.pages.settings import _trigger_type_options
-
-    value, _options = _trigger_type_options(None)
-    assert value == ExpertEventType.F_HAS_POSITION.value
-
-
-def test_the_editor_builds_its_select_through_that_helper():
-    """Read from the source: the fix is worth nothing if the dialog re-derives the options."""
-    import inspect
-
-    from ba2_trade_platform.ui.pages.settings import TradeSettingsTab
-
-    src = inspect.getsource(TradeSettingsTab)
-    assert "_trigger_type_options(trigger_config)" in src
-    assert "options=[t.value for t in ExpertEventType]" not in src
-
-
 def test_both_halves_of_the_exit_refusal_still_hold(rules_tab):
-    """N1 relaxed the MENU only. The exit-slot refusal is what actually stops a gate reaching an
-    open-positions ruleset, and it is unchanged."""
+    """N1 relaxed the MENU only. The exit-slot refusal is what actually stops a gated OPEN (or any
+    action beyond close/reduce/adjust) reaching an open-positions ruleset."""
     rules_tab[2] = _rule(2, "gated", ADX)
-    with pytest.raises(ValueError, match="open-positions / exit ruleset"):
+    with pytest.raises(ValueError, match=REFUSED):
         _RulesTab(rules_tab)._refuse("open_positions", [2])

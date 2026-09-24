@@ -20,6 +20,21 @@ from ba2_providers.macro import fred_series
 
 
 @pytest.fixture(autouse=True)
+def _let_caplog_see_it():
+    """``ba2_common`` sets propagate=False and owns its handlers, so caplog's handler on the
+    root logger never sees its records. Lift that for the duration, and put it back."""
+    import logging
+
+    lg = logging.getLogger("ba2_common")
+    was = lg.propagate
+    lg.propagate = True
+    try:
+        yield
+    finally:
+        lg.propagate = was
+
+
+@pytest.fixture(autouse=True)
 def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(fred_series, "CACHE_FOLDER", str(tmp_path), raising=False)
     monkeypatch.setattr(fred_series, "_MEM", {}, raising=False)
@@ -100,3 +115,122 @@ class TestTheOfflinePathsStillRefuse:
         _write("VIXCLS", _rows())
         with frozen_ttl_cache():
             assert fred_series._load("VIXCLS") == _rows()
+
+
+# --------------------------------------------------------------------------- #
+# STALENESS: filling an empty cache is only right for a day. VIXCLS is a DAILY
+# series, so a cache written once and never refreshed is correct on the day it
+# was written and quietly wrong afterwards -- which is worse than obviously
+# empty, because nothing complains.
+# --------------------------------------------------------------------------- #
+import time
+
+
+def _age_file(sid, hours):
+    """Backdate the cache file's mtime by *hours*."""
+    path = fred_series.cache_path(sid)
+    old = time.time() - hours * 3600.0
+    os.utime(path, (old, old))
+
+
+class TestTheLiveCacheIsRefreshedWhenStale:
+    def test_a_stale_daily_series_is_refetched(self, monkeypatch):
+        _write("VIXCLS", [{"date": "2026-01-01", "value": "1"}])
+        _age_file("VIXCLS", 13)                      # daily window is 12h
+        calls = []
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda sid, key: (calls.append(sid), _write(sid, _rows()), 1)[-1])
+        monkeypatch.setattr("ba2_common.config.get_app_setting", lambda k: "KEY", raising=False)
+
+        assert fred_series._load("VIXCLS") == _rows(), "the refreshed payload must be returned"
+        assert calls == ["VIXCLS"]
+
+    def test_a_fresh_daily_series_is_NOT_refetched(self, monkeypatch):
+        _write("VIXCLS", _rows())
+        _age_file("VIXCLS", 11)                      # inside the 12h window
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda *a, **k: pytest.fail("refetched a fresh series"))
+        assert fred_series._load("VIXCLS") == _rows()
+
+    def test_a_monthly_series_gets_the_longer_window(self, monkeypatch):
+        """PAYEMS publishes monthly; refetching it every run is a call that cannot return
+        anything new."""
+        _write("PAYEMS", _rows())
+        _age_file("PAYEMS", 13)                      # stale for daily, fresh for monthly
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda *a, **k: pytest.fail("refetched a monthly series at 13h"))
+        assert fred_series._load("PAYEMS") == _rows()
+        assert fred_series._max_age_hours("PAYEMS") == 24.0
+        assert fred_series._max_age_hours("VIXCLS") == 12.0
+
+    def test_a_failed_refresh_serves_the_STALE_copy_rather_than_dying(self, monkeypatch, caplog):
+        """Macro is an overlay. Stale degrades a regime; raising would stop the analysis."""
+        stale = [{"date": "2020-01-01", "value": "9"}]
+        _write("VIXCLS", stale)
+        _age_file("VIXCLS", 99)
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("FRED down")))
+        monkeypatch.setattr("ba2_common.config.get_app_setting", lambda k: "KEY", raising=False)
+
+        assert fred_series._load("VIXCLS") == stale
+        assert any("stale copy" in r.getMessage() for r in caplog.records), \
+            "serving stale data must be said out loud, not silently"
+
+    def test_the_MEMO_expires_too(self, monkeypatch):
+        """The memo short-circuits every file check, so without its own clock a live process
+        would serve its startup payload for the life of the process."""
+        first = [{"date": "2026-01-01", "value": "1"}]
+        _write("VIXCLS", first)
+        assert fred_series._load("VIXCLS") == first          # populates the memo
+
+        _write("VIXCLS", _rows())                            # the file moves underneath it
+        _age_file("VIXCLS", 13)
+        fred_series._MEM_AT["VIXCLS"] = time.time() - 13 * 3600.0
+        monkeypatch.setattr(fred_series, "refresh_series", lambda sid, key: 1)
+        monkeypatch.setattr("ba2_common.config.get_app_setting", lambda k: "KEY", raising=False)
+
+        assert fred_series._load("VIXCLS") == _rows(), "the memo served a payload past its window"
+
+    def test_a_fresh_memo_is_still_served_without_touching_the_disk(self, monkeypatch):
+        _write("VIXCLS", _rows())
+        assert fred_series._load("VIXCLS") == _rows()
+        monkeypatch.setattr(fred_series, "cache_path",
+                            lambda sid: pytest.fail("went to disk for a fresh memo"))
+        assert fred_series._load("VIXCLS") == _rows()
+
+
+class TestABacktestNeverAgesAnything:
+    def test_a_stale_file_is_read_as_is_under_a_frozen_run(self, monkeypatch):
+        """Determinism: a run reads what was prewarmed, however old it is."""
+        stale = [{"date": "2020-01-01", "value": "9"}]
+        _write("VIXCLS", stale)
+        _age_file("VIXCLS", 24 * 365)
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda *a, **k: pytest.fail("a backtest refetched macro data"))
+        with frozen_ttl_cache():
+            assert fred_series._load("VIXCLS") == stale
+
+    def test_a_frozen_memo_never_expires(self, monkeypatch):
+        """One payload from first bar to last -- the memo is what makes a per-bar expert cheap."""
+        first = [{"date": "2026-01-01", "value": "1"}]
+        _write("VIXCLS", first)
+        with frozen_ttl_cache():
+            assert fred_series._load("VIXCLS") == first
+            fred_series._MEM_AT["VIXCLS"] = time.time() - 24 * 3600.0
+            _write("VIXCLS", _rows())
+            assert fred_series._load("VIXCLS") == first, "a frozen run re-read the file mid-run"
+
+
+def test_a_seeded_memo_with_no_recorded_time_is_served_not_expired(monkeypatch):
+    """Seeding ``_MEM`` is how the replay-tap tests read with no disk and no network.
+
+    Treating an entry whose age is unknown as EXPIRED turned that seed into a real read of
+    the operator's own cache -- 9,245 live observations where the fixture asked for two.
+    ``_load`` always stamps what it stores, so an unstamped entry is a deliberate seed.
+    """
+    seeded = [{"date": "2026-06-11", "value": "14.5"}]
+    fred_series._MEM["VIXCLS"] = seeded
+    fred_series._MEM_AT.pop("VIXCLS", None)
+    monkeypatch.setattr(fred_series, "cache_path",
+                        lambda sid: pytest.fail("a seeded memo went to disk"))
+    assert fred_series._load("VIXCLS") == seeded

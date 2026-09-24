@@ -128,6 +128,11 @@ class _BacktestShapedAccount(_LiveShapedAccount):
     """A simulator: it publishes ``_as_of_date``, which is how the shared action code tells
     a backtest clock from a wall clock. Nothing else about the seam differs."""
 
+    def decision_label(self):
+        # The option action's DTE label (OptionsAccountInterface.decision_label,
+        # read by _OptionEntryAction._today): pinned to this fake's simulated date.
+        return self._as_of_date()
+
     def _as_of_date(self):
         return date(2026, 1, 5)
 

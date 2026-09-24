@@ -56,6 +56,33 @@ _MARKET_TZ = pytz.timezone("America/New_York")
 # protect, so it has to measure the breach with the very same number.
 OCO_STOP_LIMIT_CUSHION = 0.005
 
+# PENDING_CANCEL lifetime. A cancel is a WAIT for the broker's confirmation, and a wait
+# that can never end is a deadlock. Measured on dev 2026-09-22: four protective SELL_STOPs
+# (orders behind txns 28/29/131/133) sat in PENDING_CANCEL for up to 8 days while the
+# broker had them CANCELED all along — they were OCO legs, so refresh_orders' Step 4 put
+# them in its "safe set" and never asked about them, and the paginated list had long since
+# stopped returning them. _reconcile_pending_cancel_orders now asks by id every refresh, so
+# these ages are only reached when the BROKER keeps answering non-terminally (or stops
+# recognising the id at all). Past the max, the local PENDING_CANCEL fiction is dropped and
+# the broker's own last answer is adopted; see the method for what each case resolves to.
+_PENDING_CANCEL_MAX_AGE_HOURS = 24.0
+# Below the max but past this, log at WARNING instead of DEBUG. The 2026-08-05 wash-trade
+# deadlock went unnoticed for 9 days precisely because a still-waiting order logged at DEBUG.
+_PENDING_CANCEL_WARN_AGE_HOURS = 1.0
+
+# Hard ceiling on by-id broker lookups issued by ONE refresh for stuck PENDING_CANCEL
+# orders. THIS IS NOT A POLLER, and this constant is what keeps it from becoming one.
+#
+# The by-id pass runs only inside refresh_orders, only for orders whose LOCAL status is
+# PENDING_CANCEL, and only for those the refresh's own order listing did not already
+# answer for free. In a healthy account that set is EMPTY and the pass costs zero extra
+# API calls; the whole dev database had FOUR such orders at its worst (2026-09-22). So a
+# ceiling in the low tens is generous, and anything above it means something is wrong in a
+# way that more API calls will not fix. Past the cap the oldest go first and the rest are
+# deferred to the next refresh with a WARNING naming the count: a pathological state must
+# degrade into "slower to heal", never into hundreds of calls per cycle.
+_PENDING_CANCEL_LOOKUP_BUDGET = 20
+
 
 def _to_market_utc(value: Optional[datetime]) -> Optional[datetime]:
     """Normalise a broker datetime to tz-aware UTC.
@@ -164,6 +191,106 @@ def plan_fractional_submission(symbol: str, quantity: float, order_type_value: s
         fractionable=fractionable, reason=reason)
 
 
+# ======================================================================
+# Raw option snapshots (BT/live option parity B3)
+# ======================================================================
+# WHY RAW. alpaca-py's ``OptionsSnapshot`` model (0.43.4, and 0.44.0) keeps only
+# latest_quote / latest_trade / implied_volatility / greeks and DROPS ``dailyBar`` and
+# ``prevDailyBar`` although the REST response carries them -- and those two bars are the only
+# place a snapshot says how much a contract TRADED. Without them the live chain had no volume,
+# so the grid's ``option_min_volume`` gate refused every live chain
+# (``OptionLiquidityDataUnavailable``) and a grid option strategy deployed live never traded.
+# The account therefore reads the ``raw_data=True`` client and parses the documented REST shape:
+#   {latestQuote:{t,ax,ap,as,bx,bp,bs,c}, latestTrade:{t,x,p,s,c}, minuteBar, dailyBar,
+#    prevDailyBar (option_bar: t,o,h,l,c,v,n,vw -- all required),
+#    greeks:{delta,gamma,rho,theta,vega}, impliedVolatility}
+
+def _parse_alpaca_timestamp(value: Any, where: str) -> datetime:
+    """An Alpaca RFC-3339 timestamp as an AWARE datetime (nanoseconds truncated to micros).
+    A value without a zone is refused: which day it belongs to would be a guess."""
+    if not isinstance(value, str):
+        raise ValueError(f"Alpaca option snapshot {where}.t is not a timestamp string: {value!r}")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"Alpaca option snapshot {where}.t has no timezone: {value!r}")
+    return parsed
+
+
+def _parse_alpaca_option_bar(bar: Any, where: str) -> Tuple[Any, Any]:
+    """``(New York date, volume)`` of a present daily bar; a bar without ``t`` or ``v`` is a
+    parse bug (Alpaca's option_bar requires both) and raises.
+
+    Alpaca stamps a daily bar at New York MIDNIGHT (04:00Z under EDT, 05:00Z under EST), so the
+    bar's session is its America/New_York calendar date -- never its UTC date."""
+    from ba2_common.core.market_calendar import NY_TZ
+
+    if not isinstance(bar, dict):
+        raise ValueError(f"Alpaca option snapshot {where} is not an object: {bar!r}")
+    for key in ("t", "v"):
+        if bar.get(key) is None:
+            raise ValueError(f"Alpaca option snapshot {where} has no '{key}': {bar!r}")
+    return (_parse_alpaca_timestamp(bar["t"], where).astimezone(NY_TZ).date(), bar["v"])
+
+
+def parse_alpaca_option_bars(raw: Dict[str, Any]) -> List[Tuple[Any, Any]]:
+    """``[(ny_date, volume)]`` from a raw snapshot's ``dailyBar`` and ``prevDailyBar``,
+    whichever are present. Raises ValueError on a present bar without ``t``/``v`` (an empty
+    ``{}`` bar included) or a timestamp without a zone. Split out so the QUOTE path can
+    degrade only the volume when the bars are malformed (``get_option_quote``)."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"Alpaca option snapshot is not an object: {raw!r}")
+    return [_parse_alpaca_option_bar(raw[key], key)
+            for key in ("dailyBar", "prevDailyBar") if raw.get(key) is not None]
+
+
+def parse_alpaca_option_quote_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """The quote / trade / greeks fields of a raw snapshot (everything but the bars).
+
+    Each is ``None`` when Alpaca did not send it -- a missing field stays MISSING. Raises
+    ValueError on a snapshot that is not an object or a quote/trade timestamp without a zone.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"Alpaca option snapshot is not an object: {raw!r}")
+    quote = raw.get("latestQuote") or {}
+    trade = raw.get("latestTrade") or {}
+    greeks = raw.get("greeks") or {}
+    return {
+        "bid": quote.get("bp"),
+        "ask": quote.get("ap"),
+        "bid_size": quote.get("bs"),
+        "ask_size": quote.get("as"),
+        "quote_time": (_parse_alpaca_timestamp(quote["t"], "latestQuote")
+                       if quote.get("t") is not None else None),
+        "last": trade.get("p"),
+        "last_time": (_parse_alpaca_timestamp(trade["t"], "latestTrade")
+                      if trade.get("t") is not None else None),
+        "iv": raw.get("impliedVolatility"),
+        "delta": greeks.get("delta"),
+        "gamma": greeks.get("gamma"),
+        "theta": greeks.get("theta"),
+        "vega": greeks.get("vega"),
+        "rho": greeks.get("rho"),
+    }
+
+
+def parse_alpaca_option_snapshot(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """One raw Alpaca option snapshot -> the flat fields the live chain uses.
+
+    Returns ``bid, ask, bid_size, ask_size, quote_time, last, last_time, iv, delta, gamma,
+    theta, vega, rho`` (each ``None`` when Alpaca did not send it -- a missing field stays
+    MISSING, the liquidity checks report it) and ``bars``: ``[(ny_date, volume)]`` from
+    ``dailyBar`` and ``prevDailyBar``, whichever are present. The volume is left as sent;
+    ``option_session.session_volume`` validates the one bar a decision may read. ``minuteBar``
+    and unknown keys are ignored.
+
+    Raises ValueError on a snapshot that is not an object (e.g. ``None``), a present bar
+    without ``t``/``v`` (an empty ``{}`` bar included) or a timestamp without a zone.
+    """
+    fields = parse_alpaca_option_quote_fields(raw)
+    fields["bars"] = parse_alpaca_option_bars(raw)
+    return fields
+
+
 def alpaca_api_retry(func):
     """
     Decorator to retry Alpaca API calls with exponential backoff on rate limit errors.
@@ -215,6 +342,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     Also implements OptionsAccountInterface (option chain/quote/ATM-IV market data;
     positions / order submission / close / IV-rank land in later tasks).
     """
+
+    #: Where this account's option greeks come from (OptionsAccountInterface; recorded on
+    #: every leg of an option entry_record): Alpaca's own snapshot greeks.
+    OPTION_GREEKS_SOURCE = "broker"
 
     # Lifetime of one _margin_info_cache entry. A CLASS attribute so that a bare
     # instance built with object.__new__ (the test idiom) still has it.
@@ -2852,6 +2983,237 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error refreshing positions from Alpaca: {e}", exc_info=True)
             return False
 
+    @alpaca_api_retry
+    def _get_broker_order_or_absent(self, broker_order_id: str):
+        """Ask Alpaca about ONE order by id. Returns ``(TradingOrder | None, absent)``.
+
+        ``absent`` is True ONLY when the broker positively answers that it does not know
+        this id (``40410000`` / HTTP 404). Every other failure — transport, auth, rate
+        limit — RAISES, because "I could not ask" and "the broker says it never existed"
+        are different facts and collapsing them into one None is how a live order gets
+        written off. (``get_order`` above deliberately collapses them, which is why this
+        exists alongside it rather than replacing it.)
+
+        PROBE TRAP (docs/WASHTRADE-LOCK.md): a 40410000 also appears when the id belongs
+        to a DIFFERENT Alpaca account. Callers must only pass ids of orders whose
+        ``account_id`` is this account's, which is what makes ``absent`` meaningful.
+        """
+        try:
+            raw = self.client.get_order_by_id(broker_order_id)
+        except APIError as e:
+            text = str(e).lower()
+            if "40410000" in text or "not found" in text or "404" in text:
+                return None, True
+            raise
+        return self.alpaca_order_to_tradingorder(raw), False
+
+    def _reconcile_pending_cancel_orders(self, listed_broker_ids) -> int:
+        """Resolve STUCK PENDING_CANCEL orders by asking the broker about each DIRECTLY.
+
+        WHY IT CANNOT BE LEFT TO THE LIST. ``refresh_orders`` promotes PENDING_CANCEL from
+        the paginated ``GetOrdersRequest`` listing, so an order the listing stops returning
+        is never revisited and waits forever. Two things guarantee that happens: Alpaca's
+        listing does not carry OCO LEGS at all (they are metadata on their parent, and the
+        parent is itself gone once cancelled), and old orders fall out of the window.
+        Measured on dev 2026-09-22 — four protective SELL_STOPs stuck in PENDING_CANCEL for
+        up to 8 days, every one of them ``CANCELED`` at the broker, filled 0, and answered
+        instantly by ``get_order_by_id``. Step 4's "not in the listing" sweep could not
+        catch them either: it adds every OCO leg's broker id to its own safe set.
+
+        THIS IS NOT A POLLER, and four properties keep it from becoming one:
+
+        1. **Only PENDING_CANCEL.** No other status earns a by-id call. Nothing else in
+           the platform acquires a per-order round trip because of this method.
+        2. **Only inside the refresh cycle.** It has exactly one caller,
+           ``refresh_orders``. No timer, no background task, and nothing on a submit /
+           fill / render path.
+        3. **Only what the refresh did not already answer.** ``listed_broker_ids`` is the
+           set of broker ids the listing just returned; those were already resolved for
+           free by the main loop, so they are skipped here. In a healthy account the
+           remainder is EMPTY and this costs ZERO extra API calls — that empty set is the
+           normal case, and the stuck orders are precisely the ones outside it.
+        4. **Capped.** At most ``_PENDING_CANCEL_LOOKUP_BUDGET`` lookups per refresh,
+           oldest first, with a WARNING naming how many were deferred to the next pass.
+
+        WHAT IT WILL NOT DO. It never marks an order CANCELED on its own authority. The
+        promotion goes through ``OrderStatus.resolve_pending_cancel``, exactly as the list
+        path does, so a dependent replacement still fires only on a real terminal answer
+        (see ``cancel_order``'s note on why optimistic CANCELED is refused).
+
+        LAST RESORT. Past ``_PENDING_CANCEL_MAX_AGE_HOURS`` the local PENDING_CANCEL is
+        dropped — not replaced by another endless wait — and the BROKER'S OWN last answer
+        is adopted: its reported (non-terminal) status when it still knows the order, or
+        CANCELED when it has consistently not known it for a full day. Neither invents a
+        fact; both end the wait.
+
+        Args:
+            listed_broker_ids: broker ids the just-completed listing returned. Orders
+                whose id is in this set are skipped — the refresh already answered them.
+
+        Returns the number of orders whose status this pass changed.
+        """
+        from sqlmodel import Session, select
+
+        covered = set(listed_broker_ids or ())
+        with Session(get_db().bind) as session:
+            rows = session.exec(
+                select(TradingOrder).where(
+                    TradingOrder.account_id == self.id,
+                    TradingOrder.status == OrderStatus.PENDING_CANCEL,
+                )
+            ).all()
+            pending = [
+                (r.id, r.broker_order_id, r.symbol, r.created_at) for r in rows
+                if r.broker_order_id is None or r.broker_order_id not in covered
+            ]
+            skipped_free = len(rows) - len(pending)
+
+        if skipped_free:
+            logger.debug(
+                f"{skipped_free} PENDING_CANCEL order(s) were answered by the order "
+                f"listing itself — no by-id lookup needed for them")
+
+        if not pending:
+            logger.debug("No unresolved PENDING_CANCEL orders — no by-id lookups issued")
+            return 0
+
+        # Oldest first, so a capped pass always makes progress on the worst offenders.
+        # Sorted on the NORMALISED age (created_at can be naive or aware in this table,
+        # and comparing the two raises); undated rows go last rather than crashing.
+        def _oldest_first(row):
+            age = self._order_age_hours(row[3])
+            return (age is None, -age if age is not None else 0.0)
+
+        pending.sort(key=_oldest_first)
+        if len(pending) > _PENDING_CANCEL_LOOKUP_BUDGET:
+            deferred = len(pending) - _PENDING_CANCEL_LOOKUP_BUDGET
+            logger.warning(
+                f"{len(pending)} PENDING_CANCEL orders are unresolved by the order listing, "
+                f"more than the {_PENDING_CANCEL_LOOKUP_BUDGET}-lookup budget for one "
+                f"refresh: resolving the {_PENDING_CANCEL_LOOKUP_BUDGET} oldest and "
+                f"deferring {deferred} to the next refresh. A healthy account has none of "
+                f"these; this many means something upstream is not cancelling cleanly")
+            pending = pending[:_PENDING_CANCEL_LOOKUP_BUDGET]
+
+        logger.debug(f"Reconciling {len(pending)} PENDING_CANCEL order(s) by direct lookup")
+        resolved_count = 0
+
+        for order_id, broker_order_id, symbol, created_at in pending:
+            try:
+                age_hours = self._order_age_hours(created_at)
+                if not broker_order_id:
+                    # PENDING_CANCEL is only ever written by cancel_order, which needs a
+                    # broker id to call the broker at all. A row without one contradicts
+                    # itself and cannot be resolved by asking anyone.
+                    logger.error(
+                        f"Order {order_id} ({symbol}) is PENDING_CANCEL with NO "
+                        f"broker_order_id — nothing can be asked about it; an operator "
+                        f"must resolve this row")
+                    continue
+
+                try:
+                    broker_order, absent = self._get_broker_order_or_absent(broker_order_id)
+                except (APIError, OSError) as e:
+                    logger.warning(
+                        f"Order {order_id} ({symbol}) PENDING_CANCEL: could not read "
+                        f"broker order {broker_order_id} this pass ({e}); retrying next refresh")
+                    continue
+
+                if absent:
+                    logger.error(
+                        f"Order {order_id} ({symbol}) is PENDING_CANCEL but Alpaca does NOT "
+                        f"KNOW broker order {broker_order_id} (40410000). That is not a "
+                        f"confirmation of cancellation — it also happens when an id belongs "
+                        f"to a different Alpaca account (see docs/WASHTRADE-LOCK.md). "
+                        f"Order age: {f'{age_hours:.1f}h' if age_hours is not None else 'unknown'}")
+                    if age_hours is not None and age_hours >= _PENDING_CANCEL_MAX_AGE_HOURS:
+                        logger.error(
+                            f"Order {order_id} ({symbol}): the broker has not recognised "
+                            f"{broker_order_id} for {age_hours:.1f}h (limit "
+                            f"{_PENDING_CANCEL_MAX_AGE_HOURS}h) — marking CANCELED as a last "
+                            f"resort so the wait ends; nothing is working under this id")
+                        if self._write_pending_cancel_result(order_id, OrderStatus.CANCELED, None):
+                            resolved_count += 1
+                    continue
+
+                resolved = OrderStatus.resolve_pending_cancel(broker_order.status)
+                if resolved is not None:
+                    logger.info(
+                        f"Order {order_id} ({symbol}) PENDING_CANCEL -> {resolved.value} "
+                        f"(direct lookup of {broker_order_id}; broker reported "
+                        f"{broker_order.status})")
+                    if self._write_pending_cancel_result(order_id, resolved, broker_order):
+                        resolved_count += 1
+                    continue
+
+                # Still working at the broker: the cancel has not landed.
+                msg = (
+                    f"Order {order_id} ({symbol}) still PENDING_CANCEL after "
+                    f"{age_hours:.1f}h — broker reports {broker_order.status}"
+                    if age_hours is not None else
+                    f"Order {order_id} ({symbol}) still PENDING_CANCEL — broker reports "
+                    f"{broker_order.status}"
+                )
+                if age_hours is not None and age_hours >= _PENDING_CANCEL_MAX_AGE_HOURS:
+                    logger.error(
+                        f"{msg}. Past the {_PENDING_CANCEL_MAX_AGE_HOURS}h limit: the cancel "
+                        f"never took, so the order is NOT pending cancel — adopting the "
+                        f"broker's own status. It is a WORKING order and must be treated as one")
+                    if self._write_pending_cancel_result(order_id, broker_order.status, broker_order):
+                        resolved_count += 1
+                elif age_hours is not None and age_hours >= _PENDING_CANCEL_WARN_AGE_HOURS:
+                    logger.warning(msg)
+                else:
+                    logger.debug(msg)
+            except Exception as e:
+                logger.error(
+                    f"Error reconciling PENDING_CANCEL order {order_id}: {e}", exc_info=True)
+
+        return resolved_count
+
+    def _write_pending_cancel_result(self, order_id: int, new_status, broker_order) -> bool:
+        """Persist the broker's answer onto a PENDING_CANCEL order. Returns True if written.
+
+        Copies any execution the cancel raced (``filled_qty`` / ``open_price``) and folds a
+        partial fill back into its transaction, exactly as the list path does — a cancel
+        that lost the race to a fill leaves real shares behind.
+        """
+        fresh = get_instance(TradingOrder, order_id)
+        if not fresh or fresh.status != OrderStatus.PENDING_CANCEL:
+            logger.debug(
+                f"Order {order_id} left PENDING_CANCEL before the direct lookup landed; "
+                f"not overwriting")
+            return False
+        fresh.status = new_status
+        if broker_order is not None:
+            if broker_order.filled_qty is not None:
+                fresh.filled_qty = float(broker_order.filled_qty)
+            if broker_order.open_price:
+                fresh.open_price = broker_order.open_price
+        update_instance(fresh)
+        # A NULL filled_qty is UNKNOWN, not zero: it means the broker's answer carried no
+        # quantity, so there is nothing to reconcile and nothing to assume either.
+        filled = fresh.filled_qty
+        if (fresh.status == OrderStatus.CANCELED
+                and filled is not None and float(filled) > 0):
+            from ba2_trade_platform.core.TransactionHelper import TransactionHelper
+            TransactionHelper.reconcile_canceled_partial_fill(fresh)
+        return True
+
+    @staticmethod
+    def _order_age_hours(created_at) -> Optional[float]:
+        """Hours since ``created_at``, or None when it is missing.
+
+        A missing timestamp must never read as age 0 (silently disabling an expiry) nor as
+        infinitely old (expiring a fresh order); callers skip the age checks on None. Same
+        contract as ``TradeManager._washtrade_lock_age_hours``.
+        """
+        if not created_at:
+            return None
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created_at).total_seconds() / 3600.0
+
     def refresh_orders(self, heuristic_mapping: bool = False, fetch_all: bool = True) -> bool:
         """
         Refresh/synchronize account orders from Alpaca broker.
@@ -2877,6 +3239,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
             if not raw_alpaca_orders:
                 logger.warning("No orders returned from Alpaca during refresh")
+                # The listing answered NOTHING, so every PENDING_CANCEL is unresolved and
+                # the budgeted by-id pass is the only thing that can end their wait. It is
+                # capped, so an empty/failed listing cannot turn this into a flood.
+                self._reconcile_pending_cancel_orders(listed_broker_ids=())
                 return True
 
             updated_count = 0
@@ -3199,6 +3565,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                 fresh_order.status = OrderStatus.CANCELED
                                 update_instance(fresh_order)
                                 canceled_count += 1
+
+            # Step 4b: Any PENDING_CANCEL the listing did NOT mention is stuck — the list
+            # can never end its wait, because being absent from the list is exactly why it
+            # is stuck (OCO legs are never listed separately; old orders fall out of the
+            # window). Ask the broker about those, and ONLY those, by id. Everything the
+            # listing did mention was already resolved for free in Step 3 above, so a
+            # healthy account issues zero calls here. Budgeted; see the method.
+            #
+            # Runs BEFORE Step 5 so a newly confirmed CANCELED can trigger its dependent
+            # replacement in this same pass.
+            self._reconcile_pending_cancel_orders(
+                listed_broker_ids={str(o.id) for o in raw_alpaca_orders if o.id})
 
             # Step 5: Check for dependent orders that can now be submitted
             triggered_count = self._check_and_submit_dependent_orders()
@@ -5652,21 +6030,34 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     # ======================================================================
     # OptionsAccountInterface — market data (chain / quote / ATM-IV)
     # ======================================================================
-    def _get_option_data_client(self):
-        """Lazily create & cache an OptionHistoricalDataClient.
+    def _get_option_data_client_raw(self):
+        """Lazily create & cache a ``raw_data=True`` OptionHistoricalDataClient.
 
-        Uses getattr so that a pre-set/monkeypatched ``self._option_data_client``
-        (e.g. in tests) is honored instead of being overwritten.
+        The chain and quote read snapshots through this client because the SDK's typed
+        ``OptionsSnapshot`` drops ``dailyBar``/``prevDailyBar`` (see
+        ``parse_alpaca_option_snapshot``); it is the account's only option market-data client.
+        A pre-set/monkeypatched ``self._option_data_client_raw`` is honored.
         """
-        client = getattr(self, "_option_data_client", None)
+        client = getattr(self, "_option_data_client_raw", None)
         if client is None:
             from alpaca.data.historical.option import OptionHistoricalDataClient
             client = OptionHistoricalDataClient(
                 api_key=self.settings["api_key"],
                 secret_key=self.settings["api_secret"],
+                raw_data=True,
             )
-            self._option_data_client = client
+            self._option_data_client_raw = client
         return client
+
+    def _option_data_session(self):
+        """The completed session a live option read takes its VOLUME from:
+        ``decision_data_session(self.decision_label())`` -- the label of the live decision
+        instant (``OptionsAccountInterface.decision_label``, the same clock the action's DTE
+        window uses), and ``prior_session_v1``: the regular session before that New York
+        date, even after today's close. A backtest bar D reads D, and bar D is the live
+        decision made during the next session -- the same bar either way."""
+        from ba2_common.core.market_calendar import decision_data_session
+        return decision_data_session(self.decision_label())
 
     def _options_feed(self):
         """Return the OptionsFeed to use. Defaults to INDICATIVE unless an OPRA
@@ -5794,13 +6185,23 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """Return option-chain rows (quote + Greeks + liquidity) for the underlying
         within the given expiry / strike / type filters.
 
-        Joins live snapshot data (OptionHistoricalDataClient.get_option_chain) with
-        contract metadata (TradingClient.get_option_contracts) on the OCC symbol.
+        Joins live snapshot data (the RAW OptionHistoricalDataClient.get_option_chain, parsed
+        by ``parse_alpaca_option_snapshot``) with contract metadata
+        (TradingClient.get_option_contracts) on the OCC symbol. The raw client returns ONE
+        dict keyed by OCC symbol: the SDK's ``_get_marketdata`` follows ``next_page_token``
+        and merges every page's ``snapshots`` itself.
+
+        ``volume`` is what the contract traded in the decision's data session
+        (``_option_data_session``, computed ONCE per call; ``option_session.session_volume``
+        of the snapshot's daily bars): the same session a backtest bar reads (BT/live
+        option parity B3). A contract whose snapshot is MALFORMED is excluded with an ERROR
+        naming it (plus one summary line per call); the rest of the chain is kept.
 
         Contracts whose DELIVERABLE is not the standard 100 shares are dropped — see
         ``_is_standard_deliverable`` (OPT-L7).
         """
         from alpaca.data.requests import OptionChainRequest
+        from ba2_common.core.option_session import session_volume
         from ...core.option_types import OptionContract
         from ...core.types import OptionRight
 
@@ -5816,13 +6217,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             expiration_date_lte=expiry_max,
         )
 
-        snapshots = self._get_option_data_client().get_option_chain(request) or {}
+        data_session = self._option_data_session()
+        snapshots = self._get_option_data_client_raw().get_option_chain(request) or {}
         meta_by_symbol = self._get_option_contracts_meta(
             underlying, expiry_min, expiry_max,
             option_type=option_type, strike_min=strike_min, strike_max=strike_max,
         )
 
         chain: List[OptionContract] = []
+        excluded: List[str] = []
         for occ_symbol, snapshot in snapshots.items():
             meta = meta_by_symbol.get(occ_symbol)
             if meta is None:
@@ -5881,21 +6284,20 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 except (TypeError, ValueError):
                     open_interest = None
 
-            # --- Snapshot quote / trade / greeks (guard every field) ---
-            quote = getattr(snapshot, "latest_quote", None)
-            bid = getattr(quote, "bid_price", None) if quote is not None else None
-            ask = getattr(quote, "ask_price", None) if quote is not None else None
-
-            trade = getattr(snapshot, "latest_trade", None)
-            last = getattr(trade, "price", None) if trade is not None else None
-
-            iv = getattr(snapshot, "implied_volatility", None)
-
-            greeks = getattr(snapshot, "greeks", None)
-            delta = getattr(greeks, "delta", None) if greeks is not None else None
-            gamma = getattr(greeks, "gamma", None) if greeks is not None else None
-            theta = getattr(greeks, "theta", None) if greeks is not None else None
-            vega = getattr(greeks, "vega", None) if greeks is not None else None
+            # --- Snapshot quote / trade / greeks / session volume ---
+            # A MALFORMED snapshot (a present bar without t/v, a zoneless timestamp, a
+            # non-count volume on the session's bar) excludes THAT contract, loudly -- one bad
+            # row must not take the whole underlying's chain down with it. Never a default:
+            # the contract is absent, not priced or sized from a guess.
+            try:
+                snap = parse_alpaca_option_snapshot(snapshot)
+                volume = session_volume(snap["bars"], data_session)
+            except (ValueError, TypeError) as e:
+                excluded.append(occ_symbol)
+                logger.error(
+                    f"Excluding option contract {occ_symbol} from the {underlying} chain: "
+                    f"its Alpaca snapshot is malformed ({e}).")
+                continue
 
             chain.append(OptionContract(
                 symbol=occ_symbol,
@@ -5903,62 +6305,79 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 option_type=row_type,
                 strike=strike,
                 expiry=expiry,
-                bid=bid,
-                ask=ask,
-                last=last,
-                implied_volatility=iv,
-                delta=delta,
-                gamma=gamma,
-                theta=theta,
-                vega=vega,
+                bid=snap["bid"],
+                ask=snap["ask"],
+                last=snap["last"],
+                implied_volatility=snap["iv"],
+                delta=snap["delta"],
+                gamma=snap["gamma"],
+                theta=snap["theta"],
+                vega=snap["vega"],
                 open_interest=open_interest,
+                volume=volume,
+                rho=snap["rho"],
+                quote_time=snap["quote_time"],
+                greeks_source=self.OPTION_GREEKS_SOURCE,
             ))
 
+        if excluded:
+            logger.error(
+                f"{underlying} option chain: excluded {len(excluded)} of {len(snapshots)} "
+                f"contract(s) with a malformed Alpaca snapshot "
+                f"(data session {data_session}): {', '.join(excluded[:10])}"
+                f"{' ...' if len(excluded) > 10 else ''}")
         return chain
 
     @alpaca_api_retry
     def get_option_quote(self, contract_symbol: str) -> Optional[Any]:
         """Return the latest quote + Greeks for a single OCC option contract, or
-        None if no snapshot is available."""
+        None if no snapshot is available.
+
+        Read from the RAW snapshot like ``get_option_chain`` (the typed SDK model drops the
+        daily bars), so the quote carries the data session's ``volume`` and ``rho`` too.
+
+        ONLY THE VOLUME DEGRADES. Closes price off this quote (``CloseOptionAction``, the
+        exit seams), so a malformed daily bar -- or a market calendar that cannot answer the
+        data session -- must not fail a live close: it is logged at ERROR naming the contract
+        and the defect, and the quote is returned with ``volume=None`` (MISSING, never 0) and
+        its bid/ask/greeks intact. A malformed QUOTE itself (not an object, a zoneless quote
+        or trade time) still raises: that is the price the close would be sent at."""
         from alpaca.data.requests import OptionSnapshotRequest
+        from ba2_common.core.market_calendar import MarketCalendarUnavailable
+        from ba2_common.core.option_session import session_volume
         from ...core.option_types import OptionQuote
 
         request = OptionSnapshotRequest(
             symbol_or_symbols=contract_symbol,
             feed=self._options_feed(),
         )
-        snapshots = self._get_option_data_client().get_option_snapshot(request) or {}
+        snapshots = self._get_option_data_client_raw().get_option_snapshot(request) or {}
         snapshot = snapshots.get(contract_symbol)
         if snapshot is None:
             return None
 
-        quote = getattr(snapshot, "latest_quote", None)
-        bid = getattr(quote, "bid_price", None) if quote is not None else None
-        ask = getattr(quote, "ask_price", None) if quote is not None else None
-        timestamp = getattr(quote, "timestamp", None) if quote is not None else None
-
-        trade = getattr(snapshot, "latest_trade", None)
-        last = getattr(trade, "price", None) if trade is not None else None
-
-        iv = getattr(snapshot, "implied_volatility", None)
-
-        greeks = getattr(snapshot, "greeks", None)
-        delta = getattr(greeks, "delta", None) if greeks is not None else None
-        gamma = getattr(greeks, "gamma", None) if greeks is not None else None
-        theta = getattr(greeks, "theta", None) if greeks is not None else None
-        vega = getattr(greeks, "vega", None) if greeks is not None else None
-
+        snap = parse_alpaca_option_quote_fields(snapshot)
+        try:
+            volume = session_volume(parse_alpaca_option_bars(snapshot),
+                                    self._option_data_session())
+        except (ValueError, TypeError, MarketCalendarUnavailable) as e:
+            logger.error(
+                f"Option quote for {contract_symbol}: its session volume is unavailable "
+                f"({type(e).__name__}: {e}); returning the quote with volume=None.")
+            volume = None
         return OptionQuote(
             symbol=contract_symbol,
-            bid=bid,
-            ask=ask,
-            last=last,
-            implied_volatility=iv,
-            delta=delta,
-            gamma=gamma,
-            theta=theta,
-            vega=vega,
-            timestamp=timestamp,
+            bid=snap["bid"],
+            ask=snap["ask"],
+            last=snap["last"],
+            implied_volatility=snap["iv"],
+            delta=snap["delta"],
+            gamma=snap["gamma"],
+            theta=snap["theta"],
+            vega=snap["vega"],
+            timestamp=snap["quote_time"],
+            rho=snap["rho"],
+            volume=volume,
         )
 
     def get_atm_implied_volatility(self, underlying: str) -> Optional[float]:
@@ -6384,8 +6803,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
           ``_find_open_equity_long``); close the short-call option Transaction
           (close_reason="assigned"). If no equity long is found, record result
           "called_away_no_long" (still closes the option leg).
-        - OPEXP (expiry): close the option Transaction (close_reason="expired",
+        - OPEXP (expiry): close the option Transaction (close_reason="expired_otm",
           close_price=0.0).
+
+        Every option ``close_reason`` above is an ``OptionCloseReason`` value -- the SAME
+        vocabulary the backtest's expiry settlement writes (BT/live option parity, plan Part
+        C3) -- and each settled leg's synthetic closing order carries it as the ``trigger`` of
+        its ``exit_record`` (``_record_option_settlement_order``).
         - OPEXC (exercise): close the option Transaction (close_reason=
           "exercised"). Equity-leg reconciliation is best-effort/logged for now.
         - Anything else (e.g. OPCSH) or any malformed/unmappable activity:
@@ -6524,8 +6948,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         the Transaction ledger. Returns a result string. Raises on truly
         unexpected errors (caught by the caller). Returns an "unhandled: ..."
         string for expected-but-unmappable inputs (malformed symbol, etc.)."""
-        from ...core.types import (AssetClass, OptionRight, OrderDirection, TransactionStatus,
-                                   TXN_ORIGIN_CSP_ASSIGNMENT)
+        from ...core.types import (AssetClass, OptionCloseReason, OptionRight, OrderDirection,
+                                   TransactionStatus, TXN_ORIGIN_CSP_ASSIGNMENT)
 
         # NOT ``qty if qty is not None else 0.0``. A missing quantity is not an
         # assignment of nothing — see the OPASN guard below, which refuses BEFORE any
@@ -6601,7 +7025,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     origin=TXN_ORIGIN_CSP_ASSIGNMENT)
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="assigned", activity_id=activity_id,
+                    close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed short put txn",
                     open_note="settled the short put LEG; structure still OPEN")
@@ -6615,7 +7039,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 held = self._find_open_equity_long(underlying, expert_id)
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="assigned", activity_id=activity_id,
+                    close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed short call txn",
                     open_note="settled the short call LEG; structure still OPEN")
@@ -6640,7 +7064,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if opt_txn is not None:
                 return "expired: " + self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="expired", close_price=0.0, activity_id=activity_id,
+                    close_reason=OptionCloseReason.EXPIRED_OTM.value, close_price=0.0,
+                    activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed option txn",
                     open_note="settled the expiring LEG; structure still OPEN")
@@ -6652,7 +7077,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # Equity-leg handling for exercise is best-effort/minimal for now.
                 return "exercised: " + self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
-                    close_reason="exercised", activity_id=activity_id,
+                    close_reason=OptionCloseReason.EXERCISED.value, activity_id=activity_id,
                     underlying=underlying, right=right, strike=strike, expiry=expiry,
                     closed_note="closed option txn (equity leg not reconciled)",
                     open_note=("settled the exercised LEG; structure still OPEN "
@@ -6755,7 +7180,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                                      else -settled)
 
         if every_option_contract_is_flat(contract_net):
-            self._close_txn(opt_txn, close_reason=close_reason, close_price=close_price)
+            # WHICH settlement names the structure: the most consequential one recorded on it
+            # (assigned > exercised > expired_otm, ``settlement_close_reason``) -- the SAME rule
+            # the backtest's expiry settlement applies, so the reason does not depend on the
+            # order the OCC happens to report the legs in. A single leg closes under its own.
+            from ba2_common.core.option_trade_record import (
+                SETTLEMENT_CLOSE_PRECEDENCE, settlement_close_reason)
+            settled = {r.value for r in SETTLEMENT_CLOSE_PRECEDENCE}
+            earlier = [((o.data or {}).get("exit_record") or {}).get("trigger")
+                       for o in orders if o.open_type == OrderOpenType.EXTERNAL]
+            reason = settlement_close_reason(
+                [close_reason] + [t for t in earlier if t in settled])
+            self._close_txn(opt_txn, close_reason=reason, close_price=close_price)
             return closed_note
 
         still_open = sorted(c for c, v in contract_net.items()
@@ -6798,7 +7234,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         raised — one bad row must not abort the reconcile batch).
         """
         from ...core.interfaces.OptionsAccountInterface import DEFAULT_OPTION_MULTIPLIER
+        from ba2_common.core.option_trade_record import (
+            OPTION_TRADE_RECORD_VERSION, exit_record as option_exit_record)
 
+        # WHY the leg closed, in the shared record shape (plan Part C3): the OCC event is the
+        # trigger; a settlement prices from no quote, so the leg is named, not snapshotted.
+        # A reason outside OptionCloseReason is a caller bug: logged and recorded as an error,
+        # never allowed to stop the settlement row (the ledger matters more than the label).
+        try:
+            record = option_exit_record(close_reason, legs_without_quote=[contract])
+        except ValueError as e:
+            logger.error(f"[Account {self.id}] settlement of {contract}: {e}")
+            record = {"version": OPTION_TRADE_RECORD_VERSION, "trigger": None,
+                      "error": f"ValueError: {e}"}
         try:
             return add_instance(TradingOrder(
                 account_id=self.id,
@@ -6824,6 +7272,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                          f"(activity {activity_id}) — synthetic fill, no broker order "
                          f"exists"),
                 created_at=datetime.now(timezone.utc),
+                data={"exit_record": record},
             ))
         except Exception as e:
             logger.error(

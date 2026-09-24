@@ -1,31 +1,59 @@
 # BA2 Trade Platform
 
-A self-contained Python monorepo for algorithmic trading, shipping **two platforms** over three shared installable packages (`ba2_common` / `ba2_providers` / `ba2_experts`):
+A self-contained Python monorepo for algorithmic trading, shipping **two applications** over three shared installable packages (`ba2_common` / `ba2_providers` / `ba2_experts`):
 
-- **ba2-trade** (repo root) — the live trader: NiceGUI web app running the expert fleet against a real/paper broker (Alpaca, TastyTrade, IBKR), with ruleset-driven trade actions (equity **and** options), risk management, order execution and performance analytics.
-- **ba2-test** (`testplatform/`, aka **BA2ML**) — the backtest & ML platform: FastAPI + React app for dataset building, genetic-algorithm strategy optimization, deep-learning forecasting (12 PyTorch architectures) and point-in-time screening.
+- **ba2-trade** (repo root) — the live trader: a NiceGUI web app that runs a fleet of market experts against broker accounts (Alpaca for equities and options, TastyTrade for equities), with ruleset-driven trade actions, classic or AI risk management, order execution, manual portfolio allocation and performance analytics.
+- **ba2-test** (`testplatform/`) — the backtesting & optimization platform: a FastAPI + React app that backtests the experts day by day, searches their settings, rulesets and exits with a genetic algorithm (optionally across remote workers), stress-tests the winners and hands them to the live platform. It also carries a deep-learning forecasting module. See [testplatform/README.md](testplatform/README.md).
 
 Both apps run the *same* expert/provider code, which is what makes a backtest predictive of live behaviour.
 
-## � Screenshots
+## 📸 Screenshots
 
-### Dashboard Overview
+### Dashboard
+Analysis jobs, recommendations, orders per account and trade performance at a glance.
+
 ![Dashboard Overview](docs/screenshots/overview.png)
-*Main dashboard showing account summary and position overview*
 
-### AI Analysis Details
+### Performance analytics
+P&L, win rate and per-expert breakdowns over a chosen period.
+
+![Performance](docs/screenshots/performance.png)
+
+### Market analysis jobs
+Every expert run per symbol, with its status, recommendation, confidence and expected profit.
+
+![Market Analysis](docs/screenshots/market_analysis.png)
+
+### Analysis detail
+What an expert saw and why it decided: here the Deterministic Multi-Section Scorer's section
+scores behind a BUY.
+
 ![Analysis Details](docs/screenshots/analysis_detail.png)
-*Multi-agent AI analysis with detailed recommendations and technical indicators*
 
-### Trade Recommendations
-![Trade Recommendations](docs/screenshots/order_recommendations.png)
-*AI-generated trading recommendations with confidence levels and action items*
+### Trade recommendations
+Recommendations summarised by symbol, with the orders they produced; process them and run the
+risk manager from here.
 
-### Recommendation History
-![Recommendation History](docs/screenshots/recommendation_history.png)
-*Historical view of all generated recommendations and their performance*
+![Trade Recommendations](docs/screenshots/trade_recommendations.png)
 
-## �🚧 ALPHA SOFTWARE - UNSTABLE
+### Rules
+Rules combine triggers (conditions) with actions; rulesets order them per expert.
+
+![Rule Editor](docs/screenshots/rule_editor.png)
+
+### Trigger picker
+Triggers are grouped by category (position, signal, targets, options, market, timing) and
+searchable. Market-condition triggers say which profile the expert needs to use them.
+
+![Trigger Picker](docs/screenshots/trigger_picker.png)
+
+### Backtesting platform
+The backtesting and GA-optimization platform; see the
+[test platform README](testplatform/README.md) for more screenshots.
+
+![Backtest result](testplatform/docs/screenshots/08-backtest-result.png)
+
+## 🚧 ALPHA SOFTWARE - UNSTABLE
 
 **⚠️ THIS PROJECT IS CURRENTLY IN ALPHA STAGE AND CONSIDERED UNSTABLE ⚠️**
 
@@ -66,14 +94,83 @@ By using this software, you acknowledge that you understand and accept these ris
 ## 🚀 Features
 
 ### Core Platform
-- **Plugin Architecture**: Extensible system for trading accounts and market experts
+- **Plugin Architecture**: brokers implement `AccountInterface` (plus `OptionsAccountInterface` for
+  options), experts implement `MarketExpertInterface`; both declare their settings through
+  `ExtendableSettingsInterface` and are configured from the web UI
 - **Shared package split** (see the intro): `ba2_common` holds models/DB/interfaces/types/position
-  sizing, `ba2_providers` the market-data providers, screener and caches, `ba2_experts` the expert
-  implementations — so an expert is written once and runs identically live and in backtest.
-- **SQLModel ORM**: Modern database layer with SQLite backend, Alembic migrations
-- **NiceGUI Web Interface**: Clean, responsive web UI for configuration and monitoring
-- **Extensible Settings**: Flexible configuration system for all plugins
-- **Centralized Logging**: Comprehensive logging with file rotation and colored output
+  sizing/rule evaluation, `ba2_providers` the market-data providers, screener and caches, `ba2_experts`
+  the expert implementations — so an expert is written once and runs identically live and in backtest.
+- **SQLModel ORM**: SQLite backend with Alembic migrations (`migrate.py`)
+- **NiceGUI Web Interface**: configuration and monitoring UI, with a responsive layout for phones
+- **Scheduling & Parallelism**: `JobManager` (APScheduler) runs weekly or monthly expert schedules;
+  `WorkerQueue` analyses symbols in parallel and persists queued tasks so they resume after a restart
+- **Instrument Selection**: static lists, AI-selected, expert-selected, or a configurable stock
+  screener ([EXPERTS.md](EXPERTS.md#instrument-selection-methods))
+- **Centralized Logging**: rotating app/debug/error logs plus one log file per expert instance
+
+### Rules & Trade Automation
+- **Rulesets**: each expert instance links an *enter-market* ruleset and an *open-positions* ruleset.
+  A rule (`EventAction`) pairs trigger conditions with actions; `TradeActionEvaluator` evaluates the
+  ruleset's rules in order against each new recommendation or open position
+- **Actions**: buy, sell, close, adjust take-profit / stop-loss, increase / decrease instrument share,
+  stop processing, and the option actions listed below
+- **Trigger picker**: the rule editor groups triggers into position, signal, targets, options, market
+  and timing categories; the **Ruleset Test** page evaluates a ruleset without trading
+- **Market-condition gates**: set an expert's `market_condition_profile` (`ohlcv-v1`,
+  `ta-structure-v1`) and its rules can gate on that profile's fields, numerically or categorically.
+  A rule using a market field while the expert serves no profile is refused at save/import
+- **Import/Export**: rules, rulesets and expert settings (single expert or batch)
+- **Semi-automatic or automatic**: an expert only opens or modifies positions by itself when
+  `allow_automated_trade_opening` / `allow_automated_trade_modification` are enabled (both default
+  to off); otherwise recommendations are processed from the UI
+
+### Options Trading
+- **Option actions**: long call / put, bull and bear call / put spreads, covered call, protective put,
+  cash-secured put, long and short straddle / strangle, iron condor, jade lizard, call butterfly, put
+  ratio spread, call / put backspread, poor man's covered call (open and roll), close option
+- **Entry-option path**: a ruleset can open an option structure with no equity leg
+- **Broker**: Alpaca implements `OptionsAccountInterface`; the Live Trades page has an **Options** tab
+  with structure detail and a payoff chart
+- **Option risk rails**: `risk_manager_mode: classic_options` gates every option entry with sleeve
+  rails (max deployment, notional leverage, undefined-risk cap, max concurrent structures,
+  one-per-underlying, assignment capacity) and a drawdown circuit breaker, identically in live and in
+  backtests
+- **Historical option data** for backtests: Alpaca, ThetaData (requires a locally running Theta
+  Terminal) and TastyTrade providers; historical implied volatility / greeks are computed with
+  Black-Scholes
+
+### Risk Management & Position Sizing
+- **Classic risk manager** (`risk_manager_mode: classic`, the default): ranks and sizes
+  recommendations using the expert's rules and sizing settings; every run is recorded (ranking inputs,
+  capital mapping, per-order sizing) and shown in the UI
+- **Smart Risk Manager** (`smart`): a LangGraph agent that manages the expert's portfolio with the
+  configured `risk_manager_model`; each job has a detail page
+- **Virtual Equity**: each expert instance works with a `virtual_equity_pct` share of the account,
+  with per-instrument caps (`max_virtual_equity_per_instrument_percent`)
+- **Stops**: optional ATR-based stop sizing (`use_atr_stop`); account refresh force-closes a position
+  whose stop was breached without filling (market hours only)
+- **Margin**: per-account `margin_enabled` / `margin_factor` (default 1.8, minimum 1.0) let experts
+  size against balance × factor, never above the broker's own buying power
+
+### Portfolio Allocation (manually traded accounts)
+- Enabled per account with the *Manually traded account* setting; refuses to run on an account with
+  an enabled expert
+- Group holdings by instrument label, set each label's portfolio target, each symbol's share of its
+  label and a cash reserve
+- **Review and Submit** builds a dry-run rebalance plan (sells first, then buys), supports fractional
+  shares, checks market hours and broker buying power, and records every run
+- Dividend / cash income ledger for reinvesting into a label; cost or market valuation per account
+
+### Monitoring & Analytics
+- **Overview**: account overview, account growth (in $ or %), performance analytics, LLM usage, and
+  provider billing / credits for configured LLM keys
+- **Live Trades**: Stocks and Options tabs; the current price is highlighted near a TP/SL leg
+- **Activity Monitor**: filterable log of transactions, TP/SL changes, risk-manager runs and analyses
+- **Market Analysis**: job monitoring, manual analysis, scheduled jobs (startable on demand) and
+  trade recommendations; per-analysis detail pages, per-symbol history and PDF export
+- **Tools**: SYMBOL360 symbol dashboard, FMP Senate trades, analyst ratings, penny screener
+- **Live capture / replay** (off by default, `replay_capture_enabled` app setting): records the inputs
+  of every live expert analysis so it can be replayed offline and compared with a backtest
 
 ### Backtesting & Strategy Optimization (`ba2-test`)
 - **Event-driven backtest engine**: daily and 5-minute bars, point-in-time data only, hermetic runs
@@ -90,1012 +187,541 @@ By using this software, you acknowledge that you understand and accept these ris
   (Alpaca SIP quotes), with an optional widening stress applied on top
 - **Screener metric store**: precomputed cap-band/factor metrics so a genome's universe is
   selected point-in-time, per day, without re-scanning the market
-
+- **Option strategy grids** and **market-condition genes**, evaluated by the same rule code as live
 
 ### AI Trading Agents
-- **Multiple Expert Support**: Extensible plugin architecture supporting multiple expert types ([see EXPERTS.md](EXPERTS.md) for complete list)
-- **Parallel Market Analysis**: Simultaneous analysis across multiple symbols for efficient processing
-- **Multi-Agent Analysis**: Market, news, fundamentals, social media, and macro-economic analysts
-- **TradingAgents Integration**: Advanced multi-agent LLM framework for financial trading
-- **Government Trading Data**: FMP Senate/House trading analysis with both weighted algorithms and simple copy trading
-- **Analyst Consensus**: Finnhub and FMP analyst rating aggregation and price target analysis
-- **FRED API Integration**: Real-time macroeconomic data analysis
-- **Debate-Based Decision Making**: Bull vs bear researcher debates with research manager oversight
-- **Risk Management**: Multi-layered risk analysis and management
+- **TradingAgents**: multi-agent LLM framework — market, news, fundamentals, social media and macro
+  analysts; bull/bear researcher debate with a research manager; a trader; an aggressive /
+  conservative / neutral risk debate with a risk manager
+- **Deterministic compute**: `finance_calc` risk statistics and valuation snapshots (DCF, WACC) are
+  injected into the analysts' context
+- **LLM providers**: OpenAI, Anthropic, Google, xAI, DeepSeek, Moonshot (Kimi), OpenRouter, NagaAI
+  and AWS Bedrock, selectable per expert
+- **LLM-free experts**: most experts (ratings, Senate/House, insider, earnings, FactorRanker,
+  DeterministicScorer) need no LLM at all — see the table below
 
-### Trading Modes & Risk Management
-- **Semi-Automatic Trading**: Human approval required for trade execution
-- **Full Automatic Trading**: Autonomous trading based on AI recommendations
-- **Virtual Equity Management**: Split account balance across multiple experts to limit individual risk
-- **Expert-Level Risk Controls**: Configurable risk limits per expert instance
-- **Portfolio Diversification**: Automatic allocation management across different strategies
+### Market Data Providers (`ba2_providers`)
 
-### Market Data & APIs
-- **Multiple Data Sources**: Alpaca, Finnhub, SimFin, Yahoo Finance, FRED
-- **Real-Time & Historical Data**: Comprehensive market data coverage
-- **Economic Indicators**: Inflation, employment, treasury yields, economic calendar
-- **Social Sentiment**: Reddit and social media sentiment analysis
+| Category | Providers |
+|----------|-----------|
+| OHLCV | Yahoo Finance, Alpha Vantage, Alpaca, FMP, EODHD, Polygon |
+| Fundamentals | FMP, Alpha Vantage, Yahoo Finance |
+| News | Alpaca, Alpha Vantage, Google News, FMP, Finnhub, local files |
+| Macro / Insider | FRED / FMP |
+| Social sentiment | StockTwits |
+| Screener | FMP (live and historical) |
+| Indicators | local pandas calculation, Alpha Vantage |
+| Options history | Alpaca, ThetaData, TastyTrade |
+| Compute (offline) | `finance_calc` risk stats and valuation |
 
-### Trading Features
-- **Multi-Expert Support**: Run multiple AI experts simultaneously with individual risk management
-- **Parallel Symbol Analysis**: Analyze multiple instruments concurrently for faster decision-making
-- **Automated Trade Execution**: Semi-automatic (manual approval) or fully automatic trading modes
-- **Virtual Account Splitting**: Allocate portions of your account to different experts to limit exposure
-- **Risk-Based Position Sizing**: Dynamic position sizing based on expert confidence and risk assessment
-- **Expert Performance Tracking**: Monitor and compare performance across different expert strategies
-- **Options Strategies**: equity actions plus an entry-option path (rulesets can fire an option action with no equity leg) — long calls/puts, covered calls, credit/debit spreads, short straddle/strangle, iron condor, jade lizard, call butterfly, put ratio spread; GA-optimizable (`option_wing_width` gene + per-strategy grids), validated against real Alpaca options cache data
+The LLM-backed news, company-overview and social-sentiment providers (`AINewsProvider`,
+`AICompanyOverviewProvider`, `AISocialMediaSentiment`) stay in-tree under
+`ba2_trade_platform/modules/dataproviders/`.
 
 ### Account Providers
-- **Alpaca**: Paper and live trading, equities + options (the primary, most exercised broker)
-- **TastyTrade**: Options-oriented broker integration
-- **Interactive Brokers (IBKR)**: Broker integration
-- **Extensible Architecture**: Easy addition of new brokers via `AccountInterface`
+
+| Broker | Status |
+|--------|--------|
+| **Alpaca** | Paper and live; equities and options; TP/SL as limit, stop or OCO exit orders. The primary, most exercised broker |
+| **TastyTrade** | Equities: market / limit / stop / stop-limit orders, cancellation, order and position refresh, account snapshot. No TP/SL legs, order modification or options trading |
+| **Interactive Brokers (IBKR)** | Present, but trading is disabled (`submit_order` raises `NotImplementedError` pending a rework) |
+
+New brokers are added by implementing `AccountInterface` and registering the class in
+`ba2_trade_platform/modules/accounts/__init__.py`.
 
 ## 🤖 Available Trading Experts
 
-The platform includes multiple AI trading experts with different strategies and capabilities:
+The live expert registry (`ba2_trade_platform/modules/experts/__init__.py`):
 
 | Expert | Description | Data Sources | Special Features |
 |--------|-------------|--------------|------------------|
-| **TradingAgents** | Multi-agent AI system with debate-based analysis | Market data, news, fundamentals | Complex AI analysis, agent debates |
+| **TradingAgents** | Multi-agent AI system with debate-based analysis | Market data, news, fundamentals, social, macro | LLM analyst team, bull/bear and risk debates (in-tree, live-only) |
 | **FinnHubRating** | Analyst consensus tracker | Finnhub analyst ratings | Weighted consensus scoring |
-| **FMPRating** | Price target analyzer | FMP analyst data | Profit potential calculation |
-| **FMPSenateTraderWeight** | Government trading tracker (sophisticated) | FMP Senate/House data | Portfolio allocation analysis |
+| **FMPRating** | Price target analyzer | FMP analyst data | Profit potential calculation, rating-recency filter |
+| **FMPSenateTraderWeight** | Government trading tracker (sophisticated) | FMP Senate/House data | Trader-skill scoring, portfolio allocation analysis |
 | **FMPSenateTraderCopy** | Government trading tracker (simple copy) | FMP Senate/House data | 100% confidence copy trading, can recommend instruments |
 | **FMPInsiderClusterBuy** | Insider cluster-buy detector — BUY when several insiders bought recently | FMP insider transactions | Cluster/recency windows, min distinct insiders (no large-cap data: small/mid only) |
 | **FMPEarningsDrift** | Post-earnings-announcement drift — BUY fresh EPS beats, time-boxed hold | FMP earnings surprises | Surprise threshold, freshness window, forced time exit (small/mid only) |
-| **PennyMomentumTrader** | Live intraday penny-stock momentum trader | Market data, screener, social/news catalysts | Self-executing live expert, screener universe, staged exits |
+| **FMPEarningsEvent** | Ranks upcoming earnings events for an earnings long-volatility option strategy | FMP earnings history, option chain | Historical earnings-day move, EPS-surprise volatility, implied-move cheapness |
+| **PennyMomentumTrader** | AI-powered intraday penny-stock momentum trader | Market data, screener, social/news catalysts | Self-executing live expert, screener universe, staged exits |
 | **FactorRanker** | Cross-sectional multi-factor equity ranker | FMP fundamentals & prices, StockScreener | momentum / value / quality / PEAD factors, static or screener universe, self-rebalancing top-N (no recommendations) |
 | **DeterministicScorer** | LLM-free multi-section scorer — reproduces a TradingAgents-style verdict with pure local math, zero LLM calls | FMP/FinnHub fundamentals, prices, ratings, FRED macro | Technical + fundamental + analyst + macro sections, `tanh`-bounded composite score, Altman-Z hard veto, fully deterministic and free to run |
 
-*PremiumSeller (systematic short-premium options income) was removed 2026-08-31 — its rails and exit lifecycle were promoted into shared code, so ANY expert can now be switched to `risk_manager_mode: classic_options` and have its option ENTRIES gated by them, with the drawdown circuit breaker transitioning identically in live and in the backtest. The exit/servicing pass is live-only by design; see EXPERTS.md §8 for what is and is not wired.*
+*`ba2_experts` also contains `ETFTrend`, a research expert the backtester can load; it is not in the
+live registry. PremiumSeller was removed on 2026-08-31 — its option rails and exit lifecycle became
+shared code, so any expert can use `risk_manager_mode: classic_options` (see
+[EXPERTS.md](EXPERTS.md) §8 for what is and is not wired).*
 
 📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)** — and the dedicated [FactorRanker guide](docs/FACTORRANKER_EXPERT.md).
 
 ## 🧱 Tech Stack
 
-- **Python 3.11+**, SQLModel/SQLAlchemy ORM on SQLite (Alembic migrations)
-- **ba2-trade UI**: NiceGUI (dashboard, analysis, recommendations, rulesets, settings)
+- **Python 3.11+** (the install scripts default to 3.12), SQLModel/SQLAlchemy ORM on SQLite (Alembic migrations)
+- **ba2-trade UI**: NiceGUI, with a few HTTP API endpoints on the same FastAPI app
 - **ba2-test**: FastAPI + Uvicorn backend; React 19 + TypeScript + Vite + Tailwind CSS frontend (lightweight-charts, recharts)
+- **LLM stack**: LangChain / LangGraph (TradingAgents, Smart Risk Manager)
 - **ML**: PyTorch — 12 forecasting architectures (LSTM, GRU, TCN, InceptionTime, ResNet, XceptionTime, OmniScale CNN, MiniRocket, PatchTST, TST, LSTM-FCN, N-BEATS), GA-tuned
-- **Optimization**: DEAP genetic algorithms (strategy rails S1–S7, distributed workers, robustness-adjusted fitness)
-- **Data providers**: Alpaca (prices/options), FMP (fundamentals, earnings, insider, Senate/House, screener), Finnhub, FRED (point-in-time macro), Yahoo Finance, ThetaData (option chains)
-- **Shared state**: `BA2_HOME` cache tree (parquet OHLCV, options history, screener metric store) + shared app-settings/API-keys DB read by both platforms
+- **Optimization**: DEAP genetic algorithms (strategy rails S1–S7, option strategy grids, distributed workers, robustness-adjusted fitness)
+- **Shared state**: one `BA2_HOME` data tree — a provider cache shared by both apps (parquet OHLCV, options history, screener metric store) plus a separate database per app
 
 ## 📋 Requirements
 
-- Python 3.11+
-- SQLite (included)
-- OpenAI API Key (or compatible LLM provider)
-- Optional: Alpaca API Key, Finnhub API Key, FRED API Key, FMP API Key
+- Python 3.11+ (3.12 recommended: the install scripts use it and the test platform's `pandas-ta` needs it)
+- SQLite (included with Python)
+- Node.js / npm for the test-platform frontend
+- An LLM API key for the LLM-based components (TradingAgents, PennyMomentumTrader, Smart Risk Manager, the AI data providers); the other experts run without one
+- A broker account: Alpaca (free paper trading) or TastyTrade
+- Data API keys as needed by your experts: FMP (most non-LLM experts and the screener), Finnhub, FRED, Alpha Vantage
+- Optional: a local Theta Terminal for ThetaData option history
 
 ## 🔑 API Keys Configuration
 
-The platform requires certain API keys to function properly. Configure all API keys through the **Settings** page at `http://localhost:8080/settings`.
+Configure API keys on the **Settings** page (`http://localhost:8080/settings`, *Global Settings* tab).
+Keys are stored in the app's SQLite database (`AppSetting` table).
 
-### 🟥 Mandatory API Keys
+### LLM providers
 
-**LLM Configuration** (Required - Choose One or Both)
+The Global Settings tab has key fields for **OpenAI, Anthropic, Google, xAI, DeepSeek, Moonshot,
+OpenRouter and NagaAI**, plus AWS credentials and region for **Amazon Bedrock**. Optional *admin* keys
+(OpenAI, Anthropic, xAI, NagaAI) let the Overview page show provider usage and billing.
 
-The platform supports both **OpenAI** and **NagaAI** for AI-driven market analysis. You must configure at least one LLM provider.
+- Models are chosen **per expert** in Expert Settings with the model selector; a model is stored as a
+  `provider/model` string, so different experts can use different providers at the same time.
+- TradingAgents has separate settings for its quick-thinking, deep-thinking and final
+  trade-recommendation models; the Smart Risk Manager uses `risk_manager_model`.
+- Configure a valid key for every provider you select before enabling an expert — an expert pointed
+  at a provider without a key fails at run time.
 
-#### Option 1: OpenAI (Standard)
-- **Purpose**: Powers all AI trading experts and analysis
-- **Used by**: TradingAgents multi-agent framework, market analysis, recommendation generation
-- **Get it**: [OpenAI API Platform](https://platform.openai.com/api-keys)
-- **Configure**: Settings → Application Settings → OpenAI API Key
+### Broker keys
 
-#### Option 2: NagaAI (Alternative Provider)
-- **Purpose**: Cost-effective alternative to OpenAI with competitive models
-- **Used by**: TradingAgents multi-agent framework, market analysis, recommendation generation
-- **Get it**: [NagaAI Platform](https://www.nagaai.com) - Sign up and create API key
-- **Configure**: Settings → Application Settings → NagaAI API Key
-- **Backend URL**: `https://api.nagaai.com/v1` (automatically configured)
+Broker credentials are configured **per account** (Settings → Account Settings → add an Alpaca or
+TastyTrade account). The application-level **Alpaca API key** (Global Settings) is used for market
+data and news.
 
-#### Switching Between Providers
+### Data keys
 
-**In Web Interface** (Recommended):
-1. Navigate to Settings → Application Settings
-2. Choose your LLM provider:
-   - Enter OpenAI API Key if using OpenAI
-   - Enter NagaAI API Key if using NagaAI
-3. Select your preferred model from the dropdown
-4. Click Save - the platform automatically uses the configured provider
-
-#### Performance Comparison
-
-| Feature | OpenAI | NagaAI |
-|---------|--------|--------|
-| **Cost** | Higher | Lower (often 50-70% cheaper) |
-| **Latency** | Very fast | Fast |
-| **Rate Limits** | Per-plan | Per-plan |
-| **Setup Time** | Immediate | Immediate |
-| **Best For** | Premium features | Budget-conscious users |
-
-#### Recommendation
-
-- **Production Trading**: Use OpenAI for reliability and latest models
-- **Testing/Development**: Use NagaAI for cost savings
-- **Hybrid Approach**: Configure both and switch based on market conditions
-
-#### Expert Settings and Model Selection
-
-- Model and provider selection for AI experts is managed per-expert in the "Expert Settings" section of the web UI (Settings → Experts or the specific expert configuration page).
-- Model names include a provider prefix so the platform can route requests to the correct backend:
-    - OpenAI models appear with the prefix `OpenAI/` (for example `OpenAI/gpt-4-turbo`)
-    - NagaAI models appear with the prefix `NagaAI/` (for example `NagaAI/claude-3-sonnet`)
-- You can also choose which provider an expert uses in the same Expert Settings UI. This is a per-expert selection — different experts may use different providers concurrently.
-- Important: It is the user's responsibility to add and configure valid API keys for any provider you select before enabling or running an expert. If an expert is configured to use a provider but no valid API key is present, the expert may receive empty responses or fail during execution.
-
-### 🟡 Conditional API Keys (Required based on configuration)
-
-**Alpaca API Keys** (Required if using Alpaca account provider)
-
-Alpaca API keys are used at two levels:
-
-1. **Application Level** (Optional - for market data/news):
-   - **Purpose**: Used by platform for real-time market prices and news data
-   - **Configure**: Settings → Application Settings → Alpaca API Key
-   - **Used by**: Market data retrieval, price feeds for analysis
-
-2. **Per-Account Level** (Required for trading):
-   - **Purpose**: Live or paper trading account credentials
-   - **Configure**: Settings → Accounts → Add Alpaca Account
-   - **Keys needed**: API Key + Secret Key for each trading account
-   - **Used by**: Order execution, position tracking, account management
-
-- **Without account-level keys**: Cannot trade through Alpaca (but can still use other trading providers or paper trading accounts)
-- **Without app-level keys**: Platform uses alternative data sources for market data; reduced real-time market data accuracy
-
-### 🟢 Optional API Keys (Enhance functionality)
-
-**Finnhub API Key** (Optional - enhances market data)
-- **Purpose**: Additional market data, news, and fundamental analysis
-- **Used by**: TradingAgents news analyst, fundamental analysis
-- **Get it**: [Finnhub API](https://finnhub.io/register)
-- **Configure**: Settings → Application Settings → Finnhub API Key
-- **Without this**: Uses alternative data sources, reduced analysis depth
-
-**FRED API Key** (Optional - enhances macro analysis)
-- **Purpose**: Federal Reserve economic data for macro analysis
-- **Used by**: TradingAgents macro analyst for economic indicators
-- **Get it**: [FRED API](https://fred.stlouisfed.org/docs/api/api_key.html)
-- **Configure**: Settings → Application Settings → FRED API Key
-- **Without this**: Macro analysis uses limited economic data
-
-**FMP API Key** (Optional - enhances fundamental data)
-- **Purpose**: Financial Modeling Prep API for company fundamentals
-- **Used by**: TradingAgents fundamental analyst for detailed financial metrics
-- **Get it**: [Financial Modeling Prep](https://financialmodelingprep.com/developer/docs)
-- **Configure**: Settings → Application Settings → FMP API Key
-- **Without this**: Limited fundamental analysis capabilities
-
-### 🔧 Configuration Methods
-
-All API keys should be configured through the **Web Interface** (Recommended):
-- Navigate to `http://localhost:8080/settings`
-- Enter API keys in respective sections (OpenAI or NagaAI)
-- Select your preferred LLM model
-- Keys are stored in local database
+| Key | Used by |
+|-----|---------|
+| **FMP** | FMPRating, Senate/House, insider and earnings experts, FactorRanker, DeterministicScorer, screener, fundamentals |
+| **Finnhub** | FinnHubRating, news |
+| **FRED** | Macro data (TradingAgents macro analyst, DeterministicScorer) |
+| **Alpha Vantage** | Optional OHLCV / fundamentals / news / indicators provider |
 
 ### 🛡️ Security Notes
 
-- API keys are stored in the local SQLite database - keep the database file secure
-- Keys are never transmitted except to their respective API endpoints
+- API keys are stored in plain text in the local SQLite database — keep the database file secure
+- The web UI and the `/api/*` endpoints have **no authentication**; only run the app on a trusted network
 - Use paper trading accounts for testing (Alpaca provides free paper trading)
-- Keep your API keys secure and never share them publicly
-- Regularly rotate API keys as a security best practice
+- Never commit keys or `.env` files; rotate keys regularly
 
 ## 🛠️ Installation
 
 ### Prerequisites
-- Python 3.11 or higher
-- Git
-- Windows/Linux/macOS
+- Python 3.11+ (3.12 recommended), Git, Node.js/npm (test-platform frontend only)
+- Windows, Linux or macOS
 
-### Step-by-Step Setup
+### 1. Clone the repository
 
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/bmigette/BA2TradePlatform.git
-   cd BA2TradePlatform
-   ```
-
-   This is a **self-contained monorepo** — the shared packages (`packages/common`,
-   `packages/providers`, `packages/experts`), the live trade app (repo root → `ba2-trade`), and the
-   backtest/optimization platform (`testplatform/` → `ba2-test`) all live here. **No external or
-   sibling repositories are required.**
-
-2. **Recommended — install script (builds both venvs from this repo)**:
-
-   The install script creates two isolated venvs under `~/ba2-venvs/{trade,test}` from the in-repo
-   `packages/` chain + each app's `requirements.txt`, and registers the `ba2-trade` / `ba2-test`
-   console commands. Everything is installed **from this repo — no other git is referenced**.
-
-   **Windows**:
-   ```powershell
-   .\install.ps1 -Editable        # -e in-repo packages for development
-   ```
-   **Linux/macOS**:
-   ```bash
-   ./install.sh --editable
-   ```
-   Useful flags: `-TradeOnly`/`-TestOnly` (`--trade-only`/`--test-only`) to build just one venv,
-   `-Ui` (`--ui`) for the NiceGUI extra, `-Upgrade` (`--upgrade`) to re-resolve deps.
-
-3. **Alternative — manual single-venv setup** (trade app only):
-
-   #### Option A: Using `uv` (⚡ RECOMMENDED - Much Faster!)
-   
-   `uv` is a blazingly fast Python package installer and resolver, written in Rust. It's **10-100x faster** than pip for installing packages.
-   
-   **Install uv** (if not already installed):
-   ```bash
-   # Windows (PowerShell)
-   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-   
-   # Linux/macOS
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
-   
-   **Create virtual environment and install dependencies**:
-   ```bash
-   # Create venv and install dependencies in one command
-   uv venv
-   uv pip install -r requirements.txt
-   ```
-   
-   **Activate the virtual environment**:
-   ```bash
-   # Windows
-   .venv\Scripts\Activate.ps1
-   
-   # Linux/macOS
-   source .venv/bin/activate
-   ```
-
-   #### Option B: Using standard `pip` (Traditional Method)
-   
-   **Create and activate virtual environment**:
-   
-   **Windows**:
-   ```powershell
-   python -m venv .venv
-   .venv\Scripts\Activate.ps1
-   ```
-   
-   **Linux/macOS**:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
-
-   **Install dependencies**:
-   ```bash
-   # Windows
-   .venv\Scripts\python.exe -m pip install -r requirements.txt
-   
-   # Linux/macOS
-   .venv/bin/python -m pip install -r requirements.txt
-   ```
-
-5. **Run the application**:
-   
-   **Windows**:
-   ```powershell
-   .venv\Scripts\python.exe main.py
-   ```
-   
-   **Linux/macOS**:
-   ```bash
-   .venv/bin/python main.py
-   ```
-
-### Command-Line Arguments
-
-The application supports command-line arguments to customize data folders and HTTP port:
-
-```bash
-python main.py [options]
-```
-
-**Available Options**:
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--db-file` | Path to the SQLite database file | `~/Documents/ba2_trade_platform/db.sqlite` |
-| `--cache-folder` | Path to the cache folder for temporary data | `~/Documents/ba2_trade_platform/cache` |
-| `--log-folder` | Path to the log folder | `./logs` |
-| `--port` | HTTP port for the web interface | `8080` |
-
-**Examples**:
-
-```bash
-# View help
-python main.py --help
-
-# Use custom database path
-python main.py --db-file /data/trading/database.sqlite
-
-# Use custom port
-python main.py --port 9090
-
-# Combine multiple options
-python main.py --db-file /data/trading.db --cache-folder /tmp/cache --log-folder /var/log/ba2 --port 3000
-
-# Development setup (separate database)
-python main.py --db-file ./dev_database.sqlite --port 8081
-
-# Production setup
-python main.py --db-file /opt/ba2/production.db --cache-folder /opt/ba2/cache --log-folder /var/log/ba2 --port 80
-```
-
-**Notes**:
-- All folder paths are created automatically if they don't exist
-- The database file's parent directory is also created automatically
-- Arguments are parsed before any system initialization occurs
-- The `--help` option shows all available options without starting the application
-
-6. **Access the web interface**:
-   
-   Open your browser and navigate to:
-   ```
-   http://localhost:8080
-   ```
-
-### First-Time Configuration
-
-After starting the application:
-
-1. **Navigate to Settings** (http://localhost:8080/settings)
-2. **Configure API Keys**: Enter your OpenAI, Finnhub, and other API keys
-3. **Add Trading Account**: Configure your Alpaca or other broker credentials
-4. **Create Expert Instance**: Set up your first AI trading expert
-5. **Configure Rulesets**: Define your trading rules and risk parameters
-
-### Database Location
-
-The SQLite database is automatically created at:
-```
-~/Documents/ba2_trade_platform/db.sqlite
-```
-
-Logs are stored in:
-```
-ba2_trade_platform/logs/
-```
-
-Cache (ChromaDB, price data) is stored in:
-```
-~/Documents/ba2_trade_platform/cache/
-```
-
-## 🐳 Docker Installation (Recommended for Production)
-
-BA2 Trade Platform can be easily run in Docker with persistent data storage. The Docker setup uses separate volumes for database and cache, allowing you to persist only what you need.
-
-### Prerequisites
-- [Docker](https://docs.docker.com/get-docker/) 20.10+
-- [Docker Compose](https://docs.docker.com/compose/install/) 1.29+ (optional but recommended)
-
-### Quick Start with Docker Compose (Easiest)
-
-**1. Clone the repository**:
 ```bash
 git clone https://github.com/bmigette/BA2TradePlatform.git
 cd BA2TradePlatform
 ```
 
-**2. Start the platform**:
+This is a **self-contained monorepo** — the shared packages (`packages/common`, `packages/providers`,
+`packages/experts`), the live trade app (repo root → `ba2-trade`) and the backtest/optimization
+platform (`testplatform/` → `ba2-test`) all live here.
+
+### 2. Recommended — install script (builds both venvs from this repo)
+
+The install script creates two isolated venvs under `~/ba2-venvs/{trade,test}`, installs the in-repo
+`packages/` chain plus each app's requirements (PyTorch from the CPU or CUDA wheel index, auto-detected),
+runs `npm install` for the test frontend, and registers the `ba2-trade` / `ba2-test` console commands.
+It then copies a database from the old `~/Documents/ba2_trade_platform/` location if the new one does not
+exist yet, and applies migrations.
+
+**Windows**:
+```powershell
+.\install.ps1 -Editable        # -e in-repo packages for development
+```
+**Linux/macOS**:
 ```bash
-docker-compose up -d
+./install.sh --editable
 ```
+Useful flags: `-TradeOnly`/`-TestOnly` (`--trade-only`/`--test-only`) to build just one venv,
+`-Ui` (`--ui`) for the experts' NiceGUI extra, `-Upgrade` (`--upgrade`) to re-resolve deps,
+`-NoDb` (`--no-db`) to skip the database step, `-Python` (`--python`) to choose the interpreter.
 
-This will:
-- Build the Docker image from Dockerfile
-- Create three named volumes (`ba2_db_volume`, `ba2_cache_volume`, `ba2_logs_volume`)
-- Start the container with web interface on port 8000
-- Automatically restart if the container stops
+### 3. Alternative — manual single-venv setup (trade app only)
 
-**3. Access the web interface**:
-```
-http://localhost:8000
-```
+`requirements.txt` lists third-party dependencies only. The three shared packages are installed
+from the in-repo `packages/` first (pip resolves a relative path in a requirements file against the
+current directory, so they are kept out of it). From the repo root:
 
-**4. View logs**:
 ```bash
-docker-compose logs -f
-```
-
-**5. Stop the platform**:
-```bash
-docker-compose down
-```
-
-### Docker Compose Volume Management
-
-The `docker-compose.yml` file defines three independent volumes:
-
-| Volume | Purpose | Path in Container |
-|--------|---------|-------------------|
-| `ba2_db_volume` | Database persistence | `/opt/ba2_trade_platform/db` |
-| `ba2_cache_volume` | Cache persistence | `/opt/ba2_trade_platform/cache` |
-| `ba2_logs_volume` | Logs persistence | `/opt/ba2_trade_platform/logs` |
-
-**Persist Only Database** (best for development):
-```yaml
-volumes:
-  - ba2_db_volume:/opt/ba2_trade_platform/db
-  # Don't mount cache or logs - they'll be ephemeral
-```
-
-**Persist Only Cache** (for stateless deployments):
-```yaml
-volumes:
-  - ba2_cache_volume:/opt/ba2_trade_platform/cache
-```
-
-**Persist Everything** (default in docker-compose.yml):
-```yaml
-volumes:
-  - ba2_db_volume:/opt/ba2_trade_platform/db
-  - ba2_cache_volume:/opt/ba2_trade_platform/cache
-  - ba2_logs_volume:/opt/ba2_trade_platform/logs
-```
-
-### Using Docker Without Compose
-
-**1. Build the image**:
-```bash
-docker build -t ba2-trade-platform:latest .
-```
-
-**2. Create volumes** (optional but recommended):
-```bash
-docker volume create ba2_db_volume
-docker volume create ba2_cache_volume
-docker volume create ba2_logs_volume
-```
-
-**3. Run the container**:
-```bash
-docker run -d \
-  --name ba2-trade-platform \
-  -p 8000:8000 \
-  -v ba2_db_volume:/opt/ba2_trade_platform/db \
-  -v ba2_cache_volume:/opt/ba2_trade_platform/cache \
-  -v ba2_logs_volume:/opt/ba2_trade_platform/logs \
-  ba2-trade-platform:latest
-```
-
-**4. Access the web interface**:
-```
-http://localhost:8000
-```
-
-### Docker Run Examples
-
-**Development Setup** (persist only database):
-```bash
-docker run -d \
-  --name ba2-dev \
-  -p 8001:8000 \
-  -v ba2_dev_db:/opt/ba2_trade_platform/db \
-  ba2-trade-platform:latest
-```
-
-**Production Setup** (persist everything, custom port):
-```bash
-docker run -d \
-  --name ba2-prod \
-  -p 80:8000 \
-  --restart unless-stopped \
-  -v ba2_prod_db:/opt/ba2_trade_platform/db \
-  -v ba2_prod_cache:/opt/ba2_trade_platform/cache \
-  -v ba2_prod_logs:/opt/ba2_trade_platform/logs \
-  ba2-trade-platform:latest
-```
-
-**Custom Database Location** (use host folder instead of volume):
-```bash
-mkdir -p /data/ba2-trade/db /data/ba2-trade/cache
-chmod 755 /data/ba2-trade/*
-
-docker run -d \
-  --name ba2-custom \
-  -p 8000:8000 \
-  -v /data/ba2-trade/db:/opt/ba2_trade_platform/db \
-  -v /data/ba2-trade/cache:/opt/ba2_trade_platform/cache \
-  ba2-trade-platform:latest
-```
-
-### Docker Volume Inspection
-
-**List volumes**:
-```bash
-docker volume ls | grep ba2
-```
-
-**Inspect a volume**:
-```bash
-docker volume inspect ba2_db_volume
-```
-
-**View volume data** (Linux/macOS):
-```bash
-# Find where Docker stores volumes (Docker Desktop on macOS stores at ~/Library/Docker/volumes)
-ls -la /var/lib/docker/volumes/ba2_db_volume/_data/
-```
-
-### Backing Up Data
-
-**Backup database**:
-```bash
-docker cp ba2-trade-platform:/opt/ba2_trade_platform/db/db.sqlite ~/backup/db.sqlite
-```
-
-**Backup everything**:
-```bash
-docker run --rm \
-  -v ba2_db_volume:/data/db \
-  -v ba2_cache_volume:/data/cache \
-  -v ba2_logs_volume:/data/logs \
-  -v ~/backup:/backup \
-  ubuntu tar czf /backup/ba2-backup-$(date +%Y%m%d).tar.gz /data
-```
-
-### Cleaning Up
-
-**Stop and remove container**:
-```bash
-docker-compose down
-# or
-docker stop ba2-trade-platform
-docker rm ba2-trade-platform
-```
-
-**Remove volumes** (CAUTION - deletes data):
-```bash
-docker-compose down -v
-# or
-docker volume rm ba2_db_volume ba2_cache_volume ba2_logs_volume
-```
-
-**Remove image**:
-```bash
-docker rmi ba2-trade-platform:latest
-```
-
-### Docker Environment Details
-
-The Dockerfile:
-- **Base Image**: `python:3.11-slim` (minimal footprint)
-- **Multi-stage Build**: Reduces final image size
-- **Non-root User**: Runs as `trader` user for security
-- **Working Directory**: `/app`
-- **Exposed Port**: `8000` (web interface)
-- **Entry Point**: Automatically starts with proper volume paths
-
-**Default Paths in Container**:
-- Database: `/opt/ba2_trade_platform/db/db.sqlite`
-- Cache: `/opt/ba2_trade_platform/cache`
-- Logs: `/opt/ba2_trade_platform/logs`
-
-### Troubleshooting Docker
-
-**Port Already in Use**:
-```bash
-# Change port in docker-compose.yml or use different port
-docker run -p 9000:8000 ba2-trade-platform:latest
-
-# Check what's using port 8000
-lsof -i :8000  # Linux/macOS
-netstat -ano | findstr :8000  # Windows
-```
-
-**Container Won't Start**:
-```bash
-# View detailed logs
-docker logs ba2-trade-platform
-
-# Or with compose
-docker-compose logs -f ba2-trade-platform
-
-# Check container status
-docker ps -a | grep ba2
-```
-
-**Data Persistence Issues**:
-```bash
-# Verify volumes exist
-docker volume ls | grep ba2
-
-# Check volume data
-docker volume inspect ba2_db_volume
-
-# View volume contents
-docker run --rm -v ba2_db_volume:/data ubuntu ls -la /data
-```
-
-**Permission Denied Errors**:
-- Docker container runs as non-root user `trader` (UID 1000)
-- If using host directories, ensure they have proper permissions:
-```bash
-mkdir -p /data/ba2-trade/{db,cache}
-chmod 755 /data/ba2-trade
-chown -R 1000:1000 /data/ba2-trade
-```
-
-**Out of Disk Space**:
-```bash
-# Clean up unused volumes and images
-docker system prune -a --volumes
-
-# View disk usage
-docker system df
-```
-
-**Database Corruption**:
-- Delete the database volume and start fresh:
-```bash
-docker-compose down -v  # Removes all volumes
-docker-compose up -d    # Creates new volumes with fresh database
-```
-
-### Troubleshooting Installation
-
-**Virtual Environment Issues**:
-- Always use the virtual environment Python executable (`.venv\Scripts\python.exe` or `.venv/bin/python`)
-- Avoid using global `python` or `pip` commands
-
-**Dependency Installation Errors**:
-```bash
-# With uv (recommended - much faster)
+uv venv --python 3.12 .venv
+uv pip install -e packages/common -e packages/providers -e "packages/experts[ui]"
 uv pip install -r requirements.txt
-
-# Or with pip (upgrade first)
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+uv pip install --no-deps -e .     # optional: registers the ba2-trade command
 ```
 
-**Port Already in Use**:
-- NiceGUI runs on port 8080 by default
-- Check for other applications using this port
-- Stop conflicting services or use `--port` argument:
+(`uv` is optional: `python -m pip install ...` runs the same commands.) On Windows, prefer the CPU-only PyTorch build — see
+[Troubleshooting](#-troubleshooting).
+
+### 4. Run the application
+
 ```bash
-python main.py --port 9090
+ba2-trade                              # installed console command (same options as main.py)
+
+# or directly from a venv
+.venv\Scripts\python.exe main.py       # Windows
+.venv/bin/python main.py               # Linux/macOS
 ```
 
-**Permission Errors**:
-- Ensure you have write permissions in `~/Documents/`
-- Run terminal/PowerShell with appropriate permissions
+Then open `http://localhost:8080`. A new database is created and stamped at the latest migration on
+first run; for an existing database run `python migrate.py upgrade` after pulling (set `BA2_DB_FILE` to
+migrate a database other than the default).
+
+### Command-Line Arguments
+
+```bash
+python main.py [--db-file PATH] [--cache-folder PATH] [--log-folder PATH] [--port PORT]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--db-file` | SQLite database of this instance | `~/Documents/ba2/trade/db.sqlite` |
+| `--cache-folder` | Provider cache folder (shared with the test platform) | `~/Documents/ba2/common/cache` |
+| `--log-folder` | Log folder | `~/Documents/ba2/trade/logs` |
+| `--port` | HTTP port for the web interface | `8080` |
+
+The defaults follow `BA2_HOME` and can also be set with the `DB_FILE`, `CACHE_FOLDER` and `LOG_FOLDER`
+environment variables. At startup the application's file logs are moved next to the database, into
+`<db folder>/logs/`, so each instance keeps its logs with its data.
+
+```bash
+# Separate dev instance with its own database and port
+python main.py --db-file ~/Documents/ba2/trade/dev.db --port 8081
+```
+
+### First-Time Configuration
+
+1. **Open Settings** (`http://localhost:8080/settings`)
+2. **Global Settings**: enter your LLM and data API keys
+3. **Account Settings**: add an Alpaca (or TastyTrade) account
+4. **Expert Settings**: create an expert instance, pick its instruments, schedule and virtual equity share
+5. **Trade Settings**: create rules and rulesets, then select them as the expert's enter-market /
+   open-positions rulesets in Expert Settings
+6. Enable automated opening/modification on the expert only once you trust its behaviour
+
+### Data & Cache Layout
+
+Nothing is cached inside the repo. Data lives under a single root, **`BA2_HOME`** (env-overridable,
+default `~/Documents/ba2`), defined in `packages/common/ba2_common/config.py`:
+
+```
+BA2_HOME  (default ~/Documents/ba2)
+├── common/
+│   └── cache/                  # provider cache SHARED by both apps (CACHE_FOLDER):
+│       ├── <provider>/         #   OHLCV parquet, fmp_history, ...
+│       ├── screener/           #   metric_store/ (parquet) + screener_history.sqlite
+│       └── options/            #   options_history.sqlite
+├── test/                       # test platform data: dl_forecasting.db, datasets, trained models
+└── trade/                      # live trade data: db.sqlite (default --db-file) + logs/
+```
+
+- Each app has **its own database** holding its app settings and API keys: `trade/db.sqlite` for the
+  live trader (or whatever `--db-file` points at), `test/dl_forecasting.db` for the test platform.
+- `BA2_HOME` relocates the whole tree; `CACHE_FOLDER` / `DB_FILE` still win when set explicitly.
+- Data from the old `~/Documents/ba2_trade_platform` layout can be moved with
+  `testplatform/scripts/migrate_cache_layout.py` (dry run by default, `--apply` to move).
+
+## 🐳 Docker
+
+The `Dockerfile` copies `packages/` from the build context and installs it with `requirements.txt` in
+one `uv pip install --no-sources` step (Python 3.11 image, multi-stage). No GitHub access is needed at
+build time. The compose file builds the image, serves the UI on port **8000** and keeps three named
+volumes (`ba2_db_volume`, `ba2_cache_volume`, `ba2_logs_volume`) mounted under `/opt/ba2_trade_platform/`;
+the container runs as the non-root user `trader` (UID 1000). The image pulls the default (CUDA) PyTorch
+wheels from PyPI, so expect a multi-GB image.
+
+```bash
+docker-compose up -d        # build + start, http://localhost:8000
+docker-compose logs -f
+docker-compose down         # add -v to also delete the volumes (and the database)
+```
 
 ## 🏗️ Architecture
 
-### Core Interfaces
+### Packages
 
-#### AccountInterface
-Abstract base class for trading account implementations:
-```python
-class AccountInterface(ExtendableSettingsInterface):
-    def get_account_info(self) -> dict
-    def submit_order(self, order_data: dict) -> dict
-    def get_positions(self) -> List[dict]
-    def get_orders(self) -> List[dict]
-```
+| Package | Import name | Contents |
+|---------|-------------|----------|
+| `packages/common` | `ba2_common` | Models, DB helpers, interfaces, types, position sizing, trade conditions/rules, market conditions, option risk rails, replay contract |
+| `packages/providers` | `ba2_providers` | Market-data providers and their registries, stock screener, caches |
+| `packages/experts` | `ba2_experts` | The non-LLM experts (and PennyMomentumTrader) |
+| repo root | `ba2_trade_platform` | Live-only code: brokers, TradingAgents, Smart Risk Manager, LLM/model factory, AI providers, `JobManager` / `WorkerQueue` / `TradeManager`, instance caches, UI |
+| `testplatform/` | `app` (backend) + React frontend | Backtesting, GA optimization, ML, `ba2-test` CLI |
 
-#### MarketExpertInterface  
-Abstract base class for AI trading experts:
-```python
-class MarketExpertInterface(ExtendableSettingsInterface):
-    def get_prediction_for_instrument(self, symbol: str) -> dict
-    def get_analysis_for_instruments(self, symbols: List[str]) -> dict
-```
-
-#### ExtendableSettingsInterface
-Base class providing flexible configuration:
-```python
-@classmethod
-def get_settings_definitions(cls) -> Dict[str, Any]:
-    return {
-        "setting_name": {
-            "type": "str",
-            "required": True, 
-            "description": "Setting description"
-        }
-    }
-```
-
-### Database Models
-
-**Core Models** (in `ba2_trade_platform/core/models.py`):
-- `AppSetting`: Application-wide configuration (API keys, settings)
-- `AccountDefinition`: Trading account provider configurations
-- `AccountSetting`: Account-specific settings (key-value storage)
-- `ExpertInstance`: AI expert configurations with virtual equity allocation and rulesets
-- `ExpertSetting`: Expert-specific settings (key-value storage)
-- `ExpertRecommendation`: Trading recommendations with risk level, time horizon, and confidence
-- `MarketAnalysis`: Analysis sessions with status tracking and expert linking
-- `AnalysisOutput`: Detailed analysis outputs from individual agents
-- `TradingOrder`: Order lifecycle tracking (PENDING → OPEN → FILLED/CLOSED)
-- `Transaction`: Transaction history for orders (fills, partial fills)
-- `Position`: Current positions with P&L tracking
-- `Instrument`: Instrument metadata (symbols, exchanges, asset classes)
-- `Ruleset`: Rule-based trading logic containers
-- `EventAction`: Conditional actions within rulesets
-- `RulesetEventActionLink`: Many-to-many relationship for rulesets and actions
-- `TradeActionResult`: Results from executed trade actions (BUY, SELL, CLOSE, etc.)
+Many in-tree modules (e.g. `core/types.py`, `core/db.py`, `core/models.py`, `core/interfaces/*`, the
+non-AI data providers, the package experts) are **re-export shims**: existing
+`from ba2_trade_platform...` imports keep working, but the implementation lives in the package. Change
+shared code in `packages/`, not in the shim. The packages are wired to the live app at startup by
+`core/seam_wiring.py:wire_all_seams()`. See [CLAUDE.md](CLAUDE.md) for the full rules.
 
 ### Directory Structure
 
 ```
-ba2_trade_platform/
-├── core/                           # Core interfaces and models
-│   ├── AccountInterface.py         # Account provider interface
-│   ├── MarketExpertInterface.py    # Expert interface
-│   ├── ExtendableSettingsInterface.py # Settings management
-│   ├── models.py                   # SQLModel database models
-│   ├── types.py                    # Enums (OrderStatus, OrderDirection, RiskLevel, etc.)
-│   ├── db.py                       # Database utilities (CRUD operations)
-│   ├── utils.py                    # Helper functions
-│   ├── actions.py                  # Trade action helpers
-│   ├── TradeManager.py             # Order processing and recommendation handling
-│   ├── TradeActionEvaluator.py     # Ruleset evaluation engine
-│   ├── TradeActions.py             # Trade action implementations (BUY, SELL, CLOSE)
-│   ├── TradeConditions.py          # Condition evaluation for rulesets
-│   ├── TradeRiskManagement.py      # Risk management and position sizing
-│   ├── JobManager.py               # Background job scheduling
-│   ├── WorkerQueue.py              # Task queue for parallel processing
-│   ├── MarketAnalysisPDFExport.py  # Export analysis to PDF reports
-│   ├── rules_documentation.py      # Ruleset documentation generator
-│   └── rules_export_import.py      # Import/export rulesets
-├── modules/
-│   ├── accounts/                   # Account implementations
-│   │   ├── __init__.py            # Account registry
-│   │   └── AlpacaAccount.py        # Alpaca integration
-│   ├── experts/                    # Expert implementations
-│   │   ├── __init__.py            # Expert registry
-│   │   └── TradingAgents.py        # Multi-agent LLM expert
-│   └── marketinfo/                 # Market information providers
-├── thirdparties/
-│   └── TradingAgents/              # TradingAgents multi-agent framework
-├── ui/                             # NiceGUI web interface
-│   ├── main.py                     # Route definitions and app initialization
-│   ├── layout.py                   # Page layout components
-│   ├── menus.py                    # Navigation menus
-│   ├── svg.py                      # SVG icon utilities
-│   ├── pages/                      # Page components
-│   │   ├── overview.py            # Dashboard and account overview
-│   │   ├── marketanalysis.py       # Market analysis management
-│   │   └── settings.py            # Configuration interface
-│   ├── components/                 # Reusable UI components
-│   │   └── InstrumentSelector.py   # Instrument selection widget
-│   └── static/                     # Static assets (favicons, etc.)
-├── logs/                           # Application logs
-├── config.py                       # Global configuration
-└── logger.py                       # Centralized logging
+BA2TradePlatform/
+├── main.py                     # Live app entry point (argument parsing + startup)
+├── migrate.py                  # Alembic wrapper (create / upgrade / downgrade / current / ...)
+├── alembic/                    # Migration scripts for the live DB
+├── install.ps1, install.sh     # Two-venv installer
+├── ba2_trade_platform/
+│   ├── core/                   # Live orchestration + shims into ba2_common
+│   │   ├── interfaces/         # Re-export shims (AccountInterface, MarketExpertInterface, ...)
+│   │   ├── TradeManager.py     # Order processing and recommendation handling
+│   │   ├── TradeActionEvaluator.py, TradeActions.py, TradeRiskManagement.py
+│   │   ├── JobManager.py, WorkerQueue.py, ScheduledExpertExecutor.py
+│   │   ├── SmartRiskManagerGraph.py (+ Toolkit, Queue, Prompts)
+│   │   ├── ModelFactory.py, llm_service.py, LLMUsageTracker.py, ModelBillingUsage.py
+│   │   ├── portfolio_allocation_service.py, option_lifecycle_service.py
+│   │   ├── replay_capture.py, seam_wiring.py, utils.py
+│   │   └── rules_export_import.py, MarketAnalysisPDFExport.py
+│   ├── modules/
+│   │   ├── accounts/           # AlpacaAccount, TastyTradeAccount, IBKRAccount + registry
+│   │   ├── experts/            # TradingAgents (live) + shims/registry for ba2_experts
+│   │   └── dataproviders/      # AI providers (live) + shims for ba2_providers
+│   ├── thirdparties/TradingAgents/  # Multi-agent LLM framework
+│   ├── ui/                     # NiceGUI app: main.py (routes), menus.py, api_routes.py, pages/, components/
+│   ├── config.py, logger.py, version.py
+├── packages/{common,providers,experts}/   # Shared installable packages (each with its own tests/)
+├── testplatform/               # ba2-test: backend/ (FastAPI), frontend/ (React), version.py
+├── tests/                      # pytest suite for the live app
+├── test_files/                 # Ad-hoc scripts (not collected by pytest)
+├── tools/                      # Operational scripts (reports, deploy, cache, backup, ...)
+└── docs/                       # Design docs, plans, runbooks, screenshots
 ```
+
+### Core Interfaces
+
+All live in `ba2_common.core.interfaces` (re-exported from `ba2_trade_platform.core.interfaces`).
+
+- **`ReadOnlyAccountInterface`** → **`AccountInterface`**: brokers implement balance/positions/orders
+  reads, `refresh_positions` / `refresh_orders`, prices, and `_submit_order_impl`, `cancel_order`,
+  `modify_order`, `adjust_tp` / `adjust_sl` / `adjust_tp_sl`. The base `submit_order` wraps
+  `_submit_order_impl` with validation, transactions and TP/SL handling.
+- **`OptionsAccountInterface`**: option chains, quotes, ATM IV, option positions,
+  `_submit_option_order_impl`, `close_option_position`.
+- **`MarketExpertInterface`**: experts implement `description()`, `run_analysis(symbol, market_analysis)`
+  and `render_market_analysis(market_analysis)`; the base class declares the shared settings (trade
+  permissions, risk manager mode, position sizing, market-condition profile, option rails, ...).
+- **`ExtendableSettingsInterface`**: `get_settings_definitions()` declares typed settings that are
+  stored as key/value rows and rendered in the UI.
+
+### Database Models
+
+Defined in `ba2_common.core.models` (re-exported as `ba2_trade_platform.core.models`):
+
+- **Configuration**: `AppSetting`, `AccountDefinition`, `AccountSetting`, `ExpertInstance`
+  (virtual equity %, linked rulesets, priority), `ExpertSetting`, `Instrument`
+- **Analysis**: `MarketAnalysis`, `AnalysisOutput`, `ExpertRecommendation`
+- **Trading**: `TradingOrder`, `Transaction`, `Position`, `TradeActionResult`
+- **Rules**: `Ruleset`, `EventAction`, `RulesetEventActionLink`
+- **Risk & operations**: `RiskManagerRun`, `SmartRiskManagerJob`, `ActivityLog`, `PersistedQueueTask`,
+  `LLMUsageLog`
+- **Options**: `OptionIVSnapshot`, `OptionActivity`
+- **Portfolio allocation**: `PortfolioAllocationConfig`, `PortfolioAllocationLabel`,
+  `PortfolioAllocationSymbol`, `PortfolioAllocationRun`, `PortfolioIncomeEvent`, `AccountSymbolFacts`,
+  `SymbolMarketStats`
+
+Schema changes go through Alembic (`python migrate.py create "message"`, then `upgrade`); see
+[MIGRATIONS.md](MIGRATIONS.md).
 
 ## 🤖 TradingAgents Framework
 
-The platform integrates the TradingAgents multi-agent framework for sophisticated market analysis:
+`ba2_trade_platform/thirdparties/TradingAgents/` is an adapted copy of the TradingAgents multi-agent
+framework (see Credits):
 
 ### Agent Types
-- **Market Analyst**: Technical analysis and price patterns
-- **News Analyst**: News sentiment and impact analysis  
-- **Fundamentals Analyst**: Company financials and metrics
-- **Social Media Analyst**: Social sentiment analysis
-- **Macro Analyst**: Economic indicators and macro trends
-- **Bull/Bear Researchers**: Debate-based analysis
-- **Research Manager**: Synthesis and final recommendations
+- **Analysts**: Market (technical), News, Fundamentals, Social Media, Macro
+- **Researchers**: Bull and Bear researchers, synthesised by a Research Manager
+- **Trader**: turns the research plan into a trade proposal
+- **Risk team**: Aggressive, Conservative and Neutral debaters, judged by a Risk Manager
 
 ### Analysis Workflow
-1. **Data Collection**: Multi-source data gathering
-2. **Agent Analysis**: Parallel analysis by specialized agents
-3. **Debate Phase**: Bull vs bear researcher arguments
-4. **Synthesis**: Research manager consolidation
-5. **Risk Assessment**: Multi-perspective risk analysis
-6. **Final Recommendation**: Trading decision with confidence levels
+1. **Data Collection**: provider data is gathered for the analysts (pre-fetched for most of them)
+2. **Agent Analysis**: specialised analyst reports
+3. **Debate Phase**: bull vs bear researcher arguments
+4. **Synthesis**: research manager plan, trader proposal
+5. **Risk Assessment**: three-way risk debate
+6. **Final Recommendation**: trading decision with a confidence level (1–100)
 
-## 🎛️ Configuration
+## 🎛️ Web Interface
 
-### Web Interface
-Access the settings page at http://localhost:8080/settings to configure:
-- API Keys (OpenAI, Finnhub, FRED)
-- Account Providers (Alpaca credentials)
-- Expert Settings (TradingAgents parameters)
+| Page | Route | Contents |
+|------|-------|----------|
+| Overview | `/` | Overview, Account Overview, Account Growth, Performance, LLM Usage tabs |
+| Market Analysis | `/marketanalysis` | Job Monitoring, Manual Analysis, Scheduled Jobs, Trade Recommendations |
+| Activity Monitor | `/activitymonitor` | Filterable activity log |
+| Live Trades | `/livetrades` | Stocks and Options tabs |
+| Portfolio Allocation | `/portfolioallocation` | Manual rebalancing for manually traded accounts |
+| Tools | `/tools` | SYMBOL360, FMP Senate Trade, Analyst Ratings, Penny Screener |
+| Settings | `/settings` | Global, Account, Expert, Trade (rules & rulesets), Instruments, Cleanup |
 
-### Logging Configuration
-Modify `ba2_trade_platform/config.py`:
-```python
-STDOUT_LOGGING = True   # Console output
-FILE_LOGGING = True     # File logging with rotation
-```
+Detail pages: `/market_analysis/{id}`, `/marketanalysishistory/{symbol}`,
+`/smartriskmanagerdetail/{job_id}`, `/rulesettest`.
+
+**HTTP API** (`ba2_trade_platform/ui/api_routes.py`, unauthenticated):
+- `POST /api/reload` — drop cached expert/account instances and settings and re-read them from the DB
+- `POST /api/run-schedule` — fire a registered scheduled analysis now
+- `POST /api/process-recommendations` — run the risk-manager pass over an expert's existing recommendations
 
 ## 🔌 Extending the Platform
 
-> 📖 **For detailed information about existing experts and their implementation patterns, see [EXPERTS.md](EXPERTS.md)**
+> 📖 **For existing experts and their implementation patterns, see [EXPERTS.md](EXPERTS.md)**
 
-### Adding New Account Provider
+New *shared* code (experts that also run in backtests, providers, interfaces) belongs in `packages/`;
+live-only code (brokers, LLM, UI) belongs in `ba2_trade_platform/`.
 
-1. **Create provider class**:
+### Adding a New Account Provider
+
 ```python
-from ba2_trade_platform.core.AccountInterface import AccountInterface
+from ba2_trade_platform.core.interfaces import AccountInterface
 
 class MyBrokerAccount(AccountInterface):
     @classmethod
     def get_settings_definitions(cls):
         return {
-            "api_key": {"type": "str", "required": True},
-            "paper_trading": {"type": "bool", "required": True}
+            "api_key": {"type": "str", "required": True, "description": "API key"},
+            "paper_trading": {"type": "bool", "required": True, "description": "Paper account"},
         }
-    
-    def get_account_info(self):
-        # Implementation here
-        pass
+
+    # implement the abstract methods of ReadOnlyAccountInterface and AccountInterface
+    # (get_balance, get_positions, get_orders, refresh_orders, _submit_order_impl, cancel_order, ...)
 ```
 
-2. **Register in UI**: The provider will automatically appear in the web interface
+Register it in the `providers` dict of `ba2_trade_platform/modules/accounts/__init__.py` to make it
+selectable in Settings → Account Settings.
 
-### Adding New Market Expert
+### Adding a New Market Expert
 
-1. **Create expert class**:
 ```python
-from ba2_trade_platform.core.MarketExpertInterface import MarketExpertInterface
+from ba2_common.core.interfaces import MarketExpertInterface
 
 class MyExpert(MarketExpertInterface):
-    @classmethod  
+    @classmethod
+    def description(cls) -> str:
+        return "What this expert does"
+
+    @classmethod
     def get_settings_definitions(cls):
         return {
-            "model_type": {"type": "str", "required": True},
-            "confidence_threshold": {"type": "float", "required": True}
+            "threshold": {"type": "float", "required": True, "default": 0.5, "description": "Signal threshold"},
         }
-    
-    def get_prediction_for_instrument(self, symbol: str):
-        # Implementation here
-        pass
+
+    def run_analysis(self, symbol, market_analysis):
+        ...  # create ExpertRecommendation rows for the symbol
+
+    def render_market_analysis(self, market_analysis):
+        ...  # UI rendering of the analysis
 ```
 
-## 📊 Database Schema
-
-The platform uses SQLModel for ORM with automatic SQLite database creation:
-
-**Key Tables**:
-- `appsetting`: Application-wide configuration and API keys
-- `accountdefinition`: Trading account provider configurations
-- `accountsetting`: Account-specific settings (key-value)
-- `expertinstance`: AI expert configurations with rulesets and virtual equity
-- `expertsetting`: Expert-specific settings (key-value)
-- `expertrecommendation`: Trading recommendations with risk/confidence metrics
-- `marketanalysis`: Analysis job tracking with status and timing
-- `analysisoutput`: Detailed outputs from individual analysis agents
-- `tradingorder`: Order lifecycle and execution tracking
-- `transaction`: Transaction history for order fills
-- `position`: Current positions with unrealized P&L
-- `instrument`: Instrument metadata and specifications
-- `ruleset`: Rule-based trading logic containers
-- `eventaction`: Conditional actions (triggers and actions)
-- `ruleseteventactionlink`: Many-to-many relationship for rulesets
-- `tradeactionresult`: Results from executed trade actions
-
-**Database Features**:
-- Automatic schema creation and migrations via Alembic
-- SQLite backend with full ACID compliance
-- Foreign key constraints for data integrity
-- Indexed fields for query performance
-
-Database auto-initializes at: `~/Documents/ba2_trade_platform/db.sqlite`
+Add it to the `experts` list in `packages/experts/ba2_experts/__init__.py` (backtest registry) and to
+`_build_experts_list()` in `ba2_trade_platform/modules/experts/__init__.py` (live registry).
 
 ## 🧪 Testing
 
-**Run all unit tests (pytest)**:
 ```bash
-.venv\Scripts\python.exe -m pytest              # Run all tests
-.venv\Scripts\python.exe -m pytest -x            # Stop on first failure
-.venv\Scripts\python.exe -m pytest -k "test_name" # Run specific test
+.venv\Scripts\python.exe -m pytest              # live-app suite (tests/)
+.venv\Scripts\python.exe -m pytest -x            # stop on first failure
+.venv\Scripts\python.exe -m pytest -k "test_name" # run specific tests
 ```
 
-Test configuration is in `pytest.ini`. Tests are located in the `tests/` directory.
+- `pytest.ini` sets `testpaths = tests` and puts `packages/*` on the path, so the in-repo packages are tested.
+- Each package has its own suite under `packages/<name>/tests/`; run those in a separate invocation.
+- `test_files/` holds ad-hoc investigation scripts that pytest does **not** collect; port a script into
+  `tests/` when it becomes a durable regression test.
 
-**Legacy test scripts**:
-```bash
-python test_trade_agents.py
-python test.py
-```
+## 🔢 Versioning
+
+Two independent build versions, both `YYYY.MM.NNNNN`:
+
+- `ba2_trade_platform/version.py` → `APP_VERSION` (trade app; shown in the UI sidebar and logged at startup)
+- `testplatform/version.py` → `TEST_APP_VERSION` (test platform; remote GA workers self-update by comparing it)
+
+Bump `APP_VERSION` for changes under `ba2_trade_platform/`, and `TEST_APP_VERSION` for changes under
+`testplatform/` **or `packages/`**, before pushing.
 
 ## 📝 Logging
 
-**File Locations**:
-- Main logs: `ba2_trade_platform/logs/app.log`
-- Debug logs: `ba2_trade_platform/logs/app.debug.log` 
-- TradingAgents logs: `./tradeagents-exp{id}.log`
+- Logs are written to `<db folder>/logs/` (default `~/Documents/ba2/trade/logs/`): `app.log`,
+  `app.debug.log`, the shared `all.debug.log` / `all.error.log`, and one `<ExpertClass>-exp<id>.log` per
+  expert instance
+- Size-based rotation (10 MB per file)
+- `STDOUT_LOGGING` / `FILE_LOGGING` in `ba2_trade_platform/config.py` toggle the console and file sinks
 
-**Log Features**:
-- Automatic rotation (10MB max, 5 backups)
-- Colored console output with icons
-- Expert-specific log files
-- Configurable log levels
+## 🚀 Operations
 
-## 🔧 Development
-
-**Project Structure**:
-- Core interfaces in `ba2_trade_platform/core/`
-- Implementations in `ba2_trade_platform/modules/`
-- Web UI in `ba2_trade_platform/ui/`
-- Third-party integrations in `ba2_trade_platform/thirdparties/`
-
-**Adding Dependencies**:
-```bash
-# With uv (recommended)
-uv pip install new_package
-uv pip freeze > requirements.txt
-
-# Or with pip
-pip install new_package
-pip freeze > requirements.txt
-```
-
-## 🚀 Production Deployment
-
-1. **Configure API keys via Settings page** at `/settings`
-2. **Enable file logging**: Set `FILE_LOGGING = True` in config.py
-3. **Run with production WSGI server** (if needed)
-4. **Set up proper database backup strategy**
+- **Configuration**: API keys and settings via the Settings page; after editing settings directly in
+  the database, call `POST /api/reload` instead of restarting
+- **Error handling mode**: `BA2_ERROR_MODE` = `enforce` (default: unexpected errors in broad handlers
+  propagate), `observe` (log what would have propagated) or `legacy` (absorb everything)
+- **Backups**: `tools/backup_dbs.py` takes online SQLite backups (safe while the app is running),
+  integrity-checks them, zips them into `--dest` and keeps the newest `--keep` copies. Its default database
+  list and destination are specific to the maintainer's machine — review them before use
+- **Multiple instances**: run each with its own `--db-file` and `--port`
 
 ## 🐛 Troubleshooting
 
-**Common Issues**:
-
-1. **Import Errors**: Ensure all dependencies installed with `.venv\Scripts\python.exe -m pip install -r requirements.txt`
-
-2. **Database Issues**: Database auto-creates on first run. Check permissions in `~/Documents/`
-
-3. **API Key Issues**: Configure keys via web interface at `/settings`
-
-4. **Unicode Console Errors**: Logger automatically falls back to ASCII on Windows
-
-5. **ChromaDB Instance Conflicts**: Fixed in latest version - each expert/symbol combination now gets isolated ChromaDB storage
-
-6. **AttributeError on TradingOrder**: Ensure database schema is up-to-date. The `filled_avg_price` field was removed in favor of `open_price`
-
-7. **PyTorch DLL Error on Windows** (`OSError: [WinError 1114]`): The default PyTorch build may fail to load CUDA DLLs. Install the CPU-only build instead:
+1. **Import errors / `ModuleNotFoundError: ba2_common`**: the in-repo packages are not installed in the
+   venv — rerun the install script or the manual steps above. Always use the venv's Python, not a global one.
+2. **Port already in use**: start with `--port 9090` (default 8080).
+3. **Database schema errors after an update**: run `python migrate.py upgrade` (with `BA2_DB_FILE` for a
+   non-default database).
+4. **API key issues**: configure keys in Settings → Global Settings; each app has its own database, so
+   keys set in the trade app are not seen by the test platform.
+5. **PyTorch DLL error on Windows** (`OSError: [WinError 1114]`): install the CPU-only build:
    ```bash
    pip install torch --index-url https://download.pytorch.org/whl/cpu
    ```
-   Do not blindly upgrade torch to the latest version (e.g. 2.10+) — pin to a known working version such as `torch==2.6.0+cpu`.
+   Do not blindly upgrade torch to the latest version (e.g. 2.10+) — pin to a known working version
+   such as `torch==2.6.0+cpu`.
 
-**Debug Mode**:
-```python
-ta = TradingAgentsGraph(debug=True, config=DEFAULT_CONFIG)
-```
+## 📋 Recent Updates (October 2025 – September 2026)
 
-## 📋 Recent Updates
-
-### October 2025
-- **Fixed ChromaDB Instance Conflicts**: ChromaDB path now includes symbol to prevent conflicts when same expert analyzes multiple symbols
-- **Database Schema Improvements**: Added CASCADE foreign key constraints for proper cleanup when deleting accounts/experts
-- **Removed Redundant Fields**: Cleaned up `TradingOrder` model by removing `filled_avg_price` (now uses `open_price`)
-- **Trade Action Fixes**: 
-  - Fixed Take Profit/Stop Loss calculation to use correct order direction (from recommendation vs. existing order)
-  - Fixed increase/decrease instrument share actions to properly extract target percentage
-- **Rule Evaluation Traceability**: Added detailed tracking of trade action results linked to expert recommendations
-- **UI Enhancements**: Added magnifying glass icons for viewing detailed rule evaluation results
-
-### Key Features Added
-- **Async Price Loading**: Overview widgets load price information asynchronously to prevent UI blocking
-- **Performance Analytics**: New trade performance tab with comprehensive metrics:
-  - Average transaction time per expert
-  - Total and monthly profit analysis
-  - Sharpe ratio calculations
-  - Win/loss ratio tracking
-  - Average profit per transaction
-- **Reusable Chart Components**: Modular chart components for consistent visualization across the platform
+- **LLM stack**: unified model registry and per-expert model selector, AWS Bedrock provider, native web
+  search (xAI, Google, Moonshot), per-role models in TradingAgents, prompt caching, `finance_calc`
+  compute tools for the analysts
+- **New experts**: PennyMomentumTrader, FactorRanker, FMPInsiderClusterBuy, FMPEarningsDrift,
+  DeterministicScorer, FMPEarningsEvent; trader-skill scoring in FMPSenateTraderWeight; stock screener
+  instrument-selection mode; monthly schedules
+- **Monorepo & shared packages**: code split into `ba2_common` / `ba2_providers` / `ba2_experts`, the four
+  sibling repos and the test platform merged into this repo, `ba2-trade` / `ba2-test` commands, two-venv
+  installers, `BA2_HOME` data layout, independent app/test version numbers
+- **Backtesting & optimization** (`ba2-test`): GA over rulesets, expert settings and risk parameters;
+  distributed remote workers; robustness-adjusted fitness; measured spread costs; point-in-time screener
+  metric store; option strategy grids; market-condition genes
+- **Options**: option actions from single legs to iron condors, PMCC and backspreads; entry-option path;
+  shared option risk rails and circuit breaker (`classic_options`); historical option data from Alpaca,
+  ThetaData and TastyTrade; Options tab in Live Trades
+- **Rules**: unified rule model shared with the backtester, content-aware import dedup, categorised
+  trigger picker, market-condition gates (`ohlcv-v1`, `ta-structure-v1`)
+- **Accounts & risk**: TastyTrade equity trading, market-hours awareness with an offline NYSE calendar,
+  margin trading, structure-aware Alpaca TP/SL exits, breached-stop safety net, recorded classic
+  risk-manager runs, Smart Risk Manager sizing improvements
+- **UI**: Activity Monitor and Live Trades pages, Portfolio Allocation page, SYMBOL360 and symbol info
+  panel, account growth in $/%, phone layout
+- **Operations**: `/api/reload`, `/api/run-schedule`, `/api/process-recommendations`; live capture and
+  offline replay; nightly DB backup tool; fail-loud error mode (`BA2_ERROR_MODE`)
 
 ## 📚 Documentation
 
-- **Core Interfaces**: See docstrings in `ba2_trade_platform/core/`
-- **API Reference**: Auto-generated from type hints
-- **Examples**: Check `test_trade_agents.py` and `test.py`
+- [EXPERTS.md](EXPERTS.md) — every expert, its settings and scheduling
+- [docs/](docs/) — design docs, plans (`docs/plans/`, `docs/superpowers/`) and runbooks
+- [MIGRATIONS.md](MIGRATIONS.md) — database migrations; [MIGRATION.md](MIGRATION.md) — the move to a monorepo
+- [testplatform/README.md](testplatform/README.md) — the backtest & ML platform
+- [CLAUDE.md](CLAUDE.md) — development conventions (package vs in-tree code, config access, logging, versioning)
+- Package READMEs: `packages/common/README.md`, `packages/providers/README.md`, `packages/experts/README.md`
 
 ## 🤝 Contributing
 
@@ -1106,7 +732,13 @@ ta = TradingAgentsGraph(debug=True, config=DEFAULT_CONFIG)
 
 ## 📄 License
 
-[Add your license information here]
+Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE): you may use, study,
+modify and share it for any noncommercial purpose, and you may run it on your own personal
+brokerage accounts. Commercial use (a product, a hosted service, selling signals, or managing
+other people's money) is not licensed. Contact the author for a commercial license.
+
+Third-party code keeps its own license: `ba2_trade_platform/thirdparties/TradingAgents/` is
+Apache-2.0.
 
 ---
 
@@ -1124,52 +756,4 @@ Project that uses *TradingAgents*  https://github.com/TauricResearch/TradingAgen
       primaryClass={q-fin.TR},
       url={https://arxiv.org/abs/2412.20138}, 
 }
-```
-
-## Install / first run
-
-The live trader shares its core packages (editable installs) with the rest of
-the BA2 stack:
-
-```bash
-# from the live venv (.venv)
-.venv/bin/pip install -e ../BA2TradeCommon -e ../BA2TradeProviders -e ../BA2TradeExperts
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python main.py            # serves the NiceGUI UI on :8080
-```
-
-API keys (FMP, Finnhub, ...) live in the **shared** app-settings DB and are read
-by both the live trader and the backtester (BA2TestPlatform).
-
-## Data & cache layout
-
-Nothing is cached inside the code repos. Shared cache/data lives under a single
-root, **`BA2_HOME`** (env-overridable, default `~/Documents/ba2`):
-
-```
-BA2_HOME  (default ~/Documents/ba2)
-├── common/                 # SHARED with the backtester
-│   ├── cache/              # raw provider cache: OHLCV parquet, as_of cache, fmp_history   (CACHE_FOLDER)
-│   ├── db.sqlite           # shared app-settings / API-keys DB (FMP, Finnhub, ...)         (DB_FILE)
-│   └── options/            # options-history cache
-└── trade/                  # screener caches + your live trade instance DBs
-    └── screener/           # metric_store/ (parquet) + screener_history.sqlite
-```
-
-- The **shared app-settings/keys DB** (`ba2_common.config.DB_FILE`, default
-  `~/Documents/ba2/common/db.sqlite`) is read by both test + live.
-- A **live trade instance DB** is separate per run: point `--db-file` at a file
-  under `trade/` (e.g. `python main.py --db-file ~/Documents/ba2/trade/dev.db`).
-
-Defined in `ba2_common/config.py`. `BA2_HOME` relocates the whole tree;
-`CACHE_FOLDER` / `DB_FILE` still win when set explicitly (backward-compatible).
-
-### Migrating from the old layout
-
-The old layout used `~/Documents/ba2_trade_platform`. Migrate the shared
-cache/DB with the script in BA2TestPlatform, then restart the live app so it
-reads the relocated `common/db.sqlite`:
-
-```bash
-../BA2TestPlatform/backend/venv/bin/python ../BA2TestPlatform/scripts/migrate_cache_layout.py [--apply]
 ```

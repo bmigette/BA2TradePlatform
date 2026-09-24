@@ -30,6 +30,7 @@ import contextlib
 import datetime as _dt
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -45,6 +46,22 @@ DATABASES: Dict[str, Path] = {
     "dev": HOME / "Documents" / "ba2" / "trade" / "db.sqlite",
     "test": HOME / "Documents" / "ba2" / "test" / "dl_forecasting.db",
 }
+#: name -> (ssh destination, absolute path on that host). Backed up the SAME way as a local
+#: database -- an sqlite ONLINE COPY first, so a grid that is mid-write is captured consistently
+#: rather than torn. A plain scp of a live database (plus its 7 MB write-ahead log) can land a
+#: file that opens but fails integrity_check, which is the failure this whole script exists to
+#: avoid. The copy is made ON the remote box and streamed back, so nothing depends on the WAL
+#: being checkpointed or on the two hosts agreeing about file locking.
+#:
+#: WHY THIS IS HERE AT ALL: the option stage-1 campaign lives ONLY on the grid box -- its
+#: optimizations, its GA checkpoints and its persisted Top-N backtests are in this one file and
+#: in no other backup. Weeks of compute, previously unprotected.
+REMOTE_DATABASES: Dict[str, "tuple[str, str]"] = {
+    "grid227": ("debian@141.94.199.227", "/home/debian/ba2-grid/home/test/dl_forecasting.db"),
+}
+#: The grid box has no sqlite3 CLI, so the remote copy is driven by its python.
+_REMOTE_PY = "/opt/ba2worker/ba2-venvs/test/bin/python"
+_SSH = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30")
 DEFAULT_DEST = Path(r"G:\Mon Drive\backup\BA2")
 DEFAULT_KEEP = 7
 ARCHIVE_SUFFIX = ".sqlite.zip"
@@ -126,14 +143,65 @@ def prune(dest: Path, name: str, keep: int, dry_run: bool = False) -> List[Path]
     return victims
 
 
+def remote_online_copy(host: str, remote_src: str, dst: Path) -> None:
+    """Consistent copy of a database on ``host`` into local ``dst``.
+
+    Two steps, both on the remote box: sqlite's backup API writes a quiescent copy beside the
+    live file and integrity-checks it, then that copy is streamed back over the same ssh
+    transport and removed. The backup API is used rather than ``cp`` for the reason given on
+    REMOTE_DATABASES -- the source is a grid that writes continuously.
+
+    The check runs on the SOURCE host on purpose: refusing a copy that host already calls
+    damaged beats shipping it and finding out when it is the only surviving archive.
+
+    Raises on any failure; the caller reports it and carries on with the other databases.
+    """
+    remote_tmp = "/tmp/ba2_backup_%d_%s" % (os.getpid(), Path(remote_src).name)
+    lines = [
+        "import sqlite3, contextlib, sys",
+        "src, dst = %r, %r" % (remote_src, remote_tmp),
+        "with contextlib.closing(sqlite3.connect('file:' + src + '?mode=ro', uri=True)) as s:",
+        "    with contextlib.closing(sqlite3.connect(dst)) as d:",
+        "        s.backup(d, pages=%d, sleep=0)" % _PAGES_PER_STEP,
+        "with contextlib.closing(sqlite3.connect(dst)) as c:",
+        "    sys.stdout.write(c.execute('PRAGMA integrity_check').fetchone()[0])",
+    ]
+    # The script goes over STDIN, not as an argv token: ssh joins its command arguments and
+    # the REMOTE SHELL re-parses them, so a multi-line -c payload is torn apart before python
+    # ever sees it (measured: "Expected one or more names after import").
+    made = subprocess.run([*_SSH, host, _REMOTE_PY, "-"], input="\n".join(lines),
+                          capture_output=True, text=True, timeout=1800)
+    if made.returncode != 0:
+        raise RuntimeError("remote copy failed on %s: %s" % (host, made.stderr.strip()[:300]))
+    verdict = (made.stdout or "").strip()
+    if verdict != "ok":
+        subprocess.run([*_SSH, host, "rm", "-f", remote_tmp], capture_output=True, timeout=120)
+        raise RuntimeError("remote integrity_check on %s said %r, not ok" % (host, verdict))
+    try:
+        with open(dst, "wb") as fh:
+            pulled = subprocess.run([*_SSH, host, "cat", remote_tmp],
+                                    stdout=fh, stderr=subprocess.PIPE, timeout=1800)
+        if pulled.returncode != 0:
+            raise RuntimeError("streaming %s from %s failed: %s" % (
+                remote_tmp, host, pulled.stderr.decode(errors="replace").strip()[:300]))
+    finally:
+        subprocess.run([*_SSH, host, "rm", "-f", remote_tmp], capture_output=True, timeout=120)
+
+
 def backup_one(name: str, src: Path, dest: Path, tmp_dir: Path, keep: int, day: _dt.date,
-               dry_run: bool) -> bool:
-    if not src.is_file():
+               dry_run: bool, remote: "tuple[str, str] | None" = None) -> bool:
+    """One database -> one dated archive. ``remote`` = (ssh destination, remote path);
+    when given, ``src`` is only the NAME used for the archive member and the copy comes
+    over ssh. Everything after the copy -- integrity check, deflate, retention -- is the
+    same path for both, so a remote archive is verified exactly like a local one."""
+    if remote is None and not src.is_file():
         log(f"[{name}] MISSING source {src}", dest)
         return False
     final = dest / archive_name(name, day)
-    size_mb = src.stat().st_size / 1048576
-    log(f"[{name}] {src} ({size_mb:.0f} MB) -> {final.name}", dest)
+    if remote is None:
+        log(f"[{name}] {src} ({src.stat().st_size / 1048576:.0f} MB) -> {final.name}", dest)
+    else:
+        log(f"[{name}] {remote[0]}:{remote[1]} -> {final.name}", dest)
     if dry_run:
         victims = prune(dest, name, keep, dry_run=True)
         log(f"[{name}] dry-run: would prune {[v.name for v in victims]}", dest)
@@ -141,17 +209,21 @@ def backup_one(name: str, src: Path, dest: Path, tmp_dir: Path, keep: int, day: 
     tmp_copy = tmp_dir / f"ba2_backup_{name}_{os.getpid()}.sqlite"
     t0 = time.monotonic()
     try:
-        online_copy(src, tmp_copy)
+        if remote is None:
+            online_copy(src, tmp_copy)
+        else:
+            remote_online_copy(remote[0], remote[1], tmp_copy)
         t1 = time.monotonic()
         verdict = quick_check(tmp_copy)
         if verdict != "ok":
             log(f"[{name}] FAILED quick_check on the copy: {verdict}", dest)
             return False
         t2 = time.monotonic()
+        tmp_copy_size = tmp_copy.stat().st_size
         archived = deflate(tmp_copy, final, arcname=src.name)
         t3 = time.monotonic()
         log(f"[{name}] ok: copy {t1 - t0:.0f}s, check {t2 - t1:.0f}s, zip {t3 - t2:.0f}s -> "
-            f"{archived / 1048576:.0f} MB ({archived / max(src.stat().st_size, 1) * 100:.0f}% of source)",
+            f"{archived / 1048576:.0f} MB ({archived / max(tmp_copy_size, 1) * 100:.0f}% of source)",
             dest)
     except Exception as e:  # noqa: BLE001 -- one DB failing must not stop the others; reported + exit 1
         log(f"[{name}] FAILED: {type(e).__name__}: {e}", dest)
@@ -184,10 +256,11 @@ def main(argv: List[str] | None = None) -> int:
         ap.error("--keep must be >= 1")
 
     dest = Path(args.dest)
-    names = [n.strip() for n in args.only.split(",")] if args.only else list(DATABASES)
-    unknown = [n for n in names if n not in DATABASES]
+    all_names = list(DATABASES) + list(REMOTE_DATABASES)
+    names = [n.strip() for n in args.only.split(",")] if args.only else all_names
+    unknown = [n for n in names if n not in all_names]
     if unknown:
-        ap.error(f"unknown database(s) {unknown}; choose from {list(DATABASES)}")
+        ap.error(f"unknown database(s) {unknown}; choose from {all_names}")
     if not args.dry_run:
         try:
             dest.mkdir(parents=True, exist_ok=True)
@@ -201,7 +274,13 @@ def main(argv: List[str] | None = None) -> int:
     log(f"backup start: {names} -> {dest} (keep {args.keep}, tmp {tmp_dir})", dest if dest.exists() else None)
     ok = True
     for name in names:
-        ok = backup_one(name, DATABASES[name], dest, tmp_dir, args.keep, day, args.dry_run) and ok
+        if name in DATABASES:
+            ok = backup_one(name, DATABASES[name], dest, tmp_dir, args.keep, day,
+                            args.dry_run) and ok
+        else:
+            host, rpath = REMOTE_DATABASES[name]
+            ok = backup_one(name, Path(rpath).name and Path(rpath), dest, tmp_dir,
+                            args.keep, day, args.dry_run, remote=(host, rpath)) and ok
     log(f"backup {'OK' if ok else 'FAILED'}", dest if dest.exists() else None)
     return 0 if ok else 1
 

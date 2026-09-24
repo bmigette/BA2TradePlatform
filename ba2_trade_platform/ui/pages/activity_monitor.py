@@ -18,6 +18,7 @@ from ...core.types import ActivityLogSeverity, ActivityLogType
 from ...logger import logger
 from ..components.LazyTable import LazyTable, ColumnDef, LazyTableConfig
 from ..utils.perf_logger import PerfLogger
+from ..components.refresh_button import refresh_button
 
 
 class ActivityMonitorPage:
@@ -278,8 +279,8 @@ class ActivityMonitorPage:
                     self.refresh_interval_input = ui.input(
                         value=str(self.refresh_interval),
                         on_change=lambda e: self.update_refresh_interval(e.value)
-                    ).classes("w-20")
-                    ui.button("Refresh Now", on_click=lambda: asyncio.create_task(self.refresh_activities()), icon="refresh").props("outline")
+                    ).classes("w-20").props("dense")
+                    refresh_button(lambda: asyncio.create_task(self.refresh_activities()))
         
         # Filters
         with ui.expansion("🔍 Filters", icon="filter_list").classes("w-full"):
@@ -367,6 +368,8 @@ class ActivityMonitorPage:
             page_size_options=[25, 50, 100, 200],
             row_key='id',
             show_global_filter=True,
+            # The Auto-Refresh card's Refresh already calls this table's refresh().
+            show_refresh=False,
             show_column_filters=False,  # We have custom filters above
             default_sort_by='timestamp',
             default_sort_descending=True,

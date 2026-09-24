@@ -31,6 +31,7 @@ from app.services.strategy_optimization_handler import (  # noqa: E402
     mode_anchor_index,
 )
 from app.services.trial_memo import trial_key  # noqa: E402
+from ba2_common.core.rule_models import NUMERIC_MODE_CHOICES  # noqa: E402
 
 _LAUNCHER = os.path.normpath(os.path.join(_ROOT, "..", "ba2test_launcher.py"))
 _spec = importlib.util.spec_from_file_location("ba2test_launcher_anchor", _LAUNCHER)
@@ -57,6 +58,22 @@ def gated(monkeypatch):
 
 @pytest.fixture
 def plain():
+    """A strategy with NO mode leaf at all -- which since 2026-09-19 means a NON-DIRECTIONAL
+    structure, not just "no profile".
+
+    O_LC used to qualify; it no longer does. Its direction gate became a ``rec_direction``
+    numeric leaf with a mode gene (off/below/above), so every DIRECTIONAL option strategy now
+    carries one mode leaf even under profile ``none``. O_STRD is the straddle: it bets on the
+    SIZE of the move, keeps the ``current_rating_neutral`` FLAG leaf with its ON/OFF toggle
+    (off/below/above cannot say ``== HOLD``), and so is genuinely mode-free. The pre-profiles
+    key contract still has a strategy to be pinned against.
+    """
+    return mod._build_strategy("O_STRD", "anchor-O_STRD", "FMPRating")
+
+
+@pytest.fixture
+def directional():
+    """The DIRECTIONAL option strategy under profile ``none``: one mode leaf, no threshold gene."""
     return mod._build_strategy("O_LC", "anchor-O_LC", "FMPRating")
 
 
@@ -73,6 +90,30 @@ def test_a_run_without_mode_leaves_produces_exactly_todays_key(plain):
     assert _key(anchors, params) == LEGACY_KEY
 
 
+def test_the_direction_mode_leaf_does_not_move_the_key_either(directional):
+    """THE 2026-09-19 QUESTION, answered in the one place it is decidable.
+
+    Every directional option strategy now carries a mode leaf even with no profile, so
+    ``mode_anchor_index`` is no longer empty for them and the "no anchors, no rewrite" guard
+    above does not cover them. They are nonetheless UNAFFECTED, and for a structural reason
+    rather than by luck: the direction leaf's threshold is PINNED (``optimize: False``), so the
+    space emits no ``cond:o_lc-signal:value`` gene, and ``canonical_trial_params`` rewrites a
+    threshold only when both the mode gene AND the value gene are in the genome. With nothing
+    to canonicalise it returns the SAME dict object, so the digest is the raw one -- byte for
+    byte what the pre-change code hashed for the same params.
+
+    If the threshold ever became searchable, this test fails and the memo key for every option
+    run moves with it.
+    """
+    anchors = mode_anchor_index(directional)
+    assert anchors == {"o_lc-signal": (list(NUMERIC_MODE_CHOICES), 0.0)}
+    # the mode gene is in the genome; the value gene does not exist
+    params = {**LEGACY_IDENTITY["params"], "cond:o_lc-signal:mode": "above"}
+    assert canonical_trial_params(anchors, params) is params, "no copy, no rewrite, no cost"
+    # ...and the pinned legacy params (no signal gene at all) still hash to the pinned digest
+    assert _key(anchors, LEGACY_IDENTITY["params"]) == LEGACY_KEY
+
+
 def test_the_pinned_legacy_key_is_what_the_raw_identity_hashes_to():
     assert trial_key(LEGACY_IDENTITY) == LEGACY_KEY
 
@@ -80,8 +121,15 @@ def test_the_pinned_legacy_key_is_what_the_raw_identity_hashes_to():
 # ----------------------------------------------------------------- runs with mode genes
 def test_the_index_reads_the_authored_anchor_from_the_template(gated):
     anchors = mode_anchor_index(gated)
-    assert set(anchors) == {"o_lc-market-slope", "o_lc-market-adx", "o_lc-market-rv"}
+    # o_lc-signal joined the index on 2026-09-19 (the direction gate became a mode leaf). It is
+    # listed here rather than filtered out because the index is meant to name EVERY mode leaf:
+    # a leaf missing from it would silently stop being canonicalised if it ever gained a
+    # threshold gene.
+    assert set(anchors) == {"o_lc-signal", "o_lc-market-slope", "o_lc-market-adx",
+                            "o_lc-market-rv"}
     assert anchors["o_lc-market-adx"] == (["off", "below", "above"], 25.0)
+    # the direction leaf's anchor is the fixed point of the signed grade scale, not a threshold
+    assert anchors["o_lc-signal"] == (list(NUMERIC_MODE_CHOICES), 0.0)
 
 
 def test_two_genomes_differing_only_in_an_inactive_threshold_share_one_key(gated):

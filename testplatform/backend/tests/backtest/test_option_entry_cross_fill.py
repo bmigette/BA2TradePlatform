@@ -33,6 +33,7 @@ never clear and a concession of one always does, so the test cannot pass for the
 """
 from __future__ import annotations
 
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -84,7 +85,7 @@ class _StubPrice:
 
 
 def _acct(volumes=None, **cfg):
-    base = {"starting_cash": 100_000.0, "commission_per_trade": 0.0, "slippage_bps": 0.0,
+    base = {**_LEGACY_ZERO_SPREAD, "starting_cash": 100_000.0, "commission_per_trade": 0.0, "slippage_bps": 0.0,
             "fill_model": "next_bar_open", "option_spread_pct": 5.0}
     base.update(cfg)
     a = BacktestAccount(id=1, price_source=_StubPrice(), settings=base)

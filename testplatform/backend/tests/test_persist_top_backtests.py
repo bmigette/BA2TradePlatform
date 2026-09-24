@@ -13,6 +13,7 @@ doesn't have that attribute in the first place.
 import importlib.util
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 # Load the launcher module by path (it lives at testplatform/ba2test_launcher.py), same
 # pattern as test_option_strategy_builders.py.
@@ -32,6 +33,26 @@ from app.models.strategy_optimization import StrategyOptimization
 from app.services import strategy_optimization_handler as _soh
 from app.services import sync_client as _sync_client
 from app.services import worker_client as _worker_client
+
+
+@pytest.fixture(autouse=True)
+def _mock_worker_executor(monkeypatch):
+    """Keep lambda workers and captured calls in this persistence unit test's process.
+
+    Spawning and deadline teardown are exercised with real processes in the recovery
+    suites. These tests cover persisted rows/settings and mock out the backtest payload.
+    """
+    pools = []
+
+    def new_pool(max_workers):
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        pools.append(pool)
+        return pool
+
+    monkeypatch.setattr(mod, '_new_local_pool', new_pool)
+    yield
+    for pool in pools:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -364,6 +385,13 @@ def test_remote_then_local_falls_back_after_two_remote_failures(monkeypatch):
         _soh, "_persist_trial_worker",
         lambda cfg: {"ok": True, "results": {"from": "local-fallback"}},
     )
+    # The fallback now runs in a KILLABLE PROCESS POOL, bounded by the export deadline
+    # (2026-09-21 recheck, H1), and a patched lambda cannot be pickled into a spawned worker.
+    # Swap in a thread pool so this test keeps testing the FALLBACK DECISION; the process
+    # isolation itself is covered by tests/test_grid_stall_recheck_fixes.py.
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(mod, "_new_local_pool",
+                        lambda max_workers=1: ThreadPoolExecutor(max_workers))
 
     out = mod._remote_then_local(_FAKE_WORKER, {"name": "TOP1"}, "sharpe")
 

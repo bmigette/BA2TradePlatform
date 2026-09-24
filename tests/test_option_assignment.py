@@ -16,8 +16,12 @@ Reconciliation semantics under test (documented choices):
   away -> close the expert's OPENED equity long Transaction for the underlying
   with close_reason="called_away", close_price=strike; close the short-call
   option Transaction with close_reason="assigned".
-- OPEXP (expiry): close the option Transaction, close_reason="expired",
+- OPEXP (expiry): close the option Transaction, close_reason="expired_otm",
   close_price=0.0.
+- Every option close_reason is an ``OptionCloseReason`` value -- the SAME vocabulary the
+  backtest's expiry settlement writes (BT/live option parity, plan Part C3; the backtest
+  side is pinned in testplatform/backend/tests/backtest/test_option_close_trigger_recorded.py)
+  -- and the synthetic settlement order carries it as its ``exit_record`` trigger.
 - IDEMPOTENCY: an OptionActivity row keyed on (account_id, activity_id) prevents
   re-applying effects when reconcile is called twice with the same activities.
 """
@@ -31,7 +35,7 @@ from ba2_trade_platform.core.models import (
     TradingOrder, Transaction, OptionActivity,
 )
 from ba2_trade_platform.core.types import (
-    AssetClass, OptionRight, OrderDirection, OrderType, OrderStatus,
+    AssetClass, OptionRight, OrderDirection, OrderOpenType, OrderType, OrderStatus,
     TransactionStatus,
 )
 from sqlmodel import select
@@ -217,8 +221,9 @@ def test_expiry_closes_option_transaction(mock_account_def, mock_expert_instance
 
     opt_after = get_instance(Transaction, opt_txn_id)
     assert opt_after.status == TransactionStatus.CLOSED
-    assert opt_after.close_reason == "expired"
+    assert opt_after.close_reason == "expired_otm"
     assert opt_after.close_price == 0.0
+    _assert_settlement_exit_record(opt_txn_id, PUT_OCC, "expired_otm")
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +246,21 @@ def test_exercise_closes_option_transaction(mock_account_def, mock_expert_instan
     opt_after = get_instance(Transaction, opt_txn_id)
     assert opt_after.status == TransactionStatus.CLOSED
     assert opt_after.close_reason == "exercised"
+    _assert_settlement_exit_record(opt_txn_id, CALL_OCC, "exercised")
+
+
+def _assert_settlement_exit_record(txn_id, contract, trigger):
+    """The synthetic settlement order carries the shared exit record (plan Part C3): the
+    OCC event as its trigger, the leg NAMED (a settlement prices from no quote)."""
+    from ba2_common.core.option_trade_record import OPTION_TRADE_RECORD_VERSION
+    with get_db() as session:
+        rows = session.exec(select(TradingOrder).where(
+            TradingOrder.transaction_id == txn_id,
+            TradingOrder.open_type == OrderOpenType.EXTERNAL)).all()
+    (row,) = rows
+    assert row.data["exit_record"] == {
+        "version": OPTION_TRADE_RECORD_VERSION, "trigger": trigger, "rule_id": None,
+        "rule_name": None, "legs": [], "legs_without_quote": [contract]}
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +450,7 @@ def test_expiry_with_no_qty_still_closes_the_option(mock_account_def, mock_exper
 
     opt_txn = get_instance(Transaction, opt_txn_id)
     assert opt_txn.status == TransactionStatus.CLOSED
-    assert opt_txn.close_reason == "expired"
+    assert opt_txn.close_reason == "expired_otm"
 
 
 def test_a_crashed_activity_is_not_retried_and_cannot_double_apply(

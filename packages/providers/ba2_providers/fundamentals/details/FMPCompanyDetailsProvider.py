@@ -85,6 +85,98 @@ def past_earnings_identity(args):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Parsed past-earnings history, memoized against the PAYLOAD OBJECT it was built
+# from: {f"{SYMBOL}__{frequency}": (payload, [(date, entry), ...] newest-first)}.
+#
+# WHY. ``get_past_earnings`` is called once per (symbol, decision date). Its
+# per-call work was re-``strptime``-ing and re-building a dict for every row of
+# an immutable per-symbol history (~164 rows for AAPL, back to 1985) before
+# throwing all but ``lookback_periods`` of them away. Measured on a real
+# 10-symbol / 501-bar DeterministicScorer backtest: 5,010 calls, 10.7 s. Only the
+# end_date cut and the lookback slice actually depend on the caller.
+#
+# STALENESS -- the same rule as the FRED parse memo. The key holds the payload
+# object and it is re-checked with ``is`` on every read, so the parse can only be
+# served for the exact list it was built from. That is what makes this safe LIVE:
+# ``fmp_history_disk_cached`` is a straight passthrough to the API when the TTL
+# freeze flag is not set, so a live call gets a FRESH list every time, misses
+# here by construction, and re-parses. Only a frozen/backtest run -- where the
+# history memo deliberately returns the same object -- ever hits.
+_PAST_EARNINGS_PARSED: Dict[str, Any] = {}
+
+
+def reset_past_earnings_parse_cache() -> None:
+    """Drop the parsed past-earnings memo (tests, long-lived workers)."""
+    _PAST_EARNINGS_PARSED.clear()
+
+
+def _parse_past_earnings_rows(symbol: str, frequency: str, earnings_data: list) -> list:
+    """``[(report date, earnings entry), ...]`` newest first, parsed once per payload.
+
+    This is verbatim the body of ``get_past_earnings``' row loop minus the
+    ``end_date`` test and the ``lookback_periods`` slice -- the two things that
+    vary per call. Sorting here rather than after the cut is equivalent:
+    ``list.sort`` is stable (``reverse=True`` does not reverse ties) and the cut
+    preserves relative order, so filtering a sorted superset and sorting a
+    filtered subset produce the same sequence.
+    """
+    key = f"{symbol.upper()}__{frequency}"
+    entry = _PAST_EARNINGS_PARSED.get(key)
+    if entry is not None and entry[0] is earnings_data:
+        return entry[1]
+
+    parsed = []
+    for earning in earnings_data:
+        # Parse the date from the earning record
+        earning_date_str = earning.get("date", "")
+        if not earning_date_str:
+            continue
+
+        try:
+            earning_date = datetime.strptime(earning_date_str, "%Y-%m-%d")
+        except:  # noqa: E722 -- preserved verbatim from the inline loop
+            continue
+
+        # Build earnings entry
+        reported_eps = earning.get("eps", 0)
+        estimated_eps = earning.get("epsEstimated", 0)
+
+        earnings_entry = {
+            "fiscal_date_ending": earning_date.strftime("%Y-%m-%d"),
+            "report_date": earning_date_str,
+            "reported_eps": float(reported_eps) if reported_eps else 0,
+            "estimated_eps": float(estimated_eps) if estimated_eps else 0,
+            # ADDITIVE (2026-09-01, FMPEarningsEvent): FMP's announcement slot.
+            # Measured across 120 cached past_earnings_quarterly files (8,391 rows):
+            # 'bmo' 4,935 / 'amc' 2,505 / '--' 663 / missing 288. It decides WHICH
+            # session reacts to a print ('bmo' -> the event day itself, 'amc' -> the
+            # next session), so an earnings-day move cannot be computed without it,
+            # and '--'/None is FMP's "not confirmed yet" slot for a scheduled row.
+            # Passed through raw (never defaulted) so a consumer can tell an unknown
+            # slot apart from a real one. Every other consumer just sees one more key.
+            "time": earning.get("time"),
+        }
+
+        # Calculate surprise
+        if reported_eps and estimated_eps:
+            earnings_entry["surprise"] = earnings_entry["reported_eps"] - earnings_entry["estimated_eps"]
+            if earnings_entry["estimated_eps"] != 0:
+                earnings_entry["surprise_percent"] = (earnings_entry["surprise"] / abs(earnings_entry["estimated_eps"])) * 100
+            else:
+                earnings_entry["surprise_percent"] = 0
+        else:
+            earnings_entry["surprise"] = None
+            earnings_entry["surprise_percent"] = None
+
+        parsed.append((earning_date, earnings_entry))
+
+    # Sort by date descending (most recent first)
+    parsed.sort(key=lambda x: x[0], reverse=True)
+    _PAST_EARNINGS_PARSED[key] = (earnings_data, parsed)
+    return parsed
+
+
 def earnings_estimates_identity(args):
     """What makes a ``get_earnings_estimates`` response what it is (see above)."""
     return {
@@ -718,64 +810,26 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             # (FactorRanker passes a tz-aware as_of).
             end_date_cmp = end_date.replace(tzinfo=None) if end_date.tzinfo else end_date
 
-            filtered_earnings = []
-            for earning in earnings_data:
-                # Parse the date from the earning record
-                earning_date_str = earning.get("date", "")
-                if not earning_date_str:
-                    continue
+            # Rows are parsed ONCE per payload and handed back newest-first (see
+            # _parse_past_earnings_rows); all that is left per call is the end_date
+            # cut and the lookback slice.
+            parsed = _parse_past_earnings_rows(symbol, frequency, earnings_data)
 
-                try:
-                    earning_date = datetime.strptime(earning_date_str, "%Y-%m-%d")
-                except:
-                    continue
+            # Filter by end_date. Descending order means every row after the cut is a
+            # contiguous prefix, so skipping it is the same set the old row-by-row
+            # ``if earning_date > end_date_cmp: continue`` produced, in the same order.
+            start = 0
+            while start < len(parsed) and parsed[start][0] > end_date_cmp:
+                start += 1
 
-                # Filter by end_date
-                if earning_date > end_date_cmp:
-                    continue
-                
-                # Build earnings entry
-                reported_eps = earning.get("eps", 0)
-                estimated_eps = earning.get("epsEstimated", 0)
-                
-                earnings_entry = {
-                    "fiscal_date_ending": earning_date.strftime("%Y-%m-%d"),
-                    "report_date": earning_date_str,
-                    "reported_eps": float(reported_eps) if reported_eps else 0,
-                    "estimated_eps": float(estimated_eps) if estimated_eps else 0,
-                    # ADDITIVE (2026-09-01, FMPEarningsEvent): FMP's announcement slot.
-                    # Measured across 120 cached past_earnings_quarterly files (8,391 rows):
-                    # 'bmo' 4,935 / 'amc' 2,505 / '--' 663 / missing 288. It decides WHICH
-                    # session reacts to a print ('bmo' -> the event day itself, 'amc' -> the
-                    # next session), so an earnings-day move cannot be computed without it,
-                    # and '--'/None is FMP's "not confirmed yet" slot for a scheduled row.
-                    # Passed through raw (never defaulted) so a consumer can tell an unknown
-                    # slot apart from a real one. Every other consumer just sees one more key.
-                    "time": earning.get("time"),
-                }
-                
-                # Calculate surprise
-                if reported_eps and estimated_eps:
-                    earnings_entry["surprise"] = earnings_entry["reported_eps"] - earnings_entry["estimated_eps"]
-                    if earnings_entry["estimated_eps"] != 0:
-                        earnings_entry["surprise_percent"] = (earnings_entry["surprise"] / abs(earnings_entry["estimated_eps"])) * 100
-                    else:
-                        earnings_entry["surprise_percent"] = 0
-                else:
-                    earnings_entry["surprise"] = None
-                    earnings_entry["surprise_percent"] = None
-                
-                filtered_earnings.append((earning_date, earnings_entry))
-            
-            # Sort by date descending (most recent first)
-            filtered_earnings.sort(key=lambda x: x[0], reverse=True)
-            
-            # Apply lookback_periods limit
-            filtered_earnings = filtered_earnings[:lookback_periods]
-            
-            # Extract just the earnings data
-            result["earnings"] = [e[1] for e in filtered_earnings]
-            
+            # Apply lookback_periods limit -- the same slice as before, so a 0 or a
+            # negative lookback still means what it always did.
+            filtered_earnings = parsed[start:][:lookback_periods]
+
+            # Extract just the earnings data. Copied: the parsed entries are memoized
+            # and a caller that mutated one would poison every later read.
+            result["earnings"] = [dict(e[1]) for e in filtered_earnings]
+
             logger.info(f"Retrieved {len(result['earnings'])} past earnings periods for {symbol}")
             
             # Format output

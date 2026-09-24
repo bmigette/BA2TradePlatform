@@ -142,7 +142,7 @@ def test_real_engine_opens_selected_fund_through_shared_rules(monkeypatch):
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
     from app.services.strategy_optimization_handler import _build_daily_trial_config
     from app.services.strategy_param_space import decode_params
-    from tools.strategy_research.profiles import build_manifest
+    from tools.strategy_research.exploration.profiles import build_manifest
     from tests.backtest.fixtures.e2e_support import hermetic_providers
     from tests.backtest.fixtures import hermetic_providers as fixtures
     from datetime import date
@@ -160,7 +160,7 @@ def test_real_engine_opens_selected_fund_through_shared_rules(monkeypatch):
     bt["experts"][0]["settings"].update(universe_symbols=["AAPL", "MSFT"], momentum_bars=5,
                                          trend_bars=5, top_n=1)
     decoded = decode_params(SimpleNamespace(**job["strategy"]), {})
-    config = _build_daily_trial_config(bt, decoded)
+    config = _build_daily_trial_config(bt, decoded, option_trade_records=False)
     before = logging.root.manager.disable
     try:
         logging.disable(logging.INFO)

@@ -4,9 +4,10 @@ Three refusals, each closing a failure that is otherwise silent:
 
 * an UNRESOLVED mode gene must not be exported. ``mode_optimize`` is the optimizer's search
   template; live has no optimizer, so the leaf would arrive describing a space instead of a rule.
-* a market-condition leaf must not sit in an OPEN-POSITIONS / exit ruleset. Outside a decision
-  scope the live resolver has no context, so the gate reads ``no_context``, the rule never fires,
-  and the exit or protective-order adjustment silently stops happening.
+* a market-condition leaf on an OPEN-POSITIONS / exit rule may only CLOSE, REDUCE or ADJUST
+  TP/SL, from a top-level AND (plan 2026-09-24 Task B2). Since B1 the live exit pass opens a
+  decision scope and a failed read is unknown -- the rule does not fire -- which is safe for
+  those actions and for no other. (Before B2 any market leaf on an exit rule was refused.)
 * a field the TARGET server cannot map must REJECT, not drop. ``triggers_from_condition_tree``
   warns and drops an unknown field -- correct for a hand-edited tree, catastrophic for a deploy:
   the gates vanish and the instance trades the strategy ungated under its own name.
@@ -30,7 +31,7 @@ from ba2_common.core import rule_builders
 from ba2_common.core.market_condition_rules import (
     STRICT_FIELD_NAMES,
     assert_market_conditions_resolved,
-    assert_no_market_conditions,
+    assert_market_rule_actions,
     iter_market_condition_leaves,
     market_condition_fields,
 )
@@ -107,9 +108,9 @@ def _entry_rule(*leaves):
              "actions": [{"action_type": "buy"}]}]
 
 
-def _exit_rule(*leaves):
-    return [{"id": "x", "name": "exit", "actions": [{"action_type": "close"}],
-             "conditions": {"id": "xr", "operator": "AND", "conditions": list(leaves)}}]
+def _exit_rule(*leaves, action="close", operator="AND"):
+    return [{"id": "x", "name": "exit", "actions": [{"action_type": action}],
+             "conditions": {"id": "xr", "operator": operator, "conditions": list(leaves)}}]
 
 
 # --------------------------------------------------------------------- the registry of names
@@ -218,7 +219,7 @@ def test_a_really_decoded_genome_carries_no_template_metadata_and_exports():
         for key in ("mode_optimize", "modeOptimize", "mode_choices", "modeChoices"):
             assert key not in leaf, key
     assert_market_conditions_resolved(entry_rules, "entry_rules")
-    assert_no_market_conditions(exit_rules, "exit_rules")
+    assert_market_rule_actions(exit_rules, "exit_rules")
 
     export = trade_rules_to_live_export(entry_rules, exit_rules, name="gated")
     enter, = [r for r in export["rulesets"] if r["subtype"] == "enter_market"]
@@ -276,34 +277,219 @@ def test_an_undecoded_template_still_fails_that_same_export_path():
 
 
 # --------------------------------------------------------------------- exit rulesets
-def test_a_market_leaf_in_an_exit_ruleset_is_refused():
-    with pytest.raises(ValueError, match="not allowed in an open-positions / exit ruleset"):
-        assert_no_market_conditions(_exit_rule(_leaf()), "exit_rules")
-    with pytest.raises(ValueError, match="not allowed in an open-positions / exit ruleset"):
-        trade_rules_to_live_export(_entry_rule(_resolved_leaf()), _exit_rule(_leaf()))
+_ORDINARY_EXIT = {"id": "xtp", "field": "profit_loss_percent", "op": ">", "value": 20}
+_ROLL = "roll_pmcc_short"
+
+
+def test_a_market_leaf_on_a_close_exit_rule_is_accepted_and_exported():
+    """Plan 2026-09-24 B2: a market EXIT -- the gate on a rule that only closes -- deploys."""
+    exits = _exit_rule(_ORDINARY_EXIT, _resolved_leaf())
+    assert_market_rule_actions(exits, "exit_rules")
+    export = trade_rules_to_live_export(_entry_rule(_resolved_leaf()), exits)
+    op, = [r for r in export["rulesets"] if r["subtype"] == "open_positions"]
+    triggers = [t for rule in op["rules"] for t in rule["triggers"].values()]
+    assert any(t["event_type"] == "underlying_adx_14" for t in triggers)
+
+
+@pytest.mark.parametrize("action", ["close", "close_option",
+                                    "adjust_stop_loss", "adjust_take_profit"])
+def test_each_allowed_action_carries_a_market_leaf(action):
+    assert_market_rule_actions(_exit_rule(_resolved_leaf(), action=action), "exit_rules")
+
+
+def test_a_tree_form_reduce_is_refused_at_every_tree_door():
+    """The deploy converter would drop a ``decrease_instrument_share`` rule; refused instead."""
+    exits = _exit_rule(_resolved_leaf(), action="decrease_instrument_share")
+    for door in (lambda: assert_market_rule_actions(exits, "exit_rules"),
+                 lambda: trade_rules_to_live_export([], exits)):
+        with pytest.raises(ValueError, match="cannot carry a reduce action yet"):
+            door()
+
+
+@pytest.mark.parametrize("action", ["buy", "stop_processing", _ROLL])
+def test_a_market_leaf_in_an_exit_ruleset_is_refused_only_with_a_disallowed_action(action):
+    doors = (
+        lambda: assert_market_rule_actions(
+            _exit_rule(_resolved_leaf(), action=action), "exit_rules"),
+        lambda: trade_rules_to_live_export(
+            _entry_rule(_resolved_leaf()), _exit_rule(_resolved_leaf(), action=action)),
+    )
+    for door in doors:
+        with pytest.raises(ValueError) as e:
+            door()
+        msg = str(e.value)
+        assert repr(action) in msg and "'x'" in msg and "may not use" in msg
+        assert "adjust_stop_loss" in msg and "close_option" in msg
+
+
+def test_a_market_leaf_under_OR_on_an_exit_rule_is_refused():
+    exits = _exit_rule(_ORDINARY_EXIT, _resolved_leaf(), operator="OR")
+    with pytest.raises(ValueError, match="non-AND group"):
+        assert_market_rule_actions(exits, "exit_rules")
+    with pytest.raises(ValueError, match="non-AND group"):
+        trade_rules_to_live_export([], exits)
 
 
 def test_an_ordinary_exit_ruleset_is_untouched():
-    exits = _exit_rule({"id": "xtp", "field": "profit_loss_percent", "op": ">", "value": 20})
-    assert_no_market_conditions(exits, "exit_rules")
+    exits = _exit_rule(_ORDINARY_EXIT)
+    assert_market_rule_actions(exits, "exit_rules")
+    # ...whatever its actions and grouping: with no market leaf nothing is judged.
+    assert_market_rule_actions(_exit_rule(_ORDINARY_EXIT, action="stop_processing",
+                                          operator="OR"), "exit_rules")
     export = trade_rules_to_live_export([], exits)
     assert export["rulesets"][0]["subtype"] == "open_positions"
 
 
-def test_the_api_save_path_refuses_a_market_leaf_on_an_exit_rule():
+def test_an_unresolved_template_on_an_exit_rule_is_refused_by_the_export_doors():
+    """An optimizer template must never leave for live, on the exit side as on the entry side."""
+    from fastapi import HTTPException
+    from types import SimpleNamespace
+
+    from app.api.backtests import _derive_export_payload
+
+    exits = _exit_rule(_template_leaf())
+    with pytest.raises(ValueError, match="mode_optimize"):
+        trade_rules_to_live_export([], exits)
+    backtest = SimpleNamespace(
+        id=4245, name="exit-template", expert_name="FMPRating", engine_type="daily_expert",
+        strategy_params={"entryRules": [], "exitRules": exits},
+        start_date=None, end_date=None, initial_capital=20_000.0)
+    with pytest.raises(HTTPException) as e:
+        _derive_export_payload(backtest, "ruleset", None)
+    assert e.value.status_code == 400 and "exit_rules" in str(e.value.detail)
+    assert "mode_optimize" in str(e.value.detail)
+
+
+def _export_exits(exits, bt_id=4246):
+    from types import SimpleNamespace
+
+    from app.api.backtests import _derive_export_payload
+
+    return _derive_export_payload(SimpleNamespace(
+        id=bt_id, name="market-exit", expert_name="FMPRating", engine_type="daily_expert",
+        strategy_params={"entryRules": [], "exitRules": exits},
+        start_date=None, end_date=None, initial_capital=20_000.0), "ruleset", None)
+
+
+def test_the_backtest_export_door_accepts_a_close_exit_and_refuses_a_buy_exit():
+    from fastapi import HTTPException
+
+    payload = _export_exits(_exit_rule(_resolved_leaf()))
+    assert [label for label, _ in iter_market_condition_leaves(payload["exit_rules"], "x")] == [
+        "o_lc-market-adx"]
+    with pytest.raises(HTTPException) as e:
+        _export_exits(_exit_rule(_resolved_leaf(), action="buy"))
+    assert e.value.status_code == 400 and "'buy'" in str(e.value.detail)
+
+
+def test_the_backtest_export_door_sees_a_NOT_the_normalizer_would_hide():
+    """``normalize_trade_rules`` coerces an unknown group operator to AND; the stored list is
+    checked as well, so a NOT is refused rather than laundered."""
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as e:
+        _export_exits(_exit_rule(_resolved_leaf(), operator="NOT"), bt_id=4247)
+    assert e.value.status_code == 400 and "'NOT'" in str(e.value.detail)
+
+
+def test_the_api_save_path_refuses_a_market_leaf_on_an_exit_rule_only_with_a_disallowed_action():
     from fastapi import HTTPException
 
     from app.api.strategies import StrategyCreate, _resolve_rule_lists
 
     ok = StrategyCreate(name="s", entry_rules=_entry_rule(_resolved_leaf()),
-                        exit_rules=_exit_rule({"id": "xtp", "field": "profit_loss_percent",
-                                               "op": ">", "value": 20}))
+                        exit_rules=_exit_rule(_ORDINARY_EXIT))
     entry, exits = _resolve_rule_lists(ok)
     assert entry and exits
-    bad = StrategyCreate(name="s", entry_rules=[], exit_rules=_exit_rule(_leaf()))
-    with pytest.raises(HTTPException) as e:
-        _resolve_rule_lists(bad)
-    assert e.value.status_code == 400 and "exit ruleset" in str(e.value.detail)
+    gated = StrategyCreate(name="s", entry_rules=[], exit_rules=_exit_rule(_leaf()))
+    _entry, exits = _resolve_rule_lists(gated)
+    assert [label for label, _ in iter_market_condition_leaves(exits, "x")] == ["o_lc-market-adx"]
+    for bad in (_exit_rule(_leaf(), action="buy"), _exit_rule(_leaf(), action="stop_processing"),
+                _exit_rule(_leaf(), action=_ROLL), _exit_rule(_leaf(), operator="OR"),
+                _exit_rule(_leaf(), operator="NOT")):
+        with pytest.raises(HTTPException) as e:
+            _resolve_rule_lists(StrategyCreate(name="s", entry_rules=[], exit_rules=bad))
+        assert e.value.status_code == 400 and "exit_rules" in str(e.value.detail)
+
+
+def test_the_deploy_importer_checks_exit_leaves_are_served_too():
+    """An exit leaf no profile serves reads unknown for ever: the exit it guards silently never
+    happens. Now that exit leaves may deploy, the importer's served check covers them, BEFORE
+    anything is written (read from source: running the tool needs a live DB)."""
+    from ba2_common.core.market_condition_rules import assert_market_fields_served
+
+    tools = os.path.normpath(os.path.join(_ROOT, "..", "..", "tools"))
+    importer = open(os.path.join(tools, "import_deploy_payload.py"), encoding="utf-8").read()
+    check = importer.index("assert_market_fields_served(exit_rules, mc_profiles")
+    assert check < importer.index("add_instance(inst)")
+    assert check < importer.index("trade_rules_to_live_export(entry_rules, exit_rules")
+
+    exits = _exit_rule(_resolved_leaf())
+    with pytest.raises(ValueError, match="empty"):
+        assert_market_fields_served(exits, (), where="label: exit rules")
+    assert_market_fields_served(exits, ("ohlcv-v1",), where="label: exit rules")
+
+
+def _run_import_tool(tmp_path, exit_rules, entry_rules=()):
+    """Run ``tools/import_deploy_payload.py`` for real, in a SUBPROCESS, against a throwaway
+    SQLite file with the live schema. The tool configures the process-global DB at import time
+    from ``BA2_LIVE_DB`` (defaulting to the real live DB), so it is never imported in-process and
+    the env var is always set here. Returns (returncode, stdout, ExpertInstance row count)."""
+    import json
+    import subprocess
+
+    from sqlalchemy import create_engine, text
+    from sqlmodel import SQLModel
+
+    import ba2_common.core.models  # noqa: F401 -- registers the tables
+
+    worktree = os.path.normpath(os.path.join(_ROOT, "..", ".."))
+    db_file = str(tmp_path / "throwaway_live.sqlite")
+    engine = create_engine(f"sqlite:///{db_file}")
+    SQLModel.metadata.create_all(engine)
+    payload = [{
+        "target_instance_id": None, "account_id": 1, "label": "refused-deploy",
+        "backtest_id": 1, "expert_name": "FMPRating",
+        "ruleset": {"entry_rules": list(entry_rules), "exit_rules": exit_rules},
+        "settings": {"settings": {"expert_params": {"market_condition_profile": "ohlcv-v1"}}},
+    }]
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    env = dict(os.environ, BA2_LIVE_DB=db_file, BA2_REPO=worktree, PYTHONPATH=os.pathsep.join(
+        os.path.join(worktree, "packages", p) for p in ("common", "providers", "experts")))
+    proc = subprocess.run([sys.executable, os.path.join(worktree, "tools",
+                                                        "import_deploy_payload.py"),
+                           str(payload_file)],
+                          env=env, capture_output=True, text=True, timeout=300, cwd=str(tmp_path))
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT COUNT(*) FROM expertinstance")).scalar()
+    engine.dispose()
+    return proc.returncode, proc.stdout + proc.stderr, rows
+
+
+@pytest.mark.parametrize("bad", ["buy", "decrease_instrument_share", "template"])
+def test_a_refused_payload_writes_no_expert_instance(tmp_path, bad):
+    """The refusals run BEFORE ``add_instance``. Were they left to ``trade_rules_to_live_export``
+    (which runs after the instance is created for a null ``target_instance_id``), a refused
+    payload would leave an enabled ExpertInstance with no rulesets behind."""
+    if bad == "template":
+        exits = _exit_rule(_template_leaf())
+    else:
+        exits = _exit_rule(_resolved_leaf(), action=bad)
+    code, out, rows = _run_import_tool(tmp_path, exits)
+    assert code == 1, out
+    assert "FATAL: refused-deploy" in out, out
+    assert rows == 0, out
+
+
+def test_the_save_path_still_accepts_the_optimizer_template_on_an_exit_rule():
+    """Symmetric with the entry side: a SAVED strategy is the search template; only the export
+    and the deploy require a resolved leaf."""
+    from app.api.strategies import StrategyCreate, _resolve_rule_lists
+
+    payload = StrategyCreate(name="s", entry_rules=[], exit_rules=_exit_rule(_template_leaf()))
+    _entry, exits = _resolve_rule_lists(payload)
+    assert exits[0]["conditions"]["conditions"][0]["modeOptimize"] is True
 
 
 def test_the_save_path_still_accepts_the_optimizer_template_on_an_entry_rule():
@@ -359,11 +545,22 @@ def test_an_unknown_NON_market_field_is_still_dropped_with_a_warning(monkeypatch
     warnings: list = []
     monkeypatch.setattr(rule_builders.logger, "warning",
                         lambda msg, *a: warnings.append(msg % a if a else msg))
+    weird = {"id": "weird", "field": "not_a_registered_field", "op": ">", "value": 1}
     export = trade_rules_to_live_export(
-        _entry_rule({"id": "weird", "field": "not_a_registered_field", "op": ">", "value": 1}), [])
+        _entry_rule({"id": "bull", "field": "bullish", "op": "is_true"}, weird), [])
     rule, = export["rulesets"][0]["rules"]
-    assert rule["triggers"] == {}
+    assert rule["triggers"] == {"cond_0": {"event_type": "bullish"}}
     assert any("DROPPED" in w for w in warnings)
+
+
+def test_a_rule_whose_every_leaf_drops_is_refused_not_exported_always_true():
+    """Plan 2026-09-24 B5 review (I1c): when EVERY leaf drops, the export used to carry a rule
+    with empty triggers -- always true, here a buy on every recommendation. Refused now; the
+    partial drop above is unchanged."""
+    with pytest.raises(ValueError, match="o_lc-entry.*ALWAYS TRUE"):
+        trade_rules_to_live_export(
+            _entry_rule({"id": "weird", "field": "not_a_registered_field", "op": ">",
+                         "value": 1}), [])
 
 
 # ------------------------------------------------- the profile setting travels with the payload

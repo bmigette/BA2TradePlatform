@@ -32,7 +32,7 @@ bump before dispatching.
 
 ## CLI & Remote Server
 - CLI: `python ba2cli.py --host 192.168.1.150 --port 8000`
-- Admin token (for restart): `BA2_ADMIN_TOKEN=DSIOQDIOUHIOSQVjicpodqs`
+- Admin token (for restart): in `testplatform/CLAUDEBT.local.md` (gitignored; never commit it)
 - Remote OS: Windows, Python 3.12, GPU 24GB VRAM
 - **Timezone: CEST** (both server and local). Use `date` command to get current time — don't guess.
 

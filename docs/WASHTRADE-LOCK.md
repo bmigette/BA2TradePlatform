@@ -12,10 +12,16 @@ lifecycle and leg-exemption sections are obsolete).
   `_is_washtrade_lock_candidate`, `_find_opposing_working_order`,
   `_PRIMARY_ORDER_TYPES`, `_WASHTRADE_BLOCKING_ORDER_TYPES`, the gate in
   `submit_order`.
-- `ba2_trade_platform/core/TradeManager.py:322` —
-  `_check_all_washtrade_locked_orders`, the retry.
-- `ba2_trade_platform/modules/accounts/AlpacaAccount.py:1057` — the OCO
-  protective pair.
+- `ba2_trade_platform/core/TradeManager.py` —
+  `_check_all_washtrade_locked_orders` (the retry),
+  `classify_waiting_entry` / `_check_stranded_waiting_transactions` /
+  `_fail_terminal_unfilled_entry` (the give-up path, 2026-09-22).
+- `packages/common/ba2_common/core/washtrade.py` — the
+  `washtrade_complex_submit` / `washtrade_rejected` markers on
+  `TradingOrder.data`.
+- `ba2_trade_platform/modules/accounts/AlpacaAccount.py` — the OCO protective
+  pair, and `_reconcile_pending_cancel_orders` (the by-id `PENDING_CANCEL`
+  resolution, 2026-09-22).
 - `tests/test_washtrade_lock.py`.
 
 This area has been redesigned three times in two months, each time on evidence
@@ -123,6 +129,90 @@ The 06-03 doc had set the revisit trigger explicitly (line 96: *"Revisit if
 locks are observed surviving across sessions"*). It had been met for nine days
 with no alarm, because a still-blocked order only emits a `debug` log.
 
+### 2026-09-22 — the complex-order exemption does NOT always hold
+
+Measured against Alpaca **paper account 1** (dev DB, expert 2), read-only
+`client.get_order_by_id` against the owning account's credentials.
+
+Four transactions were found stuck in `WAITING` forever — txn 28 (SHOP) and 29
+(UNH) since 2026-09-14, txn 131 (NVDA) and 133 (AVGO) since 2026-09-21. Every
+one has the same shape:
+
+```
+entry MARKET          CANCELED         filled_qty 0, has a broker_order_id
+OCO                   CANCELED
+protective SELL_STOP  PENDING_CANCEL   <-- never resolves
+```
+
+Timings, from the broker, for the 2026-09-21 pair:
+
+| Fact | Measurement |
+|---|---|
+| Entry orders submitted | 13:42:56.489 and 13:42:58.251 |
+| Cancelled by the broker, filled 0 | **92 ms** and **142 ms** later |
+| Blocker ord 263 (NVDA `SELL_STOP`, another expert) submitted | 13:41:57, still `NEW` |
+| Blocker ord 253 (AVGO `SELL_STOP`, another expert) submitted | 13:41:52, still `NEW` |
+| `PENDING_CANCEL` legs at the broker (e.g. ord 338 NVDA) | `CANCELED`, `canceled_at` 2026-09-21T13:42:56Z, filled 0 |
+| Orders ever locked in this database (`status like '%WASHTRADE%'`) | **none, ever** |
+
+Both entries carried a `tp` and an `sl`, so both took the
+`use_complex_order = True` branch added on 2026-08-05 and went out as complex
+orders. **Alpaca cancelled them anyway, within ~100 ms, unfilled.**
+
+**Premise invalidated.** The 2026-08-05 design rests on *"brokers exempt COMPLEX
+orders from the wash-trade check"*, measured with a **`BUY STOP` staged far above
+market** as the blocker. It does **not** hold when the blocker is **another
+expert's resting protective `SELL_STOP` guarding an open position**. Probe row 4
+of the table above is still true as measured; it is simply not general.
+
+**What was NOT changed, and why.** Making a resting protective stop a hard
+blocker again was rejected: locking waits for a blocker that cannot clear while
+the position is open, which is the exact deadlock of 2026-08-05 that the 24-hour
+expiry exists to escape. Re-litigating that would be the fourth turn of the same
+circle.
+
+**What changed instead** — three defects, three fixes, none of them a new
+blocking rule:
+
+1. **A cancelled entry now fails its transaction.**
+   `TradeManager._check_stranded_waiting_transactions` +
+   `_fail_terminal_unfilled_entry`. Until now `_fail_unsent_entry` was the ONLY
+   path to `TransactionStatus.FAILED` and it covers only *"the entry never
+   reached the broker"* — it explicitly refuses any order carrying a
+   `broker_order_id`. These entries DID reach the broker, so nothing failed
+   them, and `enter_market`'s safety check then retired each symbol for expert 2
+   permanently. A **partial** fill is never failed: it is a real position.
+2. **`PENDING_CANCEL` is resolved by direct lookup.**
+   `AlpacaAccount._reconcile_pending_cancel_orders`. The old promotion ran only
+   over the paginated `GetOrdersRequest` listing, and these legs are not in it —
+   OCO legs are never listed separately and their parent was itself cancelled.
+   `get_order_by_id` answers instantly. The promotion still goes through
+   `OrderStatus.resolve_pending_cancel`, so nothing is optimistically marked
+   `CANCELED`.
+3. **The exemption is no longer trusted silently.** A contended complex
+   submission is stamped on the order (`TradingOrder.data`,
+   `washtrade_complex_submit`); when such an order ends terminal and unfilled,
+   the give-up path stamps `washtrade_rejected`, logs
+   `WASH-TRADE REJECTION CONFIRMED` with the blocker, and fails the transaction.
+   The attempt is still made — it works against most blockers — but its failure
+   is now a recorded, diagnosable event rather than an anonymous zero-fill
+   cancel.
+
+**Revisit trigger, and what alarms on it.** This design has failed if
+`WASH-TRADE REJECTION CONFIRMED` starts appearing routinely for one
+expert/symbol pair — i.e. the exemption is failing often enough that retrying it
+is just a slower lock. That line is at `ERROR` (not `debug`, the 06-03 and
+08-05 mistake) and the stamp is queryable:
+`select id, symbol, data from tradingorder where data like '%washtrade_rejected%'`.
+A second trigger: any order sitting in `PENDING_CANCEL` past
+`_PENDING_CANCEL_WARN_AGE_HOURS`, which now logs at `WARNING` every refresh.
+
+**Not reproduced as a probe.** The four rows above are real live orders with
+real broker timestamps, which is the stronger evidence; a deliberate probe would
+need another expert's stop resting on the same symbol at the same moment. If you
+change this area again, submit a contended `BRACKET` against a resting
+protective `SELL_STOP` on a paper account and record what comes back.
+
 ---
 
 ## Current design
@@ -147,6 +237,14 @@ park an entry behind a blocker that cannot clear.**
    deadlock, not a wait. Cancel the order, close its transaction as rejected,
    and log the blocker. A market entry signal two days stale is not one you want
    filling.
+5. **A contended complex order that the broker kills anyway is recognised, not
+   retried** (2026-09-22). The exemption is attempted, its use is stamped on the
+   order, and a terminal zero-fill outcome is recorded as the wash-trade
+   rejection it is and handed to the give-up path. No wait, anywhere in this
+   area, is unbounded: the lock expires at
+   `_WASHTRADE_LOCK_MAX_AGE_HOURS`, a `PENDING_CANCEL` at
+   `_PENDING_CANCEL_MAX_AGE_HOURS`, and a `WAITING` transaction whose entry is
+   terminal and unfilled is failed on the next refresh.
 
 ### Changing TP/SL after entry
 

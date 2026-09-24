@@ -71,7 +71,7 @@ def test_trial_config_derives_options_cache_for_option_rule():
     """An option exit rule (buy_call) -> the trial config carries a non-None options_cache_db
     so run_daily_backtest builds + injects the HistoricalOptionsProvider for the trial."""
     decoded = _decoded([{"id": "o1", "action": "buy_call", "option_strike_param": 0.3}])
-    cfg = H._build_daily_trial_config(_backtest_cfg(), decoded)
+    cfg = H._build_daily_trial_config(_backtest_cfg(), decoded, option_trade_records=False)
     assert cfg["options_cache_db"] is not None
     assert str(cfg["options_cache_db"]).endswith(".sqlite") or str(cfg["options_cache_db"])
 
@@ -80,13 +80,13 @@ def test_trial_config_options_cache_none_for_equity_only():
     """An equity-only exit rule (close) -> options_cache_db is None, so the trial runs WITHOUT
     the options provider (byte-identical to the equity-only path)."""
     decoded = _decoded([{"id": "e1", "action": "close"}])
-    cfg = H._build_daily_trial_config(_backtest_cfg(), decoded)
+    cfg = H._build_daily_trial_config(_backtest_cfg(), decoded, option_trade_records=False)
     assert cfg["options_cache_db"] is None
 
 
 def test_trial_config_options_cache_none_for_no_exit_rules():
     """No exit rules at all -> options_cache_db is None (equity-only, unchanged)."""
-    cfg = H._build_daily_trial_config(_backtest_cfg(), _decoded([]))
+    cfg = H._build_daily_trial_config(_backtest_cfg(), _decoded([]), option_trade_records=False)
     assert cfg["options_cache_db"] is None
 
 
@@ -94,7 +94,7 @@ def test_trial_config_forwards_explicit_run_level_options_cache():
     """An explicit run-level backtest_cfg['options_cache_db'] is forwarded as-is to the trial,
     overriding the derive-from-rules path (e.g. a fixture cache pinned by the caller)."""
     decoded = _decoded([{"id": "o1", "action": "buy_call", "option_strike_param": 0.3}])
-    cfg = H._build_daily_trial_config(_backtest_cfg(options_cache_db="/x.db"), decoded)
+    cfg = H._build_daily_trial_config(_backtest_cfg(options_cache_db="/x.db"), decoded, option_trade_records=False)
     assert cfg["options_cache_db"] == "/x.db"
 
 
@@ -102,7 +102,7 @@ def test_trial_config_forwards_explicit_cache_even_for_equity_only():
     """An explicit run-level options_cache_db is honoured even when the decoded rules are
     equity-only (the caller pinned a cache deliberately)."""
     decoded = _decoded([{"id": "e1", "action": "close"}])
-    cfg = H._build_daily_trial_config(_backtest_cfg(options_cache_db="/x.db"), decoded)
+    cfg = H._build_daily_trial_config(_backtest_cfg(options_cache_db="/x.db"), decoded, option_trade_records=False)
     assert cfg["options_cache_db"] == "/x.db"
 
 
@@ -160,7 +160,7 @@ def test_decoded_option_rule_drives_options_cache_in_trial_config():
     decoded = decode_params(
         strategy, {"exit:o1:a0:option_strike_param": 0.35, "exit:o1:a0:option_dte": 30}
     )
-    cfg = H._build_daily_trial_config(_backtest_cfg(), decoded)
+    cfg = H._build_daily_trial_config(_backtest_cfg(), decoded, option_trade_records=False)
     assert cfg["options_cache_db"] is not None
     action = cfg["exit_rules"][0]["actions"][0]
     assert action["option_strike_param"] == 0.35

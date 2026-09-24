@@ -1,6 +1,7 @@
 """Offline historical options cache (sqlite). Mirrors the screener-history cache:
 built once by `ba2-test fetch-options`, read-only at backtest time, fail-fast on miss."""
 from __future__ import annotations
+import os
 import sqlite3
 from typing import Any, Dict, List, Optional
 
@@ -40,8 +41,28 @@ _GREEK_COLS = ("iv", "delta", "gamma", "theta", "vega")
 
 
 class OptionsHistoryCache:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, read_only: bool = False):
+        """Open the cache. ``read_only=True`` is for READ paths that must not write.
+
+        A GET that serves a chart must not create a database, migrate an old one or build an
+        index (review R8: a saved path pointing at a previously absent file made the
+        read-only chart endpoint create a new SQLite database). Read-only mode therefore
+        requires the file to already exist, skips ALL schema work, and opens the connection
+        with SQLite's ``mode=ro`` so a write could not succeed even by accident. Warming and
+        migration stay where they belong -- in the fetch/backtest path, not in a request.
+        """
         self.db_path = db_path
+        self.read_only = read_only
+
+        if read_only:
+            if not db_path or not os.path.exists(db_path):
+                raise OptionsCacheMiss(f"option cache not found: {db_path}")
+            with self._conn() as cx:
+                # Fail loudly on an unreadable or non-cache file rather than pretending to
+                # have no data for the contract.
+                cx.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+            return
+
         with self._conn() as cx:
             cx.execute(_CHAIN_DDL); cx.execute(_BAR_DDL)
             for table in ("option_chain", "option_bar"):
@@ -72,7 +93,12 @@ class OptionsHistoryCache:
                     raise
 
     def _conn(self):
-        cx = sqlite3.connect(self.db_path); cx.row_factory = sqlite3.Row; return cx
+        if getattr(self, 'read_only', False):
+            cx = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        else:
+            cx = sqlite3.connect(self.db_path)
+        cx.row_factory = sqlite3.Row
+        return cx
 
     def write_chain_rows(self, underlying: str, as_of: str, rows: List[Dict[str, Any]]) -> None:
         with self._conn() as cx:

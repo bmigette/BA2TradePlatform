@@ -53,12 +53,21 @@ _REPO = os.path.dirname(os.path.dirname(_BACKEND))
 # THE WORKTREE'S packages, ahead of the installed ones. ba2_common is pip-installed from the
 # MAIN checkout, so without this a bench run from a worktree silently measures the code on
 # dev rather than the code being benchmarked -- and reports it as the branch's number.
+#
+# THE BACKEND IS THEN MOVED BACK TO THE FRONT. ``packages/common`` holds its own regular ``tests``
+# package; ahead of the backend it shadows ``tests`` for every process SPAWNED after this import
+# (a spawn child rebuilds sys.path from the parent's), so a later pytest module whose spawn pool
+# pickles ``tests.test_...`` callables dies in the child with ModuleNotFoundError -- seen as
+# test_local_pool_stall_recovery failing only in a worktree, where these paths are not already
+# on sys.path via the editable installs and so really are inserted.
 for _p in (_BACKEND, os.path.join(_REPO, "testplatform"),
            os.path.join(_REPO, "packages", "common"),
            os.path.join(_REPO, "packages", "providers"),
            os.path.join(_REPO, "packages", "experts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+sys.path.remove(_BACKEND)
+sys.path.insert(0, _BACKEND)
 
 #: The gates the trial phase turns on. Thresholds chosen to PASS most of the time so the gated
 #: arm still trades: a gated arm that entered nothing would compare a working backtest against
@@ -323,7 +332,8 @@ def phase_trial(args: Any, symbols: Sequence[str], covered: Sequence[str] = ()) 
         db.close()
 
     def _cfg(decoded, profile):
-        cfg = _build_daily_trial_config(base, decoded, hoisted)
+        cfg = _build_daily_trial_config(base, decoded, hoisted,
+                                        option_trade_records=False)  # a benchmark
         cfg["market_condition_profile"] = profile
         if profile != "none":
             cfg["market_condition_manifest"] = args.manifest

@@ -109,6 +109,12 @@ class LazyTableConfig:
     selection_mode: Literal['none', 'single', 'multi'] = 'none'
     row_key: str = 'id'
     show_global_filter: bool = True
+    # THE TABLE'S OWN REFRESH ICON. Off where the page already has a Refresh button:
+    # Activity Monitor drew "Refresh Now" AND this icon, both calling the same
+    # ``refresh()`` on the same table, and Live Trades drew its Refresh (which also
+    # repopulates the expert filter) beside this icon (which does not). Two buttons
+    # for one action, one of them doing less, is how a reader learns neither.
+    show_refresh: bool = True
     show_column_filters: bool = True
     show_loading_overlay: bool = True
     dense: bool = False
@@ -181,6 +187,8 @@ class LazyTable:
         self._loading_spinner: Optional[ui.spinner] = None
         self._pagination_label: Optional[ui.label] = None
         self._global_filter_input: Optional[ui.input] = None
+        # Between the table and its pagination controls; see ``footer``.
+        self._footer: Optional[ui.column] = None
         
         # Auto refresh task
         self._refresh_task: Optional[asyncio.Task] = None
@@ -570,11 +578,13 @@ class LazyTable:
                         lambda e: asyncio.create_task(self._on_global_filter_change(e.sender.value))
                     )
                 
-                # Refresh button
-                ui.button(
-                    icon='refresh',
-                    on_click=lambda: asyncio.create_task(self.refresh())
-                ).props('flat')
+                # Refresh button -- unless the page already draws one. See
+                # ``LazyTableConfig.show_refresh``.
+                if self.config.show_refresh:
+                    ui.button(
+                        icon='refresh',
+                        on_click=lambda: asyncio.create_task(self.refresh())
+                    ).props('flat')
                 
                 # Loading spinner
                 self._loading_spinner = ui.spinner('dots').set_visibility(False)
@@ -589,11 +599,11 @@ class LazyTable:
                     ui.button(
                         'Select All Page',
                         on_click=self.select_all
-                    ).props('flat dense size=sm')
+                    ).props('flat dense')  # size=sm made these ~9px; see LiveTradesTable
                     ui.button(
                         'Clear Selection',
                         on_click=self.clear_selection
-                    ).props('flat dense size=sm')
+                    ).props('flat dense')  # size=sm made these ~9px; see LiveTradesTable
                     ui.label().bind_text_from(
                         self._selected_ids, '__len__',
                         backward=lambda: f'{len(self._selected_ids)} selected'
@@ -660,6 +670,8 @@ class LazyTable:
             # Handle sort change from Quasar table (server-side mode)
             self._table.on('request', self._handle_sort_request)
             
+            self._footer = ui.column().classes('w-full gap-0')
+
             # Pagination controls
             self._render_pagination_controls()
         
@@ -713,6 +725,16 @@ class LazyTable:
         """Get total record count."""
         return self._total_count
     
+    @property
+    def footer(self) -> Optional[ui.column]:
+        """Container directly under the table rows, ABOVE the pagination controls.
+
+        For a page's summary strip (e.g. Live Trades' totals): under the pagination bar it
+        read as belonging to the page, not the table, and sat a scroll further away. Created
+        by ``render()``; ``None`` before it.
+        """
+        return self._footer
+
     def add_slot(self, name: str, template: str):
         """
         Add a custom slot to the table.

@@ -13,6 +13,8 @@ from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
+from ba2_common.core.washtrade import (
+    went_out_as_contended_complex, was_rejected_as_washtrade, stamp_rejection)
 # ONE constant, TWO readers: the OCO stop leg places its limit this far through the stop,
 # and _force_close_breached_stops below decides a stop was jumped by the same number. See
 # the constant's own comment in AlpacaAccount for why they can never be allowed to drift.
@@ -40,6 +42,13 @@ _WASHTRADE_LOCK_MAX_AGE_HOURS = 24.0
 # Below the max age but past this, log at WARNING instead of DEBUG. The 2026-08-05 deadlock
 # went unnoticed for 9 days precisely because a still-blocked order only logged at DEBUG.
 _WASHTRADE_LOCK_WARN_AGE_HOURS = 1.0
+
+# Grace period before a WAITING transaction whose entry looks dead is actually failed.
+# A transaction and its entry order are written by two separate statements, so a verdict
+# taken between them would act on a half-written state. Mirrors the 5-minute floor
+# AlpacaAccount's refresh already applies before concluding anything about a freshly
+# submitted order. See _check_stranded_waiting_transactions.
+_STRANDED_ENTRY_GRACE_MINUTES = 5.0
 
 
 def classify_waiting_trigger(parent_status, trigger_status):
@@ -88,6 +97,65 @@ def classify_waiting_trigger(parent_status, trigger_status):
     if parent_status in OrderStatus.get_terminal_statuses():
         return "cancel"
     return "wait"
+
+
+def classify_waiting_entry(entry_orders):
+    """Decide the fate of a WAITING transaction from the state of its ENTRY orders.
+
+    A transaction is created in WAITING by ``submit_order`` and only leaves that state
+    when its entry FILLS (-> OPENED) or when something explicitly fails it. Nothing today
+    fails an entry that DID reach the broker and was then killed there, so such a
+    transaction stays WAITING forever — and the enter_market safety check refuses any
+    symbol+expert that already has a WAITING transaction, so the symbol is retired for
+    that expert permanently. Measured on dev 2026-09-22: txns 28/29 (SHOP, UNH, since
+    09-14) and 131/133 (NVDA, AVGO, since 09-21), all expert 2 / account 1, each with a
+    CANCELED entry that filled 0. See docs/WASHTRADE-LOCK.md.
+
+    Returns one of:
+        "wait"      - no entry row yet, or at least one entry is still in flight. Nothing
+                      to conclude; ask again next refresh.
+        "filled"    - every entry is terminal and at least one reports filled quantity.
+                      A PARTIAL fill is a REAL POSITION: it must never be failed, or the
+                      platform forgets shares it actually owns. Reconciliation
+                      (``TransactionHelper.reconcile_canceled_partial_fill``) owns this
+                      case, not the give-up path.
+        "ambiguous" - every entry is terminal, none reports filled quantity, and the
+                      evidence does not agree that nothing traded: a NULL ``filled_qty``
+                      on an order the broker has touched (unknown, not zero), or a zero
+                      quantity next to a recorded fill PRICE. A disagreement is not a
+                      licence to act: refuse loudly rather than guess.
+        "dead"      - every entry is terminal and nothing filled. Give up on it.
+
+    Terminality is checked FIRST so that a partially-filled but still-working entry reads
+    as "wait" (it is progressing toward FILLED) rather than as a finished partial.
+
+    A NULL ``filled_qty`` is only read as "nothing filled" when the order carries no
+    ``broker_order_id`` — an order the broker never saw CANNOT have traded, which is a
+    measured fact rather than a coercion of unknown to zero. With a broker id, NULL means
+    the row was never synced and the quantity is genuinely unknown.
+    """
+    orders = list(entry_orders or [])
+    if not orders:
+        return "wait"
+    terminal = OrderStatus.get_terminal_statuses()
+    # FILLED is deliberately NOT in get_terminal_statuses() (that set drives buying-power
+    # release); an entry that filled is nonetheless final and is caught by the fill checks
+    # below, so treat it as settled here rather than as "still working".
+    for order in orders:
+        if order.status not in terminal and order.status != OrderStatus.FILLED:
+            return "wait"
+    for order in orders:
+        filled_qty = getattr(order, 'filled_qty', None)
+        if filled_qty is not None and float(filled_qty) > 0:
+            return "filled"
+    for order in orders:
+        if (getattr(order, 'filled_qty', None) is None
+                and getattr(order, 'broker_order_id', None)):
+            return "ambiguous"
+        open_price = getattr(order, 'open_price', None)
+        if open_price is not None and float(open_price) > 0:
+            return "ambiguous"
+    return "dead"
 
 
 def replacement_blocked_by_qty(trigger_status, available_qty, required_qty) -> bool:
@@ -356,6 +424,14 @@ class TradeManager:
             # opposite-side order working at the broker (runs after Step 1 re-synced
             # broker order state).
             self._check_all_washtrade_locked_orders()
+
+            # Step 4: Give up on WAITING transactions whose entry died at the broker
+            # without filling. Runs LAST so it reads the order state Steps 1-3 have just
+            # reconciled — in particular an entry the broker cancelled and a protective
+            # leg a by-id lookup has just settled. Nothing else can fail such a
+            # transaction, and a stranded WAITING permanently retires its symbol for its
+            # expert (see the method's docstring and docs/WASHTRADE-LOCK.md).
+            self._check_stranded_waiting_transactions()
 
             self.logger.info("Account refresh completed")
 
@@ -1053,10 +1129,6 @@ class TradeManager:
 
         Returns True when it compensated, False when it refused or had nothing to do.
         """
-        from sqlmodel import select
-        from .db import get_db
-        from .types import TransactionStatus
-
         order_id = getattr(order, 'id', None)
         if not order_id:
             self.logger.error(f"Cannot compensate an unsaved entry order ({reason})")
@@ -1091,6 +1163,30 @@ class TradeManager:
         order.status = OrderStatus.CANCELED
         update_instance(order)
 
+        self._cancel_waiting_trigger_dependents(order_id)
+
+        # The transaction id is read from the IN-MEMORY object first: submit_order creates the
+        # Transaction and stamps trading_order.transaction_id, then persists it with a SEPARATE
+        # update_instance. When that update is what failed, the row on disk has no
+        # transaction_id at all while a WAITING transaction very much exists — and that orphan
+        # is precisely what would keep blocking the symbol.
+        transaction_id = getattr(order, 'transaction_id', None) or on_disk.transaction_id
+        self._fail_waiting_transaction(
+            transaction_id,
+            f"its entry order {order_id} never reached the broker",
+        )
+        return True
+
+    def _cancel_waiting_trigger_dependents(self, order_id: int) -> int:
+        """Cancel every WAITING_TRIGGER order chained on ``order_id``.
+
+        Those legs wait on a parent status that will now never arrive, so leaving them
+        behind only moves the leak. WAITING_TRIGGER is an unsent status — the row exists
+        only in this database — so this can never hide a live broker order.
+        """
+        from sqlmodel import select
+        from .db import get_db
+
         with get_db() as session:
             dependents = session.exec(
                 select(TradingOrder).where(
@@ -1099,34 +1195,343 @@ class TradeManager:
                 )
             ).all()
             dependent_ids = [d.id for d in dependents]
+        cancelled = 0
         for dep_id in dependent_ids:
             dep = self._row_or_none(TradingOrder, dep_id)
             if dep and dep.status == OrderStatus.WAITING_TRIGGER:
                 dep.status = OrderStatus.CANCELED
                 update_instance(dep)
-                self.logger.info(f"Cancelled protective leg {dep_id} of unsent order {order_id}")
+                cancelled += 1
+                self.logger.info(f"Cancelled protective leg {dep_id} of dead entry {order_id}")
+        return cancelled
 
-        # Only fail a transaction this order never managed to open. An OPENED transaction has
-        # other filled orders behind it and a real position at the broker; the unsent order was
-        # an add-on, not the position itself.
-        #
-        # The transaction id is read from the IN-MEMORY object first: submit_order creates the
-        # Transaction and stamps trading_order.transaction_id, then persists it with a SEPARATE
-        # update_instance. When that update is what failed, the row on disk has no
-        # transaction_id at all while a WAITING transaction very much exists — and that orphan
-        # is precisely what would keep blocking the symbol.
-        transaction_id = getattr(order, 'transaction_id', None) or on_disk.transaction_id
-        if transaction_id:
-            txn = self._row_or_none(Transaction, transaction_id)
-            if txn and txn.status == TransactionStatus.WAITING:
-                txn.status = TransactionStatus.FAILED
-                update_instance(txn)
-                self.logger.warning(
-                    f"Transaction {txn.id} ({txn.symbol}) marked FAILED — its entry order "
-                    f"{order_id} never reached the broker; leaving it WAITING would block every "
-                    f"future entry for this symbol+expert"
-                )
+    def _fail_waiting_transaction(self, transaction_id, reason: str) -> bool:
+        """Mark a WAITING transaction FAILED. THE single give-up transition.
+
+        WHY IT IS SHARED. Every way of giving up on an entry leaves the same expensive
+        debris: the Transaction that ``submit_order`` created in WAITING before anything
+        went wrong. The enter_market SAFETY CHECK refuses any symbol+expert that already
+        has an OPENED or WAITING transaction, and nothing sweeps a stranded WAITING — so
+        one lost entry retires that symbol for that expert permanently. Measured on PROD
+        (CVS 2026-08-10, WSC 2026-08-24, both unsent) and on dev (SHOP/UNH 2026-09-14,
+        NVDA/AVGO 2026-09-21, all four SENT and then cancelled by the broker).
+
+        Only a WAITING transaction is failed. An OPENED one has filled orders behind it
+        and a real position at the broker; the dead order was an add-on, not the position.
+        """
+        from .types import TransactionStatus
+
+        if not transaction_id:
+            return False
+        txn = self._row_or_none(Transaction, transaction_id)
+        if not txn or txn.status != TransactionStatus.WAITING:
+            return False
+        txn.status = TransactionStatus.FAILED
+        update_instance(txn)
+        self.logger.warning(
+            f"Transaction {txn.id} ({txn.symbol}) marked FAILED — {reason}; leaving it "
+            f"WAITING would block every future entry for this symbol+expert"
+        )
         return True
+
+    def _settle_orphaned_children(self, account, txn_id: int, entry_ids) -> None:
+        """Leave nothing non-terminal behind a dead entry.
+
+        Everything on transaction ``txn_id`` that is not one of ``entry_ids`` is a
+        protective leg (or an OCO wrapper) that exists only to guard a position the entry
+        never opened. Three shapes, three different correct actions — and the difference
+        is exactly the one ``_fail_unsent_entry`` refuses to guess at:
+
+        * **unsent** (PENDING / WAITING_TRIGGER / WASHTRADE_LOCKED, no broker id) — the
+          row exists only here, so write CANCELED directly.
+        * **working at the broker** (has a broker id, not terminal, not already
+          PENDING_CANCEL) — ask the BROKER to cancel it. ``cancel_order`` sets
+          PENDING_CANCEL, and the by-id reconciliation promotes that to the broker's real
+          answer. Writing CANCELED here instead would hide a live order.
+        * **already PENDING_CANCEL** — the cancel is in flight; the by-id reconciliation
+          owns it. Say so and leave it alone.
+
+        A row that claims an unsent status while carrying a broker id is a contradiction;
+        it is reported and left untouched rather than resolved by assumption.
+        """
+        from sqlmodel import select
+        from .db import get_db
+
+        unsent = OrderStatus.get_unsent_statuses()
+        terminal = OrderStatus.get_terminal_statuses()
+        with get_db() as session:
+            children = session.exec(
+                select(TradingOrder).where(TradingOrder.transaction_id == txn_id)
+            ).all()
+            child_ids = [c.id for c in children if c.id not in entry_ids]
+
+        for child_id in child_ids:
+            child = self._row_or_none(TradingOrder, child_id)
+            if child is None or child.status in terminal or child.status == OrderStatus.FILLED:
+                continue
+            broker_id = getattr(child, 'broker_order_id', None)
+            if child.status in unsent:
+                if broker_id:
+                    self.logger.error(
+                        f"Order {child_id} ({child.symbol}) claims unsent status "
+                        f"{child.status} but carries broker id {broker_id} — REFUSING to "
+                        f"touch it; a row that contradicts itself must be looked at, not "
+                        f"resolved by assumption"
+                    )
+                    continue
+                child.status = OrderStatus.CANCELED
+                update_instance(child)
+                self.logger.info(
+                    f"Cancelled orphaned protective order {child_id} ({child.symbol} "
+                    f"{child.order_type.value}) of failed transaction {txn_id}")
+                continue
+            if child.status == OrderStatus.PENDING_CANCEL:
+                self.logger.info(
+                    f"Orphaned protective order {child_id} ({child.symbol}) of failed "
+                    f"transaction {txn_id} is already PENDING_CANCEL — the by-id "
+                    f"reconciliation will settle it against the broker")
+                continue
+            if not broker_id:
+                self.logger.error(
+                    f"Order {child_id} ({child.symbol}) is {child.status} with NO broker id "
+                    f"on failed transaction {txn_id} — cannot cancel it at the broker and "
+                    f"cannot safely cancel it here; leaving it for an operator")
+                continue
+            if account is None:
+                self.logger.error(
+                    f"Order {child_id} ({child.symbol}) is working at the broker "
+                    f"({broker_id}) on failed transaction {txn_id}, but its account could "
+                    f"not be instantiated — the protective leg is left working")
+                continue
+            self.logger.warning(
+                f"Cancelling orphaned protective order {child_id} ({child.symbol} "
+                f"{child.order_type.value}, {child.status}) at the broker: its entry never "
+                f"opened a position on transaction {txn_id}")
+            account.cancel_order(child_id)
+
+    def _fail_terminal_unfilled_entry(self, entry, txn, account, reason: str) -> bool:
+        """Give up on an entry the BROKER killed without filling it.
+
+        SIBLING OF ``_fail_unsent_entry``, same rationale, opposite precondition. That one
+        compensates an entry that never reached the broker and therefore refuses anything
+        carrying a ``broker_order_id``. This one handles precisely the case it refuses: an
+        entry that DID reach the broker, was accepted, and was then CANCELED / REJECTED /
+        EXPIRED there with zero filled quantity. Both converge on the same give-up
+        transition (``_fail_waiting_transaction``) because the debris is identical.
+
+        SAFETY — WHY THIS CAN NEVER DISCARD A REAL POSITION. A partial fill IS a position,
+        and failing its transaction would make the platform forget shares it owns. So the
+        compensation is refused unless the in-memory object AND the row on disk BOTH agree
+        that the order is in a terminal status and that its filled quantity is zero. The
+        order's own status is left exactly as the broker set it — nothing here rewrites
+        broker-reported state.
+
+        Returns True when it failed the transaction, False when it refused.
+        """
+        from .types import TransactionStatus
+
+        entry_id = getattr(entry, 'id', None)
+        if not entry_id:
+            self.logger.error(f"Cannot give up on an unsaved entry order ({reason})")
+            return False
+
+        on_disk = self._row_or_none(TradingOrder, entry_id)
+        if on_disk is None:
+            self.logger.warning(
+                f"Order {entry_id} no longer exists — nothing to give up on ({reason})")
+            return False
+
+        terminal = OrderStatus.get_terminal_statuses()
+        for view, where in ((entry, "in memory"), (on_disk, "on disk")):
+            if view.status not in terminal:
+                self.logger.error(
+                    f"REFUSING to fail transaction {txn.id} on order {entry_id} "
+                    f"({entry.symbol}): status is {view.status} ({where}), which is not a "
+                    f"terminal status — the order may still fill. Reason was: {reason}")
+                return False
+            # Mirrors classify_waiting_entry exactly, so the classifier and the actor can
+            # never disagree about what "unfilled" means.
+            filled = getattr(view, 'filled_qty', None)
+            if filled is None:
+                if getattr(view, 'broker_order_id', None):
+                    self.logger.error(
+                        f"REFUSING to fail transaction {txn.id} on order {entry_id} "
+                        f"({entry.symbol}): filled_qty is NULL ({where}) on an order the "
+                        f"broker has seen, so how much traded is UNKNOWN — and unknown is "
+                        f"not zero. Reason was: {reason}")
+                    return False
+            elif float(filled) > 0:
+                self.logger.error(
+                    f"REFUSING to fail transaction {txn.id} on order {entry_id} "
+                    f"({entry.symbol}): filled_qty is {filled} ({where}), so shares really "
+                    f"traded — failing it would make the platform forget a real position. "
+                    f"Reason was: {reason}")
+                return False
+
+        # FIX 3's half of the wash-trade story. The entry took the complex-order exemption
+        # (stamped at submit time) and the broker killed it anyway — so the exemption did
+        # not hold against this blocker. Record it on the order before the give-up, so the
+        # rejection is diagnosable long after the logs roll.
+        if went_out_as_contended_complex(entry) and not was_rejected_as_washtrade(on_disk):
+            record = stamp_rejection(on_disk, on_disk.status)
+            update_instance(on_disk)
+            self.logger.error(
+                f"WASH-TRADE REJECTION CONFIRMED: order {entry_id} ({entry.symbol} "
+                f"{entry.side.value}) was submitted as a COMPLEX order to escape blocker "
+                f"{record['blocker_order_id']} ({record['blocker_order_type']}) and the "
+                f"broker still ended it {record['final_status']} with zero fill. The "
+                f"bracket/OCO exemption does NOT hold against this blocker shape — see the "
+                f"2026-09-22 section of docs/WASHTRADE-LOCK.md"
+            )
+            reason = f"{reason}; the complex-order wash-trade exemption did not hold"
+
+        self._settle_orphaned_children(account, txn.id, {entry_id})
+        self._cancel_waiting_trigger_dependents(entry_id)
+        failed = self._fail_waiting_transaction(txn.id, reason)
+        if not failed:
+            current = self._row_or_none(Transaction, txn.id)
+            self.logger.info(
+                f"Transaction {txn.id} was no longer WAITING when the give-up path reached "
+                f"it (now {current.status if current else 'gone'})")
+        return failed
+
+    def _check_stranded_waiting_transactions(self):
+        """Fail every WAITING transaction whose entry died at the broker without filling.
+
+        THE HOLE THIS FILLS. ``_fail_unsent_entry`` is the only other path to
+        ``TransactionStatus.FAILED`` and it covers exactly one story — "the entry never
+        reached the broker". An entry that DID reach the broker and was cancelled there
+        unfilled matches nothing, so its transaction stays WAITING forever and the
+        enter_market safety check retires that symbol for that expert. Four such
+        transactions were measured on dev 2026-09-22 (SHOP/UNH since 09-14, NVDA/AVGO
+        since 09-21, all expert 2 / account 1); all four entries were accepted by Alpaca
+        and cancelled by it within ~100 ms, filled 0, blocked by another expert's resting
+        protective stop. See docs/WASHTRADE-LOCK.md.
+
+        Runs after the broker re-sync so every order status it reads is fresh.
+        """
+        from sqlmodel import select
+        from .db import get_db
+        from ..modules.accounts import get_account_class
+        from .models import AccountDefinition
+        from .types import TransactionStatus
+
+        with get_db() as session:
+            waiting_ids = [
+                t.id for t in session.exec(
+                    select(Transaction).where(Transaction.status == TransactionStatus.WAITING)
+                ).all()
+            ]
+
+        if not waiting_ids:
+            self.logger.debug("No WAITING transactions to check for a dead entry")
+            return
+
+        self.logger.debug(f"Checking {len(waiting_ids)} WAITING transaction(s) for a dead entry")
+        account_cache: Dict[int, Any] = {}
+
+        for txn_id in waiting_ids:
+            try:
+                txn = self._row_or_none(Transaction, txn_id)
+                if txn is None or txn.status != TransactionStatus.WAITING:
+                    continue  # changed since we listed it
+
+                # The ENTRY orders are the top-level orders pointing the same way as the
+                # position. Protective legs and the OCO wrapper are on the OPPOSITE side,
+                # which is what keeps them out of this classification; ``parent_order_id``
+                # then excludes the LEG rows of a composite order, whose fate belongs to
+                # their parent. (A multi-leg OPTION structure's net parent carries no side
+                # at all, so no entry matches and such a transaction is simply left alone
+                # — deliberately conservative: this sweep is for the equity entry that the
+                # broker cancelled.)
+                with get_db() as session:
+                    entries = session.exec(
+                        select(TradingOrder).where(
+                            TradingOrder.transaction_id == txn_id,
+                            TradingOrder.side == txn.side,
+                            TradingOrder.parent_order_id.is_(None),
+                        ).order_by(TradingOrder.created_at.asc())
+                    ).all()
+                    entry_rows = [
+                        (e.id, e.account_id, e.created_at) for e in entries
+                    ]
+                    verdict = classify_waiting_entry(entries)
+
+                if verdict == "wait":
+                    continue
+
+                # GRACE PERIOD. Mirrors the 5-minute floor AlpacaAccount's refresh already
+                # applies before concluding anything about a freshly submitted order: a
+                # transaction and its entry are written by two separate statements, and a
+                # verdict taken between them would act on a half-written state.
+                youngest = self._youngest_age_minutes(entry_rows)
+                if youngest is not None and youngest < _STRANDED_ENTRY_GRACE_MINUTES:
+                    self.logger.debug(
+                        f"Transaction {txn_id} ({txn.symbol}) reads {verdict} but its "
+                        f"newest entry is only {youngest:.1f} min old — leaving it")
+                    continue
+
+                if verdict == "filled":
+                    self.logger.warning(
+                        f"Transaction {txn_id} ({txn.symbol}) is WAITING with a TERMINAL "
+                        f"entry that reports a fill — this is a real position, NOT failed "
+                        f"here. Partial-fill reconciliation owns it "
+                        f"(TransactionHelper.reconcile_canceled_partial_fill)")
+                    continue
+
+                if verdict == "ambiguous":
+                    self.logger.error(
+                        f"Transaction {txn_id} ({txn.symbol}) is WAITING with a terminal "
+                        f"entry whose filled_qty is 0 but which carries a fill PRICE. The "
+                        f"two witnesses disagree about whether anything traded, so nothing "
+                        f"is decided here — an operator must reconcile it against the broker")
+                    continue
+
+                # verdict == "dead"
+                entry_id, account_id, _ = entry_rows[-1]
+                entry = self._row_or_none(TradingOrder, entry_id)
+                if entry is None:
+                    continue
+                account = account_cache.get(account_id)
+                if account is None:
+                    account_def = self._row_or_none(AccountDefinition, account_id)
+                    account_class = (
+                        get_account_class(account_def.provider) if account_def else None)
+                    if account_class is None:
+                        self.logger.error(
+                            f"No account class for order {entry_id}'s account {account_id}; "
+                            f"a broker-side protective leg cannot be cancelled this pass")
+                    else:
+                        account = account_class(account_def.id)
+                        account_cache[account_id] = account
+
+                self._fail_terminal_unfilled_entry(
+                    entry, txn, account,
+                    f"its entry order {entry_id} reached the broker and ended "
+                    f"{entry.status.value if hasattr(entry.status, 'value') else entry.status} "
+                    f"with zero filled quantity",
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"Error checking WAITING transaction {txn_id}: {e}", exc_info=True)
+
+    @staticmethod
+    def _youngest_age_minutes(rows):
+        """Age in minutes of the most RECENTLY created row, or None when none is dated.
+
+        A missing ``created_at`` must not read as age 0 (that would disable the grace
+        period silently); callers skip the check on None, exactly as
+        ``_washtrade_lock_age_hours`` does.
+        """
+        ages = []
+        for row in rows:
+            created_at = row[-1]
+            if not created_at:
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            ages.append((datetime.now(timezone.utc) - created_at).total_seconds() / 60.0)
+        return min(ages) if ages else None
 
     def _persist_funded_entry(self, order, quantity: float, stop_price=None) -> None:
         """Write the risk manager's decision onto the entry row BEFORE the broker is called.
@@ -1210,7 +1615,7 @@ class TradeManager:
         for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
             try:
                 submit_sl = self._entry_submit_stop(order, sl_price)
-                return account.submit_order(order, sl_price=submit_sl)
+                submitted = account.submit_order(order, sl_price=submit_sl)
             except Exception as e:  # noqa: BLE001 — classified immediately below
                 if "database is locked" not in str(e).lower():
                     raise  # a real answer from the broker/validator: never re-send
@@ -1221,6 +1626,17 @@ class TradeManager:
                         f"Entry submit for order {order.id} ({order.symbol}) lost to a DB lock "
                         f"(attempt {attempt}/{self._ENTRY_SUBMIT_RETRIES}); retrying in {delay:.0f}s")
                     _time.sleep(delay)
+            else:
+                # The stop this entry was SIZED on, recorded once as the transaction's max-loss
+                # stop. ``sl_price`` is the RM safeguard the candidate was sized off, BEFORE
+                # _entry_submit_stop reconciled it with the ruleset stop; the helper falls back
+                # to the ruleset stop only when there is no safeguard. OUTSIDE the try on
+                # purpose: nothing it does may be mistaken for a DB-locked submit and re-send
+                # the order. It never raises (see the helper).
+                if submitted:
+                    from ba2_common.core.trade_cycle import record_max_loss_stop
+                    record_max_loss_stop(order, sl_price)
+                return submitted
         self.logger.error(
             f"Entry submit for order {order.id} ({order.symbol}) ABANDONED after "
             f"{self._ENTRY_SUBMIT_RETRIES} DB-lock retries: {last_err}. The RM funded this trade "
@@ -2127,6 +2543,9 @@ class TradeManager:
 
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            from ba2_common.core.hold_entry import evaluate_hold_entries
+            from ba2_common.core.types import is_option_action
+            allow_hold = evaluate_hold_entries(expert.settings)
 
             # INVARIANT FOR THIS WHOLE BLOCK: `session` is READ-ONLY. Nothing loaded through it
             # may be mutated, and nothing may be added to it.
@@ -2150,8 +2569,10 @@ class TradeManager:
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,
                     ExpertRecommendation.created_at >= cutoff_time,
-                    ExpertRecommendation.recommended_action != OrderRecommendation.HOLD
                 ).order_by(ExpertRecommendation.created_at.desc())  # Most recent first
+                if not allow_hold:
+                    statement = statement.where(
+                        ExpertRecommendation.recommended_action != OrderRecommendation.HOLD)
 
                 all_recommendations = session.exec(statement).all()
 
@@ -2273,6 +2694,18 @@ class TradeManager:
                             )
                             continue
                         
+                        if allow_hold and all(is_option_action(s['action_type']) for s in action_summaries):
+                            # Option actions already size and submit through their shared
+                            # risk/capacity guards, matching the backtest option path.
+                            for result in evaluator.execute(submit_to_broker=True):
+                                if result.get("success"):
+                                    oid = (result.get("data") or {}).get("order_id")
+                                    if oid:
+                                        order = get_instance(TradingOrder, oid)
+                                        if order:
+                                            created_orders.append(order)
+                            continue
+
                         # TEMP-ORDER-LIST FLOW: do NOT execute (persist) yet. Stage a TRANSIENT
                         # candidate order (via the shared trade_cycle builder — same shape the
                         # backtest uses) for the in-memory RM sizing pass below; only the funded
@@ -2724,6 +3157,107 @@ class TradeManager:
                 'errors': [str(e)]
             }
 
+    #: ``(expert instance id, exception type name)`` whose exit-pass scope failure was already
+    #: logged at ERROR with a traceback. Process-wide (a class attribute: TradeManager is a
+    #: singleton), so a persistent fault logs its traceback once and WARNING lines afterwards.
+    _exit_scope_failures_reported: set = set()
+    _exit_scope_failures_lock = threading.Lock()
+
+    def _open_exit_pass_market_condition_scope(self, expert_instance_id: int,
+                                               account_id: Optional[int]):
+        """Open the market-condition decision scope for ONE open-positions (exit) pass.
+
+        Returns an entered ``ExitStack`` for the caller's ``with``: it closes the scope when the
+        pass ends, and it is EMPTY of a scope when the scope could not be opened. Either way it
+        also marks the pass as an EXIT pass for the market-condition dispatcher
+        (``begin_exit_pass``) until the pass ends, so a leaf's own resolver lookup never raises
+        during it, and -- after a failed opening -- answers with the guard's cause at once
+        instead of retrying the lookup per leaf.
+
+        EXITS ARE NEVER BLOCKED BY THE MARKET-CONDITION MACHINERY. Opening the scope can raise
+        for a gated expert -- a malformed manifest environment variable, a resolver build or
+        coverage refresh failing, a defect in the settings path (TypeError/AttributeError). The
+        entry pass lets that propagate: refusing entries is the safe reading. For exits it is
+        not, because the same exception would skip every stop, take-profit and close rule of
+        this expert for the pass. So a failure here is reported (ERROR + a FAILURE activity row)
+        and the pass runs WITHOUT the scope: its market-condition leaves read ``no_context`` and
+        never pass, and every other exit and protective rule runs as usual.
+
+        ONLY THE OPENING IS GUARDED. The stack is returned to the caller's ``with``, so an
+        exception raised by the pass body propagates exactly as before.
+        """
+        from contextlib import ExitStack
+
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.core.market_condition_live import (
+            begin_exit_pass,
+            market_condition_decision_scope,
+            record_exit_pass_scope_failure,
+        )
+
+        stack = ExitStack()
+        # Registered FIRST, so it is unwound LAST: the scope closes, then the exit-pass mark.
+        stack.callback(begin_exit_pass(expert_instance_id))
+        try:
+            stack.enter_context(market_condition_decision_scope(expert_instance_id=expert_instance_id))
+        except Exception as e:
+            # DELIBERATELY broad, and named as such so it survives BA2_ERROR_MODE=enforce: the
+            # scope can fail in ways this site cannot enumerate (manifest config, reader build,
+            # an injected settings seam), and whatever it is must not stop the exits. Refusals
+            # that failure_modes never absorbs still propagate (after unwinding the mark).
+            try:
+                absorb_if_benign(e, Exception)
+            except BaseException:
+                stack.close()
+                raise
+            record_exit_pass_scope_failure(e)
+            self._report_exit_scope_failure(expert_instance_id, account_id, e)
+        except BaseException:
+            stack.close()
+            raise
+        return stack
+
+    def _report_exit_scope_failure(self, expert_instance_id: int, account_id: Optional[int],
+                                   e: BaseException) -> None:
+        """ERROR with the traceback once per (expert, exception type) per process, WARNING on
+        repeats; and a FAILURE activity row EVERY pass, so operators see each degraded pass."""
+        message = (
+            f"Expert instance {expert_instance_id}: the market-condition decision scope could "
+            f"not be opened for the open-positions pass ({type(e).__name__}: {e}). Its "
+            f"market-condition exit rules read no_context this pass and will not fire; every "
+            f"other exit and protective rule still runs.")
+        key = (expert_instance_id, type(e).__name__)
+        with TradeManager._exit_scope_failures_lock:
+            first = key not in TradeManager._exit_scope_failures_reported
+            TradeManager._exit_scope_failures_reported.add(key)
+        if first:
+            self.logger.error(message, exc_info=e)
+        else:
+            self.logger.warning(message + " (repeat of an error already logged with its "
+                                          "traceback)")
+        try:
+            from .db import log_activity
+            from .types import ActivityLogSeverity, ActivityLogType
+
+            log_activity(
+                severity=ActivityLogSeverity.FAILURE,
+                activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                description=(f"Market-condition scope failed for the open-positions pass "
+                             f"({type(e).__name__}: {e}); market-condition exit rules read "
+                             f"no_context this pass, all other exit rules ran"),
+                data={
+                    "mode": "classic",
+                    "use_case": "open_positions",
+                    "stage": "market_condition_scope",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+                source_expert_id=expert_instance_id,
+                source_account_id=account_id,
+            )
+        except Exception as log_error:
+            self.logger.warning(f"Failed to log market-condition scope failure activity: {log_error}")
+
     def process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations for OPEN_POSITIONS analysis.
@@ -2773,7 +3307,6 @@ class TradeManager:
             from datetime import timedelta
             from .TradeActionEvaluator import TradeActionEvaluator
             from ..modules.accounts import get_account_class
-
             # Get the expert instance (with loaded settings)
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
@@ -2815,7 +3348,16 @@ class TradeManager:
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
-            with get_db() as session:
+            # ONE market-condition decision pass for this expert's exit rules, mirroring the
+            # entry pass (process_expert_recommendations_after_analysis). Without it a market
+            # leaf in an open_positions rule reads no_context live while the backtest evaluates
+            # it: a BT/live parity break. Opened HERE -- after the lock and the early returns,
+            # around the evaluation only -- so an expert with trade modification off or no
+            # open_positions ruleset never reads its profile. With no market_condition_profile
+            # setting the scope yields None at once (no clock read, no state): a strict no-op.
+            # No replay-capture scope: the open-positions pass never had one. A failure to OPEN
+            # the scope never stops the exits: see _open_exit_pass_market_condition_scope.
+            with self._open_exit_pass_market_condition_scope(expert_instance_id, account_def.id), get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,

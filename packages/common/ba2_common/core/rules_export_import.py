@@ -10,6 +10,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from sqlmodel import select, Session
 
+from ba2_common.core.market_condition_rules import assert_market_rule_actions_live
 from ba2_common.core.models import Ruleset, EventAction, RulesetEventActionLink
 from ba2_common.core.db import get_db, get_all_instances, add_instance, get_instance
 from ba2_common.logger import logger
@@ -301,6 +302,81 @@ class RulesExporter:
             raise
 
 
+_OPEN_POSITIONS = "open_positions"
+
+
+def _assert_market_gates_on_exit_ruleset_allowed(ruleset_info: Dict[str, Any]) -> None:
+    """Refuse a market-condition gate arriving inside an OPEN-POSITIONS ruleset payload on a rule
+    that does anything but CLOSE, REDUCE or ADJUST TP/SL (plan 2026-09-24 Task B2).
+
+    Since Task B1 the live open-positions pass opens a decision scope, so the gate evaluates live
+    exactly as in the backtest and a failed read is unknown (the rule does not fire). That is
+    safe for those actions only, which is what ``assert_market_rule_actions_live`` enforces; a
+    gated rule with any other action is still refused here, BEFORE anything is written. The
+    history below is why this door exists at all.
+
+    THE FOURTH DOOR. The expert dialog, the rules editor (ruleset save and rule save) and the
+    deploy importer all refuse this; ``_import_rule_to_session`` builds an ``EventAction`` from
+    the JSON verbatim and links it, and this module checked nothing at all -- so a payload whose
+    RULESET is open_positions and whose RULE says enter_market imported clean. The rule's own
+    subtype is not what decides: ``db.ruleset_event_actions`` loads a ruleset's rules by the LINK
+    TABLE ALONE, so the link is what makes this rule run on the open-positions pass, where the
+    live resolver has no decision context. The gate then reads ``no_context``, the rule never
+    fires, and the position's exit or protective-order adjustment silently stops happening.
+
+    Checked against the whole payload BEFORE the ruleset row is created, so a refusal leaves
+    nothing half-imported -- and, for the reuse-by-name importer, before the existing ruleset's
+    links are dropped, which would otherwise leave a live exit ruleset with no rules at all.
+    """
+    if str(ruleset_info.get("subtype") or "") != _OPEN_POSITIONS:
+        return
+    assert_market_rule_actions_live(
+        ((rule_data.get("name"), rule_data.get("triggers"), rule_data.get("actions"))
+         for rule_data in ruleset_info.get("rules", [])),
+        f"imported ruleset {ruleset_info.get('name')!r}")
+
+
+def _assert_market_gates_on_exit_rule_allowed(rule_data: Dict[str, Any]) -> None:
+    """Refuse a gate on a rule whose OWN subtype is open_positions, unless the rule only
+    closes, reduces or adjusts TP/SL (plan 2026-09-24 Task B2).
+
+    The other half, for the standalone-rule importers: ``import_rule`` links nothing, so the
+    rule's subtype is the only statement there is of where it is headed. Same message.
+    """
+    if str(rule_data.get("subtype") or "") != _OPEN_POSITIONS:
+        return
+    assert_market_rule_actions_live(
+        [(rule_data.get("name"), rule_data.get("triggers"), rule_data.get("actions"))],
+        f"imported rule {rule_data.get('name')!r}")
+
+
+def _assert_market_gates_served_by_linked_experts(ruleset_info: Dict[str, Any], ruleset_id: int,
+                                                  session) -> None:
+    """Refuse a payload whose market gates an expert ALREADY USING ``ruleset_id`` does not serve.
+
+    Only the replace-in-place importer needs it: every other importer creates a NEW ruleset,
+    which no expert uses yet (the expert dialog checks the served fields when one is attached).
+    Replacing an existing ruleset's rules is an edit of a ruleset experts may be running, so a
+    market gate added there must be served by each of them -- either slot, enabled or not -- or
+    it reads ``no_context`` for ever and the exit (or entry) it guards never happens. Entry and
+    exit rulesets alike. No market leaf in the payload, no expert query.
+    """
+    from ba2_common.core.market_condition_live import (
+        assert_market_leaves_served_by_linked_experts,
+    )
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
+    fields = market_condition_fields()
+    used = [(f"{rule_data.get('name')}.{key}", str(cfg["event_type"]))
+            for rule_data in ruleset_info.get("rules", [])
+            for key, cfg in (rule_data.get("triggers") or {}).items()
+            if isinstance(cfg, dict) and cfg.get("event_type") in fields]
+    if used:
+        assert_market_leaves_served_by_linked_experts(
+            used, [ruleset_id], where=f"imported ruleset {ruleset_info.get('name')!r}",
+            session=session)
+
+
 def _rule_content_key(type_, subtype, triggers, actions, extra_parameters, continue_processing) -> str:
     """Canonical, comparable signature of a rule's CONTENT (everything but its name/id).
 
@@ -342,6 +418,9 @@ class RulesImporter:
         try:
             with get_db() as session:
                 ruleset_info = ruleset_data["ruleset"]
+
+                # BEFORE anything is created: a market gate may not ride an exit ruleset.
+                _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                 
                 # Preserve original name, but handle duplicates
                 base_name = ruleset_info['name']
@@ -428,6 +507,7 @@ class RulesImporter:
             with get_db() as session:
                 for ruleset_data in rulesets_data["rulesets"]:
                     ruleset_info = ruleset_data
+                    _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                     warnings = []
                     
                     # Preserve original name, but handle duplicates
@@ -522,6 +602,10 @@ class RulesImporter:
         try:
             with get_db() as session:
                 for ruleset_info in rulesets_data["rulesets"]:
+                    # Before the existing ruleset's links are dropped below: refusing after that
+                    # would leave a live exit ruleset with NO rules, which is the same silence
+                    # from the other side.
+                    _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                     warnings: List[str] = []
                     name = ruleset_info["name"]
 
@@ -536,6 +620,10 @@ class RulesImporter:
                         session.add(ruleset)
                         session.flush()
                     else:
+                        # Experts already use this row: its new gates must be served by each of
+                        # them, checked before its links are dropped below.
+                        _assert_market_gates_served_by_linked_experts(ruleset_info, ruleset.id,
+                                                                      session)
                         # Reuse the row, refresh what the payload describes, and drop the old
                         # membership so the rule list is the payload's rather than a merge of
                         # both -- a merge would silently keep a rule the export had removed.
@@ -609,6 +697,7 @@ class RulesImporter:
     def _import_rule_to_session(session: Session, rule_data: Dict[str, Any], name_suffix: str = "") -> Tuple[int, List[str]]:
         """Import a rule within an existing session. Returns (rule_id, warnings)."""
         warnings = []
+        _assert_market_gates_on_exit_rule_allowed(rule_data)
 
         try:
             # Check if rule with same name already exists

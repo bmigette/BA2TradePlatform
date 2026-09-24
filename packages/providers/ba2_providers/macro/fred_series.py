@@ -32,9 +32,11 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -80,10 +82,40 @@ SERIES_SPEC: Dict[str, Dict[str, Any]] = {
 # looks-active-but-isn't input this module exists to remove. The regime composite
 # renormalizes over present inputs, so dropping PMI is the honest outcome.
 
+#: How old a cached series may be on the LIVE path before it is refetched, by the frequency
+#: SERIES_SPEC already declares. Keyed off the spec rather than one flat number because a
+#: monthly series does not become stale in twelve hours, and refetching PAYEMS every run would
+#: be a call that can never return anything new.
+#:
+#: Both values are under a day, so nothing live is ever more than one session behind. The cost
+#: is trivial -- nine small series, at most one fetch each per run -- and it is only paid live:
+#: a backtest never ages anything (see ``_load``).
+LIVE_MAX_AGE_HOURS: Dict[str, float] = {"daily": 12.0, "monthly": 24.0}
+#: The fallback for a spec that declares no frequency. The short one: being early costs a
+#: request, being late costs a trading decision made on yesterday's regime.
+LIVE_MAX_AGE_HOURS_DEFAULT = 12.0
+
 _locks: Dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 # Process-wide memo so a per-bar expert parses each series file once, not once per bar.
 _MEM: Dict[str, List[dict]] = {}
+#: When each ``_MEM`` entry was loaded, so the LIVE path can let it expire. Without this the
+#: memo is the staleness bug on its own: it short-circuits before any file check, so a
+#: long-running live process that loaded VIXCLS at startup would serve that same payload for
+#: the life of the process no matter how often the file underneath it was refreshed.
+#: A BACKTEST never expires its memo -- that is what it is for, and a run must read one payload
+#: from first bar to last.
+_MEM_AT: Dict[str, float] = {}
+# The PARSED form of each memoized series: {series id: (rows object, _ParsedSeries)}.
+#
+# STALENESS. The rows object is stored WITH the parse and re-checked with ``is`` on every
+# read, so the memo can only ever be served for the exact payload it was built from. That
+# matters on the LIVE path, where ``_fill_cache_on_the_live_path`` can rewrite a series
+# mid-process: ``_load`` then returns a NEW list and this memo misses by construction. A
+# memo keyed on the series id alone would happily serve yesterday's macro data into today's
+# trading. ``reset_cache()`` and ``refresh_series()`` drop it alongside ``_MEM`` as well --
+# belt and braces, and it keeps the parse from outliving the rows it describes.
+_PARSED: Dict[str, Any] = {}
 
 
 def _lock_for(key: str) -> threading.Lock:
@@ -167,11 +199,13 @@ def refresh_series(series_id: str, api_key: str) -> int:
                        "vintage": _spec(sid)["vintage"], "observations": rows}, fh)
         os.replace(tmp, path)        # atomic: a concurrent reader never sees a partial file
         _MEM.pop(sid, None)
+        _MEM_AT.pop(sid, None)
+        _PARSED.pop(sid, None)       # the parse describes the rows we just replaced
     return len(rows)
 
 
 def _fill_cache_on_the_live_path(sid: str, path: str) -> bool:
-    """Fetch a missing series and write it to the cache. True when the file now exists.
+    """Fetch a missing OR STALE series and write it to the cache. True when the file exists.
 
     LIVE ONLY, and that asymmetry is the point. A backtest must read a file that was already
     on disk before it started: fetching mid-run makes the run non-reproducible, un-syncable to
@@ -204,20 +238,65 @@ def _fill_cache_on_the_live_path(sid: str, path: str) -> bool:
         return False
 
 
+def _max_age_hours(sid: str) -> float:
+    """How old this series may be on the live path, from the frequency the spec declares."""
+    try:
+        freq = str(_spec(sid).get("freq") or "")
+    except ValueError:
+        return LIVE_MAX_AGE_HOURS_DEFAULT
+    return LIVE_MAX_AGE_HOURS.get(freq, LIVE_MAX_AGE_HOURS_DEFAULT)
+
+
+def _age_hours(path: str) -> Optional[float]:
+    """Age of the cache file in hours, or None when it cannot be measured."""
+    try:
+        return max(0.0, (time.time() - os.path.getmtime(path)) / 3600.0)
+    except OSError:
+        return None
+
+
+def _is_stale(sid: str, path: str) -> bool:
+    """LIVE freshness test. A file whose age cannot be read is treated as FRESH: an unreadable
+    mtime is a filesystem oddity, and refetching nine series on every analysis because of one
+    is worse than serving data that is probably current."""
+    age = _age_hours(path)
+    return age is not None and age > _max_age_hours(sid)
+
+
 def _load(series_id: str) -> List[dict]:
     sid = series_id.upper()
+    from ba2_providers.fmp_common import _is_hermetic_fmp_history, _is_ttl_frozen
+
+    # A BACKTEST NEVER AGES ANYTHING. It reads what was prewarmed, memoises it for the whole
+    # run, and never reaches the network -- determinism, worker-syncability, and the reason
+    # the memo exists at all (a per-bar expert must not re-parse per bar).
+    offline = _is_ttl_frozen() or _is_hermetic_fmp_history()
+
     cached = _MEM.get(sid)
     if cached is not None:
-        return cached
-    path = cache_path(sid)
-    if not os.path.exists(path):
-        # CACHED WINS. This only runs when the file is absent, so a warm cache behaves exactly
-        # as before -- no network, no staleness check, same bytes.
-        from ba2_providers.fmp_common import _is_hermetic_fmp_history, _is_ttl_frozen
+        if offline:
+            return cached
+        loaded_at = _MEM_AT.get(sid)
+        # NO RECORDED TIME MEANS FRESH, never "expired". ``_load`` always stamps what it
+        # stores, so in a live process this is unreachable; what it does reach is a memo
+        # SEEDED deliberately -- the replay-tap tests patch ``_MEM`` precisely so the read
+        # touches neither disk nor network. Expiring an entry whose age is unknown turned
+        # that seed into a real disk read of the operator's own cache, which is the opposite
+        # of what seeding is for. Expiry requires positive evidence of age.
+        if loaded_at is None or (time.time() - loaded_at) / 3600.0 <= _max_age_hours(sid):
+            return cached
+        # Fall through: the memo is past its window, so re-check the file underneath it.
+        # Without this the memo IS the staleness bug -- it short-circuits every check below,
+        # so a live process would serve its startup payload for its whole lifetime.
 
-        offline = _is_ttl_frozen() or _is_hermetic_fmp_history()
-        if not offline:
-            _fill_cache_on_the_live_path(sid, path)
+    path = cache_path(sid)
+    if not offline and (not os.path.exists(path) or _is_stale(sid, path)):
+        # MISSING or STALE, both on the live path only. Missing is the empty-cache case this
+        # was written for; stale is the one that makes it stay true -- VIXCLS is a daily
+        # series, so a cache filled once and never refreshed is right for a day and wrong
+        # after that, which is worse than obviously empty.
+        _fill_cache_on_the_live_path(sid, path)
+
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"FRED series {sid} is not in the cache ({path}). Run the FRED refresh/prewarm "
@@ -225,13 +304,112 @@ def _load(series_id: str) -> List[dict]:
         )
     with open(path, "r", encoding="utf-8") as fh:
         rows = json.load(fh).get("observations", [])
+    # A REFRESH THAT FAILED leaves the old file in place and we read it: stale macro degrades
+    # a regime overlay, a hard failure would stop the analysis, and macro is never worth that.
+    # Said out loud so it is a decision in the log rather than a silence.
+    if not offline and _is_stale(sid, path):
+        logger.warning(
+            "FRED %s is %.1fh old and could not be refreshed; using the stale copy",
+            sid, _age_hours(path) or -1.0)
     _MEM[sid] = rows
+    _MEM_AT[sid] = time.time()
     return rows
 
 
 def reset_cache() -> None:
-    """Drop the in-process memo (tests, and the live /api/reload path)."""
+    """Drop the in-process memos -- raw rows AND their parse (tests, live /api/reload)."""
     _MEM.clear()
+    _MEM_AT.clear()
+    _PARSED.clear()
+
+
+class _ParsedSeries:
+    """``get_series_as_of``'s per-row parse, done ONCE per cached payload.
+
+    WHY. The function used to walk every raw row on EVERY call, doing two
+    ``pd.Timestamp(<string>)`` parses per row, and it is called once per (series,
+    decision date). Measured on a real 10-symbol / 501-bar DeterministicScorer
+    backtest: 2,004 calls, 633,264 ``strptime`` calls, 49.9 s -- 59% of the whole
+    run. The answer for a given cut is a pure FILTER over a parse that never
+    changes, so the parse moves here and the call becomes a mask + Series build.
+
+    WHAT IS STORED, and why it is stored this way:
+
+      * ``index``  -- observation dates of the surviving rows, IN ORIGINAL ROW
+        ORDER. The order is load-bearing: ``get_series_as_of`` ends in
+        ``.sort_index()``, pandas' default sort is not stable, so a different
+        pre-sort order can reorder ties and change the returned series.
+      * ``known``  -- the date each surviving row became public: ``realtime_start``
+        for a vintage series, the observation date otherwise (``_spec(sid)``
+        decides, exactly as before).
+      * ``values`` -- the parsed floats, aligned with ``index``.
+      * ``deferred_known`` / ``deferred_exc`` -- see SKIP SEMANTICS.
+
+    SKIP SEMANTICS, reproduced exactly. The original loop dropped a row when the
+    date parse raised KeyError/ValueError, and -- separately -- when
+    ``float(row["value"])`` raised TypeError/ValueError; note it appended the
+    VALUE first, so a bad value skipped the row entirely rather than leaving the
+    two lists misaligned. Both drops are unconditional (a dropped row is dropped
+    for every cut), so they happen here.
+
+    A row whose ``"value"`` KEY is missing is the one case that is NOT
+    unconditional: ``row["value"]`` raises KeyError, which the original did not
+    catch -- but it was only reached for rows INSIDE the cut, because the cut was
+    tested first. Such rows are therefore parked in ``deferred_known`` and the
+    KeyError is re-raised only by a call whose cut reaches them.
+
+    One accepted narrowing: the DatetimeIndex is built over the full surviving
+    set rather than per cut. For a payload whose dates are homogeneous -- every
+    FRED file, whose dates are plain ``YYYY-MM-DD`` strings -- that is identical.
+    A payload mixing tz-aware and naive dates would raise here for every cut
+    instead of only for the cuts that span both, which is the loud direction.
+    """
+
+    __slots__ = ("index", "known", "values", "deferred_known", "deferred_exc")
+
+    def __init__(self, rows: List[dict], vintage: bool) -> None:
+        dates: List[pd.Timestamp] = []
+        known: List[pd.Timestamp] = []
+        values: List[float] = []
+        deferred: List[pd.Timestamp] = []
+        deferred_exc: Optional[KeyError] = None
+        for row in rows:
+            try:
+                obs_date = pd.Timestamp(row["date"])
+                known_on = pd.Timestamp(row["realtime_start"]) if vintage else obs_date
+            except (KeyError, ValueError):
+                continue
+            try:
+                value = float(row["value"])
+            except (TypeError, ValueError):
+                continue
+            except KeyError as e:
+                # No "value" key at all: the original raised this, but only once a
+                # cut reached the row. Defer it rather than dropping the row.
+                deferred.append(known_on)
+                if deferred_exc is None:
+                    deferred_exc = e
+                continue
+            values.append(value)
+            dates.append(obs_date)
+            known.append(known_on)
+        self.index = pd.DatetimeIndex(dates)
+        # Non-vintage rows are known on their observation date -- the same objects,
+        # so the index is aliased rather than rebuilt.
+        self.known = pd.DatetimeIndex(known) if vintage else self.index
+        self.values = np.asarray(values, dtype="float64")
+        self.deferred_known = pd.DatetimeIndex(deferred) if deferred else None
+        self.deferred_exc = deferred_exc
+
+
+def _parsed(sid: str, rows: List[dict], vintage: bool) -> _ParsedSeries:
+    """The parse of *rows*, built once and served only back to that same object."""
+    entry = _PARSED.get(sid)
+    if entry is not None and entry[0] is rows:
+        return entry[1]
+    parsed = _ParsedSeries(rows, vintage)
+    _PARSED[sid] = (rows, parsed)
+    return parsed
 
 
 def series_identity(args):
@@ -265,6 +443,8 @@ def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
     # as a confusing "not in the cache" that sends you looking for a prewarm problem.
     vintage = _spec(sid)["vintage"]
     rows = _load(sid)
+    # Parse once per payload (see _ParsedSeries); this call is then a filter + build.
+    parsed = _parsed(sid, rows, vintage)
 
     cut = None
     if as_of is not None:
@@ -272,22 +452,19 @@ def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
         if cut.tz is not None:
             cut = cut.tz_convert("UTC").tz_localize(None)
 
-    dates: List[pd.Timestamp] = []
-    values: List[float] = []
-    for row in rows:
-        try:
-            obs_date = pd.Timestamp(row["date"])
-            known_on = pd.Timestamp(row["realtime_start"]) if vintage else obs_date
-        except (KeyError, ValueError):
-            continue
-        if cut is not None and known_on > cut:
-            continue
-        try:
-            values.append(float(row["value"]))
-        except (TypeError, ValueError):
-            continue
-        dates.append(obs_date)
+    if cut is None:
+        if parsed.deferred_exc is not None:
+            raise parsed.deferred_exc
+        keep = np.ones(parsed.values.shape, dtype=bool)
+    else:
+        if parsed.deferred_known is not None and bool((~(parsed.deferred_known > cut)).any()):
+            raise parsed.deferred_exc
+        # ``~(known > cut)``, NOT ``known <= cut``. ``pd.Timestamp(None)`` is NaT, which
+        # compares False both ways -- and the original only skipped on ``known_on > cut``,
+        # so a NaT row was KEPT. Spelling this as <= would silently start dropping it.
+        keep = ~np.asarray(parsed.known > cut)
 
-    if not dates:
+    values = parsed.values[keep]
+    if not values.size:
         return pd.Series(dtype="float64")
-    return pd.Series(values, index=pd.DatetimeIndex(dates)).sort_index()
+    return pd.Series(values, index=parsed.index[keep]).sort_index()

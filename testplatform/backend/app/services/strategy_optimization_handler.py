@@ -189,6 +189,10 @@ def _maybe_mark_want_full(config: Dict[str, Any], is_last_gen: bool) -> Dict[str
         return config
     tagged = dict(config)
     tagged["_want_full_results"] = True
+    # The final generation's full results ARE persisted (``_persist_top_backtests`` reuses them
+    # as top-N rows without a re-run), so those rows carry the option trade record like every
+    # other persisted run. Output shape only: the fitness is identical either way.
+    tagged["option_trade_records"] = True
     return tagged
 
 
@@ -415,9 +419,21 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # chosen among whichever genomes were not unlucky enough to land on a starved worker.
         # Matched by NAME, like the others, so this module does not import ba2_common just to
         # classify an error (see ba2_common.core.shared_arrays.SharedArrayFdExhausted).
+        # SplitBasisRefused / OptionSpotBasisMismatch (plan Part E) are FATAL too: the option
+        # path's spot is not (or cannot be put) in the basis its strikes are quoted in. The
+        # first is deterministic -- every trial refuses identically; scored as 0 fitness the
+        # GA would "finish" on nothing. The second is data-driven -- a trial that never reads
+        # the bad symbol's chain survives, so scoring it would let the GA silently SELECT AWAY
+        # from the broken symbol and report a winner shaped by a data bug.
+        # The four run-config / calendar refusals below (BT/live option parity review) are
+        # DETERMINISTIC: the run config (spread model, option_trade_records) or the market
+        # calendar is wrong, or the clock stepped on a non-session date -- every trial refuses
+        # identically, so scoring them 0 lets the GA "finish" on nothing.
         fatal = type(e).__name__ in (
             "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
-            "SharedArrayFdExhausted")
+            "SharedArrayFdExhausted", "SplitBasisRefused", "OptionSpotBasisMismatch",
+            "SpreadModelConfigError", "OptionTradeRecordsFlagMissing",
+            "MarketCalendarUnavailable", "NotARegularSession")
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
@@ -493,6 +509,7 @@ def _worker_release_memory() -> Dict[str, Any]:
     # resolves is now a loud notice through _worker_log (the pool child's logging is globally
     # disabled — see _worker_init — so this is the only channel that survives in there).
     for mod, fn in (("app.services.backtest.options_provider", "clear_worker_options_cache"),
+                    ("app.services.backtest.option_basis_guard", "clear_basis_guard_cache"),
                     ("app.services.backtest.results", "clear_worker_5m_bars_cache")):
         try:
             m = importlib.import_module(mod)
@@ -662,6 +679,12 @@ class MemoryGovernor:
         return "ok"
 
 
+#: How long ``_SlotPools.abandon_slot`` waits for a wedged worker to honour SIGTERM before
+#: escalating to SIGKILL. Kept short: the worker is already known to be unresponsive, and this delay
+#: sits directly in the recovery path.
+_ABANDON_KILL_GRACE_S = 5.0
+
+
 class _SlotPools:
     """One SINGLE-WORKER pool per slot, so a worker can be recycled without a global barrier.
 
@@ -712,6 +735,64 @@ class _SlotPools:
             if f is fut:
                 self.busy[i] = None
                 return
+
+    def abandon_slot(self, fut, log=logger.warning) -> int:
+        """Drop an in-flight future whose worker has WEDGED, and respawn that slot AT ONCE.
+
+        NOT ``_recycle_pool``: that calls ``shutdown(wait=True)``, which is exactly wrong here --
+        it would block on the very worker we are trying to get rid of (the 2026-09-20 stall sat
+        2h47m with one trial pending; a wait here would have hung the recovery itself). The slot's
+        process is TERMINATED first, so the teardown is immediate and the batch carries on.
+
+        Returns the slot index, or -1 when the future was not in flight.
+        """
+        idx = -1
+        for i, f in enumerate(self.busy):
+            if f is fut:
+                idx = i
+                break
+        if idx < 0:
+            return -1
+        self.busy[idx] = None
+        pool = self.pools[idx]
+        try:
+            fut.cancel()
+        except Exception:  # noqa: BLE001 -- best effort; terminating the process is the real fix
+            pass
+        killed = 0
+        procs = list((getattr(pool, "_processes", None) or {}).values())
+        for proc in procs:
+            try:
+                proc.terminate()
+                killed += 1
+            except Exception:  # noqa: BLE001 -- a process already gone is the desired end state
+                pass
+        # ESCALATE (2026-09-21 review): terminate() is best effort. A worker wedged in an
+        # uninterruptible state, or one that ignores SIGTERM, would otherwise leave the slot dead
+        # for the rest of the run -- exactly the "one wedge kills the grid" failure this whole path
+        # exists to remove. Bounded grace, then SIGKILL, which cannot be caught or ignored.
+        hard = 0
+        deadline = _time.monotonic() + _ABANDON_KILL_GRACE_S
+        while _time.monotonic() < deadline and any(p.is_alive() for p in procs):
+            _time.sleep(0.05)
+        for proc in procs:
+            if proc.is_alive():
+                try:
+                    proc.kill()
+                    hard += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:  # noqa: BLE001 -- a failed teardown must not lose the run
+            log(f"slot {idx}: shutdown after a stall raised {e!r}; building a fresh pool anyway")
+        self.pools[idx] = self._make()
+        self.tasks[idx] = 0
+        self.recycles += 1
+        log(f"slot {idx}: abandoned a wedged trial ({killed} worker process(es) terminated"
+            + (f", {hard} SIGKILLed after ignoring SIGTERM" if hard else "")
+            + ") -- fresh pool built, slot reusable")
+        return idx
 
     def release_all(self) -> Dict[str, float]:
         """Drop data caches in every slot and RETURN what they freed, summed over the slots.
@@ -1286,6 +1367,50 @@ def _prepare_master_market_conditions(opt_id: int, db: Any,
     return None
 
 
+#: Prefix of the error_message written when a search ends with ZERO MEASURED trials (every trial
+#: either crashed or was abandoned as stalled). ``tools/run_options_matrix.py`` reads this prefix and
+#: CONTINUES to the next job instead of stopping the campaign: the 2026-09-20 abort showed that
+#: killing the whole matrix over one job costs far more than the job is worth, and a stall-only
+#: search has no result worth protecting. The row stays `failed` (never `completed`) so it is
+#: visible and re-runnable, and its checkpoint is PRESERVED rather than cleared. Keep the literal in
+#: sync with tools/run_options_matrix.py -- test_no_measurement_policy pins the two together.
+NO_MEASUREMENT_MARKER = "no measured trials"
+#: The FAILURE KIND that distinguishes "the search measured nothing" from a real failure. It rides
+#: ALONGSIDE the ordinary ``status="failed"`` contract instead of replacing it (2026-09-21 recheck,
+#: H3): the task queue, the UI and polling clients all already treat `failed` as failure, and
+#: inventing a second success-like status meant the main queue marked an all-stalled optimization
+#: COMPLETED (progress 100%, no error) while its row said failed -- two contradictory outcomes for
+#: one job, and `optimize-batch` could walk into its success/export path.
+NO_MEASUREMENT_KIND = "no_measurements"
+
+
+def _count_measured(all_results: list) -> int:
+    """How many records came from a REAL backtest run.
+
+    Derived from the records rather than counted alongside them: there is more than one append site
+    (the local-trial path and the dispatcher's result path), so a hand-maintained counter drifts --
+    the first cut of this fix produced "11 record(s), 0 measured" and an UnboundLocalError in the
+    path that never incremented it.
+
+    Uses the SAME predicate as the Top-N ranking (2026-09-21 recheck, H2). Counting on `status`
+    alone disagreed with ranking on old-format records, which carry the sentinel and no status.
+    """
+    from app.services.strategy_fitness import is_measured_result
+    return sum(1 for r in (all_results or []) if is_measured_result(r))
+
+
+def _final_status(all_results: list) -> str:
+    """End-of-search outcome: ``'completed'`` | ``'no_measurements'`` | ``'failed'``.
+
+    ``all_results`` is NOT the test: a stalled record lands there too, and treating a non-empty
+    list as evidence of success marked an all-stalled search ``completed``, cleared its checkpoint
+    and let Top-N export a "winner" that never ran (2026-09-21 review, G2).
+    """
+    if _count_measured(all_results) > 0:
+        return "completed"
+    return "no_measurements" if all_results else "failed"
+
+
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
     """Mark the StrategyOptimization row failed + return the failure dict."""
     logger.error(f"strategy_optimization {opt_id} failed: {msg}")
@@ -1539,6 +1664,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # The objective's robustness setting, so a resume cannot mix two incomparable
             # scales in one population (the fingerprint covers the GENE SPACE, not the metric).
             data["robust_fitness"] = robust_on
+            data["fitness_metric"] = opt.fitness_metric
             # The best entries SO FAR, so a resumed run's top-N persist can still see the
             # winners found before the interruption. See _elite_slice for why this is cheap
             # (and why the older "it would embed every trial's trades JSON" reading was wrong).
@@ -1599,11 +1725,40 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 done, _ = _fwait(list(pending), timeout=_stall_s,
                                  return_when=FIRST_COMPLETED)
                 if not done:
+                    # SURGICAL STALL RECOVERY (2026-09-21, operator decision: "a stall should not
+                    # kill grid"). The old behaviour raised TimeoutError, which failed the WHOLE
+                    # job: one wedged genome killed a 16-job matrix at job 1/16 (2026-09-20
+                    # 21:54Z) and cost 7.5h of downtime. Now the wedged individual is scored at
+                    # STALLED_SENTINEL -- a value DISTINCT from the other sentinels so the
+                    # frequency stays countable in all_results -- and its slot is RESPAWNED (the
+                    # wedged worker is terminated, see _SlotPools.abandon_slot) so the next
+                    # generation cannot inherit a dead slot. The job continues.
+                    from app.services.strategy_fitness import STALLED_SENTINEL
+                    n_stalled = len(pending)
+                    for fut in list(pending):
+                        i, flat, key = pending.pop(fut)
+                        slot = _pool.abandon_slot(fut)
+                        logger.error(
+                            f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no "
+                            f"progress in {_stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
+                            f"(STALLED), slot {slot} respawned; job CONTINUES")
+                        yield (i, flat, key, {
+                            "ok": False,
+                            "stalled": True,
+                            "fitness": STALLED_SENTINEL,
+                            "fitness_raw": STALLED_SENTINEL,
+                            "trades": 0,
+                            "total_return": 0.0,
+                            "max_drawdown": 0.0,
+                            "secs": _stall_s,
+                            "slot": slot,
+                            "error": f"stalled: no progress in {_stall_s:.0f}s",
+                        })
                     logger.error(
-                        f"LOCAL POOL STALLED: {len(pending)} trial(s) made no progress in "
-                        f"{_stall_s:.0f}s. Aborting the job so it can be restarted rather than "
-                        f"hanging silently.")
-                    raise TimeoutError("local pool stalled")
+                        f"LOCAL POOL STALLED: {n_stalled} individual(s) marked STALLED "
+                        f"({STALLED_SENTINEL:.0e}) after {_stall_s:.0f}s; slots respawned, "
+                        f"job continues")
+                    continue
                 for fut in done:
                     i, flat, key = pending.pop(fut)
                     _pool.mark_done(fut)
@@ -1635,7 +1790,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         _report_trial_result(on_result, i, cached)
                         continue
                     config = _build_daily_trial_config(
-                        backtest_cfg, decode_params(strategy, flat), hoisted
+                        backtest_cfg, decode_params(strategy, flat), hoisted,
+                        option_trade_records=False,
                     )
                     config = _maybe_mark_want_full(config, is_last_gen)
                     jobs.append((i, flat, key, config))
@@ -1755,22 +1911,50 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         # and do NOT memo it — a crash is an environment event, not a property
                         # of the genome, so a re-selection should re-run it.
                         from app.services.strategy_fitness import ZERO_TRADE_SENTINEL
-                        fit = ZERO_TRADE_SENTINEL
-                        fits[i] = fit
-                        if out.get("error"):
-                            mem = out.get("mem")
-                            logger.warning(f"trial failed in worker: {out['error']}"
-                                           + (f" | worker mem: {mem}" if mem else ""))
-                            if out.get("fatal") and fatal["msg"] is None:
-                                fatal["msg"] = out["error"]
-                                # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
-                                # an incomplete prewarm, a missing OHLCV cache -- so it affects
-                                # every remaining trial identically. Before this, fatal["msg"] was
-                                # recorded and then only consulted if all_results ended up EMPTY;
-                                # when most trials happened to succeed (the goal2020 OP case) the
-                                # run ground through all 8 generations and reported a confident
-                                # winner chosen partly by which genomes dodged the broken data.
-                                raise _FatalTrialError(out["error"])
+                        if out.get("stalled"):
+                            # A STALL is not a genome property either, but it IS reproducible
+                            # in-process: this genome wedged once, so re-selecting it would burn
+                            # another _stall_s of the batch -- up to 8-15 generations of it. So:
+                            # score it at the DEDICATED sentinel (distinct, so the frequency is
+                            # COUNTABLE in all_results -- the operator asked to see how often this
+                            # happens), memoize it, and record it. A crash stays un-memoized below.
+                            from app.services.strategy_fitness import STALLED_SENTINEL
+                            fit = STALLED_SENTINEL
+                            fits[i] = fit
+                            memo.put(key, fit)
+                            _report_trial_result(on_result, i, fit)
+                            all_results.append({
+                                "params": flat, "fitness": fit, "key": key, "trades": 0,
+                                "fitness_raw": fit, "robustness": None,
+                                "total_return": 0.0, "max_drawdown": 0.0,
+                                # DIAGNOSTICS, not a measurement (2026-09-21 review): the score is a
+                                # sentinel, so record WHAT happened -- reason, how long it burned,
+                                # which slot wedged -- instead of leaving zeros to imply a measured
+                                # flat result. `status` is what Top-N selection and the finalization
+                                # guard key on, so it must never be dropped.
+                                "status": "stalled",
+                                "stall_reason": out.get("error"),
+                                "stall_secs": out.get("secs"),
+                                "stall_slot": out.get("slot")})
+                            logger.error(f"trial STALLED (scored {fit:.0e}, memoized): "
+                                         f"{out.get('error')}")
+                        else:
+                            fit = ZERO_TRADE_SENTINEL
+                            fits[i] = fit
+                            if out.get("error"):
+                                mem = out.get("mem")
+                                logger.warning(f"trial failed in worker: {out['error']}"
+                                               + (f" | worker mem: {mem}" if mem else ""))
+                                if out.get("fatal") and fatal["msg"] is None:
+                                    fatal["msg"] = out["error"]
+                                    # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
+                                    # an incomplete prewarm, a missing OHLCV cache -- so it affects
+                                    # every remaining trial identically. Before this, fatal["msg"] was
+                                    # recorded and then only consulted if all_results ended up EMPTY;
+                                    # when most trials happened to succeed (the goal2020 OP case) the
+                                    # run ground through all 8 generations and reported a confident
+                                    # winner chosen partly by which genomes dodged the broken data.
+                                    raise _FatalTrialError(out["error"])
                     if best["fitness"] is None or fit > best["fitness"]:
                         best["fitness"] = fit
                         best["params"] = flat
@@ -1825,6 +2009,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         if ckpt:
             # REFUSE a checkpoint scored under a different objective, BEFORE anything is resumed.
             _assert_checkpoint_robustness_matches(ckpt, robust_on, opt.name, ckpt_task_id)
+            _assert_checkpoint_metric_matches(ckpt, opt.fitness_metric, opt.name, ckpt_task_id)
             start_gen, init_pop, init_fits = optimizer.resume_from_checkpoint(ckpt)
             logger.warning(
                 f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
@@ -2032,11 +2217,35 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # empty and best_fitness is a meaningless default. The GA swallows per-trial
         # exceptions as warnings, so without this guard the optimization would report
         # "completed" having evaluated NOTHING. Fail loudly instead.
-        if not all_results:
+        #
+        # `measured == 0` matters as much as an EMPTY all_results: stalled records now live in
+        # all_results (so the frequency stays countable), which means a stall-only search would
+        # otherwise sail through this guard as `completed`, clear its checkpoint and let Top-N
+        # export a "winner" that never ran (2026-09-21 review, G2). Both are failures; the
+        # stall-only one is named with a marker the matrix driver treats as SKIP-not-STOP, and its
+        # checkpoint is PRESERVED.
+        _outcome = _final_status(all_results)
+        if _outcome != "completed":
             if fatal["msg"]:
                 # A FATAL data error (OHLCV cache miss) — surface the actionable message directly
                 # instead of the generic "check the logs" hint.
                 return _fail(opt_id, db, fatal["msg"])
+            if _outcome == "no_measurements":
+                n_stalled = sum(1 for r in all_results if r.get("status") == "stalled")
+                res = _fail(
+                    opt_id, db,
+                    f"{NO_MEASUREMENT_MARKER}: {len(all_results)} record(s), {n_stalled} stalled "
+                    f"and 0 measured. The checkpoint was PRESERVED so this job can be resumed or "
+                    f"re-run; no Top-N backtest was exported. If the trials are genuinely SLOW "
+                    f"rather than wedged, raise BT_LOCAL_STALL_TIMEOUT_S (default 5400s).",
+                )
+                # Distinct from a generic failure -- but through the EXISTING failure contract, so
+                # no consumer has to learn a new success-like status (2026-09-21 recheck, H3).
+                # tools/run_options_matrix.py skips the job rather than stopping the campaign, and
+                # the CLI prints this without the JSON dump; both read `failure_kind`/the marker.
+                res["status"] = "failed"
+                res["failure_kind"] = NO_MEASUREMENT_KIND
+                return res
             return _fail(
                 opt_id, db,
                 "optimization produced 0 successful trials — every backtest failed. Check the "
@@ -2214,7 +2423,9 @@ def _run_trial_backtest(
     if engine == "daily":
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
 
-        config = _build_daily_trial_config(backtest_cfg, decoded, hoisted)
+        # The serial GA path: a FITNESS trial, never persisted from here.
+        config = _build_daily_trial_config(backtest_cfg, decoded, hoisted,
+                                           option_trade_records=False)
         return run_daily_backtest(config)
 
     if engine == "ml":
@@ -2248,9 +2459,19 @@ def _build_daily_trial_config(
     backtest_cfg: Dict[str, Any],
     decoded: Dict[str, Any],
     hoisted: Optional[Dict[str, Any]] = None,
+    *,
+    option_trade_records: bool,
 ) -> Dict[str, Any]:
     """Assemble the ``run_daily_backtest`` config for one trial from the run-level
     backtest_cfg + the decoded trial params.
+
+    ``option_trade_records`` (REQUIRED, keyword, no default -- every caller states it): whether
+    an OPTION run's trade rows carry the option trade record (entry/exit snapshots, BT/live
+    parity plan Part C4). ``False`` for a GA FITNESS trial -- the rows stay the pre-record shape
+    (plus the recorded ``exit_reason``) so nothing grows on the hot path; ``True`` for anything
+    whose rows are PERSISTED (top-N, re-runs, the final generation whose full results become
+    top-N rows). It changes the output SHAPE only -- never a decision, a fill or the fitness
+    (pinned by test) -- and is not part of any job or trial identity.
 
     The expert settings the engine feeds to ``_process`` are merged with the decoded
     expert_overrides (model:* numeric decision settings). RM sizing is part of that set:
@@ -2404,6 +2625,10 @@ def _build_daily_trial_config(
             except Exception:  # noqa: BLE001 — never break a trial on the optimization; fall back to full band
                 screener_candidate = None
 
+    if not isinstance(option_trade_records, bool):
+        raise TypeError(f"option_trade_records must be True or False, got "
+                        f"{option_trade_records!r}")
+
     # UNIQUE per-trial id: parallel trials each name their OWN per-run sqlite, so they never
     # collide on the same file (WinError 32 / cross-thread session). The run-level id is a base.
     import uuid as _uuid
@@ -2518,6 +2743,10 @@ def _build_daily_trial_config(
         # top-N persist), not by the single-backtest path. The market-condition seam reads it to
         # tell "a research run may compute on a miss" from "a search may not".
         "_ga_trial": True,
+        # OUTPUT SHAPE (see the docstring): whether option trade rows carry the trade record.
+        # In the whitelist because a knob missing here is dead; read by run_daily_backtest,
+        # which REFUSES an options run that does not state it.
+        "option_trade_records": option_trade_records,
     }
 
 
@@ -2817,6 +3046,36 @@ def _seed_all_results_from_checkpoint(
     if not isinstance(carried, list):
         return
     all_results.extend(r for r in carried if isinstance(r, dict))
+
+
+def _assert_checkpoint_metric_matches(ckpt: Dict[str, Any], metric: str,
+                                      job_name: Optional[str], task_id: str) -> None:
+    """Never mix the new soft-count objective with an old population's scores.
+
+    Legacy checkpoints did not record the metric. Preserve their existing resume
+    behavior for legacy objectives; they cannot have used the new soft30 metric.
+    Newly written checkpoints require a matching canonical metric in both directions.
+    """
+    from app.services.strategy_fitness import METRICS_CATALOG, _OCT_SOFT30_KEY
+
+    def canonical(value: str) -> str:
+        value = value.lower()
+        for item in METRICS_CATALOG:
+            if value == item["key"] or value in item["aliases"]:
+                return item["key"]
+        return value
+
+    previous = ckpt.get("fitness_metric")
+    current = canonical(metric)
+    if previous is None and current != _OCT_SOFT30_KEY:
+        return
+    if previous is not None and canonical(previous) == current:
+        return
+    raise ValueError(
+        f"checkpoint {task_id} for job {job_name!r} has fitness_metric={previous!r}, "
+        f"requested {metric!r}. Give the job a NEW name (--name / --name-suffix / "
+        "STAGE1_SUFFIX) to keep populations scored under different objectives separate."
+    )
 
 
 def _assert_checkpoint_robustness_matches(ckpt: Dict[str, Any], robust_on: bool,

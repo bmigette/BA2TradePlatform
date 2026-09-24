@@ -235,6 +235,10 @@ fi
 # to two targets and is on a different scale again). Same rule as every other economic/search
 # change here -- e.g. -st1cor for option_car_over_risk, -st1cat for option_car_target.
 STAGE1_FITNESS="${STAGE1_FITNESS:-}"
+# BT continuation (2026-09-20): STAGE1_FITNESS=option_car_target_soft30
+# scores sparse runs with min(completed structures / 30, 1), across the WHOLE
+# window, instead of rejecting them below an annual floor. Keep robustness ON.
+# Use a fresh suffix such as -st1soft30; the earlier -st1rob results stay banked.
 STAGE1_SUFFIX="${STAGE1_SUFFIX:--st1}"
 FITNESS_ARGS=()
 if [ -n "$STAGE1_FITNESS" ]; then

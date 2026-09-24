@@ -147,7 +147,7 @@ def test_ga_options_run_injects_provider_and_optimizes_option_genes(monkeypatch)
         # Go THROUGH the real per-trial config build so the options-provider wiring under test
         # is exercised + asserted for EVERY trial. (This is exactly the seam the optimizer uses
         # before calling run_daily_backtest.)
-        cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+        cfg = H._build_daily_trial_config(backtest_cfg, decoded, option_trade_records=False)
         seen_caches.append(cfg["options_cache_db"])
         # The option rule's selection params flow from the genes onto the decoded exit rule.
         rule = decoded["exit_rules"][0]

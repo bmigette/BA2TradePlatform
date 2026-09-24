@@ -144,7 +144,7 @@ def _backtest_side(key, expert):
 
     strat, genome = _genome_and_strategy(key, expert)
     decoded = decode_params(strat, genome)
-    trial = _build_daily_trial_config(_bt_block(strat, expert), decoded, None)
+    trial = _build_daily_trial_config(_bt_block(strat, expert), decoded, None, option_trade_records=False)
     return strat, genome, decoded, trial
 
 

@@ -74,7 +74,7 @@ def _decoded(m, genome, expert="FMPRating"):
         "entry_action": getattr(strat, "entry_action", None),
         "options_store": "parquet",
     }
-    return _build_daily_trial_config(backtest_cfg, decoded, None)
+    return _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
 
 
 def _entry_rule(trial, rid):
@@ -121,18 +121,30 @@ def test_both_entry_rules_share_the_same_exit_ruleset():
 
 # ---- directional gates: call=bullish, put=bearish, from the EXISTING signal machinery -------
 def test_the_call_arm_gates_on_bullish_the_put_arm_on_bearish():
+    """The two arms must gate in OPPOSITE directions by default: that is what makes the pair
+    convex rather than a doubled single-direction bet.
+
+    Since 2026-09-19 the direction lives in the leaf's OPERATOR, not in its field name -- both
+    arms read ``rec_direction`` (the expert's grade centred on HOLD) against a pinned 0
+    threshold, so bullish is ``> 0`` and bearish is ``< 0``. The mode gene lets the GA flip
+    either arm; what is pinned here is the AUTHORED default, still taken from
+    ``_OPTION_ENTRY_GATE``.
+    """
     m = _launcher()
     assert m._OPTION_ENTRY_GATE["O_CONVEXC"] == "bullish"
     assert m._OPTION_ENTRY_GATE["O_CONVEXP"] == "bearish"
     s = _built(m)
     call_rule = next(r for r in s.entry_rules if r["id"] == "o_convexc-entry")
     put_rule = next(r for r in s.entry_rules if r["id"] == "o_convexp-entry")
+    for rule in (call_rule, put_rule):
+        fields = [c.get("field") for c in rule["conditions"]["conditions"]]
+        assert "bullish" not in fields and "bearish" not in fields, fields
     call_signal = next(c for c in call_rule["conditions"]["conditions"]
-                       if c["field"] in ("bullish", "bearish"))
+                       if c.get("field") == "rec_direction")
     put_signal = next(c for c in put_rule["conditions"]["conditions"]
-                      if c["field"] in ("bullish", "bearish"))
-    assert call_signal["field"] == "bullish"
-    assert put_signal["field"] == "bearish"
+                      if c.get("field") == "rec_direction")
+    assert (call_signal["op"], call_signal["value"]) == (">", 0.0), call_signal
+    assert (put_signal["op"], put_signal["value"]) == ("<", 0.0), put_signal
 
 
 def test_the_call_arm_submits_buy_call_the_put_arm_submits_buy_put():

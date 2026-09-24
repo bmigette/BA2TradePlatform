@@ -62,3 +62,18 @@ def _restore_db_seam():
         # test left one behind on the main thread; drop it either way.
         if hasattr(db, "clear_threadlocal_db"):
             db.clear_threadlocal_db()
+
+
+@pytest.fixture(autouse=True)
+def _test_fakes_declare_a_greeks_source(monkeypatch):
+    """Every options-account FAKE in this suite declares one greeks source, here, once.
+
+    ``OptionsAccountInterface.OPTION_GREEKS_SOURCE`` is None by design and building an option
+    entry record on an account that declares none RAISES (BT/live parity Part C). The ~35
+    per-file fakes subclass the interface directly; declaring the tag on the interface for the
+    duration of each test stands in for 35 identical one-line edits. Production classes
+    declare their own (Alpaca "broker", BacktestAccount "bs_from_close") and are unaffected.
+    A test of the undeclared refusal sets it back to None itself.
+    """
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    monkeypatch.setattr(OptionsAccountInterface, "OPTION_GREEKS_SOURCE", "test_fake")

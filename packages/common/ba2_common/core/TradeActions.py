@@ -7,7 +7,7 @@ based on expert recommendations and market conditions.
 
 import math
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Callable, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, date, timedelta
 
 from ba2_common.core.interfaces import AccountInterface
@@ -15,7 +15,7 @@ from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInt
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, TradeActionResult
 from ba2_common.core.types import (
     OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus,
-    OptionRight, AssetClass, TransactionStatus,
+    OptionRight, AssetClass, TransactionStatus, OptionCloseReason,
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_economics import (
@@ -31,6 +31,15 @@ from ba2_common.core.option_payoff import (
     max_loss as _payoff_max_loss,
     _numeric as _payoff_numeric,
 )
+from ba2_common.core.option_payoff_chart import (
+    ChartLeg, PayoffUnavailable, build_payoff_chart,
+)
+from ba2_common.core.option_trade_record import (OPTION_TRADE_RECORD_VERSION, contract_from_quote,
+    entry_record as _entry_record, exit_record as _exit_record, exit_record_error as _exit_record_error,
+    exit_record_lean as _exit_record_lean, snapshot_legs, structure_snapshot, usable_spot,
+)
+from ba2_common.core.market_calendar import decision_data_session
+from ba2_common.core.interfaces.OptionsAccountInterface import DEFAULT_OPTION_MULTIPLIER
 from ba2_common.core.OptionRiskManagement import (
     admit_option_entry, option_risk_manager_enabled, record_submitted,
 )
@@ -43,7 +52,7 @@ from ba2_common.core.option_selector import (
     check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError,
     OptionLiquidityDataMissingToday, describe_pick_failure)
 from ba2_common.logger import logger
-from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.failure_modes import absorb_if_benign, is_never_absorbed
 from ba2_common.core.db import InstanceNotFound
 from ba2_common.core.instance_resolver import InstanceResolverNotConfigured
 
@@ -519,6 +528,20 @@ class BuyAction(TradeAction):
         # need 100-share equity blocks per contract.
         self.lot_size = lot_size
 
+    def _equity_lot_size(self) -> int:
+        """The round lot IN THE EQUITY BOOK'S UNIT.
+
+        ``lot_size`` is only ever set by the option-OVERLAY strategies (O_CC / O_PP: the
+        launcher's ``_with_round_lot_entry``), and it means "the shares one contract
+        delivers" -- 100 AS-TRADED shares. On a split-adjusted backtest book that is
+        ``100 x k`` adjusted shares (NFLX 2024: 1,000), via the same account seam the
+        cover check uses (``OptionsAccountInterface.option_shares_in_equity_units``). Live,
+        and on any account that cannot hold options, it is the configured int unchanged."""
+        lot = int(self.lot_size)
+        if not isinstance(self.account, OptionsAccountInterface):
+            return lot
+        return int(self.account.option_shares_in_equity_units(self.instrument_name, lot))
+
     def execute(self, quantity: Optional[float] = None) -> "TradeActionResult":
         """
         Create a pending buy order for the instrument.
@@ -553,7 +576,7 @@ class BuyAction(TradeAction):
                 side="buy",
                 quantity=quantity,
                 order_type="market",
-                extra_data={"lot_size": int(self.lot_size)} if self.lot_size else None
+                extra_data={"lot_size": self._equity_lot_size()} if self.lot_size else None
             )
             
             if not order_id:
@@ -830,7 +853,7 @@ class _AdjustPriceLevelAction(TradeAction):
         if stressed is not True:
             return self.percent
 
-        expert = self._regime_expert()
+        expert = self.resolve_expert()
         scale = regime_scale(expert, self._regime_scale_setting, stressed)
         if scale == 1.0:
             return self.percent          # exact no-op: do not even log
@@ -840,8 +863,12 @@ class _AdjustPriceLevelAction(TradeAction):
             f"={scale:g}, offset {self.percent:+.2f}% -> {scaled:+.2f}%")
         return scaled
 
-    def _regime_expert(self):
-        """The expert instance whose genome carries the regime settings, or None.
+    def resolve_expert(self):
+        """The expert instance whose genome carries this action's settings, or None.
+
+        Read by the regime overlay (the regime_* scales) and by ``ruleset_stop_policy``
+        (allow_ruleset_sl_loosen), from this action and from TradeActionEvaluator's merged
+        TP+SL branch.
 
         TP/SL actions are usually constructed WITHOUT an expert_recommendation (the ruleset
         adjusts an order that already exists -- see _create_order's "copy from existing_order"
@@ -867,6 +894,10 @@ class _AdjustPriceLevelAction(TradeAction):
             absorb_if_benign(e, InstanceNotFound, InstanceResolverNotConfigured)
             logger.debug(f"{self._label} regime overlay: no expert resolved ({e}); using neutral scale")
             return None
+
+    def _regime_expert(self):
+        """Former name of :meth:`resolve_expert`, kept as an alias."""
+        return self.resolve_expert()
 
     # --- Hooks that subclasses override ---
 
@@ -1370,6 +1401,206 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
         return enforced_price if enforced_price is not None else price
 
 
+#: The expert setting that lets a RULESET move a stop further away, down to the trade's
+#: max-loss stop. Declared on MarketExpertInterface (default False).
+RULESET_SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
+
+#: ``ruleset_stop_policy`` reasons meaning "the existing stop stands; send nothing". Every other
+#: reason means "apply the returned price". A request EQUAL to the existing stop is NOT in here:
+#: it is applied, exactly as before the policy existed (the account treats it as unchanged).
+RULESET_STOP_KEPT_REASONS = frozenset((
+    "ratchet",                  # setting off: a looser request is refused (today's behaviour)
+    "floor_would_loosen",       # setting on, the rule tightened; only the min-distance floor loosened
+    "floor_exceeds_rule",       # setting on, the floor pushed a loosen past the rule's own price
+    "no_max_loss_stop",         # setting on, but no bound was recorded: never loosen blind
+    "existing_beyond_bound",    # setting on, existing already at/looser than the bound
+    "bound_too_close",          # setting on, the clamped stop would break the min distance
+    "bound_unverifiable",       # setting on, clamped, but no current price to check it against
+))
+
+
+def _stop_price_pair(a: float, b: float) -> Tuple[str, str]:
+    """``$a``/``$b`` at 2 dp, or at 4 dp when they round to the same cents -- otherwise a log
+    line reads "keeping $97.00 ... asked for $97.00, which would LOOSEN" and looks like a bug."""
+    digits = 4 if round(a, 2) == round(b, 2) else 2
+    return f"${a:.{digits}f}", f"${b:.{digits}f}"
+
+
+def stop_is_long_position(transaction, fallback_order=None) -> bool:
+    """The position direction a stop protects: the transaction's side, else the order's.
+
+    Raises ValueError when neither names BUY or SELL. Reading an unknown side as SHORT (the
+    old behaviour) inverts which way "looser" points, so the ratchet would let a long's stop
+    fall. ``Transaction.side`` is a required column, so every real caller has one."""
+    side = getattr(transaction, "side", None) or (
+        fallback_order.side if fallback_order is not None else None)
+    side_str = str(side.value if hasattr(side, "value") else side or "").upper()
+    if side_str == "BUY":
+        return True
+    if side_str == "SELL":
+        return False
+    raise ValueError(
+        f"cannot tell which way a stop protects transaction {getattr(transaction, 'id', None)}: "
+        f"side {side!r} is neither BUY nor SELL")
+
+
+def ruleset_sl_loosen_allowed(expert) -> bool:
+    """``allow_ruleset_sl_loosen`` on ``expert``. No expert, or the setting absent -> False.
+
+    Read through ``coerce_bool``: the GA writes bool genes as integers and older rows hold the
+    JSON string "1", which must read True. A spelling ``coerce_bool`` cannot mean raises -- a
+    garbled bool setting is a bug to surface, not a value to guess."""
+    if expert is None:
+        return False
+    raw = expert.get_setting_with_interface_default(RULESET_SL_LOOSEN_SETTING, log_warning=False)
+    if raw is None:
+        return False
+    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+    return coerce_bool(raw)
+
+
+def ruleset_stop_policy(transaction, requested: float, is_long: bool,
+                        expert_getter: Callable[[], Any],
+                        *, price_getter: Optional[Callable[[], Optional[float]]] = None,
+                        rule_price: Optional[float] = None) -> Tuple[float, str]:
+    """The stop a RULESET may set. Returns ``(price_to_apply, reason)``.
+
+    THE ONE PLACE a ruleset stop-loss is decided, whatever kind of condition fired it and
+    whichever evaluator branch carries it (the SL-only ``AdjustStopLossAction`` and the merged
+    TP+SL ``adjust_tp_sl`` call both come through here).
+
+    - no existing stop, or a TIGHTER (or equal) request -> ``requested``
+    - LOOSER request, expert setting ``allow_ruleset_sl_loosen`` False (default) -> existing
+      (the ratchet, exactly the behaviour before this policy existed)
+    - LOOSER request, setting True, but the RULE's own price (``rule_price``, before the SL
+      min-distance floor) was TIGHTER than or equal to the existing stop -> existing
+      (``floor_would_loosen``). The floor pushes a stop that sits too close to the market
+      further away; applied to a tighten or a trailing request it would turn it into a loosen,
+      and a profit lock would unwind bar by bar down to the bound as the market falls. The
+      loosen setting permits a RULE to loosen, not the floor.
+    - LOOSER request, setting True, and the floor pushed it LOOSER than the rule's own price
+      (``rule_price``) -> existing (``floor_exceeds_rule``). A loosen never goes past what the
+      rule asked for: the rule's price sat too close to the market, and the floor's answer to
+      that is not a licence to loosen further.
+    - LOOSER request, setting True -> clamped at ``max_loss_stop_of(transaction)``: long
+      ``max(requested, bound)``, short ``min(requested, bound)``, so the result is never looser
+      than the bound and never looser than requested. Then:
+        * bound ABSENT -> existing (never loosen without a recorded bound);
+        * existing ALREADY at or looser than the bound -> existing. Clamping would move the stop
+          CLOSER to the market -- a tightening nobody asked for, performed as a side effect of a
+          request to loosen. The stop stays where it is instead;
+        * the clamp moved the price (bound used instead of ``requested``) -> the bound must
+          still pass the SL min-distance rule against the current price, which the caller
+          applied to ``requested`` but which nobody applied to the bound. A bound that fails it
+          (or sits through the market), or that cannot be checked for want of a price, is
+          refused and the existing stop stands. It is never pushed further away to pass: that
+          would break the max-loss bound.
+
+    Every non-trivial outcome is logged at INFO naming existing / requested / bound / applied.
+    The ratchet line keeps its historical text ("SL ratchet: keeping existing stop ...");
+    operators grep for it.
+
+    ``expert_getter`` and ``price_getter`` are zero-arg callables, called only on a loosening
+    request, so the common tighten path does no expert lookup and no price fetch. A missing
+    ``price_getter`` reads as "no current price". ``rule_price`` is the stop the rule itself
+    computed, before the min-distance floor; None when the caller has no separate pre-floor
+    price (then ``requested`` is taken to be the rule's price).
+
+    Reasons listed in ``RULESET_STOP_KEPT_REASONS`` mean "the existing stop stands, send
+    nothing"; the returned price is then the existing stop.
+    """
+    existing = getattr(transaction, "stop_loss", None)
+    txn_id = getattr(transaction, "id", None)
+    if not (existing and existing > 0) or not requested:
+        return requested, "no_existing_stop"
+    loosens = (requested < existing) if is_long else (requested > existing)
+    if not loosens:
+        return requested, "tighter_or_equal"
+
+    direction = "long" if is_long else "short"
+    ex_s, req_s = _stop_price_pair(existing, requested)
+    if not ruleset_sl_loosen_allowed(expert_getter()):
+        logger.info(
+            f"SL ratchet: keeping existing stop {ex_s} for transaction {txn_id} "
+            f"— ruleset asked for {req_s}, which would LOOSEN the {direction} stop"
+        )
+        return existing, "ratchet"
+
+    # Checked AFTER the ratchet so the default-off log stays the historical "SL ratchet" line.
+    if rule_price is not None and ((rule_price >= existing) if is_long else (rule_price <= existing)):
+        rule_s, _ = _stop_price_pair(rule_price, existing)
+        logger.info(
+            f"SL floor would loosen: keeping existing stop {ex_s} for transaction {txn_id} — the "
+            f"rule asked for {rule_s} (not looser than the {direction} stop), and only the SL "
+            f"min-distance floor moved it to {req_s}; the floor may not loosen a stop "
+            f"(applied={ex_s})"
+        )
+        return existing, "floor_would_loosen"
+
+    if rule_price is not None and ((requested < rule_price) if is_long else (requested > rule_price)):
+        rule_s, _ = _stop_price_pair(rule_price, requested)
+        logger.info(
+            f"SL floor exceeds rule: keeping existing stop {ex_s} for transaction {txn_id} — the "
+            f"rule asked to loosen the {direction} stop to {rule_s}, which is too close to the "
+            f"market; the SL min-distance floor moved it to {req_s}, past the rule's own price, "
+            f"and a loosen never goes past what the rule asked for (applied={ex_s})"
+        )
+        return existing, "floor_exceeds_rule"
+
+    from ba2_common.core.position_sizing import max_loss_stop_of
+    bound = max_loss_stop_of(transaction)
+    if bound is None:
+        logger.info(
+            f"SL loosen refused: keeping existing stop {ex_s} for transaction {txn_id} — ruleset "
+            f"asked for {req_s} ({direction}), {RULESET_SL_LOOSEN_SETTING} is on but no max-loss "
+            f"stop is recorded, so there is no bound to loosen to (bound=None, applied={ex_s})"
+        )
+        return existing, "no_max_loss_stop"
+
+    beyond = (existing <= bound) if is_long else (existing >= bound)
+    if beyond:
+        logger.info(
+            f"SL loosen: keeping existing stop {ex_s} for transaction {txn_id} — it is already at "
+            f"or beyond the max-loss stop ${bound:.4f} ({direction}); ruleset asked for {req_s}. "
+            f"Clamping would TIGHTEN it, which a loosen request must not do (applied={ex_s})"
+        )
+        return existing, "existing_beyond_bound"
+
+    applied = max(requested, bound) if is_long else min(requested, bound)
+    if applied == requested:
+        logger.info(
+            f"SL loosen: transaction {txn_id} {direction} stop {ex_s} -> {req_s} as the ruleset "
+            f"asked; within the max-loss stop ${bound:.4f} (applied={req_s})"
+        )
+        return requested, "loosen_within_bound"
+
+    # Clamped to the bound: the caller's min-distance check covered `requested`, not this.
+    price = price_getter() if price_getter is not None else None
+    if not price:
+        logger.info(
+            f"SL loosen refused: keeping existing stop {ex_s} for transaction {txn_id} — ruleset "
+            f"asked for {req_s} ({direction}), clamped to the max-loss stop ${bound:.4f}, but no "
+            f"current price is available to check its distance from the market (applied={ex_s})"
+        )
+        return existing, "bound_unverifiable"
+    from ba2_common.config import get_min_tp_sl_percent
+    min_pct = get_min_tp_sl_percent()
+    distance_pct = ((price - bound) / price * 100) if is_long else ((bound - price) / price * 100)
+    if distance_pct < min_pct:
+        logger.info(
+            f"SL loosen refused: keeping existing stop {ex_s} for transaction {txn_id} — ruleset "
+            f"asked for {req_s} ({direction}), clamped to the max-loss stop ${bound:.4f}, which is "
+            f"{distance_pct:.2f}% from the current price ${price:.2f}, below the {min_pct}% minimum "
+            f"(applied={ex_s})"
+        )
+        return existing, "bound_too_close"
+    logger.info(
+        f"SL loosen clamped: transaction {txn_id} {direction} stop {ex_s} -> ${bound:.4f} — "
+        f"ruleset asked for {req_s}, past the max-loss stop ${bound:.4f} (applied=${bound:.4f})"
+    )
+    return bound, "loosen_clamped"
+
+
 class AdjustStopLossAction(_AdjustPriceLevelAction):
     """Adjust stop loss level for an existing order."""
 
@@ -1389,33 +1620,30 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
                          expert_recommendation, target_price=stop_loss_price,
                          reference_value=reference_value, percent=percent)
         self.stop_loss_price = self.target_price  # backward-compat alias
+        #: The stop the RULE computed, before the SL min-distance floor moved it. Recorded by
+        #: _enforce_minimum_distance (SL-only path) and compute_price (merged TP+SL path) and
+        #: handed to ruleset_stop_policy, so the floor can never turn a tighten into a loosen.
+        self.rule_price: Optional[float] = None
 
     def _call_broker(self, transaction) -> bool:
-        # RATCHET-ONLY: a ruleset-driven stop-loss may only TIGHTEN, never loosen. Without this,
-        # an always-true SL rule (e.g. condition `has_position`) re-fires every management run and
-        # (a) REPLACES the risk manager's safeguard stop with a looser one — the position was
-        # SIZED off the safeguard distance, so the realized loss at stop exceeds risk_per_trade_pct
-        # — and (b) UN-TRAILS profit-lock tiers: when price falls back under a tier threshold the
-        # tier rule stops firing but the base SL rule still does, dropping the stop back below the
-        # locked level. Long: never move the stop DOWN once set; short: never UP. Scope is the
-        # ruleset path only — manual UI edits and the SmartRM call account.adjust_sl directly with
-        # their own source and stay free to loosen deliberately.
-        existing = getattr(transaction, "stop_loss", None)
-        if existing and existing > 0 and self.target_price:
-            side = getattr(transaction, "side", None) or (
-                self.existing_order.side if self.existing_order else None)
-            side_str = str(side.value if hasattr(side, "value") else side or "").upper()
-            is_long = side_str == "BUY"
-            loosens = (self.target_price < existing) if is_long else (self.target_price > existing)
-            if loosens:
-                logger.info(
-                    f"SL ratchet: keeping existing stop ${existing:.2f} for transaction "
-                    f"{transaction.id} — ruleset asked for ${self.target_price:.2f}, which would "
-                    f"LOOSEN the {'long' if is_long else 'short'} stop"
-                )
-                self.target_price = existing  # result/data reflect the kept (tighter) stop
-                self.stop_loss_price = existing
-                return True  # no-op success: the tighter stop stands
+        # RATCHET BY DEFAULT: a ruleset-driven stop-loss may only TIGHTEN, never loosen. Without
+        # this, an always-true SL rule (e.g. condition `has_position`) re-fires every management
+        # run and (a) REPLACES the risk manager's safeguard stop with a looser one — the position
+        # was SIZED off the safeguard distance, so the realized loss at stop exceeds
+        # risk_per_trade_pct — and (b) UN-TRAILS profit-lock tiers: when price falls back under a
+        # tier threshold the tier rule stops firing but the base SL rule still does, dropping the
+        # stop back below the locked level. The expert setting allow_ruleset_sl_loosen opts into
+        # loosening down to the trade's max-loss stop (the stop it was sized on) and no further.
+        # The decision lives in ruleset_stop_policy, shared with the merged TP+SL branch of
+        # TradeActionEvaluator. Scope is the ruleset path only — manual UI edits and the SmartRM
+        # call account.adjust_sl directly with their own source and stay free to loosen.
+        applied, reason = ruleset_stop_policy(
+            transaction, self.target_price, stop_is_long_position(transaction, self.existing_order),
+            self.resolve_expert, price_getter=self.get_current_price, rule_price=self.rule_price)
+        self.target_price = applied  # result/data reflect the stop that stands
+        self.stop_loss_price = applied
+        if reason in RULESET_STOP_KEPT_REASONS:
+            return True  # no-op success: the existing stop stands
         return self.account.adjust_sl(transaction, self.target_price, source="ruleset")
 
     def _post_broker_hook(self, transaction) -> None:
@@ -1441,6 +1669,7 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
         shrinking as price rallies even though its distance from CURRENT price never changes
         -- so it kept getting clobbered back down to a guaranteed loss the moment it moved
         above entry.)"""
+        self.rule_price = self.target_price    # before the floor: see ruleset_stop_policy
         if self.existing_order and self.target_price:
             current_price = self.get_current_price()
             if not current_price:
@@ -1476,6 +1705,7 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
         Same current-price-relative guard as _enforce_minimum_distance above (see its
         docstring for why open-price-relative was wrong for profit-locking stops)."""
         price = super().compute_price(order)
+        self.rule_price = price    # before the floor: the merged branch hands it to the policy
 
         # Enforce minimum SL distance from current price
         if price is not None:
@@ -1911,6 +2141,18 @@ class DecreaseInstrumentShareAction(TradeAction):
         return f"Decrease {self.instrument_name} position to {self.target_percent}% of virtual equity"
 
 
+class EntryRecordSpotUnavailable(ValueError):
+    """The option entry record needs the underlying's spot and none is usable (None, zero,
+    non-finite). ``_submit_option_order`` turns it into a REFUSED entry -- logged at ERROR and
+    returned as a failed action result -- before anything reaches the broker."""
+
+
+class OptionGreeksSourceUndeclared(RuntimeError):
+    """An options account that declares no ``OPTION_GREEKS_SOURCE`` tried to build an entry
+    record: a defect on the account class. Logged at ERROR and stored as the record's
+    ``error`` (the entry itself proceeds; see ``_entry_record_or_refusal``)."""
+
+
 def _entry_payoff_legs(legs: List[OptionLeg], limit_price) -> Optional[List[PayoffLeg]]:
     """``PayoffLeg``s equivalent to ONE contract of an entry order, or None when underivable.
 
@@ -2201,31 +2443,51 @@ class _OptionEntryAction(TradeAction):
     def _supports_options(self) -> bool:
         return isinstance(self.account, OptionsAccountInterface)
 
-    def _today(self) -> date:
-        """The 'now' date for DTE/expiry windows.
+    #: This action's decision label, read once (see ``_today``). A class default so an action
+    #: built without ``__init__`` (test doubles) still starts unread.
+    _decision_label = None
 
-        Live accounts have no simulated clock, so this is the wall-clock ``date.today()``.
-        A BACKTEST account exposes its simulated bar date via ``_as_of_date()``; using it
-        anchors the chain-fetch expiry window and ``filter_dte`` on the SIMULATED clock
-        rather than wall-clock — without it a historical contract is excluded (its expiry
-        is years before ``date.today()``), so the option entry never fires AND it would
-        leak look-ahead. The accessor is duck-typed (``getattr``) so live behaviour is
-        byte-identical (no ``_as_of_date`` -> ``date.today()``)."""
-        as_of = getattr(self.account, "_as_of_date", None)
-        if callable(as_of):
-            try:
-                d = as_of()
-                if d is not None:
-                    return d
-            except Exception:  # noqa: BLE001 — never let clock lookup break the action
-                pass
-        return date.today()
+    def _today(self) -> date:
+        """The 'now' date for DTE/expiry windows: the account's DECISION SESSION LABEL.
+
+        ``OptionsAccountInterface.decision_label`` -- the session this decision's orders
+        execute in -- on BOTH paths (BT/live option parity): live, the New York date of the
+        (replay-aware) decision instant; backtest, N(D) for bar D, since bar D fills on the
+        next bar. Before, the backtest anchored on D and live on the machine's
+        ``date.today()``, one session (and a timezone) apart. DTE is calendar days from it.
+
+        Read ONCE per action and reused by every ``_today`` site in it: one decision has one
+        label. It is NOT the only read of the account's clock: each chain/quote fetch derives
+        its volume data session from its own ``account.decision_label()`` call (once per
+        fetch). Live, inside an enter-market decision pass, every one of those returns the
+        pass's frozen instant and takes no clock read at all; outside a pass each is a
+        separate ``replay_now`` read (recorded, in call order, under capture), so a decision
+        straddling New York midnight could label its DTE and its chain volume differently.
+        No fallback: an account that cannot say its label is not an options account, and a
+        guessed date would move every expiry window."""
+        label = self._decision_label
+        if label is None:
+            label = self.account.decision_label()
+            self._decision_label = label
+        return label
+
+    #: The last spot ``_spot`` read (None until one is read): the value the builder selected
+    #: strikes against, reused by the entry record so the record never re-reads a different
+    #: price. A class default so an action built without ``__init__`` starts unread.
+    _last_spot = None
 
     def _spot(self) -> Optional[float]:
-        """Underlying mid price; fall back to default current price."""
+        """Underlying mid price IN THE OPTION BASIS; fall back to the default price type.
+
+        Read through ``OptionsAccountInterface.get_option_underlying_price`` -- the one option
+        spot read (BT/live option parity, plan Part E2). Live it IS
+        ``get_instrument_current_price`` (same arguments, same answer); a backtest converts
+        the split-adjusted close into the as-traded basis the chain's strikes are quoted in,
+        so a 5%-OTM pick on NFLX in 2024 lands near $580, not $58."""
         try:
-            price = self.account.get_instrument_current_price(self.instrument_name, 'mid')
+            price = self.account.get_option_underlying_price(self.instrument_name, 'mid')
             if price is not None:
+                self._last_spot = price
                 return price
         except TypeError:
             # Mock/account without price_type support
@@ -2233,7 +2495,30 @@ class _OptionEntryAction(TradeAction):
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.debug(f"_spot mid lookup failed for {self.instrument_name}: {e}")
-        return self.get_current_price()
+        try:
+            price = self.account.get_option_underlying_price(self.instrument_name)
+            if price is not None:
+                self._last_spot = price
+            return price
+        except Exception as e:
+            # The same handling ``get_current_price`` gives the default-type read.
+            absorb_if_benign(e, InstanceNotFound)
+            logger.error(f"Error getting current price for {self.instrument_name}: {e}", exc_info=True)
+            return None
+
+    def _contracts_coverable_by(self, held_equity_shares: float) -> int:
+        """Whole contracts ``held_equity_shares`` (the equity book's unit) can back.
+
+        ``floor(held / k / 100)`` with ``k = account.equity_shares_per_option_share`` -- a
+        contract delivers 100 AS-TRADED shares (plan Part E3). ``k`` is 1 live, so this is the
+        old ``floor(held / 100)`` there to the bit."""
+        if not held_equity_shares or held_equity_shares <= 0:
+            return 0
+        k = self.account.equity_shares_per_option_share(self.instrument_name)
+        if k == 1.0:
+            return int(math.floor(held_equity_shares / 100.0))
+        # round() first: 1000 adjusted shares / 10.000000000000002 must still be 100 shares.
+        return int(math.floor(round(held_equity_shares / float(k), 6) / 100.0))
 
     def _expiry_window(self, today: date) -> Tuple[date, date]:
         """The [expiry_min, expiry_max] fetch window, or a LOUD config error.
@@ -2730,7 +3015,7 @@ class _OptionEntryAction(TradeAction):
     def _modelled_half_spreads(self, legs: List[OptionLeg]) -> Optional[List[float]]:
         """One modelled half-spread per leg, or None when this account models no spread.
 
-        Duck-typed on purpose (the same idiom as ``_today``'s ``_as_of_date`` lookup): the hook
+        Duck-typed on purpose (``TradeConditions``' ``_as_of_date`` idiom): the hook
         exists only on the BACKTEST account, because only a simulator has a MODELLED spread to
         concede. A live account has real quotes and its builders already quote at the real
         touch, so the absence of the hook is what keeps live byte-identical.
@@ -2956,6 +3241,21 @@ class _OptionEntryAction(TradeAction):
             max_loss_per_contract if stock_cover_price is None
             else _measured_max_loss_per_contract(legs, limit_price,
                                                  stock_cover_price=stock_cover_price))
+        # THE OPTION TRADE RECORD (BT/live option parity, plan Part C2). Built HERE, the one
+        # choke point both runtimes reach, so live and backtest write the same keys by the same
+        # arithmetic from their own source values. BEFORE the broker call. Only a missing or
+        # unusable spot REFUSES the entry (logged ERROR, failed result, nothing submitted); any
+        # other failure to build the record is logged at ERROR, stored as {"version", "error"}
+        # and the entry proceeds -- the record is analysis data, never an input to the decision.
+        record, refusal = self._entry_record_or_refusal(
+            legs, quantity=quantity, limit_price=limit_price, option_strategy=option_strategy,
+            max_loss_per_contract=max_loss_per_contract)
+        if refusal is not None:
+            data["entry_record_refusal"] = refusal
+            return self._result(False, f"{option_strategy} for {self.instrument_name} "
+                                       f"REFUSED before the broker: {refusal}", data)
+        if record is not None:
+            data["entry_record"] = record
         if not self.submit_to_broker:
             logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
                         f"{option_strategy} - recording informational result")
@@ -3008,7 +3308,7 @@ class _OptionEntryAction(TradeAction):
             # stop. The charge is dropped again the moment the transaction becomes visible.
             record_submitted(rm_instance_id, getattr(order, "transaction_id", None),
                              rm_candidate)
-        # Persist the entry facts on the order row. FOUR of them, from three lineages:
+        # Persist the entry facts on the order row. FIVE of them, from four lineages:
         #   - option_reserve       -- the short-premium reserve, so available BP reflects it;
         #   - max_loss_per_contract -- the measured max loss, so the loss_pct_of_max_loss exit
         #     can read its denominator back off the row (design 2026-08-29 S8.2);
@@ -3016,7 +3316,9 @@ class _OptionEntryAction(TradeAction):
         #     days_after_event exit can read it back (design 2026-08-31 leaps-grid S9);
         #   - entry_cross          -- the entry-quote concession fraction, so a later
         #     DISCRETIONARY close can concede the SAME fraction this entry did (review
-        #     2026-08-30 F7; see CloseOptionAction._close_cross_fraction).
+        #     2026-08-30 F7; see CloseOptionAction._close_cross_fraction);
+        #   - entry_record         -- the option trade record (BT/live parity Part C2), what a
+        #     live-vs-backtest comparison reads back; added by NAME below, not via the tuple.
         # entry_cross is persisted whenever the gene is set (not only when it moved this
         # particular quote) and is absent for the 0.0 default, so a default run's order row
         # is byte-identical to before.
@@ -3034,6 +3336,10 @@ class _OptionEntryAction(TradeAction):
         # of hoping somebody remembered to extend a tuple three hundred lines away.
         if extra_entry_facts:
             entry_facts.update(extra_entry_facts)
+        # The trade record rides the row by NAME, like the caller-stated facts: it is what a
+        # later live-vs-backtest comparison reads back, so it must never be whitelisted away.
+        if "entry_record" in data:                  # absent on a GA fitness trial
+            entry_facts["entry_record"] = data["entry_record"]
         if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
             entry_facts["entry_cross"] = float(self.entry_cross)
         if entry_facts and order_id is not None:
@@ -3047,6 +3353,131 @@ class _OptionEntryAction(TradeAction):
                 logger.error(f"Failed to persist entry facts {sorted(entry_facts)} on "
                              f"order {order_id}: {e}", exc_info=True)
         return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
+
+    def _entry_record_or_refusal(self, legs: List[OptionLeg], *, quantity: int,
+                                 limit_price: float, option_strategy: str,
+                                 max_loss_per_contract: Optional[float]
+                                 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """``(record, None)``, or ``(None, reason)`` when the entry must be REFUSED.
+
+        THE RECORD IS ANALYSIS DATA; THE ENTRY DECISION DOES NOT DEPEND ON IT (controller
+        decision, 2026-09-23). Two branches, and only two:
+
+        * NO USABLE SPOT for a leg with a chosen contract -> REFUSED (logged ERROR with the
+          symbol; the caller returns a failed action result). The one intended refusal: the
+          missing spot that would fabricate a moneyness says the decision itself was blind.
+        * ANY OTHER failure building the record -> logged ERROR with the traceback, and the
+          entry PROCEEDS carrying ``{"version", "error": "<Type>: <msg>"}`` so the gap is
+          visible on the row, never silent. That includes an account that declares no
+          ``OPTION_GREEKS_SOURCE`` (``OptionGreeksSourceUndeclared``). Split-basis refusals
+          (``failure_modes.is_never_absorbed``) still propagate.
+        """
+        try:
+            if not self.account.records_option_trades():
+                # A GA FITNESS TRIAL (``option_trade_records`` False): no record is built --
+                # no snapshots, no payoff chart. The REFUSAL GATE still runs, identically:
+                # whether this entry happens must not depend on whether it is being recorded.
+                self._entry_record_spot(legs)
+                return None, None
+            return self._build_entry_record(
+                legs, quantity=quantity, limit_price=limit_price,
+                option_strategy=option_strategy,
+                max_loss_per_contract=max_loss_per_contract), None
+        except EntryRecordSpotUnavailable as e:
+            logger.error(f"{option_strategy} for {self.instrument_name} REFUSED before the "
+                         f"broker: {e}")
+            return None, str(e)
+        except Exception as e:  # noqa: BLE001 -- analysis data never blocks an entry (above)
+            if is_never_absorbed(e):
+                raise
+            logger.error(f"Option entry record for {self.instrument_name} {option_strategy} "
+                         f"could not be built ({type(e).__name__}: {e}); the entry proceeds "
+                         f"with an error record", exc_info=True)
+            return {"version": OPTION_TRADE_RECORD_VERSION,
+                    "error": f"{type(e).__name__}: {e}"}, None
+
+    def _entry_record_spot(self, legs: List[OptionLeg]) -> Tuple[str, Any]:
+        """``(greeks_source, spot)`` for the entry record -- and THE REFUSAL GATE, which runs in
+        both record shapes (full, and none on a GA fitness trial) so the entry decision is the
+        same either way. Raises ``OptionGreeksSourceUndeclared`` (-> an error record, the entry
+        proceeds) or ``EntryRecordSpotUnavailable`` (-> the entry is REFUSED)."""
+        greeks_source = getattr(self.account, "OPTION_GREEKS_SOURCE", None)
+        if not greeks_source:
+            raise OptionGreeksSourceUndeclared(
+                f"{type(self.account).__name__} declares no OPTION_GREEKS_SOURCE; an option "
+                f"entry record for {self.instrument_name} cannot say how its greeks were "
+                f"measured. Declare it on the account class ('broker', 'bs_from_close', ...).")
+        spot = self._last_spot
+        quoted = any(leg.quote is not None for leg in legs)
+        if spot is None and quoted:
+            # Only a leg snapshot needs the spot; a ticket with no chosen contract reads none.
+            spot = self.account.get_option_underlying_price(self.instrument_name)
+        if quoted:
+            if usable_spot(spot) is None:
+                raise EntryRecordSpotUnavailable(
+                    f"no usable underlying price for {self.instrument_name} (got {spot!r}); "
+                    f"the option trade record never stores a moneyness against a missing spot")
+        return greeks_source, spot
+
+    def _build_entry_record(self, legs: List[OptionLeg], *, quantity: int, limit_price: float,
+                            option_strategy: str,
+                            max_loss_per_contract: Optional[float]) -> Dict[str, Any]:
+        """The ``option_trade_record_v1`` of this entry (``core.option_trade_record``).
+
+        SOURCES, one per field family, the same calls on both paths:
+          * spot           -- the value ``_spot`` returned to the builder (``_last_spot``); only
+            when the builder read none is ``get_option_underlying_price`` asked, once. Unusable
+            -> ``EntryRecordSpotUnavailable``, a refused entry (never a 0);
+          * decision label -- ``_today()`` (the action's one read of ``account.decision_label``);
+            data session = ``decision_data_session`` of it;
+          * greeks source  -- PER ROW: the chain contract's own ``greeks_source`` when it states
+            one, else the account's ``OPTION_GREEKS_SOURCE``. An account that declares none raises
+            ``OptionGreeksSourceUndeclared``, which ``_entry_record_or_refusal`` logs at ERROR
+            and records as an ``error`` record -- never a leg tagged unknown;
+          * quote time     -- the chosen contract's own ``quote_time`` (live: Alpaca's quote
+            stamp; backtest: None, the bar has no quote instant).
+
+        A leg with no chain contract (``quote is None``) gets no leg snapshot and is NAMED in
+        ``legs_without_quote``. Every entry builder sets ``quote`` today, so the list is empty
+        on every entry; it exists so a future builder that forgets is visible, not silent.
+
+        STRUCTURE: ``max_loss`` is the stamped ``max_loss_per_contract`` (the same measurement,
+        not a second one); ``max_profit`` and ``breakevens`` come from
+        ``option_payoff_chart.build_payoff_chart`` over ``_entry_payoff_legs`` -- the payoff
+        engine the live option chart uses. Where that refuses (a leg with no right/strike, a
+        multi-expiry structure such as the PMCC diagonal) both are None and the reason is kept.
+        """
+        greeks_source, spot = self._entry_record_spot(legs)
+        label = self._today()
+        data_session = decision_data_session(label)
+        snapshots, without_quote = snapshot_legs(
+            [(leg, leg.quote) for leg in legs], spot=spot, data_session=data_session,
+            decision_label=label, greeks_source=greeks_source)
+        max_profit = breakevens = None
+        max_loss_state = max_profit_state = None
+        unavailable = None
+        payoff_legs = _entry_payoff_legs(legs, limit_price)
+        if payoff_legs is None:
+            unavailable = "the order's legs and limit do not derive a payoff"
+        else:
+            chart = build_payoff_chart([
+                ChartLeg(payoff=p, expiry=(leg.expiry.isoformat() if leg.expiry else None),
+                         underlying=leg.underlying)
+                for p, leg in zip(payoff_legs, legs)])
+            if isinstance(chart, PayoffUnavailable):
+                unavailable = chart.reason
+            else:
+                max_loss_state = chart.max_loss.state
+                max_profit_state = chart.max_profit.state
+                max_profit = chart.max_profit.amount
+                breakevens = list(chart.breakevens)
+        structure = structure_snapshot(
+            snapshots, strategy=option_strategy, quantity=quantity,
+            multiplier=DEFAULT_OPTION_MULTIPLIER, net_price=limit_price,
+            max_loss=max_loss_per_contract, max_profit=max_profit, breakevens=breakevens,
+            max_loss_state=max_loss_state, max_profit_state=max_profit_state,
+            payoff_unavailable_reason=unavailable)
+        return _entry_record(snapshots, structure, without_quote)
 
     def _build_and_submit(self) -> Dict[str, Any]:
         raise NotImplementedError
@@ -3107,6 +3538,9 @@ class _OptionEntryAction(TradeAction):
             resolved.legs, quantity, resolved.limit_price, resolved.option_strategy)
 
     def execute(self) -> "TradeActionResult":
+        # One execute, one decision: the spot the record reuses is THIS run's, never a
+        # previous execute's on the same action object.
+        self._last_spot = None
         try:
             if not self._supports_options():
                 return self._result(False, f"Account does not support options for {self.instrument_name}")
@@ -3165,7 +3599,7 @@ class BuyCallAction(_OptionEntryAction):
         limit_price = contract.ask                          # buy at ASK
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying, quote=contract)
         return ResolvedStructure(
             request=None, legs=[leg],
             payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
@@ -3215,10 +3649,10 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying, quote=long_c)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
-                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying, quote=short_c)
         return ResolvedStructure(
             request=None, legs=[long_leg, short_leg],
             payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
@@ -3265,7 +3699,7 @@ class BuyPutAction(_OptionEntryAction):
         limit_price = contract.ask                          # buy at ASK
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying, quote=contract)
         return ResolvedStructure(
             request=None, legs=[leg],
             payoff_legs=[PayoffLeg(kind="put", side=OrderDirection.BUY,
@@ -3316,10 +3750,10 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying, quote=long_c)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
-                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying, quote=short_c)
         return ResolvedStructure(
             request=None, legs=[long_leg, short_leg],
             payoff_legs=[PayoffLeg(kind="put", side=OrderDirection.BUY,
@@ -3424,7 +3858,7 @@ class SellCoveredCallAction(_OptionEntryAction):
                 f"equity order carries no filled_qty, so how many shares are held cannot "
                 f"be measured and a covered call written against them could be naked. "
                 f"Repair the order's filled_qty; unknown is not zero.")
-        quantity = int(math.floor(held / 100.0)) if held > 0 else 0
+        quantity = self._contracts_coverable_by(held)
         if quantity < 1:
             return self._decline(
                 COVERED_CALL_DECLINE_SUB_LOT,
@@ -3453,7 +3887,7 @@ class SellCoveredCallAction(_OptionEntryAction):
         limit_price = contract.bid                          # sell at BID
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
                         position_intent="sell_to_open", option_type=self.OPTION_TYPE,
-                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying, quote=contract)
         # The ACCOUNT-WIDE cover check, which ``_held_equity_shares`` above is not: that
         # sums THIS expert's own filled buys and consults no short-call book, so a second
         # covered call written against the same lot passes it (and shares bought by
@@ -3502,7 +3936,7 @@ class BuyProtectivePutAction(_OptionEntryAction):
                                 f"Share count for {self.instrument_name} is UNMEASURABLE — an executed "
                                 f"equity order carries no filled_qty, so how many shares need protecting "
                                 f"cannot be measured. Repair the order's filled_qty; unknown is not zero.")
-        quantity = int(math.floor(held / 100.0)) if held > 0 else 0
+        quantity = self._contracts_coverable_by(held)
         if quantity < 1:
             return self._result(False,
                                 f"Held equity below one contract lot for protective put on {self.instrument_name} "
@@ -3527,7 +3961,7 @@ class BuyProtectivePutAction(_OptionEntryAction):
         limit_price = contract.ask                          # buy at ASK
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying, quote=contract)
         # NO stock cover leg here, deliberately (checked with the covered-call fix,
         # 2026-08-31): the protective put also rides held stock, but a long put on its
         # own is already loss-bounded -- its max loss IS the debit, which is both what
@@ -3604,7 +4038,7 @@ class SellCashSecuredPutAction(_OptionEntryAction):
         limit_price = contract.bid                          # sell at BID
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
                         position_intent="sell_to_open", option_type=self.OPTION_TYPE,
-                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying, quote=contract)
         return self._submit_option_order([leg], quantity, limit_price, "cash_secured_put",
                                          option_reserve=reserve)
 
@@ -3684,10 +4118,10 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
                                 f"{self.account.available_option_buying_power()})")
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
-                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying, quote=short_c)
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying, quote=long_c)
         limit_price = -net_credit                           # NEGATIVE = net credit (Alpaca MLEG)
         return self._submit_option_order([short_leg, long_leg], quantity, limit_price,
                                          "bear_call_spread", option_reserve=reserve)
@@ -3799,10 +4233,10 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
             "bull_put_spread", quantity, spread_width=width, net_credit=net_credit)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
-                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying, quote=short_c)
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying, quote=long_c)
         limit_price = -net_credit                           # NEGATIVE = net credit (Alpaca MLEG)
         return self._submit_option_order([short_leg, long_leg], quantity, limit_price,
                                          "bull_put_spread", option_reserve=reserve)
@@ -3868,10 +4302,10 @@ class OpenStraddleAction(_OptionEntryAction):
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} straddle")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=OptionRight.CALL,
-                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
+                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying, quote=call_c)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.BUY,
                             position_intent="buy_to_open", option_type=OptionRight.PUT,
-                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
+                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying, quote=put_c)
         return ResolvedStructure(
             request=None, legs=[call_leg, put_leg],
             payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
@@ -3950,10 +4384,10 @@ class OpenStrangleAction(_OptionEntryAction):
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} strangle")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=OptionRight.CALL,
-                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
+                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying, quote=call_c)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.BUY,
                             position_intent="buy_to_open", option_type=OptionRight.PUT,
-                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
+                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying, quote=put_c)
         return ResolvedStructure(
             request=None, legs=[call_leg, put_leg],
             payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
@@ -4047,10 +4481,10 @@ class OpenShortStraddleAction(_OptionEntryAction):
             put_premium=put_c.bid, call_premium=call_c.bid)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
-                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
+                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying, quote=call_c)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.SELL,
                             position_intent="sell_to_open", option_type=OptionRight.PUT,
-                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
+                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying, quote=put_c)
         return self._submit_option_order([call_leg, put_leg], quantity, -net_credit,
                                          "short_straddle", option_reserve=reserve)
 
@@ -4138,10 +4572,10 @@ class OpenShortStrangleAction(_OptionEntryAction):
             put_premium=put_c.bid, call_premium=call_c.bid)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
-                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
+                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying, quote=call_c)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.SELL,
                             position_intent="sell_to_open", option_type=OptionRight.PUT,
-                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
+                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying, quote=put_c)
         return self._submit_option_order([call_leg, put_leg], quantity, -net_credit,
                                          "short_strangle", option_reserve=reserve)
 
@@ -4223,13 +4657,13 @@ class OpenIronCondorAction(_OptionEntryAction):
             "iron_condor", quantity, spread_width=width, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
-                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
+                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying, quote=sp),
             OptionLeg(contract_symbol=lp.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
-                      option_type=OptionRight.PUT, strike=lp.strike, expiry=lp.expiry, underlying=lp.underlying),
+                      option_type=OptionRight.PUT, strike=lp.strike, expiry=lp.expiry, underlying=lp.underlying, quote=lp),
             OptionLeg(contract_symbol=sc.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
-                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying),
+                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying, quote=sc),
             OptionLeg(contract_symbol=lc.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
-                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying),
+                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying, quote=lc),
         ]
         return self._submit_option_order(legs, quantity, -net_credit, "iron_condor",
                                          option_reserve=reserve)
@@ -4312,11 +4746,11 @@ class OpenJadeLizardAction(_OptionEntryAction):
             "jade_lizard", quantity, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
-                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
+                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying, quote=sp),
             OptionLeg(contract_symbol=sc.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
-                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying),
+                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying, quote=sc),
             OptionLeg(contract_symbol=lc.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
-                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying),
+                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying, quote=lc),
         ]
         return self._submit_option_order(legs, quantity, -net_credit, "jade_lizard",
                                          option_reserve=reserve)
@@ -4378,13 +4812,13 @@ class OpenCallButterflyAction(_OptionEntryAction):
         legs = [
             OptionLeg(contract_symbol=lower.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.CALL,
-                      strike=lower.strike, expiry=lower.expiry, underlying=lower.underlying),
+                      strike=lower.strike, expiry=lower.expiry, underlying=lower.underlying, quote=lower),
             OptionLeg(contract_symbol=body.symbol, side=OrderDirection.SELL, ratio_qty=2,
                       position_intent="sell_to_open", option_type=OptionRight.CALL,
-                      strike=body.strike, expiry=body.expiry, underlying=body.underlying),
+                      strike=body.strike, expiry=body.expiry, underlying=body.underlying, quote=body),
             OptionLeg(contract_symbol=upper.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.CALL,
-                      strike=upper.strike, expiry=upper.expiry, underlying=upper.underlying),
+                      strike=upper.strike, expiry=upper.expiry, underlying=upper.underlying, quote=upper),
         ]
         return ResolvedStructure(
             request=None, legs=legs,
@@ -4484,10 +4918,10 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         legs = [
             OptionLeg(contract_symbol=long_p.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.PUT,
-                      strike=long_p.strike, expiry=long_p.expiry, underlying=long_p.underlying),
+                      strike=long_p.strike, expiry=long_p.expiry, underlying=long_p.underlying, quote=long_p),
             OptionLeg(contract_symbol=short_p.symbol, side=OrderDirection.SELL, ratio_qty=2,
                       position_intent="sell_to_open", option_type=OptionRight.PUT,
-                      strike=short_p.strike, expiry=short_p.expiry, underlying=short_p.underlying),
+                      strike=short_p.strike, expiry=short_p.expiry, underlying=short_p.underlying, quote=short_p),
         ]
         return self._submit_option_order(legs, quantity, net, "put_ratio_spread",
                                          option_reserve=reserve)
@@ -4603,11 +5037,11 @@ class _BackspreadAction(_OptionEntryAction):
             OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                       ratio_qty=BACKSPREAD_SHORT_RATIO, position_intent="sell_to_open",
                       option_type=self.OPTION_TYPE, strike=short_c.strike,
-                      expiry=short_c.expiry, underlying=short_c.underlying),
+                      expiry=short_c.expiry, underlying=short_c.underlying, quote=short_c),
             OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                       ratio_qty=BACKSPREAD_LONG_RATIO, position_intent="buy_to_open",
                       option_type=self.OPTION_TYPE, strike=long_c.strike,
-                      expiry=long_c.expiry, underlying=long_c.underlying),
+                      expiry=long_c.expiry, underlying=long_c.underlying, quote=long_c),
         ]
         # THE RATIO INVARIANT, checked on the legs that would actually be sent.
         shape = _backspread_shape_refusal(legs, option_type=self.OPTION_TYPE)
@@ -4911,11 +5345,11 @@ class OpenPMCCAction(_OptionEntryAction):
         legs = [
             OptionLeg(contract_symbol=leaps.symbol, side=OrderDirection.BUY,
                       position_intent="buy_to_open", option_type=self.OPTION_TYPE,
-                      strike=leaps.strike, expiry=leaps.expiry, underlying=leaps.underlying),
+                      strike=leaps.strike, expiry=leaps.expiry, underlying=leaps.underlying, quote=leaps),
             OptionLeg(contract_symbol=overlay.symbol, side=OrderDirection.SELL,
                       position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                       strike=overlay.strike, expiry=overlay.expiry,
-                      underlying=overlay.underlying),
+                      underlying=overlay.underlying, quote=overlay),
         ]
         # THE RISK NUMBER, from the payoff evaluator over these same legs and this same net --
         # the same MEASUREMENT the submit stamp will make, not a second formula. A structure
@@ -5087,6 +5521,7 @@ class RollPMCCShortAction(_OptionEntryAction):
         return None
 
     def execute(self) -> "TradeActionResult":
+        self._last_spot = None          # see _OptionEntryAction.execute
         try:
             from ba2_common.core.OptionRiskManagement import build_structure
             from ba2_common.core.models import Transaction
@@ -5213,7 +5648,7 @@ class RollPMCCShortAction(_OptionEntryAction):
             OptionLeg(contract_symbol=picked.symbol, side=OrderDirection.SELL,
                       ratio_qty=ratio, position_intent="sell_to_open",
                       option_type=self.OPTION_TYPE, strike=picked.strike,
-                      expiry=picked.expiry, underlying=picked.underlying),
+                      expiry=picked.expiry, underlying=picked.underlying, quote=picked),
         ]
         unsafe = roll_legs_are_fail_closed(legs)
         if unsafe is not None:
@@ -5244,17 +5679,40 @@ class RollPMCCShortAction(_OptionEntryAction):
         # DISCRETIONARY close).
         self.entry_cross = (getattr(entry, "data", None) or {}).get("entry_cross")
         quoted = self._quote_with_concession(legs, net)
+        # THE TRADE RECORD OF THE NEW SHORT (BT/live parity Part C2): the same shared builder
+        # the entries use. The buy-back leg has no chain contract and is listed in
+        # ``legs_without_quote``. ``max_loss`` is None: a roll ticket's own payoff is not the
+        # position's risk (see the NO RESTAMP note below).
+        record, refusal = self._entry_record_or_refusal(
+            legs, quantity=int(structures), limit_price=quoted,
+            option_strategy=PMCC_ROLL_STRATEGY, max_loss_per_contract=None)
+        if refusal is not None:
+            return self._refuse(f"REFUSED before the broker: {refusal}",
+                                {"entry_record_refusal": refusal})
         if not self.submit_to_broker:
             return self._result(True, f"PMCC roll deferred for {self.instrument_name} "
                                       f"(manual review, not submitted)",
                                 {"contract_symbols": [l.contract_symbol for l in legs],
-                                 "limit_price": quoted, "status": "PENDING"})
+                                 "limit_price": quoted, "status": "PENDING",
+                                 "entry_record": record})
         submitted = self.account.submit_option_order(
             legs=legs, quantity=int(structures), order_type="limit", limit_price=quoted,
             option_strategy=PMCC_ROLL_STRATEGY, transaction_id=txn.id)
         if submitted is None:
             return self._refuse(f"the broker refused the roll order "
                                 f"({short.contract_symbol} -> {picked.symbol})")
+        # THE ROLL IS ALSO A CLOSE (plan Part C3): the buy-back leg closes the old overlay, so
+        # the ticket carries that leg's exit_record beside the new short's entry_record, from
+        # the quote the buy-back was priced at (``old_row``) and this decision's own label.
+        exit_rec = build_exit_record(
+            self.account, OptionCloseReason.ROLL, legs=[legs[0]],
+            quotes={short.contract_symbol: old_row}, underlying=structure.underlying,
+            decision_label=today)
+        facts = {"exit_record": exit_rec}
+        if record is not None:                      # None on a GA fitness trial
+            facts["entry_record"] = record
+        stamp_order_data(getattr(submitted, "id", None), facts,
+                         f"the {self.instrument_name} roll's trade records")
         # NO RESTAMP HERE (2026-09-02 review). The stamp follows the FILL, not the ticket:
         # ``ReadOnlyAccountInterface.refresh_transactions`` re-derives it from the executed
         # rows through ``OptionRiskManagement.max_loss_from_fills``, which is the one place
@@ -5271,7 +5729,8 @@ class RollPMCCShortAction(_OptionEntryAction):
              "opened_contract": picked.symbol,
              "limit_price": quoted,
              "projected_max_loss_per_contract": restamped_max_loss(
-                 (getattr(entry, "data", None) or {}).get("max_loss_per_contract"), quoted)})
+                 (getattr(entry, "data", None) or {}).get("max_loss_per_contract"), quoted),
+             "entry_record": record})
 
     def _safe_quote(self, contract_symbol: str):
         try:
@@ -5281,6 +5740,89 @@ class RollPMCCShortAction(_OptionEntryAction):
             logger.debug(f"get_option_quote failed for {contract_symbol}: {e}")
             return None
 
+
+
+def build_exit_record(account, trigger, *, legs: List[OptionLeg], quotes: Dict[str, Any],
+                      underlying: Optional[str], rule_id: Optional[int] = None,
+                      rule_name: Optional[str] = None,
+                      decision_label: Optional[date] = None) -> Dict[str, Any]:
+    """The ``exit_record`` of one option CLOSING ticket (BT/live option parity, plan Part C3).
+
+    ONE builder for every close path that runs through shared code (``CloseOptionAction``'s
+    single-leg and multi-leg closes, the PMCC roll's buy-back), so the two runtimes write the
+    same keys by the same arithmetic -- and the leg snapshots come from the SAME
+    ``option_trade_record.snapshot_legs`` the entry record uses.
+
+    ``quotes`` maps a contract to the quote the close PRICED ITSELF FROM (no second quote is
+    fetched for the record). A leg whose quote is None is named in ``legs_without_quote``.
+    The spot is read once, through ``get_option_underlying_price`` (the as-traded spot, the
+    same call the entry uses), only when some leg has a quote; ``decision_label`` defaults to
+    the account's own (``OptionsAccountInterface.decision_label``).
+
+    NEVER BLOCKS THE CLOSE, and never fails silently: any failure (no usable spot, an account
+    without ``OPTION_GREEKS_SOURCE``, a malformed quote) is logged at ERROR and returned as
+    ``{"version", "trigger", "rule_id", "rule_name", "error"}`` -- the trigger survives, the
+    gap is visible on the row. Only a ``failure_modes.is_never_absorbed`` refusal (a broken
+    split basis) propagates, as it does on the entry path."""
+    try:
+        if not account.records_option_trades():
+            # A GA FITNESS TRIAL: only what the row's ``exit_reason`` needs -- no quote
+            # conversion, no spot read, no snapshot.
+            return _exit_record_lean(trigger, rule_id=rule_id, rule_name=rule_name)
+        pairs = [(leg, contract_from_quote(quotes.get(leg.contract_symbol), leg))
+                 for leg in legs]
+        snapshots: List[Dict[str, Any]] = []
+        without_quote = [leg.contract_symbol for leg in legs]
+        if any(contract is not None for _, contract in pairs):
+            greeks_source = getattr(account, "OPTION_GREEKS_SOURCE", None)
+            if not greeks_source:
+                raise OptionGreeksSourceUndeclared(
+                    f"{type(account).__name__} declares no OPTION_GREEKS_SOURCE")
+            spot = account.get_option_underlying_price(underlying)
+            if usable_spot(spot) is None:
+                raise EntryRecordSpotUnavailable(
+                    f"no usable underlying price for {underlying} (got {spot!r}); the exit "
+                    f"record never stores a moneyness against a missing spot")
+            label = decision_label if decision_label is not None else account.decision_label()
+            snapshots, without_quote = snapshot_legs(
+                pairs, spot=spot, data_session=decision_data_session(label),
+                decision_label=label, greeks_source=greeks_source)
+        return _exit_record(trigger, rule_id=rule_id, rule_name=rule_name, legs=snapshots,
+                            legs_without_quote=without_quote)
+    except Exception as e:  # noqa: BLE001 -- analysis data never blocks a close (above)
+        if is_never_absorbed(e):
+            raise
+        logger.error(f"Option exit record for {underlying} ({trigger}) could not be built "
+                     f"({type(e).__name__}: {e}); the close proceeds with an error record",
+                     exc_info=True)
+        try:
+            return _exit_record_error(trigger, f"{type(e).__name__}: {e}", rule_id=rule_id,
+                                      rule_name=rule_name)
+        except ValueError as bad_trigger:
+            # The TRIGGER itself is not an OptionCloseReason (a caller bug). Still recorded,
+            # still named -- never dropped.
+            logger.error(f"Option exit record for {underlying}: {bad_trigger}")
+            return {"version": OPTION_TRADE_RECORD_VERSION, "trigger": None,
+                    "rule_id": rule_id, "rule_name": rule_name,
+                    "error": f"{type(e).__name__}: {e}"}
+
+
+def stamp_order_data(order_id: Optional[int], facts: Dict[str, Any], what: str) -> None:
+    """Merge ``facts`` into ``TradingOrder(order_id).data`` -- the one way a record rides the
+    order row after submission. A failure is logged at ERROR (never raised: the order is
+    already at the broker), and an order with no id is named, not skipped in silence."""
+    if order_id is None:
+        logger.error(f"Cannot persist {what} ({sorted(facts)}): the submitted order has no id")
+        return
+    try:
+        stored = get_instance(TradingOrder, order_id)
+        if stored is not None:
+            stored.data = {**(stored.data or {}), **facts}
+            update_instance(stored)
+    except Exception as e:
+        absorb_if_benign(e, InstanceNotFound)
+        logger.error(f"Failed to persist {what} ({sorted(facts)}) on order {order_id}: {e}",
+                     exc_info=True)
 
 
 def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) -> "tuple[List[OptionLeg], Optional[float]]":
@@ -5393,14 +5935,35 @@ class CloseOptionAction(TradeAction):
     revisited.
     """
 
+    #: Class defaults so a double built with ``__new__`` (no ``__init__``) records a
+    #: ``manual`` close with no rule, and remembers its quotes like any other instance.
+    close_trigger: Any = OptionCloseReason.MANUAL
+    rule_id: Optional[int] = None
+    rule_name: Optional[str] = None
+    _close_quotes: Optional[Dict[str, Any]] = None
+
     def __init__(self, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation,
                  existing_order: Optional[TradingOrder] = None,
                  expert_recommendation: Optional[ExpertRecommendation] = None,
                  forced_exit: bool = False, close_target: Optional[str] = None,
+                 close_trigger: Any = None, rule_id: Optional[int] = None,
+                 rule_name: Optional[str] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
+        #: WHY this close happens (an ``OptionCloseReason``), and WHICH rule fired it --
+        #: RECORDED on the close order's ``exit_record`` (plan Part C3), never read by the
+        #: close decision. The evaluator classifies it from the firing rule's triggers
+        #: (``TradeActionEvaluator.option_close_trigger``); a close constructed outside the
+        #: evaluator had no rule behind it and is ``manual``.
+        self.close_trigger = (close_trigger if close_trigger is not None
+                              else OptionCloseReason.MANUAL)
+        self.rule_id = rule_id
+        self.rule_name = rule_name
+        #: The quote each contract's close limit was priced from (``contract -> quote|None``),
+        #: kept so the exit record snapshots exactly what the close saw -- no second fetch.
+        self._close_quotes: Dict[str, Any] = {}
         #: True when this close is a RISK exit (stop-loss / DTE roll) rather than a
         #: discretionary one — a forced close crosses the modelled spread fully.
         self.forced_exit = bool(forced_exit)
@@ -5530,6 +6093,7 @@ class CloseOptionAction(TradeAction):
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
                     message=f"Failed to close option position {position.contract_symbol}", data={})
+            self._stamp_exit_record(result, [self._closing_leg(position)], position.underlying)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
                 message=f"Submitted close for {position.contract_symbol}",
@@ -5641,6 +6205,37 @@ class CloseOptionAction(TradeAction):
                 return o
         return orders[0] if orders else None
 
+    @staticmethod
+    def _closing_leg(position: OptionPosition) -> OptionLeg:
+        """The single-leg CLOSING leg of ``position``: the opposite side, the close intent."""
+        close_side = (OrderDirection.SELL if position.side == OrderDirection.BUY
+                      else OrderDirection.BUY)
+        return OptionLeg(
+            contract_symbol=position.contract_symbol, side=close_side,
+            position_intent="sell_to_close" if close_side == OrderDirection.SELL else "buy_to_close",
+            option_type=position.option_type, strike=position.strike,
+            expiry=position.expiry, underlying=position.underlying)
+
+    def _remember_quote(self, contract_symbol: str, quote) -> None:
+        if self._close_quotes is None:
+            self._close_quotes = {}
+        self._close_quotes[contract_symbol] = quote
+
+    def _stamp_exit_record(self, submitted, legs: List[OptionLeg],
+                           underlying: Optional[str]) -> None:
+        """Write this close's ``exit_record`` onto the submitted closing order's row."""
+        record = build_exit_record(
+            self.account, self.close_trigger, legs=legs, quotes=self._close_quotes or {},
+            underlying=underlying, rule_id=self.rule_id, rule_name=self.rule_name)
+        stamp_order_data(getattr(submitted, "id", None), {"exit_record": record},
+                         f"the exit_record of the {self.instrument_name} option close")
+
+    def _recording_quote(self, contract_symbol: str):
+        """``_safe_option_quote``, remembering what it returned for the exit record."""
+        quote = self._safe_option_quote(contract_symbol)
+        self._remember_quote(contract_symbol, quote)
+        return quote
+
     def _close_limit_price(self, position: OptionPosition, order: TradingOrder) -> Optional[float]:
         """Long(BUY) closes at the bid; short(SELL) closes at the ask. Use a fresh
         quote when available, else fall back to the entry premium.
@@ -5655,8 +6250,7 @@ class CloseOptionAction(TradeAction):
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.debug(f"get_option_quote failed for {position.contract_symbol}: {e}")
-        close_side = (OrderDirection.SELL if position.side == OrderDirection.BUY
-                      else OrderDirection.BUY)
+        self._remember_quote(position.contract_symbol, quote)
         px = None
         if position.side == OrderDirection.BUY:
             if quote is not None and quote.bid is not None:
@@ -5666,13 +6260,8 @@ class CloseOptionAction(TradeAction):
                 px = quote.ask
         if px is None:
             return order.open_price if order.open_price is not None else order.limit_price
-        closing_leg = OptionLeg(
-            contract_symbol=position.contract_symbol, side=close_side,
-            position_intent="sell_to_close" if close_side == OrderDirection.SELL else "buy_to_close",
-            option_type=position.option_type, strike=position.strike,
-            expiry=position.expiry, underlying=position.underlying)
         return self._concede_close_limit(
-            float(px), [closing_leg], self._close_cross_fraction(order))
+            float(px), [self._closing_leg(position)], self._close_cross_fraction(order))
 
     def _close_multi_leg(self, order: TradingOrder) -> "TradeActionResult":
         """Close a spread position by reversing its child leg orders as one
@@ -5752,7 +6341,7 @@ class CloseOptionAction(TradeAction):
         # short call, which is precisely the invariant this structure is not allowed to break.
         children = self._closing_children(children, txn_orders, held_qty)
         legs, net_limit = build_closing_legs(
-            children, parent_quantity=quantity, quote_fn=self._safe_option_quote,
+            children, parent_quantity=quantity, quote_fn=self._recording_quote,
             held_qty=held_qty)
         # FAIL-CLOSED ORDERING, for a DECLARED two-expiry structure only. The cover here is
         # an option leg, so the ticket must buy the short back before it releases the long;
@@ -5819,6 +6408,7 @@ class CloseOptionAction(TradeAction):
                 action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
                 message=f"Failed to close spread position for {self.instrument_name} ({contract_syms})",
                 data={"contract_symbols": contract_syms})
+        self._stamp_exit_record(result, legs, order.underlying_symbol or order.symbol)
         return self.create_and_save_action_result(
             action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
             message=f"Submitted multi-leg close for {self.instrument_name} ({contract_syms})",

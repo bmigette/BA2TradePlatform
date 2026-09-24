@@ -218,6 +218,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic opening of new trading positions"
                 },
+                "evaluate_entry_rules_on_hold": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Evaluate entry rules on HOLD recommendations. Rules and "
+                                   "risk management decide what to do. Default off preserves "
+                                   "existing behavior."
+                },
                 "allow_automated_trade_modification": {
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic modification and closing of existing positions"
@@ -393,6 +399,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "so a '+10% from entry' target becomes +15% at 1.5. This is the only "
                                "volatility awareness the take-profit has; the stop is already "
                                "ATR-scaled. 1.0 = no change. Requires regime_overlay_enabled."
+                },
+                # Ruleset stop policy (TradeActions.ruleset_stop_policy). Off = the ratchet every
+                # expert has always had: a ruleset stop only tightens. Deliberately NOT a forced
+                # backtest setting (deploy_parity) nor an inert toggle: a genome may set it, and
+                # it travels with the other expert settings on export/deploy.
+                "allow_ruleset_sl_loosen": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Let ruleset rules move a stop-loss further away (up to the "
+                                   "trade's max-loss stop). Off: stops only tighten.",
+                    "tooltip": "Off (default): a ruleset adjust_stop_loss may only tighten an "
+                               "existing stop. On: it may also loosen it, down to (up to, for "
+                               "shorts) the max-loss stop recorded at entry (the stop the "
+                               "position was sized on) and never past it. Trades with no "
+                               "recorded max-loss stop are never loosened, and the SL "
+                               "minimum-distance floor never turns a tightening rule into a "
+                               "loosen. Manual edits and the Smart Risk Manager are unaffected."
                 },
                 # AI Model Settings
                 "risk_manager_model": {

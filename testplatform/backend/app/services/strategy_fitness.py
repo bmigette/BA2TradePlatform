@@ -15,7 +15,7 @@ win_rate, sortino_ratio, calmar_ratio, sqn, max_drawdown (all confirmed present)
 import math
 from datetime import date, datetime
 import os as _os
-from typing import Optional
+from typing import Any, Optional
 
 # Distinct from 0.0 (the exception fallback) so a no-trade config is never
 # confused with a crashed trial, and is always worse than any real config.
@@ -34,6 +34,46 @@ LOW_TRADE_SENTINEL = -1.0e8
 # than never having traded at all, so this must rank BELOW ZERO_TRADE_SENTINEL, not just
 # alongside it.
 WIPED_OUT_SENTINEL = -2.0e9
+
+# A trial whose WORKER WEDGED. The local pool's stall guard saw no completion for
+# BT_LOCAL_STALL_TIMEOUT_S (default 5400s) and now ABANDONS that individual instead of failing the
+# whole job (2026-09-21: one wedged genome killed a 16-job matrix and cost 7.5h of downtime).
+# Distinct from every sentinel above so the frequency is COUNTABLE in all_results -- the operator
+# asked to see how often it happens -- and ranked BELOW WIPED_OUT_SENTINEL because it is the only
+# value here that is not a measurement of the genome at all, and the documented invariant is that
+# a real outcome outranks a non-measurement:
+#   STALLED_SENTINEL < WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0
+STALLED_SENTINEL = -3.0e9
+
+
+def is_measured_result(result: Any) -> bool:
+    """True when a trial/checkpoint record carries a REAL measurement of its genome.
+
+    ONE predicate, used by BOTH the count that decides the run's final status and the Top-N
+    ranking that decides what to export (2026-09-21 recheck, H2). They disagreed: the count only
+    tested ``status``, but the patch immediately before this one wrote the sentinel WITHOUT a
+    status field, so an old-format stalled record counted as a measurement, ``_final_status``
+    reported ``completed``, finalization cleared an all-stalled checkpoint and the matrix skipped
+    the job -- while Top-N correctly excluded the same record. Two tests, two answers, one record.
+
+    Both markers are recognised, and an ordinary historical record (a numeric fitness and no
+    status at all) stays measured, which is what the older checkpoints contain.
+
+    A MISSING or non-numeric fitness is NOT a measurement (2026-09-21 recheck, H5): it cannot be
+    ranked, and treating it as one made the ranking helper raise while formatting its dedup key.
+    Deciding it here keeps that decision in one place instead of in an exception handler.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("status") == "stalled":
+        return False
+    fitness = result.get("fitness")
+    if not isinstance(fitness, (int, float)) or isinstance(fitness, bool):
+        return False
+    try:
+        return math.isfinite(fitness) and fitness != STALLED_SENTINEL
+    except OverflowError:
+        return False
 
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
@@ -135,7 +175,8 @@ _OCAR_DD_FLOOR = 5.0
 # LOW_TRADE_SENTINEL (-1e8), which is numerically ABOVE WIPED_OUT_SENTINEL (-2e9) and even
 # ABOVE ZERO_TRADE_SENTINEL (-1e9) -- "a 3-trade blow-up outranks never trading". The decided
 # invariant is that a measured wipeout ranks WORST of every other disqualification the metric
-# produces, full stop: WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0. A
+# produces, full stop: WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0 (with
+# STALLED_SENTINEL below all three: a wedged worker is not a measurement of the genome). A
 # wiped account teaches the GA nothing a losing-but-alive or merely-thin-data genome would, and
 # collapsing it into either of those buckets would let the search read it as "somewhat bad"
 # instead of "never do this again".
@@ -269,6 +310,11 @@ _OCT_ALIASES = ("option_car_target",)
 # ONE name, same reasoning as ``option_car_over_risk`` above: there are now three option metrics
 # whose names all begin "option_car", so a short alias would be a typo away from silently ranking
 # a grid under a different objective. The full spelling is the whole safety margin.
+_OCT_SOFT30_KEY = "option_car_target_soft30"
+# Explicit research objective: full credit at 30 completed structures over the
+# WHOLE window, with a linear penalty below it and no positive-count hard floor.
+# Keep a separate metric name so stored scores and discovery identities retain
+# their original meaning. The legacy CAR objectives are unchanged.
 
 # --- option_convex metric constants (CONFIG, not genes) ----------------------------------------
 # The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
@@ -471,6 +517,17 @@ _SPECIAL_META = {
         "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
     },
+    _OCT_SOFT30_KEY: {
+        "label": "CAR Target, Soft 30 Trades (Option)",
+        "description": "CAR Target with a linear completed-structure count penalty: "
+                       "min(structures / 30, 1) over the whole backtest, replacing the "
+                       "annual trade floor and ramp. Positive-count runs remain scoreable. "
+                       "Zero trades, wipeout, concentration and other robustness checks "
+                       "still apply. Scores are not comparable with option_car_target.",
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": True,
+        "uses_adjusted_under_caps": True,
+    },
     _CONVEX_KEY: {
         "label": "Convex Harvest (Option)",
         "description": "For a CONVEX option book (many cheap far-OTM long-dated tickets): "
@@ -525,9 +582,11 @@ def _build_metrics_catalog() -> list:
         _OCAR_KEY: sorted(a for a in _OCAR_ALIASES if a != _OCAR_KEY),
         _OCR_KEY: sorted(a for a in _OCR_ALIASES if a != _OCR_KEY),
         _OCT_KEY: sorted(a for a in _OCT_ALIASES if a != _OCT_KEY),
+        _OCT_SOFT30_KEY: [],
         _CONVEX_KEY: sorted(a for a in _CONVEX_ALIASES if a != _CONVEX_KEY),
     }
-    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _OCT_KEY, _CONVEX_KEY):
+    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _OCT_KEY,
+                    _OCT_SOFT30_KEY, _CONVEX_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -558,7 +617,7 @@ def assert_catalog_complete() -> None:
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
     expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
                 | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES)
-                | set(_CONVEX_ALIASES))
+                | {_OCT_SOFT30_KEY} | set(_CONVEX_ALIASES))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -631,16 +690,17 @@ def compute_fitness(fitness_metric: str, results: dict,
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
 
-    if metric in _OCT_ALIASES:
+    if metric in _OCT_ALIASES or metric == _OCT_SOFT30_KEY:
         # OPTION-ONLY, and a THIRD DISTINCT OBJECTIVE rather than a rescaling of either branch
         # above (see _option_car_target): CAR > 35%/yr AND CAR > drawdown. The branch above is
         # indifferent to the CAR/DD ratio (it divides by sqrt(dd), so 40%/40% and 20%/10% score
         # identically); this one ramps on it. Same three wrappers as CAR, option_car and
         # option_car_over_risk -- win-rate factor, spread stress, robustness -- so
         # --robust-fitness / --stress-spread behave identically whichever option metric a grid
-        # names; only the factor product inside differs. Reached ONLY by an explicit
-        # "option_car_target", which is what keeps every running grid out of this path.
-        _fit = _apply_win_rate_factor(_option_car_target(results), results)
+        # names; only the factor product inside differs. The explicitly named soft30
+        # variant replaces only the trade gate, preserving the legacy metric's results.
+        _fit = _apply_win_rate_factor(
+            _option_car_target(results, soft_total_trades=(metric == _OCT_SOFT30_KEY)), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
@@ -675,7 +735,7 @@ def compute_fitness(fitness_metric: str, results: dict,
     if key is None:
         raise ValueError(
             f"Unknown fitness_metric: {fitness_metric!r}. "
-            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES) | set(_CONVEX_ALIASES))}"
+            f"Valid: {sorted(catalog_accepted_metrics())}"
         )
     # Profit-cap-aware: when EITHER cap was applied (per-trade basis cap ``profit_cap_pct`` or
     # portfolio-share cap ``profit_share_cap_pct``), the GA must rank on the ADJUSTED return-based
@@ -895,7 +955,7 @@ def _min_with_stressed(base_fitness: float, fitness_metric: str, results: dict,
         stress_spread_bps = float(results.get("stress_spread_bps") or 0.0)
     if stress_spread_bps <= 0:
         return base_fitness
-    if base_fitness in (ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
+    if base_fitness in (STALLED_SENTINEL, ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
         return base_fitness
     stressed = stressed_results(results, stress_spread_bps)
     if stressed is None:
@@ -1038,7 +1098,7 @@ def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0) 
     a bad genome look BETTER, which is the classic sign-flip bug in penalty schemes.
     """
     comp = robustness_metrics(results, spread_bps)
-    if base_fitness in (ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
+    if base_fitness in (STALLED_SENTINEL, ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
         return base_fitness, comp
     if base_fitness <= 0:
         return base_fitness, comp
@@ -1627,9 +1687,13 @@ def _option_car_target_factor(base: float, dd: float) -> float:
     return car_ramp * mar_ramp * _option_car_target_dd_penalty(d)
 
 
-def _option_car_target(results: dict) -> float:
+def _option_car_target(results: dict, *, soft_total_trades: bool = False) -> float:
     """OPTION-ONLY goal metric: ``base x CAR-ramp x MAR-ramp x high_dd_penalty x consistency x
     trade_gate``.
+
+    ``soft_total_trades=True`` is used exclusively by ``option_car_target_soft30``:
+    replace the annual trade gate below with min(completed structures / 30, 1).
+    The default path retains the legacy objective and all of its scores.
 
     THE OBJECTIVE, stated by the operator on 2026-09-17 after watching the other two option
     metrics rank a real population: "a fitness calibrated for CAR > 35 and CAR > DD". TWO
@@ -1729,18 +1793,28 @@ def _option_car_target(results: dict) -> float:
         return ZERO_TRADE_SENTINEL
     base = float(base)
 
-    # --- trade gate: proportional ramp, hard floor below it -----------------------------------
-    # STRUCTURES per year, not legs (see _trades_per_year). An iron condor is ONE bet and four
-    # rows; reading the published leg rate here would inflate essentially every genome in a
-    # pure-option population.
-    tpy = _trades_per_year(results)
-    if tpy is None:
-        return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
-    _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
-    _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
-    if float(tpy) < _floor:
-        return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
-    trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
+    # Only the explicitly named soft30 objective replaces the legacy annual gate.
+    if soft_total_trades:
+        trades = results.get("trades")
+        if not isinstance(trades, list):
+            raise ValueError(
+                "option_car_target_soft30 requires results['trades'] to count completed "
+                "structures, not legs. Restore the trades column when re-scoring a backtest."
+            )
+        structures = _structure_count(trades)
+        if structures == 0:
+            return ZERO_TRADE_SENTINEL
+        trade_gate = min(structures / 30.0, 1.0)
+    else:
+        # Legacy objective, including explicit per-run/expert cadence overrides.
+        tpy = _trades_per_year(results)
+        if tpy is None:
+            return LOW_TRADE_SENTINEL
+        _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
+        _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
+        if float(tpy) < _floor:
+            return LOW_TRADE_SENTINEL
+        trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
 
     if base <= 0:
         return base  # unfactored: penalty factors on a negative would flip its sign

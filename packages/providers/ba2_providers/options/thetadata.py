@@ -134,6 +134,42 @@ def _chunk_window(start: date, end: date,
     return out
 
 
+#: ROOT HISTORY (BT/live option parity plan, Part G3). An underlying whose option ROOT changed:
+#: ``{symbol: ((cutover, old_root), ...)}`` -- before ``cutover`` the chain traded as
+#: ``old_root``; from it, as the symbol itself. Entries are cutover-ascending; each old root
+#: covers the dates from the previous cutover up to the day before its own.
+#:
+#: META: Meta Platforms' options traded as FB until 2022-06-08 and as META from 2022-06-09.
+#: Before that date the ticker META belonged to the Roundhill Ball Metaverse ETF, and
+#: ThetaData's META root returns THAT chain (strikes $4-27, measured on the local store): a
+#: META request before 2022-06-09 fetches the wrong company, and the partitions whose life
+#: spans the rename (expiries 2022-08-19, 2022-09-16) mixed ETF rows with Meta rows. So every
+#: request window is split at the cutover, the earlier part asked for under the OLD root, and
+#: EVERY row is stored under the platform symbol with the platform symbol's OCC root
+#: (``_occ_symbol("META", ...)``), so one partition holds one company under one contract id.
+ROOT_HISTORY: Dict[str, Tuple[Tuple[date, str], ...]] = {
+    "META": ((date(2022, 6, 9), "FB"),),
+}
+
+
+def _root_segments(underlying: str, start: date, end: date) -> List[Tuple[str, date, date]]:
+    """``[(vendor_root, seg_start, seg_end), ...]`` covering ``[start, end]`` (inclusive) in
+    date order: the root ThetaData knew the underlying by over each part of the window
+    (``ROOT_HISTORY``). An underlying without history is one segment under its own name."""
+    u = underlying.upper()
+    out: List[Tuple[str, date, date]] = []
+    cur = start
+    for cutover, old_root in sorted(ROOT_HISTORY.get(u, ())):
+        seg_end = min(end, cutover - timedelta(days=1))
+        if cur <= seg_end:
+            out.append((old_root.upper(), cur, seg_end))
+        if cutover > cur:
+            cur = cutover
+    if cur <= end:
+        out.append((u, cur, end))
+    return out
+
+
 def _parse_date(value: Any) -> Optional[date]:
     """Accepts a ``date``/``datetime``/pandas ``Timestamp`` (tz-aware or not) or a
     ``YYYY-MM-DD``/``YYYYMMDD`` string — the library returns dates as plain strings in some
@@ -405,27 +441,54 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
         """Only reached by ``--discovery rest``; the default (and what a real backfill uses)
         is ``--discovery synthetic``, which builds contracts from the local price cache and
         never calls this. Kept correct rather than optimised: one ``option_list_strikes`` call
-        per expiry in the window."""
+        per expiry in the window.
+
+        For a REPLACING root (``ROOT_HISTORY``: META from 2022-06-09) each expiry's listed
+        strikes are also filtered by ``_strikes_live_under`` (one extra request per expiry): a
+        strike listed today, or with no quote/trade rows in the last
+        ``_LIVE_STRIKE_PROBE_DAYS`` of its life, is OMITTED from discovery until it quotes --
+        the price of never admitting the previous ticker holder's strikes. The bulk
+        backfill (``fetch_underlying_eod_bars``, the wide shape) never calls this path; it
+        stores whatever the chain returns."""
         client = self._get_client()
-        exps = client.option_list_expirations(underlying.upper())
         out: List[OptionContractMeta] = []
-        for row in exps.itertuples(index=False):
-            exp = _parse_date(getattr(row, "expiration", None))
-            if exp is None or exp < expiry_gte or exp > expiry_lte:
-                continue
-            strikes = client.option_list_strikes(underlying.upper(), exp)
-            for srow in strikes.itertuples(index=False):
-                strike = _num(getattr(srow, "strike", None))
-                if strike is None:
+        seen: set = set()
+        # One listing per vendor ROOT (ROOT_HISTORY). A root only lists the contracts it could
+        # have traded: an expiry before the root's first day belongs to an earlier root (or,
+        # for META before 2022-06-09, to another company). Contracts carry the platform root.
+        for root, root_from, _root_to in _root_segments(underlying, date.min, date.max):
+            exps = client.option_list_expirations(root)
+            for row in exps.itertuples(index=False):
+                exp = _parse_date(getattr(row, "expiration", None))
+                if exp is None or exp < expiry_gte or exp > expiry_lte or exp < root_from:
                     continue
-                if strike_min is not None and strike < strike_min:
-                    continue
-                if strike_max is not None and strike > strike_max:
-                    continue
-                for right in ("call", "put"):
-                    occ = _occ_symbol(underlying, exp, right, strike)
-                    out.append(OptionContractMeta(occ_symbol=occ, underlying=underlying.upper(),
-                                                   option_type=right, strike=strike, expiry=exp))
+                strikes = client.option_list_strikes(root, exp)
+                # A root that took over a ticker (META from 2022-06-09) may still LIST the
+                # previous holder's strikes for an expiry its life spans (the Roundhill ETF's
+                # $4-27 strikes under META for 2022-08-19 / 2022-09-16). Keep only strikes
+                # this root actually quoted/traded on or after its first day -- see
+                # _strikes_live_under.
+                live = (self._strikes_live_under(client, root, exp, root_from)
+                        if root_from > date.min else None)
+                for srow in strikes.itertuples(index=False):
+                    strike = _num(getattr(srow, "strike", None))
+                    if strike is None:
+                        continue
+                    if live is not None and strike not in live:
+                        continue
+                    if strike_min is not None and strike < strike_min:
+                        continue
+                    if strike_max is not None and strike > strike_max:
+                        continue
+                    for right in ("call", "put"):
+                        occ = _occ_symbol(underlying, exp, right, strike)
+                        if occ in seen:
+                            continue
+                        seen.add(occ)
+                        out.append(OptionContractMeta(occ_symbol=occ,
+                                                      underlying=underlying.upper(),
+                                                      option_type=right, strike=strike,
+                                                      expiry=exp))
         if max_contracts is not None and len(out) > max_contracts:
             # Keep strikes nearest the band centre — near-the-money is what gets selected.
             if strike_min is not None and strike_max is not None:
@@ -435,6 +498,43 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                 centre = strikes_sorted[len(strikes_sorted) // 2]
             out = sorted(out, key=lambda c: abs(c.strike - centre))[:max_contracts]
         return out
+
+    #: How far back from an expiry's last session ``_strikes_live_under`` looks.
+    _LIVE_STRIKE_PROBE_DAYS = 14
+
+    def _strikes_live_under(self, client, root: str, expiry: date, root_from: date) -> set:
+        """Strikes of ``expiry`` with a real quote or trade under ``root`` on or after
+        ``root_from`` (the day the root started meaning this underlying).
+
+        WHY THIS RULE. The ETF strikes a renamed root still lists stopped trading under it the
+        day the ticker changed hands (the ETF moved to its new ticker), while every contract of
+        the new holder has EOD rows -- a quote at least -- every session until it expires.
+        So "has a row under this root after the cutover" separates the two companies without
+        any price band (a band needs the underlying's price on the listing date, i.e. another
+        data source, and fails for deep strikes and for an ETF priced near the parent). The
+        probe is the LAST ``_LIVE_STRIKE_PROBE_DAYS`` of the contract's life (clamped to
+        after ``root_from`` and before today at the exchange), which is always after the
+        cutover and always inside a live contract's quoting life. One per-expiry request."""
+        end = min(expiry, _exchange_today() - timedelta(days=1))
+        start = max(root_from, end - timedelta(days=self._LIVE_STRIKE_PROBE_DAYS))
+        if end < start:
+            return set()
+        try:
+            df = client.option_history_greeks_eod(
+                symbol=root, expiration=expiry, strike="*", right="both",
+                start_date=start, end_date=end)
+        except self._no_data_exc:
+            return set()
+        live = set()
+        if df is None or len(df) == 0:
+            return live
+        for row in df.itertuples(index=False):
+            r = row._asdict()
+            strike = _num(r.get("strike"))
+            bid, ask = _quote(_num(r.get("bid")), _num(r.get("ask")))
+            if strike is not None and (_traded(_num(r.get("close"))) or ask is not None):
+                live.add(strike)
+        return live
 
     def fetch_eod_bars(self, contracts: Iterable[OptionContractMeta], *,
                        start: date, end: date) -> Iterator[OptionEodBar]:
@@ -468,8 +568,10 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             # own start, which is exactly today's behaviour.
             group_start = start
             try:
+                # The root the contract was LISTED under: the one covering the window's start.
+                probe_root = _root_segments(underlying, start, group_end)[0][0]
                 dates_df = client.option_list_dates(
-                    request_type="quote", symbol=underlying, expiration=expiry)
+                    request_type="quote", symbol=probe_root, expiration=expiry)
                 first_traded = _parse_date(
                     dates_df.iloc[0].get("date")) if dates_df is not None and len(dates_df) else None
                 if first_traded is not None and first_traded > group_start:
@@ -483,11 +585,16 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             # non-overlapping, so no bar_date can appear in two of them: concatenating the
             # per-chunk results (by just yielding as each chunk is processed) is safe without
             # any cross-chunk de-duplication.
-            windows = _chunk_window(group_start, group_end)
-            for w_start, w_end in windows:
+            # ROOT_HISTORY: each part of the window is asked for under the root the chain
+            # traded as then; every row is keyed on the platform symbol's OCC id below.
+            windows = [(root, w_start, w_end)
+                       for root, seg_start, seg_end in _root_segments(underlying, group_start,
+                                                                      group_end)
+                       for w_start, w_end in _chunk_window(seg_start, seg_end)]
+            for root, w_start, w_end in windows:
                 try:
                     bars_df = client.option_history_greeks_eod(
-                        symbol=underlying, expiration=expiry, strike="*", right="both",
+                        symbol=root, expiration=expiry, strike="*", right="both",
                         start_date=w_start, end_date=w_end)
                 except self._no_data_exc:
                     # The library RAISES rather than returning an empty dataframe when a
@@ -501,7 +608,7 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                     continue  # nothing for this expiry in this chunk -- normal, not an error
                 try:
                     oi_df = client.option_history_open_interest(
-                        symbol=underlying, expiration=expiry, strike="*", right="both",
+                        symbol=root, expiration=expiry, strike="*", right="both",
                         start_date=w_start, end_date=w_end)
                 except self._no_data_exc:
                     oi_df = None  # no OI for this chunk; bars alone are still worth keeping
@@ -606,10 +713,16 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
         if end < start:
             return
 
-        for w_start, w_end in _chunk_window(start, end):
+        # ROOT_HISTORY: the window is split at every root change and each part asked for
+        # under the root the chain traded as then (segments are date-ordered, so the ordering
+        # contract below still holds across them). Rows are stored under ``underlying``.
+        windows = [(root, w_start, w_end)
+                   for root, seg_start, seg_end in _root_segments(underlying, start, end)
+                   for w_start, w_end in _chunk_window(seg_start, seg_end)]
+        for root, w_start, w_end in windows:
             try:
                 bars_df = client.option_history_eod(
-                    symbol=underlying, expiration="*", strike="*", right="both",
+                    symbol=root, expiration="*", strike="*", right="both",
                     start_date=w_start, end_date=w_end)
             except self._no_data_exc:
                 continue  # no chain at all in this window -- normal, not an error
@@ -618,7 +731,7 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
 
             try:
                 oi_df = client.option_history_open_interest(
-                    symbol=underlying, expiration="*", strike="*", right="both",
+                    symbol=root, expiration="*", strike="*", right="both",
                     start_date=w_start, end_date=w_end)
             except self._no_data_exc:
                 oi_df = None  # bars alone are still worth keeping
@@ -632,7 +745,7 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                     _parse_date(v) for v in bars_df["created"]) if d is not None}):
                 try:
                     greeks_df = client.option_history_greeks_eod(
-                        symbol=underlying, expiration="*", strike="*", right="both",
+                        symbol=root, expiration="*", strike="*", right="both",
                         start_date=day, end_date=day)
                 except self._no_data_exc:
                     continue

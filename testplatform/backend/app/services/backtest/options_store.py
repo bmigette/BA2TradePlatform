@@ -135,7 +135,8 @@ def default_options_risk_free_rate() -> float:
     return float(_FALLBACK_RISK_FREE_RATE)
 
 
-def price_source_spot(price_source: Any) -> Callable[[str, date], Optional[float]]:
+def price_source_spot(price_source: Any, split_basis: Any = None
+                      ) -> Callable[[str, date], Optional[float]]:
     """``(underlying, bar_date) -> close`` over the run's ``AsOfPriceSource``.
 
     ``close_asof`` (last known close AT OR BEFORE the date, no clock required) rather than
@@ -148,13 +149,29 @@ def price_source_spot(price_source: Any) -> Callable[[str, date], Optional[float
     clamped to <= the engine clock, and it returns a close at or before that date. On an
     intraday ``execution_interval`` the daily-midnight key resolves to the previous session's
     last bar rather than that day's close — staler, still causal, and immaterial to a greek.
+
+    AS-TRADED (plan Part E2). The option store's strikes and premiums are as traded; the
+    close is split-adjusted. With ``split_basis`` (an ``option_split_basis.RunSplitBasis`` —
+    every real options run passes one, see ``build_options_run``) the close is multiplied by
+    the as-traded factor OF THE CLOSE'S OWN DATE, so the greeks are inverted against the spot
+    the contract actually traded against. ``None`` is the identity, for fixture callers whose
+    symbols have no splits.
     """
+    if split_basis is None:
+        def spot(underlying: str, on: date) -> Optional[float]:
+            return price_source.close_asof(underlying, on)
+        return spot
+
     def spot(underlying: str, on: date) -> Optional[float]:
-        return price_source.close_asof(underlying, on)
+        dated = price_source.close_asof_dated(underlying, on)
+        if dated is None:
+            return None
+        px, px_day = dated
+        return px * split_basis.factor(underlying, px_day)
     return spot
 
 
-def spot_scope(config: Dict[str, Any]) -> str:
+def spot_scope(config: Dict[str, Any], split_basis: Any = None) -> str:
     """The identity of what this run's price source will answer for a (symbol, date).
 
     Deliberately the SAME tuple ``price_source.evict_memo_if_working_set_changed`` keys the
@@ -162,16 +179,50 @@ def spot_scope(config: Dict[str, Any]) -> str:
     inputs over which ``AsOfPriceSource.close_asof`` is a pure function. The parquet reader
     caches its greeks overlay at worker level and those greeks are inverted against these
     closes; see ``ParquetOptionsProvider.__init__`` for the wrong number this prevents.
+
+    With a ``split_basis`` the spot is the close x the as-traded factor, so the factor's
+    inputs join the key (``RunSplitBasis.digest`` -- the per-symbol calendar splits the cache
+    holds and its basis date). A re-fetched FMP file or calendar that moves a factor is then a
+    cache MISS, never an overlay inverted against the old basis. Without one the key is
+    exactly what it was, so every run on record keeps its cache identity.
     """
-    return repr((
+    base = (
         tuple(sorted(config.get("enabled_instruments") or [])),
         config.get("execution_interval", "1d"),
         str(config.get("start_date")), str(config.get("end_date")),
         int(config.get("warmup_days") or 0),
-    ))
+    )
+    if split_basis is None:
+        return repr(base)
+    return repr(base + (("as_traded", split_basis.digest()),))
 
 
-def build_options_provider(config: Dict[str, Any], *, price_source: Any):
+def build_options_run(config: Dict[str, Any], *, price_source: Any, ohlcv_provider: Any):
+    """``(options_provider, split_basis)`` for a run -- ``(None, None)`` on an equity-only run.
+
+    THE ONE PLACE A REAL OPTIONS RUN IS WIRED (``run_daily_backtest``). An options run ALWAYS
+    gets a verified ``RunSplitBasis`` for its universe (plan Part E): the reader's greeks spot
+    and the account's option spot, intrinsic, settlement and cover all convert through it.
+    Building it REFUSES (``SplitBasisRefused``) when any universe symbol's basis cannot be
+    stated -- before the first bar, not mid-run. An equity-only run never reaches it, so it
+    reads no calendar and no extra file.
+    """
+    if not config.get("options_cache_db"):
+        return None, None
+    # EXPLICIT, no "1d" default: the split basis is only defined for the daily clock
+    # (``build_run_split_basis`` refuses an intraday interval), so a config that dropped the key
+    # must be refused rather than assumed daily. Every production config builder states it
+    # (daily_backtest_handler payload, rerun_handler, the GA trial config, the launcher).
+    if "execution_interval" not in config:
+        raise ValueError("an OPTIONS run must state 'execution_interval'; it is absent from "
+                         "this run config")
+    from .option_split_basis import build_run_split_basis
+    basis = build_run_split_basis(config.get("enabled_instruments") or [], ohlcv_provider,
+                                  interval=config["execution_interval"])
+    return build_options_provider(config, price_source=price_source, split_basis=basis), basis
+
+
+def build_options_provider(config: Dict[str, Any], *, price_source: Any, split_basis: Any = None):
     """The run's option reader, or None when the run does not use options.
 
     ``config['options_cache_db']`` remains the OPTIONS-RUN FLAG for every store (it is what
@@ -187,12 +238,30 @@ def build_options_provider(config: Dict[str, Any], *, price_source: Any):
         return None
     store = resolve_options_store(config)
     if store == SQLITE:
+        # NO E4 GUARD on this store, and its greeks are NOT in the as-traded basis: they were
+        # inverted at BUILD time (fetch_options) against the FMP close of the day, which is
+        # split-ADJUSTED, so on a symbol with a later split every stored delta/iv is wrong by
+        # the split. ``split_basis`` still converts everything the ACCOUNT computes (spot for
+        # strike selection, intrinsic, settlement, cover), but delta-based selection and the
+        # stored greeks here are unconverted. Deliberately not refused: every sqlite option
+        # number on record came from this path. Use the thetadata store for split-affected
+        # universes (plan Part E; the stage-1 grid reads thetadata).
         from .options_provider import HistoricalOptionsProvider
         return HistoricalOptionsProvider(config["options_cache_db"])
     from .parquet_options_provider import ParquetOptionsProvider
     root = config.get("options_parquet_root") or default_options_parquet_root(store)
     rate = config.get("options_risk_free_rate")
     return ParquetOptionsProvider(
-        root, spot_source=price_source_spot(price_source),
+        root, spot_source=price_source_spot(price_source, split_basis),
         risk_free_rate=default_options_risk_free_rate() if rate is None else float(rate),
-        spot_scope=spot_scope(config))
+        spot_scope=spot_scope(config, split_basis),
+        basis_guard=split_basis is not None,
+        basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis))
+
+
+def _split_dates_of(split_basis: Any):
+    """``symbol -> ex-dates`` of the run's verified split basis (the guard's forced checks)."""
+    def dates(symbol: str):
+        b = split_basis.basis_of(symbol)
+        return () if b is None else tuple(s.date for s in b.splits)
+    return dates

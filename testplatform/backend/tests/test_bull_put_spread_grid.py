@@ -155,10 +155,20 @@ def test_the_standalone_strategy_builds_and_carries_the_entry_action():
 
 def test_it_gates_on_the_BULLISH_signal():
     """A put credit spread pays while the underlying stays UP. Gating it bearish (the
-    ``O_BEARCS`` copy-paste) would run it into exactly the move that breaks it."""
+    ``O_BEARCS`` copy-paste) would run it into exactly the move that breaks it.
+
+    Since 2026-09-19 the direction is a NUMERIC leaf on ``rec_direction`` (the expert's grade
+    centred on HOLD) with the threshold pinned at 0, not a ``bullish``/``bearish`` flag, so
+    bullish is ``> 0`` and bearish is ``< 0``. The GA may evolve this arm to the contrarian
+    side through the leaf's mode gene; what is pinned here is the AUTHORED default the run
+    starts from -- and, as before, that it is not the bearish one.
+    """
     strat = mod._build_strategy(KIND, KIND, "FMPRating")
-    fields = [c.get("field") for c in strat.entry_rules[0]["conditions"]["conditions"]]
-    assert "bullish" in fields and "bearish" not in fields, fields
+    leaves = strat.entry_rules[0]["conditions"]["conditions"]
+    fields = [c.get("field") for c in leaves]
+    assert "bullish" not in fields and "bearish" not in fields, fields
+    signal = next(c for c in leaves if c.get("field") == "rec_direction")
+    assert (signal["op"], signal["value"]) == (">", 0.0), signal
 
 
 def test_its_genes_are_emitted_standalone():

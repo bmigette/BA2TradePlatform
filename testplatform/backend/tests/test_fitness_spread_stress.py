@@ -149,7 +149,7 @@ def test_stress_level_survives_the_per_trial_config_whitelist():
         "profit_cap_pct": 2000.0, "profit_share_cap_pct": 25.0,
         "stress_spread_bps": 40.0,
     }
-    cfg = _build_daily_trial_config(backtest_cfg, {})
+    cfg = _build_daily_trial_config(backtest_cfg, {}, option_trade_records=False)
     assert cfg.get("stress_spread_bps") == 40.0, (
         "stress_spread_bps was dropped by the per-trial config whitelist -- the GA would score "
         "every genome unstressed while the CLI, the run config and the logs all claim otherwise")

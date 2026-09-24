@@ -1,22 +1,44 @@
 from nicegui import ui
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from sqlmodel import select, func, Session
 from typing import Dict, Any, List, Tuple, Optional
 import asyncio
 
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
+from ...core.option_positions import opening_legs
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType, OrderDirection
+from ...core.types import AssetClass
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_order_status_color, get_expert_options_for_ui
 from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from ..components.option_structure_chart import (
+    fetch_underlying_bars, render_option_structure_chart,
+)
+from .option_trades import OptionTradesTab
 from ..account_filter_context import get_selected_account_id
 from ..components.account_scope import scope_transactions_to_account
 from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
+from ..components.refresh_button import refresh_button
+
+#: The Live Trades tabs, IN ORDER. Stocks first and DEFAULT, so the page's existing view is
+#: what you get before touching anything.
+#:
+#: The split is made on ``Transaction.asset_class`` -- the explicit, indexed field. The
+#: pre-``asset_class`` tell (``multiplier == 100``) is deliberately NOT used: it is a
+#: heuristic, and a mis-filed row would be listed under the wrong tab instead of showing
+#: as unclassified.
+#:
+#: Module-level so the tab contract is unit-testable without rendering a page, the same
+#: reason ``ui/menus.py`` keeps ``MENU_ITEMS`` at module level.
+ASSET_CLASS_TABS: tuple = (
+    ('Stocks', AssetClass.EQUITY, 'show_chart'),
+    ('Options', AssetClass.OPTION, 'donut_large'),
+)
 
 #: How close to a bracket leg counts as "about to hit it", as a fraction of the leg's price.
 PRICE_NEAR_LEG_FRACTION = 0.05
@@ -99,77 +121,104 @@ class LiveTradesTab:
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label('💼 Live Trades').classes('text-h6')
 
-                # Filter controls
-                with ui.row().classes('gap-2'):
-                    # Multi-select status filter with all except CLOSED selected by default
-                    self.status_filter = ui.select(
-                        label='Status Filter',
-                        options=['Waiting', 'Open', 'Closing', 'Closed'],
-                        value=['Waiting', 'Open', 'Closing'],  # Default: all except Closed
-                        multiple=True,
-                        on_change=lambda: self._refresh_transactions()
-                    ).classes('w-48')
+            with ui.tabs().classes('w-full') as _tabs:
+                _tab_refs = [ui.tab(label, icon=icon) for label, _asset, icon in ASSET_CLASS_TABS]
 
-                    # Expert filter - populated with all experts
-                    self.expert_filter = ui.select(
-                        label='Expert',
-                        options=expert_options,
-                        value='All',
-                        on_change=lambda: self._refresh_transactions()
-                    ).classes('w-48')
+            with ui.tab_panels(_tabs, value=_tab_refs[0]).classes('w-full'):
+                # STOCKS (first and default): the existing view, byte for byte.
+                with ui.tab_panel(_tab_refs[0]):
+                    self._render_equity_filter_row(expert_options)
+                    self.transactions_container = ui.column().classes('w-full')
+                    with self.transactions_container:
+                        await self._render_transactions_table_async()
 
-                    self.symbol_filter = ui.input(
-                        label='Symbol',
-                        placeholder='Filter by symbol...',
-                        on_change=lambda: self._refresh_transactions()
-                    ).props('stack-label').classes('w-40')
-
-                    self.broker_order_id_filter = ui.input(
-                        label='Broker Order ID',
-                        placeholder='Search by broker order ID...',
-                        on_change=lambda: self._refresh_transactions()
-                    ).props('stack-label').classes('w-48')
-
-                    ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
-
-                    ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
-
-                    # Batch operation buttons
-                    self.batch_operations_container = ui.row().classes('gap-2 ml-4')
-                    self.batch_select_all_btn = ui.button(
-                        'Select All',
-                        icon='done_all',
-                        on_click=self._select_all_transactions
-                    ).props('outline size=md').classes('hidden')
-                    self.batch_select_all_btn.set_visibility(False)
-
-                    self.batch_clear_btn = ui.button(
-                        'Clear',
-                        icon='clear',
-                        on_click=self._clear_selected_transactions
-                    ).props('outline size=md').classes('hidden')
-                    self.batch_clear_btn.set_visibility(False)
-
-                    self.batch_close_btn = ui.button(
-                        'Batch Close',
-                        icon='close',
-                        on_click=self._batch_close_transactions
-                    ).props('outline color=negative size=md').classes('hidden')
-                    self.batch_close_btn.set_visibility(False)
-
-                    self.batch_adjust_tp_btn = ui.button(
-                        'Batch Adjust TP',
-                        icon='trending_up',
-                        on_click=self._batch_adjust_tp_dialog
-                    ).props('outline color=info size=md').classes('hidden')
-                    self.batch_adjust_tp_btn.set_visibility(False)
-
-            # Transactions table container
-            self.transactions_container = ui.column().classes('w-full')
-            with self.transactions_container:
-                await self._render_transactions_table_async()
+                # OPTIONS: its own columns, filters, totals and PRICING -- see the module
+                # docstring of ui/pages/option_trades.py. A separate class on purpose: the
+                # equity path above is never reached from it.
+                with ui.tab_panel(_tab_refs[1]):
+                    self.option_tab = OptionTradesTab(
+                        on_view_details=self._handle_view_transaction_details,
+                        on_close_transaction=self._handle_close_transaction,
+                        on_edit_transaction=self._handle_edit_transaction,
+                        on_retry_close=self._handle_retry_close_transaction,
+                        on_recreate_tpsl=self._handle_recreate_tpsl,
+                        on_view_recommendation=self._handle_view_recommendation,
+                    )
+                    await self.option_tab.render()
         
         render_timer.stop("filters_rendered")
+
+    def _render_equity_filter_row(self, expert_options) -> None:
+        """The STOCKS tab's filter row and batch controls (unchanged from the single-tab page).
+
+        Extracted verbatim so tabs could be added AROUND it: the batch buttons act on the
+        STOCKS table, which is why they belong in this row and not above both tabs.
+        """
+        # Filter controls
+        with ui.row().classes('gap-2 items-center'):
+            # Multi-select status filter with all except CLOSED selected by default
+            self.status_filter = ui.select(
+                label='Status Filter',
+                options=['Waiting', 'Open', 'Closing', 'Closed'],
+                value=['Waiting', 'Open', 'Closing'],  # Default: all except Closed
+                multiple=True,
+                on_change=lambda: self._refresh_transactions()
+            ).classes('w-56')
+
+            # Expert filter - populated with all experts
+            self.expert_filter = ui.select(
+                label='Expert',
+                options=expert_options,
+                value='All',
+                on_change=lambda: self._refresh_transactions()
+            ).classes('w-48')
+
+            self.symbol_filter = ui.input(
+                label='Symbol',
+                placeholder='Filter by symbol...',
+                on_change=lambda: self._refresh_transactions()
+            ).props('stack-label').classes('w-40')
+
+            self.broker_order_id_filter = ui.input(
+                label='Broker Order ID',
+                placeholder='Search by broker order ID...',
+                on_change=lambda: self._refresh_transactions()
+            ).props('stack-label').classes('w-48')
+
+            refresh_button(lambda: self._refresh_transactions())
+
+            ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
+
+            # Batch operation buttons
+            self.batch_operations_container = ui.row().classes('gap-2 ml-4')
+            self.batch_select_all_btn = ui.button(
+                'Select All',
+                icon='done_all',
+                on_click=self._select_all_transactions
+            ).props('outline size=md').classes('hidden')
+            self.batch_select_all_btn.set_visibility(False)
+
+            self.batch_clear_btn = ui.button(
+                'Clear',
+                icon='clear',
+                on_click=self._clear_selected_transactions
+            ).props('outline size=md').classes('hidden')
+            self.batch_clear_btn.set_visibility(False)
+
+            self.batch_close_btn = ui.button(
+                'Batch Close',
+                icon='close',
+                on_click=self._batch_close_transactions
+            ).props('outline color=negative size=md').classes('hidden')
+            self.batch_close_btn.set_visibility(False)
+
+            self.batch_adjust_tp_btn = ui.button(
+                'Batch Adjust TP',
+                icon='trending_up',
+                on_click=self._batch_adjust_tp_dialog
+            ).props('outline color=info size=md').classes('hidden')
+            self.batch_adjust_tp_btn.set_visibility(False)
+
 
     def _get_expert_options(self):
         """Get list of expert options and ID mapping."""
@@ -834,6 +883,8 @@ class LiveTradesTab:
                 page_size=20,
                 table_name="LiveTradesTable",
                 show_global_filter=True,
+                # The filter row's Refresh does this AND repopulates the expert filter.
+                show_refresh=False,
                 show_selection=True,
                 dense=True,
                 auto_refresh_interval=30,
@@ -850,13 +901,13 @@ class LiveTradesTab:
         # Render the table
         await self.live_trades_table.render()
 
-        # Totals strip, under the table and matching the Overview page's shape (cost ->
-        # unrealised P/L -> market value). Created AFTER render() so it sits below the
-        # pagination controls; the data loader has usually already run by now, so paint it
-        # immediately from whatever it stored and let later loads repaint it.
-        ui.separator().classes('my-2')
-        self._totals_row = ui.row().classes(
-            'w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-t border-white/10')
+        # Totals strip, matching the Overview page's shape (cost -> unrealised P/L -> market
+        # value), in the table's footer: right under the rows, above the pagination controls.
+        # The data loader has usually already run by now, so paint it immediately from
+        # whatever it stored and let later loads repaint it.
+        with self.live_trades_table.footer:
+            self._totals_row = ui.row().classes(
+                'w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-b border-white/10')
         self._refresh_totals_row()
 
         logger.debug("[RENDER] _render_transactions_table_async() - END")
@@ -1775,6 +1826,13 @@ class LiveTradesTab:
                 ui.button(icon='close', on_click=dialog.close).props('flat round')
 
             with ui.scroll_area().classes('w-full h-full'):
+                # OPTION STRUCTURE (spec 2026-09-20, step 8). Rendered BEFORE the generic
+                # cards because a structure's terms are what make the numbers below
+                # readable at all: without them "Open Price $8.00" reads like a share
+                # price, and four legs of one condor read as four separate trades.
+                if getattr(txn, 'asset_class', None) == AssetClass.OPTION:
+                    self._render_option_structure_section(txn, orders)
+
                 # Transaction Overview
                 with ui.card().classes('w-full mb-4'):
                     ui.label('📊 Transaction Overview').classes('text-h6 mb-3')
@@ -1854,6 +1912,13 @@ class LiveTradesTab:
                     with ui.card().classes('bg-primary/5 mt-4'):
                         ui.label('Expert').classes('text-caption text-grey-7')
                         ui.label(expert_name).classes('text-body1 font-bold')
+
+                # WHAT WILL CLOSE THIS POSITION, directly under the numbers describing
+                # it. The dialog could say which expert opened a trade and not one word
+                # about the rules that will exit it -- the question an open position
+                # actually raises -- so the answer was a trip to Settings, into the
+                # expert, into its ruleset, with the transaction no longer on screen.
+                self._render_expert_strategy_section(expert)
 
                 # Transaction Meta Data
                 if txn.meta_data and txn.meta_data:
@@ -1965,6 +2030,468 @@ class LiveTradesTab:
                         ui.label('No orders found for this transaction').classes('text-grey-6 text-center q-pa-md')
 
         dialog.open()
+
+    # --------------------------------------------------------------- strategy ---
+
+    #: Entry blue, exit amber -- the test platform's two tones, so the same rule in the
+    #: two UIs is the same colour. Both are ``/10`` over the dark card beneath them.
+    _RULE_TONES = {'entry': 'bg-blue/10', 'exit': 'bg-orange/10'}
+
+    def _render_expert_strategy_section(self, expert) -> None:
+        """The expert's entry rules, exit conditions and screener filter. Read-only.
+
+        Drawn as the test platform's Strategy tab draws them -- WHEN <gate> THEN
+        <action>, one line per clause, the joining word in the gutter -- through the
+        same formatter (``ui.utils.ruleset_view``). An operator reading a live position
+        is almost always holding it against the backtest it was deployed from, and two
+        wordings for one rule engine is a translation step in their head.
+
+        Nothing here edits: the rules belong to a RULESET, which several experts may
+        share, so an edit made from a single transaction would silently reach every
+        position the ruleset governs. The section names the rulesets so the Settings
+        page can be found.
+
+        A transaction with no expert (allocator- or hand-created) draws nothing at all
+        rather than an empty card promising rules that do not exist.
+        """
+        from ..utils.ruleset_view import ruleset_rule_views, screener_criteria
+
+        if expert is None:
+            return
+
+        # SMART MODE BYPASSES THE RULESETS. ``WorkerQueue._process_expert_recommendations``
+        # hands a smart-mode expert to the SmartRiskManager instead of the TradeManager,
+        # and it is the TradeManager that evaluates these rules -- so printing them
+        # without saying so would describe a mechanism that is not running.
+        settings, risk_mode = {}, 'classic'
+        try:
+            from ...core.utils import get_risk_manager_mode
+            interface = get_expert_instance_from_id(expert.id)
+            if interface:
+                settings = interface.settings or {}
+                risk_mode = get_risk_manager_mode(settings)
+        except Exception as e:
+            # The rules still render: they are read from the DB, not from the interface.
+            logger.warning(f'Could not load settings for expert {expert.id}: {e}')
+
+        entry = ruleset_rule_views(expert.enter_market_ruleset_id)
+        exits = ruleset_rule_views(expert.open_positions_ruleset_id)
+        criteria = (screener_criteria(settings, self._screener_definitions())
+                    if settings.get('instrument_selection_method') == 'screener' else [])
+        if not entry and not exits and not criteria:
+            return
+
+        with ui.card().classes('w-full mb-4'):
+            with ui.row().classes('w-full items-center gap-2 mb-3'):
+                ui.label('🎯 Expert Strategy').classes('text-h6')
+                if risk_mode == 'smart':
+                    with ui.badge('Smart risk manager', color='purple'):
+                        ui.tooltip('This expert is in Smart mode: the Smart Risk Manager '
+                                   'decides entries and exits, and these rules are not '
+                                   'what closes the position.')
+            self._render_rule_group('Entry Rules', entry, tone='entry', color='blue',
+                                    ruleset_id=expert.enter_market_ruleset_id)
+            self._render_rule_group('Exit Conditions', exits, tone='exit', color='orange',
+                                    ruleset_id=expert.open_positions_ruleset_id)
+            if criteria:
+                self._render_screener_criteria(criteria)
+
+    def _render_rule_group(self, title: str, views, *, tone: str, color: str,
+                           ruleset_id) -> None:
+        """One side of the strategy: a heading, the ruleset's name, and its rules.
+
+        The clause markup is ``ruleset_view.render_clause``, shared with the RULESET
+        EDITOR: two copies of it is how the read-only view and the editable one start
+        describing one rule in two different shapes.
+        """
+        from ..utils.ruleset_view import render_clause
+
+        if not views:
+            return
+        with ui.row().classes('w-full items-baseline gap-2 mt-2'):
+            ui.label(f'{title} ({len(views)})').classes(f'text-subtitle2 text-{color}')
+            name = self._ruleset_name(ruleset_id)
+            if name:
+                ui.label(name).classes('text-caption text-grey-7')
+            if len(views) > 1:
+                # THE PRECEDENCE, said out loud. ``TradeActionEvaluator`` breaks after
+                # the first rule whose conditions pass unless that rule is marked
+                # ``continue_processing``, so a reader who takes this list as "all of
+                # these apply" has the mechanism backwards.
+                ui.label('— in order; the first match wins') \
+                    .classes('text-caption text-grey-7')
+        for view in views:
+            with ui.card().classes(f'w-full q-pa-sm q-mb-xs {self._RULE_TONES[tone]}'):
+                with ui.row().classes('items-baseline gap-2'):
+                    ui.label(view.name).classes('text-body2 text-weight-bold')
+                    if view.continues:
+                        with ui.badge('continues', color='orange'):
+                            ui.tooltip('Evaluation carries on to the next rule even '
+                                       'after this one matches.')
+                render_clause('WHEN', 'AND', view.when)
+                render_clause('THEN', 'AND', view.then)
+
+    @staticmethod
+    def _screener_definitions():
+        """``MarketExpertInterface``'s built-in setting metadata, or ``{}``.
+
+        The source of truth for what a screener setting is called and what it falls
+        back to -- the same dict the Settings dialog builds its editors from, so the
+        read-only view and the editable one can never disagree about a label.
+        """
+        try:
+            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+            MarketExpertInterface._ensure_builtin_settings()
+            return MarketExpertInterface._builtin_settings or {}
+        except Exception as e:
+            logger.warning(f'Could not load built-in expert settings: {e}')
+            return {}
+
+    def _render_screener_criteria(self, criteria) -> None:
+        """The filter that decides which instruments this expert may even look at.
+
+        Each row carries the raw setting KEY beside its description. That is not
+        clutter: ``screener_market_cap_max`` at 0 means no ceiling, and the deploy that
+        read it as "admits nothing" is why the key is on screen (see the deploy-parity
+        note in the settings export tooling).
+        """
+        with ui.row().classes('w-full items-baseline gap-2 mt-3'):
+            ui.label(f'Screener ({len(criteria)})').classes('text-subtitle2 text-teal')
+            ui.label('— the universe this expert selects from') \
+                .classes('text-caption text-grey-7')
+        with ui.grid(columns=2).classes('w-full gap-x-6 gap-y-1'):
+            for criterion in criteria:
+                with ui.row().classes('w-full items-baseline justify-between no-wrap gap-2'):
+                    with ui.column().classes('gap-0 min-w-0'):
+                        ui.label(criterion.label).classes('text-body2 truncate')
+                        ui.label(criterion.key).classes('text-caption text-grey-7 font-mono')
+                    # A value the user CHOSE and one that merely defaulted are different
+                    # facts about a filter, and only the first was a decision.
+                    value = ui.label(criterion.value).classes('text-body2 font-mono')
+                    if criterion.is_default:
+                        value.classes('text-grey-7')
+                        value.tooltip('Not set on this expert — the platform default applies.')
+
+    def _ruleset_name(self, ruleset_id) -> str:
+        """The ruleset's name, or a stated absence. Never raises into the dialog.
+
+        A dangling id -- the ruleset was deleted while an expert still pointed at it --
+        is a real state, and it must show as one rather than collapsing the section
+        that was about to explain what closes this position.
+        """
+        if not ruleset_id:
+            return ''
+        try:
+            from ...core.models import Ruleset
+            ruleset = get_instance(Ruleset, ruleset_id)
+            return ruleset.name if ruleset else '(not found)'
+        except Exception:
+            logger.warning(f'Transaction details reference missing ruleset {ruleset_id}')
+            return '(not found)'
+
+    # ------------------------------------------------------------------ options ---
+    #: Fewer stored ATM-IV samples than this and a "rank" would be a percentile of noise.
+    IV_RANK_MIN_SAMPLES = 20
+
+    def _render_option_structure_section(self, txn, orders) -> None:
+        """The option intent, its legs, and the legs' live contract detail.
+
+        Reads only what the transaction and its orders already hold, so it cannot fail on
+        the network. The contract detail (quote, IV, greeks, moneyness) is a BROKER call and
+        is filled in afterwards on a worker thread -- see ``_fill_option_contract_detail``.
+        """
+        from ...core.types import OrderDirection, OrderStatus
+
+        option_orders = [o for o in orders if getattr(o, 'contract_symbol', None)]
+        multiplier = getattr(txn, 'multiplier', None)
+        expiry = getattr(txn, 'expiry', None)
+        today = datetime.now(timezone.utc).date()
+        dte = (expiry - today).days if isinstance(expiry, date) else None
+        is_debit = getattr(txn, 'side', None) == OrderDirection.BUY
+
+        with ui.card().classes('w-full mb-4'):
+            with ui.row().classes('items-center gap-2 mb-2'):
+                ui.label('🧩 Option Structure').classes('text-h6')
+                ui.badge('OPTION', color='purple')
+                if getattr(txn, 'option_strategy', None):
+                    ui.badge(str(txn.option_strategy), color='indigo')
+
+            with ui.grid(columns=4).classes('w-full gap-4'):
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Strategy').classes('text-caption text-grey-7')
+                    ui.label(str(getattr(txn, 'option_strategy', None) or '—')).classes('text-body1 font-bold')
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Expiry').classes('text-caption text-grey-7')
+                    ui.label(
+                        '—' if expiry is None
+                        else f'{expiry.isoformat()}' + (f' · {dte} DTE' if dte is not None else '')
+                    ).classes('text-body1 font-bold')
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Legs / Multiplier').classes('text-caption text-grey-7')
+                    ui.label(
+                        f'{len(option_orders) or len(orders)} legs · '
+                        + (f'x{multiplier}' if multiplier else 'multiplier NOT recorded')
+                    ).classes('text-body1 font-bold')
+                with ui.card().classes('bg-primary/5'):
+                    ui.label('Net Premium / share').classes('text-caption text-grey-7')
+                    ui.label(
+                        '—' if txn.open_price is None
+                        else f"${abs(float(txn.open_price)):.2f} {'debit' if is_debit else 'credit'}"
+                    ).classes('text-body1 font-bold')
+
+            if not multiplier:
+                # Say it here rather than letting a 100x-undersized P&L read as a fact.
+                ui.label(
+                    'Contract multiplier not recorded: dollar P&L for this transaction cannot be '
+                    'derived (it is NOT assumed to be 100).'
+                ).classes('text-xs text-orange-400 mt-2')
+
+            ui.label(
+                'TP / SL on this transaction are PREMIUM levels (per share), not underlying prices.'
+            ).classes('text-xs text-secondary-custom mt-2')
+
+            if option_orders:
+                columns = ['Leg', 'Contract', 'Strike', 'Expiry', 'Qty × mult', 'Intent', 'Status', 'Fill prem.']
+                rows = []
+                for order in option_orders:
+                    rows.append({
+                        'Leg': f"{getattr(order.side, 'value', '?')} {getattr(order.option_type, 'value', getattr(order, 'option_type', '') or '?')}",
+                        'Contract': order.contract_symbol,
+                        'Strike': '—' if order.strike is None else f'${float(order.strike):.2f}',
+                        'Expiry': order.expiry.isoformat() if getattr(order, 'expiry', None) else '—',
+                        'Qty × mult': f"{order.quantity:g} × {getattr(order, 'multiplier', None) or '?'}",
+                        'Intent': getattr(order, 'position_intent', None) or '—',
+                        'Status': getattr(order.status, 'value', '') or '—',
+                        'Fill prem.': '—' if order.open_price is None else f'${float(order.open_price):.2f}/share',
+                    })
+                ui.table(columns=[{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in columns],
+                         rows=rows, row_key='Contract').classes('w-full mt-3').props('dense flat')
+
+            # THE CHART (spec steps 9-10): cached-style daily candles for the underlying,
+            # one dashed line per strike, both marker sets, and the expiration payoff drawn
+            # rotated onto the price axis. Built from a worker thread because it fetches
+            # bars; the payoff itself is derived from the recorded terms alone.
+            self._option_chart_container = ui.column().classes('w-full mt-3')
+            asyncio.create_task(self._fill_option_chart(self._option_chart_container, txn, orders))
+
+            # BROKER data lands here, off the render path.
+            self._option_detail_container = ui.column().classes('w-full mt-3')
+            if option_orders:
+                account_id = next((o.account_id for o in orders if getattr(o, 'account_id', None)), None)
+                if account_id:
+                    asyncio.create_task(self._fill_option_contract_detail(
+                        self._option_detail_container, account_id,
+                        [o.contract_symbol for o in option_orders], txn.symbol,
+                    ))
+
+    def _payoff_for(self, txn, orders):
+        """The expiration payoff of this transaction, from its recorded order terms.
+
+        A live ORDER's multiplier is a recorded contract term (the order carries the real
+        one, and it is copied onto the transaction at creation), so it is trusted when
+        present -- and a missing one still refuses to price rather than assuming 100.
+        """
+        from ba2_common.core.option_payoff_chart import (
+            PayoffUnavailable, build_payoff_chart, chart_legs_from_rows,
+        )
+
+        # The ENTRY structure, never the order history (review R2). Concatenating every order
+        # with a contract symbol drew the net cash of already-closed fills as if it were the
+        # structure's expiration outcomes: a spread's -600/+400 curve flattened to +370 at
+        # every price, and a cancelled order could add exposure that was never held.
+        leg_set = opening_legs(txn, orders)
+
+        # An executed OPENING leg dropped for a missing size or premium leaves a DIFFERENT
+        # position, so the curve is refused rather than drawn for the remainder (second
+        # review, N4): a 95/105 spread missing its short leg's premium would otherwise plot as
+        # a lone long call with UNLIMITED maximum profit.
+        if leg_set.incomplete:
+            return PayoffUnavailable(leg_set.unavailable_reason or 'structure incompletely recorded')
+
+        return build_payoff_chart(chart_legs_from_rows(leg_set.chart_rows()))
+
+    async def _fill_option_chart(self, container, txn, orders) -> None:
+        """Fetch the underlying's bars off the render path, then paint the figure."""
+        from ba2_common.core.option_payoff_chart import PayoffUnavailable
+
+        payoff = self._payoff_for(txn, orders)
+
+        stamps = [getattr(order, 'created_at', None) for order in orders]
+        stamps += [getattr(txn, 'open_date', None), getattr(txn, 'close_date', None)]
+        stamps = [stamp for stamp in stamps if stamp is not None]
+        if stamps:
+            start = min(stamps) - timedelta(days=20)
+            end = max(stamps) + timedelta(days=20)
+        else:
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=60)
+
+        bars = None
+        try:
+            bars = await asyncio.to_thread(fetch_underlying_bars, txn.symbol, start, end)
+        except Exception as exc:
+            # A missing bar series is not a broken popup: the strikes, the leg table and
+            # the payoff figures are all still there.
+            logger.warning(f"[OPTION CHART] no bars for {txn.symbol}: {exc}")
+
+        try:
+            render_option_structure_chart(
+                container, txn=txn, orders=orders, payoff=payoff, bars=bars,
+                underlying=txn.symbol)
+            if isinstance(payoff, PayoffUnavailable):
+                with container:
+                    ui.label(f'Expiration payoff unavailable — {payoff.reason}').classes(
+                        'text-xs text-secondary-custom')
+        except Exception as exc:
+            logger.warning(f"[OPTION CHART] could not render for txn {txn.id}: {exc}")
+
+    def _collect_option_contract_detail(self, account_id, contracts, underlying):
+        """BLOCKING broker reads for the leg table's detail block.
+
+        Only ever called inside ``asyncio.to_thread`` (the repo's convention for broker
+        round trips). Every failure is per-leg and reported as unknown: a missing greek is
+        never rendered as zero, and an account that does not implement the options
+        interface simply has no detail to show.
+        """
+        from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+        detail = {'account_supports_options': False, 'spot': None, 'atm_iv': None,
+                  'iv_rank': None, 'quotes': {}, 'errors': {}}
+        try:
+            account = get_account_instance_from_id(account_id)
+        except Exception as exc:
+            detail['errors']['account'] = str(exc)
+            return detail
+
+        if not isinstance(account, OptionsAccountInterface):
+            detail['errors']['account'] = 'account does not implement the options interface'
+            return detail
+        detail['account_supports_options'] = True
+
+        try:
+            detail['spot'] = account.get_instrument_current_price(underlying, 'mid')
+        except Exception as exc:
+            detail['errors']['spot'] = str(exc)
+
+        for contract in contracts:
+            try:
+                quote = account.get_option_quote(contract)
+            except Exception as exc:
+                detail['errors'][contract] = str(exc)
+                continue
+            if quote is None:
+                detail['errors'][contract] = 'no snapshot'
+                continue
+            detail['quotes'][contract] = {
+                'bid': getattr(quote, 'bid', None), 'ask': getattr(quote, 'ask', None),
+                'last': getattr(quote, 'last', None), 'mid': getattr(quote, 'mid', None),
+                'iv': getattr(quote, 'implied_volatility', None),
+                'delta': getattr(quote, 'delta', None), 'gamma': getattr(quote, 'gamma', None),
+                'theta': getattr(quote, 'theta', None), 'vega': getattr(quote, 'vega', None),
+                'timestamp': getattr(quote, 'timestamp', None),
+            }
+
+        try:
+            detail['atm_iv'] = account.get_atm_implied_volatility(underlying)
+        except Exception as exc:
+            detail['errors']['atm_iv'] = str(exc)
+
+        return detail
+
+    def _iv_rank(self, account_id, underlying, current_iv):
+        """IV rank from OUR OWN stored ATM-IV series (brokers publish no IV history).
+
+        Returns ``(rank_percent, sample_count)`` or ``(None, count)`` when the window is too
+        short to mean anything -- a percentile of four samples is not a rank.
+        """
+        from ...core.models import OptionIVSnapshot
+
+        # The session is acquired INSIDE the guard: a DB handle that cannot be obtained is
+        # the same outcome as a read that fails -- no rank -- and must not escape into the
+        # task that is painting the dialog.
+        session = None
+        try:
+            session = get_db()
+            rows = session.exec(
+                select(OptionIVSnapshot)
+                .where(OptionIVSnapshot.account_id == account_id,
+                       OptionIVSnapshot.underlying == underlying)
+                .order_by(OptionIVSnapshot.recorded_at)
+            ).all()
+        except Exception as exc:
+            logger.debug(f"[OPTION DETAIL] IV history read failed: {exc}")
+            return None, 0
+        finally:
+            if session is not None:
+                session.close()
+
+        samples = [float(r.atm_iv) for r in rows if getattr(r, 'atm_iv', None) is not None]
+        if len(samples) < self.IV_RANK_MIN_SAMPLES or current_iv is None:
+            return None, len(samples)
+        at_or_below = sum(1 for value in samples if value <= float(current_iv))
+        return (at_or_below / len(samples)) * 100.0, len(samples)
+
+    async def _fill_option_contract_detail(self, container, account_id, contracts, underlying) -> None:
+        """Fill the contract-detail block from a worker thread, then paint it."""
+        try:
+            detail = await asyncio.to_thread(
+                self._collect_option_contract_detail, account_id, contracts, underlying)
+        except Exception as exc:
+            logger.warning(f"[OPTION DETAIL] contract detail unavailable: {exc}")
+            return
+
+        iv_rank, samples = self._iv_rank(account_id, underlying, detail.get('atm_iv'))
+
+        with container:
+            if not detail.get('account_supports_options'):
+                ui.label(
+                    'Contract detail unavailable: ' + detail['errors'].get('account', 'no options interface')
+                ).classes('text-xs text-secondary-custom')
+                return
+
+            with ui.row().classes('items-center gap-3'):
+                ui.label('📈 Contract detail (CURRENT — not the position\'s P&L)').classes('text-subtitle1 font-bold')
+                if detail.get('spot') is not None:
+                    ui.label(f"underlying now ${float(detail['spot']):.2f}").classes('text-xs text-secondary-custom')
+                if detail.get('atm_iv') is not None:
+                    ui.label(f"ATM IV now {float(detail['atm_iv']) * 100:.1f}%").classes('text-xs text-secondary-custom')
+                if iv_rank is not None:
+                    ui.label(f"IV rank {iv_rank:.0f}% ({samples} samples)").classes('text-xs text-secondary-custom')
+                elif detail.get('atm_iv') is not None:
+                    ui.label(
+                        f'IV rank not available yet ({samples} of {self.IV_RANK_MIN_SAMPLES} stored samples)'
+                    ).classes('text-xs text-secondary-custom')
+
+            def cell(value, fmt='{:.2f}'):
+                return '—' if value is None else fmt.format(float(value))
+
+            table_rows = []
+            for contract in contracts:
+                quote = detail['quotes'].get(contract)
+                if quote is None:
+                    table_rows.append({
+                        'Contract': contract, 'Bid': '—', 'Ask': '—', 'Mid': '—', 'Last': '—',
+                        'IV': '—', 'Delta': '—', 'Gamma': '—', 'Theta': '—', 'Vega': '—',
+                        'Note': detail['errors'].get(contract, 'unavailable'),
+                    })
+                    continue
+                table_rows.append({
+                    'Contract': contract,
+                    'Bid': cell(quote['bid']), 'Ask': cell(quote['ask']),
+                    'Mid': cell(quote['mid']), 'Last': cell(quote['last']),
+                    'IV': '—' if quote['iv'] is None else f"{float(quote['iv']) * 100:.1f}%",
+                    'Delta': cell(quote['delta'], '{:+.3f}'), 'Gamma': cell(quote['gamma'], '{:.4f}'),
+                    'Theta': cell(quote['theta'], '{:+.3f}'), 'Vega': cell(quote['vega'], '{:.3f}'),
+                    'Note': '',
+                })
+
+            columns = ['Contract', 'Bid', 'Ask', 'Mid', 'Last', 'IV', 'Delta', 'Gamma', 'Theta', 'Vega', 'Note']
+            ui.table(columns=[{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in columns],
+                     rows=table_rows, row_key='Contract').classes('w-full').props('dense flat')
+            ui.label(
+                'Broker-sourced and current: greeks and IV describe the contract RIGHT NOW, '
+                'and are not part of any expiration payoff.'
+            ).classes('text-xs text-secondary-custom')
 
     def _get_transaction_status_color(self, status):
         """Get color for transaction status badge."""

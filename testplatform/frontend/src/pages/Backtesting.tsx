@@ -1,7 +1,9 @@
 import { API_BASE } from '../lib/config';
 import { actionRefOf, actionValueOf } from '../lib/actionValues';
 import { boldNumbers } from '../lib/textParts';
-import { capitalUsageSeries, summariseUsage, IDLE_PCT, HEAVY_PCT } from '../lib/capitalUsage';
+import {
+  capitalUsageSeries, summariseUsage, usageExclusions, IDLE_PCT, HEAVY_PCT,
+} from '../lib/capitalUsage';
 import {
   contractValue, groupTradesByStructure, isOptionTrade, optionBadge, summariseStructure,
 } from '../lib/optionTrades';
@@ -2086,7 +2088,10 @@ const Backtesting: React.FC = () => {
       setUniverse({
         mode: 'screener',
         screener_settings: (u as any).screener_settings ?? {},
-        ...(typeof st === 'string' && st.trim() ? { screener_store: st } : {}),
+        // `screener_store` is REQUIRED to run, so an import without one sets the
+        // picker's own empty value rather than silently inheriting whatever store
+        // the page happened to be pointed at.
+        screener_store: typeof st === 'string' ? st : '',
         ...(typeof cad === 'number' && cad > 0 ? { screener_cadence_days: cad } : {}),
       });
       // Also keep the separate page-level screenerStore/screenerCadenceDays in sync
@@ -2283,8 +2288,26 @@ const Backtesting: React.FC = () => {
   // per share (what the chain quotes, and what these columns have always held)
   // and the money that actually moved (premium x contracts x 100) -- without the
   // second figure a 4.20 option entry reads exactly like a 4.20 stock.
+  /**
+   * The row handed to the chart modal for a STRUCTURE.
+   *
+   * The modal resolves the whole transaction from the row's id (the legs share one
+   * transactionId), so the CHART was already complete -- but the header showed that one leg's
+   * own percent and reason, which reads as the structure's result. The aggregate numbers are
+   * passed instead, and the modal labels the scope.
+   */
+  const structureChartTrade = (legs: Trade[]): Trade => {
+    const summary = summariseStructure(legs);
+    const first = legs[0];
+    return {
+      ...first,
+      entryDate: summary.entryDate, exitDate: summary.exitDate,
+      pnl: summary.pnl, pnlPercent: summary.pnlPercent, exitReason: summary.exitReason,
+    };
+  };
+
   const tradeRow = (trade: Trade, asLeg = false) => {
-    const isHidden = hiddenTradeIds.has(trade.id);
+    const isHidden = hiddenTradeIds.has(String(trade.id));
     const option = isOptionTrade(trade);
     const badge = optionBadge(trade);
     const entryCash = contractValue(trade.entryPrice, trade.size, trade.multiplier);
@@ -2294,7 +2317,7 @@ const Backtesting: React.FC = () => {
           onClick={() => setChartTrade(trade)}
           title="Click to view the daily chart with entry/exit markers"
           className={`cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${isHidden ? 'opacity-40' : ''}`}>
-        <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(trade.id); }}>
+        <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(String(trade.id)); }}>
           <button type="button"
                   title={isHidden ? 'Show: include this trade in the metrics again' : 'Hide: exclude this trade and recompute the metrics'}
                   className="text-gray-400 hover:text-amber-600 dark:hover:text-amber-400">
@@ -3047,7 +3070,7 @@ const Backtesting: React.FC = () => {
                   <p className="text-xs text-gray-500 dark:text-gray-400">Profit Factor</p>
                   {(() => {
                     const fullRaw = selectedBacktest.profitFactor ?? 0;
-                    const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_profit_factor;
+                    const a = (selectedBacktest.results as unknown as Record<string, number> | undefined)?.adjusted_profit_factor;
                     const hasAdj = !hiding && a != null && Math.abs(a - fullRaw) > 0.05;
                     const primary = rc ? rc.profitFactor : (hasAdj ? a! : fullRaw);
                     return (<>
@@ -3075,7 +3098,7 @@ const Backtesting: React.FC = () => {
                   <p className="text-xs text-gray-500 dark:text-gray-400">Best Trade</p>
                   {(() => {
                     const fullRaw = selectedBacktest.bestTrade ?? 0;
-                    const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_best_trade;
+                    const a = (selectedBacktest.results as unknown as Record<string, number> | undefined)?.adjusted_best_trade;
                     const hasAdj = !hiding && a != null && Math.abs(a - fullRaw) > 0.05;
                     const primary = rc ? rc.best : (hasAdj ? a! : fullRaw);
                     return (<>
@@ -3211,6 +3234,10 @@ const Backtesting: React.FC = () => {
                       selectedBacktest.results?.trades,
                       adjEquityCurve ?? selectedBacktest.results?.equityCurve);
                     const stats = summariseUsage(usage);
+                    // What the series could not measure. An option position whose contract
+                    // multiplier was never recorded is left OUT (never counted at 1x), and a
+                    // credit structure's real constraint is margin, which this does not model.
+                    const exclusions = usageExclusions(selectedBacktest.results?.trades);
                     if (!usage.length) {
                       return (
                         <p className="text-sm text-gray-500 dark:text-gray-400 py-8 text-center">
@@ -3244,7 +3271,30 @@ const Backtesting: React.FC = () => {
                           Open position notional as a share of account equity that day —
                           how much of the account this strategy actually occupies, and so
                           how much is left for another to run alongside it.
+                          {exclusions.positions > 0
+                            ? ` An option structure counts once, at its NET premium`
+                              + ` (${exclusions.positions} position${exclusions.positions === 1 ? '' : 's'} counted).`
+                            : ''}
                         </p>
+                        {(exclusions.unpriced > 0 || exclusions.credit > 0) && (
+                          <ul className="text-[11px] text-amber-700 dark:text-amber-300 mb-2 space-y-0.5">
+                            {exclusions.unpriced > 0 && (
+                              <li>
+                                {exclusions.unpriced} option position
+                                {exclusions.unpriced === 1 ? '' : 's'} left out: the contract
+                                multiplier was never recorded, so their notional is unknown.
+                                They are NOT counted as zero.
+                              </li>
+                            )}
+                            {exclusions.credit > 0 && (
+                              <li>
+                                {exclusions.credit} credit structure
+                                {exclusions.credit === 1 ? '' : 's'} counted at the net premium
+                                RECEIVED — the margin they actually tie up is not modelled here.
+                              </li>
+                            )}
+                          </ul>
+                        )}
                         <div className="h-80">
                           <ResponsiveContainer width="100%" height="100%">
                             <AreaChart data={usage}>
@@ -3363,8 +3413,8 @@ const Backtesting: React.FC = () => {
                               const someHidden = !allHidden && ids.some(id => hiddenTradeIds.has(id));
                               return (
                                 <React.Fragment key={group.key}>
-                                  <tr onClick={() => toggleStructure(group.key)}
-                                      title="Click to show or hide this structure's legs"
+                                  <tr onClick={() => setChartTrade(structureChartTrade(group.legs))}
+                                      title="Click to view the daily chart for the whole structure"
                                       className={`cursor-pointer bg-gray-50/60 dark:bg-gray-800/40 hover:bg-blue-50 dark:hover:bg-blue-900/20 ${allHidden ? 'opacity-40' : ''}`}>
                                     <td className="px-2 py-2 text-center"
                                         onClick={(e) => { e.stopPropagation(); toggleHideStructure(group.legs); }}>
@@ -3378,8 +3428,14 @@ const Backtesting: React.FC = () => {
                                     </td>
                                     <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${allHidden ? 'line-through' : ''}`}>
                                       <span className="inline-flex items-center gap-1">
-                                        {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" />
-                                              : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                                        <span
+                                          role="button"
+                                          title="Show or hide this structure's legs"
+                                          onClick={(e) => { e.stopPropagation(); toggleStructure(group.key); }}
+                                          className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                                          {open ? <ChevronDown className="w-3.5 h-3.5" />
+                                                : <ChevronRight className="w-3.5 h-3.5" />}
+                                        </span>
                                         {s.symbol || '—'}
                                         <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 text-[11px] font-semibold text-indigo-700 dark:text-indigo-300"
                                               title={`${s.legCount} legs: ${s.longLegs} long / ${s.shortLegs} short. One structure, one bet.`}>
@@ -3722,7 +3778,15 @@ const Backtesting: React.FC = () => {
 
   return (
     <div className="p-6 space-y-6">
-      <TradeChartModal trade={chartTrade} onClose={() => setChartTrade(null)} />
+      {/* An OPTION row opens the option view: the complete transaction's terms, its
+          strikes, both marker sets and the expiration payoff overlay. Its data comes
+          from the cache-only trade-chart endpoint, keyed by backtest + saved row id. */}
+      <TradeChartModal
+        trade={chartTrade}
+        optionSelection={chartTrade && isOptionTrade(chartTrade) && selectedBacktest?.id
+          ? { backtestId: selectedBacktest.id, tradeId: Number(chartTrade.id) }
+          : null}
+        onClose={() => setChartTrade(null)} />
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold flex items-center gap-2 text-gray-900 dark:text-gray-100">
           <BarChart3 className="w-8 h-8 text-blue-500" />

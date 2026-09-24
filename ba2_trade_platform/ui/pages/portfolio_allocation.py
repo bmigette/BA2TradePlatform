@@ -95,6 +95,7 @@ runs, which is exactly why the pure logic lives in ``ui/utils/`` instead. It onl
 keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
+from ..components.refresh_button import refresh_button
 import asyncio
 import threading
 from datetime import date, datetime, timezone
@@ -159,6 +160,7 @@ from ..utils.portfolio_allocation_view import (
     SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
     LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_BAR_LEGEND, LABEL_TOTAL_CLASSES,
     LABEL_TOTAL_COLORS, LABEL_TOTAL_TOOLTIP, ZERO_SHARE_BADGE_TOOLTIP_FMT,
+    SYMBOL_COUNT_BADGE_TOOLTIP_FMT,
     class_color_style, count_zero_share_symbols,
     fractionable_badge, leverage_badge,
     label_total_readout,
@@ -172,6 +174,7 @@ from ..utils.portfolio_allocation_view import (
     resolve_label_icon_color, resolve_symbol_weights,
     sort_label_views, store_color_value,
     symbol_delta,
+    symbol_target_quantity,
     symbol_target_values,
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
     wipe_symbol_shares, working_orders_notice,
@@ -872,6 +875,11 @@ MARKER_LABEL_ICON = 'pf-label-icon'
 #: The orange count beside that icon: symbols in the label whose share is 0% or
 #: unset. Marked because its text is a bare integer that repeats all over the row.
 MARKER_LABEL_ZERO_BADGE = 'pf-label-zero-badge'
+#: The plain count AFTER the label's name: how many symbols the label holds.
+#: Marked for the same reason as the badge above -- a bare integer on a row full
+#: of them -- and kept apart from it because the two count different things and
+#: only one of them is a complaint.
+MARKER_LABEL_COUNT_BADGE = 'pf-label-count-badge'
 #: The warning triangle beside it: this label's symbol weights do not total
 #: 100% -- either short (advisory) or over (the same thing that blocks Submit).
 #: A separate icon rather than folded into the zero-share badge because the two
@@ -1093,6 +1101,11 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
     here rather than in the Quasar template because "which of these is unmeasurable" is
     a decision, and decisions do not belong in a cell slot -- the template only picks a
     colour and prints a string.
+
+    The TARGET QUANTITY is written here too, for exactly that reason: it moves with
+    the target value on every share edit, and the quantity delta printed under it is
+    that same figure minus the held shares. Computing it anywhere else would be a
+    second writer for a number this one already has to derive.
     """
     delta = symbol_delta(weight_pct=row.get('weight_pct'),
                          pct_of_label=row.get('pct_of_label'),
@@ -1108,6 +1121,11 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
     # rows hold 25.4595 and 3.7515), and 2dp would round a real change to +0.00.
     row['qty_delta'] = format_delta(delta.quantity, places=4)
     row['qty_delta_color'] = delta_color(delta.quantity)
+    # The shares that target buys. ``None`` stays None all the way to the cell --
+    # an unpriced row prints nothing rather than a 0 that claims a target of none.
+    target_qty = symbol_target_quantity(target_value=row.get('target_value'),
+                                        price=row.get('price'))
+    row['target_quantity'] = None if target_qty is None else round(target_qty, 4)
 
 
 def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
@@ -2711,6 +2729,13 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # the slot below draws a button over it.
         {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
+        # THE HELD SHARES, beside the held money they are the other half of. This
+        # column already existed, out past ``Target value`` and wearing the buy/sell
+        # change as its caption -- which reads as a target column, and had the
+        # operator asking for the current quantity to be "added". It was never
+        # added: it moved, and the change moved with the TARGET quantity below,
+        # which is the figure it is a change to.
+        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
         # AGAINST THE LABEL'S TARGET MONEY, not against what the label happens to
         # hold (2026-09-05). The old denominator was the label's own held total, so
         # the column summed to exactly 100% on every label whatever its funding --
@@ -2735,7 +2760,10 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # own; a blank cell means the symbol has never been allocated.
         {'name': 'previous_weight_pct', 'label': 'Last %', 'field': 'previous_weight_pct', 'sortable': True, 'align': 'right'},
         {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
-        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
+        # The shares that money buys, and under it the change from what is held --
+        # the pair the order is actually placed from. Both are written by
+        # ``_write_row_deltas``, so a share edit moves the two together or neither.
+        {'name': 'target_quantity', 'label': 'Target qty', 'field': 'target_quantity', 'sortable': True, 'align': 'right'},
         {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
         {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
         {'name': 'market_value', 'label': 'Market value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
@@ -2873,7 +2901,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                  :class="'text-' + props.row.value_delta_color">{{ props.row.value_delta }}</div>
         </q-td>
     ''')
-    table.add_slot('body-cell-quantity', r'''
+    # On the TARGET quantity, not the held one. The caption is the distance between
+    # the two columns, and it belongs under the end of that journey: printed under
+    # the held shares it read as a correction to a broker fact, which is the one
+    # number on the row that no edit on this page can move.
+    table.add_slot('body-cell-target_quantity', r'''
         <q-td :props="props">
             <div>{{ props.value }}</div>
             <div v-if="props.row.qty_delta" class="text-caption"
@@ -3170,6 +3202,21 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                 widgets['weight_warning_tooltip'] = ui.tooltip('')
             widgets['weight_warning'] = weight_warning
             ui.label(view.label).classes('w-48 truncate font-medium')
+            # HOW MANY SYMBOLS THE LABEL HOLDS, beside the name it is a size of.
+            # Static: membership is changed by adding or removing symbols, and both
+            # paths reload the page -- unlike the orange badge above, which counts
+            # something a share EDIT moves and therefore needs a live writer.
+            #
+            # Always drawn, including at 0. The zero-share badge hides itself
+            # because an orange 0 beside a healthy label is noise; this one is not a
+            # warning, and "this label has nothing in it" is the single state of the
+            # count most worth seeing without opening the fold.
+            count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
+                .classes('shrink-0').mark(MARKER_LABEL_COUNT_BADGE)
+            with count_badge:
+                ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
+                    count=len(view.rows), label=view.label))
+            widgets['count_badge'] = count_badge
             widgets['value'] = ui.label('').classes('w-28 text-right')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
@@ -3982,7 +4029,7 @@ async def content() -> None:
                 .props('dense outlined hide-bottom-space').classes('w-44')
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
-            ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
+            refresh_button(_refresh)
             # The what-if control sits in the TOOLBAR, beside Valuation: both change
             # how every number below is computed, and neither is a number itself.
             ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)

@@ -156,6 +156,11 @@ class PMCCAccount(OptionsAccountInterface):
         self.refuse_next_fill = None
 
     # -- clock / prices ------------------------------------------------------
+    def decision_label(self):
+        # The option action's DTE label (OptionsAccountInterface.decision_label,
+        # read by _OptionEntryAction._today): pinned to this fake's simulated date.
+        return self._as_of_date()
+
     def _as_of_date(self):
         return self.today
 
@@ -1276,6 +1281,23 @@ def test_the_rule_reader_and_the_live_pass_read_the_SAME_roll_window():
     assert cond.calculated_value == live_days
     assert live_days == (OVERLAY_EXPIRY - ROLL_DAY).days == 4
     assert fired is True
+
+
+def test_the_roll_window_counts_from_the_accounts_decision_label_not_the_recommendation():
+    """BT/live option parity: the short-leg DTE counts from the account's decision session
+    label (the date the entry counted from), whatever the recommendation's created_at says."""
+    from ba2_common.core.TradeConditions import create_condition
+    from ba2_common.core.types import ExpertEventType
+
+    acct, parent = _open()
+    acct.today = ROLL_DAY
+    rec = SimpleNamespace(
+        id=1, instance_id=None, data=None, price_at_date=None, expected_profit_percent=None,
+        recommended_action=None, created_at=datetime(2020, 1, 2, tzinfo=timezone.utc))
+    cond = create_condition(ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY, acct, "XYZ", rec,
+                            existing_order=parent, operator_str="<=", value=10)
+    cond.evaluate()
+    assert cond.calculated_value == (OVERLAY_EXPIRY - ROLL_DAY).days
 
 
 def test_the_rule_reader_and_the_live_pass_read_the_SAME_credit_decay():

@@ -48,10 +48,34 @@ Per (key, expert) case:
 TOGGLE genes (``*:enabled``) carry no value to find -- their non-default value IS removal -- so
 they are audited by EFFECT in ``test_every_toggle_gene_changes_the_emitted_ruleset``.
 
+MODE genes (``cond:<id>:mode``) carry a TOKEN, not a number, and their destination is the
+emitted leaf's OPERATOR -- so they are followed by ``_check_mode_gene`` instead of by the
+sentinel, and they are followed for EVERY choice, not one:
+
+  * ``below`` / ``above`` on a numeric leaf must emit that leaf's trigger with operator ``<``
+    / ``>``. The expected operator comes from this file's own ``_MODE_OPERATOR`` table, so the
+    check is against the CONTRACT rather than against whatever the decoder happened to write.
+  * a CATEGORICAL token (the market-condition ``structure_state`` leaf) must emit operator
+    ``==`` and the registry CODE of that token as the value.
+  * ``off`` must REMOVE the leaf: gone from the decoded tree, and exactly one fewer trigger of
+    its event type in the emitted export.
+
+A mode gene is therefore NOT allowlisted as GA-level -- it demonstrably changes the artefact,
+and that change is what is checked.
+
+WHY THE MARKET-CONDITION MODE LEAVES NEVER TRIPPED THIS. They only exist under
+``--market-condition-profile``, and ``ba2test_launcher._MARKET_CONDITION_PROFILES`` defaults to
+``()``; every case here built its strategy with that default, so no ``:mode`` gene was ever in
+a collected space. The first mode gene to reach the audit was the option DIRECTION gate
+(2026-09-19), which is profile-independent. Both are covered now: the profiled cases below set
+the global for the duration of the case, and ``ta-structure-v1`` is included precisely because
+it is the one registered profile with a CATEGORICAL searched field.
+
 ``option_dte`` is the one DERIVED gene: it decodes as the window CENTRE and the action carries
 ``dte_min``/``dte_max`` = centre -/+ the authored half-width (``_apply_option_dte``). The audit
 re-derives that arithmetic rather than looking for the centre literally.
 """
+import contextlib
 import importlib
 import importlib.util
 import os
@@ -123,14 +147,35 @@ def _option_keys(m):
 
 OPTION_KEYS = _option_keys(_M)
 
-#: (key, expert, screener_on). Every option key under FMPRating (the grid's default ranking
-#: expert); O_ERN under FMPEarningsEvent as well, because that is the expert grid-2 actually
-#: pairs it with (design 2026-08-31 S9) and its ``model:`` genes are a different set; and ONE
-#: screener-enabled case, which is the only shape that emits the six ``screener:*`` genes
-#: (the launcher merges them only under ``--screener``).
-AUDIT_CASES = ([(k, "FMPRating", False) for k in OPTION_KEYS]
-               + [("O_ERN", "FMPEarningsEvent", False),
-                  ("O_LC", "FMPRating", True)])
+#: (key, expert, screener_on, profiles). Every option key under FMPRating (the grid's default
+#: ranking expert); O_ERN under FMPEarningsEvent as well, because that is the expert grid-2
+#: actually pairs it with (design 2026-08-31 S9) and its ``model:`` genes are a different set;
+#: ONE screener-enabled case, which is the only shape that emits the six ``screener:*`` genes
+#: (the launcher merges them only under ``--screener``); and ONE market-condition case, which
+#: is the only shape that emits the profile's ``cond:<id>:mode`` genes -- both profiles at once
+#: so the case covers the numeric mode leaves AND ``ta-structure-v1``'s categorical one.
+_ALL_PROFILES = ("ohlcv-v1", "ta-structure-v1")
+
+AUDIT_CASES = ([(k, "FMPRating", False, ()) for k in OPTION_KEYS]
+               + [("O_ERN", "FMPEarningsEvent", False, ()),
+                  ("O_LC", "FMPRating", True, ()),
+                  ("O_LC", "FMPRating", False, _ALL_PROFILES)])
+
+
+@contextlib.contextmanager
+def _profiles(m, profs):
+    """Build strategies with these market-condition profiles selected, then put the global back.
+
+    The launcher reads the profile list from a MODULE GLOBAL (``optimize`` sets it from
+    ``--market-condition-profile``), so this is how a case asks for the profiled shape -- and
+    restoring it is what keeps the unprofiled cases unprofiled when they run afterwards.
+    """
+    saved = m._MARKET_CONDITION_PROFILES
+    m._MARKET_CONDITION_PROFILES = tuple(profs)
+    try:
+        yield
+    finally:
+        m._MARKET_CONDITION_PROFILES = saved
 
 
 # ==================================================================================================
@@ -238,7 +283,7 @@ def _trial(m, strat, expert, genome, screener=False):
 
     decoded = decode_params(strat, genome)
     return decoded, _build_daily_trial_config(_backtest_cfg(strat, expert), decoded,
-                                              _hoisted(screener))
+                                              _hoisted(screener), option_trade_records=False)
 
 
 def _export(entry_rules, exit_rules):
@@ -284,6 +329,20 @@ def _trigger_values(rule, ns, event_type):
         return []
     return [t["value"] for t in exported["triggers"].values()
             if t.get("event_type") == event_type and "value" in t]
+
+
+def _exported_triggers(rule, ns, event_type):
+    """``[(operator, value)]`` for every emitted trigger of ``event_type`` on ONE rule.
+
+    The operator is what a MODE gene decides, so the audit has to read it off the artefact and
+    not off the decoded leaf: ``triggers_from_condition_tree`` is free to drop a leaf, and a
+    dropped leaf is exactly the failure a mode gene could hide behind.
+    """
+    exported = _export_one(rule, ns)
+    if exported is None:
+        return []
+    return [(t.get("operator"), t.get("value")) for t in exported["triggers"].values()
+            if t.get("event_type") == event_type]
 
 
 def _find_leaf(rules, cid):
@@ -357,6 +416,100 @@ def _action_destination(field):
     return None
 
 
+#: What each non-off NUMERIC mode MEANS, as the operator it must emit. Written out HERE rather
+#: than imported from ``strategy_param_space._THRESHOLD_OPS`` on purpose: an audit that imports
+#: the mapping it is auditing would pass however that mapping changed.
+_MODE_OPERATOR = {"below": "<", "above": ">"}
+
+
+def _decode_find(strat, base, gene, token, cid):
+    """``(sub_ns, rule, leaf)`` for leaf ``cid`` after decoding ``base`` with ``gene=token``,
+    or None when the mode dropped the leaf (which is what ``off`` is supposed to do)."""
+    from app.services.strategy_param_space import decode_params
+
+    decoded = decode_params(strat, dict(base, **{gene: token}))
+    for sub_ns in ("entry", "exit"):
+        rule, leaf = _find_leaf(decoded[f"{sub_ns}_rules"], cid)
+        if leaf is not None:
+            return sub_ns, rule, leaf
+    return None
+
+
+def _mode_expectation(token, leaf):
+    """``(operator, value)`` the emitted trigger must carry for this non-off mode.
+
+    NUMERIC: the operator is the mode, the threshold is whatever the threshold gene decoded to
+    (a mode gene does not move it). CATEGORICAL: the operator is ``==`` and the value is the
+    registry CODE of the token -- the mode IS the value there, so the audit re-derives it from
+    the registry instead of reading it back off the leaf.
+    """
+    op = _MODE_OPERATOR.get(token)
+    if op is not None:
+        return op, leaf.get("value")
+    from ba2_common.core.market_conditions import field_codes
+
+    return "==", float(field_codes(leaf["field"])[token])
+
+
+def _check_mode_gene(m, strat, base, gene, cid, domain):
+    """Follow a ``cond:<id>:mode`` gene to its destination: the emitted leaf's OPERATOR.
+
+    Every choice is followed, because a mode gene's domain is the whole contract: a live mode
+    that emitted the authored operator, or an ``off`` that left the leaf standing, would be a
+    gene the GA searches and the simulation cannot see -- the same defect as a value gene that
+    never arrives, one level up.
+    """
+    from ba2_common.core.rule_models import MODE_OFF
+
+    choices = list(domain["choices"])
+    live = [c for c in choices if c != MODE_OFF]
+    if MODE_OFF not in choices or not live:
+        return (f"{gene}: a mode gene's domain must be {MODE_OFF!r} plus at least one live "
+                f"mode; got {choices!r}")
+
+    ref = _decode_find(strat, base, gene, live[0], cid)
+    if ref is None:
+        return (f"{gene}: mode {live[0]!r} leaves no leaf {cid!r} in the decoded ruleset, so "
+                f"the gene selects between nothing")
+    sub_ns, ref_rule, ref_leaf = ref
+    ev = _event_type_for_field(ref_leaf["field"])
+    if ev is None:
+        return (f"{gene}: field {ref_leaf['field']!r} maps to no ExpertEventType, so the shared "
+                f"converter DROPS the leaf and every mode this gene picks reaches nothing")
+
+    seen = {}
+    for token in live:
+        hit = _decode_find(strat, base, gene, token, cid)
+        if hit is None:
+            return f"{gene}: mode {token!r} left no leaf {cid!r} in the decoded ruleset"
+        ns, rule, leaf = hit
+        want = _mode_expectation(token, leaf)
+        emitted = _exported_triggers(rule, ns, ev)
+        if not any(op == want[0] and _at_destination(want[1], val) for op, val in emitted):
+            return (f"{gene}={token!r} should emit a {ev} trigger {want!r} on rule "
+                    f"{rule.get('id')!r}; emitted {emitted!r}")
+        seen[token] = want
+    if len(set(seen.values())) != len(seen):
+        return (f"{gene}: two modes emit the SAME trigger {seen!r} -- the gene has choices the "
+                f"artefact cannot tell apart, so the GA is searching a distinction that does "
+                f"not exist")
+
+    # ...and OFF must REMOVE it: out of the tree, and one fewer trigger in the export.
+    if _decode_find(strat, base, gene, MODE_OFF, cid) is not None:
+        return (f"{gene}: mode {MODE_OFF!r} left leaf {cid!r} in the decoded ruleset; 'off' is "
+                f"the gene's only way to drop the gate")
+    from app.services.strategy_param_space import decode_params
+
+    off = decode_params(strat, dict(base, **{gene: MODE_OFF}))
+    off_rule = _rule_by_id(off[f"{sub_ns}_rules"], ref_rule.get("id"))
+    n_off = 0 if off_rule is None else len(_exported_triggers(off_rule, sub_ns, ev))
+    n_ref = len(_exported_triggers(ref_rule, sub_ns, ev))
+    if n_off != n_ref - 1:
+        return (f"{gene}: mode {MODE_OFF!r} should remove exactly one {ev} trigger from rule "
+                f"{ref_rule.get('id')!r} ({n_ref} -> {n_ref - 1}); the export carries {n_off}")
+    return None
+
+
 def _declared_settings(expert_name):
     """Every settings key this expert actually DECLARES -- its own definitions plus the shared
     ``MarketExpertInterface`` builtins (trading permissions, RM sizing, schedules).
@@ -392,6 +545,12 @@ def _at_destination(value, arrived):
 def _check_gene(m, key, expert, strat, base, gene, domain, screener):
     """Vary ONE gene to a sentinel and follow it to its destination. Returns a complaint or None."""
     from app.services.strategy_param_space import decode_params
+
+    # A MODE gene is not a value to find at a key -- it selects the leaf's OPERATOR, and 'off'
+    # selects no leaf at all. It gets its own follower, which visits EVERY choice rather than
+    # one sentinel.
+    if gene.startswith("cond:") and gene.rsplit(":", 1)[-1] == "mode":
+        return _check_mode_gene(m, strat, base, gene, gene.split(":", 2)[1], domain)
 
     taken = [v for g, v in base.items() if g != gene]
     probe = _sentinel(domain, taken)
@@ -532,10 +691,11 @@ def _authored_action(m, key, expert, rid, aidx):
     raise AssertionError(f"{key}: no template rule {rid!r}")
 
 
-@pytest.mark.parametrize("key,expert,screener", AUDIT_CASES,
+@pytest.mark.parametrize("key,expert,screener,profiles", AUDIT_CASES,
                          ids=[f"{k}|{e}{'|screener' if s else ''}"
-                              for k, e, s in AUDIT_CASES])
-def test_every_gene_lands_at_its_own_destination(key, expert, screener):
+                              f"{'|' + '+'.join(p) if p else ''}"
+                              for k, e, s, p in AUDIT_CASES])
+def test_every_gene_lands_at_its_own_destination(key, expert, screener, profiles):
     """CONDITIONAL DOMAINS, and why a failing gene gets a second look.
 
     A categorical gene selects which OTHER genes are read: under ``option_strike_method=delta``
@@ -546,6 +706,11 @@ def test_every_gene_lands_at_its_own_destination(key, expert, screener):
     retried under the first-choice base. A gene that lands under NEITHER is consumed nowhere at
     all, and that is the failure this test exists to catch."""
     m = _M
+    with _profiles(m, profiles):
+        _run_destination_audit(m, key, expert, screener)
+
+
+def _run_destination_audit(m, key, expert, screener):
     strat, space = _space(m, key, expert, screener)
     bases = [{g: _non_default(d, choice) for g, d in space.items()} for choice in (-1, 0)]
 
@@ -627,7 +792,12 @@ def test_the_case_list_is_exactly_what_the_launcher_tables_produce():
                                +  3 equity-entry/overlay keys (O_CC O_PP O_STK)
                                +  1 wheel (O_WHEEL)
                                = 29
-        cases = 29 x FMPRating + O_ERN|FMPEarningsEvent + O_LC|screener = 31
+        cases = 29 x FMPRating + O_ERN|FMPEarningsEvent + O_LC|screener
+                + O_LC|ohlcv-v1+ta-structure-v1 = 32
+
+    31 -> 32 on 2026-09-19: the market-condition profiles are the only shape that emits a
+    ``cond:<id>:mode`` gene for a MARKET leaf, and both profiles are selected in that one case
+    so the audit covers the numeric mode leaves and ``ta-structure-v1``'s categorical one.
 
     28 -> 29 on 2026-09-02 (plan Task 6): O_PMCC left _PHASE_GATED_OPTION_STRATEGIES once the
     two-expiry lifecycle it was gated behind landed, so it is now a launchable single and every
@@ -640,10 +810,16 @@ def test_the_case_list_is_exactly_what_the_launcher_tables_produce():
     assert len(OPTION_KEYS) == 29, (
         f"the launchable option-key set moved to {len(OPTION_KEYS)}: {OPTION_KEYS}. If that was "
         f"deliberate, update the arithmetic in this docstring in the same commit.")
-    assert len(AUDIT_CASES) == len(OPTION_KEYS) + 2
-    assert ("O_LEAP", "FMPRating", False) in AUDIT_CASES, "the merged LEAPS key must be audited"
-    assert ("O_ERN", "FMPEarningsEvent", False) in AUDIT_CASES
-    assert ("O_LC", "FMPRating", True) in AUDIT_CASES, "the screener genes must be audited"
+    assert len(AUDIT_CASES) == len(OPTION_KEYS) + 3
+    assert ("O_LEAP", "FMPRating", False, ()) in AUDIT_CASES, "the merged LEAPS key must be audited"
+    assert ("O_ERN", "FMPEarningsEvent", False, ()) in AUDIT_CASES
+    assert ("O_LC", "FMPRating", True, ()) in AUDIT_CASES, "the screener genes must be audited"
+    assert ("O_LC", "FMPRating", False, _ALL_PROFILES) in AUDIT_CASES, (
+        "the market-condition mode genes must be audited")
+    from ba2_common.core.market_conditions import PROFILES
+    assert set(_ALL_PROFILES) == set(PROFILES), (
+        f"a profile was registered or removed: {sorted(PROFILES)}. The profiled case must "
+        f"select every one of them, or its mode leaves go unaudited.")
 
 
 def test_the_screener_case_actually_emits_screener_genes():

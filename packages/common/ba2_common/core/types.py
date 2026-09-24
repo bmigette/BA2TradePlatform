@@ -298,6 +298,60 @@ class BrokerOrderErrorReason(str, Enum):
     UNAUTHORIZED = "unauthorized"
     UNKNOWN = "unknown"                              # unmapped — broker message kept verbatim
 
+class OptionCloseReason(str, Enum):
+    """WHY an option leg / structure was closed -- the ONE vocabulary both runtimes record
+    (BT/live option parity, plan Part C3).
+
+    Written into ``TradingOrder.data["exit_record"]["trigger"]`` on every option closing order
+    and into ``Transaction.close_reason`` wherever an OPTION-specific path closes the
+    transaction (expiry / assignment / exercise / forced liquidation), identically in the
+    backtest and live. The backtest's option trade rows take their ``exit_reason`` from it
+    (never from a price-proximity guess).
+
+    Rule-fired closes (``CloseOptionAction``) are classified from the firing rule's TRIGGER
+    SEMANTICS by ``TradeActionEvaluator.option_close_trigger`` -- never from the rule's name.
+    """
+    #: A profit-side rule threshold (``profit_loss_* >``, ``profit_multiple_of_premium >=``,
+    #: ``credit_decayed_pct >=``), or the live lifecycle's ``profit_capture``.
+    TAKE_PROFIT = "take_profit"
+    #: A loss-side rule threshold (the ``_LOSS_SIDE_STOP_OPERATORS`` table), or the live
+    #: lifecycle's ``credit_stop``.
+    STOP_LOSS = "stop_loss"
+    #: An ELAPSED-time rule (``days_opened``, ``days_after_event``).
+    TIME_EXIT = "time_exit"
+    #: A REMAINING-life rule (``days_to_expiry`` / ``short_leg_days_to_expiry`` /
+    #: ``covered_call_days_to_expiry``).
+    DTE_EXIT = "dte_exit"
+    #: A rule whose triggers are none of the above (sentiment, rating, delta, ...). This
+    #: includes the PMCC's ``pmcc_delta_floor`` (``long_leg_delta <``): a PROTECTIVE exit that
+    #: flattens the structure once the long leg stops behaving like stock -- not a P&L stop and
+    #: not a schedule, so it is deliberately not folded into ``stop_loss``. The launcher's
+    #: emitted close rules are pinned to their reasons by
+    #: ``testplatform/backend/tests/test_option_close_trigger_classifier_covers_grid_rules.py``.
+    RULE_EXIT = "rule_exit"
+    #: The leg was bought back by an overlay ROLL (``roll_pmcc_short``).
+    ROLL = "roll"
+    #: Expired out of the money (live: the OCC's OPEXP activity).
+    EXPIRED_OTM = "expired_otm"
+    #: A SHORT leg assigned at expiry (live: OPASN).
+    ASSIGNED = "assigned"
+    #: A LONG leg in the money at expiry (live: OPEXC). The backtest settles it at its
+    #: premium / intrinsic instead of delivering shares (its documented no-orphaned-stock
+    #: policy, ``BacktestAccount.settle_single_leg_expiry``); the EVENT is the same.
+    EXERCISED = "exercised"
+    #: Bought back by the account's margin-call liquidation.
+    FORCED_LIQUIDATION = "forced_liquidation"
+    #: A close no rule fired: ``CloseOptionAction`` constructed outside the rule evaluator
+    #: (an operator script, a manual action).
+    MANUAL = "manual"
+    #: LIVE lifecycle pass only (``option_lifecycle.decide``), each its own risk mechanism
+    #: rather than a rule threshold: the tested short, the sleeve circuit breaker, and a
+    #: covered call whose shares are gone.
+    TESTED = "tested"
+    CIRCUIT_BREAKER = "circuit_breaker"
+    COVER_LOST = "cover_lost"
+
+
 class OrderOpenType(str, Enum):
     MANUAL = "manual"
     AUTOMATIC = "automatic"
@@ -413,6 +467,26 @@ class ExpertEventType(str, Enum):
     N_DAYS_SINCE_LAST_PROFITABLE_CLOSE = "days_since_last_profitable_close"
     N_DAYS_SINCE_LAST_LOSING_CLOSE = "days_since_last_losing_close"
     N_CONFIDENCE = "confidence"
+    # THE EXPERT'S DIRECTION CALL AS A SIGNED NUMBER, so a rule can gate on it with an
+    # ORDERING rather than with one of the three ``bullish``/``bearish``/
+    # ``current_rating_neutral`` boolean flags. Ordinal, centred on HOLD and derived from the
+    # SAME 5-grade scale the rating-change events use (TradeConditions._RATING_RANK, shifted
+    # so HOLD == 0): SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2.
+    #
+    # WHY A NUMBER AND NOT THE FLAGS. A flag leaf can only be switched OFF; the FIELD is
+    # authored and fixed, so "long calls, but on the SELL signal" (the contrarian arm) was
+    # not expressible at all. A numeric leaf carries a MODE gene whose three choices are
+    # exactly off / below / above, so with the threshold pinned at 0 one gene says
+    # "bullish only" (> 0), "bearish only" (< 0) or "no direction filter" (off) -- and it
+    # REPLACES the flag's on/off gene, so the direction becomes searchable at zero net gene
+    # cost (testplatform/ba2test_launcher.py::_option_entry_rule).
+    #
+    # ERROR (and any grade absent from the scale) is UNEVALUABLE -- it fires in NEITHER
+    # direction, exactly like rec_days_to_earnings with no stamp. Mapping it to 0 would read
+    # as HOLD, i.e. an expert that FAILED would look like an expert with no view, and a
+    # `< 0` gate would silently admit nothing while a `> 0` gate silently admitted nothing
+    # either -- the failure would be invisible rather than refused.
+    N_REC_DIRECTION = "rec_direction"
     N_INSTRUMENT_ACCOUNT_SHARE = "instrument_account_share"    # Current instrument value as % of expert virtual equity
     N_PERCENT_OPEN_TO_NEW_TARGET = "percent_open_to_new_target"  # Distance from open price to new expert target as %
     # Option-related numeric events

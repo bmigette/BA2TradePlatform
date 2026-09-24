@@ -7,7 +7,7 @@ Guidance for AI coding agents working in this repository. Read this before makin
 **BA2 Trade Platform** is a Python-based algorithmic trading monorepo. It contains two applications and three shared libraries:
 
 - **Live trading app** (`ba2_trade_platform/`, package `ba2trade-app`): AI-driven market analysis, multi-agent trading strategies (LLM-based), and a plugin architecture for broker accounts and market experts. Built with SQLModel ORM (SQLite), NiceGUI web interface, and a vendored copy of the TradingAgents multi-agent LLM framework.
-- **Test/backtest app** (`testplatform/`, package `ba2test-app`): "BA2ML" — dataset builder, deep-learning model trainer (genetic-optimization driven), and strategy backtester. FastAPI backend + React/TypeScript frontend.
+- **Test/backtest app** (`testplatform/`, package `ba2test-app`, command `ba2-test`): the backtesting and genetic-optimization platform for the experts, with distributed GA workers and a deep-learning forecasting module (datasets, model training). FastAPI backend + React/TypeScript frontend.
 - **Shared libraries** (`packages/`): `ba2_common` (interfaces, types, models, ruleset engine, risk/sizing), `ba2_providers` (market data providers), `ba2_experts` (the "clean" experts). Both apps consume these.
 
 The project is in **alpha**; APIs and DB schema change without notice. All work happens on the `dev` branch. The 4 former sibling repos (BA2TradeCommon/Providers/Experts, BA2TestPlatform) are frozen archives — do not reference or push to them; the packages now live in-tree under `packages/` (see `MIGRATION.md`).
@@ -176,7 +176,7 @@ These are enforced project idioms from `CLAUDE.md` — follow them exactly:
 ## Security Considerations
 
 - **This software trades real money.** It is alpha/experimental; always test against paper-trading accounts first. Never bypass risk limits, position-sizing rules, or approval flows.
-- **Secrets**: API keys (OpenAI, Finnhub, Alpha Vantage, Alpaca, FMP, ...) come from `.env` (see `.env.example`) or, mostly, the web UI Settings page (stored in the `AppSetting` DB table). Never hardcode keys, never log them, never commit `.env` or `creds.env`.
+- **Secrets**: API keys (OpenAI, Finnhub, Alpha Vantage, Alpaca, FMP, ...) are entered on each app's web UI Settings page and stored in that app's DB (`AppSetting` table); some test-platform scripts also read them from environment variables or a local, untracked `.env`. Never hardcode keys, never log them, never commit `.env` or `creds.env`.
 - **No silent fallbacks for money-related values** (see conventions) — fail loud instead of trading on fabricated data.
 - The Docker image runs as a non-root user (`trader`); keep it that way.
 - The NiceGUI `STORAGE_SECRET` in `config.py` is a placeholder default for session storage — override it for any real deployment.

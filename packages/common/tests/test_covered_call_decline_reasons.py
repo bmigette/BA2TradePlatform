@@ -83,6 +83,9 @@ def _action(monkeypatch, *, supports=True, held=200.0, chain=(), contract=..., b
     a.strike_param = 5.0
     a.dte_min, a.dte_max = 25, 45
     a.selection_policy = None
+    # The one account read on the sizing path: equity-book shares per as-traded share
+    # (plan Part E3). 1.0 is every live broker's answer.
+    a.account = SimpleNamespace(equity_shares_per_option_share=lambda u: 1.0)
 
     monkeypatch.setattr(a, "_supports_options", lambda: supports, raising=False)
     monkeypatch.setattr(a, "_held_equity_shares", lambda: held, raising=False)

@@ -914,10 +914,11 @@ def coverage_detail(mapped: Any, missing: Any) -> str:
 # every decision date reports ``missing_session``, every gated entry is refused, and the GA
 # scores that suppression as strategy behaviour (review 2026-09-16 finding F1, reproduced).
 #
-# So the pin is validated against the run's DECISION WINDOW before dispatch. For a decision on
-# session D the reader asks for ``prior_regular_session(D)`` (timing policy ``prior_session_v1``),
-# so a window ``[start, end]`` requires the feature sessions from ``prior(first session >= start)``
-# to ``prior(last session <= end)`` inclusive -- a contiguous run of regular sessions.
+# So the pin is validated against the run's BACKTEST WINDOW before dispatch. Bar D is the live
+# decision labelled ``backtest_decision_label(D)``, which reads ``decision_data_session`` of it --
+# D itself -- so a window of bars needs exactly its own sessions' rows. ``window_start``/``end``
+# are the dates the snapshot was warmed FOR; the rows actually held are checked per symbol from
+# the coverage record, so a snapshot whose rows stop short is refused, never silently read.
 #
 # WHAT IS A FAULT AND WHAT IS A LEGITIMATE UNKNOWN. The warmup writes a row for EVERY session of
 # the window it was built for, carrying a status; a row it could not compute is an explicit
@@ -990,7 +991,8 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
     Empty list = it does. Each string is one symbol's (or the pin's) fault, phrased for an
     operator reading a launch refusal. ``mapped`` is a :class:`MappedMarketConditionReader`
     (``None`` -> research mode with no pin, nothing to compare to); ``universe`` the run's
-    instruments; ``start``/``end`` its DECISION dates (date/datetime/ISO string).
+    instruments; ``start``/``end`` its BACKTEST BAR window (date/datetime/ISO string) -- the
+    run config's ``start_date``/``end_date``.
 
     Symbols the snapshot has no rows for at all are NOT reported here -- that is
     :func:`missing_coverage`'s answer, and reporting it twice would name the same symbol in two
@@ -1021,7 +1023,9 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
 
 def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
                               first: date, last: date) -> List[str]:
-    from ba2_common.core.market_calendar import prior_regular_session, regular_session_dates
+    from ba2_common.core.market_calendar import (
+        backtest_decision_label, decision_data_session, regular_session_dates,
+    )
 
     digest = _bare(str(getattr(mapped, "manifest_digest", "?")))
     manifest = getattr(mapped, "manifest", None)
@@ -1031,22 +1035,23 @@ def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
         return [f"market-condition snapshot {digest} cannot report the sessions it covers "
                 f"({type(mapped).__name__} carries no manifest), so the pin cannot be checked "
                 f"against this run's window."]
-    decisions = regular_session_dates(first, last)
-    if not decisions:
+    bars = regular_session_dates(first, last)
+    if not bars:
         return [f"the run's window {first}..{last} contains no regular NYSE session, so no "
                 f"market-condition observation is defined anywhere in it."]
-    want_first = prior_regular_session(decisions[0])
-    want_last = prior_regular_session(decisions[-1])
+    # The row each end bar reads, through the ONE decision-session rule (== the bar itself).
+    want_first = decision_data_session(backtest_decision_label(bars[0]))
+    want_last = decision_data_session(backtest_decision_label(bars[-1]))
     required = regular_session_dates(want_first, want_last)
 
     problems: List[str] = []
     pin_first = _opt_date(manifest.get("window_start"))
     pin_last = _opt_date(manifest.get("window_end"))
     if pin_first is not None and pin_last is not None \
-            and (decisions[0] < pin_first or decisions[-1] > pin_last):
+            and (bars[0] < pin_first or bars[-1] > pin_last):
         # ONE message, and no per-symbol noise after it: the pin is for another experiment.
-        return [f"market-condition snapshot {digest} was built for decision dates "
-                f"{pin_first}..{pin_last}; this run decides on {decisions[0]}..{decisions[-1]}, "
+        return [f"market-condition snapshot {digest} was built for decision/bar dates "
+                f"{pin_first}..{pin_last}; this run's backtest bars are {bars[0]}..{bars[-1]}, "
                 f"which it does not cover. Every gate outside the snapshot's window reads "
                 f"missing_session, so every gated entry would be refused for a cache reason and "
                 f"the search would score that as strategy behaviour. Pin (or warm) a snapshot "
@@ -1098,7 +1103,7 @@ def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
             more = f", and {len(holes) - 6} more month(s)" if len(holes) > 6 else ""
             problems.append(
                 f"{symbol}: the snapshot has no row at all for part of this run's window "
-                f"({shown}{more}) -- those decision dates would read missing_session")
+                f"({shown}{more}) -- those backtest bars would read missing_session")
             continue
         problems.extend(_status_problems(symbol, record, want_first, want_last))
     if len(problems) > WINDOW_PROBLEM_NAMES:

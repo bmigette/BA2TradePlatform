@@ -1,35 +1,33 @@
-# Documentation
+# Test platform documentation
 
-This folder contains all project documentation.
+Documents for `ba2-test`, the backtesting and GA-optimization platform. Start with the
+[test platform README](../README.md) (install, run, pages, CLI, API) and the
+[Quick Start](../QUICK_START.md). Dated documents record a plan or finding at that date and
+are not kept up to date afterwards.
 
-## Structure
+## Living references
 
-```
-docs/
-├── README.md               # This file
-├── feature_list.json       # Complete list of implemented features (229/231)
-├── implementation/         # Development session notes and progress
-│   ├── SESSION_*_HANDOFF.md   # Individual session summaries
-│   └── claude-progress.txt     # Detailed progress log
-└── spec/                   # Project specifications
-    ├── app_spec.txt           # Original application specification
-    └── test_export_manually.md # Manual testing notes
-```
+- [grid-and-fitness-guide.md](grid-and-fitness-guide.md) — launching and resuming the cap-band optimization grid, every fitness metric and knob, filtering results
+- [robustness-suite.md](robustness-suite.md) — Monte Carlo and schedule-perturbation robustness tests on a saved backtest
+- [daily-expert-backtest-scope.md](daily-expert-backtest-scope.md) — scope, guardrails and caveats of the daily expert backtest engine
+- [exit-ruleset-ui-requirements.md](exit-ruleset-ui-requirements.md) — requirements for editing and optimizing open-positions exit rulesets in the UI
 
-## Feature Status
+## Plans and analyses (dated)
 
-Current feature implementation: **229/231 (99.1%)**
+- [optimization-plan-2026-06.md](optimization-plan-2026-06.md) and [optimization-jobs-plan-2026-06-17.md](optimization-jobs-plan-2026-06-17.md) — the June 2026 expert-optimization plan and job list
+- [2026-06-17-5min-optimization-grid-analysis.md](2026-06-17-5min-optimization-grid-analysis.md) — tests and performance of the 5-minute optimization grid
+- [2026-06-13-phase5-ohlcv-resource-cutover.md](2026-06-13-phase5-ohlcv-resource-cutover.md) — the `OHLCV_SOURCE` flag for re-sourcing ML datasets through the shared cache
+- [superpowers/](superpowers/) — designs (`specs/`) and implementation plans (`plans/`) for the backtest interface rework, options backtests, the exit-ruleset UI and screener-settings optimization
+- [plans/](plans/) — deep-learning module plans (prediction targets, classification/regression jobs, multi-dataset training), OHLCV date ranges with the news batch fetch, and the original backtest strategy builder
 
-See `feature_list.json` for the complete breakdown of all features and their status.
+## Data
 
-### Remaining Features (Need API Keys)
-1. Polygon.io OHLCV Provider - Requires `POLYGON_API_KEY`
-2. EODHD OHLCV Provider - Requires `EODHD_API_KEY`
+- [live_rulesets/](live_rulesets/) — live-platform rulesets exported per expert by `backend/scripts/export_live_rulesets.py`, used as optimization starting points
+- [screenshots/](screenshots/) — images used by the test platform README
 
-## Quick Links
+## Historical
 
-- [Main README](../README.md) - Project overview and setup
-- [Quick Start](../QUICK_START.md) - Getting started guide
-- [Tests](../tests/README.md) - Running tests
-- [Backend](../backend/) - FastAPI backend
-- [Frontend](../frontend/) - React frontend
+The test platform began as a standalone deep-learning forecasting app built over many agent
+sessions. Its original specification (`spec/`), feature checklist (`feature_list.json`) and
+session hand-offs (`implementation/`) are kept for the record; they do not describe the
+current platform.

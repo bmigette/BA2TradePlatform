@@ -95,9 +95,9 @@ ba2_trade_platform/
 > **Phase 6 packages (source of truth for shared code).** As of the Phase 6
 > migration, the *implementation* of most pure/shared code under
 > `ba2_trade_platform/core`, `modules/dataproviders`, and `modules/experts` now
-> lives in three installable sibling packages — `ba2_common`
-> (`BA2TradeCommon`), `ba2_providers` (`BA2TradeProviders`), and `ba2_experts`
-> (`BA2TradeExperts`). The matching in-tree modules are now thin **re-export
+> lives in three installable in-repo packages — `ba2_common`
+> (`packages/common`), `ba2_providers` (`packages/providers`), and `ba2_experts`
+> (`packages/experts`). The matching in-tree modules are now thin **re-export
 > shims** (e.g. `core/types.py`, `core/db.py`, `core/position_sizing.py`,
 > `core/TradeConditions.py`, the `core/interfaces/*`, the non-AI data providers,
 > and the clean experts), so every existing `from ba2_trade_platform...` import
@@ -116,7 +116,7 @@ ba2_trade_platform/
 > classic-RM ATR indicator provider.
 
 ### Database
-- SQLite at `~/Documents/ba2_trade_platform/db.sqlite`
+- SQLite at `~/Documents/ba2/trade/db.sqlite` (under `BA2_HOME`; override with `--db-file`)
 - Key models: `AccountDefinition`, `ExpertInstance`, `ExpertRecommendation`, `MarketAnalysis`, `TradingOrder`, `Transaction`, `Ruleset`, `EventAction`
 
 ### TradingAgents Framework

@@ -118,7 +118,8 @@ def provider(store_root):
 
 
 def _wide(p, as_of):
-    return p.get_chain(_UNDER, as_of, expiry_min=date(2023, 1, 1), expiry_max=date(2023, 12, 31))
+    return p.get_chain(_UNDER, as_of, expiry_min=date(2023, 1, 1), expiry_max=date(2023, 12, 31),
+                       data_session=as_of)
 
 
 # --------------------------------------------------------------------------- #
@@ -188,8 +189,8 @@ def test_get_bar_matches_the_sqlite_backend_exact_date_semantics(provider, tmp_p
 
 
 def test_get_quote_is_exact_date_and_never_leaks_forward(provider):
-    assert provider.get_quote(_C100, date(2023, 1, 6)) is None
-    q = provider.get_quote(_C100, date(2023, 1, 5))
+    assert provider.get_quote(_C100, date(2023, 1, 6), data_session=date(2023, 1, 6)) is None
+    q = provider.get_quote(_C100, date(2023, 1, 5), data_session=date(2023, 1, 5))
     assert (q.bid, q.ask, q.last) == pytest.approx((6.2, 6.2, 6.2))
 
 
@@ -290,18 +291,22 @@ def test_bar_dict_is_built_once_per_row(provider):
 def test_chain_filters(provider):
     d = date(2023, 1, 10)
     calls = provider.get_chain(_UNDER, d, expiry_min=date(2023, 1, 1),
-                               expiry_max=date(2023, 12, 31), option_type=OptionRight.CALL)
+                               expiry_max=date(2023, 12, 31), option_type=OptionRight.CALL,
+                               data_session=d)
     assert {c.symbol for c in calls} == {_C100, _C110}
-    near = provider.get_chain(_UNDER, d, expiry_min=date(2023, 1, 1), expiry_max=date(2023, 1, 31))
+    near = provider.get_chain(_UNDER, d, expiry_min=date(2023, 1, 1), expiry_max=date(2023, 1, 31),
+                              data_session=d)
     assert {c.symbol for c in near} == {_C100, _P100}
     banded = provider.get_chain(_UNDER, d, expiry_min=date(2023, 1, 1),
-                                expiry_max=date(2023, 12, 31), strike_min=105.0)
+                                expiry_max=date(2023, 12, 31), strike_min=105.0,
+                                data_session=d)
     assert {c.symbol for c in banded} == {_C110}
 
 
 def test_unknown_underlying_is_an_empty_chain_not_a_crash(provider):
     assert provider.get_chain("NOPE", date(2023, 1, 10), expiry_min=date(2023, 1, 1),
-                              expiry_max=date(2023, 12, 31)) == []
+                              expiry_max=date(2023, 12, 31),
+                              data_session=date(2023, 1, 10)) == []
     assert provider.get_atm_iv("NOPE", date(2023, 1, 10)) is None
     assert provider.get_bar("NOPE230120C00100000", date(2023, 1, 10)) is None
 
@@ -400,7 +405,7 @@ def test_underlying_cache_is_lru_bounded(monkeypatch, store_root):
                                   spot_scope="test")
     _wide(p, date(2023, 1, 10))
     p.get_chain("OTHER", date(2023, 1, 10), expiry_min=date(2023, 1, 1),
-                expiry_max=date(2023, 12, 31))
+                expiry_max=date(2023, 12, 31), data_session=date(2023, 1, 10))
     assert len(pq._WORKER_UNDERLYING_CACHE) <= 1
     assert len(pq._WORKER_RAW_CACHE) <= 1
 
@@ -538,7 +543,7 @@ def test_real_store_serves_a_plausible_2023_chain(monkeypatch):
         p = ParquetOptionsProvider(root, spot_source=lambda s, d: 90.0,
                                    risk_free_rate=_RATE, spot_scope="real-store-probe")
         chain = p.get_chain("GOOG", date(2023, 1, 17), expiry_min=date(2023, 2, 1),
-                            expiry_max=date(2023, 3, 31))
+                            expiry_max=date(2023, 3, 31), data_session=date(2023, 1, 17))
         assert len(chain) > 50
         assert len({c.expiry for c in chain}) >= 4
         assert all(date(2023, 2, 1) <= c.expiry <= date(2023, 3, 31) for c in chain)
@@ -693,7 +698,7 @@ def test_an_underlying_with_no_partitions_warns(caplog, provider):
     clear_worker_parquet_options_cache()
     with caplog.at_level(logging.WARNING, logger=pq.__name__):
         provider.get_chain("NOPE", date(2023, 1, 10), expiry_min=date(2023, 1, 1),
-                           expiry_max=date(2023, 12, 31))
+                           expiry_max=date(2023, 12, 31), data_session=date(2023, 1, 10))
     assert any("NO partitions for NOPE" in r.getMessage() for r in caplog.records)
 
 
@@ -736,7 +741,8 @@ def test_a_store_with_quotes_serves_the_real_bid_ask_not_the_close_proxy(quoted_
                                risk_free_rate=_RATE, spot_scope="test")
     row = {c.symbol: c for c in p.get_chain(_UNDER, date(2023, 1, 3),
                                             expiry_min=date(2023, 1, 1),
-                                            expiry_max=date(2023, 12, 31))}[_C100]
+                                            expiry_max=date(2023, 12, 31),
+                                            data_session=date(2023, 1, 3))}[_C100]
     assert row.bid == pytest.approx(5.10)
     assert row.ask == pytest.approx(5.30)
     assert row.bid != row.ask, "a real spread, not the zero-spread proxy"
@@ -751,7 +757,8 @@ def test_a_no_trade_day_is_marked_at_the_quote_not_at_zero(quoted_store_root):
                                risk_free_rate=_RATE, spot_scope="test")
     row = {c.symbol: c for c in p.get_chain(_UNDER, date(2023, 1, 5),
                                             expiry_min=date(2023, 1, 1),
-                                            expiry_max=date(2023, 12, 31))}[_C100]
+                                            expiry_max=date(2023, 12, 31),
+                                            data_session=date(2023, 1, 5))}[_C100]
     assert row.bid == pytest.approx(55.10) and row.ask == pytest.approx(56.20)
     assert row.mid == pytest.approx(55.65)
     assert row.last is None, "there was no trade, so there is no last price"
@@ -760,7 +767,7 @@ def test_a_no_trade_day_is_marked_at_the_quote_not_at_zero(quoted_store_root):
     bar = p.get_bar(_C100, date(2023, 1, 5))
     assert bar["close"] is None, "a no-trade day must not report a 0.0 close"
 
-    q = p.get_quote(_C100, date(2023, 1, 5))
+    q = p.get_quote(_C100, date(2023, 1, 5), data_session=date(2023, 1, 5))
     assert (q.bid, q.ask) == (pytest.approx(55.10), pytest.approx(56.20)), (
         "get_quote and get_chain must price identically (options_provider bug B4)")
 
@@ -1025,7 +1032,7 @@ def test_shared_and_private_paths_are_bit_identical(root_fixture, request, monke
         p = ParquetOptionsProvider(root, spot_source=_spot_source, risk_free_rate=_RATE,
                                    spot_scope="parity")
         chain = sorted(p.get_chain(_UNDER, as_of, expiry_min=date(2023, 1, 1),
-                                   expiry_max=date(2023, 12, 31)),
+                                   expiry_max=date(2023, 12, 31), data_session=as_of),
                        key=lambda c: c.symbol)
         raw = pq._raw_underlying(root, _UNDER)
         raws[flag] = raw
@@ -1121,7 +1128,7 @@ def test_a_reserved_device_name_ticker_is_still_readable(symbol, tmp_path, monke
     p = ParquetOptionsProvider(root, spot_source=_spot_source, risk_free_rate=_RATE,
                                spot_scope="reserved-name")
     chain = p.get_chain(symbol, date(2023, 1, 3), expiry_min=date(2023, 1, 1),
-                        expiry_max=date(2023, 12, 31))
+                        expiry_max=date(2023, 12, 31), data_session=date(2023, 1, 3))
     assert [c.symbol for c in chain] == [occ]
     assert p.get_bar(occ, date(2023, 1, 3))["close"] == pytest.approx(5.2)
 
@@ -1156,7 +1163,7 @@ def test_a_reserved_device_name_ticker_is_still_readable(symbol, tmp_path, monke
 # recomputes byte-identically, because every input is immutable for the life of the overlay),
 # and it is actually bounded.
 # --------------------------------------------------------------------------- #
-_GREEK_KEYS = ("iv", "delta", "gamma", "theta", "vega")
+_GREEK_KEYS = ("iv", "delta", "gamma", "theta", "vega", "rho")
 
 
 def _overlay(root, rate=_RATE, scope="test", underlying=_UNDER):
@@ -1406,7 +1413,7 @@ def _read_everything(p, dates=(date(2023, 1, 3), date(2023, 1, 5), date(2023, 1,
         for occ in (_C100, _P100, _C110):
             bar = p.get_bar(occ, as_of)
             out.append((occ, None if bar is None else tuple(sorted(bar.items(), key=str))))
-            q = p.get_quote(occ, as_of)
+            q = p.get_quote(occ, as_of, data_session=as_of)
             out.append((occ, None if q is None else (q.bid, q.ask)))
             out.append((occ, p.delta_at_entry(_UNDER, occ, as_of)))
     return out
@@ -1738,3 +1745,22 @@ def test_a_cap_of_zero_memoises_nothing_and_still_answers(store_root, monkeypatc
     assert _read_everything(
         ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
                                spot_scope="cap-roomy")) == got
+
+
+# --------------------------------------------------------------------------- #
+# plan Part F1: the bar dict carries the as-of NBBO the fill's spread is read from
+# --------------------------------------------------------------------------- #
+def test_a_quoted_stores_bar_dict_carries_its_real_bid_ask(quoted_store_root):
+    p = ParquetOptionsProvider(quoted_store_root, spot_source=_spot_source,
+                               risk_free_rate=_RATE, spot_scope="test")
+    bar = p.get_bar(_C100, date(2023, 1, 3))
+    assert (bar["bid"], bar["ask"]) == (pytest.approx(5.10), pytest.approx(5.30))
+    quote_only = p.get_bar(_C100, date(2023, 1, 5))
+    assert (quote_only["bid"], quote_only["ask"]) == (pytest.approx(55.10), pytest.approx(56.20))
+
+
+def test_an_unquoted_stores_bar_dict_has_no_bid_ask(provider):
+    """No quote is None -- never the close proxy the CHAIN uses (a proxy would be a zero spread,
+    and the fill would then be charged nothing)."""
+    bar = provider.get_bar(_C100, date(2023, 1, 10))
+    assert bar["bid"] is None and bar["ask"] is None

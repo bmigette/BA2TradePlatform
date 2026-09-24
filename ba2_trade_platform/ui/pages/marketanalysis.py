@@ -21,6 +21,7 @@ from ..account_filter_context import get_selected_account_id, get_expert_ids_for
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
 from sqlmodel import select, func, distinct
+from ..components.refresh_button import refresh_button
 
 
 # =============================================================================================
@@ -91,7 +92,10 @@ def classic_run_detail_columns() -> list:
          'align': 'left', 'style': 'width: 120px'},
         {'name': 'weight', 'label': 'Weight', 'field': 'weight',
          'align': 'right', 'style': 'width: 70px'},
-        {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
+        # A FLOOR, not a width: on a narrow screen the table scrolls sideways inside the
+        # card rather than squeezing the one column written in sentences.
+        {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left',
+         'style': 'min-width: 320px', 'headerStyle': 'min-width: 320px'},
     ]
 
 
@@ -509,7 +513,7 @@ class JobMonitoringTab:
                         options=recommendation_options,
                         value='all',
                         label='Recommendation'
-                    ).classes('w-40')
+                    ).classes('w-44')
                     self.recommendation_select.on_value_change(self._on_recommendation_filter_change)
                     
                     # Symbol filter
@@ -520,8 +524,8 @@ class JobMonitoringTab:
                     self.symbol_input.on_value_change(self._on_symbol_filter_change)
                 
                 with ui.row().classes('gap-2'):
-                    ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
-                    ui.button('Refresh', on_click=self._start_async_refresh, icon='refresh')
+                    ui.button('Clear Filters', on_click=self._clear_filters, icon='clear').props('outline')
+                    refresh_button(self._start_async_refresh)
                     with ui.switch('Auto-refresh', value=True) as auto_refresh:
                         auto_refresh.on_value_change(self.toggle_auto_refresh)
             
@@ -720,7 +724,7 @@ class JobMonitoringTab:
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('Risk Manager Runs').classes('text-md font-bold')
-                ui.button('Refresh', on_click=self.refresh_smart_risk_data, icon='refresh').props('flat dense')
+                refresh_button(self.refresh_smart_risk_data, dense=True)
             
             # Filters row
             with ui.row().classes('w-full gap-4 mb-4'):
@@ -1202,7 +1206,10 @@ class JobMonitoringTab:
             ui.notify(f"Risk manager run {run_id} not found", type='negative')
             return
 
-        with ui.dialog() as dialog, ui.card().classes('w-full max-w-5xl'):
+        # WIDE, like the other working dialogs (Settings' 90vw). Ten fixed-width columns
+        # add up to 1000px, so at the old max-w-5xl (1024px) REASON -- the column the
+        # refusals are explained in -- got the ~70px left over and wrapped a word per line.
+        with ui.dialog() as dialog, ui.card().classes('w-full').style('width: 95vw; max-width: 1600px'):
             with ui.row().classes('w-full justify-between items-center'):
                 ui.label(f'{"Classic" if run.mode == "classic" else "Options"} Risk Manager '
                          f'— run {run.id}').classes('text-h6')
@@ -1304,7 +1311,7 @@ class JobMonitoringTab:
                     options=page_size_options,
                     value=str(self.smart_risk_page_size),
                     label='Page Size'
-                ).classes('w-32')
+                ).classes('w-36')
                 page_size_select.on_value_change(self._on_smart_risk_page_size_change)
     
     def _change_smart_risk_page(self, new_page: int):
@@ -1549,7 +1556,7 @@ class JobMonitoringTab:
             with ui.card().classes('w-full'):
                 with ui.row().classes('w-full justify-between items-center mb-2'):
                     ui.label('Queued Tasks (In-Memory Worker Queue)').classes('text-md font-bold')
-                    ui.button('Refresh', on_click=self._refresh_queued_tasks_table, icon='refresh').props('flat dense')
+                    refresh_button(self._refresh_queued_tasks_table, dense=True)
                 
                 queued_tasks_data = self._get_queued_tasks_data()
                 
@@ -2107,7 +2114,7 @@ class JobMonitoringTab:
                     options=page_size_options,
                     value=str(self.page_size),
                     label='Page Size'
-                ).classes('w-32')
+                ).classes('w-36')
                 page_size_select.on_value_change(self._on_page_size_change)
     
     def _change_page(self, new_page: int):
@@ -3263,15 +3270,15 @@ class ScheduledJobsTab:
                         options=page_size_options,
                         value=self.page_size,
                         label='Rows per page'
-                    ).classes('w-32')
+                    ).classes('w-40')
                     self.page_size_select.on_value_change(self._on_page_size_change)
                     
                     # Text filter
                     self.filter_input = ui.input('Search', placeholder='Filter by symbol...').props('stack-label').classes('w-40')
                 
                 with ui.row().classes('gap-2'):
-                    ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
-                    ui.button('Refresh', on_click=self._start_async_refresh, icon='refresh')
+                    ui.button('Clear Filters', on_click=self._clear_filters, icon='clear').props('outline')
+                    refresh_button(self._start_async_refresh)
                     with ui.switch('Auto-refresh', value=True) as auto_refresh:
                         auto_refresh.on_value_change(self.toggle_auto_refresh)
             
@@ -3934,7 +3941,7 @@ class ScheduledJobsTab:
                     options=page_size_options,
                     value=str(self.page_size),
                     label='Page Size'
-                ).classes('w-32')
+                ).classes('w-36')
                 page_size_select.on_value_change(self._on_page_size_change)
     
     def _change_page(self, new_page: int):
@@ -4135,7 +4142,7 @@ class OrderRecommendationsTab:
             # Controls Row 1: Action Buttons
             with ui.row().classes('w-full justify-between items-center mb-2 gap-4'):
                 with ui.row().classes('items-center gap-2'):
-                    ui.button('Refresh', on_click=self.refresh_data).props('color=primary outline')
+                    refresh_button(self.refresh_data)
                     
                     ui.button(
                         'Process Recommendations', 
@@ -4157,14 +4164,14 @@ class OrderRecommendationsTab:
                     options=expert_options,
                     label='Expert Filter',
                     value='all'  # Default to 'all'
-                ).classes('w-44').props('dense outlined')
+                ).classes('w-44')
                 self.expert_select.on_value_change(self._on_expert_filter_change)
                 
                 # Symbol search filter
                 self.symbol_search = ui.input(
                     label='Symbol',
                     placeholder='Filter by symbol...'
-                ).classes('w-36').props('dense outlined')
+                ).classes('w-40').props('stack-label')
                 self.symbol_search.on_value_change(lambda: self.refresh_data())
                 
                 # Action filter
@@ -4172,7 +4179,7 @@ class OrderRecommendationsTab:
                     options=['All', 'BUY', 'OVERWEIGHT', 'HOLD', 'UNDERWEIGHT', 'SELL'],
                     label='Action',
                     value='All'
-                ).classes('w-28').props('dense outlined')
+                ).classes('w-28')
                 self.action_filter.on_value_change(lambda: self.refresh_data())
                 
                 # Show/Hide filter for orders
@@ -4180,7 +4187,7 @@ class OrderRecommendationsTab:
                     options=['All', 'With Orders', 'Without Orders'],
                     label='Order Status',
                     value='All'
-                ).classes('w-44').props('dense outlined')
+                ).classes('w-44')
                 self.order_status_filter.on_value_change(lambda: self.refresh_data())
             
             # Summary table container

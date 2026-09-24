@@ -621,6 +621,11 @@ ZERO_SHARE_BADGE_TOOLTIP_FMT = (
     'label, so they receive no money and produce no order. Give each one a share, '
     'or remove it from the label.')
 
+#: The plain count beside the label's NAME: how many symbols it holds. A size, not
+#: a warning -- which is why it is worded as a fact and drawn in a neutral colour,
+#: unlike the orange badge above it that is counting a problem.
+SYMBOL_COUNT_BADGE_TOOLTIP_FMT = '{count} symbol(s) in {label}'
+
 
 def count_zero_share_symbols(symbols, weights) -> int:
     """How many of ``symbols`` have no share of their label. Pure.
@@ -1685,6 +1690,23 @@ def emitted_value(event) -> Any:
     return args
 
 
+def symbol_target_quantity(*, target_value: Optional[float],
+                           price: Optional[float]) -> Optional[float]:
+    """The shares a target's MONEY buys at this price. Pure. ``None`` when unknown.
+
+    Derived from the money rather than from the share, because the money is what
+    the engine actually solves for: dividing the same number the Target value
+    column prints is what stops the two columns disagreeing by a rounding step.
+
+    ``None`` -- never 0.0 -- for a row with no target or no usable price. A zero
+    there reads as "the target is no shares", which is a decision the engine has
+    not made; an absent price means nobody knows, and the table draws a blank.
+    """
+    if target_value is None or price is None or not float(price):
+        return None
+    return float(target_value) / float(price)
+
+
 def symbol_delta(*, weight_pct: Optional[float], pct_of_label: Optional[float],
                  target_value: Optional[float], current_value: Optional[float],
                  quantity: Optional[float], price: Optional[float]) -> SymbolDelta:
@@ -1708,10 +1730,12 @@ def symbol_delta(*, weight_pct: Optional[float], pct_of_label: Optional[float],
              else float(weight_pct) - float(pct_of_label))
     value = (None if target_value is None or current_value is None
              else float(target_value) - float(current_value))
-    if target_value is None or price is None or not price or quantity is None:
-        qty = None
-    else:
-        qty = float(target_value) / float(price) - float(quantity)
+    # THROUGH the same helper the Target qty COLUMN is written from, never a second
+    # copy of the division: the column and the change printed under it are the same
+    # subtraction seen from both ends, and two divisions would let them drift.
+    target_qty = symbol_target_quantity(target_value=target_value, price=price)
+    qty = (None if target_qty is None or quantity is None
+           else target_qty - float(quantity))
     return SymbolDelta(share=share, value=value, quantity=qty)
 
 

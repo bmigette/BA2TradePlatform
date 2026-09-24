@@ -52,6 +52,14 @@ PERMITTED = ["O_LC", "O_LP", "O_VERT", "O_BULLCS", "O_BULLPS", "O_BEARCS", "O_BF
 
 #: ``_option_entry_rule("O_LC")`` as the code before this change produced it. See the module
 #: docstring for how it was obtained; it is a PIN, never regenerate it to make a test pass.
+#:
+#: AMENDED ONCE, 2026-09-19, for the ``-signal`` leaf ONLY: the direction gate became a
+#: ``rec_direction`` numeric leaf with a MODE gene so the GA can also pick the CONTRARIAN
+#: direction (the flag leaf could only be switched off). That is a deliberate change to the
+#: authored rule, not profile drift, and it is behaviour-preserving at the authored default
+#: (``> 0`` on a HOLD-centred scale IS the old ``bullish`` flag -- see
+#: test_launcher_option_entry_rule.py). Every other leaf, and the leaf ORDER, is untouched,
+#: which is what this pin exists to protect: profile ``none`` must still append NOTHING.
 PROFILE_NONE_O_LC = json.loads(r"""
 {
     "id": "o_lc-entry",
@@ -62,9 +70,16 @@ PROFILE_NONE_O_LC = json.loads(r"""
         "conditions": [
             {
                 "id": "o_lc-signal",
-                "field": "bullish",
-                "field_type": "flag",
-                "toggle_optimize": true
+                "field": "rec_direction",
+                "field_type": "numeric",
+                "op": ">",
+                "value": 0.0,
+                "optimize": false,
+                "value_min": 0.0,
+                "value_max": 0.0,
+                "value_step": 1.0,
+                "mode_optimize": true,
+                "mode_choices": ["off", "below", "above"]
             },
             {
                 "id": "o_lc-flat",
@@ -528,20 +543,59 @@ def _build_without_profile(kind: str):
 
 
 # --------------------------------------------------------------------------- the all-off control
+def _market_mode_genes(space) -> list:
+    """The MARKET-CONDITION mode genes of a collected space.
+
+    A gene-level filter, not "every ``:mode`` gene", and the distinction became load-bearing on
+    2026-09-19: the option DIRECTION gate is now a mode leaf too (``<m>-signal`` on
+    ``rec_direction``, off/below/above). That gene is not part of the market-condition profile
+    and exists under profile ``none`` as well, so switching it off would not build the control
+    -- it would build a DIFFERENT strategy (one that enters in both directions) and the
+    comparison below would fail for a reason that has nothing to do with the profile. The
+    control holds it at its authored mode on both sides, which is exactly what "the same run
+    with the market gates off" means.
+    """
+    return [g for g in space if g.endswith(":mode") and "-market-" in g]
+
+
 @pytest.mark.parametrize("kind", PERMITTED)
 def test_the_all_off_control_decodes_to_the_profile_none_tree(kind, profile_on):
-    """Explicit ``mode=off`` on every market gene must leave the SAME tree profile ``none``
+    """Explicit ``mode=off`` on every MARKET gene must leave the SAME tree profile ``none``
     builds -- for every permitted structure, since Task 9's compatibility gate compares a whole
     frozen run and one structure's stray leaf would move its orders."""
     gated = _built(kind)
     space = collect_param_space(gated)
-    genome = {g: (MODE_OFF if g.endswith(":mode") else _authored(gated, g))
+    market_modes = _market_mode_genes(space)
+    assert len(market_modes) == 3, (kind, market_modes)
+    genome = {g: (MODE_OFF if g in market_modes else _authored(gated, g))
               for g in space if g.startswith("cond:") or g.startswith("entry:")}
     decoded = decode_params(gated, {k: v for k, v in genome.items() if v is not None})
     plain = decode_params(_build_without_profile(kind), {})
     assert _market_ids(decoded["entry_rules"]) == []
     assert decoded["entry_rules"] == plain["entry_rules"]
     assert decoded["exit_rules"] == plain["exit_rules"]
+
+
+@pytest.mark.parametrize("kind", PERMITTED)
+def test_the_control_holds_the_direction_gate_and_only_the_market_gates_go_off(kind, profile_on):
+    """The exclusion above, pinned rather than left implicit.
+
+    Two halves. (1) The market mode genes the control switches off are EXACTLY the three the
+    profile added -- turning a fourth one off would be a different strategy, not a control.
+    (2) The direction mode gene, where the structure has one, is present in BOTH the gated and
+    the profile-``none`` space, which is why holding it at its authored mode is the honest
+    comparison. The overlays (O_CC / O_PP, whose entry is the shared equity builder's) and the
+    non-directional structures have no direction mode gene at all, so the set is empty for
+    them -- asserted here so this test still says something for every kind.
+    """
+    gated_space = collect_param_space(_built(kind))
+    plain_space = collect_param_space(_build_without_profile(kind))
+    market = set(_market_mode_genes(gated_space))
+    assert market == {f"cond:{kind.lower()}-market-{s}:mode" for s in ("slope", "adx", "rv")}
+    other_gated = {g for g in gated_space if g.endswith(":mode")} - market
+    other_plain = {g for g in plain_space if g.endswith(":mode")}
+    assert other_gated == other_plain, kind
+    assert not [g for g in plain_space if "-market-" in g], kind
 
 
 def _authored(strategy, gene):
@@ -672,11 +726,13 @@ def _publish_manifest(root, symbols=("AAA", "BBB")):
 
     profile = PROFILES["ohlcv-v1"]
     fields = [f.name for f in profile.fields]
-    # FEATURE sessions. The manifest's window is the DECISION window they serve: a decision on
-    # session D reads the row of the session before D (``prior_session_v1``), so these two rows
-    # serve exactly the decisions MC_START..MC_END below -- which is the window every test here
-    # launches over, because a pin is now validated against the run's sessions too (F1).
-    sessions = [date(2025, 6, 27), date(2025, 6, 30)]
+    # FEATURE sessions, built the way the warmup builds them for the window MC_START..MC_END:
+    # ``[prior(first decision), last decision]`` (BT/live parity plan 2026-09-22 A3) -- a live
+    # decision on S reads prior(S), a backtest BAR D reads D itself, and these three rows serve
+    # both over the window every test here launches over (a pin is validated against the run's
+    # sessions too, F1). Before the parity fix the fixture was the two rows 06-27, 06-30: the
+    # backtest's last bar 07-01 then read 06-30.
+    sessions = [date(2025, 6, 27), date(2025, 6, 30), date(2025, 7, 1)]
     store = MarketConditionStore(root)
     objects = []
     for symbol in symbols:
@@ -685,8 +741,12 @@ def _publish_manifest(root, symbols=("AAA", "BBB")):
                  "reasons": ["published row"] * len(fields),
                  "window_digest": "sha256:" + "0" * 64, "raw_shard_ref": "",
                  "raw_row_lo": 0, "raw_row_hi": 0} for s in sessions]
-        entry, _ = store.write_feature_object(profile, symbol, rows)
-        objects.append(entry)
+        # One feature object per (symbol, calendar month) -- the store's sharding rule.
+        for month in sorted({(r["session"].year, r["session"].month) for r in rows}):
+            entry, _ = store.write_feature_object(
+                profile, symbol,
+                [r for r in rows if (r["session"].year, r["session"].month) == month])
+            objects.append(entry)
     manifest = store.make_manifest(
         profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
         objects=objects, raw_objects=[],
@@ -891,7 +951,7 @@ def test_the_persisted_digest_round_trips_into_a_trial_config(profile_on, snapsh
     mod._apply_market_conditions("optimize", backtest_cfg, strat)
     # Round-trip through JSON: the persisted optimization_config is a JSON column.
     backtest_cfg = json.loads(json.dumps(backtest_cfg, default=str))
-    trial = _build_daily_trial_config(backtest_cfg, decode_params(strat, {}), None)
+    trial = _build_daily_trial_config(backtest_cfg, decode_params(strat, {}), None, option_trade_records=False)
     assert trial["market_condition_profiles"] == ["ohlcv-v1"]
     assert trial["market_condition_manifests"] == {"ohlcv-v1": snapshot}
     assert trial["_ga_trial"] is True
@@ -907,7 +967,7 @@ def test_a_pre_task10_persisted_config_still_round_trips_into_a_trial_config():
               "enabled_instruments": ["AAA"], "experts": [{"class": "FMPRating", "settings": {}}],
               "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
               "market_condition_profile": "ohlcv-v1", "market_condition_manifest": "e" * 64}
-    trial = _build_daily_trial_config(json.loads(json.dumps(legacy)), {})
+    trial = _build_daily_trial_config(json.loads(json.dumps(legacy)), {}, option_trade_records=False)
     assert trial["market_condition_profiles"] == ["ohlcv-v1"]
     assert trial["market_condition_manifests"] == {"ohlcv-v1": "e" * 64}
     assert trial["_ga_trial"] is True

@@ -42,6 +42,26 @@ def get_event_type_documentation() -> dict:
             "type": "boolean",
             "example": "Useful for open_positions rules to manage this expert's existing holdings"
         },
+        ExpertEventType.F_HAS_BUY_POSITION.value: {
+            "name": "Expert Has a Long Position",
+            "description": ("Triggers when this expert has an open BUY (long) position for this "
+                            "symbol. Narrower than has_position, which fires on an open position "
+                            "in either direction: use this when the rule only makes sense on the "
+                            "long side. It does NOT distinguish stock the expert bought from "
+                            "stock that was PUT to it by an assignment -- has_assigned_shares is "
+                            "the trigger that can tell those apart."),
+            "type": "boolean",
+            "example": "Only write a covered call against stock we are actually long: has_buy_position"
+        },
+        ExpertEventType.F_HAS_SELL_POSITION.value: {
+            "name": "Expert Has a Short Position",
+            "description": ("Triggers when this expert has an open SELL (short) position for this "
+                            "symbol. The mirror of has_buy_position, and narrower than "
+                            "has_position: use it when the action only makes sense against a "
+                            "short."),
+            "type": "boolean",
+            "example": "Cover the short when the expert turns bullish: has_sell_position AND bullish"
+        },
         ExpertEventType.F_HAS_NO_POSITION_ACCOUNT.value: {
             "name": "No Account Position Exists",
             "description": "Triggers when the account has NO open position for this symbol (any expert).",
@@ -112,11 +132,30 @@ def get_event_type_documentation() -> dict:
             "type": "boolean",
             "example": "Filter to only act when expert maintains bullish view"
         },
+        ExpertEventType.F_CURRENT_RATING_OVERWEIGHT.value: {
+            "name": "Current Rating is Overweight",
+            "description": ("Triggers when the expert's current rating is OVERWEIGHT -- one grade "
+                            "above HOLD on the 5-grade scale (SELL < UNDERWEIGHT < HOLD < "
+                            "OVERWEIGHT < BUY). Distinct from current_rating_positive, which fires "
+                            "only on a full BUY: an expert that publishes the middle grades will "
+                            "otherwise look neutral to a rule that knows only the three buckets."),
+            "type": "boolean",
+            "example": "Take a half-size entry on the weaker bullish grade: current_rating_overweight"
+        },
         ExpertEventType.F_CURRENT_RATING_NEUTRAL.value: {
             "name": "Current Rating is Neutral",
             "description": "Triggers when the expert's current rating is HOLD (neutral).",
             "type": "boolean",
             "example": "Filter to only act during neutral market conditions"
+        },
+        ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT.value: {
+            "name": "Current Rating is Underweight",
+            "description": ("Triggers when the expert's current rating is UNDERWEIGHT -- one grade "
+                            "below HOLD on the 5-grade scale (SELL < UNDERWEIGHT < HOLD < "
+                            "OVERWEIGHT < BUY). Distinct from current_rating_negative, which fires "
+                            "only on a full SELL."),
+            "type": "boolean",
+            "example": "Trim rather than exit on the weaker bearish grade: current_rating_underweight"
         },
         ExpertEventType.F_CURRENT_RATING_NEGATIVE.value: {
             "name": "Current Rating is Negative",
@@ -227,6 +266,18 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Only enter when percent_to_new_target >= 2% (target at least 2% above current price)"
         },
+        ExpertEventType.N_NEW_TARGET_PERCENT.value: {
+            "name": "New Target vs Current TP %",
+            "description": ("For open positions: the percent change from the position's CURRENT "
+                            "take profit price to the expert's NEW target -- positive when the new "
+                            "target is higher, negative when it is lower. The numeric twin of the "
+                            "new_target_higher / new_target_lower flags, which answer the same "
+                            "question with a fixed 2% tolerance baked in: use this one when the "
+                            "size of the move should decide, so a 0.5% drift does not trigger a TP "
+                            "rewrite while a 15% upgrade does."),
+            "type": "numeric",
+            "example": "Only move the TP on a meaningful upgrade: new_target_percent >= 5"
+        },
         ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: {
             "name": "Profit/Loss Amount",
             "description": "For open positions: absolute dollar profit or loss. Positive values = profit, negative = loss. Used with numeric comparisons.",
@@ -239,11 +290,101 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Stop loss when profit_loss_percent <= -10%"
         },
+
+        # Price vs. the analyst price-target range (FMPRating)
+        ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT.value: {
+            "name": "Price vs Analyst Low Target %",
+            "description": (
+                "Where the current price sits relative to the analyst LOW (most conservative) "
+                "price target, as a percent: (price - target_low) / target_low * 100. POSITIVE "
+                "means price is ABOVE the low target. Read off the price-target lines FMPRating "
+                "persists on every recommendation, and deliberately decoupled from the expert's "
+                "BUY/SELL/HOLD rating, so an entry can gate on WHERE price sits in the analyst "
+                "range independently of the directional signal. With no FMPRating price targets "
+                "on the recommendation the condition is unevaluable and does NOT fire in either "
+                "direction."
+            ),
+            "type": "numeric",
+            "example": "Buy only near the floor of the analyst range: price_vs_target_low_percent <= 5"
+        },
+        ExpertEventType.N_PRICE_VS_TARGET_HIGH_PERCENT.value: {
+            "name": "Price vs Analyst High Target %",
+            "description": (
+                "Where the current price sits relative to the analyst HIGH (most bullish) price "
+                "target, as a percent: (price - target_high) / target_high * 100. POSITIVE means "
+                "price is above even the most optimistic analyst's number -- overextended by the "
+                "whole range. This is the reading that lets an entry fire a bearish structure on "
+                "price POSITIONING alone, whatever the expert's own rating still says. "
+                "Unevaluable -- and so never firing, in either direction -- when the "
+                "recommendation carries no FMPRating price targets."
+            ),
+            "type": "numeric",
+            "example": "Fade an overextended name: price_vs_target_high_percent > 0"
+        },
+        ExpertEventType.N_PRICE_VS_TARGET_CONSENSUS_PERCENT.value: {
+            "name": "Price vs Analyst Consensus Target %",
+            "description": (
+                "Where the current price sits relative to the analyst CONSENSUS price target, as "
+                "a percent: (price - target_consensus) / target_consensus * 100. POSITIVE means "
+                "price is above consensus (little implied upside left), negative means it is "
+                "below (upside to the consensus number). The middle of the same range the low and "
+                "high readings bracket. Unevaluable -- and so never firing, in either direction "
+                "-- when the recommendation carries no FMPRating price targets."
+            ),
+            "type": "numeric",
+            "example": "Require real upside to consensus: price_vs_target_consensus_percent <= -10"
+        },
         ExpertEventType.N_DAYS_OPENED.value: {
             "name": "Days Position Open",
             "description": "For open positions: number of calendar days since the position was opened. Used with numeric comparisons.",
             "type": "numeric",
             "example": "Review positions when days_opened >= 90 for rebalancing"
+        },
+
+        # Cooldown Gates (days since this expert last CLOSED the symbol)
+        ExpertEventType.N_DAYS_SINCE_LAST_CLOSE.value: {
+            "name": "Days Since Last Close (cooldown)",
+            "description": (
+                "Calendar days since THIS expert last closed a transaction on this symbol, in "
+                "either direction and at any outcome. A cooldown gate: pair it with '>' on an "
+                "entry rule so the same name cannot be re-bought the moment it is exited, which "
+                "is how a strategy churns one symbol instead of trading a universe. The reference "
+                "'now' is the recommendation's own timestamp -- the simulated as-of bar in a "
+                "backtest -- so the number means the same thing in both runtimes. WHEN THIS "
+                "EXPERT HAS NEVER CLOSED THE SYMBOL the value is a large sentinel, so a '>' "
+                "cooldown gate PASSES: no prior trade means no cooldown to serve. A close that "
+                "exists but cannot be aged or classified is a different case -- unevaluable, "
+                "firing in neither direction, never the sentinel."
+            ),
+            "type": "numeric",
+            "example": "Wait a week before re-entering the same name: days_since_last_close > 7"
+        },
+        ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE.value: {
+            "name": "Days Since Last Profitable Close (cooldown)",
+            "description": (
+                "The same cooldown as days_since_last_close, counting only closes this expert "
+                "took at a PROFIT. Use it to space out re-entries into a name that has already "
+                "paid, while leaving an entry after a loss ungated. Never having closed the "
+                "symbol profitably yields the large sentinel, so a '>' cooldown gate PASSES -- no "
+                "prior winner means no cooldown to serve. A close whose P&L cannot be read is "
+                "unevaluable instead and fires in neither direction."
+            ),
+            "type": "numeric",
+            "example": "Do not immediately re-buy a name we just took profit on: days_since_last_profitable_close > 14"
+        },
+        ExpertEventType.N_DAYS_SINCE_LAST_LOSING_CLOSE.value: {
+            "name": "Days Since Last Losing Close (cooldown)",
+            "description": (
+                "The same cooldown as days_since_last_close, counting only closes this expert "
+                "took at a LOSS. The one most worth gating on: it stops the strategy walking "
+                "straight back into the trade that just stopped it out. Never having closed the "
+                "symbol at a loss yields the large sentinel, so a '>' cooldown gate PASSES -- no "
+                "prior loss means no cooldown to serve, and a name that has only ever won is not "
+                "held back. A close whose P&L cannot be read is unevaluable instead and fires in "
+                "neither direction."
+            ),
+            "type": "numeric",
+            "example": "Stand down after a stop-out: days_since_last_losing_close > 30"
         },
         ExpertEventType.N_CONFIDENCE.value: {
             "name": "Confidence Score",
@@ -333,6 +474,22 @@ def get_event_type_documentation() -> dict:
             ),
             "type": "numeric",
             "example": "Enter the straddle 1-5 days before the print: rec_days_to_earnings <= 3"
+        },
+        ExpertEventType.N_REC_DIRECTION.value: {
+            "name": "Recommendation Direction (signed)",
+            "description": (
+                "The expert's direction call as a signed number on the 5-grade scale, centred "
+                "on HOLD: SELL -2, UNDERWEIGHT -1, HOLD 0, OVERWEIGHT +1, BUY +2. The numeric "
+                "twin of the bullish / bearish / current_rating_neutral flags: 'rec_direction "
+                "> 0' is bullish (BUY or OVERWEIGHT), '< 0' is bearish (SELL or UNDERWEIGHT). "
+                "Use it when the direction itself should be a searchable choice -- one "
+                "threshold comparison covers both directions, where the flags fix the "
+                "direction at authoring time. A recommendation whose action is ERROR (or any "
+                "grade outside the five) is UNEVALUABLE and does NOT fire in either "
+                "direction; it is never read as 0 (which would mean HOLD)."
+            ),
+            "type": "numeric",
+            "example": "Enter only on a bearish call: rec_direction < 0"
         },
         ExpertEventType.N_DAYS_AFTER_EVENT.value: {
             "name": "Days after the Event",
@@ -526,11 +683,11 @@ def get_action_type_documentation() -> dict:
         },
         ExpertActionType.ADJUST_STOP_LOSS.value: {
             "name": "Adjust Stop Loss",
-            "description": "Modify the stop-loss price for an existing open position. Used to protect profits or limit losses based on price movement and market conditions.",
+            "description": "Modify the stop-loss price for an existing open position. Used to protect profits or limit losses based on price movement and market conditions. A rule only TIGHTENS an existing stop; a looser request keeps the current stop, unless the expert setting allow_ruleset_sl_loosen is on, which lets it loosen down to (up to, for shorts) the trade's max-loss stop (the stop it was sized on) and no further; trades with no recorded max-loss stop are never loosened. The SL minimum-distance floor never turns a tightening rule into a loosen.",
             "use_cases": [
                 "Raise stop-loss as price moves up (trailing stop)",
                 "Tighten stop-loss when approaching target",
-                "Loosen stop-loss if conviction increases",
+                "Loosen stop-loss if conviction increases (requires allow_ruleset_sl_loosen; never past the max-loss stop; trades with no recorded max-loss stop are never loosened)",
                 "Move stop-loss to breakeven after certain profit threshold"
             ],
             "parameters": "Requires reference value (order_open_price, current_price, expert_target_price) and percentage/amount adjustment",

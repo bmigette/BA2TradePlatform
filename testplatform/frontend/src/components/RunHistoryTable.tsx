@@ -6,6 +6,8 @@ import { usePersistentState } from '../lib/usePersistentState';
 import { matchesLabels } from '../lib/labelFilter';
 import { RunHoverCard } from './RunHoverCard';
 import type { LabelMatchMode } from '../lib/labelFilter';
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react';
+import { paginate, normalizePageSize, PAGE_SIZE_OPTIONS, DEFAULT_PAGE_SIZE } from '../lib/pagination';
 
 // Trigger a browser download of a JSON object via a Blob + temporary <a download>.
 // No server filesystem write — the bytes are produced entirely client-side.
@@ -65,6 +67,20 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
   // Sort state: column key + direction. Default newest-first (id desc).
   const [sortKey, setSortKey] = usePersistentState<string>(ns + 'sortKey', 'id');
   const [sortDir, setSortDir] = usePersistentState<'asc' | 'desc'>(ns + 'sortDir', 'desc');
+  // Paging is client-side, AFTER filter + sort (see lib/pagination.ts): the filters, the sort
+  // and the dropdown options still see every run; only the rendered rows are cut to one page.
+  // Rendering thousands of rows (each with hover handlers) is what made the tab heavy.
+  const [pageSizeRaw, setPageSize] = usePersistentState<number>(ns + 'pageSize', DEFAULT_PAGE_SIZE);
+  const pageSize = normalizePageSize(pageSizeRaw);
+  // The page belongs to the filters/search/sort/page size it was chosen under: change any of
+  // them and you are back on page 1. A save/delete refresh changes none of them, so it keeps
+  // the page you were working on (paginate() clamps it if the list shrank). Keyed state rather
+  // than a reset effect, which would render the old page once before snapping back.
+  const pageKey = JSON.stringify([expert, optId, q, minSharpe, minTrades, minRet, maxDD, minWin,
+    selectedLabels, labelMode, sortKey, sortDir, pageSize]);
+  const [pageAt, setPageAt] = useState<{ key: string; page: number }>({ key: pageKey, page: 1 });
+  const page = pageAt.key === pageKey ? pageAt.page : 1;
+  const setPage = (p: number) => setPageAt({ key: pageKey, page: p });
 
   useEffect(() => {
     // expert/optId are filtered CLIENT-side (see `filtered` below) so the dropdown options —
@@ -186,6 +202,8 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
     return sortDir === 'asc' ? cmp : -cmp;
   });
 
+  const shown = paginate(sorted, page, pageSize);
+
   const toggleSort = (key: string) => {
     if (sortKey === key) { setSortDir(d => (d === 'asc' ? 'desc' : 'asc')); }
     else { setSortKey(key); setSortDir(key === 'name' || key === 'expert' ? 'asc' : 'desc'); }  // numbers high-first, text A-Z
@@ -218,7 +236,9 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
             Clear
           </button>
         )}
-        <span className="ml-auto text-xs text-gray-500 dark:text-gray-400 self-center">{sorted.length} run{sorted.length === 1 ? '' : 's'}</span>
+        <span className="ml-auto text-xs text-gray-500 dark:text-gray-400 self-center">
+          {shown.totalPages > 1 ? `${shown.start}–${shown.end} of ` : ''}{sorted.length} run{sorted.length === 1 ? '' : 's'}
+        </span>
       </div>
       {showFilters && (
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 p-3 bg-gray-50 dark:bg-gray-800/40 border-b border-gray-200 dark:border-gray-700">
@@ -321,7 +341,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
           </tr>
         </thead>
         <tbody onMouseLeave={() => setHover(null)}>
-          {sorted.map(r => (
+          {shown.rows.map(r => (
             // The hover card opens on mouseenter with NO timer -- the delay was the complaint --
             // and tracks mousemove so it follows the cursor instead of anchoring wherever the row
             // was entered. Costs no request; see RunHoverCard.
@@ -408,6 +428,38 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
           ))}
         </tbody>
       </table>
+      <div className="flex flex-wrap items-center gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-700/50 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-300">
+        <label className="flex items-center gap-1">
+          Rows per page
+          <select value={pageSize} onChange={(e) => setPageSize(Number(e.target.value))} className={inputClass}>
+            {PAGE_SIZE_OPTIONS.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </label>
+        <span className="ml-auto">
+          {sorted.length ? `${shown.start}–${shown.end} of ${sorted.length}` : 'No runs'}
+        </span>
+        <div className="flex items-center gap-1">
+          {([
+            { icon: ChevronsLeft, to: 1, title: 'First page', disabled: shown.page <= 1 },
+            { icon: ChevronLeft, to: shown.page - 1, title: 'Previous page', disabled: shown.page <= 1 },
+          ]).map(({ icon: Icon, to, title, disabled }) => (
+            <button key={title} type="button" title={title} disabled={disabled} onClick={() => setPage(to)}
+              className="p-1 border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed">
+              <Icon className="w-4 h-4" />
+            </button>
+          ))}
+          <span className="px-2 whitespace-nowrap">Page {shown.page} of {shown.totalPages}</span>
+          {([
+            { icon: ChevronRight, to: shown.page + 1, title: 'Next page', disabled: shown.page >= shown.totalPages },
+            { icon: ChevronsRight, to: shown.totalPages, title: 'Last page', disabled: shown.page >= shown.totalPages },
+          ]).map(({ icon: Icon, to, title, disabled }) => (
+            <button key={title} type="button" title={title} disabled={disabled} onClick={() => setPage(to)}
+              className="p-1 border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed">
+              <Icon className="w-4 h-4" />
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
     <RunHoverCard row={hover?.row ?? null} x={hover?.x ?? 0} y={hover?.y ?? 0} />
     <ExportDialog

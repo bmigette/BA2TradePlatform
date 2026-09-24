@@ -45,12 +45,47 @@ class LiveProviderBundle:
 
     def __init__(self, get_provider: Callable[..., Any]):
         self._get = get_provider
+        self._memo: Dict[str, Any] = {}
+
+    def _once(self, category: str, name: str):
+        """Resolve ``(category, name)`` once PER BUNDLE and reuse that instance.
+
+        WHY. The registry accessors below are called inside every expert's
+        ``_gather``, i.e. once per (symbol, decision). ``get_provider`` builds a
+        NEW object every time, and these providers' constructors are not free --
+        ``FMPCompanyDetailsProvider.__init__`` reads ``FMP_API_KEY`` out of the
+        AppSetting table. Measured on a real 10-symbol / 501-bar
+        DeterministicScorer backtest: 10,020 constructions, 4.6 s, for what is a
+        stateless api-key holder.
+
+        WHY HERE, and not in ``get_provider``. ``get_provider`` is the registry's
+        factory; other callers pass constructor kwargs and some genuinely want a
+        distinct instance, so caching there would change resolution for everyone.
+        A BUNDLE, by contrast, already has exactly the right lifetime: live builds
+        a fresh one per ``run_analysis`` (``MarketExpertInterface._live_providers``),
+        a backtest builds one per run. So a memo here can never outlive the scope
+        the bundle was made for, and live cannot be served a provider built for an
+        earlier analysis.
+
+        ``ohlcv`` deliberately does NOT go through this. The backtest host's
+        resolver returns a per-run OHLCV OVERRIDE that it may install or clear at
+        any point in the run (``seam_wiring._current_ohlcv_override``), so the
+        ohlcv provider must stay a live lookup -- and it costs nothing, because
+        the override is returned rather than constructed. ``indicators`` is built
+        FROM it and is left alone for the same reason.
+        """
+        key = f"{category}/{name}"
+        provider = self._memo.get(key)
+        if provider is None:
+            provider = self._get(category, name)
+            self._memo[key] = provider
+        return provider
 
     def ohlcv(self): return self._get("ohlcv", "fmp")
-    def fundamentals_details(self): return self._get("fundamentals_details", "fmp")
-    def fundamentals_overview(self): return self._get("fundamentals_overview", "fmp")
-    def insider(self): return self._get("insider", "fmp")
-    def news(self): return self._get("news", "fmp")
+    def fundamentals_details(self): return self._once("fundamentals_details", "fmp")
+    def fundamentals_overview(self): return self._once("fundamentals_overview", "fmp")
+    def insider(self): return self._once("insider", "fmp")
+    def news(self): return self._once("news", "fmp")
 
     def indicators(self):
         # PandasIndicatorCalc requires an OHLCV provider in its constructor; pass

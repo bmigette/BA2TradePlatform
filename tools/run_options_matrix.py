@@ -70,6 +70,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+from typing import Optional
 
 # Sibling helper in tools/ (shared by all three matrix drivers). The directory is put on the
 # path explicitly so the import works however the script is reached (path, -m, or a test import).
@@ -77,6 +78,8 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import cap_passthrough  # noqa: E402
+from ba2_common.core.option_spread_model import (  # noqa: E402
+    LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
 
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "options_universe_top100.txt")
@@ -102,6 +105,7 @@ _DISCOVERY_STRATEGIES = [
 # Both singles are refused by the launcher; this is not a performance survival gate.
 _DISCOVERY_EXCLUDED = {"O_SSTG", "O_SSTD"}
 _DISCOVERY_EXPERTS = ["FMPRating", "DeterministicScorer"]
+_NEUTRAL_STRUCTURES = {"O_IC", "O_STRD", "O_STRG"}
 
 
 def _universe(path=_UNIVERSE_FILE) -> str:
@@ -116,6 +120,15 @@ def _db_path() -> str:
     return os.getenv("DB_FILE", r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db")
 
 
+#: Mirrors ``NO_MEASUREMENT_MARKER`` in
+#: testplatform/backend/app/services/strategy_optimization_handler.py -- keep the two literals
+#: identical (test_no_measurement_policy pins them together). A job that ends with ZERO MEASURED
+#: trials (every trial crashed or was abandoned as stalled) is recorded as `failed` with this prefix
+#: in error_message, and the campaign CONTINUES: killing the whole matrix over one job costs far more
+#: than the job is worth, and a stall-only search has no result worth protecting.
+NO_MEASUREMENT_MARKER = "no measured trials"
+
+
 def _completed_names() -> set:
     import sqlite3
     path = Path(_db_path()).resolve()
@@ -128,6 +141,98 @@ def _completed_names() -> set:
     finally:
         c.close()
     return {r[0] for r in rows}
+
+
+def _failure_reason(name: str, created_after: Optional[int] = None) -> str:
+    """error_message of the newest row for ``name`` created AFTER ``created_after`` ('' if none).
+
+    ``created_after`` is the optimization id that existed BEFORE a job was launched: only a row
+    created later can speak for the attempt that just exited (2026-09-21 recheck, H4). A marker
+    left by an earlier run of the same name is not evidence about this one, and treating it as
+    such hid a fresh launch failure (bad args, preflight, import, startup -- all of which write no
+    row at all).
+
+    Read-only and best effort: the driver must never crash on a DB hiccup, and an unreadable reason
+    simply means "treat it as an ordinary failure" (stop the campaign), which is the safe default.
+    """
+    import sqlite3
+    path = Path(_db_path()).resolve()
+    if not path.exists():
+        return ""
+    try:
+        c = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        sql = "SELECT error_message FROM strategy_optimizations WHERE name=?"
+        params: list = [name]
+        if created_after is not None:
+            # ONLY a row created after the launch that just failed can speak for it (2026-09-21
+            # recheck, H4). Without this the newest row with the same NAME was used, so a marker
+            # left by an earlier run hid a fresh launch failure.
+            sql += " AND id > ?"
+            params.append(int(created_after))
+        row = c.execute(sql + " ORDER BY id DESC LIMIT 1", tuple(params)).fetchone()
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        c.close()
+    return (row[0] or "") if row else ""
+
+
+def _classify_failure(name: str, prior_max_id: Optional[int]) -> str:
+    """``'skip'`` or ``'stop'`` for a job that just exited non-zero.
+
+    ONLY a no-measurement marker on a row created AFTER the launch may skip the job (2026-09-21
+    recheck, H4). Anything else stops the campaign: a marker left by an earlier run of the same
+    name is not evidence about this attempt, and an unreadable table means the marker cannot be
+    attributed at all -- skipping on either would hide a real launch failure (bad args, preflight,
+    import, startup), none of which write a row.
+    """
+    if prior_max_id is None:
+        return "stop"
+    reason = _failure_reason(name, created_after=prior_max_id)
+    return "skip" if reason.startswith(NO_MEASUREMENT_MARKER) else "stop"
+
+
+def _newest_optimization_id() -> Optional[int]:
+    """The highest ``strategy_optimizations.id`` right now, or ``None`` if it cannot be read.
+
+    Captured BEFORE a job is launched so the post-mortem can require a row created after it
+    (2026-09-21 recheck, H4). Read-only and best effort, like ``_failure_reason``; ``None`` means
+    the driver cannot tell whether a marker belongs to the attempt that failed, and it must then
+    STOP rather than skip. An empty table yields 0, which lets any new row qualify.
+    """
+    import sqlite3
+    path = Path(_db_path()).resolve()
+    if not path.exists():
+        return None
+    try:
+        c = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        row = c.execute("SELECT MAX(id) FROM strategy_optimizations").fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        c.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _spread_name_tag(model: str) -> str:
+    """The job-NAME token for an option spread model: '' for legacy-pct, else e.g. '-spow0922'.
+
+    Matrix-mode job names carry no identity digest and ARE the completion/checkpoint key, so
+    without this a relaunch under the calibrated model would skip (or resume) every job a
+    legacy-priced campaign already completed under the same name. legacy-pct keeps today's
+    names exactly, so existing legacy completions still match themselves.
+    """
+    if model == LEGACY_PCT_MODEL:
+        return ""
+    import re
+    m = re.fullmatch(r"([a-z]+)-\d{4}-(\d{2})-(\d{2})", model)
+    return "-s" + (m.group(1) + m.group(2) + m.group(3) if m else re.sub(r"[^a-z0-9]", "", model))
 
 
 def _jobs(experts, strategies, name_suffix=""):
@@ -174,6 +279,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--experts", default=None,
                     help="Comma list of experts (default FMPRating; EarningsDrift/Insider "
                          "excluded — no large-cap signal on this options universe).")
+    ap.add_argument("--neutral-entry-modes", default="legacy",
+                    help="Discovery only: joint evolves HOLD vs low-confidence in one job; "
+                         "hold,low_confidence runs two separate jobs for each "
+                         "neutral structure. Other structures retain their existing identities.")
     ap.add_argument("--strategies", default=None,
                     help="Comma list of option strategy keys: grouped OS1-4 and/or singles "
                          "(O_LC,O_LP,O_VERT,O_BULLCS,O_BF,O_SSTG,O_SSTD,O_IC,O_CSP,O_JL,O_RS,"
@@ -205,6 +314,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Options store serving the run, forwarded to the launcher per job "
                          "(default thetadata -- floor 2018-09-14, the only vendor reaching a "
                          "2020 start; tastytrade floors at 2022-10-01, alpaca at 2024-01-18).")
+    ap.add_argument("--option-spread-model", default=SPREAD_MODEL_VERSION, choices=SPREAD_MODELS,
+                    help="Option fill spread model, forwarded to the launcher per job (default "
+                         f"{SPREAD_MODEL_VERSION}: the decision bar's real quote, else the "
+                         "calibrated fallback). ALWAYS passed, so it is part of the discovery "
+                         "identity digest: a job priced by a different spread model can neither "
+                         "skip against nor resume from one priced by this one. Matrix-mode job "
+                         "names carry no digest, so the model is folded into the NAME instead "
+                         "(e.g. -spow0922; nothing for legacy-pct).")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
@@ -217,6 +334,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Per-gene mutation probability passthrough (default: launcher's).")
     ap.add_argument("--seed", type=int, default=42,
                     help="Random seed, included in discovery job identity; vary for stability pilots.")
+    ap.add_argument("--labels", default="",
+                    help="Comma-separated labels stamped on every persisted Top-N backtest "
+                         "of every job (forwarded to the launcher's --labels). NOT part of "
+                         "the discovery identity digest, so labelling a campaign does not "
+                         "rename its jobs or orphan their checkpoints.")
     ap.add_argument("--elitism-percent", type=float, default=10.0)
     ap.add_argument("--interval", default="1d",
                     help="Analysis/fill interval (default 1d — option cache bars are daily).")
@@ -236,7 +358,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "(40/dd)^1.5 penalty past 40%% dd -- the only one of the three that "
                          "prices the CAR/DD ratio (option_car_over_risk divides by sqrt(dd), "
                          "so it scores a 40%%/40%% genome and a 20%%/10%% one identically). "
-                         "No two of the three are comparable -- a matrix run under one never "
+                         "'option_car_target_soft30' keeps those targets but replaces the "
+                         "annual trade floor/ramp with min(completed structures / 30, 1) "
+                         "over the whole backtest; a positive count is penalised, not discarded. "
+                         "These objectives are not comparable -- a matrix run under one never "
                          "shares a table with a matrix run under another.")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "
@@ -327,6 +452,14 @@ def build_parser() -> argparse.ArgumentParser:
 def resolve_args(ap, argv=None):
     args = ap.parse_args(argv)
     discovery = args.profile == "discovery"
+    modes = [m.strip() for m in args.neutral_entry_modes.split(",")]
+    if (not modes or len(modes) != len(set(modes))
+            or set(modes) - {"legacy", "hold", "low_confidence", "joint"}
+            or (set(modes) & {"legacy", "joint"} and len(modes) > 1)):
+        ap.error("--neutral-entry-modes must be legacy, hold, low_confidence, hold,low_confidence or joint")
+    if modes != ["legacy"] and not discovery:
+        ap.error("--neutral-entry-modes requires --profile discovery")
+    args.neutral_entry_modes = ",".join(modes)
     if args.experts is None:
         args.experts = ",".join(_DISCOVERY_EXPERTS if discovery else _DEFAULT_EXPERTS)
     if args.strategies is None:
@@ -397,7 +530,7 @@ def resolve_args(ap, argv=None):
     return args
 
 
-def build_cmd(args, launcher, name, expert, strat, universe):
+def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode="legacy"):
     cmd = ([sys.executable, launcher] if launcher.endswith(".py") else [launcher]) + [
         "optimize", "--expert", expert, "--universe", universe, "--strategy", strat,
         "--start", args.start, "--end", args.end,
@@ -410,9 +543,24 @@ def build_cmd(args, launcher, name, expert, strat, universe):
         # a store chosen via env is a decision the master made that the worker cannot see, and
         # the worker would silently re-resolve to the sqlite default. That is how a whole grid
         # once scored against the wrong vendor's history while every log said otherwise.
-        "--options-store", args.options_store]
+        "--options-store", args.options_store,
+        # EXPLICIT per job for the same reason, and so the spread model is in the job identity
+        # (discovery_name digests these args): the launcher's own default is a code constant
+        # that a later model version would change silently under an unchanged job name.
+        "--option-spread-model", args.option_spread_model]
+    if args.labels:
+        # The STRUCTURE is appended per job, because one --labels string cannot vary across
+        # the 16 jobs a campaign launches and the structure is the one thing that does. The
+        # EXPERT is deliberately NOT added: backtests.expert_name is already an indexed
+        # column, so a label would duplicate it; there is no column for the structure.
+        labels = [t.strip() for t in args.labels.split(",") if t.strip()]
+        if strat not in labels:
+            labels.append(strat)
+        cmd += ["--labels", ",".join(labels)]
     cmd += _gate_passthrough(args)
     cmd += _market_condition_passthrough(args)
+    if neutral_entry_mode != "legacy":
+        cmd += ["--neutral-entry-mode", neutral_entry_mode]
     for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
                         ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
         value = getattr(args, field)
@@ -434,14 +582,14 @@ def build_cmd(args, launcher, name, expert, strat, universe):
     return cmd
 
 
-def discovery_name(args, launcher, name, expert, strat, universe):
+def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_mode="legacy"):
     """Version the experiment, not the machine's consumer count or selected job subset.
 
     Name is also the backend checkpoint key. Changed window/seed/capital/GA knobs
     must neither skip an older completion nor resume its incompatible experiment.
     Cache contents/code changes at the same paths still require a fresh name suffix.
     """
-    cmd = build_cmd(args, launcher, "", expert, strat, universe)
+    cmd = build_cmd(args, launcher, "", expert, strat, universe, neutral_entry_mode)
     tokens = cmd[cmd.index("optimize") + 1:]
     config = {}
     i = 0
@@ -452,7 +600,10 @@ def discovery_name(args, launcher, name, expert, strat, universe):
             config[flag] = True
             i += 1
         else:
-            if flag not in ("--name", "--parallel", "--workers"):
+            # --labels is METADATA, not search configuration: it must not move the job
+            # identity, or adding a label would rename every job and orphan its GA
+            # checkpoint. Same reasoning as --name/--parallel/--workers.
+            if flag not in ("--name", "--parallel", "--workers", "--labels"):
                 config[flag] = tokens[i + 1]
             i += 2
     identity = {"schema": 1, "args": config, "launcher": os.path.abspath(launcher),
@@ -461,6 +612,18 @@ def discovery_name(args, launcher, name, expert, strat, universe):
                     "BACKTEST_OPTIONS_RISK_FREE_RATE", "TASTYTRADE_OPTIONS_HISTORY_FLOOR")}}
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
     return f"{name}-d{digest}"
+
+
+def planned_jobs(args, launcher, experts, strategies, universe):
+    """Separate neutral arms without changing any other job/checkpoint identity."""
+    suffix = _spread_name_tag(args.option_spread_model) + args.name_suffix
+    for name, expert, strategy in _jobs(experts, strategies, suffix):
+        modes = args.neutral_entry_modes.split(",") if strategy in _NEUTRAL_STRUCTURES else ["legacy"]
+        for mode in modes:
+            arm_name = name if mode == "legacy" else name + "-" + mode + "-rules1"
+            if args.profile == "discovery":
+                arm_name = discovery_name(args, launcher, arm_name, expert, strategy, universe, mode)
+            yield arm_name, expert, strategy, mode
 
 
 def main(argv=None) -> int:
@@ -476,10 +639,8 @@ def main(argv=None) -> int:
         launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test.exe")
         if not os.path.exists(launcher):
             launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test")
-    jobs = list(_jobs(experts, strategies, args.name_suffix))
+    jobs = list(planned_jobs(args, launcher, experts, strategies, universe))
     if args.profile == "discovery":
-        jobs = [(discovery_name(args, launcher, nm, exp, strat, universe), exp, strat)
-                for nm, exp, strat in jobs]
         print("DISCOVERY: permitted singles only; all remain eligible for composition. "
               "Stage-1 rankings provide seeds, not a survival gate.")
         print("Risk-policy exclusions: O_SSTG, O_SSTD (2026-08-31; not performance exclusions).")
@@ -502,25 +663,42 @@ def main(argv=None) -> int:
           f"{'ON (launcher default)' if args.robust_fitness else 'OFF (--no-robust-fitness)'}"
           " -- scores are NOT comparable across the robustness setting.")
     if args.dry_run:
-        for nm, exp, s in jobs:
+        for nm, exp, s, mode in jobs:
             print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s})")
-            print("    " + shlex.join(build_cmd(args, launcher, nm, exp, s, universe)))
+            print("    " + shlex.join(build_cmd(args, launcher, nm, exp, s, universe, mode)))
         print("Dry-run only: cache coverage and vendor compatibility have NOT been validated.")
         return 0
 
     if args.screener_gate_store and not Path(args.screener_gate_store).exists():
         ap.error(f"Screener gate store does not exist: {args.screener_gate_store}")
 
-    for i, (name, expert, strat) in enumerate(jobs, 1):
+    for i, (name, expert, strat, mode) in enumerate(jobs, 1):
         if name in _completed_names():   # re-read each loop (resumable)
             print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
             continue
-        cmd = build_cmd(args, launcher, name, expert, strat, universe)
+        # BEFORE the launch, so the post-mortem below can tell THIS attempt's row from an older
+        # one with the same name (2026-09-21 recheck, H4).
+        prior_max_id = _newest_optimization_id()
+        cmd = build_cmd(args, launcher, name, expert, strat, universe, mode)
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
         if rc != 0:
-            print(f"options matrix stopped: {name} failed; remaining jobs were not launched.", flush=True)
+            decision = _classify_failure(name, prior_max_id)
+            if decision == "skip":
+                # A stall-only job (2026-09-21 review, G2). Its checkpoint was PRESERVED, so a later
+                # pass can resume or re-run it; it must not stop the other 15 jobs, which is what
+                # happened on 2026-09-20 when the same class of failure killed the campaign.
+                print(f"[{i}/{len(jobs)}] {name} produced {NO_MEASUREMENT_MARKER} (stall-only, "
+                      f"verified against this launch); recorded and SKIPPED -- the campaign "
+                      f"continues. Re-run this job later; its checkpoint was preserved.", flush=True)
+                continue
+            if prior_max_id is None:
+                print(f"[{i}/{len(jobs)}] options matrix stopped: {name} failed and its marker "
+                      f"could not be verified (no readable optimization table).", flush=True)
+            else:
+                print(f"[{i}/{len(jobs)}] options matrix stopped: {name} failed; remaining jobs "
+                      f"were not launched.", flush=True)
             return rc if rc > 0 else 1
     print("options matrix driver: done.")
     return 0

@@ -54,8 +54,9 @@ Genes:
 - target delta **0.10–0.35 step 0.05** (the cheapness/convexity dial)
 - entry DTE **180–540** (medium-long: enough runway for a thesis to play out;
   not restricted to January LEAPS cycles)
-- per-ticket premium sizing **0.5–2.0% of sleeve** (many small tickets — no
-  single ticket may dominate ex-ante)
+- per-ticket premium sizing **0.5–5.0% of sleeve, step 0.5** (many small tickets —
+  no single ticket may dominate ex-ante). **CEILING RAISED from 2.0% on
+  2026-09-20, operator decision, grid not yet run** — see §9.
 - max concurrent tickets per underlying: 1 (fixed); portfolio breadth comes
   from the universe, not from pyramiding one name
 - take-profit multiple **3x–10x premium, plus hold-to-expiry** (searched — the
@@ -157,3 +158,31 @@ Different fitness (option_convex vs option_car), different universe threshold
 strong signal). Sharing a matrix with the LEAPS keys would invite comparing
 fitness numbers across metrics — the exact cross-metric comparison the
 CAR-scale change of 2026-08-04 taught us never to allow.
+
+## 9. Amendment — per-ticket sizing ceiling 2.0% → 5.0% (2026-09-20, operator decision)
+
+**What changed.** `_OPTION_SIZING_BANDS[1.0]` in `testplatform/ba2test_launcher.py` moved from
+`(0.5, 2.0, 0.25)` (7 levels) to **`(0.5, 5.0, 0.5)`** (10 levels). The floor is unchanged; only
+the ceiling moved. Applies to both arms (`O_CONVEXC`, `O_CONVEXP`); nothing else is authored 1.0,
+so no other structure's band is touched. The grid had NOT been run when this landed, so no result
+comparability is lost.
+
+**Why.** The grid trades a $20k account, so the old 2.0% ceiling was a $400 ticket. A 180–540 DTE
+premium is expensive enough (a 1-year ATM call on a $50 name runs ~$600–800/contract) that a $400
+cap effectively restricted the arm to cheap underlyings and deeper-OTM contracts — the strategy
+could not express "a somewhat larger long-dated ticket" anywhere in its gene space. 5.0% ($1,000
+at the start) opens that region while staying well inside the per-instrument cap the grid already
+searches (`max_virtual_equity_per_instrument_percent`, 5–50%).
+
+**What did NOT change, and why that keeps the thesis intact.** The floor stays at 0.5%, the
+one-ticket-per-underlying rule stays FIXED, and the stop stays default-OFF. Breadth is what §1 and
+§7 rest on, and breadth comes from the universe × the one-ticket rule, not from the ceiling: the GA
+can now pick 0.5–1% tickets if breadth pays and up to 5% if a bigger ticket pays. The step coarsens
+0.25 → 0.5 because this grid is deliberately tiny (pop 40 / gen 6); a 19-level band would have been
+barely searchable at 240 evaluations.
+
+**Open question this creates.** §7 warns that a rare-win strategy needs many independent draws and
+that ~2.5 years of one regime is already near the statistical minimum. A larger per-ticket ceiling
+means fewer tickets for the same capital at the top of the band — so when reading results, report
+the chosen sizing together with the ticket COUNT, and treat a high-sizing winner as
+evidence-against the breadth thesis rather than as a better strategy.

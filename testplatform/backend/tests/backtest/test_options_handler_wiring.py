@@ -1,3 +1,4 @@
+from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 import pytest
 from datetime import date
 from app.services.backtest.daily_backtest_handler import validate_options_window
@@ -43,7 +44,7 @@ def _make_account(options_provider):
 
     ps = AsOfPriceSource(ohlcv_provider=None)
     settings = {
-        "starting_cash": 100000.0,
+        **_LEGACY_ZERO_SPREAD, "starting_cash": 100000.0,
         "commission_per_trade": 0.0,
         "slippage_bps": 0.0,
         "fill_model": "next_open",
