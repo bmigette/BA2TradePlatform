@@ -206,13 +206,18 @@ def test_the_decision_scope_refreshes_the_coverage_itself(pinned, seam, fixed_cl
 
 
 # --------------------------------------------------------------------------- the universe
+def _instance(id, enabled, entry, exit=None):
+    return SimpleNamespace(id=id, enabled=enabled, enter_market_ruleset_id=entry,
+                           open_positions_ruleset_id=exit)
+
+
 def test_the_universe_is_the_union_of_the_GATED_instances_enabled_instruments(monkeypatch):
     instances = [
-        SimpleNamespace(id=1, enabled=True, enter_market_ruleset_id=10),    # gated
-        SimpleNamespace(id=2, enabled=True, enter_market_ruleset_id=20),    # not gated
-        SimpleNamespace(id=3, enabled=False, enter_market_ruleset_id=10),   # disabled
-        SimpleNamespace(id=4, enabled=True, enter_market_ruleset_id=None),  # no entry ruleset
-        SimpleNamespace(id=5, enabled=True, enter_market_ruleset_id=30),    # gated, dynamic
+        _instance(1, True, 10),            # gated
+        _instance(2, True, 20, 20),        # not gated (entry nor exit)
+        _instance(3, False, 10, 30),       # disabled
+        _instance(4, True, None, None),    # no ruleset at all
+        _instance(5, True, 30),            # gated, dynamic
     ]
     # ``name`` is a NOT NULL column on EventAction and the leaf walk labels its findings with
     # it, so the doubles carry one (a double missing a required column is a test artefact, not
@@ -240,6 +245,40 @@ def test_the_universe_is_the_union_of_the_GATED_instances_enabled_instruments(mo
     # symbol that does not exist.
     assert symbols == ("AAA", "BBB")
     assert deferred == ((5, "SCREENER"),)
+
+
+def test_an_expert_gated_only_on_its_exits_is_coverage_checked(monkeypatch):
+    """Plan 2026-09-24 B2: a market leaf may sit on an open-positions rule. An expert gated ONLY
+    there must still be listed, or its uncovered symbols' exits read unknown with nothing at
+    startup naming the snapshot that misses them. A ``None`` slot is skipped, not read."""
+    instances = [
+        _instance(6, True, 20, 40),        # entry ungated, EXIT gated
+        _instance(7, True, None, 40),      # no entry ruleset, exit gated
+        _instance(8, True, 20, None),      # neither gated, no exit ruleset
+        _instance(9, False, None, 40),     # disabled
+    ]
+    rules = {
+        20: [SimpleNamespace(name="entry", triggers={"cond_0": {"event_type": "confidence"}})],
+        40: [SimpleNamespace(name="market exit",
+                             triggers={"cond_0": {"event_type": FIELD.value}})],
+    }
+    read: list = []
+    experts = {6: SimpleNamespace(get_enabled_instruments=lambda: ["ccc"]),
+               7: SimpleNamespace(get_enabled_instruments=lambda: ["DDD", "SCREENER"])}
+    import ba2_common.core.db as db
+    import ba2_common.core.instance_resolver as ir
+
+    monkeypatch.setattr(db, "get_all_instances", lambda model: instances)
+    monkeypatch.setattr(db, "ruleset_event_actions",
+                        lambda rid: read.append(rid) or rules.get(rid, []))
+    monkeypatch.setattr(ir, "get_instance_resolver",
+                        lambda: SimpleNamespace(get_expert_instance=experts.__getitem__))
+
+    assert live.gated_expert_instances() == (6, 7)
+    assert None not in read
+    symbols, deferred = live.gated_live_universe()
+    assert symbols == ("CCC", "DDD")
+    assert deferred == ((7, "SCREENER"),)
 
 
 def test_an_unreadable_universe_at_install_warns_and_re_checks_later(pinned, logs, monkeypatch):

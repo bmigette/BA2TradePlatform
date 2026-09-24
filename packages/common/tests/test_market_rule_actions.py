@@ -26,7 +26,8 @@ from ba2_common.core.types import ExpertActionType
 
 ADX = "underlying_adx_14"
 ROLL = ExpertActionType.ROLL_PMCC_SHORT.value
-ALLOWED = ("close", "decrease_instrument_share", "adjust_stop_loss", "adjust_take_profit")
+ALLOWED = ("close", "close_option", "decrease_instrument_share", "adjust_stop_loss",
+           "adjust_take_profit")
 
 
 def _leaf(**over):
@@ -68,6 +69,7 @@ def _refused(rules, *needles):
 
 # ------------------------------------------------------------------------ the allow-list
 def test_the_allow_list_is_exactly_close_reduce_and_adjust_tp_sl():
+    """``close_option`` counts as a close (the option position the rule runs on)."""
     assert MARKET_RULE_ACTIONS == frozenset(ALLOWED)
     for name in ALLOWED:
         assert name in {m.value for m in ExpertActionType}, name
@@ -280,6 +282,13 @@ def test_the_deploy_converter_refuses_an_unresolved_template_on_an_exit_rule():
         trade_rules_to_live_export([], [rule])
     msg = str(e.value)
     assert "open_positions ruleset" in msg and "mode_optimize" in msg and "mkt-adx" in msg
+
+
+def test_the_deploy_converter_exports_a_gated_close_option_rule():
+    export = trade_rules_to_live_export([], [_rule("close_option")], name="mx")
+    rule, = export["rulesets"][0]["rules"]
+    assert [a["action_type"] for a in rule["actions"].values()] == ["close_option"]
+    assert any(t["event_type"] == ADX for t in rule["triggers"].values())
 
 
 def test_the_deploy_converter_leaves_an_ordinary_exit_ruleset_alone():

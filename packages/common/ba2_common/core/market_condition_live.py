@@ -443,12 +443,15 @@ def ruleset_rule_contents(ruleset_id: Any) -> Tuple[Tuple[str, Any, Any], ...]:
 
 
 def gated_expert_instances() -> Tuple[int, ...]:
-    """Ids of the ENABLED expert instances whose ENTER-MARKET ruleset carries a market leaf.
+    """Ids of the ENABLED expert instances whose ENTER-MARKET or OPEN-POSITIONS ruleset carries a
+    market leaf.
 
-    Only the enter-market ruleset is scanned. Until plan 2026-09-24 Task B2 that was the only
-    ruleset a market leaf could live on; B2 allows one on an open-positions rule that only
-    closes, reduces or adjusts TP/SL (``market_condition_rules.assert_market_rule_actions``), and
-    such an instance is NOT listed here -- an exit-only-gated instance is not coverage-checked.
+    Both rulesets are scanned. Since plan 2026-09-24 Task B2 a market leaf may sit on an
+    open-positions rule that only closes, reduces or adjusts TP/SL
+    (``market_condition_rules.assert_market_rule_actions``), and an expert gated ONLY on its exits
+    needs the same startup coverage check as an entry-gated one: an uncovered symbol's exit leaf
+    reads unknown on every pass and the exit it guards silently never happens. A ruleset slot
+    that is ``None`` (no ruleset assigned) is skipped; an expert with neither is not gated.
 
     The leaf walk itself is :func:`market_condition_fields_in_ruleset` (persisted rules speak
     ``EventAction.triggers``, not condition trees).
@@ -458,9 +461,11 @@ def gated_expert_instances() -> Tuple[int, ...]:
 
     found: list = []
     for instance in get_all_instances(ExpertInstance):
-        if not instance.enabled or not instance.enter_market_ruleset_id:
+        if not instance.enabled:
             continue
-        if market_condition_fields_in_ruleset(instance.enter_market_ruleset_id):
+        rulesets = [rid for rid in (instance.enter_market_ruleset_id,
+                                    instance.open_positions_ruleset_id) if rid]
+        if any(market_condition_fields_in_ruleset(rid) for rid in rulesets):
             found.append(int(instance.id))
     return tuple(found)
 
@@ -468,6 +473,7 @@ def gated_expert_instances() -> Tuple[int, ...]:
 def gated_live_universe() -> Tuple[Tuple[str, ...], Tuple[Tuple[int, str], ...]]:
     """``(symbols, deferred)`` for every gated instance: the union of their enabled instruments,
     and the ``(instance_id, sentinel)`` pairs whose universe is only known at analysis time.
+    "Gated" is :func:`gated_expert_instances`: a market leaf on the entry OR the exit ruleset.
 
     Built from the same accessor ``JobManager._schedule_expert_jobs`` schedules from -- the
     expert's own ``get_enabled_instruments()`` -- not a second reading of the settings rows.

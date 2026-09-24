@@ -138,9 +138,11 @@ def assert_no_market_conditions(rules: Any, where: str) -> None:
 #: Everything else is refused: an open (``buy``/``sell``, every option entry) is an entry
 #: decision on the exit pass; ``stop_processing`` would let an unknown read silence the rules
 #: BELOW it; a roll / lifecycle / overlay action skipped on an unknown read can leave a short leg
-#: to be assigned.
+#: to be assigned. ``close_option`` (``ExpertActionType.CLOSE_OPTION``) is a close too: it closes
+#: the option position the rule runs on.
 MARKET_RULE_ACTIONS = frozenset({
     "close",
+    "close_option",
     "decrease_instrument_share",
     "adjust_stop_loss",
     "adjust_take_profit",
