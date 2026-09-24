@@ -314,6 +314,16 @@ and settled against a different contract.
 
 **Execution order:** 2 → 1a → 1b → 3 → 4 → 5 → 8 → 9 → 10 → 6 → 7.
 
+**Backward-compatibility acceptance** (user, 2026-09-24). This is a Task 6 gate.
+
+- Re-run at least TWO existing stored stock backtests from the local testplatform DB on the final branch,
+  with their stored configs and the same data. Each result must be BYTE-IDENTICAL to the stored one:
+  trades, equity curve and every metric.
+- Pick ONE DeterministicScorer stock backtest, because Task 10 changes that expert's code, and ONE backtest
+  from another expert, for example FMPRating or FactorRanker.
+- Any difference fails the gate; it must be explained and fixed, not waived.
+- Option backtests are exempt: bugs 1-4 change them on purpose.
+
 **Task 10 is IN stage 1** (user, 2026-09-24).
 
 - Stage 1 uses the new behaviour through its launcher setting.
