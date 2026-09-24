@@ -108,15 +108,24 @@ class FakeOHLCV:
 class Recorder:
     def __init__(self):
         self.warnings = []
+        self.debugs = []
 
     def warning(self, message, *args, **kwargs):
         self.warnings.append(message % args if args else message)
 
+    def debug(self, message, *args, **kwargs):
+        self.debugs.append(message % args if args else message)
+
 
 @pytest.fixture
-def warnings(monkeypatch):
+def recorder(monkeypatch):
     recorder = Recorder()
     monkeypatch.setattr(MODULE, "logger", recorder)
+    return recorder
+
+
+@pytest.fixture
+def warnings(recorder):
     return recorder.warnings
 
 
@@ -518,6 +527,28 @@ def test_listing_day_itself_is_a_recent_listing(warnings):
     # Without a sound SPY reference it still aborts.
     with pytest.raises(FMPHistoryCacheMiss, match="Missing OHLCV history: SPY"):
         analyze({"AAA": frame}, settings_for())
+
+
+def test_each_skip_reason_warns_once_per_symbol_per_instance(recorder):
+    """Consecutive skipped bars for the same (symbol, reason): one WARNING, then DEBUG. Another
+    symbol, another reason, or another instance warns again; the skip itself is unchanged."""
+    expert = object.__new__(PullbackReversion)
+    frames = {"AAA": recent_listing(), "BBB": recent_listing(), "SPY": spy_full()}
+    friday, monday = AS_OF - timedelta(days=3), AS_OF  # two consecutive sessions' decisions
+    frames_friday = {k: v.iloc[:-1] for k, v in frames.items()}
+    first, _ = analyze(frames_friday, settings_for(), as_of=friday, expert=expert)
+    second, _ = analyze(frames, settings_for(), as_of=monday, expert=expert)
+    assert first.skip_reason == second.skip_reason == "insufficient_history"
+    assert first.raw_outputs == second.raw_outputs == {}
+    assert len(recorder.warnings) == 1 and len(recorder.debugs) == 1
+    assert "AAA" in recorder.debugs[0] and "insufficient_history" in recorder.debugs[0]
+    analyze(frames, settings_for(), symbol="BBB", expert=expert)            # another symbol
+    stopped = {"AAA": provider_frame(long_dip(), end="2024-05-31"), "SPY": spy_full()}
+    analyze(stopped, settings_for(), expert=expert)                         # another reason
+    analyze(stopped, settings_for(), expert=expert)
+    analyze(frames, settings_for())                                         # another instance
+    assert len(recorder.warnings) == 4 and len(recorder.debugs) == 2
+    assert PullbackReversion._skips_logged is None  # never shared through the class
 
 
 def test_a_skip_leaves_the_backtest_ledger_untouched():

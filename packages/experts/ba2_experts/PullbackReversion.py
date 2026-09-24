@@ -424,6 +424,9 @@ class PullbackReversion(MarketExpertInterface):
     #: of a bar, so it is fetched and converted once per session (class default for instances
     #: built without ``__init__``).
     _spy_memo = None
+    #: ``{(symbol, skip_reason)}`` already logged at WARNING by this instance (created on the
+    #: first skip; the class default serves instances built without ``__init__``).
+    _skips_logged = None
 
     @classmethod
     def description(cls):
@@ -481,7 +484,14 @@ class PullbackReversion(MarketExpertInterface):
         return bars
 
     def _skip(self, symbol, reason, message, current_price, first, last, spy):
-        logger.warning(
+        # A recent listing or a held delisted symbol skips on every bar for months, in every
+        # GA trial: WARNING once per (symbol, reason) per instance, DEBUG on the repeats.
+        logged = self._skips_logged
+        if logged is None:
+            logged = self._skips_logged = set()
+        first_time = (symbol, reason) not in logged
+        logged.add((symbol, reason))
+        (logger.warning if first_time else logger.debug)(
             f"PullbackReversion skip {symbol}: {reason}; {symbol} sessions {first}..{last}; "
             f"{SPY_SYMBOL} sessions {_span(spy)}. {message}")
         return Recommendation(
