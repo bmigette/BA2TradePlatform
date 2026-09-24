@@ -21,6 +21,7 @@ function has no DB/IO so it is unit-testable; ``get_latest_atr`` is the thin
 data-fetch wrapper.
 """
 
+import math
 from datetime import datetime
 from typing import Any, Callable, Optional
 
@@ -314,6 +315,84 @@ def reconcile_protective_stop(ruleset_sl: Optional[float], safeguard_sl: Optiona
     if safeguard_sl and not ruleset_sl:
         return safeguard_sl
     return None
+
+
+#: ``Transaction.meta_data`` key holding the stop each equity position was SIZED on, written once
+#: at entry (see ``trade_cycle.record_max_loss_stop``). Rules that later adjust the stop may move
+#: it, but the adjust policy reads this as the loosest stop a rule may ever set.
+MAX_LOSS_STOP_KEY = "max_loss_stop"
+
+
+def _usable_stop_price(value: Any) -> Optional[float]:
+    """A stop price as a float, or None when it is absent or not a usable price.
+
+    None, a bool, a non-number, NaN, +/-inf, zero and negatives are all "no stop": a stop price is
+    a positive finite number or it is nothing. Never defaults a price."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+def sized_on_stop(ruleset_sl: Optional[float], safeguard_sl: Optional[float]) -> Optional[float]:
+    """The stop a classic-RM entry was SIZED on: its max-loss stop.
+
+    WHY THE SAFEGUARD, EVEN WHEN A TIGHTER RULESET STOP IS WHAT GETS SUBMITTED. The classic RM
+    decides the entry's stop in ``TradeRiskManagement._ensure_safeguard_stop`` on a candidate
+    order that carries no ``stop_price`` (``trade_cycle.build_entry_candidate`` never sets one),
+    so it always synthesises the safeguard, writes it to ``order.stop_price``, and
+    ``_risk_atr_quantity`` then sizes the quantity off exactly that price
+    (``compute_risk_based_quantity(stop_price=order.stop_price)``). The ruleset's own entry
+    stop lives on ``Transaction.stop_loss`` and never enters the sizing arithmetic.
+    ``reconcile_protective_stop`` then attaches the TIGHTER of the two, so a tighter ruleset stop
+    protects the position, but the RISK BUDGET was spent against the safeguard distance. A rule
+    that loosens the stop back to the safeguard therefore still loses at most what the position
+    was sized to lose. Recording the tighter submitted stop instead would make every such rule a
+    no-op. In ``notional`` sizing the quantity ignores the stop, but the same safeguard is still
+    the RM's own loss cap (``risk_per_trade_pct`` distance), so the same value is recorded.
+
+    No usable safeguard (synthesis returned None: no usable price or risk_per_trade_pct) -> the
+    ruleset stop, which is then the ONLY stop the entry carries and so the one it was sized
+    against. Neither -> None: the entry has no stop and nothing is recorded.
+
+    Pure function."""
+    safeguard = _usable_stop_price(safeguard_sl)
+    if safeguard is not None:
+        return safeguard
+    return _usable_stop_price(ruleset_sl)
+
+
+def with_max_loss_stop(meta_data: Optional[dict], stop: Optional[float]) -> Optional[dict]:
+    """A NEW ``meta_data`` dict carrying ``max_loss_stop``, or None when nothing is to be written.
+
+    Nothing is written when ``stop`` is not a usable price, or when the key is ALREADY present:
+    the max-loss stop is written exactly once, at entry, and nothing later (a stop adjustment, a
+    wash-trade re-submit, a retry) may replace it. The input dict is never mutated: a JSON column
+    only persists a change SQLModel can see, which is a new object assigned to the attribute."""
+    value = _usable_stop_price(stop)
+    if value is None:
+        return None
+    existing = meta_data if isinstance(meta_data, dict) else {}
+    if MAX_LOSS_STOP_KEY in existing:
+        return None
+    return {**existing, MAX_LOSS_STOP_KEY: value}
+
+
+def max_loss_stop_of(transaction: Any) -> Optional[float]:
+    """The max-loss stop recorded on ``transaction`` at entry, or None.
+
+    None means "not known": an option transaction, a transaction opened before this was
+    recorded, an entry path that does not record it, or a stored value that is not a usable
+    price. Callers must treat None as "no floor is known", never substitute a price for it."""
+    meta = getattr(transaction, "meta_data", None)
+    if not isinstance(meta, dict) or MAX_LOSS_STOP_KEY not in meta:
+        return None
+    return _usable_stop_price(meta[MAX_LOSS_STOP_KEY])
 
 
 def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: str = "1d",

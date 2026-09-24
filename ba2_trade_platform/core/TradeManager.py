@@ -1615,7 +1615,7 @@ class TradeManager:
         for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
             try:
                 submit_sl = self._entry_submit_stop(order, sl_price)
-                return account.submit_order(order, sl_price=submit_sl)
+                submitted = account.submit_order(order, sl_price=submit_sl)
             except Exception as e:  # noqa: BLE001 — classified immediately below
                 if "database is locked" not in str(e).lower():
                     raise  # a real answer from the broker/validator: never re-send
@@ -1626,6 +1626,17 @@ class TradeManager:
                         f"Entry submit for order {order.id} ({order.symbol}) lost to a DB lock "
                         f"(attempt {attempt}/{self._ENTRY_SUBMIT_RETRIES}); retrying in {delay:.0f}s")
                     _time.sleep(delay)
+            else:
+                # The stop this entry was SIZED on, recorded once as the transaction's max-loss
+                # stop. ``sl_price`` is the RM safeguard the candidate was sized off, BEFORE
+                # _entry_submit_stop reconciled it with the ruleset stop; the helper falls back
+                # to the ruleset stop only when there is no safeguard. OUTSIDE the try on
+                # purpose: nothing it does may be mistaken for a DB-locked submit and re-send
+                # the order. It never raises (see the helper).
+                if submitted:
+                    from ba2_common.core.trade_cycle import record_max_loss_stop
+                    record_max_loss_stop(order, sl_price)
+                return submitted
         self.logger.error(
             f"Entry submit for order {order.id} ({order.symbol}) ABANDONED after "
             f"{self._ENTRY_SUBMIT_RETRIES} DB-lock retries: {last_err}. The RM funded this trade "

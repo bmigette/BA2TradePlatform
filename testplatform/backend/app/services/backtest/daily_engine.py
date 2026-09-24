@@ -54,6 +54,7 @@ from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
+from ba2_common.core.trade_cycle import record_max_loss_stop
 from ba2_common.core.types import (
     AnalysisUseCase,
     OrderDirection,
@@ -1729,7 +1730,11 @@ class DailyBacktestEngine:
                         ruleset_sl=(txn.stop_loss if txn else None),
                         safeguard_sl=(order.stop_price or None),
                         is_long=(order.side == OrderDirection.BUY))
-                    self.account.submit_order(order, sl_price=sl_price)
+                    submitted = self.account.submit_order(order, sl_price=sl_price)
+                    # Additive metadata: the stop the size was keyed off, written once as the
+                    # transaction's max-loss stop (never raises; see record_max_loss_stop).
+                    if submitted:
+                        record_max_loss_stop(order, order.stop_price or None)
                 except Exception as e:  # noqa: BLE001
                     _reraise_option_basis_refusal(e)
                     self._log(f"submit_order failed for order {order.id}: {e}")
@@ -1785,8 +1790,13 @@ class DailyBacktestEngine:
                     ruleset_sl=(txn.stop_loss if txn else None),
                     safeguard_sl=(cand.stop_price or None),
                     is_long=(order.side == OrderDirection.BUY))
-                self.account.submit_order(order, sl_price=sl_price)
+                submitted = self.account.submit_order(order, sl_price=sl_price)
                 created_any = True
+                # Additive metadata: the stop the size was keyed off (cand.stop_price, the RM
+                # safeguard), written once as the transaction's max-loss stop. Same shared
+                # helper as the live funded loop; it never raises.
+                if submitted:
+                    record_max_loss_stop(order, cand.stop_price or None)
             except Exception as e:  # noqa: BLE001
                 _reraise_option_basis_refusal(e)
                 self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
