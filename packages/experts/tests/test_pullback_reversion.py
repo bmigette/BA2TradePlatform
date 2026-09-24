@@ -12,8 +12,9 @@ import pandas as pd
 import pytest
 
 from ba2_common.core.market_conditions import (
-    STATUS_VALID, STRUCTURE_STATE_CODES, WINDOW, compute_chart_structure, compute_market_conditions)
-from ba2_experts.PullbackReversion import pullback_signal
+    STATUS_INVALID_PRICES, STATUS_VALID, STRUCTURE_STATE_CODES, WINDOW, compute_chart_structure,
+    compute_market_conditions)
+from ba2_experts.PullbackReversion import _wilder_rsi, pullback_signal
 
 
 # ----------------------------------------------------------------------------- builders
@@ -122,13 +123,44 @@ def test_slope_gate_follows_the_platform_trend_slope():
     assert out["trend_ok"] is False and out["action"] == "none"
 
 
-def test_slope_gate_with_unknown_status_is_not_trend_ok():
-    bars = bars_from_returns(UPTREND + DIP)
-    bars.iloc[-10, bars.columns.get_loc("High")] = bars["Low"].iloc[-10] * 0.9  # high < low
-    assert compute_market_conditions(*window(bars)).trend_slope.status != STATUS_VALID
-    out = pullback_signal(bars, settings(trend_gate="slope_ohlcv_v1"))
+def _corrupt_high(bars, back=10):
+    bars = bars.copy()
+    bars.iloc[-back, bars.columns.get_loc("High")] = bars["Low"].iloc[-back] * 0.9  # high < low
+    return bars
+
+
+def test_slope_gate_on_corrupt_bars_raises():
+    bars = _corrupt_high(bars_from_returns(UPTREND + DIP))
+    assert compute_market_conditions(*window(bars)).trend_slope.status == STATUS_INVALID_PRICES
+    with pytest.raises(ValueError, match="Corrupt bars"):
+        pullback_signal(bars, settings(trend_gate="slope_ohlcv_v1"))
+
+
+def test_slope_gate_with_unmeasurable_slope_is_not_trend_ok(monkeypatch):
+    """A non-valid status that is NOT corrupt data (none is reachable with 128 validated bars
+    today) reads as "trend not ok", never as passing."""
+    import dataclasses
+
+    import ba2_experts.PullbackReversion as mod
+    from ba2_common.core.market_conditions import STATUS_INSUFFICIENT_HISTORY, Observation
+
+    real = mod.compute_market_conditions
+
+    def unmeasurable(*arrays):
+        return dataclasses.replace(real(*arrays), trend_slope=Observation(
+            None, STATUS_INSUFFICIENT_HISTORY, "test"))
+
+    monkeypatch.setattr(mod, "compute_market_conditions", unmeasurable)
+    out = pullback_signal(bars_from_returns(UPTREND + DIP), settings(trend_gate="slope_ohlcv_v1"))
     assert out["trend_ok"] is False
     assert out["action"] != "entry"
+
+
+def test_corrupt_bars_outside_the_calculator_modes_do_not_matter():
+    """Only the close enters the SMA gates and exits; the OHLV bar checks belong to the
+    calculators, so a corrupt high does not block an sma200/sma5 decision."""
+    bars = _corrupt_high(bars_from_returns(UPTREND + DIP))
+    assert pullback_signal(bars, settings())["action"] == "entry"
 
 
 # ----------------------------------------------------------------------------- exits
@@ -200,11 +232,27 @@ def test_choch_exit_fires_on_bull_structure_for_a_short():
     assert out["structure_state"] == "bull"
 
 
-def test_choch_mode_reports_unknown_structure_as_none_and_no_choch():
-    bars = _bear_structure_bars()
-    bars.iloc[-10, bars.columns.get_loc("High")] = bars["Low"].iloc[-10] * 0.9  # high < low
-    assert compute_chart_structure(*window(bars)).structure_state.status != STATUS_VALID
-    out = pullback_signal(bars, settings(exit_mode="sma5_or_choch"))
+def test_choch_mode_on_corrupt_bars_raises():
+    bars = _corrupt_high(_bear_structure_bars())
+    assert compute_chart_structure(*window(bars)).structure_state.status == STATUS_INVALID_PRICES
+    with pytest.raises(ValueError, match="Corrupt bars"):
+        pullback_signal(bars, settings(exit_mode="sma5_or_choch"))
+
+
+def test_choch_mode_reports_unmeasurable_structure_as_None_and_no_choch(monkeypatch):
+    import dataclasses
+
+    import ba2_experts.PullbackReversion as mod
+    from ba2_common.core.market_conditions import STATUS_INSUFFICIENT_HISTORY, Observation
+
+    real = mod.compute_chart_structure
+
+    def unmeasurable(*arrays):
+        return dataclasses.replace(real(*arrays), structure_state=Observation(
+            None, STATUS_INSUFFICIENT_HISTORY, "test"))
+
+    monkeypatch.setattr(mod, "compute_chart_structure", unmeasurable)
+    out = pullback_signal(_bear_structure_bars(), settings(exit_mode="sma5_or_choch"))
     assert out["structure_state"] is None
     assert out["action"] == "none"  # below SMA5 and no measurable CHoCH
 
@@ -220,6 +268,7 @@ def test_entry_beats_exit_on_the_same_bar():
     out = pullback_signal(bars, settings(exit_mode="sma5_or_choch", entry_threshold=30.0))
     assert out["rsi"] < 30.0  # the entry condition holds too
     assert out["action"] == "entry"
+    assert out["structure_state"] == "bear"  # reported on entry bars too
 
 
 # ----------------------------------------------------------------------------- SPY gate
@@ -259,14 +308,75 @@ def test_spy_gate_missing_short_or_misaligned_spy_raises():
         pullback_signal(stock.iloc[:-1], s, spy_bars=bars_from_returns(DOWNTREND + RALLY))
 
 
-# ----------------------------------------------------------------------------- causality
+def test_spy_gate_timezone_mismatch_names_the_timezones():
+    stock = bars_from_returns(DOWNTREND + RALLY)
+    spy = bars_from_returns(DOWNTREND + RALLY)
+    spy.index = spy.index.tz_localize("UTC")
+    s = settings(direction="short", trend_gate="sma200_and_spy")
+    with pytest.raises(ValueError, match="Timezone mismatch.*tz-naive.*UTC"):
+        pullback_signal(stock, s, spy_bars=spy)
+    stock.index = stock.index.tz_localize("America/New_York")
+    with pytest.raises(ValueError, match="Timezone mismatch.*America/New_York.*UTC"):
+        pullback_signal(stock, s, spy_bars=spy)
+
+
+def test_range_index_raises_for_bars_and_spy():
+    stock = bars_from_returns(DOWNTREND + RALLY)
+    with pytest.raises(ValueError, match="DatetimeIndex"):
+        pullback_signal(stock.reset_index(names="Date"), settings())
+    with pytest.raises(ValueError, match="DatetimeIndex"):
+        pullback_signal(stock, settings(direction="short", trend_gate="sma200_and_spy"),
+                        spy_bars=bars_from_returns(DOWNTREND + RALLY).reset_index(names="Date"))
+
+
+# ----------------------------------------------------------------------------- RSI
+def _pandas_rsi(close, n):
+    """The probe's ``rsi()`` verbatim, last value."""
+    d = pd.Series(close).diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return float((100 - 100 / (1 + up / dn.replace(0, np.nan))).iloc[-1])
+
+
+@pytest.mark.parametrize("n", [2, 3, 4, 5])
+def test_wilder_rsi_matches_the_pandas_ewm_formulation(n):
+    rng = np.random.default_rng(n)
+    close = 100 * np.cumprod(1 + rng.normal(0, 0.02, 600))
+    for k in (3, 10, 199, 200, 350, 600):
+        assert _wilder_rsi(close[:k], n) == pytest.approx(_pandas_rsi(close[:k], n), abs=1e-9)
+    for series in (UPTREND + DIP, DOWNTREND + RALLY, UPTREND + DIP + [0.06]):
+        c = bars_from_returns(series)["Close"].to_numpy()
+        assert _wilder_rsi(c, n) == pytest.approx(_pandas_rsi(c, n), abs=1e-9)
+
+
+def test_no_down_move_gives_rsi_100():
+    """The probe's RSI is NaN when the smoothed history holds no down move, so neither its entry
+    nor its RSI exit ever fired on that bar. Here the RSI is 100:
+    * a long in ``rsi`` exit mode now EXITS (the probe held);
+    * the short-entry RSI condition holds too, but a history with no down move closes above its
+      SMA200 and has a positive slope, so every short trend gate refuses it: no short entry."""
+    bars = bars_from_returns([0.004] * 262)
+    assert math.isnan(_pandas_rsi(bars["Close"].to_numpy(), 2))
+    out = pullback_signal(bars, settings(exit_mode="rsi"))
+    assert out["rsi"] == 100.0
+    assert out["action"] == "exit"
+    for gate in ("sma200", "slope_ohlcv_v1"):
+        short = pullback_signal(bars, settings(direction="short", trend_gate=gate, exit_mode="time"))
+        assert short["rsi"] == 100.0
+        assert short["trend_ok"] is False and short["action"] == "none"
+
+
+# ----------------------------------------------------------------------------- determinism
 ALL_MODES = [settings(direction=d, trend_gate=g, exit_mode=e)
              for d in ("long", "short")
              for g in ("sma200", "slope_ohlcv_v1", "sma200_and_spy")
              for e in ("sma5", "rsi", "sma5_or_choch", "time")]
 
 
-def test_appending_future_bars_never_changes_a_prefix_result():
+def test_prefix_results_are_deterministic_carry_no_state_and_do_not_mutate_inputs():
+    """Pure-function guard: a prefix's result does not depend on bars after it, on earlier
+    calls, or on call order, and inputs are untouched. The real lookahead test (``as_of``
+    slicing of provider data) belongs to the expert in Task A2."""
     base = bars_from_returns(UPTREND + DIP + [0.06] + DOWNTREND[:20] + RALLY)
     wild = bars_from_returns(UPTREND + DIP + [0.06] + DOWNTREND[:20] + RALLY)
     cut = 270
