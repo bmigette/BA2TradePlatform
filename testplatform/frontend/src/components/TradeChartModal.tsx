@@ -120,10 +120,16 @@ const TradeChartModal: React.FC<{
   }, [stockKey, symbol, entryDate, exitDate]);
 
   // ---- OPTION: the complete transaction, cache-only ----------------------------
+  // Keyed on the two ids, NOT on the ``optionSelection`` object: the page hands over a fresh
+  // object on every re-render (its running-jobs poll re-renders it every few seconds), and an
+  // object dependency re-fetched the trade each time -- and ``setScope(null)`` below then
+  // snapped the payoff selector back to "Whole structure" moments after a leg was picked.
+  const optionBacktestId = optionSelection?.backtestId;
+  const optionTradeId = optionSelection?.tradeId;
   useEffect(() => {
-    if (!optionKey || !optionSelection) return;
+    if (!optionKey || optionBacktestId == null || optionTradeId == null) return;
     let alive = true;
-    getTradeChartContext(optionSelection.backtestId, optionSelection.tradeId)
+    getTradeChartContext(optionBacktestId, optionTradeId)
       .then(res => {
         if (!alive) return;
         setOptionLoad({ key: optionKey, value: res, error: null });
@@ -133,7 +139,7 @@ const TradeChartModal: React.FC<{
         if (alive) setOptionLoad({ key: optionKey, value: null, error: String(e) });
       });
     return () => { alive = false; };
-  }, [optionKey, optionSelection]);
+  }, [optionKey, optionBacktestId, optionTradeId]);
 
   const stockReady = stockLoad && stockLoad.key === stockKey ? stockLoad : null;
   const optionReady = optionLoad && optionLoad.key === optionKey ? optionLoad : null;
@@ -198,6 +204,22 @@ const TradeChartModal: React.FC<{
           axisLabelVisible: true,
           title: line.label,
         });
+      }
+      // The line the green/red zones meet at. Without it the zones read as "profit / no
+      // profit" for the TRADE, and an early exit that sat in the red zone -- sold for more
+      // than it cost, weeks before expiry -- looked impossible. Labelled as what it is.
+      if (showOverlay && payoff?.available) {
+        for (const breakeven of payoff.breakevens) {
+          if (!Number.isFinite(breakeven)) continue;
+          series.createPriceLine({
+            price: breakeven,
+            color: '#eab308',
+            lineWidth: 1,
+            lineStyle: LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: `Breakeven at expiry $${breakeven.toFixed(2)}`,
+          });
+        }
       }
       for (const marker of allMarkers(context.legs, {
         structure: showStructureMarkers, legs: showLegMarkers,
@@ -276,7 +298,7 @@ const TradeChartModal: React.FC<{
       seriesRef.current = null;
       chart.remove();
     };
-  }, [trade, data, isOptionView, context, showStructureMarkers, showLegMarkers]);
+  }, [trade, data, isOptionView, context, showStructureMarkers, showLegMarkers, showOverlay, payoff]);
 
   // ---- position the rotated payoff overlay ------------------------------------
   useEffect(() => {
@@ -466,10 +488,12 @@ const TradeChartModal: React.FC<{
             <label className="inline-flex items-center gap-1">
               <input type="checkbox" checked={showOverlay}
                      onChange={e => setShowOverlay(e.target.checked)} />
-              Payoff overlay
+              Expiry payoff zones
             </label>
             <span className="text-[11px] text-gray-500 dark:text-gray-400">
-              Green/red is hypothetical profit/loss at expiration — not the recorded result.
+              Green/red: profit/loss if held to expiration with the underlying at that price. An
+              early exit is priced off the option's premium (time value included), so it can
+              profit from the red zone. Markers are stacked labels on the bar, not price levels.
             </span>
           </div>
         )}

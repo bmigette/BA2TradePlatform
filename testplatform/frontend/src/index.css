@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+/* `dark:` follows the app's `.dark` class (hard-coded on <html> in index.html), NOT the OS.
+   Tailwind v4 ignores tailwind.config.js `darkMode: ["class"]` unless the config is loaded
+   with @config, so without this line every `dark:` utility in the components was gated on
+   prefers-color-scheme: on a machine in LIGHT mode the light `bg-*-100` chips stayed light
+   while the `.dark .text-*` overrides below lightened their text -- white on near-white,
+   in the trade list, the trade-details popup and elsewhere, one report at a time. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: 0 0% 100%;
   --foreground: 222.2 84% 4.9%;
@@ -424,11 +432,11 @@ body {
   color: rgb(209 213 219) !important; /* gray-300 */
 }
 
-/* Fix text in cards and panels */
-.dark .bg-gray-50 p,
-.dark .bg-gray-100 p {
-  color: rgb(55 65 81); /* gray-700 - dark text on light bg in dark mode */
-}
+/* Fix text in cards and panels.
+   (A `.dark .bg-gray-50 p, .dark .bg-gray-100 p { gray-700 }` rule stood here, for "dark text
+   on a light bg". Both surfaces are forced DARK above, and the app's root layout is
+   `bg-gray-100` -- so it turned every <p> on a non-gray-800 panel dark-gray-on-slate:
+   "No running jobs.", "Loading cache usage…". Removed; `.dark p` gives them gray-300.) */
 
 .dark .bg-gray-700 p,
 .dark .bg-gray-800 p,
