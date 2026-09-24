@@ -20,7 +20,8 @@ if str(ROOT) not in sys.path:
 from tools.strategy_research.exploration.profiles import (
     ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, build_manifest, fingerprint)
 from tools.strategy_research.exploration.runtime import (
-    check_database, execute_ready, job_lock, preflight, refuse_unrunnable, resolve_universe, write_json)
+    check_database, database_url, execute_ready, job_lock, preflight, refuse_unrunnable,
+    resolve_universe, write_json)
 
 
 def parser():
@@ -77,6 +78,9 @@ def run_child(args):
     job = json.loads(path.read_text(encoding="utf-8"))
     verify_job(job)
     database = check_database(args.db_file)
+    # Bind the backend to --db-file before ANYTHING can import app.models.database (its engine
+    # is created at import); preflight must not, but this does not depend on it.
+    os.environ["DATABASE_URL"] = database_url(database)
     # Lock scope is the destination DB, so different output directories cannot
     # accidentally start the same job twice.
     lock = database.parent / "research10-locks" / (job["name"] + ".lock")

@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import date
 import itertools
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -280,15 +281,93 @@ def _screen_one(monkeypatch, tmp_path, job):
     return job
 
 
-def test_reference_symbols_come_from_the_expert_through_the_backtest_registry():
+def test_reference_symbols_come_from_the_expert_class():
     import importlib
+    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
     module = importlib.import_module("ba2_experts.PullbackReversion")
     assert R.expert_class("PullbackReversion") is module.PullbackReversion
     assert module.PullbackReversion.REFERENCE_DAILY_SYMBOLS == (module.SPY_SYMBOL,) == ("SPY",)
     bt = jobs()["long_sma5"]["optimization_config"]["backtest"]
     assert R.reference_requirements(bt) == {"SPY": module.MAX_STALE_DAYS}
-    for job in P.build_manifest()["jobs"]:  # no default family's expert declares any
-        assert R.reference_requirements(job["optimization_config"]["backtest"]) == {}
+    for job in P.build_manifest()["jobs"] + list(jobs().values()):
+        name = job["expert"]
+        # expert_class's ba2_experts.<name> is the module the backtest handler runs.
+        assert _SUPPORTED_EXPERTS[name] == "ba2_experts." + name
+        if job["family"] != "pullback_rsi":  # no default family's expert declares any
+            assert R.reference_requirements(job["optimization_config"]["backtest"]) == {}
+
+
+def test_an_unknown_expert_class_is_a_clear_error():
+    with pytest.raises(ValueError, match="Unknown expert class 'NoSuchExpert'"):
+        R.expert_class("NoSuchExpert")
+    with pytest.raises(ValueError, match="defines no class"):
+        R.expert_class("settings_io")  # a real ba2_experts module, but no class of that name
+    bt = deepcopy(jobs()["long_sma5"]["optimization_config"]["backtest"])
+    bt["experts"][0]["class"] = "NoSuchExpert"
+    with pytest.raises(ValueError, match="NoSuchExpert"):
+        R.reference_requirements(bt)
+
+
+_NO_BACKEND_SCRIPT = """
+import sys
+from pathlib import Path
+import pandas as pd
+root, cache = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path.insert(0, str(root))
+from tools.strategy_research.exploration import profiles as P, runtime as R
+R.add_source_paths()
+from ba2_providers.screener import metric_store as ms
+ms.load_store = lambda _: pd.DataFrame({"date": ["2020-01-02", "2025-12-31"]})
+ms.screened_symbol_union = lambda *args: ["AAA"]
+R.code_signature = lambda: "source-version"
+for symbol, intervals in (("AAA", ("1d", "5min")), ("SPY", ("1d",))):
+    for interval in intervals:
+        pd.DataFrame({"Date": pd.to_datetime(["2018-01-01", "2020-01-02", "2025-12-31"], utc=True)}
+                     ).to_parquet(cache / f"{symbol}_{interval}.parquet")
+for family, variant in (("large_ds", "control"), ("pullback_rsi", "long_sma5")):
+    job = next(j for j in P.build_manifest(families=[family])["jobs"] if j["variant"] == variant)
+    job["optimization_config"]["backtest"]["screener_opt"]["store"] = str(cache)
+    R.reference_requirements(job["optimization_config"]["backtest"])
+    R.preflight(job, cache)
+loaded = sorted(m for m in sys.modules if m == "app" or m.startswith("app."))
+print("BACKEND:", loaded)
+"""
+
+
+def test_preflight_never_imports_the_backend_database_module(tmp_path):
+    """app.models.database binds its engine to DATABASE_URL at import. A preflight importing it
+    (the old registry lookup did) before execute_ready applies --db-file sent every family's
+    rows to the default test DB. A fresh interpreter, so this module's imports cannot mask it."""
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    done = subprocess.run([sys.executable, "-c", _NO_BACKEND_SCRIPT, str(ROOT), str(tmp_path)],
+                          cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stderr[-4000:]
+    assert "BACKEND: []" in done.stdout, done.stdout[-2000:]
+
+
+def test_run_child_binds_the_db_file_before_preflight(monkeypatch, tmp_path):
+    monkeypatch.delenv("DATABASE_URL", raising=False)  # restored after the test either way
+    monkeypatch.delenv("CACHE_FOLDER", raising=False)
+    database = (tmp_path / "chosen.db").resolve()
+    job = jobs()["long_sma5"]
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps(job), encoding="utf-8")
+    seen = {}
+
+    def capture(job, cache_dir):
+        seen["url"] = os.environ.get("DATABASE_URL")
+        raise RuntimeError("stop after preflight")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("execute_ready ran")
+    monkeypatch.setattr(D, "check_database", lambda path: Path(path).resolve())
+    monkeypatch.setattr(D, "preflight", capture)
+    monkeypatch.setattr(D, "execute_ready", forbidden)
+    assert D.main(["--job-file", str(job_file), "--db-file", str(database),
+                   "--cache-dir", str(tmp_path / "FMPOHLCVProvider")]) == 1
+    assert seen["url"] == R.database_url(database) == "sqlite:///" + database.as_posix()
+
 
 
 def test_preflight_requires_spy_daily_for_pullback_rsi_only(monkeypatch, tmp_path):

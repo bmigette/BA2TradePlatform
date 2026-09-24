@@ -113,11 +113,28 @@ def resolve_universe(bt):
 
 
 def expert_class(name):
-    """The class the daily backtest handler runs for ``name``, via its registry
-    (``_SUPPORTED_EXPERTS``: class name -> module)."""
+    """The expert class ``name`` from ``ba2_experts.<name>``, as ``execute_ready`` resolves it.
+
+    Never through the backtest handler's registry: importing ``app.*`` imports
+    ``app.models.database``, which binds its engine to ``DATABASE_URL`` AT IMPORT, so a
+    preflight doing it before ``execute_ready`` sets ``--db-file`` would send every row of the
+    run to the default test database."""
     add_source_paths()
-    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
-    return getattr(importlib.import_module(_SUPPORTED_EXPERTS[name]), name)
+    module_name = "ba2_experts." + name
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            raise  # the expert exists but one of ITS imports is missing: not an unknown name
+        raise ValueError(f"Unknown expert class {name!r}: there is no module {module_name}") from exc
+    if not isinstance(getattr(module, name, None), type):
+        raise ValueError(f"Unknown expert class {name!r}: {module_name} defines no class {name}")
+    return getattr(module, name)
+
+
+def database_url(database):
+    """The ``DATABASE_URL`` the backend binds to for a checked ``--db-file`` path."""
+    return "sqlite:///" + Path(database).as_posix()
 
 
 def reference_requirements(bt):
@@ -353,7 +370,7 @@ def persist_top(db, opt, job):
 def execute_ready(job, database, *, resume=False):
     """Only called after explicit --run and successful cache preflight."""
     database = check_database(database)
-    os.environ["DATABASE_URL"] = "sqlite:///" + database.as_posix()
+    os.environ["DATABASE_URL"] = database_url(database)
     add_source_paths()
     import ba2test_launcher as launcher
     launcher._enter_backend()
@@ -364,7 +381,7 @@ def execute_ready(job, database, *, resume=False):
     from app.services.strategy_param_space import collect_param_space
     from types import SimpleNamespace
 
-    expert_cls = getattr(importlib.import_module("ba2_experts." + job["expert"]), job["expert"])
+    expert_cls = expert_class(job["expert"])
     definitions = expert_cls.get_merged_settings_definitions()
     settings = job["optimization_config"]["backtest"]["experts"][0]["settings"]
     unknown = (set(settings) | set(job["optimization_config"]["expert_params"])) - set(definitions)
