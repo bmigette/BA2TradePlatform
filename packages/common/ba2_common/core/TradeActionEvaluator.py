@@ -928,6 +928,10 @@ class TradeActionEvaluator:
                     condition_evaluation["error"] = "No event_type specified"
                     condition_evaluation["condition_description"] = "Invalid trigger configuration"
                     rule_evaluation["conditions"].append(condition_evaluation)
+                    # An unreadable trigger FAILS the rule, like "Could not create condition"
+                    # below: skipping it left the other triggers to decide, so a one-trigger
+                    # rule fired unconditionally.
+                    rule_evaluation["all_conditions_met"] = False
                     continue
                 
                 try:
@@ -938,6 +942,8 @@ class TradeActionEvaluator:
                     condition_evaluation["error"] = f"Invalid event type: {event_type_str}"
                     condition_evaluation["condition_description"] = "Invalid event type"
                     rule_evaluation["conditions"].append(condition_evaluation)
+                    # Unknown to THIS code (a rollback, or a rule from newer code): fail the rule.
+                    rule_evaluation["all_conditions_met"] = False
                     continue
                 
                 # Create condition instance
