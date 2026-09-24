@@ -73,3 +73,13 @@ yarn.lock
 .env.*.local
 *.tmp
 .cache
+
+# Secrets and local data: never part of an image
+*.env
+creds.env
+testplatform/CLAUDEBT.local.md
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+logs/

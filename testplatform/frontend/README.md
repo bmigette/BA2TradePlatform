@@ -1,13 +1,23 @@
-# BA2MLTestPlatform Frontend
+# BA2 Test Platform Frontend
 
-React + TypeScript + Vite frontend for the ML Test Platform.
+React + TypeScript + Vite frontend for the BA2 Test Platform (`ba2-test`): backtesting,
+GA optimization and the deep-learning module. See [../README.md](../README.md).
 
 ## Setup
+
+The repo-root install script runs `npm install` here. To run the UI, use `ba2-test serve`
+(API + UI) or `ba2-test serve --mode front` (UI only), or by hand:
 
 ```bash
 cd frontend
 npm install
 npm run dev
+```
+
+## Test
+
+```bash
+npm test        # vitest
 ```
 
 ## Build

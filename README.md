@@ -353,22 +353,18 @@ Useful flags: `-TradeOnly`/`-TestOnly` (`--trade-only`/`--test-only`) to build j
 
 ### 3. Alternative — manual single-venv setup (trade app only)
 
-`requirements.txt` still lists the three shared packages as `git+ssh` URLs of their former standalone
-repos. For a manual setup, install the **in-repo** packages first and strip those lines, as the install
-script does:
+`requirements.txt` lists third-party dependencies only. The three shared packages are installed
+from the in-repo `packages/` first (pip resolves a relative path in a requirements file against the
+current directory, so they are kept out of it). From the repo root:
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install --no-sources -e packages/common
-uv pip install --no-sources -e packages/providers
-uv pip install --no-sources -e "packages/experts[ui]"
-grep -v -i -E 'ba2trade-|BA2TradeCommon|BA2TradeProviders|BA2TradeExperts' requirements.txt > requirements.local.txt
-uv pip install -r requirements.local.txt
-uv pip install --no-sources --no-deps -e .     # optional: registers the ba2-trade command
+uv pip install -e packages/common -e packages/providers -e "packages/experts[ui]"
+uv pip install -r requirements.txt
+uv pip install --no-deps -e .     # optional: registers the ba2-trade command
 ```
 
-(`uv` is optional — `python -m pip` works the same way without `--no-sources`. On Windows, run the
-`grep` line from Git Bash.) On Windows, prefer the CPU-only PyTorch build — see
+(`uv` is optional: `python -m pip install ...` runs the same commands.) On Windows, prefer the CPU-only PyTorch build — see
 [Troubleshooting](#-troubleshooting).
 
 ### 4. Run the application
@@ -441,14 +437,12 @@ BA2_HOME  (default ~/Documents/ba2)
 
 ## 🐳 Docker
 
-`Dockerfile` and `docker-compose.yml` date from November 2025 and predate the monorepo: the image runs
-`uv pip install -r requirements.txt` as-is, whose `ba2trade-*` lines point at `git+ssh` URLs of the
-former standalone package repos instead of the in-repo `packages/`. **Treat the Docker setup as
-unmaintained** — it needs updating before it will build reliably.
-
-For reference, the compose file builds the image, serves the UI on port **8000** and keeps three named
+The `Dockerfile` copies `packages/` from the build context and installs it with `requirements.txt` in
+one `uv pip install --no-sources` step (Python 3.11 image, multi-stage). No GitHub access is needed at
+build time. The compose file builds the image, serves the UI on port **8000** and keeps three named
 volumes (`ba2_db_volume`, `ba2_cache_volume`, `ba2_logs_volume`) mounted under `/opt/ba2_trade_platform/`;
-the container runs as the non-root user `trader` (UID 1000):
+the container runs as the non-root user `trader` (UID 1000). The image pulls the default (CUDA) PyTorch
+wheels from PyPI, so expect a multi-GB image.
 
 ```bash
 docker-compose up -d        # build + start, http://localhost:8000
@@ -681,14 +675,12 @@ Bump `APP_VERSION` for changes under `ba2_trade_platform/`, and `TEST_APP_VERSIO
 
 1. **Import errors / `ModuleNotFoundError: ba2_common`**: the in-repo packages are not installed in the
    venv — rerun the install script or the manual steps above. Always use the venv's Python, not a global one.
-2. **`pip install -r requirements.txt` asks for GitHub SSH access**: it is resolving the `ba2trade-*`
-   `git+ssh` lines — install from `packages/` instead (see manual setup).
-3. **Port already in use**: start with `--port 9090` (default 8080).
-4. **Database schema errors after an update**: run `python migrate.py upgrade` (with `BA2_DB_FILE` for a
+2. **Port already in use**: start with `--port 9090` (default 8080).
+3. **Database schema errors after an update**: run `python migrate.py upgrade` (with `BA2_DB_FILE` for a
    non-default database).
-5. **API key issues**: configure keys in Settings → Global Settings; each app has its own database, so
+4. **API key issues**: configure keys in Settings → Global Settings; each app has its own database, so
    keys set in the trade app are not seen by the test platform.
-6. **PyTorch DLL error on Windows** (`OSError: [WinError 1114]`): install the CPU-only build:
+5. **PyTorch DLL error on Windows** (`OSError: [WinError 1114]`): install the CPU-only build:
    ```bash
    pip install torch --index-url https://download.pytorch.org/whl/cpu
    ```
@@ -740,7 +732,13 @@ Bump `APP_VERSION` for changes under `ba2_trade_platform/`, and `TEST_APP_VERSIO
 
 ## 📄 License
 
-[Add your license information here]
+Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE): you may use, study,
+modify and share it for any noncommercial purpose, and you may run it on your own personal
+brokerage accounts. Commercial use (a product, a hosted service, selling signals, or managing
+other people's money) is not licensed. Contact the author for a commercial license.
+
+Third-party code keeps its own license: `ba2_trade_platform/thirdparties/TradingAgents/` is
+Apache-2.0.
 
 ---
 

@@ -1,11 +1,12 @@
-# BA2 Trade packages (Phase-0 extraction) — installed editable from sibling repos.
-# These provide ba2_common (interfaces/models/seams), ba2_providers (data providers),
-# and ba2_experts (the FMP experts) consumed by the backtest engine. A fresh
-# `pip install -r requirements.txt` from BA2TestPlatform/backend reproduces the
-# editable installs (relative to this file at BA2TestPlatform/backend/requirements.txt).
--e ../../BA2TradeCommon
--e ../../BA2TradeProviders
--e ../../BA2TradeExperts
+# Shared BA2 packages (ba2_common / ba2_providers / ba2_experts, consumed by the backtest engine)
+# live in this monorepo under packages/ and are NOT listed here: pip resolves a relative path in
+# a requirements file against the current directory, not against this file. Install them first,
+# from the repo root (`install.ps1 -TestOnly` / `install.sh --test-only` do all of this for you):
+#   pip install -e packages/common -e packages/providers -e packages/experts
+#   pip install -r testplatform/backend/requirements.txt
+#   pip install --no-deps -e testplatform          # registers the `ba2-test` command
+# (with uv, pass --no-sources to the package installs: the packages still carry [tool.uv.sources]
+# git pins to their retired standalone repos.)
 
 # Core API Framework
 fastapi>=0.115.0

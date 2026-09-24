@@ -193,3 +193,6 @@ dl_forecasting.db
 tools/_wu_chunk_*.txt
 remaining_5min_symbols.txt
 .superpowers/
+
+# Local-only secrets referenced by testplatform/CLAUDEBT.md
+testplatform/CLAUDEBT.local.md

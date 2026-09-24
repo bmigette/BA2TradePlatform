@@ -221,6 +221,10 @@ ba2-test serve                 # API on :8000 + Vite UI on :5173
 ba2-test serve --mode back     # API only (add --reload for development)
 ```
 
+`start.bat` / `start.sh` in this folder are thin wrappers around the same command
+(`start.bat backend|frontend|all [serve flags]`); they find `ba2-test` on `PATH` or in the
+installer's default `~/ba2-venvs/test`.
+
 - UI: http://localhost:5173. API: http://localhost:8000. OpenAPI docs: http://localhost:8000/docs.
 - The frontend reads `VITE_API_BASE` (default `http://localhost:8000/api`, see
   `frontend/src/lib/config.ts`).
@@ -345,3 +349,9 @@ Useful docs: [grid & fitness guide](docs/grid-and-fitness-guide.md),
 [daily expert backtest scope](docs/daily-expert-backtest-scope.md),
 [exit ruleset UI](docs/exit-ruleset-ui-requirements.md), `docs/superpowers/` (backtest, options
 and screener designs).
+
+## License
+
+Part of the BA2 Trade Platform monorepo and covered by its [license](../LICENSE): PolyForm
+Noncommercial 1.0.0, with an added permission to run it on your own personal accounts.
+Commercial use is not licensed.

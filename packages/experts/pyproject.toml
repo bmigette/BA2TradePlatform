@@ -23,8 +23,8 @@ ui = ["nicegui>=3.0.0"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "import-linter>=2.0", "libcst>=1.4"]
 
 [tool.uv.sources]
-ba2trade-common = { git = "ssh://git@github.com/bmigette/BA2TradeCommon.git", branch = "dev" }
-ba2trade-providers = { git = "ssh://git@github.com/bmigette/BA2TradeProviders.git", branch = "dev" }
+ba2trade-common = { path = "../common", editable = true }
+ba2trade-providers = { path = "../providers", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["ba2_experts"]

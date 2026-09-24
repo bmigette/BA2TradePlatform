@@ -65,8 +65,8 @@ function Invoke-Uv {
   if ($LASTEXITCODE -ne 0) { throw "uv pip install failed (exit $LASTEXITCODE): $($Rest -join ' ')" }
 }
 
-# Install one chain package. --no-sources: ignore the [tool.uv.sources] git pins in
-# providers/experts so OUR explicit (editable or @branch) install of each package wins.
+# Install one chain package. --no-sources: ignore the [tool.uv.sources] sibling paths in
+# providers/experts so OUR explicit install (editable or built copy) of each package wins.
 function Install-One {
   param([string]$Uv, [string]$Vpy, [bool]$Up, [string]$Target)
   $rest = @("--no-sources")
@@ -89,19 +89,14 @@ function Install-Chain {
   Install-One -Uv $Uv -Vpy $Vpy -Up $Up -Target $exp
 }
 
-# requirements.txt for both apps pins ba2trade-* to the package chain. We install the chain
-# explicitly (above), so strip those lines to avoid a conflicting re-resolve.
+# Each app's requirements.txt holds only third-party deps: the ba2trade-* chain is deliberately
+# NOT listed there (it is installed explicitly by Install-Chain above), so it is used as-is.
 function Install-Reqs {
   param([string]$Uv, [string]$Vpy, [string]$ReqPath, [bool]$Up)
   if (-not (Test-Path $ReqPath)) { return }
-  $tmp = New-TemporaryFile
-  Get-Content $ReqPath |
-    Where-Object { $_ -notmatch '(?i)ba2trade-|BA2TradeCommon|BA2TradeProviders|BA2TradeExperts|packages[\\/](common|providers|experts)' } |
-    Set-Content $tmp.FullName
   $rest = @(); if ($Up) { $rest += "--upgrade" }
-  $rest += @("-r", $tmp.FullName)
+  $rest += @("-r", $ReqPath)
   Invoke-Uv -Uv $Uv -Vpy $Vpy -Rest $rest
-  Remove-Item $tmp.FullName -Force
 }
 
 function New-AppVenv {
