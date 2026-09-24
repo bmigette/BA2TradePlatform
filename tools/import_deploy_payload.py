@@ -181,17 +181,20 @@ def main() -> int:
         # profile key (the universe block, the RM toggles, the forced instrument-selection method
         # and the schedule all write other names), so checking it here checks what gets saved.
         #
-        # The exit ruleset is not checked: ``trade_rules_to_live_export`` below already refuses a
-        # market leaf anywhere on it (``assert_no_market_conditions``).
+        # The exit rules are checked for SERVED fields too: since plan 2026-09-24 Task B2 an exit
+        # rule may carry a market leaf (``trade_rules_to_live_export`` below refuses one on any
+        # rule that does more than close, reduce or adjust TP/SL), and an unserved exit leaf reads
+        # unknown for ever -- the exit it guards silently never happens.
         try:
             mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
             assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
+            assert_market_fields_served(exit_rules, mc_profiles, where=f"{label}: exit rules")
         except ValueError as e:
             print(f"FATAL: {label}: {e}")
             return 1
         if mc_profiles:
             print(f"market-condition profile(s): {list(mc_profiles)} (every market gate in the "
-                  f"entry rules is served)")
+                  f"entry and exit rules is served)")
 
         created = False
         if inst_id is None:

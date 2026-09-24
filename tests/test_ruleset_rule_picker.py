@@ -585,9 +585,9 @@ def test_a_linked_rule_whose_subtype_no_longer_matches_is_dropped_on_open_and_re
 def test_a_market_gate_on_an_open_positions_ruleset_is_still_refused(editor,
                                                                     nicegui_client):
     """UNCHANGED BY THIS REWRITE, and checked against the rules the save actually links.
-    Outside the entry decision pass the live resolver has no context, the gate reads
-    ``no_context``, the rule NEVER fires, and the position's exit silently stops
-    happening."""
+    The gated rule here OPENS (the factory's default ``buy``): since plan 2026-09-24 Task B2 a
+    market gate on an exit rule may only close, reduce or adjust TP/SL, because a failed read
+    on the exit pass is unknown and the rule does not fire."""
     from ba2_common.core.market_condition_rules import market_condition_fields
 
     field = sorted(market_condition_fields())[0]
@@ -610,6 +610,21 @@ def test_a_market_gate_on_an_open_positions_ruleset_is_still_refused(editor,
     assert _stored_order(ruleset.id) == [gate.id], 'the links were rewritten by a refusal'
     assert get_instance(Ruleset, ruleset.id).name == 'exit-rs', (
         'the ruleset row was written by a refusal')
+
+
+def test_a_market_gate_on_an_open_positions_close_rule_is_accepted(editor, nicegui_client):
+    """Plan 2026-09-24 Task B2, against stored rules: the same gate on an exit rule that only
+    CLOSES is a market exit, and the ruleset door lets it through."""
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
+    field = sorted(market_condition_fields())[0]
+    gate = _rule('market-close', EXIT,
+                 triggers={'t0': {'event_type': field, 'operator': '>', 'value': 20.0}},
+                 actions={'action_0': {'action_type': 'close'}})
+    ruleset = _ruleset('market-exit-rs', [gate.id], subtype=EXIT)
+
+    _open(editor, nicegui_client, ruleset)
+    assert editor._refuse_market_gates_on_exit_ruleset(EXIT, editor.ruleset_rule_ids) is None
 
 
 # =========================================================================================

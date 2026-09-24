@@ -10,7 +10,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from sqlmodel import select, Session
 
-from ba2_common.core.market_condition_rules import assert_no_market_fields
+from ba2_common.core.market_condition_rules import assert_market_rule_actions_live
 from ba2_common.core.models import Ruleset, EventAction, RulesetEventActionLink
 from ba2_common.core.db import get_db, get_all_instances, add_instance, get_instance
 from ba2_common.logger import logger
@@ -305,23 +305,15 @@ class RulesExporter:
 _OPEN_POSITIONS = "open_positions"
 
 
-def _market_gates_in(triggers: Any) -> List[Tuple[str, str]]:
-    """``(label, field)`` for every trigger in ``triggers`` naming a market-condition field.
-
-    The trigger vocabulary, not the condition-tree one: a persisted rule keys its triggers on
-    ``event_type`` while a deploy payload carries trees keyed on ``field``. Both end at
-    ``assert_no_market_fields`` so the refusal is one message.
-    """
-    from ba2_common.core.market_condition_rules import market_condition_fields
-
-    fields = market_condition_fields()
-    return [(key, str(cfg["event_type"]))
-            for key, cfg in (triggers or {}).items()
-            if isinstance(cfg, dict) and cfg.get("event_type") in fields]
-
-
 def _assert_no_market_gates_on_exit_ruleset(ruleset_info: Dict[str, Any]) -> None:
-    """Refuse a market-condition gate arriving inside an OPEN-POSITIONS ruleset payload.
+    """Refuse a market-condition gate arriving inside an OPEN-POSITIONS ruleset payload on a rule
+    that does anything but CLOSE, REDUCE or ADJUST TP/SL (plan 2026-09-24 Task B2).
+
+    Since Task B1 the live open-positions pass opens a decision scope, so the gate evaluates live
+    exactly as in the backtest and a failed read is unknown (the rule does not fire). That is
+    safe for those actions only, which is what ``assert_market_rule_actions_live`` enforces; a
+    gated rule with any other action is still refused here, BEFORE anything is written. The
+    history below is why this door exists at all.
 
     THE FOURTH DOOR. The expert dialog, the rules editor (ruleset save and rule save) and the
     deploy importer all refuse this; ``_import_rule_to_session`` builds an ``EventAction`` from
@@ -338,23 +330,24 @@ def _assert_no_market_gates_on_exit_ruleset(ruleset_info: Dict[str, Any]) -> Non
     """
     if str(ruleset_info.get("subtype") or "") != _OPEN_POSITIONS:
         return
-    used: List[Tuple[str, str]] = []
-    for rule_data in ruleset_info.get("rules", []):
-        for key, field in _market_gates_in(rule_data.get("triggers")):
-            used.append((f"{rule_data.get('name')}.{key}", field))
-    assert_no_market_fields(used, f"imported ruleset {ruleset_info.get('name')!r}")
+    assert_market_rule_actions_live(
+        ((rule_data.get("name"), rule_data.get("triggers"), rule_data.get("actions"))
+         for rule_data in ruleset_info.get("rules", [])),
+        f"imported ruleset {ruleset_info.get('name')!r}")
 
 
 def _assert_no_market_gates_on_exit_rule(rule_data: Dict[str, Any]) -> None:
-    """Refuse a gate on a rule whose OWN subtype is open_positions.
+    """Refuse a gate on a rule whose OWN subtype is open_positions, unless the rule only
+    closes, reduces or adjusts TP/SL (plan 2026-09-24 Task B2).
 
     The other half, for the standalone-rule importers: ``import_rule`` links nothing, so the
     rule's subtype is the only statement there is of where it is headed. Same message.
     """
     if str(rule_data.get("subtype") or "") != _OPEN_POSITIONS:
         return
-    assert_no_market_fields(_market_gates_in(rule_data.get("triggers")),
-                            f"imported rule {rule_data.get('name')!r}")
+    assert_market_rule_actions_live(
+        [(rule_data.get("name"), rule_data.get("triggers"), rule_data.get("actions"))],
+        f"imported rule {rule_data.get('name')!r}")
 
 
 def _rule_content_key(type_, subtype, triggers, actions, extra_parameters, continue_processing) -> str:

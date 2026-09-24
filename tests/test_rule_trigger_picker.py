@@ -470,9 +470,16 @@ def test_a_deployed_market_gate_can_still_be_opened_and_saved_unchanged(editor,
 # The refusals
 # =========================================================================================
 
-def _gate_rule(subtype, event_type=ADX):
+#: What a gated open-positions rule may and may not DO (plan 2026-09-24 Task B2).
+BUY_ACTIONS = {'action_0': {'action_type': 'buy'}}
+CLOSE_ACTIONS = {'action_0': {'action_type': 'close'}}
+REFUSED = 'may not use'
+
+
+def _gate_rule(subtype, event_type=ADX, actions=BUY_ACTIONS):
     tab = _RuleEditor(subtype=subtype, name='exit on adx')
     tab.triggers_data = {'cond_0': {'event_type': event_type, 'operator': '>', 'value': 25.0}}
+    tab.actions_data = actions
     return tab
 
 
@@ -490,19 +497,39 @@ def _ruleset(name, subtype):
                            subtype=SimpleNamespace(value=subtype))
 
 
-def test_a_market_gate_on_an_open_positions_rule_is_refused_at_rule_save():
-    """The gap Part 3 closes. Assembling the rule INTO an open-positions ruleset already
-    refused; the rule itself did not, and the fields are now one click away in the editor.
-    Outside the entry decision pass the resolver has no context, the condition reads
-    ``no_context``, and the exit silently stops happening."""
+def test_a_market_gate_on_an_open_positions_buy_rule_is_refused_at_rule_save():
+    """The gap Part 3 closes, narrowed by plan 2026-09-24 Task B2: on the exit pass a market read
+    that fails is unknown and the rule does not fire, which is safe for a close/reduce/TP-SL
+    adjustment and for nothing else. A gated OPEN on the exit pass is still refused."""
     tab = _gate_rule('open_positions')
 
     with pytest.raises(ValueError) as excinfo:
-        tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data)
+        tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                              tab.actions_data)
 
     msg = str(excinfo.value)
-    assert 'cond_0' in msg and 'open-positions / exit ruleset' in msg
+    assert 'cond_0' in msg and REFUSED in msg and "'buy'" in msg
     assert 'exit on adx' in msg, 'the message must name the rule the operator is looking at'
+
+
+@pytest.mark.parametrize('action', ['close', 'decrease_instrument_share',
+                                    'adjust_stop_loss', 'adjust_take_profit'])
+def test_a_market_gate_on_an_open_positions_rule_that_closes_reduces_or_adjusts_saves(action):
+    """The B2 contract: a market EXIT is authorable in the editor."""
+    tab = _gate_rule('open_positions', actions={'action_0': {'action_type': action}})
+
+    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                                 tab.actions_data) is None
+
+
+@pytest.mark.parametrize('action', ['stop_processing', 'roll_pmcc_short'])
+def test_a_market_gate_beside_a_stop_or_a_roll_is_refused_at_rule_save(action):
+    tab = _gate_rule('open_positions', actions={'action_0': {'action_type': 'close'},
+                                                'action_1': {'action_type': action}})
+
+    with pytest.raises(ValueError, match=repr(action)):
+        tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                              tab.actions_data)
 
 
 def test_the_same_gate_on_an_enter_market_rule_saves():
@@ -510,15 +537,16 @@ def test_the_same_gate_on_an_enter_market_rule_saves():
     the expert's profile serves them is the expert dialog's question, not this one's."""
     tab = _gate_rule('enter_market')
 
-    assert tab._refuse_market_gates_on_exit_rule('enter_market', tab.triggers_data) is None
-    assert tab._refuse_market_gates_on_exit_rule(None, tab.triggers_data) is None
-    assert tab._refuse_market_gates_on_exit_rule('', tab.triggers_data) is None
+    for subtype in ('enter_market', None, ''):
+        assert tab._refuse_market_gates_on_exit_rule(subtype, tab.triggers_data,
+                                                     tab.actions_data) is None
 
 
 def test_an_ordinary_open_positions_rule_still_saves():
     tab = _gate_rule('open_positions', event_type='profit_loss_percent')
 
-    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data) is None
+    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                                 tab.actions_data) is None
 
 
 def test_the_rule_refusal_speaks_the_ruleset_refusal_s_words():
@@ -527,25 +555,30 @@ def test_the_rule_refusal_speaks_the_ruleset_refusal_s_words():
     import inspect
 
     src = inspect.getsource(TradeSettingsTab._refuse_market_gates_on_exit_rule)
-    assert 'assert_no_market_fields(' in src, (
+    assert 'assert_market_rule_actions_live(' in src, (
         'the message must come from market_condition_rules, not be re-typed here')
 
 
 def test_the_rule_refusal_runs_before_any_write():
     """A refusal after ``update_instance`` leaves the rule persisted carrying the gate it
-    just refused -- and the operator reading the error believes nothing was saved."""
+    just refused -- and the operator reading the error believes nothing was saved. It runs
+    AFTER the actions are collected, because what the rule DOES is half the question."""
     import inspect
 
     src = inspect.getsource(TradeSettingsTab._save_rule)
     guard = src.index('_refuse_market_gates_on_exit_rule(')
     writes = [src.index(c) for c in ('update_instance(rule)', 'add_instance(new_rule)')]
     assert guard < min(writes)
+    assert src.index('actions_data[action_id] = action_config') < guard
+    call = src[guard:]
+    assert 'actions_data' in call[:call.index(')') + 1]
 
 
 def test_the_refused_rule_is_not_written_and_the_operator_is_told(editor, nicegui_client):
     """End to end through the real save: the ValueError must reach the notification, not
     the log alone, or the Save button appears to do nothing at all."""
     editor.rule_subtype_select.value = 'open_positions'
+    editor.actions['a0'] = {'type_select': SimpleNamespace(value='buy')}
     picker = _row(editor, nicegui_client)
     dialog = _open(nicegui_client, picker, category='market')
     _click(_entry_card(dialog, ADX))
@@ -557,20 +590,44 @@ def test_the_refused_rule_is_not_written_and_the_operator_is_told(editor, nicegu
         editor._save_rule()
 
     assert editor.saved == []
-    assert any('open-positions / exit ruleset' in msg and kind == 'negative'
+    assert any(REFUSED in msg and "'buy'" in msg and kind == 'negative'
                for msg, kind in editor.notifications), editor.notifications
+
+
+def test_a_gated_close_rule_is_written_through_the_real_save(editor, nicegui_client):
+    """The other half, end to end: the same gate on an open-positions rule that CLOSES saves,
+    carrying its gate and its action exactly as authored."""
+    editor.rule_subtype_select.value = 'open_positions'
+    editor.actions['a0'] = {'type_select': SimpleNamespace(value='close')}
+    picker = _row(editor, nicegui_client)
+    dialog = _open(nicegui_client, picker, category='market')
+    _click(_entry_card(dialog, ADX))
+
+    refs = editor.triggers[next(reversed(editor.triggers))]
+    with nicegui_client:
+        refs['operator_select']().value = '>'
+        refs['value_input']().value = '25'
+        editor._save_rule()
+
+    saved, = editor.saved
+    assert list(saved.triggers.values()) == [{'event_type': ADX, 'operator': '>', 'value': 25.0}]
+    assert saved.actions == {'a0': {'action_type': 'close'}}
 
 
 def test_the_ruleset_level_refusal_still_fires(monkeypatch):
     """A regression test, not a duplicate: the menu filter that used to make this refusal
     nearly unreachable is gone, so the door it guards is now the one operators walk through."""
-    rule = SimpleNamespace(id=2, name='gated', triggers={'cond_0': {'event_type': ADX}})
+    rule = SimpleNamespace(id=2, name='gated', triggers={'cond_0': {'event_type': ADX}},
+                           actions=BUY_ACTIONS)
     monkeypatch.setattr(settings_page, 'get_instance', lambda model, rid: rule)
     tab = object.__new__(TradeSettingsTab)
     tab.ruleset_name_input = SimpleNamespace(value='exit rules')
 
-    with pytest.raises(ValueError, match='open-positions / exit ruleset'):
+    with pytest.raises(ValueError, match=REFUSED):
         TradeSettingsTab._refuse_market_gates_on_exit_ruleset(tab, 'open_positions', [2])
+    rule.actions = CLOSE_ACTIONS
+    assert TradeSettingsTab._refuse_market_gates_on_exit_ruleset(
+        tab, 'open_positions', [2]) is None
 
 
 # =========================================================================================
@@ -683,10 +740,11 @@ def test_a_gate_on_a_rule_linked_into_an_open_positions_ruleset_is_refused(linke
     linked_rulesets[41] = [_ruleset('exit rules', 'open_positions')]
 
     with pytest.raises(ValueError) as excinfo:
-        tab._refuse_market_gates_on_exit_rule('enter_market', tab.triggers_data, 41)
+        tab._refuse_market_gates_on_exit_rule('enter_market', tab.triggers_data,
+                                              tab.actions_data, 41)
 
     msg = str(excinfo.value)
-    assert 'open-positions / exit ruleset' in msg
+    assert REFUSED in msg
     assert 'exit rules' in msg, 'the message must name the ruleset the operator has to go fix'
     assert 'cond_0' in msg
 
@@ -698,7 +756,8 @@ def test_a_gate_on_a_rule_linked_only_into_entry_rulesets_still_saves(linked_rul
     linked_rulesets[41] = [_ruleset('entry rules', 'enter_market'),
                            _ruleset('more entries', 'enter_market')]
 
-    assert tab._refuse_market_gates_on_exit_rule('enter_market', tab.triggers_data, 41) is None
+    assert tab._refuse_market_gates_on_exit_rule('enter_market', tab.triggers_data,
+                                                 tab.actions_data, 41) is None
 
 
 def test_the_rules_own_subtype_still_refuses_a_brand_new_unlinked_rule(linked_rulesets):
@@ -707,8 +766,9 @@ def test_the_rules_own_subtype_still_refuses_a_brand_new_unlinked_rule(linked_ru
     headed."""
     tab = _gate_rule('open_positions')
 
-    with pytest.raises(ValueError, match='open-positions / exit ruleset'):
-        tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data, None)
+    with pytest.raises(ValueError, match=REFUSED):
+        tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                              tab.actions_data, None)
 
 
 def test_an_ungated_rule_in_an_open_positions_ruleset_is_never_asked_about_its_links(
@@ -720,7 +780,8 @@ def test_an_ungated_rule_in_an_open_positions_ruleset_is_never_asked_about_its_l
                         lambda rule_id: asked.append(rule_id) or [])
     tab = _gate_rule('open_positions', event_type='profit_loss_percent')
 
-    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data, 41) is None
+    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                                 tab.actions_data, 41) is None
     assert asked == []
 
 
@@ -731,6 +792,7 @@ def test_the_link_lookup_is_used_by_the_real_save(editor, nicegui_client, linked
     saved_rule = SimpleNamespace(id=41, name='was an exit rule', triggers={}, actions={},
                                  type=None, subtype=None, continue_processing=False)
     editor.rule_subtype_select.value = 'enter_market'
+    editor.actions['a0'] = {'type_select': SimpleNamespace(value='buy')}
     linked_rulesets[41] = [_ruleset('exit rules', 'open_positions')]
     picker = _row(editor, nicegui_client)
     dialog = _open(nicegui_client, picker, category='market')

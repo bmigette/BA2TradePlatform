@@ -84,6 +84,7 @@ __all__ = [
     "UNIVERSE_SENTINELS",
     "gated_expert_instances",
     "market_condition_fields_in_ruleset",
+    "ruleset_rule_contents",
     "gated_live_universe",
 ]
 
@@ -424,13 +425,30 @@ def market_condition_fields_in_ruleset(ruleset_id: Any) -> Tuple[Tuple[str, str]
     return tuple(found)
 
 
+def ruleset_rule_contents(ruleset_id: Any) -> Tuple[Tuple[str, Any, Any], ...]:
+    """``(name, triggers, actions)`` for every rule of a PERSISTED live ruleset, in link order.
+
+    The input ``market_condition_rules.assert_market_rule_actions_live`` takes: a market leaf on
+    an open-positions rule is judged together with what that rule DOES (plan 2026-09-24 Task
+    B2), so the pairs :func:`market_condition_fields_in_ruleset` returns are not enough. Read by
+    the link table (``db.ruleset_event_actions``), like every other live read of a ruleset.
+    ``ruleset_id`` of ``None`` yields nothing (no ruleset assigned).
+    """
+    from ba2_common.core.db import ruleset_event_actions
+
+    if ruleset_id is None:
+        return ()
+    return tuple((str(action.name), action.triggers or {}, action.actions or {})
+                 for action in ruleset_event_actions(ruleset_id))
+
+
 def gated_expert_instances() -> Tuple[int, ...]:
     """Ids of the ENABLED expert instances whose ENTER-MARKET ruleset carries a market leaf.
 
-    Only the enter-market ruleset is scanned because that is the only ruleset a market leaf may
-    live on (``market_condition_rules.assert_no_market_conditions`` refuses one on an exit /
-    open-positions ruleset, and the whole point of that refusal is that the live resolver has no
-    context outside the entry decision pass).
+    Only the enter-market ruleset is scanned. Until plan 2026-09-24 Task B2 that was the only
+    ruleset a market leaf could live on; B2 allows one on an open-positions rule that only
+    closes, reduces or adjusts TP/SL (``market_condition_rules.assert_market_rule_actions``), and
+    such an instance is NOT listed here -- an exit-only-gated instance is not coverage-checked.
 
     The leaf walk itself is :func:`market_condition_fields_in_ruleset` (persisted rules speak
     ``EventAction.triggers``, not condition trees).
