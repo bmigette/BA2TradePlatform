@@ -3195,6 +3195,7 @@ class TradeManager:
             from datetime import timedelta
             from .TradeActionEvaluator import TradeActionEvaluator
             from ..modules.accounts import get_account_class
+            from ba2_common.core.market_condition_live import market_condition_decision_scope
 
             # Get the expert instance (with loaded settings)
             expert = get_expert_instance_from_id(expert_instance_id)
@@ -3237,7 +3238,15 @@ class TradeManager:
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
-            with get_db() as session:
+            # ONE market-condition decision pass for this expert's exit rules, mirroring the
+            # entry pass (process_expert_recommendations_after_analysis). Without it a market
+            # leaf in an open_positions rule reads no_context live while the backtest evaluates
+            # it: a BT/live parity break. Opened HERE -- after the lock and the early returns,
+            # around the evaluation only -- so an expert with trade modification off or no
+            # open_positions ruleset never reads its profile. With no market_condition_profile
+            # setting the scope yields None at once (no clock read, no state): a strict no-op.
+            # No replay-capture scope: the open-positions pass never had one.
+            with market_condition_decision_scope(expert_instance_id=expert_instance_id), get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,
