@@ -346,6 +346,12 @@ class LiveTradesTab:
             selected_account_id = get_selected_account_id()
             base_query = scope_transactions_to_account(base_query, selected_account_id)
 
+            # THIS is the Stocks tab: its asset class, per ASSET_CLASS_TABS. Option rows belong
+            # to the Options tab, and priced here they are wrong twice -- the underlying's
+            # price against a premium, and no contract multiplier (8082, 2026-09-24: a $1.03
+            # KO call read "+8567%"). Every count/total below is built from this query.
+            base_query = base_query.where(Transaction.asset_class == ASSET_CLASS_TABS[0][1])
+
             # Apply status filter (from page filter controls)
             status_values = self.status_filter.value if hasattr(self, 'status_filter') else ['Waiting', 'Open', 'Closing']
             if status_values and len(status_values) > 0:

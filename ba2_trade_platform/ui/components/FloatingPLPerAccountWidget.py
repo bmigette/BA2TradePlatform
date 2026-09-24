@@ -5,12 +5,12 @@ Displays unrealized profit/loss for open positions grouped by account.
 from nicegui import ui
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Sequence, Tuple
+from typing import Any, Dict, Optional, List, Sequence, Tuple
 from sqlmodel import select, Session
 from ...logger import logger
 from ...core.db import get_db
 from ...core.models import Transaction, AccountDefinition, TradingOrder, ExpertInstance
-from ...core.types import TransactionStatus, OrderStatus, OrderDirection, OrderType
+from ...core.types import AssetClass, TransactionStatus, OrderStatus, OrderDirection, OrderType
 from ...core.utils import get_account_instance_from_id
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .account_scope import scope_transactions_to_account
@@ -431,9 +431,20 @@ class _FloatingPLWidgetBase:
         pl_by_name: Dict[str, float] = {name: 0.0 for name in names}
         unpriced_by_name: Dict[str, List[str]] = {name: [] for name in names}
 
+        # One quote per contract for this account's pass (same caching as the Options tab).
+        option_quotes: Dict[Any, Any] = {}
+
         for trans, display_name in trans_list:
             try:
-                measured = self._transaction_pl(trans, prices, session)
+                if trans.asset_class == AssetClass.OPTION:
+                    # An option is NOT priced off the position map: the broker files it under
+                    # the CONTRACT symbol while the transaction carries the underlying, and
+                    # the equity formula below omits the contract multiplier (x100). The
+                    # Options tab's seam prices it from the premium, multiplier-aware.
+                    measured = self._option_transaction_pl(
+                        trans, account, account_id, option_quotes, session)
+                else:
+                    measured = self._transaction_pl(trans, prices, session)
             except Exception as e:
                 logger.error(f"Error calculating P/L for transaction {trans.id}: {e}",
                              exc_info=True)
@@ -453,6 +464,33 @@ class _FloatingPLWidgetBase:
                       unpriced=tuple(unpriced_by_name[name]),
                       tradable=tradable, broker_bp=broker_bp)
                 for name in names]
+
+    def _option_transaction_pl(self, trans: Transaction, account, account_id: int,
+                               quote_cache: Dict[Any, Any], session: Session
+                               ) -> Optional[float]:
+        """An OPTION transaction's floating P/L, or ``None`` when it cannot be priced.
+
+        ``0.0`` when nothing is held yet (a working entry), as for equity: no position,
+        nothing missing. Otherwise the shared ``open_option_transaction_pnl`` seam, the
+        one the Options tab uses, so the two surfaces cannot disagree.
+        """
+        from ...core.option_pnl_display import open_option_transaction_pnl, quote_caching_account
+
+        orders = session.exec(
+            select(TradingOrder).where(TradingOrder.transaction_id == trans.id)
+            .order_by(TradingOrder.created_at)
+        ).all()
+        if trans.status == TransactionStatus.WAITING:
+            return 0.0
+        priced, leg_set = open_option_transaction_pnl(
+            quote_caching_account(account, quote_cache, account_id), trans, orders)
+        if not priced.available:
+            if leg_set.count == 0 and not leg_set.incomplete:
+                return 0.0  # nothing executed: no position, nothing missing
+            logger.warning(f"Floating P/L: option transaction {trans.id} ({trans.symbol}) "
+                           f"unpriced: {priced.reason}")
+            return None
+        return priced.amount
 
     def _transaction_pl(self, trans: Transaction, prices: Dict[str, float],
                         session: Session) -> Optional[float]:

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 
@@ -179,6 +179,36 @@ def option_transaction_pnl(
         percent=None if pnl.get("percent") is None else float(pnl["percent"]),
         source=source,
     )
+
+
+def open_option_transaction_pnl(account: Any, transaction: Any, orders: Any
+                                ) -> Tuple[OptionPnlDisplay, Any]:
+    """Unrealised P&L of an OPEN option transaction from its orders, plus its leg set.
+
+    The ONE place that turns a transaction's order history into a priced structure: the
+    Options tab and the floating P/L cards both call it, so they cannot disagree. An
+    incompletely recorded structure is refused rather than priced as its remainder (second
+    review, N4); a multi-leg structure is priced from its representative (the parent when
+    recorded) with the leg COUNT, so the dispatch follows the structure (review R1).
+    """
+    from .option_positions import opening_legs
+
+    leg_set = opening_legs(transaction, orders)
+    if leg_set.incomplete:
+        return (unavailable_pnl(f'{UNAVAILABLE_INCOMPLETE}: '
+                                + '; '.join(leg_set.incomplete_reasons)), leg_set)
+    if leg_set.is_multi_leg:
+        representative = leg_set.representative_order()
+    else:
+        # The real ORDER, not the normalised leg: the seam resolves the transaction from
+        # the order it is handed.
+        ordered = list(orders or ())
+        representative = (leg_set.legs[0].order if leg_set.legs
+                          else (ordered[0] if ordered else None))
+    if representative is None:
+        return _unavailable(UNAVAILABLE_NO_FILLS), leg_set
+    return option_transaction_pnl(account, representative,
+                                  opening_legs=leg_set.count), leg_set
 
 
 def option_closed_pnl(transaction: Any) -> OptionPnlDisplay:
