@@ -21,7 +21,7 @@ import pytest
 
 from ba2_common.core import TradeConditions
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
-from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus, TransactionStatus
+from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus, OrderType, TransactionStatus
 from ba2_trade_platform.core.option_pnl_display import option_transaction_pnl
 from ba2_trade_platform.core.option_positions import opening_legs
 from ba2_trade_platform.ui.pages.live_trades import LiveTradesTab
@@ -36,7 +36,11 @@ def order(oid, contract, side, strike, premium, **extra):
                   open_price=premium, quantity=1, filled_qty=1, multiplier=100,
                   underlying_symbol='XYZ', expiry=date(2026, 9, 18),
                   asset_class=AssetClass.OPTION, status=OrderStatus.FILLED,
-                  position_intent=None, created_at=ENTRY_AT)
+                  position_intent=None, created_at=ENTRY_AT,
+                  # what the row expansion's "Related Orders" list reads (related_order_rows)
+                  order_type=OrderType.BUY_LIMIT, limit_price=premium, stop_price=None,
+                  depends_on_order=None, broker_order_id=None, comment=None,
+                  expert_recommendation_id=None)
     values.update(extra)
     return NS(**values)
 
