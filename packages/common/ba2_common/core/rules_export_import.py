@@ -350,6 +350,33 @@ def _assert_market_gates_on_exit_rule_allowed(rule_data: Dict[str, Any]) -> None
         f"imported rule {rule_data.get('name')!r}")
 
 
+def _assert_market_gates_served_by_linked_experts(ruleset_info: Dict[str, Any], ruleset_id: int,
+                                                  session) -> None:
+    """Refuse a payload whose market gates an expert ALREADY USING ``ruleset_id`` does not serve.
+
+    Only the replace-in-place importer needs it: every other importer creates a NEW ruleset,
+    which no expert uses yet (the expert dialog checks the served fields when one is attached).
+    Replacing an existing ruleset's rules is an edit of a ruleset experts may be running, so a
+    market gate added there must be served by each of them -- either slot, enabled or not -- or
+    it reads ``no_context`` for ever and the exit (or entry) it guards never happens. Entry and
+    exit rulesets alike. No market leaf in the payload, no expert query.
+    """
+    from ba2_common.core.market_condition_live import (
+        assert_market_leaves_served_by_linked_experts,
+    )
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
+    fields = market_condition_fields()
+    used = [(f"{rule_data.get('name')}.{key}", str(cfg["event_type"]))
+            for rule_data in ruleset_info.get("rules", [])
+            for key, cfg in (rule_data.get("triggers") or {}).items()
+            if isinstance(cfg, dict) and cfg.get("event_type") in fields]
+    if used:
+        assert_market_leaves_served_by_linked_experts(
+            used, [ruleset_id], where=f"imported ruleset {ruleset_info.get('name')!r}",
+            session=session)
+
+
 def _rule_content_key(type_, subtype, triggers, actions, extra_parameters, continue_processing) -> str:
     """Canonical, comparable signature of a rule's CONTENT (everything but its name/id).
 
@@ -593,6 +620,10 @@ class RulesImporter:
                         session.add(ruleset)
                         session.flush()
                     else:
+                        # Experts already use this row: its new gates must be served by each of
+                        # them, checked before its links are dropped below.
+                        _assert_market_gates_served_by_linked_experts(ruleset_info, ruleset.id,
+                                                                      session)
                         # Reuse the row, refresh what the payload describes, and drop the old
                         # membership so the rule list is the payload's rather than a merge of
                         # both -- a merge would silently keep a rule the export had removed.

@@ -85,6 +85,9 @@ __all__ = [
     "gated_expert_instances",
     "market_condition_fields_in_ruleset",
     "ruleset_rule_contents",
+    "experts_linked_to_rulesets",
+    "expert_market_condition_profiles",
+    "assert_market_leaves_served_by_linked_experts",
     "gated_live_universe",
 ]
 
@@ -423,6 +426,91 @@ def market_condition_fields_in_ruleset(ruleset_id: Any) -> Tuple[Tuple[str, str]
             if isinstance(trigger, Mapping) and trigger.get("event_type") in fields:
                 found.append((f"{action.name}.{key}", str(trigger["event_type"])))
     return tuple(found)
+
+
+def experts_linked_to_rulesets(ruleset_ids: Sequence[Any], *,
+                               session: Any = None) -> Tuple[Tuple[int, str, int], ...]:
+    """``(instance_id, slot, ruleset_id)`` for EVERY expert instance -- enabled or not -- whose
+    enter-market or open-positions slot holds one of ``ruleset_ids``.
+
+    ``slot`` is ``"enter-market"`` or ``"open-positions"``. Disabled instances are included on
+    purpose: enabling one does not pass through any ruleset door, so a ruleset edited under it
+    must already be servable. ``session`` lets a caller that holds an open write session (the
+    rules importer) read through it. An empty ``ruleset_ids`` issues no query.
+    """
+    from sqlmodel import or_, select
+
+    from ba2_common.core.db import get_db
+    from ba2_common.core.models import ExpertInstance
+
+    ids = sorted({int(r) for r in ruleset_ids if r is not None})
+    if not ids:
+        return ()
+    statement = select(ExpertInstance).where(or_(ExpertInstance.enter_market_ruleset_id.in_(ids),
+                                                 ExpertInstance.open_positions_ruleset_id.in_(ids)))
+
+    def rows(s):
+        found = []
+        for inst in s.exec(statement).all():
+            for slot, rid in (("enter-market", inst.enter_market_ruleset_id),
+                              ("open-positions", inst.open_positions_ruleset_id)):
+                if rid in ids:
+                    found.append((int(inst.id), slot, int(rid)))
+        return tuple(found)
+
+    if session is not None:
+        return rows(session)
+    with get_db() as own:
+        return rows(own)
+
+
+def expert_market_condition_profiles(instance_id: Any) -> Tuple[str, ...]:
+    """The profiles expert instance ``instance_id``'s ``market_condition_profile`` names.
+
+    Read through the instance-resolver seam, as :func:`gated_live_universe` and the live
+    resolver read it. A setting that cannot be READ is not "no profile" here -- this answers a
+    save that is about to be judged on it, so it raises ``ValueError`` naming the instance and
+    the cause, and the save is refused rather than judged on a guess.
+    """
+    from ba2_common.core.instance_resolver import get_instance_resolver
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING, parse_profile_setting
+
+    try:
+        expert = get_instance_resolver().get_expert_instance(int(instance_id))
+        value = expert.settings.get(PROFILE_SETTING)
+    except Exception as e:  # noqa: BLE001 -- re-raised as a refusal, never absorbed
+        raise ValueError(
+            f"cannot verify the market-condition gates: {PROFILE_SETTING} of expert instance "
+            f"{instance_id} could not be read ({type(e).__name__}: {e}). Fix the instance before "
+            f"saving a market-gated rule into a ruleset it uses.") from e
+    return parse_profile_setting(value, setting=f"{PROFILE_SETTING} of expert instance "
+                                                f"{instance_id}")
+
+
+def assert_market_leaves_served_by_linked_experts(used: Sequence[Tuple[str, str]],
+                                                  ruleset_ids: Sequence[Any], *, where: str,
+                                                  session: Any = None) -> None:
+    """Refuse ``(label, field)`` market leaves that an expert USING one of ``ruleset_ids`` does not
+    serve.
+
+    The editors and the replace-in-place importer change a ruleset that may already be linked to
+    experts. The expert dialog checks the served fields when a ruleset is ATTACHED; nothing
+    checked them when a linked ruleset's rules CHANGE -- so a market exit added to a ruleset an
+    unprofiled expert already runs reads ``no_context`` for ever and the exit it guards never
+    fires. Every linked instance (either slot, enabled or not) must serve every leaf. A ruleset
+    linked to no expert passes: the dialog checks it when it is attached. No leaves, no query.
+    """
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING, assert_fields_served
+
+    used = tuple(used)
+    if not used:
+        return
+    for instance_id, slot, ruleset_id in experts_linked_to_rulesets(ruleset_ids, session=session):
+        assert_fields_served(
+            used, expert_market_condition_profiles(instance_id),
+            where=f"{where} (ruleset {ruleset_id} is expert instance {instance_id}'s {slot} "
+                  f"ruleset)",
+            setting=f"{PROFILE_SETTING} of expert instance {instance_id}")
 
 
 def ruleset_rule_contents(ruleset_id: Any) -> Tuple[Tuple[str, Any, Any], ...]:

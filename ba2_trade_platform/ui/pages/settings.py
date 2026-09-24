@@ -6018,28 +6018,42 @@ class TradeSettingsTab:
         The link table is consulted only when a gate is actually present, so an ordinary save
         pays for no query.
 
+        AND THE EXPERTS BEHIND THOSE LINKS. A gate this rule carries must be SERVED by the
+        ``market_condition_profile`` of every expert instance (enabled or not, either slot)
+        using a ruleset the rule is linked into -- otherwise it reads ``no_context`` for ever and
+        the exit (or entry) it guards never happens. The expert dialog checks this when a
+        ruleset is attached; this door checks it when a linked rule CHANGES. A rule linked
+        nowhere (a new one) passes.
+
         The message comes from ``assert_market_rule_actions_live``, the same function the ruleset
         door and the rules importer use (the deploy importer uses its tree-form twin). One
         failure, one vocabulary: two wordings would read as two different problems and send the
         operator looking for two different fixes. The linked
         ruleset is NAMED in it, because "somewhere" is not a place the operator can go and fix.
         """
+        from ba2_common.core.market_condition_live import (
+            assert_market_leaves_served_by_linked_experts,
+        )
+
         fields = market_condition_fields()
-        if not any(config["event_type"] in fields for config in (triggers_data or {}).values()):
+        used = [(key, str(config["event_type"])) for key, config in (triggers_data or {}).items()
+                if config["event_type"] in fields]
+        if not used:
             return
 
+        # A rule being CREATED has no id and no links; its Subtype is all there is.
+        linked = rulesets_for_event_action(rule_id) if rule_id is not None else []
         where = "open-positions rule"
-        if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value:
-            # A rule being CREATED has no id and no links; its Subtype is all there is.
-            linked = rulesets_for_event_action(rule_id) if rule_id is not None else []
-            exit_rulesets = [rs.name for rs in linked
-                             if rs.subtype is not None
-                             and str(rs.subtype.value) == AnalysisUseCase.OPEN_POSITIONS.value]
-            if not exit_rulesets:
-                return
+        exit_rulesets = [rs.name for rs in linked
+                         if rs.subtype is not None
+                         and str(rs.subtype.value) == AnalysisUseCase.OPEN_POSITIONS.value]
+        if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value and exit_rulesets:
             where = f"rule linked into open-positions ruleset(s) {exit_rulesets!r}"
-        assert_market_rule_actions_live(
-            [(self.rule_name_input.value, triggers_data, actions_data)], where)
+        if str(subtype_value or "") == AnalysisUseCase.OPEN_POSITIONS.value or exit_rulesets:
+            assert_market_rule_actions_live(
+                [(self.rule_name_input.value, triggers_data, actions_data)], where)
+        assert_market_leaves_served_by_linked_experts(
+            used, [rs.id for rs in linked], where=f"rule {self.rule_name_input.value!r}")
 
     def _save_rule(self, rule=None):
         """Save the rule (EventAction)."""
@@ -6630,7 +6644,8 @@ class TradeSettingsTab:
         ui.notify(f'{len(chosen)} rule(s) added at the end of the ruleset. '
                   f'Save to keep them.', type='positive')
 
-    def _refuse_market_gates_on_exit_ruleset(self, subtype_value, selected_rule_ids) -> None:
+    def _refuse_market_gates_on_exit_ruleset(self, subtype_value, selected_rule_ids,
+                                             ruleset_id=None) -> None:
         """Refuse a market-condition gate on a ruleset destined for the OPEN-POSITIONS slot,
         on any rule that does anything but CLOSE, REDUCE or ADJUST TP/SL (plan 2026-09-24 B2).
 
@@ -6642,7 +6657,17 @@ class TradeSettingsTab:
         dialog got it in Task 12 -- but the RULES editor is a third door: editing a ruleset that
         is ALREADY assigned to the open-positions slot passes through neither. Checked before
         anything is written, against the rules THIS save selects.
+
+        The gates must also be SERVED by every expert instance already using this ruleset
+        (``ruleset_id``; enabled or not, either slot): the expert dialog checks that on attach,
+        and an edit of a ruleset an unprofiled expert already runs would otherwise add a market
+        exit that reads ``no_context`` for ever. A new ruleset (no id) is linked to nobody. No
+        market leaf, no expert query.
         """
+        from ba2_common.core.market_condition_live import (
+            assert_market_leaves_served_by_linked_experts,
+        )
+
         if str(subtype_value or "") != AnalysisUseCase.OPEN_POSITIONS.value:
             return
         rules = []
@@ -6651,7 +6676,14 @@ class TradeSettingsTab:
             if rule is None:
                 continue
             rules.append((rule.name, rule.triggers or {}, rule.actions or {}))
-        assert_market_rule_actions_live(rules, f"ruleset {self.ruleset_name_input.value!r}")
+        where = f"ruleset {self.ruleset_name_input.value!r}"
+        assert_market_rule_actions_live(rules, where)
+        fields = market_condition_fields()
+        used = [(f"{name}.{key}", str(trigger["event_type"]))
+                for name, triggers, _actions in rules for key, trigger in triggers.items()
+                if isinstance(trigger, dict) and trigger.get("event_type") in fields]
+        if used and ruleset_id is not None:
+            assert_market_leaves_served_by_linked_experts(used, [ruleset_id], where=where)
 
     def _save_ruleset(self, ruleset=None):
         """Save the ruleset, and its rules IN THE ORDER THE DIALOG SHOWS THEM.
@@ -6700,7 +6732,8 @@ class TradeSettingsTab:
 
             # BEFORE any write: a market gate may not ride an open-positions ruleset.
             self._refuse_market_gates_on_exit_ruleset(
-                self.ruleset_subtype_select.value, selected_rule_ids)
+                self.ruleset_subtype_select.value, selected_rule_ids,
+                ruleset.id if ruleset is not None else None)
 
             from sqlmodel import delete
             from ...core.models import RulesetEventActionLink

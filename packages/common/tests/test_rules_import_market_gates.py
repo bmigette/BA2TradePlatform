@@ -204,3 +204,141 @@ def test_a_standalone_enter_market_rule_carrying_a_gate_imports():
     rule_id, _ = RulesImporter.import_rule(payload)
 
     assert rule_id
+
+
+# ------------------------------------------- replace-in-place: the experts ALREADY using it
+#
+# ``import_rulesets_reusing_by_name`` edits a ruleset experts may be running. A market gate it
+# adds must be SERVED by each of them (their ``market_condition_profile``), or it reads
+# ``no_context`` for ever and the exit it guards never fires. Every other importer creates a NEW
+# ruleset, which no expert uses yet -- the expert dialog checks the profile when it is attached.
+
+class _Expert:
+    def __init__(self, profile):
+        self.settings = {"market_condition_profile": profile}
+
+
+@pytest.fixture
+def profiles(monkeypatch):
+    """``instance id -> profile setting``, served through the instance-resolver seam."""
+    from ba2_common.core import instance_resolver
+
+    table: dict = {}
+    asked: list = []
+
+    class _Resolver:
+        def get_expert_instance(self, instance_id):
+            asked.append(instance_id)
+            return _Expert(table[instance_id])
+
+    previous = instance_resolver.get_instance_resolver()
+    instance_resolver.set_instance_resolver(_Resolver())
+    table["asked"] = asked
+    yield table
+    instance_resolver.set_instance_resolver(previous)
+
+
+def _linked_exit_ruleset(name, profile_table, profile, *, enabled=True):
+    """An existing open-positions ruleset used by one expert whose profile is ``profile``."""
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import ExpertInstance
+
+    ruleset_ids, _ = RulesImporter.import_rulesets_reusing_by_name(
+        {"rulesets": [_ruleset(name, "open_positions",
+                               [_rule(f"{name} stop", "open_positions", ORDINARY, CLOSE)])]})
+    instance_id = add_instance(ExpertInstance(account_id=1, expert="MockExpert", enabled=enabled,
+                                              open_positions_ruleset_id=ruleset_ids[0]))
+    profile_table[instance_id] = profile
+    return ruleset_ids[0], instance_id
+
+
+def _market_exit_payload(name):
+    return {"rulesets": [_ruleset(name, "open_positions",
+                                  [_rule(f"{name} market close", "open_positions", GATE, CLOSE)])]}
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_replacing_a_linked_ruleset_with_an_unserved_market_exit_is_refused(profiles, enabled):
+    ruleset_id, instance_id = _linked_exit_ruleset(f"unserved-{enabled}", profiles, "",
+                                                   enabled=enabled)
+
+    with pytest.raises(ValueError) as e:
+        RulesImporter.import_rulesets_reusing_by_name(_market_exit_payload(f"unserved-{enabled}"))
+
+    msg = str(e.value)
+    assert f"expert instance {instance_id}" in msg and ADX in msg and "open-positions" in msg
+    from ba2_common.core.db import ruleset_event_actions
+    assert [r.name for r in ruleset_event_actions(ruleset_id)] == [f"unserved-{enabled} stop"], (
+        "refused BEFORE the old links were dropped")
+
+
+def test_a_profile_that_serves_nothing_the_leaf_needs_is_refused_too(profiles):
+    _linked_exit_ruleset("wrong-profile", profiles, "ta-structure-v1")
+    with pytest.raises(ValueError, match="ta-structure-v1"):
+        RulesImporter.import_rulesets_reusing_by_name(_market_exit_payload("wrong-profile"))
+
+
+def test_replacing_a_linked_ruleset_with_a_served_market_exit_is_accepted(profiles):
+    ruleset_id, _ = _linked_exit_ruleset("served", profiles, "ohlcv-v1")
+
+    ids, _ = RulesImporter.import_rulesets_reusing_by_name(_market_exit_payload("served"))
+
+    assert ids == [ruleset_id]
+    from ba2_common.core.db import ruleset_event_actions
+    assert [r.name for r in ruleset_event_actions(ruleset_id)] == ["served market close"]
+
+
+def test_replacing_an_unlinked_ruleset_with_a_market_exit_is_accepted(profiles):
+    RulesImporter.import_rulesets_reusing_by_name(
+        {"rulesets": [_ruleset("nobody uses me", "open_positions",
+                               [_rule("nobody stop", "open_positions", ORDINARY, CLOSE)])]})
+
+    ids, _ = RulesImporter.import_rulesets_reusing_by_name(_market_exit_payload("nobody uses me"))
+
+    assert ids and profiles["asked"] == []
+
+
+def test_replacing_a_linked_ruleset_with_ordinary_rules_asks_no_expert(profiles, monkeypatch):
+    """No market leaf, no expert query: the linked-expert lookup is never reached."""
+    import ba2_common.core.market_condition_live as live
+
+    _linked_exit_ruleset("ordinary", profiles, "")
+    looked_up: list = []
+    real = live.experts_linked_to_rulesets
+    monkeypatch.setattr(live, "experts_linked_to_rulesets",
+                        lambda *a, **k: looked_up.append(a) or real(*a, **k))
+
+    RulesImporter.import_rulesets_reusing_by_name(
+        {"rulesets": [_ruleset("ordinary", "open_positions",
+                               [_rule("ordinary stop 2", "open_positions", ORDINARY, CLOSE)])]})
+
+    assert looked_up == [] and profiles["asked"] == []
+
+
+def test_an_expert_whose_profile_cannot_be_read_refuses_rather_than_guesses(profiles):
+    """An unreadable setting is not "no profile": the save is refused and says why."""
+    _linked_exit_ruleset("unreadable", profiles, "")
+    profiles.clear()          # the resolver now raises KeyError for that instance
+    profiles["asked"] = []
+
+    with pytest.raises(ValueError, match="cannot verify the market-condition gates"):
+        RulesImporter.import_rulesets_reusing_by_name(_market_exit_payload("unreadable"))
+
+
+def test_the_linked_expert_lookup_reads_both_slots():
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.market_condition_live import experts_linked_to_rulesets
+    from ba2_common.core.models import ExpertInstance
+
+    entry_id, exit_id = 880_001, 880_002
+    a = add_instance(ExpertInstance(account_id=1, expert="MockExpert",
+                                    enter_market_ruleset_id=entry_id,
+                                    open_positions_ruleset_id=exit_id))
+    b = add_instance(ExpertInstance(account_id=1, expert="MockExpert", enabled=False,
+                                    open_positions_ruleset_id=exit_id))
+
+    assert sorted(experts_linked_to_rulesets([entry_id, exit_id])) == sorted([
+        (a, "enter-market", entry_id), (a, "open-positions", exit_id),
+        (b, "open-positions", exit_id)])
+    assert experts_linked_to_rulesets([]) == ()
+    assert experts_linked_to_rulesets([None]) == ()

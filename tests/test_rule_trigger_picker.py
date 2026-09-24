@@ -785,6 +785,106 @@ def test_an_ungated_rule_in_an_open_positions_ruleset_is_never_asked_about_its_l
     assert asked == []
 
 
+# =========================================================================================
+# The experts behind the links: a gate must be SERVED by every expert using the ruleset
+# =========================================================================================
+
+@pytest.fixture
+def expert_profiles(monkeypatch):
+    """``instance id -> market_condition_profile`` through the instance-resolver seam."""
+    from ba2_common.core import instance_resolver
+
+    table = {}
+    previous = instance_resolver.get_instance_resolver()
+    instance_resolver.set_instance_resolver(SimpleNamespace(
+        get_expert_instance=lambda iid: SimpleNamespace(
+            settings={'market_condition_profile': table[iid]})))
+    yield table
+    instance_resolver.set_instance_resolver(previous)
+
+
+_LINKED_IDS = iter(range(900_001, 901_000))
+
+
+def _linked_ruleset(name, subtype):
+    """A ruleset double with an id no other test's ruleset or expert can share -- ``_ruleset``
+    derives its id from a hash, and a collision here would find ANOTHER test's expert."""
+    return SimpleNamespace(id=next(_LINKED_IDS), name=name, subtype=SimpleNamespace(value=subtype))
+
+
+def _expert_using(ruleset, profiles, profile, slot='open_positions_ruleset_id'):
+    from ba2_trade_platform.core.db import add_instance as db_add_instance
+    from ba2_trade_platform.core.models import ExpertInstance
+
+    instance_id = db_add_instance(ExpertInstance(account_id=1, expert='MockExpert',
+                                                 **{slot: ruleset.id}))
+    profiles[instance_id] = profile
+    return instance_id
+
+
+def test_a_market_exit_rule_linked_into_a_ruleset_an_unprofiled_expert_uses_is_refused(
+        linked_rulesets, expert_profiles):
+    """A close is an allowed market exit -- but the expert already running the ruleset this
+    rule is linked into serves no market data, so the gate would read no_context for ever."""
+    exits = _linked_ruleset('rule-door exits unserved', 'open_positions')
+    linked_rulesets[41] = [exits]
+    instance_id = _expert_using(exits, expert_profiles, '')
+    tab = _gate_rule('open_positions', actions=CLOSE_ACTIONS)
+
+    with pytest.raises(ValueError) as excinfo:
+        tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                              tab.actions_data, 41)
+    msg = str(excinfo.value)
+    assert f'expert instance {instance_id}' in msg and ADX in msg and 'exit on adx' in msg
+
+
+def test_a_market_entry_rule_linked_into_an_unprofiled_experts_entry_ruleset_is_refused(
+        linked_rulesets, expert_profiles):
+    """The rule editor handles entry rules too, so the same question is asked of the expert
+    using the ENTRY ruleset the rule is linked into."""
+    entries = _linked_ruleset('rule-door entries unserved', 'enter_market')
+    linked_rulesets[41] = [entries]
+    _expert_using(entries, expert_profiles, 'ta-structure-v1', slot='enter_market_ruleset_id')
+    tab = _gate_rule('enter_market')
+
+    with pytest.raises(ValueError, match='ta-structure-v1'):
+        tab._refuse_market_gates_on_exit_rule('enter_market', tab.triggers_data,
+                                              tab.actions_data, 41)
+
+
+def test_a_market_exit_rule_linked_into_a_ruleset_its_expert_serves_is_accepted(
+        linked_rulesets, expert_profiles):
+    exits = _linked_ruleset('rule-door exits served', 'open_positions')
+    linked_rulesets[41] = [exits]
+    _expert_using(exits, expert_profiles, 'ohlcv-v1')
+    tab = _gate_rule('open_positions', actions=CLOSE_ACTIONS)
+
+    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                                 tab.actions_data, 41) is None
+
+
+def test_an_unlinked_market_exit_rule_is_accepted(linked_rulesets, expert_profiles):
+    tab = _gate_rule('open_positions', actions=CLOSE_ACTIONS)
+
+    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                                 tab.actions_data, 41) is None
+    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                                 tab.actions_data, None) is None
+
+
+def test_an_ordinary_rule_asks_about_no_expert(monkeypatch):
+    import ba2_common.core.market_condition_live as live
+
+    looked_up = []
+    monkeypatch.setattr(live, 'experts_linked_to_rulesets',
+                        lambda *a, **k: looked_up.append(a) or ())
+    tab = _gate_rule('open_positions', event_type='profit_loss_percent')
+
+    assert tab._refuse_market_gates_on_exit_rule('open_positions', tab.triggers_data,
+                                                 tab.actions_data, 41) is None
+    assert looked_up == []
+
+
 def test_the_link_lookup_is_used_by_the_real_save(editor, nicegui_client, linked_rulesets,
                                                   monkeypatch):
     """End to end through ``_save_rule``: the rule is an ENTER MARKET rule, so only the link can
