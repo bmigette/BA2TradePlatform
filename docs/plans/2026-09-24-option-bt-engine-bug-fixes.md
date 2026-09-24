@@ -314,6 +314,13 @@ and settled against a different contract.
 
 **Execution order:** 2 → 1a → 1b → 3 → 4 → 5 → 8 → 9 → 10 → 6 → 7.
 
+**Task 10 is IN stage 1** (user, 2026-09-24).
+
+- Stage 1 uses the new behaviour through its launcher setting.
+- DeterministicScorer runs LIVE, so the flag's default MUST keep every existing expert, backtest and live
+  result exactly as it is.
+- Future grids can change the default choice.
+
 - **Task 1a — lot basis + collision guard.**
   - Record `k_lot` (the as-traded factor on the fill day) when a lot opens.
   - Every held-lot spot is `adjusted_close × k_lot`: marks, BS fallback, no-arb bounds, margin,
