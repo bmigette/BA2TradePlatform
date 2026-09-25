@@ -88,7 +88,27 @@ def test_the_live_candidate_carries_the_rules_lot_size_and_the_broker_gets_whole
 
 
 def test_less_than_one_lot_is_not_placed_at_all(file_db):
-    _seen, submits = _run(file_db, SUB_LOT_PRICE, lot_size=100)
+    """...and the refusal is said at WARNING, naming the symbol (as the backtest test pins)."""
+    import logging
+    from ba2_common.logger import logger as ba2_logger
+
+    class _Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.WARNING)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    grab = _Grab()
+    ba2_logger.addHandler(grab)
+    try:
+        _seen, submits = _run(file_db, SUB_LOT_PRICE, lot_size=100)
+    finally:
+        ba2_logger.removeHandler(grab)
+    assert any("Lot sizing REFUSED AAPL" in m and "less than one lot of 100" in m
+               for m in grab.messages), (
+        f"the sub-lot refusal was not announced at WARNING: {grab.messages[-5:]}")
     assert submits == [], (
         f"88 affordable shares is less than one lot; nothing may reach the broker: {submits}")
     assert [o for o in _orders("AAPL") if o.order_type == OrderType.MARKET] == [], (

@@ -94,6 +94,14 @@ def test_no_lot_size_when_the_fired_buy_carries_none():
         [SellAction("AAPL", _PlainAccount(), OrderRecommendation.SELL)])) is None
 
 
+def test_a_non_evaluator_fails_loudly_instead_of_reading_as_no_lot():
+    """Handed something with no ``trade_actions``, the helper must raise -- reading that as
+    "no lot size" would silently size a round-lot strategy in odd lots again."""
+    import pytest
+    with pytest.raises(AttributeError):
+        trade_cycle.fired_entry_lot_size(object())
+
+
 def test_the_lot_is_the_ACTIONS_equity_lot_not_the_raw_int():
     """On a split-adjusted backtest book one contract delivers 100 x k ADJUSTED shares; the
     action's own ``_equity_lot_size`` owns that conversion, so the helper must go through it."""

@@ -276,3 +276,16 @@ def test_WITHOUT_lot_size_the_same_run_buys_the_odd_lot():
     """The control: the constraint, not the fixture, is what makes the lot whole."""
     equity, _options = _run("O_CC", ODD_LOT_SPOT, 875, lot_size=None)
     assert [_qty(o) for o in equity][:1] == [537]
+
+
+def test_the_round_lot_is_authored_on_the_BUY_entry_only():
+    """``SellAction`` takes no lot size and ``rules_convert`` carries it on the buy alone, so a
+    sell-side lot would be authored and then dropped without a word."""
+    from types import SimpleNamespace
+    m = _launcher()
+    s = SimpleNamespace(entry_rules=[
+        {"id": "b", "actions": [{"action_type": "buy"}]},
+        {"id": "s", "actions": [{"action_type": "sell"}]}])
+    m._with_round_lot_entry(s)
+    assert s.entry_rules[0]["actions"][0]["lot_size"] == 100
+    assert "lot_size" not in s.entry_rules[1]["actions"][0]

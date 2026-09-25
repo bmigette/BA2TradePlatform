@@ -57,7 +57,7 @@ def fired_entry_lot_size(evaluator: Any) -> Optional[int]:
     ``TradeManager`` funded-entry loop and the backtest ``daily_engine`` equity entry)."""
     from ba2_common.core.TradeActions import BuyAction
 
-    for action in (getattr(evaluator, "trade_actions", None) or []):
+    for action in evaluator.trade_actions:
         if isinstance(action, BuyAction) and action.lot_size:
             return int(action._equity_lot_size())
     return None

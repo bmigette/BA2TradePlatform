@@ -5476,7 +5476,10 @@ def _with_round_lot_entry(s, lot: int = 100):
     they are real covered calls / protective puts instead of mislabelled equity."""
     for rule in (s.entry_rules or []):
         for action in (rule.get("actions") or []):
-            if action.get("action_type") in ("buy", "sell"):
+            # BUY only: the lot is what the overlay writes AGAINST (shares held long), and it is
+            # carried by BuyAction alone -- SellAction takes no lot size and rules_convert emits
+            # it on the buy only, so a sell-side lot here would be dropped without a word.
+            if action.get("action_type") == "buy":
                 action["lot_size"] = int(lot)
     return s
 
