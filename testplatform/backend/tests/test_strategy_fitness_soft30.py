@@ -173,3 +173,84 @@ def test_equity_metrics_keep_the_single_trade_early_return(metric):
     comp = r["robustness"]
     assert comp["top1_pct"] is None
     assert comp["conc_factor"] == 1.0
+
+
+# ---------------------------------------------------------------------------------------------
+# Option metrics score concentration on STRUCTURES, not legs
+# ---------------------------------------------------------------------------------------------
+# Rows are legs, so on the row list one iron condor is 4 "trades", any run with <= 5 rows reads
+# top5 = 100%, and offsetting legs push top1 past 100%. The soft30 ramp already counts
+# structures; the screen must too.
+
+def structures(legs_per_structure, **changes):
+    """A run from explicit per-structure leg P&Ls: [[leg, leg, ...], ...]; pnl_pct = pnl / 1000."""
+    trades = [{"contract_symbol": f"T{txn}L{k}", "transaction_id": txn, "symbol": "AAPL",
+               "pnl": p, "pnl_pct": p / 1000.0, "entry_price": 1.0, "size": 1.0,
+               "exit_time": "2020-12-30"}
+              for txn, legs in enumerate(legs_per_structure) for k, p in enumerate(legs)]
+    return result(0, **{"total_trades": len(trades), "trades": trades,
+                        "avg_trades_per_year": len(trades) / 6, **changes})
+
+
+def comp_for(metric, run):
+    F.compute_fitness(metric, run, robust=True)
+    return run["robustness"]
+
+
+@pytest.mark.parametrize("metric", ["option_consistent_annual_return", "option_car", "ocar",
+                                    "option_car_over_risk", "option_car_target", METRIC,
+                                    "Option_Car_Target_SOFT30", "OCAR"])
+def test_every_option_metric_name_scores_structures(metric):
+    # The hard-floor option metrics return LOW_TRADE_SENTINEL for one trade, but the screen's
+    # components are still recorded -- which is what shows the flag reached it.
+    comp = comp_for(metric, structures([[100.0]]))
+    assert (comp["top1_pct"], comp["top5_pct"], comp["conc_factor"]) == (100.0, 100.0, 0.0)
+
+
+def test_one_iron_condor_is_concentrated_exactly_like_one_single_leg_trade():
+    condor = structures([[300.0, -100.0, 200.0, -50.0]])
+    single = structures([[350.0]])
+    condor_fit = F.compute_fitness(METRIC, condor, robust=True)
+    single_fit = F.compute_fitness(METRIC, single, robust=True)
+    assert condor["robustness"] == single["robustness"]
+    # On legs the condor read top1 = 300/350 = 85.7% and resampled legs apart; on the one bet it
+    # is 100% with a neutral MC, like any single trade.
+    assert condor["robustness"]["top1_pct"] == 100.0
+    assert condor["robustness"]["mc_factor"] == 1.0
+    assert condor_fit == single_fit == 0.0
+
+
+def test_six_structures_concentration_is_computed_on_structures():
+    # Structures: one vertical netting 400 + 100 = 500, then five single legs of 100.
+    # net = 1000; top1 = 500/1000 = 50%; top5 = (500 + 4 x 100)/1000 = 90%;
+    # factor = ((100 - 90) / (100 - 40)) ** 1.5 = (1/6) ** 1.5.
+    # (On the 7 LEGS it would read top1 = 40%, top5 = 80%, factor (1/3) ** 1.5.)
+    comp = comp_for(METRIC, structures([[400.0, 100.0]] + [[100.0]] * 5))
+    assert comp["top1_pct"] == pytest.approx(50.0)
+    assert comp["top5_pct"] == pytest.approx(90.0)
+    assert comp["conc_factor"] == pytest.approx((1.0 / 6.0) ** 1.5)
+
+
+@pytest.mark.parametrize("book", [
+    [[1664.1432316152855]],                                          # 100*x/x == 99.99999999999999
+    [[77.28734524697666], [428.9689436710173], [-412.49148439023816]],  # sorted-sum reorder
+], ids=["one_structure", "three_structures"])
+def test_a_by_definition_100pct_share_is_exactly_100(book):
+    """Float division read these as 99.99999999999999 -> factor ~3.6e-24, ranking a thin genome
+    above an exact 0. Where the share is 100% by definition it is set, not divided."""
+    comp = comp_for(METRIC, structures(book))
+    assert comp["top5_pct"] == 100.0
+    assert comp["conc_factor"] == 0.0
+    if len(book) == 1:
+        assert comp["top1_pct"] == 100.0
+
+
+def test_monte_carlo_resamples_structures_not_legs():
+    # 20 verticals, each +100 / -90 on its two legs: every BET wins +10, so no reordering of
+    # bets can lose. Resampling the LEGS independently splits the hedge and loses often.
+    run = structures([[100.0, -90.0]] * 20, max_drawdown=-5.0)
+    comp = comp_for(METRIC, run)
+    assert comp["mc_prob_neg"] == 0.0
+    assert comp["mc_factor"] == 1.0
+    legs = F.robustness_metrics(run)          # equity/row view of the same list, for contrast
+    assert legs["mc_prob_neg"] > 0.0

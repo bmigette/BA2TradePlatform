@@ -676,7 +676,7 @@ def compute_fitness(fitness_metric: str, results: dict,
         _fit = _apply_win_rate_factor(_option_consistent_annual_return(results), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
-            fitness_metric, results, stress_spread_bps, robust)
+            fitness_metric, results, stress_spread_bps, robust, option_structures=True)
 
     if metric in _OCR_ALIASES:
         # OPTION-ONLY, and a DIFFERENT OBJECTIVE from the branch above rather than a rescaling
@@ -688,7 +688,7 @@ def compute_fitness(fitness_metric: str, results: dict,
         _fit = _apply_win_rate_factor(_option_car_over_risk(results), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
-            fitness_metric, results, stress_spread_bps, robust)
+            fitness_metric, results, stress_spread_bps, robust, option_structures=True)
 
     if metric in _OCT_ALIASES or metric == _OCT_SOFT30_KEY:
         # OPTION-ONLY, and a THIRD DISTINCT OBJECTIVE rather than a rescaling of either branch
@@ -703,7 +703,7 @@ def compute_fitness(fitness_metric: str, results: dict,
             _option_car_target(results, soft_total_trades=(metric == _OCT_SOFT30_KEY)), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
-            fitness_metric, results, stress_spread_bps, robust)
+            fitness_metric, results, stress_spread_bps, robust, option_structures=True)
 
     if metric in _CONVEX_ALIASES:
         # CONVEX-HARVEST-ONLY. Reached only by an explicit ``option_convex``, which is what
@@ -779,7 +779,8 @@ def compute_fitness(fitness_metric: str, results: dict,
 
 
 def _maybe_robust(val: float, fitness_metric: str, results: dict,
-                  stress_spread_bps: float, robust: Optional[bool]) -> float:
+                  stress_spread_bps: float, robust: Optional[bool],
+                  option_structures: bool = False) -> float:
     """Apply the robustness adjustment and RECORD BOTH VIEWS on the results dict.
 
     Opt-in, exactly like the spread stress: `robust` None falls back to the level the RUN was
@@ -790,6 +791,10 @@ def _maybe_robust(val: float, fitness_metric: str, results: dict,
     Both numbers are stored -- fitness_raw and fitness_robust, plus every component -- because a
     single blended score that cannot be decomposed is not auditable, and because scores either
     side of this flag are NOT comparable (same trap as the 2026-08-04 dd_guard rescale).
+
+    ``option_structures`` is passed True by the three option CAR-family branches of
+    ``compute_fitness`` and by nothing else, so the screen reads per-STRUCTURE P&L for them only
+    (see ``robustness_metrics``). Every equity metric leaves it False and is byte-identical.
     """
     if robust is None:
         robust = bool(results.get("robust_fitness") or False)
@@ -802,8 +807,7 @@ def _maybe_robust(val: float, fitness_metric: str, results: dict,
         return val
     adj, comp = robust_fitness(val, results, stress_spread_bps
                                or float(results.get("stress_spread_bps") or 0.0),
-                               single_trade_concentrated=(
-                                   fitness_metric.lower() in _SINGLE_TRADE_CONCENTRATED_METRICS))
+                               option_structures=option_structures)
     results["fitness_robust"] = adj
     results["robustness"] = comp
     return adj
@@ -866,7 +870,7 @@ def _structure_count(trades) -> Optional[int]:
     return n
 
 
-def _structure_pnls(trades) -> list:
+def _structure_pnls(trades, field: str = "pnl") -> list:
     """Net P&L per independent BET, in first-appearance order -- the same partition
     ``_structure_count`` counts, but carrying each structure's SUMMED P&L rather than a tally.
 
@@ -888,6 +892,11 @@ def _structure_pnls(trades) -> list:
     ``test_strategy_fitness_convex_frozen`` pins that so the two partitions cannot drift.
     Non-dict rows are counted as their own zero-P&L bet, which is what keeps that identity true
     (``_structure_count`` counts them individually too).
+
+    ``field`` selects which per-row number is summed (default ``pnl``). ``pnl_pct`` is valid to
+    sum too: each leg's pnl_pct is its P&L over account equity AT ENTRY
+    (``BacktestAccount.get_round_trip_trades``), and a structure's legs open together, so the
+    sum is the structure's own equity-relative return.
     """
     pnls: list = []
     slots: dict = {}          # transaction_id -> index into pnls
@@ -895,7 +904,7 @@ def _structure_pnls(trades) -> list:
         if not isinstance(t, dict):
             pnls.append(0.0)
             continue
-        pnl = float(t.get("pnl") or 0.0)
+        pnl = float(t.get(field) or 0.0)
         txn = t.get("transaction_id")
         if t.get("contract_symbol") and txn is not None:
             if txn in slots:
@@ -1031,55 +1040,72 @@ _CONC_EXP = float(_os.getenv("BT_CONC_EXP", "1.5"))             # >1 bites harde
 # while dropping converged influence to ~1.4x return.
 
 #
-# A SINGLE WINNING TRADE IS 100% CONCENTRATED (2026-09-24, plan Task 4). robustness_metrics
-# historically returned every factor 1.0 below two trades, so one winning trade scored as
-# PERFECTLY diversified while a 2-5-trade book (top5 = 100% of net) got conc_factor 0. Under
-# option_car_target_soft30 -- no count floor, only a linear ramp per bet -- that inversion made
-# every top O_LP genome a 1-trade genome. Decided design (user, 2026-09-23): thin trading is
-# PENALISED through the same concentration formula, not zeroed by a new hard trade floor.
+# OPTION METRICS SCORE CONCENTRATION ON STRUCTURES (2026-09-24/25, plan Task 4).
 #
-# GATED TO THE OPTION CAR-FAMILY METRIC NAMES, not applied everywhere, because the generic
-# metrics (calmar, sharpe, total_return, ...) have NO trade floor: a 1-trade equity run reaches
-# this screen, and the equity path is frozen bit-for-bit (test_strategy_fitness_equity_frozen
-# pins single_trade -> all factors 1.0). Same rule as the option metrics themselves: a metric an
-# equity run never NAMES is a code path it cannot reach. option_convex is absent on purpose: it
-# never calls the robustness screen (see compute_fitness).
-_SINGLE_TRADE_CONCENTRATED_METRICS = frozenset(
-    _OCAR_ALIASES + _OCR_ALIASES + _OCT_ALIASES + (_OCT_SOFT30_KEY,))
+# WHY STRUCTURES. The round-trip recorder emits ONE ROW PER LEG, so on the row list an iron
+# condor is 4 "trades" and any run with <= 5 rows reads top5 = 100% whatever its bets were;
+# offsetting legs also distort top1 (a condor's winning short leg can exceed 100% of the net).
+# The soft30 trade ramp and every other count on the option metrics already use STRUCTURES
+# (_trades_per_year / _structure_count); the concentration screen now reads the same partition
+# (_structure_pnls), so "one bet carried the book" means one BET, not one leg.
+#
+# A SINGLE WINNING STRUCTURE IS 100% CONCENTRATED. The screen used to return every factor 1.0
+# below two rows, so one winning trade scored as PERFECTLY diversified while a 2-5-trade book
+# got conc_factor 0. Under option_car_target_soft30 -- no count floor, only a linear ramp per
+# bet -- that inversion made every top O_LP genome a 1-trade genome. Decided design (user,
+# 2026-09-23): thin trading is PENALISED through the same concentration formula, not zeroed by a
+# new hard trade floor.
+#
+# OPTION METRICS ONLY. ``compute_fitness``'s three option CAR-family branches pass
+# ``option_structures=True``; nothing else does. The generic metrics (calmar, sharpe,
+# total_return, ...) have NO trade floor, so a 1-trade equity run DOES reach this screen, and
+# the equity path is frozen bit-for-bit (test_strategy_fitness_equity_frozen pins single_trade
+# -> all factors 1.0). option_convex never calls the screen (see compute_fitness).
 
 
 def robustness_metrics(results: dict, spread_bps: float = 0.0,
-                       single_trade_concentrated: bool = False) -> dict:
+                       option_structures: bool = False) -> dict:
     """The three robustness screens for one finished run. Pure post-hoc, no re-simulation.
 
     Returns a dict with every component so BOTH the raw and the adjusted view are inspectable
     afterwards -- a single blended number that cannot be decomposed is not auditable.
 
-    ``single_trade_concentrated`` (option metrics only, see
-    ``_SINGLE_TRADE_CONCENTRATED_METRICS``): a run of exactly one trade with positive net P&L is
-    scored as 100% concentrated instead of being skipped. False keeps the historical early return.
+    ``option_structures`` (the option CAR-family metrics only; see the block comment above):
+    concentration and the monte-carlo resample read per-STRUCTURE P&L instead of per-row (leg)
+    P&L, and a book of exactly one winning structure is scored as 100% concentrated instead of
+    being skipped. False keeps the historical row-level behaviour byte for byte.
     """
     out = {"top1_pct": None, "top5_pct": None, "mc_p5": None, "mc_prob_neg": None,
            "spread_keep_pct": None, "conc_factor": 1.0, "mc_factor": 1.0, "spread_factor": 1.0}
     trades = results.get("trades") or []
-    pnl = [float(t.get("pnl") or 0.0) for t in trades]
+    if option_structures:
+        pnl = _structure_pnls(trades)
+    else:
+        pnl = [float(t.get("pnl") or 0.0) for t in trades]
     net = sum(pnl)
     # 0 trades or a non-positive book: there is no profit to be concentrated in, and scaling a
     # loser's fitness by a <1 factor would promote it (robust_fitness leaves negatives alone).
-    # One winning trade on an option metric falls through: it IS the whole result, so the
-    # concentration formula below gives top1 = top5 = 100% and a factor of 0 at the default
-    # _CONC_DEAD_PCT. The monte-carlo screen then skips itself (it needs >= 2 trades): a
-    # trade-order resample of one trade has nothing to reorder, so mc_factor stays a neutral
-    # 1.0 rather than a fabricated verdict -- concentration is the screen that speaks here.
     if net <= 0 or len(pnl) == 0:
         return out
-    if len(pnl) < 2 and not single_trade_concentrated:
+    # One winning row on an equity metric: the historical skip, kept (frozen). On an option
+    # metric one winning STRUCTURE falls through: it IS the whole result.
+    if len(pnl) < 2 and not option_structures:
         return out
 
     # --- concentration -------------------------------------------------------------------
     srt = sorted(pnl, reverse=True)
     out["top1_pct"] = 100.0 * srt[0] / net
     out["top5_pct"] = 100.0 * sum(srt[:5]) / net
+    if option_structures:
+        # EXACT 100.0 where the share is 100% by definition. Float division does not guarantee
+        # it: sum(srt[:5]) adds in sorted order while net added in trade order, so a book of
+        # <= 5 structures can read 99.99999999999999 -- factor ~3.6e-24 instead of 0.0, which
+        # ranks a 1-trade genome ABOVE an exact-0 one. Option path only (the equity path is
+        # frozen, rounding and all).
+        if len(pnl) <= 5:
+            out["top5_pct"] = 100.0      # the five best ARE the whole book
+        if len(pnl) == 1:
+            out["top1_pct"] = 100.0
     t5 = out["top5_pct"]
     if t5 <= _CONC_FREE_PCT:
         out["conc_factor"] = 1.0
@@ -1091,9 +1117,19 @@ def robustness_metrics(results: dict, spread_bps: float = 0.0,
     # Bootstrap the pnl_pct sequence. This asks "was the equity path luck of ordering?" -- it
     # CANNOT see that one huge winner is a single position (resampling redraws it), which is
     # exactly why the concentration screen above exists alongside it.
+    # Under ``option_structures`` the resample draws STRUCTURES (legs' equity-relative pnl_pct
+    # summed per transaction), not legs: the legs of one structure are one bet, and drawing them
+    # independently would split a hedge -- a condor's winning short leg without the wing that
+    # capped it -- inventing paths the strategy cannot produce. One structure leaves size 1, so
+    # the resample skips itself below: a trade-ORDER shuffle of one bet has nothing to reorder,
+    # and mc_factor stays a neutral 1.0 rather than a fabricated verdict -- concentration is the
+    # screen that speaks for a single bet.
     try:
         import numpy as _np
-        pct = _np.array([float(t.get("pnl_pct") or 0.0) for t in trades], dtype=float) / 100.0
+        if option_structures:
+            pct = _np.array(_structure_pnls(trades, "pnl_pct"), dtype=float) / 100.0
+        else:
+            pct = _np.array([float(t.get("pnl_pct") or 0.0) for t in trades], dtype=float) / 100.0
         if pct.size >= 2 and _np.isfinite(pct).all():
             rng = _np.random.default_rng(_ROBUST_MC_SEED)
             idx = rng.integers(0, pct.size, size=(_ROBUST_MC_PATHS, pct.size))
@@ -1123,7 +1159,7 @@ def robustness_metrics(results: dict, spread_bps: float = 0.0,
 
 
 def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0,
-                   single_trade_concentrated: bool = False) -> tuple:
+                   option_structures: bool = False) -> tuple:
     """(adjusted_fitness, components). Multiplicative, so a genome must clear ALL THREE screens.
 
     Sentinels pass through untouched: a disqualified or wiped-out genome keeps its sentinel RANK
@@ -1131,7 +1167,7 @@ def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0,
     A NEGATIVE base is returned unchanged too -- multiplying a negative by a <1 factor would make
     a bad genome look BETTER, which is the classic sign-flip bug in penalty schemes.
     """
-    comp = robustness_metrics(results, spread_bps, single_trade_concentrated)
+    comp = robustness_metrics(results, spread_bps, option_structures)
     if base_fitness in (STALLED_SENTINEL, ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
         return base_fitness, comp
     if base_fitness <= 0:

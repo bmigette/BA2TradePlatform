@@ -224,9 +224,21 @@ TOP1 −25.49% (daily) vs the new refined value.
 factor comes from the same formula as every other run (it gives 0 above `_CONC_DEAD_PCT`). With 0 trades or
 net ≤ 0, keep the current early return.
 
-**Equity no-impact check:** equity CAR-family fitnesses return `LOW_TRADE_SENTINEL` below 12 trades/yr
-before robustness is applied (`:958`, `:1101`, `:1272`). Confirm by reading, and name every other caller of
-`robustness_metrics` in the report.
+**Equity no-impact check (corrected 2026-09-25):** the equity CAR metrics (`car`/`goal`/
+`consistent_annual_return`) do return `LOW_TRADE_SENTINEL` below their trade floor (12/yr, 8/yr for
+DeterministicScorer) before robustness is applied, and `robust_fitness` passes a sentinel through. But the
+generic metrics (calmar, sharpe, total_return, sortino, profit_factor, sqn, win_rate) have NO trade floor,
+and robust fitness is on by default since 2026-09-17, so a 1-trade equity run on one of them DOES reach the
+screen (`test_strategy_fitness_equity_frozen` pins `single_trade` -> all factors 1.0). That is why the change
+is gated to the option CAR-family metrics: `compute_fitness`'s three option branches pass
+`option_structures=True` and nothing else does. `robustness_metrics` has one caller, `robust_fitness`, whose
+one caller is `_maybe_robust` inside `compute_fitness`.
+
+Under the same flag the screen reads per-STRUCTURE P&L (`_structure_pnls`), not per-row leg P&L: rows are
+legs, so any run of <= 5 rows read top5 = 100%, and offsetting legs pushed top1 past 100%. The MC resample
+draws structures too (legs of one bet are not independent draws). A share that is 100% by definition (one
+structure, or top5 of <= 5 structures) is set to exactly 100.0, because float division gave
+99.99999999999999 and a factor of ~3.6e-24 that outranked an exact 0.
 
 **Files:**
 - Modify: `testplatform/backend/app/services/strategy_fitness.py` `robustness_metrics`.
