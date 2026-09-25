@@ -5,6 +5,7 @@ Implements genetic algorithm optimization for model hyperparameters
 using DEAP (Distributed Evolutionary Algorithms in Python).
 """
 
+import math
 import numpy as np
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Callable, Tuple
@@ -30,6 +31,68 @@ logger = logging.getLogger(__name__)
 #: the ML GA, whose metrics are non-negative: 0.0 was already its worst score, and this is still
 #: worst.
 FITNESS_EVALUATION_FAILED = -1.0e9
+
+#: Where a numeric gene's step lattice is counted from (``GeneticOptimizer(lattice_anchor=...)``).
+#:
+#: ``"zero"`` -- the LEGACY decode, ``round(v / step) * step``: levels are multiples of ``step``
+#: counted from 0, so a gene whose ``min`` is not itself a multiple of the step decodes off its
+#: intended levels and can land BELOW ``min`` / ABOVE ``max`` (LEAPS entry DTE 410..500 step 15
+#: decodes 410 to 405; O_ERN's 14..23 step 3 decodes 23 to 24). It stays the DEFAULT because
+#: running grids and persisted results were produced by it: measured 2026-09-25, the stage-1
+#: option discovery grid (``cond:xlk:value`` 3..20 step 2) and the equity S1-S7 grids (several
+#: condition/action genes, FMPSenateTraderWeight ``min_trader_avg_hold_days``) carry such genes,
+#: so changing the default would make a resumed checkpoint decode a different genome.
+#:
+#: ``"min"`` -- levels are ``min + j*step`` inside ``[min, max]``; a decoded value is always one
+#: of them. Opt-in per job (optimization_config ``latticeAnchor``). On a gene whose ``min`` IS a
+#: multiple of the step the two lattices coincide, and the decode reuses the legacy arithmetic
+#: there so it is BIT-identical to ``"zero"`` for every in-range value -- turning the anchor on
+#: moves only the genes whose lattice was actually wrong. The one exception is float noise at an
+#: end of the range (``-6 * 0.05`` is ``-0.30000000000000004``, an ulp below a -0.3 min): ``"min"``
+#: returns the exact bound there, because "never below min" is the point of it.
+LATTICE_ANCHORS = ("zero", "min")
+
+
+def _on_zero_lattice(x: float, step: float) -> bool:
+    """Is ``x`` a multiple of ``step`` (to float noise)?"""
+    r = x / step
+    return abs(r - round(r)) < 1e-9
+
+
+def snap_to_lattice(value, config: Dict, anchor: str = "zero"):
+    """Decode one raw numeric gene value onto its step lattice (see :data:`LATTICE_ANCHORS`).
+
+    ``"zero"`` is the legacy formula, verbatim, including its lack of clamping. ``"min"``
+    returns ``min + j*step`` with ``j`` clamped to ``[0, floor((max-min)/step)]``, and the result
+    clamped to ``[min, max]`` against float noise -- never below ``min`` nor above ``max``, also
+    for a raw value from outside the range (a warm-start seed encoded from a differently-ranged
+    source).
+    """
+    if anchor not in LATTICE_ANCHORS:
+        # Public helper: an unknown anchor is a caller bug, never silently "min".
+        raise ValueError(f"lattice anchor must be one of {LATTICE_ANCHORS}, got {anchor!r}")
+    is_int = config['type'] == 'int'
+    step = config.get('step', 1 if is_int else 0.01)
+    if anchor == "zero":
+        if is_int:
+            return int(round(value / step) * step)
+        return round(value / step) * step
+    lo, hi = config['min'], config['max']
+    if _on_zero_lattice(lo, step):
+        # Same lattice as "zero": keep its arithmetic (bit-identical in range), clamp the index.
+        k = min(max(round(value / step), round(lo / step)), math.floor(hi / step + 1e-9))
+        if is_int:
+            return int(k * step)
+        snapped = k * step
+    else:
+        j = min(max(round((value - lo) / step), 0), math.floor((hi - lo) / step + 1e-9))
+        if is_int:
+            return int(round(lo + j * step))
+        # 10 dp, as the brute-force axis builds the same min-anchored lattice: drops the
+        # 3.0000000000000004-style noise of lo + j*step without moving any level.
+        snapped = round(lo + j * step, 10)
+    # An ulp of float noise must not carry an end level outside the range.
+    return lo if snapped < lo else hi if snapped > hi else snapped
 
 # Check for DEAP availability
 try:
@@ -160,7 +223,8 @@ class GeneticOptimizer:
         mutation_prob: float = 0.2,
         early_stopping_generations: int = 3,
         elitism_percent: float = 10.0,
-        parallel_individuals: int = 1
+        parallel_individuals: int = 1,
+        lattice_anchor: str = "zero",
     ):
         """
         Initialize GeneticOptimizer.
@@ -173,9 +237,15 @@ class GeneticOptimizer:
             mutation_prob: Probability of mutation
             early_stopping_generations: Stop if no improvement for this many generations
             elitism_percent: Percentage of best individuals to preserve unchanged (default 10%)
+            lattice_anchor: where numeric genes' step lattice is counted from -- "zero"
+                (legacy default) or "min"; see LATTICE_ANCHORS
         """
         if not DEAP_AVAILABLE:
             raise RuntimeError("DEAP library not available. Install with: pip install deap")
+        if lattice_anchor not in LATTICE_ANCHORS:
+            raise ValueError(
+                f"lattice_anchor must be one of {LATTICE_ANCHORS}, got {lattice_anchor!r}")
+        self.lattice_anchor = lattice_anchor
 
         self.param_ranges = param_ranges or self.DEFAULT_PARAM_RANGES
         self.population_size = population_size
@@ -386,14 +456,9 @@ class GeneticOptimizer:
                 # target_price_type string). Clamp defensively to a valid index.
                 idx = int(np.clip(round(value), 0, len(config['choices']) - 1))
                 value = config['choices'][idx]
-            elif config['type'] == 'int':
-                # Round to step size
-                step = config.get('step', 1)
-                value = int(round(value / step) * step)
             else:
-                # Round to step size
-                step = config.get('step', 0.01)
-                value = round(value / step) * step
+                # Snap to the step lattice (int or float; see LATTICE_ANCHORS).
+                value = snap_to_lattice(value, config, self.lattice_anchor)
             raw_params[param_name] = value
 
         # Combine per-layer hidden dims into a list

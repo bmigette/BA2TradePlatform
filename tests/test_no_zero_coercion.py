@@ -367,14 +367,14 @@ ALLOWLIST: dict = {
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
         "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
-        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245",
+        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245; the equity-short netting rule removed a permission checkbox and its load/save, :4240",
     "ba2_trade_platform/ui/pages/settings.py:4295":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
         "continuation line 3795, one past the outer .get(...)'s opening line 3794; plan "
         "Task 12's widget + guard then moved the pair to :3850/:3898, then :3889/:3939; the "
-        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289); the UI consistency pass added the shared refresh_button import, :4240/:4290; the pullback/market-exits merge with origin/dev, :4245/:4295",
+        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289); the UI consistency pass added the shared refresh_button import, :4240/:4290; the pullback/market-exits merge with origin/dev, :4245/:4295; the equity-short netting rule, :4240/:4290",
     "ba2_trade_platform/ui/components/performance_charts.py:475":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
         "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging)",
@@ -388,7 +388,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:1806":
+    "packages/common/ba2_common/core/TradeActions.py:2203":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
@@ -412,7 +412,14 @@ ALLOWLIST: dict = {
         "(+23 from :1576); :1751 after plan 2026-09-24 Task B4 added ruleset_stop_policy and "
         "its helpers just above AdjustStopLossAction (+152); :1791 after the B4 review fixes "
         "(floor_would_loosen, the resolve_expert alias, a strict stop side, rule_price) added "
-        "40 more above it; :1806 after floor_exceeds_rule added 15 more",
+        "40 more above it; :1806 after floor_exceeds_rule added 15 more; :2007 after equity "
+        "short selling (plan 2026-09-24 Task S1) added the netting helpers to TradeAction and "
+        "rewrote SellAction/BuyAction above it (+201); :2032 after the S1 review fixes "
+        "(side classification, filled-quantity guard, shared expert id); :2041 after TP/SL "
+        "direction moved to _position_is_long (+9); :2135 after the close percent + permission "
+        "matrix (_close_own_position, buying_enabled) rewrote SellAction/BuyAction above it; :2197 "
+        "after the be1a0aab review fixes (partial-close refusals, FIFO plan) grew them; :2203 "
+        "after refusals gained closed_transaction_ids",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",

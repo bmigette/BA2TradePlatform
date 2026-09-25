@@ -36,15 +36,15 @@ class TestColumnSets:
 
     def test_the_equity_column_set_is_untouched(self):
         names = self._names(LiveTradesTable.TRANSACTION_COLUMNS)
-        # 21 columns, and NOT an option term among them -- adding the option set beside it
-        # must not have edited this one.
-        assert len(names) == 21
+        # 20 columns (Current P/L + Closed P/L became one P/L on 2026-09-24), and NOT an
+        # option term among them -- the option set beside it must not have edited this one.
+        assert len(names) == 20
         for absent in ('strategy', 'expiry', 'legs'):
             assert absent not in names
 
     def test_the_option_set_carries_the_terms_the_equity_set_lacks(self):
         names = self._names(LiveTradesTable.OPTION_TRANSACTION_COLUMNS)
-        for present in ('strategy', 'expiry', 'legs', 'symbol', 'open_price', 'current_pnl'):
+        for present in ('strategy', 'expiry', 'legs', 'symbol', 'open_price', 'pnl'):
             assert present in names
 
     def test_tp_and_sl_are_labelled_as_premium_levels(self):
@@ -75,3 +75,38 @@ def test_the_table_defaults_to_the_equity_column_set():
     table = LiveTradesTable(data_loader=lambda *args, **kwargs: ([], 0))
     assert [column.name for column in table.columns] == \
         [column.name for column in LiveTradesTable.TRANSACTION_COLUMNS]
+
+
+def test_the_stocks_tab_lists_no_option_transaction(monkeypatch):
+    """8082, 2026-09-24: two open long calls were listed on the STOCKS tab too, priced off the
+    underlying with no multiplier (a $1.03 KO call read "+8567%"). The Stocks query must keep
+    only its own asset class; every count and total on the tab is built from that query."""
+    import asyncio
+    import sys
+    from types import SimpleNamespace
+
+    from tests import factories
+    from ba2_trade_platform.ui.pages.live_trades import LiveTradesTab
+
+    factories.create_transaction(symbol="AAPL")
+    factories.create_transaction(symbol="KO", asset_class=AssetClass.OPTION, multiplier=100)
+
+    page = sys.modules[LiveTradesTab.__module__]
+    monkeypatch.setattr(page, "get_selected_account_id", lambda: None)
+    tab = object.__new__(LiveTradesTab)
+    tab.status_filter = SimpleNamespace(value=['Waiting', 'Open', 'Closing'])
+    tab.expert_filter = SimpleNamespace(value='All')
+    tab.symbol_filter = SimpleNamespace(value='')
+    tab.broker_order_id_filter = SimpleNamespace(value='')
+    tab.expert_id_map = {}
+    totals_seen = []
+    monkeypatch.setattr(LiveTradesTab, "_compute_filtered_totals",
+                        lambda self, session, q: totals_seen.append(
+                            [t.symbol for t, _e in session.exec(q).all()]))
+    monkeypatch.setattr(LiveTradesTab, "_build_transaction_rows",
+                        lambda self, txns, experts, session: [{'symbol': t.symbol} for t in txns])
+
+    rows, total = asyncio.run(tab._transactions_data_loader(1, 20, {}, None, False))
+
+    assert [r['symbol'] for r in rows] == ['AAPL'] and total == 1
+    assert totals_seen == [['AAPL']], "the totals strip must not sum an option row either"

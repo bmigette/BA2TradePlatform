@@ -33,6 +33,99 @@ from ...logger import logger
 from ..utils.perf_logger import PerfLogger
 
 
+def bracket_level_cell(level: Any, open_price: Any, quantity: Any, side: Any,
+                       multiplier: Any = 1) -> str:
+    """A TP/SL cell: ``"$9.01 ($-35.10)"`` -- the level, then the P/L if it is hit.
+
+    The P/L is ``(level - open) x quantity x multiplier`` for a long, sign flipped for a short
+    (``side`` BUY/LONG is long). ``multiplier`` is 1 for shares and the contract multiplier for
+    an option, whose levels are PREMIUMS. Without an open price, quantity or multiplier only
+    the level is shown: a P/L computed from a missing input would be a made-up number.
+    """
+    try:
+        level = float(level) if level is not None else None
+    except (TypeError, ValueError):
+        level = None
+    if not level:
+        return ''
+    text = f"${level:.2f}"
+    try:
+        open_value, qty, mult = float(open_price), abs(float(quantity)), float(multiplier)
+    except (TypeError, ValueError):
+        return text
+    if not open_value or not qty or not mult:
+        return text
+    side_value = str(getattr(side, 'value', side) or '').upper()
+    sign = -1.0 if side_value in ('SELL', 'SHORT') else 1.0
+    pnl = sign * (level - open_value) * qty * mult
+    return f"{text} (${pnl:+.2f})"
+
+
+def transaction_status_color(status: Any) -> str:
+    """The Quasar colour of a transaction's STATUS badge -- one map for every trades table.
+
+    The stock rows, the option rows and the transaction dialog each kept their own map (or
+    none: the option rows set no colour, so WAITING rendered in Quasar's default teal, the
+    colour OPENED uses, and the dialog painted WAITING blue while the table painted it
+    orange). Accepts the enum or its value.
+    """
+    from ...core.types import TransactionStatus
+    try:
+        status = TransactionStatus(getattr(status, 'value', status))
+    except ValueError:
+        return 'grey'
+    return {
+        TransactionStatus.WAITING: 'orange',
+        TransactionStatus.OPENED: 'green',
+        TransactionStatus.CLOSING: 'orange',
+        TransactionStatus.CLOSED: 'grey',
+        TransactionStatus.FAILED: 'red',
+    }.get(status, 'grey')
+
+
+def related_order_rows(orders: List[Any]) -> List[Dict[str, Any]]:
+    """The row expansion's "Related Orders" entries -- one builder for every trades table.
+
+    The expansion template reads ``row.orders``; the stock rows built it inline and the option
+    rows never did, so an option transaction said "Related Orders (2)" above "No orders found
+    for this transaction". An option leg's CONTRACT is appended to its type: the transaction
+    is keyed on the underlying, so without it every leg of a structure reads the same.
+    """
+    from ...core.TransactionHelper import TransactionHelper
+    from ...core.utils import get_order_status_color
+
+    rows = []
+    for order in orders:
+        category = 'Entry'
+        if TransactionHelper.is_tpsl_order(order):
+            if TransactionHelper.is_tp_order(order):
+                category = 'Take Profit'
+            elif TransactionHelper.is_sl_order(order):
+                category = 'Stop Loss'
+            else:
+                category = 'Dependent'
+        order_type = getattr(order.order_type, 'value', str(order.order_type))
+        contract = getattr(order, 'contract_symbol', None)
+        rows.append({
+            'id': order.id,
+            'type': f"{order_type} · {contract}" if contract else order_type,
+            'side': getattr(order.side, 'value', str(order.side)),
+            'category': category,
+            'quantity': f"{order.quantity:.2f}" if order.quantity else '0.00',
+            'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '0.00',
+            'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
+            'stop_price': f"${order.stop_price:.2f}" if order.stop_price else '',
+            'status': getattr(order.status, 'value', str(order.status)),
+            'status_color': get_order_status_color(order.status),
+            'broker_order_id': order.broker_order_id or '',
+            'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else '',
+            'comment': order.comment or '',
+            'expert_recommendation_id': order.expert_recommendation_id,
+            'has_recommendation': order.expert_recommendation_id is not None,
+        })
+    return rows
+
+
 @dataclass
 class LiveTradesTableConfig(LazyTableConfig):
     """Configuration for LiveTradesTable."""
@@ -76,10 +169,12 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='current_price', label='Current', field='current_price', align='right'),
         ColumnDef(name='value', label='Value / CapReq', field='value', align='right', sortable=True),
         ColumnDef(name='close_price', label='Close Price', field='close_price', align='right'),
-        ColumnDef(name='take_profit', label='TP', field='take_profit', align='right'),
+        # SL before TP (asked 2026-09-24), each as "level (P/L if hit)".
         ColumnDef(name='stop_loss', label='SL', field='stop_loss', align='right'),
-        ColumnDef(name='current_pnl', label='Current P/L', field='current_pnl_numeric', align='right', sortable=True),
-        ColumnDef(name='closed_pnl', label='Closed P/L', field='closed_pnl_numeric', align='right', sortable=True),
+        ColumnDef(name='take_profit', label='TP', field='take_profit', align='right'),
+        # ONE P/L column (asked 2026-09-24): the unrealised P/L while the trade is open, the
+        # realised one once it is closed -- two half-empty columns said the same thing twice.
+        ColumnDef(name='pnl', label='P/L', field='pnl_numeric', align='right', sortable=True),
         ColumnDef(name='status', label='Status', field='status', align='center', sortable=True),
         ColumnDef(name='order_count', label='Orders', field='order_count', align='center'),
         ColumnDef(name='created_at', label='Created', field='created_at', align='left', sortable=True),
@@ -109,10 +204,11 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='current_price', label='Current Prem.', field='current_price', align='right'),
         ColumnDef(name='value', label='Value / CapReq', field='value', align='right', sortable=True),
         ColumnDef(name='close_price', label='Close Premium', field='close_price', align='right'),
-        ColumnDef(name='take_profit', label='TP (prem.)', field='take_profit', align='right'),
         ColumnDef(name='stop_loss', label='SL (prem.)', field='stop_loss', align='right'),
-        ColumnDef(name='current_pnl', label='Current P/L', field='current_pnl_numeric', align='right', sortable=True),
-        ColumnDef(name='closed_pnl', label='Closed P/L', field='closed_pnl_numeric', align='right', sortable=True),
+        ColumnDef(name='take_profit', label='TP (prem.)', field='take_profit', align='right'),
+        # ONE P/L column (asked 2026-09-24): the unrealised P/L while the trade is open, the
+        # realised one once it is closed -- two half-empty columns said the same thing twice.
+        ColumnDef(name='pnl', label='P/L', field='pnl_numeric', align='right', sortable=True),
         ColumnDef(name='status', label='Status', field='status', align='center', sortable=True),
         ColumnDef(name='order_count', label='Orders', field='order_count', align='center'),
         ColumnDef(name='created_at', label='Created', field='created_at', align='left', sortable=True),
@@ -141,7 +237,9 @@ class LiveTradesTable(LazyTable):
                     />
                 </template>
                 <template v-else-if="col.name === 'direction'">
-                    <q-badge :color="col.value === 'BUY' ? 'positive' : 'negative'" :label="col.value" />
+                    <!-- The option rows say LONG/SHORT, the stock rows BUY/SELL: keyed on 'BUY'
+                         alone, every LONG option structure rendered red. -->
+                    <q-badge :color="['BUY', 'LONG'].includes(col.value) ? 'positive' : 'negative'" :label="col.value" />
                 </template>
                 <template v-else-if="col.name === 'status'">
                     <q-badge :color="props.row.status_color" :label="col.value" />
@@ -159,6 +257,14 @@ class LiveTradesTable(LazyTable):
                 <template v-else-if="col.name === 'current_pnl'">
                     <span :class="props.row.current_pnl_numeric > 0 ? 'number-positive font-bold' : props.row.current_pnl_numeric < 0 ? 'number-negative font-bold' : ''">
                         {{ props.row.current_pnl }}
+                    </span>
+                    <q-icon v-if="props.row.pnl_reason" name="info_outline" class="q-ml-xs">
+                        <q-tooltip>{{ props.row.pnl_reason }}</q-tooltip>
+                    </q-icon>
+                </template>
+                <template v-else-if="col.name === 'pnl'">
+                    <span :class="props.row.pnl_numeric > 0 ? 'number-positive font-bold' : props.row.pnl_numeric < 0 ? 'number-negative font-bold' : ''">
+                        {{ props.row.pnl }}
                     </span>
                     <q-icon v-if="props.row.pnl_reason" name="info_outline" class="q-ml-xs">
                         <q-tooltip>{{ props.row.pnl_reason }}</q-tooltip>

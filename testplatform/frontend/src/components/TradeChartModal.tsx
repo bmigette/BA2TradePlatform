@@ -32,6 +32,15 @@ const addDays = (iso: string, n: number) => {
 };
 
 const CHART_HEIGHT = 380;
+/** Width of the payoff panel beside the chart. The payoff used to be drawn OVER the candles,
+ *  rotated, so the horizontal axis meant time for the candles and dollars for the curve at
+ *  once, and its $0 line read as a date. It now has its own strip, sharing only the price
+ *  axis (the one thing the two genuinely have in common). */
+const PAYOFF_PANEL_WIDTH = 200;
+// (The panel itself was removed on 2026-09-24 as more confusing than the overlay it replaced:
+// the chart now shows the payoff only as the breakeven line and the faint profit/loss zones,
+// and the numbers live in the "Expiration payoff" section under the chart. The panel geometry
+// below is still computed for the zones' band rectangles.)
 
 /**
  * A load, keyed by WHAT WAS ASKED FOR.
@@ -43,9 +52,11 @@ const CHART_HEIGHT = 380;
  */
 type Loaded<T> = { key: string; value: T; error: string | null };
 
-/** Overlay paths for the rotated payoff, in SVG user units. */
+/** Zone bands over the candles (``width``) and the payoff panel beside them
+ *  (``panelWidth``: ``zeroX``, ``curve``, ``fills`` and ``ticks`` are panel coordinates). */
 type OverlayShape = {
   width: number;
+  panelWidth: number;
   height: number;
   zeroX: number;
   curve: string;
@@ -120,10 +131,16 @@ const TradeChartModal: React.FC<{
   }, [stockKey, symbol, entryDate, exitDate]);
 
   // ---- OPTION: the complete transaction, cache-only ----------------------------
+  // Keyed on the two ids, NOT on the ``optionSelection`` object: the page hands over a fresh
+  // object on every re-render (its running-jobs poll re-renders it every few seconds), and an
+  // object dependency re-fetched the trade each time -- and ``setScope(null)`` below then
+  // snapped the payoff selector back to "Whole structure" moments after a leg was picked.
+  const optionBacktestId = optionSelection?.backtestId;
+  const optionTradeId = optionSelection?.tradeId;
   useEffect(() => {
-    if (!optionKey || !optionSelection) return;
+    if (!optionKey || optionBacktestId == null || optionTradeId == null) return;
     let alive = true;
-    getTradeChartContext(optionSelection.backtestId, optionSelection.tradeId)
+    getTradeChartContext(optionBacktestId, optionTradeId)
       .then(res => {
         if (!alive) return;
         setOptionLoad({ key: optionKey, value: res, error: null });
@@ -133,7 +150,7 @@ const TradeChartModal: React.FC<{
         if (alive) setOptionLoad({ key: optionKey, value: null, error: String(e) });
       });
     return () => { alive = false; };
-  }, [optionKey, optionSelection]);
+  }, [optionKey, optionBacktestId, optionTradeId]);
 
   const stockReady = stockLoad && stockLoad.key === stockKey ? stockLoad : null;
   const optionReady = optionLoad && optionLoad.key === optionKey ? optionLoad : null;
@@ -179,6 +196,10 @@ const TradeChartModal: React.FC<{
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#16a34a', downColor: '#dc2626', borderVisible: false,
       wickUpColor: '#16a34a', wickDownColor: '#dc2626',
+      // No "last price" line: a dotted line at the window's final close read as a level
+      // (a target, a stop) on a chart whose other horizontal lines all mean something.
+      priceLineVisible: false,
+      lastValueVisible: false,
     });
     series.setData(data);
     seriesRef.current = series;
@@ -198,6 +219,22 @@ const TradeChartModal: React.FC<{
           axisLabelVisible: true,
           title: line.label,
         });
+      }
+      // The line the green/red zones meet at. Without it the zones read as "profit / no
+      // profit" for the TRADE, and an early exit that sat in the red zone -- sold for more
+      // than it cost, weeks before expiry -- looked impossible. Labelled as what it is.
+      if (showOverlay && payoff?.available) {
+        for (const breakeven of payoff.breakevens) {
+          if (!Number.isFinite(breakeven)) continue;
+          series.createPriceLine({
+            price: breakeven,
+            color: '#eab308',
+            lineWidth: 1,
+            lineStyle: LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: `Breakeven at expiry $${breakeven.toFixed(2)}`,
+          });
+        }
       }
       for (const marker of allMarkers(context.legs, {
         structure: showStructureMarkers, legs: showLegMarkers,
@@ -276,7 +313,7 @@ const TradeChartModal: React.FC<{
       seriesRef.current = null;
       chart.remove();
     };
-  }, [trade, data, isOptionView, context, showStructureMarkers, showLegMarkers]);
+  }, [trade, data, isOptionView, context, showStructureMarkers, showLegMarkers, showOverlay, payoff]);
 
   // ---- position the rotated payoff overlay ------------------------------------
   useEffect(() => {
@@ -291,11 +328,12 @@ const TradeChartModal: React.FC<{
 
     const geometry = payoffGeometry(payoff);
     const plotWidth = width - series.priceScale().width();
-    // Symmetric about the middle of the plot: P&L runs outwards from a vertical zero
-    // line, and the curve reaches at most `widthFraction` of the plot's half-width so
-    // the candles stay readable underneath it.
-    const zeroX = plotWidth / 2;
-    const halfWidth = (plotWidth * geometry.widthFraction) / 2;
+    // The panel: P&L runs outwards from a vertical $0 line in its middle, using the whole
+    // strip (less a margin for the curve's stroke). Heights come from the chart's own price
+    // projection, so a price means the same height on both sides.
+    const panelWidth = PAYOFF_PANEL_WIDTH;
+    const zeroX = panelWidth / 2;
+    const halfWidth = panelWidth / 2 - 8;
     const scale = geometry.maxAbsPnl > 0 ? halfWidth / geometry.maxAbsPnl : 0;
 
     // `priceToCoordinate` returns a branded Coordinate: unwrap it to a plain number
@@ -334,11 +372,21 @@ const TradeChartModal: React.FC<{
 
     // The P&L scale along the top: without it the reader cannot tell how much P&L the
     // horizontal distance represents, which is the whole point of the rotated overlay.
+    // In a 200px strip every round value would overprint its neighbours, so outward from
+    // $0 a tick is kept only when it clears the last kept one on its side.
     const ticks: OverlayShape['ticks'] = [];
-    for (const value of pnlTicks(geometry.maxAbsPnl)) {
-      const x = zeroX + value * scale;
-      if (x < 0 || x > plotWidth) continue;
-      ticks.push({ x, label: `${value >= 0 ? '+' : '−'}$${Math.abs(value)}` });
+    const MIN_TICK_GAP = 46;
+    for (const side of [1, -1]) {
+      let lastX = zeroX;
+      const values = pnlTicks(geometry.maxAbsPnl)
+        .filter(value => value * side > 0)
+        .sort((a, b) => Math.abs(a) - Math.abs(b));
+      for (const value of values) {
+        const x = zeroX + value * scale;
+        if (x < 18 || x > panelWidth - 18 || Math.abs(x - lastX) < MIN_TICK_GAP) continue;
+        ticks.push({ x, label: `${value >= 0 ? '+' : '−'}$${Math.abs(value)}` });
+        lastX = x;
+      }
     }
 
     // Sign-only bands, projected here rather than during render (a ref read during
@@ -363,7 +411,7 @@ const TradeChartModal: React.FC<{
     }
 
     setOverlay({
-      width: plotWidth, height: CHART_HEIGHT, zeroX,
+      width: plotWidth, panelWidth, height: CHART_HEIGHT, zeroX,
       curve: toPath(defined), fills, bandRects, ticks,
     });
     // `data` is a dep because the bands are clipped to the bars on screen.
@@ -466,10 +514,13 @@ const TradeChartModal: React.FC<{
             <label className="inline-flex items-center gap-1">
               <input type="checkbox" checked={showOverlay}
                      onChange={e => setShowOverlay(e.target.checked)} />
-              Payoff overlay
+              Expiry payoff
             </label>
             <span className="text-[11px] text-gray-500 dark:text-gray-400">
-              Green/red is hypothetical profit/loss at expiration — not the recorded result.
+              Yellow line: breakeven at expiration. Green/red: where holding to expiration would
+              end in profit/loss. An early exit is priced off the option's premium (time value
+              included), so it can profit in the red zone. Markers are labels on the bar, not
+              price levels.
             </span>
           </div>
         )}
@@ -483,9 +534,10 @@ const TradeChartModal: React.FC<{
               : !dataReady
                 ? <div className="flex items-center justify-center text-sm text-gray-500 px-4 text-center" style={{ height: CHART_HEIGHT }}>{emptyMessage}</div>
                 : (
-                  <div className="relative">
+                  <div className="flex items-stretch">
+                  <div className="relative flex-1 min-w-0">
                     <div ref={containerRef} />
-                    {isOptionView && overlay && (
+                    {isOptionView && overlay && showOverlay && (
                       <svg
                         className="absolute left-0 top-0 pointer-events-none"
                         width={overlay.width} height={overlay.height}
@@ -497,33 +549,12 @@ const TradeChartModal: React.FC<{
                             <rect key={`band-${index}`} x={0} y={band.y}
                                   width={overlay.width} height={band.height}
                                   fill={band.sign === 'profit' ? '#16a34a' : '#dc2626'}
-                                  fillOpacity={showOverlay ? 0.06 : 0.10} />
+                                  fillOpacity={0.06} />
                           )
                         ))}
-                        {showOverlay && overlay.fills.map((fill, index) => (
-                          <path key={`fill-${index}`} d={fill.path}
-                                fill={fill.sign === 'profit' ? '#16a34a' : '#dc2626'}
-                                fillOpacity={0.12} stroke="none" />
-                        ))}
-                        {showOverlay && (
-                          <>
-                            <line x1={overlay.zeroX} y1={0} x2={overlay.zeroX} y2={overlay.height}
-                                  stroke="#94a3b8" strokeWidth={1} strokeDasharray="4 4" />
-                            <path d={overlay.curve} fill="none" stroke="#0e7490" strokeWidth={2} />
-                            {/* The P&L scale: a tick per round dollar value, so the
-                                horizontal distance has a readable magnitude. */}
-                            {overlay.ticks.map(tick => (
-                              <g key={`tick-${tick.label}`}>
-                                <line x1={tick.x} y1={0} x2={tick.x} y2={5}
-                                      stroke="#94a3b8" strokeWidth={1} />
-                                <text x={tick.x} y={13} textAnchor="middle" fontSize={9}
-                                      fill="#94a3b8">{tick.label}</text>
-                              </g>
-                            ))}
-                          </>
-                        )}
                       </svg>
                     )}
+                  </div>
                   </div>
                 )}
 

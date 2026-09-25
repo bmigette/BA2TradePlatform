@@ -55,7 +55,11 @@ def order(oid, transaction_id, symbol='XYZ_C95', side=OrderDirection.BUY):
               open_price=8.0, quantity=1, filled_qty=1, multiplier=100,
               underlying_symbol='XYZ', expiry=None, asset_class=AssetClass.OPTION,
               status=OrderStatus.FILLED, position_intent=None,
-              created_at=datetime(2026, 9, 8, 13, 30))
+              created_at=datetime(2026, 9, 8, 13, 30),
+              # what the row expansion's "Related Orders" list reads (related_order_rows)
+              order_type=OrderType.BUY_LIMIT, limit_price=8.0, stop_price=None,
+              depends_on_order=None, broker_order_id='b-1', comment=None,
+              expert_recommendation_id=None)
 
 
 # ---------------------------------------------------------------- real database fixture
@@ -153,7 +157,9 @@ class TestBrowsingIsNotCappedByTheTotals:
 
 
 class TestSortingFromTableHeaders:
-    @pytest.mark.parametrize('column', ['current_pnl', 'closed_pnl'])
+    # One P/L column since 2026-09-24: it is sorted on the unrealised P/L of OPEN rows and
+    # the realised P/L of CLOSED ones. `column` picks which of the two this run exercises.
+    @pytest.mark.parametrize('column', ['open', 'closed'])
     @pytest.mark.parametrize('descending', [True, False])
     def test_pnl_is_sorted_numerically_before_pagination(self, column, descending):
         engine, session = _seed_database(3)
@@ -162,7 +168,7 @@ class TestSortingFromTableHeaders:
         percentages = dict(zip(ids, (90.0, 20.0, 10.0)))
         for i, txn in enumerate(transactions):
             txn.created_at = datetime(2026, 9, 1) + timedelta(days=i)
-            if column == 'closed_pnl':
+            if column == 'closed':
                 txn.status = TransactionStatus.CLOSED
                 txn.close_price = txn.open_price * (1 + percentages[txn.id] / 100)
             session.add(txn)
@@ -176,7 +182,7 @@ class TestSortingFromTableHeaders:
                 patch.object(TradeConditions, '_get_option_pnl_via_transaction',
                              lambda a, o: {'amount': percentages[o.transaction_id] * 6,
                                            'percent': percentages[o.transaction_id]}):
-            rows, total = tab()._collect_rows(1, 2, {}, column, descending)
+            rows, total = tab()._collect_rows(1, 2, {}, 'pnl', descending)
         engine.dispose()
         assert total == 3
         assert [r['id'] for r in rows] == (ids[:2] if descending else ids[:0:-1])
@@ -205,10 +211,10 @@ class TestSortingFromTableHeaders:
             txn.close_price = closing_price
             session.add(txn)
         session.commit()
-        rows, _ = collect(tab(), session, page_size=3, sort_by='closed_pnl', descending=descending)
+        rows, _ = collect(tab(), session, page_size=3, sort_by='pnl', descending=descending)
         engine.dispose()
         assert rows[-1]['id'] == ids[0]
-        assert rows[-1]['closed_pnl_numeric'] is None
+        assert rows[-1]['closed_pnl_numeric'] is None and rows[-1]['pnl_numeric'] is None
         assert [r['id'] for r in rows[:2]] == (ids[1:] if descending else ids[:0:-1])
 
 
@@ -238,6 +244,24 @@ class TestTheRealClass:
             rows = OptionTradesTab._build_rows(instance, [single], {}, _OrdersOnly([order(1, 1)]))
         assert len(rows) == 1
         assert rows[0]['leg_count'] == 1
+
+    def test_the_row_expansion_lists_the_legs_it_counts(self):
+        # 8082, 2026-09-24: "Related Orders (2)" above "No orders found for this transaction"
+        # -- the option rows set order_count but never the `orders` the expansion reads.
+        instance = tab()
+        account = MagicMock(spec=OptionsAccountInterface)
+        account.get_option_quote.return_value = NS(bid=13.3, ask=13.4, last=13.35)
+        single = Transaction(
+            symbol='XYZ', quantity=1, open_price=6.0, multiplier=100,
+            asset_class=AssetClass.OPTION, option_strategy='long_call',
+            status=TransactionStatus.OPENED, side=OrderDirection.BUY,
+            created_at=datetime(2026, 9, 1, 14, 0), open_date=datetime(2026, 9, 1, 14, 0),
+        )
+        with patch.object(option_trades, 'get_account_instance_from_id', lambda *a, **k: account):
+            (row,) = OptionTradesTab._build_rows(instance, [single], {}, _OrdersOnly([order(1, 1)]))
+        assert row['order_count'] == len(row['orders']) == 1
+        (leg,) = row['orders']
+        assert leg['category'] == 'Entry' and leg['type'].endswith('XYZ_C95'), leg
 
 
 class _OrdersOnly:

@@ -141,3 +141,76 @@ class TestClosedPnl:
     def test_a_genuine_multiplier_of_one_is_accepted(self):
         result = option_closed_pnl(_txn(multiplier=1, open_price=8.0, close_price=13.3))
         assert result.amount == pytest.approx(5.3)
+
+
+# ---- open_structure_pnl: the ONE display rule (Options tab + Floating P/L cards) -----------
+from datetime import date as _date, datetime as _datetime
+
+from ba2_trade_platform.core.option_pnl_display import UNAVAILABLE_NO_FILLS, open_structure_pnl
+from ba2_trade_platform.core.types import OrderStatus
+
+
+def _gild_entry(status=OrderStatus.FILLED, filled_qty=2.0):
+    """The options instance's real entry, 2026-09-24: 2 x GILD261120C00165000 at $2.95."""
+    return SimpleNamespace(
+        id=1, transaction_id=1, account_id=1, symbol='GILD', side=OrderDirection.BUY,
+        status=status, quantity=2.0, filled_qty=filled_qty, open_price=2.95,
+        asset_class=AssetClass.OPTION, contract_symbol='GILD261120C00165000',
+        option_type='CALL', strike=165.0, expiry=_date(2026, 11, 20), multiplier=100,
+        position_intent='buy_to_open', option_strategy='long_call', underlying_symbol='GILD',
+        created_at=_datetime(2026, 9, 24, 13, 40), data=None, comment=None,
+    )
+
+
+def _gild_txn():
+    return SimpleNamespace(id=1, symbol='GILD', side=OrderDirection.BUY, quantity=2.0,
+                           open_price=2.95, multiplier=100, asset_class=AssetClass.OPTION)
+
+
+def test_a_filled_long_call_is_priced_through_the_single_leg_seam():
+    single, multi = _Seam({'amount': 110.0, 'percent': 18.6}), _Seam({'amount': -1.0})
+    result = open_structure_pnl(object(), _gild_txn(), [_gild_entry()],
+                                single_leg=single, multi_leg=multi)
+
+    assert result.available and result.amount == 110.0
+    assert result.source == 'single_leg_premium'
+    assert single.calls and single.calls[0].contract_symbol == 'GILD261120C00165000'
+    assert not multi.calls
+
+
+def test_an_entry_that_has_not_filled_holds_nothing():
+    single = _Seam({'amount': 999.0})
+    result = open_structure_pnl(object(), _gild_txn(),
+                                [_gild_entry(status=OrderStatus.OPEN, filled_qty=0.0)],
+                                single_leg=single, multi_leg=single)
+
+    assert not result.available and result.reason == UNAVAILABLE_NO_FILLS
+    assert not single.calls
+
+
+def test_the_floating_pl_cards_price_an_option_through_the_same_rule(monkeypatch):
+    """The cards looked GILD up in the broker's book, which holds the CONTRACT: every option
+    structure read 'no broker price for GILD' and the total said $0.00 (partial)."""
+    import ba2_trade_platform.core.option_pnl_display as display
+    from ba2_trade_platform.ui.components.FloatingPLPerAccountWidget import _FloatingPLWidgetBase
+
+    seen = []
+
+    def fake(account, transaction, orders, **kw):
+        seen.append(transaction.symbol)
+        return display.OptionPnlDisplay(amount=42.0, percent=7.0, source='single_leg_premium')
+
+    monkeypatch.setattr(display, 'open_structure_pnl', fake)
+    measured = _FloatingPLWidgetBase._option_transaction_pl(
+        _gild_txn(), [_gild_entry()], object(), 1, {})
+    assert measured == 42.0 and seen == ['GILD']
+
+    monkeypatch.setattr(display, 'open_structure_pnl',
+                        lambda *a, **k: display.unavailable_pnl(UNAVAILABLE_NO_FILLS))
+    assert _FloatingPLWidgetBase._option_transaction_pl(
+        _gild_txn(), [_gild_entry()], object(), 1, {}) == 0.0      # holds nothing: a zero
+
+    monkeypatch.setattr(display, 'open_structure_pnl',
+                        lambda *a, **k: display.unavailable_pnl(UNAVAILABLE_NO_QUOTE))
+    assert _FloatingPLWidgetBase._option_transaction_pl(
+        _gild_txn(), [_gild_entry()], object(), 1, {}) is None     # held but unquoted

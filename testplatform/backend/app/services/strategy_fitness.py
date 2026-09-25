@@ -13,7 +13,7 @@ _convert_bt_results: total_trades, sharpe_ratio, total_return, profit_factor,
 win_rate, sortino_ratio, calmar_ratio, sqn, max_drawdown (all confirmed present).
 """
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import os as _os
 from typing import Any, Optional
 
@@ -623,6 +623,21 @@ def assert_catalog_complete() -> None:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
 
 
+def scores_option_structures(fitness_metric: str) -> bool:
+    """Whether ``compute_fitness`` scores this metric on the OPTION-STRUCTURE partition
+    (``_option_structure_groups``) rather than on raw rows -- i.e. whether it is one of the
+    three option CAR-family branches that pass ``option_structures=True``.
+
+    For callers OUTSIDE the fitness (the deploy-time concentration check) that must group trades
+    exactly as the GA did. ``compute_fitness`` itself does not read this: each branch passes the
+    flag explicitly. The two are pinned equal by
+    tests/test_strategy_fitness_soft30.py::test_scores_option_structures_matches_compute_fitness.
+    """
+    metric = str(fitness_metric).lower()
+    return (metric in _OCAR_ALIASES or metric in _OCR_ALIASES or metric in _OCT_ALIASES
+            or metric == _OCT_SOFT30_KEY)
+
+
 def compute_fitness(fitness_metric: str, results: dict,
                     stress_spread_bps: float = 0.0,
                     robust: Optional[bool] = None) -> float:
@@ -676,7 +691,7 @@ def compute_fitness(fitness_metric: str, results: dict,
         _fit = _apply_win_rate_factor(_option_consistent_annual_return(results), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
-            fitness_metric, results, stress_spread_bps, robust)
+            fitness_metric, results, stress_spread_bps, robust, option_structures=True)
 
     if metric in _OCR_ALIASES:
         # OPTION-ONLY, and a DIFFERENT OBJECTIVE from the branch above rather than a rescaling
@@ -688,7 +703,7 @@ def compute_fitness(fitness_metric: str, results: dict,
         _fit = _apply_win_rate_factor(_option_car_over_risk(results), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
-            fitness_metric, results, stress_spread_bps, robust)
+            fitness_metric, results, stress_spread_bps, robust, option_structures=True)
 
     if metric in _OCT_ALIASES or metric == _OCT_SOFT30_KEY:
         # OPTION-ONLY, and a THIRD DISTINCT OBJECTIVE rather than a rescaling of either branch
@@ -703,7 +718,7 @@ def compute_fitness(fitness_metric: str, results: dict,
             _option_car_target(results, soft_total_trades=(metric == _OCT_SOFT30_KEY)), results)
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
-            fitness_metric, results, stress_spread_bps, robust)
+            fitness_metric, results, stress_spread_bps, robust, option_structures=True)
 
     if metric in _CONVEX_ALIASES:
         # CONVEX-HARVEST-ONLY. Reached only by an explicit ``option_convex``, which is what
@@ -779,7 +794,8 @@ def compute_fitness(fitness_metric: str, results: dict,
 
 
 def _maybe_robust(val: float, fitness_metric: str, results: dict,
-                  stress_spread_bps: float, robust: Optional[bool]) -> float:
+                  stress_spread_bps: float, robust: Optional[bool],
+                  option_structures: bool = False) -> float:
     """Apply the robustness adjustment and RECORD BOTH VIEWS on the results dict.
 
     Opt-in, exactly like the spread stress: `robust` None falls back to the level the RUN was
@@ -790,6 +806,10 @@ def _maybe_robust(val: float, fitness_metric: str, results: dict,
     Both numbers are stored -- fitness_raw and fitness_robust, plus every component -- because a
     single blended score that cannot be decomposed is not auditable, and because scores either
     side of this flag are NOT comparable (same trap as the 2026-08-04 dd_guard rescale).
+
+    ``option_structures`` is passed True by the three option CAR-family branches of
+    ``compute_fitness`` and by nothing else, so the screen reads per-STRUCTURE P&L for them only
+    (see ``robustness_metrics``). Every equity metric leaves it False and is byte-identical.
     """
     if robust is None:
         robust = bool(results.get("robust_fitness") or False)
@@ -801,7 +821,8 @@ def _maybe_robust(val: float, fitness_metric: str, results: dict,
         results["fitness_robust"] = None
         return val
     adj, comp = robust_fitness(val, results, stress_spread_bps
-                               or float(results.get("stress_spread_bps") or 0.0))
+                               or float(results.get("stress_spread_bps") or 0.0),
+                               option_structures=option_structures)
     results["fitness_robust"] = adj
     results["robustness"] = comp
     return adj
@@ -824,7 +845,7 @@ def _apply_win_rate_factor(val: float, results: dict) -> float:
 # ---------------------------------------------------------------------------
 # Trade FREQUENCY: structures, not legs
 # ---------------------------------------------------------------------------
-def _structure_count(trades) -> Optional[int]:
+def _structure_count(trades, option_structures: bool = False) -> Optional[int]:
     """How many independent BETS a trade list represents, or None when it is absent.
 
     ``BacktestAccount.get_round_trip_trades`` keys on ``(transaction_id, contract_symbol)`` --
@@ -833,12 +854,17 @@ def _structure_count(trades) -> Optional[int]:
     inflation lands hardest on exactly the multi-leg credit structures whose per-bet means are
     least estimable.
 
-    The partition is the one ``results._cap_groups`` already uses for the profit cap: option
-    legs (marked by ``contract_symbol``) that share a ``transaction_id`` are ONE bet;
-    everything else -- equity, and any option leg with no transaction id -- is its own. The
-    equity carve-out is deliberate and matches ``_cap_groups``: a covered call books shares and
-    a short call under one transaction, but the shares are a separate cost basis, so folding
-    them in would UNDER-count the equity side.
+    The default partition is the one ``results._cap_groups`` already uses for the profit cap:
+    option legs (marked by ``contract_symbol``) that share a ``transaction_id`` are ONE bet;
+    everything else -- equity, and any option leg with no transaction id -- is its own. That
+    keeps a share lot apart from its covered-call / protective-put overlay: the overlay is
+    submitted as its OWN transaction and assigned stock opens a NEW equity transaction, so the
+    two never share an id (this docstring used to claim they did).
+
+    ``option_structures=True`` (the option CAR-family metrics only) uses
+    ``_option_structure_groups`` instead, which additionally joins a share lot with the option
+    structures written against it -- see there. The default is the historical partition, byte
+    for byte, and is what every equity metric and ``option_convex`` read.
 
     A missing ``transaction_id`` is UNKNOWN structure identity, not a shared one. Merging on
     ``None`` would join unrelated legs into a single fabricated bet and could disqualify an
@@ -849,6 +875,8 @@ def _structure_count(trades) -> Optional[int]:
     """
     if trades is None:
         return None
+    if option_structures:
+        return len(_option_structure_groups(trades))
     slots = set()
     n = 0
     for t in trades:
@@ -864,7 +892,7 @@ def _structure_count(trades) -> Optional[int]:
     return n
 
 
-def _structure_pnls(trades) -> list:
+def _structure_pnls(trades, field: str = "pnl", option_structures: bool = False) -> list:
     """Net P&L per independent BET, in first-appearance order -- the same partition
     ``_structure_count`` counts, but carrying each structure's SUMMED P&L rather than a tally.
 
@@ -886,14 +914,34 @@ def _structure_pnls(trades) -> list:
     ``test_strategy_fitness_convex_frozen`` pins that so the two partitions cannot drift.
     Non-dict rows are counted as their own zero-P&L bet, which is what keeps that identity true
     (``_structure_count`` counts them individually too).
+
+    ``field`` selects which per-row number is summed (default ``pnl``). ``pnl_pct`` is summed
+    too, as an approximation: each row's pnl_pct is its P&L over account equity AT ITS OWN
+    ENTRY (``BacktestAccount.get_round_trip_trades``). Legs that open together share that
+    equity, so their sum is exact; rows that open later -- a rolled PMCC short, an overlay
+    written on a lot already held, a call written on assigned stock -- are measured against a
+    slightly different equity, so the sum is close but not exact.
+
+    ``option_structures=True`` sums over ``_option_structure_groups`` (share lots joined with
+    their overlays) instead of the transaction partition; see ``_structure_count``.
     """
+    if option_structures:
+        out = []
+        for rows in _option_structure_groups(trades):
+            total = 0.0
+            for i in rows:
+                t = trades[i]
+                if isinstance(t, dict):
+                    total += float(t.get(field) or 0.0)
+            out.append(total)
+        return out
     pnls: list = []
     slots: dict = {}          # transaction_id -> index into pnls
     for t in trades:
         if not isinstance(t, dict):
             pnls.append(0.0)
             continue
-        pnl = float(t.get("pnl") or 0.0)
+        pnl = float(t.get(field) or 0.0)
         txn = t.get("transaction_id")
         if t.get("contract_symbol") and txn is not None:
             if txn in slots:
@@ -904,7 +952,119 @@ def _structure_pnls(trades) -> list:
     return pnls
 
 
-def _trades_per_year(results: dict) -> Optional[float]:
+# Option exit triggers under which the SETTLEMENT itself delivered shares (the share lot opens at
+# the strike, on the bar the leg closes). Values of ``OptionCloseReason``; see
+# ``BacktestAccount.settle_single_leg_expiry``.
+_DELIVERY_TRIGGERS = ("assigned", "exercised")
+
+
+def _row_dt(value):
+    """A trade timestamp as a NAIVE UTC datetime, or None. Rows of one run share a format, but
+    an aware and a naive datetime do not compare at all, so normalise rather than trust it."""
+    dt = _parse_dt(value)
+    if dt is not None and dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _option_structure_groups(trades) -> list:
+    """The OPTION-METRIC partition of a trade list into independent bets: lists of row indices,
+    ordered by each bet's first row.
+
+    Step 1 is the default partition (``_structure_count``): option legs sharing a
+    ``transaction_id`` are one bet, every other row its own.
+
+    Step 2 joins a SHARE LOT with the option structures written against it. The order code
+    books them apart -- a covered-call / protective-put overlay is its own transaction, and
+    assigned stock opens a new equity transaction -- but they are one position whose legs
+    offset each other: O_PP's shares make +1000 while its put costs -600, so scoring them as two
+    bets read top5 = 104% of net (concentration factor 0) where 12 combined bets are ~42%. A
+    share lot (an equity row, no ``contract_symbol``) and an option structure on the SAME
+    underlying are joined when
+      * their holding windows overlap for a positive length (entry < other's exit, both ways):
+        the overlay was open while the shares were held; or
+      * the option was SETTLED INTO the lot: a leg's exit trigger is assigned/exercised, it
+        closed on the bar the lot opened, and the lot opened at that leg's strike (a CSP
+        assigned into a wheel's shares).
+    Joins are transitive (union-find), so shares held across several call cycles, and a wheel's
+    CSP -> assigned stock -> covered calls -> called away, are each ONE bet per share-holding
+    window. Pure-option structures keep their transaction grouping; two share lots are never
+    joined directly (an equity-only list is therefore partitioned exactly as by default).
+
+    WHY NOT A TOUCHING WINDOW. Closing one cycle and opening the next on the same bar is
+    ordinary (sell the shares and the put at T, buy both again at T); an inclusive overlap would
+    chain every cycle of a run into one bet. Only a settlement at the strike hands one
+    position to the next, which is what the second rule matches.
+
+    A row without a parseable entry or exit time cannot be placed in time and is never joined.
+    This is the FITNESS grouping only; order and ledger code are unchanged.
+    """
+    groups: list = []
+    slots: dict = {}
+    for i, t in enumerate(trades):
+        if isinstance(t, dict):
+            txn = t.get("transaction_id")
+            if t.get("contract_symbol") and txn is not None:
+                if txn in slots:
+                    groups[slots[txn]].append(i)
+                    continue
+                slots[txn] = len(groups)
+        groups.append([i])
+
+    shares: dict = {}     # underlying -> [(group, entry, exit, row)]
+    options: dict = {}    # underlying -> [(group, entry, exit, rows)]
+    for g, rows in enumerate(groups):
+        first = trades[rows[0]]
+        if not isinstance(first, dict):
+            continue
+        entries = [_row_dt(trades[i].get("entry_time")) for i in rows]
+        exits = [_row_dt(trades[i].get("exit_time")) for i in rows]
+        if any(d is None for d in entries) or any(d is None for d in exits):
+            continue
+        if first.get("contract_symbol"):
+            name = first.get("underlying_symbol") or first.get("symbol")
+            if name:
+                options.setdefault(str(name), []).append(
+                    (g, min(entries), max(exits), [trades[i] for i in rows]))
+        else:
+            name = first.get("symbol")
+            if name:
+                shares.setdefault(str(name), []).append((g, entries[0], exits[0], first))
+
+    parent = list(range(len(groups)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def settled_into(legs, lot_entry, lot_row) -> bool:
+        lot_px = lot_row.get("entry_price")
+        for leg in legs:
+            strike = leg.get("strike")
+            if (str(leg.get("exit_reason") or "").lower() in _DELIVERY_TRIGGERS
+                    and _row_dt(leg.get("exit_time")) == lot_entry
+                    and strike is not None and lot_px is not None
+                    and math.isclose(float(strike), float(lot_px), rel_tol=1e-9, abs_tol=1e-9)):
+                return True
+        return False
+
+    for name, lots in shares.items():
+        for g_s, s_in, s_out, lot_row in lots:
+            for g_o, o_in, o_out, legs in options.get(name, ()):
+                if (s_in < o_out and o_in < s_out) or settled_into(legs, s_in, lot_row):
+                    ra, rb = find(g_s), find(g_o)
+                    if ra != rb:
+                        parent[max(ra, rb)] = min(ra, rb)
+
+    merged: dict = {}
+    for g, rows in enumerate(groups):
+        merged.setdefault(find(g), []).extend(rows)
+    return sorted((sorted(rows) for rows in merged.values()), key=lambda rows: rows[0])
+
+
+def _trades_per_year(results: dict, option_structures: bool = False) -> Optional[float]:
     """The run's trade frequency in STRUCTURES per year, or None when underivable.
 
     ``results["avg_trades_per_year"]`` is ``len(trades) / years`` computed in
@@ -916,6 +1076,10 @@ def _trades_per_year(results: dict) -> Optional[float]:
     Falls back to the published leg rate when ``results`` carries no ``trades`` list -- the
     signature of a re-scored DB row, since ``backtests.results`` stores the trade list in its
     own column. Degraded (today's inflated behaviour), not broken.
+
+    ``option_structures`` counts on the option-metric partition (``_option_structure_groups``),
+    so an option CAR-family metric's trade gate counts the same bets its concentration screen
+    scores. Default False: the historical partition, which every equity metric reads.
     """
     tpy = results.get("avg_trades_per_year")
     if tpy is None:
@@ -926,7 +1090,7 @@ def _trades_per_year(results: dict) -> Optional[float]:
         return None
     tpy = float(tpy)
     trades = results.get("trades")
-    structures = _structure_count(trades)
+    structures = _structure_count(trades, option_structures)
     if structures is None or not trades:
         return tpy
     return tpy * (float(structures) / float(len(trades)))
@@ -1028,25 +1192,75 @@ _CONC_EXP = float(_os.getenv("BT_CONC_EXP", "1.5"))             # >1 bites harde
 # which is where return should decide. EXP=1.5 keeps the top-end bite (90% -> 0.068, 95% -> 0.024)
 # while dropping converged influence to ~1.4x return.
 
+#
+# OPTION METRICS SCORE CONCENTRATION ON STRUCTURES (2026-09-24/25, plan Task 4).
+#
+# WHY STRUCTURES. The round-trip recorder emits ONE ROW PER LEG, so on the row list an iron
+# condor is 4 "trades" and any run with <= 5 rows reads top5 = 100% whatever its bets were;
+# offsetting legs also distort top1 (a condor's winning short leg can exceed 100% of the net).
+# The soft30 trade ramp and every other count on the option metrics already use STRUCTURES
+# (_trades_per_year / _structure_count); the concentration screen now reads the same partition
+# (_structure_pnls), so "one bet carried the book" means one BET, not one leg. On these metrics
+# the partition also joins a share lot with the overlays written against it (O_CC / O_PP /
+# O_WHEEL) -- see _option_structure_groups -- and the trade gates count the same partition.
+#
+# A SINGLE WINNING STRUCTURE IS 100% CONCENTRATED. The screen used to return every factor 1.0
+# below two rows, so one winning trade scored as PERFECTLY diversified while a 2-5-trade book
+# got conc_factor 0. Under option_car_target_soft30 -- no count floor, only a linear ramp per
+# bet -- that inversion made every top O_LP genome a 1-trade genome. Decided design (user,
+# 2026-09-23): thin trading is PENALISED through the same concentration formula, not zeroed by a
+# new hard trade floor.
+#
+# OPTION METRICS ONLY. ``compute_fitness``'s three option CAR-family branches pass
+# ``option_structures=True``; nothing else does. The generic metrics (calmar, sharpe,
+# total_return, ...) have NO trade floor, so a 1-trade equity run DOES reach this screen, and
+# the equity path is frozen bit-for-bit (test_strategy_fitness_equity_frozen pins single_trade
+# -> all factors 1.0). option_convex never calls the screen (see compute_fitness).
 
-def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
+
+def robustness_metrics(results: dict, spread_bps: float = 0.0,
+                       option_structures: bool = False) -> dict:
     """The three robustness screens for one finished run. Pure post-hoc, no re-simulation.
 
     Returns a dict with every component so BOTH the raw and the adjusted view are inspectable
     afterwards -- a single blended number that cannot be decomposed is not auditable.
+
+    ``option_structures`` (the option CAR-family metrics only; see the block comment above):
+    concentration and the monte-carlo resample read per-STRUCTURE P&L instead of per-row (leg)
+    P&L, and a book of exactly one winning structure is scored as 100% concentrated instead of
+    being skipped. False keeps the historical row-level behaviour byte for byte.
     """
     out = {"top1_pct": None, "top5_pct": None, "mc_p5": None, "mc_prob_neg": None,
            "spread_keep_pct": None, "conc_factor": 1.0, "mc_factor": 1.0, "spread_factor": 1.0}
     trades = results.get("trades") or []
-    pnl = [float(t.get("pnl") or 0.0) for t in trades]
+    if option_structures:
+        pnl = _structure_pnls(trades, option_structures=True)
+    else:
+        pnl = [float(t.get("pnl") or 0.0) for t in trades]
     net = sum(pnl)
-    if len(pnl) < 2 or net <= 0:
+    # 0 trades or a non-positive book: there is no profit to be concentrated in, and scaling a
+    # loser's fitness by a <1 factor would promote it (robust_fitness leaves negatives alone).
+    if net <= 0 or len(pnl) == 0:
+        return out
+    # One winning row on an equity metric: the historical skip, kept (frozen). On an option
+    # metric one winning STRUCTURE falls through: it IS the whole result.
+    if len(pnl) < 2 and not option_structures:
         return out
 
     # --- concentration -------------------------------------------------------------------
     srt = sorted(pnl, reverse=True)
     out["top1_pct"] = 100.0 * srt[0] / net
     out["top5_pct"] = 100.0 * sum(srt[:5]) / net
+    if option_structures:
+        # EXACT 100.0 where the share is 100% by definition. Float division does not guarantee
+        # it: sum(srt[:5]) adds in sorted order while net added in trade order, so a book of
+        # <= 5 structures can read 99.99999999999999 -- factor ~3.6e-24 instead of 0.0, which
+        # ranks a 1-trade genome ABOVE an exact-0 one. Option path only (the equity path is
+        # frozen, rounding and all).
+        if len(pnl) <= 5:
+            out["top5_pct"] = 100.0      # the five best ARE the whole book
+        if len(pnl) == 1:
+            out["top1_pct"] = 100.0
     t5 = out["top5_pct"]
     if t5 <= _CONC_FREE_PCT:
         out["conc_factor"] = 1.0
@@ -1058,9 +1272,20 @@ def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
     # Bootstrap the pnl_pct sequence. This asks "was the equity path luck of ordering?" -- it
     # CANNOT see that one huge winner is a single position (resampling redraws it), which is
     # exactly why the concentration screen above exists alongside it.
+    # Under ``option_structures`` the resample draws STRUCTURES (legs' equity-relative pnl_pct
+    # summed per transaction), not legs: the legs of one structure are one bet, and drawing them
+    # independently would split a hedge -- a condor's winning short leg without the wing that
+    # capped it -- inventing paths the strategy cannot produce. One structure leaves size 1, so
+    # the resample skips itself below: a trade-ORDER shuffle of one bet has nothing to reorder,
+    # and mc_factor stays a neutral 1.0 rather than a fabricated verdict -- concentration is the
+    # screen that speaks for a single bet.
     try:
         import numpy as _np
-        pct = _np.array([float(t.get("pnl_pct") or 0.0) for t in trades], dtype=float) / 100.0
+        if option_structures:
+            pct = _np.array(_structure_pnls(trades, "pnl_pct", option_structures=True),
+                            dtype=float) / 100.0
+        else:
+            pct = _np.array([float(t.get("pnl_pct") or 0.0) for t in trades], dtype=float) / 100.0
         if pct.size >= 2 and _np.isfinite(pct).all():
             rng = _np.random.default_rng(_ROBUST_MC_SEED)
             idx = rng.integers(0, pct.size, size=(_ROBUST_MC_PATHS, pct.size))
@@ -1089,7 +1314,8 @@ def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
     return out
 
 
-def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0) -> tuple:
+def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0,
+                   option_structures: bool = False) -> tuple:
     """(adjusted_fitness, components). Multiplicative, so a genome must clear ALL THREE screens.
 
     Sentinels pass through untouched: a disqualified or wiped-out genome keeps its sentinel RANK
@@ -1097,7 +1323,7 @@ def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0) 
     A NEGATIVE base is returned unchanged too -- multiplying a negative by a <1 factor would make
     a bad genome look BETTER, which is the classic sign-flip bug in penalty schemes.
     """
-    comp = robustness_metrics(results, spread_bps)
+    comp = robustness_metrics(results, spread_bps, option_structures)
     if base_fitness in (STALLED_SENTINEL, ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
         return base_fitness, comp
     if base_fitness <= 0:
@@ -1455,7 +1681,7 @@ def _option_consistent_annual_return(results: dict) -> float:
     # It matters MORE here than there. This is the DEFAULT metric for pure-option grids
     # (``_resolve_fitness``), where multi-leg structures are not an edge case but the entire
     # population, so the inflation applied to essentially every genome being ranked.
-    tpy = _trades_per_year(results)
+    tpy = _trades_per_year(results, option_structures=True)
     if tpy is None:
         return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
     _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
@@ -1604,7 +1830,7 @@ def _option_car_over_risk(results: dict) -> float:
     # STRUCTURES per year, not legs (see _trades_per_year). An iron condor is ONE bet and four
     # rows; reading the published leg rate here would inflate essentially every genome in a
     # pure-option population, which is the exact defect the previous copy shipped with.
-    tpy = _trades_per_year(results)
+    tpy = _trades_per_year(results, option_structures=True)
     if tpy is None:
         return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
     _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
@@ -1801,13 +2027,13 @@ def _option_car_target(results: dict, *, soft_total_trades: bool = False) -> flo
                 "option_car_target_soft30 requires results['trades'] to count completed "
                 "structures, not legs. Restore the trades column when re-scoring a backtest."
             )
-        structures = _structure_count(trades)
+        structures = _structure_count(trades, option_structures=True)
         if structures == 0:
             return ZERO_TRADE_SENTINEL
         trade_gate = min(structures / 30.0, 1.0)
     else:
         # Legacy objective, including explicit per-run/expert cadence overrides.
-        tpy = _trades_per_year(results)
+        tpy = _trades_per_year(results, option_structures=True)
         if tpy is None:
             return LOW_TRADE_SENTINEL
         _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
@@ -1896,11 +2122,12 @@ def _convex_telemetry(trades, tickets_per_year: float, underlyings: int) -> dict
     the risk this telemetry is recorded to expose. ``_structure_pnls`` does the grouping.
 
     Computed directly rather than through ``robustness_metrics`` on purpose: that function also
-    runs a 1000-path Monte Carlo (cost this metric has no use for), and it reads the raw ROWS,
-    so its own top1/top5 carry the per-leg split described above (a pre-existing gap in the
-    robustness screen, out of scope here -- it is not consulted by this metric). The
-    net-negative convention is nonetheless kept identical: a share of a negative or zero net is
-    not a share, so those stay None.
+    runs a 1000-path Monte Carlo (cost this metric has no use for). Its per-leg gap is closed
+    for the option CAR-family metrics only (``option_structures``, 2026-09-25); this metric
+    keeps the default transaction partition, which does not join a share lot with its
+    overlays -- a convex book writes no overlays, so the two partitions coincide on it. The
+    net-negative convention is kept identical: a share of a negative or zero net is not a
+    share, so those stay None.
     """
     pnl = _structure_pnls(trades)
     n = len(pnl)

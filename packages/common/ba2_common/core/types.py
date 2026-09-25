@@ -956,6 +956,27 @@ def uses_arc_floor(action_value):
     return action_value in get_arc_floor_action_values()
 
 
+def get_min_one_contract_action_values():
+    """Option ENTRY action types whose size comes from the COST sizer, and so read
+    ``min_one_contract`` (the optional 1-contract floor, plan 2026-09-24 Task 8).
+
+    Every entry builder EXCEPT the two share overlays: the covered call and the protective
+    put size off the HELD share count (one contract per round lot) and never reach
+    ``_OptionEntryAction._size_by_cost``, so a floor offered there would be a knob nothing
+    reads -- the ``wing_width_pct`` decoy failure mode. Derived from
+    ``get_option_entry_action_values`` rather than listed, so a new cost-sized builder is
+    covered without anyone remembering to add it here.
+    """
+    share_sized = (ExpertActionType.SELL_COVERED_CALL.value,
+                   ExpertActionType.BUY_PROTECTIVE_PUT.value)
+    return [v for v in get_option_entry_action_values() if v not in share_sized]
+
+
+def uses_min_one_contract(action_value):
+    """Check whether an option action type reads ``min_one_contract``."""
+    return action_value in get_min_one_contract_action_values()
+
+
 def get_strike_method_action_values():
     """Option action types whose builder actually READS ``strike_method``.
 

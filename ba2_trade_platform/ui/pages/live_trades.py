@@ -14,6 +14,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
+from ..components.LiveTradesTable import bracket_level_cell, related_order_rows, transaction_status_color
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.option_structure_chart import (
     fetch_underlying_bars, render_option_structure_chart,
@@ -346,6 +347,12 @@ class LiveTradesTab:
             selected_account_id = get_selected_account_id()
             base_query = scope_transactions_to_account(base_query, selected_account_id)
 
+            # THIS is the Stocks tab: its asset class, per ASSET_CLASS_TABS. Option rows belong
+            # to the Options tab, and priced here they are wrong twice -- the underlying's
+            # price against a premium, and no contract multiplier (8082, 2026-09-24: a $1.03
+            # KO call read "+8567%"). Every count/total below is built from this query.
+            base_query = base_query.where(Transaction.asset_class == ASSET_CLASS_TABS[0][1])
+
             # Apply status filter (from page filter controls)
             status_values = self.status_filter.value if hasattr(self, 'status_filter') else ['Waiting', 'Open', 'Closing']
             if status_values and len(status_values) > 0:
@@ -398,7 +405,9 @@ class LiveTradesTab:
             # Apply sorting
             # Keys are column NAMES (Quasar sends column name as sortBy, not field)
             # Computed fields (current_pnl) require in-memory sorting after price fetch
-            IN_MEMORY_SORT_FIELDS = {'current_pnl': 'current_pnl_numeric'}  # column name -> row data key
+            # column name -> row data key. 'pnl' mixes realised (closed) and unrealised (open)
+            # rows, so it can only be ordered once the rows are built.
+            IN_MEMORY_SORT_FIELDS = {'current_pnl': 'current_pnl_numeric', 'pnl': 'pnl_numeric'}
             SORT_MAP = {
                 'direction': Transaction.side,
                 'closed_at': Transaction.close_date,
@@ -586,12 +595,7 @@ class LiveTradesTab:
                 closed_pnl_numeric = pnl_closed_pct
 
             # Status styling
-            status_color = {
-                TransactionStatus.OPENED: 'green',
-                TransactionStatus.CLOSING: 'orange',
-                TransactionStatus.CLOSED: 'gray',
-                TransactionStatus.WAITING: 'orange'
-            }.get(txn.status, 'gray')
+            status_color = transaction_status_color(txn.status)
 
             # Expert shortname
             expert = transaction_experts.get(txn.id)
@@ -608,38 +612,7 @@ class LiveTradesTab:
                         TradingOrder.transaction_id == txn.id
                     ).order_by(TradingOrder.created_at)
                     txn_orders = list(session.exec(orders_statement).all())
-
-                    for order in txn_orders:
-                        order_type_display = order.order_type.value if hasattr(order.order_type, 'value') else str(order.order_type)
-                        order_side_display = order.side.value if hasattr(order.side, 'value') else str(order.side)
-                        order_status_display = order.status.value if hasattr(order.status, 'value') else str(order.status)
-
-                        order_category = 'Entry'
-                        if TransactionHelper.is_tpsl_order(order):
-                            if TransactionHelper.is_tp_order(order):
-                                order_category = 'Take Profit'
-                            elif TransactionHelper.is_sl_order(order):
-                                order_category = 'Stop Loss'
-                            else:
-                                order_category = 'Dependent'
-
-                        orders_data.append({
-                            'id': order.id,
-                            'type': order_type_display,
-                            'side': order_side_display,
-                            'category': order_category,
-                            'quantity': f"{order.quantity:.2f}" if order.quantity else '0.00',
-                            'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '0.00',
-                            'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
-                            'stop_price': f"${order.stop_price:.2f}" if order.stop_price else '',
-                            'status': order_status_display,
-                            'status_color': self._get_order_status_color(order.status),
-                            'broker_order_id': order.broker_order_id or '',
-                            'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else '',
-                            'comment': order.comment or '',
-                            'expert_recommendation_id': order.expert_recommendation_id,
-                            'has_recommendation': order.expert_recommendation_id is not None
-                        })
+                    orders_data = related_order_rows(txn_orders)
                 except Exception as e:
                     logger.error(f"Error loading orders for transaction {txn.id}: {e}")
 
@@ -682,12 +655,18 @@ class LiveTradesTab:
                 'current_price_zone': current_price_zone,
                 'value': value_str,
                 'close_price': f"${txn.close_price:.2f}" if txn.close_price else '',
-                'take_profit': f"${txn.take_profit:.2f}" if txn.take_profit else '',
-                'stop_loss': f"${txn.stop_loss:.2f}" if txn.stop_loss else '',
+                'take_profit': bracket_level_cell(txn.take_profit, txn.open_price,
+                                                  txn.quantity, txn.side),
+                'stop_loss': bracket_level_cell(txn.stop_loss, txn.open_price,
+                                                txn.quantity, txn.side),
                 'current_pnl': current_pnl,
                 'current_pnl_numeric': current_pnl_numeric,
                 'closed_pnl': closed_pnl,
                 'closed_pnl_numeric': closed_pnl_numeric,
+                # The P/L column: realised once CLOSED, unrealised otherwise.
+                'pnl': closed_pnl if txn.status == TransactionStatus.CLOSED else current_pnl,
+                'pnl_numeric': (closed_pnl_numeric if txn.status == TransactionStatus.CLOSED
+                                else current_pnl_numeric),
                 'status': txn.status.value,
                 'status_color': status_color,
                 'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
@@ -2320,8 +2299,14 @@ class LiveTradesTab:
         stamps += [getattr(txn, 'open_date', None), getattr(txn, 'close_date', None)]
         stamps = [stamp for stamp in stamps if stamp is not None]
         if stamps:
-            start = min(stamps) - timedelta(days=20)
-            end = max(stamps) + timedelta(days=20)
+            # ~60 sessions of history before the first event: with 20 days a position opened
+            # today showed about a dozen candles, too few to read a trend. The window runs to
+            # today for an open position and a little past the exit for a closed one.
+            start = min(stamps) - timedelta(days=90)
+            if getattr(txn, 'close_date', None) is not None:
+                end = max(stamps) + timedelta(days=10)
+            else:
+                end = datetime.now(timezone.utc)
         else:
             end = datetime.now(timezone.utc)
             start = end - timedelta(days=60)
@@ -2494,17 +2479,8 @@ class LiveTradesTab:
             ).classes('text-xs text-secondary-custom')
 
     def _get_transaction_status_color(self, status):
-        """Get color for transaction status badge."""
-        from ...core.types import TransactionStatus
-        
-        status_colors = {
-            TransactionStatus.WAITING: 'blue',
-            TransactionStatus.OPENED: 'green',
-            TransactionStatus.CLOSING: 'orange',
-            TransactionStatus.CLOSED: 'grey',
-            TransactionStatus.FAILED: 'red',
-        }
-        return status_colors.get(status, 'grey')
+        """Get color for transaction status badge (the one map the tables use too)."""
+        return transaction_status_color(status)
 
     def _select_all_transactions(self):
         """Select all visible transactions."""

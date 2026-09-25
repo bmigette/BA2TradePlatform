@@ -1133,6 +1133,59 @@ def _load_raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
     return u
 
 
+def _open_raw_underlying_read_only(root: str, underlying: str) -> Optional["_RawUnderlying"]:
+    """``_load_raw_underlying`` for a caller that must not WRITE: None instead of a build.
+
+    Same partitions, same signature, same key, same ``from_arrays`` -- so the arrays are the
+    ones every run on this host maps -- but it only ever OPENS a set that is already
+    published. ``build_or_open`` would publish a missing set (and its successful open touches
+    the done-marker's mtime); both are writes, so the published set is mapped here directly.
+    None means "no published set for the current partitions on this host".
+
+    Under ``BA2_SHARED_ARRAYS=0`` the run itself parses privately and writes nothing, so that
+    is what this does too.
+    """
+    import json
+
+    from ba2_common.core import shared_arrays as _sa
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    store = OptionHistoryParquetStore(root=root)
+    parts = store.partition_paths(underlying)
+    if not parts:
+        return _RawUnderlying(underlying, None)
+    if not _sa.enabled():
+        return _RawUnderlying.from_arrays(
+            underlying, _RawUnderlying.arrays_from_frame(store.read_underlying(underlying, parts)))
+    derived = _sa.DerivedArrayStore(_sa.derived_root_for(root))
+    final = derived.current_dir(derived_key_for_underlying(underlying), parts)
+    marker = final / _sa.DONE_MARKER
+    if not marker.is_file():
+        return None
+    names = json.loads(marker.read_text(encoding="utf-8"))["arrays"]
+    arrays = {name: np.asarray(np.load(final / f"{name}.npy", mmap_mode="r")) for name in names}
+    return _RawUnderlying.from_arrays(underlying, arrays)
+
+
+def read_only_overlay(root: str, underlying: str, rate: float) -> Optional[_Underlying]:
+    """A PRIVATE greeks overlay for one read-only consumer (the backtest trade popup).
+
+    The greeks it serves are this module's, unchanged: ``_Underlying.bar_dict`` ->
+    ``greeks_tuple`` -> ``compute_iv_and_greeks``, given the caller's provider's
+    ``spot_source`` exactly as ``ParquetOptionsProvider.get_bar`` does. What differs is only
+    where the overlay lives: it is NOT inserted into the worker caches (a popup must not evict
+    a running re-run's overlays, nor leave its own behind), and its raw is either the worker's
+    already-cached one (peeked without an LRU touch) or ``_open_raw_underlying_read_only``.
+    None when the underlying's arrays are not published on this host.
+    """
+    raw = _WORKER_RAW_CACHE.get((root, underlying))
+    if raw is None:
+        raw = _open_raw_underlying_read_only(root, underlying)
+        if raw is None:
+            return None
+    return _Underlying(raw, rate)
+
+
 def _raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
     """The parquet bytes for (root, underlying), read at most once per worker.
 

@@ -33,14 +33,17 @@ from nicegui import ui
 
 from ...core.db import get_db
 from ...core.option_pnl_display import (
-    UNAVAILABLE_INCOMPLETE, option_closed_pnl, option_transaction_pnl, quote_caching_account,
+    UNAVAILABLE_INCOMPLETE, open_structure_pnl, option_closed_pnl, quote_caching_account,
     unavailable_pnl,
 )
 from ...core.option_positions import opening_legs
 from ...core.utils import get_account_instance_from_id, get_expert_options_for_ui
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
-from ..components.LiveTradesTable import LiveTradesTable, LiveTradesTableConfig
+from ..components.LiveTradesTable import (
+    LiveTradesTable, LiveTradesTableConfig, bracket_level_cell, related_order_rows,
+    transaction_status_color,
+)
 from ..components.account_scope import scope_transactions_to_account
 from ..components.refresh_button import refresh_button
 
@@ -52,7 +55,8 @@ from ..components.refresh_button import refresh_button
 _TOTALS_ROW_LIMIT = 500
 
 _COMPUTED_SORT_FIELDS = frozenset({
-    'current_pnl_numeric', 'closed_pnl_numeric', 'value', 'expiry_display', 'leg_count',
+    'current_pnl_numeric', 'closed_pnl_numeric', 'pnl_numeric', 'value', 'expiry_display',
+    'leg_count',
     'account_name',
 })
 _SORT_FIELDS = {column.name: column.field
@@ -399,25 +403,15 @@ class OptionTradesTab:
                 current_pnl = unavailable_pnl(
                     f'{UNAVAILABLE_INCOMPLETE}: ' + '; '.join(leg_set.incomplete_reasons))
             elif is_open:
-                # The representative: for a STRUCTURE it is the parent (the seam resolves the
-                # legs itself), for a single contract it is that contract's own order. The
-                # count is passed too, so the seam is chosen by the structure (review R1).
-                if leg_set.is_multi_leg:
-                    representative = leg_set.representative_order()
-                else:
-                    # The real ORDER, not the normalised leg: the seam resolves the
-                    # transaction from the order it is handed.
-                    representative = leg_set.legs[0].order if leg_set.legs else first_order
-                if representative is not None and account_id:
+                if account_id:
                     account_inst = get_account_instance_from_id(account_id, session=session)
                     if account_inst is not None:
                         # One quote per (account, contract) for the whole refresh, shared by
                         # the pricing seam and the Current column (second review, N5).
                         account_inst = quote_caching_account(
                             account_inst, self._quote_snapshot, account_id)
-                        priced = option_transaction_pnl(
-                            account_inst, representative, opening_legs=leg_set.count,
-                        )
+                        # The one display rule, shared with the Floating P/L cards.
+                        priced = open_structure_pnl(account_inst, txn, orders, leg_set=leg_set)
                         current_pnl = priced
                         if leg_set.count == 1:
                             quote = self._contract_quote(account_inst, leg_set.legs[0])
@@ -453,8 +447,11 @@ class OptionTradesTab:
                 'current_price': current_price,
                 'value': cost,
                 'close_price': txn.close_price,
-                'take_profit': txn.take_profit,
-                'stop_loss': txn.stop_loss,
+                # Premium levels x contracts x multiplier (see bracket_level_cell).
+                'take_profit': bracket_level_cell(txn.take_profit, txn.open_price,
+                                                  txn.quantity, txn.side, multiplier),
+                'stop_loss': bracket_level_cell(txn.stop_loss, txn.open_price,
+                                                txn.quantity, txn.side, multiplier),
                 'current_pnl': _pnl_text(current_pnl.amount, current_pnl.percent) if current_pnl else '—',
                 # WHY a row has no P&L, when the reason is not "the broker had no quote": an
                 # incompletely recorded structure must not read as a plain blank (N4).
@@ -462,7 +459,17 @@ class OptionTradesTab:
                 'current_pnl_numeric': current_pnl.percent if current_pnl else None,
                 'closed_pnl': _pnl_text(closed.amount, closed.percent) if closed else '—',
                 'closed_pnl_numeric': closed.percent if closed else None,
+                # The P/L column: unrealised while open, realised once CLOSED, unknown otherwise
+                # (a structure whose entry is still waiting has no P/L yet).
+                'pnl': (_pnl_text(current_pnl.amount, current_pnl.percent) if (is_open and current_pnl)
+                        else _pnl_text(closed.amount, closed.percent) if (closed and txn.status == TransactionStatus.CLOSED)
+                        else '—'),
+                'pnl_numeric': (current_pnl.percent if (is_open and current_pnl)
+                                else closed.percent if (closed and txn.status == TransactionStatus.CLOSED)
+                                else None),
                 'status': getattr(txn.status, 'value', '') or '—',
+                'status_color': transaction_status_color(txn.status),
+                'orders': related_order_rows(orders),
                 'order_count': len(orders),
                 'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '—',
                 'closed_at': txn.close_date.strftime('%Y-%m-%d %H:%M') if txn.close_date else '—',

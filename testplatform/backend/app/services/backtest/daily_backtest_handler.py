@@ -470,6 +470,9 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     enabled_instruments = _resolve_enabled_instruments(payload, start_date, end_date)
 
+    # Lazy, like the BacktestAccount import in run_daily_backtest (keeps this module light).
+    from app.services.backtest.backtest_account import resolve_short_borrow_rate_pa
+
     initial_capital = float(payload["initial_capital"])
     # Optional FIXED-notional equity ceiling. Absent/None = off (every path byte-identical to
     # before). Validated HERE, at config time, so a bad value fails the run up front instead of
@@ -493,6 +496,10 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # ALREADY-decided trades, robustness.py's apply_spread_cost) -- this one can change
         # WHICH exit a trade takes, not just its realized pnl.
         "spread_bps": float(payload.get("spread_bps") or 0.0),
+        # Annual borrow rate on open SHORT equity positions (plan 2026-09-24 S4). RESOLVED here
+        # (absent -> the 0.5%/yr default, a stated value validated) so the config carries the
+        # decision the account charges, and results echo it. A long-only run pays nothing.
+        "short_borrow_rate_pa": resolve_short_borrow_rate_pa(payload),
         # OPTION bid-ask spread: the model key (plan Part F) plus the legacy percent-of-premium
         # knobs -- see _option_spread_settings and BacktestAccount._option_half_spread.
         **_option_spread_settings(payload),
@@ -503,6 +510,11 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # path's passthrough so a payload can carry it too. See
         # BacktestAccount.get_settings_definitions for what holding costs.
         "hold_assigned_stock": _as_bool(payload.get("hold_assigned_stock")),
+        # Optional, BACKTEST-ONLY (plan 2026-09-24 Task 11): size opening option orders within
+        # the fill engine's volume cap. Written ONLY when on, so every config that does not
+        # ask for it keeps its exact shape (and every older run reproduces).
+        **({"option_size_within_fill_volume": True}
+           if _as_bool(payload.get("option_size_within_fill_volume")) else {}),
     }
 
     # warmup_days: longest indicator/lookback window the experts need preloaded before

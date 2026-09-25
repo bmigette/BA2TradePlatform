@@ -5,6 +5,13 @@ never-exited position). Same cost/usage as run_genome_once.py -- one process, ~1
 
 Usage:  [BA2_START=YYYY-MM-DD] [BA2_END=YYYY-MM-DD] python tools/genome_concentration_check.py \\
             <opt_id> <rank> <label>
+
+GROUPING. An optimization scored on an option CAR-family metric (option_car, option_car_over_risk,
+option_car_target, option_car_target_soft30) had its concentration screened on option STRUCTURES
+(legs of one transaction summed, a share lot joined with the overlays written against it -- see
+strategy_fitness._option_structure_groups). This check groups the same way for those runs, so the
+deploy-time number agrees with what the GA ranked on. Every other metric keeps the per-row
+computation below, unchanged.
 """
 import json
 import logging
@@ -38,8 +45,8 @@ DB = os.path.expanduser(r"~\Documents\ba2\test\dl_forecasting.db")
 def main() -> int:
     opt_id, rank, label = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    cfg_json, all_results, strategy_id = con.execute(
-        "SELECT optimization_config, all_results, strategy_id "
+    cfg_json, all_results, strategy_id, fitness_metric = con.execute(
+        "SELECT optimization_config, all_results, strategy_id, fitness_metric "
         "FROM strategy_optimizations WHERE id = ?", (opt_id,)
     ).fetchone()
     cfg, res = json.loads(cfg_json), json.loads(all_results)
@@ -85,7 +92,14 @@ def main() -> int:
     _elapsed = time.perf_counter() - _t0
 
     trades = out.get("trades") or []
-    pnls = sorted((float(t.get("pnl") or 0.0) for t in trades), reverse=True)
+    from app.services.strategy_fitness import _structure_pnls, scores_option_structures
+    if scores_option_structures(fitness_metric):
+        # The partition the GA's concentration screen used for this metric (see module doc).
+        count_label = f"n_structures={{}} metric={fitness_metric}"
+        pnls = sorted(_structure_pnls(trades, option_structures=True), reverse=True)
+    else:
+        count_label = "n_trades={}"
+        pnls = sorted((float(t.get("pnl") or 0.0) for t in trades), reverse=True)
     net = sum(pnls)
     top1 = pnls[0] if pnls else 0.0
     top5 = sum(pnls[:5])
@@ -100,7 +114,7 @@ def main() -> int:
     )
     print(
         f"CONCENTRATION label={label} net_pnl={net:.2f} top1={top1:.2f} ({top1_pct:.1f}%) "
-        f"top5={top5:.2f} ({top5_pct:.1f}%) n_trades={len(pnls)}",
+        f"top5={top5:.2f} ({top5_pct:.1f}%) " + count_label.format(len(pnls)),
         flush=True,
     )
     return 0

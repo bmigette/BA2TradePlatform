@@ -181,6 +181,48 @@ def option_transaction_pnl(
     )
 
 
+def open_structure_pnl(
+    account: Any,
+    transaction: Any,
+    orders: Any,
+    *,
+    leg_set: Any = None,
+    single_leg: Optional[Callable[[Any, Any], Optional[Dict[str, float]]]] = None,
+    multi_leg: Optional[Callable[[Any, Any], Optional[Dict[str, float]]]] = None,
+) -> OptionPnlDisplay:
+    """Unrealised P&L of an OPEN option transaction, from its orders: THE display rule.
+
+    The Options tab and the Floating P/L cards both call this, so they cannot disagree. (The
+    cards used to price option transactions with the equity formula -- the broker position
+    keyed by the transaction's UNDERLYING symbol, which an option book never holds, so every
+    option structure read "no broker price" -- and would have missed the contract
+    multiplier even if it had matched.)
+
+    Refuses an incompletely recorded structure rather than pricing what is left of it (the
+    seam would see a DIFFERENT structure, second review N4), and reports a transaction whose
+    entry has not executed as ``UNAVAILABLE_NO_FILLS``: it holds nothing yet.
+    ``leg_set`` may be passed when the caller already built it (``opening_legs``).
+    """
+    if leg_set is None:
+        from .option_positions import opening_legs
+        leg_set = opening_legs(transaction, orders)
+    if leg_set.incomplete:
+        return _unavailable(f"{UNAVAILABLE_INCOMPLETE}: " + "; ".join(leg_set.incomplete_reasons))
+    if leg_set.count == 0:
+        return _unavailable(UNAVAILABLE_NO_FILLS)
+    # The representative: for a STRUCTURE it is the parent (the seam resolves the legs
+    # itself), for a single contract it is that contract's own ORDER -- the seam resolves the
+    # transaction from the order it is handed. The count picks the seam (review R1).
+    if leg_set.is_multi_leg:
+        representative = leg_set.representative_order()
+    else:
+        representative = leg_set.legs[0].order
+    if representative is None:
+        return _unavailable(UNAVAILABLE_INCOMPLETE)
+    return option_transaction_pnl(account, representative, opening_legs=leg_set.count,
+                                  single_leg=single_leg, multi_leg=multi_leg)
+
+
 def option_closed_pnl(transaction: Any) -> OptionPnlDisplay:
     """Realised P&L of a CLOSED option transaction, MULTIPLIER-AWARE.
 

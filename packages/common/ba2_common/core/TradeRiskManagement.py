@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
+from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
 from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
@@ -216,13 +217,10 @@ class TradeRiskManagement:
                 self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, skipping risk management")
                 return updated_orders
             
-            # Get expert trading permissions using interface defaults
-            enable_buy = expert.get_setting_with_interface_default(
-                'enable_buy', log_warning=False
-            )
-            enable_sell = expert.get_setting_with_interface_default(
-                'enable_sell', log_warning=False
-            )
+            # Get expert trading permissions using interface defaults, through the ONE shared
+            # permission reader (SellAction's short gate reads enable_sell the same way).
+            enable_buy = trading_permission(expert, 'enable_buy')
+            enable_sell = trading_permission(expert, 'enable_sell')
             
             # Get virtual equity per instrument limit using interface default
             max_virtual_equity_per_instrument_percent = expert.get_setting_with_interface_default(
@@ -521,8 +519,8 @@ class TradeRiskManagement:
                               f"skipping candidate sizing")
             return []
 
-        enable_buy = expert.get_setting_with_interface_default('enable_buy', log_warning=False)
-        enable_sell = expert.get_setting_with_interface_default('enable_sell', log_warning=False)
+        enable_buy = trading_permission(expert, 'enable_buy')
+        enable_sell = trading_permission(expert, 'enable_sell')
         max_pct = expert.get_setting_with_interface_default(
             'max_virtual_equity_per_instrument_percent', log_warning=False)
         if max_pct is None:

@@ -78,6 +78,7 @@ from ba2_common.core.option_trade_record import (
 )
 from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
 from ba2_common.core.utils import as_utc_key
+from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core import option_spread_model as _osm
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
@@ -185,13 +186,25 @@ def _attach_option_records(trades: List[Dict[str, Any]], carriers: Dict[int, tup
         row["entry_record"] = entry_view
         exit_rec = (exit_carrier.data or {}).get("exit_record") if exit_carrier is not None else None
         if isinstance(exit_rec, dict):
+            # A row re-keyed at a split (Task 1b) is stated under its ORIGINAL contract, but its
+            # exit traded the ADJUSTED one: that is the leg the exit record snapshots.
+            rekey = row.get("split_rekey")
+            exit_contract = rekey["to_contract"] if rekey else contract
             row["exit_record"] = {
                 "trigger": exit_rec.get("trigger"), "rule_id": exit_rec.get("rule_id"),
                 "rule_name": exit_rec.get("rule_name"),
                 **({"error": exit_rec["error"]} if "error" in exit_rec else {}),
-                "leg": _record_leg(exit_rec, contract)}
+                "leg": _record_leg(exit_rec, exit_contract)}
         else:
             row["exit_record"] = None
+
+
+class OptionLotBasisMismatch(RuntimeError):
+    """An option fill would change a held lot that was opened in ANOTHER share basis (a split
+    lies between them). A lot cannot hold two bases -- no single strike/spot pair values it --
+    so the fill is refused by raising, never averaged in. The fill engine refuses such a bar
+    first (``BacktestAccount._crossed_held_lot``), so reaching this is an engine defect; the
+    named type lets an aborted trial be classified rather than read as a generic crash."""
 
 
 class StaleMarkToMarket(RuntimeError):
@@ -250,6 +263,15 @@ class _OptionLot:
     estimate, so this can never compound (BS pricing off a BS-implied "iv" that was never
     observed). Consulted by ``_bs_fallback_premium`` when the CURRENT bar is missing, and
     only within ``_BS_IV_STALENESS_DAYS`` of ``last_iv_date`` — see that constant.
+
+    ``underlying``/``basis_factor``/``basis_date`` (plan 2026-09-24 Task 1a): the share
+    basis the lot was TRADED in -- the run's as-traded factor on the day the lot opened, and
+    that day. A strike is fixed in the basis of the day it traded, so a lot held across a
+    split is valued with ``adjusted close x basis_factor``, never with the current bar's
+    factor (which made a pre-split put gain, and a call lose, the split ratio). STORED rather
+    than derived from ``_lot_order``: that index returns the FIRST order ever seen for an OCC
+    string, which is the wrong order once a string is reused after a split. None on a lot
+    built without a fill (fixtures): such a lot keeps the bar's own factor, as before.
     """
 
     contract_symbol: str
@@ -258,6 +280,9 @@ class _OptionLot:
     multiplier: float = 100.0
     last_iv: Optional[float] = None
     last_iv_date: Optional[date] = None
+    underlying: Optional[str] = None
+    basis_factor: Optional[float] = None
+    basis_date: Optional[date] = None
 
 
 @dataclass(slots=True)
@@ -311,6 +336,36 @@ _BS_IV_STALENESS_DAYS = 5
 # An order needing more contracts than participation x bar volume does NOT fill that
 # bar; it stays pending and retries the next (see BacktestAccount._option_fill_price).
 _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
+
+
+def _option_fill_capacity(volume) -> float:
+    """Contracts a premium bar of ``volume`` can absorb under the participation cap -- THE one
+    definition, read by the fill engine (``_volume_cap_reject_reason``) and by the order-time
+    sizing (``option_order_quantity_limit``), so the two cannot disagree on the number. A
+    missing volume is 0 (nothing fills)."""
+    return _OPTION_FILL_MAX_VOLUME_PARTICIPATION * (float(volume) if volume is not None else 0.0)
+
+
+def _new_integrity_counters() -> Dict[str, Any]:
+    return {"option_ledger_mismatches": {"count": 0, "examples": []},
+            "option_orders_volume_sized": 0,
+            "option_orders_volume_refused": 0,
+            "option_split_rekeys": 0,
+            "option_split_rekey_refusals": 0}
+
+
+def _max_units_within(capacity: float, per_unit: float) -> int:
+    """The largest whole count ``n`` with ``n * per_unit <= capacity`` -- decided by the SAME
+    float comparison the fill engine makes (``required > capacity`` rejects), not by a
+    division whose rounding could land one unit either side of it."""
+    if per_unit <= 0 or capacity <= 0:
+        return 0
+    n = int(math.floor(capacity / per_unit))
+    while n > 0 and n * per_unit > capacity:
+        n -= 1
+    while (n + 1) * per_unit <= capacity:
+        n += 1
+    return n
 
 # ---------------------------------------------------------------------------
 # OPTION BID-ASK SPREAD MODEL (2026-07-25) -- NOW THE ``legacy-pct`` MODEL ONLY
@@ -367,6 +422,54 @@ _OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
 #: set FROM those same quotes can miss itself by a float ulp; a broker would fill that. Well
 #: below the $0.01 minimum option tick, so it can never let a genuinely worse net through.
 _NET_LIMIT_TOLERANCE = 1e-9
+
+
+# ---------------------------------------------------------------------------
+# SHORT BORROW COST (plan 2026-09-24 equity short selling, Task S4)
+# ---------------------------------------------------------------------------
+# A short seller pays the lender a borrow fee for every day the shares are out. The account
+# charges it once per trading session, at the session's last bar (``accrue_short_borrow``,
+# called by the engine just before the equity snapshot), on the MARKET VALUE of every open
+# short equity position: ``|qty| x mark x short_borrow_rate_pa / BORROW_SESSIONS_PER_YEAR``.
+# The charge is debited from cash, exactly like a fill's commission, so it moves equity and
+# the curve; the running total is reported as ``short_borrow_cost`` in the results, separate
+# from spread.
+#
+# DAY COUNT: rate/252 per session. The account models no other interest (no margin interest,
+# no interest on idle cash), so there is no existing convention to mirror; 252 trading
+# sessions a year charges a position held for a full year exactly the annual rate. A weekend
+# is NOT charged (a broker charges calendar days, so this undercharges a held short by
+# roughly 365/252 on the calendar -- about 0.2%/yr of market value at the 0.5% default).
+#
+# DEFAULT 0.5%/yr: the easy-to-borrow large-cap rate (design section 4). A config that does
+# not state the rate (every stored pre-S4 config, and account fixtures) gets the default; a
+# long-only run holds no short, pays nothing, and is byte-identical at any rate.
+DEFAULT_SHORT_BORROW_RATE_PA = 0.005
+BORROW_SESSIONS_PER_YEAR = 252
+
+
+def resolve_short_borrow_rate_pa(settings: Optional[Dict[str, Any]]) -> float:
+    """The annual short borrow rate a run config states, validated.
+
+    Absent or None -> ``DEFAULT_SHORT_BORROW_RATE_PA``. The absence is the documented default
+    (design section 4), not a hidden one: configs written before the knob existed never short,
+    so they pay nothing whatever the rate. A stated value must be a finite number >= 0; 0 is a
+    legitimate "no borrow cost" run. A bool, a negative, NaN/Inf or a non-number is refused, so
+    a mistyped rate cannot silently become a free (or a paying) short.
+    """
+    raw = settings.get("short_borrow_rate_pa") if settings else None
+    if raw is None:
+        return DEFAULT_SHORT_BORROW_RATE_PA
+    if isinstance(raw, bool):
+        raise TypeError(f"short_borrow_rate_pa must be a number, got {raw!r}")
+    try:
+        rate = float(raw)
+    except (TypeError, ValueError):
+        raise TypeError(f"short_borrow_rate_pa must be a number, got {raw!r}") from None
+    if not math.isfinite(rate) or rate < 0:
+        raise ValueError(f"short_borrow_rate_pa must be a finite annual rate >= 0 "
+                         f"(0.005 = 0.5%/yr), got {raw!r}")
+    return rate
 
 
 class SpreadModelConfigError(ValueError):
@@ -430,6 +533,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # ``.get`` is correct rather than a hidden default: absence IS the off state, and 0.0
         # would be a very different (and catastrophic) instruction — see equity_cap.py.
         self._equity_cap: Optional[float] = settings.get("equity_cap")
+        # Short borrow cost (see the SHORT BORROW COST block above ``resolve_short_borrow_rate_pa``).
+        # Validated here, before the first bar, so a bad rate refuses the run up front.
+        self._short_borrow_rate_pa: float = resolve_short_borrow_rate_pa(settings)
+        # Running total of borrow charged (currency), reported as results' ``short_borrow_cost``.
+        self._short_borrow_cost: float = 0.0
+        # The session already charged: the once-per-session guard.
+        self._borrow_session: Optional[date] = None
         # WHICH option spread model prices every option fill (plan Part F; see
         # ``_option_half_spread`` and ``_resolve_spread_model``). Resolved HERE, before the first
         # bar, on every OPTIONS run (a provider is injected), so an unstated or zero spread
@@ -543,6 +653,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # for 40 consecutive bars), so the full explanation is logged once per symbol per
         # reason and the recurrences drop to DEBUG. See _pledged_share_lock.
         self._pledged_lock_logged: set = set()
+        # Task 1a: (contract_symbol, basis_date) of every lot already reported as held across
+        # a split -- the crossing is checked on every bar the lot is read, and logged ONCE.
+        self._split_crossed_lots: set = set()
+        # Task 1a review: order ids whose fill was refused because the underlying SPLIT between
+        # the order's decision day and its fill day (logged once per order), and the as-traded
+        # factor of every option fill's own day by order id -- the basis a round-trip row's
+        # entry is in (``option_basis_factor`` on the row; results.py's intraday refinement).
+        self._split_refused_orders: set = set()
+        self._option_fill_basis: Dict[int, float] = {}
+        # Task 1b: keys of the split re-key refusals / deferrals already logged (a lot waiting
+        # for its adjusted contract is re-checked on every bar and must be explained ONCE).
+        self._split_rekey_logged: set = set()
+        # (contract, basis_date) of lots whose re-key can NEVER succeed -- their order rows do
+        # not reconcile with the lot, and no fill can repair that (a fill on a crossed lot is
+        # refused). Skipped instead of re-planned on every bar until expiry.
+        self._split_rekey_never: set = set()
+        # RUN COUNTERS for the option-integrity events of plan 2026-09-24 Tasks 1b / 11 / 13,
+        # published in the results (``option_integrity_stats`` -> results.py). A GA trial child
+        # runs under ``logging.disable(logging.ERROR)`` (price_source._worker_init), which drops
+        # ERROR and everything below it, so the log lines alone are invisible exactly where most
+        # runs happen; these numbers are not.
+        self._option_integrity: Dict[str, Any] = _new_integrity_counters()
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
         # and is therefore useless for ageing in a backtest. Read only by
@@ -620,6 +752,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "required). An OPTIONS run must state one; see "
                                "_resolve_spread_model. Recorded in the run's results.",
             },
+            "option_size_within_fill_volume": {
+                "type": "bool",
+                "required": False,
+                "description": "BACKTEST-ONLY (plan 2026-09-24 Task 11). When True, an OPENING "
+                               "option order is sized down at ORDER time to what the fill "
+                               "engine's volume-participation cap (10% of a premium bar's "
+                               "volume, per leg) can fill, read on the DECISION bar; a cap of 0 "
+                               "places no order and says why. Without it an order larger than "
+                               "the cap simply expires unfilled. Live is unaffected (a broker "
+                               "fills a small order whatever the day's volume). Defaults to "
+                               "False (exact no-op): older option runs reproduce.",
+            },
             "hold_assigned_stock": {
                 "type": "bool",
                 "required": False,
@@ -657,6 +801,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "cross the spread, so a marginal TP can miss entirely and the "
                                "trade resolves via SL/timeout instead, not just at a worse "
                                "price. Default 0.0 (exact no-op, existing behaviour unchanged).",
+            },
+            "short_borrow_rate_pa": {
+                "type": "float",
+                "required": False,
+                "description": "Annual borrow rate charged on open SHORT equity positions "
+                               "(0.005 = 0.5%/yr, the default when absent). Accrued once per "
+                               "trading session at rate/252 x the short's market value, "
+                               "debited from cash and reported as short_borrow_cost. 0 = no "
+                               "borrow cost. A long-only run pays nothing at any rate.",
             },
             "fill_model": {
                 "type": "str",
@@ -768,14 +921,83 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            px = self._price.close_at(p.symbol)
-            if px is None:
-                px = self._price.close_asof(p.symbol)  # forward-fill: last known close
-            if px is None:
-                px = getattr(p, "avg_price", None)  # never-priced held symbol -> entry
+            px = self._equity_mark_price(p)
             if px is not None:
                 total += p.qty * px
         return total + self._option_positions_mtm()
+
+    def _equity_mark_price(self, p: "_Position") -> Optional[float]:
+        """The price an equity position is marked at: this bar's close, else the last known
+        close (forward-fill), else the entry price for a never-priced symbol. The ONE mark
+        both the equity curve (``_compute_open_positions_mtm``) and the short borrow accrual
+        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows."""
+        px = self._price.close_at(p.symbol)
+        if px is None:
+            px = self._price.close_asof(p.symbol)  # forward-fill: last known close
+        if px is None:
+            px = getattr(p, "avg_price", None)  # never-priced held symbol -> entry
+        return px
+
+    @property
+    def short_borrow_rate_pa(self) -> float:
+        """The annual borrow rate this run charges on open short equity positions."""
+        return self._short_borrow_rate_pa
+
+    @property
+    def short_borrow_cost(self) -> float:
+        """Total borrow charged so far, in account currency (a positive number)."""
+        return self._short_borrow_cost
+
+    def accrue_short_borrow(self, as_of: Any) -> float:
+        """Charge ONE session's borrow on the open short equity positions; return the charge.
+
+        The engine calls this once per bar, just before ``snapshot_equity``, and only on the
+        LAST bar of a trading session (every bar on a daily clock), so the fee is charged on
+        what is held into the close -- the short the broker lends overnight -- at the mark the
+        curve records. A second call for the same session charges nothing (the guard below).
+
+        Charge = sum(|qty| x mark) x rate / ``BORROW_SESSIONS_PER_YEAR``, debited from cash
+        like a commission and added to ``short_borrow_cost``. Nothing is touched when the
+        rate is 0 or no short is held, so a long-only run is byte-identical.
+
+        OUT OF SCOPE, deliberately: short stock created by an option ASSIGNMENT that is
+        queued for next-bar liquidation (``_pending_assignment_sells``). That stock exists
+        for one overnight under the no-orphaned-stock policy; charging it would move every
+        stored naked-short-call option backtest, which the short-selling plan forbids (no
+        behaviour change for current rules). Assigned short stock a run HOLDS
+        (``hold_assigned_stock``) is a real held short and is charged.
+        """
+        session = as_of.date() if isinstance(as_of, datetime) else as_of
+        if session == self._borrow_session:
+            return 0.0
+        self._borrow_session = session
+        if self._short_borrow_rate_pa == 0.0:
+            return 0.0
+        short_value = 0.0
+        for p in self._positions.values():
+            if p.qty >= 0:
+                continue
+            # Assignment short stock queued for liquidation (see the docstring) is exempt.
+            queued = self._pending_assignment_sells.get(p.symbol, 0.0)
+            shares = -p.qty - (-queued if queued < 0 else 0.0)
+            if shares <= 0:
+                continue
+            px = self._equity_mark_price(p)
+            if px is None:  # a held position always has an entry price; never skip silently
+                raise ValueError(f"[backtest] short {p.symbol} has no mark at {as_of}: "
+                                 f"its borrow cost cannot be charged.")
+            short_value += shares * float(px)
+        if short_value <= 0.0:
+            return 0.0
+        charge = short_value * self._short_borrow_rate_pa / BORROW_SESSIONS_PER_YEAR
+        if not math.isfinite(charge):
+            raise ValueError(
+                f"[backtest] non-finite short borrow charge at {as_of}: short market value "
+                f"{short_value!r} x rate {self._short_borrow_rate_pa!r}.")
+        # Cash only: the marked book is unchanged, so no _touch_book (see _book_gen's note).
+        self._cash -= charge
+        self._short_borrow_cost += charge
+        return charge
 
     #: Option strategies whose leg combination is DEFINED-RISK: the structure can only ever be
     #: worth a bounded amount, so its mid-life mark-to-market has a theoretical no-arbitrage
@@ -849,7 +1071,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 or gb["strategy"] in self.DEFINED_RISK_SHORT_STRATEGIES
             )
 
-            bar = self._options.get_bar(lot.contract_symbol, self._as_of_date())
+            # A bar under the lot's OCC string on a day in ANOTHER share basis belongs to a
+            # different contract reusing the string after a split: "no bar" (Task 1a).
+            bar = self._option_bar(lot.contract_symbol)
             if bar and bar.get("close") is not None:
                 # A bar EXISTS but the sparse cache carries junk prints (the arb guard's
                 # own documented class: a $0.01 call against $50+ of intrinsic). Clamp the
@@ -944,7 +1168,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if o is None or o.option_type is None:
             return None
         underlying = getattr(o, "underlying_symbol", None) or o.symbol
-        spot = self._option_spot_asof(underlying)
+        spot = self._lot_spot(contract_symbol, underlying)   # in the LOT's basis (Task 1a)
         if spot is None:
             return None
         if o.option_type == OptionRight.CALL:
@@ -1271,7 +1495,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Never negative. None only when no number resolves at all — the caller then
         refuses to pair and the legs are charged per-leg instead.
         """
-        bar = self._options.get_bar(lot.contract_symbol, self._as_of_date()) if self._options else None
+        bar = self._option_bar(lot.contract_symbol) if self._options else None
         bounds = self._lot_no_arb_bounds(lot.contract_symbol)
         px = None
         if bar and bar.get("close") is not None:
@@ -1335,7 +1559,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return None, None, None
         spot = None
         if o.underlying_symbol:
-            spot = self._option_spot_asof(o.underlying_symbol)
+            # The HELD lot's spot is in the basis the lot traded in (Task 1a): every caller
+            # (MTM clamp, BS fallback, no-arb bounds, naked/Reg-T margin, liquidation) values
+            # a lot the account holds.
+            spot = self._lot_spot(contract_symbol, o.underlying_symbol)
         return float(o.strike), (float(spot) if spot is not None else None), o.option_type
 
     @staticmethod
@@ -1489,9 +1716,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             available = float(pos.qty) if (pos is not None and pos.qty > 0) else 0.0
             # A contract delivers 100 AS-TRADED shares; ``available`` counts this book's
             # split-adjusted shares (plan Part E3). 1.0 without a split in the window.
-            k = self._as_traded_factor(underlying) if available > 0 else 1.0
+            k_bar = self._as_traded_factor(underlying) if available > 0 else 1.0
             for lot in sorted(lots, key=lambda l: abs(l.qty), reverse=True):
                 needed = abs(lot.qty) * float(lot.multiplier or 100)
+                # ...shares of the basis the call was WRITTEN in (Task 1a): a call written
+                # before a 4:1 split still delivers 100 pre-split = 400 adjusted shares.
+                k = self._lot_equity_factor(lot, k_bar) if available > 0 else k_bar
                 if k != 1.0:
                     needed *= k
                 if needed <= available:
@@ -1762,7 +1992,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return qty  # MEASURED zero: nothing has a claim, path unchanged
         # The pledge is AS-TRADED shares (contracts x 100); ``held`` is this book's
         # split-adjusted unit (plan Part E3). Identity without a split in the window.
-        pledged = self.option_shares_in_equity_units(symbol, pledged)
+        # Each held call in the basis it was WRITTEN in (Task 1a: a call written before a
+        # split still delivers its pre-split share count) -- see pledged_shares_in_equity_units.
+        pledged = self.pledged_shares_in_equity_units(symbol, pledged)
 
         # Round the holding DOWN against a pledge rounded UP: a fractional share cannot
         # cover a contract, so both roundings point at "less free inventory".
@@ -1875,7 +2107,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
     def _liquidate_option_lot(self, lot: "_OptionLot") -> bool:
         """Buy back a SHORT option lot at the current premium close; book cash + close the txn."""
-        bar = self._options.get_bar(lot.contract_symbol, self._as_of_date()) if self._options else None
+        bar = self._option_bar(lot.contract_symbol) if self._options else None
         bounds = self._lot_no_arb_bounds(lot.contract_symbol)  # (intrinsic, upper) or None
         if bar and bar.get("close") is not None:
             # The blow-up bar's print can be junk (the arb guard's documented class):
@@ -1914,20 +2146,41 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     premium = max(bounds[0], premium)
         if premium is None:
             return False
-        txn = self._option_transaction_for_contract(lot.contract_symbol)
         contracts = abs(lot.qty)
         multiplier = lot.multiplier
+        # WHICH transactions the buy-back closes (Task 13). The lot is per CONTRACT; two OPENED
+        # transactions can hold the same contract. Booking the whole lot's close on the first
+        # one (what _option_transaction_for_contract returns) over-closed it and left the other
+        # OPENED with contracts the ledger no longer holds -- an orphan whose view kept being
+        # settled and exited. So the close is DISTRIBUTED: each holding transaction gets a
+        # close of exactly what it holds. With one holder (every run without a shared
+        # contract) this is the old single booking, unchanged.
+        holdings = [(t, q) for t, q in self._open_option_holdings(lot.contract_symbol)
+                    if (q < 0) == (lot.qty < 0)]
+        if not holdings:
+            txn = self._option_transaction_for_contract(lot.contract_symbol)
+            holdings = [(txn, lot.qty)] if txn is not None else []
+        booked = sum(abs(q) for _t, q in holdings)
+        if holdings and abs(booked - contracts) > 1e-9:
+            logger.error(
+                "[backtest] margin_call_liquidation of %s: the lot holds %g contract(s) but its "
+                "OPENED transactions hold %g -- the option ledger and the transaction view "
+                "disagree (see the ledger consistency check). Each transaction is closed for "
+                "what it holds; the difference has no transaction to book on.",
+                lot.contract_symbol, contracts, booked)
         # Buying back a short lot DEBITS cash (premium x contracts x multiplier).
         self._cash -= contracts * float(premium) * multiplier
-        if txn is not None:
+        for txn, held in holdings:
             # Build the OptionPosition view for this leg so the close is recorded like an expiry
             # settlement (synthetic FILLED closing order for round-trip pairing).
-            pos = self._option_position_for_lot(lot, txn)
+            pos = self._option_position_for_lot(lot, txn, quantity=abs(held))
             if pos is not None:
                 self._record_option_expiry_close(
                     txn, pos, float(premium), trigger=OptionCloseReason.FORCED_LIQUIDATION)
         self._zero_option_lot(lot)
-        if txn is not None and self._all_legs_resolved(txn):
+        for txn, _held in holdings:
+            if not self._all_legs_resolved(txn):
+                continue
             from ba2_common.core.utils import close_transaction_with_logging
 
             txn.close_price = float(premium)
@@ -1945,8 +2198,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         )
         return True
 
-    def _option_position_for_lot(self, lot: "_OptionLot", txn) -> Optional[OptionPosition]:
-        """An OptionPosition describing a held lot (for recording its liquidation close)."""
+    def _option_position_for_lot(self, lot: "_OptionLot", txn,
+                                 quantity: Optional[float] = None) -> Optional[OptionPosition]:
+        """An OptionPosition describing a held lot (for recording its liquidation close) --
+        ``quantity`` contracts of it (default: the whole lot), for the part one transaction
+        holds when several share the contract."""
         o = self._lot_order(lot.contract_symbol)
         if o is None:
             return None
@@ -1957,7 +2213,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             strike=o.strike,
             expiry=o.expiry,
             side=(OrderDirection.BUY if lot.qty > 0 else OrderDirection.SELL),
-            quantity=abs(lot.qty),
+            quantity=abs(lot.qty) if quantity is None else float(quantity),
             avg_entry_price=lot.avg_price,
             multiplier=lot.multiplier,
         )
@@ -2554,6 +2810,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
             if o.order_type not in day_limits:
+                # A MARKET option order is never aged -- EXCEPT once its underlying has split
+                # since it was decided (Task 1a review): its OCC string now names a different
+                # (or no) contract and ``_option_fill_price`` refuses it for good, so left
+                # working it would stay open (and reserve buying power) forever. A broker
+                # cancels it; so does this.
+                if self._market_order_across_split(o, today):
+                    o.status = OrderStatus.CANCELED
+                    o.comment = (f"{(o.comment or '')} | canceled: {o.underlying_symbol} split "
+                                 f"since the order was decided").strip(" |")
+                    update_instance(o)
+                    self._option_order_day.pop(o.id, None)
+                    expired_any = True
                 continue
             placed = self._option_order_day.get(o.id)
             if placed is None or placed >= today:
@@ -2575,6 +2843,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._bump_option_memo()
         return expired_any
 
+    def _market_order_across_split(self, order, today) -> bool:
+        """A working option order whose underlying's share basis on ``today`` differs from
+        the one on the day it was staged (see ``_expire_stale_option_limits``)."""
+        if self._split_basis is None:
+            return False
+        placed = self._option_order_day.get(order.id)
+        underlying = getattr(order, "underlying_symbol", None)
+        if placed is None or placed >= today or not underlying:
+            return False
+        if self._as_traded_factor(underlying, placed) == self._as_traded_factor(underlying, today):
+            return False
+        logger.warning(
+            "[backtest] option MARKET order CANCELED: %s %s decided %s; %s split before %s, "
+            "so its OCC string no longer names the contract it was decided on.",
+            getattr(order, "side", None), getattr(order, "contract_symbol", None), placed,
+            underlying, today)
+        return True
+
     def _is_single_leg_option(self, order) -> bool:
         """True for an OPTION order that fills *independently* against a premium bar.
 
@@ -2591,6 +2877,62 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             and bool(getattr(order, "contract_symbol", None))
             and getattr(order, "parent_order_id", None) is None
         )
+
+    def _option_fill_day(self, order, as_of) -> Optional[date]:
+        """The calendar day an option order's premium is read on, per ``fill_model``: the
+        current bar's date for ``same_bar_close``, else the underlying's NEXT trading day
+        (None when there is none). The trading calendar is the UNDERLYING's, not the
+        contract's: a multi-leg CHILD's ``symbol`` is its OCC contract (which has no underlying
+        bars). Shared by the fill price and the lot's basis day, so the two cannot disagree."""
+        if self._cfg["fill_model"] == "same_bar_close":
+            return as_of.date() if hasattr(as_of, "date") else as_of
+        calendar_symbol = getattr(order, "underlying_symbol", None) or order.symbol
+        fill_day = self._price.next_bar_date(calendar_symbol, as_of)
+        if fill_day is None:
+            return None
+        if hasattr(fill_day, "date"):
+            fill_day = fill_day.date()
+        return fill_day
+
+    def _order_decision_day(self, order, as_of) -> date:
+        """The simulated day the order was DECIDED (staged) on -- ``_option_order_day`` -- or
+        the current bar's date for an order with no recorded staging day."""
+        placed = self._option_order_day.get(getattr(order, "id", None))
+        if placed is not None:
+            return placed
+        return as_of.date() if hasattr(as_of, "date") else as_of
+
+    def _split_between_decision_and_fill(self, order, as_of, fill_day) -> bool:
+        """True (and the fill must be REFUSED) when the order's underlying split between the
+        day the order was decided and its fill day.
+
+        The order names an OCC string chosen in the DECISION day's share basis. On and after
+        the ex-date that string is either absent or REUSED by a different contract (Task 0:
+        AAPL201016P00250000 0.49 on 08-28, 120.40 on 08-31), so a fill there is a different
+        trade -- a BUY decided 2020-08-28 under next_bar_open filled on 08-31 at the reused
+        contract's 300.5, and a limit does not protect because the reused bar clears it. A
+        broker cancels open orders on adjusted contracts, so refusing is parity-safe: a DAY
+        limit then expires through ``_expire_stale_option_limits``, and a MARKET order (which
+        that sweep otherwise never ages) is cancelled there for the same reason."""
+        underlying = getattr(order, "underlying_symbol", None)
+        if not underlying:
+            return False
+        decided = self._order_decision_day(order, as_of)
+        k_decided = self._as_traded_factor(underlying, decided)
+        k_fill = self._as_traded_factor(underlying, fill_day)
+        if k_decided == k_fill:
+            return False
+        key = getattr(order, "id", None)
+        if key not in self._split_refused_orders:
+            self._split_refused_orders.add(key)
+            logger.warning(
+                "[backtest] option fill REFUSED: %s %s was decided on %s (share basis x%g) but "
+                "would fill on %s (basis x%g) -- %s split %g:1 between them, so the OCC string "
+                "now names a different (or no) contract. Brokers cancel open orders on "
+                "adjusted contracts; the order does not fill and is left to expire.",
+                getattr(order, "side", None), order.contract_symbol, decided, k_decided,
+                fill_day, k_fill, underlying, k_decided / k_fill)
+        return True
 
     def _option_fill_price(self, order, as_of) -> Optional[float]:
         """Premium per share for an option order on its fill bar, per ``fill_model``.
@@ -2631,18 +2973,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if self._options is None:
             return None
         same_bar = self._cfg["fill_model"] == "same_bar_close"
-        # The trading calendar is the UNDERLYING's, not the contract's: a multi-leg CHILD's
-        # ``symbol`` is its OCC contract (which has no underlying bars), so use the underlying.
-        calendar_symbol = getattr(order, "underlying_symbol", None) or order.symbol
-        if same_bar:
-            fill_day = as_of.date() if hasattr(as_of, "date") else as_of
-        else:
-            fill_day = self._price.next_bar_date(calendar_symbol, as_of)
-            if fill_day is None:
-                return None
-            if hasattr(fill_day, "date"):
-                fill_day = fill_day.date()
-        bar = self._options.get_bar(order.contract_symbol, fill_day)
+        fill_day = self._option_fill_day(order, as_of)
+        if fill_day is None:
+            return None
+        if self._split_basis is not None and self._split_between_decision_and_fill(
+                order, as_of, fill_day):
+            return None
+        # A HELD lot's contract fills only on a bar in the lot's own share basis: after a split
+        # a bar under the same OCC string is another contract reusing it (Task 1a), so a close
+        # or an add does not fill -- the lot rides to expiry settlement in its own basis.
+        bar = self._option_bar(order.contract_symbol, fill_day)
         if not bar:
             return None
         px = bar.get("close") if same_bar else bar.get("open")
@@ -2658,7 +2998,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 as_of_bar = bar
             else:
                 as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
-                as_of_bar = self._options.get_bar(order.contract_symbol, as_of_day)
+                as_of_bar = self._option_bar(order.contract_symbol, as_of_day)
         limit = getattr(order, "limit_price", None)
         ot = order.order_type
         if limit is not None and ot == OrderType.BUY_LIMIT:
@@ -2690,7 +3030,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 self.rejected_arb_fills,
             )
             return None
-        reason = self._volume_cap_reject_reason(order, bar)
+        # WHICH BAR'S VOLUME caps the fill. Default: the FILL bar's (the documented look-ahead
+        # in _volume_cap_reject_reason's TODO, left as is so every existing run reproduces).
+        # Under ``option_size_within_fill_volume`` (approved 2026-09-25): the DECISION bar's --
+        # the bar the engine is on, the one ``option_order_quantity_limit`` sized the order
+        # against -- so the order-time cap is exact under next_bar_open too and the fill-day
+        # volume is never read. Under same_bar_close the two bars are the same bar.
+        volume_bar = bar
+        if self._cfg.get("option_size_within_fill_volume", False) and not same_bar:
+            volume_bar = as_of_bar
+            if volume_bar is None:           # the legacy spread model did not fetch it above
+                as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
+                volume_bar = self._option_bar(order.contract_symbol, as_of_day)
+            volume_bar = volume_bar or {}    # no decision bar: volume 0, nothing fills
+        reason = self._volume_cap_reject_reason(order, volume_bar)
         if reason is not None:
             self.rejected_illiquid_fills += 1
             logger.warning(
@@ -2848,7 +3201,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """
         if self._options is None:
             return None
-        bar = self._options.get_bar(contract_symbol, self._as_of_date())
+        bar = self._option_bar(contract_symbol)
         if not bar:
             return None
         if self._spread_model != _osm.LEGACY_PCT_MODEL:
@@ -2904,7 +3257,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return None
         volume = bar.get("volume")
         volume = float(volume) if volume is not None else 0.0
-        capacity = _OPTION_FILL_MAX_VOLUME_PARTICIPATION * volume
+        capacity = _option_fill_capacity(volume)
         if required > capacity:
             return (
                 f"order requires {required:g} contracts but bar volume {volume:g} allows "
@@ -3648,7 +4001,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # NEVER the underlying close. (Pre-F2 this line read "entry premium
                     # (breakeven)" flat; review 2026-08-30 F2 replaced that with the floor
                     # and the wording is corrected here to match what runs.)
-                    bar = self._options.get_bar(opening.contract_symbol, self._as_of_date())
+                    # Guarded like the equity-curve mark: a bar in another share basis than
+                    # the held lot's is a different contract reusing the OCC string (Task 1a).
+                    bar = self._option_bar(opening.contract_symbol)
                     exit_px = bar["close"] if bar and bar.get("close") is not None else None
                     if exit_px is None:
                         # No premium bar at run end: the same intrinsic-floored fallback
@@ -3661,7 +4016,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         intr = upper = None
                         if opening.strike is not None and opening.option_type is not None:
                             und = getattr(opening, "underlying_symbol", None) or opening.symbol
-                            spot = self._option_spot_asof(und)
+                            spot = self._lot_spot(opening.contract_symbol, und)
                             if spot is not None:
                                 intr, upper = self._no_arb_premium_bounds(
                                     opening.strike,
@@ -3777,6 +4132,37 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # leaving the losing one, scoring a max-profit condor NEGATIVE).
                     "transaction_id": txn_id,
             }
+            # The share basis the ENTRY traded in (the opening fill's day) -- only on option rows
+            # of a run with a split basis, so equity rows and basis-less runs keep their exact
+            # shape. results.py's intraday refinement prices the trade's 5m path in it.
+            basis_k = self._option_fill_basis.get(getattr(opening, "id", None))
+            if basis_k is not None:
+                row["option_basis_factor"] = basis_k
+            # A lot re-keyed at a split (Task 1b): its rows were rewritten into the ADJUSTED
+            # contract's units (qty x k, premium / k), so entries and exits above are all in one
+            # unit and ``pnl`` is exact. The row is STATED in the ORIGINAL contract's units --
+            # the contract the entry traded, its strike, its entry basis (option_basis_factor,
+            # the intraday refinement's factor) and the contract ``delta_at_entry`` reads
+            # before the split -- with the adjusted exit kept in ``split_rekey``. Scaling price
+            # by k and size by 1/k leaves (exit - entry) x size unchanged.
+            rekey = ((getattr(opening, "data", None) or {}).get("split_rekey")
+                     if _is_option_row(opening) else None)
+            if rekey:
+                k = float(rekey["ratio"])
+                row["split_rekey"] = {
+                    "date": rekey["date"], "ratio": rekey["ratio"],
+                    "from_contract": rekey["from_contract"],
+                    "to_contract": opening.contract_symbol,
+                    "from_strike": rekey["from_strike"], "to_strike": opening.strike,
+                    "entry_price": entry_px, "exit_price": exit_px, "size": size,
+                }
+                if row["symbol"] == opening.contract_symbol:
+                    row["symbol"] = rekey["from_contract"]
+                row["contract_symbol"] = rekey["from_contract"]
+                row["strike"] = rekey["from_strike"]
+                row["entry_price"] = entry_px * k
+                row["exit_price"] = exit_px * k
+                row["size"] = size / k
             trades.append(row)
             if option_records and _is_option_row(opening):
                 option_carriers[id(row)] = (
@@ -3925,6 +4311,616 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return None
         return self.option_basis_price(underlying, dated[0], dated[1])
 
+    # ----------------------------------------------------------------------
+    # A HELD lot's basis (plan 2026-09-24 Task 1a)
+    #
+    # Everything above converts with the factor of the bar being read -- right for what is
+    # being SELECTED or OPENED today, wrong for a lot opened before a split and still held
+    # after it: its strike is in the basis it traded in, so its spot is
+    # ``adjusted close x lot.basis_factor``. And a bar under its OCC string on a day in
+    # another basis is not its bar at all (the string is reused by another contract after
+    # the split, Task 0: AAPL201016P00250000 0.49 on 08-28, 120.40 on 08-31).
+    # ----------------------------------------------------------------------
+    def _lot_has_basis(self, lot: Optional[_OptionLot]) -> bool:
+        """``lot`` is HELD and carries a recorded basis, on a run with a split basis."""
+        return (self._split_basis is not None and lot is not None and lot.qty != 0
+                and lot.basis_factor is not None)
+
+    def _held_lot_with_basis(self, contract_symbol: str) -> Optional[_OptionLot]:
+        """The HELD lot for ``contract_symbol`` when it carries a recorded basis on a run
+        with a split basis -- else None (the caller then keeps the bar's own factor)."""
+        lot = self._option_positions.get(contract_symbol)
+        return lot if self._lot_has_basis(lot) else None
+
+    def _lot_basis_differs(self, lot: _OptionLot, day) -> bool:
+        """PURE: ``day`` is in another share basis than the one ``lot`` traded in."""
+        if self._split_basis is None or lot.basis_factor is None or not lot.underlying:
+            return False
+        return self._as_traded_factor(lot.underlying, day) != lot.basis_factor
+
+    def _report_split_crossing(self, lot: _OptionLot, day) -> None:
+        """Log -- ONCE per lot, at WARNING -- that ``lot`` is held across a split.
+
+        Only a ``day`` AFTER the lot's basis day is a crossing. A day BEFORE it (a lot whose
+        premium was read on the NEXT bar while the fill is booked at the clock's) is not
+        this lot's bar either, but nothing about the lot has crossed anything: DEBUG only."""
+        if lot.basis_date is not None and day < lot.basis_date:
+            logger.debug(
+                "[backtest] option lot %s: %s precedes its basis day %s (basis x%g); that "
+                "day's bar is not this lot's.", lot.contract_symbol, day, lot.basis_date,
+                lot.basis_factor)
+            return
+        key = (lot.contract_symbol, lot.basis_date)
+        if key in self._split_crossed_lots:
+            return
+        self._split_crossed_lots.add(key)
+        k = self._as_traded_factor(lot.underlying, day)
+        basis_of = getattr(self._split_basis, "basis_of", None)
+        sb = basis_of(lot.underlying) if callable(basis_of) else None
+        splits = [f"{sp.date.isoformat()} ratio {float(sp.ratio):g}"
+                  for sp in (sb.splits if sb is not None else ())
+                  if (lot.basis_date is None or lot.basis_date < sp.date) and sp.date <= day]
+        logger.warning(
+            "[backtest] option lot %s (%+g contract(s) on %s) is held ACROSS A SPLIT: "
+            "opened %s in share basis x%g, today %s is basis x%g (split(s): %s). It is "
+            "valued in its OWN basis (adjusted close x %g) from now on, and any bar under "
+            "its OCC string in the new basis belongs to ANOTHER contract reusing the "
+            "string -- it is not used to mark, quote, fill or settle this lot, which "
+            "therefore cannot be exited by an order and rides to expiry settlement.",
+            lot.contract_symbol, lot.qty, lot.underlying, lot.basis_date,
+            lot.basis_factor, day, k, ", ".join(splits) or "not in the calendar",
+            lot.basis_factor)
+
+    def _crossed_held_lot(self, contract_symbol: str, day=None) -> bool:
+        """True when a HELD lot on ``contract_symbol`` is in another share basis than
+        ``day``'s (default: this bar): that day's store rows under the OCC string belong to a
+        different contract reusing it after a split. Reports the crossing (once per lot)."""
+        if self._split_basis is None:
+            return False
+        lot = self._option_positions.get(contract_symbol)
+        if lot is None or lot.qty == 0:
+            return False
+        day = self._as_of_date() if day is None else day
+        if not self._lot_basis_differs(lot, day):
+            return False
+        self._report_split_crossing(lot, day)
+        return True
+
+    def _option_bar(self, contract_symbol: str, day=None) -> Optional[Dict[str, Any]]:
+        """The option store's bar for ``contract_symbol`` on ``day`` (default: this bar) --
+        None when a HELD lot on that contract is in another share basis than ``day``'s (the
+        bar then belongs to a different contract reusing the OCC string after a split). A
+        contract not held, and every day in the lot's own basis, reads the store unchanged."""
+        day = self._as_of_date() if day is None else day
+        if self._crossed_held_lot(contract_symbol, day):
+            return None
+        return self._options.get_bar(contract_symbol, day)
+
+    def _lot_spot(self, contract_symbol: str, underlying: str) -> Optional[float]:
+        """The valuation spot of a HELD lot in the basis it traded in: this bar's close (or
+        the last known one) x ``lot.basis_factor``. The adjusted series is on ONE basis, so a
+        forward-filled close needs no factor of its own date here. A contract with no held
+        lot, or a lot with no recorded basis, is ``_option_spot_asof`` unchanged -- and so is
+        a lot that never crossed a split (its factor is the bar's)."""
+        lot = self._held_lot_with_basis(contract_symbol)
+        if lot is None:
+            return self._option_spot_asof(underlying)
+        adj = self._price.close_at(underlying)
+        if adj is None:
+            adj = self._price.close_asof(underlying)
+        if adj is None:
+            return None
+        # (No crossing report here: this runs several times per lot per bar -- bounds, BS,
+        # margin -- and the per-bar mark's ``_option_bar`` read of every held lot reports it.)
+        k = lot.basis_factor
+        return adj if k == 1.0 else float(adj) * k
+
+    def _lot_equity_factor(self, lot: _OptionLot, k_bar: float) -> float:
+        """Adjusted book shares per share the HELD ``lot`` delivers: its own basis factor, or
+        ``k_bar`` (the bar's) for a lot with no recorded basis / on a run without one."""
+        return lot.basis_factor if self._lot_has_basis(lot) else k_bar
+
+    def lot_basis_price(self, contract_symbol: str, underlying: str, adjusted_price,
+                        price_day) -> Optional[float]:
+        """An adjusted price of ``price_day`` in the basis of the HELD lot on
+        ``contract_symbol`` -- the expiry-settlement spot (``daily_engine._apply_option_expiry``).
+        No held lot with a basis: the factor of ``price_day`` itself, as ``option_basis_price``
+        always converted it."""
+        if adjusted_price is None:
+            return None
+        lot = self._held_lot_with_basis(contract_symbol)
+        if lot is None:
+            return self.option_basis_price(underlying, adjusted_price, price_day)
+        if self._lot_basis_differs(lot, price_day):
+            self._report_split_crossing(lot, price_day)
+        k = lot.basis_factor
+        return adjusted_price if k == 1.0 else float(adjusted_price) * k
+
+    def pledged_shares_in_equity_units(self, underlying: str, pledged) -> int:
+        """OVERRIDE (OptionsAccountInterface): the AS-TRADED ``pledged`` shares in this book's
+        adjusted unit, with every held SHORT CALL counted in the basis it was WRITTEN in.
+
+        The base conversion is the bar's factor (``option_shares_in_equity_units``). A call
+        written before a split and still held after it delivers its PRE-split share count
+        (100 pre-split = 400 adjusted after a 4:1 split), so each such lot adds
+        ``contracts x multiplier x (k_lot - k_bar)``. With no such lot (every run without a
+        split crossing) this is exactly the base conversion. Rounded UP like the base."""
+        base = self.option_shares_in_equity_units(underlying, pledged)
+        if self._split_basis is None or not pledged:
+            return base
+        wanted = (underlying or "").strip().upper()
+        today = self._as_of_date()
+        k_bar = None
+        excess = 0.0
+        for lot in self._option_positions.values():
+            if lot.qty >= 0 or lot.basis_factor is None:
+                continue
+            if (lot.underlying or "").strip().upper() != wanted:
+                continue
+            o = self._lot_order(lot.contract_symbol)
+            if o is None or o.option_type != OptionRight.CALL:
+                continue
+            if o.expiry is not None and o.expiry < today:
+                continue      # an expired call pledges nothing (_ledger_shares_pledged_...)
+            if k_bar is None:
+                k_bar = self._as_traded_factor(underlying)
+            if lot.basis_factor == k_bar:
+                continue
+            excess += abs(float(lot.qty)) * float(lot.multiplier) * (lot.basis_factor - k_bar)
+        if excess == 0.0:
+            return base
+        return int(math.ceil(round(float(pledged) * k_bar + excess, 6)))
+
+    # ----------------------------------------------------------------------
+    # Re-key onto the ADJUSTED contract at an integer forward split (plan 2026-09-24 Task 1b)
+    #
+    # What OCC and the broker do on the ex-date of a k:1 split: every listed contract becomes
+    # strike / k, contracts x k, deliverable still 100 shares, carried under the NEW OCC string
+    # (Task 0: AAPL200918P00400000 has no bar after 08-28; the adjusted contract trades as
+    # AAPL200918P00100000 from 08-31). Task 1a kept such a lot in its own basis, which values it
+    # correctly but strands it: no bars, no quotes, no exit by an order. Here the lot AND the
+    # order linkage move to the adjusted contract, so marks, quotes, exits and settlement all
+    # use the adjusted contract's real bars -- live parity.
+    #
+    # THE LINKAGE IS THE ORDER ROWS. Every reader of "which contract does this transaction
+    # hold" -- the shared close path (CloseOptionAction._resolve_option_order / _close_multi_leg,
+    # held_covered_calls), the option conditions (quote vs open_price, strike vs spot, expiry),
+    # get_option_positions, _option_transaction_for_contract, _lot_order, the group bounds --
+    # reads the executed option TradingOrder rows. A lookup-side mapping would have to be
+    # threaded through all of them, most in shared (live) code; rewriting the rows in place
+    # (contract/strike/qty x k/prices / k, the originals kept in ``data['split_rekey']``)
+    # re-points every one at once and leaves live untouched. Premium x quantity is invariant, so
+    # every cash/P&L sum over the rewritten rows is unchanged; the round-trip recorder states the
+    # row back in the ORIGINAL contract's units (``get_round_trip_trades``).
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _adjusted_occ(contract_symbol: str, ratio: int) -> Optional[tuple]:
+        """``(adjusted OCC string, adjusted strike)`` of ``contract_symbol`` after a
+        ``ratio``:1 split, or None when the string is not an OCC symbol.
+
+        The adjusted strike is strike / ratio ROUNDED HALF-UP TO THE CENT, which is what the
+        ThetaData store carries (measured 2026-09-25: ANET 4:1 362.5 -> P00090630 strike 90.63,
+        352.5 -> 88.13; TSLA 3:1 815 -> 271.67; no 3-decimal strike field in the store). Decimal
+        arithmetic, because float rounding of x.xx5 goes either way."""
+        from decimal import Decimal, ROUND_HALF_UP
+        if len(contract_symbol) < 16 or contract_symbol[-9] not in "CP":
+            return None
+        field = contract_symbol[-8:]
+        if not field.isdigit():
+            return None
+        adjusted = (Decimal(field) / 1000 / ratio).quantize(Decimal("0.01"),
+                                                            rounding=ROUND_HALF_UP)
+        return f"{contract_symbol[:-8]}{int(adjusted * 1000):08d}", float(adjusted)
+
+    def _log_rekey_once(self, key, level: int, fmt: str, *args, refusal: bool = True) -> None:
+        """A re-key refusal/deferral is re-evaluated on every bar; explain it ONCE per key --
+        and count it once (``option_split_rekey_refusals``) unless it is not a refusal."""
+        if key in self._split_rekey_logged:
+            logger.debug(fmt, *args)
+            return
+        self._split_rekey_logged.add(key)
+        if refusal:
+            self._integrity()["option_split_rekey_refusals"] += 1
+        logger.log(level, fmt, *args)
+
+    def apply_split_rekeys(self) -> int:
+        """Re-key every held option lot whose underlying split since it opened (Task 1b).
+
+        Called by the engine at the HEAD of every bar, right after the clock moves and before
+        any expert reads the book, so the ex-date's marks, quotes and exit rules already see the
+        adjusted contract. Returns the number of lots re-keyed on this bar.
+
+        A lot is re-keyed when ``r = lot.basis_factor / factor(today)`` is an integer >= 2 and
+        the option store LISTS the adjusted contract today (a row, traded or not). The store is
+        asked about TODAY only: a lot whose adjusted contract is not listed yet waits in its own
+        basis (Task 1a) and is re-checked on every later bar -- no look-ahead, and ThetaData
+        lists a contract every session once it exists (ANET P00092500: 13 rows 12-04..12-20).
+        Non-integer (3:2) and reverse splits are never re-keyed and stay on Task 1a. A
+        multi-leg structure is re-keyed whole in one bar or not at all."""
+        if self._split_basis is None or self._options is None or not self._option_positions:
+            return 0
+        today = self._as_of_date()
+        crossed = [lot for lot in self._option_positions.values()
+                   if lot.qty != 0 and lot.basis_date is not None and lot.basis_date < today
+                   and self._lot_basis_differs(lot, today)]
+        if not crossed:
+            return 0
+        return self._rekey_crossed_lots(crossed, today)
+
+    def _rekey_plan(self, lot: _OptionLot, today) -> Optional[Dict[str, Any]]:
+        """The re-key of ONE crossed lot, or None (logged) when it cannot be re-keyed today."""
+        k_today = self._as_traded_factor(lot.underlying, today)
+        cs = lot.contract_symbol
+        r = lot.basis_factor / k_today
+        ri = int(round(r))
+        if r < 1.0 or abs(r - ri) > 1e-9 or ri < 2:
+            # OCC adjusts these into a NON-STANDARD deliverable (e.g. 150 shares per contract
+            # after a 3:2) under a new root the store does not carry: nothing to re-key onto.
+            self._log_rekey_once(
+                (cs, lot.basis_date, "ratio", k_today), logging.WARNING,
+                "[backtest] option lot %s (%+g contract(s)) NOT RE-KEYED: %s split a %s split "
+                "(ratio %g, share basis x%g on %s -> x%g today). Only integer forward splits are "
+                "re-keyed; OCC turns this one into a non-standard deliverable the store does not "
+                "carry. The lot stays in its OWN basis (Task 1a): valued at adjusted close x %g, "
+                "no bars, rides to expiry settlement.",
+                cs, lot.qty, lot.underlying, "reverse" if r < 1.0 else "non-integer", r,
+                lot.basis_factor, lot.basis_date, k_today, lot.basis_factor)
+            return None
+        adj = self._adjusted_occ(cs, ri)
+        if adj is None:
+            self._log_rekey_once(
+                (cs, lot.basis_date, "occ"), logging.ERROR,
+                "[backtest] option lot %s NOT RE-KEYED: not an OCC symbol, so its adjusted "
+                "contract cannot be named. It stays in its own basis (Task 1a).", cs)
+            return None
+        new_symbol, new_strike = adj
+        old_strike = int(cs[-8:]) / 1000.0
+        o = self._lot_order(cs)
+        if o is not None and o.strike is not None and abs(float(o.strike) - old_strike) > 1e-6:
+            self._log_rekey_once(
+                (cs, lot.basis_date, "strike"), logging.ERROR,
+                "[backtest] option lot %s NOT RE-KEYED: its order row says strike %s but the "
+                "OCC string says %s -- the book is inconsistent and the adjusted contract cannot "
+                "be derived safely. It stays in its own basis (Task 1a).",
+                cs, o.strike, old_strike)
+            return None
+        # The store is read RAW here, not through ``_option_bar``: the question is whether the
+        # adjusted contract is LISTED today, and today is post-split, so today's row under the
+        # new string IS the adjusted contract (a held lot on the same string would be guarded).
+        if self._options.get_bar(new_symbol, today) is None:
+            self._log_rekey_once(
+                (cs, lot.basis_date, "missing"), logging.WARNING,
+                "[backtest] option lot %s (%+g contract(s)) NOT RE-KEYED on %s: its adjusted "
+                "contract %s (%d:1 split of %s) is not listed in the option store that day. The "
+                "lot stays in its OWN basis (Task 1a) and is re-keyed on the first later bar "
+                "that lists %s; if none does, it rides to expiry settlement.",
+                cs, lot.qty, today, new_symbol, ri, lot.underlying, new_symbol)
+            return None
+        return {"lot": lot, "ratio": ri, "new": new_symbol, "new_strike": new_strike,
+                "old_strike": old_strike, "k_today": k_today}
+
+    def _row_basis_differs(self, o, today) -> bool:
+        """An order row was traded -- or, unfilled, staged -- in another share basis than
+        ``today``'s: its recorded fill basis, else the factor of its sim fill date, else of its
+        staging day. A row whose basis cannot be told counts as differing (reported, not
+        assumed harmless)."""
+        underlying = getattr(o, "underlying_symbol", None)
+        if not underlying:
+            return True
+        k_today = self._as_traded_factor(underlying, today)
+        k = self._option_fill_basis.get(o.id)
+        if k is None:
+            day = self._fill_dates.get(o.id)
+            if day is not None:
+                day = day.date() if hasattr(day, "date") else day
+            else:
+                day = self._option_order_day.get(o.id)
+            if day is None:
+                return True
+            k = self._as_traded_factor(underlying, day)
+        return k != k_today
+
+    def _rekey_crossed_lots(self, crossed: List[_OptionLot], today) -> int:
+        """Plan, group, conflict-check and apply the re-key of ``crossed`` (see
+        ``apply_split_rekeys``). Nothing is mutated until every check has passed."""
+        plans: Dict[str, Dict[str, Any]] = {}
+        for lot in crossed:
+            if (lot.contract_symbol, lot.basis_date) in self._split_rekey_never:
+                continue        # refused for good (see _split_rekey_never): not re-planned
+            plan = self._rekey_plan(lot, today)
+            if plan is not None:
+                plans[lot.contract_symbol] = plan
+        if not plans:
+            # Nothing re-keyable today (a 3:2 split, an adjusted contract not listed yet): skip
+            # the order scan below, which a lot riding on Task 1a would otherwise pay every bar.
+            return 0
+        crossed_syms = {lot.contract_symbol for lot in crossed}
+
+        # ---- the order linkage: executed option rows of OPENED transactions ----------------
+        opened = {t.id: t for t in transactions_where(status=TransactionStatus.OPENED)}
+        executed = OrderStatus.get_executed_statuses()
+        rows_of: Dict[str, List[TradingOrder]] = {}       # crossed contract -> its rows
+        txns_of: Dict[str, set] = {}                      # crossed contract -> txn ids
+        txn_contracts: Dict[int, set] = {}                # txn id -> option contracts traded
+        parents_of: Dict[int, List[TradingOrder]] = {}    # txn id -> multi-leg parent rows
+        target_of = {p["new"]: cs for cs, p in plans.items()}
+        foreign: Dict[str, List[int]] = {}                # target string -> other-basis rows
+        for o in self.get_orders():
+            if o.contract_symbol in target_of and self._row_basis_differs(o, today):
+                foreign.setdefault(o.contract_symbol, []).append(o.id)
+            if (getattr(o, "asset_class", None) != AssetClass.OPTION
+                    or o.transaction_id not in opened or o.status not in executed):
+                continue
+            cs = o.contract_symbol
+            if not cs:
+                parents_of.setdefault(o.transaction_id, []).append(o)
+                continue
+            txn_contracts.setdefault(o.transaction_id, set()).add(cs)
+            if cs in crossed_syms:
+                rows_of.setdefault(cs, []).append(o)
+                txns_of.setdefault(cs, set()).add(o.transaction_id)
+        # A row that ALREADY carries an adjusted string but was traded (or staged) in another
+        # share basis is a different contract that used the string before the split -- e.g. a
+        # closed pre-split trade of the old P100 when P400 is re-keyed onto P100. Order-derived
+        # lookups take the FIRST row per string (_lot_order, _option_group_bounds' owner), so
+        # such a row can own the re-keyed lot's grouping/strategy label. Its TERMS are the same
+        # (the string encodes them), so the re-key still proceeds -- but loudly.
+        for new, ids in foreign.items():
+            self._log_rekey_once(
+                (new, "foreign-rows", tuple(ids)), logging.WARNING,
+                "[backtest] split re-key onto %s (from %s): order row(s) %s already carry %s but "
+                "were traded in ANOTHER share basis (a different contract that used the string "
+                "before the split). Order-derived lookups take the first row per OCC string, so "
+                "they may attribute the re-keyed lot's group/strategy to those rows.",
+                new, target_of[new], ids, new, refusal=False)
+        # The rows to move must add up to the lot: a lot whose book does not reconcile cannot
+        # have its linkage moved consistently (an exit would close the wrong quantity).
+        for cs in list(plans):
+            lot = plans[cs]["lot"]
+            # An EXECUTED row with no quantity is a defect, not a zero: refuse loudly.
+            booked = sum(must_measure(o.filled_qty if o.filled_qty is not None else o.quantity,
+                                      f"executed quantity of option order {o.id}")
+                         * (1.0 if o.side == OrderDirection.BUY else -1.0)
+                         for o in rows_of.get(cs, ()))
+            if abs(booked - lot.qty) > 1e-9:
+                self._log_rekey_once(
+                    (cs, lot.basis_date, "ledger"), logging.ERROR,
+                    "[backtest] option lot %s NOT RE-KEYED: the lot holds %+g contract(s) but the "
+                    "executed order rows of its OPENED transactions add up to %+g, so its order "
+                    "linkage cannot be moved consistently. It stays in its own basis (Task 1a).",
+                    cs, lot.qty, booked)
+                self._split_rekey_never.add((cs, lot.basis_date))
+                del plans[cs]
+
+        # ---- groups: contracts sharing a transaction move together -------------------------
+        parent: Dict[str, str] = {}
+
+        def _find(x):
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for cs in crossed_syms:
+            _find(cs)
+            for tid in txns_of.get(cs, ()):
+                for other in txn_contracts.get(tid, ()):
+                    held = self._option_positions.get(other)
+                    if held is not None and held.qty != 0:
+                        parent[_find(other)] = _find(cs)
+        groups: Dict[str, set] = {}
+        for cs in list(parent):
+            groups.setdefault(_find(cs), set()).add(cs)
+
+        moving: set = set()
+        group_of: Dict[str, frozenset] = {}
+        for members in groups.values():
+            members = frozenset(members)
+            crossed_members = sorted(m for m in members if m in crossed_syms)
+            if not crossed_members:
+                continue
+            for m in members:
+                group_of[m] = members
+            missing = [m for m in crossed_members if m not in plans]
+            ratios = {plans[m]["ratio"] for m in crossed_members if m in plans}
+            if missing or len(ratios) > 1:
+                ready = [m for m in crossed_members if m in plans]
+                if ready:
+                    # A half-re-keyed structure is wrong (legs in two bases, quantities in two
+                    # units): the whole structure stays on Task 1a this bar.
+                    self._log_rekey_once(
+                        (members, "whole", tuple(missing), len(ratios)),
+                        logging.ERROR if len(ratios) > 1 else logging.WARNING,
+                        "[backtest] option structure %s NOT RE-KEYED: a structure is re-keyed "
+                        "whole or not at all, and %s cannot be re-keyed%s (see above). %s stay "
+                        "in their own basis (Task 1a) with the rest of the structure.",
+                        sorted(members), missing or sorted(members),
+                        " (legs disagree on the split ratio)" if len(ratios) > 1 else "",
+                        ready)
+                continue
+            moving.update(crossed_members)
+
+        # ---- target conflicts: the adjusted string may already be held ---------------------
+        def _drop(cs, reason, level, fmt, *args):
+            members = group_of.get(cs, frozenset({cs}))
+            moving.difference_update(members)
+            # Keyed on the STABLE identity (never on the day): a conflict that stands for many
+            # bars is explained once.
+            self._log_rekey_once((members, "target", reason, cs, plans[cs]["new"]),
+                                 level, fmt, *args)
+
+        changed = True
+        while changed:
+            changed = False
+            targets: Dict[str, List[str]] = {}
+            for cs in moving:
+                targets.setdefault(plans[cs]["new"], []).append(cs)
+            for new, srcs in targets.items():
+                if len(srcs) > 1:
+                    for cs in srcs:
+                        _drop(cs, "collision", logging.ERROR,
+                              "[backtest] option lot %s NOT RE-KEYED: %s would map several lots "
+                              "(%s) onto one adjusted contract. They stay in their own basis.",
+                              cs, new, sorted(srcs))
+                    changed = True
+                    break
+                cs = srcs[0]
+                occ = self._option_positions.get(new)
+                if occ is None or occ.qty == 0 or new in moving:
+                    continue            # free, or its occupant moves away in this same bar
+                lot = plans[cs]["lot"]
+                if new in crossed_syms or (occ.basis_factor is not None
+                                           and occ.basis_factor != plans[cs]["k_today"]):
+                    _drop(cs, "other-basis", logging.WARNING,
+                          "[backtest] option lot %s NOT RE-KEYED (first seen %s): %s is already held by "
+                          "a lot in ANOTHER share basis that is not re-keyed this bar; one lot "
+                          "cannot hold two bases. Retried on every later bar.", cs, today, new)
+                elif (occ.qty > 0) != (lot.qty > 0):
+                    # Netting a long against a short of the same contract is a CLOSE: it
+                    # realises P&L on two different transactions, which the re-key (a pure
+                    # identity) must never do. Refused; the broker would net them, so say so.
+                    _drop(cs, "opposite", logging.ERROR,
+                          "[backtest] option lot %s (%+g) NOT RE-KEYED: the adjusted contract %s "
+                          "is already held on the opposite side (%+g contract(s)). Merging would "
+                          "net -- i.e. close -- positions of two transactions and realise P&L, "
+                          "which a re-key must not do. It stays in its own basis (Task 1a).",
+                          cs, lot.qty, new, occ.qty)
+                else:
+                    continue
+                changed = True
+                break
+        if not moving:
+            return 0
+        self._apply_rekeys([plans[cs] for cs in sorted(moving)], rows_of, txns_of, parents_of,
+                           opened, today)
+        return len(moving)
+
+    def _apply_rekeys(self, plans, rows_of, txns_of, parents_of, opened, today) -> None:
+        """Mutate the book for the checked ``plans``: order rows, parents, transactions, lots.
+
+        An IDENTITY transformation: no cash moves, no commission, no fill. Every row keeps
+        premium x quantity (price / k, qty x k), the lot keeps avg_price x qty, and the strike x
+        share count differs only by OCC's rounding of the adjusted strike to the cent."""
+        by_old = {p["lot"].contract_symbol: p for p in plans}
+        # Transaction-level decisions BEFORE any row changes (the entry lookup reads the rows).
+        txn_ratio: Dict[int, int] = {}
+        for cs, p in by_old.items():
+            for tid in txns_of.get(cs, ()):
+                txn_ratio[tid] = p["ratio"]
+        scale_txn: Dict[int, bool] = {}
+        for tid in txn_ratio:
+            entry = self._entry_order_for_transaction(opened[tid])
+            scale_txn[tid] = (entry is not None
+                              and getattr(entry, "asset_class", None) == AssetClass.OPTION
+                              and (not entry.contract_symbol or entry.contract_symbol in by_old))
+        rewritten_parents: set = set()
+        for cs, p in by_old.items():
+            for o in rows_of.get(cs, ()):
+                self._rekey_order_row(o, p["ratio"], today, new_contract=p["new"],
+                                      new_strike=p["new_strike"], old_contract=cs)
+                if o.parent_order_id is not None:
+                    rewritten_parents.add(o.parent_order_id)
+        for tid, r in txn_ratio.items():
+            # A multi-leg parent carries the STRUCTURE count and the net per structure: scaled
+            # only when its own legs moved (a roll parent written after the split is already in
+            # the new units).
+            for par in parents_of.get(tid, ()):
+                if par.id in rewritten_parents:
+                    self._rekey_order_row(par, r, today)
+            t = opened[tid]
+            before = {"from_quantity": t.quantity, "from_open_price": t.open_price,
+                      "scaled": scale_txn[tid]}
+            if scale_txn[tid]:
+                if t.quantity is not None:
+                    t.quantity = float(t.quantity) * r
+                if t.open_price is not None:
+                    t.open_price = float(t.open_price) / r
+            moved = [{"date": today.isoformat(), "ratio": r, "from_contract": cs,
+                      "to_contract": p["new"], **before}
+                     for cs, p in sorted(by_old.items()) if tid in txns_of.get(cs, ())]
+            meta = dict(t.meta_data or {})
+            meta["split_rekeys"] = list(meta.get("split_rekeys") or []) + moved
+            t.meta_data = meta
+            update_instance(t)
+
+        # The ledger: retire every old lot first (a target string may be an old lot's key that
+        # moves away in this same bar), then install or merge the adjusted lots.
+        new_lots = []
+        for p in plans:
+            old, r = p["lot"], p["ratio"]
+            new_lots.append((p, old.qty, old.avg_price, _OptionLot(
+                contract_symbol=p["new"], qty=old.qty * r, avg_price=old.avg_price / r,
+                multiplier=old.multiplier,
+                # IV is scale-free: BS(S/k, K/k, iv) = BS(S, K, iv) / k, so the contract's last
+                # observed iv is exactly the adjusted contract's -- carried, not reset, so the BS
+                # mark fallback still works on a day the adjusted contract has no bar.
+                last_iv=old.last_iv, last_iv_date=old.last_iv_date,
+                underlying=old.underlying, basis_factor=p["k_today"], basis_date=today)))
+        for p, _q, _a, _new in new_lots:
+            self._zero_option_lot(p["lot"])
+        for p, old_qty, old_avg, new in new_lots:
+            occ = self._option_positions.get(new.contract_symbol)
+            if occ is not None and occ.qty != 0:
+                # Same side, same (today's) basis -- checked in _rekey_crossed_lots.
+                total = occ.qty + new.qty
+                occ.avg_price = ((occ.avg_price * abs(occ.qty) + new.avg_price * abs(new.qty))
+                                 / abs(total))
+                occ.qty = total
+                if occ.last_iv_date is None or (new.last_iv_date is not None
+                                                and new.last_iv_date > occ.last_iv_date):
+                    occ.last_iv, occ.last_iv_date = new.last_iv, new.last_iv_date
+                merged = f" (merged into the {occ.qty - new.qty:+g} already held)"
+            else:
+                self._option_positions[new.contract_symbol] = new
+                merged = ""
+            self._integrity()["option_split_rekeys"] += 1
+            logger.info(
+                "[backtest] option lot RE-KEYED at the %s %d:1 split (%s): %s %+g @ %.4f -> %s "
+                "%+g @ %.4f, strike %g -> %g%s.", new.underlying, p["ratio"], today,
+                p["lot"].contract_symbol, old_qty, old_avg, new.contract_symbol, new.qty,
+                new.avg_price, p["old_strike"], p["new_strike"], merged)
+        # Order rows changed contract/quantity in place and lots were added: both the order
+        # cache's derived views and the option memos (group bounds, _lot_order index) are stale.
+        self.invalidate_order_cache()
+        self._bump_option_memo()
+
+    @staticmethod
+    def _rekey_order_row(o, r: int, today, *, new_contract: Optional[str] = None,
+                         new_strike: Optional[float] = None,
+                         old_contract: Optional[str] = None) -> None:
+        """Rewrite one executed option row into the adjusted contract's units, keeping the
+        ORIGINAL terms in ``data['split_rekey']`` (cumulative across two splits: the first
+        ``from_*`` terms and the product of the ratios)."""
+        prev = (o.data or {}).get("split_rekey") or {}
+        note = {
+            "date": today.isoformat(),
+            "ratio": int(r * int(prev.get("ratio", 1))),
+            "from_contract": prev.get("from_contract", old_contract),
+            "to_contract": new_contract,
+            "from_strike": prev.get("from_strike", o.strike if new_contract else None),
+            "to_strike": new_strike,
+            "from_quantity": prev.get("from_quantity", o.quantity),
+            "from_filled_qty": prev.get("from_filled_qty", o.filled_qty),
+            "from_open_price": prev.get("from_open_price", o.open_price),
+            "from_limit_price": prev.get("from_limit_price", o.limit_price),
+            "from_stop_price": prev.get("from_stop_price", getattr(o, "stop_price", None)),
+        }
+        if new_contract is not None:
+            if o.symbol == o.contract_symbol:
+                o.symbol = new_contract
+            o.contract_symbol = new_contract
+            o.strike = new_strike
+        if o.quantity is not None:
+            o.quantity = float(o.quantity) * r
+        if o.filled_qty is not None:
+            o.filled_qty = float(o.filled_qty) * r
+        for field in ("open_price", "limit_price", "stop_price"):
+            v = getattr(o, field, None)
+            if v is not None:
+                setattr(o, field, float(v) / r)
+        o.data = {**(o.data or {}), "split_rekey": note}
+        update_instance(o)
+
     # ======================================================================
     # OptionsAccountInterface — READ methods (Task 4)
     #
@@ -3947,6 +4943,30 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         equity-only path. ``supports_options`` is the CLASS capability and is always True."""
         return self._options is not None
 
+    def _integrity(self) -> Dict[str, Any]:
+        """The run's option-integrity counters (created on first use for account doubles built
+        without ``__init__``)."""
+        c = getattr(self, "_option_integrity", None)
+        if c is None:
+            c = self._option_integrity = _new_integrity_counters()
+        return c
+
+    def option_integrity_stats(self) -> Dict[str, Any]:
+        """The option-integrity counters of this run, JSON-safe (results.py publishes each key):
+
+          * ``option_ledger_mismatches``: {count, examples (first 3)} -- DISTINCT lot/view
+            disagreements found by ``check_option_ledger`` (Task 13);
+          * ``option_orders_volume_sized`` / ``option_orders_volume_refused``: opening orders
+            cut / not placed by the fill-volume cap (Task 11);
+          * ``option_split_rekeys`` / ``option_split_rekey_refusals``: lots re-keyed at a split,
+            and distinct NOT-RE-KEYED explanations (refused or deferred; Task 1b).
+
+        Recorded, not scored."""
+        c = self._integrity()
+        return {**c, "option_ledger_mismatches": {
+            "count": c["option_ledger_mismatches"]["count"],
+            "examples": [dict(e) for e in c["option_ledger_mismatches"]["examples"]]}}
+
     def option_basis_guard_stats(self) -> Optional[Dict[str, Any]]:
         """The run's E4 split-basis guard counters (``option_basis_guard.BasisGuard.stats``),
         or None when this run's reader carries no guard (sqlite store / fixture readers).
@@ -3955,6 +4975,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             raise RuntimeError("option_basis_guard_stats() on an account with no options provider")
         fn = getattr(self._options, "basis_guard_stats", None)
         return fn() if callable(fn) else None
+
+    def option_min_one_contract_floored_entries(self) -> int:
+        """How many option ENTRY orders this run submitted at a size that came from the
+        1-contract floor (``min_one_contract``, plan 2026-09-24 Task 8) -- i.e. entries that
+        exist only because the floor turned a 0-contract budget into 1.
+
+        Read off the ORDER ROWS, where the shared entry path stamps
+        ``data['min_one_contract_floor']`` (only on a floored entry), so this counts exactly
+        what the action decided -- no second, backtest-only bookkeeping that could drift from
+        it. SUBMITTED entries, not fills: a floored ticket that never fills was still a
+        decision the genome relied on. Options runs only, like ``option_chain_staleness``."""
+        if self._options is None:
+            raise RuntimeError(
+                "option_min_one_contract_floored_entries() on an account with no options provider")
+        return sum(1 for o in orders_where(account_id=self.id)
+                   if isinstance(o.data, dict) and o.data.get("min_one_contract_floor") is True)
 
     def option_chain_staleness(self) -> Dict[str, Any]:
         """This run's stale-price chain-row counts from its option reader
@@ -4031,7 +5067,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             option_type=option_type, strike_min=strike_min, strike_max=strike_max)
 
     def get_option_quote(self, contract_symbol):
-        return None if self._options is None else self._options.get_quote(
+        if self._options is None:
+            return None
+        # A HELD lot on a day in another share basis has no quote: the store's row under its
+        # OCC string is another contract reusing the string after a split (Task 1a), and an
+        # exit rule must not read -- or price a close off -- that contract's premium.
+        if self._crossed_held_lot(contract_symbol):
+            return None
+        return self._options.get_quote(
             contract_symbol, self._as_of_date(), data_session=self._option_data_session())
 
     def get_atm_implied_volatility(self, underlying):
@@ -4145,6 +5188,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                   for d in self._iv_rank_sample_dates(as_of, lookback_days)]
         return self._iv_rank_from_series(series, current, min_samples)
 
+    def has_open_option_positions(self) -> bool:
+        """True while the option ledger holds any lot with non-zero contracts (long or short).
+
+        The engine's advance step asks this so a held option counts as ACTIVITY: the equity
+        ``get_positions()`` never lists option lots, so without it an option-only book looked
+        flat and the loop jumped from entry day to entry day -- exits unevaluated, the curve
+        unsampled and expiry settled on the next visited bar at THAT bar's spot (findings
+        2026-09-24 section 5.1, bug 3).
+
+        Reads the in-memory ledger rather than ``get_option_positions()``: this is asked once
+        per bar, and that view is a transaction query. Lots settled or netted to zero stay in
+        the dict (``_zero_option_lot`` keeps the object), so ``qty != 0`` is what "open" means.
+        """
+        return any(lot.qty != 0 for lot in self._option_positions.values())
+
     def get_option_positions(self):
         """Held option positions, derived from OPENED transactions whose entry is an OPTION.
 
@@ -4245,6 +5303,70 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
         return out
 
+    def option_order_quantity_limit(self, legs, quantity: int, option_strategy) -> int:
+        """OVERRIDE (OptionsAccountInterface size seam, plan 2026-09-24 Task 11): with the run's
+        ``option_size_within_fill_volume`` on, cap an OPENING order at what the fill engine
+        will let fill.
+
+        The fill engine refuses a fill whose contracts exceed ``_option_fill_capacity`` of the
+        fill bar's volume (``_volume_cap_reject_reason``); an order sized above it just expires
+        (about half of the expired O_LP entries in the 2026-09-24 diagnosis). Here the same
+        capacity is read on the DECISION bar -- the bar the order is decided on, and under
+        ``same_bar_close`` the very bar it fills on. Under ``next_bar_open`` the fill engine
+        normally reads the NEXT session's volume (its documented look-ahead); with this flag on
+        it reads the decision bar too (``_option_fill_price``), so the size decided here is
+        exactly the size the fill engine admits.
+
+        The shared entry choke point (``_OptionEntryAction._submit_option_order``) asks this
+        FIRST, so the reserve, the RM admission/charge and the entry record are the capped
+        order's; ``submit_option_order`` asks again as a backstop (idempotent).
+
+        MULTI-LEG: the parent quantity is a STRUCTURE count and each leg fills
+        ``structures x ratio_qty`` contracts, so the cap is the most constrained leg's
+        ``floor(capacity / ratio_qty)``.
+
+        Scope: only orders whose every leg OPENS (``*_to_open``). A close, a roll or a
+        partial flatten keeps its size -- capping an exit would leave a remainder the exit rule
+        has to fire again for, which is a different behaviour change than this one.
+
+        0 -> the order is not placed (the base returns None) and the reason is logged at
+        WARNING: never a silent 0."""
+        # ``getattr``: account doubles built without __init__ (parity harnesses) carry no config;
+        # for them, as for every run that does not state the flag, it is OFF.
+        cfg = getattr(self, "_cfg", None) or {}
+        if not cfg.get("option_size_within_fill_volume", False) or getattr(self, "_options", None) is None:
+            return quantity
+        if not legs or any(not (getattr(l, "position_intent", "") or "").endswith("_to_open")
+                           for l in legs):
+            return quantity
+        allowed = None
+        tightest = None
+        for leg in legs:
+            bar = self._option_bar(leg.contract_symbol)
+            volume = bar.get("volume") if bar else None
+            per_unit = float(getattr(leg, "ratio_qty", 1) or 1)
+            n = _max_units_within(_option_fill_capacity(volume), per_unit)
+            if allowed is None or n < allowed:
+                allowed, tightest = n, (leg.contract_symbol, volume, per_unit)
+        if allowed >= quantity:
+            return quantity
+        contract, volume, per_unit = tightest
+        if allowed <= 0:
+            self._integrity()["option_orders_volume_refused"] += 1
+            logger.warning(
+                "[backtest] option order NOT PLACED (%s x%d, option_size_within_fill_volume): "
+                "%s's decision-bar volume %s lets %.0f%% participation fill no %s, so not even "
+                "one would fill.", option_strategy, quantity, contract, volume,
+                _OPTION_FILL_MAX_VOLUME_PARTICIPATION * 100,
+                "contract" if per_unit == 1 else f"structure ({per_unit:g} contracts each)")
+            return 0
+        self._integrity()["option_orders_volume_sized"] += 1
+        logger.info(
+            "[backtest] option order sized %d -> %d (%s, option_size_within_fill_volume): %s's "
+            "decision-bar volume %s allows %d at %.0f%% participation.", quantity, allowed,
+            option_strategy, contract, volume, allowed, _OPTION_FILL_MAX_VOLUME_PARTICIPATION * 100)
+        return allowed
+
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
         """Stage the option order(s) so the per-bar fill engine fills them next bar.
 
@@ -4273,15 +5395,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 self._option_order_day[row.id] = placed_on
         return trading_order
 
-    def close_option_position(self, position, order_type="limit", limit_price=None):
+    def close_option_position(self, position, order_type="limit", limit_price=None,
+                              transaction_id=None):
         """Submit a closing order for a held option position (opposite intent).
 
         Builds a single-leg ``OptionLeg`` on the same contract with the opposite side
         (BUY long -> SELL_TO_CLOSE; SELL short -> BUY_TO_CLOSE) and routes it through the
         inherited ``submit_option_order`` so it is staged fillable like any other option order.
 
-        The close RIDES the OPEN position's transaction (we look up the OPENED option
-        transaction for the contract and pass its id), so the sell-to-close leg REDUCES the
+        The close RIDES the OPEN position's transaction -- the caller's ``transaction_id`` when
+        it still holds the position, else the shared open-holder lookup (see below) -- so the
+        sell-to-close leg REDUCES the
         original position to flat (net open qty -> 0) instead of spawning a separate OPENED
         transaction holding the opposite-side leg. This also lets round-trip P&L pair the
         open and close (they share one ``transaction_id``).
@@ -4303,16 +5427,104 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             expiry=position.expiry,
             underlying=position.underlying,
         )
-        txn = self._option_transaction_for_contract(position.contract_symbol)
-        txn_id = getattr(txn, "id", None) if txn is not None else None
+        # WHICH TRANSACTION THE CLOSE RIDES (Task 13, revised by review 2026-09-25 I2).
+        # An explicit id -- what the shared CloseOptionAction now passes: the transaction of the
+        # order it resolved -- wins, as on every live account, PROVIDED that transaction still
+        # holds the contract on this side; one that holds nothing would book a close that opens
+        # the opposite position on it, so that is an ERROR and the id is dropped. Without an id
+        # the SHARED lookup answers (open_option_transaction_id_for_contract: the lowest-id
+        # transaction still holding a net position) -- exact live parity. The earlier
+        # backtest-only requester heuristic (matching the position's quantity/price to a
+        # holder) is retired: with the id passed it had nothing left to decide, and where it
+        # guessed it could guess wrong (two holders of equal size and price).
+        if transaction_id is not None:
+            long_ = position.side == OrderDirection.BUY
+            held = {t.id: q for t, q in self._open_option_holdings(position.contract_symbol)}
+            q = held.get(transaction_id, 0.0)
+            if q == 0 or (q > 0) != long_:
+                logger.error(
+                    "[backtest] close of %s %s requested for transaction %s, which holds no %s "
+                    "position in it (net %+g); falling back to the shared open-holder lookup.",
+                    "long" if long_ else "short", position.contract_symbol, transaction_id,
+                    "long" if long_ else "short", q)
+                transaction_id = None
+        if transaction_id is None:
+            transaction_id = self.open_option_transaction_id_for_contract(position.contract_symbol)
         return self.submit_option_order(
             legs=[leg],
             quantity=int(position.quantity),
             order_type=order_type,
             limit_price=limit_price,
             option_strategy="close",
-            transaction_id=txn_id,
+            transaction_id=transaction_id,
         )
+
+    def _open_option_holdings(self, contract_symbol: str) -> List[tuple]:
+        """[(transaction, signed contracts held)] for every OPENED transaction holding
+        ``contract_symbol``, netted over its executed option rows on that contract, in the
+        order ``transactions_where`` returns them (the order the old single lookup used)."""
+        executed = OrderStatus.get_executed_statuses()
+        net: Dict[int, float] = {}
+        for o in self.get_orders():
+            if (o.contract_symbol != contract_symbol or o.transaction_id is None
+                    or getattr(o, "asset_class", None) != AssetClass.OPTION
+                    or o.status not in executed):
+                continue
+            # An EXECUTED row with no quantity is a defect, not a zero: refuse loudly.
+            q = must_measure(o.filled_qty if o.filled_qty is not None else o.quantity,
+                             f"executed quantity of option order {o.id}")
+            net[o.transaction_id] = net.get(o.transaction_id, 0.0) + (
+                q if o.side == OrderDirection.BUY else -q)
+        if not net:
+            return []
+        return [(t, net[t.id]) for t in transactions_where(status=TransactionStatus.OPENED)
+                if abs(net.get(t.id, 0.0)) > 1e-9]
+
+    def check_option_ledger(self, positions=None, *, context: str = "") -> List[Dict[str, Any]]:
+        """Compare the option LOT ledger with the transaction view (Task 13).
+
+        Every non-zero lot in ``_option_positions`` against ``get_option_positions()`` summed
+        per contract (signed). They must agree: the lot is what the equity mark, margin,
+        covered-call cover and liquidation read; the view is what expiry settles and what the
+        exits resolve. A mismatch is an orphan (a lot no transaction holds, or a transaction
+        holding what the ledger does not), so it is logged at ERROR -- once per (contract,
+        lot qty, view qty) -- and returned. It is NOT repaired here: a silent repair would
+        hide which route produced it.
+
+        ``positions``: the view already read by the caller (the expiry pass reads it anyway),
+        else it is read here."""
+        if self._options is None:
+            return []
+        if positions is None:
+            positions = self.get_option_positions()
+        view: Dict[str, float] = {}
+        for p in positions:
+            q = float(p.quantity) * (1.0 if p.side == OrderDirection.BUY else -1.0)
+            view[p.contract_symbol] = view.get(p.contract_symbol, 0.0) + q
+        lots = {cs: float(l.qty) for cs, l in self._option_positions.items() if l.qty != 0}
+        out = []
+        for cs in sorted(set(lots) | set(view)):
+            lq, vq = lots.get(cs, 0.0), view.get(cs, 0.0)
+            if abs(lq - vq) <= 1e-9:
+                continue
+            out.append({"contract": cs, "lot_qty": lq, "view_qty": vq})
+            key = ("ledger-check", cs, round(lq, 9), round(vq, 9))
+            if key in self._split_rekey_logged:
+                continue
+            self._split_rekey_logged.add(key)
+            lm = self._integrity()["option_ledger_mismatches"]
+            lm["count"] += 1
+            if len(lm["examples"]) < 3:
+                lm["examples"].append({"contract": cs, "lot_qty": lq, "view_qty": vq,
+                                       "date": self._as_of_date().isoformat(),
+                                       "context": context or "check"})
+            logger.error(
+                "[backtest] OPTION LEDGER MISMATCH (%s, %s): %s -- the lot ledger holds %+g "
+                "contract(s) but the OPENED transactions show %+g. The lot is marked, margined "
+                "and used as cover from the ledger, while expiry and exits act on the "
+                "transactions: one of them is an orphan. Not auto-repaired.",
+                context or "check", self._as_of_date(), cs, lq, vq)
+        return out
 
     def settle_option_expiry(
         self,
@@ -4365,6 +5577,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # 2. Remove THIS leg's option lot from the option ledger (its cash was settled at entry; the
         #    conversion below moves the share-leg cash). Worthless simply zeroes it out.
         lot = self._option_positions.get(position.contract_symbol)
+        # The share basis the contract was traded in, read BEFORE the lot is zeroed: an
+        # assignment delivers shares of THAT basis (Task 1a). None -> the bar's own factor.
+        lot_k = lot.basis_factor if self._lot_has_basis(lot) else None
         if lot is not None:
             self._zero_option_lot(lot)
 
@@ -4381,8 +5596,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # TRADED (100 x contracts at the contract's strike); this book is split-ADJUSTED.
             # Book ``shares x k`` at ``strike / k``: the cash above is unchanged (moved at the
             # as-traded numbers, exactly), and the lot marks against the adjusted closes like
-            # every other share in the book. k == 1 books the originals untouched.
-            k = self._as_traded_factor(position.underlying)
+            # every other share in the book. k == 1 books the originals untouched. ``k`` is the
+            # LOT's basis (Task 1a): a P400 written before a 4:1 split delivers 100 pre-split
+            # shares at 400 = 400 adjusted shares at 100, whatever today's factor is.
+            k = lot_k if lot_k is not None else self._as_traded_factor(position.underlying)
             book_qty, book_px = signed, float(share_price)
             if k != 1.0:
                 book_qty, book_px = signed * k, float(share_price) / k
@@ -4606,7 +5823,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # the expiry bar's premium close; intrinsic when the cache has no bar (near expiry
         # the premium converges to intrinsic). Cash is credited at the premium; NO share
         # position is created.
-        bar = self._options.get_bar(position.contract_symbol, self._as_of_date()) if self._options else None
+        # A bar in another share basis than the lot's is a different contract reusing the
+        # OCC string after a split (Task 1a): the lot settles at its own-basis intrinsic.
+        bar = self._option_bar(position.contract_symbol) if self._options else None
         if bar and bar.get("close") is not None:
             # The expiry bar's print can be junk (the arb guard's own documented class: a
             # $0.01 call against $50+ of intrinsic) and this credit is REALISED cash, not
@@ -5012,6 +6231,36 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         update_instance(trading_order)
         return trading_order
 
+    def reduce_transaction(self, transaction_id: int, quantity: float) -> dict:
+        """PARTIAL close in the simulator: one closing MARKET order for ``quantity``, linked to
+        the transaction and submitted as a closing order.
+
+        Overrides the live default (``TransactionHelper.adjust_quantity_with_tpsl``) for the
+        reason ``AccountInterface.reduce_transaction`` gives: live must cancel and re-arm the
+        broker's resting TP/SL legs around a partial close, the simulator has none. Its lean
+        brackets (``_apply_bracket_exits``) read the NET FILLED quantity every bar, so the
+        remainder stays protected at the transaction's TP/SL with no leg to resize, and the
+        pledged-cover lock in ``_apply_fill`` still guards the sale. The transaction stays
+        OPENED (FILLED is not terminal, and the position is not balanced)."""
+        transaction = get_instance(Transaction, transaction_id)
+        refusal = self._reduce_transaction_refusal(transaction, quantity)
+        if refusal:
+            logger.error("reduce_transaction(%s, %s): %s", transaction_id, quantity, refusal)
+            return {"success": False, "message": refusal, "close_order_ids": []}
+        close_side = (OrderDirection.SELL if transaction.side == OrderDirection.BUY
+                      else OrderDirection.BUY)
+        order = TradingOrder(
+            account_id=self.id, symbol=transaction.symbol, quantity=float(quantity),
+            side=close_side, order_type=OrderType.MARKET, transaction_id=transaction.id,
+            comment=f"Partial close of transaction {transaction.id}")
+        submitted = self.submit_order(order, is_closing_order=True)
+        if not submitted:
+            return {"success": False, "message": "partial close submission returned nothing",
+                    "close_order_ids": []}
+        return {"success": True,
+                "message": f"Partial close of {quantity:g} {transaction.symbol} submitted",
+                "close_order_ids": [getattr(submitted, "id", None)]}
+
     def cancel_order(self, order_id: str) -> Any:
         """Cancel a working order (reserved cash/position is notional-only in this sim)."""
         o = self.get_order(order_id)
@@ -5404,7 +6653,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Buying spends cash (signed>0 -> cash decreases); selling adds cash. Scaled x100.
         self._cash -= signed * fill_px * multiplier
         self._cash -= commission
-        self._update_option_position(order.contract_symbol, signed, fill_px, multiplier)
+        underlying = getattr(order, "underlying_symbol", None)
+        # The day the premium was read on is the day the lot's share basis is taken from
+        # (Task 1a). Without a split basis every factor is 1, so the clock's date is enough
+        # and no extra calendar read is made.
+        if self._split_basis is not None and underlying:
+            fill_day = self._option_fill_day(order, as_of)
+        else:
+            fill_day = None
+        if fill_day is None:
+            fill_day = as_of.date() if hasattr(as_of, "date") else as_of
+        self._update_option_position(order.contract_symbol, signed, fill_px, multiplier,
+                                     underlying=underlying, fill_day=fill_day)
+        if self._split_basis is not None and underlying and order.id is not None:
+            self._option_fill_basis[order.id] = self._as_traded_factor(underlying, fill_day)
         order.filled_qty = qty
         order.open_price = fill_px
         order.status = OrderStatus.FILLED
@@ -5413,13 +6675,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._fill_dates[order.id] = as_of
 
     def _update_option_position(
-        self, contract_symbol: str, signed_qty: float, fill_px: float, multiplier: float
+        self, contract_symbol: str, signed_qty: float, fill_px: float, multiplier: float,
+        *, underlying: Optional[str] = None, fill_day: Optional[date] = None,
     ) -> None:
         """Apply a signed option fill to the option ledger (weighted-avg premium on adds).
 
         Mirrors ``_update_position``'s averaging logic but on contracts: same-sign exposure
         updates the weighted-average premium; reducing/closing leaves the avg unchanged;
         flipping through zero re-bases the avg at the new fill premium.
+
+        A fill that OPENS the lot (from flat, or the remainder of a flip) records the share
+        basis it traded in: ``basis_factor = as_traded_factor(underlying, fill_day)`` (Task 1a,
+        see ``_OptionLot``). A fill on a lot already open must be in that same basis -- the
+        fill engine refuses a bar in another basis (``_option_bar``), so a mismatch here is a
+        mixed-basis lot no single strike/spot pair can value, and it is REFUSED loudly rather
+        than averaged into a number that means nothing.
         """
         lot = self._option_positions.get(contract_symbol)
         if lot is None:
@@ -5433,15 +6703,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Every option fill moves qty/avg_price, i.e. the mark — not only the NEW-lot case the
         # generation bump above covers (that one is about the contract->group MAPPING).
         self._touch_book()
+        old_qty = lot.qty
+        new_qty = old_qty + signed_qty
+        if underlying:
+            k_fill = self._as_traded_factor(underlying, fill_day)
+            opens = old_qty == 0 or (new_qty != 0 and (new_qty > 0) != (old_qty > 0))
+            if opens:
+                lot.underlying = underlying
+                lot.basis_factor = k_fill
+                lot.basis_date = fill_day
+            elif lot.basis_factor is not None and k_fill != lot.basis_factor:
+                raise OptionLotBasisMismatch(
+                    f"[backtest] option fill on {contract_symbol} ({signed_qty:+g} contracts on "
+                    f"{fill_day}) is in share basis x{k_fill:g}, but the lot it would change "
+                    f"({old_qty:+g} contracts) was opened on {lot.basis_date} in basis "
+                    f"x{lot.basis_factor:g}: a split lies between them. A lot cannot hold two "
+                    f"bases; the fill engine should have refused this bar (_crossed_held_lot).")
         # Task 3: seed/refresh last_iv at FILL time too, not only from a later equity-mark
         # bar lookup — a position that opens and then immediately hits a missing-bar day
         # (before any snapshot has run at the entry bar) must not lose the entry bar's iv
         # to a same-day ordering accident.
         if self._options is not None:
-            self._update_lot_last_iv(
-                lot, self._options.get_bar(contract_symbol, self._as_of_date()))
-        old_qty = lot.qty
-        new_qty = old_qty + signed_qty
+            self._update_lot_last_iv(lot, self._option_bar(contract_symbol))
         if old_qty == 0 or (old_qty > 0) == (signed_qty > 0):
             total_cost = lot.avg_price * abs(old_qty) + fill_px * abs(signed_qty)
             denom = abs(new_qty)

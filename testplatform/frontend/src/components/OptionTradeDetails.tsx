@@ -91,6 +91,13 @@ const OptionTradeDetails: React.FC<{
   // understates the total. It is counted instead, and the total says it is partial.
   const missingPnl = legs.filter(leg => leg.pnl == null).length;
   const openAtEnd = legs.some(leg => leg.positionStatus === 'open_at_end');
+  // The premiums per share (one per leg) and the underlying beside them: a card that gives
+  // only a date left the reader hunting through the leg table for what was actually paid
+  // and received -- and for why an exit BELOW the strike can still be a winner.
+  const premiums = (pick: (leg: typeof legs[number]) => number | null) =>
+    legs.map(leg => money(pick(leg))).join(' / ');
+  const spotAt = (pick: (leg: typeof legs[number]) => { price: number | null } | null | undefined) =>
+    money(legs.map(leg => pick(leg)?.price).find(price => price != null) ?? null);
 
   return (
     <div className="space-y-3">
@@ -108,12 +115,18 @@ const OptionTradeDetails: React.FC<{
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
         <Card label="Entry">
           <div>{entries[0] ? entries[0].slice(0, 16).replace('T', ' ') : '—'}</div>
+          <div className="text-xs font-normal text-gray-700 dark:text-gray-300">
+            premium {premiums(leg => leg.entryPrice)}/share · {underlying} {spotAt(leg => leg.entryUnderlying)}
+          </div>
           <div className="text-[11px] font-normal text-gray-500">
             {legs.length > 1 ? 'first entry · average premiums' : 'recorded entry'}
           </div>
         </Card>
         <Card label={openAtEnd ? 'Marked at run end' : 'Exit'}>
           <div>{openAtEnd ? 'still open' : exits[exits.length - 1]?.slice(0, 16).replace('T', ' ') || '—'}</div>
+          <div className="text-xs font-normal text-gray-700 dark:text-gray-300">
+            {openAtEnd ? 'mark' : 'premium'} {premiums(leg => leg.exitPrice)}/share · {underlying} {spotAt(leg => leg.exitUnderlying)}
+          </div>
           <div className="text-[11px] font-normal text-gray-500">
             {openAtEnd ? 'valuation, not a closing fill' : 'last exit'}
           </div>
@@ -177,7 +190,7 @@ const OptionTradeDetails: React.FC<{
       </div>
 
       <div className="overflow-x-auto">
-        <table className="w-full text-xs">
+        <table className="w-full text-xs [&_th]:px-2 [&_td]:px-2 [&_th]:whitespace-nowrap">
           <thead className="text-gray-500 dark:text-gray-400">
             <tr>
               <th className="text-left py-1">Leg</th>
@@ -229,7 +242,7 @@ const OptionTradeDetails: React.FC<{
             Contract detail — as the option cache recorded it
           </div>
           <div className="overflow-x-auto">
-            <table className="w-full text-xs">
+            <table className="w-full text-xs [&_th]:px-2 [&_td]:px-2 [&_th]:whitespace-nowrap">
               <thead className="text-gray-500 dark:text-gray-400">
                 <tr>
                   <th className="text-left py-1">Leg</th>

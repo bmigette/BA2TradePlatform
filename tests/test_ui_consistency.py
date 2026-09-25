@@ -218,3 +218,55 @@ def test_a_tooltip_separates_from_the_page(css):
     assert 'box-shadow' in rule
     match = re.search(r'border:\s*1px solid rgba\(255, 255, 255, ([0-9.]+)\)', rule)
     assert match and float(match.group(1)) >= 0.2, 'the edge must be visible'
+
+
+# ---- trades tables: one status palette, LONG reads as a long -------------------------------
+def test_every_trades_table_paints_a_status_the_same_colour():
+    """The option rows set no status colour (WAITING rendered in the default teal that OPENED
+    uses) and the transaction dialog painted WAITING blue while the table painted it orange."""
+    from ba2_trade_platform.core.types import TransactionStatus
+    from ba2_trade_platform.ui.components.LiveTradesTable import transaction_status_color
+
+    assert transaction_status_color(TransactionStatus.WAITING) == 'orange'
+    assert transaction_status_color('WAITING') == 'orange'          # the value works too
+    assert transaction_status_color(TransactionStatus.OPENED) == 'green'
+    assert transaction_status_color(TransactionStatus.FAILED) == 'red'
+    assert transaction_status_color('not-a-status') == 'grey'
+
+
+def test_a_long_option_structure_is_not_painted_as_a_sell():
+    """The direction badge was keyed on 'BUY' alone; option rows say LONG/SHORT."""
+    from ba2_trade_platform.ui.components.LiveTradesTable import LiveTradesTable
+
+    assert "['BUY', 'LONG'].includes(col.value) ? 'positive' : 'negative'" in LiveTradesTable.BODY_TEMPLATE
+
+
+# ---- TP / SL cells: "level (P/L if hit)" ----------------------------------------------------
+def test_a_bracket_cell_shows_the_level_and_the_pnl_if_it_is_hit():
+    from ba2_trade_platform.ui.components.LiveTradesTable import bracket_level_cell
+
+    # SBSW, 26 shares long from $10.36 (the 2026-09-24 screenshot).
+    assert bracket_level_cell(9.01, 10.36, 26, 'BUY') == '$9.01 ($-35.10)'
+    assert bracket_level_cell(10.76, 10.36, 26, 'BUY') == '$10.76 ($+10.40)'
+    # A short profits when the level is BELOW its entry.
+    assert bracket_level_cell(9.0, 10.0, 10, 'SELL') == '$9.00 ($+10.00)'
+    # Option premium levels: x contracts x multiplier.
+    assert bracket_level_cell(5.0, 2.95, 2, 'BUY', 100) == '$5.00 ($+410.00)'
+
+
+def test_a_bracket_cell_never_invents_a_pnl_from_a_missing_input():
+    from ba2_trade_platform.ui.components.LiveTradesTable import bracket_level_cell
+
+    assert bracket_level_cell(None, 10.0, 5, 'BUY') == ''
+    assert bracket_level_cell(9.01, None, 26, 'BUY') == '$9.01'
+    assert bracket_level_cell(9.01, 10.36, None, 'BUY') == '$9.01'
+    assert bracket_level_cell(5.0, 2.95, 2, 'BUY', None) == '$5.00'
+
+
+def test_sl_comes_before_tp_and_one_pnl_column_replaces_two():
+    from ba2_trade_platform.ui.components.LiveTradesTable import LiveTradesTable
+
+    for columns in (LiveTradesTable.TRANSACTION_COLUMNS, LiveTradesTable.OPTION_TRANSACTION_COLUMNS):
+        names = [column.name for column in columns]
+        assert names.index('stop_loss') < names.index('take_profit')
+        assert 'pnl' in names and 'current_pnl' not in names and 'closed_pnl' not in names

@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import bisect
 import random
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dtime, timezone
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
@@ -186,6 +186,14 @@ def _as_date(d: Any) -> date:
     if isinstance(d, str):
         return datetime.fromisoformat(d).date()
     raise TypeError(f"Cannot normalise {d!r} ({type(d)}) to a date")
+
+
+def _is_session_close(days: List[Any], i: int) -> bool:
+    """Is ``days[i]`` the LAST bar of its trading session (the next bar is another day, or
+    there is none)? Always True on a daily clock. Used for once-per-session charges (the short
+    borrow accrual). A US session never crosses midnight in ET or UTC, so the calendar day of
+    the bar key is the session."""
+    return i + 1 >= len(days) or _as_date(days[i + 1]) != _as_date(days[i])
 
 
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
@@ -611,6 +619,13 @@ class DailyBacktestEngine:
             self.price.set_clock(as_of_dt)
             self._bust_price_cache()
 
+            # 1c. (plan 2026-09-24 Task 1b) re-key option lots whose underlying split since they
+            #     opened onto the ADJUSTED contract -- what OCC and the broker do on the ex-date.
+            #     HERE, before any expert reads the book, so the ex-date's marks, quotes and exit
+            #     rules already see the adjusted contract. A no-op without a split crossing.
+            if hasattr(self.account, "apply_split_rekeys"):
+                self.account.apply_split_rekeys()
+
             # 1b. publish this bar's market regime ONCE, market-wide. Everything downstream
             #     (TradeRiskManagement sizing/stops, the TP/SL adjust actions) reads it from the
             #     regime_overlay seam instead of classifying per symbol. Cheap: a bisect into the
@@ -755,6 +770,17 @@ class DailyBacktestEngine:
             #     testable on its own.
             self._fills_and_settlements(as_of_dt)
 
+            # 4b-bis. borrow cost on open SHORT equity positions, once per trading session, on
+            #     the session's LAST bar (every bar on a daily clock), so the fee is charged on
+            #     the short held into the close at the mark the curve records. Before the option
+            #     breaker and the snapshot, so both measure the post-fee equity. The account owns
+            #     the rate and the maths (BacktestAccount.accrue_short_borrow); a long-only run
+            #     holds no short and this touches nothing.
+            if _is_session_close(days, i):
+                accrue = getattr(self.account, "accrue_short_borrow", None)
+                if accrue is not None:
+                    accrue(as_of_dt)
+
             # 4c. the option sleeve's drawdown circuit breaker, once per bar, for a
             #     ``classic_options`` expert and no other. Until 2026-09-01 the breaker
             #     TRANSITIONED only in the live tree (``option_lifecycle_service``, off
@@ -813,6 +839,11 @@ class DailyBacktestEngine:
         # worker across individuals -- clear it so the next trial cannot inherit this run's last
         # bar before its own first set_stressed.
         reset_stressed()
+        # Task 13: the same ledger check once more at run end (open_at_end rows are priced from
+        # the transactions, the final equity from the ledger).
+        if (hasattr(self.account, "check_option_ledger")
+                and getattr(self.account, "has_options_provider", False)):
+            self.account.check_option_ledger(context="run end")
         return self._build_minimal_results()
 
     def _has_activity(self) -> bool:
@@ -823,6 +854,15 @@ class DailyBacktestEngine:
             if self.account.get_positions():
                 return True
         except Exception:  # noqa: BLE001 — be conservative: unknown -> step densely
+            return True
+        # A HELD OPTION LOT is activity too. ``get_positions()`` is the equity ledger only, so an
+        # option-only book with no working order used to read as flat and the loop jumped from
+        # entry day to entry day: the manage pass never ran in between (exits late), the curve
+        # was sampled on entry days only, and expiry settled on the next VISITED bar at that
+        # bar's spot. Live manages open positions on its own daily cadence, so stepping every
+        # bar while a lot is open is the parity behaviour (findings 2026-09-24 §5.1 bug 3).
+        # An equity run never holds a lot, so its visited-bar sequence is unchanged.
+        if self.account.has_open_option_positions():
             return True
         try:
             from ba2_common.core.types import OrderStatus
@@ -1585,7 +1625,9 @@ class DailyBacktestEngine:
         the transaction-roll change signal (review 2026-08-30 F8).
 
         For each held option whose ``expiry <= as_of.date()`` the engine reads the
-        underlying's bar CLOSE; defined-risk combos unit-settle as a group, everything else
+        underlying's close OF THE EXPIRY DATE (``_expiry_close``), converted into the basis
+        the lot was traded in (``BacktestAccount.lot_basis_price``, Task 1a); defined-risk
+        combos unit-settle as a group, everything else
         settles per leg via ``BacktestAccount.settle_single_leg_expiry`` (the
         no-orphaned-stock backtest policy):
 
@@ -1606,6 +1648,11 @@ class DailyBacktestEngine:
         as_of_date = as_of.date() if isinstance(as_of, datetime) else as_of
         settled_any = False
         positions = self.account.get_option_positions()
+        # Task 13: the lot ledger must agree with this view BEFORE it is settled (the view is
+        # what expiry acts on, the ledger what the mark/margin/cover read). Loud on mismatch;
+        # never repaired here. Reuses the view just read -- no extra query.
+        if hasattr(self.account, "check_option_ledger"):
+            self.account.check_option_ledger(positions, context=f"expiry pass {as_of_date}")
 
         # DEFINED-RISK multi-leg combos (butterfly / verticals / iron condor) must settle as a
         # UNIT — leg-by-leg share assignment does NOT preserve the combo's bounded payoff and
@@ -1633,15 +1680,25 @@ class DailyBacktestEngine:
         # Unit-settle each defined-risk combo once.
         for legs in combo_groups.values():
             try:
-                spot = self.price.close_at(legs[0].underlying)
-                if spot is None:
+                dated = self._expiry_close(legs[0].underlying, legs[0].expiry, as_of_date)
+                if dated is None:
                     self._log(
                         f"option expiry: no underlying close for {legs[0].underlying} "
                         f"(combo {legs[0].contract_symbol}) @ {as_of_date} — skipped"
                     )
                     continue
-                # The strikes are AS TRADED; the close is split-adjusted (plan Part E2).
-                spot = self.account.option_basis_price(legs[0].underlying, spot)
+                # The strikes are AS TRADED; the close is split-adjusted (plan Part E2) -- and
+                # converted into the basis each leg was TRADED in (Task 1a), which for one
+                # combo must be a single basis: its legs fill together, all-or-none.
+                spots = {float(self.account.lot_basis_price(
+                    leg.contract_symbol, leg.underlying, dated[0], dated[1])) for leg in legs}
+                if len(spots) != 1:
+                    from ba2_common.core.split_basis import SplitBasisRefused
+                    raise SplitBasisRefused(
+                        f"defined-risk combo {[leg.contract_symbol for leg in legs]} on "
+                        f"{legs[0].underlying} holds legs in different share bases (expiry "
+                        f"spots {sorted(spots)}): one net payoff cannot be stated for it")
+                spot = spots.pop()
                 if self.account.settle_defined_risk_combo_expiry(legs, float(spot)):
                     settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
@@ -1650,8 +1707,8 @@ class DailyBacktestEngine:
 
         for pos in per_leg:
             try:
-                spot = self.price.close_at(pos.underlying)
-                if spot is None:
+                dated = self._expiry_close(pos.underlying, pos.expiry, as_of_date)
+                if dated is None:
                     self._log(
                         f"option expiry: no underlying close for {pos.underlying} "
                         f"({pos.contract_symbol}) @ {as_of_date} — skipped"
@@ -1660,8 +1717,10 @@ class DailyBacktestEngine:
                 # The account applies the no-orphaned-stock backtest policy (long ITM ->
                 # sell-to-close, never exercise / short ITM -> physical assignment with the
                 # stock liquidated at the next bar's open) — see
-                # BacktestAccount.settle_single_leg_expiry.
-                spot = self.account.option_basis_price(pos.underlying, spot)  # as traded
+                # BacktestAccount.settle_single_leg_expiry. The spot is AS TRADED in the
+                # basis the lot was traded in (Task 1a), not the settlement bar's.
+                spot = self.account.lot_basis_price(
+                    pos.contract_symbol, pos.underlying, dated[0], dated[1])
                 if self.account.settle_single_leg_expiry(pos, float(spot)):
                     settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
@@ -1670,6 +1729,22 @@ class DailyBacktestEngine:
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
                 )
         return settled_any
+
+    def _expiry_close(self, underlying: str, expiry, as_of_date):
+        """``(adjusted close, its date)`` the expiry of ``expiry`` settles against, or None.
+
+        The EXPIRY DATE's close (Task 1a), not the settlement bar's: the engine can reach an
+        expiry on a later bar (an expiry on a day the underlying has no bar), and the payoff
+        is fixed by the market at expiry. On the expiry bar itself this is the bar's own close
+        -- the read this pass always made -- forward-filled when the underlying has no bar on
+        it; for an expiry already past, the last close ON OR BEFORE the expiry date. Never a
+        close after the clock: on an intraday clock the expiry day's later bars are future."""
+        if expiry is None or expiry >= as_of_date:
+            close = self.price.close_at(underlying)
+            if close is not None:
+                return close, as_of_date
+            return self.price.close_asof_dated(underlying)
+        return self.price.close_asof_dated(underlying, datetime.combine(expiry, dtime.max))
 
     def _update_option_breakers(self) -> None:
         """Transition every ``classic_options`` sleeve's drawdown breaker for this bar.

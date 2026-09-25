@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import math
 import os
+from bisect import bisect_right
 from collections import OrderedDict
 from datetime import date, datetime
+from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
 # Import the metric-coercion helpers from the lightweight ``metrics_utils`` module, NOT from
@@ -209,7 +211,9 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
 
     final = equity_curve[-1]["equity"] if equity_curve else initial
 
-    refine_drawdown_fn = _build_refine_drawdown_fn(account, config)
+    # The cap goes in explicitly: on a capped run ``drawdown_curve`` is cap-denominated, and the
+    # refinement's dips must be measured on that same denominator (see refine_max_drawdown).
+    refine_drawdown_fn = _build_refine_drawdown_fn(account, config, equity_cap=_cap)
     metrics = _compute_metrics(
         equity_curve, drawdown_curve, trades, initial, final, config, refine_drawdown_fn,
     )
@@ -222,6 +226,11 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     # of scoring it on the (already-clamped-at-0) numbers a real-money account could never
     # actually produce.
     metrics["account_wiped_out"] = bool(getattr(account, "_wiped_out", False))
+    # SHORT BORROW COST (plan 2026-09-24 S4): the annual rate the run charged on open short
+    # equity positions, and the total it charged (currency), on its own line so it reads
+    # separately from spread. Already inside final_equity and the curve (it is debited from
+    # cash each session); this is the attribution, not a second deduction.
+    metrics.update(_short_borrow_echo(account, config))
     # Positions still OPEN at the end of the run. total_trades counts CLOSED round-trips, so a
     # buy-and-hold (no exit rule) shows 0 trades while equity still moves (entry commission +
     # the held position's mark-to-market). Surfacing these explains "0 trades but P&L changed".
@@ -235,10 +244,47 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
         # The E4 split-basis guard's counters (plan Part E4): None when the run's reader has
         # no guard (the sqlite store, or a guard-less fixture reader). Recorded, not scored.
         metrics["option_basis_guard"] = account.option_basis_guard_stats()
+        # How many entries exist only because the 1-contract sizing floor turned a 0-contract
+        # budget into 1 (``min_one_contract``, plan 2026-09-24 Task 8): a genome whose result
+        # rests on floored tickets is a different bet from one sized by its own budget, and
+        # without this count the two look the same. Additive; recorded, not scored.
+        metrics["option_min_one_contract_floored_entries"] = (
+            account.option_min_one_contract_floored_entries())
+        # Option-integrity counters (plan 2026-09-24 Tasks 1b / 11 / 13): ledger mismatches,
+        # volume-sized / refused orders, split re-keys and re-key refusals. A GA trial child
+        # runs with logging disabled, so these keys are how those events stay visible. Options
+        # runs only (additive keys; equity results unchanged). Recorded, not scored.
+        stats = getattr(account, "option_integrity_stats", None)
+        if callable(stats):
+            metrics.update(stats())
     return metrics
 
 
-def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[Any]:
+def _short_borrow_echo(account: Any, config: Dict[str, Any]) -> Dict[str, float]:
+    """``short_borrow_rate_pa`` + ``short_borrow_cost`` for the results.
+
+    Read off the ACCOUNT, which is what actually charged. A lightweight stub account (tests)
+    has neither attribute as a number: its rate is resolved from the config's
+    ``account_settings`` exactly as the account would, and it cannot have charged anything.
+    """
+    from app.services.backtest.backtest_account import resolve_short_borrow_rate_pa
+
+    def _number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    rate = getattr(account, "short_borrow_rate_pa", None)
+    if not _number(rate):
+        rate = resolve_short_borrow_rate_pa(config.get("account_settings"))
+    cost = getattr(account, "short_borrow_cost", None)
+    return {
+        "short_borrow_rate_pa": float(rate),
+        "short_borrow_cost": round(_finite(cost if _number(cost) else 0.0,
+                                           "short_borrow_cost"), 2),
+    }
+
+
+def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
+                              equity_cap: Optional[float] = None) -> Optional[Any]:
     """Build the ``refine_drawdown_fn(trades, max_drawdown) -> max_drawdown`` closure that
     ``_compute_metrics`` calls, wiring ``intraday_drawdown.refine_max_drawdown``'s
     dependency-injected callables to REAL data sources: the account's own daily price source
@@ -260,6 +306,9 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     on which store served the options, for a reason nothing in the result could show. Both
     readers now implement ``delta_at_entry(underlying, occ_symbol, when)``; a reader that does
     not is a WARNING, because silence is the actual defect.
+
+    ``equity_cap`` is the run's validated cap (None: no cap). It becomes the refinement's
+    ``drawdown_base`` so a capped run's dips are measured on the cap, like its daily curve.
     """
     price = getattr(account, "_price", None)
     options = getattr(account, "_options", None)
@@ -314,20 +363,38 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     # entry close and every 5-minute bar must be in the as-traded basis too, or on a split
     # symbol the move is 1/k of the real one (NFLX 2024: 10x too small). Converted through the
     # account's own ``option_basis_price`` -- the run's split basis, the identity without one
-    # -- each price with the factor of ITS OWN date. The FMP 5-minute cache is back-adjusted
+    # -- in the basis the trade's ENTRY traded in (its strike and delta are in it): the row's
+    # recorded ``option_basis_factor`` when present, else the entry date's factor. ONE factor
+    # per trade, for the entry close and every 5-minute bar alike (Task 1a: per-bar factors
+    # read a trade held across a split as a fake k-fold move). The FMP 5-minute cache is back-adjusted
     # like the daily one (measured: NFLX 5m close 2024-05-01 55.155 vs daily 55.17; NVDA 5m
     # 2024-06-06 120.94, adjusted for the 2024-06-10 split).
     from app.services.backtest.backtest_account import BacktestAccount
     to_option_basis = account.option_basis_price if isinstance(account, BacktestAccount) else None
 
-    def _as_traded(symbol: str, px: Any, dt: Any) -> Optional[float]:
-        if px is None or to_option_basis is None:
+    #: (underlying, parsed entry_time) -> the entry basis recorded on the trade row; filled
+    #: by ``_refine`` before the refinement runs. Every call the refinement makes for a trade
+    #: passes that trade's own (underlying, entry_time), so this is the per-trade key.
+    recorded_basis: Dict[Any, float] = {}
+
+    def _entry_factor(symbol: str, entry: Any) -> Optional[float]:
+        """The trade's ONE factor (None: no basis at all -> prices pass through)."""
+        if to_option_basis is None:
+            return None
+        k = recorded_basis.get((symbol, entry))
+        if k is not None:
+            return k
+        day = entry.date() if hasattr(entry, "date") else entry
+        return account._as_traded_factor(symbol, day)
+
+    def _in_basis(px: Any, k: Optional[float]) -> Optional[float]:
+        # Same arithmetic as ``option_basis_price``: a factor of 1 returns the very value.
+        if px is None or k is None or k == 1.0:
             return px
-        day = dt.date() if hasattr(dt, "date") else dt
-        return to_option_basis(symbol, px, day)
+        return float(px) * k
 
     def _underlying_price_at(symbol: str, dt: Any) -> Optional[float]:
-        return _as_traded(symbol, price.close_at(symbol, dt), dt)
+        return _in_basis(price.close_at(symbol, dt), _entry_factor(symbol, dt))
 
     def _delta_at_entry(underlying: str, contract: str, dt: Any) -> Optional[float]:
         # The seam, whichever reader is behind it. Each backend answers it over its OWN
@@ -349,8 +416,12 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
         window = df[(df["Date"] >= entry) & (df["Date"] <= exit_)]
         if window.empty:
             return []
-        return [{"Low": _as_traded(symbol, row["Low"], row["Date"]),
-                 "High": _as_traded(symbol, row["High"], row["Date"])}
+        # Every bar in the basis the trade's ENTRY traded in (Task 1a), not its own date's: the
+        # contract's strike and delta stay in that basis, so on a trade held across a split
+        # the post-split bars would otherwise read as a fake k-fold move. Without a split
+        # inside the trade the two factors are the same number.
+        k = _entry_factor(symbol, entry)
+        return [{"Low": _in_basis(row["Low"], k), "High": _in_basis(row["High"], k)}
                 for _, row in window.iterrows()]
 
     def _refine(trades: List[Dict[str, Any]], max_drawdown: float) -> float:
@@ -363,10 +434,36 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
             {**t, "entry_time": _parse_date(t.get("entry_time")), "exit_time": _parse_date(t.get("exit_time"))}
             for t in trades
         ]
+        recorded_basis.clear()
+        for t in parsed_trades:
+            if t.get("option_basis_factor") is not None and t.get("underlying_symbol"):
+                recorded_basis[(t["underlying_symbol"], t["entry_time"])] = float(
+                    t["option_basis_factor"])
+
+        # THE PEAK COMES FROM THE SAME CURVE AS THE EQUITY. A trade's dip is measured from the
+        # running peak at its entry, so the peak must be read from the recorded snapshots that
+        # ``_equity_at`` bisects, with its at/just-before lookup (a pre-curve entry reads the
+        # first point) -- otherwise equity and peak would describe two different moments.
+        # A stub without a balance history answers None, and the refinement skips the trade.
+        history = getattr(account, "get_balance_history", None)
+        snaps = history() if callable(history) else []
+        snap_dates = [s["date"] for s in snaps]
+        running_peaks = list(accumulate(
+            (float(s["net_liquidating_value"]) for s in snaps), max))
+
+        def _peak_at(dt: Any) -> Optional[float]:
+            if not running_peaks:
+                return None
+            if dt is None:
+                return running_peaks[0]
+            return running_peaks[max(bisect_right(snap_dates, dt) - 1, 0)]
+
         return refine_max_drawdown(
             parsed_trades,
             max_drawdown,
             equity_at=lambda dt: getattr(account, "_equity_at", lambda _dt: None)(dt),
+            peak_at=_peak_at,
+            drawdown_base=equity_cap,
             daily_bar_low=_daily_bar_low,
             prior_daily_bar_low=_prior_daily_bar_low,
             delta_at_entry=_delta_at_entry,
@@ -498,6 +595,21 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
                 row[key] = trade[key]
         row["entry_record"] = trade["entry_record"]
         row["exit_record"] = trade["exit_record"]
+    # The share basis the option ENTRY traded in (Task 1a): set by the recorder only on option
+    # rows of a run with a split basis, so every other row keeps exactly the keys above.
+    if "option_basis_factor" in trade:
+        row["option_basis_factor"] = _finite(trade["option_basis_factor"],
+                                             "trade.option_basis_factor")
+    # A lot re-keyed onto the adjusted contract at a split (Task 1b): the row is stated in the
+    # ORIGINAL contract's units and this note carries the adjusted contract and the as-traded
+    # exit. Only on such rows, so every other row keeps exactly the keys above.
+    if "split_rekey" in trade:
+        rk = trade["split_rekey"]
+        row["split_rekey"] = {
+            **{k: rk[k] for k in ("date", "ratio", "from_contract", "to_contract")},
+            **{k: _finite(rk[k], f"trade.split_rekey.{k}")
+               for k in ("from_strike", "to_strike", "entry_price", "exit_price", "size")},
+        }
     return row
 
 
@@ -620,6 +732,11 @@ def _compute_metrics(
     # --- drawdown ----------------------------------------------------------
     dd_values = [pt["drawdown"] for pt in drawdown_curve]  # <= 0
     max_drawdown = min(dd_values) if dd_values else 0.0  # most negative
+    #: What the intraday refinement did to max_drawdown (published ONLY for runs that have a
+    #: refinement, i.e. option runs): "none" (no curve to refine --
+    #: the curve was empty), "applied" (it ran; the figure may or may not have moved) or
+    #: "failed:<ExcType>" (it raised; the daily figure stands). Recorded next to the figure.
+    refinement_status = "none"
     if refine_drawdown_fn is not None and dd_values:
         # Best-effort: a daily-bar equity curve can hide a real intraday dip for a
         # single-bar-held option trade, or one whose exit day made a new low vs. the day
@@ -629,8 +746,14 @@ def _compute_metrics(
         # (a quick option trade whose entry/exit bars never register a dip on the daily curve).
         try:
             max_drawdown = refine_drawdown_fn(trades, max_drawdown)
+            refinement_status = "applied"
         except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
-            logger.debug(f"intraday drawdown refinement failed, using daily-only figure: {e}")
+            # Kept running on the daily figure, but LOUDLY and on the record: a refinement that
+            # failed reports a max_drawdown that is a different quantity from one that ran, and
+            # every metric divided by it (calmar, the option CAR family) inherits that.
+            logger.warning(f"intraday drawdown refinement FAILED, max_drawdown stays at the "
+                           f"daily-only figure: {type(e).__name__}: {e}", exc_info=True)
+            refinement_status = f"failed:{type(e).__name__}"
     # BOTH FIGURES SURVIVE. The refined value replaced the daily one in place, so a stored
     # result could not say whether its max_drawdown was measured from the equity curve or
     # estimated from a first-order delta re-pricing -- two different quantities under one
@@ -869,6 +992,11 @@ def _compute_metrics(
         # equity-only run and on any run where the refinement found nothing; strictly less
         # negative when it did. Kept so a stored result can say which quantity it reports.
         "max_drawdown_daily": round(_finite(max_drawdown_daily, "max_drawdown_daily"), 2),
+        # Only where a refinement exists (option runs): an equity result must keep exactly its
+        # old key set, so a stored stock backtest re-runs byte-identical (user acceptance gate,
+        # 2026-09-25 -- the key used to be written as "none" on every equity run).
+        **({"max_drawdown_refinement": refinement_status}
+           if refine_drawdown_fn is not None else {}),
         "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
         "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),
         # Trade quality metrics
