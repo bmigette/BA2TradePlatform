@@ -59,6 +59,10 @@ Measured 2026-09-25:
   - Build on the LOCAL box and sync to remote227 (user, 2026-09-23: fetch/build locally, sync).
   - Record both new digests here.
   - The 97-name digests `ca4d65d4…` / `2b6e8ca8…` stay for stage 1.
+  - **DONE 2026-09-26: built and verified for the 753-name stage-2 universe**, and both synced to
+    remote227. The universe is 820 names minus 67 recorded exclusions (user decision).
+    - `ohlcv-v1`: `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd`
+    - `ta-structure-v1`: `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e`
 
 ## 3. What has to be built (from spec §7 / §7.1, still open)
 
