@@ -704,8 +704,9 @@ def _compute_metrics(
     # --- drawdown ----------------------------------------------------------
     dd_values = [pt["drawdown"] for pt in drawdown_curve]  # <= 0
     max_drawdown = min(dd_values) if dd_values else 0.0  # most negative
-    #: What the intraday refinement did to max_drawdown: "none" (no refinement for this run --
-    #: equity-only, or no curve), "applied" (it ran; the figure may or may not have moved) or
+    #: What the intraday refinement did to max_drawdown (published ONLY for runs that have a
+    #: refinement, i.e. option runs): "none" (no curve to refine --
+    #: the curve was empty), "applied" (it ran; the figure may or may not have moved) or
     #: "failed:<ExcType>" (it raised; the daily figure stands). Recorded next to the figure.
     refinement_status = "none"
     if refine_drawdown_fn is not None and dd_values:
@@ -963,7 +964,11 @@ def _compute_metrics(
         # equity-only run and on any run where the refinement found nothing; strictly less
         # negative when it did. Kept so a stored result can say which quantity it reports.
         "max_drawdown_daily": round(_finite(max_drawdown_daily, "max_drawdown_daily"), 2),
-        "max_drawdown_refinement": refinement_status,
+        # Only where a refinement exists (option runs): an equity result must keep exactly its
+        # old key set, so a stored stock backtest re-runs byte-identical (user acceptance gate,
+        # 2026-09-25 -- the key used to be written as "none" on every equity run).
+        **({"max_drawdown_refinement": refinement_status}
+           if refine_drawdown_fn is not None else {}),
         "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
         "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),
         # Trade quality metrics

@@ -741,10 +741,12 @@ def test_build_results_passes_the_equity_cap_to_the_refinement(monkeypatch, cap)
     assert seen == {"equity_cap": cap}
 
 
-def test_refinement_status_is_none_without_a_refinement():
+def test_an_equity_run_carries_no_refinement_status_key():
+    """No refinement (equity-only run) -> the key is ABSENT, so a stored stock backtest re-runs
+    with exactly its old key set (user acceptance gate 2026-09-25: byte-identical re-runs)."""
     from app.services.backtest.results import build_results
 
-    assert build_results(_CurveAccount(_CURVE), _cfg(None))["max_drawdown_refinement"] == "none"
+    assert "max_drawdown_refinement" not in build_results(_CurveAccount(_CURVE), _cfg(None))
 
 
 def test_refinement_status_is_applied_when_it_ran(monkeypatch):
