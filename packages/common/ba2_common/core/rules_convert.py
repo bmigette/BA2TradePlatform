@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from ba2_common.core.rule_order import rules_in_precedence
+from ba2_common.logger import logger
 from ba2_common.core.market_condition_rules import (
     assert_market_conditions_resolved,
     assert_market_rule_actions,
@@ -264,26 +266,36 @@ def live_export_to_strategy(payload: dict) -> dict:
       * ``open_positions`` -> exit rules via ``eventaction_to_exit_rule`` (None -> skipped).
 
     Returns ``{"buy_entry_conditions": tree|None, "sell_entry_conditions": tree|None,
-    "exit_conditions": [rule, ...], "summary": {...}}``. Pure/total: never raises on an unknown
+    "exit_conditions": [rule, ...], "summary": {...}}``. Never raises on an unknown
     event_type/action (it is skipped) so a partial/edited file still imports.
+
+    RULE ORDER is each ruleset's precedence as ``rule_order.rules_in_precedence`` reads it --
+    the SAME reading the live importer (``RulesImporter``) writes its links from, so a file whose
+    ``order_index`` disagrees with its list order runs the same precedence in the backtest as
+    live. A fallback reading (no / tied / partial ``order_index``) is logged and listed in
+    ``summary["order_warnings"]``; an unreadable ``order_index`` (bool, string, float) RAISES
+    ``ValueError`` -- a precedence that has to be guessed is refused on both sides.
     """
     buy_groups: List[dict] = []
     sell_groups: List[dict] = []
     exit_rules: List[dict] = []
+    order_warnings: List[str] = []
     n_rulesets = n_rules = buy_n = sell_n = skipped = ignored_brackets = 0
 
     for rs in _iter_export_rulesets(payload or {}):
         n_rulesets += 1
         rs_sub = rs.get("subtype")
-        for ridx, rule in enumerate(rs.get("rules") or []):
-            if not isinstance(rule, dict):
-                continue
+        ordered, order_warning = rules_in_precedence(rs.get("rules") or [],
+                                                     rs.get("name") or rs_sub)
+        if order_warning:
+            logger.warning(order_warning)
+            order_warnings.append(order_warning)
+        for ea_id, rule in ordered:
             n_rules += 1
             subtype = rule.get("subtype") or rs_sub
             triggers = rule.get("triggers") or {}
             actions = rule.get("actions") or {}
-            name = rule.get("name") or f"rule-{ridx}"
-            ea_id = rule.get("order_index", ridx)
+            name = rule.get("name") or f"rule-{ea_id}"
 
             if subtype:
                 is_exit = subtype == AnalysisUseCase.OPEN_POSITIONS.value
@@ -332,6 +344,7 @@ def live_export_to_strategy(payload: dict) -> dict:
             "exit_rules": len(exit_rules),
             "skipped_rules": skipped,
             "ignored_initial_brackets": ignored_brackets,
+            "order_warnings": order_warnings,
         },
     }
 
@@ -377,25 +390,32 @@ def live_export_to_trade_rules(payload: dict) -> dict:
     stop_processing guards, multi-action exits), rule order follows ``order_index`` when
     present, and numeric leaves / adjust values get default optimize ranges. Routing by
     effective subtype matches ``live_export_to_strategy``.
+
+    Rule order is ``rule_order.rules_in_precedence`` -- the reading the live importer writes its
+    links from (see ``live_export_to_strategy``): same fallbacks, same refusals, warnings in
+    ``summary["order_warnings"]``.
     """
     from ba2_common.core.rule_models import normalize_trade_rules
 
     entry_rules: List[dict] = []
     exit_rules: List[dict] = []
+    order_warnings: List[str] = []
     n_rulesets = n_rules = skipped = 0
 
     for rs in _iter_export_rulesets(payload or {}):
         n_rulesets += 1
         rs_sub = rs.get("subtype")
-        rules = [r for r in (rs.get("rules") or []) if isinstance(r, dict)]
-        rules.sort(key=lambda r: (r.get("order_index") is None, r.get("order_index", 0)))
-        for ridx, rule in enumerate(rules):
+        ordered, order_warning = rules_in_precedence(rs.get("rules") or [],
+                                                     rs.get("name") or rs_sub)
+        if order_warning:
+            logger.warning(order_warning)
+            order_warnings.append(order_warning)
+        for ea_id, rule in ordered:
             n_rules += 1
             subtype = rule.get("subtype") or rs_sub
             triggers = rule.get("triggers") or {}
             actions = rule.get("actions") or {}
-            name = rule.get("name") or f"rule-{ridx}"
-            ea_id = rule.get("order_index", ridx)
+            name = rule.get("name") or f"rule-{ea_id}"
 
             action_list = []
             for cfg in actions.values():
@@ -436,6 +456,7 @@ def live_export_to_trade_rules(payload: dict) -> dict:
             "entry_rules": len(entry_rules),
             "exit_rules": len(exit_rules),
             "skipped_rules": skipped,
+            "order_warnings": order_warnings,
         },
     }
 

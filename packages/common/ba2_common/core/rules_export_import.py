@@ -12,6 +12,7 @@ from sqlmodel import select, Session
 
 from ba2_common.core.market_condition_rules import assert_market_rule_actions_live
 from ba2_common.core.models import Ruleset, EventAction, RulesetEventActionLink
+from ba2_common.core.rule_order import resolve_order_indices
 from ba2_common.core.db import get_db, get_all_instances, add_instance, get_instance
 from ba2_common.logger import logger
 
@@ -377,6 +378,35 @@ def _assert_market_gates_served_by_linked_experts(ruleset_info: Dict[str, Any], 
             session=session)
 
 
+def _order_indices_or_refuse(ruleset_info: Dict[str, Any], warnings: List[str]) -> List[int]:
+    """The ``order_index`` each imported rule's LINK gets, aligned with ``ruleset_info['rules']``.
+
+    ``order_index`` IS rule precedence (first match wins). The importers used to write
+    ``rule_data.get('order_index', 0)``, so a file without it landed every rule at 0 and
+    precedence became whatever SQLite returned for the tie. The reading is
+    ``rule_order.resolve_order_indices`` -- the SAME one the backtest converters use, so a file
+    runs one precedence in both. A fallback reading (no/tied/partial indices) is logged and added
+    to ``warnings``; an unreadable one raises ``ValueError``. Call it before anything is written.
+    """
+    orders, warning = resolve_order_indices(ruleset_info["rules"], ruleset_info.get("name"))
+    if warning:
+        logger.warning(warning)
+        warnings.append(warning)
+    return orders
+
+
+def _all_order_indices_or_refuse(rulesets: List[Dict[str, Any]]) -> List[Tuple[List[int], List[str]]]:
+    """``_order_indices_or_refuse`` for EVERY ruleset of a multi-ruleset payload, up front.
+
+    So one bad index anywhere refuses the whole payload before the first ruleset is created or
+    -- for the reuse-by-name importer -- has its links replaced."""
+    out: List[Tuple[List[int], List[str]]] = []
+    for ruleset_info in rulesets:
+        order_warnings: List[str] = []
+        out.append((_order_indices_or_refuse(ruleset_info, order_warnings), order_warnings))
+    return out
+
+
 def _rule_content_key(type_, subtype, triggers, actions, extra_parameters, continue_processing) -> str:
     """Canonical, comparable signature of a rule's CONTENT (everything but its name/id).
 
@@ -421,6 +451,8 @@ class RulesImporter:
 
                 # BEFORE anything is created: a market gate may not ride an exit ruleset.
                 _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
+                # ...nor a rule order that cannot be read (refused before any write).
+                orders = _order_indices_or_refuse(ruleset_info, warnings)
                 
                 # Preserve original name, but handle duplicates
                 base_name = ruleset_info['name']
@@ -456,7 +488,7 @@ class RulesImporter:
                 processed_rule_ids = set()
 
                 # Import rules and create links
-                for rule_data in ruleset_info["rules"]:
+                for rule_data, order_index in zip(ruleset_info["rules"], orders):
                     rule_id, rule_warnings = RulesImporter._import_rule_to_session(
                         session, rule_data, ""  # Don't add suffix to individual rules
                     )
@@ -470,7 +502,7 @@ class RulesImporter:
                     link = RulesetEventActionLink(
                         ruleset_id=ruleset.id,
                         eventaction_id=rule_id,
-                        order_index=rule_data.get('order_index', 0)
+                        order_index=order_index
                     )
                     session.add(link)
 
@@ -504,11 +536,14 @@ class RulesImporter:
         processed_rule_names = {}  # Map rule names to IDs to avoid duplicates across rulesets
 
         try:
+            # Every ruleset's rule order, BEFORE the first one is created.
+            resolved = _all_order_indices_or_refuse(rulesets_data["rulesets"])
             with get_db() as session:
-                for ruleset_data in rulesets_data["rulesets"]:
+                for ruleset_data, (orders, order_warnings) in zip(rulesets_data["rulesets"],
+                                                                  resolved):
                     ruleset_info = ruleset_data
                     _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
-                    warnings = []
+                    warnings = list(order_warnings)
                     
                     # Preserve original name, but handle duplicates
                     base_name = ruleset_info['name']
@@ -542,7 +577,7 @@ class RulesImporter:
                     ruleset_ids.append(ruleset.id)
 
                     # Import rules and create links, reusing rules across rulesets
-                    for rule_data in ruleset_info["rules"]:
+                    for rule_data, order_index in zip(ruleset_info["rules"], orders):
                         rule_name = f"{rule_data['name']}{name_suffix}"
                         
                         # Check if we already processed this rule in current import batch
@@ -560,7 +595,7 @@ class RulesImporter:
                         link = RulesetEventActionLink(
                             ruleset_id=ruleset.id,
                             eventaction_id=rule_id,
-                            order_index=rule_data.get('order_index', 0)
+                            order_index=order_index
                         )
                         session.add(link)
                     
@@ -600,13 +635,16 @@ class RulesImporter:
         processed_rule_names: Dict[str, int] = {}
 
         try:
+            # Every ruleset's rule order, BEFORE the first one has its links replaced.
+            resolved = _all_order_indices_or_refuse(rulesets_data["rulesets"])
             with get_db() as session:
-                for ruleset_info in rulesets_data["rulesets"]:
+                for ruleset_info, (orders, order_warnings) in zip(rulesets_data["rulesets"],
+                                                                  resolved):
                     # Before the existing ruleset's links are dropped below: refusing after that
                     # would leave a live exit ruleset with NO rules, which is the same silence
                     # from the other side.
                     _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
-                    warnings: List[str] = []
+                    warnings: List[str] = list(order_warnings)
                     name = ruleset_info["name"]
 
                     ruleset = session.exec(select(Ruleset).where(Ruleset.name == name)).first()
@@ -647,7 +685,7 @@ class RulesImporter:
 
                     ruleset_ids.append(ruleset.id)
 
-                    for rule_data in ruleset_info["rules"]:
+                    for rule_data, order_index in zip(ruleset_info["rules"], orders):
                         rule_name = f"{rule_data['name']}{name_suffix}"
                         if rule_name in processed_rule_names:
                             rule_id = processed_rule_names[rule_name]
@@ -661,7 +699,7 @@ class RulesImporter:
                         session.add(RulesetEventActionLink(
                             ruleset_id=ruleset.id,
                             eventaction_id=rule_id,
-                            order_index=rule_data.get("order_index", 0),
+                            order_index=order_index,
                         ))
 
                     all_warnings.extend(warnings)

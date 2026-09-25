@@ -2741,6 +2741,40 @@ _OPTION_STRATS = {
 #: fitness/universe/matrix script -- see _CONVEX_OPTION_STRATEGIES.
 _GRID2_OPTION_STRATEGIES = {"O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"}
 
+
+def _lattice_anchor_for(kind: str, override: "str | None") -> str:
+    """The GA step-lattice anchor a job for strategy ``kind`` is launched with.
+
+    ``--lattice-anchor`` wins when given. Otherwise GRID 2 (the LEAPS grid) is ``"min"`` and every
+    other key is ``"zero"``, the legacy lattice (``genetic.LATTICE_ANCHORS``):
+
+    * GRID 2 NEEDS it. Its DTE genes are the ones whose ``min`` is not a multiple of the step:
+      O_LEAPC/O_LEAPP/O_PMCC 410..500 step 15 decoded 410 to 405 on the zero lattice -- an entry
+      window starting at 360, under design §2's 365 floor -- and O_ERN 14..23 step 3 decoded 23 to
+      24, a dte_max of 31 against the designed 7-30 band. On the min lattice they decode to the
+      levels their row comments state.
+    * EVERYTHING ELSE KEEPS zero, because it was measured to matter (2026-09-25): the stage-1
+      discovery grid (``cond:xlk:value`` 3..20 step 2) and the equity S1-S7 grids carry genes that
+      decode differently under ``"min"``, and they have running checkpoints and persisted TOP-N
+      rows produced on the zero lattice.
+
+    A new grid that wants the corrected lattice (e.g. option stage 2) passes ``--lattice-anchor
+    min``; the handler folds a non-zero anchor into the checkpoint fingerprint, so it can never
+    resume a zero-anchored checkpoint.
+    """
+    if override is not None:
+        return override
+    return "min" if kind in _GRID2_OPTION_STRATEGIES else "zero"
+
+
+def _apply_lattice_anchor(cfg: dict, kind: str, override: "str | None") -> dict:
+    """Write ``latticeAnchor`` onto a GA config ONLY when it is not the legacy ``"zero"``, so every
+    job that does not opt in persists a byte-identical ``optimization_config``."""
+    anchor = _lattice_anchor_for(kind, override)
+    if anchor != "zero":
+        cfg["latticeAnchor"] = anchor
+    return cfg
+
 #: O_LEAP's two members (operator decision 2026-09-02, superseding the two separate keys
 #: O_LEAPC/O_LEAPP). Same shape as _CONVEX_MEMBER_KEYS: not launchable on their own (no
 #: ``_STRATEGY_BUILDERS`` row), but they keep their OWN rows in ``_OPTION_STRATS`` and in every
@@ -6297,6 +6331,7 @@ def _cmd_optimize(args) -> int:
                                     **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
+        _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
         _worker_ids = _worker_ids_from_args(args)
@@ -6539,6 +6574,7 @@ def _cmd_optimize_batch(args) -> int:
                                         **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,
             }
+            _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=name, fitness_metric=fitness,
                 optimization_type="genetic", optimization_config=cfg,
@@ -7598,6 +7634,12 @@ def main(argv: "list | None" = None) -> int:
                          "2026-08-30: this used to be hardcoded to 0.1 here -- floor(0.1%% of "
                          "population, min 1) is exactly ONE elite regardless of population "
                          "size, not the intended 10%%.")
+    op.add_argument("--lattice-anchor", choices=["zero", "min"], default=None,
+                    help="Where the GA counts each numeric gene's step lattice from. 'zero' is "
+                         "the legacy decode (round(v/step)*step; can land below a gene's min when "
+                         "min is not a multiple of step), 'min' counts levels from the gene's "
+                         "min and never leaves [min, max]. Default: 'min' for the grid-2 (LEAPS) "
+                         "keys, 'zero' for everything else -- see _lattice_anchor_for.")
     op.add_argument("--save-top", type=int, default=5,
                     help="Persist the top-N distinct param sets as saved Backtests (default 5).")
     op.add_argument("--seed", type=int, default=42, help="RNG seed (determinism).")
@@ -7820,6 +7862,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--elitism-percent", type=float, default=10.0,
                     help="Percent of the population preserved unchanged each generation "
                          "(engine default: 10.0). See optimize --elitism-percent.")
+    ob.add_argument("--lattice-anchor", choices=["zero", "min"], default=None,
+                    help="See optimize --lattice-anchor (per-strategy default).")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)
