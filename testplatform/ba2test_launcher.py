@@ -3592,11 +3592,27 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
 # it is a fraction of that structure's own legs' own spreads -- so a shared band is the same
 # hypothesis everywhere.
 #
-# 0.0 IS THE AUTHORED DEFAULT AND IT IS AN EXACT NO-OP: the entry keeps quoting the builder's
-# `contract.ask`/`contract.bid`/net untouched, so no existing option result moves. 1.0 quotes
-# at the far touch `_option_cross` already models the fill at. 0.25 steps give the GA five
-# levels including both ends.
-_OPTION_ENTRY_CROSS_BAND = (0.0, 1.0, 0.25)
+# SEMANTICS: 0.0 quotes at the mid (the builder's `contract.ask`/`contract.bid`/net untouched,
+# the pre-F3 quote exactly); 1.0 quotes at the far touch `_option_cross` already models the
+# fill at (a buy pays mid + half-spread, a sell takes mid - half-spread). The SAME gene also
+# prices DISCRETIONARY exits: `CloseOptionAction._close_cross_fraction` concedes the fraction
+# the entry persisted in `data['entry_cross']`; forced exits (SL / DTE roll / post-event) always
+# cross fully, whatever this is.
+#
+# THE BAND IS 0.75..1.0 FOR NEW GRID RUNS (plan 2026-09-24 Task 9; it was 0.0..1.0 in 0.25
+# steps, authored at 0.0). Under `next_bar_open` a passive quote fills only when the premium
+# moved in the entry's favour overnight -- a long put only when the put got CHEAPER, i.e. on
+# the days the bearish thesis did NOT work -- so low-cross genomes select against their own
+# thesis, and their exits (conceding the same fraction) expire too and positions ride to
+# expiry. Measured in the O_LP diagnosis (docs/findings-2026-09-24-deterministicscorer-
+# bearish-options.md): 23 of 39 and 149 of 191 submitted entries expired unfilled; the
+# deployed 8082 O_LC genome sits at 0.25. The floor keeps a quarter of the spread negotiable
+# rather than pinning 1.0, so the GA can still trade a little price for fill rate. 0.05 steps
+# give six levels; the floor is on the lattice (the GA rounds to multiples of the step from
+# zero, so the floor must be one) and is the authored default -- so an un-searched run now
+# quotes at 0.75, NOT the no-op 0.0. A searched genome carries its own value of this gene, so
+# only freshly built strategies move (and a genome predating F3, decoded onto a new template).
+_OPTION_ENTRY_CROSS_BAND = (0.75, 1.0, 0.05)
 
 
 def _apply_option_entry_cross_gene(cfg: dict) -> dict:
@@ -3637,7 +3653,7 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
 # zero-weight features entirely, so a weight at 0.0 costs nothing and changes nothing), which
 # gives the GA the same control arm every other option gene has and keeps the un-searched run
 # reproducible as a sampled trial. 9 levels for the signed weights, 5 for the unsigned one —
-# the same order of resolution as option_entry_cross's 5.
+# the same order of resolution as option_entry_cross's 6.
 #
 # WHAT IS DELIBERATELY NOT IN THIS TABLE (each withheld on recorded evidence, the F15
 # standard — a gene the GA can never move is budget burned on a dead search dimension):
@@ -4398,23 +4414,41 @@ def _iv_rank_gate(m: str, member: str) -> dict:
 # RELATIVE VOLUME. The UNDERLYING's volume over its own trailing 20-bar average (current bar
 # excluded). One direction for both halves -- real participation behind the signal is a
 # confirmation whether you are buying or selling premium -- so the searched threshold is the
-# only per-half difference, and there is none. 0.5..3.0 brackets both "any liquidity at all"
-# and "genuinely unusual"; the authored default sits at the permissive end.
+# only per-half difference, and there is none. The authored default sits at the permissive end.
+#
+# 0.5..1.5, NOT 0.5..3.0 (plan 2026-09-24 Task 12; new grid runs only). The old ceiling was
+# authored, and the upper half of it was dead search space: measured in the O_LP diagnosis
+# (docs/findings-2026-09-24-deterministicscorer-bearish-options.md), the SELL-signal bars'
+# median relative volume is 0.88 and only ~5% sit above 1.5, so a genome above 2 lost 97% of
+# the entries left after the other gates and one at 2.5 blocked ~everything. The GA could learn
+# that, but only by burning early generations on genomes that never trade. 1.5 still demands
+# "clearly busier than usual"; the 0.5 floor and the 0.25 step (five levels) are unchanged.
 #
 # Not volume/OPEN INTEREST, which would be the better CONTRACT-level unusual-activity signal:
 # `open_interest` is NULL on every cached option row (see option_selector.passes_liquidity), so
 # it is not computable here today.
-_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 3.0, "value_step": 0.25}
+_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 1.5, "value_step": 0.25}
 
 # IV / REALISED VOL -- the variance risk premium, i.e. the actual edge in premium selling: you
 # are paid implied and you pay out realised. OPPOSITE PER HALF for the same reason as iv_rank
 # (the gene space never searches an operator): a seller wants the ratio HIGH, a buyer wants it
-# LOW. The window brackets 1.0 on both sides so either half can express "no edge here".
+# LOW. The authored value is each half's PERMISSIVE end, and "no edge here" is the gate's
+# OFF toggle.
+#
+# THE RANGE IS PER HALF (plan 2026-09-24 Task 12; new grid runs only). Both halves searched
+# 0.8..1.6 until then. The DEBIT floor rises to 1.0: a buyer's "<" gate below parity demands
+# implied vol be well UNDER realised, which is rare -- measured in the O_LP diagnosis
+# (docs/findings-2026-09-24-deterministicscorer-bearish-options.md), `iv_rv < 0.8` dropped 79%
+# of the entries where it was enabled -- so the 0.8..1.0 slice mostly produced genomes that
+# never trade. At 1.0 the strictest debit genome still asks "implied no dearer than realised".
+# The CREDIT half keeps 0.8..1.6: nothing measured argues for moving it. Step 0.1 on both
+# (seven debit levels, nine credit). Each authored value stays inside its own range.
 _IV_RV_GATE = {
-    True:  {"op": "<", "value": 1.6},   # debit: buy premium only when it is cheap vs realised
-    False: {"op": ">", "value": 0.8},   # credit: sell premium only when it is genuinely rich
+    # debit: buy premium only when it is cheap vs realised
+    True:  {"op": "<", "value": 1.6, "value_min": 1.0, "value_max": 1.6, "value_step": 0.1},
+    # credit: sell premium only when it is genuinely rich
+    False: {"op": ">", "value": 0.8, "value_min": 0.8, "value_max": 1.6, "value_step": 0.1},
 }
-_IV_RV_RANGE = {"value_min": 0.8, "value_max": 1.6, "value_step": 0.1}
 
 
 def _relative_volume_gate() -> dict:
@@ -4448,7 +4482,8 @@ def _iv_rv_gate(m: str, member: str) -> dict:
     spec = _IV_RV_GATE[member in _DEBIT_OPTION_MEMBERS]
     return {"id": f"{m}-iv_rv", "field": "iv_to_realized_vol", "op": spec["op"],
             "value": spec["value"], "optimize": True, "toggle_optimize": True,
-            **_IV_RV_RANGE}
+            "value_min": spec["value_min"], "value_max": spec["value_max"],
+            "value_step": spec["value_step"]}
 
 
 # EXPECTED PROFIT — the entry's only signal-strength gate, and the ONLY one every expert can

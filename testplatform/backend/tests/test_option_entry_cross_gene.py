@@ -1,4 +1,4 @@
-"""``option_entry_cross`` must be a SEARCHED gene on every option entry, defaulting to a no-op.
+"""``option_entry_cross`` must be a SEARCHED gene on every option entry, over the 0.75..1.0 band.
 
 Enforcement and direction land in ``TradeActions`` / ``option_entry_quote`` (see
 ``packages/common/tests/test_option_entry_cross_gene.py``) and the fill-side closure in
@@ -11,6 +11,13 @@ quote struck on the ANALYSIS bar, and the historical option store's ``bid == ask
 quote at the MID -- so an entry must earn the whole modelled spread back overnight before
 anything fills. How much of that spread an entry should give up is a real trade-off (price
 against fill probability) with no obvious right answer, which is precisely what the GA is for.
+
+WHY THE BAND NO LONGER REACHES THE MID (plan 2026-09-24 Task 9). It was 0.0..1.0 authored at
+the 0.0 no-op. Under next-open fills a passive quote fills only when the premium moved the
+entry's way overnight, which selects against the days the thesis works; the O_LP diagnosis
+measured 23 of 39 and 149 of 191 submitted entries expiring unfilled, and discretionary exits
+concede the same fraction, so positions rode to expiry. New grid runs search 0.75..1.0, and the
+authored default is the band floor -- an un-searched run is no longer the pre-F3 quote.
 """
 import importlib.util
 import os
@@ -43,34 +50,39 @@ def _build(kind):
 
 
 # --------------------------------------------------------------------------- #
-# 1. the authored default is the exact no-op
+# 1. the authored default is the band floor
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("kind", _SINGLES)
-def test_every_option_structure_is_authored_at_the_neutral_value(kind):
-    """THE REQUIREMENT. 0.0 quotes at the mid -- the pre-F3 behaviour -- so a run that does not
-    search this gene produces byte-identical numbers to one from before it existed."""
+def test_every_option_structure_is_authored_at_the_band_floor(kind):
+    """The authored value is the band's floor, 0.75: inside the searched band (so the
+    un-searched run is a configuration the GA can also sample) and, deliberately, NOT the
+    pre-F3 mid quote any more -- that quote is what left entries and exits expiring unfilled."""
     from ba2_common.core.option_entry_quote import ENTRY_CROSS_NEUTRAL
 
     cfg = mod._option_entry_action_for(kind)
-    assert cfg["option_entry_cross"] == ENTRY_CROSS_NEUTRAL == 0.0
+    assert cfg["option_entry_cross"] == mod._OPTION_ENTRY_CROSS_BAND[0] == 0.75
+    assert cfg["option_entry_cross"] != ENTRY_CROSS_NEUTRAL
 
 
-def test_the_overlay_actions_are_authored_at_the_neutral_value_too():
+def test_the_overlay_actions_are_authored_at_the_band_floor_too():
     """O_CC's covered call and O_PP's protective put are the grid's only option legs that are
     not in _OPTION_STRATS; they were the ones min_volume forgot."""
     for action_type in ("sell_covered_call", "buy_protective_put"):
         cfg = mod._option_overlay_action(action_type, strike_param=5.0, strike_min=2.0,
                                          strike_max=10.0, strike_step=2.0)
-        assert cfg["option_entry_cross"] == 0.0
+        assert cfg["option_entry_cross"] == 0.75
         assert cfg["option_entry_cross_optimize"] is True
+        assert (cfg["option_entry_cross_min"], cfg["option_entry_cross_max"],
+                cfg["option_entry_cross_step"]) == mod._OPTION_ENTRY_CROSS_BAND
 
 
 # --------------------------------------------------------------------------- #
 # 2. the band
 # --------------------------------------------------------------------------- #
-def test_the_band_runs_from_the_mid_to_the_full_cross():
+def test_the_band_runs_from_three_quarters_to_the_full_cross():
     lo, hi, step = mod._OPTION_ENTRY_CROSS_BAND
-    assert (lo, hi) == (0.0, 1.0), "the band must span mid -> far touch and nothing beyond"
+    assert (lo, hi, step) == (0.75, 1.0, 0.05), (
+        "Task 9: 0.75 -> far touch, nothing beyond; passive quotes went unfilled at next-open")
     assert step > 0 and (hi - lo) / step >= 2, "a band the GA cannot move is a constant"
 
 
@@ -89,8 +101,15 @@ def test_the_authored_default_is_a_level_the_GA_can_actually_sample():
     """A default outside the sampled lattice would mean the un-searched run and the GA's
     'lowest' trial are two different configurations."""
     lo, hi, step = mod._OPTION_ENTRY_CROSS_BAND
-    levels = [lo + i * step for i in range(int(round((hi - lo) / step)) + 1)]
-    assert 0.0 in levels and 1.0 in levels
+    # The GA decodes a float gene as ``round(v / step) * step`` -- a lattice anchored at ZERO,
+    # not at ``min`` -- so both ends must be multiples of the step, or the floor itself (the
+    # authored value) is not a level any trial can land on.
+    for end in (lo, hi):
+        assert round(end / step) * step == pytest.approx(end)
+    levels = [round(round((lo + i * step) / step) * step, 10)
+              for i in range(int(round((hi - lo) / step)) + 1)]
+    assert levels == [0.75, 0.8, 0.85, 0.9, 0.95, 1.0]
+    assert mod._option_entry_action_for("O_LC")["option_entry_cross"] in levels
 
 
 # --------------------------------------------------------------------------- #
@@ -118,8 +137,8 @@ def test_every_group_member_quotes_independently(kind):
 def test_a_decoded_value_reaches_the_action_config():
     rules = [{"id": "enter", "actions": [mod._option_entry_action_for("O_CSP")]}]
     decoded = _decode_rule_list(
-        rules, "entry", {"enter": {"a0": {"option_entry_cross": 0.75}}}, {})
-    assert decoded[0]["actions"][0]["option_entry_cross"] == 0.75
+        rules, "entry", {"enter": {"a0": {"option_entry_cross": 0.9}}}, {})
+    assert decoded[0]["actions"][0]["option_entry_cross"] == 0.9   # != the 0.75 default
 
 
 def test_the_decoded_value_survives_the_rule_builder_into_the_action_kwargs():
@@ -129,16 +148,26 @@ def test_the_decoded_value_survives_the_rule_builder_into_the_action_kwargs():
 
     rules = [{"id": "enter", "actions": [mod._option_entry_action_for("O_IC")]}]
     decoded = _decode_rule_list(
-        rules, "entry", {"enter": {"a0": {"option_entry_cross": 0.5}}}, {})
+        rules, "entry", {"enter": {"a0": {"option_entry_cross": 0.95}}}, {})
     cfg = action_from_rule(decoded[0]["actions"][0])["act"]
-    assert cfg["entry_cross"] == 0.5
+    assert cfg["entry_cross"] == 0.95
     assert "entry_cross" in _OPTION_ENTRY_PARAM_KEYS
 
 
 def test_the_UNdecoded_default_also_survives_the_rule_builder():
-    """0.0 must reach the action as 0.0, not be dropped as falsy -- an absent kwarg and an
-    explicit neutral one happen to agree today, and this is what keeps them agreeing."""
+    """The authored 0.75 must reach the action: a dropped kwarg would silently mean the 0.0
+    mid quote -- exactly the unfilled-limit behaviour the 0.75..1.0 band retires."""
     from ba2_common.core.rule_builders import action_from_rule
 
     cfg = action_from_rule(mod._option_entry_action_for("O_CSP"))["act"]
-    assert cfg["entry_cross"] == 0.0
+    assert cfg["entry_cross"] == 0.75
+
+
+def test_an_explicit_zero_still_survives_the_rule_builder():
+    """A stored pre-Task-9 strategy can still carry 0.0; it must reach the action as 0.0, not be
+    dropped as falsy -- an absent kwarg and an explicit neutral one agree, and this keeps them
+    agreeing."""
+    from ba2_common.core.rule_builders import action_from_rule
+
+    action = dict(mod._option_entry_action_for("O_CSP"), option_entry_cross=0.0)
+    assert action_from_rule(action)["act"]["entry_cross"] == 0.0
