@@ -1661,6 +1661,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             for transaction in transactions:
                 if transaction.open_price is None or transaction.quantity is None:
                     logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
+                    # ...but an OPTION position's collateral still exists (stage-2 E1b review
+                    # M6): a WAITING option transaction has no open_price when no quote was
+                    # available at submit (both runtimes create it through the shared
+                    # AccountInterface._create_transaction_for_order). Recorded with a used
+                    # charge of 0 so the equity RM's budget charges its full reserve; the used
+                    # TOTAL is unchanged.
+                    if (option_used_out is not None and transaction.multiplier
+                            and transaction.multiplier != 1):
+                        option_used_out[transaction.id] = 0.0
                     continue
 
                 is_option = bool(transaction.multiplier and transaction.multiplier != 1)

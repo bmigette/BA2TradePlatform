@@ -62,6 +62,8 @@ def rm_equity_budget(balances: ExpertBalance, account: Any) -> ExpertBalance:
             f"account {getattr(account, 'id', '?')}: the collateral reserved by this expert's "
             f"option positions is UNKNOWN ({'; '.join(pool.unmeasurable)}), so the equity "
             f"budget cannot be stated -- an unknown reserve is not zero")
+    # A CSP is charged its full strike collateral (not net of the premium it collected):
+    # conservative, and identical in both runtimes (review M4, kept deliberately).
     reserve_of = dict(pool.by_transaction)
     extra = 0.0
     for tid, used_charge in balances.option_used:

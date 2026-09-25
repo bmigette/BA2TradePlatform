@@ -121,3 +121,33 @@ def test_the_used_balance_pass_reports_each_option_positions_own_charge():
         assert used == pytest.approx(600.0 + 1400.0)
         # ...and the plain call is unchanged
         assert expert._calculate_used_balance(account) == used
+
+
+def test_an_option_position_with_NO_open_price_yet_is_still_charged_its_reserve():
+    """Review M6. Both runtimes create the WAITING transaction through the shared
+    ``AccountInterface._create_transaction_for_order``, whose ``open_price`` is the option's
+    quote mid, else the order's limit price, else None. With None (no quote at submit, a
+    market order) the used pass skips the transaction -- and the budget then never saw its
+    collateral. It is recorded with a used charge of 0 so the reserve is charged in full,
+    identically wherever the quote happened to be missing."""
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.types import OrderDirection, TransactionStatus
+    from tests.test_used_balance_options import _StubAccount, _StubExpert
+
+    with ts.inmem_trades():
+        account = _StubAccount(stock_price=150.0, quote=None)
+        expert = _StubExpert(expert_id=1)
+        waiting_id = add_instance(Transaction(
+            symbol="META", quantity=2, side=OrderDirection.SELL,
+            status=TransactionStatus.WAITING, expert_id=1, open_price=None,
+            multiplier=100.0))
+        per_option = {}
+        used = expert._calculate_used_balance(account, option_used_out=per_option)
+        assert used == 0.0, "the used total itself is unchanged (the row is still skipped)"
+        assert per_option == {waiting_id: 0.0}
+
+    balances = ExpertBalance(virtual=100_000.0, used=0.0, available=100_000.0,
+                             option_used=((waiting_id, 0.0),))
+    out = rm_equity_budget(balances, _Account({waiting_id: 60_000.0}))
+    assert out.available == pytest.approx(40_000.0)
