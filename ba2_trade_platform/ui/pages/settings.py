@@ -5155,6 +5155,22 @@ class ExpertSettingsTab:
             ui.notify(f'Error deleting expert: {e}', type='negative')
 
 
+#: Action-config keys the rule editor has NO widget for, carried forward from the loaded rule
+#: by ``_save_rule`` when the action type is unchanged. The save rebuilds ``action_config``
+#: from the widgets alone, so without this a re-save silently stripped them -- the
+#: covered-call / wheel close (``cc_dte``) lost its ``close_target`` and went back to closing
+#: the evaluated order, which on those overlays is the STOCK.
+#:
+#: A NAMED list, not "every key the editor does not know": a widget-backed field the user
+#: cleared (``min_arc``, ``strike_param``, ...) must stay cleared, and a blanket carry-over
+#: would resurrect it. Every key here must be one no widget writes (pinned by test). Keys
+#: deliberately NOT listed: ``take_profit_price`` / ``stop_loss_price`` (a fixed price wins
+#: over the value/reference widgets, so carrying it would make the user's edit inert),
+#: ``value`` on the share actions (same: it would override the Target % widget), and
+#: ``min_volume`` (no live chain carries volume; see the note in ``_save_rule``).
+PRESERVED_HIDDEN_ACTION_KEYS = ('entry_tag', 'close_target', 'entry_cross', 'lot_size')
+
+
 class TradeSettingsTab:
     """
     UI tab for managing trading rules and rulesets.
@@ -6031,6 +6047,10 @@ class TradeSettingsTab:
                 self.actions[action_id] = {
                     'card': action_card,
                     'type_select': action_select,
+                    # The rule as loaded, so _save_rule can carry forward the keys no widget
+                    # renders (PRESERVED_HIDDEN_ACTION_KEYS). A copy: nothing here may mutate
+                    # the rule object before Save.
+                    'loaded_config': dict(action_config or {}),
                     'value_input': lambda: value_input,
                     'reference_select': lambda: reference_select,
                     'target_percent_input': lambda: target_percent_input,
@@ -6306,6 +6326,24 @@ class TradeSettingsTab:
                         # greeks -- so OptionContract.volume is always None on the live path
                         # and the gate could only ever raise OptionLiquidityDataUnavailable.
                         # A field whose every value is an error is worse than no field.
+
+                # KEYS NO WIDGET RENDERS: carried forward from the loaded rule, or they are
+                # stripped by this rebuild (see PRESERVED_HIDDEN_ACTION_KEYS). Only while the
+                # type is unchanged -- on another action type they mean nothing, so they are
+                # dropped, and the user is told rather than left to find out live.
+                loaded = action_refs['loaded_config']
+                hidden = [k for k in PRESERVED_HIDDEN_ACTION_KEYS
+                          if k in loaded and k not in action_config]
+                if hidden:
+                    loaded_type = loaded.get('action_type') or loaded.get('type')
+                    if loaded_type == action_type:
+                        for k in hidden:
+                            action_config[k] = loaded[k]
+                    else:
+                        ui.notify(f'Action {action_id}: changing the type from {loaded_type} '
+                                  f'to {action_type} dropped {", ".join(hidden)} (not '
+                                  f'editable here, not meaningful on the new type)',
+                                  type='warning')
 
                 actions_data[action_id] = action_config
 
