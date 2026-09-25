@@ -345,6 +345,14 @@ def _option_fill_capacity(volume) -> float:
     return _OPTION_FILL_MAX_VOLUME_PARTICIPATION * (float(volume) if volume is not None else 0.0)
 
 
+def _new_integrity_counters() -> Dict[str, Any]:
+    return {"option_ledger_mismatches": {"count": 0, "examples": []},
+            "option_orders_volume_sized": 0,
+            "option_orders_volume_refused": 0,
+            "option_split_rekeys": 0,
+            "option_split_rekey_refusals": 0}
+
+
 def _max_units_within(capacity: float, per_unit: float) -> int:
     """The largest whole count ``n`` with ``n * per_unit <= capacity`` -- decided by the SAME
     float comparison the fill engine makes (``required > capacity`` rejects), not by a
@@ -605,6 +613,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # not reconcile with the lot, and no fill can repair that (a fill on a crossed lot is
         # refused). Skipped instead of re-planned on every bar until expiry.
         self._split_rekey_never: set = set()
+        # RUN COUNTERS for the option-integrity events of plan 2026-09-24 Tasks 1b / 11 / 13,
+        # published in the results (``option_integrity_stats`` -> results.py). A GA trial child
+        # runs under ``logging.disable(logging.ERROR)`` (price_source._worker_init), which drops
+        # ERROR and everything below it, so the log lines alone are invisible exactly where most
+        # runs happen; these numbers are not.
+        self._option_integrity: Dict[str, Any] = _new_integrity_counters()
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
         # and is therefore useless for ageing in a backtest. Read only by
@@ -4364,12 +4378,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                                             rounding=ROUND_HALF_UP)
         return f"{contract_symbol[:-8]}{int(adjusted * 1000):08d}", float(adjusted)
 
-    def _log_rekey_once(self, key, level: int, fmt: str, *args) -> None:
-        """A re-key refusal/deferral is re-evaluated on every bar; explain it ONCE per key."""
+    def _log_rekey_once(self, key, level: int, fmt: str, *args, refusal: bool = True) -> None:
+        """A re-key refusal/deferral is re-evaluated on every bar; explain it ONCE per key --
+        and count it once (``option_split_rekey_refusals``) unless it is not a refusal."""
         if key in self._split_rekey_logged:
             logger.debug(fmt, *args)
             return
         self._split_rekey_logged.add(key)
+        if refusal:
+            self._integrity()["option_split_rekey_refusals"] += 1
         logger.log(level, fmt, *args)
 
     def apply_split_rekeys(self) -> int:
@@ -4521,7 +4538,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 "were traded in ANOTHER share basis (a different contract that used the string "
                 "before the split). Order-derived lookups take the first row per OCC string, so "
                 "they may attribute the re-keyed lot's group/strategy to those rows.",
-                new, target_of[new], ids, new)
+                new, target_of[new], ids, new, refusal=False)
         # The rows to move must add up to the lot: a lot whose book does not reconcile cannot
         # have its linkage moved consistently (an exit would close the wrong quantity).
         for cs in list(plans):
@@ -4720,6 +4737,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             else:
                 self._option_positions[new.contract_symbol] = new
                 merged = ""
+            self._integrity()["option_split_rekeys"] += 1
             logger.info(
                 "[backtest] option lot RE-KEYED at the %s %d:1 split (%s): %s %+g @ %.4f -> %s "
                 "%+g @ %.4f, strike %g -> %g%s.", new.underlying, p["ratio"], today,
@@ -4788,6 +4806,30 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """True when this run was built with an option reader (an options run), False on the
         equity-only path. ``supports_options`` is the CLASS capability and is always True."""
         return self._options is not None
+
+    def _integrity(self) -> Dict[str, Any]:
+        """The run's option-integrity counters (created on first use for account doubles built
+        without ``__init__``)."""
+        c = getattr(self, "_option_integrity", None)
+        if c is None:
+            c = self._option_integrity = _new_integrity_counters()
+        return c
+
+    def option_integrity_stats(self) -> Dict[str, Any]:
+        """The option-integrity counters of this run, JSON-safe (results.py publishes each key):
+
+          * ``option_ledger_mismatches``: {count, examples (first 3)} -- DISTINCT lot/view
+            disagreements found by ``check_option_ledger`` (Task 13);
+          * ``option_orders_volume_sized`` / ``option_orders_volume_refused``: opening orders
+            cut / not placed by the fill-volume cap (Task 11);
+          * ``option_split_rekeys`` / ``option_split_rekey_refusals``: lots re-keyed at a split,
+            and distinct NOT-RE-KEYED explanations (refused or deferred; Task 1b).
+
+        Recorded, not scored."""
+        c = self._integrity()
+        return {**c, "option_ledger_mismatches": {
+            "count": c["option_ledger_mismatches"]["count"],
+            "examples": [dict(e) for e in c["option_ledger_mismatches"]["examples"]]}}
 
     def option_basis_guard_stats(self) -> Optional[Dict[str, Any]]:
         """The run's E4 split-basis guard counters (``option_basis_guard.BasisGuard.stats``),
@@ -5158,6 +5200,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return quantity
         contract, volume, per_unit = tightest
         if allowed <= 0:
+            self._integrity()["option_orders_volume_refused"] += 1
             logger.warning(
                 "[backtest] option order NOT PLACED (%s x%d, option_size_within_fill_volume): "
                 "%s's decision-bar volume %s lets %.0f%% participation fill no %s, so not even "
@@ -5165,6 +5208,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 _OPTION_FILL_MAX_VOLUME_PARTICIPATION * 100,
                 "contract" if per_unit == 1 else f"structure ({per_unit:g} contracts each)")
             return 0
+        self._integrity()["option_orders_volume_sized"] += 1
         logger.info(
             "[backtest] option order sized %d -> %d (%s, option_size_within_fill_volume): %s's "
             "decision-bar volume %s allows %d at %.0f%% participation.", quantity, allowed,
@@ -5360,6 +5404,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if key in self._split_rekey_logged:
                 continue
             self._split_rekey_logged.add(key)
+            lm = self._integrity()["option_ledger_mismatches"]
+            lm["count"] += 1
+            if len(lm["examples"]) < 3:
+                lm["examples"].append({"contract": cs, "lot_qty": lq, "view_qty": vq,
+                                       "date": self._as_of_date().isoformat(),
+                                       "context": context or "check"})
             logger.error(
                 "[backtest] OPTION LEDGER MISMATCH (%s, %s): %s -- the lot ledger holds %+g "
                 "contract(s) but the OPENED transactions show %+g. The lot is marked, margined "
