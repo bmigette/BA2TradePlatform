@@ -129,9 +129,16 @@ def refine_max_drawdown(
     SAME equity trough at once). Accumulating them additively across hundreds of trades would
     make the result worsen without bound purely from trade COUNT, not from any single real
     dip -- confirmed live: a 251-trade run's refined drawdown reached -101.71% (worse than a
-    total account wipeout) while the actual equity curve's peak-to-trough was only -41%. The
-    result is also hard-floored at -100%: drawdown relative to total equity cannot exceed that
-    even as a hypothetical estimate.
+    total account wipeout) while the actual equity curve's peak-to-trough was only -41%.
+
+    EACH DIP is floored at -100% (an estimate cannot lose more than the equity it is measured
+    on); the INPUT is never clamped. On a capped run the daily figure can legitimately sit
+    below -100% (a $30k loss on a $20k cap is -150%), and flooring the result would IMPROVE a
+    figure this layer may only ever worsen -- with no flagged trade at all.
+
+    KNOWN LIMIT: a multi-day trade is measured from the peak at its ENTRY. If the equity sets a
+    new peak while the trade is open and the intraday low comes after it, the real dip is
+    deeper than this estimate (understated, never overstated).
     """
     if drawdown_base is not None and not drawdown_base > 0:
         # A cap is validated positive at config time (equity_cap.validate_equity_cap); a
@@ -141,6 +148,8 @@ def refine_max_drawdown(
     refined = max_drawdown
     flagged = 0        # trades that reached the delta lookup (already past the dip filter)
     uncovered = 0      # of those, the ones with no usable entry delta / underlying price
+    errored = 0        # option trades dropped because a lookup or the arithmetic raised
+    no_base = 0        # dips dropped because their denominator (the peak) was not positive
     for t in trades:
         contract = t.get("contract_symbol")
         underlying = t.get("underlying_symbol")
@@ -192,19 +201,27 @@ def refine_max_drawdown(
             peak = max(float(peak), float(equity))
             base = drawdown_base if drawdown_base is not None else peak
             if base <= 0:
+                no_base += 1
                 continue
-            dip_dd = (float(equity) + worst_loss - peak) / base * 100.0
+            dip_dd = max((float(equity) + worst_loss - peak) / base * 100.0, -100.0)
             refined = min(refined, dip_dd)
-        except Exception as e:  # noqa: BLE001 - best-effort refinement, never break the backtest
-            logger.debug(f"intraday drawdown refinement skipped for a trade: {e}")
+        except Exception as e:  # noqa: BLE001 - best-effort per trade; counted and reported below
+            errored += 1
+            logger.debug(f"intraday drawdown refinement skipped for a trade: "
+                         f"{type(e).__name__}: {e}")
             continue
-    if flagged:
-        pct = uncovered / flagged * 100.0
+    if flagged or errored:
+        pct = uncovered / flagged * 100.0 if flagged else 0.0
         # WARNING, not debug, past a third: the refinement moved from the entry day's own
         # snapshot to the last one strictly BEFORE it, so a contract whose first snapshot IS
         # its entry day now has no prior and drops out. That is the correct answer, but it
         # changes what the refined figure covers, and coverage is not visible in the result.
-        (logger.warning if pct >= 33.0 else logger.info)(
+        # Any trade dropped by an exception or a non-positive base is a WARNING too: those
+        # are not "no dip", they are trades the figure silently does not cover.
+        loud = pct >= 33.0 or errored > 0 or no_base > 0
+        (logger.warning if loud else logger.info)(
             f"intraday drawdown refinement: {flagged - uncovered}/{flagged} flagged trade(s) "
-            f"had a usable pre-entry delta ({pct:.0f}% uncovered)")
-    return max(refined, -100.0)
+            f"had a usable pre-entry delta ({pct:.0f}% uncovered); {errored} trade(s) skipped "
+            f"on an exception, {no_base} on a non-positive drawdown base")
+    # Only the dips were floored; ``refined`` starts at the input and only ever moves down.
+    return refined

@@ -8,7 +8,7 @@ Run from the backend dir:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -602,10 +602,13 @@ def test_the_wiring_builds_peak_at_as_the_running_peak_of_the_same_curve(monkeyp
     from app.services.backtest.results import _build_refine_drawdown_fn
 
     _no_fmp(monkeypatch)
-    snaps = [{"date": datetime(2024, 1, 2), "net_liquidating_value": 10_000.0},
-             {"date": datetime(2024, 1, 3), "net_liquidating_value": 12_000.0},
-             {"date": datetime(2024, 1, 4), "net_liquidating_value": 11_000.0},
-             {"date": datetime(2024, 1, 5), "net_liquidating_value": 12_500.0}]
+    # UTC-AWARE, like the real account: snapshot dates and the entry times ``_refine`` parses
+    # back from ISO strings both carry +00:00, and the bisect compares them directly.
+    utc = timezone.utc
+    snaps = [{"date": datetime(2024, 1, 2, tzinfo=utc), "net_liquidating_value": 10_000.0},
+             {"date": datetime(2024, 1, 3, tzinfo=utc), "net_liquidating_value": 12_000.0},
+             {"date": datetime(2024, 1, 4, tzinfo=utc), "net_liquidating_value": 11_000.0},
+             {"date": datetime(2024, 1, 5, tzinfo=utc), "net_liquidating_value": 12_500.0}]
     acct = SimpleNamespace(
         _price=_RefinePrice(),
         _options=SimpleNamespace(delta_at_entry=lambda u, c, w: 0.5),
@@ -617,11 +620,154 @@ def test_the_wiring_builds_peak_at_as_the_running_peak_of_the_same_curve(monkeyp
 
     _build_refine_drawdown_fn(acct, _REFINE_CFG)([], -2.0)
     peak_at = seen["peak_at"]
-    assert peak_at(datetime(2024, 1, 1)) == 10_000.0          # pre-curve: the first point
-    assert peak_at(datetime(2024, 1, 2, 15, 45)) == 10_000.0
-    assert peak_at(datetime(2024, 1, 4, 15, 45)) == 12_000.0  # peak held through the dip
-    assert peak_at(datetime(2024, 1, 5)) == 12_500.0          # at the snapshot: included
+    assert peak_at(datetime(2024, 1, 1, tzinfo=utc)) == 10_000.0          # pre-curve: first point
+    assert peak_at(datetime(2024, 1, 2, 15, 45, tzinfo=utc)) == 10_000.0
+    assert peak_at(datetime(2024, 1, 4, 15, 45, tzinfo=utc)) == 12_000.0  # held through the dip
+    assert peak_at(datetime(2024, 1, 5, tzinfo=utc)) == 12_500.0          # at the snapshot: in
     assert seen["drawdown_base"] is None
 
     _build_refine_drawdown_fn(acct, _REFINE_CFG, equity_cap=20_000.0)([], -2.0)
     assert seen["drawdown_base"] == 20_000.0
+
+
+# ---------------------------------------------------------------------------
+# Task 3 review follow-ups: only the DIPS are floored, skips are counted out loud, and the
+# result records what the refinement did.
+# ---------------------------------------------------------------------------
+
+def test_a_capped_daily_drawdown_below_minus_100_comes_back_UNCHANGED():
+    """A $30k loss on a $20k cap is a -150% daily drawdown. The old final ``max(refined, -100)``
+    clamped the INPUT, so this came back -100 with no flagged trade at all -- improving a
+    figure the refinement may only worsen."""
+    unflagged = _make_trade(bars_held=5)
+    kw = _refine_kw(daily_bar_low=lambda sym, dt: 101.0, prior_daily_bar_low=lambda sym, dt: 100.0)
+    for trades in ([], [unflagged]):
+        assert refine_max_drawdown(
+            trades, max_drawdown=-150.0, equity_at=lambda dt: 11_156.0,
+            peak_at=lambda dt: 12_000.0, drawdown_base=20_000.0, **kw) == -150.0
+
+
+def test_a_capped_daily_drawdown_below_minus_100_survives_a_flagged_dip():
+    """A flagged trade whose dip (-6.72% on the cap) is shallower than the -150% daily figure
+    leaves it alone."""
+    refined = refine_max_drawdown(
+        [_make_trade(pnl=51_048.0)], max_drawdown=-150.0,
+        equity_at=lambda dt: 11_156.0, peak_at=lambda dt: 12_000.0,
+        drawdown_base=20_000.0, **_refine_kw())
+    assert refined == -150.0
+
+
+def test_a_dip_past_minus_100_is_floored_on_a_capped_run_too():
+    """The floor applies to the dip: -$500 worst on $100 of equity under a $100 cap is -500%,
+    reported as -100 because the daily figure (-50) is shallower."""
+    refined = refine_max_drawdown(
+        [_make_trade()], max_drawdown=-50.0,
+        equity_at=lambda dt: 100.0, peak_at=lambda dt: 100.0,
+        drawdown_base=100.0, **_refine_kw())
+    assert refined == pytest.approx(-100.0)
+
+
+def test_a_trade_dropped_by_an_exception_is_a_WARNING_with_its_count():
+    def _boom(*a, **k):
+        raise RuntimeError("cache unavailable")
+
+    with _captured_warnings() as msgs:
+        refined = refine_max_drawdown(
+            [_make_trade()], max_drawdown=-2.0,
+            equity_at=lambda dt: 20_000.0, peak_at=lambda dt: 20_000.0,
+            **_refine_kw(daily_bar_low=_boom))
+    assert refined == pytest.approx(-2.0)
+    assert any("1 trade(s) skipped on an exception" in m for m in msgs), msgs
+
+
+def test_a_dip_dropped_for_a_non_positive_base_is_a_WARNING_with_its_count():
+    """Negative equity makes the peak (the base) non-positive: the dip has no meaningful
+    denominator and is dropped -- counted, not silently."""
+    with _captured_warnings() as msgs:
+        refined = refine_max_drawdown(
+            [_make_trade()], max_drawdown=-2.0,
+            equity_at=lambda dt: -100.0, peak_at=lambda dt: -200.0, **_refine_kw())
+    assert refined == pytest.approx(-2.0)
+    assert any("1 on a non-positive drawdown base" in m for m in msgs), msgs
+
+
+def test_a_clean_refinement_logs_no_warning():
+    with _captured_warnings() as msgs:
+        refine_max_drawdown(
+            [_make_trade()], max_drawdown=-2.0,
+            equity_at=lambda dt: 20_000.0, peak_at=lambda dt: 20_000.0, **_refine_kw())
+    assert not [m for m in msgs if "intraday drawdown refinement" in m], msgs
+
+
+# --- build_results level: the cap goes in, the refinement status comes out ------------------
+
+class _CurveAccount:
+    """``build_results`` reads only these two methods on a non-option account."""
+
+    def __init__(self, snaps):
+        self._snaps = snaps
+
+    def get_balance_history(self):
+        return self._snaps
+
+    def get_filled_trades(self):
+        return []
+
+
+_CURVE = [{"date": datetime(2024, 1, d, tzinfo=timezone.utc), "net_liquidating_value": v,
+           "cash_balance": v, "equity_value": 0.0}
+          for d, v in ((2, 20_000.0), (3, 22_000.0), (4, 19_800.0))]
+
+
+def _cfg(cap):
+    return {"initial_capital": 20_000.0,
+            "account_settings": {"starting_cash": 20_000.0, "commission_per_trade": 0.0,
+                                 "slippage_bps": 0.0, "fill_model": "next_bar_open",
+                                 "equity_cap": cap}}
+
+
+@pytest.mark.parametrize("cap", [20_000.0, None])
+def test_build_results_passes_the_equity_cap_to_the_refinement(monkeypatch, cap):
+    from app.services.backtest import results as R
+
+    seen = {}
+
+    def _spy(account, config, **kw):
+        seen.update(kw)
+        return None
+
+    monkeypatch.setattr(R, "_build_refine_drawdown_fn", _spy)
+    R.build_results(_CurveAccount(_CURVE), _cfg(cap))
+    assert seen == {"equity_cap": cap}
+
+
+def test_refinement_status_is_none_without_a_refinement():
+    from app.services.backtest.results import build_results
+
+    assert build_results(_CurveAccount(_CURVE), _cfg(None))["max_drawdown_refinement"] == "none"
+
+
+def test_refinement_status_is_applied_when_it_ran(monkeypatch):
+    from app.services.backtest import results as R
+
+    monkeypatch.setattr(R, "_build_refine_drawdown_fn",
+                        lambda account, config, **kw: (lambda trades, md: md - 1.0))
+    out = R.build_results(_CurveAccount(_CURVE), _cfg(None))
+    assert out["max_drawdown_refinement"] == "applied"
+    assert out["max_drawdown"] == pytest.approx(out["max_drawdown_daily"] - 1.0)
+
+
+def test_a_refinement_that_RAISES_is_a_warning_and_is_recorded(monkeypatch):
+    """No silent failure: the daily figure stands, but the log says so at WARNING and the
+    result records that its max_drawdown is the unrefined one, and why."""
+    from app.services.backtest import results as R
+
+    def _raises(trades, md):
+        raise RuntimeError("5m cache unreadable")
+
+    monkeypatch.setattr(R, "_build_refine_drawdown_fn", lambda account, config, **kw: _raises)
+    with _captured_warnings() as msgs:
+        out = R.build_results(_CurveAccount(_CURVE), _cfg(None))
+    assert out["max_drawdown_refinement"] == "failed:RuntimeError"
+    assert out["max_drawdown"] == out["max_drawdown_daily"] == pytest.approx(-10.0)
+    assert any("refinement FAILED" in m and "RuntimeError" in m for m in msgs), msgs

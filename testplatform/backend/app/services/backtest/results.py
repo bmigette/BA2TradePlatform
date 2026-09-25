@@ -691,6 +691,10 @@ def _compute_metrics(
     # --- drawdown ----------------------------------------------------------
     dd_values = [pt["drawdown"] for pt in drawdown_curve]  # <= 0
     max_drawdown = min(dd_values) if dd_values else 0.0  # most negative
+    #: What the intraday refinement did to max_drawdown: "none" (no refinement for this run --
+    #: equity-only, or no curve), "applied" (it ran; the figure may or may not have moved) or
+    #: "failed:<ExcType>" (it raised; the daily figure stands). Recorded next to the figure.
+    refinement_status = "none"
     if refine_drawdown_fn is not None and dd_values:
         # Best-effort: a daily-bar equity curve can hide a real intraday dip for a
         # single-bar-held option trade, or one whose exit day made a new low vs. the day
@@ -700,8 +704,14 @@ def _compute_metrics(
         # (a quick option trade whose entry/exit bars never register a dip on the daily curve).
         try:
             max_drawdown = refine_drawdown_fn(trades, max_drawdown)
+            refinement_status = "applied"
         except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
-            logger.debug(f"intraday drawdown refinement failed, using daily-only figure: {e}")
+            # Kept running on the daily figure, but LOUDLY and on the record: a refinement that
+            # failed reports a max_drawdown that is a different quantity from one that ran, and
+            # every metric divided by it (calmar, the option CAR family) inherits that.
+            logger.warning(f"intraday drawdown refinement FAILED, max_drawdown stays at the "
+                           f"daily-only figure: {type(e).__name__}: {e}", exc_info=True)
+            refinement_status = f"failed:{type(e).__name__}"
     # BOTH FIGURES SURVIVE. The refined value replaced the daily one in place, so a stored
     # result could not say whether its max_drawdown was measured from the equity curve or
     # estimated from a first-order delta re-pricing -- two different quantities under one
@@ -940,6 +950,7 @@ def _compute_metrics(
         # equity-only run and on any run where the refinement found nothing; strictly less
         # negative when it did. Kept so a stored result can say which quantity it reports.
         "max_drawdown_daily": round(_finite(max_drawdown_daily, "max_drawdown_daily"), 2),
+        "max_drawdown_refinement": refinement_status,
         "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
         "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),
         # Trade quality metrics
