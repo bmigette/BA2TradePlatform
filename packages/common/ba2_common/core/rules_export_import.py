@@ -377,6 +377,52 @@ def _assert_market_gates_served_by_linked_experts(ruleset_info: Dict[str, Any], 
             session=session)
 
 
+def _resolve_order_indices(rules: List[Dict[str, Any]], ruleset_name: Any) -> Tuple[List[int], Optional[str]]:
+    """The ``order_index`` each imported rule's LINK gets, aligned with ``rules`` (file order),
+    plus a warning when the file's own values could not be used as they stand.
+
+    ``order_index`` IS rule precedence: the live evaluator walks a ruleset's links in
+    ``order_index`` order and the FIRST matching rule wins (``db.ruleset_event_actions``). The
+    importers used to write ``rule_data.get('order_index', 0)``, so a file without it (an old
+    export, a hand-written payload) landed every rule at 0 and precedence became whatever SQLite
+    returned for the tie. Now:
+
+    * every rule carries a distinct integer -> restored EXACTLY (the normal round trip);
+    * none carries one -> the FILE ORDER, ``0..n-1`` (an exporter lists rules in precedence);
+    * duplicates, or only some rules carrying one -> the order ``live_export_to_trade_rules``
+      reads on the backtest side (indexed rules by value, ties and unindexed rules in file
+      order, unindexed after indexed), renumbered ``0..n-1`` so no two links tie;
+    * a value that is not an integer -> ``ValueError``, before anything is written.
+    """
+    values: List[Optional[int]] = []
+    for pos, rule_data in enumerate(rules):
+        v = rule_data.get("order_index")
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+            raise ValueError(
+                f"Imported ruleset {ruleset_name!r}: rule {rule_data.get('name')!r} (position {pos}) "
+                f"has order_index {v!r}; it must be an integer (it is the rule's precedence)")
+        values.append(v)
+
+    n = len(values)
+    present = [v for v in values if v is not None]
+    if len(present) == n and len(set(present)) == n:
+        return [int(v) for v in values], None
+
+    ranked = sorted(range(n), key=lambda i: (values[i] is None, values[i] or 0, i))
+    orders = [0] * n
+    for new_index, pos in enumerate(ranked):
+        orders[pos] = new_index
+
+    if not present:
+        why = "carries no order_index (older export format); assigned 0..n-1 in file order"
+    elif len(present) < n:
+        why = (f"carries order_index on only {len(present)} of {n} rules; indexed rules first by "
+               f"value, the rest in file order, renumbered 0..n-1")
+    else:
+        why = ("has tied order_index values; tie broken by file order, renumbered 0..n-1")
+    return orders, f"Ruleset {ruleset_name!r} {why} (order_index is rule precedence: first match wins)"
+
+
 def _rule_content_key(type_, subtype, triggers, actions, extra_parameters, continue_processing) -> str:
     """Canonical, comparable signature of a rule's CONTENT (everything but its name/id).
 
@@ -421,6 +467,12 @@ class RulesImporter:
 
                 # BEFORE anything is created: a market gate may not ride an exit ruleset.
                 _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
+                # ...nor a rule order that cannot be read (refused before any write).
+                orders, order_warning = _resolve_order_indices(ruleset_info["rules"],
+                                                               ruleset_info.get("name"))
+                if order_warning:
+                    logger.warning(order_warning)
+                    warnings.append(order_warning)
                 
                 # Preserve original name, but handle duplicates
                 base_name = ruleset_info['name']
@@ -456,7 +508,7 @@ class RulesImporter:
                 processed_rule_ids = set()
 
                 # Import rules and create links
-                for rule_data in ruleset_info["rules"]:
+                for rule_data, order_index in zip(ruleset_info["rules"], orders):
                     rule_id, rule_warnings = RulesImporter._import_rule_to_session(
                         session, rule_data, ""  # Don't add suffix to individual rules
                     )
@@ -470,7 +522,7 @@ class RulesImporter:
                     link = RulesetEventActionLink(
                         ruleset_id=ruleset.id,
                         eventaction_id=rule_id,
-                        order_index=rule_data.get('order_index', 0)
+                        order_index=order_index
                     )
                     session.add(link)
 
@@ -509,6 +561,11 @@ class RulesImporter:
                     ruleset_info = ruleset_data
                     _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                     warnings = []
+                    orders, order_warning = _resolve_order_indices(ruleset_info["rules"],
+                                                                   ruleset_info.get("name"))
+                    if order_warning:
+                        logger.warning(order_warning)
+                        warnings.append(order_warning)
                     
                     # Preserve original name, but handle duplicates
                     base_name = ruleset_info['name']
@@ -542,7 +599,7 @@ class RulesImporter:
                     ruleset_ids.append(ruleset.id)
 
                     # Import rules and create links, reusing rules across rulesets
-                    for rule_data in ruleset_info["rules"]:
+                    for rule_data, order_index in zip(ruleset_info["rules"], orders):
                         rule_name = f"{rule_data['name']}{name_suffix}"
                         
                         # Check if we already processed this rule in current import batch
@@ -560,7 +617,7 @@ class RulesImporter:
                         link = RulesetEventActionLink(
                             ruleset_id=ruleset.id,
                             eventaction_id=rule_id,
-                            order_index=rule_data.get('order_index', 0)
+                            order_index=order_index
                         )
                         session.add(link)
                     
@@ -608,6 +665,11 @@ class RulesImporter:
                     _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                     warnings: List[str] = []
                     name = ruleset_info["name"]
+                    # Also before the links are dropped: an unreadable order refuses here.
+                    orders, order_warning = _resolve_order_indices(ruleset_info["rules"], name)
+                    if order_warning:
+                        logger.warning(order_warning)
+                        warnings.append(order_warning)
 
                     ruleset = session.exec(select(Ruleset).where(Ruleset.name == name)).first()
                     if ruleset is None:
@@ -647,7 +709,7 @@ class RulesImporter:
 
                     ruleset_ids.append(ruleset.id)
 
-                    for rule_data in ruleset_info["rules"]:
+                    for rule_data, order_index in zip(ruleset_info["rules"], orders):
                         rule_name = f"{rule_data['name']}{name_suffix}"
                         if rule_name in processed_rule_names:
                             rule_id = processed_rule_names[rule_name]
@@ -661,7 +723,7 @@ class RulesImporter:
                         session.add(RulesetEventActionLink(
                             ruleset_id=ruleset.id,
                             eventaction_id=rule_id,
-                            order_index=rule_data.get("order_index", 0),
+                            order_index=order_index,
                         ))
 
                     all_warnings.extend(warnings)
