@@ -5565,6 +5565,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         trigger: OptionCloseReason,
         hold_assigned: Optional[bool] = None,
         assigned_entry_tag: Optional[int] = None,
+        outcome: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Settle a held single-leg option position at expiry (Task 7).
 
@@ -5592,9 +5593,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         resolved (``_all_legs_resolved``), so settling the first leg does not orphan the second.
 
         ``hold_assigned`` / ``assigned_entry_tag``: the assignment's disposition, when the caller
-        already decided it (``settle_single_leg_expiry``, which logs it); otherwise decided here
-        through ``_assignment_disposition`` -- BEFORE any write, so a refused (untagged)
-        assignment leaves the book untouched.
+        already decided it; otherwise decided here through ``_assignment_disposition`` -- ONLY
+        when the delivery OPENS a lot (a covered call called away closes the held lot and
+        opens nothing, so there is no stock to hold or liquidate and nothing to decide), and
+        BEFORE any write, so a refused (untagged) assignment leaves the book untouched.
+        ``outcome`` (optional OUT dict): ``{"opening": shares the delivery opened, "hold": the
+        decision or None when nothing opened}`` -- what ``settle_single_leg_expiry`` logs.
         """
         from ba2_common.core.utils import close_transaction_with_logging
 
@@ -5602,8 +5606,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if txn is None:
             return False
         share_leg = share_side is not None and bool(shares) and share_price is not None
-        if share_leg and hold_assigned is None:
-            hold_assigned, assigned_entry_tag = self._assignment_disposition(txn)
+        book_qty = book_px = None
+        if share_leg:
+            # The booked delivery, computed BEFORE any write (read-only: the lot is zeroed in
+            # step 2, the position moves in step 3). THE OPTION -> STOCK BOUNDARY (plan Part
+            # E3): ``shares`` and the strike are AS TRADED (100 x contracts at the contract's
+            # strike); this book is split-ADJUSTED, so book ``shares x k`` at ``strike / k``.
+            # ``k`` is the LOT's basis (Task 1a): a P400 written before a 4:1 split delivers 100
+            # pre-split shares at 400 = 400 adjusted shares at 100, whatever today's factor is.
+            early_lot = self._option_positions.get(position.contract_symbol)
+            lot_k = early_lot.basis_factor if self._lot_has_basis(early_lot) else None
+            k = lot_k if lot_k is not None else self._as_traded_factor(position.underlying)
+            signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
+            book_qty, book_px = signed, float(share_price)
+            if k != 1.0:
+                book_qty, book_px = signed * k, float(share_price) / k
+            opening = self._assignment_split(position.underlying, book_qty)[1]
+            # Stage-2 E2: who keeps the stock is a question only when the delivery OPENS a lot.
+            if opening > 0 and hold_assigned is None:
+                hold_assigned, assigned_entry_tag = self._assignment_disposition(txn)
+            if outcome is not None:
+                outcome["opening"] = opening
+                outcome["hold"] = hold_assigned if opening > 0 else None
 
         # 1. Record a synthetic CLOSING fill on THIS leg at the resolved premium (intrinsic, or 0
         #    for worthless) so round-trip P&L can pair open<->close. This moves NO cash: the option
@@ -5615,9 +5639,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # 2. Remove THIS leg's option lot from the option ledger (its cash was settled at entry; the
         #    conversion below moves the share-leg cash). Worthless simply zeroes it out.
         lot = self._option_positions.get(position.contract_symbol)
-        # The share basis the contract was traded in, read BEFORE the lot is zeroed: an
-        # assignment delivers shares of THAT basis (Task 1a). None -> the bar's own factor.
-        lot_k = lot.basis_factor if self._lot_has_basis(lot) else None
+        # (The share basis the contract was traded in was read above, BEFORE the lot is
+        # zeroed: an assignment delivers shares of THAT basis -- Task 1a.)
         if lot is not None:
             self._zero_option_lot(lot)
 
@@ -5628,22 +5651,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         #    the delivery to the ORDER/TRANSACTION tables (OPT-B2/F7) — the ledger alone is not the
         #    book.
         if share_leg:
-            signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
             self._cash -= signed * float(share_price)  # buy debits, sell credits — at strike.
-            # THE OPTION -> STOCK BOUNDARY (plan Part E3). ``shares`` and the strike are AS
-            # TRADED (100 x contracts at the contract's strike); this book is split-ADJUSTED.
-            # Book ``shares x k`` at ``strike / k``: the cash above is unchanged (moved at the
-            # as-traded numbers, exactly), and the lot marks against the adjusted closes like
-            # every other share in the book. k == 1 books the originals untouched. ``k`` is the
-            # LOT's basis (Task 1a): a P400 written before a 4:1 split delivers 100 pre-split
-            # shares at 400 = 400 adjusted shares at 100, whatever today's factor is.
-            k = lot_k if lot_k is not None else self._as_traded_factor(position.underlying)
-            book_qty, book_px = signed, float(share_price)
-            if k != 1.0:
-                book_qty, book_px = signed * k, float(share_price) / k
+            # The cash above moved at the AS-TRADED numbers, exactly; the lot is booked at the
+            # split-adjusted ``book_qty`` / ``book_px`` computed before any write, and marks
+            # against the adjusted closes like every other share in the book (k == 1 books the
+            # originals untouched).
             self._book_assignment_share_leg(
                 position.underlying, book_qty, book_px, expert_id=txn.expert_id,
-                hold=bool(hold_assigned), entry_tag=assigned_entry_tag)
+                hold=hold_assigned, entry_tag=assigned_entry_tag)
 
         # 4. Close the SHARED transaction only once every option leg on it has resolved. For a
         #    single-leg option this is immediate; for a multi-leg spread the transaction stays
@@ -5682,6 +5697,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             resolve_assigned_stock_hold_policy(self._cfg), tag,
             where=f"[backtest] assignment of option transaction {txn.id} ({txn.symbol})")
         return hold, tag
+
+    def _assignment_split(self, symbol: str, signed: float) -> "tuple[float, float]":
+        """``(closing, opening)`` of a SIGNED share delivery against what is held now: the part
+        that offsets an existing lot closes it, the rest opens a new lot. Read-only."""
+        pos = self._positions.get(symbol)
+        held = float(pos.qty) if pos is not None else 0.0
+        closing = 0.0
+        if held and (held > 0) != (signed > 0):
+            closing = min(abs(signed), abs(held))
+        return closing, abs(signed) - closing
 
     def _book_assignment_share_leg(
         self, symbol: str, signed: float, price: float, *, expert_id: Optional[int] = None,
@@ -5728,19 +5753,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         ``hold`` None (a caller with no settling transaction at hand) decides through the same
         shared function from ``entry_tag`` alone -- the run-level flag, or a refusal in a
-        member-scoped run when no tag is given.
+        member-scoped run when no tag is given -- and ONLY when the delivery opens a lot
+        (stage-2 E2 review C1: a delivery that only closes a held lot has nothing to decide).
         """
-        if hold is None:
-            hold = holds_assigned_stock(
-                resolve_assigned_stock_hold_policy(self._cfg), entry_tag,
-                where=f"[backtest] assignment share leg on {symbol}")
         pos = self._positions.get(symbol)
         held = float(pos.qty) if pos is not None else 0.0
         # The offsetting part (opposite sign to what is held) closes; the rest opens.
-        closing = 0.0
-        if held and (held > 0) != (signed > 0):
-            closing = min(abs(signed), abs(held))
-        opening = abs(signed) - closing
+        closing, opening = self._assignment_split(symbol, signed)
+        if opening > 0 and hold is None:
+            hold = holds_assigned_stock(
+                resolve_assigned_stock_hold_policy(self._cfg), entry_tag,
+                where=f"[backtest] assignment share leg on {symbol}")
 
         self._update_position(symbol, signed, price)
 
@@ -5865,16 +5888,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if position.side == OrderDirection.SELL:
             # SHORT ITM -> ALWAYS physically assigned (called away / put to us) at the strike.
             share_side = OrderDirection.SELL if is_call else OrderDirection.BUY
-            # WHO KEEPS THE STOCK is decided per assignment, before anything is written
-            # (stage-2 E2: the member-scoped hold; ``_assignment_disposition``).
-            txn = self._option_transaction_for_contract(position.contract_symbol)
-            hold, tag = (self._assignment_disposition(txn) if txn is not None
-                         else (None, None))
+            # WHO KEEPS THE STOCK is decided inside, per assignment, only when the delivery
+            # opens a lot, and before anything is written (stage-2 E2; ``outcome`` says what
+            # was decided, for the log line below).
+            outcome: Dict[str, Any] = {}
             ok = self.settle_option_expiry(
                 position, close_premium=intrinsic,
                 share_side=share_side, shares=shares, share_price=strike,
-                trigger=OptionCloseReason.ASSIGNED,
-                hold_assigned=hold, assigned_entry_tag=tag,
+                trigger=OptionCloseReason.ASSIGNED, outcome=outcome,
             )
             if ok:
                 # The stock the assignment ORPHANS (long from a short put, short from a naked
@@ -5890,9 +5911,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "[backtest] short-%s assignment of %d x %s at strike %.2f — %s "
                     "(cash now $%.2f).",
                     "call" if is_call else "put", shares, position.underlying, strike,
-                    ("HOLDING the assigned stock (the run holds this assignment's stock; the "
+                    ("delivered against shares already held (a covered call called away): "
+                     "nothing new to hold or liquidate"
+                     if not outcome.get("opening") else
+                     "HOLDING the assigned stock (the run holds this assignment's stock; the "
                      "strategy's own rules must manage and exit it)"
-                     if hold else
+                     if outcome.get("hold") else
                      "scheduling assignment_liquidation of the assigned stock at the next "
                      "bar's open"),
                     self._cash,

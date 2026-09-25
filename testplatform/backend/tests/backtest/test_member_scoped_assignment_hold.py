@@ -73,9 +73,15 @@ def _spot_on(d: date) -> float:
     return 20.0 if d < PUT_EXPIRY - timedelta(days=3) else 18.0
 
 
-def _bars():
-    return [{"Date": d, "Open": _spot_on(d), "High": _spot_on(d) + 0.1,
-             "Low": _spot_on(d) - 0.1, "Close": _spot_on(d), "Volume": 1_000_000}
+def _called_away_spot_on(d: date) -> float:
+    """As ``_spot_on`` through the put phase and the call's writing, then 22 from the first of
+    February: the 19-strike covered call finishes ITM and the shares are CALLED AWAY."""
+    return 22.0 if d >= date(2024, 2, 1) else _spot_on(d)
+
+
+def _bars(spot_on=_spot_on):
+    return [{"Date": d, "Open": spot_on(d), "High": spot_on(d) + 0.1,
+             "Low": spot_on(d) - 0.1, "Close": spot_on(d), "Volume": 1_000_000}
             for d in DAYS]
 
 
@@ -175,7 +181,7 @@ def _exit_rules():
     ]
 
 
-def _run(account_id, cfg, entry_rules):
+def _run(account_id, cfg, entry_rules, spot_on=_spot_on):
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
         backtest_trading_db, seed_account_definition, seed_expert_instance)
@@ -212,7 +218,7 @@ def _run(account_id, cfg, entry_rules):
                              open_positions_ruleset_id=open_id, instance_id=account_id)
         ps = AsOfPriceSource(ohlcv_provider=None)
         for sym in (WHL, CSP):
-            ps.load_bars(sym, _bars())
+            ps.load_bars(sym, _bars(spot_on))
         ps.set_clock(START)
         account = BacktestAccount(account_id, ps, cfg, options_provider=provider)
         resolver.register_account(account_id, account)
@@ -245,6 +251,13 @@ def _stock(orders, sym):
 def _held(account, sym):
     rows = [p for p in account.get_positions() if p["symbol"] == sym]
     return float(rows[0]["qty"]) if rows else 0.0
+
+
+def _delivered_buy(orders, sym):
+    """Shares the PUT's assignment delivered on ``sym``."""
+    (row,) = [o for o in _stock(orders, sym)
+              if o.comment == "option_assignment" and o.side is OrderDirection.BUY]
+    return float(row.filled_qty or row.quantity)
 
 
 def _delivered(orders, sym):
@@ -382,5 +395,70 @@ def test_borrow_is_charged_exactly_on_the_assigned_short_stock_a_member_HOLDS(
             assert charge == pytest.approx(100 * 190.0 * 0.252 / 252)
         else:
             assert charge == 0.0, "short stock queued for liquidation was charged borrow"
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# =========================================================================================== #
+# C1: the wheel's covered call finishing ITM is a closing delivery, not an assignment to decide
+# =========================================================================================== #
+@pytest.fixture(scope="module")
+def called_away_run():
+    return _run(9304, MEMBER_CFG, _entry_rules(), spot_on=_called_away_spot_on)
+
+
+def test_a_wheel_call_finishing_ITM_is_called_away_and_the_run_completes(called_away_run):
+    """The written call carries no entry tag of its own unless it inherits one, and the
+    delivery it causes OPENS nothing (it closes the held lot), so there is no hold/liquidate
+    decision to make: the run must not refuse it as an untagged assignment."""
+    orders, account = called_away_run
+    (call,) = _written_calls(orders, WHL)
+    away = [o for o in _stock(orders, WHL)
+            if o.comment == "option_assignment" and o.side is OrderDirection.SELL]
+    assert away, "the ITM covered call did not call the shares away"
+    assert sum(float(o.filled_qty or o.quantity) for o in away) == pytest.approx(
+        _delivered_buy(orders, WHL))
+    assert _held(account, WHL) == pytest.approx(0.0), "shares remain after being called away"
+    assert not [o for o in _stock(orders, WHL) if o.comment == "assignment_liquidation"]
+
+
+def test_the_written_covered_call_inherits_the_wheel_members_tag(called_away_run):
+    """The overlay entry (``sell_covered_call`` from an OPEN_POSITIONS rule) authors no tag;
+    it inherits the covered stock's, so the wheel member's own tag-scoped exits see it."""
+    from ba2_common.core.entry_tag import order_entry_tag
+
+    orders, _ = called_away_run
+    (call,) = _written_calls(orders, WHL)
+    assert order_entry_tag(call) == TAG_WHEEL, call.data
+
+
+def test_an_UNTAGGED_call_called_away_in_a_member_scoped_run_decides_nothing(tmp_path):
+    """C1 on its own, without the overlay's tag inheritance: a call delivered against shares
+    already held only CLOSES the lot, so no hold/liquidate decision -- and so no untagged
+    refusal -- is made for it. Account level, through the settlement the engine drives."""
+    from ba2_common.core.db import update_instance
+    from ba2_common.core.types import OptionRight
+    from tests.backtest.test_wheel_assignment import (
+        _CALL170, _assign_the_put, _build, _engine, _sell_the_put, _shares, _write_the_call)
+
+    cfg = {**BASE_CFG, "hold_assigned_stock_tags": [TAG_WHEEL]}
+    acct, ps, ctx = _build(tmp_path, "c1untagged", 9320, cfg)
+    try:
+        _sell_the_put(acct)
+        (put_entry,) = [o for o in acct.get_orders() if o.contract_symbol]
+        put_entry.data = {**(put_entry.data or {}), "entry_tag": TAG_WHEEL}
+        update_instance(put_entry)
+        _assign_the_put(acct, ps, cfg)
+        assert _shares(acct) == pytest.approx(100.0) and acct._pending_assignment_sells == {}
+
+        ps.set_clock(datetime(2024, 3, 11))
+        _write_the_call(acct, occ=_CALL170, strike=170.0)       # NO tag on the call
+        as_of = datetime(2024, 3, 28)                              # closes 190: ITM
+        ps.set_clock(as_of)
+        _engine(acct, ps, cfg)._apply_option_expiry(as_of)
+        acct.refresh_transactions()
+
+        assert _shares(acct) == pytest.approx(0.0), "the shares were not called away"
+        assert acct._pending_assignment_sells == {}
     finally:
         ctx.__exit__(None, None, None)

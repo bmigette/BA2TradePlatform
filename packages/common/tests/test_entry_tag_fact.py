@@ -335,3 +335,60 @@ def test_an_untagged_entry_with_no_row_keeps_todays_behaviour(buy_call_with):
     sub = buy_call_with()
     res = _submit_against(sub.action, 987654)
     assert res["success"] is True
+
+
+# ------------------------------------------------------------------------------------------- #
+# stage-2 E2 review C1: an OVERLAY entry inherits the tag of the position it is written on
+# ------------------------------------------------------------------------------------------- #
+@pytest.mark.parametrize("action_type, cfg", [
+    (ExpertActionType.SELL_COVERED_CALL, {"action_type": "sell_covered_call"}),
+    (ExpertActionType.BUY_PROTECTIVE_PUT, {"action_type": "buy_protective_put"}),
+])
+def test_an_overlay_inherits_the_member_tag_of_the_evaluated_position(action_type, cfg):
+    """``sell_covered_call`` / ``buy_protective_put`` come from an OPEN_POSITIONS rule and
+    author no tag; the covered stock's entry order (the evaluated ``existing_order`` both
+    runtimes hand the rule) carries its member's. The overlay inherits it, so that member's
+    own tag-scoped exits can see its call / put. Shared: the live open-positions pass builds
+    its actions through this same evaluator."""
+    from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+    from ba2_common.core.types import OrderRecommendation
+
+    ev = TradeActionEvaluator.__new__(TradeActionEvaluator)
+    ev.account = FakeAccount(order_id=1)
+    stock = SimpleNamespace(id=9, data={ORDER_ENTRY_TAG_KEY: 7}, contract_symbol=None)
+    action = ev._create_trade_action(action_type, dict(cfg), "XYZ", OrderRecommendation.BUY,
+                                     stock, _rec())
+    assert action is not None and action.entry_tag == 7
+
+    untagged = ev._create_trade_action(action_type, dict(cfg), "XYZ",
+                                       OrderRecommendation.BUY,
+                                       SimpleNamespace(id=9, data=None, contract_symbol=None),
+                                       _rec())
+    assert untagged is not None and untagged.entry_tag is None, "untagged stays untagged"
+
+
+def test_an_overlays_own_authored_tag_wins_over_the_inherited_one():
+    from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+    from ba2_common.core.types import OrderRecommendation
+
+    ev = TradeActionEvaluator.__new__(TradeActionEvaluator)
+    ev.account = FakeAccount(order_id=1)
+    stock = SimpleNamespace(id=9, data={ORDER_ENTRY_TAG_KEY: 7}, contract_symbol=None)
+    action = ev._create_trade_action(
+        ExpertActionType.SELL_COVERED_CALL, {"action_type": "sell_covered_call", "entry_tag": 2},
+        "XYZ", OrderRecommendation.BUY, stock, _rec())
+    assert action.entry_tag == 2
+
+
+def test_a_non_overlay_entry_never_inherits_a_tag():
+    """A plain option entry is its own member's position: it must not pick up the tag of
+    whatever order happens to be evaluated."""
+    from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+    from ba2_common.core.types import OrderRecommendation
+
+    ev = TradeActionEvaluator.__new__(TradeActionEvaluator)
+    ev.account = FakeAccount(order_id=1)
+    stock = SimpleNamespace(id=9, data={ORDER_ENTRY_TAG_KEY: 7}, contract_symbol=None)
+    action = ev._create_trade_action(ExpertActionType.BUY_CALL, {"action_type": "buy_call"},
+                                     "XYZ", OrderRecommendation.BUY, stock, _rec())
+    assert action.entry_tag is None

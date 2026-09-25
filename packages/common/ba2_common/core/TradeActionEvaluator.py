@@ -22,6 +22,7 @@ from sqlmodel import select
 import enum
 import datetime
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.entry_tag import order_entry_tag
 
 
 # Canonical option action-type sets, derived from get_option_action_values() so a new
@@ -37,6 +38,10 @@ _ALL_OPTION_ACTION_TYPES = frozenset(ExpertActionType(v) for v in get_option_act
 #: on the order row, so a param forwarded to it would be a knob nothing reads.
 _OPTION_ENTRY_ACTION_TYPES = frozenset(
     ExpertActionType(v) for v in get_option_entry_action_values())
+#: The option entries written as an OVERLAY on a held position by an OPEN_POSITIONS rule: they
+#: inherit that position's style-member tag (see ``_create_trade_action``).
+_OVERLAY_ACTION_TYPES = frozenset({
+    ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PROTECTIVE_PUT})
 
 # Selection-param keys forwarded from an option action config to the _OptionEntryAction
 # ctor. ``wing_width_pct`` is required by the 4-/3-leg structures (iron condor, jade
@@ -1402,6 +1407,19 @@ class TradeActionEvaluator:
                 for opt_key in _OPTION_ENTRY_PARAM_KEYS:
                     if opt_key in action_config:
                         kwargs[opt_key] = action_config.get(opt_key)
+                # An OVERLAY (covered call / protective put, written by an OPEN_POSITIONS rule
+                # on a held position) authors no member tag: it INHERITS the tag of the
+                # position it is written on -- the evaluated ``existing_order``, the row the
+                # rule's own ``entry_tag`` leaf was scoped by (stage-2 E2 review C1). So a
+                # wheel member's covered call carries the wheel's tag and that member's own
+                # tag-scoped exits can see it. Untagged position -> nothing inherited
+                # (byte-identical); an authored tag wins. Shared by both runtimes: the live
+                # open-positions pass builds its actions through this same evaluator.
+                if (action_type in _OVERLAY_ACTION_TYPES and kwargs.get('entry_tag') is None
+                        and existing_order is not None):
+                    inherited = order_entry_tag(existing_order)
+                    if inherited is not None:
+                        kwargs['entry_tag'] = inherited
 
             # Create action using factory function, passing expert_recommendation
             action = create_action(
