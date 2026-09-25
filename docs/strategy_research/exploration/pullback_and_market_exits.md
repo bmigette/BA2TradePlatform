@@ -89,10 +89,11 @@ The expert never submits orders and never loops over prices checking whether to 
 | `short_spy` | short, sma200_and_spy gate | same |
 
 - **Size:** 5 jobs and 72 combinations, small enough to run as an exhaustive grid.
-- **Only the 3 long jobs (48 combinations) run today.** Equity shorts cannot open: the `sell`
-  action only sells an existing long. `runtime.refuse_unrunnable` therefore refuses any selection
-  that includes `short_sma5` or `short_spy` before its first job starts. Both jobs are fully
-  specified (direction, rules, stop 8% above entry, `enable_short`) for when shorts exist.
+- **All 5 jobs (72 combinations) run.** Since short selling landed
+  ([design](../../plans/2026-09-24-equity-short-selling-design.md)), a `sell` from a flat book
+  opens a short when `enable_sell` is on (`enable_short` feeds it), so `short_sma5` and
+  `short_spy` open real shorts: stop 8% above entry, covered by the BUY exit signal or the time
+  limit, and charged the backtest's borrow cost (`short_borrow_rate_pa`, default 0.5%/yr).
 - **Long and short in one account is a portfolio question.** It comes after both sides are
   measured separately, not before.
 
@@ -199,7 +200,6 @@ session in both, and that all-off templates are byte-identical to no templates.
 
 ## Known gaps (operator)
 
-- **Equity shorts cannot open**, so the `pullback_rsi` short jobs are refused.
 - **UI reduce rules store `target_percent`, but the evaluator reads `value`.** A reduce authored in
   the settings UI does not carry its percent to `decrease_instrument_share`.
 - **`TradeActionEvaluator` treats a trigger with an unknown `event_type` as passing.** The

@@ -214,11 +214,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 # Trading Permissions (generic settings for all market experts)
                 "enable_buy": {
                     "type": "bool", "required": False, "default": True,
-                    "description": "Allow buy orders for this expert"
+                    "description": ("Allow long positions: a buy opens a long, and a sell "
+                                    "closing or reducing this expert's long needs this setting")
                 },
                 "enable_sell": {
                     "type": "bool", "required": False, "default": False,
-                    "description": "Allow sell orders for this expert"
+                    "description": ("Allow short positions: a sell from flat opens a short, and "
+                                    "a buy covering this expert's short needs this setting")
                 },
                 # No hedging permission: see RETIRED_EXPERT_SETTINGS (netting rule).
                 "allow_automated_trade_opening": {

@@ -638,10 +638,19 @@ def get_action_type_documentation() -> dict:
     return {
         ExpertActionType.SELL.value: {
             "name": "Bearish (Sell)",
-            "description": "Create a SELL order for the symbol. Can be used to open a short position or close a long position.",
+            "description": ("A SELL, as at the broker. While this expert is long it closes or "
+                            "reduces the long (capped at the shares held, so it never flips to "
+                            "short). From flat it opens a short, sized and protected like a buy "
+                            "entry (stop above the price, take-profit below), which needs a "
+                            "SELL/UNDERWEIGHT recommendation. Netting rule: an order opposite to "
+                            "an open position only reduces or closes it; a new position in the "
+                            "other direction opens only from flat. Refused while this expert is "
+                            "already short (it would add to the short), while it holds both a "
+                            "long and a short (a legacy hedge), or when the broker is long the "
+                            "symbol for another expert."),
             "use_cases": [
-                "Enter a short position when bearish signals detected",
-                "Close an existing long position to take profits or cut losses",
+                "Enter a short position from flat when bearish signals are detected (needs enable_sell)",
+                "Close or trim an existing long position to take profits or cut losses (needs enable_buy)",
                 "Exit the market on negative sentiment change"
             ],
             "parameters": ("Optional Close % (1-100, empty = 100): when the sell closes this "
@@ -654,10 +663,14 @@ def get_action_type_documentation() -> dict:
         },
         ExpertActionType.BUY.value: {
             "name": "Bullish (Buy)",
-            "description": "Create a BUY order for the symbol. Can be used to open a long position or close a short position.",
+            "description": ("A BUY, as at the broker. While this expert is short it covers or "
+                            "reduces the short (capped at the shares held, so it never flips to "
+                            "long). From flat or long it is a long entry, sized by the risk "
+                            "manager and gated on enable_buy, as before. Refused while this "
+                            "expert holds both a long and a short (a legacy hedge)."),
             "use_cases": [
                 "Enter a long position when bullish signals detected",
-                "Close an existing short position to take profits or cut losses",
+                "Cover or trim an existing short position to take profits or cut losses (needs enable_sell)",
                 "Enter the market on positive sentiment change"
             ],
             "parameters": ("Optional Close % (1-100, empty = 100): when the buy covers this "
@@ -682,7 +695,7 @@ def get_action_type_documentation() -> dict:
         },
         ExpertActionType.ADJUST_TAKE_PROFIT.value: {
             "name": "Adjust Take Profit",
-            "description": "Modify the take-profit price for an existing open position. Used to lock in gains or adjust profit targets based on changing market conditions.",
+            "description": "Modify the take-profit price for an existing open position. Used to lock in gains or adjust profit targets based on changing market conditions. Long vs short comes from the POSITION's side (the recommendation is used only when there is no position), so a bearish bar on a held long still sets a long-side target. Skipped on a transaction the same pass closed or reduced, on an option transaction, and on the whole symbol for the pass when a close on it raised or has an uncertain outcome.",
             "use_cases": [
                 "Raise take-profit target when price moves favorably (trailing profit)",
                 "Lower take-profit target when volatility increases",
@@ -693,7 +706,7 @@ def get_action_type_documentation() -> dict:
         },
         ExpertActionType.ADJUST_STOP_LOSS.value: {
             "name": "Adjust Stop Loss",
-            "description": "Modify the stop-loss price for an existing open position. Used to protect profits or limit losses based on price movement and market conditions. A rule only TIGHTENS an existing stop; a looser request keeps the current stop, unless the expert setting allow_ruleset_sl_loosen is on, which lets it loosen down to (up to, for shorts) the trade's max-loss stop (the stop it was sized on) and no further; trades with no recorded max-loss stop are never loosened. The SL minimum-distance floor never turns a tightening rule into a loosen.",
+            "description": "Modify the stop-loss price for an existing open position. Used to protect profits or limit losses based on price movement and market conditions. A rule only TIGHTENS an existing stop; a looser request keeps the current stop, unless the expert setting allow_ruleset_sl_loosen is on, which lets it loosen down to (up to, for shorts) the trade's max-loss stop (the stop it was sized on) and no further; trades with no recorded max-loss stop are never loosened. The SL minimum-distance floor never turns a tightening rule into a loosen. Long vs short comes from the POSITION's side (the recommendation is used only when there is no position), so a bearish bar on a held long still sets a stop below the price. Skipped on a transaction the same pass closed or reduced, on an option transaction, and on the whole symbol for the pass when a close on it raised or has an uncertain outcome.",
             "use_cases": [
                 "Raise stop-loss as price moves up (trailing stop)",
                 "Tighten stop-loss when approaching target",

@@ -1,6 +1,29 @@
 # Equity short selling — design
 
-Status: **approved by the operator 2026-09-24**, not implemented. Branch `feat/short-selling`.
+Status: **implemented on `feat/short-selling` (2026-09-25)**; approved by the operator 2026-09-24.
+
+## Implemented differences
+
+What landed differs from the sections below in these points:
+
+- **Closes are gated by the permission that opened the position** (operator, 2026-09-25): a sell
+  closing a long needs `enable_buy`, a buy covering a short needs `enable_sell`. One reader,
+  `trading_permission`, serves every path.
+- **Close percent:** sell and buy take an optional percent (1–100, default 100) when they close.
+  It rounds to whole shares and is refused on a partly filled or fractional position. A percent
+  rule re-trims every time it matches (100 → 50 → 25), so its conditions must stop it.
+- **TP/SL direction comes from the position**, not the recommendation. Of the 7 exposed
+  forward-test backtests, only 1030 (+0.44 CAR) and 1439 (−1.28 CAR) moved. The live prod account
+  is unaffected (bt1330 re-runs identical).
+- **Same-pass TP/SL adjusts are skipped** on a transaction the pass closed or reduced, on option
+  transactions, and on the symbol when a close raised or its outcome is uncertain. This removed a
+  stray SHARE stop that O_CC wrote onto its covered-call option transaction; stored O_CC runs may
+  change where it fired.
+- **Borrow cost exemption:** short stock from an assigned short call, queued for next-open
+  liquidation, is not charged, so stored option runs stay identical.
+- **Open BT/live gap:** a backtest does not rebase the stop to the fill price, as live does. It is
+  a known item, row 6 of
+  [the engine unification plan](2026-07-02-live-backtest-engine-unification.md).
 
 ## Goal and hard constraint
 

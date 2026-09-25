@@ -1473,8 +1473,10 @@ class ExpertSettingsTab:
            - ordinal: 1, 2 or 3 (1st/2nd/3rd)
            - weekday: lowercase weekday name (monday..sunday)
            - times: List of execution times in HH:MM format
-       - enable_buy (bool): Whether the expert can place BUY orders (default: True)
-       - enable_sell (bool): Whether the expert can place SELL orders (default: False)
+       - enable_buy (bool): Whether the expert can open longs, and so close them with a
+         sell (default: True)
+       - enable_sell (bool): Whether the expert can open shorts (a sell from flat), and so
+         cover them with a buy (default: False)
     
     2. **Expert-Specific Settings** (saved as ExpertSetting records):
        - Settings defined by each expert class's get_settings_definitions() method
@@ -2067,6 +2069,9 @@ class ExpertSettingsTab:
                         with ui.row().classes('w-full gap-4'):
                             self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=True)
                             self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=False)
+                        ui.label('BUY opens longs; SELL opens shorts (a sell from flat). Closing a '
+                                 'position needs the permission that opened it: a sell closing a long '
+                                 'needs BUY, a buy covering a short needs SELL.').classes('text-body2 text-grey-7 ml-6')
                         ui.label('An order opposite to an open position only reduces or closes it; '
                                  'a new position in the other direction opens only from flat').classes('text-body2 text-grey-7 ml-6')
                         
