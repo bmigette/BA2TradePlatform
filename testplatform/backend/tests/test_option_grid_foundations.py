@@ -1731,14 +1731,56 @@ def test_the_overlay_window_is_FIXED_and_carries_no_gene():
         "the overlay window must not be searched; see the row's own comment")
 
 
-def test_the_leaps_entry_dte_gene_can_never_decode_below_365():
-    """Design §2's "DTE >= 365". ``_apply_option_dte`` decodes the gene as a window CENTRE and
-    subtracts a half-width fixed by the AUTHORED window, so the floor is re-derived here from
-    the table rather than restated."""
+def _decoded_dte_windows(m, key):
+    """Every entry-DTE window the GA can actually produce for ``key``: each raw gene value in
+    the emitted range, decoded by ``GeneticOptimizer`` under the lattice anchor the launcher
+    gives that key, then turned into a window by the real ``_apply_option_dte``.
+
+    Table arithmetic alone is not enough: the GA snaps the gene to its step lattice FIRST, and
+    under the legacy zero-anchored lattice 410..500 step 15 decodes 410 to 405 (window 360..450,
+    below the floor this test exists for)."""
+    from app.services.genetic import GeneticOptimizer
+    from app.services.strategy_param_space import _apply_option_dte
+
+    space = _space(m, key)
+    genes = [g for g in space if g.endswith(":option_dte")]
+    assert genes, f"{key} emits no option_dte gene"
+    opt = GeneticOptimizer(param_ranges=space, population_size=2, n_generations=1,
+                           lattice_anchor=m._lattice_anchor_for(key, None))
+    names = list(space)
+    base = [space[n]["min"] if space[n]["type"] != "choice" else 0 for n in names]
+    windows = set()
+    for gene in genes:
+        member = gene.split(":")[1][: -len("-entry")].upper()
+        cfg = m._OPTION_STRATS[member]
+        for raw in range(space[gene]["min"], space[gene]["max"] + 1):
+            ind = list(base)
+            ind[names.index(gene)] = raw
+            action = {"option_dte_min": cfg["option_dte_min"],
+                      "option_dte_max": cfg["option_dte_max"]}
+            _apply_option_dte(action, opt.decode_individual(ind)[gene])
+            windows.add((action["option_dte_min"], action["option_dte_max"]))
+    return windows
+
+
+@pytest.mark.parametrize("key", ["O_PMCC", "O_LEAP"])
+def test_the_leaps_entry_dte_gene_can_never_decode_below_365(key):
+    """Design §2's "DTE >= 365" (entry band 365-550), checked on what the GA DECODES, not on the
+    table: ``_apply_option_dte`` decodes the gene as a window CENTRE and subtracts a half-width
+    fixed by the AUTHORED window, and the GA snaps the centre to the lattice before that."""
     m = _launcher()
-    cfg = m._OPTION_STRATS["O_PMCC"]
-    hw = max(int((cfg["option_dte_max"] - cfg["option_dte_min"]) // 2), 7)
-    assert cfg["option_dte_min_range"] - hw >= 365
+    windows = _decoded_dte_windows(m, key)
+    assert min(lo for lo, _ in windows) >= 365, sorted(windows)
+    assert max(hi for _, hi in windows) <= 550, sorted(windows)
+    assert windows == {(c - 45, c + 45) for c in range(410, 501, 15)}
+
+
+def test_the_earnings_entry_dte_windows_stay_inside_the_designed_7_to_30_band():
+    """O_ERN's row comment: centres 14..23 step 3 decode to [7,21] [10,24] [13,27] [16,30]. The
+    zero-anchored lattice decoded them to centres 15..24, i.e. up to [17,31]."""
+    m = _launcher()
+    windows = _decoded_dte_windows(m, "O_ERN")
+    assert windows == {(7, 21), (10, 24), (13, 27), (16, 30)}
 
 
 @pytest.mark.parametrize("rule_id,field,op", [
