@@ -26,6 +26,12 @@ OPERATOR CHECKLIST BEFORE LAUNCHING ANY OPTION GRID (2026-09-03, options-grid2 c
   5. Equity grids: BT_BAR_CACHE_TRIALS=0 re-preloads bars before EVERY individual (matrix3 paid
      ~8 h); evaluate a non-zero value for the next launch (memory: the union of per-individual
      symbol sets is retained until recycle).
+  6. Expert settings fixed for OPTION jobs only (a launcher spec's ``option_fixed_settings``,
+     e.g. DeterministicScorer macro_short_side=mirror since 2026-09-25) are folded into the
+     discovery digest, so such a job gets a NEW name and never SKIPs on / resumes a job run
+     without them. The digest reads them from the launcher the job runs (--launcher when it is a
+     ba2test_launcher.py, else this checkout's). --profile matrix names carry no digest: give a
+     matrix relaunch a fresh --name-suffix after changing option_fixed_settings.
 
 Runs `ba2-test optimize --strategy <OS?/O_?>` SEQUENTIALLY (one job at a time) over the
 option-strategy matrix on the top-100 large-cap universe covered by the offline options
@@ -322,6 +328,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "skip against nor resume from one priced by this one. Matrix-mode job "
                          "names carry no digest, so the model is folded into the NAME instead "
                          "(e.g. -spow0922; nothing for legacy-pct).")
+    ap.add_argument("--option-size-within-fill-volume", action="store_true", default=False,
+                    help="Forward --option-size-within-fill-volume to every job (plan "
+                         "2026-09-24 Task 11): opening option orders are sized at order time "
+                         "to what the fill engine's volume cap can fill. Off by default so "
+                         "existing job names/commands are unchanged; a digest token when on, so "
+                         "a sized run never shares a name (checkpoint) with an unsized one. "
+                         "tools/stage1_run.sh passes it.")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
@@ -572,6 +585,9 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
                 "--fitness-trade-scale-target", str(args.fitness_trade_scale_target)]
     if args.fitness_win_rate_factor:
         cmd += ["--fitness-win-rate-factor"]
+    # Task 11 order-time sizing: forwarded only when on, so every existing command is unchanged.
+    if getattr(args, "option_size_within_fill_volume", False):
+        cmd += ["--option-size-within-fill-volume"]
     # Robustness is DEFAULT-ON in the launcher, so the ON case passes nothing (every existing
     # job name is unchanged) and only the opt-OUT is forwarded -- and it is a digest token, so a
     # raw-ranked run cannot share a name, and therefore a checkpoint, with a robust one.
@@ -580,6 +596,43 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
     if args.workers:
         cmd += ["--workers", args.workers]
     return cmd
+
+
+_CHECKOUT_LAUNCHER = os.path.join(os.path.dirname(_TOOLS_DIR), "testplatform", "ba2test_launcher.py")
+_LAUNCHER_MODULES: dict = {}
+
+
+def _launcher_module(launcher):
+    """The launcher module whose expert specs the job will actually run with.
+
+    A --launcher naming a ``ba2test_launcher.py`` (a worktree's, or the remote grid checkout's)
+    IS that code; anything else (the installed ``ba2-test`` entry point) runs this checkout's.
+    Loaded once per path -- import is cheap (the backend is imported lazily by the commands).
+    """
+    import importlib.util
+    path = os.path.abspath(launcher if os.path.basename(launcher) == "ba2test_launcher.py"
+                           else _CHECKOUT_LAUNCHER)
+    if path not in _LAUNCHER_MODULES:
+        spec = importlib.util.spec_from_file_location(
+            f"_rom_launcher_{len(_LAUNCHER_MODULES)}", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _LAUNCHER_MODULES[path] = mod
+    return _LAUNCHER_MODULES[path]
+
+
+def option_fixed_settings(launcher, expert, strat):
+    """The expert settings the launcher pins for THIS option job (``{}`` for most experts).
+
+    Same function the launcher applies (``_option_fixed_settings_for``), so the name and the run
+    cannot disagree. An expert the launcher does not know yields {}: the launcher refuses such a
+    job outright, so there is no run whose identity could be mixed up.
+    """
+    mod = _launcher_module(launcher)
+    spec = mod._EXPERT_OPT.get(expert)
+    if spec is None:
+        return {}
+    return mod._option_fixed_settings_for(spec, strat)
 
 
 def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_mode="legacy"):
@@ -596,7 +649,7 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     while i < len(tokens):
         flag = tokens[i]
         if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor",
-                    "--no-robust-fitness"):
+                    "--no-robust-fitness", "--option-size-within-fill-volume"):
             config[flag] = True
             i += 1
         else:
@@ -610,6 +663,12 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
                 "store": {key: os.environ.get(key) for key in (
                     "BA2_HOME", "BACKTEST_OPTIONS_STORE", "BACKTEST_OPTIONS_PARQUET_ROOT",
                     "BACKTEST_OPTIONS_RISK_FREE_RATE", "TASTYTRADE_OPTIONS_HISTORY_FLOOR")}}
+    # Settings the launcher fixes for option jobs only are not on the command line, so they are
+    # folded in explicitly -- and ONLY when present, so every job without them (every FMPRating
+    # job, every pre-existing name) keeps its digest byte for byte.
+    fixed = option_fixed_settings(launcher, expert, strat)
+    if fixed:
+        identity["option_fixed_settings"] = fixed
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
     return f"{name}-d{digest}"
 

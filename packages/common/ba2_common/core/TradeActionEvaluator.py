@@ -58,6 +58,11 @@ _OPTION_ENTRY_PARAM_KEYS = (
     # gives up when it quotes. Absent or 0.0 leaves the builder's quote untouched, and a live
     # account -- which models no spread -- ignores it entirely. See core.option_entry_quote.
     'entry_cross',
+    # 1-CONTRACT SIZING FLOOR (plan 2026-09-24 Task 8): lets a cost-sized entry whose budget
+    # rounds to 0 buy ONE contract when it fits under the per-instrument cap. Absent is off;
+    # the ctor reads it through coerce_bool (a GA/deploy "1" must mean on). Shared by live
+    # and backtest -- this forwarding is what makes the two size identically.
+    'min_one_contract',
     # SELECTION-POLICY WEIGHTS (design 2026-08-29 §7): the GA-wired choosing inside the box.
     # Absent or all-zero builds no policy and the selector keeps its legacy path byte for
     # byte. w_profit/w_rr are deliberately not forwarded until a builder supplies the

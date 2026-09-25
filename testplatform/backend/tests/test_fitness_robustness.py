@@ -246,7 +246,12 @@ def test_a_losing_genome_is_never_improved_by_the_adjustment():
 
 
 def test_a_run_with_too_few_trades_is_left_alone():
-    """No distribution to measure -> factors stay 1.0 rather than fabricating a penalty."""
+    """No distribution to measure -> factors stay 1.0 rather than fabricating a penalty.
+
+    This is the ROW-level (equity) path, which is frozen. The option CAR-family metrics are the
+    exception (``option_structures=True``, plan 2026-09-24 Task 4): there one winning STRUCTURE
+    is 100% concentrated and scores conc_factor 0 -- pinned in test_strategy_fitness_soft30.py.
+    """
     comp = robustness_metrics(_run([500.0]))
     assert (comp["conc_factor"], comp["mc_factor"], comp["spread_factor"]) == (1.0, 1.0, 1.0)
 

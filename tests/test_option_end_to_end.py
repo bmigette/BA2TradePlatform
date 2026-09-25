@@ -230,9 +230,12 @@ def test_open_positions_close_option_end_to_end(monkeypatch):
     # Capture close_option_position.
     captured = {}
 
-    def fake_close(position, order_type="limit", limit_price=None):
+    def fake_close(position, order_type="limit", limit_price=None, transaction_id=None):
+        # transaction_id: the interface's explicit link, which CloseOptionAction passes
+        # (review 2026-09-25 I2) -- the close rides the transaction it was decided for.
         captured.update(called=True, contract_symbol=position.contract_symbol,
-                        quantity=position.quantity, limit_price=limit_price)
+                        quantity=position.quantity, limit_price=limit_price,
+                        transaction_id=transaction_id)
         return TradingOrder(account_id=account.id, symbol="AAPL", quantity=position.quantity,
                             side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
                             status=OrderStatus.FILLED)
@@ -266,4 +269,5 @@ def test_open_positions_close_option_end_to_end(monkeypatch):
     results = ev.execute(submit_to_broker=True)
     assert captured.get("called") is True
     assert captured["contract_symbol"] == contract_symbol
+    assert captured["transaction_id"] == txn.id
     assert any(r.get("success") for r in results)

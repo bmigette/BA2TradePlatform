@@ -16,7 +16,7 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, uses_min_one_contract, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
     preview_trade_action_result_retention, execute_trade_action_result_retention,
@@ -5153,6 +5153,61 @@ class ExpertSettingsTab:
             ui.notify(f'Error deleting expert: {e}', type='negative')
 
 
+#: Action-config keys the rule editor has NO widget for, carried forward from the loaded rule
+#: by ``_save_rule`` when the action type is unchanged. The save rebuilds ``action_config``
+#: from the widgets alone, so without this a re-save silently stripped them -- the
+#: covered-call / wheel close (``cc_dte``) lost its ``close_target`` and went back to closing
+#: the evaluated order, which on those overlays is the STOCK.
+#:
+#: A NAMED list, not "every key the editor does not know": a widget-backed field the user
+#: cleared (``min_arc``, ``strike_param``, ...) must stay cleared, and a blanket carry-over
+#: would resurrect it. Every key here must be one no widget writes (pinned by test). Keys
+#: deliberately NOT listed: ``take_profit_price`` / ``stop_loss_price`` (a fixed price wins
+#: over the value/reference widgets, so carrying it would make the user's edit inert),
+#: ``value`` on the share actions (same: it would override the Target % widget), and
+#: ``min_volume`` (no live chain carries volume; see the note in ``_save_rule``).
+PRESERVED_HIDDEN_ACTION_KEYS = ('entry_tag', 'close_target', 'entry_cross', 'lot_size')
+
+#: The action-row widget refs and the action_config key each one writes. A key whose widget
+#: is RENDERED on the row at save time is one the user could see and clear, so its absence
+#: from the saved config is the user's choice. A loaded key with no rendered widget that is
+#: not carried by PRESERVED_HIDDEN_ACTION_KEYS is dropped by the save -- and ``_save_rule``
+#: says so rather than letting it vanish.
+ACTION_WIDGET_KEYS = (
+    ('value_input', 'value'),
+    ('reference_select', 'reference_value'),
+    ('target_percent_input', 'target_percent'),
+    ('strike_method_select', 'strike_method'),
+    ('strike_param_input', 'strike_param'),
+    ('dte_min_input', 'dte_min'),
+    ('dte_max_input', 'dte_max'),
+    ('sizing_input', 'sizing'),
+    ('min_oi_input', 'min_open_interest'),
+    ('max_spread_input', 'max_spread_pct'),
+    ('wing_width_input', 'wing_width_pct'),
+    ('short_dte_min_input', 'short_dte_min'),
+    ('short_dte_max_input', 'short_dte_max'),
+    ('min_arc_input', 'min_arc'),
+    ('min_one_contract_input', 'min_one_contract'),
+    ('w_premium_input', 'w_premium'),
+    ('w_iv_input', 'w_iv'),
+    ('w_rvol_input', 'w_rvol'),
+)
+
+#: The type key and its legacy spelling: rewritten by every save, never "dropped".
+_ACTION_TYPE_KEYS = ('action_type', 'type')
+
+
+def _first_unused_row_id(prefix: str, rows) -> str:
+    """A row id no current row holds. ``f"{prefix}_{len(rows)}"`` alone is not one: load
+    action_0 + action_1, delete action_0, Add -> a second action_1, whose refs REPLACE the
+    loaded row's while its card stays on screen, and the save writes the new row over it."""
+    n = len(rows)
+    while f"{prefix}_{n}" in rows:
+        n += 1
+    return f"{prefix}_{n}"
+
+
 class TradeSettingsTab:
     """
     UI tab for managing trading rules and rulesets.
@@ -5533,7 +5588,7 @@ class TradeSettingsTab:
             logger.error("Triggers container not initialized")
             return
             
-        trigger_id = trigger_key or f"trigger_{len(self.triggers)}"
+        trigger_id = trigger_key or _first_unused_row_id("trigger", self.triggers)
         
         with self.triggers_container:
             with ui.card().classes('w-full p-2') as trigger_card:
@@ -5662,7 +5717,7 @@ class TradeSettingsTab:
             logger.error("Actions container not initialized")
             return
             
-        action_id = action_key or f"action_{len(self.actions)}"
+        action_id = action_key or _first_unused_row_id("action", self.actions)
         
         with self.actions_container:
             with ui.card().classes('w-full p-2') as action_card:
@@ -5721,6 +5776,7 @@ class TradeSettingsTab:
                 short_dte_min_input = None
                 short_dte_max_input = None
                 min_arc_input = None
+                min_one_contract_input = None
                 w_premium_input = None
                 w_iv_input = None
                 w_rvol_input = None
@@ -5729,7 +5785,7 @@ class TradeSettingsTab:
                     nonlocal value_input, reference_select, target_percent_input
                     nonlocal strike_method_select, strike_param_input, dte_min_input
                     nonlocal dte_max_input, sizing_input, min_oi_input, max_spread_input
-                    nonlocal wing_width_input, min_arc_input
+                    nonlocal wing_width_input, min_arc_input, min_one_contract_input
                     nonlocal short_dte_min_input, short_dte_max_input
                     nonlocal w_premium_input, w_iv_input, w_rvol_input
 
@@ -5749,7 +5805,7 @@ class TradeSettingsTab:
                     dte_min_input = dte_max_input = sizing_input = None
                     min_oi_input = max_spread_input = wing_width_input = None
                     short_dte_min_input = short_dte_max_input = None
-                    min_arc_input = None
+                    min_arc_input = min_one_contract_input = None
                     w_premium_input = w_iv_input = w_rvol_input = None
 
                     selected_type = action_select.value
@@ -5857,6 +5913,38 @@ class TradeSettingsTab:
                                     step=0.1,
                                     format='%.1f'
                                 ).classes('w-24').props('dense')
+                                # 1-CONTRACT FLOOR (plan 2026-09-24 Task 8). Offered only on
+                                # the cost-sized entries: the covered call / protective put size
+                                # off held shares and never reach the sizer, so it would be a
+                                # decoy there. Unchecked by default == the behaviour every rule
+                                # had before the flag. It is here, not just in the GA, because a
+                                # deployed genome carries it and re-saving a rule rebuilds
+                                # action_config key by key -- no widget would WIPE it.
+                                if uses_min_one_contract(selected_type):
+                                    # coerce_bool, not bool(): a stored "false"/"0" must load
+                                    # unchecked, exactly as the action ctor reads it. A value
+                                    # nothing can mean must not break the whole dialog: it is
+                                    # shown unchecked and logged -- the action ctor still
+                                    # refuses it at run time until the rule is re-saved.
+                                    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+                                    _m1c_raw = action_config.get('min_one_contract') if action_config else None
+                                    _m1c = False
+                                    if _m1c_raw is not None:
+                                        try:
+                                            _m1c = coerce_bool(_m1c_raw)
+                                        except ValueError:
+                                            logger.warning(
+                                                f"Rule action {action_key}: stored min_one_contract "
+                                                f"{_m1c_raw!r} is not a boolean; showing it unchecked "
+                                                f"(saving the rule will store False)")
+                                    min_one_contract_input = ui.checkbox(
+                                        'Min 1 contract',
+                                        value=_m1c,
+                                    ).props('dense').tooltip(
+                                        'When Sizing % rounds to 0 contracts, buy 1 contract if it '
+                                        'fits under the per-instrument cap (max virtual equity per '
+                                        'instrument). Buying power and the option risk manager '
+                                        'still apply.')
                                 min_oi_input = ui.number(
                                     label='Min OI',
                                     value=action_config.get('min_open_interest', 100) if action_config else 100,
@@ -6012,6 +6100,10 @@ class TradeSettingsTab:
                 self.actions[action_id] = {
                     'card': action_card,
                     'type_select': action_select,
+                    # The rule as loaded, so _save_rule can carry forward the keys no widget
+                    # renders (PRESERVED_HIDDEN_ACTION_KEYS). A copy: nothing here may mutate
+                    # the rule object before Save.
+                    'loaded_config': dict(action_config or {}),
                     'value_input': lambda: value_input,
                     'reference_select': lambda: reference_select,
                     'target_percent_input': lambda: target_percent_input,
@@ -6026,6 +6118,7 @@ class TradeSettingsTab:
                     'short_dte_min_input': lambda: short_dte_min_input,
                     'short_dte_max_input': lambda: short_dte_max_input,
                     'min_arc_input': lambda: min_arc_input,
+                    'min_one_contract_input': lambda: min_one_contract_input,
                     'w_premium_input': lambda: w_premium_input,
                     'w_iv_input': lambda: w_iv_input,
                     'w_rvol_input': lambda: w_rvol_input
@@ -6134,6 +6227,9 @@ class TradeSettingsTab:
 
             # Collect actions
             actions_data = {}
+            # Drop warnings, shown only once the rule is actually WRITTEN: a notice about a
+            # save that validation then refuses would describe something that never happened.
+            notices = []
             for action_id, action_refs in self.actions.items():
                 action_type = action_refs['type_select'].value
                 action_config = {'action_type': action_type}  # Use 'action_type' instead of 'type'
@@ -6205,6 +6301,7 @@ class TradeSettingsTab:
                         sdmin = action_refs['short_dte_min_input']()
                         sdmax = action_refs['short_dte_max_input']()
                         maf = action_refs['min_arc_input']()
+                        m1c = action_refs['min_one_contract_input']()
                         weight_widgets = (
                             ('w_premium', action_refs['w_premium_input']()),
                             ('w_iv', action_refs['w_iv_input']()),
@@ -6260,6 +6357,11 @@ class TradeSettingsTab:
                         # on the widget, for the reason spelled out at strike_method above.
                         if uses_arc_floor(action_type) and maf and maf.value is not None:
                             action_config['min_arc'] = float(maf.value) / 100.0
+                        # Keyed on the ACTION as well as on the widget (the stale-closure
+                        # rail above). Written as a real bool: an explicit False means the
+                        # same as absent (off), so re-saving an old rule changes nothing.
+                        if uses_min_one_contract(action_type) and m1c is not None:
+                            action_config['min_one_contract'] = bool(m1c.value)
                         # SELECTION-POLICY WEIGHTS. Persisted for every entry action --
                         # every select_single call in TradeActions is policy-governed, so
                         # there is no structure on which these are a decoy. 0.0 is written
@@ -6297,6 +6399,34 @@ class TradeSettingsTab:
                         # greeks -- so OptionContract.volume is always None on the live path
                         # and the gate could only ever raise OptionLiquidityDataUnavailable.
                         # A field whose every value is an error is worse than no field.
+
+                # KEYS NO WIDGET RENDERS: carried forward from the loaded rule, or they are
+                # stripped by this rebuild (see PRESERVED_HIDDEN_ACTION_KEYS). Only while the
+                # type is unchanged: after a type change they are dropped like any other
+                # key, and the user is told.
+                loaded = action_refs['loaded_config']
+                loaded_type = loaded.get('action_type') or loaded.get('type')
+                same_type = loaded_type == action_type
+                if same_type:
+                    for k in PRESERVED_HIDDEN_ACTION_KEYS:
+                        if k in loaded and k not in action_config:
+                            action_config[k] = loaded[k]
+                # NO SILENT DROP. A loaded key that no rendered widget could have cleared and
+                # that was not carried is gone after this save -- say which.
+                dropped = [k for k in loaded
+                           if k not in action_config and k not in _ACTION_TYPE_KEYS]
+                if dropped:
+                    editable = {key for ref, key in ACTION_WIDGET_KEYS
+                                if action_refs[ref]() is not None}
+                    dropped = [k for k in dropped if k not in editable]
+                if dropped:
+                    if same_type:
+                        notices.append(f'Action {action_id}: dropped {", ".join(dropped)} '
+                                       f'(no editor field)')
+                    else:
+                        notices.append(f'Action {action_id}: changing the type from '
+                                       f'{loaded_type} to {action_type} dropped '
+                                       f'{", ".join(dropped)}; re-author it for the new type')
 
                 actions_data[action_id] = action_config
 
@@ -6337,7 +6467,9 @@ class TradeSettingsTab:
             self.rules_dialog.close()
             self._update_rules_table()
             ui.notify('Rule saved successfully!', type='positive')
-            
+            for notice in notices:
+                ui.notify(notice, type='warning')
+
         except Exception as e:
             logger.error(f"Error saving rule: {e}", exc_info=True)
             ui.notify(f"Error saving rule: {e}", type='negative')

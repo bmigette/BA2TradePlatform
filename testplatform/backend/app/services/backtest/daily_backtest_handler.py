@@ -510,6 +510,11 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # path's passthrough so a payload can carry it too. See
         # BacktestAccount.get_settings_definitions for what holding costs.
         "hold_assigned_stock": _as_bool(payload.get("hold_assigned_stock")),
+        # Optional, BACKTEST-ONLY (plan 2026-09-24 Task 11): size opening option orders within
+        # the fill engine's volume cap. Written ONLY when on, so every config that does not
+        # ask for it keeps its exact shape (and every older run reproduces).
+        **({"option_size_within_fill_volume": True}
+           if _as_bool(payload.get("option_size_within_fill_volume")) else {}),
     }
 
     # warmup_days: longest indicator/lookback window the experts need preloaded before

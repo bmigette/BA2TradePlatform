@@ -1040,7 +1040,22 @@ def _daily_manage_schedule() -> dict:
 _INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
 
 
-def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None) -> dict:
+def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
+    """The spec's ``option_fixed_settings`` when ``strategy_kind`` is an option job, else {}.
+
+    ONE rule, read by ``_expert_run_settings`` (what the job runs) AND by
+    ``tools/run_options_matrix.discovery_name`` (what the job is CALLED): a job's identity has
+    to change exactly when its settings do, or a "mirror" job would SKIP on, or resume the GA
+    checkpoint of, a completed "same" job of the same name. Option kind = ``_OPTION_STRATEGY_KEYS``
+    minus ``O_STK``, the plain-equity control arm (same carve-out as ``_rm_opt_for``).
+    """
+    if strategy_kind in _OPTION_STRATEGY_KEYS and strategy_kind != "O_STK":
+        return dict(spec.get("option_fixed_settings") or {})
+    return {}
+
+
+def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
+                         strategy_kind: "str | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
     expert that reads its universe from a setting, not from enabled_instruments; no current
@@ -1065,8 +1080,15 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     ABSENT IS THE DEFAULT and stays absent: a spec that does not name the key produces the
     same settings dict it always did, byte for byte, so every existing job is unchanged.
     ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
+
+    ``option_fixed_settings`` (optional spec key) is layered over ``fixed_settings`` only when
+    ``strategy_kind`` is an option strategy (see ``_option_fixed_settings_for``). It lets ONE expert spec
+    serve both the equity grids and the option grids with a setting the option grids need
+    (DeterministicScorer's ``macro_short_side``) without moving any equity job. No kind given
+    (bypass experts, ad-hoc callers) = not an option job = the plain ``fixed_settings``.
     """
     settings = dict(spec["fixed_settings"])
+    settings.update(_option_fixed_settings_for(spec, strategy_kind))
     # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY. See _INERT_RM_TOGGLES.
     settings.update(_INERT_RM_TOGGLES)
     if spec.get("universe_setting"):
@@ -1328,6 +1350,17 @@ _EXPERT_OPT = {
             "k_target": {"optimize": True, "min": 3.0, "max": 6.0, "step": 1.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
+        # OPTION JOBS ONLY (plan 2026-09-24 Task 10, stage-1 relaunch): the regime multiplier
+        # mirrors on the SELL side, so a bearish regime amplifies SELL conviction instead of
+        # muting it -- without it the bearish option arms (O_LP, O_BEARCS) get almost no SELL
+        # supply in exactly the years they exist for (2022: 7.7% -> 0.6% of bars below -0.4).
+        # A FIXED setting, not a gene. Scoped to option kinds by _expert_run_settings because
+        # this spec is shared with the equity grids, whose S1-S7 and O_STK (the equity control
+        # arm) results must stay comparable with every run on record -- the expert default
+        # ("same") is what they get. Every key here must also be listed in
+        # strategy_optimization_handler.CHECKPOINT_IDENTITY_EXPERT_SETTINGS (pinned by test), and
+        # run_options_matrix folds this dict into the discovery job name.
+        "option_fixed_settings": {"macro_short_side": "mirror"},
     },
     # NOTE: FinnHubRating is intentionally NOT optimized — it is REDUNDANT with FMPRating (both
     # are analyst-consensus rating experts on the same large-cap universe).
@@ -2708,6 +2741,40 @@ _OPTION_STRATS = {
 #: fitness/universe/matrix script -- see _CONVEX_OPTION_STRATEGIES.
 _GRID2_OPTION_STRATEGIES = {"O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"}
 
+
+def _lattice_anchor_for(kind: str, override: "str | None") -> str:
+    """The GA step-lattice anchor a job for strategy ``kind`` is launched with.
+
+    ``--lattice-anchor`` wins when given. Otherwise GRID 2 (the LEAPS grid) is ``"min"`` and every
+    other key is ``"zero"``, the legacy lattice (``genetic.LATTICE_ANCHORS``):
+
+    * GRID 2 NEEDS it. Its DTE genes are the ones whose ``min`` is not a multiple of the step:
+      O_LEAPC/O_LEAPP/O_PMCC 410..500 step 15 decoded 410 to 405 on the zero lattice -- an entry
+      window starting at 360, under design §2's 365 floor -- and O_ERN 14..23 step 3 decoded 23 to
+      24, a dte_max of 31 against the designed 7-30 band. On the min lattice they decode to the
+      levels their row comments state.
+    * EVERYTHING ELSE KEEPS zero, because it was measured to matter (2026-09-25): the stage-1
+      discovery grid (``cond:xlk:value`` 3..20 step 2) and the equity S1-S7 grids carry genes that
+      decode differently under ``"min"``, and they have running checkpoints and persisted TOP-N
+      rows produced on the zero lattice.
+
+    A new grid that wants the corrected lattice (e.g. option stage 2) passes ``--lattice-anchor
+    min``; the handler folds a non-zero anchor into the checkpoint fingerprint, so it can never
+    resume a zero-anchored checkpoint.
+    """
+    if override is not None:
+        return override
+    return "min" if kind in _GRID2_OPTION_STRATEGIES else "zero"
+
+
+def _apply_lattice_anchor(cfg: dict, kind: str, override: "str | None") -> dict:
+    """Write ``latticeAnchor`` onto a GA config ONLY when it is not the legacy ``"zero"``, so every
+    job that does not opt in persists a byte-identical ``optimization_config``."""
+    anchor = _lattice_anchor_for(kind, override)
+    if anchor != "zero":
+        cfg["latticeAnchor"] = anchor
+    return cfg
+
 #: O_LEAP's two members (operator decision 2026-09-02, superseding the two separate keys
 #: O_LEAPC/O_LEAPP). Same shape as _CONVEX_MEMBER_KEYS: not launchable on their own (no
 #: ``_STRATEGY_BUILDERS`` row), but they keep their OWN rows in ``_OPTION_STRATS`` and in every
@@ -3345,6 +3412,14 @@ def _option_entry_action_for(kind: str) -> dict:
     so it was inert and the selector kept handing the fill engine contracts it would reject.
     """
     cfg = dict(_OPTION_STRATS[kind])
+    # FIXED, not a gene (plan 2026-09-24 Task 8, stage-1 relaunch): a budget that rounds to 0
+    # contracts buys 1 when it fits under the per-instrument cap, instead of refusing ~half the
+    # expensive-premium entries (the O_LP diagnosis). Shared live/backtest sizing reads it.
+    # EXCEPT every O_CONVEX* key (operator decision 2026-09-25): convex harvest is "many small
+    # tickets at ~1% sizing, no single ticket may dominate", and the floor would let one ticket
+    # the budget cannot afford grow to the per-instrument cap (searched up to 50%).
+    if not kind.startswith("O_CONVEX"):
+        cfg.setdefault("option_min_one_contract", True)
     _apply_option_min_volume(cfg)
     _apply_option_strike_method_gene(cfg)
     _apply_option_sizing_gene(cfg)
@@ -3584,11 +3659,27 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
 # it is a fraction of that structure's own legs' own spreads -- so a shared band is the same
 # hypothesis everywhere.
 #
-# 0.0 IS THE AUTHORED DEFAULT AND IT IS AN EXACT NO-OP: the entry keeps quoting the builder's
-# `contract.ask`/`contract.bid`/net untouched, so no existing option result moves. 1.0 quotes
-# at the far touch `_option_cross` already models the fill at. 0.25 steps give the GA five
-# levels including both ends.
-_OPTION_ENTRY_CROSS_BAND = (0.0, 1.0, 0.25)
+# SEMANTICS: 0.0 quotes at the mid (the builder's `contract.ask`/`contract.bid`/net untouched,
+# the pre-F3 quote exactly); 1.0 quotes at the far touch `_option_cross` already models the
+# fill at (a buy pays mid + half-spread, a sell takes mid - half-spread). The SAME gene also
+# prices DISCRETIONARY exits: `CloseOptionAction._close_cross_fraction` concedes the fraction
+# the entry persisted in `data['entry_cross']`; forced exits (SL / DTE roll / post-event) always
+# cross fully, whatever this is.
+#
+# THE BAND IS 0.75..1.0 FOR NEW GRID RUNS (plan 2026-09-24 Task 9; it was 0.0..1.0 in 0.25
+# steps, authored at 0.0). Under `next_bar_open` a passive quote fills only when the premium
+# moved in the entry's favour overnight -- a long put only when the put got CHEAPER, i.e. on
+# the days the bearish thesis did NOT work -- so low-cross genomes select against their own
+# thesis, and their exits (conceding the same fraction) expire too and positions ride to
+# expiry. Measured in the O_LP diagnosis (docs/findings-2026-09-24-deterministicscorer-
+# bearish-options.md): 23 of 39 and 149 of 191 submitted entries expired unfilled; the
+# deployed 8082 O_LC genome sits at 0.25. The floor keeps a quarter of the spread negotiable
+# rather than pinning 1.0, so the GA can still trade a little price for fill rate. 0.05 steps
+# give six levels; the floor is on the lattice (the GA rounds to multiples of the step from
+# zero, so the floor must be one) and is the authored default -- so an un-searched run now
+# quotes at 0.75, NOT the no-op 0.0. A searched genome carries its own value of this gene, so
+# only freshly built strategies move (and a genome predating F3, decoded onto a new template).
+_OPTION_ENTRY_CROSS_BAND = (0.75, 1.0, 0.05)
 
 
 def _apply_option_entry_cross_gene(cfg: dict) -> dict:
@@ -3629,7 +3720,7 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
 # zero-weight features entirely, so a weight at 0.0 costs nothing and changes nothing), which
 # gives the GA the same control arm every other option gene has and keeps the un-searched run
 # reproducible as a sampled trial. 9 levels for the signed weights, 5 for the unsigned one —
-# the same order of resolution as option_entry_cross's 5.
+# the same order of resolution as option_entry_cross's 6.
 #
 # WHAT IS DELIBERATELY NOT IN THIS TABLE (each withheld on recorded evidence, the F15
 # standard — a gene the GA can never move is budget burned on a dead search dimension):
@@ -4390,23 +4481,41 @@ def _iv_rank_gate(m: str, member: str) -> dict:
 # RELATIVE VOLUME. The UNDERLYING's volume over its own trailing 20-bar average (current bar
 # excluded). One direction for both halves -- real participation behind the signal is a
 # confirmation whether you are buying or selling premium -- so the searched threshold is the
-# only per-half difference, and there is none. 0.5..3.0 brackets both "any liquidity at all"
-# and "genuinely unusual"; the authored default sits at the permissive end.
+# only per-half difference, and there is none. The authored default sits at the permissive end.
+#
+# 0.5..1.5, NOT 0.5..3.0 (plan 2026-09-24 Task 12; new grid runs only). The old ceiling was
+# authored, and the upper half of it was dead search space: measured in the O_LP diagnosis
+# (docs/findings-2026-09-24-deterministicscorer-bearish-options.md), the SELL-signal bars'
+# median relative volume is 0.88 and only ~5% sit above 1.5, so a genome above 2 lost 97% of
+# the entries left after the other gates and one at 2.5 blocked ~everything. The GA could learn
+# that, but only by burning early generations on genomes that never trade. 1.5 still demands
+# "clearly busier than usual"; the 0.5 floor and the 0.25 step (five levels) are unchanged.
 #
 # Not volume/OPEN INTEREST, which would be the better CONTRACT-level unusual-activity signal:
 # `open_interest` is NULL on every cached option row (see option_selector.passes_liquidity), so
 # it is not computable here today.
-_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 3.0, "value_step": 0.25}
+_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 1.5, "value_step": 0.25}
 
 # IV / REALISED VOL -- the variance risk premium, i.e. the actual edge in premium selling: you
 # are paid implied and you pay out realised. OPPOSITE PER HALF for the same reason as iv_rank
 # (the gene space never searches an operator): a seller wants the ratio HIGH, a buyer wants it
-# LOW. The window brackets 1.0 on both sides so either half can express "no edge here".
+# LOW. The authored value is each half's PERMISSIVE end, and "no edge here" is the gate's
+# OFF toggle.
+#
+# THE RANGE IS PER HALF (plan 2026-09-24 Task 12; new grid runs only). Both halves searched
+# 0.8..1.6 until then. The DEBIT floor rises to 1.0: a buyer's "<" gate below parity demands
+# implied vol be well UNDER realised, which is rare -- measured in the O_LP diagnosis
+# (docs/findings-2026-09-24-deterministicscorer-bearish-options.md), `iv_rv < 0.8` dropped 79%
+# of the entries where it was enabled -- so the 0.8..1.0 slice mostly produced genomes that
+# never trade. At 1.0 the strictest debit genome still asks "implied no dearer than realised".
+# The CREDIT half keeps 0.8..1.6: nothing measured argues for moving it. Step 0.1 on both
+# (seven debit levels, nine credit). Each authored value stays inside its own range.
 _IV_RV_GATE = {
-    True:  {"op": "<", "value": 1.6},   # debit: buy premium only when it is cheap vs realised
-    False: {"op": ">", "value": 0.8},   # credit: sell premium only when it is genuinely rich
+    # debit: buy premium only when it is cheap vs realised
+    True:  {"op": "<", "value": 1.6, "value_min": 1.0, "value_max": 1.6, "value_step": 0.1},
+    # credit: sell premium only when it is genuinely rich
+    False: {"op": ">", "value": 0.8, "value_min": 0.8, "value_max": 1.6, "value_step": 0.1},
 }
-_IV_RV_RANGE = {"value_min": 0.8, "value_max": 1.6, "value_step": 0.1}
 
 
 def _relative_volume_gate() -> dict:
@@ -4440,7 +4549,8 @@ def _iv_rv_gate(m: str, member: str) -> dict:
     spec = _IV_RV_GATE[member in _DEBIT_OPTION_MEMBERS]
     return {"id": f"{m}-iv_rv", "field": "iv_to_realized_vol", "op": spec["op"],
             "value": spec["value"], "optimize": True, "toggle_optimize": True,
-            **_IV_RV_RANGE}
+            "value_min": spec["value_min"], "value_max": spec["value_max"],
+            "value_step": spec["value_step"]}
 
 
 # EXPECTED PROFIT — the entry's only signal-strength gate, and the ONLY one every expert can
@@ -4606,6 +4716,12 @@ def _add_option_spread_args(p) -> None:
     p.add_argument("--option-spread-min-tick", type=float, default=None,
                    help="LEGACY override: absolute floor on the percent-of-premium spread in "
                         "premium dollars (full width). Setting it selects the legacy model.")
+    p.add_argument("--option-size-within-fill-volume", action="store_true", default=False,
+                   help="BACKTEST-ONLY: size every OPENING option order at order time to what "
+                        "the fill engine's 10%%-of-bar-volume participation cap can fill "
+                        "(decision bar; a multi-leg structure by its most constrained leg). "
+                        "Off by default so older runs reproduce; tools/stage1_run.sh turns it "
+                        "on. Changes which trades exist: not comparable across the setting.")
 
 
 def _add_short_borrow_args(p) -> None:
@@ -4646,6 +4762,15 @@ def _option_spread_account_settings(args) -> Dict[str, Any]:
                 "option_spread_min_tick": float(_LEGACY_OPTION_SPREAD_MIN_TICK
                                                 if tick is None else tick)}
     return {"option_spread_model": model}
+
+
+def _option_sizing_account_settings(args) -> Dict[str, Any]:
+    """``option_size_within_fill_volume`` (plan 2026-09-24 Task 11) for ``account_settings`` --
+    written ONLY when on, so a run that does not ask for it has exactly the config it had
+    before (its identity, its stored shape, its reproduction)."""
+    if getattr(args, "option_size_within_fill_volume", False):
+        return {"option_size_within_fill_volume": True}
+    return {}
 
 
 # adding a stock-managing structure later is one line, next to the reason.
@@ -6020,7 +6145,9 @@ def _cmd_optimize(args) -> int:
         backtest_block = {
             "engine": "daily",
             "enabled_instruments": universe,
-            "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe, _sizing_overrides(args))}],
+            "experts": [{"class": expert, "settings": _expert_run_settings(
+                spec, universe, _sizing_overrides(args),
+                strategy_kind=None if bypass else args.strategy)}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -6033,6 +6160,8 @@ def _cmd_optimize(args) -> int:
                 # The option spread model + its legacy knobs (plan Part F): see
                 # _option_spread_account_settings.
                 **_option_spread_account_settings(args),
+                # Order-time sizing within the fill-volume cap (Task 11), only when asked.
+                **_option_sizing_account_settings(args),
                 "fill_model": args.fill_model,
                 # RUN-LEVEL, never a gene (see --equity-cap): every individual in the
                 # population must face the same capital, or they are scored against
@@ -6224,6 +6353,7 @@ def _cmd_optimize(args) -> int:
                                     **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
+        _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
         _worker_ids = _worker_ids_from_args(args)
@@ -6387,7 +6517,9 @@ def _cmd_optimize_batch(args) -> int:
             backtest_block = {
                 "engine": "daily",
                 "enabled_instruments": universe,
-                "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe, _sizing_overrides(args))}],
+                "experts": [{"class": expert, "settings": _expert_run_settings(
+                    spec, universe, _sizing_overrides(args),
+                    strategy_kind=None if bypass else strat_kind)}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
@@ -6399,6 +6531,8 @@ def _cmd_optimize_batch(args) -> int:
                     "short_borrow_rate_pa": _short_borrow_account_setting(args),
                     # The option spread model + its legacy knobs (plan Part F).
                     **_option_spread_account_settings(args),
+                    # Order-time sizing within the fill-volume cap (Task 11), only when asked.
+                    **_option_sizing_account_settings(args),
                     "fill_model": args.fill_model,
                     # RUN-LEVEL, never a gene (see --equity-cap). None = off.
                     "equity_cap": getattr(args, "equity_cap", None),
@@ -6464,6 +6598,7 @@ def _cmd_optimize_batch(args) -> int:
                                         **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,
             }
+            _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=name, fitness_metric=fitness,
                 optimization_type="genetic", optimization_config=cfg,
@@ -7523,6 +7658,12 @@ def main(argv: "list | None" = None) -> int:
                          "2026-08-30: this used to be hardcoded to 0.1 here -- floor(0.1%% of "
                          "population, min 1) is exactly ONE elite regardless of population "
                          "size, not the intended 10%%.")
+    op.add_argument("--lattice-anchor", choices=["zero", "min"], default=None,
+                    help="Where the GA counts each numeric gene's step lattice from. 'zero' is "
+                         "the legacy decode (round(v/step)*step; can land below a gene's min when "
+                         "min is not a multiple of step), 'min' counts levels from the gene's "
+                         "min and never leaves [min, max]. Default: 'min' for the grid-2 (LEAPS) "
+                         "keys, 'zero' for everything else -- see _lattice_anchor_for.")
     op.add_argument("--save-top", type=int, default=5,
                     help="Persist the top-N distinct param sets as saved Backtests (default 5).")
     op.add_argument("--seed", type=int, default=42, help="RNG seed (determinism).")
@@ -7746,6 +7887,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--elitism-percent", type=float, default=10.0,
                     help="Percent of the population preserved unchanged each generation "
                          "(engine default: 10.0). See optimize --elitism-percent.")
+    ob.add_argument("--lattice-anchor", choices=["zero", "min"], default=None,
+                    help="See optimize --lattice-anchor (per-strategy default).")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)

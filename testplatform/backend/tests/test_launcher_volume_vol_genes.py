@@ -187,14 +187,41 @@ def test_the_two_halves_use_opposite_iv_rv_directions():
     assert set(ops.values()) == {"<", ">"}
 
 
-def test_the_iv_rv_window_brackets_parity():
-    """Both halves must be able to express "no edge here" (a ratio of 1.0), or the gate is a
-    one-sided constant dressed as a search."""
+#: The searched IV/RV window PER HALF (plan 2026-09-24 Task 12). The debit floor rose from 0.8
+#: to 1.0 -- ``iv_rv < 0.8`` dropped 79% of O_LP's entries where enabled, so the sub-parity
+#: slice was mostly genomes that never trade -- and the credit half kept its window.
+_IV_RV_WINDOW = {True: (1.0, 1.6, 0.1), False: (0.8, 1.6, 0.1)}
+
+
+@pytest.mark.parametrize("kind", _SINGLES)
+def test_the_iv_rv_window_is_the_one_for_the_structures_half(kind):
+    """Only the DEBIT floor moved: a shared range would drag the credit half along with it."""
+    spec = collect_param_space(_build(kind))[f"cond:{kind.lower()}-iv_rv:value"]
+    debit = kind in mod._DEBIT_OPTION_MEMBERS
+    assert (spec["min"], spec["max"], spec["step"]) == _IV_RV_WINDOW[debit], (
+        f"{kind} ({'debit' if debit else 'credit'}) searches IV/RV over {spec}")
+
+
+def test_the_iv_rv_window_reaches_parity():
+    """Every structure can still set its threshold AT parity (a ratio of 1.0) and somewhere
+    beyond it, so the searched value is a real choice and not a one-sided constant. The
+    debit window now STARTS at parity: its strictest genome asks "implied no dearer than
+    realised"; "no edge required" is the gate's OFF gene."""
     for kind in _SINGLES:
         spec = collect_param_space(_build(kind))[f"cond:{kind.lower()}-iv_rv:value"]
-        assert spec["min"] < 1.0 < spec["max"], (
+        assert spec["min"] <= 1.0 < spec["max"], (
             f"{kind}: IV/RV searched over {spec['min']}..{spec['max']}, which cannot express "
             f"parity between implied and realised")
+
+
+@pytest.mark.parametrize("kind", _SINGLES)
+def test_the_authored_iv_rv_value_is_inside_its_halfs_window(kind):
+    """An authored value outside the searched window is a configuration no trial can
+    reproduce (debit 1.6, credit 0.8 -- each half's permissive end)."""
+    leaf = _leaf(mod._option_entry_rule(kind), f"{kind.lower()}-iv_rv")
+    lo, hi, _step = _IV_RV_WINDOW[kind in mod._DEBIT_OPTION_MEMBERS]
+    assert lo <= leaf["value"] <= hi, f"{kind}: authored {leaf['value']} outside {lo}..{hi}"
+    assert leaf["value"] == (1.6 if kind in mod._DEBIT_OPTION_MEMBERS else 0.8)
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +237,23 @@ def test_relative_volume_asks_for_participation(kind):
     assert leaf["op"] == ">"
 
 
-def test_the_relative_volume_window_spans_quiet_to_unusual():
+def test_the_relative_volume_window_spans_quiet_to_busy():
     spec = collect_param_space(_build("O_LC"))["cond:shared-rel_volume:value"]
     assert spec["min"] < 1.0 < spec["max"], (
         f"relative volume searched over {spec['min']}..{spec['max']}: it cannot distinguish "
         f"quiet from busy")
-    assert spec["max"] >= 2.0, "cannot demand genuinely unusual activity"
     assert spec["min"] > 0.0, "a 0x threshold is a gate that always passes"
+
+
+def test_the_relative_volume_ceiling_is_one_and_a_half():
+    """Plan 2026-09-24 Task 12: the ceiling came DOWN from 3.0. SELL-signal bars' median
+    relative volume is 0.88 with only ~5% above 1.5, so a threshold above that is a genome that
+    never trades -- dead search the GA would burn early generations learning to avoid."""
+    spec = collect_param_space(_build("O_LC"))["cond:shared-rel_volume:value"]
+    assert (spec["min"], spec["max"], spec["step"]) == (0.5, 1.5, 0.25)
+    leaf = _leaf(mod._option_entry_rule("O_LC"), "shared-rel_volume")
+    assert spec["min"] <= leaf["value"] <= spec["max"], (
+        f"authored {leaf['value']} is outside the searched window")
 
 
 # ---------------------------------------------------------------------------

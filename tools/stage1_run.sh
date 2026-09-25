@@ -289,6 +289,12 @@ if [ -n "$STAGE1_ROBUST" ]; then
   esac
 fi
 
+# ORDER-TIME SIZING (plan 2026-09-24 Task 11): --option-size-within-fill-volume cuts every OPENING
+# option order to what the backtest fill engine's 10%-of-bar-volume cap can fill (read on the
+# decision bar; a structure by its most constrained leg). Without it an oversized order simply
+# expired -- about half of the expired O_LP entries in the 2026-09-24 diagnosis. It is a
+# discovery-digest token, so these job names differ from any run made without it (no resume
+# across the setting). Backtest-only: live fills small orders whatever the day's volume.
 # STAGE1_START/END allow explicit shorter pilots (a 2023 start prints LIMITED WINDOW and gets
 # its own discovery identity). A dry-run (pass --dry-run) prints every resolved command.
 exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
@@ -300,6 +306,7 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   --parallel "$PARALLEL" \
   --screener-gate-store "$SCREENER_STORE" --max-stock-price 0 \
   --name-suffix="$STAGE1_SUFFIX" \
+  --option-size-within-fill-volume \
   ${FITNESS_ARGS[@]+"${FITNESS_ARGS[@]}"} \
   ${ROBUST_ARGS[@]+"${ROBUST_ARGS[@]}"} \
   ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
