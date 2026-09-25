@@ -37,13 +37,24 @@ def test_a_member_scoped_run_is_refused_for_deploy_by_name():
         refuse_undeployable(_facts(hold_assigned_stock_tags=(7,)))
 
 
-def test_the_deploy_report_skips_a_backtest_only_row_that_states_nothing():
+
+def test_only_the_rows_whose_None_means_nothing_are_marked_silent_when_none():
+    silent = {r.key for r in BACKTEST_FORCED_SETTINGS if r.silent_when_none}
+    assert silent == {"hold_assigned_stock_tags", "entry_action"}
+    # the flag is a statement about a backtest-only record; a live-carried row never has it
+    assert all(r.live_setting is None for r in BACKTEST_FORCED_SETTINGS if r.silent_when_none)
+
+
+def test_the_deploy_report_skips_a_None_row_only_where_the_table_says_None_means_nothing():
     """Every deployable payload carries ``hold_assigned_stock_tags: None`` (a member-scoped run is
-    refused above), so printing it on every deploy is noise. A None row says nothing about the
-    run; every other row -- False included -- is still reported."""
-    from ba2_common.core.deploy_parity import backtest_only_notices
-    notices = backtest_only_notices(backtest_only_settings(_facts(hold_assigned_stock=True)))
-    assert notices == ["BACKTEST-ONLY, not applied: hold_assigned_stock=True"]
-    assert backtest_only_notices({"a": False, "b": None, "c": 0}) == [
-        "BACKTEST-ONLY, not applied: a=False", "BACKTEST-ONLY, not applied: c=0"]
-    assert backtest_only_notices({}) == []
+    refused above) and an equity run ``entry_action: None``; printing them on every deploy is
+    noise. The decision is the ROW's, not a blanket "skip None": a None on any other row, or on
+    a key the table does not know, is still reported."""
+    from ba2_common.core.deploy_parity import reportable_backtest_only
+    assert reportable_backtest_only(backtest_only_settings(_facts(hold_assigned_stock=True))) == {
+        "hold_assigned_stock": True}
+    assert reportable_backtest_only({"hold_assigned_stock": None, "unknown_row": None,
+                                     "hold_assigned_stock_tags": None, "entry_action": None}) == {
+        "hold_assigned_stock": None, "unknown_row": None}
+    assert reportable_backtest_only({"hold_assigned_stock": False, "entry_action": "open_call"})         == {"hold_assigned_stock": False, "entry_action": "open_call"}
+    assert reportable_backtest_only(None) == {} and reportable_backtest_only({}) == {}

@@ -34,7 +34,7 @@ platform checkout and has only the packages on its path).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 __all__ = [
     "BacktestRunFacts",
@@ -42,7 +42,7 @@ __all__ = [
     "BACKTEST_FORCED_SETTINGS",
     "forced_expert_settings",
     "backtest_only_settings",
-    "backtest_only_notices",
+    "reportable_backtest_only",
     "live_settings_from_universe",
     "SCREENER_UNIVERSE_SETTING",
     "explicit_default_settings",
@@ -105,6 +105,10 @@ class ForcedSetting:
     #: For a ``live_setting is None`` row: what closing the gap would take. The deploy round-trip
     #: pin quotes this, so an un-carried behaviour cannot be forgotten, only accepted.
     why_no_live_analogue: str = ""
+    #: For a ``live_setting is None`` row: True when a None VALUE states no behaviour for the run
+    #: (e.g. no member-scoped hold, no option entry action), so the deploy report omits it rather
+    #: than print it on every deploy. Set per row, never as a blanket "skip None".
+    silent_when_none: bool = False
 
     def value(self, facts: BacktestRunFacts) -> Any:
         return _VALUES[self.key](facts)
@@ -205,6 +209,9 @@ BACKTEST_FORCED_SETTINGS = (
             "reproduce. Unlike hold_assigned_stock this is not merely recorded: "
             "refuse_undeployable refuses the export of such a run. Closing it needs a live "
             "liquidation step keyed on the member tag, an operator decision.",
+        # None = the run had no member-scoped hold (every deployable payload: one that had it
+        # is refused), so there is nothing to report.
+        silent_when_none=True,
     ),
     ForcedSetting(
         key="entry_action",
@@ -219,6 +226,8 @@ BACKTEST_FORCED_SETTINGS = (
             "live has no such key and needs none: a live account's option capability comes from "
             "its broker, and entry routing is the shared per-entry decision. Recorded so a deploy "
             "states it.",
+        # None = an equity run: no option entry action to state.
+        silent_when_none=True,
     ),
 )
 
@@ -262,15 +271,14 @@ def backtest_only_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
             for row in BACKTEST_FORCED_SETTINGS if row.live_setting is None}
 
 
-def backtest_only_notices(backtest_only: Optional[Dict[str, Any]]) -> List[str]:
-    """The deploy report's line for each ``backtest_only`` row of a payload -- carried, never
-    applied, and SAID so (review V4/V5), except a row whose value is None: None states no
-    behaviour for this run (``hold_assigned_stock_tags`` on a run that is not member-scoped --
-    a member-scoped one is refused at export -- or ``entry_action`` on an equity run), so
-    printing it on every deploy is noise that hides the rows that matter. ``False`` / ``0`` are
-    real values and are reported."""
-    return [f"BACKTEST-ONLY, not applied: {k}={v!r}"
-            for k, v in (backtest_only or {}).items() if v is not None]
+def reportable_backtest_only(backtest_only: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The ``backtest_only`` rows of a payload a deploy tool must REPORT -- carried, never
+    applied, and SAID so (review V4/V5). A row is omitted only when its value is None AND its
+    table row declares ``silent_when_none`` (None states no behaviour for the run). A None on
+    any other row, or on a key the table does not know, is reported: never a blanket skip."""
+    silent = {row.key for row in BACKTEST_FORCED_SETTINGS if row.silent_when_none}
+    return {k: v for k, v in (backtest_only or {}).items()
+            if not (v is None and k in silent)}
 
 
 def live_settings_from_universe(universe: Optional[Dict[str, Any]]) -> Dict[str, Any]:

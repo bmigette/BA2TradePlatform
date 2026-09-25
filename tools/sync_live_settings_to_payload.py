@@ -69,7 +69,7 @@ def main() -> int:
     _ba2_db.configure_db(LIVE_DB)
     from ba2_common.core.db import get_instance
     from ba2_common.core.deploy_parity import (
-        live_settings_from_universe, unmapped_screener_keys,
+        live_settings_from_universe, reportable_backtest_only, unmapped_screener_keys,
     )
     from ba2_common.core.models import ExpertInstance
     from ba2_trade_platform.modules.experts import experts as live_experts
@@ -117,7 +117,8 @@ def main() -> int:
             if ns.apply:
                 expert.save_settings({key: (value, None)})
 
-        for k, v in (entry["settings"].get("backtest_only") or {}).items():
+        # Same rule as import_deploy_payload: a None the table marks silent_when_none is omitted.
+        for k, v in reportable_backtest_only(entry["settings"].get("backtest_only")).items():
             print(f"  BACKTEST-ONLY, no live analogue, not applied: {k}={v!r}")
         print()
 

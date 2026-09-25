@@ -69,8 +69,8 @@ from ba2_common.core.market_condition_rules import (  # noqa: E402
     assert_market_rule_actions, parse_profile_setting,
 )
 from ba2_common.core.deploy_parity import (  # noqa: E402
-    SCREENER_UNIVERSE_SETTING, backtest_only_notices, explicit_default_settings,
-    live_settings_from_universe, unmapped_screener_keys,
+    SCREENER_UNIVERSE_SETTING, explicit_default_settings, live_settings_from_universe,
+    reportable_backtest_only, unmapped_screener_keys,
 )
 from ba2_common.core.models import ExpertInstance  # noqa: E402
 from ba2_common.core.rules_convert import trade_rules_to_live_export  # noqa: E402
@@ -385,9 +385,10 @@ def main() -> int:
               + ("  (incl. allow_automated_trade_opening)" if created else ""))
         # Behaviours the backtest derived that live has no analogue for. NOT applied -- a
         # deploy that differs from its backtest must SAY so (review V4/V5).
-        # A None row states nothing (e.g. hold_assigned_stock_tags on every deployable run).
-        for line in backtest_only_notices(entry["settings"].get("backtest_only")):
-            print(f"  {line}")
+        # A None row the table marks silent_when_none states nothing (e.g.
+        # hold_assigned_stock_tags on every deployable run) and is omitted.
+        for k, v in reportable_backtest_only(entry["settings"].get("backtest_only")).items():
+            print(f"  BACKTEST-ONLY, not applied: {k}={v!r}")
 
     print("\n=== deploy complete ===")
     return 0
