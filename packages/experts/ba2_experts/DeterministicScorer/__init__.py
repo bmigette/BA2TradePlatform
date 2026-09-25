@@ -58,7 +58,8 @@ from .combine import (final_score, schmitt_trigger, atr_target_price,
                       atr_stop_price, resolve_target_price, confidence_from_score,
                       DEF_W_TECHNICAL, DEF_W_FUNDAMENTAL, DEF_W_ANALYST,
                       DEF_K_COMPRESS, DEF_THETA_BUY, DEF_THETA_SELL,
-                      DEF_K_STOP, DEF_K_TARGET, DEF_VETO_CAP, DEF_W_EARNINGS)
+                      DEF_K_STOP, DEF_K_TARGET, DEF_VETO_CAP, DEF_W_EARNINGS,
+                      DEF_MACRO_SHORT_SIDE, MACRO_SHORT_SIDE_VALUES)
 
 
 class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
@@ -89,7 +90,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     # Analyst/Earnings section for their own sub-detail knobs to tune.
     EXPORT_RELEVANT_SETTINGS = (
         "w_technical", "w_fundamental", "w_analyst", "w_earnings",
-        "macro_mode", "m_floor", "hard_riskoff", "macro_gate_min", "w_macro",
+        "macro_mode", "m_floor", "hard_riskoff", "macro_short_side", "macro_gate_min", "w_macro",
         "k_compress", "theta_buy", "theta_sell", "veto_cap", "skip_on_missing_section",
         "mom_lookback_days", "mom_skip_days", "vol_window", "sma_trend_period",
         "rsi_period", "donchian_period", "adx_period", "adx_gate", "adx_rsi_boost",
@@ -150,6 +151,14 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                         "description": "Minimum exposure multiplier in multiply mode"},
             "hard_riskoff": {"type": "float", "required": False, "default": -0.75,
                              "description": "Regime below this forces exposure to 0"},
+            "macro_short_side": {"type": "str", "required": False, "default": DEF_MACRO_SHORT_SIDE,
+                                 "valid_values": list(MACRO_SHORT_SIDE_VALUES),
+                                 "description": "Multiply mode, SELL side: same=scale negative scores by the "
+                                                "same regime multiplier as longs (a bearish regime mutes "
+                                                "SELLs); mirror=scale them by the multiplier of the "
+                                                "opposite regime (a bearish regime amplifies SELLs, a "
+                                                "bullish one damps them; hard risk-off no longer zeroes "
+                                                "shorts, a hard risk-on above -hard_riskoff does)"},
             "macro_gate_min": {"type": "float", "required": False, "default": -0.5,
                                "description": "Gate mode: regime below this flattens bullish signals"},
             "w_macro": {"type": "float", "required": False, "default": 0.2,
@@ -326,7 +335,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
 
     _SETTING_KEYS = (
         "w_technical", "w_fundamental", "w_analyst", "macro_mode", "m_floor",
-        "hard_riskoff", "macro_gate_min", "w_macro",
+        "hard_riskoff", "macro_short_side", "macro_gate_min", "w_macro",
         "k_compress", "theta_buy", "theta_sell", "veto_cap", "skip_on_missing_section",
         "w_earnings", "earnings_drift_window_days", "earnings_halflife_days",
         "earnings_scale_pct", "earnings_use_sue",

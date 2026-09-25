@@ -46,6 +46,17 @@ DEF_K_STOP = 2.5
 DEF_K_TARGET = 4.5
 DEF_EXIT_HYSTERESIS = 0.0
 DEF_SKIP_ON_MISSING = "skip"
+# How the 'multiply' regime multiplier treats a NEGATIVE (SELL-side) score.
+#   "same"   -- the historical behaviour, kept as the default so every live expert and every
+#               stored backtest reproduces bit for bit: score * m(regime) for BOTH signs.
+#   "mirror" -- a negative score is scaled by m(-regime). m(regime) was built to cut LONG
+#               exposure in a bad regime; applied to both signs it also shrinks the SELL side
+#               exactly when a bear regime makes shorts most credible (measured 2026-09-24,
+#               141k bars 2020-2025: bars with final < -0.4 in 2022 fell from 7.7% pre-macro to
+#               0.6% at default weights). Mirroring the regime makes a bearish regime amplify
+#               SELL conviction (up to x1) and a bullish one damp it, symmetrically.
+MACRO_SHORT_SIDE_VALUES = ("same", "mirror")
+DEF_MACRO_SHORT_SIDE = "same"
 
 
 def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
@@ -126,8 +137,21 @@ def final_score(technical: Optional[float], fundamental: Optional[float],
     degraded hermetic-backtest case, where only the index trend survives) can
     reach exactly -1.0 without corroboration, and must not be allowed to flatten
     the whole book. None = unknown = keep the cutoff armed (conservative).
+
+    `macro_short_side` ('multiply' mode only; see DEF_MACRO_SHORT_SIDE): "same" scales both
+    signs by m(regime); "mirror" scales a negative score by m(-regime) instead. Because the
+    mirror feeds -regime through the SAME exposure_multiplier, the hard cutoff mirrors too:
+    a corroborated hard RISK-OFF (regime < hard_riskoff) still zeroes the long side but
+    leaves the short side at its strongest, and the symmetric hard RISK-ON
+    (regime > -hard_riskoff, same n_inputs corroboration) zeroes the short side.
     """
     mode = str(s.get("macro_mode", "multiply")).lower()
+    short_side = str(s.get("macro_short_side", DEF_MACRO_SHORT_SIDE)).lower()
+    if short_side not in MACRO_SHORT_SIDE_VALUES:
+        # Refuse rather than fall back: a mistyped "mirror" would otherwise score as "same"
+        # while the stored settings claim a mirror run.
+        raise ValueError(f"macro_short_side must be one of {MACRO_SHORT_SIDE_VALUES}, "
+                         f"got {s.get('macro_short_side')!r}")
     weights = {
         "technical": float(s.get("w_technical", DEF_W_TECHNICAL)),
         "fundamental": float(s.get("w_fundamental", DEF_W_FUNDAMENTAL)),
@@ -148,7 +172,10 @@ def final_score(technical: Optional[float], fundamental: Optional[float],
     m = 1.0
     if regime is not None and mode == "multiply":
         from .macro import exposure_multiplier, DEF_M_FLOOR, DEF_HARD_RISKOFF
-        m = exposure_multiplier(regime, float(s.get("m_floor", DEF_M_FLOOR)),
+        # Only a strictly negative score takes the mirrored regime: a 0.0 score is 0 either
+        # way, and keeping it on the long arm leaves the reported multiplier unchanged there.
+        eff_regime = -regime if (short_side == "mirror" and score < 0) else regime
+        m = exposure_multiplier(eff_regime, float(s.get("m_floor", DEF_M_FLOOR)),
                                 float(s.get("hard_riskoff", DEF_HARD_RISKOFF)),
                                 n_inputs=regime_n_inputs)
         score = score * m
