@@ -105,7 +105,6 @@ def _run(bars, signals, *, run_id, inmem, enable_short, account_settings,
                     "end_date": datetime.combine(bars[-1][0], datetime.min.time()),
                     "enabled_instruments": ["AAPL"], "seed": 42, "enable_short": enable_short},
             indicator_provider=NoAtrIndicatorProvider())
-        engine._indicator_provider = None
         engine.run()
 
         orders = sorted(

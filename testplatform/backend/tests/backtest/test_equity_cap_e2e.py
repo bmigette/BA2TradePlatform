@@ -269,7 +269,6 @@ def run_engine(rows: List[Dict[str, Any]], *, equity_cap: Optional[float],
                     "enabled_instruments": ["AAPL"], "seed": 42},
             indicator_provider=NoAtrIndicatorProvider(),
         )
-        engine._indicator_provider = None
         engine.run()
 
         trades = account.get_round_trip_trades()

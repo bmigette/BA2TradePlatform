@@ -123,7 +123,6 @@ def _run(bars, *, run_id, inmem, entry_actions, exit_rules, loosen=None, buy_on=
                     "end_date": datetime.combine(bars[-1][0], datetime.min.time()),
                     "enabled_instruments": ["AAPL"], "seed": 42},
             indicator_provider=NoAtrIndicatorProvider())
-        engine._indicator_provider = None
         engine.run()
 
         entries = [o for o in account.get_orders()

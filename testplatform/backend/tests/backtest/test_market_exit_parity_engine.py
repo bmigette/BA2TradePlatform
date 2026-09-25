@@ -238,7 +238,6 @@ def _run(bars, *, run_id, inmem, exit_rules, pins=None):
             account=account, experts=[(expert, expert_id, {}, enter_id)], price_source=ps,
             config={"start_date": start, "end_date": end, "enabled_instruments": [SYMBOL], "seed": 42},
             indicator_provider=NoAtrIndicatorProvider())
-        engine._indicator_provider = None
         real_manage = engine._manage_open_positions
 
         def manage_and_snapshot(expert_, expert_id_, settings_, as_of):
