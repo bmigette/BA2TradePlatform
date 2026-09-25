@@ -52,6 +52,25 @@ def coerce_bool(value: Any) -> bool:
     raise ValueError(f"cannot read {value!r} as a boolean setting value")
 
 
+def trading_permission(expert: Any, setting_key: str) -> bool:
+    """An expert's trading PERMISSION (``enable_buy`` / ``enable_sell``) as a bool.
+
+    The ONE reader for both the risk manager's permission filter and ``SellAction``'s short
+    gate, so the two can never disagree on what a stored value means. No expert, or the setting
+    absent (None, no declared default) -> False: a permission nobody granted is not granted.
+    Read through :func:`coerce_bool`; an unreadable spelling raises rather than being guessed.
+
+    A real expert's ``settings`` loader already coerces a bool-declared row (and reads an
+    unreadable stored spelling as False, loudly), so for every stored form this returns exactly
+    the truthiness the risk manager used to test."""
+    if expert is None:
+        return False
+    raw = expert.get_setting_with_interface_default(setting_key, log_warning=False)
+    if raw is None:
+        return False
+    return coerce_bool(raw)
+
+
 class ExtendableSettingsInterface(ABC):
     # Hidden variable for builtin settings that all implementations share
     _builtin_settings: Dict[str, Any] = {}

@@ -476,6 +476,13 @@ def action_from_rule(rule: dict, key: str = "act") -> Optional[Dict[str, dict]]:
         cfg["reference_value"] = rule.get("reference_value") or ReferenceValue.ORDER_OPEN_PRICE.value
         val = rule.get("value")
         cfg["value"] = val if val is not None else rule.get("action_value")
+    elif action_type == ExpertActionType.SELL:
+        # A sell's optional CLOSE PERCENT (1..100 of a held long; absent = a full close). Carried
+        # only when set, so every existing sell converts byte-identically.
+        val = rule.get("value")
+        val = val if val is not None else rule.get("action_value")
+        if val is not None:
+            cfg["value"] = val
     return {key: cfg}
 
 

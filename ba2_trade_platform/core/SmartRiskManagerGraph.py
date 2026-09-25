@@ -337,7 +337,7 @@ def _format_relative_time(timestamp_str: str) -> str:
 def _build_locked_symbols_section(
     expert_instance_id: int, trade_summary: Dict[str, Dict[str, float]]
 ) -> str:
-    """Build locked symbols section for the research prompt when hedging is disabled."""
+    """Build locked symbols section for the research prompt (netting rule, account-wide)."""
     from datetime import timedelta
 
     try:
@@ -376,7 +376,7 @@ def _build_locked_symbols_section(
 
         if locked_lines:
             section = (
-                "\n**Locked Symbols (account-wide positions, hedging disabled):**\n"
+                "\n**Locked Symbols (account-wide positions, netting rule):**\n"
                 "The following symbols already have positions on this account (across all experts). "
                 "You MUST NOT open positions in the opposite direction.\n"
                 + "\n".join(locked_lines)
@@ -572,6 +572,7 @@ from .SmartRiskManagerPrompts import (
     PORTFOLIO_ANALYSIS_PROMPT,
     RESEARCH_PROMPT,
     FINALIZATION_PROMPT,
+    NETTING_RULE_SENTENCE,
 )
 
 # ==================== STATE SCHEMA ====================
@@ -707,7 +708,6 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Prepare trading permission status messages
         enable_buy = expert_config.get("enable_buy")  # Already fetched with interface defaults above
         enable_sell = expert_config.get("enable_sell")  # Already fetched with interface defaults above
-        allow_hedging = expert.get_setting_with_interface_default("allow_hedging")
         auto_trade_opening = expert.get_setting_with_interface_default("allow_automated_trade_opening")
         auto_trade_modification = expert.get_setting_with_interface_default("allow_automated_trade_modification")
         auto_trading = auto_trade_opening and auto_trade_modification
@@ -715,21 +715,21 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         buy_status = "✅ ENABLED" if enable_buy else "❌ DISABLED"
         sell_status = "✅ ENABLED" if enable_sell else "❌ DISABLED"
         auto_trading_status = "✅ ENABLED" if auto_trading else "❌ DISABLED"
-        hedging_status = "✅ ALLOWED" if allow_hedging else "❌ NOT ALLOWED"
         
         # Generate focused guidance based on permissions
         # Note: auto_trade_modification allows closing/modifying existing positions regardless of enable_buy/enable_sell
         # enable_buy/enable_sell only affect NEW position opening when auto_trade_opening is True
-        hedging_note = " Note: Hedging is disabled - you cannot open positions in the opposite direction on symbols where you already have positions." if not allow_hedging else ""
+        # Netting rule (a US equity account nets per symbol): replaces the retired hedging note.
+        netting_note = f" Note: {NETTING_RULE_SENTENCE}."
         
         if auto_trade_modification and auto_trade_opening:
             # Full automation enabled
             if enable_buy and enable_sell:
-                trading_focus_guidance = f"**Your Focus:** Full automation enabled. You can open new positions (both BUY and SELL), close existing positions, and modify them. Manage the full portfolio lifecycle.{hedging_note}"
+                trading_focus_guidance = f"**Your Focus:** Full automation enabled. You can open new positions (both BUY and SELL), close existing positions, and modify them. Manage the full portfolio lifecycle.{netting_note}"
             elif enable_buy:
-                trading_focus_guidance = f"**Your Focus:** You can open new LONG positions (BUY only), close any existing positions, and modify them. Focus on long entry opportunities and managing all positions.{hedging_note}"
+                trading_focus_guidance = f"**Your Focus:** You can open new LONG positions (BUY only), close any existing positions, and modify them. Focus on long entry opportunities and managing all positions.{netting_note}"
             elif enable_sell:
-                trading_focus_guidance = f"**Your Focus:** You can open new SHORT positions (SELL only), close any existing positions, and modify them. Focus on short entry opportunities and managing all positions.{hedging_note}"
+                trading_focus_guidance = f"**Your Focus:** You can open new SHORT positions (SELL only), close any existing positions, and modify them. Focus on short entry opportunities and managing all positions.{netting_note}"
             else:
                 trading_focus_guidance = "**Your Focus:** You can close and modify existing positions, but cannot open new ones (both BUY and SELL disabled). Focus on managing existing positions only."
         elif auto_trade_modification:
@@ -738,11 +738,11 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         elif auto_trade_opening:
             # Can open new positions but not modify existing ones
             if enable_buy and enable_sell:
-                trading_focus_guidance = f"**Your Focus:** You can open new positions (both BUY and SELL), but cannot close or modify existing ones. Focus on new entry opportunities only.{hedging_note}"
+                trading_focus_guidance = f"**Your Focus:** You can open new positions (both BUY and SELL), but cannot close or modify existing ones. Focus on new entry opportunities only.{netting_note}"
             elif enable_buy:
-                trading_focus_guidance = f"**Your Focus:** You can open new LONG positions (BUY only), but cannot close or modify existing ones. Focus on long entry opportunities only.{hedging_note}"
+                trading_focus_guidance = f"**Your Focus:** You can open new LONG positions (BUY only), but cannot close or modify existing ones. Focus on long entry opportunities only.{netting_note}"
             elif enable_sell:
-                trading_focus_guidance = f"**Your Focus:** You can open new SHORT positions (SELL only), but cannot close or modify existing ones. Focus on short entry opportunities only.{hedging_note}"
+                trading_focus_guidance = f"**Your Focus:** You can open new SHORT positions (SELL only), but cannot close or modify existing ones. Focus on short entry opportunities only.{netting_note}"
             else:
                 trading_focus_guidance = "**Your Focus:** Both BUY and SELL are disabled. You cannot perform any trading actions. Focus on analysis only."
         else:
@@ -754,7 +754,7 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
             user_instructions=user_instructions,
             buy_status=buy_status,
             sell_status=sell_status,
-            hedging_status=hedging_status,
+            netting_rule=NETTING_RULE_SENTENCE,
             auto_trading_status=auto_trading_status,
             trading_focus_guidance=trading_focus_guidance
         ))
@@ -1965,7 +1965,7 @@ class SmartRiskManagerGraph:
             
             Use this tool to:
             - Check overall market exposure (long vs short bias)
-            - Identify excessive one-directional positions when hedging is disabled
+            - Identify excessive one-directional positions (an opposite order only reduces or closes)
             - Understand the full portfolio composition
             
             Returns a formatted table showing total buy/sell quantities for each symbol.
@@ -2187,7 +2187,7 @@ class SmartRiskManagerGraph:
         self, expert_instance_id: int, trade_summary: Dict[str, Dict[str, float]]
     ) -> str:
         """
-        Build a locked symbols section for the research prompt when hedging is disabled.
+        Build a locked symbols section for the research prompt (netting rule, account-wide).
 
         Checks which symbols this expert has analyzed in the last 7 days, then cross-references
         with account-wide positions (trade_summary) to determine direction locks.
@@ -2243,7 +2243,7 @@ class SmartRiskManagerGraph:
 
             if locked_lines:
                 section = (
-                    "\n**🔒 Locked Symbols (account-wide positions, hedging disabled):**\n"
+                    "\n**🔒 Locked Symbols (account-wide positions, netting rule):**\n"
                     "The following symbols already have positions on this account (across all experts). "
                     "You MUST NOT open positions in the opposite direction.\n"
                     + "\n".join(locked_lines)
@@ -2336,19 +2336,15 @@ class SmartRiskManagerGraph:
             else:
                 trade_summary_by_symbol = "No positions or pending orders found across any experts."
             
-            # Build hedging instructions based on allow_hedging setting
-            allow_hedging = expert.get_setting_with_interface_default("allow_hedging")
-            if allow_hedging:
-                hedging_check_note = " (ENABLED)"
-                hedging_instructions = "- Hedging is ENABLED - You may open opposite positions on symbols where positions exist\n- Use `get_trade_summary_by_symbol_tool()` to verify aggregate exposure across all experts\n- Consider hedging opportunities when market conditions suggest opposite direction exposure"
-            else:
-                hedging_check_note = " (DISABLED - CRITICAL)"
-                hedging_instructions = "- ⚠️ Hedging is DISABLED - You CANNOT open positions in opposite direction on symbols where positions already exist\n- BEFORE recommending new positions, ALWAYS call `get_trade_summary_by_symbol_tool()` to check aggregate exposure\n- If a symbol has BUY positions, you CANNOT open SELL positions (and vice versa)\n- Review the AGGREGATE TRADE SUMMARY above to ensure no excessive one-directional exposure"
+            # Netting rule (a US equity account nets per symbol). Replaced the retired
+            # allow_hedging branch: every stored value was false, and this keeps that text
+            # apart from its first line.
+            netting_instructions = f"- ⚠️ {NETTING_RULE_SENTENCE}\n- BEFORE recommending new positions, ALWAYS call `get_trade_summary_by_symbol_tool()` to check aggregate exposure\n- If a symbol has BUY positions, you CANNOT open SELL positions (and vice versa)\n- Review the AGGREGATE TRADE SUMMARY above to ensure no excessive one-directional exposure"
 
-            # Build locked symbols section when hedging is disabled
+            # Build locked symbols section (netting rule, account-wide)
             # Check symbols from recent analyses against account-wide positions
             locked_symbols_section = ""
-            if not allow_hedging and trade_summary:
+            if trade_summary:
                 locked_symbols_section = self._build_locked_symbols_section(
                     expert_instance_id, trade_summary
                 )
@@ -2360,8 +2356,7 @@ class SmartRiskManagerGraph:
                 expert_instructions=formatted_expert_instructions,
                 max_position_pct=max_position_pct,
                 max_position_equity=max_position_equity,
-                hedging_check_note=hedging_check_note,
-                hedging_instructions=hedging_instructions,
+                netting_instructions=netting_instructions,
                 locked_symbols_section=locked_symbols_section
             )
 

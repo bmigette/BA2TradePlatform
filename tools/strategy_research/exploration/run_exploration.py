@@ -21,7 +21,7 @@ from tools.strategy_research.exploration.market_conditions import refuse_inert_m
 from tools.strategy_research.exploration.profiles import (
     ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, budget_text, build_manifest, fingerprint)
 from tools.strategy_research.exploration.runtime import (
-    check_database, database_url, execute_ready, job_lock, preflight, refuse_unrunnable,
+    check_database, database_url, execute_ready, job_lock, preflight,
     resolve_universe, write_json)
 
 
@@ -188,9 +188,6 @@ def main(argv=None):
             path.write_text("\n".join(symbols) + "\n", encoding="utf-8")
             print(f"Warmup universe: {path} ({len(symbols)} symbols); no optimization started.")
             return 0
-        if args.run or args.preflight:
-            # The whole selection, before its first job: a short job must not fail hours in.
-            refuse_unrunnable(manifest["jobs"])
         if args.run:
             return run_jobs(manifest["jobs"], output, args)
         if args.preflight:

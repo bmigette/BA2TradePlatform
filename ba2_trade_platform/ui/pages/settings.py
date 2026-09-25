@@ -1473,8 +1473,10 @@ class ExpertSettingsTab:
            - ordinal: 1, 2 or 3 (1st/2nd/3rd)
            - weekday: lowercase weekday name (monday..sunday)
            - times: List of execution times in HH:MM format
-       - enable_buy (bool): Whether the expert can place BUY orders (default: True)
-       - enable_sell (bool): Whether the expert can place SELL orders (default: False)
+       - enable_buy (bool): Whether the expert can open longs, and so close them with a
+         sell (default: True)
+       - enable_sell (bool): Whether the expert can open shorts (a sell from flat), and so
+         cover them with a buy (default: False)
     
     2. **Expert-Specific Settings** (saved as ExpertSetting records):
        - Settings defined by each expert class's get_settings_definitions() method
@@ -2067,8 +2069,11 @@ class ExpertSettingsTab:
                         with ui.row().classes('w-full gap-4'):
                             self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=True)
                             self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=False)
-                            self.allow_hedging_checkbox = ui.checkbox('Allow hedging', value=False)
-                        ui.label('Hedging allows opening opposite direction positions on same symbol').classes('text-body2 text-grey-7 ml-6')
+                        ui.label('BUY opens longs; SELL opens shorts (a sell from flat). Closing a '
+                                 'position needs the permission that opened it: a sell closing a long '
+                                 'needs BUY, a buy covering a short needs SELL.').classes('text-body2 text-grey-7 ml-6')
+                        ui.label('An order opposite to an open position only reduces or closes it; '
+                                 'a new position in the other direction opens only from flat').classes('text-body2 text-grey-7 ml-6')
                         
                         ui.separator().classes('my-4')
                         
@@ -2868,7 +2873,6 @@ class ExpertSettingsTab:
             # Load trading permissions - convert to booleans if they're strings
             enable_buy = settings_source.get('enable_buy', True)  # Default to True
             enable_sell = settings_source.get('enable_sell', False)  # Default to False
-            allow_hedging = settings_source.get('allow_hedging', False)  # Default to False
             
             # Handle legacy automatic_trading setting by splitting it into new settings
             legacy_automatic_trading = settings_source.get('automatic_trading', None)
@@ -2889,8 +2893,6 @@ class ExpertSettingsTab:
                 enable_buy = enable_buy.lower() == 'true'
             if isinstance(enable_sell, str):
                 enable_sell = enable_sell.lower() == 'true'
-            if isinstance(allow_hedging, str):
-                allow_hedging = allow_hedging.lower() == 'true'
             if isinstance(allow_automated_trade_opening, str):
                 allow_automated_trade_opening = allow_automated_trade_opening.lower() == 'true'
             if isinstance(allow_automated_trade_modification, str):
@@ -2900,8 +2902,6 @@ class ExpertSettingsTab:
                 self.enable_buy_checkbox.value = enable_buy
             if hasattr(self, 'enable_sell_checkbox'):
                 self.enable_sell_checkbox.value = enable_sell
-            if hasattr(self, 'allow_hedging_checkbox'):
-                self.allow_hedging_checkbox.value = allow_hedging
             if hasattr(self, 'allow_automated_trade_opening_checkbox'):
                 self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
             if hasattr(self, 'allow_automated_trade_modification_checkbox'):
@@ -4778,9 +4778,7 @@ class ExpertSettingsTab:
             expert.save_setting('enable_sell', self.enable_sell_checkbox.value, setting_type="bool")
             expert.save_setting('allow_automated_trade_opening', self.allow_automated_trade_opening_checkbox.value, setting_type="bool")
             expert.save_setting('allow_automated_trade_modification', self.allow_automated_trade_modification_checkbox.value, setting_type="bool")
-            if hasattr(self, 'allow_hedging_checkbox'):
-                expert.save_setting('allow_hedging', self.allow_hedging_checkbox.value, setting_type="bool")
-            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, hedging={getattr(self, "allow_hedging_checkbox", None) and self.allow_hedging_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
+            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
         
         # Save risk management settings
         if hasattr(self, 'max_virtual_equity_per_instrument_input'):
@@ -5830,6 +5828,22 @@ class TradeSettingsTab:
                                 label='Reference',
                                 value=action_config.get('reference_value', 'current_price') if action_config else 'current_price'
                             ).classes('w-40').props('dense')
+                    elif selected_type in (ExpertActionType.BUY.value, ExpertActionType.SELL.value):
+                        # Optional CLOSE PERCENT: when the buy covers this expert's short, or the
+                        # sell closes its long, trade this % of the position (whole shares).
+                        # Empty = 100% (a full close). An entry ignores it.
+                        with action_value_container:
+                            # Prefill ONLY from a saved buy/sell row: switching a row from an
+                            # adjust action must not carry its offset (-8) in as a close percent.
+                            saved_type = (action_config.get('action_type', action_config.get('type'))
+                                          if action_config else None)
+                            prefill = (str(action_config.get('value', ''))
+                                       if saved_type == selected_type else '')
+                            value_input = ui.input(
+                                label='Close % (optional)',
+                                value=prefill,
+                                placeholder='100 = full close'
+                            ).classes('w-40').props('dense')
                     elif selected_type and is_share_adjustment_action(selected_type):
                         # Share adjustment action - show target_percent inline
                         with action_value_container:
@@ -6236,6 +6250,23 @@ class TradeSettingsTab:
                     if reference_select:
                         action_config['reference_value'] = reference_select.value
                 
+                elif action_type in (ExpertActionType.BUY.value, ExpertActionType.SELL.value):
+                    # Optional close percent (1..100) for a buy covering a short / a sell closing
+                    # a long; saved as the action's value only when given. .get: a buy/sell row
+                    # built without the field (older callers) simply has no percent.
+                    value_ref = action_refs.get('value_input')
+                    value_input = value_ref() if value_ref else None
+                    if value_input and str(value_input.value or '').strip():
+                        try:
+                            close_pct = float(value_input.value)
+                        except (ValueError, TypeError):
+                            ui.notify(f'Invalid close percent for action {action_type}', type='negative')
+                            return
+                        if close_pct < 1 or close_pct > 100:
+                            ui.notify(f'Close percent must be between 1 and 100 for action {action_type}', type='negative')
+                            return
+                        action_config['value'] = close_pct
+
                 elif is_share_adjustment_action(action_type):
                     # Share adjustment action (INCREASE/DECREASE_INSTRUMENT_SHARE)
                     target_percent_input = action_refs['target_percent_input']()

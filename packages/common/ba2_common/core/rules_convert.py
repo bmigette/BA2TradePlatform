@@ -175,6 +175,9 @@ def eventaction_to_exit_rule(
         "toggle_optimize": True,
     }
 
+    if action == SELL_ACTION and action_cfg.get("value") is not None:
+        rule["action_value"] = action_cfg["value"]      # the sell's close percent
+
     if action in ADJUST_ACTIONS:
         rule["reference_value"] = (
             action_cfg.get("reference_value") or ReferenceValue.ORDER_OPEN_PRICE.value
@@ -469,8 +472,15 @@ def _action_cfg_to_live(action: dict, key: str) -> Optional[Dict[str, dict]]:
     at = str(action.get("action_type") or action.get("action") or "")
     if at in (BUY_ACTION, SELL_ACTION) and at not in ADJUST_ACTIONS:
         # 'sell' is also a close-flavored EXIT_ACTION; as a TradeRule action we emit the
-        # bare open/close action with no reference baggage — identical either way.
-        return {key: {"action_type": at}}
+        # bare open/close action with no reference baggage — identical either way. Its only
+        # parameter is the optional CLOSE PERCENT (a buy covering a short / a sell closing a
+        # long; 1..100, absent = full), carried as ``value`` only when set.
+        cfg = {"action_type": at}
+        val = action.get("action_value")
+        val = val if val is not None else action.get("value")
+        if val is not None:
+            cfg["value"] = val
+        return {key: cfg}
     if at == ExpertActionType.STOP_PROCESSING.value:
         return {key: {"action_type": at}}
     return action_from_rule(action, key=key)
