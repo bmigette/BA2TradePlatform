@@ -568,8 +568,9 @@ def test_close_option_calls_close(monkeypatch, mock_account, mock_expert_instanc
     entry = get_instance(TradingOrder, entry_id)
     closed = {}
     monkeypatch.setattr(mock_account, "close_option_position",
-        lambda position, order_type="limit", limit_price=None: closed.update(
-            position=position, limit_price=limit_price) or "CLOSED", raising=False)
+        lambda position, order_type="limit", limit_price=None, transaction_id=None: closed.update(
+            position=position, limit_price=limit_price,
+            transaction_id=transaction_id) or "CLOSED", raising=False)
     action = create_action(action_type=ExpertActionType.CLOSE_OPTION, instrument_name="AAPL",
         account=mock_account, order_recommendation=OrderRecommendation.SELL,
         existing_order=entry, expert_recommendation=sample_recommendation)
@@ -577,3 +578,5 @@ def test_close_option_calls_close(monkeypatch, mock_account, mock_expert_instanc
     assert res["success"] is True
     assert closed["position"].contract_symbol == "AAPL150C"
     assert closed["position"].side == OrderDirection.BUY    # long position
+    # The close rides the transaction it was decided for (review 2026-09-25 I2).
+    assert closed["transaction_id"] == txn_id

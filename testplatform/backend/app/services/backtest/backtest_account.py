@@ -5251,8 +5251,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         (BUY long -> SELL_TO_CLOSE; SELL short -> BUY_TO_CLOSE) and routes it through the
         inherited ``submit_option_order`` so it is staged fillable like any other option order.
 
-        The close RIDES the OPEN position's transaction (we look up the OPENED option
-        transaction for the contract and pass its id), so the sell-to-close leg REDUCES the
+        The close RIDES the OPEN position's transaction -- the caller's ``transaction_id`` when
+        it still holds the position, else the shared open-holder lookup (see below) -- so the
+        sell-to-close leg REDUCES the
         original position to flat (net open qty -> 0) instead of spawning a separate OPENED
         transaction holding the opposite-side leg. This also lets round-trip P&L pair the
         open and close (they share one ``transaction_id``).
@@ -5274,84 +5275,37 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             expiry=position.expiry,
             underlying=position.underlying,
         )
+        # WHICH TRANSACTION THE CLOSE RIDES (Task 13, revised by review 2026-09-25 I2).
+        # An explicit id -- what the shared CloseOptionAction now passes: the transaction of the
+        # order it resolved -- wins, as on every live account, PROVIDED that transaction still
+        # holds the contract on this side; one that holds nothing would book a close that opens
+        # the opposite position on it, so that is an ERROR and the id is dropped. Without an id
+        # the SHARED lookup answers (open_option_transaction_id_for_contract: the lowest-id
+        # transaction still holding a net position) -- exact live parity. The earlier
+        # backtest-only requester heuristic (matching the position's quantity/price to a
+        # holder) is retired: with the id passed it had nothing left to decide, and where it
+        # guessed it could guess wrong (two holders of equal size and price).
         if transaction_id is not None:
-            # An explicit id wins -- the interface contract (live AlpacaAccount does the same).
-            bookings = [(transaction_id, int(position.quantity))]
-        else:
-            bookings = self._close_bookings(position)
-        first = None
-        for txn_id, qty in bookings:
-            submitted = self.submit_option_order(
-                legs=[leg],
-                quantity=int(qty),
-                order_type=order_type,
-                limit_price=limit_price,
-                option_strategy="close",
-                transaction_id=txn_id,
-            )
-            if first is None:
-                first = submitted
-        return first
-
-    def _close_bookings(self, position) -> List[tuple]:
-        """[(transaction id, contracts)] a close of ``position`` is booked on (Task 13).
-
-        One OPENED transaction holding the contract on the position's side (every run without
-        a shared contract): that one -- the old behaviour. None: the old lookup
-        (``_option_transaction_for_contract``), which may also answer None.
-
-        SEVERAL (two transactions -- e.g. two experts, or a re-keyed lot merged at a split --
-        on one contract): the close belongs to the transaction that REQUESTED it. The shared
-        caller (``CloseOptionAction``) does not pass its transaction id; it builds the
-        position from that transaction's option order (quantity = the order's filled qty,
-        avg = its fill price), so the requester is the holder whose order -- or whose own
-        position view (open qty, transaction open price) -- has exactly those numbers. Passing
-        the id from the shared action would be the direct fix, but that is a LIVE code path
-        and is left to a separate decision; nothing here changes live.
-
-        No holder matches (a genuinely contract-level request): FIFO lot relief, the brokers
-        default -- the oldest holding transaction is closed first, one close order per
-        transaction, so each order reduces exactly the transaction it rides. FIFO rather than
-        pro-rata because it is what a broker does and keeps whole contracts per transaction.
-        The extra orders carry no exit_record (the caller stamps only the returned one) and
-        the split is logged at WARNING."""
-        long_ = position.side == OrderDirection.BUY
-        holdings = [(t, q) for t, q in self._open_option_holdings(position.contract_symbol)
-                    if (q > 0) == long_]
-        if len(holdings) <= 1:
-            txn = (holdings[0][0] if holdings
-                   else self._option_transaction_for_contract(position.contract_symbol))
-            return [(getattr(txn, "id", None) if txn is not None else None,
-                     int(position.quantity))]
-        want_qty = float(position.quantity)
-        want_px = position.avg_entry_price
-        executed = OrderStatus.get_executed_statuses()
-        for t, q in holdings:
-            views = [(abs(q), t.open_price)]
-            for o in self._orders_filtered(transaction_id=t.id):
-                if (o.contract_symbol == position.contract_symbol and o.status in executed
-                        and (o.side == OrderDirection.BUY) == long_):
-                    views.append((float(o.filled_qty or o.quantity or 0.0), o.open_price))
-            if any(abs(vq - want_qty) < 1e-9 and vp is not None and want_px is not None
-                   and abs(float(vp) - float(want_px)) < 1e-9 for vq, vp in views):
-                return [(t.id, int(position.quantity))]
-        remaining = int(position.quantity)
-        out = []
-        for t, q in holdings:
-            if remaining <= 0:
-                break
-            take = min(remaining, int(round(abs(q))))
-            if take > 0:
-                out.append((t.id, take))
-                remaining -= take
-        if remaining > 0 and out:
-            out[-1] = (out[-1][0], out[-1][1] + remaining)
-        logger.warning(
-            "[backtest] close of %s %g x %s matches none of the %d OPENED transactions holding "
-            "it: booked FIFO as %s (one close order per transaction; only the first carries "
-            "the exit record).", "long" if long_ else "short", position.quantity,
-            position.contract_symbol, len(holdings), out)
-        return out
+            long_ = position.side == OrderDirection.BUY
+            held = {t.id: q for t, q in self._open_option_holdings(position.contract_symbol)}
+            q = held.get(transaction_id, 0.0)
+            if q == 0 or (q > 0) != long_:
+                logger.error(
+                    "[backtest] close of %s %s requested for transaction %s, which holds no %s "
+                    "position in it (net %+g); falling back to the shared open-holder lookup.",
+                    "long" if long_ else "short", position.contract_symbol, transaction_id,
+                    "long" if long_ else "short", q)
+                transaction_id = None
+        if transaction_id is None:
+            transaction_id = self.open_option_transaction_id_for_contract(position.contract_symbol)
+        return self.submit_option_order(
+            legs=[leg],
+            quantity=int(position.quantity),
+            order_type=order_type,
+            limit_price=limit_price,
+            option_strategy="close",
+            transaction_id=transaction_id,
+        )
 
     def _open_option_holdings(self, contract_symbol: str) -> List[tuple]:
         """[(transaction, signed contracts held)] for every OPENED transaction holding

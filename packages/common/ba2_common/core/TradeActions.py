@@ -6117,7 +6117,18 @@ class CloseOptionAction(TradeAction):
                     data={"contract_symbol": position.contract_symbol, "limit_price": limit_price,
                           "status": "PENDING"})
 
-            result = self.account.close_option_position(position, order_type="limit", limit_price=limit_price)
+            # THE CLOSE RIDES THE TRANSACTION IT WAS DECIDED FOR (review 2026-09-25 I2). The
+            # resolved order belongs to exactly one transaction; passing its id makes the
+            # account book the close there instead of re-deriving "the" holder from the
+            # contract, which picks the FIRST open holder when two transactions hold the same
+            # contract (two experts, a merged lot) -- closing the wrong one and leaving the
+            # other open (a spread leg closed out of the wrong structure leaves its partner
+            # naked). Every account honours an explicit id (AlpacaAccount's close_option_position
+            # "an explicit transaction_id from a caller that has one still wins";
+            # _close_multi_leg already passes it); with one holder it is the same id as before.
+            result = self.account.close_option_position(
+                position, order_type="limit", limit_price=limit_price,
+                transaction_id=getattr(order, "transaction_id", None))
             if result is None:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
