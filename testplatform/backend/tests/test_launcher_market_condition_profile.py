@@ -64,6 +64,10 @@ PERMITTED = ["O_LC", "O_LP", "O_VERT", "O_BULLCS", "O_BULLPS", "O_BEARCS", "O_BF
 #: AMENDED 2026-09-25 (plan 2026-09-24 Task 9), the entry action's ``option_entry_cross`` band
 #: ONLY: 0.0..1.0 step 0.25 authored at 0.0 -> 0.75..1.0 step 0.05 authored at 0.75 (passive
 #: limits went unfilled under next-open fills). A deliberate gene-range change, not profile drift.
+#:
+#: AMENDED 2026-09-25 (plan 2026-09-24 Task 12), two gate RANGES only, values untouched:
+#: ``shared-rel_volume`` value_max 3.0 -> 1.5, and ``o_lc-iv_rv`` (a DEBIT member) value_min
+#: 0.8 -> 1.0. Deliberate gene-range changes, not profile drift.
 PROFILE_NONE_O_LC = json.loads(r"""
 {
     "id": "o_lc-entry",
@@ -120,7 +124,7 @@ PROFILE_NONE_O_LC = json.loads(r"""
                 "toggle_optimize": true,
                 "value": 0.5,
                 "value_min": 0.5,
-                "value_max": 3.0,
+                "value_max": 1.5,
                 "value_step": 0.25
             },
             {
@@ -130,7 +134,7 @@ PROFILE_NONE_O_LC = json.loads(r"""
                 "value": 1.6,
                 "optimize": true,
                 "toggle_optimize": true,
-                "value_min": 0.8,
+                "value_min": 1.0,
                 "value_max": 1.6,
                 "value_step": 0.1
             },

@@ -4406,23 +4406,41 @@ def _iv_rank_gate(m: str, member: str) -> dict:
 # RELATIVE VOLUME. The UNDERLYING's volume over its own trailing 20-bar average (current bar
 # excluded). One direction for both halves -- real participation behind the signal is a
 # confirmation whether you are buying or selling premium -- so the searched threshold is the
-# only per-half difference, and there is none. 0.5..3.0 brackets both "any liquidity at all"
-# and "genuinely unusual"; the authored default sits at the permissive end.
+# only per-half difference, and there is none. The authored default sits at the permissive end.
+#
+# 0.5..1.5, NOT 0.5..3.0 (plan 2026-09-24 Task 12; new grid runs only). The old ceiling was
+# authored, and the upper half of it was dead search space: measured in the O_LP diagnosis
+# (docs/findings-2026-09-24-deterministicscorer-bearish-options.md), the SELL-signal bars'
+# median relative volume is 0.88 and only ~5% sit above 1.5, so a genome above 2 lost 97% of
+# the entries left after the other gates and one at 2.5 blocked ~everything. The GA could learn
+# that, but only by burning early generations on genomes that never trade. 1.5 still demands
+# "clearly busier than usual"; the 0.5 floor and the 0.25 step (five levels) are unchanged.
 #
 # Not volume/OPEN INTEREST, which would be the better CONTRACT-level unusual-activity signal:
 # `open_interest` is NULL on every cached option row (see option_selector.passes_liquidity), so
 # it is not computable here today.
-_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 3.0, "value_step": 0.25}
+_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 1.5, "value_step": 0.25}
 
 # IV / REALISED VOL -- the variance risk premium, i.e. the actual edge in premium selling: you
 # are paid implied and you pay out realised. OPPOSITE PER HALF for the same reason as iv_rank
 # (the gene space never searches an operator): a seller wants the ratio HIGH, a buyer wants it
-# LOW. The window brackets 1.0 on both sides so either half can express "no edge here".
+# LOW. The authored value is each half's PERMISSIVE end, and "no edge here" is the gate's
+# OFF toggle.
+#
+# THE RANGE IS PER HALF (plan 2026-09-24 Task 12; new grid runs only). Both halves searched
+# 0.8..1.6 until then. The DEBIT floor rises to 1.0: a buyer's "<" gate below parity demands
+# implied vol be well UNDER realised, which is rare -- measured in the O_LP diagnosis
+# (docs/findings-2026-09-24-deterministicscorer-bearish-options.md), `iv_rv < 0.8` dropped 79%
+# of the entries where it was enabled -- so the 0.8..1.0 slice mostly produced genomes that
+# never trade. At 1.0 the strictest debit genome still asks "implied no dearer than realised".
+# The CREDIT half keeps 0.8..1.6: nothing measured argues for moving it. Step 0.1 on both
+# (seven debit levels, nine credit). Each authored value stays inside its own range.
 _IV_RV_GATE = {
-    True:  {"op": "<", "value": 1.6},   # debit: buy premium only when it is cheap vs realised
-    False: {"op": ">", "value": 0.8},   # credit: sell premium only when it is genuinely rich
+    # debit: buy premium only when it is cheap vs realised
+    True:  {"op": "<", "value": 1.6, "value_min": 1.0, "value_max": 1.6, "value_step": 0.1},
+    # credit: sell premium only when it is genuinely rich
+    False: {"op": ">", "value": 0.8, "value_min": 0.8, "value_max": 1.6, "value_step": 0.1},
 }
-_IV_RV_RANGE = {"value_min": 0.8, "value_max": 1.6, "value_step": 0.1}
 
 
 def _relative_volume_gate() -> dict:
@@ -4456,7 +4474,8 @@ def _iv_rv_gate(m: str, member: str) -> dict:
     spec = _IV_RV_GATE[member in _DEBIT_OPTION_MEMBERS]
     return {"id": f"{m}-iv_rv", "field": "iv_to_realized_vol", "op": spec["op"],
             "value": spec["value"], "optimize": True, "toggle_optimize": True,
-            **_IV_RV_RANGE}
+            "value_min": spec["value_min"], "value_max": spec["value_max"],
+            "value_step": spec["value_step"]}
 
 
 # EXPECTED PROFIT — the entry's only signal-strength gate, and the ONLY one every expert can
