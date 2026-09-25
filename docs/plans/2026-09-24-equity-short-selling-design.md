@@ -23,8 +23,22 @@ Let rules open short equity positions in live trading and in backtests.
 | `buy` | flat or long | Unchanged. |
 | `close` | short | Already buys to cover (`close_transaction`). |
 
-- **The only gate** is the expert's existing `enable_sell` setting. No account-level setting is
-  added.
+- **Permission gates (operator, 2026-09-25):** closing is gated by the permission that opened the
+  position.
+
+  | Order | Position | Allowed when |
+  |---|---|---|
+  | sell | flat | `enable_sell` on (opens a short) |
+  | sell | long | `enable_buy` on (close, or reduce by an optional percent 1–100, default 100) |
+  | buy | flat | `enable_buy` on (opens a long, unchanged) |
+  | buy | short | `enable_sell` on (cover, or reduce by an optional percent) |
+
+  No account-level setting is added. The old inert "sell with enable_sell off on a long" behaviour
+  is replaced; no live or stored rule used it.
+- **TP/SL direction (bug found 2026-09-25):** adjustments take long vs short from the POSITION'S side,
+  and use the recommendation only when there is no position. Before, a SELL bar on a held long
+  computed a short-style stop. Up to 220 stored backtests were exposed; the operator accepted that
+  they change.
 - **Backtests:** the existing `enable_short` config keeps feeding `enable_sell` (`deploy_parity`),
   so the long/short seed rulesets and the pullback_rsi short jobs start working.
 - **Already short-ready, and reused as is:**
