@@ -145,6 +145,7 @@ def test_refine_worsens_drawdown_for_flagged_trade_with_hidden_dip():
         [trade],
         max_drawdown=-2.0,
         equity_at=lambda dt: 20_000.0,
+        peak_at=lambda dt: 20_000.0,
         daily_bar_low=lambda sym, dt: 100.0,
         prior_daily_bar_low=lambda sym, dt: 105.0,  # flags via bars_held=1 anyway
         delta_at_entry=lambda underlying, contract, dt: 0.5,
@@ -152,8 +153,9 @@ def test_refine_worsens_drawdown_for_flagged_trade_with_hidden_dip():
         bars_5m_between=lambda sym, entry, exit_: [{"Low": 90.0, "High": 101.0}],
     )
     # implied worst premium = 5.0 + 0.5*(90-100) = 0.0 (floored); worst_pnl = (0-5)*1*100 = -500.
-    # extra_loss = min(0, -500 - 100) = -600; candidate_dd = -2.0 + (-600/20000*100) = -5.0.
-    assert refined == pytest.approx(-5.0)
+    # dip = (20000 - 500) / 20000 - 1 = -2.5% (Task 3: measured from the peak; the realised
+    # +100 plays no part -- the old formula subtracted it and reported -5.0).
+    assert refined == pytest.approx(-2.5)
     assert refined < -2.0
 
 
@@ -167,6 +169,7 @@ def test_refine_leaves_drawdown_unchanged_when_no_hidden_dip():
         [trade],
         max_drawdown=-2.0,
         equity_at=lambda dt: 20_000.0,
+        peak_at=lambda dt: 20_000.0,
         daily_bar_low=lambda sym, dt: 100.0,
         prior_daily_bar_low=lambda sym, dt: 99.0,
         delta_at_entry=lambda underlying, contract, dt: 0.5,
@@ -182,6 +185,7 @@ def test_refine_skips_unflagged_multi_bar_trade():
         [trade],
         max_drawdown=-2.0,
         equity_at=lambda dt: 20_000.0,
+        peak_at=lambda dt: 20_000.0,
         daily_bar_low=lambda sym, dt: 101.0,   # exit-day low
         prior_daily_bar_low=lambda sym, dt: 100.0,  # prior-day low; exit low is NOT lower -> unflagged
         delta_at_entry=lambda underlying, contract, dt: 0.5,
@@ -198,6 +202,7 @@ def test_refine_skips_trade_missing_contract_symbol():
         [trade],
         max_drawdown=-2.0,
         equity_at=lambda dt: 20_000.0,
+        peak_at=lambda dt: 20_000.0,
         daily_bar_low=lambda sym, dt: 100.0,
         prior_daily_bar_low=lambda sym, dt: 105.0,
         delta_at_entry=lambda underlying, contract, dt: 0.5,
@@ -219,6 +224,7 @@ def test_refine_is_best_effort_on_lookup_exception():
         [trade],
         max_drawdown=-2.0,
         equity_at=lambda dt: 20_000.0,
+        peak_at=lambda dt: 20_000.0,
         daily_bar_low=_boom,
         prior_daily_bar_low=lambda sym, dt: 105.0,
         delta_at_entry=lambda underlying, contract, dt: 0.5,
@@ -419,6 +425,7 @@ def test_refine_never_improves_on_the_daily_figure():
         [trade],
         max_drawdown=-2.0,
         equity_at=lambda dt: 20_000.0,
+        peak_at=lambda dt: 20_000.0,
         daily_bar_low=lambda sym, dt: 100.0,
         prior_daily_bar_low=lambda sym, dt: 105.0,
         delta_at_entry=lambda underlying, contract, dt: 0.5,
@@ -443,17 +450,17 @@ def test_refine_does_not_accumulate_additively_across_many_flagged_trades():
         trades,
         max_drawdown=-2.0,
         equity_at=lambda dt: 20_000.0,
+        peak_at=lambda dt: 20_000.0,
         daily_bar_low=lambda sym, dt: 100.0,
         prior_daily_bar_low=lambda sym, dt: 105.0,
         delta_at_entry=lambda underlying, contract, dt: 0.5,
         underlying_price_at=lambda sym, dt: 100.0,
         bars_5m_between=lambda sym, entry, exit_: [{"Low": 90.0, "High": 101.0}],
     )
-    # Each trade individually implies candidate_dd = -2.0 + (-600/20000*100) = -5.0 (same math as
-    # test_refine_worsens_drawdown_for_flagged_trade_with_hidden_dip). With 20 trades, the OLD
-    # (buggy) additive-accumulation behavior would reach roughly -2.0 + 20*-3.0 = -62.0. The
-    # fixed behavior must land at exactly the worst SINGLE trade's candidate, -5.0.
-    assert refined == pytest.approx(-5.0)
+    # Each trade individually implies a -2.5% dip (same math as
+    # test_refine_worsens_drawdown_for_flagged_trade_with_hidden_dip). Stacking 20 of them would
+    # reach -50%; the result must land at exactly the worst SINGLE trade's dip, -2.5.
+    assert refined == pytest.approx(-2.5)
 
 
 def test_refine_is_hard_floored_at_negative_100_percent():
@@ -465,12 +472,156 @@ def test_refine_is_hard_floored_at_negative_100_percent():
         [trade],
         max_drawdown=-2.0,
         equity_at=lambda dt: 100.0,  # tiny equity relative to the loss -> candidate blows past -100%
+        peak_at=lambda dt: 100.0,
         daily_bar_low=lambda sym, dt: 100.0,
         prior_daily_bar_low=lambda sym, dt: 105.0,
         delta_at_entry=lambda underlying, contract, dt: 0.5,
         underlying_price_at=lambda sym, dt: 100.0,
         bars_5m_between=lambda sym, entry, exit_: [{"Low": 90.0, "High": 101.0}],
     )
-    # extra_loss = -600 against equity=100 -> candidate_dd = -2.0 + (-600/100*100) = -602.0,
+    # worst_pnl = -500 against equity = peak = 100 -> dip = (100 - 500) / 100 - 1 = -500%,
     # must be floored to exactly -100.0.
     assert refined == pytest.approx(-100.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (plan 2026-09-24-option-bt-engine-bug-fixes): the refinement measures a DIP from the
+# running equity peak, not "worst P&L minus realised P&L". The old formula counted a winning
+# trade's realised GAIN as drawdown: +$51,048 realised against a -$500 intraday worst read as a
+# -$51,548 "extra loss" -> -462% -> floored to -100%, the bust sentinel on a profitable run.
+# ---------------------------------------------------------------------------
+
+def _refine_kw(**overrides):
+    """The injected data access every Task 3 test shares: one flagged (bars_held=1) trade whose
+    5m window floors the premium to 0 (worst_pnl = -entry_premium * size * 100)."""
+    kw = dict(
+        daily_bar_low=lambda sym, dt: 100.0,
+        prior_daily_bar_low=lambda sym, dt: 105.0,
+        delta_at_entry=lambda underlying, contract, dt: 0.5,
+        underlying_price_at=lambda sym, dt: 100.0,
+        bars_5m_between=lambda sym, entry, exit_: [{"Low": 90.0, "High": 101.0}],
+    )
+    kw.update(overrides)
+    return kw
+
+
+def test_a_WINNING_trade_refines_to_its_dip_not_to_minus_100():
+    """Realised +$51,048, worst intraday -$500, entry equity $11,156, running peak $12,000.
+    The dip is (11156 - 500) / 12000 - 1 = -11.2%; the old formula said -100%."""
+    trade = _make_trade(pnl=51_048.0)  # entry 5.0 x 1 lot -> worst_pnl = -500
+    refined = refine_max_drawdown(
+        [trade], max_drawdown=-5.0,
+        equity_at=lambda dt: 11_156.0, peak_at=lambda dt: 12_000.0, **_refine_kw())
+    assert refined == pytest.approx((11_156.0 - 500.0) / 12_000.0 * 100.0 - 100.0)  # -11.2
+    assert refined == pytest.approx(-11.2)
+
+
+def test_a_winning_trade_whose_dip_is_shallower_than_the_daily_max_changes_nothing():
+    """Same trade against the O_LC TOP1's daily figure: -11.2% is inside -25.49%, so the
+    daily curve already holds the worst point and the refinement must leave it alone."""
+    trade = _make_trade(pnl=51_048.0)
+    refined = refine_max_drawdown(
+        [trade], max_drawdown=-25.49,
+        equity_at=lambda dt: 11_156.0, peak_at=lambda dt: 12_000.0, **_refine_kw())
+    assert refined == pytest.approx(-25.49)
+
+
+def test_a_LOSING_trade_with_a_worse_intraday_low_deepens_the_drawdown_by_the_dip():
+    """Realised -$1,000, intraday worst -$2,000 (4 lots floored to 0 from 5.0), entry equity
+    $18,000 under a $20,000 peak: dip = (18000 - 2000) / 20000 - 1 = -20%. The realised loss
+    plays no part -- the dip is measured from the peak, not relative to what was realised
+    (the old formula gave -2 + (-1000/18000*100) = -7.56%)."""
+    trade = _make_trade(pnl=-1_000.0, size=4.0)
+    refined = refine_max_drawdown(
+        [trade], max_drawdown=-2.0,
+        equity_at=lambda dt: 18_000.0, peak_at=lambda dt: 20_000.0, **_refine_kw())
+    assert refined == pytest.approx(-20.0)
+
+
+def test_no_flagged_trades_returns_the_input_unchanged():
+    unflagged = _make_trade(bars_held=5)
+    kw = _refine_kw(daily_bar_low=lambda sym, dt: 101.0,        # exit low NOT below prior
+                    prior_daily_bar_low=lambda sym, dt: 100.0)
+    for trades in ([], [unflagged]):
+        refined = refine_max_drawdown(
+            trades, max_drawdown=-7.25,
+            equity_at=lambda dt: 11_156.0, peak_at=lambda dt: 12_000.0, **kw)
+        assert refined == -7.25
+
+
+def test_a_window_that_never_goes_below_entry_changes_nothing():
+    """worst_pnl >= 0: the trade never dipped, so equity_at(entry) is itself a point on the
+    daily curve and cannot be worse than that curve's max drawdown."""
+    trade = _make_trade(pnl=51_048.0)
+    refined = refine_max_drawdown(
+        [trade], max_drawdown=-1.0,
+        equity_at=lambda dt: 11_156.0, peak_at=lambda dt: 12_000.0,
+        **_refine_kw(bars_5m_between=lambda sym, entry, exit_: [{"Low": 102.0, "High": 105.0}]))
+    assert refined == pytest.approx(-1.0)
+
+
+def test_a_capped_run_measures_the_dip_on_the_cap_like_its_daily_curve():
+    """With an equity cap the daily drawdown is (P&L - peak P&L) / cap
+    (``equity_cap.capped_drawdown_curve``), so the dip must use the same fixed denominator or
+    the refinement would compare a peak-relative figure against a cap-relative one:
+    (11156 - 500 - 12000) / 20000 = -6.72%, not the uncapped -11.2%."""
+    trade = _make_trade(pnl=51_048.0)
+    refined = refine_max_drawdown(
+        [trade], max_drawdown=-5.0,
+        equity_at=lambda dt: 11_156.0, peak_at=lambda dt: 12_000.0,
+        drawdown_base=20_000.0, **_refine_kw())
+    assert refined == pytest.approx(-6.72)
+
+
+def test_the_peak_is_never_below_the_equity_it_is_read_with():
+    """A running peak includes the point it is read at. A peak callable answering below the
+    entry equity (an inconsistent source) must not turn a dip into a positive 'drawdown' or a
+    shallower one: the dip is measured from max(peak, equity)."""
+    trade = _make_trade(pnl=0.0)
+    refined = refine_max_drawdown(
+        [trade], max_drawdown=0.0,
+        equity_at=lambda dt: 20_000.0, peak_at=lambda dt: 10_000.0, **_refine_kw())
+    assert refined == pytest.approx(-2.5)  # (20000 - 500) / 20000 - 1
+
+
+def test_a_non_positive_drawdown_base_is_refused_loudly():
+    with pytest.raises(ValueError, match="drawdown_base"):
+        refine_max_drawdown(
+            [_make_trade()], max_drawdown=-1.0,
+            equity_at=lambda dt: 1.0, peak_at=lambda dt: 1.0, drawdown_base=0.0,
+            **_refine_kw())
+
+
+def test_the_wiring_builds_peak_at_as_the_running_peak_of_the_same_curve(monkeypatch):
+    """``results._build_refine_drawdown_fn`` must hand the refinement a ``peak_at`` read from
+    the account's recorded equity curve with ``_equity_at``'s own at/just-before lookup, so the
+    peak and the equity are read at the same point of the same series -- and it must forward a
+    configured cap as the dip's denominator."""
+    from types import SimpleNamespace
+    from app.services.backtest import intraday_drawdown
+    from app.services.backtest.results import _build_refine_drawdown_fn
+
+    _no_fmp(monkeypatch)
+    snaps = [{"date": datetime(2024, 1, 2), "net_liquidating_value": 10_000.0},
+             {"date": datetime(2024, 1, 3), "net_liquidating_value": 12_000.0},
+             {"date": datetime(2024, 1, 4), "net_liquidating_value": 11_000.0},
+             {"date": datetime(2024, 1, 5), "net_liquidating_value": 12_500.0}]
+    acct = SimpleNamespace(
+        _price=_RefinePrice(),
+        _options=SimpleNamespace(delta_at_entry=lambda u, c, w: 0.5),
+        _equity_at=lambda dt: 100_000.0,
+        get_balance_history=lambda: list(snaps))
+    seen = {}
+    monkeypatch.setattr(intraday_drawdown, "refine_max_drawdown",
+                        lambda trades, md, **kw: (seen.update(kw), md)[1])
+
+    _build_refine_drawdown_fn(acct, _REFINE_CFG)([], -2.0)
+    peak_at = seen["peak_at"]
+    assert peak_at(datetime(2024, 1, 1)) == 10_000.0          # pre-curve: the first point
+    assert peak_at(datetime(2024, 1, 2, 15, 45)) == 10_000.0
+    assert peak_at(datetime(2024, 1, 4, 15, 45)) == 12_000.0  # peak held through the dip
+    assert peak_at(datetime(2024, 1, 5)) == 12_500.0          # at the snapshot: included
+    assert seen["drawdown_base"] is None
+
+    _build_refine_drawdown_fn(acct, _REFINE_CFG, equity_cap=20_000.0)([], -2.0)
+    assert seen["drawdown_base"] == 20_000.0

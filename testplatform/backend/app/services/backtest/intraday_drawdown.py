@@ -15,8 +15,9 @@ option's delta as-of entry (real, cached data -- see ``options_cache.py``'s ``op
 table): assuming premium moves linearly with delta x underlying price change (a first-order
 approximation -- it ignores gamma/theta/vega, so it is directionally useful, not a precise
 recomputation), find the underlying's most adverse 5-minute print in the trade's holding window
-and re-price the option there. If that implies a bigger drawdown than what the daily curve
-recorded, fold it into ``max_drawdown``.
+and re-price the option there. The trade's worst point is then read as a DIP from the running
+equity peak at its entry; if that dip is deeper than the daily curve's worst, it becomes
+``max_drawdown``.
 
 All data access is dependency-injected (callables) so the estimation math is unit-testable
 without real cache files or a live account -- see ``_build_refine_callbacks`` in ``results.py``
@@ -90,6 +91,7 @@ def refine_max_drawdown(
     max_drawdown: float,
     *,
     equity_at: Callable[[Any], Optional[float]],
+    peak_at: Callable[[Any], Optional[float]],
     daily_bar_low: Callable[[str, Any], Optional[float]],
     prior_daily_bar_low: Callable[[str, Any], Optional[float]],
     delta_at_entry: Callable[[str, str, Any], Optional[float]],
@@ -97,6 +99,7 @@ def refine_max_drawdown(
     bars_5m_between: Callable[[str, Any, Any], List[Dict[str, Optional[float]]]],
     commission_per_trade: float = 0.0,
     multiplier: float = 100.0,
+    drawdown_base: Optional[float] = None,
 ) -> float:
     """Re-derive ``max_drawdown`` (percentage points, <= 0), folding in an estimated intraday
     dip for each flagged option trade. All data access is dependency-injected so this stays
@@ -105,8 +108,23 @@ def refine_max_drawdown(
     daily-computed figure, since the daily curve is authoritative and this is a refinement on
     top of it, not a replacement.
 
-    Each flagged trade's candidate is computed against the ORIGINAL ``max_drawdown``, not the
-    running ``refined`` value -- these are separate, non-overlapping trades on different dates
+    A TRADE'S CANDIDATE IS A DIP, NOT A P&L DIFFERENCE. The trade's estimated worst intraday
+    P&L is laid on top of the equity it opened on and measured from the running peak at that
+    point, exactly as the daily curve measures every other point::
+
+        dip_dd = (equity_at(entry) + min(0, worst_pnl) - peak) / base * 100
+
+    where ``peak = max(peak_at(entry), equity_at(entry))`` and ``base`` is ``peak`` (the
+    running-peak drawdown of ``results._drawdown_curve``) or, on an equity-capped run, the
+    fixed ``drawdown_base`` (``equity_cap.capped_drawdown_curve`` divides by the cap). The
+    realised P&L plays no part. This replaced ``max_drawdown + (worst_pnl - realised_pnl) /
+    equity``, which counted a WINNING trade's realised gain as drawdown: +$51,048 realised
+    against a -$500 intraday worst read as a -$51,548 "extra loss", -462%, floored to -100% --
+    the bust sentinel on a profitable run -- and inflated every refined option drawdown (O_LC
+    TOP1: -34.27% refined against a -25.49% daily curve).
+
+    Each flagged trade's candidate is computed independently, never on top of the running
+    ``refined`` value -- these are separate, non-overlapping trades on different dates
     whose hypothetical worst cases are mutually exclusive (they can't all have happened to the
     SAME equity trough at once). Accumulating them additively across hundreds of trades would
     make the result worsen without bound purely from trade COUNT, not from any single real
@@ -115,6 +133,11 @@ def refine_max_drawdown(
     result is also hard-floored at -100%: drawdown relative to total equity cannot exceed that
     even as a hypothetical estimate.
     """
+    if drawdown_base is not None and not drawdown_base > 0:
+        # A cap is validated positive at config time (equity_cap.validate_equity_cap); a
+        # non-positive base here is a wiring bug, and dividing by it would flip or blow up
+        # every dip. Refused for the whole call, not skipped trade by trade in the loop below.
+        raise ValueError(f"drawdown_base must be > 0 or None, got {drawdown_base!r}")
     refined = max_drawdown
     flagged = 0        # trades that reached the delta lookup (already past the dip filter)
     uncovered = 0      # of those, the ones with no usable entry delta / underlying price
@@ -154,15 +177,24 @@ def refine_max_drawdown(
             )
             if worst_pnl is None:
                 continue
-            realised_pnl = t.get("pnl") or 0.0
-            extra_loss = min(0.0, worst_pnl - realised_pnl)  # only matters if it's WORSE
-            if extra_loss == 0.0:
+            worst_loss = min(0.0, worst_pnl)
+            if worst_loss == 0.0:
+                # The window never went below entry: equity_at(entry) is itself a point on the
+                # daily curve, which max_drawdown already covers.
                 continue
             equity = equity_at(t.get("entry_time"))
-            if not equity:
+            peak = peak_at(t.get("entry_time"))
+            if not equity or peak is None:
                 continue
-            candidate_dd = max_drawdown + (extra_loss / equity * 100.0)
-            refined = min(refined, candidate_dd)
+            # A running peak includes the point it is read at, so it can never sit below the
+            # equity read there; a source that says otherwise would make the dip shallower (or
+            # positive) and hide exactly the risk this layer exists to surface.
+            peak = max(float(peak), float(equity))
+            base = drawdown_base if drawdown_base is not None else peak
+            if base <= 0:
+                continue
+            dip_dd = (float(equity) + worst_loss - peak) / base * 100.0
+            refined = min(refined, dip_dd)
         except Exception as e:  # noqa: BLE001 - best-effort refinement, never break the backtest
             logger.debug(f"intraday drawdown refinement skipped for a trade: {e}")
             continue

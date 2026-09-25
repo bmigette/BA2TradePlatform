@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import math
 import os
+from bisect import bisect_right
 from collections import OrderedDict
 from datetime import date, datetime
+from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
 # Import the metric-coercion helpers from the lightweight ``metrics_utils`` module, NOT from
@@ -209,7 +211,9 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
 
     final = equity_curve[-1]["equity"] if equity_curve else initial
 
-    refine_drawdown_fn = _build_refine_drawdown_fn(account, config)
+    # The cap goes in explicitly: on a capped run ``drawdown_curve`` is cap-denominated, and the
+    # refinement's dips must be measured on that same denominator (see refine_max_drawdown).
+    refine_drawdown_fn = _build_refine_drawdown_fn(account, config, equity_cap=_cap)
     metrics = _compute_metrics(
         equity_curve, drawdown_curve, trades, initial, final, config, refine_drawdown_fn,
     )
@@ -238,7 +242,8 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     return metrics
 
 
-def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[Any]:
+def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
+                              equity_cap: Optional[float] = None) -> Optional[Any]:
     """Build the ``refine_drawdown_fn(trades, max_drawdown) -> max_drawdown`` closure that
     ``_compute_metrics`` calls, wiring ``intraday_drawdown.refine_max_drawdown``'s
     dependency-injected callables to REAL data sources: the account's own daily price source
@@ -260,6 +265,9 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     on which store served the options, for a reason nothing in the result could show. Both
     readers now implement ``delta_at_entry(underlying, occ_symbol, when)``; a reader that does
     not is a WARNING, because silence is the actual defect.
+
+    ``equity_cap`` is the run's validated cap (None: no cap). It becomes the refinement's
+    ``drawdown_base`` so a capped run's dips are measured on the cap, like its daily curve.
     """
     price = getattr(account, "_price", None)
     options = getattr(account, "_options", None)
@@ -390,10 +398,31 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
             if t.get("option_basis_factor") is not None and t.get("underlying_symbol"):
                 recorded_basis[(t["underlying_symbol"], t["entry_time"])] = float(
                     t["option_basis_factor"])
+
+        # THE PEAK COMES FROM THE SAME CURVE AS THE EQUITY. A trade's dip is measured from the
+        # running peak at its entry, so the peak must be read from the recorded snapshots that
+        # ``_equity_at`` bisects, with its at/just-before lookup (a pre-curve entry reads the
+        # first point) -- otherwise equity and peak would describe two different moments.
+        # A stub without a balance history answers None, and the refinement skips the trade.
+        history = getattr(account, "get_balance_history", None)
+        snaps = history() if callable(history) else []
+        snap_dates = [s["date"] for s in snaps]
+        running_peaks = list(accumulate(
+            (float(s["net_liquidating_value"]) for s in snaps), max))
+
+        def _peak_at(dt: Any) -> Optional[float]:
+            if not running_peaks:
+                return None
+            if dt is None:
+                return running_peaks[0]
+            return running_peaks[max(bisect_right(snap_dates, dt) - 1, 0)]
+
         return refine_max_drawdown(
             parsed_trades,
             max_drawdown,
             equity_at=lambda dt: getattr(account, "_equity_at", lambda _dt: None)(dt),
+            peak_at=_peak_at,
+            drawdown_base=equity_cap,
             daily_bar_low=_daily_bar_low,
             prior_daily_bar_low=_prior_daily_bar_low,
             delta_at_entry=_delta_at_entry,
