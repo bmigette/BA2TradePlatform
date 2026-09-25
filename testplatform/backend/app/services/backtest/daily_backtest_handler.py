@@ -1185,7 +1185,8 @@ def _build_experts(
     entry_rules = config.get("entry_rules")
     enable_short = bool(config.get("enable_short"))
     # Pure-option ENTRY (legacy path): when set, the enter_market ruleset fires this option
-    # action directly (no equity leg) — the engine submits it directly (``_entry_is_option``).
+    # action directly (no equity leg) — the engine submits it directly, because the fired
+    # rule's actions are all option actions (per-entry ``trade_cycle.entry_route``, E1).
     # On the unified model an option entry is just an entry rule whose action is the option.
     entry_action = config.get("entry_action")
 

@@ -180,13 +180,16 @@ BACKTEST_FORCED_SETTINGS = (
     ForcedSetting(
         key="entry_action",
         live_setting=None,
-        source="ba2test_launcher -> backtest_cfg['entry_action'] -> daily_engine._entry_is_option",
-        why="review V4. A run-global flag derived from it makes the engine submit option entries "
-            "DIRECTLY instead of staging an RM candidate.",
+        source="ba2test_launcher -> backtest_cfg['entry_action'] -> the options-run wiring "
+               "(daily_backtest_handler.strategy_uses_options, BacktestRunFacts)",
+        why="review V4. It no longer routes entries: since plan 2026-09-25 E1 BOTH runtimes route "
+            "each fired entry by its own actions through trade_cycle.entry_route (all-option "
+            "self-sizes, equity goes to the RM, a mix is refused). It still marks the run as an "
+            "options run.",
         why_no_live_analogue=
-            "live has no such key: TradeManager stages EVERY enter-market recommendation as an RM "
-            "candidate. The asymmetry is in the live engine, not in the payload, so carrying it "
-            "as an applied setting would be a lie. Recorded so a deploy states it.",
+            "live has no such key and needs none: a live account's option capability comes from "
+            "its broker, and entry routing is the shared per-entry decision. Recorded so a deploy "
+            "states it.",
     ),
 )
 

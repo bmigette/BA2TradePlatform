@@ -25,13 +25,66 @@ ba2_common-pure: no ba2_providers / ba2_trade_platform imports.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from ba2_common.core.failure_modes import is_never_absorbed
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
 from ba2_common.core.position_sizing import sized_on_stop, with_max_loss_stop
-from ba2_common.core.types import AssetClass, OrderDirection, OrderRecommendation, OrderStatus, OrderType
+from ba2_common.core.types import (
+    AssetClass, OrderDirection, OrderRecommendation, OrderStatus, OrderType,
+    get_option_action_values)
 from ba2_common.logger import logger
+
+#: The two ways an entry is executed (see :func:`entry_route`).
+ENTRY_ROUTE_OPTION = "option"
+ENTRY_ROUTE_EQUITY = "equity"
+
+
+#: ``types.is_option_action``'s set, frozen once: the router runs per fired entry, and the list
+#: behind ``is_option_action`` is rebuilt on every call. Compared by VALUE -- a str-Enum member
+#: hashes by its NAME, so an enum would silently miss a set of value strings.
+_OPTION_ACTION_VALUES = frozenset(get_option_action_values())
+
+
+class MixedEntryActionsRefused(ValueError):
+    """An entry rule fired option AND equity actions together: neither path can size both."""
+
+
+def entry_route(action_types: Iterable[Any]) -> str:
+    """HOW the fired entry executes, from the action types its rule produced -- the ONE routing
+    decision both runtimes make (plan 2026-09-25 option-stage2-build, revision Task E1).
+
+    * every action an option action -> ``ENTRY_ROUTE_OPTION``: the option actions size and
+      submit themselves through their shared risk/capacity guards (``execute(submit_to_broker=
+      True)``). They must never reach the equity RM, which would re-label the contracts as
+      shares and stage a STOCK safeguard stop (live 8082, 2026-09-24).
+    * no option action -> ``ENTRY_ROUTE_EQUITY``: staged as a transient candidate for the RM
+      sizing pass (``build_entry_candidate``), the S-family flow.
+    * a MIX -> ``MixedEntryActionsRefused``: the equity RM would stamp a share count onto the
+      option order, and the option path would submit the equity action unsized.
+
+    Decided PER FIRED ENTRY, never per run: a style expert composes equity-entry members
+    (O_CC / O_PP) with option-entry members in one ruleset. Live ``TradeManager`` and the
+    backtest ``daily_engine`` both call this, so the routing cannot drift between them.
+    O(number of actions); a pure function of its argument.
+
+    ``action_types`` are ``ExpertActionType`` members or their string values. An empty list is
+    refused: both callers stop on "no actions" before routing, so reaching here with none is a
+    caller bug, and answering would pick a path for nothing.
+    """
+    types = list(action_types)
+    if not types:
+        raise ValueError("entry_route: the fired entry produced no actions to route")
+    flags = [getattr(t, "value", t) in _OPTION_ACTION_VALUES for t in types]
+    if all(flags):
+        return ENTRY_ROUTE_OPTION
+    if any(flags):
+        raise MixedEntryActionsRefused(
+            f"the entry rule mixes option and equity actions "
+            f"{[getattr(t, 'value', t) for t in types]}: neither the option self-sizing path "
+            f"nor the equity RM can size both halves")
+    return ENTRY_ROUTE_EQUITY
+
 
 # Recommendation directions that open a SHORT (sell-entry); everything else opens a long (buy).
 _SHORT_ENTRY_ACTIONS = (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT)

@@ -2544,7 +2544,6 @@ class TradeManager:
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             from ba2_common.core.hold_entry import evaluate_hold_entries
-            from ba2_common.core.types import is_option_action
             allow_hold = evaluate_hold_entries(expert.settings)
 
             # INVARIANT FOR THIS WHOLE BLOCK: `session` is READ-ONLY. Nothing loaded through it
@@ -2694,23 +2693,28 @@ class TradeManager:
                             )
                             continue
                         
-                        option_flags = [is_option_action(s['action_type']) for s in action_summaries]
-                        if any(option_flags) and not all(option_flags):
+                        # PER-ENTRY ROUTING through the SHARED router the backtest engine calls
+                        # too (trade_cycle.entry_route; plan 2026-09-25 option-stage2-build E1),
+                        # so the two runtimes cannot route the same fired rule differently.
+                        from .trade_cycle import (ENTRY_ROUTE_OPTION, MixedEntryActionsRefused,
+                                                  entry_route)
+                        try:
+                            route = entry_route(s['action_type'] for s in action_summaries)
+                        except MixedEntryActionsRefused as mixed:
                             # Neither path can size both halves: the equity RM would stamp a
                             # share count + stock stop onto the option order, and the option
                             # path would submit the equity action unsized. Refuse loudly.
                             self.logger.error(
                                 f"Refusing recommendation {recommendation.id} for {recommendation.symbol}: "
-                                f"its entry rule mixes option and equity actions "
-                                f"{[s['action_type'] for s in action_summaries]}")
+                                f"{mixed}")
                             continue
-                        if all(option_flags):
+                        if route == ENTRY_ROUTE_OPTION:
                             # Option actions size and submit themselves through their shared
-                            # risk/capacity guards, matching the backtest option path
-                            # (daily_engine._entry_is_option), whatever the signal. They must
-                            # never reach the equity RM below: it re-labels the contracts as
-                            # shares and stages a STOCK safeguard stop at the broker (8082,
-                            # 2026-09-24: SELL 9 GILD @ 138.56 behind a 2-contract call).
+                            # risk/capacity guards, exactly like the backtest option path,
+                            # whatever the signal. They must never reach the equity RM below:
+                            # it re-labels the contracts as shares and stages a STOCK safeguard
+                            # stop at the broker (8082, 2026-09-24: SELL 9 GILD @ 138.56 behind
+                            # a 2-contract call).
                             for result in evaluator.execute(submit_to_broker=True):
                                 if result.get("success"):
                                     oid = (result.get("data") or {}).get("order_id")

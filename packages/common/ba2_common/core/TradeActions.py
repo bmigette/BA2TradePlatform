@@ -521,13 +521,17 @@ class BuyAction(TradeAction):
     def __init__(self, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
                  expert_recommendation: Optional[ExpertRecommendation] = None,
-                 lot_size: Optional[int] = None):
+                 lot_size: Optional[int] = None, entry_tag: Any = None):
         super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
         # Optional round-lot constraint: the risk manager sizes the order in
         # multiples of lot_size and rejects it when not even one lot is fundable.
         # Used by option-overlay strategies (covered call / protective put) that
         # need 100-share equity blocks per contract.
         self.lot_size = lot_size
+        # The style-group MEMBER TAG of an equity-entry member (O_CC / O_PP; plan 2026-09-25
+        # option-stage2-build, E1), written into the entry order's data at creation -- the row
+        # that member's tag-scoped exits read. None on every existing rule: nothing written.
+        self.entry_tag = coerce_entry_tag(entry_tag)
 
     def _equity_lot_size(self) -> int:
         """The round lot IN THE EQUITY BOOK'S UNIT.
@@ -573,11 +577,14 @@ class BuyAction(TradeAction):
                 )
             
             # Create PENDING order record (not submitted to broker yet)
+            extra_data = {"lot_size": self._equity_lot_size()} if self.lot_size else {}
+            if self.entry_tag is not None:
+                extra_data[ORDER_ENTRY_TAG_KEY] = self.entry_tag
             order_id = self.create_order_record(
                 side="buy",
                 quantity=quantity,
                 order_type="market",
-                extra_data={"lot_size": self._equity_lot_size()} if self.lot_size else None
+                extra_data=extra_data or None
             )
             
             if not order_id:

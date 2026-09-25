@@ -175,9 +175,13 @@ def test_rule_builder_omits_an_absent_tag():
 
 
 def test_close_option_never_carries_a_tag():
-    """A close resolves its position; the tag belongs to the ENTRY that opened it."""
-    cfg = action_from_rule({"action_type": "close_option", "option_entry_tag": 7})["act"]
-    assert cfg == {"action_type": "close_option"}
+    """A close resolves its position; the tag belongs to the ENTRY that opened it. A tag on a
+    close is a label nothing stamps, so it is REFUSED (E1 follow-up; it used to be dropped
+    silently)."""
+    with pytest.raises(ValueError, match="entry_tag"):
+        action_from_rule({"action_type": "close_option", "option_entry_tag": 7})
+    assert action_from_rule({"action_type": "close_option"})["act"] == {
+        "action_type": "close_option"}
 
 
 def test_the_evaluator_forwards_it_to_the_entry_action():

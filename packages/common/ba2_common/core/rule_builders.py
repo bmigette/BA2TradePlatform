@@ -13,6 +13,7 @@ from ba2_common.core.types import (
     ExpertActionType,
     ExpertEventType,
     ReferenceValue,
+    get_option_entry_action_values,
     is_option_action,
 )
 from ba2_common.core.market_conditions import PROFILES
@@ -450,6 +451,37 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 )
 
 
+#: The actions that WRITE a style-group member tag onto the order row they create: every
+#: option ENTRY (``_OptionEntryAction._submit_option_order``) and the equity ``buy``
+#: (``BuyAction``, the O_CC / O_PP stock entry -- plan 2026-09-25 option-stage2-build, E1).
+_TAG_WRITING_ACTIONS = frozenset(get_option_entry_action_values()) | {ExpertActionType.BUY.value}
+
+
+def checked_entry_tag(action: dict) -> Optional[int]:
+    """The style-group member tag an action config carries (``option_entry_tag`` or the bare
+    ``entry_tag``), validated, or None when it carries none.
+
+    REFUSED (``ValueError`` naming ``entry_tag``): a tag that is not a positive integer, the two
+    spellings disagreeing, and a tag on an action that never writes one (a close, a sell, an
+    adjust, ``stop_processing``, ``close_option``, a roll): the member's exits would look for a
+    label nothing stamps, and so silently never fire.
+    """
+    raw_tag = action.get("option_entry_tag")
+    bare = action.get("entry_tag")
+    if raw_tag is not None and bare is not None and coerce_entry_tag(raw_tag) != coerce_entry_tag(bare):
+        raise ValueError(f"entry_tag: option_entry_tag={raw_tag!r} and entry_tag={bare!r} disagree")
+    tag = coerce_entry_tag(raw_tag if raw_tag is not None else bare)
+    if tag is None:
+        return None
+    at = str(action.get("action_type") or action.get("action") or "")
+    if at not in _TAG_WRITING_ACTIONS:
+        raise ValueError(
+            f"entry_tag={tag} on a {at!r} action: only entry actions (option entries and "
+            f"'buy') write the member tag onto their order, so on {at!r} it would be a label "
+            f"nothing stamps")
+    return tag
+
+
 def _option_action_config(raw: str, rule: dict) -> dict:
     """Build the option action config for ``raw`` (an option ExpertActionType value), pulling
     the selection params from the rule's ``option_*`` fields into the evaluator's keys.
@@ -504,6 +536,9 @@ def action_from_rule(rule: dict, key: str = "act") -> Optional[Dict[str, dict]]:
     if rule.get("enabled") is False:
         return None
     raw = rule.get("action_type") or rule.get("action")
+    # A member tag on an action that never writes one is refused here, before any branch (the
+    # option branch keeps the tag it validates; every other branch would drop it silently).
+    checked_entry_tag(rule)
     if is_option_action(str(raw)):
         return {key: _option_action_config(str(raw), rule)}
     spec = EXIT_ACTION.get(str(raw))

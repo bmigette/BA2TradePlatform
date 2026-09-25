@@ -4351,7 +4351,9 @@ def _build_strategy_option(kind: str):
     entry-option path submits the option directly), exits = close at +50% / time. The option
     action config is ALSO carried as the transient ``entry_action`` attribute (not a mapped
     column, never persisted): the run-config assembly threads it into the backtest block,
-    where the engine's ``_entry_is_option`` flag keys off ``config["entry_action"]``."""
+    where it marks the run as an options run. It no longer routes the entry: since plan
+    2026-09-25 E1 the engine routes each fired entry by its own actions
+    (``trade_cycle.entry_route``), and this rule's action is the option."""
     from app.models.strategy import Strategy
     from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
 

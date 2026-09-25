@@ -54,7 +54,8 @@ from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
-from ba2_common.core.trade_cycle import record_max_loss_stop
+from ba2_common.core.trade_cycle import (
+    ENTRY_ROUTE_OPTION, MixedEntryActionsRefused, entry_route, record_max_loss_stop)
 from ba2_common.core.types import (
     AnalysisUseCase,
     OrderDirection,
@@ -422,17 +423,13 @@ class DailyBacktestEngine:
         # per-bar stop pass its equity, and went with it.)
         self._bypass_pm: Dict[int, Any] = {}
 
-        # Entry-option path: when the run's enter_market action IS an option action (pure-option
-        # entry, no equity leg), the option action must size + submit itself — so the entry runs
-        # with ``submit_to_broker=True`` (like the open-positions path), unlike the equity entry
-        # which stages a PENDING qty=0 order the RM sizes next. ONE strategy per run, so a single
-        # global flag derived from ``config["entry_action"]`` is sufficient + unambiguous.
-        self._entry_is_option = False
-        ea = config.get("entry_action")
-        if isinstance(ea, dict):
-            from ba2_common.core.types import is_option_action
-            a = ea.get("action_type") or ea.get("action") or ea.get("option_strategy")
-            self._entry_is_option = bool(a and is_option_action(str(a)))
+        # ENTRY ROUTING IS PER FIRED ENTRY (plan 2026-09-25 option-stage2-build, E1), decided in
+        # ``_stage_recommendation_candidate`` by the SHARED ``trade_cycle.entry_route`` -- the
+        # same call live ``TradeManager`` makes. It used to be ONE run-global flag derived from
+        # ``config["entry_action"]`` (``_entry_is_option``), which could not run a style expert
+        # mixing an equity-entry member (O_CC / O_PP) with option-entry members. Every launcher
+        # key's entry rules route exactly as that flag did (all-option on an option key, all-
+        # equity otherwise), so pure-option and pure-equity runs are unchanged.
 
         # The option sleeves whose drawdown breaker this run transitions per bar, as
         # (expert, expert_instance_id). Filled in by ``run()`` from the SAME
@@ -1085,7 +1082,16 @@ class DailyBacktestEngine:
                               f"@ {as_of:%Y-%m-%d} — {equity_reason}")
                     return False
 
-            if self._entry_is_option:
+            # PER-ENTRY ROUTING (E1): the actions THIS fired rule produced decide the path, via
+            # the shared router live TradeManager also calls. O(actions) per fired entry.
+            try:
+                route = entry_route(s["action_type"] for s in action_summaries)
+            except MixedEntryActionsRefused as e:
+                # Refused LOUDLY, as live does: neither path can size both halves.
+                logger.error(f"[daily_engine] entry REFUSED for {symbol} (expert {expert_id}) "
+                             f"@ {as_of:%Y-%m-%d}: {e}")
+                return False
+            if route == ENTRY_ROUTE_OPTION:
                 # OPTION entry: the option action sizes + submits ITSELF in execute (no equity
                 # leg, no RM candidate sizing) — submit directly, like the open-positions path.
                 results = evaluator.execute(submit_to_broker=True)

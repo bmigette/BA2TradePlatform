@@ -1243,6 +1243,11 @@ class TradeActionEvaluator:
                 # strategies whose contracts cover 100 shares each).
                 if 'lot_size' in action_config and action_config.get('lot_size'):
                     kwargs['lot_size'] = action_config.get('lot_size')
+                # The style-group MEMBER TAG of an equity-entry member (O_CC / O_PP, plan
+                # 2026-09-25 option-stage2-build E1): only when the rule carries one, so every
+                # existing BUY is built exactly as before.
+                if action_config.get('entry_tag') is not None:
+                    kwargs['entry_tag'] = action_config.get('entry_tag')
             elif action_type == ExpertActionType.ADJUST_TAKE_PROFIT:
                 # Extract reference_value and percent (value) for TP calculation
                 kwargs['reference_value'] = action_config.get('reference_value')

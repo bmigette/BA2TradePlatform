@@ -26,11 +26,13 @@ from ba2_common.core.market_condition_rules import (
     assert_market_conditions_resolved,
     assert_market_rule_actions,
 )
+from ba2_common.core.entry_tag import ORDER_ENTRY_TAG_KEY
 from ba2_common.core.rule_builders import (
     FIELD_EVENT,
     FLAG_FIELD_EVENT,
     action_from_rule,
     assert_market_fields_mappable,
+    checked_entry_tag,
     rule_triggers_from_tree,
     triggers_from_condition_tree,
 )
@@ -467,10 +469,18 @@ def _action_cfg_to_live(action: dict, key: str) -> Optional[Dict[str, dict]]:
     ``action_from_rule`` so option params and adjust references stay consistent with the
     forward builders."""
     at = str(action.get("action_type") or action.get("action") or "")
+    # The style-group MEMBER TAG (plan 2026-09-25 option-stage2-build, E1): validated for every
+    # action (a tag on one that never writes it is refused), and carried on the equity ``buy`` --
+    # the O_CC / O_PP stock entry -- whose order row is what that member's exits read. Absent
+    # on every existing rule, which therefore converts exactly as before.
+    tag = checked_entry_tag(action)
     if at in (BUY_ACTION, SELL_ACTION) and at not in ADJUST_ACTIONS:
         # 'sell' is also a close-flavored EXIT_ACTION; as a TradeRule action we emit the
         # bare open/close action with no reference baggage — identical either way.
-        return {key: {"action_type": at}}
+        cfg = {"action_type": at}
+        if tag is not None:
+            cfg[ORDER_ENTRY_TAG_KEY] = tag
+        return {key: cfg}
     if at == ExpertActionType.STOP_PROCESSING.value:
         return {key: {"action_type": at}}
     return action_from_rule(action, key=key)
