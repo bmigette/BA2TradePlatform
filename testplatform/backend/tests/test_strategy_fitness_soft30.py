@@ -125,3 +125,51 @@ def test_launcher_persists_metric_with_robustness_on(monkeypatch):
         row = db.query(StrategyOptimization).order_by(StrategyOptimization.id.desc()).first()
         assert row.fitness_metric == METRIC
     assert config["backtest"]["robust_fitness"] is True
+
+
+# ---------------------------------------------------------------------------------------------
+# A 1-trade genome is 100% concentrated (plan 2026-09-24 Task 4)
+# ---------------------------------------------------------------------------------------------
+# robustness_metrics used to return every factor 1.0 below 2 trades, so a single winning trade
+# was scored as PERFECTLY diversified while a 2-5-trade book got concentration factor 0. Under
+# soft30 (which has no count floor, only a 1/30-per-bet ramp) that made every top O_LP genome a
+# 1-trade genome. Thin trading is penalised, not zeroed by a new floor: the one trade simply
+# goes through the same concentration formula as every other run.
+
+def test_a_single_winning_trade_is_fully_concentrated():
+    r = result(1)
+    F.compute_fitness(METRIC, r, robust=True)
+    comp = r["robustness"]
+    assert comp["top1_pct"] == 100.0
+    assert comp["top5_pct"] == 100.0
+    assert comp["conc_factor"] == 0.0
+    # A trade-ORDER resample of one trade has nothing to reorder; the factor is left neutral
+    # rather than fabricated -- concentration is the screen that speaks here.
+    assert comp["mc_factor"] == 1.0
+
+
+def test_one_trade_never_outscores_two_under_soft30():
+    one = F.compute_fitness(METRIC, result(1), robust=True)
+    two = F.compute_fitness(METRIC, result(2), robust=True)
+    assert one <= two
+
+
+def test_a_single_losing_trade_keeps_the_early_return():
+    r = result(1)
+    r["trades"][0]["pnl"] = -100.0
+    F.compute_fitness(METRIC, r, robust=True)
+    assert r["robustness"]["top1_pct"] is None
+    assert r["robustness"]["conc_factor"] == 1.0
+
+
+@pytest.mark.parametrize("metric", ["calmar_ratio", "total_return", "sharpe_ratio",
+                                    "consistent_annual_return"])
+def test_equity_metrics_keep_the_single_trade_early_return(metric):
+    # The equity path is frozen bit-for-bit (test_strategy_fitness_equity_frozen). The
+    # generic metrics have no trade floor, so a 1-trade equity run DOES reach the robustness
+    # screen; the change is therefore gated to the option CAR-family metric names.
+    r = result(1, calmar_ratio=2.0, total_return=5.0, sharpe_ratio=1.0)
+    F.compute_fitness(metric, r, robust=True)
+    comp = r["robustness"]
+    assert comp["top1_pct"] is None
+    assert comp["conc_factor"] == 1.0

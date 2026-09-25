@@ -801,7 +801,9 @@ def _maybe_robust(val: float, fitness_metric: str, results: dict,
         results["fitness_robust"] = None
         return val
     adj, comp = robust_fitness(val, results, stress_spread_bps
-                               or float(results.get("stress_spread_bps") or 0.0))
+                               or float(results.get("stress_spread_bps") or 0.0),
+                               single_trade_concentrated=(
+                                   fitness_metric.lower() in _SINGLE_TRADE_CONCENTRATED_METRICS))
     results["fitness_robust"] = adj
     results["robustness"] = comp
     return adj
@@ -1028,19 +1030,50 @@ _CONC_EXP = float(_os.getenv("BT_CONC_EXP", "1.5"))             # >1 bites harde
 # which is where return should decide. EXP=1.5 keeps the top-end bite (90% -> 0.068, 95% -> 0.024)
 # while dropping converged influence to ~1.4x return.
 
+#
+# A SINGLE WINNING TRADE IS 100% CONCENTRATED (2026-09-24, plan Task 4). robustness_metrics
+# historically returned every factor 1.0 below two trades, so one winning trade scored as
+# PERFECTLY diversified while a 2-5-trade book (top5 = 100% of net) got conc_factor 0. Under
+# option_car_target_soft30 -- no count floor, only a linear ramp per bet -- that inversion made
+# every top O_LP genome a 1-trade genome. Decided design (user, 2026-09-23): thin trading is
+# PENALISED through the same concentration formula, not zeroed by a new hard trade floor.
+#
+# GATED TO THE OPTION CAR-FAMILY METRIC NAMES, not applied everywhere, because the generic
+# metrics (calmar, sharpe, total_return, ...) have NO trade floor: a 1-trade equity run reaches
+# this screen, and the equity path is frozen bit-for-bit (test_strategy_fitness_equity_frozen
+# pins single_trade -> all factors 1.0). Same rule as the option metrics themselves: a metric an
+# equity run never NAMES is a code path it cannot reach. option_convex is absent on purpose: it
+# never calls the robustness screen (see compute_fitness).
+_SINGLE_TRADE_CONCENTRATED_METRICS = frozenset(
+    _OCAR_ALIASES + _OCR_ALIASES + _OCT_ALIASES + (_OCT_SOFT30_KEY,))
 
-def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
+
+def robustness_metrics(results: dict, spread_bps: float = 0.0,
+                       single_trade_concentrated: bool = False) -> dict:
     """The three robustness screens for one finished run. Pure post-hoc, no re-simulation.
 
     Returns a dict with every component so BOTH the raw and the adjusted view are inspectable
     afterwards -- a single blended number that cannot be decomposed is not auditable.
+
+    ``single_trade_concentrated`` (option metrics only, see
+    ``_SINGLE_TRADE_CONCENTRATED_METRICS``): a run of exactly one trade with positive net P&L is
+    scored as 100% concentrated instead of being skipped. False keeps the historical early return.
     """
     out = {"top1_pct": None, "top5_pct": None, "mc_p5": None, "mc_prob_neg": None,
            "spread_keep_pct": None, "conc_factor": 1.0, "mc_factor": 1.0, "spread_factor": 1.0}
     trades = results.get("trades") or []
     pnl = [float(t.get("pnl") or 0.0) for t in trades]
     net = sum(pnl)
-    if len(pnl) < 2 or net <= 0:
+    # 0 trades or a non-positive book: there is no profit to be concentrated in, and scaling a
+    # loser's fitness by a <1 factor would promote it (robust_fitness leaves negatives alone).
+    # One winning trade on an option metric falls through: it IS the whole result, so the
+    # concentration formula below gives top1 = top5 = 100% and a factor of 0 at the default
+    # _CONC_DEAD_PCT. The monte-carlo screen then skips itself (it needs >= 2 trades): a
+    # trade-order resample of one trade has nothing to reorder, so mc_factor stays a neutral
+    # 1.0 rather than a fabricated verdict -- concentration is the screen that speaks here.
+    if net <= 0 or len(pnl) == 0:
+        return out
+    if len(pnl) < 2 and not single_trade_concentrated:
         return out
 
     # --- concentration -------------------------------------------------------------------
@@ -1089,7 +1122,8 @@ def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
     return out
 
 
-def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0) -> tuple:
+def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0,
+                   single_trade_concentrated: bool = False) -> tuple:
     """(adjusted_fitness, components). Multiplicative, so a genome must clear ALL THREE screens.
 
     Sentinels pass through untouched: a disqualified or wiped-out genome keeps its sentinel RANK
@@ -1097,7 +1131,7 @@ def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0) 
     A NEGATIVE base is returned unchanged too -- multiplying a negative by a <1 factor would make
     a bad genome look BETTER, which is the classic sign-flip bug in penalty schemes.
     """
-    comp = robustness_metrics(results, spread_bps)
+    comp = robustness_metrics(results, spread_bps, single_trade_concentrated)
     if base_fitness in (STALLED_SENTINEL, ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
         return base_fitness, comp
     if base_fitness <= 0:
