@@ -5774,6 +5774,16 @@ class TradeSettingsTab:
                                 label='Reference',
                                 value=action_config.get('reference_value', 'current_price') if action_config else 'current_price'
                             ).classes('w-40').props('dense')
+                    elif selected_type in (ExpertActionType.BUY.value, ExpertActionType.SELL.value):
+                        # Optional CLOSE PERCENT: when the buy covers this expert's short, or the
+                        # sell closes its long, trade this % of the position (whole shares).
+                        # Empty = 100% (a full close). An entry ignores it.
+                        with action_value_container:
+                            value_input = ui.input(
+                                label='Close % (optional)',
+                                value=str(action_config.get('value', '')) if action_config else '',
+                                placeholder='100 = full close'
+                            ).classes('w-40').props('dense')
                     elif selected_type and is_share_adjustment_action(selected_type):
                         # Share adjustment action - show target_percent inline
                         with action_value_container:
@@ -6140,6 +6150,23 @@ class TradeSettingsTab:
                     if reference_select:
                         action_config['reference_value'] = reference_select.value
                 
+                elif action_type in (ExpertActionType.BUY.value, ExpertActionType.SELL.value):
+                    # Optional close percent (1..100) for a buy covering a short / a sell closing
+                    # a long; saved as the action's value only when given. .get: a buy/sell row
+                    # built without the field (older callers) simply has no percent.
+                    value_ref = action_refs.get('value_input')
+                    value_input = value_ref() if value_ref else None
+                    if value_input and str(value_input.value or '').strip():
+                        try:
+                            close_pct = float(value_input.value)
+                        except (ValueError, TypeError):
+                            ui.notify(f'Invalid close percent for action {action_type}', type='negative')
+                            return
+                        if close_pct < 1 or close_pct > 100:
+                            ui.notify(f'Close percent must be between 1 and 100 for action {action_type}', type='negative')
+                            return
+                        action_config['value'] = close_pct
+
                 elif is_share_adjustment_action(action_type):
                     # Share adjustment action (INCREASE/DECREASE_INSTRUMENT_SHARE)
                     target_percent_input = action_refs['target_percent_input']()

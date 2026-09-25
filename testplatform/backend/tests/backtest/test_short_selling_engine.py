@@ -7,10 +7,13 @@
   * It is covered by its stop (price rallies through it) or by the reverse-signal close rule
     (a bullish recommendation fires the open-positions ``close``).
   * With ``enable_sell`` off the same bearish rule opens nothing.
-  * No-impact: a long-only run (buy entries, a ``sell`` exit rule, a ``close`` exit rule) gives
-    byte-identical orders, trades and equity with SellAction/BuyAction as they are now and with
-    the pre-short-selling ``execute`` bodies patched back in. The fixture must actually exercise a
-    buy, a sell against a held long, and a close.
+  * No-impact: a long-only run (buy entries, a ``close`` exit rule) gives byte-identical orders,
+    trades and equity with SellAction/BuyAction as they are now and with the pre-short-selling
+    ``execute`` bodies patched back in. It exercises buys and closes and NO ``sell`` action: no
+    stored strategy has one, and a sell against a long now closes it (operator 2026-09-25).
+  * A ``sell``/``buy`` exit with a close percent reduces the position in the simulator
+    (``BacktestAccount.reduce_transaction``): the transaction stays OPENED with the remainder,
+    still protected by its stop.
 
 Both trade-store modes; the SQLite mode forces the leaked in-memory flag off and asserts it.
 
@@ -289,6 +292,50 @@ def test_a_buy_against_a_short_covers_it_and_never_flips(monkeypatch, inmem):
     assert txns[0]["status"] == "CLOSED"
 
 
+def _signal_rule_pct(field, action, percent):
+    rule = _signal_rule(field, action)
+    rule["actions"][0]["action_value"] = percent
+    return rule
+
+
+def _position(outcome_orders):
+    """Net filled shares from the (side, type, status, qty, filled_qty, ...) order tuples."""
+    net = 0.0
+    for side, _type, status, _qty, filled, *_ in outcome_orders:
+        if status == "filled" and filled:
+            net += filled if side == "BUY" else -filled
+    return net
+
+
+@pytest.mark.parametrize("inmem", ["1", "0"], ids=["inmem-store", "sqlite"])
+def test_a_sell_with_a_percent_partially_closes_a_long(monkeypatch, inmem):
+    """BUY on day 1 (risk_atr: 100 shares at 100); a bearish bar fires `sell` 50%: 50 are sold,
+    the transaction stays OPENED with the other 50 and its stop."""
+    _store_mode(monkeypatch, inmem)
+    outcome, txns = _run(DRIFT, {DAY1: BUY, date(2024, 1, 4): SELL},
+                         run_id=_run_id(880, inmem), inmem=inmem, enable_short=False,
+                         exit_rules=[_signal_rule_pct("bearish", "sell", 50)])
+    assert [t["side"] for t in txns] == ["BUY"]
+    assert txns[0]["status"] == "OPENED", "a partial close must leave the transaction open"
+    assert txns[0]["stop_loss"] is not None and txns[0]["stop_loss"] < 100.0
+    sells = [o for o in outcome["orders"] if o[0] == "SELL" and o[1] == "market" and o[2] == "filled"]
+    assert len(sells) == 1 and sells[0][4] == pytest.approx(50.0), sells
+    assert _position(outcome["orders"]) == pytest.approx(50.0), "never flips, never over-sells"
+
+
+@pytest.mark.parametrize("inmem", ["1", "0"], ids=["inmem-store", "sqlite"])
+def test_a_buy_with_a_percent_partially_covers_a_short(monkeypatch, inmem):
+    _store_mode(monkeypatch, inmem)
+    outcome, txns = _run(DRIFT, {DAY1: SELL, date(2024, 1, 5): BUY},
+                         run_id=_run_id(890, inmem), inmem=inmem, enable_short=True,
+                         exit_rules=[_signal_rule_pct("bullish", "buy", 50)])
+    assert [t["side"] for t in txns] == ["SELL"]
+    assert txns[0]["status"] == "OPENED"
+    covers = [o for o in outcome["orders"] if o[0] == "BUY" and o[1] == "market" and o[2] == "filled"]
+    assert len(covers) == 1 and covers[0][4] == pytest.approx(50.0), covers
+    assert _position(outcome["orders"]) == pytest.approx(-50.0)
+
+
 # --------------------------------------------------------------------------- #
 # No impact on a long-only run
 # --------------------------------------------------------------------------- #
@@ -382,11 +429,6 @@ _ALWAYS = {"type": "AND", "conditions": [
 _IN_PROFIT = {"type": "AND", "conditions": [
     {"id": "p", "field": "profit_loss_percent", "op": ">=", "value": 5}]}
 LONG_ONLY_EXITS = [
-    # A `sell` exit (EXIT_ACTION's close-flavoured sell) on every held bar: exercises SellAction
-    # against a held long. With enable_sell off it stages the PENDING sell the RM drops, before
-    # and after -- continue_processing so the close rule below still gets its turn.
-    {"id": "sell-exit", "name": "sell-exit", "conditions": _ALWAYS,
-     "actions": [{"action_type": "sell"}], "continue_processing": True},
     {"id": "close-in-profit", "name": "close-in-profit", "conditions": _IN_PROFIT,
      "actions": [{"action_type": "close"}], "continue_processing": False},
 ]
@@ -398,7 +440,7 @@ def test_a_long_only_run_is_byte_identical(monkeypatch, inmem):
     _store_mode(monkeypatch, inmem)
     signals = {d: BUY for (d, *_rest) in LONG_ONLY}
 
-    calls = {"buy": 0, "sell_with_long": 0, "close": 0}
+    calls = {"buy": 0, "sell": 0, "close": 0}
     real_buy, real_sell, real_close = TA.BuyAction.execute, TA.SellAction.execute, TA.CloseAction.execute
 
     def counting_buy(self, *a, **k):
@@ -406,10 +448,8 @@ def test_a_long_only_run_is_byte_identical(monkeypatch, inmem):
         return real_buy(self, *a, **k)
 
     def counting_sell(self, *a, **k):
-        result = real_sell(self, *a, **k)
-        if result["success"] and (result.get("data") or {}).get("order_id"):
-            calls["sell_with_long"] += 1
-        return result
+        calls["sell"] += 1
+        return real_sell(self, *a, **k)
 
     def counting_close(self, *a, **k):
         result = real_close(self, *a, **k)
@@ -423,7 +463,7 @@ def test_a_long_only_run_is_byte_identical(monkeypatch, inmem):
                          enable_short=False, exit_rules=LONG_ONLY_EXITS)
 
     assert calls["buy"] >= 2, calls
-    assert calls["sell_with_long"] >= 1, f"the fixture never sold against a held long: {calls}"
+    assert calls["sell"] == 0, f"a long-only fixture must not run a sell action: {calls}"
     assert calls["close"] >= 1, f"the fixture never closed a position: {calls}"
     assert len(now["trades"]) >= 2 and all(t["direction"] == "buy" for t in now["trades"])
     assert {t["exit_reason"] for t in now["trades"]} >= {"exit", "stop_loss"}, now["trades"]

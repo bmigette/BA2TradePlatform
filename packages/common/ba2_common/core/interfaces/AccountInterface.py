@@ -2264,6 +2264,49 @@ class AccountInterface(ReadOnlyAccountInterface):
                 )
                 return {"success": False, "message": "Failed to submit closing order", "close_order_id": None}
 
+    def reduce_transaction(self, transaction_id: int, quantity: float) -> dict:
+        """PARTIALLY close a transaction: buy back / sell ``quantity`` of its FILLED position.
+
+        The partial twin of :meth:`close_transaction`, for ``sell``/``buy`` rules that close a
+        percentage of a position. ``quantity`` must be > 0 and strictly LESS than the
+        transaction's measured net open quantity; a full close is ``close_transaction``'s job.
+
+        LIVE (this default) delegates to ``TransactionHelper.adjust_quantity_with_tpsl``, the
+        existing partial-close facility (Smart RM, portfolio allocation): a broker holds the
+        shares under a resting TP/SL (Alpaca's ``held_for_orders``), so the protective legs are
+        cancelled, the close is triggered off that cancel, and TP/SL legs for the remainder are
+        re-armed. The backtest account overrides this: its brackets are lean (read off the net
+        filled quantity each bar, no resting leg rows), so a direct closing order is the whole
+        mechanism there.
+
+        Returns ``{"success", "message", "close_order_ids"}``; never raises for an operational
+        refusal (an OPTION transaction, a quantity out of range, a pledged-cover lock)."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+
+        transaction = get_instance(Transaction, transaction_id)
+        refusal = self._reduce_transaction_refusal(transaction, quantity)
+        if refusal:
+            logger.error(f"reduce_transaction({transaction_id}, {quantity}): {refusal}")
+            return {"success": False, "message": refusal, "close_order_ids": []}
+        result = TransactionHelper.adjust_quantity_with_tpsl(
+            self, transaction, -float(quantity), expert_id=transaction.expert_id)
+        return {"success": bool(result.get("success")), "message": result.get("message", ""),
+                "close_order_ids": list(result.get("orders_created") or [])}
+
+    @staticmethod
+    def _reduce_transaction_refusal(transaction, quantity) -> Optional[str]:
+        """Why ``reduce_transaction`` must not run, or None. Shared by every implementation."""
+        if transaction.asset_class == AssetClass.OPTION:
+            return (f"transaction {transaction.id} is an OPTION position; a partial equity close "
+                    f"cannot resize it (close it with the close_option action)")
+        net = abs(transaction.get_current_open_qty())
+        if not quantity or quantity <= 0:
+            return f"a partial close needs a positive quantity, got {quantity!r}"
+        if quantity >= net:
+            return (f"a partial close of {quantity:g} is not below the {net:g} held on transaction "
+                    f"{transaction.id}; a full close is close_transaction's job")
+        return None
+
     def close_transaction(self, transaction_id: int) -> dict:
         """
         Close a transaction by:

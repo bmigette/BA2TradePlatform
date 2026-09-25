@@ -5012,6 +5012,36 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         update_instance(trading_order)
         return trading_order
 
+    def reduce_transaction(self, transaction_id: int, quantity: float) -> dict:
+        """PARTIAL close in the simulator: one closing MARKET order for ``quantity``, linked to
+        the transaction and submitted as a closing order.
+
+        Overrides the live default (``TransactionHelper.adjust_quantity_with_tpsl``) for the
+        reason ``AccountInterface.reduce_transaction`` gives: live must cancel and re-arm the
+        broker's resting TP/SL legs around a partial close, the simulator has none. Its lean
+        brackets (``_apply_bracket_exits``) read the NET FILLED quantity every bar, so the
+        remainder stays protected at the transaction's TP/SL with no leg to resize, and the
+        pledged-cover lock in ``_apply_fill`` still guards the sale. The transaction stays
+        OPENED (FILLED is not terminal, and the position is not balanced)."""
+        transaction = get_instance(Transaction, transaction_id)
+        refusal = self._reduce_transaction_refusal(transaction, quantity)
+        if refusal:
+            logger.error("reduce_transaction(%s, %s): %s", transaction_id, quantity, refusal)
+            return {"success": False, "message": refusal, "close_order_ids": []}
+        close_side = (OrderDirection.SELL if transaction.side == OrderDirection.BUY
+                      else OrderDirection.BUY)
+        order = TradingOrder(
+            account_id=self.id, symbol=transaction.symbol, quantity=float(quantity),
+            side=close_side, order_type=OrderType.MARKET, transaction_id=transaction.id,
+            comment=f"Partial close of transaction {transaction.id}")
+        submitted = self.submit_order(order, is_closing_order=True)
+        if not submitted:
+            return {"success": False, "message": "partial close submission returned nothing",
+                    "close_order_ids": []}
+        return {"success": True,
+                "message": f"Partial close of {quantity:g} {transaction.symbol} submitted",
+                "close_order_ids": [getattr(submitted, "id", None)]}
+
     def cancel_order(self, order_id: str) -> Any:
         """Cancel a working order (reserved cash/position is notional-only in this sim)."""
         o = self.get_order(order_id)

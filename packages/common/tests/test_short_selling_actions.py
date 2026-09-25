@@ -47,6 +47,7 @@ class _StubAccount(AccountInterface):
         self._positions = positions
         self._price = price
         self.closed = []
+        self.reduced = []
         self.position_reads = 0
 
     def get_positions(self):
@@ -56,6 +57,11 @@ class _StubAccount(AccountInterface):
     def close_transaction(self, transaction_id):
         self.closed.append(transaction_id)
         return {"success": True, "message": f"closed {transaction_id}", "close_order_id": 900 + transaction_id}
+
+    def reduce_transaction(self, transaction_id, quantity):
+        self.reduced.append((transaction_id, quantity))
+        return {"success": True, "message": f"reduced {transaction_id} by {quantity:g}",
+                "close_order_ids": [800 + transaction_id]}
 
     def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
         return self._price
@@ -80,8 +86,13 @@ class _StubAccount(AccountInterface):
 
 
 class _Expert:
-    def __init__(self, enable_sell):
-        self._settings = {} if enable_sell is None else {"enable_sell": enable_sell}
+    """``enable_sell`` / ``enable_buy`` as stored; unset reads as the INTERFACE default
+    (enable_buy True, enable_sell False), as a real expert's get_setting_with_interface_default."""
+
+    def __init__(self, enable_sell, enable_buy=True):
+        self._settings = {"enable_buy": enable_buy}
+        if enable_sell is not None:
+            self._settings["enable_sell"] = enable_sell
 
     def get_setting_with_interface_default(self, key, log_warning=False):
         return self._settings.get(key)
@@ -105,8 +116,8 @@ def world():
     previous = instance_resolver.get_instance_resolver()
     state = SimpleNamespace()
 
-    def configure(enable_sell):
-        instance_resolver.set_instance_resolver(_Resolver(_Expert(enable_sell)))
+    def configure(enable_sell, enable_buy=True):
+        instance_resolver.set_instance_resolver(_Resolver(_Expert(enable_sell, enable_buy)))
 
     state.configure = configure
     configure(False)
@@ -222,7 +233,7 @@ class TestSellFromFlat:
                             expert_recommendation=rec)
         result = action.execute()
         assert result["success"] is False
-        assert "enable_sell is off" in result["message"]
+        assert "no expert" in result["message"]
 
     def test_the_broker_holding_another_experts_long_is_refused(self, world):
         """This expert is flat, the broker is long (another expert on the account): a sell would
@@ -325,21 +336,15 @@ class TestSellWhileLong:
         assert result["success"] is True and result["data"]["status"] == "PENDING"
         assert account.closed == []
 
-    def test_enable_sell_off_keeps_the_pre_change_pending_sell(self, world):
-        """UNCHANGED: with enable_sell off (every live expert) a long still stages the PENDING
-        qty-0 sell it always did. The risk manager's permission filter then drops it, as before;
-        whether that inert `sell` exit should close the long is a separate decision."""
-        world.configure(False)
-        _hold(OrderDirection.BUY, 10.0)
+    def test_enable_sell_off_still_closes_the_long(self, world):
+        """Operator 2026-09-25: closing a long is gated by enable_BUY (the permission that opened
+        it). The old inert "stage a PENDING sell the RM drops" path is gone."""
+        world.configure(False, enable_buy=True)
+        txn_id = _hold(OrderDirection.BUY, 10.0)
         account = _StubAccount([{"symbol": SYMBOL, "qty": 10.0}])
         result = _sell(account).execute()
-
-        assert result["success"] is True
-        assert "opens_short" not in result["data"]
-        order = get_instance(TradingOrder, result["data"]["order_id"])
-        assert (order.side, order.quantity, order.status) == (
-            OrderDirection.SELL, 0.0, OrderStatus.PENDING)
-        assert account.closed == []
+        assert result["success"] is True and result["data"]["closing"] is True
+        assert account.closed == [txn_id] and _pending_orders() == []
 
 
 # --------------------------------------------------------------------------- #
@@ -356,11 +361,13 @@ class TestSellWhileShort:
         assert "already short" in result["message"]
         assert _pending_orders() == [] and account.closed == []
 
-    def test_enable_sell_off_short_book_keeps_the_legacy_refusal(self, world):
+    def test_another_experts_short_with_enable_sell_off_is_the_disabled_refusal(self, world):
+        """This expert is flat (the broker short belongs to someone else): the sell would OPEN
+        a short, which enable_sell forbids."""
         world.configure(False)
         result = _sell(_StubAccount([{"symbol": SYMBOL, "qty": -10.0}])).execute()
         assert result["success"] is False
-        assert result["message"] == f"No long position to sell for {SYMBOL}"
+        assert result["message"] == SellAction.SELLING_DISABLED_MESSAGE
 
 
 # --------------------------------------------------------------------------- #
@@ -379,6 +386,7 @@ class TestFetchFailureRefuses:
         assert _pending_orders() == [] and account.closed == []
 
     def test_a_cover_refuses_on_an_unverified_book(self, world):
+        world.configure(True)
         _hold(OrderDirection.SELL, 10.0)
         account = _StubAccount(None)
         result = _buy(account).execute()
@@ -392,9 +400,9 @@ class TestFetchFailureRefuses:
 # --------------------------------------------------------------------------- #
 
 class TestBuy:
-    @pytest.mark.parametrize("enable_sell", [True, False])
-    def test_buy_while_short_covers_and_never_flips(self, world, enable_sell):
-        world.configure(enable_sell)
+    @pytest.mark.parametrize("enable_buy", [True, False])
+    def test_buy_while_short_covers_and_never_flips(self, world, enable_buy):
+        world.configure(True, enable_buy=enable_buy)     # covering needs enable_SELL only
         txn_id = _hold(OrderDirection.SELL, 10.0)
         account = _StubAccount([{"symbol": SYMBOL, "qty": -10.0}])
         result = _buy(account).execute()
@@ -405,6 +413,7 @@ class TestBuy:
         assert _pending_orders() == [], "a pending BUY would be sized as a fresh long entry"
 
     def test_a_zero_quantity_waiting_short_still_counts_as_short(self, world):
+        world.configure(True)
         txn_id = _hold(OrderDirection.SELL, 0.0, TransactionStatus.WAITING)
         account = _StubAccount([])
         result = _buy(account).execute()
@@ -412,6 +421,7 @@ class TestBuy:
         assert account.closed == [txn_id] and _pending_orders() == []
 
     def test_a_partially_filled_short_covers_what_filled(self, world):
+        world.configure(True)
         txn_id = _hold(OrderDirection.SELL, 100.0, filled=60.0)
         account = _StubAccount([{"symbol": SYMBOL, "qty": -60.0}])
         result = _buy(account).execute()
@@ -419,6 +429,7 @@ class TestBuy:
         assert account.closed == [txn_id]
 
     def test_an_unfilled_short_entry_is_cancelled_not_refused(self, world):
+        world.configure(True)
         txn_id = _hold(OrderDirection.SELL, 10.0, TransactionStatus.WAITING)
         account = _StubAccount([])
         result = _buy(account).execute()
@@ -426,6 +437,7 @@ class TestBuy:
         assert account.closed == [txn_id] and _pending_orders() == []
 
     def test_buy_while_short_refuses_when_the_broker_is_less_short(self, world):
+        world.configure(True)
         _hold(OrderDirection.SELL, 10.0)
         account = _StubAccount([{"symbol": SYMBOL, "qty": -3.0}])
         result = _buy(account).execute()
@@ -517,6 +529,7 @@ class TestLegacyHedge:
         assert account.closed == [] and _pending_orders() == []
 
     def test_a_buy_refuses(self, world):
+        world.configure(True)
         self._both()
         account = _StubAccount([{"symbol": SYMBOL, "qty": 6.0}])
         result = _buy(account).execute()
@@ -555,3 +568,173 @@ class TestExpertPosition:
         action = SellAction(SYMBOL, _StubAccount([]), OrderRecommendation.SELL, existing_order=order)
         assert action.get_expert_position() == 12.0
         assert action.resolve_expert() is not None
+
+
+# --------------------------------------------------------------------------- #
+# the permission matrix (operator decision 2026-09-25)
+# --------------------------------------------------------------------------- #
+
+PERMISSIONS = [(True, True), (True, False), (False, True), (False, False)]
+PERM_IDS = ["buy+sell", "buy-only", "sell-only", "none"]
+
+
+@pytest.mark.parametrize("enable_buy, enable_sell", PERMISSIONS, ids=PERM_IDS)
+class TestPermissionMatrix:
+    """Open: enable_sell opens a short, enable_buy a long. Close: gated by the permission that
+    OPENED the position -- a sell reducing a long needs enable_buy, a buy covering a short needs
+    enable_sell -- whatever the other one says."""
+
+    def test_flat_sell_opens_a_short_only_with_enable_sell(self, world, enable_buy, enable_sell):
+        world.configure(enable_sell, enable_buy=enable_buy)
+        result = _sell(_StubAccount([])).execute()
+        if enable_sell:
+            assert result["success"] is True and result["data"]["opens_short"] is True
+        else:
+            assert result["success"] is False
+            assert result["message"] == SellAction.SELLING_DISABLED_MESSAGE
+            assert result["data"]["missing_setting"] == "enable_sell"
+            assert _pending_orders() == []
+
+    @pytest.mark.parametrize("percent, closed, reduced", [
+        (None, True, None), (100, True, None), (50, False, 5.0)], ids=["full", "100pct", "50pct"])
+    def test_long_sell_closes_only_with_enable_buy(self, world, enable_buy, enable_sell,
+                                                   percent, closed, reduced):
+        world.configure(enable_sell, enable_buy=enable_buy)
+        txn_id = _hold(OrderDirection.BUY, 10.0)
+        account = _StubAccount([{"symbol": SYMBOL, "qty": 10.0}])
+        action = _sell(account)
+        action.close_percent = percent
+        result = action.execute()
+        if enable_buy:
+            assert result["success"] is True, result["message"]
+            assert account.closed == ([txn_id] if closed else [])
+            assert account.reduced == ([] if closed else [(txn_id, reduced)])
+        else:
+            assert result["success"] is False
+            assert "enable_buy" in result["message"]
+            assert result["data"]["missing_setting"] == "enable_buy"
+            assert account.closed == [] and account.reduced == []
+        assert _pending_orders() == []
+
+    def test_flat_buy_is_the_unchanged_entry(self, world, enable_buy, enable_sell):
+        """The action always stages the PENDING buy; the risk manager's permission filter is
+        what gates the long entry on enable_buy (unchanged)."""
+        from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+        world.configure(enable_sell, enable_buy=enable_buy)
+        result = _buy(_StubAccount([])).execute()
+        assert result["success"] is True
+        order = get_instance(TradingOrder, result["data"]["order_id"])
+        kept = TradeRiskManagement()._filter_orders_by_permissions([order], enable_buy, enable_sell)
+        assert (kept == [order]) is enable_buy
+
+    @pytest.mark.parametrize("percent, closed, reduced", [
+        (None, True, None), (100, True, None), (50, False, 5.0)], ids=["full", "100pct", "50pct"])
+    def test_short_buy_covers_only_with_enable_sell(self, world, enable_buy, enable_sell,
+                                                    percent, closed, reduced):
+        world.configure(enable_sell, enable_buy=enable_buy)
+        txn_id = _hold(OrderDirection.SELL, 10.0)
+        account = _StubAccount([{"symbol": SYMBOL, "qty": -10.0}])
+        action = _buy(account)
+        action.close_percent = percent
+        result = action.execute()
+        if enable_sell:
+            assert result["success"] is True, result["message"]
+            assert account.closed == ([txn_id] if closed else [])
+            assert account.reduced == ([] if closed else [(txn_id, reduced)])
+        else:
+            assert result["success"] is False
+            assert "enable_sell" in result["message"]
+            assert result["data"]["missing_setting"] == "enable_sell"
+            assert account.closed == [] and account.reduced == []
+        assert _pending_orders() == []
+
+
+# --------------------------------------------------------------------------- #
+# the close percent
+# --------------------------------------------------------------------------- #
+
+class TestClosePercent:
+    def _long(self, world, *lots, broker=None):
+        world.configure(True)
+        ids = [_hold(OrderDirection.BUY, q) for q in lots]
+        return ids, _StubAccount([{"symbol": SYMBOL, "qty": sum(lots) if broker is None else broker}])
+
+    def test_half_of_100_sells_50(self, world):
+        ids, account = self._long(world, 100.0)
+        action = _sell(account)
+        action.close_percent = 50
+        result = action.execute()
+        assert result["success"] is True
+        assert account.reduced == [(ids[0], 50.0)] and account.closed == []
+        assert result["data"]["quantity"] == 50.0 and result["data"]["percent"] == 50.0
+
+    def test_rounds_down_to_whole_shares(self, world):
+        ids, account = self._long(world, 10.0)
+        action = _sell(account)
+        action.close_percent = 55
+        action.execute()
+        assert account.reduced == [(ids[0], 5.0)]
+
+    def test_a_percent_that_rounds_to_zero_is_refused(self, world):
+        ids, account = self._long(world, 10.0)
+        action = _sell(account)
+        action.close_percent = 1
+        result = action.execute()
+        assert result["success"] is False and "rounds to 0" in result["message"]
+        assert account.closed == [] and account.reduced == []
+
+    @pytest.mark.parametrize("bad", [0, -5, 100.5, 150])
+    def test_a_percent_out_of_range_is_refused(self, world, bad):
+        ids, account = self._long(world, 10.0)
+        action = _sell(account)
+        action.close_percent = bad
+        result = action.execute()
+        assert result["success"] is False and "1..100" in result["message"]
+        assert account.closed == [] and account.reduced == []
+
+    def test_a_partial_close_is_taken_fifo_across_lots(self, world):
+        """4 + 6 held, 50% = 5: the oldest lot (4) is closed whole, the next reduced by 1."""
+        ids, account = self._long(world, 4.0, 6.0)
+        action = _sell(account)
+        action.close_percent = 50
+        assert action.execute()["success"] is True
+        assert account.closed == [ids[0]]
+        assert account.reduced == [(ids[1], 1.0)]
+
+    def test_a_percent_never_flips(self, world):
+        """The broker holds less than the slice: refused, nothing sent."""
+        ids, account = self._long(world, 100.0, broker=30.0)
+        action = _sell(account)
+        action.close_percent = 50
+        result = action.execute()
+        assert result["success"] is False and "flip" in result["message"]
+        assert account.closed == [] and account.reduced == []
+
+    def test_a_buy_covering_a_short_takes_the_same_percent(self, world):
+        world.configure(True)
+        txn_id = _hold(OrderDirection.SELL, 100.0)
+        account = _StubAccount([{"symbol": SYMBOL, "qty": -100.0}])
+        action = _buy(account)
+        action.close_percent = 25
+        assert action.execute()["success"] is True
+        assert account.reduced == [(txn_id, 25.0)]
+
+    def test_an_entry_ignores_the_percent(self, world):
+        world.configure(True)
+        action = _sell(_StubAccount([]))
+        action.close_percent = 50
+        result = action.execute()
+        assert result["success"] is True and result["data"]["opens_short"] is True
+
+    def test_the_evaluator_passes_the_rule_value_as_the_percent(self):
+        from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+        from ba2_common.core.types import ExpertActionType
+        ev = TradeActionEvaluator.__new__(TradeActionEvaluator)
+        ev.account = _StubAccount([])
+        for at, cls in ((ExpertActionType.SELL, SellAction), (ExpertActionType.BUY, BuyAction)):
+            action = ev._create_trade_action(at, {"action_type": at.value, "value": 40.0}, SYMBOL,
+                                             OrderRecommendation.SELL, None, _rec())
+            assert isinstance(action, cls) and action.close_percent == 40.0
+            plain = ev._create_trade_action(at, {"action_type": at.value}, SYMBOL,
+                                            OrderRecommendation.SELL, None, _rec())
+            assert plain.close_percent is None

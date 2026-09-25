@@ -1232,6 +1232,11 @@ class TradeActionEvaluator:
             # Extract additional parameters for specific action types
             kwargs = {}
 
+            if action_type in (ExpertActionType.BUY, ExpertActionType.SELL):
+                # Optional CLOSE PERCENT (1..100) for a buy covering a short / a sell closing a
+                # long: the rule's action value. Absent -> a full close. Entries ignore it.
+                if action_config.get('value') is not None:
+                    kwargs['percent'] = action_config.get('value')
             if action_type == ExpertActionType.BUY:
                 # Optional round-lot sizing (e.g. lot_size=100 for option-overlay
                 # strategies whose contracts cover 100 shares each).
