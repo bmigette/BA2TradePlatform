@@ -2256,3 +2256,26 @@ is the rule.
   warm start becomes strict.
 
 Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1 → E2 → Tasks 3-21.
+
+### Added after the E1 review (2026-09-25)
+
+- **E1 is done** (`917a1681`): one shared router, `trade_cycle.entry_route`, used by the backtest engine
+  AND live TradeManager. A tag on equity entries is supported.
+- **E1b: CSP collateral in mixed runs.** Must land before any premium-style result is trusted.
+  - **The gap:** the equity RM does not see the collateral a cash-secured put ties up. An open short put
+    counts only its premium as used (`MarketExpertInterface.py:~1677`), and the backtest `buying_power`
+    is plain cash (`backtest_account.py:~2302`).
+  - **Consequence:** in a style run that holds both a CSP member and a stock-buying member (O_CC/O_PP),
+    the RM can spend cash the CSP collateral requires. Live Alpaca's Reg-T buying power would refuse that
+    trade.
+  - **Fix direction:** subtract the reserved option collateral when the RM reads the available budget,
+    shared live and backtest, byte-identical when no option collateral is reserved. Do it together with
+    E2.
+- **Round lot (`lot_size`) now applies.** It is fixed on its own branch, `fix/equity-lot-size-effective`,
+  from dev, and fast-forwarded to the stage-1 grid before its O_CC/O_PP jobs. This branch merges dev
+  afterwards.
+- **E1 follow-ups:**
+  - fix the covered-call coexist test so its round-lot assertion no longer passes by coincidence;
+  - stub the ATR indicator provider in the real-engine tests (they call FMP with a fake key);
+  - refresh the stale `_entry_is_option` docstrings (4 test files);
+  - make `test_bull_put_spread_grid` assert through `entry_route`.
