@@ -530,6 +530,16 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
     if "option_basis_factor" in trade:
         row["option_basis_factor"] = _finite(trade["option_basis_factor"],
                                              "trade.option_basis_factor")
+    # A lot re-keyed onto the adjusted contract at a split (Task 1b): the row is stated in the
+    # ORIGINAL contract's units and this note carries the adjusted contract and the as-traded
+    # exit. Only on such rows, so every other row keeps exactly the keys above.
+    if "split_rekey" in trade:
+        rk = trade["split_rekey"]
+        row["split_rekey"] = {
+            **{k: rk[k] for k in ("date", "ratio", "from_contract", "to_contract")},
+            **{k: _finite(rk[k], f"trade.split_rekey.{k}")
+               for k in ("from_strike", "to_strike", "entry_price", "exit_price", "size")},
+        }
     return row
 
 

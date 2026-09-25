@@ -611,6 +611,13 @@ class DailyBacktestEngine:
             self.price.set_clock(as_of_dt)
             self._bust_price_cache()
 
+            # 1c. (plan 2026-09-24 Task 1b) re-key option lots whose underlying split since they
+            #     opened onto the ADJUSTED contract -- what OCC and the broker do on the ex-date.
+            #     HERE, before any expert reads the book, so the ex-date's marks, quotes and exit
+            #     rules already see the adjusted contract. A no-op without a split crossing.
+            if hasattr(self.account, "apply_split_rekeys"):
+                self.account.apply_split_rekeys()
+
             # 1b. publish this bar's market regime ONCE, market-wide. Everything downstream
             #     (TradeRiskManagement sizing/stops, the TP/SL adjust actions) reads it from the
             #     regime_overlay seam instead of classifying per symbol. Cheap: a bisect into the

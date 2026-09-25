@@ -185,11 +185,15 @@ def _attach_option_records(trades: List[Dict[str, Any]], carriers: Dict[int, tup
         row["entry_record"] = entry_view
         exit_rec = (exit_carrier.data or {}).get("exit_record") if exit_carrier is not None else None
         if isinstance(exit_rec, dict):
+            # A row re-keyed at a split (Task 1b) is stated under its ORIGINAL contract, but its
+            # exit traded the ADJUSTED one: that is the leg the exit record snapshots.
+            rekey = row.get("split_rekey")
+            exit_contract = rekey["to_contract"] if rekey else contract
             row["exit_record"] = {
                 "trigger": exit_rec.get("trigger"), "rule_id": exit_rec.get("rule_id"),
                 "rule_name": exit_rec.get("rule_name"),
                 **({"error": exit_rec["error"]} if "error" in exit_rec else {}),
-                "leg": _record_leg(exit_rec, contract)}
+                "leg": _record_leg(exit_rec, exit_contract)}
         else:
             row["exit_record"] = None
 
@@ -572,6 +576,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # entry is in (``option_basis_factor`` on the row; results.py's intraday refinement).
         self._split_refused_orders: set = set()
         self._option_fill_basis: Dict[int, float] = {}
+        # Task 1b: keys of the split re-key refusals / deferrals already logged (a lot waiting
+        # for its adjusted contract is re-checked on every bar and must be explained ONCE).
+        self._split_rekey_logged: set = set()
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
         # and is therefore useless for ageing in a backtest. Read only by
@@ -3908,6 +3915,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             basis_k = self._option_fill_basis.get(getattr(opening, "id", None))
             if basis_k is not None:
                 row["option_basis_factor"] = basis_k
+            # A lot re-keyed at a split (Task 1b): its rows were rewritten into the ADJUSTED
+            # contract's units (qty x k, premium / k), so entries and exits above are all in one
+            # unit and ``pnl`` is exact. The row is STATED in the ORIGINAL contract's units --
+            # the contract the entry traded, its strike, its entry basis (option_basis_factor,
+            # the intraday refinement's factor) and the contract ``delta_at_entry`` reads
+            # before the split -- with the adjusted exit kept in ``split_rekey``. Scaling price
+            # by k and size by 1/k leaves (exit - entry) x size unchanged.
+            rekey = ((getattr(opening, "data", None) or {}).get("split_rekey")
+                     if _is_option_row(opening) else None)
+            if rekey:
+                k = float(rekey["ratio"])
+                row["split_rekey"] = {
+                    "date": rekey["date"], "ratio": rekey["ratio"],
+                    "from_contract": rekey["from_contract"],
+                    "to_contract": opening.contract_symbol,
+                    "from_strike": rekey["from_strike"], "to_strike": opening.strike,
+                    "entry_price": entry_px, "exit_price": exit_px, "size": size,
+                }
+                if row["symbol"] == opening.contract_symbol:
+                    row["symbol"] = rekey["from_contract"]
+                row["contract_symbol"] = rekey["from_contract"]
+                row["strike"] = rekey["from_strike"]
+                row["entry_price"] = entry_px * k
+                row["exit_price"] = exit_px * k
+                row["size"] = size / k
             trades.append(row)
             if option_records and _is_option_row(opening):
                 option_carriers[id(row)] = (
@@ -4215,6 +4247,402 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if excess == 0.0:
             return base
         return int(math.ceil(round(float(pledged) * k_bar + excess, 6)))
+
+    # ----------------------------------------------------------------------
+    # Re-key onto the ADJUSTED contract at an integer forward split (plan 2026-09-24 Task 1b)
+    #
+    # What OCC and the broker do on the ex-date of a k:1 split: every listed contract becomes
+    # strike / k, contracts x k, deliverable still 100 shares, carried under the NEW OCC string
+    # (Task 0: AAPL200918P00400000 has no bar after 08-28; the adjusted contract trades as
+    # AAPL200918P00100000 from 08-31). Task 1a kept such a lot in its own basis, which values it
+    # correctly but strands it: no bars, no quotes, no exit by an order. Here the lot AND the
+    # order linkage move to the adjusted contract, so marks, quotes, exits and settlement all
+    # use the adjusted contract's real bars -- live parity.
+    #
+    # THE LINKAGE IS THE ORDER ROWS. Every reader of "which contract does this transaction
+    # hold" -- the shared close path (CloseOptionAction._resolve_option_order / _close_multi_leg,
+    # held_covered_calls), the option conditions (quote vs open_price, strike vs spot, expiry),
+    # get_option_positions, _option_transaction_for_contract, _lot_order, the group bounds --
+    # reads the executed option TradingOrder rows. A lookup-side mapping would have to be
+    # threaded through all of them, most in shared (live) code; rewriting the rows in place
+    # (contract/strike/qty x k/prices / k, the originals kept in ``data['split_rekey']``)
+    # re-points every one at once and leaves live untouched. Premium x quantity is invariant, so
+    # every cash/P&L sum over the rewritten rows is unchanged; the round-trip recorder states the
+    # row back in the ORIGINAL contract's units (``get_round_trip_trades``).
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _adjusted_occ(contract_symbol: str, ratio: int) -> Optional[tuple]:
+        """``(adjusted OCC string, adjusted strike)`` of ``contract_symbol`` after a
+        ``ratio``:1 split, or None when the string is not an OCC symbol.
+
+        The adjusted strike is strike / ratio ROUNDED HALF-UP TO THE CENT, which is what the
+        ThetaData store carries (measured 2026-09-25: ANET 4:1 362.5 -> P00090630 strike 90.63,
+        352.5 -> 88.13; TSLA 3:1 815 -> 271.67; no 3-decimal strike field in the store). Decimal
+        arithmetic, because float rounding of x.xx5 goes either way."""
+        from decimal import Decimal, ROUND_HALF_UP
+        if len(contract_symbol) < 16 or contract_symbol[-9] not in "CP":
+            return None
+        field = contract_symbol[-8:]
+        if not field.isdigit():
+            return None
+        adjusted = (Decimal(field) / 1000 / ratio).quantize(Decimal("0.01"),
+                                                            rounding=ROUND_HALF_UP)
+        return f"{contract_symbol[:-8]}{int(adjusted * 1000):08d}", float(adjusted)
+
+    def _log_rekey_once(self, key, level: int, fmt: str, *args) -> None:
+        """A re-key refusal/deferral is re-evaluated on every bar; explain it ONCE per key."""
+        if key in self._split_rekey_logged:
+            logger.debug(fmt, *args)
+            return
+        self._split_rekey_logged.add(key)
+        logger.log(level, fmt, *args)
+
+    def apply_split_rekeys(self) -> int:
+        """Re-key every held option lot whose underlying split since it opened (Task 1b).
+
+        Called by the engine at the HEAD of every bar, right after the clock moves and before
+        any expert reads the book, so the ex-date's marks, quotes and exit rules already see the
+        adjusted contract. Returns the number of lots re-keyed on this bar.
+
+        A lot is re-keyed when ``r = lot.basis_factor / factor(today)`` is an integer >= 2 and
+        the option store LISTS the adjusted contract today (a row, traded or not). The store is
+        asked about TODAY only: a lot whose adjusted contract is not listed yet waits in its own
+        basis (Task 1a) and is re-checked on every later bar -- no look-ahead, and ThetaData
+        lists a contract every session once it exists (ANET P00092500: 13 rows 12-04..12-20).
+        Non-integer (3:2) and reverse splits are never re-keyed and stay on Task 1a. A
+        multi-leg structure is re-keyed whole in one bar or not at all."""
+        if self._split_basis is None or self._options is None or not self._option_positions:
+            return 0
+        today = self._as_of_date()
+        crossed = [lot for lot in self._option_positions.values()
+                   if lot.qty != 0 and lot.basis_date is not None and lot.basis_date < today
+                   and self._lot_basis_differs(lot, today)]
+        if not crossed:
+            return 0
+        return self._rekey_crossed_lots(crossed, today)
+
+    def _rekey_plan(self, lot: _OptionLot, today) -> Optional[Dict[str, Any]]:
+        """The re-key of ONE crossed lot, or None (logged) when it cannot be re-keyed today."""
+        k_today = self._as_traded_factor(lot.underlying, today)
+        cs = lot.contract_symbol
+        r = lot.basis_factor / k_today
+        ri = int(round(r))
+        if r < 1.0 or abs(r - ri) > 1e-9 or ri < 2:
+            # OCC adjusts these into a NON-STANDARD deliverable (e.g. 150 shares per contract
+            # after a 3:2) under a new root the store does not carry: nothing to re-key onto.
+            self._log_rekey_once(
+                (cs, lot.basis_date, "ratio", k_today), logging.WARNING,
+                "[backtest] option lot %s (%+g contract(s)) NOT RE-KEYED: %s split a %s split "
+                "(ratio %g, share basis x%g on %s -> x%g today). Only integer forward splits are "
+                "re-keyed; OCC turns this one into a non-standard deliverable the store does not "
+                "carry. The lot stays in its OWN basis (Task 1a): valued at adjusted close x %g, "
+                "no bars, rides to expiry settlement.",
+                cs, lot.qty, lot.underlying, "reverse" if r < 1.0 else "non-integer", r,
+                lot.basis_factor, lot.basis_date, k_today, lot.basis_factor)
+            return None
+        adj = self._adjusted_occ(cs, ri)
+        if adj is None:
+            self._log_rekey_once(
+                (cs, lot.basis_date, "occ"), logging.ERROR,
+                "[backtest] option lot %s NOT RE-KEYED: not an OCC symbol, so its adjusted "
+                "contract cannot be named. It stays in its own basis (Task 1a).", cs)
+            return None
+        new_symbol, new_strike = adj
+        old_strike = int(cs[-8:]) / 1000.0
+        o = self._lot_order(cs)
+        if o is not None and o.strike is not None and abs(float(o.strike) - old_strike) > 1e-6:
+            self._log_rekey_once(
+                (cs, lot.basis_date, "strike"), logging.ERROR,
+                "[backtest] option lot %s NOT RE-KEYED: its order row says strike %s but the "
+                "OCC string says %s -- the book is inconsistent and the adjusted contract cannot "
+                "be derived safely. It stays in its own basis (Task 1a).",
+                cs, o.strike, old_strike)
+            return None
+        # The store is read RAW here, not through ``_option_bar``: the question is whether the
+        # adjusted contract is LISTED today, and today is post-split, so today's row under the
+        # new string IS the adjusted contract (a held lot on the same string would be guarded).
+        if self._options.get_bar(new_symbol, today) is None:
+            self._log_rekey_once(
+                (cs, lot.basis_date, "missing"), logging.WARNING,
+                "[backtest] option lot %s (%+g contract(s)) NOT RE-KEYED on %s: its adjusted "
+                "contract %s (%d:1 split of %s) is not listed in the option store that day. The "
+                "lot stays in its OWN basis (Task 1a) and is re-keyed on the first later bar "
+                "that lists %s; if none does, it rides to expiry settlement.",
+                cs, lot.qty, today, new_symbol, ri, lot.underlying, new_symbol)
+            return None
+        return {"lot": lot, "ratio": ri, "new": new_symbol, "new_strike": new_strike,
+                "old_strike": old_strike, "k_today": k_today}
+
+    def _rekey_crossed_lots(self, crossed: List[_OptionLot], today) -> int:
+        """Plan, group, conflict-check and apply the re-key of ``crossed`` (see
+        ``apply_split_rekeys``). Nothing is mutated until every check has passed."""
+        plans: Dict[str, Dict[str, Any]] = {}
+        for lot in crossed:
+            plan = self._rekey_plan(lot, today)
+            if plan is not None:
+                plans[lot.contract_symbol] = plan
+        if not plans:
+            # Nothing re-keyable today (a 3:2 split, an adjusted contract not listed yet): skip
+            # the order scan below, which a lot riding on Task 1a would otherwise pay every bar.
+            return 0
+        crossed_syms = {lot.contract_symbol for lot in crossed}
+
+        # ---- the order linkage: executed option rows of OPENED transactions ----------------
+        opened = {t.id: t for t in transactions_where(status=TransactionStatus.OPENED)}
+        executed = OrderStatus.get_executed_statuses()
+        rows_of: Dict[str, List[TradingOrder]] = {}       # crossed contract -> its rows
+        txns_of: Dict[str, set] = {}                      # crossed contract -> txn ids
+        txn_contracts: Dict[int, set] = {}                # txn id -> option contracts traded
+        parents_of: Dict[int, List[TradingOrder]] = {}    # txn id -> multi-leg parent rows
+        for o in self.get_orders():
+            if (getattr(o, "asset_class", None) != AssetClass.OPTION
+                    or o.transaction_id not in opened or o.status not in executed):
+                continue
+            cs = o.contract_symbol
+            if not cs:
+                parents_of.setdefault(o.transaction_id, []).append(o)
+                continue
+            txn_contracts.setdefault(o.transaction_id, set()).add(cs)
+            if cs in crossed_syms:
+                rows_of.setdefault(cs, []).append(o)
+                txns_of.setdefault(cs, set()).add(o.transaction_id)
+        # The rows to move must add up to the lot: a lot whose book does not reconcile cannot
+        # have its linkage moved consistently (an exit would close the wrong quantity).
+        for cs in list(plans):
+            lot = plans[cs]["lot"]
+            booked = sum((float(o.filled_qty if o.filled_qty is not None else o.quantity or 0.0))
+                         * (1.0 if o.side == OrderDirection.BUY else -1.0)
+                         for o in rows_of.get(cs, ()))
+            if abs(booked - lot.qty) > 1e-9:
+                self._log_rekey_once(
+                    (cs, lot.basis_date, "ledger"), logging.ERROR,
+                    "[backtest] option lot %s NOT RE-KEYED: the lot holds %+g contract(s) but the "
+                    "executed order rows of its OPENED transactions add up to %+g, so its order "
+                    "linkage cannot be moved consistently. It stays in its own basis (Task 1a).",
+                    cs, lot.qty, booked)
+                del plans[cs]
+
+        # ---- groups: contracts sharing a transaction move together -------------------------
+        parent: Dict[str, str] = {}
+
+        def _find(x):
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for cs in crossed_syms:
+            _find(cs)
+            for tid in txns_of.get(cs, ()):
+                for other in txn_contracts.get(tid, ()):
+                    held = self._option_positions.get(other)
+                    if held is not None and held.qty != 0:
+                        parent[_find(other)] = _find(cs)
+        groups: Dict[str, set] = {}
+        for cs in list(parent):
+            groups.setdefault(_find(cs), set()).add(cs)
+
+        moving: set = set()
+        group_of: Dict[str, frozenset] = {}
+        for members in groups.values():
+            members = frozenset(members)
+            crossed_members = sorted(m for m in members if m in crossed_syms)
+            if not crossed_members:
+                continue
+            for m in members:
+                group_of[m] = members
+            missing = [m for m in crossed_members if m not in plans]
+            ratios = {plans[m]["ratio"] for m in crossed_members if m in plans}
+            if missing or len(ratios) > 1:
+                ready = [m for m in crossed_members if m in plans]
+                if ready:
+                    # A half-re-keyed structure is wrong (legs in two bases, quantities in two
+                    # units): the whole structure stays on Task 1a this bar.
+                    self._log_rekey_once(
+                        (members, "whole", tuple(missing), len(ratios)),
+                        logging.ERROR if len(ratios) > 1 else logging.WARNING,
+                        "[backtest] option structure %s NOT RE-KEYED: a structure is re-keyed "
+                        "whole or not at all, and %s cannot be re-keyed%s (see above). %s stay "
+                        "in their own basis (Task 1a) with the rest of the structure.",
+                        sorted(members), missing or sorted(members),
+                        " (legs disagree on the split ratio)" if len(ratios) > 1 else "",
+                        ready)
+                continue
+            moving.update(crossed_members)
+
+        # ---- target conflicts: the adjusted string may already be held ---------------------
+        def _drop(cs, level, fmt, *args):
+            members = group_of.get(cs, frozenset({cs}))
+            moving.difference_update(members)
+            self._log_rekey_once((members, "target", args[:2]), level, fmt, *args)
+
+        changed = True
+        while changed:
+            changed = False
+            targets: Dict[str, List[str]] = {}
+            for cs in moving:
+                targets.setdefault(plans[cs]["new"], []).append(cs)
+            for new, srcs in targets.items():
+                if len(srcs) > 1:
+                    for cs in srcs:
+                        _drop(cs, logging.ERROR,
+                              "[backtest] option lot %s NOT RE-KEYED: %s would map several lots "
+                              "(%s) onto one adjusted contract. They stay in their own basis.",
+                              cs, new, sorted(srcs))
+                    changed = True
+                    break
+                cs = srcs[0]
+                occ = self._option_positions.get(new)
+                if occ is None or occ.qty == 0 or new in moving:
+                    continue            # free, or its occupant moves away in this same bar
+                lot = plans[cs]["lot"]
+                if new in crossed_syms or (occ.basis_factor is not None
+                                           and occ.basis_factor != plans[cs]["k_today"]):
+                    _drop(cs, logging.WARNING,
+                          "[backtest] option lot %s NOT RE-KEYED on %s: %s is already held by "
+                          "a lot in ANOTHER share basis that is not re-keyed this bar; one lot "
+                          "cannot hold two bases. Retried on the next bar.", cs, today, new)
+                elif (occ.qty > 0) != (lot.qty > 0):
+                    # Netting a long against a short of the same contract is a CLOSE: it
+                    # realises P&L on two different transactions, which the re-key (a pure
+                    # identity) must never do. Refused; the broker would net them, so say so.
+                    _drop(cs, logging.ERROR,
+                          "[backtest] option lot %s (%+g) NOT RE-KEYED: the adjusted contract %s "
+                          "is already held on the opposite side (%+g contract(s)). Merging would "
+                          "net -- i.e. close -- positions of two transactions and realise P&L, "
+                          "which a re-key must not do. It stays in its own basis (Task 1a).",
+                          cs, lot.qty, new, occ.qty)
+                else:
+                    continue
+                changed = True
+                break
+        if not moving:
+            return 0
+        self._apply_rekeys([plans[cs] for cs in sorted(moving)], rows_of, txns_of, parents_of,
+                           opened, today)
+        return len(moving)
+
+    def _apply_rekeys(self, plans, rows_of, txns_of, parents_of, opened, today) -> None:
+        """Mutate the book for the checked ``plans``: order rows, parents, transactions, lots.
+
+        An IDENTITY transformation: no cash moves, no commission, no fill. Every row keeps
+        premium x quantity (price / k, qty x k), the lot keeps avg_price x qty, and the strike x
+        share count differs only by OCC's rounding of the adjusted strike to the cent."""
+        by_old = {p["lot"].contract_symbol: p for p in plans}
+        # Transaction-level decisions BEFORE any row changes (the entry lookup reads the rows).
+        txn_ratio: Dict[int, int] = {}
+        for cs, p in by_old.items():
+            for tid in txns_of.get(cs, ()):
+                txn_ratio[tid] = p["ratio"]
+        scale_txn: Dict[int, bool] = {}
+        for tid in txn_ratio:
+            entry = self._entry_order_for_transaction(opened[tid])
+            scale_txn[tid] = (entry is not None
+                              and getattr(entry, "asset_class", None) == AssetClass.OPTION
+                              and (not entry.contract_symbol or entry.contract_symbol in by_old))
+        rewritten_parents: set = set()
+        for cs, p in by_old.items():
+            for o in rows_of.get(cs, ()):
+                self._rekey_order_row(o, p["ratio"], today, new_contract=p["new"],
+                                      new_strike=p["new_strike"], old_contract=cs)
+                if o.parent_order_id is not None:
+                    rewritten_parents.add(o.parent_order_id)
+        for tid, r in txn_ratio.items():
+            # A multi-leg parent carries the STRUCTURE count and the net per structure: scaled
+            # only when its own legs moved (a roll parent written after the split is already in
+            # the new units).
+            for par in parents_of.get(tid, ()):
+                if par.id in rewritten_parents:
+                    self._rekey_order_row(par, r, today)
+            t = opened[tid]
+            if scale_txn[tid]:
+                if t.quantity is not None:
+                    t.quantity = float(t.quantity) * r
+                if t.open_price is not None:
+                    t.open_price = float(t.open_price) / r
+            moved = [{"date": today.isoformat(), "ratio": r, "from_contract": cs,
+                      "to_contract": p["new"]}
+                     for cs, p in sorted(by_old.items()) if tid in txns_of.get(cs, ())]
+            meta = dict(t.meta_data or {})
+            meta["split_rekeys"] = list(meta.get("split_rekeys") or []) + moved
+            t.meta_data = meta
+            update_instance(t)
+
+        # The ledger: retire every old lot first (a target string may be an old lot's key that
+        # moves away in this same bar), then install or merge the adjusted lots.
+        new_lots = []
+        for p in plans:
+            old, r = p["lot"], p["ratio"]
+            new_lots.append((p, old.qty, old.avg_price, _OptionLot(
+                contract_symbol=p["new"], qty=old.qty * r, avg_price=old.avg_price / r,
+                multiplier=old.multiplier,
+                # IV is scale-free: BS(S/k, K/k, iv) = BS(S, K, iv) / k, so the contract's last
+                # observed iv is exactly the adjusted contract's -- carried, not reset, so the BS
+                # mark fallback still works on a day the adjusted contract has no bar.
+                last_iv=old.last_iv, last_iv_date=old.last_iv_date,
+                underlying=old.underlying, basis_factor=p["k_today"], basis_date=today)))
+        for p, _q, _a, _new in new_lots:
+            self._zero_option_lot(p["lot"])
+        for p, old_qty, old_avg, new in new_lots:
+            occ = self._option_positions.get(new.contract_symbol)
+            if occ is not None and occ.qty != 0:
+                # Same side, same (today's) basis -- checked in _rekey_crossed_lots.
+                total = occ.qty + new.qty
+                occ.avg_price = ((occ.avg_price * abs(occ.qty) + new.avg_price * abs(new.qty))
+                                 / abs(total))
+                occ.qty = total
+                if occ.last_iv_date is None or (new.last_iv_date is not None
+                                                and new.last_iv_date > occ.last_iv_date):
+                    occ.last_iv, occ.last_iv_date = new.last_iv, new.last_iv_date
+                merged = f" (merged into the {occ.qty - new.qty:+g} already held)"
+            else:
+                self._option_positions[new.contract_symbol] = new
+                merged = ""
+            logger.info(
+                "[backtest] option lot RE-KEYED at the %s %d:1 split (%s): %s %+g @ %.4f -> %s "
+                "%+g @ %.4f, strike %g -> %g%s.", new.underlying, p["ratio"], today,
+                p["lot"].contract_symbol, old_qty, old_avg, new.contract_symbol, new.qty,
+                new.avg_price, p["old_strike"], p["new_strike"], merged)
+        # Order rows changed contract/quantity in place and lots were added: both the order
+        # cache's derived views and the option memos (group bounds, _lot_order index) are stale.
+        self.invalidate_order_cache()
+        self._bump_option_memo()
+
+    @staticmethod
+    def _rekey_order_row(o, r: int, today, *, new_contract: Optional[str] = None,
+                         new_strike: Optional[float] = None,
+                         old_contract: Optional[str] = None) -> None:
+        """Rewrite one executed option row into the adjusted contract's units, keeping the
+        ORIGINAL terms in ``data['split_rekey']`` (cumulative across two splits: the first
+        ``from_*`` terms and the product of the ratios)."""
+        prev = (o.data or {}).get("split_rekey") or {}
+        note = {
+            "date": today.isoformat(),
+            "ratio": int(r * int(prev.get("ratio", 1))),
+            "from_contract": prev.get("from_contract", old_contract),
+            "to_contract": new_contract,
+            "from_strike": prev.get("from_strike", o.strike if new_contract else None),
+            "to_strike": new_strike,
+            "from_quantity": prev.get("from_quantity", o.quantity),
+            "from_filled_qty": prev.get("from_filled_qty", o.filled_qty),
+            "from_open_price": prev.get("from_open_price", o.open_price),
+            "from_limit_price": prev.get("from_limit_price", o.limit_price),
+        }
+        if new_contract is not None:
+            if o.symbol == o.contract_symbol:
+                o.symbol = new_contract
+            o.contract_symbol = new_contract
+            o.strike = new_strike
+        if o.quantity is not None:
+            o.quantity = float(o.quantity) * r
+        if o.filled_qty is not None:
+            o.filled_qty = float(o.filled_qty) * r
+        for field in ("open_price", "limit_price", "stop_price"):
+            v = getattr(o, field, None)
+            if v is not None:
+                setattr(o, field, float(v) / r)
+        o.data = {**(o.data or {}), "split_rekey": note}
+        update_instance(o)
 
     # ======================================================================
     # OptionsAccountInterface — READ methods (Task 4)
