@@ -1651,7 +1651,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # Checkpoints are keyed on the JOB (its name), not this row's id, so a relaunch of an
         # interrupted job -- which inserts a NEW StrategyOptimization row -- still finds them.
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
-        ckpt_fingerprint = checkpoint_fingerprint(param_space, ga)
+        ckpt_fingerprint = checkpoint_fingerprint(
+            param_space, ga, checkpoint_expert_settings_identity(backtest_cfg))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -2914,7 +2915,36 @@ def _report_trial_result(on_result, idx: int, fitness: float) -> None:
         logger.warning(f"on_result callback failed (ignored): {e}")
 
 
-def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> str:
+#: Expert settings that change what every genome SCORES without being a gene, and that a job can
+#: carry or not under the SAME name -- today the launcher's ``option_fixed_settings`` (see
+#: ba2test_launcher._EXPERT_OPT; a test pins that every key there is listed here). A checkpoint
+#: written under DeterministicScorer macro_short_side="same" must not seed a "mirror" run: the
+#: genes are identical, only their scores mean something else, so the gene-space fingerprint
+#: alone cannot see it.
+#:
+#: Mapped to the expert's DEFAULT (pinned against get_settings_definitions by test): a value equal
+#: to the default scores exactly like an absent key, so it is not folded -- an explicit "same"
+#: from a UI-built config must not orphan a checkpoint written without the key.
+CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same"}
+
+
+def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """{"<ExpertClass>.<key>": value} for every CHECKPOINT_IDENTITY_EXPERT_SETTINGS key the run's
+    expert settings carry with a NON-default value. A run that carries none gets {} -- and an
+    unchanged fingerprint."""
+    out: Dict[str, Any] = {}
+    for spec in (backtest_cfg or {}).get("experts") or []:
+        if not isinstance(spec, dict):
+            continue
+        settings = spec.get("settings") or {}
+        for key, default in CHECKPOINT_IDENTITY_EXPERT_SETTINGS.items():
+            if key in settings and settings[key] != default:
+                out[f"{spec.get('class')}.{key}"] = settings[key]
+    return out
+
+
+def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
+                           expert_settings: Optional[Dict[str, Any]] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -2925,6 +2955,9 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> s
     restored counter is compared against it.
 
     Gene ORDER is included (not just the set): ``encode_params`` maps by position.
+
+    ``expert_settings`` (see ``checkpoint_expert_settings_identity``) joins the payload ONLY when
+    non-empty, so every run that carries none keeps the fingerprint its checkpoints already have.
     """
     import hashlib
     import json
@@ -2935,6 +2968,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> s
         "population": ga.get("populationSize"),
         "generations": ga.get("generations"),
     }
+    if expert_settings:
+        payload["expert_settings"] = sorted(expert_settings.items())
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 

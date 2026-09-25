@@ -1040,7 +1040,22 @@ def _daily_manage_schedule() -> dict:
 _INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
 
 
-def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None) -> dict:
+def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
+    """The spec's ``option_fixed_settings`` when ``strategy_kind`` is an option job, else {}.
+
+    ONE rule, read by ``_expert_run_settings`` (what the job runs) AND by
+    ``tools/run_options_matrix.discovery_name`` (what the job is CALLED): a job's identity has
+    to change exactly when its settings do, or a "mirror" job would SKIP on, or resume the GA
+    checkpoint of, a completed "same" job of the same name. Option kind = ``_OPTION_STRATEGY_KEYS``
+    minus ``O_STK``, the plain-equity control arm (same carve-out as ``_rm_opt_for``).
+    """
+    if strategy_kind in _OPTION_STRATEGY_KEYS and strategy_kind != "O_STK":
+        return dict(spec.get("option_fixed_settings") or {})
+    return {}
+
+
+def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
+                         strategy_kind: "str | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
     expert that reads its universe from a setting, not from enabled_instruments; no current
@@ -1065,8 +1080,15 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     ABSENT IS THE DEFAULT and stays absent: a spec that does not name the key produces the
     same settings dict it always did, byte for byte, so every existing job is unchanged.
     ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
+
+    ``option_fixed_settings`` (optional spec key) is layered over ``fixed_settings`` only when
+    ``strategy_kind`` is an option strategy (see ``_option_fixed_settings_for``). It lets ONE expert spec
+    serve both the equity grids and the option grids with a setting the option grids need
+    (DeterministicScorer's ``macro_short_side``) without moving any equity job. No kind given
+    (bypass experts, ad-hoc callers) = not an option job = the plain ``fixed_settings``.
     """
     settings = dict(spec["fixed_settings"])
+    settings.update(_option_fixed_settings_for(spec, strategy_kind))
     # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY. See _INERT_RM_TOGGLES.
     settings.update(_INERT_RM_TOGGLES)
     if spec.get("universe_setting"):
@@ -1328,6 +1350,17 @@ _EXPERT_OPT = {
             "k_target": {"optimize": True, "min": 3.0, "max": 6.0, "step": 1.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
+        # OPTION JOBS ONLY (plan 2026-09-24 Task 10, stage-1 relaunch): the regime multiplier
+        # mirrors on the SELL side, so a bearish regime amplifies SELL conviction instead of
+        # muting it -- without it the bearish option arms (O_LP, O_BEARCS) get almost no SELL
+        # supply in exactly the years they exist for (2022: 7.7% -> 0.6% of bars below -0.4).
+        # A FIXED setting, not a gene. Scoped to option kinds by _expert_run_settings because
+        # this spec is shared with the equity grids, whose S1-S7 and O_STK (the equity control
+        # arm) results must stay comparable with every run on record -- the expert default
+        # ("same") is what they get. Every key here must also be listed in
+        # strategy_optimization_handler.CHECKPOINT_IDENTITY_EXPERT_SETTINGS (pinned by test), and
+        # run_options_matrix folds this dict into the discovery job name.
+        "option_fixed_settings": {"macro_short_side": "mirror"},
     },
     # NOTE: FinnHubRating is intentionally NOT optimized — it is REDUNDANT with FMPRating (both
     # are analyst-consensus rating experts on the same large-cap universe).
@@ -6043,7 +6076,9 @@ def _cmd_optimize(args) -> int:
         backtest_block = {
             "engine": "daily",
             "enabled_instruments": universe,
-            "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe, _sizing_overrides(args))}],
+            "experts": [{"class": expert, "settings": _expert_run_settings(
+                spec, universe, _sizing_overrides(args),
+                strategy_kind=None if bypass else args.strategy)}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -6408,7 +6443,9 @@ def _cmd_optimize_batch(args) -> int:
             backtest_block = {
                 "engine": "daily",
                 "enabled_instruments": universe,
-                "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe, _sizing_overrides(args))}],
+                "experts": [{"class": expert, "settings": _expert_run_settings(
+                    spec, universe, _sizing_overrides(args),
+                    strategy_kind=None if bypass else strat_kind)}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
