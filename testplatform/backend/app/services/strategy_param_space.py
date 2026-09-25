@@ -74,6 +74,24 @@ logger = logging.getLogger(__name__)
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+# The days a daily-bar backtest actually has bars for. saturday/sunday stay in SCHEDULE_DAYS
+# (their genes are part of stored genomes and of the export/deploy reconstruction below), but
+# they can never produce a decision point on their own.
+_WEEKDAYS = SCHEDULE_DAYS[:5]
+
+
+def _repair_no_weekday(days: Dict[str, bool]) -> Dict[str, bool]:
+    """Force the first weekday ON when no WEEKDAY is on; weekend flags are left as they are.
+
+    A genome with no weekday ON never scans for entries on a daily clock -- saturday/sunday
+    have no bars -- so it is a dead config the fitness cannot tell from "just unlucky", whether
+    its weekend flags are on or off. Repair, don't reject. Shared by ``decode_params`` (what a
+    trial runs) and ``schedule_override_from_genes`` (what a re-run/export reconstructs) so the
+    two cannot drift apart.
+    """
+    if not any(days.get(day) for day in _WEEKDAYS):
+        days[SCHEDULE_DAYS[0]] = True
+    return days
 
 #: The SelectionPolicy weights emitted as shared per-half genes (``optsel:<half>:<w>``).
 #: Deliberately NOT w_spread (the parquet store this grid reads synthesises bid == ask, so
@@ -939,14 +957,15 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
                                     optsel_by_half)
                   if _template_exit else None)
 
-    # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a
-    # dead config the fitness function can't even distinguish from "just unlucky"), so force the
-    # first weekday (fixed SCHEDULE_DAYS order) back ON rather than wasting a trial evaluating it.
+    # Repair, don't reject: an individual with no WEEKDAY on would never scan for entries on a
+    # daily clock (a dead config the fitness function can't even distinguish from "just
+    # unlucky"), so force the first weekday back ON rather than wasting a trial evaluating it.
+    # Keyed on weekdays, not on "all seven off": a weekend-only genome has zero decision points
+    # too, and the old all-off test let it through (see _repair_no_weekday).
     schedule_days: Optional[Dict[str, bool]] = None
     if schedule_by_day:
-        schedule_days = {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS}
-        if not any(schedule_days.values()):
-            schedule_days[SCHEDULE_DAYS[0]] = True
+        schedule_days = _repair_no_weekday(
+            {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS})
 
     return {
         "expert_overrides": expert_overrides,
@@ -972,9 +991,9 @@ def schedule_override_from_genes(
     instead of the days the GA selected. That is exactly how five live instances came to fire
     on Mondays when their genomes had chosen Thursday, or Tue/Thu/Fri (2026-09-07).
 
-    Mirrors ``decode_params``' repair rule: an all-days-OFF genome gets the first weekday
-    forced back ON, because a config that never scans for entries is dead rather than merely
-    unlucky.
+    Mirrors ``decode_params``' repair rule (``_repair_no_weekday``): a genome with no weekday
+    ON gets the first weekday forced back ON, because a config that never scans for entries is
+    dead rather than merely unlucky.
 
     ``weekdays_only`` translates the genome into the cadence it EFFECTIVELY ran, for callers
     that drive a real scheduler rather than a bar loop. On a daily clock there are no weekend
@@ -998,11 +1017,11 @@ def schedule_override_from_genes(
         return None
     days = {day: by_day.get(day, False) for day in SCHEDULE_DAYS}
     if weekdays_only:
-        days = {day: (value and day in SCHEDULE_DAYS[:5]) for day, value in days.items()}
-    # Same repair as decode_params, applied after the weekday filter so an all-weekend genome
-    # deploys as Monday rather than as an instance that never scans at all.
-    if not any(days.values()):
-        days[SCHEDULE_DAYS[0]] = True
+        days = {day: (value and day in _WEEKDAYS) for day, value in days.items()}
+    # Same repair as decode_params, so a re-run reconstructs the days the trial actually ran
+    # with. With weekdays_only the filter above has already cleared the weekend, so an
+    # all-weekend genome deploys as Monday rather than as an instance that never scans at all.
+    days = _repair_no_weekday(days)
     return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}
 
 

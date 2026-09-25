@@ -105,3 +105,38 @@ def test_decode_schedule_days_repairs_all_off_to_first_day():
     out = decode_params(s, {"schedule:monday": 0, "schedule:tuesday": 0, "schedule:wednesday": 0})
     assert out["schedule_days"]["monday"] is True
     assert sum(out["schedule_days"].values()) == 1
+
+
+# A daily-bar backtest has no weekend bars, so a genome whose only ON days are saturday/sunday
+# gets ZERO decision points -- a dead config exactly like all-OFF, which the old repair (fired
+# only when EVERY day was off) let through. Plan 2026-09-24 Task 5.
+_WEEKEND_ONLY = {"schedule:monday": 0, "schedule:tuesday": 0, "schedule:wednesday": 0,
+                 "schedule:thursday": 0, "schedule:friday": 0,
+                 "schedule:saturday": 1, "schedule:sunday": 0}
+
+
+def test_decode_schedule_days_repairs_a_weekend_only_genome_to_monday():
+    out = decode_params(_strategy(), dict(_WEEKEND_ONLY))
+    assert out["schedule_days"]["monday"] is True
+    # The weekend flag is left as the genome set it: the gene stays in the search space (it is
+    # read by export/deploy), only the dead-config repair changes.
+    assert out["schedule_days"]["saturday"] is True
+    assert [d for d, on in out["schedule_days"].items() if on] == ["monday", "saturday"]
+
+
+def test_decode_schedule_days_leaves_a_genome_with_a_weekday_alone():
+    genes = dict(_WEEKEND_ONLY, **{"schedule:thursday": 1})
+    out = decode_params(_strategy(), genes)
+    assert [d for d, on in out["schedule_days"].items() if on] == ["thursday", "saturday"]
+
+
+def test_schedule_override_reconstruction_mirrors_the_weekend_repair():
+    """A re-run/export reconstructs the cadence with schedule_override_from_genes; it must give
+    the same days the trial ran with, or a re-run of a weekend-only genome goes back to zero
+    decision points."""
+    from app.services.strategy_param_space import schedule_override_from_genes
+    decoded = decode_params(_strategy(), dict(_WEEKEND_ONLY))["schedule_days"]
+    rebuilt = schedule_override_from_genes(dict(_WEEKEND_ONLY))
+    assert rebuilt["days"] == decoded
+    deployed = schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True)
+    assert [d for d, on in deployed["days"].items() if on] == ["monday"]
