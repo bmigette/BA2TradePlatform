@@ -847,7 +847,7 @@ class SellAction(TradeAction):
                 action_type=ExpertActionType.SELL.value,
                 success=False,
                 message="Failed to create order record",
-                data={}
+                data={"closed_transaction_ids": []}
             )
 
         # Order stays in PENDING status for risk management review
@@ -957,7 +957,7 @@ class BuyAction(TradeAction):
                     action_type=ExpertActionType.BUY.value,
                     success=False,
                     message=f"Cannot get current price for {self.instrument_name}",
-                    data={}
+                    data={"closed_transaction_ids": []}
                 )
             
             # Create PENDING order record (not submitted to broker yet)
@@ -973,7 +973,7 @@ class BuyAction(TradeAction):
                     action_type=ExpertActionType.BUY.value,
                     success=False,
                     message="Failed to create order record",
-                    data={}
+                    data={"closed_transaction_ids": []}
                 )
             
             # Order stays in PENDING status for risk management review
@@ -1034,7 +1034,7 @@ class CloseAction(TradeAction):
         When an existing_order with a transaction_id is available (open_positions
         use case), delegates to AccountInterface.close_transaction() which:
         - Uses transaction.quantity (correct per-expert qty, not broker total)
-        - Passes is_closing_order=True to bypass hedging checks
+        - Passes is_closing_order=True to bypass the opposite-position (netting) entry check
         - Handles existing close orders, ERROR retries, WAITING_TRIGGER cleanup
 
         Returns:

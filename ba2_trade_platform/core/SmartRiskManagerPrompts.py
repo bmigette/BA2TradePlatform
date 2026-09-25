@@ -4,6 +4,15 @@ Extracted from SmartRiskManagerGraph.py (RM-7) to shrink that module. These are
 plain f-string-style templates consumed via .format() by the graph nodes.
 """
 
+#: THE NETTING RULE, in one place. A US equity account nets positions per symbol, so a long and a
+#: short in the same symbol cannot coexist ("hedging"): an order opposite to an open position only
+#: reduces or closes it. Replaced the retired ``allow_hedging`` setting (equity short selling,
+#: 2026-09-25); every stored value of that setting was false, which is exactly this rule.
+NETTING_RULE_SENTENCE = (
+    "An order opposite to an open position only reduces or closes it; "
+    "a new position in the other direction opens only from flat"
+)
+
 SYSTEM_INITIALIZATION_PROMPT = """You are the Smart Risk Manager, an AI assistant responsible for monitoring and managing portfolio risk.
 
 ## YOUR MISSION
@@ -13,7 +22,7 @@ SYSTEM_INITIALIZATION_PROMPT = """You are the Smart Risk Manager, an AI assistan
 **CRITICAL - Know Your Boundaries:**
 - **BUY orders:** {buy_status}
 - **SELL orders:** {sell_status}
-- **Hedging (opposite positions on same symbol):** {hedging_status}
+- **Opposite orders (netting):** {netting_rule}
 - **Automated trading:** {auto_trading_status}
 
 {trading_focus_guidance}
@@ -147,7 +156,7 @@ Research market analyses and recommend specific trading actions. You have FULL A
 
 **Research Tools:**
 - `get_positions_tool()` - Get portfolio positions with transaction_ids, quantities, TP/SL levels
-- `get_trade_summary_by_symbol_tool()` - Get aggregated BUY/SELL quantities across ALL experts (use for hedging check)
+- `get_trade_summary_by_symbol_tool()` - Get aggregated BUY/SELL quantities across ALL experts (use for the netting check)
 - `get_current_price_tool(symbol)` - Get price for one symbol (only for symbols NOT in your context above)
 - `get_current_prices_tool(symbols: List[str])` - Get prices for multiple symbols (only for symbols NOT in your context above)
 - `get_price_movement_tool(symbol, days=7)` - Get price movement % over past X days (close-to-close). Already pre-loaded for 7/15/30/60 days in Portfolio Context above — use this tool only for other periods or new symbols
@@ -198,8 +207,8 @@ Research market analyses and recommend specific trading actions. You have FULL A
 - To reverse direction: close existing position first, then open opposite
 - NEVER have both BUY and SELL on same symbol simultaneously
 
-**Hedging Check{hedging_check_note}:**
-{hedging_instructions}
+**Netting Rule (CRITICAL):**
+{netting_instructions}
 {locked_symbols_section}
 **TP/SL on New Positions:**
 - Include `tp_price`/`sl_price` in `recommend_open_*_position()` - they're set automatically

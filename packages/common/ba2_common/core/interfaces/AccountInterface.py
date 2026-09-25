@@ -121,7 +121,7 @@ class AccountInterface(ReadOnlyAccountInterface):
             trading_order: A validated TradingOrder object containing all order details.
             tp_price: Optional take profit price for bracket orders (broker-specific support).
             sl_price: Optional stop loss price for bracket orders (broker-specific support).
-            is_closing_order: If True, this order closes an existing position (skip hedging checks).
+            is_closing_order: If True, this order closes an existing position (skip the opposite-position entry check).
             use_complex_order: If True, submit as a native complex order (bracket/OTO) with the
                 given tp_price/sl_price as attached legs, instead of a plain order plus separate
                 protective legs. Set by ``submit_order`` when an opposing order is working at the
@@ -2084,7 +2084,7 @@ class AccountInterface(ReadOnlyAccountInterface):
         still holds shares against a just-canceled TP/SL OCO order.
 
         If no dependency is needed the order is submitted to the broker
-        immediately (``is_closing_order=True`` bypasses hedging checks).
+        immediately (``is_closing_order=True`` bypasses the opposite-position entry check).
 
         TWO REFUSALS LIVE HERE, and they answer to different conventions — see each
         one's comment for why. An OPTION transaction RAISES (a caller error: wrong

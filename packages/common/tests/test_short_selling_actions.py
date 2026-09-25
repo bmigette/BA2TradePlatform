@@ -514,8 +514,8 @@ class TestShortEntryBracketDirection:
 # --------------------------------------------------------------------------- #
 
 class TestLegacyHedge:
-    """Classification is by SIDE: a long AND a short at once (only ``allow_hedging`` could make
-    one) must not be summed into a net and acted on."""
+    """Classification is by SIDE: a long AND a short at once (only the retired hedging setting,
+    now replaced by the netting rule, could make one) must not be summed into a net and acted on."""
 
     def _both(self):
         return _hold(OrderDirection.BUY, 10.0), _hold(OrderDirection.SELL, 4.0)
@@ -890,3 +890,40 @@ def test_position_direction_survives_a_missing_transaction_row(world):
                                   expert_recommendation=_rec(), reference_value="current_price",
                                   percent=-5.0)
     assert action._position_is_long(order) == (False, "recommendation SELL (no order)")
+
+
+# --------------------------------------------------------------------------- #
+# S2 (S1 review note): an ENTRY that failed before creating an order closed nothing
+# --------------------------------------------------------------------------- #
+
+class TestAFailedEntrySaysItClosedNothing:
+    """BUY/SELL are closing-type actions (a buy covers a short, a sell closes a long), so a
+    result with neither ``closed_transaction_ids`` nor an ``order_id`` reads as "unknown what it
+    closed" and blocks every TP/SL adjustment of the pass. The three early failures of an ENTRY
+    closed nothing, and now say so."""
+
+    @staticmethod
+    def _assert_closed_nothing(result, message):
+        from ba2_common.core.TradeActionEvaluator import _closed_ids_or_unknown
+        from ba2_common.core.types import ExpertActionType
+
+        assert result["success"] is False
+        assert result["message"] == message
+        assert result["data"]["closed_transaction_ids"] == []
+        for action_type in (ExpertActionType.BUY, ExpertActionType.SELL):
+            assert _closed_ids_or_unknown(action_type, result["data"], set()) is False
+
+    def test_a_buy_without_a_price(self, world):
+        result = _buy(_StubAccount([], price=None)).execute()
+        self._assert_closed_nothing(result, f"Cannot get current price for {SYMBOL}")
+
+    def test_a_buy_whose_order_record_failed(self, world, monkeypatch):
+        action = _buy(_StubAccount([]))
+        monkeypatch.setattr(action, "create_order_record", lambda **k: None)
+        self._assert_closed_nothing(action.execute(), "Failed to create order record")
+
+    def test_a_short_entry_whose_order_record_failed(self, world, monkeypatch):
+        world.configure(True)
+        action = _sell(_StubAccount([]))
+        monkeypatch.setattr(action, "create_order_record", lambda **k: None)
+        self._assert_closed_nothing(action.execute(), "Failed to create order record")

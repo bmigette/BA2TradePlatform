@@ -281,9 +281,14 @@ def test_execution_persists_once_and_recovers_partial_top_rows(monkeypatch, gate
 
 
 def test_generated_settings_are_recognized_by_actual_experts():
+    # A RETIRED builtin (allow_hedging, still in the 2026-09-07 baseline snapshot) is
+    # known-and-ignored, exactly as runtime.execute_ready treats it. The snapshot keeps carrying
+    # it on purpose: stripping it would re-hash every job name and orphan in-flight resumes.
+    from ba2_common.core.interfaces.MarketExpertInterface import RETIRED_EXPERT_SETTINGS
     for job in P.build_manifest()["jobs"]:
         expert = getattr(importlib.import_module("ba2_experts." + job["expert"]), job["expert"])
-        known = set(expert.get_merged_settings_definitions())
+        known = set(expert.get_merged_settings_definitions()) | RETIRED_EXPERT_SETTINGS
+        assert not RETIRED_EXPERT_SETTINGS & set(expert.get_merged_settings_definitions())
         config = job["optimization_config"]
         assert set(config["backtest"]["experts"][0]["settings"]) <= known
         assert set(config["expert_params"]) <= known

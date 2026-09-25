@@ -1404,10 +1404,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             # SHORT position (qty < 0) conflicts with SELL entry order (would add to short instead of opening new)
                             if position_qty > 0 and order_side == OrderDirection.SELL:
                                 logger.error(f"Cannot open SHORT position for {trading_order.symbol}: LONG position of {position_qty} shares already exists at broker")
-                                raise ValueError(f"Cannot open SHORT position for {trading_order.symbol}: Existing LONG position of {position_qty} shares would be closed instead. Close all existing positions first or enable hedging.")
+                                raise ValueError(f"Cannot open SHORT position for {trading_order.symbol}: Existing LONG position of {position_qty} shares would be closed instead. Close all existing positions first.")
                             elif position_qty < 0 and order_side == OrderDirection.BUY:
                                 logger.error(f"Cannot open LONG position for {trading_order.symbol}: SHORT position of {position_qty} shares already exists at broker")
-                                raise ValueError(f"Cannot open LONG position for {trading_order.symbol}: Existing SHORT position of {position_qty} shares would be closed instead. Close all existing positions first or enable hedging.")
+                                raise ValueError(f"Cannot open LONG position for {trading_order.symbol}: Existing SHORT position of {position_qty} shares would be closed instead. Close all existing positions first.")
                             
                             logger.debug(f"Entry order check passed: {order_side.value} order compatible with existing position qty={position_qty}")
                     except Exception as e:

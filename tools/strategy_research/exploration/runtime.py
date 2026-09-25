@@ -386,7 +386,11 @@ def execute_ready(job, database, *, resume=False):
     expert_cls = expert_class(job["expert"])
     definitions = expert_cls.get_merged_settings_definitions()
     settings = job["optimization_config"]["backtest"]["experts"][0]["settings"]
-    unknown = (set(settings) | set(job["optimization_config"]["expert_params"])) - set(definitions)
+    # A RETIRED builtin (e.g. allow_hedging, still in the 2026-09-07 baseline snapshot) is
+    # known-and-ignored: nothing reads it, and refusing it would refuse every snapshot job.
+    from ba2_common.core.interfaces.MarketExpertInterface import RETIRED_EXPERT_SETTINGS
+    unknown = ((set(settings) | set(job["optimization_config"]["expert_params"]))
+               - set(definitions) - RETIRED_EXPERT_SETTINGS)
     if unknown:
         raise ValueError(f"Unknown expert settings: {sorted(unknown)}")
     collect_param_space(SimpleNamespace(**job["strategy"]), job["optimization_config"]["expert_params"])

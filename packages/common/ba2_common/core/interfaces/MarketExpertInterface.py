@@ -25,6 +25,16 @@ CAPITAL_MAPPING_DOLLAR_KEYS = frozenset({
     "available_balance", "equivalent_unlevered_balance",
 })
 
+#: Builtin settings that were REMOVED from the definitions but may still sit in stored rows
+#: (expertsetting, exports, research snapshots). Nothing reads them; the settings loader keeps
+#: them as undeclared keys, export/import carries them inertly, and a strict "unknown setting"
+#: check (the research runner's) must treat them as known-and-ignored rather than refuse a job.
+#:
+#: ``allow_hedging``: replaced by the NETTING rule (equity short selling, 2026-09-25). A US
+#: equity account nets per symbol, so an order opposite to an open position only reduces or
+#: closes it. Every stored value was false, which is exactly that rule.
+RETIRED_EXPERT_SETTINGS = frozenset({"allow_hedging"})
+
 
 class _Unset:
     """The "caller passed nothing" sentinel for the capital-mapping ``balances`` argument.
@@ -210,10 +220,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow sell orders for this expert"
                 },
-                "allow_hedging": {
-                    "type": "bool", "required": False, "default": False,
-                    "description": "Allow opening positions in opposite direction when a position already exists (hedging)"
-                },
+                # No hedging permission: see RETIRED_EXPERT_SETTINGS (netting rule).
                 "allow_automated_trade_opening": {
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic opening of new trading positions"

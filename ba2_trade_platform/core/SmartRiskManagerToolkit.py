@@ -26,6 +26,7 @@ from .interfaces import MarketExpertInterface
 # import paths are literally the same object -- either spelling would do.)
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from .TransactionHelper import TransactionHelper
+from .SmartRiskManagerPrompts import NETTING_RULE_SENTENCE
 
 
 class SmartRiskManagerToolkit:
@@ -2128,21 +2129,20 @@ class SmartRiskManagerToolkit:
                             "direction": direction
                         }
                     else:
-                        # Opposite direction - check if hedging is allowed
-                        allow_hedging = self.expert.get_setting_with_interface_default("allow_hedging")
-                        if not allow_hedging:
-                            return {
-                                "success": False,
-                                "message": f"Cannot open {direction} position: An open {existing_direction.value} position already exists for {symbol} (transaction_id={existing_transaction.id}). Hedging is disabled. Enable 'Allow hedging' in expert settings or close the existing position first.",
-                                "transaction_id": existing_transaction.id,
-                                "order_id": None,
-                                "symbol": symbol,
-                                "quantity": quantity,
-                                "direction": direction
-                            }
-                        # Hedging is allowed - continue with position opening
-                        logger.info(f"Hedging enabled: Opening {direction} position while {existing_direction.value} position exists for {symbol}")
-            
+                        # Opposite direction. NETTING RULE: a US equity account nets per
+                        # symbol, so an order opposite to an open position only reduces or
+                        # closes it; a new position in the other direction opens only from
+                        # flat. Refuse and point at the close/reduce tools.
+                        return {
+                            "success": False,
+                            "message": f"Cannot open {direction} position: An open {existing_direction.value} position already exists for {symbol} (transaction_id={existing_transaction.id}). {NETTING_RULE_SENTENCE}. Use close_position or adjust_quantity on transaction {existing_transaction.id} instead.",
+                            "transaction_id": existing_transaction.id,
+                            "order_id": None,
+                            "symbol": symbol,
+                            "quantity": quantity,
+                            "direction": direction
+                        }
+
             # Check if symbol is enabled in expert settings
             # Skip check for dynamic/expert/screener instrument selection modes (runtime-determined)
             enabled_instruments = self.expert.get_enabled_instruments()
@@ -2653,8 +2653,8 @@ class SmartRiskManagerToolkit:
         Get aggregated buy/sell quantities per symbol across ALL experts on the account.
         
         This provides visibility into overall market exposure and helps identify:
-        - Excessive one-directional exposure when hedging is disabled
-        - Potential hedging conflicts when hedging is enabled
+        - Excessive one-directional exposure
+        - Symbols where an opposite order would only reduce or close a position (netting)
         - Overall portfolio bias (long vs short)
         
         Includes both FILLED positions and PENDING orders (not yet filled).
