@@ -67,7 +67,7 @@ __all__ = [
     "overrides_version_for",
 ]
 
-OVERRIDES_VERSION = "2026-09-23.2"
+OVERRIDES_VERSION = "2026-09-25.1"
 
 #: An anchor close may differ from the recorded one by at most this fraction (0.1%).
 ANCHOR_TOLERANCE = 0.001
@@ -135,6 +135,32 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
                   ((_A2020, 40.18),), _SCCO_EVIDENCE + ". FMP closes 2025-10-20..2025-11-11 "
                   "already carry this adjustment (16 sessions ~0.85% off after the fix, below "
                   "the 5% guard tolerance); accepted"),
+    # ---- stage-2 universe, measured 2026-09-25 (parity spot of the nearest expiry / FMP close x
+    # factor, every session 2020-2025; tests/test_split_basis_overrides_stage2.py) ----------
+    BasisOverride(
+        "TRP", date(2024, 10, 2), 1.1007, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 48.0),),
+        "South Bow spin-off, ex 2024-10-02 (last pre-event session 10-01 at 1.1013, 10-02 "
+        "unevaluable, 10-03 at 1.0023); in FMP prices, not in the calendar. Parity/FMP median "
+        "1.1007 over the 60 evaluable sessions before (p10-p90 1.0875-1.1028, the low tail being "
+        "ex-dividend weeks), 1.0024 after; 2020-2023 plateau 1.096-1.101."),
+    BasisOverride(
+        "MMM", date(2024, 4, 1), 1.1971, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 150.49),),
+        "Solventum spin-off, ex 2024-04-01 (last pre-event session 03-28 at 1.1968, 04-02 at "
+        "1.0024); in FMP prices, not in the calendar. Parity/FMP median 1.1971 (p10-p90 "
+        "1.1961-1.1979) over 60 sessions before, 1.0009 after; 2020-2024 plateau 1.195-1.197."),
+    BasisOverride(
+        "SKM", date(2021, 12, 27), 1.6517, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 22.5),),
+        "SK Telecom ADR: the as-traded ADR left FMP's basis on 2021-11-30 (the calendar row "
+        "0.607, which STAYS) and returned to it on 2021-12-27, when the chain re-struck "
+        "(strikes 20.74/25.74/... first listed that day). Parity/(FMP x factor): 1.6515 over "
+        "60 sessions before 11-30 (x0.607 = 1.0025), 1.6517 over 11-30..12-23, 0.9965 from "
+        "12-29. This x1.6517 on 12-27 puts both plateaus at 1.000."),
+    BasisOverride(
+        "MTCH", date(2020, 7, 1), 3.502, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 84.19),),
+        "The 2020-07-01 row 1751/500 is IAC's separation ratio; FMP's MTCH closes before it are "
+        "the OLD Match Group's own price, never adjusted by it. Parity (MTCH root) / (FMP x "
+        "3.502) = 0.2848 over 60 sessions before (p10-p90 0.2828-0.2857: 0.9974 without the "
+        "row), 1.0000 after. Not a root change: IAC's chain / FMP is 2.65-3.17, not constant."),
 )
 
 
