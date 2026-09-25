@@ -31,6 +31,7 @@ from datetime import date, datetime, timedelta
 import pytest
 
 from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.types import OrderDirection, OrderRecommendation, OrderStatus, Recommendation
 
@@ -208,7 +209,7 @@ def _run(key, spot, account_id, *, lot_size="authored"):
             price_source=ps,
             config={"start_date": START, "end_date": END, "enabled_instruments": [SYMBOL],
                     "seed": 42},
-            indicator_provider=None)
+            indicator_provider=NoAtrIndicatorProvider())   # None = the real FMP provider
         engine.run()
         executed = [o for o in orders_where(account_id=account_id)
                     if o.status in OrderStatus.get_executed_statuses()]

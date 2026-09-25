@@ -22,6 +22,7 @@ Run from the backend dir:
 from __future__ import annotations
 
 from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 import logging
 import os
 import tempfile
@@ -48,11 +49,16 @@ OPX = "OPX"
 OPX_SPOT = 50.0
 OPX_CALL = f"OPX{EXPIRY:%y%m%d}C00050000"
 OPX_PUT = f"OPX{EXPIRY:%y%m%d}P00048000"
-#: The EQUITY-entry symbol (the expert is lukewarm on it -> the equity rule fires). Cheap, so a
-#: whole 100-share lot fits any per-instrument cap on $100k (the covered-call overlay needs it).
+#: The EQUITY-entry symbol (the expert is lukewarm on it -> the equity rule fires). Priced so
+#: the RM's 10% per-instrument cap on $100k affords an ODD lot -- $10,000 / $18.60 = 537.6 ->
+#: 537 shares -- so a whole-lot fill (500) is the ``lot_size`` constraint at work, never
+#: arithmetic. (At the old $20 spot the cap afforded exactly 500 and the round-lot assertion
+#: passed whether or not ``lot_size`` applied.)
 CCX = "CCX"
-CCX_SPOT = 20.0
-CCX_CALL = f"CCX{EXPIRY:%y%m%d}C00021000"
+CCX_SPOT = 18.60
+CCX_CALL = f"CCX{EXPIRY:%y%m%d}C00019500"
+#: The RM's per-instrument cap (the default expert setting) as a fraction of $100k.
+CAP_FRACTION = 0.10
 
 CONFIDENCE = {OPX: 90.0, CCX: 60.0}
 
@@ -85,7 +91,7 @@ def _contract(occ, underlying, right, strike, px):
 
 
 _CONTRACTS = [(OPX_CALL, OPX, "call", 50.0, 2.0), (OPX_PUT, OPX, "put", 48.0, 1.0),
-              (CCX_CALL, CCX, "call", 21.0, 0.60)]
+              (CCX_CALL, CCX, "call", 19.5, 0.60)]
 
 
 def _bar_rows():
@@ -209,7 +215,7 @@ def _run(account_id, entry_rules, exit_rules=()):
                   "seed": 42}
         engine = DailyBacktestEngine(
             account=account, experts=[(expert, account_id, expert.settings, enter_id)],
-            price_source=ps, config=config, indicator_provider=None)
+            price_source=ps, config=config, indicator_provider=NoAtrIndicatorProvider())
         engine.run()
         return list(orders_where(account_id=account_id)), account
     finally:
@@ -333,7 +339,13 @@ def test_a_covered_call_member_and_a_csp_member_coexist(rm_spy):
     assert OPX not in rm_spy
 
     shares = _executed(_stock_orders(orders, CCX))
-    assert shares and (shares[0].filled_qty or shares[0].quantity) % 100 == 0
+    unrounded = int(100_000.0 * CAP_FRACTION // CCX_SPOT)
+    assert unrounded == 537, "fixture drift: the cap must afford an ODD lot"
+    assert shares, "the O_CC-style member bought no CCX shares"
+    bought = shares[0].filled_qty or shares[0].quantity
+    assert bought == 500, (
+        f"the round lot did not apply: bought {bought} shares, the cap alone affords "
+        f"{unrounded}, whole 100-share lots give 500")
     written = [o for o in _executed(_option_orders(orders, CCX)) if o.side is OrderDirection.SELL]
     assert len(written) == 1, (
         f"the covered-call overlay should write exactly one call on CCX, got {len(written)}")
