@@ -820,6 +820,11 @@ class DailyBacktestEngine:
         # worker across individuals -- clear it so the next trial cannot inherit this run's last
         # bar before its own first set_stressed.
         reset_stressed()
+        # Task 13: the same ledger check once more at run end (open_at_end rows are priced from
+        # the transactions, the final equity from the ledger).
+        if (hasattr(self.account, "check_option_ledger")
+                and getattr(self.account, "has_options_provider", False)):
+            self.account.check_option_ledger(context="run end")
         return self._build_minimal_results()
 
     def _has_activity(self) -> bool:
@@ -1624,6 +1629,11 @@ class DailyBacktestEngine:
         as_of_date = as_of.date() if isinstance(as_of, datetime) else as_of
         settled_any = False
         positions = self.account.get_option_positions()
+        # Task 13: the lot ledger must agree with this view BEFORE it is settled (the view is
+        # what expiry acts on, the ledger what the mark/margin/cover read). Loud on mismatch;
+        # never repaired here. Reuses the view just read -- no extra query.
+        if hasattr(self.account, "check_option_ledger"):
+            self.account.check_option_ledger(positions, context=f"expiry pass {as_of_date}")
 
         # DEFINED-RISK multi-leg combos (butterfly / verticals / iron condor) must settle as a
         # UNIT — leg-by-leg share assignment does NOT preserve the combo's bounded payoff and

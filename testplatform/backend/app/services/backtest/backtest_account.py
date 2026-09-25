@@ -1964,20 +1964,41 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     premium = max(bounds[0], premium)
         if premium is None:
             return False
-        txn = self._option_transaction_for_contract(lot.contract_symbol)
         contracts = abs(lot.qty)
         multiplier = lot.multiplier
+        # WHICH transactions the buy-back closes (Task 13). The lot is per CONTRACT; two OPENED
+        # transactions can hold the same contract. Booking the whole lot's close on the first
+        # one (what _option_transaction_for_contract returns) over-closed it and left the other
+        # OPENED with contracts the ledger no longer holds -- an orphan whose view kept being
+        # settled and exited. So the close is DISTRIBUTED: each holding transaction gets a
+        # close of exactly what it holds. With one holder (every run without a shared
+        # contract) this is the old single booking, unchanged.
+        holdings = [(t, q) for t, q in self._open_option_holdings(lot.contract_symbol)
+                    if (q < 0) == (lot.qty < 0)]
+        if not holdings:
+            txn = self._option_transaction_for_contract(lot.contract_symbol)
+            holdings = [(txn, lot.qty)] if txn is not None else []
+        booked = sum(abs(q) for _t, q in holdings)
+        if holdings and abs(booked - contracts) > 1e-9:
+            logger.error(
+                "[backtest] margin_call_liquidation of %s: the lot holds %g contract(s) but its "
+                "OPENED transactions hold %g -- the option ledger and the transaction view "
+                "disagree (see the ledger consistency check). Each transaction is closed for "
+                "what it holds; the difference has no transaction to book on.",
+                lot.contract_symbol, contracts, booked)
         # Buying back a short lot DEBITS cash (premium x contracts x multiplier).
         self._cash -= contracts * float(premium) * multiplier
-        if txn is not None:
+        for txn, held in holdings:
             # Build the OptionPosition view for this leg so the close is recorded like an expiry
             # settlement (synthetic FILLED closing order for round-trip pairing).
-            pos = self._option_position_for_lot(lot, txn)
+            pos = self._option_position_for_lot(lot, txn, quantity=abs(held))
             if pos is not None:
                 self._record_option_expiry_close(
                     txn, pos, float(premium), trigger=OptionCloseReason.FORCED_LIQUIDATION)
         self._zero_option_lot(lot)
-        if txn is not None and self._all_legs_resolved(txn):
+        for txn, _held in holdings:
+            if not self._all_legs_resolved(txn):
+                continue
             from ba2_common.core.utils import close_transaction_with_logging
 
             txn.close_price = float(premium)
@@ -1995,8 +2016,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         )
         return True
 
-    def _option_position_for_lot(self, lot: "_OptionLot", txn) -> Optional[OptionPosition]:
-        """An OptionPosition describing a held lot (for recording its liquidation close)."""
+    def _option_position_for_lot(self, lot: "_OptionLot", txn,
+                                 quantity: Optional[float] = None) -> Optional[OptionPosition]:
+        """An OptionPosition describing a held lot (for recording its liquidation close) --
+        ``quantity`` contracts of it (default: the whole lot), for the part one transaction
+        holds when several share the contract."""
         o = self._lot_order(lot.contract_symbol)
         if o is None:
             return None
@@ -2007,7 +2031,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             strike=o.strike,
             expiry=o.expiry,
             side=(OrderDirection.BUY if lot.qty > 0 else OrderDirection.SELL),
-            quantity=abs(lot.qty),
+            quantity=abs(lot.qty) if quantity is None else float(quantity),
             avg_entry_price=lot.avg_price,
             multiplier=lot.multiplier,
         )
@@ -5066,7 +5090,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 self._option_order_day[row.id] = placed_on
         return trading_order
 
-    def close_option_position(self, position, order_type="limit", limit_price=None):
+    def close_option_position(self, position, order_type="limit", limit_price=None,
+                              transaction_id=None):
         """Submit a closing order for a held option position (opposite intent).
 
         Builds a single-leg ``OptionLeg`` on the same contract with the opposite side
@@ -5096,16 +5121,143 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             expiry=position.expiry,
             underlying=position.underlying,
         )
-        txn = self._option_transaction_for_contract(position.contract_symbol)
-        txn_id = getattr(txn, "id", None) if txn is not None else None
-        return self.submit_option_order(
-            legs=[leg],
-            quantity=int(position.quantity),
-            order_type=order_type,
-            limit_price=limit_price,
-            option_strategy="close",
-            transaction_id=txn_id,
-        )
+        if transaction_id is not None:
+            # An explicit id wins -- the interface contract (live AlpacaAccount does the same).
+            bookings = [(transaction_id, int(position.quantity))]
+        else:
+            bookings = self._close_bookings(position)
+        first = None
+        for txn_id, qty in bookings:
+            submitted = self.submit_option_order(
+                legs=[leg],
+                quantity=int(qty),
+                order_type=order_type,
+                limit_price=limit_price,
+                option_strategy="close",
+                transaction_id=txn_id,
+            )
+            if first is None:
+                first = submitted
+        return first
+
+    def _close_bookings(self, position) -> List[tuple]:
+        """[(transaction id, contracts)] a close of ``position`` is booked on (Task 13).
+
+        One OPENED transaction holding the contract on the position's side (every run without
+        a shared contract): that one -- the old behaviour. None: the old lookup
+        (``_option_transaction_for_contract``), which may also answer None.
+
+        SEVERAL (two transactions -- e.g. two experts, or a re-keyed lot merged at a split --
+        on one contract): the close belongs to the transaction that REQUESTED it. The shared
+        caller (``CloseOptionAction``) does not pass its transaction id; it builds the
+        position from that transaction's option order (quantity = the order's filled qty,
+        avg = its fill price), so the requester is the holder whose order -- or whose own
+        position view (open qty, transaction open price) -- has exactly those numbers. Passing
+        the id from the shared action would be the direct fix, but that is a LIVE code path
+        and is left to a separate decision; nothing here changes live.
+
+        No holder matches (a genuinely contract-level request): FIFO lot relief, the brokers
+        default -- the oldest holding transaction is closed first, one close order per
+        transaction, so each order reduces exactly the transaction it rides. FIFO rather than
+        pro-rata because it is what a broker does and keeps whole contracts per transaction.
+        The extra orders carry no exit_record (the caller stamps only the returned one) and
+        the split is logged at WARNING."""
+        long_ = position.side == OrderDirection.BUY
+        holdings = [(t, q) for t, q in self._open_option_holdings(position.contract_symbol)
+                    if (q > 0) == long_]
+        if len(holdings) <= 1:
+            txn = (holdings[0][0] if holdings
+                   else self._option_transaction_for_contract(position.contract_symbol))
+            return [(getattr(txn, "id", None) if txn is not None else None,
+                     int(position.quantity))]
+        want_qty = float(position.quantity)
+        want_px = position.avg_entry_price
+        executed = OrderStatus.get_executed_statuses()
+        for t, q in holdings:
+            views = [(abs(q), t.open_price)]
+            for o in self._orders_filtered(transaction_id=t.id):
+                if (o.contract_symbol == position.contract_symbol and o.status in executed
+                        and (o.side == OrderDirection.BUY) == long_):
+                    views.append((float(o.filled_qty or o.quantity or 0.0), o.open_price))
+            if any(abs(vq - want_qty) < 1e-9 and vp is not None and want_px is not None
+                   and abs(float(vp) - float(want_px)) < 1e-9 for vq, vp in views):
+                return [(t.id, int(position.quantity))]
+        remaining = int(position.quantity)
+        out = []
+        for t, q in holdings:
+            if remaining <= 0:
+                break
+            take = min(remaining, int(round(abs(q))))
+            if take > 0:
+                out.append((t.id, take))
+                remaining -= take
+        if remaining > 0 and out:
+            out[-1] = (out[-1][0], out[-1][1] + remaining)
+        logger.warning(
+            "[backtest] close of %s %g x %s matches none of the %d OPENED transactions holding "
+            "it: booked FIFO as %s (one close order per transaction; only the first carries "
+            "the exit record).", "long" if long_ else "short", position.quantity,
+            position.contract_symbol, len(holdings), out)
+        return out
+
+    def _open_option_holdings(self, contract_symbol: str) -> List[tuple]:
+        """[(transaction, signed contracts held)] for every OPENED transaction holding
+        ``contract_symbol``, netted over its executed option rows on that contract, in the
+        order ``transactions_where`` returns them (the order the old single lookup used)."""
+        executed = OrderStatus.get_executed_statuses()
+        net: Dict[int, float] = {}
+        for o in self.get_orders():
+            if (o.contract_symbol != contract_symbol or o.transaction_id is None
+                    or getattr(o, "asset_class", None) != AssetClass.OPTION
+                    or o.status not in executed):
+                continue
+            q = float(o.filled_qty if o.filled_qty is not None else o.quantity or 0.0)
+            net[o.transaction_id] = net.get(o.transaction_id, 0.0) + (
+                q if o.side == OrderDirection.BUY else -q)
+        if not net:
+            return []
+        return [(t, net[t.id]) for t in transactions_where(status=TransactionStatus.OPENED)
+                if abs(net.get(t.id, 0.0)) > 1e-9]
+
+    def check_option_ledger(self, positions=None, *, context: str = "") -> List[Dict[str, Any]]:
+        """Compare the option LOT ledger with the transaction view (Task 13).
+
+        Every non-zero lot in ``_option_positions`` against ``get_option_positions()`` summed
+        per contract (signed). They must agree: the lot is what the equity mark, margin,
+        covered-call cover and liquidation read; the view is what expiry settles and what the
+        exits resolve. A mismatch is an orphan (a lot no transaction holds, or a transaction
+        holding what the ledger does not), so it is logged at ERROR -- once per (contract,
+        lot qty, view qty) -- and returned. It is NOT repaired here: a silent repair would
+        hide which route produced it.
+
+        ``positions``: the view already read by the caller (the expiry pass reads it anyway),
+        else it is read here."""
+        if self._options is None:
+            return []
+        if positions is None:
+            positions = self.get_option_positions()
+        view: Dict[str, float] = {}
+        for p in positions:
+            q = float(p.quantity) * (1.0 if p.side == OrderDirection.BUY else -1.0)
+            view[p.contract_symbol] = view.get(p.contract_symbol, 0.0) + q
+        lots = {cs: float(l.qty) for cs, l in self._option_positions.items() if l.qty != 0}
+        out = []
+        for cs in sorted(set(lots) | set(view)):
+            lq, vq = lots.get(cs, 0.0), view.get(cs, 0.0)
+            if abs(lq - vq) <= 1e-9:
+                continue
+            out.append({"contract": cs, "lot_qty": lq, "view_qty": vq})
+            key = ("ledger-check", cs, round(lq, 9), round(vq, 9))
+            if key in self._split_rekey_logged:
+                continue
+            self._split_rekey_logged.add(key)
+            logger.error(
+                "[backtest] OPTION LEDGER MISMATCH (%s, %s): %s -- the lot ledger holds %+g "
+                "contract(s) but the OPENED transactions show %+g. The lot is marked, margined "
+                "and used as cover from the ledger, while expiry and exits act on the "
+                "transactions: one of them is an orphan. Not auto-repaired.",
+                context or "check", self._as_of_date(), cs, lq, vq)
+        return out
 
     def settle_option_expiry(
         self,
