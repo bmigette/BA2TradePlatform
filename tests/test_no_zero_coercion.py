@@ -388,7 +388,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:2135":
+    "packages/common/ba2_common/core/TradeActions.py:2197":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
@@ -417,7 +417,8 @@ ALLOWLIST: dict = {
         "rewrote SellAction/BuyAction above it (+201); :2032 after the S1 review fixes "
         "(side classification, filled-quantity guard, shared expert id); :2041 after TP/SL "
         "direction moved to _position_is_long (+9); :2135 after the close percent + permission "
-        "matrix (_close_own_position, buying_enabled) rewrote SellAction/BuyAction above it",
+        "matrix (_close_own_position, buying_enabled) rewrote SellAction/BuyAction above it; :2197 "
+        "after the be1a0aab review fixes (partial-close refusals, FIFO plan) grew them",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",

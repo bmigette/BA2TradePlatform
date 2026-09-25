@@ -222,10 +222,11 @@ class TradeAction(ABC):
         """This expert's WAITING/OPENED EQUITY transactions in this symbol, or None when the
         action has no expert (a manual action: nothing is owned, so nothing can be netted).
 
-        EQUITY only, unlike ``get_expert_position``: an option Transaction's ``symbol`` is the
-        UNDERLYING and its quantity is a contract count, so summing it into a share position
-        would make a covered call read as a short. A read failure propagates -- the callers
-        decide an order's direction on this and must not guess.
+        EQUITY only (``get_expert_position`` reads its share position from this list too): an
+        option Transaction's ``symbol`` is the UNDERLYING and its quantity is a contract count,
+        so counting it as shares would make a covered call read as a short. A read failure
+        propagates -- the netting callers decide an order's direction on this and must not guess
+        (``get_expert_position`` catches it and returns None).
 
         The expert is found the same way ``resolve_expert`` finds it (``_owning_expert_id``)."""
         expert_id = self._owning_expert_id()
@@ -342,8 +343,16 @@ class TradeAction(ABC):
         reduced through ``account.reduce_transaction``. A percent that rounds to zero shares is
         refused. The broker must hold at least what is traded, so the order can never pass
         through zero and flip the position."""
-        pct = 100.0 if self.close_percent is None else float(self.close_percent)
-        if not (1.0 <= pct <= 100.0):
+        if self.close_percent is None:
+            pct = 100.0
+        else:
+            try:
+                pct = float(self.close_percent)
+            except (TypeError, ValueError):
+                return self._refused(action_type, (
+                    f"{what} for {self.instrument_name}: the close percent must be a number "
+                    f"1..100, got {self.close_percent!r}"), percent=repr(self.close_percent))
+        if not (math.isfinite(pct) and 1.0 <= pct <= 100.0):
             return self._refused(action_type, (
                 f"{what} for {self.instrument_name}: the close percent must be 1..100, got "
                 f"{self.close_percent!r}"), percent=self.close_percent)
@@ -354,7 +363,9 @@ class TradeAction(ABC):
         held_at_broker = broker_qty if is_long else -broker_qty
         filled = self._open_filled_quantity(transactions)
         full = pct >= 100.0
-        quantity = filled if full else float(math.floor(filled * pct / 100.0))
+        # Rounded before the floor: 375 x 18.4 / 100 is 68.99999999999999 in binary, and flooring
+        # that would sell a share less than the percent asked for.
+        quantity = filled if full else float(math.floor(round(filled * pct / 100.0, 9)))
         if not full and quantity <= 0:
             return self._refused(action_type, (
                 f"{what} for {self.instrument_name}: {pct:g}% of the {filled:g} held rounds to 0 "
@@ -368,25 +379,55 @@ class TradeAction(ABC):
         if full:
             return self._close_own_transactions(transactions, action_type, what)
 
-        ids = [t.id for t in transactions]
+        # PARTIAL close: plan the FIFO legs, and refuse -- before anything is sent -- what the
+        # partial-close facilities cannot do safely.
+        opened = sorted((t for t in transactions if t.status == TransactionStatus.OPENED),
+                        key=lambda t: t.id)
+        lots = [(t, abs(float(t.get_current_open_qty()))) for t in opened]
+        lots = [(t, net) for t, net in lots if net > 0]
+
+        def _whole(x: float) -> bool:
+            return abs(x - round(x)) < 1e-9
+
+        fractional = [t.id for t, net in lots if not _whole(net)]
+        if fractional or not _whole(filled):
+            # A broker refuses a fractional OCO, which the live trim re-arms for the remainder.
+            return self._refused(action_type, (
+                f"{what} for {self.instrument_name}: a partial close needs a whole-share "
+                f"position, but the {filled:g} held (lots {fractional or [t.id for t, _ in lots]}) "
+                f"is fractional; close it in full instead"),
+                percent=pct, fractional_transaction_ids=fractional)
+        partly_filled = [t.id for t, net in lots if abs(net - abs(float(t.quantity))) > 1e-9]
+        if partly_filled:
+            # The live trim (TransactionHelper.adjust_quantity_with_tpsl) sizes from the ORDERED
+            # quantity; on a partly filled entry that trims the wrong amount. Not changed there
+            # (Smart RM shares it): a partial close on such a lot is refused instead.
+            return self._refused(action_type, (
+                f"{what} for {self.instrument_name}: transaction(s) {partly_filled} are only "
+                f"partly filled (filled quantity differs from the ordered one); a partial close "
+                f"cannot be sized safely on them - close in full instead"),
+                percent=pct, partly_filled_transaction_ids=partly_filled)
+
+        plan = []
+        remaining = quantity
+        for t, net in lots:
+            if remaining <= 0:
+                break
+            take = min(net, remaining)
+            plan.append((t, net, take))
+            remaining -= take
+
+        ids = [t.id for t, _, _ in plan]
         if not self.submit_to_broker:
             logger.info(f"{type(self).__name__}: automated trade modification disabled - "
                         f"not closing {quantity:g} of {self.instrument_name}")
             return self.create_and_save_action_result(
                 action_type=action_type, success=True,
                 message=f"{what} deferred for {self.instrument_name} (awaiting manual review)",
-                data={"closing": True, "transaction_ids": ids, "quantity": quantity,
-                      "percent": pct, "status": "PENDING"})
-        remaining = quantity
+                data={"closing": True, "transaction_ids": ids, "closed_transaction_ids": ids,
+                      "quantity": quantity, "percent": pct, "status": "PENDING"})
         legs = []
-        for t in sorted((t for t in transactions if t.status == TransactionStatus.OPENED),
-                        key=lambda t: t.id):
-            if remaining <= 0:
-                break
-            net = abs(float(t.get_current_open_qty()))
-            if net <= 0:
-                continue
-            take = min(net, remaining)
+        for t, net, take in plan:
             if take >= net:
                 logger.info(f"{type(self).__name__}: {what.lower()} - closing transaction {t.id} "
                             f"({net:g} {self.instrument_name}) via close_transaction")
@@ -397,16 +438,25 @@ class TradeAction(ABC):
                             f"by {take:g} of {net:g} {self.instrument_name} via reduce_transaction")
                 result = self.account.reduce_transaction(t.id, take)
                 order_ids = list(result.get("close_order_ids") or [])
-            legs.append((t.id, take, result, order_ids))
-            remaining -= take
-        success = bool(legs) and all(r.get("success", False) for _, _, r, _ in legs)
+            legs.append({"transaction_id": t.id, "quantity": take,
+                         "success": bool(result.get("success", False)),
+                         "message": str(result.get("message", "")), "close_order_ids": order_ids})
+            if not legs[-1]["success"]:
+                # Stop at the first failed leg: the later ones were planned against a slice that
+                # did not happen. What was already sent is recorded below.
+                logger.error(f"{type(self).__name__}: {what.lower()} - leg on transaction {t.id} "
+                             f"failed ({legs[-1]['message']}); not sending the remaining legs")
+                break
+        success = len(legs) == len(plan) and all(leg["success"] for leg in legs)
+        sent = [leg["transaction_id"] for leg in legs]
         return self.create_and_save_action_result(
             action_type=action_type, success=success,
             message=(f"{what} for {self.instrument_name} ({pct:g}% = {quantity:g} shares): "
-                     + "; ".join(str(r.get("message", "")) for _, _, r, _ in legs)),
+                     + "; ".join(leg["message"] for leg in legs)
+                     + ("" if success else f" [stopped after {len(legs)} of {len(plan)} legs]")),
             data={"closing": True, "percent": pct, "quantity": quantity,
-                  "transaction_ids": [tid for tid, _, _, _ in legs],
-                  "close_order_ids": [oid for _, _, _, ids_ in legs for oid in ids_]})
+                  "transaction_ids": sent, "closed_transaction_ids": sent, "legs": legs,
+                  "close_order_ids": [oid for leg in legs for oid in leg["close_order_ids"]]})
 
     def _close_own_transactions(self, transactions, action_type: str, what: str) -> Dict[str, Any]:
         """Close ``transactions`` (this expert's own position) through ``close_transaction``.
@@ -428,7 +478,8 @@ class TradeAction(ABC):
             return self.create_and_save_action_result(
                 action_type=action_type, success=True,
                 message=f"{what} deferred for {self.instrument_name} (awaiting manual review)",
-                data={"closing": True, "transaction_ids": ids, "status": "PENDING"})
+                data={"closing": True, "transaction_ids": ids, "closed_transaction_ids": ids,
+                      "status": "PENDING"})
         results = []
         for t in transactions:
             logger.info(f"{type(self).__name__}: {what.lower()} - closing transaction {t.id} "
@@ -439,7 +490,7 @@ class TradeAction(ABC):
             action_type=action_type, success=success,
             message=(f"{what} for {self.instrument_name}: "
                      + "; ".join(str(r.get("message", "")) for r in results)),
-            data={"closing": True, "transaction_ids": ids,
+            data={"closing": True, "transaction_ids": ids, "closed_transaction_ids": ids,
                   "close_order_ids": [r.get("close_order_id") for r in results]})
 
     def _build_order_data(self, expert_recommendation_id: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -660,7 +711,10 @@ class SellAction(TradeAction):
     * this expert LONG  -> CLOSE ``percent`` (1..100, default 100) of the long through
       ``close_transaction`` / ``reduce_transaction``: whole shares, capped at what is held,
       never flips, never sized as an entry. Needs ``enable_buy`` (the permission that opened
-      the long), whatever ``enable_sell`` says;
+      the long), whatever ``enable_sell`` says. A PERCENT RULE RE-TRIMS EVERY TIME IT MATCHES:
+      50% on 100 shares sells 50, the next matching pass sells 25 of the 50 left, then 12... --
+      the rule's own conditions must gate it (e.g. a one-shot profit level), nothing else does.
+      A partial close is refused on a fractional or a partly filled position (close in full);
     * this expert SHORT -> refused (a sell would add to the short);
     * long AND short (a legacy hedge) -> refused;
     * this expert flat but the BROKER long (another expert's position) -> refused: the sell
@@ -817,7 +871,8 @@ class BuyAction(TradeAction):
 
     * this expert SHORT -> COVER ``percent`` (1..100, default 100) of the short, exactly as a
       sell closes a long (``TradeAction._close_own_position``). Needs ``enable_sell`` (the
-      permission that opened the short), whatever ``enable_buy`` says;
+      permission that opened the short), whatever ``enable_buy`` says. Like the sell, a
+      percent rule re-trims every time it matches (100 -> 50 -> 25): gate it by its conditions;
     * long AND short (a legacy hedge) -> refused;
     * flat or long -> unchanged: a PENDING buy the risk manager sizes (and gates on enable_buy).
       ``percent`` does not apply to an entry.
@@ -993,7 +1048,8 @@ class CloseAction(TradeAction):
                         action_type=ExpertActionType.CLOSE.value,
                         success=True,
                         message=f"Close action deferred for {self.instrument_name} (awaiting manual review)",
-                        data={"transaction_id": transaction_id, "status": "PENDING"}
+                        data={"transaction_id": transaction_id, "status": "PENDING",
+                              "closed_transaction_ids": [transaction_id]}
                     )
 
                 logger.info(
@@ -1008,6 +1064,7 @@ class CloseAction(TradeAction):
                     message=result.get("message", "Unknown result"),
                     data={
                         "transaction_id": transaction_id,
+                        "closed_transaction_ids": [transaction_id],
                         "close_order_id": result.get("close_order_id"),
                         "canceled_count": result.get("canceled_count", 0),
                         "deleted_count": result.get("deleted_count", 0),
@@ -1238,7 +1295,12 @@ class _AdjustPriceLevelAction(TradeAction):
             txn_id = getattr(order, "transaction_id", None)
             if txn_id:
                 from ba2_common.core.models import Transaction
-                txn = get_instance(Transaction, txn_id)
+                try:
+                    txn = get_instance(Transaction, txn_id)
+                except InstanceNotFound:
+                    # get_instance RAISES on a missing row (it never returns None): fall through
+                    # to the recommendation rather than failing the adjustment.
+                    txn = None
                 if txn is not None:
                     return stop_is_long_position(txn), f"transaction {txn_id} side"
         if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):

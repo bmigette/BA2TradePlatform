@@ -457,6 +457,11 @@ class TradeActionEvaluator:
         """
         action_results = []
         created_order_ids = []  # Track orders created during this execution
+        # Transactions a Phase-1 action in THIS pass closed or reduced (a closing sell/buy, a
+        # CloseAction, a partial trim). Phase 2 must never adjust their TP/SL: the close is in
+        # flight, and re-arming exit legs on it cancels a pending partial close at the broker
+        # (AlpacaAccount._handle_filled_entry_exit) or stages exit legs on a closing position.
+        closed_or_reduced_txn_ids = set()
         
         # Store the submit_to_broker flag for use by actions
         self.submit_to_broker = submit_to_broker
@@ -580,6 +585,12 @@ class TradeActionEvaluator:
                         additional_data=result_dict.get('data', {})
                     )
                     
+                    # Closed/reduced transactions, whatever the outcome: a failed leg may still
+                    # have cancelled legs or sent part of the close.
+                    for _tid in ((result_dict.get('data') or {}).get('closed_transaction_ids') or []):
+                        if _tid is not None:
+                            closed_or_reduced_txn_ids.add(_tid)
+
                     # Capture created order ID for use in phase 2
                     if result_dict['success'] and result_dict.get('data', {}).get('order_id'):
                         created_order_ids.append(result_dict['data']['order_id'])
@@ -661,7 +672,30 @@ class TradeActionEvaluator:
                                 exc_info=True
                             )
 
-                if not orders_to_adjust:
+                if closed_or_reduced_txn_ids:
+                    kept = []
+                    for _order in orders_to_adjust:
+                        if getattr(_order, 'transaction_id', None) in closed_or_reduced_txn_ids:
+                            logger.info(
+                                f"Phase 2 - skipping TP/SL adjustment of transaction "
+                                f"{_order.transaction_id} ({self.instrument_name}): this pass "
+                                f"closed or reduced the position")
+                            action_results.append({
+                                "action_type": ExpertActionType.ADJUST_STOP_LOSS,
+                                "success": True,
+                                "message": (f"TP/SL adjustment skipped for {self.instrument_name}: "
+                                            f"this pass closed or reduced the position"),
+                                "data": {"transaction_id": _order.transaction_id,
+                                         "skipped": "closed_or_reduced_this_pass"},
+                                "description": "TP/SL adjustment skipped (position closed/reduced)",
+                            })
+                        else:
+                            kept.append(_order)
+                    if not kept:
+                        adjustment_actions = []
+                    orders_to_adjust = kept
+
+                if not orders_to_adjust and adjustment_actions:
                     error_msg = (
                         f"No orders available for TP/SL adjustments for {self.instrument_name or 'unknown'} "
                         f"(created_orders: {len(created_order_ids)}, existing_transactions: {len(self.existing_transactions)})"

@@ -2305,6 +2305,12 @@ class AccountInterface(ReadOnlyAccountInterface):
         if quantity >= net:
             return (f"a partial close of {quantity:g} is not below the {net:g} held on transaction "
                     f"{transaction.id}; a full close is close_transaction's job")
+        if abs(net - abs(float(transaction.quantity))) > 1e-9:
+            # The live trim (TransactionHelper.adjust_quantity_with_tpsl) sizes the remainder
+            # from the ORDERED quantity; on a partly filled entry that is the wrong number.
+            return (f"transaction {transaction.id} is only partly filled ({net:g} filled of "
+                    f"{abs(float(transaction.quantity)):g} ordered); a partial close cannot "
+                    f"be sized safely - close it in full")
         return None
 
     def close_transaction(self, transaction_id: int) -> dict:

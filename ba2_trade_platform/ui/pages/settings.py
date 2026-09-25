@@ -5779,9 +5779,15 @@ class TradeSettingsTab:
                         # sell closes its long, trade this % of the position (whole shares).
                         # Empty = 100% (a full close). An entry ignores it.
                         with action_value_container:
+                            # Prefill ONLY from a saved buy/sell row: switching a row from an
+                            # adjust action must not carry its offset (-8) in as a close percent.
+                            saved_type = (action_config.get('action_type', action_config.get('type'))
+                                          if action_config else None)
+                            prefill = (str(action_config.get('value', ''))
+                                       if saved_type == selected_type else '')
                             value_input = ui.input(
                                 label='Close % (optional)',
-                                value=str(action_config.get('value', '')) if action_config else '',
+                                value=prefill,
                                 placeholder='100 = full close'
                             ).classes('w-40').props('dense')
                     elif selected_type and is_share_adjustment_action(selected_type):

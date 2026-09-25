@@ -738,3 +738,155 @@ class TestClosePercent:
             plain = ev._create_trade_action(at, {"action_type": at.value}, SYMBOL,
                                             OrderRecommendation.SELL, None, _rec())
             assert plain.close_percent is None
+
+
+# --------------------------------------------------------------------------- #
+# review fixes of be1a0aab: what a partial close refuses, and how it stops
+# --------------------------------------------------------------------------- #
+
+class TestPartialCloseRefusals:
+    def _long(self, world, qty=100.0, filled=None, broker=None):
+        world.configure(True)
+        txn_id = _hold(OrderDirection.BUY, qty, filled=filled)
+        held = qty if filled is None else filled
+        return txn_id, _StubAccount([{"symbol": SYMBOL, "qty": held if broker is None else broker}])
+
+    @pytest.mark.parametrize("bad", ["half", "", [50], {"p": 50}])
+    def test_a_non_numeric_percent_is_refused_not_raised(self, world, bad):
+        txn_id, account = self._long(world)
+        action = _sell(account)
+        action.close_percent = bad
+        result = action.execute()
+        assert result["success"] is False and "must be a number" in result["message"]
+        assert account.closed == [] and account.reduced == []
+
+    def test_nan_is_refused(self, world):
+        txn_id, account = self._long(world)
+        action = _sell(account)
+        action.close_percent = float("nan")
+        assert action.execute()["success"] is False
+        assert account.closed == [] and account.reduced == []
+
+    def test_a_partly_filled_lot_refuses_a_partial_close(self, world):
+        """100 ordered, 60 filled: the live trim sizes from the ORDERED quantity, so a partial
+        close is refused (TransactionHelper is shared with Smart RM and left unchanged)."""
+        txn_id, account = self._long(world, 100.0, filled=60.0)
+        action = _sell(account)
+        action.close_percent = 50
+        result = action.execute()
+        assert result["success"] is False and "partly filled" in result["message"]
+        assert result["data"]["partly_filled_transaction_ids"] == [txn_id]
+        assert account.closed == [] and account.reduced == []
+
+    def test_a_partly_filled_lot_still_closes_in_full(self, world):
+        txn_id, account = self._long(world, 100.0, filled=60.0)
+        assert _sell(account).execute()["success"] is True
+        assert account.closed == [txn_id]
+
+    def test_a_fractional_position_refuses_a_partial_close(self, world):
+        txn_id, account = self._long(world, 10.5)
+        action = _sell(account)
+        action.close_percent = 50
+        result = action.execute()
+        assert result["success"] is False and "fractional" in result["message"]
+        assert account.closed == [] and account.reduced == []
+
+    def test_a_fractional_position_still_closes_in_full(self, world):
+        txn_id, account = self._long(world, 10.5)
+        assert _sell(account).execute()["success"] is True
+        assert account.closed == [txn_id]
+
+    def test_one_fractional_lot_refuses_even_when_the_total_is_whole(self, world):
+        world.configure(True)
+        _hold(OrderDirection.BUY, 4.5)
+        _hold(OrderDirection.BUY, 5.5)
+        account = _StubAccount([{"symbol": SYMBOL, "qty": 10.0}])
+        action = _sell(account)
+        action.close_percent = 50
+        result = action.execute()
+        assert result["success"] is False and "fractional" in result["message"]
+
+    def test_the_float_floor_edge(self, world):
+        """375 x 18.4 / 100 is 68.99999999999999 in binary: 18.4% of 375 must sell 69, not 68."""
+        txn_id, account = self._long(world, 375.0)
+        action = _sell(account)
+        action.close_percent = 18.4
+        assert action.execute()["success"] is True
+        assert account.reduced == [(txn_id, 69.0)]
+
+
+class TestFifoStopsAtTheFirstFailedLeg:
+    def test_a_failed_close_stops_the_remaining_legs(self, world):
+        world.configure(True)
+        a, b = _hold(OrderDirection.BUY, 4.0), _hold(OrderDirection.BUY, 6.0)
+
+        class _FailingFirst(_StubAccount):
+            def close_transaction(self, transaction_id):
+                self.closed.append(transaction_id)
+                return {"success": False, "message": "broker said no", "close_order_id": None}
+
+        account = _FailingFirst([{"symbol": SYMBOL, "qty": 10.0}])
+        action = _sell(account)
+        action.close_percent = 50               # 5 = lot a (4) whole + 1 of lot b
+        result = action.execute()
+        assert result["success"] is False
+        assert account.closed == [a] and account.reduced == [], "must stop at the failed leg"
+        assert [leg["transaction_id"] for leg in result["data"]["legs"]] == [a]
+        assert result["data"]["legs"][0]["success"] is False
+        assert result["data"]["closed_transaction_ids"] == [a]
+        assert "stopped after 1 of 2 legs" in result["message"]
+
+
+class TestLiveReduceTransactionDefault:
+    """I1: the live AccountInterface.reduce_transaction delegates to the shared partial-close
+    facility with a NEGATIVE quantity change and maps its orders_created."""
+
+    def test_delegation_sign_and_mapping(self, world, monkeypatch):
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        txn_id = _hold(OrderDirection.BUY, 100.0)
+        account = _StubAccount([])
+        calls = []
+
+        def fake(acct, transaction, qty_change, tp_price=None, sl_price=None, expert_id=None):
+            calls.append((acct, transaction.id, qty_change, expert_id))
+            return {"success": True, "message": "trimmed", "orders_created": [11, 12],
+                    "orders_canceled": [3]}
+
+        monkeypatch.setattr(TransactionHelper, "adjust_quantity_with_tpsl", staticmethod(fake))
+        result = AccountInterface.reduce_transaction(account, txn_id, 30.0)
+        assert calls == [(account, txn_id, -30.0, EXPERT_ID)]
+        assert result == {"success": True, "message": "trimmed", "close_order_ids": [11, 12]}
+
+    @pytest.mark.parametrize("qty, filled, want", [
+        (100.0, None, "not below"),       # a full close is close_transaction's job
+        (0, None, "positive quantity"),
+        (30.0, 60.0, "partly filled"),    # I2 at the account seam too
+    ])
+    def test_refusals_never_reach_the_facility(self, world, monkeypatch, qty, filled, want):
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        txn_id = _hold(OrderDirection.BUY, 100.0, filled=filled)
+        monkeypatch.setattr(TransactionHelper, "adjust_quantity_with_tpsl",
+                            staticmethod(lambda *a, **k: pytest.fail("reached the facility")))
+        result = AccountInterface.reduce_transaction(_StubAccount([]), txn_id, qty)
+        assert result["success"] is False and want in result["message"]
+        assert result["close_order_ids"] == []
+
+    def test_an_option_transaction_is_refused(self, world, monkeypatch):
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        txn_id = add_instance(Transaction(symbol=SYMBOL, quantity=2.0, side=OrderDirection.BUY,
+                                          status=TransactionStatus.OPENED, expert_id=EXPERT_ID,
+                                          asset_class=AssetClass.OPTION))
+        monkeypatch.setattr(TransactionHelper, "adjust_quantity_with_tpsl",
+                            staticmethod(lambda *a, **k: pytest.fail("reached the facility")))
+        result = AccountInterface.reduce_transaction(_StubAccount([]), txn_id, 1.0)
+        assert result["success"] is False and "OPTION" in result["message"]
+
+
+def test_position_direction_survives_a_missing_transaction_row(world):
+    """_position_is_long's transaction fallback: get_instance RAISES on a missing row; the
+    lookup must fall through to the recommendation instead of failing the adjustment."""
+    order = SimpleNamespace(id=1, side=None, transaction_id=987654)
+    action = AdjustStopLossAction(SYMBOL, _StubAccount([]), OrderRecommendation.SELL, order,
+                                  expert_recommendation=_rec(), reference_value="current_price",
+                                  percent=-5.0)
+    assert action._position_is_long(order) == (False, "recommendation SELL (no order)")

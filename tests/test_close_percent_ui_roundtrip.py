@@ -28,6 +28,17 @@ def test_the_editor_renders_and_saves_the_field():
     src = inspect.getsource(settings)
     render = src.index("label='Close % (optional)'")
     assert "selected_type in (ExpertActionType.BUY.value, ExpertActionType.SELL.value)" in src[
-        render - 600:render]
+        render - 1200:render]
     save = src.index("Close percent must be between 1 and 100")
     assert "action_config['value'] = close_pct" in src[save:save + 300]
+
+
+def test_switching_a_row_to_buy_sell_does_not_prefill_an_adjust_offset():
+    """A row saved as adjust_stop_loss -8 and switched to sell must not show -8 as a close
+    percent: the field prefills only from a row SAVED as the selected buy/sell type."""
+    from ba2_trade_platform.ui.pages import settings
+    src = inspect.getsource(settings)
+    render = src.index("label='Close % (optional)'")
+    block = src[render - 700:render]
+    assert "if saved_type == selected_type else ''" in block
+    assert "value=prefill" in src[render:render + 120]

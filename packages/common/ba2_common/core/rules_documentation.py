@@ -644,7 +644,12 @@ def get_action_type_documentation() -> dict:
                 "Close an existing long position to take profits or cut losses",
                 "Exit the market on negative sentiment change"
             ],
-            "parameters": "Typically combined with quantity and order type settings",
+            "parameters": ("Optional Close % (1-100, empty = 100): when the sell closes this "
+                           "expert's long, only that percent of it is sold (whole shares; refused "
+                           "if it rounds to 0, or on a fractional or partly filled position). A "
+                           "percent rule RE-TRIMS EVERY TIME IT MATCHES (100 -> 50 -> 25 ...), so "
+                           "gate it with conditions that stop it matching again. Closing a long "
+                           "needs enable_buy; opening a short from flat needs enable_sell."),
             "example": "When rating changes to NEGATIVE and confidence > 70%, action: SELL"
         },
         ExpertActionType.BUY.value: {
@@ -655,7 +660,12 @@ def get_action_type_documentation() -> dict:
                 "Close an existing short position to take profits or cut losses",
                 "Enter the market on positive sentiment change"
             ],
-            "parameters": "Typically combined with quantity and order type settings",
+            "parameters": ("Optional Close % (1-100, empty = 100): when the buy covers this "
+                           "expert's short, only that percent of it is bought back (whole shares; "
+                           "refused if it rounds to 0, or on a fractional or partly filled "
+                           "position). A percent rule RE-TRIMS EVERY TIME IT MATCHES (100 -> 50 -> "
+                           "25 ...), so gate it with conditions that stop it matching again. "
+                           "Covering a short needs enable_sell; an entry ignores the percent."),
             "example": "When rating is POSITIVE and confidence > 75% and no_position, action: BUY"
         },
         ExpertActionType.CLOSE.value: {
