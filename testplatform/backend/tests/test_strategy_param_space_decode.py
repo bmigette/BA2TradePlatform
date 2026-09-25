@@ -107,36 +107,67 @@ def test_decode_schedule_days_repairs_all_off_to_first_day():
     assert sum(out["schedule_days"].values()) == 1
 
 
+
 # A daily-bar backtest has no weekend bars, so a genome whose only ON days are saturday/sunday
 # gets ZERO decision points -- a dead config exactly like all-OFF, which the old repair (fired
-# only when EVERY day was off) let through. Plan 2026-09-24 Task 5.
+# only when EVERY day was off) let through. Plan 2026-09-24 Task 5. Scoped to OPTION runs:
+# stock backtests and grids must not change behaviour, so an equity genome keeps the old rule.
 _WEEKEND_ONLY = {"schedule:monday": 0, "schedule:tuesday": 0, "schedule:wednesday": 0,
                  "schedule:thursday": 0, "schedule:friday": 0,
                  "schedule:saturday": 1, "schedule:sunday": 0}
 
 
-def test_decode_schedule_days_repairs_a_weekend_only_genome_to_monday():
-    out = decode_params(_strategy(), dict(_WEEKEND_ONLY))
-    assert out["schedule_days"]["monday"] is True
+def _option_strategy():
+    """An option strategy as the launcher builds it: the entry rule's action is an option type."""
+    return _strategy(entry_rules=[{"id": "o_lp-entry", "conditions": None,
+                                   "actions": [{"action_type": "buy_put"}],
+                                   "continue_processing": False}])
+
+
+def _on(days):
+    return [d for d, on in days.items() if on]
+
+
+def test_decode_repairs_an_option_weekend_only_genome_to_monday():
+    out = decode_params(_option_strategy(), dict(_WEEKEND_ONLY))
     # The weekend flag is left as the genome set it: the gene stays in the search space (it is
     # read by export/deploy), only the dead-config repair changes.
-    assert out["schedule_days"]["saturday"] is True
-    assert [d for d, on in out["schedule_days"].items() if on] == ["monday", "saturday"]
+    assert _on(out["schedule_days"]) == ["monday", "saturday"]
 
 
-def test_decode_schedule_days_leaves_a_genome_with_a_weekday_alone():
+def test_decode_leaves_an_equity_weekend_only_genome_exactly_as_before():
+    """Equity keeps the all-seven-off rule: the weekend-only genome decodes unrepaired and
+    goes on scoring ZERO_TRADE, as every stored equity result was scored."""
+    out = decode_params(_strategy(), dict(_WEEKEND_ONLY))
+    assert out["schedule_days"] == {
+        "monday": False, "tuesday": False, "wednesday": False, "thursday": False,
+        "friday": False, "saturday": True, "sunday": False,
+    }
+
+
+def test_decode_all_off_repair_is_unchanged_for_both_run_kinds():
+    genes = dict(_WEEKEND_ONLY, **{"schedule:saturday": 0})
+    for strat in (_strategy(), _option_strategy()):
+        assert _on(decode_params(strat, dict(genes))["schedule_days"]) == ["monday"]
+
+
+def test_decode_leaves_an_option_genome_with_a_weekday_alone():
     genes = dict(_WEEKEND_ONLY, **{"schedule:thursday": 1})
-    out = decode_params(_strategy(), genes)
-    assert [d for d, on in out["schedule_days"].items() if on] == ["thursday", "saturday"]
+    out = decode_params(_option_strategy(), genes)
+    assert _on(out["schedule_days"]) == ["thursday", "saturday"]
 
 
-def test_schedule_override_reconstruction_mirrors_the_weekend_repair():
+def test_schedule_override_reconstruction_mirrors_the_repair_per_run_kind():
     """A re-run/export reconstructs the cadence with schedule_override_from_genes; it must give
-    the same days the trial ran with, or a re-run of a weekend-only genome goes back to zero
-    decision points."""
+    the same days the trial ran with, for either run kind."""
     from app.services.strategy_param_space import schedule_override_from_genes
-    decoded = decode_params(_strategy(), dict(_WEEKEND_ONLY))["schedule_days"]
-    rebuilt = schedule_override_from_genes(dict(_WEEKEND_ONLY))
-    assert rebuilt["days"] == decoded
-    deployed = schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True)
-    assert [d for d, on in deployed["days"].items() if on] == ["monday"]
+    for strat, option_run in ((_option_strategy(), True), (_strategy(), False)):
+        decoded = decode_params(strat, dict(_WEEKEND_ONLY))["schedule_days"]
+        rebuilt = schedule_override_from_genes(dict(_WEEKEND_ONLY), option_run=option_run)
+        assert rebuilt["days"] == decoded
+        # Deploy output (weekdays_only) is Monday either way, exactly as before this change.
+        deployed = schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True,
+                                                option_run=option_run)
+        assert _on(deployed["days"]) == ["monday"]
+    # The deploy callers pass no option_run; their output must not depend on it.
+    assert schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True) ==         schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True, option_run=True)
