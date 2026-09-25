@@ -31,6 +31,8 @@ from ...core.account_types import (
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance, InstanceNotFound
+from ba2_common.core.assignment_hold import assigned_stock_entry_data
+from ba2_common.core.entry_tag import order_entry_tag
 from sqlmodel import Session, select, or_
 
 # Namespace of the external_id get_cash_transfers() mints for dividends, whether
@@ -7085,6 +7087,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if right == OptionRight.PUT and is_short:
                 # Cash-secured put assigned -> we BUY 100*contracts shares @ strike.
                 share_qty = 100.0 * contracts
+                # The delivered stock INHERITS the put's style-member tag (stage-2 E2), read
+                # BEFORE any ledger write so a corrupt stored tag refuses the whole activity.
+                # Same fact, same shared stamp as the backtest's assignment
+                # (BacktestAccount._open_assigned_stock_transaction). Untagged -> no data.
+                stock_entry_data = assigned_stock_entry_data(self._position_entry_tag(opt_txn))
                 now = datetime.now(timezone.utc)
                 equity_txn = Transaction(
                     symbol=underlying,
@@ -7107,7 +7114,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     transaction_id=equity_txn_id, symbol=underlying,
                     side=OrderDirection.BUY, shares=share_qty, price=strike,
                     contract=symbol, activity_id=activity_id, created_at=now,
-                    origin=TXN_ORIGIN_CSP_ASSIGNMENT)
+                    origin=TXN_ORIGIN_CSP_ASSIGNMENT, data=stock_entry_data)
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
                     close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
@@ -7507,6 +7514,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """
         from ...core.types import TransactionStatus
 
+        # Still the same member's stock: the remainder's entry row keeps the lot's style-member
+        # tag (stage-2 E2). Read before any write; untagged -> no data, as before.
+        remainder_entry_data = assigned_stock_entry_data(self._position_entry_tag(held))
+
         meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
         meta["split_from_transaction_id"] = held.id
         meta["split_reason"] = "called_away"
@@ -7534,7 +7545,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             comment=(f"called_away_remainder: {remainder_qty:g} of {held.symbol} kept "
                      f"after {exit_qty:g} were called away by {contract} (broker activity "
                      f"{activity_id}) — the un-called part of transaction {held.id}, "
-                     f"synthetic fill, no broker order exists"))
+                     f"synthetic fill, no broker order exists"),
+            data=remainder_entry_data)
         if entry_id is None:
             # Without the order row the remaining shares exist only as a Transaction, and
             # every share count in the platform reads orders. Say so: the split is still
@@ -7554,7 +7566,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     def _record_assignment_equity_order(self, *, transaction_id, symbol: str, side,
                                         shares: float, price, contract: str,
                                         activity_id: str, created_at, origin: str,
-                                        comment: "Optional[str]" = None) -> "Optional[int]":
+                                        comment: "Optional[str]" = None,
+                                        data: "Optional[dict]" = None) -> "Optional[int]":
         """Persist the equity ``TradingOrder`` that an option ASSIGNMENT produced.
 
         WHY THIS ROW MUST EXIST. Almost nothing in the platform reads share counts off
@@ -7605,6 +7618,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         transaction's entry order, so it can never be mistaken for the entry by the
         oldest-first resolution in ``TradeManager`` / ``has_pending_closing_order``.
 
+        ``data``: an ENTRY row's facts -- the style-member tag the delivered stock inherits
+        (``assignment_hold.assigned_stock_entry_data``, stage-2 E2). None (every untagged
+        position, i.e. every row on record) writes no data, exactly as before.
+
         IDEMPOTENCY is the caller's: this runs inside ``reconcile_option_assignments``'s
         ``OptionActivity(account_id, activity_id)`` guard, so a repeated 7-day-lookback
         batch never reaches here twice for the same activity.
@@ -7641,12 +7658,30 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                          f"{price} (broker activity {activity_id}) — synthetic fill, "
                          f"no broker order exists"),
                 created_at=created_at,
+                data=data,
             ))
         except Exception as e:
             logger.error(
                 f"[Account {self.id}] Failed to record {origin} equity order for "
                 f"{symbol} (activity {activity_id}): {e}", exc_info=True)
             return None
+
+    def _position_entry_tag(self, transaction) -> "Optional[int]":
+        """The style-member tag of ``transaction``'s position, or None (stage-2 E2).
+
+        Read off the row the live OPEN_POSITIONS pass hands ``EntryTagCondition`` as
+        ``existing_order`` (``TradeManager.resolve_entry_order``), so the tag an assignment
+        passes on is by construction the one that position's rules were scoped by. A stored
+        value no entry could have written raises (``order_entry_tag``) instead of reading as
+        untagged.
+        """
+        if transaction is None:
+            return None
+        from ...core.TradeManager import resolve_entry_order
+
+        with get_db() as session:
+            entry = resolve_entry_order(session, transaction)
+            return order_entry_tag(entry) if entry is not None else None
 
     def _entry_order_id_for_transaction(self, transaction_id: int) -> "Optional[int]":
         """Id of the transaction's oldest entry-level order (``depends_on_order IS NULL``)."""

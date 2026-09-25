@@ -83,6 +83,12 @@ from ba2_common.core.option_bs import bs_price
 from ba2_common.core import option_spread_model as _osm
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
 from ba2_common.core.trade_store import orders_where, transactions_where
+from ba2_common.core.assignment_hold import (
+    assigned_stock_entry_data,
+    holds_assigned_stock,
+    resolve_assigned_stock_hold_policy,
+)
+from ba2_common.core.entry_tag import order_entry_tag
 
 from .price_source import AsOfPriceSource
 from .options_provider import HistoricalOptionsProvider
@@ -643,9 +649,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # from an assigned naked short call). Option strategies never manage the resulting
         # stock, so process_pending_assignment_liquidations closes ALL of it at the NEXT
         # bar's open (broker post-assignment liquidation; no orphaned stock in backtests).
-        # Stays EMPTY when the run sets ``hold_assigned_stock`` — read from ``self._cfg`` at
-        # each assignment in _book_assignment_share_leg (assignments are rare; nothing is
-        # gained by caching it, and a cached copy would silently ignore a config change).
+        # Stays EMPTY for an assignment whose stock the run HOLDS -- ``hold_assigned_stock``
+        # (every assignment) or ``hold_assigned_stock_tags`` (only the listed members'; plan
+        # 2026-09-25 stage-2 E2). Decided per assignment by the SHARED
+        # ``assignment_hold.holds_assigned_stock``, reading ``self._cfg`` then (assignments are
+        # rare; nothing is gained by caching it, and a cached copy would silently ignore a
+        # config change). Resolved once HERE too, so a malformed or ambiguous policy is refused
+        # when the run is built, not at its first assignment weeks into the simulation.
+        resolve_assigned_stock_hold_policy(self._cfg)
         self._pending_assignment_sells: Dict[str, float] = {}
         # OPT-L1 exit half: (symbol, reason) pairs the PLEDGED-COVER lock has already
         # explained at ERROR in this run. The lock fires REPEATEDLY by design (a staged
@@ -781,6 +792,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "longs riding to 67-85% of final equity was the OS1 blow-up. "
                                "Only turn it on for a strategy that actually manages stock. "
                                "Defaults to False (exact no-op, pre-2026-08-27 behaviour).",
+            },
+            "hold_assigned_stock_tags": {
+                "type": "list",
+                "required": False,
+                "description": "MEMBER-SCOPED form of hold_assigned_stock (plan 2026-09-25 "
+                               "stage-2 E2): the entry tags of the style-expert members "
+                               "whose assigned stock is KEPT (the wheel). Every other "
+                               "member's assignment is liquidated at the next bar's open, as "
+                               "without the setting. Decided per assignment from the entry "
+                               "tag of the option position that was assigned; an untagged "
+                               "assignment in such a run is REFUSED (the run ends). May not "
+                               "be combined with hold_assigned_stock=True. Absent (the "
+                               "default) = hold_assigned_stock alone decides, byte-identical.",
             },
             "option_spread_min_tick": {
                 "type": "float",
@@ -965,7 +989,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for one overnight under the no-orphaned-stock policy; charging it would move every
         stored naked-short-call option backtest, which the short-selling plan forbids (no
         behaviour change for current rules). Assigned short stock a run HOLDS
-        (``hold_assigned_stock``) is a real held short and is charged.
+        (``hold_assigned_stock``, or a member listed in ``hold_assigned_stock_tags``) is a real
+        held short and is charged. The member-scoped hold keeps this consistent by
+        construction: the per-assignment decision is what fills (or does not fill)
+        ``_pending_assignment_sells``, so a liquidated member's short stock is exempt and a
+        holding member's is charged, whichever members share the run.
         """
         session = as_of.date() if isinstance(as_of, datetime) else as_of
         if session == self._borrow_session:
@@ -5535,6 +5563,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         shares: int = 0,
         share_price: Optional[float] = None,
         trigger: OptionCloseReason,
+        hold_assigned: Optional[bool] = None,
+        assigned_entry_tag: Optional[int] = None,
     ) -> bool:
         """Settle a held single-leg option position at expiry (Task 7).
 
@@ -5560,12 +5590,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Each leg is settled INDEPENDENTLY here (its own lot -> its own share conversion + its own
         closing fill for round-trip P&L); the shared transaction is closed ONLY once every leg has
         resolved (``_all_legs_resolved``), so settling the first leg does not orphan the second.
+
+        ``hold_assigned`` / ``assigned_entry_tag``: the assignment's disposition, when the caller
+        already decided it (``settle_single_leg_expiry``, which logs it); otherwise decided here
+        through ``_assignment_disposition`` -- BEFORE any write, so a refused (untagged)
+        assignment leaves the book untouched.
         """
         from ba2_common.core.utils import close_transaction_with_logging
 
         txn = self._option_transaction_for_contract(position.contract_symbol)
         if txn is None:
             return False
+        share_leg = share_side is not None and bool(shares) and share_price is not None
+        if share_leg and hold_assigned is None:
+            hold_assigned, assigned_entry_tag = self._assignment_disposition(txn)
 
         # 1. Record a synthetic CLOSING fill on THIS leg at the resolved premium (intrinsic, or 0
         #    for worthless) so round-trip P&L can pair open<->close. This moves NO cash: the option
@@ -5589,7 +5627,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         #    ITM assignment loss is real and PERSISTS. ``_book_assignment_share_leg`` also writes
         #    the delivery to the ORDER/TRANSACTION tables (OPT-B2/F7) — the ledger alone is not the
         #    book.
-        if share_side is not None and shares and share_price is not None:
+        if share_leg:
             signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
             self._cash -= signed * float(share_price)  # buy debits, sell credits — at strike.
             # THE OPTION -> STOCK BOUNDARY (plan Part E3). ``shares`` and the strike are AS
@@ -5604,7 +5642,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if k != 1.0:
                 book_qty, book_px = signed * k, float(share_price) / k
             self._book_assignment_share_leg(
-                position.underlying, book_qty, book_px, expert_id=txn.expert_id)
+                position.underlying, book_qty, book_px, expert_id=txn.expert_id,
+                hold=bool(hold_assigned), entry_tag=assigned_entry_tag)
 
         # 4. Close the SHARED transaction only once every option leg on it has resolved. For a
         #    single-leg option this is immediate; for a multi-leg spread the transaction stays
@@ -5626,8 +5665,27 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             update_instance(txn)
         return True
 
+    def _assignment_disposition(self, txn: Transaction) -> "tuple[bool, Optional[int]]":
+        """``(hold, entry_tag)`` for the assignment of ``txn``'s short leg (stage-2 E2).
+
+        ``entry_tag`` is the member tag on the option position's ENTRY order -- the row the
+        OPEN_POSITIONS pass hands ``EntryTagCondition`` (``_entry_order_for_transaction``, the
+        parent of a multi-leg structure) -- or None. ``hold`` is the SHARED decision
+        (``assignment_hold.holds_assigned_stock``): the run-level ``hold_assigned_stock`` when
+        the run names no member tags (every run before stage 2, byte-identical), else whether
+        the tag is one of ``hold_assigned_stock_tags``; an untagged position in a member-scoped
+        run raises ``UntaggedAssignmentRefused``, which ends the run (``daily_engine``).
+        """
+        entry = self._entry_order_for_transaction(txn)
+        tag = order_entry_tag(entry) if entry is not None else None
+        hold = holds_assigned_stock(
+            resolve_assigned_stock_hold_policy(self._cfg), tag,
+            where=f"[backtest] assignment of option transaction {txn.id} ({txn.symbol})")
+        return hold, tag
+
     def _book_assignment_share_leg(
-        self, symbol: str, signed: float, price: float, *, expert_id: Optional[int] = None
+        self, symbol: str, signed: float, price: float, *, expert_id: Optional[int] = None,
+        hold: Optional[bool] = None, entry_tag: Optional[int] = None,
     ) -> None:
         """Apply an assignment's SHARE delivery to the ledger AND to the order/transaction book.
 
@@ -5657,8 +5715,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             the next-bar orphan liquidation — scheduling the full assignment would sell down
             an unrelated lot the strategy still owns.
 
-        ``hold_assigned_stock`` (run setting, DEFAULT OFF) suppresses ONLY that last
-        scheduling step. Everything else about an assignment — the cash at the strike, the
+        ``hold`` (the assignment's disposition, ``_assignment_disposition``: the run setting
+        ``hold_assigned_stock``, DEFAULT OFF, or the member-scoped ``hold_assigned_stock_tags``)
+        suppresses ONLY that last scheduling step. Everything else about an assignment — the cash at the strike, the
         ledger move, the closing fill on an offset lot, the new lot's transaction + entry
         order and its ``origin=csp_assignment`` tag — is identical either way, so a run with
         the switch off is bit-for-bit what it was before the switch existed. It is opt-in
@@ -5666,7 +5725,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         the setting's description in ``get_settings_definitions`` for what holding costs.
 
         Cash has already moved in the caller; this moves no cash of its own.
+
+        ``hold`` None (a caller with no settling transaction at hand) decides through the same
+        shared function from ``entry_tag`` alone -- the run-level flag, or a refusal in a
+        member-scoped run when no tag is given.
         """
+        if hold is None:
+            hold = holds_assigned_stock(
+                resolve_assigned_stock_hold_policy(self._cfg), entry_tag,
+                where=f"[backtest] assignment share leg on {symbol}")
         pos = self._positions.get(symbol)
         held = float(pos.qty) if pos is not None else 0.0
         # The offsetting part (opposite sign to what is held) closes; the rest opens.
@@ -5682,11 +5749,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 symbol, closing, was_long=(held > 0), px=price, comment="option_assignment")
         if opening > 0:
             self._open_assigned_stock_transaction(
-                symbol, opening, is_long=(signed > 0), price=price, expert_id=expert_id)
+                symbol, opening, is_long=(signed > 0), price=price, expert_id=expert_id,
+                entry_tag=entry_tag)
             # Only the newly-orphaned lot is unmanaged; schedule THAT for the next bar —
-            # unless this run HOLDS assigned stock, in which case the lot is the strategy's
+            # unless this assignment's stock is HELD, in which case the lot is the strategy's
             # to manage (the wheel writes calls against it) and nothing is scheduled.
-            if not self._cfg.get("hold_assigned_stock", False):
+            if not hold:
                 self._pending_assignment_sells[symbol] = (
                     self._pending_assignment_sells.get(symbol, 0.0)
                     + (opening if signed > 0 else -opening)
@@ -5694,7 +5762,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
     def _open_assigned_stock_transaction(
         self, symbol: str, qty: float, *, is_long: bool, price: float,
-        expert_id: Optional[int] = None,
+        expert_id: Optional[int] = None, entry_tag: Optional[int] = None,
     ) -> None:
         """Persist the equity Transaction + FILLED entry order for an assignment-created lot.
 
@@ -5707,6 +5775,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         Written as an ENTRY (no ``depends_on_order``): the next-bar liquidation's closing leg
         is what resolves against it, and ``refresh_transactions`` closes the transaction then.
+
+        The entry order INHERITS the assigned option position's member tag
+        (``assignment_hold.assigned_stock_entry_data``, shared with the live reconciler), so a
+        tag-scoped rule still sees whose shares these are -- the wheel's covered-call overlay
+        writes only on its own member's stock. An untagged position writes no ``data``.
         """
         from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
 
@@ -5742,6 +5815,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment="option_assignment",
             created_at=as_of,
+            data=assigned_stock_entry_data(entry_tag),
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -5791,10 +5865,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if position.side == OrderDirection.SELL:
             # SHORT ITM -> ALWAYS physically assigned (called away / put to us) at the strike.
             share_side = OrderDirection.SELL if is_call else OrderDirection.BUY
+            # WHO KEEPS THE STOCK is decided per assignment, before anything is written
+            # (stage-2 E2: the member-scoped hold; ``_assignment_disposition``).
+            txn = self._option_transaction_for_contract(position.contract_symbol)
+            hold, tag = (self._assignment_disposition(txn) if txn is not None
+                         else (None, None))
             ok = self.settle_option_expiry(
                 position, close_premium=intrinsic,
                 share_side=share_side, shares=shares, share_price=strike,
                 trigger=OptionCloseReason.ASSIGNED,
+                hold_assigned=hold, assigned_entry_tag=tag,
             )
             if ok:
                 # The stock the assignment ORPHANS (long from a short put, short from a naked
@@ -5803,15 +5883,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # opened a new lot. A COVERED call delivers shares the account already held:
                 # that part is booked as a closing fill on the lot's own transaction and there
                 # is nothing left to liquidate (scheduling it would sell down an unrelated lot).
-                # ``hold_assigned_stock`` runs skip the scheduling entirely — say which
+                # A HELD assignment (``hold_assigned_stock``, or its member listed in
+                # ``hold_assigned_stock_tags``) skips the scheduling entirely — say which
                 # happened, or the log reads as a liquidation that never comes.
                 logger.warning(
                     "[backtest] short-%s assignment of %d x %s at strike %.2f — %s "
                     "(cash now $%.2f).",
                     "call" if is_call else "put", shares, position.underlying, strike,
-                    ("HOLDING the assigned stock (hold_assigned_stock is on; the strategy's "
-                     "own rules must manage and exit it)"
-                     if self._cfg.get("hold_assigned_stock", False) else
+                    ("HOLDING the assigned stock (the run holds this assignment's stock; the "
+                     "strategy's own rules must manage and exit it)"
+                     if hold else
                      "scheduling assignment_liquidation of the assigned stock at the next "
                      "bar's open"),
                     self._cash,

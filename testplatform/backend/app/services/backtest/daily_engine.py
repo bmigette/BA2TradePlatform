@@ -86,10 +86,15 @@ def _reraise_option_basis_refusal(e: BaseException) -> None:
     basis refusal is not that: it means every strike, greek and intrinsic value the run
     would produce is in the wrong basis, so it must END the run loudly -- exactly like the
     hermetic cache misses those handlers already re-raise. Only the option path can raise
-    these, so an equity run never reaches this."""
+    these, so an equity run never reaches this.
+
+    ``UntaggedAssignmentRefused`` (stage-2 E2) ends the run for the same reason: a
+    member-scoped run assigned a position with no member tag, so whether its stock is held
+    (a wheel) or liquidated cannot be known, and every later bar would simulate a guess."""
+    from ba2_common.core.assignment_hold import UntaggedAssignmentRefused
     from ba2_common.core.split_basis import SplitBasisRefused
     from app.services.backtest.option_basis_guard import OptionSpotBasisMismatch
-    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch)):
+    if isinstance(e, (SplitBasisRefused, OptionSpotBasisMismatch, UntaggedAssignmentRefused)):
         raise e
 
 
