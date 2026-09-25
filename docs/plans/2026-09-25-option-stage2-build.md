@@ -2211,3 +2211,48 @@ grid runs (the memory note on distributed optimize traps).
 14. **Q14: the soft30 trade floor.** The long-dated floor is applied to a style with any O_LEAP /
     O_PMCC member (the any-member rule). Task 7 records whether `option_car_target_soft30` reads it
     at all. If it does not, the floor is inert for stage 2.
+
+---
+
+## Revisions after the user's answers (2026-09-25)
+
+**Premium style holds stock + options** (user: "options with covered calls / underlying stocks
+should be able to purchase it, and backtested on it"). This removes the build's refusals for O_CC,
+O_PP and O_WHEEL inside a group and adds two engine tasks. Both are backtest-only; parity with live
+is the rule.
+
+- **Task E1: route each entry by its own action type** (in `daily_engine`).
+  - Today the engine picks ONE entry path per run from `config["entry_action"]`
+    (`_entry_is_option`): either stock entries staged for the equity RM, or self-sizing option
+    actions.
+  - Route PER ENTRY instead: an entry whose actions are all option actions self-sizes, as in the
+    option path today; an equity entry goes through the RM sizing pass; a mix inside ONE rule is
+    refused loudly.
+  - This mirrors the live TradeManager routing fixed on 2026-09-24 (`f73a33f3`: all-option actions
+    self-size, anything else goes to the RM, a mix is refused).
+  - Pure-equity and pure-option runs must stay byte-identical: equity goldens, option goldens, and
+    the stage-1 discovery names and outputs.
+  - Result: O_CC and O_PP (a stock entry plus an option overlay) can be members of a style.
+- **Task E2: member-scoped assigned-stock hold.**
+  - Today `hold_assigned_stock` is one run-level flag, so in a group every assignment would be held
+    and have calls written on it.
+  - Decide per assignment from the ENTRY TAG of the option position that was assigned (Tasks 1-2
+    add `entry_tag`): hold only when that member declares `hold_assigned_stock` (the wheel), and
+    liquidate at the next bar's open otherwise (CSP, JL, RS), as today.
+  - The covered-call overlay rules must only write calls on the shares the wheel member holds.
+  - Tests: a wheel and a CSP in one style; each assignment follows its own member's policy.
+- **The LEAPS/convex style runs on its OWN filtered universe** (user choice): the names whose
+  chains reach the LEAPS DTE window, measured by the stage-2 data preflight. No per-member universe
+  filter is built.
+- **Members without a seed start ON at their authored defaults** (user choice).
+- **Fixed now, independently of stage 2:**
+  - **(Q12)** The GA rounds integer genes from zero, not from `min`, so the O_LEAP/O_PMCC DTE gene
+    can decode below its 365 floor (and O_ERN's `dte_max` can reach 31). Anchor the rounding at
+    `min`, or clamp. Check that stage-1 genes are unaffected, or document the effect.
+  - **(Q13)** `rules_export_import` resets `order_index` to 0 on import and collapses rule order.
+    This blocks any style deploy (memory: order_index IS precedence).
+- **Still decided after stage 1:** the mid-term DTE windows, which experts, the price-cap choice
+  per style, shared-gene source per seed, convex fitness for the LEAPS/convex style, and whether
+  warm start becomes strict.
+
+Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1 → E2 → Tasks 3-21.
