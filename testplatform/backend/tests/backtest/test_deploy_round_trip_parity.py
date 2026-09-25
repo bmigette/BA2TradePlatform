@@ -416,7 +416,11 @@ def test_a_behaviour_with_no_live_analogue_is_RECORDED_rather_than_silently_drop
     payload = _settings_payload(db, bt)
 
     uncarried = [r for r in BACKTEST_FORCED_SETTINGS if r.live_setting is None]
-    assert {r.key for r in uncarried} == {"hold_assigned_stock", "entry_action"}, (
+    # hold_assigned_stock_tags (stage-2 E2 review I1): the member-scoped hold. No live
+    # analogue (live never liquidates assigned stock); recorded here AND refused for export
+    # when set (deploy_parity.refuse_undeployable).
+    assert {r.key for r in uncarried} == {"hold_assigned_stock", "entry_action",
+                                          "hold_assigned_stock_tags"}, (
         "a behaviour gained or lost a live analogue -- re-read deploy_parity's table and say "
         "here which, and why")
     for row in uncarried:

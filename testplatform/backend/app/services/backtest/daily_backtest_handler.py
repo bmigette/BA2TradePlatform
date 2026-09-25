@@ -26,7 +26,8 @@ import pathlib
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
+from ba2_common.core.deploy_parity import (
+    BacktestRunFacts, forced_expert_settings, member_hold_tags_fact)
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.types import is_option_action
 
@@ -1150,6 +1151,8 @@ def _run_facts(config: Dict[str, Any],
     return BacktestRunFacts(
         enable_short=bool(config.get("enable_short")),
         hold_assigned_stock=bool(account_settings.get("hold_assigned_stock")),
+        hold_assigned_stock_tags=member_hold_tags_fact(
+            account_settings.get("hold_assigned_stock_tags")),
         entry_action=config.get("entry_action"),
         use_atr_stop=_toggle("use_atr_stop"),
         regime_overlay_enabled=_toggle("regime_overlay_enabled"),

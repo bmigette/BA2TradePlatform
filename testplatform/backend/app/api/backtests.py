@@ -18,7 +18,8 @@ from app.services.backtest_trade_chart import (
 )
 from app.services.sync_client import push_backtest
 from ba2_common.core.deploy_parity import (
-    BacktestRunFacts, backtest_only_settings, forced_expert_settings,
+    BacktestRunFacts, UndeployableRunRefused, backtest_only_settings, forced_expert_settings,
+    member_hold_tags_fact, refuse_undeployable,
 )
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 
@@ -1342,10 +1343,18 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
             enable_short=bool(execution.get("enable_short")),
             hold_assigned_stock=bool((acct if bt_block is not None else {}).get(
                 "hold_assigned_stock")),
+            hold_assigned_stock_tags=member_hold_tags_fact(
+                (acct if bt_block is not None else {}).get("hold_assigned_stock_tags")),
             entry_action=(bt_block.get("entry_action") if bt_block is not None else None),
             use_atr_stop=_executed_toggle("use_atr_stop"),
             regime_overlay_enabled=_executed_toggle("regime_overlay_enabled"),
         )
+        # A run live cannot reproduce has no honest deploy payload (stage-2 E2 review I1):
+        # refused by name, never exported with a field that describes a different run.
+        try:
+            refuse_undeployable(facts)
+        except UndeployableRunRefused as e:
+            raise HTTPException(status_code=409, detail=f"backtest {backtest.id}: {e}")
         expert_params = {**expert_params, **forced_expert_settings(facts)}
         return {
             "backtest_id": backtest.id,
