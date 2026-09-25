@@ -240,6 +240,25 @@ draws structures too (legs of one bet are not independent draws). A share that i
 structure, or top5 of <= 5 structures) is set to exactly 100.0, because float division gave
 99.99999999999999 and a factor of ~3.6e-24 that outranked an exact 0.
 
+**Share lots + overlays (decision 2026-09-25).** The order code books an O_CC / O_PP overlay as its own
+transaction and assigned stock as a new equity transaction, so on the transaction partition one position
+became two offsetting "bets" (O_PP, 12 cycles of shares +1000 / put −600: top5 = 104% → factor 0, where 12
+combined bets are 41.7% → 0.959). The option metrics' partition (`_option_structure_groups`) therefore also
+joins a share lot with an option structure on the same underlying when their holding windows overlap for a
+positive length, or when the option was settled INTO the lot (assigned/exercised, closed on the bar the lot
+opened, lot opened at its strike). Joins are transitive (union-find): one bet per share-holding window, so a
+wheel (CSP → assignment → covered calls → called away) is one bet. The option CAR-family trade gates (soft30
+ramp and the legacy per-year gates) count the same partition, so the ramp and the screen agree; the default
+partition (equity metrics, `option_convex`) is unchanged. Known limitations:
+- windows that merely TOUCH (close both legs and re-open both on the same bar) are deliberately not joined,
+  or every cycle of a run would chain into one bet; only a settlement at the strike hands one position on;
+- a share lot held across many overlay cycles is ONE bet, so a buy-and-hold covered-call book counts as few
+  bets on the trade gate as well as on concentration;
+- summed `pnl_pct` is approximate for rows that open later than their structure (an overlay written on a lot
+  already held, a rolled PMCC short), since each row is relative to equity at its own entry;
+- this is the FITNESS grouping only; `tools/genome_concentration_check.py` uses it for option-metric runs
+  (`scores_option_structures`) so the deploy-time check agrees with the GA. Order/ledger code is unchanged.
+
 **Files:**
 - Modify: `testplatform/backend/app/services/strategy_fitness.py` `robustness_metrics`.
 - Test: `testplatform/backend/tests/test_strategy_fitness_*` (add to the file covering robustness; find it
