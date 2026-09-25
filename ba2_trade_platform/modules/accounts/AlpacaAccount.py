@@ -30,7 +30,7 @@ from ...core.account_types import (
 )
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
-from ...core.db import get_db, get_instance, update_instance, add_instance
+from ...core.db import get_db, get_instance, update_instance, add_instance, InstanceNotFound
 from sqlmodel import Session, select, or_
 
 # Namespace of the external_id get_cash_transfers() mints for dividends, whether
@@ -1320,6 +1320,79 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             f"{fresh_order.comment} | {reason}" if fresh_order.comment else reason)[:500]
         update_instance(fresh_order)
 
+    @staticmethod
+    def _order_opens_short(trading_order: TradingOrder, is_closing_order: bool) -> bool:
+        """True when submitting ``trading_order`` would OPEN (or extend) an equity short.
+
+        Decided from the order and its TRANSACTION, never from the order side alone:
+        every long's TP/SL leg is a SELL too, and those reach ``submit_order`` without
+        ``is_closing_order`` (``_create_broker_tp_order`` / ``_create_broker_sl_order`` /
+        ``_create_broker_oco_order`` and the dependent-order trigger).
+
+        * ``is_closing_order`` -- close/reduce paths (``close_transaction``,
+          ``reduce_transaction``, the breached-stop MARKET retry): never opens.
+        * a BUY never opens a short.
+        * an OPTION order: not an equity short (and options submit through
+          ``_submit_option_order_impl`` anyway).
+        * the transaction's ``side`` is BUY for a long and SELL for a short
+          (``Transaction.side``), and a short's own exits are BUYs. So a non-closing
+          SELL on a SELL transaction opens the short, and a SELL on a BUY transaction
+          is a long's protective leg.
+        * a SELL with NO transaction is not checked. It cannot arrive through
+          ``submit_order``, which gives every non-closing order a transaction (created or
+          validated in ``_handle_transaction_requirements``) and lets only a CLOSING order
+          through without one. So only a direct ``_submit_order_impl`` call reaches this
+          branch, and existing callers use it for protective legs. Should a short ever
+          arrive this way, Alpaca still rejects it and the order is marked ERROR.
+        """
+        if is_closing_order:
+            return False
+        if trading_order.side != OrderDirection.SELL:
+            return False
+        if getattr(trading_order, 'asset_class', None) == CoreAssetClass.OPTION:
+            return False
+        if not trading_order.transaction_id:
+            return False
+        # A dangling transaction_id must NOT refuse the order: the non-closing SELLs that
+        # reach here are overwhelmingly a long's protective legs, and blocking a stop leg
+        # is worse than skipping this gate (Alpaca still rejects a genuinely unshortable
+        # short, and the order is marked ERROR). Log it loudly instead.
+        try:
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+        except InstanceNotFound:
+            logger.warning(
+                f"Shortability gate skipped for order {trading_order.id} ({trading_order.symbol}): "
+                f"transaction {trading_order.transaction_id} not found, so it cannot be told "
+                f"whether this SELL opens a short or protects a long")
+            return False
+        return transaction.side == OrderDirection.SELL
+
+    def _require_shortable(self, symbol: str) -> None:
+        """Raise ValueError unless Alpaca reports ``symbol`` shortable AND easy to borrow.
+
+        Reads the shared ``_asset_cache`` through ``_load_assets`` (the same Asset rows
+        behind get_symbol_margin_info / get_fractionability, same _ASSET_CACHE_TTL), so a
+        repeat short on the same symbol costs no extra broker call.
+
+        A symbol the broker could not describe (fetch error, nothing returned, or not
+        authenticated) is REFUSED: shortability is never assumed.
+        """
+        normalised = (symbol or '').strip().upper()
+        asset = self._load_assets([normalised]).get(normalised)
+        if asset is None:
+            raise ValueError(
+                f"Cannot open SHORT position for {symbol}: the Alpaca asset could not be "
+                f"fetched, so shortable/easy_to_borrow are unknown. Refusing rather than "
+                f"assuming the stock can be shorted.")
+        failed = [flag for flag in ('shortable', 'easy_to_borrow')
+                  if getattr(asset, flag, None) is not True]
+        if failed:
+            flags = ', '.join(f"{flag}={getattr(asset, flag, None)}" for flag in failed)
+            raise ValueError(
+                f"Cannot open SHORT position for {symbol}: Alpaca reports {flags}. "
+                f"Only shortable, easy-to-borrow stocks can be shorted.")
+        logger.debug(f"[Account {self.id}] {normalised} is shortable and easy to borrow")
+
     @alpaca_api_retry
     def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False, use_complex_order: bool = False) -> TradingOrder:
         """
@@ -1415,7 +1488,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             raise  # Re-raise position conflict errors
                         logger.warning(f"Failed to check broker positions for entry order {trading_order.id}: {e}")
                         # Continue anyway - let broker handle validation
-            
+
+            # SHORTABILITY GATE: an order that OPENS a short is refused here, before the
+            # request is built, unless Alpaca says the asset is shortable AND easy to
+            # borrow. Raised inside this try so it surfaces exactly like the position
+            # conflict above: FAILURE activity + order marked ERROR with the reason.
+            if self._order_opens_short(trading_order, is_closing_order):
+                self._require_shortable(trading_order.symbol)
+
             # Convert side to Alpaca enum
             side = OrderSide.BUY if trading_order.side == OrderDirection.BUY else OrderSide.SELL
             
