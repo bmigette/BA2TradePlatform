@@ -107,7 +107,6 @@ def test_decode_schedule_days_repairs_all_off_to_first_day():
     assert sum(out["schedule_days"].values()) == 1
 
 
-
 # A daily-bar backtest has no weekend bars, so a genome whose only ON days are saturday/sunday
 # gets ZERO decision points -- a dead config exactly like all-OFF, which the old repair (fired
 # only when EVERY day was off) let through. Plan 2026-09-24 Task 5. Scoped to OPTION runs:
@@ -170,4 +169,21 @@ def test_schedule_override_reconstruction_mirrors_the_repair_per_run_kind():
                                                 option_run=option_run)
         assert _on(deployed["days"]) == ["monday"]
     # The deploy callers pass no option_run; their output must not depend on it.
-    assert schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True) ==         schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True, option_run=True)
+    assert (schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True)
+            == schedule_override_from_genes(dict(_WEEKEND_ONLY), weekdays_only=True,
+                                            option_run=True))
+
+
+def test_run_kind_is_classified_only_where_the_two_rules_disagree(monkeypatch):
+    """Only a weekend-only genome needs the run kind; every other day combination decodes the
+    same under both rules, so an equity GA trial never pays for (or imports) the classifier."""
+    import itertools
+    from app.services import strategy_param_space as P
+    calls = []
+    monkeypatch.setattr(P, "_strategy_is_option_run", lambda s: calls.append(s) or False)
+    for bits in itertools.product((0, 1), repeat=7):
+        genes = {f"schedule:{d}": b for d, b in zip(P.SCHEDULE_DAYS, bits)}
+        decode_params(_strategy(), genes)
+        weekend_only = not any(bits[:5]) and any(bits[5:])
+        assert len(calls) == (1 if weekend_only else 0), bits
+        calls.clear()

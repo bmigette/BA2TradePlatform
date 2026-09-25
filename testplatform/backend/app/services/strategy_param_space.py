@@ -95,8 +95,12 @@ def _repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, boo
     historical rule, kept unchanged on purpose. Stock backtests and grids must not change
     behaviour (user rule): an equity weekend-only genome keeps scoring ZERO_TRADE exactly as
     every stored equity result and every in-flight equity checkpoint was scored.
+
+    MUTATES ``days`` in place (and returns it for convenience); callers pass a dict they built
+    for this call.
     """
-    dead = (not any(days.get(day) for day in _WEEKDAYS)) if option_run         else (not any(days.values()))
+    dead = ((not any(days.get(day) for day in _WEEKDAYS)) if option_run
+            else (not any(days.values())))
     if dead:
         days[SCHEDULE_DAYS[0]] = True
     return days
@@ -992,9 +996,14 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # _repair_no_weekday.
     schedule_days: Optional[Dict[str, bool]] = None
     if schedule_by_day:
-        schedule_days = _repair_no_weekday(
-            {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS},
-            option_run=_strategy_is_option_run(strategy))
+        days = {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS}
+        # Classify the run ONLY where the two rules disagree -- no weekday on but some weekend
+        # day on. Everywhere else they give the same answer, so option_run=False is exact, and
+        # an equity decode (every GA trial of S1-S7) never imports the backtest handler.
+        option_run = (not any(days[day] for day in _WEEKDAYS)
+                      and any(days.values())
+                      and _strategy_is_option_run(strategy))
+        schedule_days = _repair_no_weekday(days, option_run=option_run)
 
     return {
         "expert_overrides": expert_overrides,
