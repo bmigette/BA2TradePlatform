@@ -1540,10 +1540,19 @@ class TradeRiskManagement:
                 # buying a useless partial lot.
                 lot_size = apply_lot_size((order.data or {}), quantity)
                 if lot_size is not None and lot_size != quantity:
-                    self.logger.info(
-                        f"  Lot sizing: {quantity} -> {lot_size} shares "
-                        f"(lot_size={(order.data or {}).get('lot_size')})"
-                    )
+                    if lot_size == 0:
+                        # A REFUSAL, said as one: the strategy asked for whole lots (O_CC / O_PP
+                        # need 100 shares per contract) and not even one fits.
+                        self.logger.warning(
+                            f"  Lot sizing REFUSED {symbol}: {quantity} affordable share(s) is "
+                            f"less than one lot of {(order.data or {}).get('lot_size')} -- "
+                            f"not buying a partial lot the strategy cannot use"
+                        )
+                    else:
+                        self.logger.info(
+                            f"  Lot sizing: {quantity} -> {lot_size} shares "
+                            f"(lot_size={(order.data or {}).get('lot_size')})"
+                        )
                     quantity = lot_size
                     self._trace_note(trace, binding=BINDING_LOT_SIZE)
 

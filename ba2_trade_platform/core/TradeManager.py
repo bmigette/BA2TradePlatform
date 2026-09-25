@@ -2724,8 +2724,10 @@ class TradeManager:
                         # candidate order (via the shared trade_cycle builder — same shape the
                         # backtest uses) for the in-memory RM sizing pass below; only the funded
                         # subset is executed + submitted (no qty=0 churn, no unfunded deletes).
-                        from .trade_cycle import build_entry_candidate
-                        candidate = build_entry_candidate(recommendation, account.id)
+                        from .trade_cycle import build_entry_candidate, fired_entry_lot_size
+                        candidate = build_entry_candidate(
+                            recommendation, account.id,
+                            lot_size=fired_entry_lot_size(evaluator))
                         entry_candidates.append((candidate, evaluator, recommendation))
 
                     except Exception as e:

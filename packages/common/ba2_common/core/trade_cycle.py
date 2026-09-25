@@ -44,16 +44,45 @@ def entry_side_for(recommendation: ExpertRecommendation) -> OrderDirection:
     return OrderDirection.SELL if action in _SHORT_ENTRY_ACTIONS else OrderDirection.BUY
 
 
-def build_entry_candidate(recommendation: ExpertRecommendation, account_id: int) -> TradingOrder:
+def fired_entry_lot_size(evaluator: Any) -> Optional[int]:
+    """The round lot the fired entry ``BuyAction`` asks for, in the EQUITY BOOK's unit, or None.
+
+    Read off ``evaluator.trade_actions`` (what ``evaluate()`` just built for this symbol) via the
+    action's own ``_equity_lot_size()`` -- the SAME value ``BuyAction.execute`` stamps into the
+    persisted order's ``data``. Not the raw configured int: on a split-adjusted backtest book one
+    contract delivers ``100 x k`` adjusted shares, and that conversion belongs to the action.
+
+    Only the option-overlay keys (O_CC / O_PP) author a lot size; for every other rule this is
+    None and the candidate is built exactly as before. Called by BOTH enter paths (the live
+    ``TradeManager`` funded-entry loop and the backtest ``daily_engine`` equity entry)."""
+    from ba2_common.core.TradeActions import BuyAction
+
+    for action in (getattr(evaluator, "trade_actions", None) or []):
+        if isinstance(action, BuyAction) and action.lot_size:
+            return int(action._equity_lot_size())
+    return None
+
+
+def build_entry_candidate(recommendation: ExpertRecommendation, account_id: int,
+                          lot_size: Optional[int] = None) -> TradingOrder:
     """Build the TRANSIENT (unpersisted) candidate entry order for the temp-order-list flow.
 
     Carries exactly what ``TradeRiskManagement.size_candidate_orders`` needs to size it — symbol,
-    side, the linked recommendation (for expected-profit prioritization), and ``data`` (lot_size for
-    option-overlay strategies). It is NOT added to the DB: only candidates the RM funds are later
-    persisted + submitted, so unfunded recs never create qty=0 rows (no churn, no deletes).
+    side, the linked recommendation (for expected-profit prioritization), and ``data``. It is NOT
+    added to the DB: only candidates the RM funds are later persisted + submitted, so unfunded
+    recs never create qty=0 rows (no churn, no deletes).
+
+    ``lot_size`` (``fired_entry_lot_size(evaluator)``): the fired BuyAction's round lot, merged
+    into a COPY of the recommendation's data so the RM (``apply_lot_size`` / the risk-based
+    sizer) floors the size to whole lots and refuses below one. Until 2026-09-25 the candidate
+    carried only the recommendation's data, so a rule's ``lot_size`` never reached the sizing
+    at all. None (every rule but O_CC / O_PP) leaves the candidate exactly as before.
 
     Used identically by the live and backtest enter paths so the candidate shape can't drift.
     """
+    data = getattr(recommendation, "data", None) or None
+    if lot_size:
+        data = {**(data or {}), "lot_size": int(lot_size)}
     return TradingOrder(
         account_id=account_id,
         symbol=recommendation.symbol,
@@ -62,7 +91,7 @@ def build_entry_candidate(recommendation: ExpertRecommendation, account_id: int)
         order_type=OrderType.MARKET,
         status=OrderStatus.PENDING,
         expert_recommendation_id=recommendation.id,
-        data=(getattr(recommendation, "data", None) or None),
+        data=data,
     )
 
 

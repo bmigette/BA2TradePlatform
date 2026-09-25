@@ -1112,8 +1112,9 @@ class DailyBacktestEngine:
 
             # EQUITY entry: stage a TRANSIENT candidate (NOT persisted) for the temp-list RM
             # pass via the shared trade_cycle builder (same shape live uses).
-            from ba2_common.core.trade_cycle import build_entry_candidate
-            candidate = build_entry_candidate(recommendation, self.account.id)
+            from ba2_common.core.trade_cycle import build_entry_candidate, fired_entry_lot_size
+            candidate = build_entry_candidate(recommendation, self.account.id,
+                                              lot_size=fired_entry_lot_size(evaluator))
             equity_candidates.append((candidate, evaluator, symbol, recommendation))
             return False
         except Exception as e:  # noqa: BLE001

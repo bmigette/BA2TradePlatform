@@ -480,6 +480,14 @@ def _action_cfg_to_live(action: dict, key: str) -> Optional[Dict[str, dict]]:
         val = val if val is not None else action.get("value")
         if val is not None:
             cfg["value"] = val
+        # ...and the BUY's round lot. O_CC / O_PP (the launcher's _with_round_lot_entry)
+        # author lot_size=100 on the equity entry so the overlay has whole 100-share lots to
+        # write against, and the evaluator hands it to BuyAction -> the RM candidate. Dropping
+        # it here (as this did from 37d207c4 until 2026-09-25) made the constraint inert in the
+        # seeded backtest ruleset AND in every live export. Emitted ONLY when set, so every rule
+        # without one converts byte-identically. Not on SELL: SellAction takes no lot size.
+        if at == BUY_ACTION and action.get("lot_size"):
+            cfg["lot_size"] = int(action["lot_size"])
         return {key: cfg}
     if at == ExpertActionType.STOP_PROCESSING.value:
         return {key: {"action_type": at}}
