@@ -336,6 +336,28 @@ _BS_IV_STALENESS_DAYS = 5
 # bar; it stays pending and retries the next (see BacktestAccount._option_fill_price).
 _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 
+
+def _option_fill_capacity(volume) -> float:
+    """Contracts a premium bar of ``volume`` can absorb under the participation cap -- THE one
+    definition, read by the fill engine (``_volume_cap_reject_reason``) and by the order-time
+    sizing (``option_order_quantity_limit``), so the two cannot disagree on the number. A
+    missing volume is 0 (nothing fills)."""
+    return _OPTION_FILL_MAX_VOLUME_PARTICIPATION * (float(volume) if volume is not None else 0.0)
+
+
+def _max_units_within(capacity: float, per_unit: float) -> int:
+    """The largest whole count ``n`` with ``n * per_unit <= capacity`` -- decided by the SAME
+    float comparison the fill engine makes (``required > capacity`` rejects), not by a
+    division whose rounding could land one unit either side of it."""
+    if per_unit <= 0 or capacity <= 0:
+        return 0
+    n = int(math.floor(capacity / per_unit))
+    while n > 0 and n * per_unit > capacity:
+        n -= 1
+    while (n + 1) * per_unit <= capacity:
+        n += 1
+    return n
+
 # ---------------------------------------------------------------------------
 # OPTION BID-ASK SPREAD MODEL (2026-07-25) -- NOW THE ``legacy-pct`` MODEL ONLY
 # ---------------------------------------------------------------------------
@@ -659,6 +681,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "formula from option_spread_pct/option_spread_min_tick (both "
                                "required). An OPTIONS run must state one; see "
                                "_resolve_spread_model. Recorded in the run's results.",
+            },
+            "option_size_within_fill_volume": {
+                "type": "bool",
+                "required": False,
+                "description": "BACKTEST-ONLY (plan 2026-09-24 Task 11). When True, an OPENING "
+                               "option order is sized down at ORDER time to what the fill "
+                               "engine's volume-participation cap (10% of a premium bar's "
+                               "volume, per leg) can fill, read on the DECISION bar; a cap of 0 "
+                               "places no order and says why. Without it an order larger than "
+                               "the cap simply expires unfilled. Live is unaffected (a broker "
+                               "fills a small order whatever the day's volume). Defaults to "
+                               "False (exact no-op): older option runs reproduce.",
             },
             "hold_assigned_stock": {
                 "type": "bool",
@@ -3062,7 +3096,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return None
         volume = bar.get("volume")
         volume = float(volume) if volume is not None else 0.0
-        capacity = _OPTION_FILL_MAX_VOLUME_PARTICIPATION * volume
+        capacity = _option_fill_capacity(volume)
         if required > capacity:
             return (
                 f"order requires {required:g} contracts but bar volume {volume:g} allows "
@@ -5061,6 +5095,64 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 )
             )
         return out
+
+    def option_order_quantity_limit(self, legs, quantity: int, option_strategy) -> int:
+        """OVERRIDE (OptionsAccountInterface size seam, plan 2026-09-24 Task 11): with the run's
+        ``option_size_within_fill_volume`` on, cap an OPENING order at what the fill engine
+        will let fill.
+
+        The fill engine refuses a fill whose contracts exceed ``_option_fill_capacity`` of the
+        fill bar's volume (``_volume_cap_reject_reason``); an order sized above it just expires
+        (about half of the expired O_LP entries in the 2026-09-24 diagnosis). Here the same
+        capacity is read on the DECISION bar -- the bar the order is decided on, and under
+        ``same_bar_close`` the very bar it fills on. Under ``next_bar_open`` the fill reads the
+        next session's volume (the fill engine's own documented look-ahead, see its TODO); the
+        order cannot know that number without looking ahead, so an order sized here can still
+        be refused there if the next bar trades less.
+
+        MULTI-LEG: the parent quantity is a STRUCTURE count and each leg fills
+        ``structures x ratio_qty`` contracts, so the cap is the most constrained leg's
+        ``floor(capacity / ratio_qty)``.
+
+        Scope: only orders whose every leg OPENS (``*_to_open``). A close, a roll or a
+        partial flatten keeps its size -- capping an exit would leave a remainder the exit rule
+        has to fire again for, which is a different behaviour change than this one.
+
+        0 -> the order is not placed (the base returns None) and the reason is logged at
+        WARNING: never a silent 0."""
+        # ``getattr``: account doubles built without __init__ (parity harnesses) carry no config;
+        # for them, as for every run that does not state the flag, it is OFF.
+        cfg = getattr(self, "_cfg", None) or {}
+        if not cfg.get("option_size_within_fill_volume", False) or getattr(self, "_options", None) is None:
+            return quantity
+        if not legs or any(not (getattr(l, "position_intent", "") or "").endswith("_to_open")
+                           for l in legs):
+            return quantity
+        allowed = None
+        tightest = None
+        for leg in legs:
+            bar = self._option_bar(leg.contract_symbol)
+            volume = bar.get("volume") if bar else None
+            per_unit = float(getattr(leg, "ratio_qty", 1) or 1)
+            n = _max_units_within(_option_fill_capacity(volume), per_unit)
+            if allowed is None or n < allowed:
+                allowed, tightest = n, (leg.contract_symbol, volume, per_unit)
+        if allowed >= quantity:
+            return quantity
+        contract, volume, per_unit = tightest
+        if allowed <= 0:
+            logger.warning(
+                "[backtest] option order NOT PLACED (%s x%d, option_size_within_fill_volume): "
+                "%s's decision-bar volume %s lets %.0f%% participation fill no %s, so not even "
+                "one would fill.", option_strategy, quantity, contract, volume,
+                _OPTION_FILL_MAX_VOLUME_PARTICIPATION * 100,
+                "contract" if per_unit == 1 else f"structure ({per_unit:g} contracts each)")
+            return 0
+        logger.info(
+            "[backtest] option order sized %d -> %d (%s, option_size_within_fill_volume): %s's "
+            "decision-bar volume %s allows %d at %.0f%% participation.", quantity, allowed,
+            option_strategy, contract, volume, allowed, _OPTION_FILL_MAX_VOLUME_PARTICIPATION * 100)
+        return allowed
 
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
         """Stage the option order(s) so the per-bar fill engine fills them next bar.

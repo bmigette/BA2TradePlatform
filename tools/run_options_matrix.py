@@ -322,6 +322,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "skip against nor resume from one priced by this one. Matrix-mode job "
                          "names carry no digest, so the model is folded into the NAME instead "
                          "(e.g. -spow0922; nothing for legacy-pct).")
+    ap.add_argument("--option-size-within-fill-volume", action="store_true", default=False,
+                    help="Forward --option-size-within-fill-volume to every job (plan "
+                         "2026-09-24 Task 11): opening option orders are sized at order time "
+                         "to what the fill engine's volume cap can fill. Off by default so "
+                         "existing job names/commands are unchanged; a digest token when on, so "
+                         "a sized run never shares a name (checkpoint) with an unsized one. "
+                         "tools/stage1_run.sh passes it.")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
@@ -572,6 +579,9 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
                 "--fitness-trade-scale-target", str(args.fitness_trade_scale_target)]
     if args.fitness_win_rate_factor:
         cmd += ["--fitness-win-rate-factor"]
+    # Task 11 order-time sizing: forwarded only when on, so every existing command is unchanged.
+    if getattr(args, "option_size_within_fill_volume", False):
+        cmd += ["--option-size-within-fill-volume"]
     # Robustness is DEFAULT-ON in the launcher, so the ON case passes nothing (every existing
     # job name is unchanged) and only the opt-OUT is forwarded -- and it is a digest token, so a
     # raw-ranked run cannot share a name, and therefore a checkpoint, with a robust one.
@@ -596,7 +606,7 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     while i < len(tokens):
         flag = tokens[i]
         if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor",
-                    "--no-robust-fitness"):
+                    "--no-robust-fitness", "--option-size-within-fill-volume"):
             config[flag] = True
             i += 1
         else:
