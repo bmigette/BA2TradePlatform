@@ -2279,3 +2279,35 @@ Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1
   - stub the ATR indicator provider in the real-engine tests (they call FMP with a fake key);
   - refresh the stale `_entry_is_option` docstrings (4 test files);
   - make `test_bull_put_spread_grid` assert through `entry_route`.
+
+### Added after Tasks 3-4 (2026-09-25)
+
+- **E2 changes Task 6's stock-phase exemption.** Task 6 (and Tasks 8-9) assumed the wheel's
+  stock-phase rules (`has_assigned_shares` / `has_covered_call` / `covered_call_days_to_expiry`)
+  must stay UNSCOPED because the assigned stock lot had no entry tag. Since E2 it has one: the
+  delivered stock inherits the assigned put's member tag (`assignment_hold.assigned_stock_entry_data`)
+  and a CC/PP overlay inherits the covered position's tag. So Task 6 should AND the member tag into
+  the stock-phase rules too (drop the `_STYLE_STOCK_PHASE_FIELDS` exemption and flip the
+  "must stay UNSCOPED" assertions in Tasks 6 and 9). That is also what keeps O_CC's
+  `cc_guard`/`cc_sell` and O_PP's `pp_guard`/`pp_buy` (they read `has_covered_call` /
+  `has_position`) off another member's shares. Update the stale sentence in
+  `EntryTagCondition`'s docstring ("the assigned stock lot has no entry tag") with it.
+- **Task 3 as built** (`41943d1e`):
+  - O_CC / O_PP are admissible (E1) with tags 21 / 22; O_STK stays refused (no option structure).
+  - The Q2 refusal (O_WHEEL with O_CSP/O_JL/O_RS) is NOT built: E2 answered it.
+  - A generic refusal replaces it: two members whose builders emit the SAME entry rule or
+    non-`shared-*` condition ids are refused (today O_WHEEL + O_CSP and O_CC + O_PP), because their
+    genes would merge into one. Letting both in needs a re-id of one member's entry (Tasks 5/6).
+  - `action_overrides` on an equity-entry member (O_CC/O_PP) are refused: nothing to act on.
+- **Task 4 as built** (`e317a399`): premium = O_BULLPS, O_BEARCS, O_IC, O_JL, O_RS, O_CC, O_WHEEL
+  (the stage-2 plan's premium list minus O_CSP), `price_cap_policy: none` (Q3), wheel last (Q4).
+- **Knock-on for later tasks:**
+  - Task 5: premium now has an EQUITY entry (O_CC), so "every option action carries its member
+    tag" must become "every entry action carries its member tag" (E1 supports a tag on equity
+    entries), and `s.entry_action` must not assume the first member is an option.
+  - Task 7: for O_STYLE, write `hold_assigned_stock_tags = [tags of members in
+    _HOLDS_ASSIGNED_STOCK]` instead of the run-level `hold_assigned_stock` (a run may not name
+    both), and expect deploy parity to refuse exporting such a run.
+  - Task 9: `test_no_other_premium_member_can_produce_assigned_stock` no longer holds (O_JL/O_RS
+    are premium members). Replace it with: their assignments liquidate while the wheel's hold
+    (the E2 tests pin the mechanism; Task 9 pins it on the built premium style).
