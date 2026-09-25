@@ -361,14 +361,14 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:4240":
+    "ba2_trade_platform/ui/pages/settings.py:4245":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
         "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
         "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
         ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245; the equity-short netting rule removed a permission checkbox and its load/save, :4240",
-    "ba2_trade_platform/ui/pages/settings.py:4290":
+    "ba2_trade_platform/ui/pages/settings.py:4295":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "

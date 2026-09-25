@@ -181,6 +181,18 @@ def test_a_sell_with_no_transaction_is_not_checked():
 # Never checked
 # ---------------------------------------------------------------------------
 
+def test_a_dependent_leg_never_fetches_the_asset():
+    """A TP/SL leg waiting on its entry (depends_on_order set) never opens a position,
+    so the gate never runs for it -- not even on a SELL-side transaction."""
+    acct = _bare_account(_asset(shortable=False, easy_to_borrow=False))
+    entry = _short_entry()
+    leg = _saved_order(side=OrderDirection.SELL, transaction_id=entry.transaction_id,
+                       depends_on_order=entry.id)
+
+    assert AlpacaAccount._order_opens_short(leg, is_closing_order=False) is False
+    acct.client.get_asset.assert_not_called()
+
+
 def test_a_closing_sell_never_fetches_the_asset():
     acct = _bare_account(_asset(shortable=False, easy_to_borrow=False))
     txn_id = _transaction(OrderDirection.BUY, status=TransactionStatus.OPENED)

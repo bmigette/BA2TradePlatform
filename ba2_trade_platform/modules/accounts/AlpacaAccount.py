@@ -1353,6 +1353,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return False
         if not trading_order.transaction_id:
             return False
+        # A dependent order (a TP/SL leg waiting on its entry) never opens a position, so it
+        # is never gated -- and skipping it also keeps a protective stop leg clear of the
+        # transaction lookup below.
+        if getattr(trading_order, 'depends_on_order', None):
+            return False
         # A dangling transaction_id must NOT refuse the order: the non-closing SELLs that
         # reach here are overwhelmingly a long's protective legs, and blocking a stop leg
         # is worse than skipping this gate (Alpaca still rejects a genuinely unshortable
