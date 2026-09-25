@@ -60,6 +60,10 @@ PERMITTED = ["O_LC", "O_LP", "O_VERT", "O_BULLCS", "O_BULLPS", "O_BEARCS", "O_BF
 #: (``> 0`` on a HOLD-centred scale IS the old ``bullish`` flag -- see
 #: test_launcher_option_entry_rule.py). Every other leaf, and the leaf ORDER, is untouched,
 #: which is what this pin exists to protect: profile ``none`` must still append NOTHING.
+#:
+#: AMENDED 2026-09-25 (plan 2026-09-24 Task 9), the entry action's ``option_entry_cross`` band
+#: ONLY: 0.0..1.0 step 0.25 authored at 0.0 -> 0.75..1.0 step 0.05 authored at 0.75 (passive
+#: limits went unfilled under next-open fills). A deliberate gene-range change, not profile drift.
 PROFILE_NONE_O_LC = json.loads(r"""
 {
     "id": "o_lc-entry",
@@ -174,11 +178,11 @@ PROFILE_NONE_O_LC = json.loads(r"""
             "option_sizing_min": 1.0,
             "option_sizing_max": 10.0,
             "option_sizing_step": 1.0,
-            "option_entry_cross": 0.0,
+            "option_entry_cross": 0.75,
             "option_entry_cross_optimize": true,
-            "option_entry_cross_min": 0.0,
+            "option_entry_cross_min": 0.75,
             "option_entry_cross_max": 1.0,
-            "option_entry_cross_step": 0.25,
+            "option_entry_cross_step": 0.05,
             "option_selection_half": "debit",
             "option_w_premium_optimize": true,
             "option_w_premium_min": -2.0,

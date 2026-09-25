@@ -3584,11 +3584,27 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
 # it is a fraction of that structure's own legs' own spreads -- so a shared band is the same
 # hypothesis everywhere.
 #
-# 0.0 IS THE AUTHORED DEFAULT AND IT IS AN EXACT NO-OP: the entry keeps quoting the builder's
-# `contract.ask`/`contract.bid`/net untouched, so no existing option result moves. 1.0 quotes
-# at the far touch `_option_cross` already models the fill at. 0.25 steps give the GA five
-# levels including both ends.
-_OPTION_ENTRY_CROSS_BAND = (0.0, 1.0, 0.25)
+# SEMANTICS: 0.0 quotes at the mid (the builder's `contract.ask`/`contract.bid`/net untouched,
+# the pre-F3 quote exactly); 1.0 quotes at the far touch `_option_cross` already models the
+# fill at (a buy pays mid + half-spread, a sell takes mid - half-spread). The SAME gene also
+# prices DISCRETIONARY exits: `CloseOptionAction._close_cross_fraction` concedes the fraction
+# the entry persisted in `data['entry_cross']`; forced exits (SL / DTE roll / post-event) always
+# cross fully, whatever this is.
+#
+# THE BAND IS 0.75..1.0 FOR NEW GRID RUNS (plan 2026-09-24 Task 9; it was 0.0..1.0 in 0.25
+# steps, authored at 0.0). Under `next_bar_open` a passive quote fills only when the premium
+# moved in the entry's favour overnight -- a long put only when the put got CHEAPER, i.e. on
+# the days the bearish thesis did NOT work -- so low-cross genomes select against their own
+# thesis, and their exits (conceding the same fraction) expire too and positions ride to
+# expiry. Measured in the O_LP diagnosis (docs/findings-2026-09-24-deterministicscorer-
+# bearish-options.md): 23 of 39 and 149 of 191 submitted entries expired unfilled; the
+# deployed 8082 O_LC genome sits at 0.25. The floor keeps a quarter of the spread negotiable
+# rather than pinning 1.0, so the GA can still trade a little price for fill rate. 0.05 steps
+# give six levels; the floor is on the lattice (the GA rounds to multiples of the step from
+# zero, so the floor must be one) and is the authored default -- so an un-searched run now
+# quotes at 0.75, NOT the no-op 0.0. A searched genome carries its own value of this gene, so
+# only freshly built strategies move (and a genome predating F3, decoded onto a new template).
+_OPTION_ENTRY_CROSS_BAND = (0.75, 1.0, 0.05)
 
 
 def _apply_option_entry_cross_gene(cfg: dict) -> dict:
@@ -3629,7 +3645,7 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
 # zero-weight features entirely, so a weight at 0.0 costs nothing and changes nothing), which
 # gives the GA the same control arm every other option gene has and keeps the un-searched run
 # reproducible as a sampled trial. 9 levels for the signed weights, 5 for the unsigned one —
-# the same order of resolution as option_entry_cross's 5.
+# the same order of resolution as option_entry_cross's 6.
 #
 # WHAT IS DELIBERATELY NOT IN THIS TABLE (each withheld on recorded evidence, the F15
 # standard — a gene the GA can never move is budget burned on a dead search dimension):
