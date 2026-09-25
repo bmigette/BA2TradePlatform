@@ -398,7 +398,7 @@ class SmartRiskManagerContentRenderer:
 
         Rebuilds a SmartRiskManagerToolkit for the job's expert+account and re-runs the
         same open_buy/sell_position with the action's saved arguments. The toolkit handles
-        duplicate/hedging guards. The broker call runs off the event loop; the outcome is
+        duplicate/netting guards. The broker call runs off the event loop; the outcome is
         appended to the job's actions_log and the page reloads to show it."""
         from nicegui import run
 

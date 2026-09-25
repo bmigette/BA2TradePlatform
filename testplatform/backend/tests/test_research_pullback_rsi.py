@@ -219,49 +219,43 @@ def test_cli_rejects_an_unknown_family():
         D.parser().parse_args(["--families", "pullback_rsx"])
 
 
-# --------------------------------------------------------------------------- refusing short jobs
-def test_refusal_is_keyed_on_a_sell_entry_with_enable_short():
-    short, long_ = jobs()["short_sma5"], jobs()["long_sma5"]
-    assert R.opens_equity_short(short) and R.opens_equity_short(jobs()["short_spy"])
-    assert not R.opens_equity_short(long_)
-    no_flag = deepcopy(short)
-    del no_flag["optimization_config"]["backtest"]["enable_short"]
-    assert not R.opens_equity_short(no_flag)  # a `sell` entry without shorts only ever closes a long
-    flag_only = deepcopy(long_)
-    flag_only["optimization_config"]["backtest"]["enable_short"] = True
-    assert not R.opens_equity_short(flag_only)  # enable_short alone opens nothing through `buy`
-    R.refuse_unrunnable([long_, flag_only])
-    with pytest.raises(ValueError, match=r"equity short entries cannot open yet .* 1 selected job"):
-        R.refuse_unrunnable([long_, short])
+# --------------------------------------------------------------------------- short jobs run
+def test_the_short_jobs_open_shorts_and_nothing_refuses_them():
+    """Equity shorts open now (plan 2026-09-24 S1-S4), so the old selection refusal is gone: a
+    short job is an ordinary job. What makes it open shorts is its own config -- enable_short
+    plus a `sell` entry -- which the long jobs do not carry."""
+    for variant, job in jobs().items():
+        bt = job["optimization_config"]["backtest"]
+        sells = [a["action_type"] == "sell"
+                 for rule in job["strategy"]["entry_rules"] for a in rule["actions"]]
+        short = variant.startswith("short")
+        assert bool(bt.get("enable_short")) is short and any(sells) is short, variant
+    assert not hasattr(R, "refuse_unrunnable") and not hasattr(R, "opens_equity_short")
+    assert not hasattr(D, "refuse_unrunnable")
 
 
-def test_preflight_refuses_short_jobs_loudly(tmp_path):
+def test_preflight_accepts_the_short_jobs(monkeypatch, tmp_path):
+    _cache(tmp_path, ["AAA"])
+    _cache(tmp_path, ["SPY"], intervals=("1d",))
     for variant in ("short_sma5", "short_spy"):
-        with pytest.raises(ValueError, match="equity short entries cannot open yet"):
-            R.preflight(jobs()[variant], tmp_path)
+        ready = R.preflight(_screen_one(monkeypatch, tmp_path, jobs()[variant]), tmp_path)
+        bt = ready["optimization_config"]["backtest"]
+        assert bt["enable_short"] is True and bt["enabled_instruments"] == ["AAA"]
+        D.verify_job(ready)
 
 
 @pytest.mark.parametrize("mode", ["--preflight", "--run"])
-def test_cli_refuses_a_selection_with_a_short_job_before_any_job(monkeypatch, tmp_path, capsys, mode):
-    def forbidden(*args, **kwargs):
-        pytest.fail("a job was prepared or started before the selection was refused")
-    for name in ("preflight", "run_jobs", "check_database"):
-        monkeypatch.setattr(D, name, forbidden)
-    # The long job comes first: it must not run before the short one is found.
-    argv = ["--families", "pullback_rsi", "--variants", "long_sma5", "short_spy", mode,
-            "--output-dir", str(tmp_path)]
-    assert D.main(argv) == 1
-    assert "equity short entries cannot open yet" in capsys.readouterr().err
-
+def test_cli_runs_a_selection_with_short_jobs_in_order(monkeypatch, tmp_path, mode):
     started = []
     monkeypatch.setattr(D, "preflight", lambda job, cache_dir: started.append(job["variant"])
                         or {**job, "preflight": {"symbols": 1}})
     monkeypatch.setattr(D, "run_jobs", lambda selected, output, args: started.extend(
         j["variant"] for j in selected) or 0)
-    argv = ["--families", "pullback_rsi", "--variants", "long_sma5", "long_choch", "long_rsi", mode,
-            "--output-dir", str(tmp_path)]
+    argv = ["--families", "pullback_rsi", "--variants", "long_sma5", "short_spy", "short_sma5",
+            mode, "--output-dir", str(tmp_path)]
     assert D.main(argv) == 0
-    assert started == ["long_sma5", "long_choch", "long_rsi"]
+    # The manifest's own order (the order jobs() lists them), every selected job, shorts included.
+    assert started == ["long_sma5", "short_sma5", "short_spy"]
 
 
 # --------------------------------------------------------------------------- preflight
@@ -527,8 +521,8 @@ def _run(monkeypatch, tmp_path, variants, closes_for):
     (_dip("recovers"), "long_sma5", "short_sma5"), (_rally, "short_sma5", "long_sma5")])
 def test_the_engine_fixtures_are_entry_signals(closes_for, entering, idle):
     """Outside the engine: at SIGNAL the expert's own decision is an entry for the job the
-    fixture is built for, and not for the other. So the xfail below can only fail because the
-    engine refused the short, never because the fixture gave no short signal."""
+    fixture is built for, and not for the other. So the engine tests below measure the engine,
+    never a fixture that gave no signal."""
     from ba2_experts.PullbackReversion import completed_bars, pullback_signal
     sessions = _sessions()
     frame = pd.DataFrame(_series(sessions, closes_for(len(sessions), sessions.index(SIGNAL))))
@@ -556,13 +550,86 @@ def test_long_job_trades_in_the_real_engine(monkeypatch, tmp_path, engine_caches
         assert first["exit_price"] == pytest.approx(first["entry_price"] * 0.92, rel=0.02)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "Equity shorts cannot open: TradeActions.SellAction refuses a flat book ('No long position "
-    "to sell'), whatever enable_short/enable_sell say, so runtime.refuse_unrunnable refuses short "
-    "jobs. When this XPASSes, drop that refusal."))
 def test_short_job_opens_a_short_in_the_real_engine(monkeypatch, tmp_path, engine_caches):
+    """The short_sma5 job on a rally in a downtrend opens ONE short in the real engine (it was a
+    strict xfail until equity shorts could open): sold at the next open after the signal, with a
+    stop ABOVE the entry, charged borrow (0.5%/yr default) on every session it is held, and
+    covered at a profit by the bullish reverse-signal close. Its P&L is the fill arithmetic, and
+    the account's own equity lands on it exactly."""
+    import ba2_common.core.trade_cycle as trade_cycle
+    from app.services.backtest import daily_engine
+    from app.services.backtest.backtest_account import BORROW_SESSIONS_PER_YEAR, BacktestAccount
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.types import OrderDirection
+
+    charges, snapshots, stops = [], {}, []
+    real_accrue, real_snapshot = BacktestAccount.accrue_short_borrow, BacktestAccount.snapshot_equity
+
+    def accrue(self, as_of):
+        charge = real_accrue(self, as_of)
+        if charge:
+            charges.append((as_of.date(), charge))
+        return charge
+
+    def snapshot(self, as_of):
+        snap = real_snapshot(self, as_of)
+        snapshots.setdefault(id(self), []).append(snap["net_liquidating_value"])  # per run
+        return snap
+
+    def record(order, safeguard):
+        txn = get_instance(Transaction, order.transaction_id)
+        stops.append((order.side, txn.side, safeguard, txn.stop_loss))
+        return trade_cycle.record_max_loss_stop(order, safeguard)
+
+    monkeypatch.setattr(BacktestAccount, "accrue_short_borrow", accrue)
+    monkeypatch.setattr(BacktestAccount, "snapshot_equity", snapshot)
+    monkeypatch.setattr(daily_engine, "record_max_loss_stop", record)
     results = _run(monkeypatch, tmp_path, ["short_sma5", "long_sma5"], _rally)
     assert results["long_sma5"]["total_trades"] == 0
-    trades = results["short_sma5"]["trades"]
-    assert len(trades) == 1, "the short job placed no trade"
-    assert trades[0]["direction"] == "sell" and trades[0]["pnl"] > 0
+    result = results["short_sma5"]
+    [trade] = result["trades"]
+    assert trade["direction"] == "sell" and trade["symbol"] == "AAA"
+    assert trade["exit_reason"] == "exit", "covered by the bullish reverse-signal close"
+
+    # The fills: next-bar open, crossing half the 5 bps spread (a short sells at the bid and
+    # buys back at the ask). The engine stamps a next_bar_open fill with its decision bar.
+    sessions = _sessions()
+    closes = dict(zip(sessions, (round(c, 4) for c in _rally(len(sessions), sessions.index(SIGNAL)))))
+    opened = date.fromisoformat(trade["entry_time"][:10])
+    covered = date.fromisoformat(trade["exit_time"][:10])
+    next_open = lambda d: closes[sessions[sessions.index(d) + 1]]  # the fixture's open == close
+    half = 5.0 / 2 / 10_000
+    assert trade["entry_price"] == pytest.approx(next_open(opened) * (1 - half))
+    assert trade["exit_price"] == pytest.approx(next_open(covered) * (1 + half))
+    assert trade["exit_price"] < trade["entry_price"]
+    commission = 0.1
+    assert trade["pnl"] == pytest.approx(
+        (trade["entry_price"] - trade["exit_price"]) * trade["size"] - 2 * commission)
+    assert trade["pnl"] > 0
+
+    # Its protection: a SELL entry on a SELL-side transaction, stopped ABOVE the entry.
+    [(order_side, txn_side, safeguard, stop_loss)] = stops
+    assert order_side == txn_side == OrderDirection.SELL
+    assert safeguard > trade["entry_price"] and stop_loss > trade["entry_price"]
+    # The job's -8% is taken off the decision bar's close (the pre-fill reference of a market
+    # entry). The backtest keeps it there when the next open gaps; live re-bases a pending stop
+    # to the actual fill (TradeManager.rebase_price_to_fill), for longs and shorts alike.
+    assert stop_loss == pytest.approx(closes[opened] * 1.08)
+
+    # Borrow (S4): charged on every session the short is on the book -- its fill bar up to, not
+    # including, the bar that covers it -- on |qty| x that close x rate / 252.
+    rate = result["short_borrow_rate_pa"]
+    assert rate == 0.005
+    held = [d for d in sessions if opened <= d < covered]
+    assert [d for d, _ in charges] == held and held
+    for d, charge in charges:
+        assert charge == pytest.approx(trade["size"] * closes[d] * rate / BORROW_SESSIONS_PER_YEAR)
+    borrow = sum(c for _, c in charges)
+    assert result["short_borrow_cost"] == pytest.approx(round(borrow, 2)) and result["short_borrow_cost"] > 0
+
+    # The account's own equity after the cover: the covered short's P&L less its borrow, exactly.
+    # (results' equity_curve is the fixed-notional SCORING curve, restated; the recorded
+    # snapshots are the account itself.)
+    short_run = next(iter(snapshots.values()))  # short_sma5 runs first
+    assert short_run[-1] == pytest.approx(10_000.0 + trade["pnl"] - borrow)

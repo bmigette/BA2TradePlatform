@@ -470,6 +470,9 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     enabled_instruments = _resolve_enabled_instruments(payload, start_date, end_date)
 
+    # Lazy, like the BacktestAccount import in run_daily_backtest (keeps this module light).
+    from app.services.backtest.backtest_account import resolve_short_borrow_rate_pa
+
     initial_capital = float(payload["initial_capital"])
     # Optional FIXED-notional equity ceiling. Absent/None = off (every path byte-identical to
     # before). Validated HERE, at config time, so a bad value fails the run up front instead of
@@ -493,6 +496,10 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # ALREADY-decided trades, robustness.py's apply_spread_cost) -- this one can change
         # WHICH exit a trade takes, not just its realized pnl.
         "spread_bps": float(payload.get("spread_bps") or 0.0),
+        # Annual borrow rate on open SHORT equity positions (plan 2026-09-24 S4). RESOLVED here
+        # (absent -> the 0.5%/yr default, a stated value validated) so the config carries the
+        # decision the account charges, and results echo it. A long-only run pays nothing.
+        "short_borrow_rate_pa": resolve_short_borrow_rate_pa(payload),
         # OPTION bid-ask spread: the model key (plan Part F) plus the legacy percent-of-premium
         # knobs -- see _option_spread_settings and BacktestAccount._option_half_spread.
         **_option_spread_settings(payload),

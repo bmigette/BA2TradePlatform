@@ -36,7 +36,10 @@ from ba2_common.core.market_conditions import STRUCTURE_STATE_CODES
 from ba2_common.core.rules_convert import trade_rules_to_live_export
 
 DEFAULT_FINGERPRINT = "798c8787f90a6e1215f964edc453d3c58a29138fec845cefab1f7d2873bb2fa9"
-PULLBACK_RSI_FINGERPRINT = "b9524f745111e7ecfd4f17c7cbbc8c952df545879612e1359456b5c14aee6720"
+# Re-pinned 2026-09-25 (was b9524f74...): the netting rule retired the allow_hedging builtin,
+# so interface_settings no longer carries it into the PullbackReversion job. Restoring that
+# one key reproduces the old pin exactly; nothing else in the manifest moved.
+PULLBACK_RSI_FINGERPRINT = "f657a22189289cf4b5f9c66498794636d8badd8b6ffc5b63cf3b1b994c78be52"
 PINS = {"ohlcv-v1": "a" * 64, "ta-structure-v1": "b" * 64}
 BOTH = "ohlcv-v1,ta-structure-v1"
 KINDS = ("exit", "stop", "tp")

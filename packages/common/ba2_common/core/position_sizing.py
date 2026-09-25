@@ -174,11 +174,16 @@ def compute_risk_based_quantity(
             out["capped_by"] = "balance"
 
     # Round DOWN to whole lots when a lot constraint applies.
+    below_one_lot = False
     if lot_size and lot_size > 1:
+        below_one_lot = 1 <= qty < lot_size
         qty = (qty // lot_size) * lot_size
 
     if qty < 1:
-        out["reason"] = "after notional/balance/lot caps the affordable quantity is 0"
+        out["reason"] = (
+            f"lot sizing refused: the affordable quantity is less than one lot of {lot_size}"
+            if below_one_lot else
+            "after notional/balance/lot caps the affordable quantity is 0")
         out["quantity"] = 0
         return out
 

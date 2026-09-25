@@ -2212,7 +2212,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # is a stub from a rejected/canceled order chain. Delete it (cascading
                     # to its orders) instead of leaving a zero-qty CLOSED row that clutters
                     # the Live Trades view. Example causes: "asset not found" at broker,
-                    # hedging block on conflicting side, insufficient buying power.
+                    # opposite-position block on conflicting side, insufficient buying power.
                     never_opened = (
                         all_orders_terminal
                         and not has_filled_entry_order

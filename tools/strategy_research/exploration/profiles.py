@@ -267,9 +267,8 @@ def pullback_rsi_short(job):
     bt = job["backtest"]
     # enable_short reaches the trial config (_build_daily_trial_config) and forces the RM's
     # enable_sell gate (deploy_parity: enable_sell follows enable_short); the expert setting
-    # states the same permission for a deployed instance. NOT SUFFICIENT TODAY: the `sell`
-    # action refuses a flat book (TradeActions.SellAction), so runtime.refuse_unrunnable
-    # refuses short jobs until equity short entries exist.
+    # states the same permission for a deployed instance. With it, the `sell` entry opens a
+    # short from a flat book (TradeActions.SellAction).
     bt["enable_short"] = True
     bt["experts"][0]["settings"].update(direction="short", enable_sell=True)
 

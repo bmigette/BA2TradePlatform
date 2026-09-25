@@ -177,6 +177,9 @@ def eventaction_to_exit_rule(
         "toggle_optimize": True,
     }
 
+    if action == SELL_ACTION and action_cfg.get("value") is not None:
+        rule["action_value"] = action_cfg["value"]      # the sell's close percent
+
     if action in ADJUST_ACTIONS:
         rule["reference_value"] = (
             action_cfg.get("reference_value") or ReferenceValue.ORDER_OPEN_PRICE.value
@@ -476,8 +479,24 @@ def _action_cfg_to_live(action: dict, key: str) -> Optional[Dict[str, dict]]:
     tag = checked_entry_tag(action)
     if at in (BUY_ACTION, SELL_ACTION) and at not in ADJUST_ACTIONS:
         # 'sell' is also a close-flavored EXIT_ACTION; as a TradeRule action we emit the
-        # bare open/close action with no reference baggage — identical either way.
+        # bare open/close action with no reference baggage — identical either way. Its only
+        # parameter is the optional CLOSE PERCENT (a buy covering a short / a sell closing a
+        # long; 1..100, absent = full), carried as ``value`` only when set.
         cfg = {"action_type": at}
+        val = action.get("action_value")
+        val = val if val is not None else action.get("value")
+        if val is not None:
+            cfg["value"] = val
+        # ...and the BUY's round lot. O_CC / O_PP (the launcher's _with_round_lot_entry)
+        # author lot_size=100 on the equity entry so the overlay has whole 100-share lots to
+        # write against, and the evaluator hands it to BuyAction -> the RM candidate. Dropping
+        # it here (as this did from 37d207c4 until 2026-09-25) made the constraint inert in the
+        # seeded backtest ruleset AND in every live export. Emitted ONLY when set, so every rule
+        # without one converts byte-identically. Not on SELL: SellAction takes no lot size.
+        if at == BUY_ACTION and action.get("lot_size"):
+            cfg["lot_size"] = int(action["lot_size"])
+        # ...and the style-group member tag (validated above; checked_entry_tag already refuses
+        # one on a SELL, so only a BUY can reach here with it). Emitted ONLY when set.
         if tag is not None:
             cfg[ORDER_ENTRY_TAG_KEY] = tag
         return {key: cfg}

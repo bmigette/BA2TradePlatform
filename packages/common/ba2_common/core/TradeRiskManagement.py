@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
+from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
 from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
@@ -216,13 +217,10 @@ class TradeRiskManagement:
                 self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, skipping risk management")
                 return updated_orders
             
-            # Get expert trading permissions using interface defaults
-            enable_buy = expert.get_setting_with_interface_default(
-                'enable_buy', log_warning=False
-            )
-            enable_sell = expert.get_setting_with_interface_default(
-                'enable_sell', log_warning=False
-            )
+            # Get expert trading permissions using interface defaults, through the ONE shared
+            # permission reader (SellAction's short gate reads enable_sell the same way).
+            enable_buy = trading_permission(expert, 'enable_buy')
+            enable_sell = trading_permission(expert, 'enable_sell')
             
             # Get virtual equity per instrument limit using interface default
             max_virtual_equity_per_instrument_percent = expert.get_setting_with_interface_default(
@@ -521,8 +519,8 @@ class TradeRiskManagement:
                               f"skipping candidate sizing")
             return []
 
-        enable_buy = expert.get_setting_with_interface_default('enable_buy', log_warning=False)
-        enable_sell = expert.get_setting_with_interface_default('enable_sell', log_warning=False)
+        enable_buy = trading_permission(expert, 'enable_buy')
+        enable_sell = trading_permission(expert, 'enable_sell')
         max_pct = expert.get_setting_with_interface_default(
             'max_virtual_equity_per_instrument_percent', log_warning=False)
         if max_pct is None:
@@ -1542,10 +1540,19 @@ class TradeRiskManagement:
                 # buying a useless partial lot.
                 lot_size = apply_lot_size((order.data or {}), quantity)
                 if lot_size is not None and lot_size != quantity:
-                    self.logger.info(
-                        f"  Lot sizing: {quantity} -> {lot_size} shares "
-                        f"(lot_size={(order.data or {}).get('lot_size')})"
-                    )
+                    if lot_size == 0:
+                        # A REFUSAL, said as one: the strategy asked for whole lots (O_CC / O_PP
+                        # need 100 shares per contract) and not even one fits.
+                        self.logger.warning(
+                            f"  Lot sizing REFUSED {symbol}: {quantity} affordable share(s) is "
+                            f"less than one lot of {(order.data or {}).get('lot_size')} -- "
+                            f"not buying a partial lot the strategy cannot use"
+                        )
+                    else:
+                        self.logger.info(
+                            f"  Lot sizing: {quantity} -> {lot_size} shares "
+                            f"(lot_size={(order.data or {}).get('lot_size')})"
+                        )
                     quantity = lot_size
                     self._trace_note(trace, binding=BINDING_LOT_SIZE)
 

@@ -239,3 +239,34 @@ def test_a_long_option_structure_is_not_painted_as_a_sell():
     from ba2_trade_platform.ui.components.LiveTradesTable import LiveTradesTable
 
     assert "['BUY', 'LONG'].includes(col.value) ? 'positive' : 'negative'" in LiveTradesTable.BODY_TEMPLATE
+
+
+# ---- TP / SL cells: "level (P/L if hit)" ----------------------------------------------------
+def test_a_bracket_cell_shows_the_level_and_the_pnl_if_it_is_hit():
+    from ba2_trade_platform.ui.components.LiveTradesTable import bracket_level_cell
+
+    # SBSW, 26 shares long from $10.36 (the 2026-09-24 screenshot).
+    assert bracket_level_cell(9.01, 10.36, 26, 'BUY') == '$9.01 ($-35.10)'
+    assert bracket_level_cell(10.76, 10.36, 26, 'BUY') == '$10.76 ($+10.40)'
+    # A short profits when the level is BELOW its entry.
+    assert bracket_level_cell(9.0, 10.0, 10, 'SELL') == '$9.00 ($+10.00)'
+    # Option premium levels: x contracts x multiplier.
+    assert bracket_level_cell(5.0, 2.95, 2, 'BUY', 100) == '$5.00 ($+410.00)'
+
+
+def test_a_bracket_cell_never_invents_a_pnl_from_a_missing_input():
+    from ba2_trade_platform.ui.components.LiveTradesTable import bracket_level_cell
+
+    assert bracket_level_cell(None, 10.0, 5, 'BUY') == ''
+    assert bracket_level_cell(9.01, None, 26, 'BUY') == '$9.01'
+    assert bracket_level_cell(9.01, 10.36, None, 'BUY') == '$9.01'
+    assert bracket_level_cell(5.0, 2.95, 2, 'BUY', None) == '$5.00'
+
+
+def test_sl_comes_before_tp_and_one_pnl_column_replaces_two():
+    from ba2_trade_platform.ui.components.LiveTradesTable import LiveTradesTable
+
+    for columns in (LiveTradesTable.TRANSACTION_COLUMNS, LiveTradesTable.OPTION_TRANSACTION_COLUMNS):
+        names = [column.name for column in columns]
+        assert names.index('stop_loss') < names.index('take_profit')
+        assert 'pnl' in names and 'current_pnl' not in names and 'closed_pnl' not in names

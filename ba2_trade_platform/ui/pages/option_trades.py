@@ -41,7 +41,8 @@ from ...core.utils import get_account_instance_from_id, get_expert_options_for_u
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
 from ..components.LiveTradesTable import (
-    LiveTradesTable, LiveTradesTableConfig, related_order_rows, transaction_status_color,
+    LiveTradesTable, LiveTradesTableConfig, bracket_level_cell, related_order_rows,
+    transaction_status_color,
 )
 from ..components.account_scope import scope_transactions_to_account
 from ..components.refresh_button import refresh_button
@@ -54,7 +55,8 @@ from ..components.refresh_button import refresh_button
 _TOTALS_ROW_LIMIT = 500
 
 _COMPUTED_SORT_FIELDS = frozenset({
-    'current_pnl_numeric', 'closed_pnl_numeric', 'value', 'expiry_display', 'leg_count',
+    'current_pnl_numeric', 'closed_pnl_numeric', 'pnl_numeric', 'value', 'expiry_display',
+    'leg_count',
     'account_name',
 })
 _SORT_FIELDS = {column.name: column.field
@@ -445,8 +447,11 @@ class OptionTradesTab:
                 'current_price': current_price,
                 'value': cost,
                 'close_price': txn.close_price,
-                'take_profit': txn.take_profit,
-                'stop_loss': txn.stop_loss,
+                # Premium levels x contracts x multiplier (see bracket_level_cell).
+                'take_profit': bracket_level_cell(txn.take_profit, txn.open_price,
+                                                  txn.quantity, txn.side, multiplier),
+                'stop_loss': bracket_level_cell(txn.stop_loss, txn.open_price,
+                                                txn.quantity, txn.side, multiplier),
                 'current_pnl': _pnl_text(current_pnl.amount, current_pnl.percent) if current_pnl else '—',
                 # WHY a row has no P&L, when the reason is not "the broker had no quote": an
                 # incompletely recorded structure must not read as a plain blank (N4).
@@ -454,6 +459,14 @@ class OptionTradesTab:
                 'current_pnl_numeric': current_pnl.percent if current_pnl else None,
                 'closed_pnl': _pnl_text(closed.amount, closed.percent) if closed else '—',
                 'closed_pnl_numeric': closed.percent if closed else None,
+                # The P/L column: unrealised while open, realised once CLOSED, unknown otherwise
+                # (a structure whose entry is still waiting has no P/L yet).
+                'pnl': (_pnl_text(current_pnl.amount, current_pnl.percent) if (is_open and current_pnl)
+                        else _pnl_text(closed.amount, closed.percent) if (closed and txn.status == TransactionStatus.CLOSED)
+                        else '—'),
+                'pnl_numeric': (current_pnl.percent if (is_open and current_pnl)
+                                else closed.percent if (closed and txn.status == TransactionStatus.CLOSED)
+                                else None),
                 'status': getattr(txn.status, 'value', '') or '—',
                 'status_color': transaction_status_color(txn.status),
                 'orders': related_order_rows(orders),

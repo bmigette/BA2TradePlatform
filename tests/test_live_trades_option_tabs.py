@@ -36,15 +36,15 @@ class TestColumnSets:
 
     def test_the_equity_column_set_is_untouched(self):
         names = self._names(LiveTradesTable.TRANSACTION_COLUMNS)
-        # 21 columns, and NOT an option term among them -- adding the option set beside it
-        # must not have edited this one.
-        assert len(names) == 21
+        # 20 columns (Current P/L + Closed P/L became one P/L on 2026-09-24), and NOT an
+        # option term among them -- the option set beside it must not have edited this one.
+        assert len(names) == 20
         for absent in ('strategy', 'expiry', 'legs'):
             assert absent not in names
 
     def test_the_option_set_carries_the_terms_the_equity_set_lacks(self):
         names = self._names(LiveTradesTable.OPTION_TRANSACTION_COLUMNS)
-        for present in ('strategy', 'expiry', 'legs', 'symbol', 'open_price', 'current_pnl'):
+        for present in ('strategy', 'expiry', 'legs', 'symbol', 'open_price', 'pnl'):
             assert present in names
 
     def test_tp_and_sl_are_labelled_as_premium_levels(self):
