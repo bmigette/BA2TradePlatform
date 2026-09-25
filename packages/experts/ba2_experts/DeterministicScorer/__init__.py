@@ -118,6 +118,11 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     car_hard_min_trades_per_year: float = 8.0
     car_min_trades_per_year: float = 20.0
 
+    # Written with the class default by a deploy whose payload omits them (see
+    # ba2_common.core.deploy_parity.explicit_default_settings): an equity payload leaves
+    # macro_short_side out, and a "mirror" left by an earlier option deploy must not survive.
+    DEPLOY_EXPLICIT_DEFAULT_SETTINGS = ("macro_short_side",)
+
     def __init__(self, id: int):
         super().__init__(id)
         self.logger = get_expert_logger(self.__class__.__name__, id)
@@ -575,6 +580,10 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             "stop_price": stop_price,
             "atr": atr,
         }
+        # Only a mirrored SELL bar carries it (see combine.final_score), so a "same" run's calc
+        # dict -- persisted and replayed -- is unchanged.
+        if "exposure_side" in result:
+            calc["exposure_side"] = result["exposure_side"]
 
         details = calc["details"]
         return Recommendation(
@@ -795,7 +804,10 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         if result.get("veto"):
             parts.append("VETO: fundamental distress cap applied")
         if regime is not None and result.get("exposure_multiplier") != 1.0:
-            parts.append(f"regime exposure x{result['exposure_multiplier']:.2f}")
+            # On a mirrored SELL bar the multiplier is the short side's m(-regime); unlabelled
+            # it reads as LONG exposure, the opposite of what it measures.
+            side = " (short side)" if result.get("exposure_side") == "short" else ""
+            parts.append(f"regime exposure{side} x{result['exposure_multiplier']:.2f}")
         if target_price is not None:
             parts.append(f"price {price:.2f} -> target {target_price:.2f}")
         return " | ".join(parts)
@@ -936,6 +948,9 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                         "regime": calc["regime"],
                         "exposure_multiplier": calc["exposure_multiplier"],
                         "veto": calc["veto"],
+                        # Present only on a mirrored SELL bar; the card labels the multiplier.
+                        **({"exposure_side": calc["exposure_side"]}
+                           if "exposure_side" in calc else {}),
                     },
                     "levels": {
                         "target_price": calc["target_price"],
@@ -1130,7 +1145,8 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                             f'color: {color}; width: 46px; text-align: right')
                 mult = scores.get("exposure_multiplier")
                 if mult is not None:
-                    ui.label(f'Macro exposure multiplier: x{float(mult):.2f}').classes(
+                    side = " (short side)" if scores.get("exposure_side") == "short" else ""
+                    ui.label(f'Macro exposure multiplier{side}: x{float(mult):.2f}').classes(
                         'text-caption').style('color: #a0aec0; margin-top: 8px')
                 if scores.get("veto"):
                     with ui.row().classes('w-full items-center gap-2').style(

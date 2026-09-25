@@ -191,9 +191,19 @@ def test_default_is_bit_identical_to_pre_change_output(extra):
         assert float(res["exposure_multiplier"]).hex() == mult_hex, (t, r, n)
 
 
-def test_result_keys_unchanged():
-    """The combination dict is persisted in raw_outputs: the setting must not add keys."""
-    assert set(_fs(-0.3, -0.5, 3, macro_short_side="mirror")) == set(_fs(-0.3, -0.5, 3))
+def test_result_keys_unchanged_except_on_a_mirrored_sell():
+    """The combination dict is persisted in raw_outputs: "same" must never change its shape,
+    and "mirror" adds exactly one marker, only when the short arm was taken."""
+    base_keys = set(_fs(-0.3, -0.5, 3))
+    for t, r, n, _f, _m in _GOLDEN:
+        assert set(_fs(t, r, n)) == base_keys
+        assert "exposure_side" not in _fs(t, r, n, macro_short_side="same")
+    mirrored = _fs(-0.3, -0.5, 3, macro_short_side="mirror")
+    assert set(mirrored) == base_keys | {"exposure_side"}
+    assert mirrored["exposure_side"] == "short"
+    assert "exposure_side" not in _fs(0.3, -0.5, 3, macro_short_side="mirror")
+    assert "exposure_side" not in _fs(-0.3, -0.5, 3, macro_short_side="mirror",
+                                      macro_mode="gate")
 
 
 def test_setting_default_and_values_declared():
@@ -354,3 +364,31 @@ def test_live_resolved_settings_carry_the_setting(monkeypatch):
     assert resolved["macro_short_side"] == "mirror"
     f = exp._process(_bundle(), resolved).raw_outputs["calc"]["final_score"]
     assert f < exp._process(_bundle(), defaults).raw_outputs["calc"]["final_score"] < 0
+
+
+# ---------------------------------------------------------------- labels
+def test_details_text_labels_the_short_side_multiplier():
+    exp = _Stubbed()
+    mirror = exp._process(_bundle(), {**_defaults(), "macro_short_side": "mirror"})
+    assert mirror.raw_outputs["calc"]["exposure_side"] == "short"
+    assert "regime exposure (short side) x" in mirror.details
+
+
+def test_default_details_text_and_calc_are_unchanged():
+    """"same" keeps the exact historical wording and calc shape."""
+    exp = _Stubbed()
+    same = exp._process(_bundle(), _defaults())
+    assert "exposure_side" not in same.raw_outputs["calc"]
+    assert "(short side)" not in same.details
+    m = same.raw_outputs["combination"]["exposure_multiplier"]
+    assert f"regime exposure x{m:.2f}" in same.details
+
+
+def test_the_card_labels_the_short_side_multiplier():
+    """The analysis card reads state['deterministic_scorer']['scores'] (run_analysis writes the
+    marker only on a mirrored SELL bar). Read from source: rendering needs a NiceGUI client."""
+    import inspect
+    src = inspect.getsource(DeterministicScorer)
+    assert 'side = " (short side)" if scores.get("exposure_side") == "short" else ""' in src
+    assert "f'Macro exposure multiplier{side}: x{float(mult):.2f}'" in src
+    assert '**({"exposure_side": calc["exposure_side"]}' in src

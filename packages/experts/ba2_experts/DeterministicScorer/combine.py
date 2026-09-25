@@ -170,11 +170,13 @@ def final_score(technical: Optional[float], fundamental: Optional[float],
     score = apply_vetoes(score, veto, float(s.get("veto_cap", DEF_VETO_CAP)))
 
     m = 1.0
+    short_arm = False
     if regime is not None and mode == "multiply":
         from .macro import exposure_multiplier, DEF_M_FLOOR, DEF_HARD_RISKOFF
         # Only a strictly negative score takes the mirrored regime: a 0.0 score is 0 either
         # way, and keeping it on the long arm leaves the reported multiplier unchanged there.
-        eff_regime = -regime if (short_side == "mirror" and score < 0) else regime
+        short_arm = short_side == "mirror" and score < 0
+        eff_regime = -regime if short_arm else regime
         m = exposure_multiplier(eff_regime, float(s.get("m_floor", DEF_M_FLOOR)),
                                 float(s.get("hard_riskoff", DEF_HARD_RISKOFF)),
                                 n_inputs=regime_n_inputs)
@@ -184,7 +186,7 @@ def final_score(technical: Optional[float], fundamental: Optional[float],
         if regime < gate_min:
             score = min(score, 0.0)
 
-    return {
+    out = {
         "final": float(np.clip(score, -1.0, 1.0)),
         "raw": comb["raw"],
         "components": comb["components"],
@@ -194,6 +196,12 @@ def final_score(technical: Optional[float], fundamental: Optional[float],
         "macro_mode": mode,
         "n_sections": comb["n_sections"],
     }
+    if short_arm:
+        # The multiplier above is then the SHORT side's m(-regime), not long exposure; the
+        # details text and the UI label it so. Added only here -- never under "same" -- so the
+        # dict every existing run persisted in raw_outputs keeps its exact shape.
+        out["exposure_side"] = "short"
+    return out
 
 
 def schmitt_trigger(final: float, s: Dict[str, Any],

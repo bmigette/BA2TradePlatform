@@ -44,6 +44,7 @@ __all__ = [
     "backtest_only_settings",
     "live_settings_from_universe",
     "SCREENER_UNIVERSE_SETTING",
+    "explicit_default_settings",
 ]
 
 
@@ -261,6 +262,26 @@ def live_settings_from_universe(universe: Optional[Dict[str, Any]]) -> Dict[str,
         settings[key] = value
     settings[SCREENER_UNIVERSE_SETTING] = "screener"
     return settings
+
+
+def explicit_default_settings(expert_cls: Any, expert_params: Dict[str, Any]) -> Dict[str, Any]:
+    """{key: class default} for each setting the expert class lists in
+    ``DEPLOY_EXPLICIT_DEFAULT_SETTINGS`` that ``expert_params`` does not carry.
+
+    A deploy writes settings key by key and deletes nothing, while a payload leaves a setting
+    out when the backtest ran on its default ("absent = default"). For most keys that is
+    harmless; for one a PRIOR deploy may have set to a non-default value it is not: the old
+    value stays live under the new genome. DeterministicScorer's ``macro_short_side`` is the
+    case -- an equity genome (default "same") deployed onto an instance that once held a
+    "mirror" option genome would keep scoring its SELLs mirrored, a strategy no backtest ran.
+    Writing the default explicitly closes that. The default is read from the class's own
+    definitions (a missing one is a KeyError, not a guess).
+    """
+    keys = getattr(expert_cls, "DEPLOY_EXPLICIT_DEFAULT_SETTINGS", ())
+    if not keys:
+        return {}
+    defs = expert_cls.get_settings_definitions()
+    return {k: defs[k]["default"] for k in keys if k not in expert_params}
 
 
 def unmapped_screener_keys(universe: Optional[Dict[str, Any]]) -> list:

@@ -69,7 +69,8 @@ from ba2_common.core.market_condition_rules import (  # noqa: E402
     assert_market_rule_actions, parse_profile_setting,
 )
 from ba2_common.core.deploy_parity import (  # noqa: E402
-    SCREENER_UNIVERSE_SETTING, live_settings_from_universe, unmapped_screener_keys,
+    SCREENER_UNIVERSE_SETTING, explicit_default_settings, live_settings_from_universe,
+    unmapped_screener_keys,
 )
 from ba2_common.core.models import ExpertInstance  # noqa: E402
 from ba2_common.core.rules_convert import trade_rules_to_live_export  # noqa: E402
@@ -312,6 +313,13 @@ def main() -> int:
         # deploy always states its ATR/regime posture instead of silently carrying whatever the
         # exporting run happened to embed. Off by default = parity with the backtest.
         _apply_rm_toggles(expert_params, enabled)
+        # Settings a payload omits when the backtest ran on the default, written EXPLICITLY:
+        # save_settings never deletes, so an omitted key would keep whatever a PRIOR deploy put
+        # there (e.g. macro_short_side="mirror" from an option genome under a new equity one).
+        for key, value in explicit_default_settings(expert.__class__, expert_params).items():
+            expert_params[key] = value
+            print(f"  {key}={value!r} (absent from the payload = the expert default; written "
+                  f"explicitly so a prior deploy's value cannot survive)")
 
         required_ism = (expert.__class__.get_expert_properties() or {}).get(
             "required_instrument_selection_method")
