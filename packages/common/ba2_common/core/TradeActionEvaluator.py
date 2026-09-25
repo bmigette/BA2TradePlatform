@@ -12,7 +12,7 @@ from ba2_common.core.TradeActions import RULESET_STOP_KEPT_REASONS, ruleset_stop
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from ba2_common.core.types import (
-    OrderRecommendation, ExpertEventType, ExpertActionType, OptionCloseReason,
+    OrderRecommendation, ExpertEventType, ExpertActionType, OptionCloseReason, AssetClass,
     get_option_action_values,
     get_option_entry_action_values,
 )
@@ -271,6 +271,51 @@ def _sanitize_for_json(obj):
     return obj
 
 
+#: Phase-1 action types that can CLOSE or REDUCE a position (a buy covers a short, a sell
+#: closes a long). Their results must say which transactions they touched
+#: (``data.closed_transaction_ids``) so Phase 2 leaves those alone; one that raises, or does not
+#: say, blocks every TP/SL adjustment of the pass (``_closed_ids_or_unknown``).
+_CLOSING_ACTION_TYPES = frozenset({
+    ExpertActionType.SELL, ExpertActionType.BUY, ExpertActionType.CLOSE,
+    ExpertActionType.CLOSE_OPTION, ExpertActionType.ROLL_PMCC_SHORT,
+})
+
+
+def _closed_ids_or_unknown(action_type, data, into: set) -> bool:
+    """Add a Phase-1 result's closed/reduced transaction ids to ``into``; True when the result
+    is a closing-type action's and it cannot say what it closed (``close_uncertain``, or no
+    ``closed_transaction_ids`` and not a plain buy/sell ENTRY carrying its new ``order_id``)."""
+    data = data if isinstance(data, dict) else {}
+    ids = data.get('closed_transaction_ids')
+    for tid in (ids or []):
+        if tid is not None:
+            into.add(tid)
+    if action_type not in _CLOSING_ACTION_TYPES:
+        return False
+    if data.get('close_uncertain'):
+        return True
+    if ids is not None:
+        return False
+    if action_type in (ExpertActionType.BUY, ExpertActionType.SELL) and data.get('order_id'):
+        return False            # an entry: it opened, it closed nothing
+    return True
+
+
+def _is_option_order(order) -> bool:
+    """An order of an OPTION position (its own asset class, else its transaction's)."""
+    if getattr(order, 'asset_class', None) == AssetClass.OPTION:
+        return True
+    txn_id = getattr(order, 'transaction_id', None)
+    if txn_id is None:
+        return False
+    from ba2_common.core.models import Transaction
+    try:
+        txn = get_instance(Transaction, txn_id)
+    except InstanceNotFound:
+        return False
+    return getattr(txn, 'asset_class', None) == AssetClass.OPTION
+
+
 class TradeActionEvaluator:
     """
     Evaluates trade conditions and executes actions based on rulesets.
@@ -462,6 +507,9 @@ class TradeActionEvaluator:
         # flight, and re-arming exit legs on it cancels a pending partial close at the broker
         # (AlpacaAccount._handle_filled_entry_exit) or stages exit legs on a closing position.
         closed_or_reduced_txn_ids = set()
+        # A closing-type action that RAISED, or returned without saying which transactions it
+        # touched: nobody knows what it closed, so Phase 2 adjusts NOTHING on this symbol.
+        close_outcome_unknown = False
         
         # Store the submit_to_broker flag for use by actions
         self.submit_to_broker = submit_to_broker
@@ -587,9 +635,9 @@ class TradeActionEvaluator:
                     
                     # Closed/reduced transactions, whatever the outcome: a failed leg may still
                     # have cancelled legs or sent part of the close.
-                    for _tid in ((result_dict.get('data') or {}).get('closed_transaction_ids') or []):
-                        if _tid is not None:
-                            closed_or_reduced_txn_ids.add(_tid)
+                    if _closed_ids_or_unknown(action_type, result_dict.get('data'),
+                                              closed_or_reduced_txn_ids):
+                        close_outcome_unknown = True
 
                     # Capture created order ID for use in phase 2
                     if result_dict['success'] and result_dict.get('data', {}).get('order_id'):
@@ -599,6 +647,11 @@ class TradeActionEvaluator:
                     logger.info(f"Order creation result: {result_dict['success']} - {result_dict['message']}")
                     
                 except Exception as e:
+                    if self._get_action_type_from_action(action) in _CLOSING_ACTION_TYPES:
+                        # A closing action that RAISED may have sent part of its close. Set
+                        # BEFORE absorb_if_benign: a non-benign error propagates out of this
+                        # pass entirely (no Phase 2 at all), a benign one continues to Phase 2.
+                        close_outcome_unknown = True
                     absorb_if_benign(e)
                     logger.error(f"Error creating order: {e}", exc_info=True)
                     action_results.append({
@@ -672,25 +725,35 @@ class TradeActionEvaluator:
                                 exc_info=True
                             )
 
-                if closed_or_reduced_txn_ids:
+                if orders_to_adjust:
                     kept = []
                     for _order in orders_to_adjust:
-                        if getattr(_order, 'transaction_id', None) in closed_or_reduced_txn_ids:
-                            logger.info(
-                                f"Phase 2 - skipping TP/SL adjustment of transaction "
-                                f"{_order.transaction_id} ({self.instrument_name}): this pass "
-                                f"closed or reduced the position")
-                            action_results.append({
-                                "action_type": ExpertActionType.ADJUST_STOP_LOSS,
-                                "success": True,
-                                "message": (f"TP/SL adjustment skipped for {self.instrument_name}: "
-                                            f"this pass closed or reduced the position"),
-                                "data": {"transaction_id": _order.transaction_id,
-                                         "skipped": "closed_or_reduced_this_pass"},
-                                "description": "TP/SL adjustment skipped (position closed/reduced)",
-                            })
+                        _txn_id = getattr(_order, 'transaction_id', None)
+                        if _is_option_order(_order):
+                            # TP/SL adjust actions are SHARE-price actions. An option position's
+                            # exits are its own rules (close_option on its P&L fields); a share
+                            # stop written on it would, live, cancel its pending close.
+                            reason, why = "option_position", "it is an OPTION position"
+                        elif close_outcome_unknown:
+                            reason, why = ("close_outcome_unknown",
+                                           "a closing action this pass failed or did not say "
+                                           "what it closed")
+                        elif _txn_id in closed_or_reduced_txn_ids:
+                            reason, why = ("closed_or_reduced_this_pass",
+                                           "this pass closed or reduced the position")
                         else:
                             kept.append(_order)
+                            continue
+                        logger.info(
+                            f"Phase 2 - skipping TP/SL adjustment of transaction {_txn_id} "
+                            f"({self.instrument_name}): {why}")
+                        action_results.append({
+                            "action_type": ExpertActionType.ADJUST_STOP_LOSS,
+                            "success": True,
+                            "message": f"TP/SL adjustment skipped for {self.instrument_name}: {why}",
+                            "data": {"transaction_id": _txn_id, "skipped": reason},
+                            "description": f"TP/SL adjustment skipped ({reason})",
+                        })
                     if not kept:
                         adjustment_actions = []
                     orders_to_adjust = kept

@@ -326,8 +326,11 @@ class TradeAction(ABC):
         return trading_permission(self.resolve_expert(), 'enable_buy')
 
     def _refused(self, action_type: str, message: str, **data) -> "TradeActionResult":
-        """A refused action, logged and recorded (success False, nothing sent)."""
+        """A refused action, logged and recorded (success False, nothing sent). It carries an
+        EMPTY ``closed_transaction_ids``: the evaluator reads a missing key on a closing-type
+        action as "unknown what it closed" and then adjusts nothing this pass."""
         logger.info(f"{type(self).__name__} refused for {self.instrument_name}: {message}")
+        data.setdefault("closed_transaction_ids", [])
         return self.create_and_save_action_result(
             action_type=action_type, success=False, message=message, data=data)
 
@@ -757,7 +760,7 @@ class SellAction(TradeAction):
                     success=False,
                     message=(f"Position book unverified for {self.instrument_name} "
                              f"(broker position fetch failed) - refusing to sell"),
-                    data={"position_fetch_failed": True}
+                    data={"position_fetch_failed": True, "closed_transaction_ids": []}
                 )
             return self._decide(current_position)
 
@@ -768,7 +771,8 @@ class SellAction(TradeAction):
                 action_type=ExpertActionType.SELL.value,
                 success=False,
                 message=f"Error creating sell order: {str(e)}",
-                data={}
+                # It may have sent part of a close before raising: the evaluator adjusts nothing.
+                data={"close_uncertain": True}
             )
 
     def _refuse(self, message: str, **data) -> "TradeActionResult":
@@ -934,7 +938,8 @@ class BuyAction(TradeAction):
                     return self.create_and_save_action_result(
                         action_type=ExpertActionType.BUY.value, success=False, message=message,
                         data={"long_transaction_ids": [t.id for t in longs],
-                              "short_transaction_ids": [t.id for t in shorts]})
+                              "short_transaction_ids": [t.id for t in shorts],
+                              "closed_transaction_ids": []})
                 if shorts:
                     return self._cover_own_short(shorts)
 
@@ -989,7 +994,8 @@ class BuyAction(TradeAction):
                 action_type=ExpertActionType.BUY.value,
                 success=False,
                 message=f"Error creating buy order: {str(e)}",
-                data={}
+                # It may have been covering a short when it raised: the evaluator adjusts nothing.
+                data={"close_uncertain": True}
             )
     
     def _cover_own_short(self, shorts) -> "TradeActionResult":
@@ -1009,7 +1015,7 @@ class BuyAction(TradeAction):
                 action_type=ExpertActionType.BUY.value, success=False,
                 message=(f"Position book unverified for {self.instrument_name} "
                          f"(broker position fetch failed) - refusing to cover the short"),
-                data={"position_fetch_failed": True})
+                data={"position_fetch_failed": True, "closed_transaction_ids": []})
         return self._close_own_position(shorts, broker_position, ExpertActionType.BUY.value,
                                         "Buy covers the short")
 
@@ -5912,6 +5918,19 @@ class RollPMCCShortAction(_OptionEntryAction):
         return None
 
     def execute(self) -> "TradeActionResult":
+        """Roll the overlay, and say which transaction the roll acted on
+        (``closed_transaction_ids``) so the same pass never re-arms a TP/SL on it."""
+        self._raised = False
+        result = self._execute_roll()
+        txn_id = getattr(self.existing_order, "transaction_id", None) if self.existing_order else None
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict):
+            data.setdefault("closed_transaction_ids", [txn_id] if txn_id is not None else [])
+            if self._raised:
+                data["close_uncertain"] = True
+        return result
+
+    def _execute_roll(self) -> "TradeActionResult":
         self._last_spot = None          # see _OptionEntryAction.execute
         try:
             from ba2_common.core.OptionRiskManagement import build_structure
@@ -5966,6 +5985,7 @@ class RollPMCCShortAction(_OptionEntryAction):
             return self._result(False, str(e))
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
+            self._raised = True
             logger.error(f"Error executing {self._action_type_value()} for "
                          f"{self.instrument_name}: {e}", exc_info=True)
             return self._result(False, f"Error executing option action: {str(e)}")
@@ -6436,6 +6456,20 @@ class CloseOptionAction(TradeAction):
         return conceded
 
     def execute(self) -> "TradeActionResult":
+        """Close the option position, and say which transaction it closed
+        (``closed_transaction_ids``) so the same pass never re-arms a TP/SL on it."""
+        self._closing_transaction_id = None
+        self._raised = False
+        result = self._execute_close()
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict):
+            txn_id = self._closing_transaction_id
+            data.setdefault("closed_transaction_ids", [txn_id] if txn_id is not None else [])
+            if self._raised:
+                data["close_uncertain"] = True
+        return result
+
+    def _execute_close(self) -> "TradeActionResult":
         try:
             if not isinstance(self.account, OptionsAccountInterface):
                 return self.create_and_save_action_result(
@@ -6447,6 +6481,7 @@ class CloseOptionAction(TradeAction):
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
                     message=f"No open option position to close for {self.instrument_name}", data={})
+            self._closing_transaction_id = getattr(order, "transaction_id", None)
 
             # Multi-leg (spread) positions: the parent order intentionally has no
             # contract_symbol — closing it as a single leg would submit
@@ -6492,6 +6527,7 @@ class CloseOptionAction(TradeAction):
 
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
+            self._raised = True
             logger.error(f"Error executing close_option for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
