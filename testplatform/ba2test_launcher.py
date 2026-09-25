@@ -5482,12 +5482,17 @@ _STYLE_MEMBER_TAGS = {
     "O_LEAP": 15, "O_PMCC": 16, "O_CONVEX": 17, "O_ERN": 18, "O_CBS": 19, "O_PBS": 20,
     "O_CC": 21, "O_PP": 22,
 }
+#: Tag VALUES of members retired from styles. A retired member stays in ``_STYLE_MEMBER_TAGS``
+#: (order rows written with its tag still exist, and a deployed ruleset may still read it) and
+#: its value is never reused; it is simply no longer admissible. Empty today.
+_STYLE_RETIRED_TAGS: set = set()
 #: Members whose short leg is assigned PER LEG (not unit-settled as a defined-risk combo --
 #: BacktestAccount.defined_risk_combo_strategy returns None for them), so an assignment leaves
 #: STOCK behind. Since plan revision E2 the run holds that stock only for the members listed in
 #: ``hold_assigned_stock_tags`` (the wheel) and liquidates the others' at the next bar's open,
 #: so these members may share a style with O_WHEEL; the set stays the statement of which members
-#: can put stock on the book at all (Task 9 checks it against the settlement path).
+#: can put stock on the book at all. READ BY TASK 9's tests (test_option_style_premium_wheel.py),
+#: which check it against BacktestAccount's per-leg settlement path.
 _STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL"}
 #: Members whose ENTRY is an equity buy (the S2 baseline in round lots) with an option overlay
 #: in their exits. Admissible (revision E1), but the option-entry ``action_overrides`` have
@@ -5535,7 +5540,35 @@ def _style_tree_leaves(node, out=None) -> list:
 
 
 def _style_is_number(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    """A real, FINITE number. NaN / Infinity are refused: every NaN comparison is False, so a
+    NaN band would pass every ``min <= value <= max`` check it should fail."""
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+class _StylePairs(list):
+    """A JSON object as its raw (key, value) pairs, so duplicate keys survive parsing and can be
+    refused with their path (``json.load`` alone keeps the LAST value silently)."""
+
+
+def _style_json_tree(node, path: str = ""):
+    """``_StylePairs`` -> dict, refusing a repeated key by name and path."""
+    if isinstance(node, _StylePairs):
+        out: dict = {}
+        for key, value in node:
+            if key in out:
+                raise ValueError(f"duplicate key {key!r} at {path or '<top level>'}: JSON keeps "
+                                 f"only the last one, so one of them would be silently dropped")
+            out[key] = _style_json_tree(value, f"{path}.{key}" if path else key)
+        return out
+    if isinstance(node, list):
+        return [_style_json_tree(v, f"{path}[{i}]") for i, v in enumerate(node)]
+    return node
+
+
+def _style_refuse_json_constant(name: str):
+    raise ValueError(f"non-finite JSON constant {name} (a NaN/Infinity band passes every "
+                     f"comparison check it should fail)")
 
 
 def _style_member_group_of(key: str) -> "str | None":
@@ -5570,6 +5603,9 @@ def _validate_style_member_key(where: str, key, admissible: set) -> None:
         raise ValueError(
             f"{where}: O_STK is a plain equity long with no option structure; the stock-plus-"
             f"option members a style may hold are {sorted(_STYLE_EQUITY_ENTRY)}")
+    if key in _STYLE_MEMBER_TAGS and _STYLE_MEMBER_TAGS[key] in _STYLE_RETIRED_TAGS:
+        raise ValueError(f"{where}: {key} is RETIRED from styles (_STYLE_RETIRED_TAGS); its tag "
+                         f"{_STYLE_MEMBER_TAGS[key]} is kept for existing rows, never reused")
     if key not in admissible:
         raise ValueError(
             f"{where}: {key!r} is not a style member (admissible: {sorted(admissible)})")
@@ -5591,7 +5627,7 @@ def _validate_style_action_overrides(where: str, key: str, overrides) -> None:
         if not isinstance(v, int) or isinstance(v, bool) or v < 0:
             raise ValueError(f"{where}: action_overrides[{k!r}] must be a non-negative "
                              f"integer, got {v!r}")
-    if overrides.get("option_dte_step") == 0:
+    if "option_dte_step" in overrides and overrides["option_dte_step"] == 0:
         raise ValueError(f"{where}: action_overrides option_dte_step must be > 0")
     for lo, hi in (("option_dte_min", "option_dte_max"),
                    ("option_dte_min_range", "option_dte_max_range")):
@@ -5615,7 +5651,7 @@ def _validate_style_exit_overrides(where: str, overrides) -> None:
                              f"{sorted(_STYLE_EXIT_OVERRIDE_FIELDS)}; refused {unknown}")
         bad = sorted(f for f, v in band.items() if not _style_is_number(v))
         if bad:
-            raise ValueError(f"{where}: exit_overrides[{cid!r}] {bad} must be numbers")
+            raise ValueError(f"{where}: exit_overrides[{cid!r}] {bad} must be finite numbers")
         if "value_step" in band and band["value_step"] <= 0:
             raise ValueError(f"{where}: exit_overrides[{cid!r}] value_step must be > 0")
         order = [f for f in ("value_min", "value", "value_max") if f in band]
@@ -5720,9 +5756,11 @@ def _validate_style(name: str, style: dict) -> None:
                 raise ValueError(
                     f"{where}: {a} and {b} build the SAME entry rule/condition ids {clash}; one "
                     f"expert cannot carry two entry rules under one id (their genes would be one "
-                    f"gene). Keep one of them"
-                    + (" -- O_WHEEL's entry IS O_CSP's" if {a, b} == {"O_WHEEL", "O_CSP"}
-                       else "") + ".")
+                    f"gene). This is a MECHANISM limit, not a strategy verdict"
+                    + (" (O_WHEEL reuses O_CSP's entry ids by design; since E2 they are "
+                       "different strategies)" if {a, b} == {"O_WHEEL", "O_CSP"} else "")
+                    + f": re-identifying one member's entry is a Task 5/6 design question in "
+                    f"{_STYLE_PLAN}; until it is answered, list only one of them.")
     _validate_style_price_caps(where, style, keys)
 
 
@@ -5735,9 +5773,10 @@ def _load_style_spec(path: str, name: str) -> dict:
     from copy import deepcopy
     try:
         with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"style spec {path}: cannot be read as JSON: {exc}") from exc
+            data = _style_json_tree(json.load(fh, object_pairs_hook=_StylePairs,
+                                              parse_constant=_style_refuse_json_constant))
+    except (OSError, ValueError) as exc:     # JSONDecodeError, a duplicate key, NaN/Infinity
+        raise ValueError(f"style spec {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"style spec {path}: top level must be an object")
     unknown = sorted(set(data) - {"schema", "styles"})

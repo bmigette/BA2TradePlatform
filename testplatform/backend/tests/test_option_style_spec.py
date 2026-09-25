@@ -32,9 +32,15 @@ _TAGS_AS_FIRST_PERSISTED = {
 }
 
 
-def test_member_tags_cover_exactly_the_admissible_members_and_never_collide():
+def test_member_tags_cover_every_admissible_member_and_never_collide():
     m = _launcher()
-    assert set(m._STYLE_MEMBER_TAGS) == m._style_admissible_members()
+    tags = m._STYLE_MEMBER_TAGS
+    assert m._style_admissible_members() <= set(tags)
+    # A tagged member that is no longer admissible must be RETIRED explicitly: its tag stays in
+    # the table (rows written with it still exist) and is never reused.
+    assert m._STYLE_RETIRED_TAGS <= set(tags.values())
+    assert {k for k in tags if k not in m._style_admissible_members()} == {
+        k for k, v in tags.items() if v in m._STYLE_RETIRED_TAGS}
     assert len(set(m._STYLE_MEMBER_TAGS.values())) == len(m._STYLE_MEMBER_TAGS)
     assert all(isinstance(v, int) and not isinstance(v, bool) and v >= 1
                for v in m._STYLE_MEMBER_TAGS.values())
@@ -206,17 +212,75 @@ def test_the_candidate_file_has_the_four_styles_all_marked_candidate():
 
 def test_the_premium_candidate_holds_stock_and_options_per_the_revision():
     """User decision 2026-09-25: the premium style holds stock + options. O_CC is a member (E1)
-    and O_JL / O_RS sit beside O_WHEEL (E2). O_CSP is not: O_WHEEL's entry IS O_CSP's."""
+    and O_JL / O_RS sit beside O_WHEEL (E2)."""
     m = _launcher()
     style = m._load_style_spec(_CANDIDATES, "premium")
     keys = [x["key"] for x in style["members"]]
     assert {"O_CC", "O_WHEEL", "O_JL", "O_RS"} <= set(keys)
-    assert "O_CSP" not in keys
     assert keys[-1] == "O_WHEEL"                       # Q4 placeholder: the wheel last
     assert style["price_cap_policy"] == "none"         # Q3 placeholder: mixed $100 / uncapped
+
+
+def test_premium_plus_O_CSP_is_refused_by_the_shared_entry_id_mechanism(tmp_path):
+    """O_CSP's absence from premium is NOT a strategy choice (membership is decided after
+    stage 1; since E2 a CSP and a wheel are different strategies). It is a MECHANISM limit: the
+    wheel reuses O_CSP's entry ids, and re-identifying one of them is a Task 5/6 design
+    question. Pinned here as the loader's refusal, so lifting it is a visible change."""
+    m = _launcher()
+    data = json.loads(Path(_CANDIDATES).read_text())
+    premium = data["styles"]["premium"]
+    premium["members"] = premium["members"][:-1] + [{"key": "O_CSP"}] + premium["members"][-1:]
+    path = tmp_path / "with_csp.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=r"O_CSP and O_WHEEL build the SAME entry") as exc:
+        m._load_style_spec(str(path), "premium")
+    assert "o_csp-entry" in str(exc.value) and "Task 5/6" in str(exc.value)
 
 
 def test_the_leaps_convex_candidate_carries_no_convex_waiver():
     """Q5 is open: the style must refuse a CAR-family fitness (Task 7), so no waiver is authored."""
     m = _launcher()
     assert "convex_fitness_waiver" not in m._load_style_spec(_CANDIDATES, "leaps_convex")
+
+
+# --- review fixes: duplicate keys and non-finite numbers are refused, never absorbed ----------
+def test_a_repeated_style_name_is_refused_naming_it(tmp_path):
+    m = _launcher()
+    p = tmp_path / "dup.json"
+    p.write_text('{"schema": 1, "styles": {'
+                 '"premium": {"status": "candidate", "members": [{"key": "O_LC"}]}, '
+                 '"premium": {"status": "candidate", "members": [{"key": "O_LP"}]}}}')
+    with pytest.raises(ValueError, match=r"duplicate key 'premium' at styles"):
+        m._load_style_spec(str(p), "premium")
+
+
+def test_a_member_with_two_key_fields_is_refused_naming_the_path(tmp_path):
+    m = _launcher()
+    p = tmp_path / "dup.json"
+    p.write_text('{"schema": 1, "styles": {"s": {"status": "candidate", '
+                 '"members": [{"key": "O_LC"}, {"key": "O_LP", "key": "O_BF"}]}}}')
+    with pytest.raises(ValueError, match=r"duplicate key 'key' at styles\.s\.members\[1\]"):
+        m._load_style_spec(str(p), "s")
+
+
+def test_non_finite_json_constants_are_refused_at_load(tmp_path):
+    m = _launcher()
+    bad = {"value": float("nan"), "value_min": 50, "value_max": 10,
+           "value_step": float("inf")}
+    path = _write(tmp_path, {"s": {"status": "candidate",
+                                   "members": [{"key": "O_LC", "exit_overrides": {"td": bad}}]}})
+    assert "NaN" in Path(path).read_text()        # json.dumps writes the non-standard constant
+    with pytest.raises(ValueError, match="non-finite"):
+        m._load_style_spec(path, "s")
+
+
+@pytest.mark.parametrize("field, v", [("value", float("nan")), ("value_step", float("inf")),
+                                      ("value_min", float("-inf"))])
+def test_non_finite_band_values_are_refused_by_the_validator_too(field, v):
+    """Belt and braces: a spec reaching the validator by another route (a dict built in code)
+    must not slip a NaN past the band checks -- every NaN comparison is False."""
+    m = _launcher()
+    band = {"value": 20, "value_min": 10, "value_max": 30, "value_step": 5, field: v}
+    with pytest.raises(ValueError, match=rf"\[{field!r}\] must be (finite )?numbers"):
+        m._validate_style("s", {"status": "candidate",
+                                "members": [{"key": "O_LC", "exit_overrides": {"td": band}}]})

@@ -2299,8 +2299,17 @@ Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1
     non-`shared-*` condition ids are refused (today O_WHEEL + O_CSP and O_CC + O_PP), because their
     genes would merge into one. Letting both in needs a re-id of one member's entry (Tasks 5/6).
   - `action_overrides` on an equity-entry member (O_CC/O_PP) are refused: nothing to act on.
+  - Review fixes: the loader refuses a duplicate JSON key (naming it and its path) and any
+    NaN/Infinity (at parse and in the band checks). A member can be retired without breaking
+    append-only: its tag goes in `_STYLE_RETIRED_TAGS` and stays in the table, never reused.
 - **Task 4 as built** (`e317a399`): premium = O_BULLPS, O_BEARCS, O_IC, O_JL, O_RS, O_CC, O_WHEEL
   (the stage-2 plan's premium list minus O_CSP), `price_cap_policy: none` (Q3), wheel last (Q4).
+  - **O_CSP is excluded for now by a MECHANISM limit, not a strategy decision.** O_WHEEL reuses
+    O_CSP's entry ids, so the loader refuses the pair (pinned by
+    `test_premium_plus_O_CSP_is_refused_by_the_shared_entry_id_mechanism`). Since E2 a CSP (liquidates
+    on assignment) and a wheel (holds and writes calls) are DIFFERENT strategies, so re-identifying
+    one member's entry is an open Task 5/6 design question, and whether O_CSP joins premium is a user
+    decision after stage 1.
 - **Knock-on for later tasks:**
   - Task 5: premium now has an EQUITY entry (O_CC), so "every option action carries its member
     tag" must become "every entry action carries its member tag" (E1 supports a tag on equity
