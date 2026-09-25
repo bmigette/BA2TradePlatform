@@ -2373,6 +2373,10 @@ class _OptionEntryAction(TradeAction):
     _min_one_contract_note: Optional[str] = None
     #: True when the latest sizing's quantity came from the floor (recorded on the result).
     _min_one_contract_applied: bool = False
+    #: The style-group MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1), None unless a
+    #: rule carries one. Class-level for the same reason as ``min_one_contract``: an action
+    #: built without the ctor reads it as absent, like every config written before it existed.
+    entry_tag: Optional[int] = None
 
     def __init__(self, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation,
@@ -2393,6 +2397,7 @@ class _OptionEntryAction(TradeAction):
                  w_iv: Optional[float] = None,
                  w_rvol: Optional[float] = None,
                  min_one_contract: Any = None,
+                 entry_tag: Any = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -2455,6 +2460,14 @@ class _OptionEntryAction(TradeAction):
         # no-zero-coercion audit pins allowlisted sites by file:line.)
         from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
         self.min_one_contract = False if min_one_contract is None else coerce_bool(min_one_contract)
+        # STYLE-GROUP MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1): which member of
+        # a composed option expert this entry belongs to. Stamped onto the PARENT order row at
+        # submit (see ``_submit_option_order``) and read back by ``EntryTagCondition`` to scope
+        # that member's exits. None (absent) on every rule not emitted by a style expert, and
+        # then nothing is stamped -- byte-identical. Anything but a positive integer is REFUSED
+        # here: the tag decides which exits may close the position, so it is never guessed at.
+        from ba2_common.core.entry_tag import coerce_entry_tag
+        self.entry_tag = coerce_entry_tag(entry_tag)
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -3552,6 +3565,13 @@ class _OptionEntryAction(TradeAction):
             entry_facts["entry_record"] = data["entry_record"]
         if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
             entry_facts["entry_cross"] = float(self.entry_cross)
+        # The style-group MEMBER TAG rides the row by NAME too (never via the whitelist tuple
+        # above -- the trap that comment describes): EntryTagCondition reads it back off this
+        # row to scope the member's exits. Only when the rule carried one, so every untagged
+        # entry's row -- every existing run and every live rule -- is byte-identical.
+        if self.entry_tag is not None:
+            from ba2_common.core.entry_tag import ORDER_ENTRY_TAG_KEY
+            entry_facts[ORDER_ENTRY_TAG_KEY] = self.entry_tag
         if entry_facts and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)

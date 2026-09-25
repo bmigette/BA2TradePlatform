@@ -283,9 +283,16 @@ def test_the_editor_persists_every_param_it_is_expected_to(editor):
     # (``uses_short_dte_window``), so on an iron condor the pair is a decoy in exactly the
     # way Wing Width is a decoy on a long call. Their reachability ON the PMCC is asserted
     # by its own test below, so this exclusion cannot hide the fields disappearing.
+    #
+    # entry_tag is the fourth, and it is not a KNOB at all: it is the style-group member
+    # identity (plan 2026-09-25 option-stage2-build, Task 1) that the style builder stamps on
+    # each member's entry action so the member's tag-scoped exits can find its positions. A
+    # hand-typed tag would re-route a position to another member's exits, so the editor must
+    # never OFFER it -- pinned by the `not in persisted` assertion below.
     expected = consumed - {'min_volume', 'strike_method', 'entry_cross',
-                           'short_dte_min', 'short_dte_max'}
+                           'short_dte_min', 'short_dte_max', 'entry_tag'}
     assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
+    assert 'entry_tag' not in persisted
     assert 'min_volume' not in persisted
     assert 'strike_method' not in persisted
     assert 'short_dte_min' not in persisted and 'short_dte_max' not in persisted
@@ -306,9 +313,10 @@ def test_the_editor_persists_every_param_for_a_structure_that_reads_the_strike_m
     persisted = set(saved) - {'action_type'}
     consumed = set(_OPTION_ENTRY_PARAM_KEYS)
     # wing_width_pct and the PMCC's second expiry window are the per-action omissions here,
-    # mirroring strike_method above; entry_cross is backtest-only (see the sibling test).
+    # mirroring strike_method above; entry_cross is backtest-only and entry_tag is the style
+    # builder's member identity, not a knob (see the sibling test).
     expected = consumed - {'min_volume', 'wing_width_pct', 'entry_cross',
-                           'short_dte_min', 'short_dte_max'}
+                           'short_dte_min', 'short_dte_max', 'entry_tag'}
     assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
     assert 'strike_method' in persisted
     assert persisted <= consumed

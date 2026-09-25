@@ -16,6 +16,7 @@ from ba2_common.core.types import (
     is_option_action,
 )
 from ba2_common.core.market_conditions import PROFILES
+from ba2_common.core.entry_tag import ORDER_ENTRY_TAG_KEY, coerce_entry_tag
 
 # Strategy condition-tree field -> ExpertEventType for value (N_*) gates. These are the
 # numeric fields an entry/exit condition tree tunes on; an unknown field is skipped (it
@@ -410,6 +411,15 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("w_premium", ("option_w_premium",)),
     ("w_iv", ("option_w_iv",)),
     ("w_rvol", ("option_w_rvol",)),
+    # STYLE-GROUP MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1): which member of a
+    # composed option expert this entry belongs to, stamped on the parent order row and read
+    # back by ``EntryTagCondition`` to scope that member's exits. Absent stays absent --
+    # byte-identical for every existing rule. The bare ``entry_tag`` is ALSO accepted as a
+    # source so a live ruleset round-trips (``_live_action_to_action_cfg`` keeps the live key
+    # verbatim): a tag lost on re-export would leave that member's positions untagged, and
+    # its tag-scoped exits could then never fire. Validated here too (``coerce_entry_tag``),
+    # so a bad tag is refused where the rule is converted, not first at live evaluation.
+    ("entry_tag", ("option_entry_tag", "entry_tag")),
 )
 
 
@@ -434,6 +444,8 @@ def _option_action_config(raw: str, rule: dict) -> dict:
         for src in source_keys:
             val = rule.get(src)
             if val is not None:
+                if cfg_key == ORDER_ENTRY_TAG_KEY:
+                    val = coerce_entry_tag(val)
                 cfg[cfg_key] = val
                 break
     return cfg

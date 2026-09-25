@@ -68,6 +68,13 @@ _OPTION_ENTRY_PARAM_KEYS = (
     # byte. w_profit/w_rr are deliberately not forwarded until a builder supplies the
     # structure_fn they need -- see _OptionEntryAction.__init__.
     'w_premium', 'w_iv', 'w_rvol',
+    # STYLE-GROUP MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1): stamped by
+    # _submit_option_order onto the parent order row, read back by EntryTagCondition. Absent
+    # on every rule not emitted by a style expert, and then never forwarded (only keys present
+    # in the config are), so the ctor keeps its None default -- byte-identical. Not a user
+    # knob: the live rule editor deliberately offers no widget for it (see
+    # tests/test_option_ui_param_reachability.py).
+    'entry_tag',
 )
 
 
