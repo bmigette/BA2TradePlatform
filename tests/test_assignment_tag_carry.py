@@ -81,3 +81,51 @@ def test_a_partial_called_away_remainder_keeps_the_lots_member_tag(mock_account_
     entries = [o for o in _orders_of(remainder.id) if o.depends_on_order is None]
     assert len(entries) == 1
     assert order_entry_tag(entries[0]) == WHEEL, entries[0].data
+
+
+# --------------------------------------------------------------------------------------------- #
+# review M1: a CORRUPT stored tag is a retryable refusal, read before any ledger write
+# --------------------------------------------------------------------------------------------- #
+def _activity_row(account_id, activity_id):
+    from ba2_trade_platform.core.models import OptionActivity
+    with get_db() as session:
+        return session.exec(select(OptionActivity)
+                            .where(OptionActivity.account_id == account_id)
+                            .where(OptionActivity.activity_id == activity_id)).first()
+
+
+def test_a_corrupt_tag_on_the_assigned_put_is_a_RETRYABLE_refusal_with_no_ledger_write(
+        mock_account, mock_expert_instance):
+    acct = _make_alpaca(mock_account.id)
+    opt_txn_id = _seed_short_option(mock_account.id, mock_expert_instance.id, PUT_OCC,
+                                    OptionRight.PUT, strike=150.0, contracts=1)
+    _tag_the_option_entry(opt_txn_id, "seven")        # nothing an entry could have written
+
+    (result,) = _assign(acct, PUT_OCC, 1, "act-corrupt")
+    assert result["result"].startswith("unhandled:"), result
+    assert not result["result"].startswith("unhandled: exception:"), (
+        f"a corrupt tag must be RETRYABLE once the row is repaired: {result}")
+    assert "entry_tag" in result["result"]
+    assert _equity_txns(mock_expert_instance.id) == [], "a ledger write happened anyway"
+
+    # repaired -> the next pass applies it
+    _tag_the_option_entry(opt_txn_id, WHEEL)
+    (again,) = _assign(acct, PUT_OCC, 1, "act-corrupt")
+    assert again["result"].startswith("csp_assignment"), again
+    (txn,) = _equity_txns(mock_expert_instance.id)
+    (entry,) = _orders_for(txn.id)
+    assert order_entry_tag(entry) == WHEEL
+
+
+def test_a_corrupt_tag_on_a_partially_called_away_lot_is_a_RETRYABLE_refusal(
+        mock_account_def, mock_expert_instance):
+    acct = _make_alpaca(mock_account_def.id)
+    lot_id = _assigned_equity_txn(mock_account_def.id, mock_expert_instance.id, shares=300.0)
+    _tag_the_option_entry(lot_id, -4)
+
+    (result,) = _reconcile_called_away(acct, mock_account_def.id, mock_expert_instance.id,
+                                       contracts=1)
+    assert result["result"].startswith("unhandled:"), result
+    assert not result["result"].startswith("unhandled: exception:"), result
+    (still,) = _open_txns(mock_expert_instance.id)
+    assert still.id == lot_id and float(still.quantity) == 300.0, "the lot was split anyway"

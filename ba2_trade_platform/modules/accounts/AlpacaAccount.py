@@ -7088,10 +7088,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # Cash-secured put assigned -> we BUY 100*contracts shares @ strike.
                 share_qty = 100.0 * contracts
                 # The delivered stock INHERITS the put's style-member tag (stage-2 E2), read
-                # BEFORE any ledger write so a corrupt stored tag refuses the whole activity.
-                # Same fact, same shared stamp as the backtest's assignment
+                # BEFORE any ledger write, so a corrupt stored tag refuses the whole activity
+                # as a RETRYABLE ``unhandled:`` result (applied on a later pass once the row is
+                # repaired). Same fact, same shared stamp as the backtest's assignment
                 # (BacktestAccount._open_assigned_stock_transaction). Untagged -> no data.
-                stock_entry_data = assigned_stock_entry_data(self._position_entry_tag(opt_txn))
+                stock_entry_data, refusal = self._member_tag_entry_data(opt_txn, "assigned put")
+                if refusal is not None:
+                    return refusal
                 now = datetime.now(timezone.utc)
                 equity_txn = Transaction(
                     symbol=underlying,
@@ -7129,6 +7132,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # SPLIT when it is bigger than the assignment (see _settle_called_away),
                 # never erased.
                 held = self._find_open_equity_long(underlying, expert_id)
+                # A partial call-away leaves a remainder lot that keeps the held lot's member
+                # tag (stage-2 E2). Read HERE, before the option leg or the lot is touched, so
+                # a corrupt stored tag is a retryable refusal rather than a half-applied split.
+                remainder_entry_data = None
+                if held is not None:
+                    remainder_entry_data, refusal = self._member_tag_entry_data(
+                        held, "called-away lot")
+                    if refusal is not None:
+                        return refusal
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
                     close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
@@ -7139,7 +7151,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     return self._settle_called_away(
                         held=held, underlying=underlying, contracts=contracts,
                         strike=strike, contract=symbol, activity_id=activity_id,
-                        leg_note=leg_note)
+                        leg_note=leg_note, remainder_entry_data=remainder_entry_data)
                 logger.warning(
                     f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
                     f"equity long found for {underlying} (expert {expert_id}).")
@@ -7381,7 +7393,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
     def _settle_called_away(self, *, held, underlying: str, contracts: float,
                             strike: float, contract: str, activity_id: str,
-                            leg_note: str = "closed short call txn") -> str:
+                            leg_note: str = "closed short call txn",
+                            remainder_entry_data: "Optional[dict]" = None) -> str:
         """Take the called-away shares off ONE equity lot, SPLITTING it when the lot is
         larger than the assignment.
 
@@ -7466,7 +7479,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         if remainder_qty > 0.0:
             remainder_id = self._open_called_away_remainder(
                 held=held, underlying=underlying, remainder_qty=remainder_qty,
-                exit_qty=exit_qty, contract=contract, activity_id=activity_id)
+                exit_qty=exit_qty, contract=contract, activity_id=activity_id,
+                entry_data=remainder_entry_data)
             # The original row now describes ONLY the shares that left. Persisted by the
             # _close_txn below (update_instance writes the whole object).
             held.quantity = exit_qty
@@ -7497,7 +7511,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
     def _open_called_away_remainder(self, *, held, underlying: str, remainder_qty: float,
                                     exit_qty: float, contract: str,
-                                    activity_id: str) -> "Optional[int]":
+                                    activity_id: str,
+                                    entry_data: "Optional[dict]" = None) -> "Optional[int]":
         """Open the transaction that holds the shares a partial called-away LEFT BEHIND.
 
         It is the same position as before, only smaller: same symbol, side, cost basis,
@@ -7511,12 +7526,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         lot's own ``open_date``: this row stands in for the part of the original purchase
         that is still held, so ``DaysOpenedCondition``'s order-level fallback lands on the
         same date as the transaction's ``open_date``.
+
+        ``entry_data``: the lot's style-member tag for the remainder's entry row (stage-2 E2),
+        read by the caller BEFORE the split starts (``_member_tag_entry_data``). None -> no data,
+        as before.
         """
         from ...core.types import TransactionStatus
-
-        # Still the same member's stock: the remainder's entry row keeps the lot's style-member
-        # tag (stage-2 E2). Read before any write; untagged -> no data, as before.
-        remainder_entry_data = assigned_stock_entry_data(self._position_entry_tag(held))
 
         meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
         meta["split_from_transaction_id"] = held.id
@@ -7546,7 +7561,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                      f"after {exit_qty:g} were called away by {contract} (broker activity "
                      f"{activity_id}) — the un-called part of transaction {held.id}, "
                      f"synthetic fill, no broker order exists"),
-            data=remainder_entry_data)
+            data=entry_data)
         if entry_id is None:
             # Without the order row the remaining shares exist only as a Transaction, and
             # every share count in the platform reads orders. Say so: the split is still
@@ -7665,6 +7680,23 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"[Account {self.id}] Failed to record {origin} equity order for "
                 f"{symbol} (activity {activity_id}): {e}", exc_info=True)
             return None
+
+    def _member_tag_entry_data(self, transaction, what: str) -> "tuple":
+        """``(entry data, None)`` carrying ``transaction``'s style-member tag for an assignment's
+        stock entry row -- or ``(None, refusal)`` when the stored tag is corrupt.
+
+        The refusal is an ``unhandled: ...`` result WITHOUT the ``exception:`` prefix, which
+        ``reconcile_option_assignments`` retries on a later pass: the caller returns it before
+        any ledger write, so nothing is half-applied and the activity is re-tried once the
+        order row is repaired (stage-2 E2 review M1)."""
+        try:
+            return assigned_stock_entry_data(self._position_entry_tag(transaction)), None
+        except ValueError as e:
+            logger.error(
+                f"[Account {self.id}] {what} (transaction {getattr(transaction, 'id', None)}): "
+                f"its entry order carries an unreadable style-member entry_tag ({e}); refusing "
+                f"the activity before any ledger write -- it is retried once the row is fixed.")
+            return None, f"unhandled: unreadable entry_tag on the {what}: {e}"
 
     def _position_entry_tag(self, transaction) -> "Optional[int]":
         """The style-member tag of ``transaction``'s position, or None (stage-2 E2).
