@@ -4608,6 +4608,26 @@ def _add_option_spread_args(p) -> None:
                         "premium dollars (full width). Setting it selects the legacy model.")
 
 
+def _add_short_borrow_args(p) -> None:
+    """``--short-borrow-rate-pa``, shared by ``optimize`` and ``optimize-batch`` so the two
+    cannot drift apart (plan 2026-09-24 equity short selling, Task S4)."""
+    p.add_argument("--short-borrow-rate-pa", type=float, default=None,
+                   help="Annual borrow rate charged on open SHORT equity positions, accrued "
+                        "once per trading session at rate/252 x the short's market value and "
+                        "reported as short_borrow_cost in the results. Default 0.005 "
+                        "(0.5%%/yr, easy-to-borrow large caps); 0 = no borrow cost. A "
+                        "long-only run pays nothing at any rate.")
+
+
+def _short_borrow_account_setting(args) -> float:
+    """The resolved ``short_borrow_rate_pa`` for ``account_settings``: the stated rate,
+    validated, or the account's documented default. Written EXPLICITLY into the run config so
+    the stored block (and every trial built from it) carries the rate the run charged."""
+    from app.services.backtest.backtest_account import resolve_short_borrow_rate_pa
+    return resolve_short_borrow_rate_pa(
+        {"short_borrow_rate_pa": getattr(args, "short_borrow_rate_pa", None)})
+
+
 def _option_spread_account_settings(args) -> Dict[str, Any]:
     """The ``account_settings`` slice that tells ``BacktestAccount`` how to charge option spreads.
 
@@ -6008,6 +6028,8 @@ def _cmd_optimize(args) -> int:
                 "commission_per_trade": float(args.commission),
                 "slippage_bps": float(args.slippage),
                 "spread_bps": float(getattr(args, "spread_bps", 0.0)),
+                # Borrow cost on open short equity positions (see --short-borrow-rate-pa).
+                "short_borrow_rate_pa": _short_borrow_account_setting(args),
                 # The option spread model + its legacy knobs (plan Part F): see
                 # _option_spread_account_settings.
                 **_option_spread_account_settings(args),
@@ -6373,6 +6395,8 @@ def _cmd_optimize_batch(args) -> int:
                     "commission_per_trade": float(args.commission),
                     "slippage_bps": float(args.slippage),
                     "spread_bps": float(getattr(args, "spread_bps", 0.0)),
+                    # Borrow cost on open short equity positions (see --short-borrow-rate-pa).
+                    "short_borrow_rate_pa": _short_borrow_account_setting(args),
                     # The option spread model + its legacy knobs (plan Part F).
                     **_option_spread_account_settings(args),
                     "fill_model": args.fill_model,
@@ -7581,6 +7605,7 @@ def main(argv: "list | None" = None) -> int:
                          "fill-engine level (widens LIMIT/TP trigger thresholds + degrades "
                          "MARKET/STOP fill prices) -- see BacktestAccount._slip/"
                          "_limit_trigger_price. Default 0.0 (off).")
+    _add_short_borrow_args(op)
     _add_option_spread_args(op)
     op.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
                     help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "
@@ -7743,6 +7768,7 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points (see optimize --spread-bps).")
+    _add_short_borrow_args(ob)
     _add_option_spread_args(ob)
     ob.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
                     help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "

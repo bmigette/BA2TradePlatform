@@ -188,6 +188,14 @@ def _as_date(d: Any) -> date:
     raise TypeError(f"Cannot normalise {d!r} ({type(d)}) to a date")
 
 
+def _is_session_close(days: List[Any], i: int) -> bool:
+    """Is ``days[i]`` the LAST bar of its trading session (the next bar is another day, or
+    there is none)? Always True on a daily clock. Used for once-per-session charges (the short
+    borrow accrual). A US session never crosses midnight in ET or UTC, so the calendar day of
+    the bar key is the session."""
+    return i + 1 >= len(days) or _as_date(days[i + 1]) != _as_date(days[i])
+
+
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
@@ -754,6 +762,17 @@ class DailyBacktestEngine:
             #     roll — extracted into _fills_and_settlements so the bar tail is
             #     testable on its own.
             self._fills_and_settlements(as_of_dt)
+
+            # 4b-bis. borrow cost on open SHORT equity positions, once per trading session, on
+            #     the session's LAST bar (every bar on a daily clock), so the fee is charged on
+            #     the short held into the close at the mark the curve records. Before the option
+            #     breaker and the snapshot, so both measure the post-fee equity. The account owns
+            #     the rate and the maths (BacktestAccount.accrue_short_borrow); a long-only run
+            #     holds no short and this touches nothing.
+            if _is_session_close(days, i):
+                accrue = getattr(self.account, "accrue_short_borrow", None)
+                if accrue is not None:
+                    accrue(as_of_dt)
 
             # 4c. the option sleeve's drawdown circuit breaker, once per bar, for a
             #     ``classic_options`` expert and no other. Until 2026-09-01 the breaker

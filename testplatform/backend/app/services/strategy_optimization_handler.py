@@ -2658,6 +2658,10 @@ def _build_daily_trial_config(
         ),
         "experts": experts_out,
         "initial_capital": float(backtest_cfg["initial_capital"]),
+        # Carried WHOLE (not rebuilt key by key), so every account knob the run states reaches
+        # the trial's BacktestAccount -- including ``short_borrow_rate_pa`` (plan 2026-09-24 S4),
+        # which the account reads from here and results echo. Rebuilding this block key by key
+        # would reintroduce the whitelist trap for all of them (test_short_borrow_cost pins it).
         "account_settings": backtest_cfg["account_settings"],
         "warmup_days": int(backtest_cfg["warmup_days"]),
         "seed": int(backtest_cfg["seed"]),

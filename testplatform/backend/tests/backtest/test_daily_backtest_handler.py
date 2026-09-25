@@ -113,6 +113,10 @@ def test_build_config_assembles_account_settings():
         "slippage_bps": 0.0,
         "fill_model": "next_bar_open",
         "spread_bps": 0.0,  # optional, defaults to 0.0 (exact no-op) when absent from payload
+        # Borrow rate on open SHORT equity positions (plan 2026-09-24 S4): RESOLVED to the
+        # stated default when absent, so the config says what the run charges. A long-only
+        # run pays nothing at any rate.
+        "short_borrow_rate_pa": 0.005,
         # OPTION spread (plan Part F, 2026-09-22): NO keys when the payload states none. The
         # handler never invents a spread -- the old 0.0 default was a silent zero-spread run.
         # An OPTIONS run with no stated model is refused by the account

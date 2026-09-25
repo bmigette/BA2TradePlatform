@@ -222,6 +222,11 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     # of scoring it on the (already-clamped-at-0) numbers a real-money account could never
     # actually produce.
     metrics["account_wiped_out"] = bool(getattr(account, "_wiped_out", False))
+    # SHORT BORROW COST (plan 2026-09-24 S4): the annual rate the run charged on open short
+    # equity positions, and the total it charged (currency), on its own line so it reads
+    # separately from spread. Already inside final_equity and the curve (it is debited from
+    # cash each session); this is the attribution, not a second deduction.
+    metrics.update(_short_borrow_echo(account, config))
     # Positions still OPEN at the end of the run. total_trades counts CLOSED round-trips, so a
     # buy-and-hold (no exit rule) shows 0 trades while equity still moves (entry commission +
     # the held position's mark-to-market). Surfacing these explains "0 trades but P&L changed".
@@ -236,6 +241,29 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
         # no guard (the sqlite store, or a guard-less fixture reader). Recorded, not scored.
         metrics["option_basis_guard"] = account.option_basis_guard_stats()
     return metrics
+
+
+def _short_borrow_echo(account: Any, config: Dict[str, Any]) -> Dict[str, float]:
+    """``short_borrow_rate_pa`` + ``short_borrow_cost`` for the results.
+
+    Read off the ACCOUNT, which is what actually charged. A lightweight stub account (tests)
+    has neither attribute as a number: its rate is resolved from the config's
+    ``account_settings`` exactly as the account would, and it cannot have charged anything.
+    """
+    from app.services.backtest.backtest_account import resolve_short_borrow_rate_pa
+
+    def _number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    rate = getattr(account, "short_borrow_rate_pa", None)
+    if not _number(rate):
+        rate = resolve_short_borrow_rate_pa(config.get("account_settings"))
+    cost = getattr(account, "short_borrow_cost", None)
+    return {
+        "short_borrow_rate_pa": float(rate),
+        "short_borrow_cost": round(_finite(cost if _number(cost) else 0.0,
+                                           "short_borrow_cost"), 2),
+    }
 
 
 def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[Any]:

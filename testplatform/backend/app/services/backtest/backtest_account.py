@@ -369,6 +369,54 @@ _OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
 _NET_LIMIT_TOLERANCE = 1e-9
 
 
+# ---------------------------------------------------------------------------
+# SHORT BORROW COST (plan 2026-09-24 equity short selling, Task S4)
+# ---------------------------------------------------------------------------
+# A short seller pays the lender a borrow fee for every day the shares are out. The account
+# charges it once per trading session, at the session's last bar (``accrue_short_borrow``,
+# called by the engine just before the equity snapshot), on the MARKET VALUE of every open
+# short equity position: ``|qty| x mark x short_borrow_rate_pa / BORROW_SESSIONS_PER_YEAR``.
+# The charge is debited from cash, exactly like a fill's commission, so it moves equity and
+# the curve; the running total is reported as ``short_borrow_cost`` in the results, separate
+# from spread.
+#
+# DAY COUNT: rate/252 per session. The account models no other interest (no margin interest,
+# no interest on idle cash), so there is no existing convention to mirror; 252 trading
+# sessions a year charges a position held for a full year exactly the annual rate. A weekend
+# is NOT charged (a broker charges calendar days, so this undercharges a held short by
+# roughly 365/252 on the calendar -- about 0.2%/yr of market value at the 0.5% default).
+#
+# DEFAULT 0.5%/yr: the easy-to-borrow large-cap rate (design section 4). A config that does
+# not state the rate (every stored pre-S4 config, and account fixtures) gets the default; a
+# long-only run holds no short, pays nothing, and is byte-identical at any rate.
+DEFAULT_SHORT_BORROW_RATE_PA = 0.005
+BORROW_SESSIONS_PER_YEAR = 252
+
+
+def resolve_short_borrow_rate_pa(settings: Optional[Dict[str, Any]]) -> float:
+    """The annual short borrow rate a run config states, validated.
+
+    Absent or None -> ``DEFAULT_SHORT_BORROW_RATE_PA``. The absence is the documented default
+    (design section 4), not a hidden one: configs written before the knob existed never short,
+    so they pay nothing whatever the rate. A stated value must be a finite number >= 0; 0 is a
+    legitimate "no borrow cost" run. A bool, a negative, NaN/Inf or a non-number is refused, so
+    a mistyped rate cannot silently become a free (or a paying) short.
+    """
+    raw = settings.get("short_borrow_rate_pa") if settings else None
+    if raw is None:
+        return DEFAULT_SHORT_BORROW_RATE_PA
+    if isinstance(raw, bool):
+        raise TypeError(f"short_borrow_rate_pa must be a number, got {raw!r}")
+    try:
+        rate = float(raw)
+    except (TypeError, ValueError):
+        raise TypeError(f"short_borrow_rate_pa must be a number, got {raw!r}") from None
+    if not math.isfinite(rate) or rate < 0:
+        raise ValueError(f"short_borrow_rate_pa must be a finite annual rate >= 0 "
+                         f"(0.005 = 0.5%/yr), got {raw!r}")
+    return rate
+
+
 class SpreadModelConfigError(ValueError):
     """An options run config that does not state a usable spread model
     (``BacktestAccount._resolve_spread_model``). A ``ValueError`` so existing catches still
@@ -430,6 +478,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # ``.get`` is correct rather than a hidden default: absence IS the off state, and 0.0
         # would be a very different (and catastrophic) instruction — see equity_cap.py.
         self._equity_cap: Optional[float] = settings.get("equity_cap")
+        # Short borrow cost (see the SHORT BORROW COST block above ``resolve_short_borrow_rate_pa``).
+        # Validated here, before the first bar, so a bad rate refuses the run up front.
+        self._short_borrow_rate_pa: float = resolve_short_borrow_rate_pa(settings)
+        # Running total of borrow charged (currency), reported as results' ``short_borrow_cost``.
+        self._short_borrow_cost: float = 0.0
+        # The session already charged: the once-per-session guard.
+        self._borrow_session: Optional[date] = None
         # WHICH option spread model prices every option fill (plan Part F; see
         # ``_option_half_spread`` and ``_resolve_spread_model``). Resolved HERE, before the first
         # bar, on every OPTIONS run (a provider is injected), so an unstated or zero spread
@@ -658,6 +713,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "trade resolves via SL/timeout instead, not just at a worse "
                                "price. Default 0.0 (exact no-op, existing behaviour unchanged).",
             },
+            "short_borrow_rate_pa": {
+                "type": "float",
+                "required": False,
+                "description": "Annual borrow rate charged on open SHORT equity positions "
+                               "(0.005 = 0.5%/yr, the default when absent). Accrued once per "
+                               "trading session at rate/252 x the short's market value, "
+                               "debited from cash and reported as short_borrow_cost. 0 = no "
+                               "borrow cost. A long-only run pays nothing at any rate.",
+            },
             "fill_model": {
                 "type": "str",
                 "required": True,
@@ -768,14 +832,83 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            px = self._price.close_at(p.symbol)
-            if px is None:
-                px = self._price.close_asof(p.symbol)  # forward-fill: last known close
-            if px is None:
-                px = getattr(p, "avg_price", None)  # never-priced held symbol -> entry
+            px = self._equity_mark_price(p)
             if px is not None:
                 total += p.qty * px
         return total + self._option_positions_mtm()
+
+    def _equity_mark_price(self, p: "_Position") -> Optional[float]:
+        """The price an equity position is marked at: this bar's close, else the last known
+        close (forward-fill), else the entry price for a never-priced symbol. The ONE mark
+        both the equity curve (``_compute_open_positions_mtm``) and the short borrow accrual
+        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows."""
+        px = self._price.close_at(p.symbol)
+        if px is None:
+            px = self._price.close_asof(p.symbol)  # forward-fill: last known close
+        if px is None:
+            px = getattr(p, "avg_price", None)  # never-priced held symbol -> entry
+        return px
+
+    @property
+    def short_borrow_rate_pa(self) -> float:
+        """The annual borrow rate this run charges on open short equity positions."""
+        return self._short_borrow_rate_pa
+
+    @property
+    def short_borrow_cost(self) -> float:
+        """Total borrow charged so far, in account currency (a positive number)."""
+        return self._short_borrow_cost
+
+    def accrue_short_borrow(self, as_of: Any) -> float:
+        """Charge ONE session's borrow on the open short equity positions; return the charge.
+
+        The engine calls this once per bar, just before ``snapshot_equity``, and only on the
+        LAST bar of a trading session (every bar on a daily clock), so the fee is charged on
+        what is held into the close -- the short the broker lends overnight -- at the mark the
+        curve records. A second call for the same session charges nothing (the guard below).
+
+        Charge = sum(|qty| x mark) x rate / ``BORROW_SESSIONS_PER_YEAR``, debited from cash
+        like a commission and added to ``short_borrow_cost``. Nothing is touched when the
+        rate is 0 or no short is held, so a long-only run is byte-identical.
+
+        OUT OF SCOPE, deliberately: short stock created by an option ASSIGNMENT that is
+        queued for next-bar liquidation (``_pending_assignment_sells``). That stock exists
+        for one overnight under the no-orphaned-stock policy; charging it would move every
+        stored naked-short-call option backtest, which the short-selling plan forbids (no
+        behaviour change for current rules). Assigned short stock a run HOLDS
+        (``hold_assigned_stock``) is a real held short and is charged.
+        """
+        session = as_of.date() if isinstance(as_of, datetime) else as_of
+        if session == self._borrow_session:
+            return 0.0
+        self._borrow_session = session
+        if self._short_borrow_rate_pa == 0.0:
+            return 0.0
+        short_value = 0.0
+        for p in self._positions.values():
+            if p.qty >= 0:
+                continue
+            # Assignment short stock queued for liquidation (see the docstring) is exempt.
+            queued = self._pending_assignment_sells.get(p.symbol, 0.0)
+            shares = -p.qty - (-queued if queued < 0 else 0.0)
+            if shares <= 0:
+                continue
+            px = self._equity_mark_price(p)
+            if px is None:  # a held position always has an entry price; never skip silently
+                raise ValueError(f"[backtest] short {p.symbol} has no mark at {as_of}: "
+                                 f"its borrow cost cannot be charged.")
+            short_value += shares * float(px)
+        if short_value <= 0.0:
+            return 0.0
+        charge = short_value * self._short_borrow_rate_pa / BORROW_SESSIONS_PER_YEAR
+        if not math.isfinite(charge):
+            raise ValueError(
+                f"[backtest] non-finite short borrow charge at {as_of}: short market value "
+                f"{short_value!r} x rate {self._short_borrow_rate_pa!r}.")
+        # Cash only: the marked book is unchanged, so no _touch_book (see _book_gen's note).
+        self._cash -= charge
+        self._short_borrow_cost += charge
+        return charge
 
     #: Option strategies whose leg combination is DEFINED-RISK: the structure can only ever be
     #: worth a bounded amount, so its mid-life mark-to-market has a theoretical no-arbitrage
