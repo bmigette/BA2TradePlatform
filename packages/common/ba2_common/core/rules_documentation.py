@@ -725,7 +725,7 @@ def get_action_type_documentation() -> dict:
                 "Increase allocation when confidence improves",
                 "Build position gradually over time"
             ],
-            "parameters": "Requires target_percent (e.g., 15.0 for 15% of virtual equity). Automatically calculates required quantity.",
+            "parameters": "Requires the target percent of virtual equity (e.g., 15.0 for 15%), saved as target_percent by the rule editor or value in exported rules; either key works, and both set but different is refused. Automatically calculates required quantity.",
             "example": "When confidence >= 85% and instrument_account_share < 10%, increase_instrument_share to 12%"
         },
         ExpertActionType.DECREASE_INSTRUMENT_SHARE.value: {
@@ -737,7 +737,7 @@ def get_action_type_documentation() -> dict:
                 "Rebalance when instrument share exceeds target",
                 "Reduce exposure when confidence decreases"
             ],
-            "parameters": "Requires target_percent (e.g., 5.0 for 5% of virtual equity). Keeps minimum 1 share if target > 0%. Automatically calculates quantity to sell.",
+            "parameters": "Requires the target percent of virtual equity (e.g., 5.0 for 5%), saved as target_percent by the rule editor or value in exported rules; either key works, and both set but different is refused. Keeps minimum 1 share if target > 0%. Automatically calculates quantity to sell.",
             "example": "When instrument_account_share > 15%, decrease_instrument_share to 10% (rebalance)"
         },
         ExpertActionType.STOP_PROCESSING.value: {
