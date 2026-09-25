@@ -158,27 +158,6 @@ def reference_requirements(bt):
     return dict(sorted(out.items()))
 
 
-def opens_equity_short(job):
-    """True when a job depends on a `sell` ENTRY opening a short (``enable_short`` plus an entry
-    rule with a `sell` action). The engine cannot do that yet: ba2_common's
-    ``TradeActions.SellAction`` only sells an existing long ("No long position to sell"), so the
-    RM's enable_sell gate, which ``enable_short`` forces on, is never reached."""
-    bt = job["optimization_config"]["backtest"]
-    return bool(bt.get("enable_short")) and any(
-        action["action_type"] == "sell"
-        for rule in job["strategy"]["entry_rules"] for action in rule["actions"])
-
-
-def refuse_unrunnable(jobs):
-    """Refuse the whole selection, before any job starts, when a job could never trade: every
-    trial would score a strategy that never opened a position."""
-    bad = [job["name"] for job in jobs if opens_equity_short(job)]
-    if bad:
-        raise ValueError(
-            f"equity short entries cannot open yet (SellAction only sells an existing long), so "
-            f"{len(bad)} selected job(s) would never trade: {bad}; select the long variants")
-
-
 def _covers(lo, hi, needed, end, end_slack_days):
     """History ``lo..hi`` covers ``needed..end``: 30 days of start slack (listing/holiday
     alignment), ``end_slack_days`` at the end."""
@@ -195,7 +174,6 @@ def preflight(job, cache_dir, *, sample=150, min_covered_pct=75.0):
 
     ready = deepcopy(job)
     bt = ready["optimization_config"]["backtest"]
-    refuse_unrunnable([job])  # also a child's own check; main() refuses the selection first
     cache_dir = Path(cache_dir).resolve()
     start, end = date.fromisoformat(bt["start_date"]), date.fromisoformat(bt["end_date"])
     if not cache_dir.is_dir():
