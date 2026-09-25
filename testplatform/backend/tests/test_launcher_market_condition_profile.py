@@ -60,6 +60,11 @@ PERMITTED = ["O_LC", "O_LP", "O_VERT", "O_BULLCS", "O_BULLPS", "O_BEARCS", "O_BF
 #: (``> 0`` on a HOLD-centred scale IS the old ``bullish`` flag -- see
 #: test_launcher_option_entry_rule.py). Every other leaf, and the leaf ORDER, is untouched,
 #: which is what this pin exists to protect: profile ``none`` must still append NOTHING.
+#:
+#: AMENDED AGAIN, 2026-09-25, for ONE action key: ``option_min_one_contract: true`` (plan
+#: 2026-09-24 Task 8 -- the launcher authors the 1-contract sizing floor as a FIXED param on
+#: every non-convex pure-option entry). A deliberate authoring change to the ACTION, not
+#: market-condition profile drift; the condition tree is untouched.
 PROFILE_NONE_O_LC = json.loads(r"""
 {
     "id": "o_lc-entry",
@@ -151,6 +156,7 @@ PROFILE_NONE_O_LC = json.loads(r"""
             "option_dte_min": 25,
             "option_dte_max": 45,
             "option_sizing": 5.0,
+            "option_min_one_contract": true,
             "option_strike_param_optimize": true,
             "option_strike_param_min": 0.0,
             "option_strike_param_max": 8.0,

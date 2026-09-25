@@ -27,12 +27,44 @@ _spec.loader.exec_module(mod)
 from app.services.strategy_param_space import collect_param_space, decode_params  # noqa: E402
 
 _SINGLES = sorted(mod._OPTION_STRATS)
+#: Convex harvest opts OUT (operator decision 2026-09-25): its design is many small tickets at
+#: ~1% sizing, and the floor would let one ticket the budget cannot afford grow to the
+#: per-instrument cap. Every O_CONVEX* key, derived by prefix so a new arm is covered too.
+_CONVEX = sorted(k for k in _SINGLES if k.startswith("O_CONVEX"))
+_FLOORED = sorted(set(_SINGLES) - set(_CONVEX))
 
 
-@pytest.mark.parametrize("kind", _SINGLES)
-def test_every_pure_option_entry_carries_the_floor_as_a_fixed_param(kind):
+def test_the_convex_exclusion_is_not_vacuous():
+    assert set(_CONVEX) >= {"O_CONVEXC", "O_CONVEXP"}, _CONVEX
+    assert _FLOORED
+
+
+@pytest.mark.parametrize("kind", _FLOORED)
+def test_every_non_convex_pure_option_entry_carries_the_floor_as_a_fixed_param(kind):
     cfg = mod._option_entry_action_for(kind)
     assert cfg["option_min_one_contract"] is True
+
+
+@pytest.mark.parametrize("kind", _CONVEX)
+def test_the_convex_arms_do_not_carry_the_floor(kind):
+    cfg = mod._option_entry_action_for(kind)
+    assert "option_min_one_contract" not in cfg, cfg
+
+
+def test_the_convex_group_emits_no_floored_action():
+    """The launchable key is the GROUP ``O_CONVEX``; nothing it builds may carry the floor."""
+    from app.services.strategy_param_space import decode_params
+    from ba2_common.core.rules_convert import live_actions_from_trade_rule
+
+    strat = mod._build_strategy_option_group("O_CONVEX")
+    decoded = decode_params(strat, {})
+    for rule in decoded["entry_rules"]:
+        for a in rule.get("actions") or []:
+            if isinstance(a, dict):
+                assert "option_min_one_contract" not in a, a
+        for v in (live_actions_from_trade_rule(rule) or {}).values():
+            assert "min_one_contract" not in v, v
+    assert "option_min_one_contract" not in (getattr(strat, "entry_action", None) or {})
 
 
 @pytest.mark.parametrize("kind", _SINGLES)
