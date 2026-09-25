@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "styles": {
+    "short": {
+      "status": "candidate",
+      "note": "CANDIDATE: membership decided after stage 1 + the LEAPS grid. Short-term directional DEBIT at the stage-1 25-60 DTE bands.",
+      "members": [{"key": "O_LC"}, {"key": "O_LP"}, {"key": "O_BULLCS"}, {"key": "O_VERT"}, {"key": "O_BF"}]
+    },
+    "mid": {
+      "status": "candidate",
+      "note": "CANDIDATE: membership decided after stage 1 + the LEAPS grid. The directional families at LONGER DTE plus the long-vol pair. The DTE windows and the td/dte exit bands below are PLACEHOLDERS (question Q7), not decisions.",
+      "members": [
+        {"key": "O_LC", "action_overrides": {"option_dte_min": 60, "option_dte_max": 90, "option_dte_min_range": 60, "option_dte_max_range": 120, "option_dte_step": 10},
+         "exit_overrides": {"td": {"value": 45, "value_min": 20, "value_max": 90, "value_step": 5}, "dte": {"value": 21, "value_min": 7, "value_max": 35, "value_step": 7}}},
+        {"key": "O_LP", "action_overrides": {"option_dte_min": 60, "option_dte_max": 90, "option_dte_min_range": 60, "option_dte_max_range": 120, "option_dte_step": 10},
+         "exit_overrides": {"td": {"value": 45, "value_min": 20, "value_max": 90, "value_step": 5}, "dte": {"value": 21, "value_min": 7, "value_max": 35, "value_step": 7}}},
+        {"key": "O_BULLCS", "action_overrides": {"option_dte_min": 60, "option_dte_max": 90, "option_dte_min_range": 60, "option_dte_max_range": 120, "option_dte_step": 10}},
+        {"key": "O_VERT", "action_overrides": {"option_dte_min": 60, "option_dte_max": 90, "option_dte_min_range": 60, "option_dte_max_range": 120, "option_dte_step": 10}},
+        {"key": "O_STRD"}, {"key": "O_STRG"}
+      ]
+    },
+    "leaps_convex": {
+      "status": "candidate",
+      "note": "CANDIDATE: membership decided after stage 1 + the LEAPS grid. Long-dated / convex, run on its OWN filtered universe (the names whose chains reach the LEAPS DTE window, per the stage-2 data preflight; user decision 2026-09-25). REFUSES TO LAUNCH under a CAR-family fitness until question Q5 is answered (no convex_fitness_waiver on purpose).",
+      "members": [{"key": "O_LEAP"}, {"key": "O_PMCC"}, {"key": "O_CONVEX"}]
+    },
+    "premium": {
+      "status": "candidate",
+      "note": "CANDIDATE: membership decided after stage 1 + the LEAPS grid. Credit/income holding stock + options (user decision 2026-09-25): O_CC is a member (revision E1) and O_JL/O_RS sit beside O_WHEEL (revision E2, member-scoped assigned-stock hold). O_CSP is not listed: O_WHEEL's entry IS O_CSP's (same entry ids). price_cap_policy 'none' pending Q3; member order is precedence and a placeholder pending Q4 (defined-risk first, the wheel LAST).",
+      "price_cap_policy": "none",
+      "members": [{"key": "O_BULLPS"}, {"key": "O_BEARCS"}, {"key": "O_IC"}, {"key": "O_JL"}, {"key": "O_RS"}, {"key": "O_CC"}, {"key": "O_WHEEL"}]
+    }
+  }
+}

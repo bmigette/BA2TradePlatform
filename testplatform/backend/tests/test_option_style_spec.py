@@ -187,3 +187,36 @@ def test_a_broken_sibling_style_breaks_the_whole_file(tmp_path):
                              "broken": {"status": "candidate", "members": [{"key": "O_SSTG"}]}})
     with pytest.raises(ValueError, match="'broken'"):
         m._load_style_spec(path, "ok")
+
+
+# --- Task 4: the candidate style configs, as data ----------------------------------------------
+_CANDIDATES = str(Path(__file__).resolve().parents[3] / "tools/option_styles.candidates.json")
+_CANDIDATE_NOTE = "CANDIDATE: membership decided after stage 1 + the LEAPS grid"
+
+
+def test_the_candidate_file_has_the_four_styles_all_marked_candidate():
+    m = _launcher()
+    data = json.loads(Path(_CANDIDATES).read_text())
+    assert set(data["styles"]) == {"short", "mid", "leaps_convex", "premium"}
+    assert {s["status"] for s in data["styles"].values()} == {"candidate"}
+    for name, style in data["styles"].items():
+        assert _CANDIDATE_NOTE in style["note"], name
+        m._load_style_spec(_CANDIDATES, name)          # every candidate validates
+
+
+def test_the_premium_candidate_holds_stock_and_options_per_the_revision():
+    """User decision 2026-09-25: the premium style holds stock + options. O_CC is a member (E1)
+    and O_JL / O_RS sit beside O_WHEEL (E2). O_CSP is not: O_WHEEL's entry IS O_CSP's."""
+    m = _launcher()
+    style = m._load_style_spec(_CANDIDATES, "premium")
+    keys = [x["key"] for x in style["members"]]
+    assert {"O_CC", "O_WHEEL", "O_JL", "O_RS"} <= set(keys)
+    assert "O_CSP" not in keys
+    assert keys[-1] == "O_WHEEL"                       # Q4 placeholder: the wheel last
+    assert style["price_cap_policy"] == "none"         # Q3 placeholder: mixed $100 / uncapped
+
+
+def test_the_leaps_convex_candidate_carries_no_convex_waiver():
+    """Q5 is open: the style must refuse a CAR-family fitness (Task 7), so no waiver is authored."""
+    m = _launcher()
+    assert "convex_fitness_waiver" not in m._load_style_spec(_CANDIDATES, "leaps_convex")
