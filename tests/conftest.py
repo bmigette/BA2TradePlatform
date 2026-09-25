@@ -10,6 +10,7 @@ Provides:
 import pytest
 from unittest.mock import patch, MagicMock
 from sqlmodel import SQLModel, Session, create_engine
+from sqlalchemy.pool import StaticPool
 from datetime import datetime, timezone
 
 # Import models to register them with SQLModel metadata
@@ -39,10 +40,18 @@ from ba2_trade_platform.core.interfaces.MarketExpertInterface import MarketExper
 
 @pytest.fixture(scope="session")
 def test_engine():
-    """Create an in-memory SQLite engine shared across the entire test session."""
+    """Create an in-memory SQLite engine shared across the entire test session.
+
+    ``StaticPool``: ONE connection for every thread. The default pool for ``:memory:`` is
+    ``SingletonThreadPool`` (one connection -- and so one separate, EMPTY in-memory database --
+    per thread), whose ``_cleanup`` can close the main thread's connection when a background
+    thread (the ActivityLogWorker) connects; the next query in the main thread then reopens a
+    fresh empty database and fails with "no such table" (an order-dependent flake).
+    """
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
     )
     SQLModel.metadata.create_all(engine)
     return engine
