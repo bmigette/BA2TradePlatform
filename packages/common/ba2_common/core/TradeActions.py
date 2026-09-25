@@ -1121,6 +1121,38 @@ class _AdjustPriceLevelAction(TradeAction):
 
     # resolve_expert() is inherited from TradeAction (shared with SellAction's enable_sell read).
 
+    def _position_is_long(self, order=None) -> Tuple[Optional[bool], str]:
+        """``(is_long, source)``: the direction of the POSITION this TP/SL protects.
+
+        THE SIDE OF THE POSITION, NOT THE RECOMMENDATION. This used to read the bar's
+        recommendation FIRST and the order side only on a HOLD, so a LONG held through a
+        SELL/UNDERWEIGHT bar was priced as a short: the stop-only path tightened it to the
+        min-distance floor under the market, the TP-only path dropped the target to the minimum
+        profit, and the merged path put the stop ABOVE the market and the target BELOW it (and the
+        mirror for a short on a BUY bar). A recommendation says where the expert thinks the price
+        goes; which side of it a protective level sits on is fixed by the position.
+
+        Order of evidence: the order being adjusted (the position's entry order, or the entry just
+        created), then its transaction, then -- only when neither exists -- the recommendation.
+        ``is_long`` is None when nothing says."""
+        order = order if order is not None else self.existing_order
+        if order is not None:
+            side = getattr(order, "side", None)
+            side_str = str(side.value if hasattr(side, "value") else side or "").upper()
+            if side_str in ("BUY", "SELL"):
+                return side_str == "BUY", f"order {getattr(order, 'id', None)} side {side_str}"
+            txn_id = getattr(order, "transaction_id", None)
+            if txn_id:
+                from ba2_common.core.models import Transaction
+                txn = get_instance(Transaction, txn_id)
+                if txn is not None:
+                    return stop_is_long_position(txn), f"transaction {txn_id} side"
+        if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
+            return True, f"recommendation {self.order_recommendation.value} (no order)"
+        if self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
+            return False, f"recommendation {self.order_recommendation.value} (no order)"
+        return None, "nothing"
+
     def _regime_expert(self):
         """Former name of :meth:`resolve_expert`, kept as an alias."""
         return self.resolve_expert()
@@ -1254,17 +1286,11 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
-                # Determine position direction
-                is_long_position = False
-                if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
-                    is_long_position = True
-                    logger.info(f"{self._label} Direction: Using order_recommendation={self.order_recommendation.value} -> LONG position")
-                elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
-                    is_long_position = False
-                    logger.info(f"{self._label} Direction: Using order_recommendation={self.order_recommendation.value} -> SHORT position")
-                elif self.existing_order:
-                    is_long_position = (self.existing_order.side.upper() == "BUY")
-                    logger.info(f"{self._label} Direction: Using existing_order.side={self.existing_order.side.upper()} -> {'LONG' if is_long_position else 'SHORT'} position")
+                # Determine position direction: the POSITION's side (see _position_is_long)
+                is_long_position, direction_source = self._position_is_long()
+                if is_long_position is not None:
+                    logger.info(f"{self._label} Direction: {direction_source} -> "
+                                f"{'LONG' if is_long_position else 'SHORT'} position")
                 else:
                     logger.error(f"Cannot determine order direction for {self._label} calculation")
                     return self.create_and_save_action_result(
@@ -1405,13 +1431,9 @@ class _AdjustPriceLevelAction(TradeAction):
         if reference_price is None:
             return None
 
-        if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
-            is_long = True
-        elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
-            is_long = False
-        else:
-            order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
-            is_long = (order_side == "BUY")
+        is_long, _source = self._position_is_long(order)
+        if is_long is None:
+            return None
 
         eff_percent = self._regime_scaled_percent()
         if is_long:
@@ -1470,10 +1492,7 @@ class _AdjustPriceLevelAction(TradeAction):
 
                 # Calculate final price
                 if preview["reference_price"] and self.percent is not None:
-                    is_long = (self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT))
-                    if not is_long and self.existing_order:
-                        order_side = str(self.existing_order.side.value if hasattr(self.existing_order.side, 'value') else self.existing_order.side).upper()
-                        is_long = (order_side == "BUY")
+                    is_long, _source = self._position_is_long()
 
                     if is_long:
                         preview["calculated_price"] = preview["reference_price"] * (1 + self.percent / 100)
@@ -1615,13 +1634,9 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
             return price
 
         min_pct = self._resolve_min_take_profit_pct()
-        if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
-            is_long = True
-        elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
-            is_long = False
-        else:
-            order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
-            is_long = (order_side == "BUY")
+        is_long, _source = self._position_is_long(order)
+        if is_long is None:
+            return price
 
         enforced_price = compute_tp_floor_price(price, entry_price, min_pct, is_long)
         return enforced_price if enforced_price is not None else price
@@ -1940,13 +1955,7 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
                 from ba2_common.config import get_min_tp_sl_percent
                 min_pct = get_min_tp_sl_percent()
 
-                if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
-                    is_long = True
-                elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
-                    is_long = False
-                else:
-                    order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
-                    is_long = (order_side == "BUY")
+                is_long, _source = self._position_is_long(order)
 
                 if is_long:
                     actual_pct = ((current_price - price) / current_price) * 100
