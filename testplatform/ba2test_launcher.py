@@ -3345,6 +3345,14 @@ def _option_entry_action_for(kind: str) -> dict:
     so it was inert and the selector kept handing the fill engine contracts it would reject.
     """
     cfg = dict(_OPTION_STRATS[kind])
+    # FIXED, not a gene (plan 2026-09-24 Task 8, stage-1 relaunch): a budget that rounds to 0
+    # contracts buys 1 when it fits under the per-instrument cap, instead of refusing ~half the
+    # expensive-premium entries (the O_LP diagnosis). Shared live/backtest sizing reads it.
+    # EXCEPT every O_CONVEX* key (operator decision 2026-09-25): convex harvest is "many small
+    # tickets at ~1% sizing, no single ticket may dominate", and the floor would let one ticket
+    # the budget cannot afford grow to the per-instrument cap (searched up to 50%).
+    if not kind.startswith("O_CONVEX"):
+        cfg.setdefault("option_min_one_contract", True)
     _apply_option_min_volume(cfg)
     _apply_option_strike_method_gene(cfg)
     _apply_option_sizing_gene(cfg)

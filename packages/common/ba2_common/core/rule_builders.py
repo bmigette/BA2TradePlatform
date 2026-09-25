@@ -397,6 +397,11 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # engine already models). Absent or 0.0 is the pre-F3 quote EXACTLY. See
     # ``core.option_entry_quote``.
     ("entry_cross", ("option_entry_cross",)),
+    # 1-CONTRACT SIZING FLOOR (plan 2026-09-24 Task 8): a size that rounds to 0 becomes 1
+    # when one contract fits under the per-instrument cap -- see
+    # ``_OptionEntryAction._size_by_cost``. Absent is OFF, and absent stays absent here, so
+    # every rule written before the flag converts to the byte-identical action config.
+    ("min_one_contract", ("option_min_one_contract",)),
     # SELECTION-POLICY WEIGHTS (design 2026-08-29 §7): which contract inside the rule's box
     # wins. GA genes, shared per debit/credit half by the launcher; absent means the default
     # policy, which is a proven no-op over the legacy selector. w_profit/w_rr are deliberately

@@ -623,3 +623,62 @@ def test_the_arc_action_list_matches_the_builders_that_consult_the_gate():
     assert set(get_arc_floor_action_values()) == set(by_value)
     for value, cls in by_value.items():
         assert "_refuse_if_arc_below_floor" in inspect.getsource(cls), value
+
+
+# --------------------------------------------------------------------------- #
+# min_one_contract (plan 2026-09-24 Task 8): the 1-contract sizing floor
+# --------------------------------------------------------------------------- #
+def test_the_editor_persists_a_checked_min_one_contract(editor):
+    """A deployed genome carries it; re-saving the rule must keep what the user sees."""
+    editor.add_row(PLAIN_OPTION_ACTION)
+    editor.widget('min_one_contract_input').value = True
+    assert editor.save()['min_one_contract'] is True
+
+
+def test_an_existing_rules_min_one_contract_is_loaded_back(editor):
+    saved = editor.add_row(PLAIN_OPTION_ACTION, min_one_contract=True).save()
+    assert editor.widget('min_one_contract_input').value is True
+    assert saved['min_one_contract'] is True
+
+
+def test_min_one_contract_is_offered_for_exactly_the_cost_sized_entries(
+        settings_module, nicegui_client, monkeypatch):
+    """The covered call / protective put size off held shares: a floor there is a decoy."""
+    from ba2_common.core.types import uses_min_one_contract
+
+    entries = [a.value for a in ExpertActionType
+               if settings_module.is_option_action(a.value)
+               and a is not ExpertActionType.CLOSE_OPTION]
+    for action_type in entries:
+        with nicegui_client:
+            saved = _Editor(settings_module, monkeypatch).add_row(action_type).save()
+        if uses_min_one_contract(action_type):
+            assert saved.get('min_one_contract') is False, (action_type, saved)
+        else:
+            assert 'min_one_contract' not in saved, (action_type, saved)
+
+
+def test_switching_onto_a_share_sized_overlay_drops_a_stale_min_one_contract(editor):
+    editor.add_row(PLAIN_OPTION_ACTION)
+    editor.widget('min_one_contract_input').value = True
+    saved = editor.choose(ExpertActionType.SELL_COVERED_CALL.value).save()
+    assert 'min_one_contract' not in saved, saved
+
+
+def test_a_stored_false_string_loads_unchecked(editor):
+    """Read the way the action ctor reads it (coerce_bool): "false" is off, not truthy."""
+    saved = editor.add_row(PLAIN_OPTION_ACTION, min_one_contract="false").save()
+    assert editor.widget('min_one_contract_input').value is False
+    assert saved['min_one_contract'] is False
+
+
+def test_a_garbage_stored_value_does_not_break_the_dialog(editor, settings_module, monkeypatch):
+    """A value nothing can mean is shown unchecked and LOGGED, never a dialog that fails to
+    render (the action ctor still refuses it at run time until the rule is re-saved)."""
+    warnings = []
+    monkeypatch.setattr(settings_module.logger, 'warning',
+                        lambda msg, *a, **k: warnings.append(str(msg)))
+    saved = editor.add_row(PLAIN_OPTION_ACTION, min_one_contract="maybe").save()
+    assert editor.widget('min_one_contract_input').value is False
+    assert saved['min_one_contract'] is False
+    assert any("min_one_contract" in w and "'maybe'" in w for w in warnings), warnings

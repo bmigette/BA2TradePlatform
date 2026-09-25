@@ -16,7 +16,7 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, uses_min_one_contract, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
     preview_trade_action_result_retention, execute_trade_action_result_retention,
@@ -5723,6 +5723,7 @@ class TradeSettingsTab:
                 short_dte_min_input = None
                 short_dte_max_input = None
                 min_arc_input = None
+                min_one_contract_input = None
                 w_premium_input = None
                 w_iv_input = None
                 w_rvol_input = None
@@ -5731,7 +5732,7 @@ class TradeSettingsTab:
                     nonlocal value_input, reference_select, target_percent_input
                     nonlocal strike_method_select, strike_param_input, dte_min_input
                     nonlocal dte_max_input, sizing_input, min_oi_input, max_spread_input
-                    nonlocal wing_width_input, min_arc_input
+                    nonlocal wing_width_input, min_arc_input, min_one_contract_input
                     nonlocal short_dte_min_input, short_dte_max_input
                     nonlocal w_premium_input, w_iv_input, w_rvol_input
 
@@ -5751,7 +5752,7 @@ class TradeSettingsTab:
                     dte_min_input = dte_max_input = sizing_input = None
                     min_oi_input = max_spread_input = wing_width_input = None
                     short_dte_min_input = short_dte_max_input = None
-                    min_arc_input = None
+                    min_arc_input = min_one_contract_input = None
                     w_premium_input = w_iv_input = w_rvol_input = None
 
                     selected_type = action_select.value
@@ -5843,6 +5844,38 @@ class TradeSettingsTab:
                                     step=0.1,
                                     format='%.1f'
                                 ).classes('w-24').props('dense')
+                                # 1-CONTRACT FLOOR (plan 2026-09-24 Task 8). Offered only on
+                                # the cost-sized entries: the covered call / protective put size
+                                # off held shares and never reach the sizer, so it would be a
+                                # decoy there. Unchecked by default == the behaviour every rule
+                                # had before the flag. It is here, not just in the GA, because a
+                                # deployed genome carries it and re-saving a rule rebuilds
+                                # action_config key by key -- no widget would WIPE it.
+                                if uses_min_one_contract(selected_type):
+                                    # coerce_bool, not bool(): a stored "false"/"0" must load
+                                    # unchecked, exactly as the action ctor reads it. A value
+                                    # nothing can mean must not break the whole dialog: it is
+                                    # shown unchecked and logged -- the action ctor still
+                                    # refuses it at run time until the rule is re-saved.
+                                    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+                                    _m1c_raw = action_config.get('min_one_contract') if action_config else None
+                                    _m1c = False
+                                    if _m1c_raw is not None:
+                                        try:
+                                            _m1c = coerce_bool(_m1c_raw)
+                                        except ValueError:
+                                            logger.warning(
+                                                f"Rule action {action_key}: stored min_one_contract "
+                                                f"{_m1c_raw!r} is not a boolean; showing it unchecked "
+                                                f"(saving the rule will store False)")
+                                    min_one_contract_input = ui.checkbox(
+                                        'Min 1 contract',
+                                        value=_m1c,
+                                    ).props('dense').tooltip(
+                                        'When Sizing % rounds to 0 contracts, buy 1 contract if it '
+                                        'fits under the per-instrument cap (max virtual equity per '
+                                        'instrument). Buying power and the option risk manager '
+                                        'still apply.')
                                 min_oi_input = ui.number(
                                     label='Min OI',
                                     value=action_config.get('min_open_interest', 100) if action_config else 100,
@@ -6012,6 +6045,7 @@ class TradeSettingsTab:
                     'short_dte_min_input': lambda: short_dte_min_input,
                     'short_dte_max_input': lambda: short_dte_max_input,
                     'min_arc_input': lambda: min_arc_input,
+                    'min_one_contract_input': lambda: min_one_contract_input,
                     'w_premium_input': lambda: w_premium_input,
                     'w_iv_input': lambda: w_iv_input,
                     'w_rvol_input': lambda: w_rvol_input
@@ -6174,6 +6208,7 @@ class TradeSettingsTab:
                         sdmin = action_refs['short_dte_min_input']()
                         sdmax = action_refs['short_dte_max_input']()
                         maf = action_refs['min_arc_input']()
+                        m1c = action_refs['min_one_contract_input']()
                         weight_widgets = (
                             ('w_premium', action_refs['w_premium_input']()),
                             ('w_iv', action_refs['w_iv_input']()),
@@ -6229,6 +6264,11 @@ class TradeSettingsTab:
                         # on the widget, for the reason spelled out at strike_method above.
                         if uses_arc_floor(action_type) and maf and maf.value is not None:
                             action_config['min_arc'] = float(maf.value) / 100.0
+                        # Keyed on the ACTION as well as on the widget (the stale-closure
+                        # rail above). Written as a real bool: an explicit False means the
+                        # same as absent (off), so re-saving an old rule changes nothing.
+                        if uses_min_one_contract(action_type) and m1c is not None:
+                            action_config['min_one_contract'] = bool(m1c.value)
                         # SELECTION-POLICY WEIGHTS. Persisted for every entry action --
                         # every select_single call in TradeActions is policy-governed, so
                         # there is no structure on which these are a decoy. 0.0 is written
