@@ -464,9 +464,10 @@ def resolve_symbol_split_basis(symbol: str, dates: Any, o: Any, h: Any, l: Any, 
             f"as-traded basis. Repair with tools/warm_market_conditions.py plan --fetch-missing.")
     added = [CalendarSplit(e.event_date, float(e.ratio)) for e in entries
              if e.kind == ovr.KIND_ADD_PRICE_ADJUSTMENT]
-    included = tuple(sorted((s for s in list(good) + added
-                             if first < s.date <= last and float(s.ratio) != 1.0
-                             and s.date not in excluded),
+    # ``excluded`` removes CALENDAR rows only: an added adjustment may sit on the date of a row
+    # it replaces (an excluded vendor ratio re-stated with the measured one).
+    included = tuple(sorted((s for s in [g for g in good if g.date not in excluded] + added
+                             if first < s.date <= last and float(s.ratio) != 1.0),
                             key=lambda s: s.date))
     evidence = (f"bars {first}..{last}; marker={_marker_date(marker)}; "
                 + ", ".join(f"{ch.split_date}:{ch.ratio:g}:{ch.verdict}" for ch in checks))
@@ -484,7 +485,8 @@ def _verify_overrides(symbol: str, d: np.ndarray, c: Any, calendar: Sequence[Cal
     calendar dates the entries exclude. REFUSES when any anchor close is missing or off by more
     than ``ANCHOR_TOLERANCE``, when an ``exclude_calendar_event`` names a row the calendar does
     not hold, or when an ``add_price_adjustment`` lands on a date the calendar already lists
-    (the vendor now carries it: counting both would double the factor). Each of those means
+    (the vendor now carries it: counting both would double the factor) -- unless the symbol's
+    entries also exclude that row, which makes the add its measured replacement. Each of those means
     the entry was measured against other data: re-measure it, never guess."""
     from ba2_common.core import split_basis_overrides as ovr
 
@@ -492,7 +494,11 @@ def _verify_overrides(symbol: str, d: np.ndarray, c: Any, calendar: Sequence[Cal
         return set()
     close = np.asarray(c, dtype=np.float64)
     cal_dates = {s.date for s in calendar}
-    excluded: set = set()
+    # Exclusions first: an ``add_price_adjustment`` on the date of a row the same symbol's
+    # entries EXCLUDE is a replacement (the vendor's ratio is wrong, the measured one stands),
+    # not a double count.
+    excluded: set = {e.event_date for e in entries if e.kind == ovr.KIND_EXCLUDE_CALENDAR_EVENT
+                     and e.event_date in cal_dates}
     for e in entries:
         for a_day, a_close in e.anchors:
             hit = np.flatnonzero(d == np.datetime64(a_day, "D"))
@@ -526,7 +532,7 @@ def _verify_overrides(symbol: str, d: np.ndarray, c: Any, calendar: Sequence[Cal
                     f"(overrides {ovr.OVERRIDES_VERSION}); the calendar changed since it was "
                     f"measured. Re-measure.")
             excluded.add(e.event_date)
-        elif e.event_date in cal_dates:
+        elif e.event_date in cal_dates and e.event_date not in excluded:
             raise SplitBasisRefused(
                 f"{symbol}: split-basis override add_price_adjustment {e.event_date.isoformat()} "
                 f"x{e.ratio:g} now also appears in the vendor split calendar (overrides "
