@@ -99,6 +99,11 @@ class ReservePool:
     """
     total: float
     unmeasurable: Tuple[str, ...] = ()
+    #: ``(transaction_id, reserve)`` per transaction the counted orders belong to (None for an
+    #: order not yet linked to one), summed in the same order as ``total``. Read by the equity
+    #: RM's budget (``option_collateral_budget.rm_equity_budget``), which charges each
+    #: reserving POSITION its own collateral.
+    by_transaction: Tuple[Tuple[Optional[int], float], ...] = ()
 
     @property
     def is_measurable(self) -> bool:
@@ -2552,8 +2557,13 @@ class OptionsAccountInterface(ABC):
         # already on its way out is the direction that uncovers a call.
         return int(math.ceil(round(total, 6)))
 
-    def reserved_option_buying_power_detail(self) -> "ReservePool":
+    def reserved_option_buying_power_detail(
+            self, transaction_ids: "Optional[Any]" = None) -> "ReservePool":
         """The reserve pool WITH its unknowns named — the honest form of the answer.
+
+        ``transaction_ids`` (stage-2 E1b): restrict the pool to the orders of those
+        transactions -- one expert's open option positions, for the equity RM's budget. None
+        (every existing caller) is the whole book, computed exactly as before.
 
         A reserve belongs to the POSITION, not to the order row that created it: the broker
         frees the margin/cash the moment the structure is flattened, so this must too.
@@ -2611,7 +2621,11 @@ class OptionsAccountInterface(ABC):
         terminal = OrderStatus.get_terminal_statuses()
         total = 0.0
         blind: List[str] = []
+        per_txn: Dict[Optional[int], float] = {}
+        wanted = None if transaction_ids is None else frozenset(transaction_ids)
         for o in self.open_option_orders_book_wide():
+            if wanted is not None and getattr(o, "transaction_id", None) not in wanted:
+                continue
             strategy = getattr(o, "option_strategy", None)
             raw = (o.data or {}).get("option_reserve") if isinstance(o.data, dict) else None
             reserve = None
@@ -2634,17 +2648,22 @@ class OptionsAccountInterface(ABC):
                         f"frees buying power that is already committed)")
                     continue
                 total += reserve
+                tid = getattr(o, "transaction_id", None)
+                per_txn[tid] = per_txn.get(tid, 0.0) + reserve
             elif reserve is not None and reserve > 0:
                 # Not a priced reserving name, but it recorded a reserve anyway. Honour
                 # it: the money is spoken for whatever the row calls itself.
                 total += reserve
+                tid = getattr(o, "transaction_id", None)
+                per_txn[tid] = per_txn.get(tid, 0.0) + reserve
         if blind:
             logger.error(
                 f"Account {self.id}: {len(blind)} open option order(s) have an "
                 f"unreadable buying-power reserve, so available option buying power is "
                 f"UNKNOWN and every buying-power gate will refuse until it is repaired. "
                 + "; ".join(blind))
-        return ReservePool(total=total, unmeasurable=tuple(blind))
+        return ReservePool(total=total, unmeasurable=tuple(blind),
+                           by_transaction=tuple(per_txn.items()))
 
     def reserved_option_buying_power(self) -> float:
         """Sum of the reserves this account can actually READ, as a plain float.

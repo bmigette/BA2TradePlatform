@@ -414,6 +414,25 @@ class TradeRiskManagement:
             error_msg = f"Could not get available balance for expert {expert_instance_id}"
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
+        # ...net of the collateral this expert's open option positions reserve (stage-2 E1b):
+        # a cash-secured put's used charge is only its premium, so without this a style run
+        # holding a CSP member and a stock-buying member spent the put's collateral on stock.
+        # The SHARED budget both runtimes size from; the same ``balances`` object (nothing
+        # read) when no option position is open. Only the expert's own term is charged, so a
+        # broker figure that already nets the collateral (live Alpaca Reg-T) is not charged
+        # twice -- see option_collateral_budget.
+        if balances.option_used:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+            from ba2_common.core.option_collateral_budget import rm_equity_budget
+            try:
+                balances = rm_equity_budget(
+                    balances,
+                    get_instance_resolver().get_account_instance(expert_instance.account_id))
+            except ValueError as e:
+                error_msg = (f"Could not state the equity budget for expert "
+                             f"{expert_instance_id}: {e}")
+                self.logger.error(error_msg)
+                raise RuntimeError(error_msg) from e
         available_balance = balances.available
         total_virtual_balance = available_balance
         # THE PER-INSTRUMENT CEILING IS A SHARE OF THE SLEEVE, NOT OF WHAT IS LEFT IN IT.

@@ -2,7 +2,7 @@ import math
 from abc import abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, NamedTuple, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Tuple, runtime_checkable
 from sqlmodel import Session, select
 from ba2_common.logger import logger
 from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance
@@ -125,6 +125,10 @@ class ExpertBalance(NamedTuple):
     virtual: float      # tradable balance x virtual_equity_pct
     used: float         # what this expert's own open transactions have committed
     available: float    # virtual - used, then clamped to broker BP and account headroom
+    #: ``(transaction_id, used charge)`` for each open OPTION transaction counted in ``used``
+    #: (stage-2 E1b): what the equity RM's budget (``option_collateral_budget``) needs to charge
+    #: a reserving position its collateral instead. Empty when no option position is open.
+    option_used: Tuple[Tuple[int, float], ...] = ()
 
 
 class MarketExpertInterface(ExtendableSettingsInterface):
@@ -1294,7 +1298,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 return None
 
             # Calculate used balance from open transactions
-            used_balance = self._calculate_used_balance(account, exclude_transaction_id=exclude_transaction_id)
+            option_used: Dict[int, float] = {}
+            used_balance = self._calculate_used_balance(account, exclude_transaction_id=exclude_transaction_id,
+                                                        option_used_out=option_used)
             if used_balance is None:
                 return None
             
@@ -1378,7 +1384,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         f"Used balance=${used_balance}, Available balance=${available_balance}")
 
             return ExpertBalance(virtual=virtual_balance, used=used_balance,
-                                 available=available_balance)
+                                 available=available_balance,
+                                 option_used=tuple(option_used.items()))
 
         except Exception as e:
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
@@ -1614,7 +1621,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return False, f"Error checking equity: {str(e)}"
     
     def _calculate_used_balance(self, account: AccountInterface,
-                                 exclude_transaction_id: Optional[int] = None) -> Optional[float]:
+                                 exclude_transaction_id: Optional[int] = None,
+                                 option_used_out: Optional[Dict[int, float]] = None
+                                 ) -> Optional[float]:
         """
         Calculate the used balance from all open transactions for this expert. Uses bulk price fetching.
 
@@ -1622,6 +1631,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             account: The account instance to get current prices
             exclude_transaction_id: Optional transaction ID to exclude from the calculation,
                 e.g. the WAITING transaction created for the order currently being validated.
+            option_used_out: Optional dict filled with ``{transaction id: its used charge}`` for
+                every OPTION transaction counted (stage-2 E1b). Recording only: the returned
+                total is computed exactly as without it.
 
         Returns:
             Optional[float]: The total used balance, None if error occurred
@@ -1690,6 +1702,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     transaction_used = (transaction.open_price * transaction.quantity * multiplier) + loss_amount
 
                 used_balance += transaction_used
+                if is_option and option_used_out is not None:
+                    option_used_out[transaction.id] = transaction_used
 
                 logger.debug(f"Transaction {transaction.id} ({transaction.symbol}): "
                            f"Open=${transaction.open_price}, Current=${current_price}, "
