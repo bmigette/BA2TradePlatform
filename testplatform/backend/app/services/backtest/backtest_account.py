@@ -579,6 +579,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Task 1b: keys of the split re-key refusals / deferrals already logged (a lot waiting
         # for its adjusted contract is re-checked on every bar and must be explained ONCE).
         self._split_rekey_logged: set = set()
+        # (contract, basis_date) of lots whose re-key can NEVER succeed -- their order rows do
+        # not reconcile with the lot, and no fill can repair that (a fill on a crossed lot is
+        # refused). Skipped instead of re-planned on every bar until expiry.
+        self._split_rekey_never: set = set()
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
         # and is therefore useless for ageing in a backtest. Read only by
@@ -4373,11 +4377,34 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return {"lot": lot, "ratio": ri, "new": new_symbol, "new_strike": new_strike,
                 "old_strike": old_strike, "k_today": k_today}
 
+    def _row_basis_differs(self, o, today) -> bool:
+        """An order row was traded -- or, unfilled, staged -- in another share basis than
+        ``today``'s: its recorded fill basis, else the factor of its sim fill date, else of its
+        staging day. A row whose basis cannot be told counts as differing (reported, not
+        assumed harmless)."""
+        underlying = getattr(o, "underlying_symbol", None)
+        if not underlying:
+            return True
+        k_today = self._as_traded_factor(underlying, today)
+        k = self._option_fill_basis.get(o.id)
+        if k is None:
+            day = self._fill_dates.get(o.id)
+            if day is not None:
+                day = day.date() if hasattr(day, "date") else day
+            else:
+                day = self._option_order_day.get(o.id)
+            if day is None:
+                return True
+            k = self._as_traded_factor(underlying, day)
+        return k != k_today
+
     def _rekey_crossed_lots(self, crossed: List[_OptionLot], today) -> int:
         """Plan, group, conflict-check and apply the re-key of ``crossed`` (see
         ``apply_split_rekeys``). Nothing is mutated until every check has passed."""
         plans: Dict[str, Dict[str, Any]] = {}
         for lot in crossed:
+            if (lot.contract_symbol, lot.basis_date) in self._split_rekey_never:
+                continue        # refused for good (see _split_rekey_never): not re-planned
             plan = self._rekey_plan(lot, today)
             if plan is not None:
                 plans[lot.contract_symbol] = plan
@@ -4394,7 +4421,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         txns_of: Dict[str, set] = {}                      # crossed contract -> txn ids
         txn_contracts: Dict[int, set] = {}                # txn id -> option contracts traded
         parents_of: Dict[int, List[TradingOrder]] = {}    # txn id -> multi-leg parent rows
+        target_of = {p["new"]: cs for cs, p in plans.items()}
+        foreign: Dict[str, List[int]] = {}                # target string -> other-basis rows
         for o in self.get_orders():
+            if o.contract_symbol in target_of and self._row_basis_differs(o, today):
+                foreign.setdefault(o.contract_symbol, []).append(o.id)
             if (getattr(o, "asset_class", None) != AssetClass.OPTION
                     or o.transaction_id not in opened or o.status not in executed):
                 continue
@@ -4406,6 +4437,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if cs in crossed_syms:
                 rows_of.setdefault(cs, []).append(o)
                 txns_of.setdefault(cs, set()).add(o.transaction_id)
+        # A row that ALREADY carries an adjusted string but was traded (or staged) in another
+        # share basis is a different contract that used the string before the split -- e.g. a
+        # closed pre-split trade of the old P100 when P400 is re-keyed onto P100. Order-derived
+        # lookups take the FIRST row per string (_lot_order, _option_group_bounds' owner), so
+        # such a row can own the re-keyed lot's grouping/strategy label. Its TERMS are the same
+        # (the string encodes them), so the re-key still proceeds -- but loudly.
+        for new, ids in foreign.items():
+            self._log_rekey_once(
+                (new, "foreign-rows", tuple(ids)), logging.WARNING,
+                "[backtest] split re-key onto %s (from %s): order row(s) %s already carry %s but "
+                "were traded in ANOTHER share basis (a different contract that used the string "
+                "before the split). Order-derived lookups take the first row per OCC string, so "
+                "they may attribute the re-keyed lot's group/strategy to those rows.",
+                new, target_of[new], ids, new)
         # The rows to move must add up to the lot: a lot whose book does not reconcile cannot
         # have its linkage moved consistently (an exit would close the wrong quantity).
         for cs in list(plans):
@@ -4420,6 +4465,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "executed order rows of its OPENED transactions add up to %+g, so its order "
                     "linkage cannot be moved consistently. It stays in its own basis (Task 1a).",
                     cs, lot.qty, booked)
+                self._split_rekey_never.add((cs, lot.basis_date))
                 del plans[cs]
 
         # ---- groups: contracts sharing a transaction move together -------------------------
@@ -4471,10 +4517,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             moving.update(crossed_members)
 
         # ---- target conflicts: the adjusted string may already be held ---------------------
-        def _drop(cs, level, fmt, *args):
+        def _drop(cs, reason, level, fmt, *args):
             members = group_of.get(cs, frozenset({cs}))
             moving.difference_update(members)
-            self._log_rekey_once((members, "target", args[:2]), level, fmt, *args)
+            # Keyed on the STABLE identity (never on the day): a conflict that stands for many
+            # bars is explained once.
+            self._log_rekey_once((members, "target", reason, cs, plans[cs]["new"]),
+                                 level, fmt, *args)
 
         changed = True
         while changed:
@@ -4485,7 +4534,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             for new, srcs in targets.items():
                 if len(srcs) > 1:
                     for cs in srcs:
-                        _drop(cs, logging.ERROR,
+                        _drop(cs, "collision", logging.ERROR,
                               "[backtest] option lot %s NOT RE-KEYED: %s would map several lots "
                               "(%s) onto one adjusted contract. They stay in their own basis.",
                               cs, new, sorted(srcs))
@@ -4498,15 +4547,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 lot = plans[cs]["lot"]
                 if new in crossed_syms or (occ.basis_factor is not None
                                            and occ.basis_factor != plans[cs]["k_today"]):
-                    _drop(cs, logging.WARNING,
-                          "[backtest] option lot %s NOT RE-KEYED on %s: %s is already held by "
+                    _drop(cs, "other-basis", logging.WARNING,
+                          "[backtest] option lot %s NOT RE-KEYED (first seen %s): %s is already held by "
                           "a lot in ANOTHER share basis that is not re-keyed this bar; one lot "
-                          "cannot hold two bases. Retried on the next bar.", cs, today, new)
+                          "cannot hold two bases. Retried on every later bar.", cs, today, new)
                 elif (occ.qty > 0) != (lot.qty > 0):
                     # Netting a long against a short of the same contract is a CLOSE: it
                     # realises P&L on two different transactions, which the re-key (a pure
                     # identity) must never do. Refused; the broker would net them, so say so.
-                    _drop(cs, logging.ERROR,
+                    _drop(cs, "opposite", logging.ERROR,
                           "[backtest] option lot %s (%+g) NOT RE-KEYED: the adjusted contract %s "
                           "is already held on the opposite side (%+g contract(s)). Merging would "
                           "net -- i.e. close -- positions of two transactions and realise P&L, "
@@ -4555,13 +4604,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 if par.id in rewritten_parents:
                     self._rekey_order_row(par, r, today)
             t = opened[tid]
+            before = {"from_quantity": t.quantity, "from_open_price": t.open_price,
+                      "scaled": scale_txn[tid]}
             if scale_txn[tid]:
                 if t.quantity is not None:
                     t.quantity = float(t.quantity) * r
                 if t.open_price is not None:
                     t.open_price = float(t.open_price) / r
             moved = [{"date": today.isoformat(), "ratio": r, "from_contract": cs,
-                      "to_contract": p["new"]}
+                      "to_contract": p["new"], **before}
                      for cs, p in sorted(by_old.items()) if tid in txns_of.get(cs, ())]
             meta = dict(t.meta_data or {})
             meta["split_rekeys"] = list(meta.get("split_rekeys") or []) + moved
@@ -4627,6 +4678,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             "from_filled_qty": prev.get("from_filled_qty", o.filled_qty),
             "from_open_price": prev.get("from_open_price", o.open_price),
             "from_limit_price": prev.get("from_limit_price", o.limit_price),
+            "from_stop_price": prev.get("from_stop_price", getattr(o, "stop_price", None)),
         }
         if new_contract is not None:
             if o.symbol == o.contract_symbol:

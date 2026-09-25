@@ -572,3 +572,143 @@ def test_a_market_entry_cancelled_across_the_split_releases_its_waiting_transact
         assert all(t.status != TransactionStatus.WAITING for t in left)
         assert not [t for t in transactions_where(status=TransactionStatus.WAITING)]
         assert PUT410 not in acct._option_positions
+
+
+# =============================================================================================
+# Review follow-ups (1b code review)
+# =============================================================================================
+ADJ_PUT25 = "AAPL200918P00025000"
+
+
+def _basis_splits(*splits):
+    from app.services.backtest.option_split_basis import RunSplitBasis
+    return RunSplitBasis({"AAPL": SymbolSplitBasis(
+        "AAPL", tuple(CalendarSplit(d, r) for d, r in splits), basis_date=date(2026, 1, 1))})
+
+
+def test_a_target_held_in_another_basis_is_explained_once_not_every_bar(caplog):
+    """P400 -> P100 is blocked because P100 is still held by the PRE-split P100 lot (itself
+    waiting: its own adjusted P25 is not listed). The conflict stands for every bar; the WARNING
+    must appear once (it used to be keyed on the day and repeat)."""
+    bars = _series(PUT400, {OPEN_DAY: 15.0, LAST_PRE: 12.0})
+    bars.update(_series(ADJ_PUT100, {OPEN_DAY: 0.5, LAST_PRE: 0.4}))
+    bars.update(_series(ADJ_PUT100, {d: 3.0 for d in _sessions() if d >= SPLIT}))
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        _open(acct, PUT400, OptionRight.PUT, 400.0, OrderDirection.BUY, "long_put")
+        _open(acct, ADJ_PUT100, OptionRight.PUT, 100.0, OrderDirection.BUY, "long_put")
+        with caplog.at_level(logging.WARNING):
+            for d in (SPLIT, D0901, D0902):
+                assert _step(acct, ps, d) == 0
+        held = [r.getMessage() for r in caplog.records
+                if "ANOTHER share basis" in r.getMessage() and "NOT RE-KEYED" in r.getMessage()]
+        assert len(held) == 1, held
+        missing = [r.getMessage() for r in caplog.records
+                   if ADJ_PUT25 in r.getMessage() and "not listed" in r.getMessage()]
+        assert len(missing) == 1, missing
+
+
+def test_two_splits_chain_and_the_note_keeps_the_first_terms_and_the_ratio_product():
+    """2:1 on 08-31 then 2:1 on 09-08: P400 -> P200 (x2) -> P100 (x4). The row note keeps the
+    ORIGINAL contract/strike/qty and the cumulative ratio 4; the round-trip row is stated in
+    the original units; the transaction meta records each move with its pre-move qty."""
+    from ba2_common.core.trade_store import transactions_where
+    second = date(2020, 9, 8)
+    basis = _basis_splits((SPLIT, 2.0), (second, 2.0))
+    adj200 = "AAPL200918P00200000"
+    bars = _series(PUT400, {OPEN_DAY: 12.0, LAST_PRE: 12.0})
+    bars.update(_series(adj200, {SPLIT: 6.0, D0901: 6.0}))
+    bars.update(_series(ADJ_PUT100, {second: 3.0, date(2020, 9, 9): 3.0}))
+    closes = [(d, 100.0) for d in _sessions()]          # 400/4, 200/2, 100: flat as traded
+    with _harness(bars, closes, basis=basis) as (engine, acct, ps):
+        _open(acct, PUT400, OptionRight.PUT, 400.0, OrderDirection.BUY, "long_put")
+        eq0 = acct.equity()
+        assert _step(acct, ps, SPLIT) == 1
+        assert acct._option_positions[adj200].qty == 2
+        assert _step(acct, ps, D0901) == 0
+        assert _step(acct, ps, second) == 1
+        lot = acct._option_positions[ADJ_PUT100]
+        assert (lot.qty, lot.avg_price, lot.basis_factor) == (4.0, pytest.approx(3.0), 1.0)
+        assert acct.equity() == pytest.approx(eq0)
+        (entry,) = _rows(acct, ADJ_PUT100)
+        note = entry.data["split_rekey"]
+        assert note["ratio"] == 4 and note["from_contract"] == PUT400
+        assert note["from_strike"] == 400.0 and note["from_quantity"] == 1
+        assert note["from_open_price"] == pytest.approx(12.0)
+        assert "from_stop_price" in note
+        assert note["to_contract"] == ADJ_PUT100 and note["date"] == second.isoformat()
+        (row,) = acct.get_round_trip_trades()
+        assert (row["contract_symbol"], row["size"]) == (PUT400, pytest.approx(1.0))
+        assert row["entry_price"] == pytest.approx(12.0)
+        assert row["split_rekey"]["ratio"] == 4
+        (txn,) = transactions_where(status=TransactionStatus.OPENED)
+        moves = txn.meta_data["split_rekeys"]
+        assert [(m["from_contract"], m["to_contract"], m["from_quantity"]) for m in moves] == [
+            (PUT400, adj200, 1), (adj200, ADJ_PUT100, 2.0)]
+        assert moves[0]["from_open_price"] == pytest.approx(12.0)
+
+
+def test_a_lot_whose_rows_do_not_reconcile_is_refused_once_and_never_replanned(caplog,
+                                                                                monkeypatch):
+    from app.services.backtest.backtest_account import BacktestAccount
+    with _harness(_long_put_bars(), _closes()) as (engine, acct, ps):
+        _open(acct, PUT400, OptionRight.PUT, 400.0, OrderDirection.BUY, "long_put")
+        acct._option_positions[PUT400].qty = 2.0          # the order book says 1
+        calls = []
+        orig = BacktestAccount._rekey_plan
+        monkeypatch.setattr(BacktestAccount, "_rekey_plan",
+                            lambda self, lot, today: calls.append(today) or orig(self, lot, today))
+        with caplog.at_level(logging.WARNING):
+            for d in (SPLIT, D0901, D0902):
+                assert _step(acct, ps, d) == 0
+        errs = [r.getMessage() for r in caplog.records
+                if r.levelno >= logging.ERROR and "add up to" in r.getMessage()]
+        assert len(errs) == 1 and PUT400 in errs[0], errs
+        assert calls == [SPLIT]                            # never re-planned after the refusal
+        assert acct._option_positions[PUT400].qty == 2.0
+        assert ADJ_PUT100 not in acct._option_positions
+
+
+def test_merge_then_expiry_books_both_transactions_rows_and_cash():
+    """Reviewer's probe: long P400 @ 15 pre-split (T1) + a NEW P100 @ 3 bought on the ex-date
+    (T2), merged into one lot of 5; expiry at 95 -> P100 intrinsic 5. Cash +2,500 after the
+    entries; T1 = 1 x 15 -> 20 (+500, original units), T2 = 1 x 3 -> 5 (+200)."""
+    bars = _series(PUT400, {OPEN_DAY: 15.0, LAST_PRE: 12.0})
+    bars.update(_series(ADJ_PUT100, {SPLIT: 3.0}))
+    with _harness(bars, _closes(overrides={EXPIRY: 95.0})) as (engine, acct, ps):
+        _open(acct, PUT400, OptionRight.PUT, 400.0, OrderDirection.BUY, "long_put")
+        ps.set_clock(_dt(SPLIT))
+        _open(acct, ADJ_PUT100, OptionRight.PUT, 100.0, OrderDirection.BUY, "long_put")
+        assert acct.apply_split_rekeys() == 1
+        assert acct._option_positions[ADJ_PUT100].qty == 5
+        cash = acct._cash
+        _expire(engine, acct, ps)
+        assert acct._cash == pytest.approx(cash + 2_500.0)
+        assert acct._option_positions[ADJ_PUT100].qty == 0
+        rows = sorted(acct.get_round_trip_trades(), key=lambda t: t["transaction_id"])
+        assert [(r["contract_symbol"], r["size"], r["entry_price"], r["exit_price"], r["pnl"])
+                for r in rows] == [
+            (PUT400, pytest.approx(1.0), pytest.approx(15.0), pytest.approx(20.0),
+             pytest.approx(500.0)),
+            (ADJ_PUT100, pytest.approx(1.0), pytest.approx(3.0), pytest.approx(5.0),
+             pytest.approx(200.0))]
+
+
+def test_a_foreign_row_already_carrying_the_target_string_is_reported(caplog):
+    """A CLOSED pre-split trade of the old P100 owns the string P400 is re-keyed onto: the
+    re-key proceeds (same terms) but says so."""
+    bars = _series(PUT400, {OPEN_DAY: 15.0, LAST_PRE: 12.0})
+    bars.update(_series(ADJ_PUT100, {OPEN_DAY: 0.5, date(2020, 8, 25): 0.6, SPLIT: 3.0}))
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        _open(acct, ADJ_PUT100, OptionRight.PUT, 100.0, OrderDirection.BUY, "long_put")
+        (pos,) = [p for p in acct.get_option_positions() if p.contract_symbol == ADJ_PUT100]
+        _open(acct, PUT400, OptionRight.PUT, 400.0, OrderDirection.BUY, "long_put")
+        ps.set_clock(_dt(date(2020, 8, 25)))
+        acct.close_option_position(pos, order_type="market")
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert acct._option_positions[ADJ_PUT100].qty == 0
+        with caplog.at_level(logging.WARNING):
+            assert _step(acct, ps, SPLIT) == 1
+        warns = [r.getMessage() for r in caplog.records if "ANOTHER share basis" in r.getMessage()
+                 and "already carry" in r.getMessage()]
+        assert len(warns) == 1 and ADJ_PUT100 in warns[0], warns
