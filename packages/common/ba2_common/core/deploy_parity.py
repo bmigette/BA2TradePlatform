@@ -34,7 +34,7 @@ platform checkout and has only the packages on its path).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 __all__ = [
     "BacktestRunFacts",
@@ -42,6 +42,7 @@ __all__ = [
     "BACKTEST_FORCED_SETTINGS",
     "forced_expert_settings",
     "backtest_only_settings",
+    "backtest_only_notices",
     "live_settings_from_universe",
     "SCREENER_UNIVERSE_SETTING",
     "explicit_default_settings",
@@ -259,6 +260,17 @@ def backtest_only_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
     """{backtest key: value} for every row with NO live analogue -- carried, never applied."""
     return {row.key: row.value(facts)
             for row in BACKTEST_FORCED_SETTINGS if row.live_setting is None}
+
+
+def backtest_only_notices(backtest_only: Optional[Dict[str, Any]]) -> List[str]:
+    """The deploy report's line for each ``backtest_only`` row of a payload -- carried, never
+    applied, and SAID so (review V4/V5), except a row whose value is None: None states no
+    behaviour for this run (``hold_assigned_stock_tags`` on a run that is not member-scoped --
+    a member-scoped one is refused at export -- or ``entry_action`` on an equity run), so
+    printing it on every deploy is noise that hides the rows that matter. ``False`` / ``0`` are
+    real values and are reported."""
+    return [f"BACKTEST-ONLY, not applied: {k}={v!r}"
+            for k, v in (backtest_only or {}).items() if v is not None]
 
 
 def live_settings_from_universe(universe: Optional[Dict[str, Any]]) -> Dict[str, Any]:

@@ -35,3 +35,15 @@ def test_a_run_without_it_records_None_and_deploys():
 def test_a_member_scoped_run_is_refused_for_deploy_by_name():
     with pytest.raises(UndeployableRunRefused, match="hold_assigned_stock_tags"):
         refuse_undeployable(_facts(hold_assigned_stock_tags=(7,)))
+
+
+def test_the_deploy_report_skips_a_backtest_only_row_that_states_nothing():
+    """Every deployable payload carries ``hold_assigned_stock_tags: None`` (a member-scoped run is
+    refused above), so printing it on every deploy is noise. A None row says nothing about the
+    run; every other row -- False included -- is still reported."""
+    from ba2_common.core.deploy_parity import backtest_only_notices
+    notices = backtest_only_notices(backtest_only_settings(_facts(hold_assigned_stock=True)))
+    assert notices == ["BACKTEST-ONLY, not applied: hold_assigned_stock=True"]
+    assert backtest_only_notices({"a": False, "b": None, "c": 0}) == [
+        "BACKTEST-ONLY, not applied: a=False", "BACKTEST-ONLY, not applied: c=0"]
+    assert backtest_only_notices({}) == []

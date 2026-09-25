@@ -25,14 +25,18 @@ TEST = Path('C:/Users/basti/Documents/ba2/test/dl_forecasting.db')
 RUNS = Path('C:/Users/basti/AppData/Local/Temp/ba2_backtest_dbs')
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / 'packages/common'))
+# _derive_export_payload lazily imports app.services.strategy_param_space (pure; no app startup).
+sys.path.insert(0, str(ROOT / 'testplatform/backend'))
 # Pure rule modules only need logging; avoid the application's file logger setup.
 log_module = ModuleType('ba2_common.logger')
 log_module.logger = logging.getLogger('readonly_audit')
 sys.modules['ba2_common.logger'] = log_module
 from ba2_common.core.deploy_parity import (
-    BacktestRunFacts, forced_expert_settings, backtest_only_settings,
-    live_settings_from_universe,
+    BacktestRunFacts, UndeployableRunRefused, forced_expert_settings, backtest_only_settings,
+    live_settings_from_universe, member_hold_tags_fact, refuse_undeployable,
 )
+from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+from fastapi import HTTPException
 from ba2_common.core.rules_convert import trade_rules_to_live_export
 
 
@@ -171,9 +175,17 @@ for path in (ROOT / 'packages/experts/ba2_experts/DeterministicScorer').glob('*.
                 ds_constants[node.targets[0].id] = ast.literal_eval(node.value)
             except (ValueError, TypeError):
                 pass
+# Every global _derive_export_payload's expert_settings path reads (the stage-2 E2 deploy refusal
+# added member_hold_tags_fact / refuse_undeployable / UndeployableRunRefused / HTTPException).
 export_ns = dict(BacktestRunFacts=BacktestRunFacts,
                  forced_expert_settings=forced_expert_settings,
                  backtest_only_settings=backtest_only_settings,
+                 member_hold_tags_fact=member_hold_tags_fact,
+                 refuse_undeployable=refuse_undeployable,
+                 UndeployableRunRefused=UndeployableRunRefused,
+                 HTTPException=HTTPException,
+                 coerce_bool=coerce_bool,
+                 logger=log_module.logger,
                  _is_bypass_expert_class=lambda name: False)
 derive_export = extract_function('testplatform/backend/app/api/backtests.py',
                                 '_derive_export_payload', export_ns)
