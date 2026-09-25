@@ -12,6 +12,7 @@ from datetime import datetime, timezone, date, timedelta
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, TradeActionResult
 from ba2_common.core.types import (
     OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus,
@@ -2364,6 +2365,16 @@ class _OptionEntryAction(TradeAction):
 
     OPTION_TYPE: OptionRight = OptionRight.CALL
 
+    #: The 1-contract sizing floor (plan 2026-09-24 Task 8), OFF unless a rule turns it on.
+    #: Class-level so an action built without the ctor (the sizing tests use ``__new__``)
+    #: reads it as off -- exactly like every config written before the flag existed.
+    min_one_contract: bool = False
+    #: Why the floor was considered and NOT applied on the latest sizing, appended to the
+    #: budget refusal by ``_budget_refusal``; None whenever the floor played no part.
+    _min_one_contract_note: Optional[str] = None
+    #: True when the latest sizing's quantity came from the floor (recorded on the result).
+    _min_one_contract_applied: bool = False
+
     def __init__(self, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation,
                  existing_order: Optional[TradingOrder] = None,
@@ -2382,6 +2393,7 @@ class _OptionEntryAction(TradeAction):
                  w_premium: Optional[float] = None,
                  w_iv: Optional[float] = None,
                  w_rvol: Optional[float] = None,
+                 min_one_contract: Any = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -2435,6 +2447,12 @@ class _OptionEntryAction(TradeAction):
         self.w_iv = w_iv
         self.w_rvol = w_rvol
         self.selection_policy = SelectionPolicy(**present) if any(present.values()) else None
+        # 1-CONTRACT SIZING FLOOR (plan 2026-09-24 Task 8): see ``_size_by_cost``. Absent/None
+        # is OFF, which is what every rule written before this flag carries. Read through
+        # coerce_bool because the GA and the deploy path deliver bools as 1 / "1" as often as
+        # True -- the "1" that once read back False is exactly how a gene the optimizer turned
+        # ON ran OFF live. A spelling nothing can mean raises instead of being guessed at.
+        self.min_one_contract = False if min_one_contract is None else coerce_bool(min_one_contract)
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -2697,9 +2715,20 @@ class _OptionEntryAction(TradeAction):
         The single sizer ``_size`` and ``_size_by_reserve`` both reduce to. They remain on the
         class (tests and the classic-RM path reference them) and now delegate here, so there is
         one definition of the cap interaction rather than two copies that can drift.
+
+        THE 1-CONTRACT FLOOR (``min_one_contract``, plan 2026-09-24 Task 8; off by default).
+        With the flag on, a size that rounds to 0 becomes 1 when one contract fits under the
+        per-instrument cap and the virtual equity -- see ``_one_contract_floor``. Every
+        later guard (buying power, assignment capacity, the option RM) runs on the quantity
+        this returns, so the floor passes THROUGH them. Each call resets the floor's state,
+        so a note from an earlier sizing can never reach a later refusal.
         """
+        self._min_one_contract_note = None
+        self._min_one_contract_applied = False
         if not cost_per_contract or cost_per_contract <= 0:
             return 0
+        # No budget at all (sizing off / unset) is not what the floor is for: it exists for a
+        # budget too SMALL for one contract, so it is never consulted before this point.
         if not sizing_pct or sizing_pct <= 0:
             return 0
         equity = self._virtual_equity()
@@ -2709,7 +2738,58 @@ class _OptionEntryAction(TradeAction):
         cap = self._max_equity_per_instrument_cap(equity)
         if cap is not None:
             budget = min(budget, cap)
-        return int(math.floor(budget / cost_per_contract))
+        quantity = int(math.floor(budget / cost_per_contract))
+        if quantity >= 1 or not self.min_one_contract:
+            return quantity
+        return self._one_contract_floor(cost_per_contract, budget=budget, equity=equity,
+                                        cap=cap)
+
+    def _one_contract_floor(self, cost_per_contract: float, *, budget: float, equity: float,
+                            cap: Optional[float]) -> int:
+        """1 if ONE contract fits under the per-instrument cap and the virtual equity, else 0
+        with ``_min_one_contract_note`` saying why (appended to the refusal).
+
+        THE CAP IS REQUIRED, NOT BEST-EFFORT, HERE. ``_max_equity_per_instrument_cap`` is a
+        supplementary ceiling elsewhere (None -> no cap, because ``option_sizing`` is already
+        bounding the size). The floor deliberately overrides ``option_sizing``, so the cap is
+        the ONLY thing left bounding a floored contract: sizing one without it would let a
+        single lumpy premium take whatever the account holds. Unresolved therefore refuses.
+
+        The virtual-equity check is separate because the cap is a percent that can exceed 100.
+        """
+        cost = float(cost_per_contract)
+        if cap is None:
+            self._min_one_contract_note = (
+                f"min_one_contract floor not applied: the per-instrument cap "
+                f"(max_virtual_equity_per_instrument_percent) could not be resolved, and it is "
+                f"the only ceiling a floored contract may be sized under "
+                f"(one contract costs {cost:.2f}, option_sizing budget {budget:.2f})")
+            return 0
+        if cost > cap:
+            self._min_one_contract_note = (
+                f"min_one_contract floor not applied: one contract costs {cost:.2f}, above the "
+                f"per-instrument cap {cap:.2f} (max_virtual_equity_per_instrument_percent)")
+            return 0
+        if cost > equity:
+            self._min_one_contract_note = (
+                f"min_one_contract floor not applied: one contract costs {cost:.2f}, above the "
+                f"virtual equity {equity:.2f}")
+            return 0
+        self._min_one_contract_applied = True
+        logger.info(
+            f"{self._action_type_value()} for {self.instrument_name}: option_sizing budget "
+            f"{budget:.2f} < one contract {cost:.2f}; sized 1 contract by the min_one_contract "
+            f"floor (within per-instrument cap {cap:.2f})")
+        return 1
+
+    def _budget_refusal(self, message: str) -> Dict[str, Any]:
+        """The "Insufficient budget to size ..." refusal, with the floor's reason appended when
+        ``min_one_contract`` was considered and did not apply. With the flag off (or when the
+        floor played no part) the note is None and the message is the builder's own,
+        byte-identical -- those strings are persisted and shown in the UI as the reason an
+        entry did not fire."""
+        note = self._min_one_contract_note
+        return self._result(False, message if note is None else f"{message}; {note}")
 
     def _size(self, premium: float, sizing_pct: Optional[float]) -> int:
         """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable.
@@ -3174,6 +3254,11 @@ class _OptionEntryAction(TradeAction):
         limit_price = quoted
         if option_reserve is not None:
             data["option_reserve"] = option_reserve
+        # Only when the quantity CAME from the 1-contract floor, so every other entry's result
+        # data is byte-identical to before; lets a run report count the entries that exist
+        # only because of the floor (the O_LP diagnosis this flag answers).
+        if self._min_one_contract_applied:
+            data["min_one_contract_floor"] = True
         if extra_entry_facts:
             data.update(extra_entry_facts)
         # Design 2026-08-29 S8.2: persist the structure's measured max loss beside
@@ -3529,8 +3614,7 @@ class _OptionEntryAction(TradeAction):
             # persisted to TradeActionResult.message and rendered in the UI as the reason an
             # entry did not fire; rewording five of seven of them would have made "behaviour
             # neutral" false in the one place a user actually looks.
-            return self._result(
-                False,
+            return self._budget_refusal(
                 resolved.budget_refusal_message
                 or (f"Insufficient budget to size {resolved.option_strategy} for "
                     f"{self.instrument_name}"))
@@ -3541,6 +3625,10 @@ class _OptionEntryAction(TradeAction):
         # One execute, one decision: the spot the record reuses is THIS run's, never a
         # previous execute's on the same action object.
         self._last_spot = None
+        # Same for the 1-contract floor's state: a share-sized overlay never calls the sizer,
+        # so without this reset it could report a previous execute's floor on its own order.
+        self._min_one_contract_note = None
+        self._min_one_contract_applied = False
         try:
             if not self._supports_options():
                 return self._result(False, f"Account does not support options for {self.instrument_name}")
@@ -4020,9 +4108,9 @@ class SellCashSecuredPutAction(_OptionEntryAction):
         per_contract_reserve = contract.strike * 100.0
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size cash_secured_put for {self.instrument_name} "
-                                f"(strike={contract.strike})")
+            return self._budget_refusal(
+                f"Insufficient budget to size cash_secured_put for {self.instrument_name} "
+                f"(strike={contract.strike})")
         reserve = self.account.option_reserve_required("cash_secured_put", quantity, strike=contract.strike)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False,
@@ -4106,9 +4194,9 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
         # max_virtual_equity_per_instrument_percent, same as every other structure.
         quantity = self._size_by_reserve(per_spread_reserve, self.sizing)
         if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size bear_call_spread for {self.instrument_name} "
-                                f"(max_loss={per_spread_reserve})")
+            return self._budget_refusal(
+                f"Insufficient budget to size bear_call_spread for {self.instrument_name} "
+                f"(max_loss={per_spread_reserve})")
         reserve = self.account.option_reserve_required(
             "bear_call_spread", quantity, spread_width=width, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
@@ -4210,9 +4298,9 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
         # max_virtual_equity_per_instrument_percent, same as every other structure.
         quantity = self._size_by_reserve(per_spread_reserve, self.sizing)
         if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size bull_put_spread for {self.instrument_name} "
-                                f"(max_loss={per_spread_reserve})")
+            return self._budget_refusal(
+                f"Insufficient budget to size bull_put_spread for {self.instrument_name} "
+                f"(max_loss={per_spread_reserve})")
         reserve = self.account.option_reserve_required(
             "bull_put_spread", quantity, spread_width=width, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
@@ -4463,7 +4551,7 @@ class OpenShortStraddleAction(_OptionEntryAction):
             put_premium=put_c.bid, call_premium=call_c.bid)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
-            return self._result(False, f"Insufficient budget to size short straddle for {self.instrument_name}")
+            return self._budget_refusal(f"Insufficient budget to size short straddle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "short_straddle", quantity, strike=call_c.strike, spot=spot,
             put_premium=put_c.bid, call_premium=call_c.bid)
@@ -4555,7 +4643,7 @@ class OpenShortStrangleAction(_OptionEntryAction):
             put_premium=put_c.bid, call_premium=call_c.bid)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
-            return self._result(False, f"Insufficient budget to size short strangle for {self.instrument_name}")
+            return self._budget_refusal(f"Insufficient budget to size short strangle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
             put_premium=put_c.bid, call_premium=call_c.bid)
@@ -4639,7 +4727,7 @@ class OpenIronCondorAction(_OptionEntryAction):
         per_contract_reserve = max_loss * 100.0
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing) if per_contract_reserve > 0 else 0
         if quantity < 1:
-            return self._result(False, f"Insufficient budget to size iron condor for {self.instrument_name}")
+            return self._budget_refusal(f"Insufficient budget to size iron condor for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "iron_condor", quantity, spread_width=width, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
@@ -4731,7 +4819,7 @@ class OpenJadeLizardAction(_OptionEntryAction):
             "jade_lizard", 1, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
-            return self._result(False, f"Insufficient budget to size jade lizard for {self.instrument_name}")
+            return self._budget_refusal(f"Insufficient budget to size jade lizard for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "jade_lizard", quantity, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
@@ -4900,7 +4988,7 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
             "put_ratio_spread", 1, strike=short_p.strike, net_credit=net_credit)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
-            return self._result(False, f"Insufficient budget to size ratio spread for {self.instrument_name}")
+            return self._budget_refusal(f"Insufficient budget to size ratio spread for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "put_ratio_spread", quantity, strike=short_p.strike, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
@@ -5075,9 +5163,9 @@ class _BackspreadAction(_OptionEntryAction):
         # ``_size``/``_size_by_reserve``.
         quantity = self._size_by_cost(max_loss_per_contract, self.sizing)
         if quantity < 1:
-            return self._result(
-                False, f"Insufficient budget to size {self.OPTION_STRATEGY} for "
-                       f"{self.instrument_name} (max_loss={max_loss_per_contract})")
+            return self._budget_refusal(
+                f"Insufficient budget to size {self.OPTION_STRATEGY} for "
+                f"{self.instrument_name} (max_loss={max_loss_per_contract})")
         # A net DEBIT is a NEGATIVE credit and the reserve branch subtracts it, so the
         # collateral is (width + debit) x 100 -- more than the width, which is correct: the
         # debit is money already spent that the worst case does not give back.
@@ -5363,9 +5451,9 @@ class OpenPMCCAction(_OptionEntryAction):
                        f"refusing rather than sizing against an unknown")
         quantity = self._size_by_cost(net_debit * 100.0, self.sizing)
         if quantity < 1:
-            return self._result(
-                False, f"Insufficient budget to size pmcc for {self.instrument_name} "
-                       f"(net_debit={net_debit})")
+            return self._budget_refusal(
+                f"Insufficient budget to size pmcc for {self.instrument_name} "
+                f"(net_debit={net_debit})")
         return self._submit_option_order(
             legs, quantity, net_debit, self.OPTION_STRATEGY,
             extra_entry_facts={ORDER_PMCC_OVERLAY_KEY: self._overlay_spec()})
