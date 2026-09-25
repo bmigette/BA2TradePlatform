@@ -108,10 +108,14 @@ def test_category_counts_cover_every_category_and_agree_with_the_catalog():
 
 def test_the_counts_the_design_agreed():
     """Pinned as NUMBERS because the chips show them: a count that drifts from the design's
-    table means somebody re-filed a trigger without saying so."""
+    table means somebody re-filed a trigger without saying so.
+
+    80 -> 81 / position 18 -> 19 (2026-09-25): ``entry_tag``, the style-group member tag (plan
+    2026-09-25 option-stage2-build, Task 2), filed under position -- it is a fact about who
+    opened the evaluated position."""
     assert category_counts() == {
-        "all": 80,
-        "position": 18,
+        "all": 81,
+        "position": 19,
         "signal": 26,
         "targets": 10,
         "options": 13,

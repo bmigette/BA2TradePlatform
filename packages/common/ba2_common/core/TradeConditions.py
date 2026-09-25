@@ -29,6 +29,9 @@ from ba2_common.core.earnings_stamp import (
     order_event_date,
     stamped_days_to_earnings,
 )
+# The style-group member tag (plan 2026-09-25 option-stage2-build): stamped on the entry order
+# row by TradeActions, read back by EntryTagCondition below.
+from ba2_common.core.entry_tag import ENTRY_TAG_OPERATORS, coerce_entry_tag, order_entry_tag
 # Market-condition entry gates (design 2026-09-15 option-market-condition-genes): the profile
 # registry the condition classes are GENERATED from, and the evaluation-scoped context type.
 from ba2_common.core.market_conditions import (
@@ -3379,6 +3382,70 @@ class DaysAfterEventCondition(CompareCondition):
         return f"{int(self.calculated_value)}d after event"
 
 
+class EntryTagCondition(CompareCondition):
+    """Which style-group MEMBER opened the evaluated position (``entry_tag`` on its entry order).
+
+    ANDed into every exit rule a style expert emits (ba2test_launcher O_STYLE, plan 2026-09-25
+    option-stage2-build), so one OPEN_POSITIONS ruleset carries each member's OWN exits. The
+    tag is read BACK off the entry order row (``entry_tag.order_entry_tag``), where
+    ``_OptionEntryAction._submit_option_order`` stamped it -- the same read-back-never-
+    reconstruct seam as ``days_after_event``. Shared by live and backtest.
+
+    UNKNOWN NEVER FIRES: no order, no row data or no tag -> ``calculated_value`` None and False
+    for EVERY operator (``!=`` included). That is safe by construction -- an untagged position
+    is not a style position, so no member's exit may close it -- and it is why the wheel's
+    stock-phase rules must stay UNSCOPED (the assigned stock lot has no entry tag).
+
+    A LABEL, NOT A QUANTITY. Only ``==`` / ``!=`` (``ENTRY_TAG_OPERATORS``), and the rule value
+    must itself be a tag (a positive integer): an ordering operator or a value like ``2.5``
+    would be a gate that can never mean what it says, so both are REFUSED at construction
+    rather than evaluated to a permanent, quiet False. A corrupted STORED tag raises from the
+    read-back and propagates (a ValueError is not a benign type under BA2_ERROR_MODE=enforce).
+    """
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        if operator_str not in ENTRY_TAG_OPERATORS:
+            raise ValueError(
+                f"entry_tag is a member LABEL: only {list(ENTRY_TAG_OPERATORS)} compare it, "
+                f"got {operator_str!r}")
+        try:
+            tag = coerce_entry_tag(value)
+        except ValueError as e:
+            raise ValueError(f"entry_tag condition value: {e}") from e
+        if tag is None:
+            raise ValueError("entry_tag condition needs a value (the member tag to match)")
+        super().__init__(account, instrument_name, expert_recommendation, operator_str,
+                         float(tag), existing_order)
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+            tag = order_entry_tag(self.existing_order)
+            if tag is None:
+                self.calculated_value = None
+                return False
+            self.calculated_value = float(tag)
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating entry_tag condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the style-group member that opened {self.instrument_name}'s "
+                f"position (entry_tag) is {self.operator_str} {int(self.value)}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"member tag {int(self.calculated_value)}"
+
+
 class DaysToExpiryCondition(CompareCondition):
     """Calendar days of option life REMAINING: ``expiry - the evaluation date``.
 
@@ -4485,6 +4552,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
     ExpertEventType.N_REC_DAYS_TO_EARNINGS: RecommendationDaysToEarningsCondition,
     ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
+    ExpertEventType.N_ENTRY_TAG: EntryTagCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
     ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY: ShortLegDaysToExpiryCondition,
     ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY: CoveredCallDaysToExpiryCondition,

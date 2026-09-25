@@ -527,6 +527,13 @@ class ExpertEventType(str, Enum):
     # the entry order carries no event date, which is every order not opened off an
     # earnings-event recommendation.
     N_DAYS_AFTER_EVENT = "days_after_event"
+    # Which MEMBER of a composed (style-group) option expert opened the evaluated position: the
+    # integer ``entry_tag`` the entry action stamped on its parent order row (plan 2026-09-25
+    # option-stage2-build, Tasks 1-2). ANDed into every member exit a style expert emits, so one
+    # OPEN_POSITIONS ruleset carries each member's OWN exits. A LABEL compared with == / !=
+    # only. UNEVALUABLE (fires in NEITHER direction) when the entry order carries no tag, which
+    # is every position not opened by a style-group entry.
+    N_ENTRY_TAG = "entry_tag"
     # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
     # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
     # "21 days after opening" and "21 days before expiry" are different quantities. This is what
@@ -753,6 +760,7 @@ def get_numeric_event_values():
         ExpertEventType.N_DAYS_TO_EARNINGS.value,
         ExpertEventType.N_REC_DAYS_TO_EARNINGS.value,
         ExpertEventType.N_DAYS_AFTER_EVENT.value,
+        ExpertEventType.N_ENTRY_TAG.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value,
         ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value,
         ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value,

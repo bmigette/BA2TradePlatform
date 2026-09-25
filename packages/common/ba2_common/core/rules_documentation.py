@@ -506,6 +506,21 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Close the straddle the day after the print: days_after_event >= 1"
         },
+        ExpertEventType.N_ENTRY_TAG.value: {
+            "name": "Entry Tag (style-group member)",
+            "description": (
+                "For an open position: which MEMBER of a composed (style-group) option expert "
+                "opened it -- the integer tag the member's entry action stamped on its entry "
+                "order. Style experts AND it into every member exit (entry_tag == <member "
+                "tag>) so one open-positions ruleset carries each member's own exits. It is a "
+                "LABEL: only == and != compare it, and the value must be a positive integer. "
+                "A position whose entry order carries no tag is UNEVALUABLE and does NOT fire "
+                "for either operator. Written by the style builder, not meant to be typed by "
+                "hand: a wrong tag routes a position to another member's exits."
+            ),
+            "type": "numeric",
+            "example": "Scope the long-call member's take-profit to its own positions: entry_tag == 1"
+        },
         ExpertEventType.N_DAYS_TO_EXPIRY.value: {
             "name": "Days to Expiry (remaining option life)",
             "description": (

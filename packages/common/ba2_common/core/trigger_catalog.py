@@ -112,7 +112,7 @@ _POSITION = (
     'has_covered_call', 'has_protective_put', 'has_assigned_shares', 'days_opened',
     'profit_loss_amount', 'profit_loss_percent', 'instrument_account_share',
     'loss_pct_of_max_loss', 'profit_multiple_of_premium', 'percent_to_current_target',
-    'percent_open_to_new_target',
+    'percent_open_to_new_target', 'entry_tag',
 )
 
 _SIGNAL = (
@@ -378,6 +378,11 @@ def operator_options_for(value) -> list:
     if spec is not None:
         allowed = OPERATORS_BY_KIND[spec.kind]
         return [op for op in get_operator_options() if op in allowed]
+    # The style-group member tag is a LABEL: EntryTagCondition refuses an ordering operator at
+    # construction, so the editor must not offer one (same table, so they cannot disagree).
+    from ba2_common.core.entry_tag import ENTRY_TAG_OPERATORS, ORDER_ENTRY_TAG_KEY
+    if value == ORDER_ENTRY_TAG_KEY:
+        return [op for op in get_operator_options() if op in ENTRY_TAG_OPERATORS]
     from ba2_common.core.types import is_numeric_event
 
     return get_operator_options() if is_numeric_event(value) else []

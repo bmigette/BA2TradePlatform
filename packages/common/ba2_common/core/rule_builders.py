@@ -88,6 +88,10 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # recommendation and every position that did not come from an earnings-event expert.
     "rec_days_to_earnings": ExpertEventType.N_REC_DAYS_TO_EARNINGS,
     "days_after_event": ExpertEventType.N_DAYS_AFTER_EVENT,
+    # The style-group MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 2): which member of
+    # a composed option expert opened the position, read back off its entry order row. ANDed
+    # into each member's exits; UNEVALUABLE (never fires) on an untagged position.
+    "entry_tag": ExpertEventType.N_ENTRY_TAG,
     # THE DIRECTION CALL AS A NUMBER (SELL -2 .. BUY +2, HOLD 0). MANDATORY here and not
     # merely tidy: the option grid's entry gate is this leaf, and an unmapped field is
     # DROPPED by triggers_from_condition_tree with nothing but a WARNING -- every option
@@ -350,6 +354,18 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
             f"{[leaf.get('id') or leaf.get('field') for leaf in leaves]!r} produced a trigger "
             f"(unknown field or missing value). A rule with no trigger is ALWAYS TRUE: it would "
             f"fire on every position. Fix or remove the leaves.")
+    # A DROPPED MEMBER-TAG LEAF IS FAIL-OPEN ACROSS MEMBERS (plan 2026-09-25 option-stage2-
+    # build): the tag is what scopes a style member's exit to that member's positions, so an
+    # exit that lost it would close EVERY position on the symbol, whichever member opened it.
+    # Refused like a dropped market-condition leaf below, never tolerated like an ordinary one.
+    tag_event = FIELD_EVENT["entry_tag"].value
+    tag_leaves = [leaf for leaf in leaves if leaf.get("field") == "entry_tag"]
+    tag_triggers = [t for t in triggers.values() if t.get("event_type") == tag_event]
+    if len(tag_triggers) < len(tag_leaves):
+        raise ValueError(
+            f"{where}: {len(tag_leaves) - len(tag_triggers)} of the rule's {len(tag_leaves)} "
+            f"entry_tag leaf/leaves {[leaf.get('id') for leaf in tag_leaves]!r} produced no "
+            f"trigger (missing value). The rule would apply to every style member's positions.")
     fields = market_condition_fields()
     market_leaves = [leaf for leaf in leaves if leaf.get("field") in fields]
     market_triggers = [t for t in triggers.values() if t.get("event_type") in fields]

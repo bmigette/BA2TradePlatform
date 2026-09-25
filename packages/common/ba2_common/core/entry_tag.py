@@ -28,6 +28,12 @@ from typing import Any, Optional
 #: The order-row ``data`` key (and the evaluator's action-config key) carrying the tag.
 ORDER_ENTRY_TAG_KEY = "entry_tag"
 
+#: The only comparisons a tag supports. It is a member LABEL, not a quantity: ``entry_tag > 3``
+#: compares member codes as if they sat on a scale. ``EntryTagCondition`` refuses anything else
+#: at construction, and the rule editor offers exactly these (``trigger_catalog``), so the two
+#: cannot disagree.
+ENTRY_TAG_OPERATORS = ("==", "!=")
+
 
 def coerce_entry_tag(raw: Any) -> Optional[int]:
     """None stays None; anything else must be a positive integer, returned as ``int``.
