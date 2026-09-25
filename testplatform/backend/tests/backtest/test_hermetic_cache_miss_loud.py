@@ -24,6 +24,7 @@ from ba2_providers.fmp_common import FMPHistoryCacheMiss
 from app.services.backtest.price_source import BacktestCacheMiss
 
 from tests.backtest.test_daily_engine_unit import _build_run, BARS
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 
 
 class _RaisingExpert(MarketExpertInterface):
@@ -86,9 +87,9 @@ def test_enter_market_swallows_ordinary_exception():
 def _open_position_via_full_run(engine, account, expert, ps):
     """Run the fixture's normal engine.run() once (well-tested to open+fill an AAPL long by
     day 2), so _manage_open_positions has a real held position to iterate."""
-    # _ensure_safeguard_stop always attempts an ATR lookup now regardless of sizing_mode;
-    # None is its documented no-ATR-available fallback.
-    engine._indicator_provider = None
+    # _ensure_safeguard_stop always attempts an ATR lookup now regardless of sizing_mode; the
+    # no-ATR stub answers it offline (None would make run() build the REAL FMP provider).
+    engine._indicator_provider = NoAtrIndicatorProvider()
     engine.run()
     assert engine._held_transactions(expert.id).get("AAPL"), \
         "fixture must have an open AAPL position to exercise the OPEN_POSITIONS path"

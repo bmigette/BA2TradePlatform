@@ -34,6 +34,7 @@ import pytest
 
 from ba2_common.core.position_sizing import max_loss_stop_of
 
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 from tests.backtest.test_max_loss_stop_engine import (
     CFG, CHOPPY, _MaxLossStubExpert, _store_mode,
 )
@@ -121,7 +122,7 @@ def _run(bars, *, run_id, inmem, entry_actions, exit_rules, loosen=None, buy_on=
             config={"start_date": datetime.combine(bars[0][0], datetime.min.time()),
                     "end_date": datetime.combine(bars[-1][0], datetime.min.time()),
                     "enabled_instruments": ["AAPL"], "seed": 42},
-            indicator_provider=None)
+            indicator_provider=NoAtrIndicatorProvider())
         engine._indicator_provider = None
         engine.run()
 

@@ -35,6 +35,7 @@ import pytest
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.types import OrderRecommendation, Recommendation
 
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 from tests.backtest.fixtures.e2e_support import (
     earnings_drift_payload,
     ensure_host_schema,
@@ -266,7 +267,7 @@ def run_engine(rows: List[Dict[str, Any]], *, equity_cap: Optional[float],
             account=account, experts=built, price_source=price,
             config={"start_date": rows[0]["Date"], "end_date": rows[-1]["Date"],
                     "enabled_instruments": ["AAPL"], "seed": 42},
-            indicator_provider=None,
+            indicator_provider=NoAtrIndicatorProvider(),
         )
         engine._indicator_provider = None
         engine.run()

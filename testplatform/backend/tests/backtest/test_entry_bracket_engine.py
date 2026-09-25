@@ -27,6 +27,7 @@ Run from the backend dir:
 from __future__ import annotations
 
 from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 from datetime import datetime, timezone
 
 import pytest
@@ -278,7 +279,7 @@ def _precedence_setup(account_id: int, expert_id: int, ruleset_sl_price: "float 
         experts=[(expert, expert_id, {}, ruleset_id)],
         price_source=ps,
         config=config,
-        indicator_provider=None,
+        indicator_provider=NoAtrIndicatorProvider(),
     )
 
     # Persist the BUY recommendation + PENDING qty=0 entry order — the Phase-1/1.5 analog
@@ -415,7 +416,7 @@ def test_config_entry_rules_reach_build_experts_and_set_stop_loss(monkeypatch):
                 "start_date": D1, "end_date": D3,
                 "enabled_instruments": ["AAPL"], "seed": 42,
             },
-            indicator_provider=None,  # notional sizing -> ATR not needed
+            indicator_provider=NoAtrIndicatorProvider(),  # notional sizing -> ATR not needed
         )
         # _ensure_safeguard_stop always attempts an ATR lookup now regardless of sizing_mode;
         # None is its documented no-ATR-available fallback, not "never touched".

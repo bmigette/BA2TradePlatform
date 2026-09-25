@@ -60,6 +60,7 @@ from ba2_common.core.interfaces.ExtendableSettingsInterface import (
 )
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.types import OrderRecommendation, Recommendation
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 
 
 # --------------------------------------------------------------------------- #
@@ -330,7 +331,7 @@ def _run_backtest(monkeypatch, *, opted_in: bool, account_id: int, expert_id: in
             account=account, experts=[(expert, expert_id, expert.settings, ruleset_id)],
             price_source=ps, config={"start_date": START, "end_date": END,
                                      "enabled_instruments": ["AAPL"], "seed": 42},
-            indicator_provider=None)
+            indicator_provider=NoAtrIndicatorProvider())
         engine._indicator_provider = None
         engine.run()
         return recorded, account

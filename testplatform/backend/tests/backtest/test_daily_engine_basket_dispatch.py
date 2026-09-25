@@ -47,6 +47,7 @@ import pytest
 
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.types import OrderRecommendation, Recommendation
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 
 
 # 5 daily bars, 2-symbol universe (AAPL, MSFT) so "called once, not once-per-symbol" is
@@ -353,9 +354,9 @@ def _build_basket_run(account_id=53, expert_id=53, expert_cls=None, with_open_po
         config=config,
         # None, not object(): _ensure_safeguard_stop now runs REGARDLESS of sizing_mode (see
         # TradeRiskManagement.py) and always attempts an ATR lookup when use_atr_stop is on
-        # (default True) -- get_latest_atr's `if indicator_provider is None: return None` is the
-        # documented graceful no-ATR-available path, exactly what a hermetic stub run needs.
-        indicator_provider=None,
+        # (default True). The no-ATR stub answers it offline with get_latest_atr's documented
+        # no-ATR-available path -- None would make run() build the REAL FMP-backed provider.
+        indicator_provider=NoAtrIndicatorProvider(),
     )
     return engine, account, expert, ctx, ps
 
@@ -748,9 +749,9 @@ def _build_real_copy_run(
         experts=[(expert, expert_id, settings, ruleset_id)],
         price_source=ps,
         config=config,
-        # None, not object(): see the comment in _build_basket_run -- _ensure_safeguard_stop
-        # always attempts an ATR lookup now, and None is its documented no-ATR-available path.
-        indicator_provider=None,
+        # The no-ATR stub, not object(): see the comment in _build_basket_run --
+        # _ensure_safeguard_stop always attempts an ATR lookup now.
+        indicator_provider=NoAtrIndicatorProvider(),
     )
     return engine, account, expert, ctx, ps
 

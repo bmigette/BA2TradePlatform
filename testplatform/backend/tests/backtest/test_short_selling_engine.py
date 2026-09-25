@@ -32,6 +32,7 @@ from ba2_common.core.position_sizing import max_loss_stop_of
 from ba2_common.core.types import OrderRecommendation, Recommendation
 
 from tests.backtest.test_max_loss_stop_engine import CFG, _store_mode
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 
 BUY, SELL, HOLD = OrderRecommendation.BUY, OrderRecommendation.SELL, OrderRecommendation.HOLD
 
@@ -138,7 +139,7 @@ def _run(bars, signals, *, run_id, inmem, enable_short, entry_actions=BRACKET,
             config={"start_date": datetime.combine(bars[0][0], datetime.min.time()),
                     "end_date": datetime.combine(bars[-1][0], datetime.min.time()),
                     "enabled_instruments": ["AAPL"], "seed": 42, "enable_short": enable_short},
-            indicator_provider=None)
+            indicator_provider=NoAtrIndicatorProvider())
         engine._indicator_provider = None
         engine.run()
 

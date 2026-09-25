@@ -27,6 +27,7 @@ from ba2_common.core.position_sizing import max_loss_stop_of
 from ba2_common.core.types import OrderRecommendation, Recommendation
 
 from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 from tests.backtest.test_entry_bracket_engine import _precedence_setup
 
 
@@ -182,7 +183,7 @@ def _run(bars, *, run_id, inmem, entry_sl_pct=None, buy_on=None):
             config={"start_date": datetime.combine(bars[0][0], datetime.min.time()),
                     "end_date": datetime.combine(bars[-1][0], datetime.min.time()),
                     "enabled_instruments": ["AAPL"], "seed": 42},
-            indicator_provider=None)
+            indicator_provider=NoAtrIndicatorProvider())
         engine._indicator_provider = None
         engine.run()
 

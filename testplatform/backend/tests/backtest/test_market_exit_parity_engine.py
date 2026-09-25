@@ -54,6 +54,7 @@ from ba2_common.core.market_conditions import (
 )
 
 from tests.backtest.test_max_loss_stop_engine import CFG, _MaxLossStubExpert, _store_mode
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 
 SYMBOL = "AAPL"          # the stub expert prices AAPL
 STRUCT, OHLCV = "ta-structure-v1", "ohlcv-v1"
@@ -236,7 +237,7 @@ def _run(bars, *, run_id, inmem, exit_rules, pins=None):
         engine = DailyBacktestEngine(
             account=account, experts=[(expert, expert_id, {}, enter_id)], price_source=ps,
             config={"start_date": start, "end_date": end, "enabled_instruments": [SYMBOL], "seed": 42},
-            indicator_provider=None)
+            indicator_provider=NoAtrIndicatorProvider())
         engine._indicator_provider = None
         real_manage = engine._manage_open_positions
 
