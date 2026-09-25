@@ -3,8 +3,9 @@
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (or subagent-driven-development)
 > to implement the build tasks task-by-task. Nothing here launches until the user says so.
 
-**Goal:** one deployable option expert. Every stage-1 structure is a toggleable member, searched on
-the FULL large-cap universe with the market-condition gates on, and seeded from the stage-1 winners.
+**Goal:** 2-3 deployable option experts, each a composition of the structures of ONE trading style.
+Each expert is searched on the FULL large-cap universe with the market-condition gates on, and seeded
+from the stage-1 (and LEAPS-grid) winners.
 
 **Status (2026-09-25):**
 
@@ -21,7 +22,7 @@ the FULL large-cap universe with the market-condition gates on, and seeded from 
 
 | Topic | Decision | Source |
 |---|---|---|
-| Shape | ONE composition job: all stage-1 structures as toggleable members of one expert. No survival gate: stage 1 only SEEDS, it never excludes. | spec §5 |
+| Shape | **2-3 STYLE experts, NOT one composition** (user, 2026-09-25, overriding spec §5's single `OS_ALL` job). Each expert is a composition of the structures of one style, e.g. **short-term** directional, **mid-term**, **LEAPS / convex**, **pure premium** (credit/income). The final grouping is decided after stage 1 AND the LEAPS grid. Within an expert there is no survival gate: every structure of that style is a member, and stage-1 results only seed it. | user 2026-09-25; spec §5 |
 | Universe | **Full large-cap universe, `tools/options_universe_large_cap.txt` (820 names)**, not the 97-name `options_universe_top100.txt`. Stage 1 finds the structures on 97 names; stage 2 composes them on everything. | user, 2026-09-25 |
 | Market conditions | ON, both profiles (`ohlcv-v1,ta-structure-v1`), pinned manifests REBUILT for the 820-name universe. | user, 2026-09-23 ("keep in stage 1, we'll see at the end") + 2026-09-25 |
 | Engine | dev `3b3465c8` or later: split-basis lots + re-key, daily stepping while holding, fixed DD refinement, structure-level concentration, ledger checks, close by transaction id. | engine-fix plan 2026-09-24 |
@@ -61,13 +62,22 @@ Measured 2026-09-25:
 
 ## 3. What has to be built (from spec §7 / §7.1, still open)
 
-1. **`OS_ALL` group:** every stage-1 structure as a member.
+1. **Style groups, 2-3 of them** (e.g. `OS_SHORT`, `OS_MID`, `OS_LONG` for LEAPS/convex,
+   `OS_PREMIUM`), each carrying the structures of one style; the membership is decided after stage 1
+   and the LEAPS grid. Candidate split, to confirm then:
+   - **short-term directional (debit):** O_LC, O_LP, O_VERT, O_BULLCS, O_BF, at short DTE;
+   - **mid-term:** the same directional families at longer DTE, O_STRD/O_STRG;
+   - **LEAPS / convex:** O_LEAPC, O_LEAPP, O_PMCC, O_CONVEX*;
+   - **pure premium (credit / income):** O_CSP, O_BULLPS, O_BEARCS, O_IC, O_JL, O_RS, O_WHEEL, O_CC.
+
+   What spec §7.1 says about `OS_ALL` applies to each style group:
    - It must inherit `hold_assigned_stock` (the wheel member).
    - Per-member exits: today exit condition ids (`tp`, `td`, `dte`, `sl`) are unprefixed, so
      per-member exits cannot be expressed, and `_option_exit_rules(kind)` would give DEBIT members
      CREDIT bands because it keys on the group.
    - Fix/replace the two live tests that assert the opposite (e.g. O_CSP/O_JL/O_RS in no group).
-   - Measure the real genome with `collect_param_space` first. The spec's ~240 is an estimate.
+   - Measure each group's real genome with `collect_param_space` first. The spec's ~240 was for ALL
+     structures; each style group is smaller.
 2. **Multi-source cross-job seeding:** `warmStartFromOptimizationId` is a single int. Stage 2 needs
    N sources merged.
    - `genetic.py` fills absent genes with `config['min']`, so an `enabled` toggle would seed to 0
@@ -96,9 +106,9 @@ Measured 2026-09-25:
   O_LC took about 130 min.
 - **Per-trial cost scales with symbols:** chain reads and IV/greeks are 40-75% of a trial. So 820
   names are roughly 8× per trial, before the composition's extra members.
-- **Rough order, stage-2 spec shape** (pop 300, gens ≤80, patience 10): about 11 batches of
-  28 per generation × ~20+ min = several hours per generation, so **1-3 weeks** for one job. That is
-  feasible for a single job but must be measured.
+- **Rough order** (pop ~300, gens ≤80, patience 10): about 11 batches of 28 per generation × ~20+ min
+  = several hours per generation, so **1-3 weeks per style job**. The 2-3 jobs run one after another
+  on remote227, or split across hosts. That is feasible, but it must be measured.
 - **The pilot:** 1 generation, pop 28, 2023-2025 window, on remote227 while stage 1 runs (or at a
   stage-1 job boundary). Measure trial time, peak RSS per slot, and the shared-array/preload
   footprint for 820 names.
@@ -111,7 +121,8 @@ Measured 2026-09-25:
 
 1. **Seeding policy:** which stage-1 jobs/ranks seed which members, and whether to narrow gene
    ranges around seeds.
-2. **Population and generations** after measuring the real OS_ALL genome (spec: 300 / 80 /
+2. **Style grouping and membership** (after stage 1 + the LEAPS grid), then the population and
+   generations per group after measuring each genome (spec reference for all structures: 300 / 80 /
    patience 10).
 3. **Experts:** DS only, or also FMPRating (it has no bearish signal on large caps, per memory).
 4. **Universe fallback** if the pilot says 820 is too slow.
