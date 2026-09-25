@@ -12,6 +12,7 @@ from sqlmodel import select, Session
 
 from ba2_common.core.market_condition_rules import assert_market_rule_actions_live
 from ba2_common.core.models import Ruleset, EventAction, RulesetEventActionLink
+from ba2_common.core.rule_order import resolve_order_indices
 from ba2_common.core.db import get_db, get_all_instances, add_instance, get_instance
 from ba2_common.logger import logger
 
@@ -377,50 +378,33 @@ def _assert_market_gates_served_by_linked_experts(ruleset_info: Dict[str, Any], 
             session=session)
 
 
-def _resolve_order_indices(rules: List[Dict[str, Any]], ruleset_name: Any) -> Tuple[List[int], Optional[str]]:
-    """The ``order_index`` each imported rule's LINK gets, aligned with ``rules`` (file order),
-    plus a warning when the file's own values could not be used as they stand.
+def _order_indices_or_refuse(ruleset_info: Dict[str, Any], warnings: List[str]) -> List[int]:
+    """The ``order_index`` each imported rule's LINK gets, aligned with ``ruleset_info['rules']``.
 
-    ``order_index`` IS rule precedence: the live evaluator walks a ruleset's links in
-    ``order_index`` order and the FIRST matching rule wins (``db.ruleset_event_actions``). The
-    importers used to write ``rule_data.get('order_index', 0)``, so a file without it (an old
-    export, a hand-written payload) landed every rule at 0 and precedence became whatever SQLite
-    returned for the tie. Now:
-
-    * every rule carries a distinct integer -> restored EXACTLY (the normal round trip);
-    * none carries one -> the FILE ORDER, ``0..n-1`` (an exporter lists rules in precedence);
-    * duplicates, or only some rules carrying one -> the order ``live_export_to_trade_rules``
-      reads on the backtest side (indexed rules by value, ties and unindexed rules in file
-      order, unindexed after indexed), renumbered ``0..n-1`` so no two links tie;
-    * a value that is not an integer -> ``ValueError``, before anything is written.
+    ``order_index`` IS rule precedence (first match wins). The importers used to write
+    ``rule_data.get('order_index', 0)``, so a file without it landed every rule at 0 and
+    precedence became whatever SQLite returned for the tie. The reading is
+    ``rule_order.resolve_order_indices`` -- the SAME one the backtest converters use, so a file
+    runs one precedence in both. A fallback reading (no/tied/partial indices) is logged and added
+    to ``warnings``; an unreadable one raises ``ValueError``. Call it before anything is written.
     """
-    values: List[Optional[int]] = []
-    for pos, rule_data in enumerate(rules):
-        v = rule_data.get("order_index")
-        if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
-            raise ValueError(
-                f"Imported ruleset {ruleset_name!r}: rule {rule_data.get('name')!r} (position {pos}) "
-                f"has order_index {v!r}; it must be an integer (it is the rule's precedence)")
-        values.append(v)
+    orders, warning = resolve_order_indices(ruleset_info["rules"], ruleset_info.get("name"))
+    if warning:
+        logger.warning(warning)
+        warnings.append(warning)
+    return orders
 
-    n = len(values)
-    present = [v for v in values if v is not None]
-    if len(present) == n and len(set(present)) == n:
-        return [int(v) for v in values], None
 
-    ranked = sorted(range(n), key=lambda i: (values[i] is None, values[i] or 0, i))
-    orders = [0] * n
-    for new_index, pos in enumerate(ranked):
-        orders[pos] = new_index
+def _all_order_indices_or_refuse(rulesets: List[Dict[str, Any]]) -> List[Tuple[List[int], List[str]]]:
+    """``_order_indices_or_refuse`` for EVERY ruleset of a multi-ruleset payload, up front.
 
-    if not present:
-        why = "carries no order_index (older export format); assigned 0..n-1 in file order"
-    elif len(present) < n:
-        why = (f"carries order_index on only {len(present)} of {n} rules; indexed rules first by "
-               f"value, the rest in file order, renumbered 0..n-1")
-    else:
-        why = ("has tied order_index values; tie broken by file order, renumbered 0..n-1")
-    return orders, f"Ruleset {ruleset_name!r} {why} (order_index is rule precedence: first match wins)"
+    So one bad index anywhere refuses the whole payload before the first ruleset is created or
+    -- for the reuse-by-name importer -- has its links replaced."""
+    out: List[Tuple[List[int], List[str]]] = []
+    for ruleset_info in rulesets:
+        order_warnings: List[str] = []
+        out.append((_order_indices_or_refuse(ruleset_info, order_warnings), order_warnings))
+    return out
 
 
 def _rule_content_key(type_, subtype, triggers, actions, extra_parameters, continue_processing) -> str:
@@ -468,11 +452,7 @@ class RulesImporter:
                 # BEFORE anything is created: a market gate may not ride an exit ruleset.
                 _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
                 # ...nor a rule order that cannot be read (refused before any write).
-                orders, order_warning = _resolve_order_indices(ruleset_info["rules"],
-                                                               ruleset_info.get("name"))
-                if order_warning:
-                    logger.warning(order_warning)
-                    warnings.append(order_warning)
+                orders = _order_indices_or_refuse(ruleset_info, warnings)
                 
                 # Preserve original name, but handle duplicates
                 base_name = ruleset_info['name']
@@ -556,16 +536,14 @@ class RulesImporter:
         processed_rule_names = {}  # Map rule names to IDs to avoid duplicates across rulesets
 
         try:
+            # Every ruleset's rule order, BEFORE the first one is created.
+            resolved = _all_order_indices_or_refuse(rulesets_data["rulesets"])
             with get_db() as session:
-                for ruleset_data in rulesets_data["rulesets"]:
+                for ruleset_data, (orders, order_warnings) in zip(rulesets_data["rulesets"],
+                                                                  resolved):
                     ruleset_info = ruleset_data
                     _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
-                    warnings = []
-                    orders, order_warning = _resolve_order_indices(ruleset_info["rules"],
-                                                                   ruleset_info.get("name"))
-                    if order_warning:
-                        logger.warning(order_warning)
-                        warnings.append(order_warning)
+                    warnings = list(order_warnings)
                     
                     # Preserve original name, but handle duplicates
                     base_name = ruleset_info['name']
@@ -657,19 +635,17 @@ class RulesImporter:
         processed_rule_names: Dict[str, int] = {}
 
         try:
+            # Every ruleset's rule order, BEFORE the first one has its links replaced.
+            resolved = _all_order_indices_or_refuse(rulesets_data["rulesets"])
             with get_db() as session:
-                for ruleset_info in rulesets_data["rulesets"]:
+                for ruleset_info, (orders, order_warnings) in zip(rulesets_data["rulesets"],
+                                                                  resolved):
                     # Before the existing ruleset's links are dropped below: refusing after that
                     # would leave a live exit ruleset with NO rules, which is the same silence
                     # from the other side.
                     _assert_market_gates_on_exit_ruleset_allowed(ruleset_info)
-                    warnings: List[str] = []
+                    warnings: List[str] = list(order_warnings)
                     name = ruleset_info["name"]
-                    # Also before the links are dropped: an unreadable order refuses here.
-                    orders, order_warning = _resolve_order_indices(ruleset_info["rules"], name)
-                    if order_warning:
-                        logger.warning(order_warning)
-                        warnings.append(order_warning)
 
                     ruleset = session.exec(select(Ruleset).where(Ruleset.name == name)).first()
                     if ruleset is None:

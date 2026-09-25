@@ -214,3 +214,131 @@ class TestFirstMatchWinsAfterImport:
         new_id, _ = RulesImporter.import_ruleset(RulesExporter.export_ruleset(rs_id))
         assert self._evaluate(rs_id) == ["r_c"]
         assert self._evaluate(new_id) == ["r_c"]
+
+
+# ------------------------------------------------------------- refusals write nothing
+
+BAD_INDICES = [pytest.param(True, id="bool"), pytest.param("3", id="numeric-string"),
+               pytest.param(3.0, id="float")]
+
+
+def _counts():
+    with get_db() as s:
+        return (len(s.exec(select(Ruleset)).all()), len(s.exec(select(EventAction)).all()),
+                len(s.exec(select(RulesetEventActionLink)).all()))
+
+
+class TestUnreadableOrderIndexIsRefused:
+    @pytest.mark.parametrize("bad", BAD_INDICES)
+    @pytest.mark.parametrize("door", ["import_ruleset", "import_multiple_rulesets",
+                                      "import_rulesets_reusing_by_name"])
+    def test_refused_and_nothing_written(self, door, bad):
+        """The FIRST rule is fine and would be created; the second's index is unreadable."""
+        rules = [_rule("refuse_ok", order_index=0), _rule("refuse_bad", order_index=bad)]
+        rs = _ruleset(f"Refused {door}", rules)
+        before = _counts()
+        with pytest.raises(ValueError, match="order_index"):
+            if door == "import_ruleset":
+                RulesImporter.import_ruleset({"ruleset": rs})
+            else:
+                getattr(RulesImporter, door)({"rulesets": [rs]})
+        assert _counts() == before
+
+    def test_null_counts_as_missing_with_a_warning(self):
+        rules = [_rule("null_first"), _rule("null_second")]
+        rules[0]["order_index"] = None
+        rules[1]["order_index"] = None
+        new_id, warnings = RulesImporter.import_ruleset({"ruleset": _ruleset("Nulls", rules)})
+        assert _links(new_id) == {"null_first": 0, "null_second": 1}
+        assert any("file order" in w for w in warnings), warnings
+
+    @pytest.mark.parametrize("door", ["import_multiple_rulesets", "import_rulesets_reusing_by_name"])
+    def test_bad_index_in_a_later_ruleset_leaves_the_earlier_one_untouched(self, door):
+        """Ruleset A comes first in the payload and would be replaced (reuse-by-name) or created;
+        B has a bad index. The whole payload is refused: A keeps its rules, B is not created."""
+        (a_id,), _ = RulesImporter.import_rulesets_reusing_by_name({"rulesets": [
+            _ruleset("Multi A", [_rule("a_one", order_index=0), _rule("a_two", order_index=1)])]})
+        before = _counts()
+        payload = {"rulesets": [
+            _ruleset("Multi A", [_rule("a_three", order_index=0)]),
+            _ruleset("Multi B", [_rule("b_one", order_index=0), _rule("b_bad", order_index="1")]),
+        ]}
+        with pytest.raises(ValueError, match="order_index"):
+            getattr(RulesImporter, door)(payload)
+        assert _counts() == before
+        assert _links(a_id) == {"a_one": 0, "a_two": 1}
+        with get_db() as s:
+            names = {r.name for r in s.exec(select(Ruleset)).all()}
+        assert "Multi B" not in names and "Multi A-1" not in names
+
+
+# ------------------------------------------------- backtest converters read the same order
+
+EXIT_TRIGGERS = {"t0": {"event_type": "profit_loss_percent", "operator": ">", "value": 5.0}}
+
+
+def _exit_rule(name, order_index=None):
+    r = _rule(name, action=ExpertActionType.CLOSE.value, order_index=order_index,
+              triggers=dict(EXIT_TRIGGERS))
+    r["subtype"] = "open_positions"
+    return r
+
+
+# name -> order_index; the FILE lists them x, y, z.
+ORDER_CASES = {
+    "disagrees-with-file-order": {"x": 2, "y": 0, "z": 1},
+    "missing": {"x": None, "y": None, "z": None},
+    "tied": {"x": 0, "y": 0, "z": 0},
+    "partial": {"x": None, "y": 4, "z": 1},
+}
+
+
+class TestBacktestConvertersMatchTheLiveImporter:
+    """``/ruleset/convert-live`` (``live_export_to_strategy``) and ``live_export_to_trade_rules``
+    build the rule lists the backtester walks IN LIST ORDER. They must produce exactly the
+    precedence the live importer writes into the links, or a hand-edited file runs one rule
+    order in the backtest and another live."""
+
+    def _payload(self, case, subtype):
+        make = _exit_rule if subtype == "open_positions" else _rule
+        rules = [make(f"{case}_{n}", order_index=idx) for n, idx in ORDER_CASES[case].items()]
+        rs = {"name": f"Parity {case} {subtype}", "description": None, "type": RULE_TYPE,
+              "subtype": subtype, "rules": rules}
+        return {"export_type": "rulesets", "rulesets": [rs]}
+
+    def _live_precedence(self, payload):
+        (rs_id,), _ = RulesImporter.import_multiple_rulesets(payload)
+        return _live_order(rs_id)
+
+    @pytest.mark.parametrize("case", list(ORDER_CASES))
+    def test_live_export_to_strategy_exit_order(self, case):
+        from ba2_common.core.rules_convert import live_export_to_strategy
+        payload = self._payload(case, "open_positions")
+        bt = [r["name"] for r in live_export_to_strategy(payload)["exit_conditions"]]
+        assert bt == self._live_precedence(payload)
+        assert len(bt) == 3
+
+    @pytest.mark.parametrize("case", list(ORDER_CASES))
+    @pytest.mark.parametrize("subtype", ["enter_market", "open_positions"])
+    def test_live_export_to_trade_rules_order(self, case, subtype):
+        from ba2_common.core.rules_convert import live_export_to_trade_rules
+        payload = self._payload(case, subtype)
+        out = live_export_to_trade_rules(payload)
+        side = out["entry_rules"] if subtype == "enter_market" else out["exit_rules"]
+        bt = [r["name"] for r in side]
+        assert bt == self._live_precedence(payload)
+        assert len({r["id"] for r in side}) == 3, "rule ids must not collide on a tie"
+        if case != "disagrees-with-file-order":
+            assert out["summary"]["order_warnings"], "a fallback reading must be reported"
+
+    @pytest.mark.parametrize("bad", BAD_INDICES)
+    def test_converters_refuse_what_the_importer_refuses(self, bad):
+        from ba2_common.core.rules_convert import (live_export_to_strategy,
+                                                   live_export_to_trade_rules)
+        payload = {"export_type": "rulesets", "rulesets": [{
+            "name": "Parity bad", "subtype": "open_positions",
+            "rules": [_exit_rule("pb_ok", 0), _exit_rule("pb_bad", bad)]}]}
+        with pytest.raises(ValueError, match="order_index"):
+            live_export_to_strategy(payload)
+        with pytest.raises(ValueError, match="order_index"):
+            live_export_to_trade_rules(payload)
