@@ -1,4 +1,4 @@
-# Option Grid Stage 2: Composition on the Full Large-Cap Universe (Plan)
+# Option Grid Stage 2: 2-3 Style Experts on the Full Large-Cap Universe (Plan)
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (or subagent-driven-development)
 > to implement the build tasks task-by-task. Nothing here launches until the user says so.
@@ -94,7 +94,7 @@ Measured 2026-09-25:
      seeds.
    - The job name digest covers the universe, the manifests, the flags and the seed set, so a
      re-run can never resume a different configuration.
-4. **Wheel / overlay composition checks** under OS_ALL: the covered-call guard, the assigned-stock
+4. **Wheel / overlay composition checks** in the premium group: the covered-call guard, the assigned-stock
    hold, and the share-lot + overlay concentration grouping.
 5. **Per-year and concentration report** at the end: per-year returns (2020 and 2022 especially) and
    top1/top5 concentration on structures. The soft30 consistency floor is ×0.25, so a single good
