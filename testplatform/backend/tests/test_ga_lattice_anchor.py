@@ -333,3 +333,56 @@ def test_the_flag_reaches_the_batch_config(monkeypatch):
     assert cfg["latticeAnchor"] == "min"
     cfg = _run_optimize_batch(_parse(_BATCH_ARGV, cmd_attr="_cmd_optimize_batch"), monkeypatch)
     assert "latticeAnchor" not in cfg
+
+
+@pytest.mark.parametrize("kind,expected", [("O_PMCC", "min"), ("O_LC", None)])
+def test_optimize_without_the_flag_stores_the_per_grid_default(monkeypatch, kind, expected):
+    """END TO END through the real CLI and ``_cmd_optimize``: a grid-2 key launched with NO
+    ``--lattice-anchor`` persists ``latticeAnchor: "min"``; a non-grid-2 key persists no key at
+    all (its config stays byte-identical to every job launched before the anchor existed)."""
+    from test_equity_cap_launcher import _parse, _run_optimize
+    monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
+    argv = ["optimize", "--expert", "FMPRating", "--universe", "AAPL",
+            "--start", "2024-03-01", "--end", "2024-04-01",
+            "--population", "2", "--generations", "1",
+            "--strategy", kind, "--options-store", "parquet"]
+    args = _parse(argv)
+    assert args.lattice_anchor is None
+    cfg = _run_optimize(args, monkeypatch)
+    if expected is None:
+        assert "latticeAnchor" not in cfg
+    else:
+        assert cfg["latticeAnchor"] == expected
+
+
+def test_snap_to_lattice_refuses_an_unknown_anchor():
+    """Public helper: an unknown anchor must raise, never fall through to the min branch."""
+    from app.services.genetic import snap_to_lattice
+    g = _OFF_LATTICE["leaps_dte"]
+    assert snap_to_lattice(410, g, "zero") == 405
+    assert snap_to_lattice(410, g, "min") == 410
+    for bad in ("max", "MIN", "", None):
+        with pytest.raises(ValueError, match="anchor"):
+            snap_to_lattice(410, g, bad)
+
+
+@pytest.mark.parametrize("adapter", ["PyGADAdapter", "ShinkaEvolveAdapter"])
+def test_the_placeholder_adapters_decode_through_snap_to_lattice(monkeypatch, adapter):
+    """The PyGAD/Shinka placeholders carried their own copy of the zero-lattice formula; they
+    now call ``snap_to_lattice`` (zero anchor, their historical behaviour) -- one formula."""
+    import app.services.genetic as G
+    import app.services.genetic_optimizer_base as B
+
+    space = {**_OFF_LATTICE, **_ON_LATTICE}
+    opt = getattr(B, adapter)(param_ranges=space)
+    raw = [g["min"] for g in space.values()]
+    want = {n: G.snap_to_lattice(v, space[n], "zero") for n, v in zip(space, raw)}
+    assert opt.decode_individual(raw) == want
+    assert opt.decode_individual(raw)["leaps_dte"] == 405
+
+    calls = []
+    real = G.snap_to_lattice
+    monkeypatch.setattr(G, "snap_to_lattice",
+                        lambda v, c, a="zero": (calls.append(a), real(v, c, a))[1])
+    opt.decode_individual(raw)
+    assert calls == ["zero"] * len(space)

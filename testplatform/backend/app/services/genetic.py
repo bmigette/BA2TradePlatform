@@ -68,6 +68,9 @@ def snap_to_lattice(value, config: Dict, anchor: str = "zero"):
     for a raw value from outside the range (a warm-start seed encoded from a differently-ranged
     source).
     """
+    if anchor not in LATTICE_ANCHORS:
+        # Public helper: an unknown anchor is a caller bug, never silently "min".
+        raise ValueError(f"lattice anchor must be one of {LATTICE_ANCHORS}, got {anchor!r}")
     is_int = config['type'] == 'int'
     step = config.get('step', 1 if is_int else 0.01)
     if anchor == "zero":
