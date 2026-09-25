@@ -224,9 +224,40 @@ TOP1 −25.49% (daily) vs the new refined value.
 factor comes from the same formula as every other run (it gives 0 above `_CONC_DEAD_PCT`). With 0 trades or
 net ≤ 0, keep the current early return.
 
-**Equity no-impact check:** equity CAR-family fitnesses return `LOW_TRADE_SENTINEL` below 12 trades/yr
-before robustness is applied (`:958`, `:1101`, `:1272`). Confirm by reading, and name every other caller of
-`robustness_metrics` in the report.
+**Equity no-impact check (corrected 2026-09-25):** the equity CAR metrics (`car`/`goal`/
+`consistent_annual_return`) do return `LOW_TRADE_SENTINEL` below their trade floor (12/yr, 8/yr for
+DeterministicScorer) before robustness is applied, and `robust_fitness` passes a sentinel through. But the
+generic metrics (calmar, sharpe, total_return, sortino, profit_factor, sqn, win_rate) have NO trade floor,
+and robust fitness is on by default since 2026-09-17, so a 1-trade equity run on one of them DOES reach the
+screen (`test_strategy_fitness_equity_frozen` pins `single_trade` -> all factors 1.0). That is why the change
+is gated to the option CAR-family metrics: `compute_fitness`'s three option branches pass
+`option_structures=True` and nothing else does. `robustness_metrics` has one caller, `robust_fitness`, whose
+one caller is `_maybe_robust` inside `compute_fitness`.
+
+Under the same flag the screen reads per-STRUCTURE P&L (`_structure_pnls`), not per-row leg P&L: rows are
+legs, so any run of <= 5 rows read top5 = 100%, and offsetting legs pushed top1 past 100%. The MC resample
+draws structures too (legs of one bet are not independent draws). A share that is 100% by definition (one
+structure, or top5 of <= 5 structures) is set to exactly 100.0, because float division gave
+99.99999999999999 and a factor of ~3.6e-24 that outranked an exact 0.
+
+**Share lots + overlays (decision 2026-09-25).** The order code books an O_CC / O_PP overlay as its own
+transaction and assigned stock as a new equity transaction, so on the transaction partition one position
+became two offsetting "bets" (O_PP, 12 cycles of shares +1000 / put −600: top5 = 104% → factor 0, where 12
+combined bets are 41.7% → 0.959). The option metrics' partition (`_option_structure_groups`) therefore also
+joins a share lot with an option structure on the same underlying when their holding windows overlap for a
+positive length, or when the option was settled INTO the lot (assigned/exercised, closed on the bar the lot
+opened, lot opened at its strike). Joins are transitive (union-find): one bet per share-holding window, so a
+wheel (CSP → assignment → covered calls → called away) is one bet. The option CAR-family trade gates (soft30
+ramp and the legacy per-year gates) count the same partition, so the ramp and the screen agree; the default
+partition (equity metrics, `option_convex`) is unchanged. Known limitations:
+- windows that merely TOUCH (close both legs and re-open both on the same bar) are deliberately not joined,
+  or every cycle of a run would chain into one bet; only a settlement at the strike hands one position on;
+- a share lot held across many overlay cycles is ONE bet, so a buy-and-hold covered-call book counts as few
+  bets on the trade gate as well as on concentration;
+- summed `pnl_pct` is approximate for rows that open later than their structure (an overlay written on a lot
+  already held, a rolled PMCC short), since each row is relative to equity at its own entry;
+- this is the FITNESS grouping only; `tools/genome_concentration_check.py` uses it for option-metric runs
+  (`scores_option_structures`) so the deploy-time check agrees with the GA. Order/ledger code is unchanged.
 
 **Files:**
 - Modify: `testplatform/backend/app/services/strategy_fitness.py` `robustness_metrics`.

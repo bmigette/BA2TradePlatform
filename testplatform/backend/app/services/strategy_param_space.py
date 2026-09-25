@@ -74,6 +74,56 @@ logger = logging.getLogger(__name__)
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+# The days a daily-bar backtest actually has bars for. saturday/sunday stay in SCHEDULE_DAYS
+# (their genes are part of stored genomes and of the export/deploy reconstruction below), but
+# they can never produce a decision point on their own.
+_WEEKDAYS = SCHEDULE_DAYS[:5]
+
+
+def _repair_no_weekday(days: Dict[str, bool], option_run: bool) -> Dict[str, bool]:
+    """Force the first weekday ON when the genome is a dead config; the weekend flags are left
+    as they are. Shared by ``decode_params`` (what a trial runs) and
+    ``schedule_override_from_genes`` (what a re-run/export reconstructs) so the two cannot
+    drift apart.
+
+    OPTION runs (``option_run=True``): repaired when no WEEKDAY is on. A daily clock has no
+    saturday/sunday bars, so a weekend-only genome never scans for entries -- the same dead
+    config as all-OFF, which the fitness cannot tell from "just unlucky" (plan 2026-09-24
+    Task 5). Repair, don't reject.
+
+    EQUITY runs (``option_run=False``): repaired only when ALL seven days are off -- the
+    historical rule, kept unchanged on purpose. Stock backtests and grids must not change
+    behaviour (user rule): an equity weekend-only genome keeps scoring ZERO_TRADE exactly as
+    every stored equity result and every in-flight equity checkpoint was scored.
+
+    MUTATES ``days`` in place (and returns it for convenience); callers pass a dict they built
+    for this call.
+    """
+    dead = ((not any(days.get(day) for day in _WEEKDAYS)) if option_run
+            else (not any(days.values())))
+    if dead:
+        days[SCHEDULE_DAYS[0]] = True
+    return days
+
+
+def _strategy_is_option_run(strategy) -> bool:
+    """Whether a Strategy's template makes this an OPTIONS run, by the same definition the
+    backtest handler uses to wire the options seam (``strategy_uses_options``: any entry/exit
+    rule action, or the transient ``entry_action``, names an option action).
+
+    Read from the TEMPLATE rules, not a run flag, so every decode caller (GA trial, re-run,
+    export, top-N persist, tools) classifies a genome identically with no new argument
+    threaded through them -- and a Strategy reloaded from the DB (which does not persist the
+    launcher's transient ``entry_action``) still classifies correctly from its rules. Measured
+    against every launcher builder: S1-S7 and O_STK are equity, every other O_* key is options.
+    Lazy import: the handler module pulls in the DB/session stack this module otherwise avoids.
+    """
+    from app.services.backtest.daily_backtest_handler import strategy_uses_options
+    return strategy_uses_options({
+        "entry_rules": getattr(strategy, "entry_rules", None),
+        "exit_rules": getattr(strategy, "exit_rules", None),
+        "entry_action": getattr(strategy, "entry_action", None),
+    })
 
 #: The SelectionPolicy weights emitted as shared per-half genes (``optsel:<half>:<w>``).
 #: Deliberately NOT w_spread (the parquet store this grid reads synthesises bid == ask, so
@@ -939,14 +989,21 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
                                     optsel_by_half)
                   if _template_exit else None)
 
-    # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a
-    # dead config the fitness function can't even distinguish from "just unlucky"), so force the
-    # first weekday (fixed SCHEDULE_DAYS order) back ON rather than wasting a trial evaluating it.
+    # Repair, don't reject: a dead schedule would never scan for entries (a config the fitness
+    # function can't even distinguish from "just unlucky"), so force the first weekday back ON
+    # rather than wasting a trial evaluating it. What counts as dead differs by run kind --
+    # no WEEKDAY on for an option run, all seven off for an equity run (unchanged) -- see
+    # _repair_no_weekday.
     schedule_days: Optional[Dict[str, bool]] = None
     if schedule_by_day:
-        schedule_days = {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS}
-        if not any(schedule_days.values()):
-            schedule_days[SCHEDULE_DAYS[0]] = True
+        days = {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS}
+        # Classify the run ONLY where the two rules disagree -- no weekday on but some weekend
+        # day on. Everywhere else they give the same answer, so option_run=False is exact, and
+        # an equity decode (every GA trial of S1-S7) never imports the backtest handler.
+        option_run = (not any(days[day] for day in _WEEKDAYS)
+                      and any(days.values())
+                      and _strategy_is_option_run(strategy))
+        schedule_days = _repair_no_weekday(days, option_run=option_run)
 
     return {
         "expert_overrides": expert_overrides,
@@ -961,6 +1018,7 @@ def schedule_override_from_genes(
     strategy_params: Optional[Dict[str, Any]],
     base_override: Optional[Dict[str, Any]] = None,
     weekdays_only: bool = False,
+    option_run: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """The run_schedule_override a stored genome ACTUALLY ran with, or None if it has no
     schedule genes.
@@ -972,9 +1030,12 @@ def schedule_override_from_genes(
     instead of the days the GA selected. That is exactly how five live instances came to fire
     on Mondays when their genomes had chosen Thursday, or Tue/Thu/Fri (2026-09-07).
 
-    Mirrors ``decode_params``' repair rule: an all-days-OFF genome gets the first weekday
-    forced back ON, because a config that never scans for entries is dead rather than merely
-    unlucky.
+    Mirrors ``decode_params``' repair rule (``_repair_no_weekday``): a dead schedule gets the
+    first weekday forced back ON, because a config that never scans for entries is dead rather
+    than merely unlucky. ``option_run`` selects which rule, exactly as ``decode_params`` derives
+    it from the strategy (``_strategy_is_option_run``): no weekday on (options) vs all seven off
+    (equity, the default). Under ``weekdays_only`` the two rules coincide -- the filter has
+    already cleared the weekend -- which is why the deploy callers need not pass it.
 
     ``weekdays_only`` translates the genome into the cadence it EFFECTIVELY ran, for callers
     that drive a real scheduler rather than a bar loop. On a daily clock there are no weekend
@@ -998,11 +1059,11 @@ def schedule_override_from_genes(
         return None
     days = {day: by_day.get(day, False) for day in SCHEDULE_DAYS}
     if weekdays_only:
-        days = {day: (value and day in SCHEDULE_DAYS[:5]) for day, value in days.items()}
-    # Same repair as decode_params, applied after the weekday filter so an all-weekend genome
-    # deploys as Monday rather than as an instance that never scans at all.
-    if not any(days.values()):
-        days[SCHEDULE_DAYS[0]] = True
+        days = {day: (value and day in _WEEKDAYS) for day, value in days.items()}
+    # Same repair as decode_params, so a re-run reconstructs the days the trial actually ran
+    # with. With weekdays_only the filter above has already cleared the weekend, so an
+    # all-weekend genome deploys as Monday rather than as an instance that never scans at all.
+    days = _repair_no_weekday(days, option_run=option_run)
     return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}
 
 
