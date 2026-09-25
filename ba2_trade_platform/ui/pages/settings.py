@@ -97,9 +97,15 @@ class TriggerTypePicker:
     #: whose trigger has since been retired. Shown, never hidden and never repaired.
     UNKNOWN_NOTE = 'not in this platform\'s catalog'
 
-    def __init__(self, value, on_change=None):
+    def __init__(self, value, on_change=None, rule_subtype=None):
         self._value = value
         self._on_change = on_change
+        # A CALLABLE returning the rule's current Subtype (an AnalysisUseCase value), read at
+        # every render so switching the Subtype re-filters the next open. It narrows what is
+        # OFFERED (trigger_catalog.trigger_offered_for: e.g. no ``entry_tag`` on an entry rule,
+        # where it could never match); a persisted value still renders as itself. None = offer
+        # everything.
+        self._rule_subtype = rule_subtype
         self._category = 'all'
 
         self.root = ui.column().classes('flex-1 gap-1')
@@ -212,8 +218,11 @@ class TriggerTypePicker:
         self._render_chips()
         self._render_results()
 
+    def _subtype(self):
+        return self._rule_subtype() if self._rule_subtype is not None else None
+
     def _render_chips(self) -> None:
-        counts = category_counts()
+        counts = category_counts(self._subtype())
         self._chip_row.clear()
         with self._chip_row:
             for category in TRIGGER_CATEGORIES:
@@ -233,7 +242,7 @@ class TriggerTypePicker:
     def _render_results(self) -> None:
         # An empty query matches everything, so search and category compose through one call:
         # a second "no query" code path is how a category chip silently stops applying.
-        entries = search_triggers(self.search.value or '', self._category)
+        entries = search_triggers(self.search.value or '', self._category, self._subtype())
         self._results.clear()
         with self._results:
             if not entries:
@@ -5553,7 +5562,8 @@ class TradeSettingsTab:
                     # ValueError on any value outside its own options). The stored shape is
                     # unchanged -- the picker carries one ``event_type`` and nothing else.
                     trigger_picker = TriggerTypePicker(
-                        trigger_value, on_change=lambda: update_value_inputs())
+                        trigger_value, on_change=lambda: update_value_inputs(),
+                        rule_subtype=lambda: self.rule_subtype_select.value)
 
                     # Inline container for operator/value inputs
                     value_container = ui.row().classes('items-center gap-2')

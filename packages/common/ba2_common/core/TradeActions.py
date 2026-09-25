@@ -44,6 +44,7 @@ from ba2_common.core.OptionRiskManagement import (
     admit_option_entry, option_risk_manager_enabled, record_submitted,
 )
 from ba2_common.core.earnings_stamp import ORDER_EVENT_DATE_KEY, stamped_event_date
+from ba2_common.core.entry_tag import ORDER_ENTRY_TAG_KEY, coerce_entry_tag
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selection_policy import SelectionPolicy, validate_wired_weights
@@ -2466,7 +2467,6 @@ class _OptionEntryAction(TradeAction):
         # that member's exits. None (absent) on every rule not emitted by a style expert, and
         # then nothing is stamped -- byte-identical. Anything but a positive integer is REFUSED
         # here: the tag decides which exits may close the position, so it is never guessed at.
-        from ba2_common.core.entry_tag import coerce_entry_tag
         self.entry_tag = coerce_entry_tag(entry_tag)
 
     # --- helpers ----------------------------------------------------------
@@ -3570,18 +3570,35 @@ class _OptionEntryAction(TradeAction):
         # row to scope the member's exits. Only when the rule carried one, so every untagged
         # entry's row -- every existing run and every live rule -- is byte-identical.
         if self.entry_tag is not None:
-            from ba2_common.core.entry_tag import ORDER_ENTRY_TAG_KEY
             entry_facts[ORDER_ENTRY_TAG_KEY] = self.entry_tag
+        # A TAGGED entry whose tag cannot reach its row is NOT a success: the order is on the
+        # wire, but the member's tag-scoped exits read only the row, so they could never close
+        # it. Every path that would otherwise skip or swallow the write (no order id, no row,
+        # InstanceNotFound or any absorbed error) raises this instead. Untagged entries keep
+        # today's log-and-continue behaviour exactly.
+        tag_lost = None
         if entry_facts and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)
                 if stored is not None:
                     stored.data = {**(stored.data or {}), **entry_facts}
                     update_instance(stored)
+                elif self.entry_tag is not None:
+                    tag_lost = f"order row {order_id} does not exist"
             except Exception as e:
                 absorb_if_benign(e, InstanceNotFound)
                 logger.error(f"Failed to persist entry facts {sorted(entry_facts)} on "
                              f"order {order_id}: {e}", exc_info=True)
+                if self.entry_tag is not None:
+                    tag_lost = f"{type(e).__name__}: {e}"
+        elif self.entry_tag is not None:
+            tag_lost = "the broker returned no order id"
+        if tag_lost is not None:
+            raise RuntimeError(
+                f"ENTRY_TAG_NOT_STAMPED: {option_strategy} for {self.instrument_name} was "
+                f"submitted (order {order_id}) but entry_tag={self.entry_tag} could not be "
+                f"written to its order row ({tag_lost}); the member's tag-scoped exits can "
+                f"never close this position")
         return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
 
     def _entry_record_or_refusal(self, legs: List[OptionLeg], *, quantity: int,

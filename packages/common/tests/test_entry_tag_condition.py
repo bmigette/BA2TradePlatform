@@ -198,3 +198,88 @@ def test_it_is_a_numeric_event_the_editor_offers_only_equality_on():
 def test_the_generated_rule_name_tag_is_curated():
     from ba2_common.core.rules_export_import import _abbr_field
     assert _abbr_field("entry_tag") == "etag"
+
+
+# --------------------------------------------------------------------------- #
+# conversion time, EVERY path (review 2026-09-25 follow-up): the shared leaf->trigger
+# converter refuses a tag leaf it cannot honour, so no path can drop it with a WARNING
+# (a dropped tag leaf = an exit applying to every member's positions on the symbol).
+# --------------------------------------------------------------------------- #
+_TP = {"id": "tp", "field": "profit_loss_percent", "op": ">", "value": 50.0}
+
+
+def _tree(tag_leaf):
+    return {"type": "AND", "conditions": [dict(_TP), tag_leaf]}
+
+
+_BAD_TAG_LEAVES = [
+    pytest.param({"id": "t", "field": "entry_tag", "op": "=="}, id="no-value"),
+    pytest.param({"id": "t", "field": "entry_tag", "op": "==", "value": None}, id="null-value"),
+    pytest.param({"id": "t", "field": "entry_tag", "value": 3.0}, id="no-operator"),
+    pytest.param({"id": "t", "field": "entry_tag", "op": ">", "value": 3.0}, id="ordering-op"),
+    pytest.param({"id": "t", "field": "entry_tag", "op": "gte", "value": 3.0}, id="word-op"),
+    pytest.param({"id": "t", "field": "entry_tag", "op": "==", "value": 2.5}, id="fraction"),
+    pytest.param({"id": "t", "field": "entry_tag", "op": "==", "value": 0}, id="zero"),
+    pytest.param({"id": "t", "field": "entry_tag", "op": "==", "value": "3"}, id="string"),
+    pytest.param({"id": "t", "field": "entry_tag", "op": "==", "value": True}, id="bool"),
+]
+
+
+@pytest.mark.parametrize("leaf", _BAD_TAG_LEAVES)
+def test_the_shared_converter_refuses_a_tag_leaf_it_cannot_honour(leaf):
+    with pytest.raises(ValueError, match="entry_tag"):
+        triggers_from_condition_tree(_tree(leaf))
+
+
+@pytest.mark.parametrize("leaf", _BAD_TAG_LEAVES)
+def test_the_live_export_exit_path_refuses_it(leaf):
+    """rules_convert.strategy_to_live_export's exit loop (the legacy one-action-per-rule
+    path) used to DROP an unmappable leaf with a WARNING."""
+    from ba2_common.core.rules_convert import strategy_to_live_export
+    rule = {"id": "o_lc-opt_tp", "action_type": "close_option", "conditions": _tree(leaf)}
+    with pytest.raises(ValueError, match="entry_tag"):
+        strategy_to_live_export(exit_rules=[rule])
+
+
+@pytest.mark.parametrize("leaf", _BAD_TAG_LEAVES)
+def test_the_trade_rule_path_refuses_it(leaf):
+    """The TradeRule -> EventAction choke point (backtest seeder + deploy export) refuses it
+    too, naming the RULE as well as the leaf."""
+    with pytest.raises(ValueError, match="entry_tag") as err:
+        rule_triggers_from_tree(_tree(leaf), where="rule o_lc-opt_tp")
+    assert "rule o_lc-opt_tp" in str(err.value)
+
+
+@pytest.mark.parametrize("op", ["==", "!=", "eq", "ne"])
+def test_a_valid_tag_leaf_converts_with_an_equality_operator(op):
+    triggers = triggers_from_condition_tree(_tree(
+        {"id": "t", "field": "entry_tag", "op": op, "value": 3}))
+    assert triggers["cond_1"]["event_type"] == "entry_tag"
+    assert triggers["cond_1"]["operator"] in ("==", "!=")
+    assert triggers["cond_1"]["value"] == 3
+
+
+def test_a_tree_without_a_tag_leaf_converts_byte_identically():
+    """No existing rule has a tag leaf: their conversion must not move at all."""
+    assert triggers_from_condition_tree({"type": "AND", "conditions": [dict(_TP)]}) == {
+        "cond_0": {"event_type": "profit_loss_percent", "operator": ">", "value": 50.0}}
+
+
+def test_the_editor_does_not_offer_the_tag_on_an_ENTRY_rule():
+    """At entry there is no position yet, so ``entry_tag`` can never match on an enter_market
+    rule: offering it there is a gate that silently blocks every entry."""
+    from ba2_common.core.trigger_catalog import (category_counts, search_triggers,
+                                                 trigger_offered_for)
+    assert trigger_offered_for("entry_tag", "open_positions") is True
+    assert trigger_offered_for("entry_tag", "enter_market") is False
+    assert trigger_offered_for("profit_loss_percent", "enter_market") is True
+    assert "entry_tag" in {e.value for e in search_triggers("", "all", "open_positions")}
+    assert "entry_tag" not in {e.value for e in search_triggers("", "all", "enter_market")}
+    assert "entry_tag" not in {e.value for e in search_triggers("tag", "position", "enter_market")}
+    assert "entry_tag" in {e.value for e in search_triggers("", "all")}      # no subtype: all
+    entry_counts, exit_counts = category_counts("enter_market"), category_counts("open_positions")
+    assert exit_counts["all"] - entry_counts["all"] == 1
+    assert exit_counts["position"] - entry_counts["position"] == 1
+    assert category_counts() == exit_counts
+    with pytest.raises(ValueError, match="subtype"):
+        trigger_offered_for("entry_tag", "enter_markt")

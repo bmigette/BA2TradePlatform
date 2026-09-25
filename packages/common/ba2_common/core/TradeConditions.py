@@ -31,7 +31,7 @@ from ba2_common.core.earnings_stamp import (
 )
 # The style-group member tag (plan 2026-09-25 option-stage2-build): stamped on the entry order
 # row by TradeActions, read back by EntryTagCondition below.
-from ba2_common.core.entry_tag import ENTRY_TAG_OPERATORS, coerce_entry_tag, order_entry_tag
+from ba2_common.core.entry_tag import order_entry_tag, validate_entry_tag_comparison
 # Market-condition entry gates (design 2026-09-15 option-market-condition-genes): the profile
 # registry the condition classes are GENERATED from, and the evaluation-scoped context type.
 from ba2_common.core.market_conditions import (
@@ -3406,16 +3406,10 @@ class EntryTagCondition(CompareCondition):
     def __init__(self, account: AccountInterface, instrument_name: str,
                  expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
                  existing_order: Optional[TradingOrder] = None):
-        if operator_str not in ENTRY_TAG_OPERATORS:
-            raise ValueError(
-                f"entry_tag is a member LABEL: only {list(ENTRY_TAG_OPERATORS)} compare it, "
-                f"got {operator_str!r}")
-        try:
-            tag = coerce_entry_tag(value)
-        except ValueError as e:
-            raise ValueError(f"entry_tag condition value: {e}") from e
-        if tag is None:
-            raise ValueError("entry_tag condition needs a value (the member tag to match)")
+        # The SAME check the rule converter runs (rule_builders.triggers_from_condition_tree),
+        # so a comparison that converted is one the engine accepts, and vice versa.
+        tag = validate_entry_tag_comparison(operator_str, value,
+                                            where=f"entry_tag condition on {instrument_name}")
         super().__init__(account, instrument_name, expert_recommendation, operator_str,
                          float(tag), existing_order)
 

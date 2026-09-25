@@ -918,3 +918,24 @@ def test_the_rule_save_passes_the_rules_id_to_the_refusal():
     call = src[src.index('_refuse_market_gates_on_exit_rule('):]
     call = call[:call.index(')') + 1]
     assert 'rule.id' in call, call
+
+
+# =========================================================================================
+# entry_tag (the style-group member tag): offered on exit rules, never on entry rules
+# =========================================================================================
+def test_the_member_tag_is_not_offered_on_an_entry_rule(editor, nicegui_client):
+    """At entry there is no position, so ``entry_tag`` can never match on an enter_market
+    rule -- offering it there is a gate that silently blocks every entry. The chip count
+    follows the rows, and switching the Subtype re-filters the next open."""
+    from ba2_common.core.trigger_catalog import category_counts
+
+    editor.rule_subtype_select.value = 'enter_market'
+    picker = _row(editor, nicegui_client)
+    dialog = _open(nicegui_client, picker, category='all')
+    assert 'entry_tag' not in set(_entry_keys(dialog))
+    assert str(category_counts('enter_market')['all']) in _chip(dialog, 'all').text
+
+    editor.rule_subtype_select.value = 'open_positions'
+    dialog = _open(nicegui_client, picker, category='all')
+    assert 'entry_tag' in set(_entry_keys(dialog))
+    assert str(category_counts('open_positions')['all']) in _chip(dialog, 'all').text

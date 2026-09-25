@@ -16,7 +16,11 @@ from ba2_common.core.types import (
     is_option_action,
 )
 from ba2_common.core.market_conditions import PROFILES
-from ba2_common.core.entry_tag import ORDER_ENTRY_TAG_KEY, coerce_entry_tag
+from ba2_common.core.entry_tag import (
+    ORDER_ENTRY_TAG_KEY,
+    coerce_entry_tag,
+    validate_entry_tag_comparison,
+)
 
 # Strategy condition-tree field -> ExpertEventType for value (N_*) gates. These are the
 # numeric fields an entry/exit condition tree tunes on; an unknown field is skipped (it
@@ -299,6 +303,12 @@ def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     line in the log; the structural guarantee is
     packages/common/tests/test_condition_registry_coverage.py, which fails if any condition
     in ``TradeConditions.CONDITION_MAP`` lacks a mapping here.
+
+    ONE FIELD IS NEVER DROPPED: ``entry_tag``, the style-group member tag. It is what scopes a
+    member's exit to that member's positions, so a tag leaf with no value (or with an operator
+    or value the engine would refuse) raises ``ValueError`` here instead -- on EVERY conversion
+    path, since they all come through this function. A tree without a tag leaf (every rule that
+    existed before the tag) converts exactly as before.
     """
     triggers: Dict[str, dict] = {}
     for i, leaf in enumerate(tree_leaves(tree)):
@@ -314,6 +324,13 @@ def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
                 f"rule_builders FIELD_EVENT/FLAG_FIELD_EVENT mapping — the gate is DROPPED "
                 f"and the rule will run without it")
             continue
+        if field == ORDER_ENTRY_TAG_KEY:
+            raw_op = leaf.get("operator") or leaf.get("op") or leaf.get("comparison")
+            # No operator is REFUSED, not defaulted: _operator_of's ">" fallback would turn an
+            # authoring slip into an ordering comparison on a label.
+            validate_entry_tag_comparison(
+                _operator_of(leaf) if raw_op else None, leaf.get("value"),
+                where=f"condition leaf {leaf.get('id') or i!r}")
         if leaf.get("value") is None:
             logger.warning(
                 f"Numeric condition leaf {leaf.get('id') or i!r} ({field!r}) has no value — "
@@ -346,7 +363,11 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
     """
     from ba2_common.core.market_condition_rules import market_condition_fields
 
-    triggers = triggers_from_condition_tree(tree) if tree else {}
+    try:
+        triggers = triggers_from_condition_tree(tree) if tree else {}
+    except ValueError as e:
+        # Name the RULE as well as the leaf (the shared converter only knows the leaf).
+        raise ValueError(f"{where}: {e}") from e
     leaves = list(tree_leaves(tree))
     if leaves and not triggers:
         raise ValueError(
@@ -354,18 +375,8 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
             f"{[leaf.get('id') or leaf.get('field') for leaf in leaves]!r} produced a trigger "
             f"(unknown field or missing value). A rule with no trigger is ALWAYS TRUE: it would "
             f"fire on every position. Fix or remove the leaves.")
-    # A DROPPED MEMBER-TAG LEAF IS FAIL-OPEN ACROSS MEMBERS (plan 2026-09-25 option-stage2-
-    # build): the tag is what scopes a style member's exit to that member's positions, so an
-    # exit that lost it would close EVERY position on the symbol, whichever member opened it.
-    # Refused like a dropped market-condition leaf below, never tolerated like an ordinary one.
-    tag_event = FIELD_EVENT["entry_tag"].value
-    tag_leaves = [leaf for leaf in leaves if leaf.get("field") == "entry_tag"]
-    tag_triggers = [t for t in triggers.values() if t.get("event_type") == tag_event]
-    if len(tag_triggers) < len(tag_leaves):
-        raise ValueError(
-            f"{where}: {len(tag_leaves) - len(tag_triggers)} of the rule's {len(tag_leaves)} "
-            f"entry_tag leaf/leaves {[leaf.get('id') for leaf in tag_leaves]!r} produced no "
-            f"trigger (missing value). The rule would apply to every style member's positions.")
+    # (A member-tag leaf that cannot be honoured never reaches this point: the shared
+    # ``triggers_from_condition_tree`` above refuses it on every path.)
     fields = market_condition_fields()
     market_leaves = [leaf for leaf in leaves if leaf.get("field") in fields]
     market_triggers = [t for t in triggers.values() if t.get("event_type") in fields]

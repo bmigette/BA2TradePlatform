@@ -33,6 +33,7 @@ from typing import Any, Dict, FrozenSet, Mapping, Optional, Tuple
 from ba2_common.core.market_condition_rules import market_condition_fields
 from ba2_common.core.rules_documentation import get_event_type_documentation
 from ba2_common.core.types import ExpertEventType, get_operator_options
+from ba2_common.core.entry_tag import ENTRY_TAG_OPERATORS, ORDER_ENTRY_TAG_KEY
 
 #: The picker's chips, in render order. ``'all'`` is first and is the ABSENCE of a filter: it
 #: is never stored on an entry, because "this trigger is in the All tab" is not a fact about
@@ -380,7 +381,6 @@ def operator_options_for(value) -> list:
         return [op for op in get_operator_options() if op in allowed]
     # The style-group member tag is a LABEL: EntryTagCondition refuses an ordering operator at
     # construction, so the editor must not offer one (same table, so they cannot disagree).
-    from ba2_common.core.entry_tag import ENTRY_TAG_OPERATORS, ORDER_ENTRY_TAG_KEY
     if value == ORDER_ENTRY_TAG_KEY:
         return [op for op in get_operator_options() if op in ENTRY_TAG_OPERATORS]
     from ba2_common.core.types import is_numeric_event
@@ -416,7 +416,34 @@ def triggers_in_category(category: str) -> Tuple[TriggerEntry, ...]:
     return tuple(e for e in trigger_catalog() if category in e.categories)
 
 
-def search_triggers(query: str, category: str = 'all') -> Tuple[TriggerEntry, ...]:
+#: Triggers that read the EVALUATED POSITION's entry order and so can never match on an
+#: enter_market rule (there is no position yet when an entry is decided): offering one there is
+#: a gate that silently blocks every entry. ``entry_tag`` (the style-group member tag) is the
+#: one such trigger this filter is for.
+_NOT_ON_ENTRY_RULES = frozenset({ORDER_ENTRY_TAG_KEY})
+
+
+def trigger_offered_for(value: str, rule_subtype: Optional[str]) -> bool:
+    """Whether the rule editor should OFFER trigger ``value`` on a rule of ``rule_subtype``
+    (an ``AnalysisUseCase`` value, or None for "not known" -- then everything is offered).
+
+    A filter on what is OFFERED, not a refusal of what is stored: a persisted rule carrying the
+    trigger still renders as itself. An unknown subtype string is refused, because answering it
+    would silently treat a typo as "no restriction".
+    """
+    if rule_subtype is None:
+        return True
+    from ba2_common.core.types import AnalysisUseCase
+    if rule_subtype not in {u.value for u in AnalysisUseCase}:
+        raise ValueError(f"unknown rule subtype {rule_subtype!r}; known: "
+                         f"{[u.value for u in AnalysisUseCase]}")
+    if rule_subtype == AnalysisUseCase.ENTER_MARKET.value:
+        return value not in _NOT_ON_ENTRY_RULES
+    return True
+
+
+def search_triggers(query: str, category: str = 'all',
+                    rule_subtype: Optional[str] = None) -> Tuple[TriggerEntry, ...]:
     """Case-insensitive substring match over the friendly name, the raw key and the description,
     within ``category``.
 
@@ -426,7 +453,8 @@ def search_triggers(query: str, category: str = 'all') -> Tuple[TriggerEntry, ..
     learned here: 'cooldown' should find the three ``days_since_last_*`` triggers even though
     none of them is spelled that way.
     """
-    entries = triggers_in_category(category)
+    entries = tuple(e for e in triggers_in_category(category)
+                    if trigger_offered_for(e.value, rule_subtype))
     needle = query.strip().lower()
     if not needle:
         return entries
@@ -436,11 +464,14 @@ def search_triggers(query: str, category: str = 'all') -> Tuple[TriggerEntry, ..
     )
 
 
-def category_counts() -> Dict[str, int]:
+def category_counts(rule_subtype: Optional[str] = None) -> Dict[str, int]:
     """``category -> how many triggers it holds``, for the picker's chips. Includes ``'all'``,
     which is the full catalog size. The counts sum to more than the catalog because eighteen
-    triggers are filed in two categories -- a trigger is not required to have one home."""
-    catalog = trigger_catalog()
+    triggers are filed in two categories -- a trigger is not required to have one home.
+
+    ``rule_subtype`` counts only what :func:`search_triggers` offers for that subtype, so a
+    chip's number always equals the rows it opens onto."""
+    catalog = tuple(e for e in trigger_catalog() if trigger_offered_for(e.value, rule_subtype))
     counts = {'all': len(catalog)}
     for category in CATEGORIES:
         if category == 'all':

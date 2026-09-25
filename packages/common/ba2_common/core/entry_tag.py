@@ -23,6 +23,7 @@ SHARED by live and backtest: both runtimes build the same ``_OptionEntryAction``
 same order row, so there is no backtest-only branch here.
 """
 import math
+import numbers
 from typing import Any, Optional
 
 #: The order-row ``data`` key (and the evaluator's action-config key) carrying the tag.
@@ -36,22 +37,50 @@ ENTRY_TAG_OPERATORS = ("==", "!=")
 
 
 def coerce_entry_tag(raw: Any) -> Optional[int]:
-    """None stays None; anything else must be a positive integer, returned as ``int``.
+    """None stays None; anything else must be a positive integer, returned as a plain ``int``.
 
-    An integral float (``3.0``, which is how a JSON/GA round trip may deliver it) is accepted.
-    Refused, by name: ``bool`` (``True == 1``), strings (a stored ``"3"`` is a producer bug, not
-    a spelling to guess at), non-integral / non-finite floats, zero, negatives, containers.
+    Any ``numbers.Integral`` (a numpy int from a GA genome included) and an integral real
+    (``3.0``, which is how a JSON/GA round trip may deliver it) are accepted. Refused, by name:
+    ``bool`` (``True == 1``; numpy's ``bool_`` is not a number ABC at all), strings (a stored
+    ``"3"`` is a producer bug, not a spelling to guess at), non-integral / non-finite reals,
+    zero, negatives, containers.
     """
     if raw is None:
         return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+    if isinstance(raw, bool) or not isinstance(raw, numbers.Real):
         raise ValueError(f"entry_tag must be a positive integer, got {raw!r} "
                          f"({type(raw).__name__})")
-    if isinstance(raw, float) and (not math.isfinite(raw) or not raw.is_integer()):
-        raise ValueError(f"entry_tag must be a positive integer, got {raw!r}")
+    if not isinstance(raw, numbers.Integral):
+        as_float = float(raw)
+        if not math.isfinite(as_float) or not as_float.is_integer():
+            raise ValueError(f"entry_tag must be a positive integer, got {raw!r}")
     if raw < 1:
         raise ValueError(f"entry_tag must be a positive integer, got {raw!r}")
     return int(raw)
+
+
+def validate_entry_tag_comparison(operator: Any, value: Any, where: str) -> int:
+    """The ONE check of an ``entry_tag`` comparison, shared by the rule converter (every
+    TradeRule -> EventAction path, via ``rule_builders.triggers_from_condition_tree``) and the
+    engine (``EntryTagCondition``), so a leaf the engine would refuse can never be converted.
+
+    ``operator`` must already be the engine symbol (``==`` / ``!=``); ``value`` must be a tag.
+    Returns the tag. Raises ``ValueError`` naming ``where`` and ``entry_tag`` otherwise -- a
+    missing value included: the tag is what scopes a member's exit to that member's positions,
+    so a leaf that cannot be honoured is refused, never dropped (a dropped tag leaf is an exit
+    for EVERY member's positions on the symbol).
+    """
+    if operator not in ENTRY_TAG_OPERATORS:
+        raise ValueError(
+            f"{where}: entry_tag is a member LABEL: only {list(ENTRY_TAG_OPERATORS)} compare "
+            f"it, got {operator!r}")
+    if value is None:
+        raise ValueError(f"{where}: entry_tag comparison has no value (the member tag to "
+                         f"match); without it the rule would apply to every member's positions")
+    try:
+        return coerce_entry_tag(value)
+    except ValueError as e:
+        raise ValueError(f"{where}: entry_tag comparison value: {e}") from e
 
 
 def order_entry_tag(order: Any) -> Optional[int]:

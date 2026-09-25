@@ -154,6 +154,11 @@ def test_no_two_fields_share_a_numeric_event_except_the_documented_aliases():
     assert not dupes, f"ambiguous reverse mapping: {dupes}"
 
 
+#: Numeric fields whose value is a LABEL, compared only with == / != (the converter refuses an
+#: ordering operator on them): the style-group member tag.
+_LABEL_OPERATOR = {"entry_tag": "=="}
+
+
 @pytest.mark.parametrize("event_type", sorted(_REGISTERED, key=lambda e: e.name))
 def test_a_leaf_naming_any_registered_condition_becomes_a_trigger(event_type):
     """End-to-end on the real converter: build a one-leaf tree for EVERY registered condition
@@ -161,8 +166,11 @@ def test_a_leaf_naming_any_registered_condition_becomes_a_trigger(event_type):
     ``price_vs_target_*`` gates without anybody having to name them."""
     numeric = event_type.name.startswith("N_")
     leaf = {"id": "x", "field": event_type.value}
+    # entry_tag is a LABEL the converter refuses to order (only == / != convert), so it is
+    # driven with == -- every other numeric field keeps the generic ``> 1`` probe.
+    op = _LABEL_OPERATOR.get(event_type.value, ">")
     if numeric:
-        leaf.update({"op": ">", "value": 1})
+        leaf.update({"op": op, "value": 1})
     triggers = triggers_from_condition_tree({"type": "AND", "conditions": [leaf]})
     assert triggers, (
         f"a rule leaf naming {event_type.value!r} produced NO trigger -- the gate is dropped "
@@ -171,7 +179,7 @@ def test_a_leaf_naming_any_registered_condition_becomes_a_trigger(event_type):
     (only,) = triggers.values()
     assert only["event_type"] == event_type.value
     if numeric:
-        assert only == {"event_type": event_type.value, "operator": ">", "value": 1}
+        assert only == {"event_type": event_type.value, "operator": op, "value": 1}
     else:
         assert only == {"event_type": event_type.value}
 

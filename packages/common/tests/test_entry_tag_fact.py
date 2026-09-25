@@ -298,3 +298,36 @@ def test_a_corrupted_stored_tag_is_refused_not_read_as_absent(stored):
     stored value no entry could have written is a defect, refused by name."""
     with pytest.raises(ValueError, match="entry_tag"):
         order_entry_tag(SimpleNamespace(id=9, data={ORDER_ENTRY_TAG_KEY: stored}))
+
+
+# --------------------------------------------------------------------------- #
+# review 2026-09-25 follow-up
+# --------------------------------------------------------------------------- #
+def test_numpy_integers_are_tags_but_numpy_bools_are_not():
+    np = pytest.importorskip("numpy")
+    assert coerce_entry_tag(np.int64(7)) == 7 and type(coerce_entry_tag(np.int64(7))) is int
+    assert coerce_entry_tag(np.float64(7.0)) == 7
+    with pytest.raises(ValueError, match="entry_tag"):
+        coerce_entry_tag(np.bool_(True))
+    with pytest.raises(ValueError, match="entry_tag"):
+        coerce_entry_tag(np.int64(0))
+
+
+def _submit_against(action, order_id):
+    action.account.order_id = order_id
+    return action._submit_option_order([_call_leg()], 1, 6.0, "long_call")
+
+
+def test_a_tag_that_cannot_reach_its_row_fails_loudly(buy_call_with):
+    """The row is the ONLY thing the member's exits can read: a tagged entry whose row is
+    missing must not report success with the tag silently lost."""
+    sub = buy_call_with(entry_tag=5)
+    with pytest.raises(RuntimeError, match="entry_tag"):
+        _submit_against(sub.action, 987654)          # no such order row
+
+
+def test_an_untagged_entry_with_no_row_keeps_todays_behaviour(buy_call_with):
+    """Byte-identical for every existing entry: the missing-row case is still only logged."""
+    sub = buy_call_with()
+    res = _submit_against(sub.action, 987654)
+    assert res["success"] is True

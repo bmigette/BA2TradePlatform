@@ -111,3 +111,33 @@ def test_option_action_exit_rule_seeds_option_event_action(_trading_db):
         assert len(triggers) == 1
         trig = next(iter(triggers.values()))
         assert trig["event_type"] == "bullish"
+
+
+@pytest.mark.parametrize("tag_leaf", [
+    {"id": "o_lc-tag", "field": "entry_tag", "op": "=="},                 # no value
+    {"id": "o_lc-tag", "field": "entry_tag", "op": ">", "value": 1.0},    # ordering op
+    {"id": "o_lc-tag", "field": "entry_tag", "op": "==", "value": 1.5},   # not a tag
+], ids=["no-value", "ordering-op", "fraction"])
+def test_the_backtest_exit_seeder_refuses_a_tag_leaf_it_cannot_honour(_trading_db, tag_leaf):
+    """seed_open_positions_ruleset used to DROP an unmappable leaf with only a WARNING. For
+    the style-group member tag that is fail-OPEN across members (the exit would close every
+    member's positions on the symbol), so the shared converter refuses it here too."""
+    with pytest.raises(ValueError, match="entry_tag"):
+        seed_open_positions_ruleset([{
+            "id": "o_lc-opt_tp", "action_type": "close_option",
+            "conditions": {"id": "g", "operator": "AND", "conditions": [
+                {"id": "tp", "field": "profit_loss_percent", "op": ">", "value": 50},
+                tag_leaf]},
+        }])
+
+
+def test_the_backtest_exit_seeder_carries_a_valid_tag_leaf(_trading_db):
+    rid = seed_open_positions_ruleset([{
+        "id": "o_lc-opt_tp", "action_type": "close_option",
+        "conditions": {"id": "g", "operator": "AND", "conditions": [
+            {"id": "tp", "field": "profit_loss_percent", "op": ">", "value": 50},
+            {"id": "o_lc-tag", "field": "entry_tag", "op": "==", "value": 1.0}]},
+    }])
+    with Session(cdb.get_engine()) as s:
+        (ea,) = list(s.get(Ruleset, rid).event_actions)
+        assert {"event_type": "entry_tag", "operator": "==", "value": 1.0} in ea.triggers.values()
