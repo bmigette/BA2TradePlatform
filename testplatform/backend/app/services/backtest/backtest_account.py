@@ -4675,6 +4675,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         fn = getattr(self._options, "basis_guard_stats", None)
         return fn() if callable(fn) else None
 
+    def option_min_one_contract_floored_entries(self) -> int:
+        """How many option ENTRY orders this run submitted at a size that came from the
+        1-contract floor (``min_one_contract``, plan 2026-09-24 Task 8) -- i.e. entries that
+        exist only because the floor turned a 0-contract budget into 1.
+
+        Read off the ORDER ROWS, where the shared entry path stamps
+        ``data['min_one_contract_floor']`` (only on a floored entry), so this counts exactly
+        what the action decided -- no second, backtest-only bookkeeping that could drift from
+        it. SUBMITTED entries, not fills: a floored ticket that never fills was still a
+        decision the genome relied on. Options runs only, like ``option_chain_staleness``."""
+        if self._options is None:
+            raise RuntimeError(
+                "option_min_one_contract_floored_entries() on an account with no options provider")
+        return sum(1 for o in orders_where(account_id=self.id)
+                   if isinstance(o.data, dict) and o.data.get("min_one_contract_floor") is True)
+
     def option_chain_staleness(self) -> Dict[str, Any]:
         """This run's stale-price chain-row counts from its option reader
         (``option_read_common.ChainStaleness``). Only meaningful on an options run: calling it

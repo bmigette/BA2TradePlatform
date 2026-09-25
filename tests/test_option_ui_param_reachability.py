@@ -670,3 +670,15 @@ def test_a_stored_false_string_loads_unchecked(editor):
     saved = editor.add_row(PLAIN_OPTION_ACTION, min_one_contract="false").save()
     assert editor.widget('min_one_contract_input').value is False
     assert saved['min_one_contract'] is False
+
+
+def test_a_garbage_stored_value_does_not_break_the_dialog(editor, settings_module, monkeypatch):
+    """A value nothing can mean is shown unchecked and LOGGED, never a dialog that fails to
+    render (the action ctor still refuses it at run time until the rule is re-saved)."""
+    warnings = []
+    monkeypatch.setattr(settings_module.logger, 'warning',
+                        lambda msg, *a, **k: warnings.append(str(msg)))
+    saved = editor.add_row(PLAIN_OPTION_ACTION, min_one_contract="maybe").save()
+    assert editor.widget('min_one_contract_input').value is False
+    assert saved['min_one_contract'] is False
+    assert any("min_one_contract" in w and "'maybe'" in w for w in warnings), warnings

@@ -12,7 +12,6 @@ from datetime import datetime, timezone, date, timedelta
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
-from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, TradeActionResult
 from ba2_common.core.types import (
     OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus,
@@ -2452,6 +2451,9 @@ class _OptionEntryAction(TradeAction):
         # coerce_bool because the GA and the deploy path deliver bools as 1 / "1" as often as
         # True -- the "1" that once read back False is exactly how a gene the optimizer turned
         # ON ran OFF live. A spelling nothing can mean raises instead of being guessed at.
+        # (Imported here, not at module top, so no line of this long file shifts: the
+        # no-zero-coercion audit pins allowlisted sites by file:line.)
+        from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
         self.min_one_contract = False if min_one_contract is None else coerce_bool(min_one_contract)
 
     # --- helpers ----------------------------------------------------------
@@ -2687,18 +2689,29 @@ class _OptionEntryAction(TradeAction):
         can't be resolved. This is a SUPPLEMENTARY safety net layered on top of
         option_sizing, not a hard requirement to trade -- a resolution hiccup must not
         block an otherwise-valid entry option_sizing already approved."""
+        pct, _why = self._per_instrument_cap_pct()
+        return None if pct is None else equity * (pct / 100.0)
+
+    def _per_instrument_cap_pct(self) -> Tuple[Optional[float], Optional[str]]:
+        """``(max_virtual_equity_per_instrument_percent, None)`` or ``(None, why it is absent)``.
+
+        Split out of ``_max_equity_per_instrument_cap`` (whose None-means-no-cap contract is
+        unchanged) so the 1-contract floor -- for which the cap is REQUIRED -- can say WHICH
+        absence refused it: an unset setting is a configuration to fix, a resolver failure is
+        an incident. They used to collapse into one indistinguishable None."""
         instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
         if not instance_id:
-            return None
+            return None, "the recommendation carries no expert instance"
         try:
             from ba2_common.core.instance_resolver import get_instance_resolver
             expert = get_instance_resolver().get_expert_instance(instance_id)
             if not expert:
-                return None
+                return None, f"expert instance {instance_id} could not be resolved"
             pct = expert.settings.get('max_virtual_equity_per_instrument_percent')
             if pct is None:
-                return None
-            return equity * (float(pct) / 100.0)
+                return None, (f"expert instance {instance_id}'s "
+                              f"max_virtual_equity_per_instrument_percent setting is unset")
+            return float(pct), None
         except Exception as e:
             # DELIBERATELY broad: the resolver is INJECTED, so it can fail in ways this module
             # cannot enumerate, and this cap is an optional refinement -- per the docstring it
@@ -2706,7 +2719,7 @@ class _OptionEntryAction(TradeAction):
             # that choice in code instead of leaving it implicit.
             absorb_if_benign(e, Exception)
             logger.debug(f"_max_equity_per_instrument_cap: could not resolve expert {instance_id}: {e}")
-            return None
+            return None, f"expert instance {instance_id} could not be resolved ({e})"
 
     def _size_by_cost(self, cost_per_contract: Optional[float],
                       sizing_pct: Optional[float]) -> int:
@@ -2746,29 +2759,46 @@ class _OptionEntryAction(TradeAction):
 
     def _one_contract_floor(self, cost_per_contract: float, *, budget: float, equity: float,
                             cap: Optional[float]) -> int:
-        """1 if ONE contract fits under the per-instrument cap and the virtual equity, else 0
-        with ``_min_one_contract_note`` saying why (appended to the refusal).
+        """1 if ONE contract fits in the REMAINING per-instrument room and the virtual equity,
+        else 0 with ``_min_one_contract_note`` saying why (appended to the refusal).
 
         THE CAP IS REQUIRED, NOT BEST-EFFORT, HERE. ``_max_equity_per_instrument_cap`` is a
         supplementary ceiling elsewhere (None -> no cap, because ``option_sizing`` is already
         bounding the size). The floor deliberately overrides ``option_sizing``, so the cap is
         the ONLY thing left bounding a floored contract: sizing one without it would let a
-        single lumpy premium take whatever the account holds. Unresolved therefore refuses.
+        single lumpy premium take whatever the account holds. Absent therefore refuses.
+
+        REMAINING room, not the whole cap (review 2026-09-25): against ``equity x pct`` every
+        floored ticket on one name would get the full cap again, so repeated floored entries
+        could stack to any multiple of it. ``_committed_to_underlying`` measures what this
+        expert already has on the name, the way the classic equity RM's per-instrument
+        allocation does; an unmeasurable commitment refuses (unknown is not zero).
 
         The virtual-equity check is separate because the cap is a percent that can exceed 100.
         """
         cost = float(cost_per_contract)
         if cap is None:
+            _pct, why = self._per_instrument_cap_pct()
             self._min_one_contract_note = (
-                f"min_one_contract floor not applied: the per-instrument cap "
-                f"(max_virtual_equity_per_instrument_percent) could not be resolved, and it is "
+                f"min_one_contract floor not applied: no per-instrument cap "
+                f"({why or 'max_virtual_equity_per_instrument_percent unavailable'}), and it is "
                 f"the only ceiling a floored contract may be sized under "
                 f"(one contract costs {cost:.2f}, option_sizing budget {budget:.2f})")
             return 0
-        if cost > cap:
+        committed, unmeasurable = self._committed_to_underlying()
+        if committed is None:
+            self._min_one_contract_note = (
+                f"min_one_contract floor not applied: what this expert already has committed "
+                f"to {self.instrument_name} cannot be measured ({unmeasurable}), so the "
+                f"remaining per-instrument room is unknown")
+            return 0
+        room = cap - committed
+        if cost > room:
             self._min_one_contract_note = (
                 f"min_one_contract floor not applied: one contract costs {cost:.2f}, above the "
-                f"per-instrument cap {cap:.2f} (max_virtual_equity_per_instrument_percent)")
+                f"remaining per-instrument room {room:.2f} (per-instrument cap {cap:.2f} "
+                f"[max_virtual_equity_per_instrument_percent] less {committed:.2f} already "
+                f"committed to {self.instrument_name} by this expert)")
             return 0
         if cost > equity:
             self._min_one_contract_note = (
@@ -2779,8 +2809,72 @@ class _OptionEntryAction(TradeAction):
         logger.info(
             f"{self._action_type_value()} for {self.instrument_name}: option_sizing budget "
             f"{budget:.2f} < one contract {cost:.2f}; sized 1 contract by the min_one_contract "
-            f"floor (within per-instrument cap {cap:.2f})")
+            f"floor (remaining per-instrument room {room:.2f} = cap {cap:.2f} - committed "
+            f"{committed:.2f})")
         return 1
+
+    def _committed_to_underlying(self) -> Tuple[Optional[float], Optional[str]]:
+        """``(dollars this expert already has committed to self.instrument_name, None)``, or
+        ``(None, why)`` when any part of it cannot be measured.
+
+        WHAT IS COUNTED -- every WAITING or OPENED transaction of this expert on the symbol
+        (the same set the classic equity RM's ``_get_existing_allocations`` reads, through the
+        same dual-path ``transactions_where``, so a backtest reads its in-memory store):
+
+        * EQUITY rows (shares): ``estimate_transaction_allocation(quantity, open_price,
+          fallback)`` with the first priced order's limit/open/stop as the fallback -- the
+          classic RM's own figure, so the two caps agree on shares.
+        * OPTION rows, on the SAME basis the sizer measured their ticket (the dollars one
+          contract took from the budget, times the contracts):
+            - a structure whose orders carry ``data['option_reserve']`` (every reserving
+              builder stamps the TOTAL collateral at submit) counts that reserve;
+            - a RESERVING strategy WITHOUT one is unmeasurable (the reserve pool's rule:
+              unknown must never read as the zero that frees room);
+            - anything else counts ``|net premium per share| x multiplier x contracts`` --
+              the premium x 100 the debit builders size by -- from ``open_price``, else the
+              first priced order (a WAITING row has no fill yet); no price is unmeasurable.
+              A non-reserving CREDIT (the covered call) is therefore counted at its credit,
+              which only ever over-states the commitment (a refusal, never a freed dollar).
+
+        The whole reserve stands even on a partially-filled terminal order, for the same
+        reason: over-counting refuses, under-counting frees money already committed.
+        """
+        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if not instance_id:
+            return None, "the recommendation carries no expert instance"
+        from ba2_common.core.trade_store import orders_where, transactions_where
+        from ba2_common.core.TradeRiskManagement import estimate_transaction_allocation
+
+        total = 0.0
+        for txn in transactions_where(
+                expert_id=instance_id, symbol=self.instrument_name,
+                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED]):
+            orders = orders_where(transaction_id=txn.id)
+            fallback = next((p for o in orders
+                             for p in (o.limit_price, o.open_price, o.stop_price) if p), None)
+            if txn.asset_class != AssetClass.OPTION:
+                total += estimate_transaction_allocation(txn.quantity, txn.open_price, fallback)
+                continue
+            reserves = [float(o.data["option_reserve"]) for o in orders
+                        if isinstance(o.data, dict)
+                        and isinstance(o.data.get("option_reserve"), (int, float))
+                        and not isinstance(o.data.get("option_reserve"), bool)
+                        and float(o.data["option_reserve"]) > 0]
+            if reserves:
+                total += sum(reserves)
+                continue
+            if txn.option_strategy in OptionsAccountInterface.RESERVING_STRATEGIES:
+                return None, (f"transaction {txn.id} ({txn.option_strategy}) must reserve "
+                              f"capital but no order carries a readable option_reserve")
+            price = txn.open_price if txn.open_price is not None else fallback
+            if price is None or txn.quantity is None:
+                return None, (f"transaction {txn.id} ({txn.option_strategy}) has no "
+                              f"{'price' if price is None else 'quantity'}")
+            # The multiplier default is build_structure's own (an option row written before
+            # the column existed is a standard 100-share contract).
+            total += (abs(float(price)) * float(txn.multiplier or DEFAULT_OPTION_MULTIPLIER)
+                      * abs(float(txn.quantity)))
+        return total, None
 
     def _budget_refusal(self, message: str) -> Dict[str, Any]:
         """The "Insufficient budget to size ..." refusal, with the floor's reason appended when
@@ -3413,8 +3507,10 @@ class _OptionEntryAction(TradeAction):
         # it) and never reaches the ORDER, which is where the exit conditions read. The stamp
         # would look configured and be inert -- the ``days_after_event`` gene would be a dead
         # gene the GA tuned for a whole campaign. Named by constant, not spelled again.
+        #   (and ``min_one_contract_floor``, only when the 1-contract floor sized the entry, so
+        #   a run report can count floored entries off the rows and a live row says it too.)
         entry_facts = {k: data[k] for k in ("option_reserve", "max_loss_per_contract",
-                                            ORDER_EVENT_DATE_KEY)
+                                            ORDER_EVENT_DATE_KEY, "min_one_contract_floor")
                        if k in data}
         # The caller-STATED facts, which is what makes them immune to the whitelist trap
         # above: the builder that needs a fact on the row names it at the call site instead

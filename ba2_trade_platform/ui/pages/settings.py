@@ -16,7 +16,6 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
-from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, uses_min_one_contract, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
@@ -5853,13 +5852,25 @@ class TradeSettingsTab:
                                 # deployed genome carries it and re-saving a rule rebuilds
                                 # action_config key by key -- no widget would WIPE it.
                                 if uses_min_one_contract(selected_type):
+                                    # coerce_bool, not bool(): a stored "false"/"0" must load
+                                    # unchecked, exactly as the action ctor reads it. A value
+                                    # nothing can mean must not break the whole dialog: it is
+                                    # shown unchecked and logged -- the action ctor still
+                                    # refuses it at run time until the rule is re-saved.
+                                    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+                                    _m1c_raw = action_config.get('min_one_contract') if action_config else None
+                                    _m1c = False
+                                    if _m1c_raw is not None:
+                                        try:
+                                            _m1c = coerce_bool(_m1c_raw)
+                                        except ValueError:
+                                            logger.warning(
+                                                f"Rule action {action_key}: stored min_one_contract "
+                                                f"{_m1c_raw!r} is not a boolean; showing it unchecked "
+                                                f"(saving the rule will store False)")
                                     min_one_contract_input = ui.checkbox(
                                         'Min 1 contract',
-                                        # coerce_bool, not bool(): a stored "false"/"0" must
-                                        # load unchecked, exactly as the action ctor reads it.
-                                        value=(coerce_bool(action_config['min_one_contract'])
-                                               if action_config and action_config.get('min_one_contract') is not None
-                                               else False),
+                                        value=_m1c,
                                     ).props('dense').tooltip(
                                         'When Sizing % rounds to 0 contracts, buy 1 contract if it '
                                         'fits under the per-instrument cap (max virtual equity per '

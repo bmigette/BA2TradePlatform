@@ -235,6 +235,12 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
         # The E4 split-basis guard's counters (plan Part E4): None when the run's reader has
         # no guard (the sqlite store, or a guard-less fixture reader). Recorded, not scored.
         metrics["option_basis_guard"] = account.option_basis_guard_stats()
+        # How many entries exist only because the 1-contract sizing floor turned a 0-contract
+        # budget into 1 (``min_one_contract``, plan 2026-09-24 Task 8): a genome whose result
+        # rests on floored tickets is a different bet from one sized by its own budget, and
+        # without this count the two look the same. Additive; recorded, not scored.
+        metrics["option_min_one_contract_floored_entries"] = (
+            account.option_min_one_contract_floored_entries())
     return metrics
 
 
