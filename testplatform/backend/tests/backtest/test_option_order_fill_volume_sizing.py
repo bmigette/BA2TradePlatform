@@ -180,3 +180,122 @@ def test_stage1_turns_it_on_and_the_matrix_forwards_it_as_an_identity_token():
     src = (repo / "tools" / "run_options_matrix.py").read_text(encoding="utf-8")
     assert 'cmd += ["--option-size-within-fill-volume"]' in src
     assert '"--no-robust-fitness", "--option-size-within-fill-volume"' in src
+
+
+# ------------------------------------------------------------------ C1: the ACTION sees the cut
+def _through_the_action(monkeypatch, acct, action_cls, legs, quantity, strategy, reserve):
+    """Run ``_OptionEntryAction._submit_option_order`` -- the choke point every builder reaches
+    -- with an option RM engaged (its admission and charge captured), exactly as a builder
+    calls it: with the reserve it computed for the UNCAPPED quantity."""
+    from types import SimpleNamespace
+    import ba2_common.core.TradeActions as TA
+    from ba2_common.core.types import OrderRecommendation
+    seen = {}
+
+    def _admit(**kw):
+        seen["admit_qty"] = kw["quantity"]
+        return SimpleNamespace(allowed=True, candidate={"quantity": kw["quantity"]},
+                               reason=None, message="ok")
+
+    monkeypatch.setattr(TA, "admit_option_entry", _admit)
+    monkeypatch.setattr(TA, "record_submitted",
+                        lambda iid, tid, cand: seen.setdefault("charged", cand))
+    action = action_cls(instrument_name="AAPL", account=acct,
+                        order_recommendation=OrderRecommendation.BUY)
+    action.create_and_save_action_result = lambda **kw: SimpleNamespace(**kw)
+    monkeypatch.setattr(action, "_option_risk_manager", lambda: (object(), 7))
+    result = action._submit_option_order(legs, quantity, 10.0, strategy, option_reserve=reserve)
+    return result, seen
+
+
+def test_a_capped_csp_carries_the_capped_reserve_rm_charge_and_record(monkeypatch):
+    """CSP P410, 8 requested, decision-bar volume 50 -> 5. The reserve on the order row (what
+    reserved_option_buying_power_detail reads for the position's life), the RM admission and
+    its submitted charge, data['quantity'] and the entry record are all the 5-lot's."""
+    from ba2_common.core.TradeActions import SellCashSecuredPutAction
+    with _harness(_bars({PUT410: 50}), _closes(), cfg=ON) as (engine, acct, ps):
+        leg = _leg(PUT410, 410.0, OrderDirection.SELL)
+        reserve8 = acct.option_reserve_required("cash_secured_put", 8, strike=410.0)
+        result, seen = _through_the_action(monkeypatch, acct, SellCashSecuredPutAction,
+                                           [leg], 8, "cash_secured_put", reserve8)
+        assert result.success, result.message
+        (order,) = _rows(acct, PUT410)
+        assert order.quantity == 5
+        assert order.data["option_reserve"] == pytest.approx(410.0 * 100 * 5)
+        assert result.data["option_reserve"] == pytest.approx(410.0 * 100 * 5)
+        assert result.data["quantity"] == 5
+        assert seen == {"admit_qty": 5, "charged": {"quantity": 5}}
+        assert order.data["entry_record"]["structure"]["quantity"] == 5
+        detail = acct.reserved_option_buying_power()
+        assert detail == pytest.approx(410.0 * 100 * 5)
+
+
+def test_a_capped_bull_put_spread_carries_the_capped_reserve_and_rm_charge(monkeypatch):
+    from ba2_common.core.TradeActions import OpenBullPutSpreadAction
+    with _harness(_bars({PUT410: 100, PUT400: 30}), _closes(), cfg=ON) as (engine, acct, ps):
+        legs = [_leg(PUT410, 410.0, OrderDirection.SELL), _leg(PUT400, 400.0, OrderDirection.BUY)]
+        reserve8 = acct.option_reserve_required("bull_put_spread", 8, spread_width=10.0,
+                                                net_credit=2.0)
+        assert reserve8 == pytest.approx(8.0 * 100 * 8)
+        result, seen = _through_the_action(monkeypatch, acct, OpenBullPutSpreadAction,
+                                           legs, 8, "bull_put_spread", reserve8)
+        assert result.success, result.message
+        parent = [o for o in acct.get_orders() if o.contract_symbol is None][0]
+        assert parent.quantity == 3
+        assert {o.contract_symbol: o.quantity for o in acct.get_orders() if o.contract_symbol} == {
+            PUT410: 3, PUT400: 3}
+        assert parent.data["option_reserve"] == pytest.approx(8.0 * 100 * 3)
+        assert result.data["quantity"] == 3
+        assert seen == {"admit_qty": 3, "charged": {"quantity": 3}}
+
+
+def test_a_cap_of_zero_is_refused_by_the_action_naming_the_volume_cap(monkeypatch):
+    from ba2_common.core.TradeActions import SellCashSecuredPutAction
+    with _harness(_bars({PUT410: 5}), _closes(), cfg=ON) as (engine, acct, ps):
+        leg = _leg(PUT410, 410.0, OrderDirection.SELL)
+        result, seen = _through_the_action(
+            monkeypatch, acct, SellCashSecuredPutAction, [leg], 2, "cash_secured_put",
+            acct.option_reserve_required("cash_secured_put", 2, strike=410.0))
+        assert not result.success
+        assert "fill-volume cap" in result.message
+        assert seen == {}                                  # never admitted, never charged
+        assert _rows(acct, PUT410) == []
+
+
+def test_flag_off_the_action_path_is_unchanged(monkeypatch):
+    from ba2_common.core.TradeActions import SellCashSecuredPutAction
+    with _harness(_bars({PUT410: 50}), _closes()) as (engine, acct, ps):
+        leg = _leg(PUT410, 410.0, OrderDirection.SELL)
+        reserve8 = acct.option_reserve_required("cash_secured_put", 8, strike=410.0)
+        result, seen = _through_the_action(monkeypatch, acct, SellCashSecuredPutAction,
+                                           [leg], 8, "cash_secured_put", reserve8)
+        (order,) = _rows(acct, PUT410)
+        assert order.quantity == 8 and order.data["option_reserve"] == pytest.approx(reserve8)
+        assert seen["admit_qty"] == 8
+
+
+# ---------------------------------------------- the fill reads the DECISION bar under the flag
+D0824, D0825 = date(2020, 8, 24), date(2020, 8, 25)
+
+
+def _two_day_bars(decision_volume, fill_volume):
+    return {(PUT410, D0824): _bar(10.0, volume=decision_volume),
+            (PUT410, D0825): _bar(10.0, volume=fill_volume)}
+
+
+@pytest.mark.parametrize("flag,filled", [(True, True), (False, False)])
+def test_under_the_flag_the_fill_cap_reads_the_decision_bar_not_the_next_one(flag, filled):
+    """next_bar_open, decided 08-24 (volume 50 -> 5 fillable), filling on 08-25 (volume 10 -> 1).
+    Flag on: the fill engine reads the DECISION bar, so the 5-lot the order was sized to fills --
+    no look-ahead into 08-25's volume. Flag off: unchanged, the fill bar's 10 refuses it."""
+    from tests.backtest.test_option_split_crossing import _dt
+    cfg = {**CFG, "fill_model": "next_bar_open",
+           **({"option_size_within_fill_volume": True} if flag else {})}
+    with _harness(_two_day_bars(50, 10), _closes(), cfg=cfg) as (engine, acct, ps):
+        ps.set_clock(_dt(D0824))
+        order = acct.submit_option_order(legs=[_leg(PUT410, 410.0, OrderDirection.BUY)],
+                                         quantity=5, order_type="market",
+                                         option_strategy="long_put")
+        acct.refresh_orders()
+        assert (order.status == OrderStatus.FILLED) is filled
+        assert acct.rejected_illiquid_fills == (0 if filled else 1)

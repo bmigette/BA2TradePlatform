@@ -2882,7 +2882,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 self.rejected_arb_fills,
             )
             return None
-        reason = self._volume_cap_reject_reason(order, bar)
+        # WHICH BAR'S VOLUME caps the fill. Default: the FILL bar's (the documented look-ahead
+        # in _volume_cap_reject_reason's TODO, left as is so every existing run reproduces).
+        # Under ``option_size_within_fill_volume`` (approved 2026-09-25): the DECISION bar's --
+        # the bar the engine is on, the one ``option_order_quantity_limit`` sized the order
+        # against -- so the order-time cap is exact under next_bar_open too and the fill-day
+        # volume is never read. Under same_bar_close the two bars are the same bar.
+        volume_bar = bar
+        if self._cfg.get("option_size_within_fill_volume", False) and not same_bar:
+            volume_bar = as_of_bar
+            if volume_bar is None:           # the legacy spread model did not fetch it above
+                as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
+                volume_bar = self._option_bar(order.contract_symbol, as_of_day)
+            volume_bar = volume_bar or {}    # no decision bar: volume 0, nothing fills
+        reason = self._volume_cap_reject_reason(order, volume_bar)
         if reason is not None:
             self.rejected_illiquid_fills += 1
             logger.warning(
@@ -5105,10 +5118,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         fill bar's volume (``_volume_cap_reject_reason``); an order sized above it just expires
         (about half of the expired O_LP entries in the 2026-09-24 diagnosis). Here the same
         capacity is read on the DECISION bar -- the bar the order is decided on, and under
-        ``same_bar_close`` the very bar it fills on. Under ``next_bar_open`` the fill reads the
-        next session's volume (the fill engine's own documented look-ahead, see its TODO); the
-        order cannot know that number without looking ahead, so an order sized here can still
-        be refused there if the next bar trades less.
+        ``same_bar_close`` the very bar it fills on. Under ``next_bar_open`` the fill engine
+        normally reads the NEXT session's volume (its documented look-ahead); with this flag on
+        it reads the decision bar too (``_option_fill_price``), so the size decided here is
+        exactly the size the fill engine admits.
+
+        The shared entry choke point (``_OptionEntryAction._submit_option_order``) asks this
+        FIRST, so the reserve, the RM admission/charge and the entry record are the capped
+        order's; ``submit_option_order`` asks again as a backstop (idempotent).
 
         MULTI-LEG: the parent quantity is a STRUCTURE count and each leg fills
         ``structures x ratio_qty`` contracts, so the cap is the most constrained leg's
