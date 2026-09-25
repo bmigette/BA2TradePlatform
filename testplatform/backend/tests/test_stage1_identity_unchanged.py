@@ -22,7 +22,14 @@ _spec.loader.exec_module(M)
 _ENV = ("BA2_HOME", "BACKTEST_OPTIONS_STORE", "BACKTEST_OPTIONS_PARQUET_ROOT",
         "BACKTEST_OPTIONS_RISK_FREE_RATE", "TASTYTRADE_OPTIONS_HISTORY_FLOOR")
 
-_ARGV = ["--profile", "discovery", "--screener-gate-store", "STORE", "--max-stock-price", "0",
+# The flags tools/stage1_run.sh passes EXPLICITLY (--start/--end/--options-store/--population/
+# --generations/--early-stop) are passed here too, at the values it passes, so the pin exercises
+# the explicit path the live campaign uses rather than only the parser defaults. (--parallel is
+# left at its default: it is a machine knob, excluded from the digest.)
+_ARGV = ["--profile", "discovery",
+         "--start", "2020-01-01", "--end", "2025-12-31", "--options-store", "thetadata",
+         "--population", "200", "--generations", "60", "--early-stop", "8",
+         "--screener-gate-store", "STORE", "--max-stock-price", "0",
          "--option-size-within-fill-volume", "--experts", "DeterministicScorer",
          "--market-condition-profile", "ohlcv-v1,ta-structure-v1",
          "--market-condition-manifest", "ohlcv-v1=aaaa,ta-structure-v1=bbbb",
