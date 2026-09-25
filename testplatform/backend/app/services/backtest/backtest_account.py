@@ -78,6 +78,7 @@ from ba2_common.core.option_trade_record import (
 )
 from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
 from ba2_common.core.utils import as_utc_key
+from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core import option_spread_model as _osm
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
@@ -4543,7 +4544,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # have its linkage moved consistently (an exit would close the wrong quantity).
         for cs in list(plans):
             lot = plans[cs]["lot"]
-            booked = sum((float(o.filled_qty if o.filled_qty is not None else o.quantity or 0.0))
+            # An EXECUTED row with no quantity is a defect, not a zero: refuse loudly.
+            booked = sum(must_measure(o.filled_qty if o.filled_qty is not None else o.quantity,
+                                      f"executed quantity of option order {o.id}")
                          * (1.0 if o.side == OrderDirection.BUY else -1.0)
                          for o in rows_of.get(cs, ()))
             if abs(booked - lot.qty) > 1e-9:
@@ -5334,7 +5337,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     or getattr(o, "asset_class", None) != AssetClass.OPTION
                     or o.status not in executed):
                 continue
-            q = float(o.filled_qty if o.filled_qty is not None else o.quantity or 0.0)
+            # An EXECUTED row with no quantity is a defect, not a zero: refuse loudly.
+            q = must_measure(o.filled_qty if o.filled_qty is not None else o.quantity,
+                             f"executed quantity of option order {o.id}")
             net[o.transaction_id] = net.get(o.transaction_id, 0.0) + (
                 q if o.side == OrderDirection.BUY else -q)
         if not net:
