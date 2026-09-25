@@ -128,20 +128,78 @@ def test_close_option_position_honours_an_explicit_transaction_id():
         assert close.transaction_id == t2
 
 
-def test_a_contract_level_close_matching_no_holder_is_booked_fifo(caplog):
+def test_an_id_less_close_uses_the_shared_open_holder_lookup():
+    """No transaction id (a contract-level caller): the SHARED lookup answers -- the
+    lowest-id transaction still holding the contract -- exactly what a live account does. (The
+    backtest-only requester heuristic and its FIFO split are retired, review 2026-09-25 I2.)"""
     bars = {(PUT410, d): _bar(15.0) for d in _sessions() if d < OPEN_DAY.replace(day=31)}
     with _harness(bars, _closes()) as (engine, acct, ps):
         _open(acct, PUT410, OptionRight.PUT, 410.0, OrderDirection.BUY, "long_put", qty=1)
         _add(acct, OrderDirection.BUY, 3)
         t1, t2 = _txn_ids(acct, PUT410)
+        pos = [p for p in acct.get_option_positions() if p.quantity == 1][0]
+        acct.close_option_position(pos, order_type="market")
+        (close,) = [o for o in _rows(acct, PUT410) if o.side == OrderDirection.SELL]
+        assert close.transaction_id == acct.open_option_transaction_id_for_contract(PUT410) == t1
+
+
+def test_an_explicit_id_that_holds_nothing_falls_back_loudly(caplog):
+    bars = {(PUT410, d): _bar(15.0) for d in _sessions() if d < OPEN_DAY.replace(day=31)}
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        _open(acct, PUT410, OptionRight.PUT, 410.0, OrderDirection.BUY, "long_put", qty=1)
+        (t1,) = _txn_ids(acct, PUT410)
         pos = acct.get_option_positions()[0]
-        pos.quantity, pos.avg_entry_price = 4, 99.0        # matches no single holder
-        with caplog.at_level(logging.WARNING):
-            acct.close_option_position(pos, order_type="market")
-        closes = sorted((o.transaction_id, o.quantity) for o in _rows(acct, PUT410)
-                        if o.side == OrderDirection.SELL)
-        assert closes == [(t1, 1), (t2, 3)]
-        assert any("FIFO" in r.getMessage() for r in caplog.records)
+        with caplog.at_level(logging.ERROR):
+            acct.close_option_position(pos, order_type="market", transaction_id=987654)
+        (close,) = [o for o in _rows(acct, PUT410) if o.side == OrderDirection.SELL]
+        assert close.transaction_id == t1
+        assert any("holds no long position" in r.getMessage() for r in caplog.records)
+
+
+def test_equal_holders_close_from_the_second_is_booked_on_the_second():
+    """The reviewer's wrong-holder probe: T1 and T2 each hold 1 x P410 bought at 15 -- equal
+    size, equal price, so no quantity/price heuristic can tell them apart. T2's exit must close
+    T2 (it closed T1 before the shared action passed its transaction id)."""
+    from ba2_common.core.TradeActions import CloseOptionAction
+    from ba2_common.core.types import OrderRecommendation
+    bars = {(PUT410, d): _bar(15.0) for d in _sessions() if d < OPEN_DAY.replace(day=31)}
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        _open(acct, PUT410, OptionRight.PUT, 410.0, OrderDirection.BUY, "long_put", qty=1)
+        _add(acct, OrderDirection.BUY, 1)
+        t1, t2 = _txn_ids(acct, PUT410)
+        (t2_entry,) = [o for o in _rows(acct, PUT410) if o.transaction_id == t2]
+        action = CloseOptionAction(instrument_name="AAPL", account=acct,
+                                   order_recommendation=OrderRecommendation.SELL,
+                                   existing_order=t2_entry)
+        action.create_and_save_action_result = lambda **kw: SimpleNamespace(**kw)
+        assert action.execute().success
+        (close,) = [o for o in _rows(acct, PUT410) if o.side == OrderDirection.SELL]
+        assert close.transaction_id == t2
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert _txn(t1).status == TransactionStatus.OPENED
+        assert _txn(t2).status == TransactionStatus.CLOSED
+        assert acct.check_option_ledger(context="test") == []
+
+
+def test_a_single_holder_close_is_unchanged():
+    from ba2_common.core.TradeActions import CloseOptionAction
+    from ba2_common.core.types import OrderRecommendation
+    bars = {(PUT410, d): _bar(15.0) for d in _sessions() if d < OPEN_DAY.replace(day=31)}
+    with _harness(bars, _closes()) as (engine, acct, ps):
+        _open(acct, PUT410, OptionRight.PUT, 410.0, OrderDirection.BUY, "long_put", qty=2)
+        (t1,) = _txn_ids(acct, PUT410)
+        (entry,) = _rows(acct, PUT410)
+        action = CloseOptionAction(instrument_name="AAPL", account=acct,
+                                   order_recommendation=OrderRecommendation.SELL,
+                                   existing_order=entry)
+        action.create_and_save_action_result = lambda **kw: SimpleNamespace(**kw)
+        assert action.execute().success
+        (close,) = [o for o in _rows(acct, PUT410) if o.side == OrderDirection.SELL]
+        assert (close.transaction_id, close.quantity) == (t1, 2)
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert _txn(t1).status == TransactionStatus.CLOSED
 
 
 def test_the_ledger_check_reports_a_constructed_orphan_once(caplog):

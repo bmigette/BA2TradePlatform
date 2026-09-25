@@ -336,6 +336,36 @@ _BS_IV_STALENESS_DAYS = 5
 # bar; it stays pending and retries the next (see BacktestAccount._option_fill_price).
 _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 
+
+def _option_fill_capacity(volume) -> float:
+    """Contracts a premium bar of ``volume`` can absorb under the participation cap -- THE one
+    definition, read by the fill engine (``_volume_cap_reject_reason``) and by the order-time
+    sizing (``option_order_quantity_limit``), so the two cannot disagree on the number. A
+    missing volume is 0 (nothing fills)."""
+    return _OPTION_FILL_MAX_VOLUME_PARTICIPATION * (float(volume) if volume is not None else 0.0)
+
+
+def _new_integrity_counters() -> Dict[str, Any]:
+    return {"option_ledger_mismatches": {"count": 0, "examples": []},
+            "option_orders_volume_sized": 0,
+            "option_orders_volume_refused": 0,
+            "option_split_rekeys": 0,
+            "option_split_rekey_refusals": 0}
+
+
+def _max_units_within(capacity: float, per_unit: float) -> int:
+    """The largest whole count ``n`` with ``n * per_unit <= capacity`` -- decided by the SAME
+    float comparison the fill engine makes (``required > capacity`` rejects), not by a
+    division whose rounding could land one unit either side of it."""
+    if per_unit <= 0 or capacity <= 0:
+        return 0
+    n = int(math.floor(capacity / per_unit))
+    while n > 0 and n * per_unit > capacity:
+        n -= 1
+    while (n + 1) * per_unit <= capacity:
+        n += 1
+    return n
+
 # ---------------------------------------------------------------------------
 # OPTION BID-ASK SPREAD MODEL (2026-07-25) -- NOW THE ``legacy-pct`` MODEL ONLY
 # ---------------------------------------------------------------------------
@@ -583,6 +613,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # not reconcile with the lot, and no fill can repair that (a fill on a crossed lot is
         # refused). Skipped instead of re-planned on every bar until expiry.
         self._split_rekey_never: set = set()
+        # RUN COUNTERS for the option-integrity events of plan 2026-09-24 Tasks 1b / 11 / 13,
+        # published in the results (``option_integrity_stats`` -> results.py). A GA trial child
+        # runs under ``logging.disable(logging.ERROR)`` (price_source._worker_init), which drops
+        # ERROR and everything below it, so the log lines alone are invisible exactly where most
+        # runs happen; these numbers are not.
+        self._option_integrity: Dict[str, Any] = _new_integrity_counters()
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
         # and is therefore useless for ageing in a backtest. Read only by
@@ -659,6 +695,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "formula from option_spread_pct/option_spread_min_tick (both "
                                "required). An OPTIONS run must state one; see "
                                "_resolve_spread_model. Recorded in the run's results.",
+            },
+            "option_size_within_fill_volume": {
+                "type": "bool",
+                "required": False,
+                "description": "BACKTEST-ONLY (plan 2026-09-24 Task 11). When True, an OPENING "
+                               "option order is sized down at ORDER time to what the fill "
+                               "engine's volume-participation cap (10% of a premium bar's "
+                               "volume, per leg) can fill, read on the DECISION bar; a cap of 0 "
+                               "places no order and says why. Without it an order larger than "
+                               "the cap simply expires unfilled. Live is unaffected (a broker "
+                               "fills a small order whatever the day's volume). Defaults to "
+                               "False (exact no-op): older option runs reproduce.",
             },
             "hold_assigned_stock": {
                 "type": "bool",
@@ -2848,7 +2896,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 self.rejected_arb_fills,
             )
             return None
-        reason = self._volume_cap_reject_reason(order, bar)
+        # WHICH BAR'S VOLUME caps the fill. Default: the FILL bar's (the documented look-ahead
+        # in _volume_cap_reject_reason's TODO, left as is so every existing run reproduces).
+        # Under ``option_size_within_fill_volume`` (approved 2026-09-25): the DECISION bar's --
+        # the bar the engine is on, the one ``option_order_quantity_limit`` sized the order
+        # against -- so the order-time cap is exact under next_bar_open too and the fill-day
+        # volume is never read. Under same_bar_close the two bars are the same bar.
+        volume_bar = bar
+        if self._cfg.get("option_size_within_fill_volume", False) and not same_bar:
+            volume_bar = as_of_bar
+            if volume_bar is None:           # the legacy spread model did not fetch it above
+                as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
+                volume_bar = self._option_bar(order.contract_symbol, as_of_day)
+            volume_bar = volume_bar or {}    # no decision bar: volume 0, nothing fills
+        reason = self._volume_cap_reject_reason(order, volume_bar)
         if reason is not None:
             self.rejected_illiquid_fills += 1
             logger.warning(
@@ -3062,7 +3123,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return None
         volume = bar.get("volume")
         volume = float(volume) if volume is not None else 0.0
-        capacity = _OPTION_FILL_MAX_VOLUME_PARTICIPATION * volume
+        capacity = _option_fill_capacity(volume)
         if required > capacity:
             return (
                 f"order requires {required:g} contracts but bar volume {volume:g} allows "
@@ -4317,12 +4378,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                                             rounding=ROUND_HALF_UP)
         return f"{contract_symbol[:-8]}{int(adjusted * 1000):08d}", float(adjusted)
 
-    def _log_rekey_once(self, key, level: int, fmt: str, *args) -> None:
-        """A re-key refusal/deferral is re-evaluated on every bar; explain it ONCE per key."""
+    def _log_rekey_once(self, key, level: int, fmt: str, *args, refusal: bool = True) -> None:
+        """A re-key refusal/deferral is re-evaluated on every bar; explain it ONCE per key --
+        and count it once (``option_split_rekey_refusals``) unless it is not a refusal."""
         if key in self._split_rekey_logged:
             logger.debug(fmt, *args)
             return
         self._split_rekey_logged.add(key)
+        if refusal:
+            self._integrity()["option_split_rekey_refusals"] += 1
         logger.log(level, fmt, *args)
 
     def apply_split_rekeys(self) -> int:
@@ -4474,7 +4538,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 "were traded in ANOTHER share basis (a different contract that used the string "
                 "before the split). Order-derived lookups take the first row per OCC string, so "
                 "they may attribute the re-keyed lot's group/strategy to those rows.",
-                new, target_of[new], ids, new)
+                new, target_of[new], ids, new, refusal=False)
         # The rows to move must add up to the lot: a lot whose book does not reconcile cannot
         # have its linkage moved consistently (an exit would close the wrong quantity).
         for cs in list(plans):
@@ -4673,6 +4737,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             else:
                 self._option_positions[new.contract_symbol] = new
                 merged = ""
+            self._integrity()["option_split_rekeys"] += 1
             logger.info(
                 "[backtest] option lot RE-KEYED at the %s %d:1 split (%s): %s %+g @ %.4f -> %s "
                 "%+g @ %.4f, strike %g -> %g%s.", new.underlying, p["ratio"], today,
@@ -4741,6 +4806,30 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """True when this run was built with an option reader (an options run), False on the
         equity-only path. ``supports_options`` is the CLASS capability and is always True."""
         return self._options is not None
+
+    def _integrity(self) -> Dict[str, Any]:
+        """The run's option-integrity counters (created on first use for account doubles built
+        without ``__init__``)."""
+        c = getattr(self, "_option_integrity", None)
+        if c is None:
+            c = self._option_integrity = _new_integrity_counters()
+        return c
+
+    def option_integrity_stats(self) -> Dict[str, Any]:
+        """The option-integrity counters of this run, JSON-safe (results.py publishes each key):
+
+          * ``option_ledger_mismatches``: {count, examples (first 3)} -- DISTINCT lot/view
+            disagreements found by ``check_option_ledger`` (Task 13);
+          * ``option_orders_volume_sized`` / ``option_orders_volume_refused``: opening orders
+            cut / not placed by the fill-volume cap (Task 11);
+          * ``option_split_rekeys`` / ``option_split_rekey_refusals``: lots re-keyed at a split,
+            and distinct NOT-RE-KEYED explanations (refused or deferred; Task 1b).
+
+        Recorded, not scored."""
+        c = self._integrity()
+        return {**c, "option_ledger_mismatches": {
+            "count": c["option_ledger_mismatches"]["count"],
+            "examples": [dict(e) for e in c["option_ledger_mismatches"]["examples"]]}}
 
     def option_basis_guard_stats(self) -> Optional[Dict[str, Any]]:
         """The run's E4 split-basis guard counters (``option_basis_guard.BasisGuard.stats``),
@@ -5078,6 +5167,70 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
         return out
 
+    def option_order_quantity_limit(self, legs, quantity: int, option_strategy) -> int:
+        """OVERRIDE (OptionsAccountInterface size seam, plan 2026-09-24 Task 11): with the run's
+        ``option_size_within_fill_volume`` on, cap an OPENING order at what the fill engine
+        will let fill.
+
+        The fill engine refuses a fill whose contracts exceed ``_option_fill_capacity`` of the
+        fill bar's volume (``_volume_cap_reject_reason``); an order sized above it just expires
+        (about half of the expired O_LP entries in the 2026-09-24 diagnosis). Here the same
+        capacity is read on the DECISION bar -- the bar the order is decided on, and under
+        ``same_bar_close`` the very bar it fills on. Under ``next_bar_open`` the fill engine
+        normally reads the NEXT session's volume (its documented look-ahead); with this flag on
+        it reads the decision bar too (``_option_fill_price``), so the size decided here is
+        exactly the size the fill engine admits.
+
+        The shared entry choke point (``_OptionEntryAction._submit_option_order``) asks this
+        FIRST, so the reserve, the RM admission/charge and the entry record are the capped
+        order's; ``submit_option_order`` asks again as a backstop (idempotent).
+
+        MULTI-LEG: the parent quantity is a STRUCTURE count and each leg fills
+        ``structures x ratio_qty`` contracts, so the cap is the most constrained leg's
+        ``floor(capacity / ratio_qty)``.
+
+        Scope: only orders whose every leg OPENS (``*_to_open``). A close, a roll or a
+        partial flatten keeps its size -- capping an exit would leave a remainder the exit rule
+        has to fire again for, which is a different behaviour change than this one.
+
+        0 -> the order is not placed (the base returns None) and the reason is logged at
+        WARNING: never a silent 0."""
+        # ``getattr``: account doubles built without __init__ (parity harnesses) carry no config;
+        # for them, as for every run that does not state the flag, it is OFF.
+        cfg = getattr(self, "_cfg", None) or {}
+        if not cfg.get("option_size_within_fill_volume", False) or getattr(self, "_options", None) is None:
+            return quantity
+        if not legs or any(not (getattr(l, "position_intent", "") or "").endswith("_to_open")
+                           for l in legs):
+            return quantity
+        allowed = None
+        tightest = None
+        for leg in legs:
+            bar = self._option_bar(leg.contract_symbol)
+            volume = bar.get("volume") if bar else None
+            per_unit = float(getattr(leg, "ratio_qty", 1) or 1)
+            n = _max_units_within(_option_fill_capacity(volume), per_unit)
+            if allowed is None or n < allowed:
+                allowed, tightest = n, (leg.contract_symbol, volume, per_unit)
+        if allowed >= quantity:
+            return quantity
+        contract, volume, per_unit = tightest
+        if allowed <= 0:
+            self._integrity()["option_orders_volume_refused"] += 1
+            logger.warning(
+                "[backtest] option order NOT PLACED (%s x%d, option_size_within_fill_volume): "
+                "%s's decision-bar volume %s lets %.0f%% participation fill no %s, so not even "
+                "one would fill.", option_strategy, quantity, contract, volume,
+                _OPTION_FILL_MAX_VOLUME_PARTICIPATION * 100,
+                "contract" if per_unit == 1 else f"structure ({per_unit:g} contracts each)")
+            return 0
+        self._integrity()["option_orders_volume_sized"] += 1
+        logger.info(
+            "[backtest] option order sized %d -> %d (%s, option_size_within_fill_volume): %s's "
+            "decision-bar volume %s allows %d at %.0f%% participation.", quantity, allowed,
+            option_strategy, contract, volume, allowed, _OPTION_FILL_MAX_VOLUME_PARTICIPATION * 100)
+        return allowed
+
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
         """Stage the option order(s) so the per-bar fill engine fills them next bar.
 
@@ -5114,8 +5267,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         (BUY long -> SELL_TO_CLOSE; SELL short -> BUY_TO_CLOSE) and routes it through the
         inherited ``submit_option_order`` so it is staged fillable like any other option order.
 
-        The close RIDES the OPEN position's transaction (we look up the OPENED option
-        transaction for the contract and pass its id), so the sell-to-close leg REDUCES the
+        The close RIDES the OPEN position's transaction -- the caller's ``transaction_id`` when
+        it still holds the position, else the shared open-holder lookup (see below) -- so the
+        sell-to-close leg REDUCES the
         original position to flat (net open qty -> 0) instead of spawning a separate OPENED
         transaction holding the opposite-side leg. This also lets round-trip P&L pair the
         open and close (they share one ``transaction_id``).
@@ -5137,84 +5291,37 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             expiry=position.expiry,
             underlying=position.underlying,
         )
+        # WHICH TRANSACTION THE CLOSE RIDES (Task 13, revised by review 2026-09-25 I2).
+        # An explicit id -- what the shared CloseOptionAction now passes: the transaction of the
+        # order it resolved -- wins, as on every live account, PROVIDED that transaction still
+        # holds the contract on this side; one that holds nothing would book a close that opens
+        # the opposite position on it, so that is an ERROR and the id is dropped. Without an id
+        # the SHARED lookup answers (open_option_transaction_id_for_contract: the lowest-id
+        # transaction still holding a net position) -- exact live parity. The earlier
+        # backtest-only requester heuristic (matching the position's quantity/price to a
+        # holder) is retired: with the id passed it had nothing left to decide, and where it
+        # guessed it could guess wrong (two holders of equal size and price).
         if transaction_id is not None:
-            # An explicit id wins -- the interface contract (live AlpacaAccount does the same).
-            bookings = [(transaction_id, int(position.quantity))]
-        else:
-            bookings = self._close_bookings(position)
-        first = None
-        for txn_id, qty in bookings:
-            submitted = self.submit_option_order(
-                legs=[leg],
-                quantity=int(qty),
-                order_type=order_type,
-                limit_price=limit_price,
-                option_strategy="close",
-                transaction_id=txn_id,
-            )
-            if first is None:
-                first = submitted
-        return first
-
-    def _close_bookings(self, position) -> List[tuple]:
-        """[(transaction id, contracts)] a close of ``position`` is booked on (Task 13).
-
-        One OPENED transaction holding the contract on the position's side (every run without
-        a shared contract): that one -- the old behaviour. None: the old lookup
-        (``_option_transaction_for_contract``), which may also answer None.
-
-        SEVERAL (two transactions -- e.g. two experts, or a re-keyed lot merged at a split --
-        on one contract): the close belongs to the transaction that REQUESTED it. The shared
-        caller (``CloseOptionAction``) does not pass its transaction id; it builds the
-        position from that transaction's option order (quantity = the order's filled qty,
-        avg = its fill price), so the requester is the holder whose order -- or whose own
-        position view (open qty, transaction open price) -- has exactly those numbers. Passing
-        the id from the shared action would be the direct fix, but that is a LIVE code path
-        and is left to a separate decision; nothing here changes live.
-
-        No holder matches (a genuinely contract-level request): FIFO lot relief, the brokers
-        default -- the oldest holding transaction is closed first, one close order per
-        transaction, so each order reduces exactly the transaction it rides. FIFO rather than
-        pro-rata because it is what a broker does and keeps whole contracts per transaction.
-        The extra orders carry no exit_record (the caller stamps only the returned one) and
-        the split is logged at WARNING."""
-        long_ = position.side == OrderDirection.BUY
-        holdings = [(t, q) for t, q in self._open_option_holdings(position.contract_symbol)
-                    if (q > 0) == long_]
-        if len(holdings) <= 1:
-            txn = (holdings[0][0] if holdings
-                   else self._option_transaction_for_contract(position.contract_symbol))
-            return [(getattr(txn, "id", None) if txn is not None else None,
-                     int(position.quantity))]
-        want_qty = float(position.quantity)
-        want_px = position.avg_entry_price
-        executed = OrderStatus.get_executed_statuses()
-        for t, q in holdings:
-            views = [(abs(q), t.open_price)]
-            for o in self._orders_filtered(transaction_id=t.id):
-                if (o.contract_symbol == position.contract_symbol and o.status in executed
-                        and (o.side == OrderDirection.BUY) == long_):
-                    views.append((float(o.filled_qty or o.quantity or 0.0), o.open_price))
-            if any(abs(vq - want_qty) < 1e-9 and vp is not None and want_px is not None
-                   and abs(float(vp) - float(want_px)) < 1e-9 for vq, vp in views):
-                return [(t.id, int(position.quantity))]
-        remaining = int(position.quantity)
-        out = []
-        for t, q in holdings:
-            if remaining <= 0:
-                break
-            take = min(remaining, int(round(abs(q))))
-            if take > 0:
-                out.append((t.id, take))
-                remaining -= take
-        if remaining > 0 and out:
-            out[-1] = (out[-1][0], out[-1][1] + remaining)
-        logger.warning(
-            "[backtest] close of %s %g x %s matches none of the %d OPENED transactions holding "
-            "it: booked FIFO as %s (one close order per transaction; only the first carries "
-            "the exit record).", "long" if long_ else "short", position.quantity,
-            position.contract_symbol, len(holdings), out)
-        return out
+            long_ = position.side == OrderDirection.BUY
+            held = {t.id: q for t, q in self._open_option_holdings(position.contract_symbol)}
+            q = held.get(transaction_id, 0.0)
+            if q == 0 or (q > 0) != long_:
+                logger.error(
+                    "[backtest] close of %s %s requested for transaction %s, which holds no %s "
+                    "position in it (net %+g); falling back to the shared open-holder lookup.",
+                    "long" if long_ else "short", position.contract_symbol, transaction_id,
+                    "long" if long_ else "short", q)
+                transaction_id = None
+        if transaction_id is None:
+            transaction_id = self.open_option_transaction_id_for_contract(position.contract_symbol)
+        return self.submit_option_order(
+            legs=[leg],
+            quantity=int(position.quantity),
+            order_type=order_type,
+            limit_price=limit_price,
+            option_strategy="close",
+            transaction_id=transaction_id,
+        )
 
     def _open_option_holdings(self, contract_symbol: str) -> List[tuple]:
         """[(transaction, signed contracts held)] for every OPENED transaction holding
@@ -5267,6 +5374,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if key in self._split_rekey_logged:
                 continue
             self._split_rekey_logged.add(key)
+            lm = self._integrity()["option_ledger_mismatches"]
+            lm["count"] += 1
+            if len(lm["examples"]) < 3:
+                lm["examples"].append({"contract": cs, "lot_qty": lq, "view_qty": vq,
+                                       "date": self._as_of_date().isoformat(),
+                                       "context": context or "check"})
             logger.error(
                 "[backtest] OPTION LEDGER MISMATCH (%s, %s): %s -- the lot ledger holds %+g "
                 "contract(s) but the OPENED transactions show %+g. The lot is marked, margined "

@@ -279,6 +279,19 @@ class OptionsAccountInterface(ABC):
         the very same int."""
         return self.option_shares_in_equity_units(underlying, pledged)
 
+    def option_order_quantity_limit(self, legs: List[OptionLeg], quantity: int,
+                                    option_strategy: Optional[str]) -> int:
+        """The contract (single leg) / structure (multi-leg) count an option order may be
+        placed at -- ``quantity`` unchanged here.
+
+        A seam for a SIMULATED account: ``BacktestAccount`` caps an opening order at what its
+        fill engine's volume-participation cap will let fill (plan 2026-09-24 Task 11, behind
+        a run flag). A live broker fills a small order against the quote whatever the day's
+        volume, so live keeps the requested size: this default is the identity. A result of 0
+        means "do not place the order"; ``submit_option_order`` then returns None before any
+        row is written, and the account that answered 0 must have logged why."""
+        return quantity
+
     # --- Market data -------------------------------------------------------
     @abstractmethod
     def get_option_chain(
@@ -420,6 +433,16 @@ class OptionsAccountInterface(ABC):
                 "calendar/diagonal would be recorded with an expiry that is simply wrong for "
                 "part of the position. No order or transaction has been created."
             )
+
+        # SIZE SEAM (plan 2026-09-24 Task 11) -- the identity on every live account (see
+        # ``option_order_quantity_limit``); a simulated account may cap the order at what its
+        # fill engine can fill. Before the cover guard (which then checks the size actually
+        # placed) and before every write, so a 0 leaves nothing half-recorded.
+        capped = self.option_order_quantity_limit(legs, quantity, option_strategy)
+        if capped != quantity:
+            if capped <= 0:
+                return None
+            quantity = capped
 
         # COVER INVARIANT — same placement and the same reason: BEFORE the parent order,
         # the leg children and the Transaction are written, and before the try/except that

@@ -245,6 +245,13 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
         # without this count the two look the same. Additive; recorded, not scored.
         metrics["option_min_one_contract_floored_entries"] = (
             account.option_min_one_contract_floored_entries())
+        # Option-integrity counters (plan 2026-09-24 Tasks 1b / 11 / 13): ledger mismatches,
+        # volume-sized / refused orders, split re-keys and re-key refusals. A GA trial child
+        # runs with logging disabled, so these keys are how those events stay visible. Options
+        # runs only (additive keys; equity results unchanged). Recorded, not scored.
+        stats = getattr(account, "option_integrity_stats", None)
+        if callable(stats):
+            metrics.update(stats())
     return metrics
 
 

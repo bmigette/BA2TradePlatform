@@ -4682,6 +4682,12 @@ def _add_option_spread_args(p) -> None:
     p.add_argument("--option-spread-min-tick", type=float, default=None,
                    help="LEGACY override: absolute floor on the percent-of-premium spread in "
                         "premium dollars (full width). Setting it selects the legacy model.")
+    p.add_argument("--option-size-within-fill-volume", action="store_true", default=False,
+                   help="BACKTEST-ONLY: size every OPENING option order at order time to what "
+                        "the fill engine's 10%%-of-bar-volume participation cap can fill "
+                        "(decision bar; a multi-leg structure by its most constrained leg). "
+                        "Off by default so older runs reproduce; tools/stage1_run.sh turns it "
+                        "on. Changes which trades exist: not comparable across the setting.")
 
 
 def _option_spread_account_settings(args) -> Dict[str, Any]:
@@ -4702,6 +4708,15 @@ def _option_spread_account_settings(args) -> Dict[str, Any]:
                 "option_spread_min_tick": float(_LEGACY_OPTION_SPREAD_MIN_TICK
                                                 if tick is None else tick)}
     return {"option_spread_model": model}
+
+
+def _option_sizing_account_settings(args) -> Dict[str, Any]:
+    """``option_size_within_fill_volume`` (plan 2026-09-24 Task 11) for ``account_settings`` --
+    written ONLY when on, so a run that does not ask for it has exactly the config it had
+    before (its identity, its stored shape, its reproduction)."""
+    if getattr(args, "option_size_within_fill_volume", False):
+        return {"option_size_within_fill_volume": True}
+    return {}
 
 
 # adding a stock-managing structure later is one line, next to the reason.
@@ -6089,6 +6104,8 @@ def _cmd_optimize(args) -> int:
                 # The option spread model + its legacy knobs (plan Part F): see
                 # _option_spread_account_settings.
                 **_option_spread_account_settings(args),
+                # Order-time sizing within the fill-volume cap (Task 11), only when asked.
+                **_option_sizing_account_settings(args),
                 "fill_model": args.fill_model,
                 # RUN-LEVEL, never a gene (see --equity-cap): every individual in the
                 # population must face the same capital, or they are scored against
@@ -6455,6 +6472,8 @@ def _cmd_optimize_batch(args) -> int:
                     "spread_bps": float(getattr(args, "spread_bps", 0.0)),
                     # The option spread model + its legacy knobs (plan Part F).
                     **_option_spread_account_settings(args),
+                    # Order-time sizing within the fill-volume cap (Task 11), only when asked.
+                    **_option_sizing_account_settings(args),
                     "fill_model": args.fill_model,
                     # RUN-LEVEL, never a gene (see --equity-cap). None = off.
                     "equity_cap": getattr(args, "equity_cap", None),

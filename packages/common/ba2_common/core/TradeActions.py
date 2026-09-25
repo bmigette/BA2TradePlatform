@@ -3330,6 +3330,35 @@ class _OptionEntryAction(TradeAction):
         would turn a quote gene into a size gene and make ``option_sizing``'s own band mean
         something different at each level of it.
         """
+        # THE SIZE SEAM, FIRST (plan 2026-09-24 Task 11). ``option_order_quantity_limit`` is
+        # the identity on every live account; a simulated account running
+        # ``option_size_within_fill_volume`` may cut the order to what its fill engine can fill.
+        # It must be asked HERE, before anything is derived from the quantity: the reserve
+        # stamped on the row (read back by ``reserved_option_buying_power_detail`` for the
+        # position's whole life), the RM admission and its ``record_submitted`` charge, the
+        # entry record and ``data["quantity"]``. Asked only inside ``submit_option_order`` (still
+        # the backstop there, idempotent: an already-capped quantity comes back unchanged), a
+        # cut order kept the UNCAPPED reserve and charge -- an 8 -> 3 cut over-reserved ~2.7x and
+        # throttled every later entry. ``option_reserve_required`` is ``per-contract x quantity``
+        # on every branch, so the reserve rescales exactly. The builder's own buying-power check
+        # ran on the uncapped reserve before this point, which only errs conservative.
+        limit_fn = getattr(self.account, "option_order_quantity_limit", None)
+        if callable(limit_fn):
+            capped = limit_fn(legs, quantity, option_strategy)
+            # Only a NUMBER is an answer (a test double's auto-attribute is not one).
+            if isinstance(capped, (int, float)) and not isinstance(capped, bool) \
+                    and capped != quantity:
+                if capped <= 0:
+                    return self._result(
+                        False,
+                        f"{option_strategy} for {self.instrument_name} NOT PLACED: the fill-volume "
+                        f"cap (option_size_within_fill_volume) lets no {quantity}-lot of these legs "
+                        f"fill on the decision bar",
+                        {"option_strategy": option_strategy, "quantity": quantity,
+                         "volume_capped_to": 0})
+                if option_reserve is not None:
+                    option_reserve = option_reserve * capped / quantity
+                quantity = capped
         quoted = self._quote_with_concession(legs, limit_price)
         expert_rec_id = self.expert_recommendation.id if self.expert_recommendation else None
         data = {
@@ -6272,7 +6301,18 @@ class CloseOptionAction(TradeAction):
                     data={"contract_symbol": position.contract_symbol, "limit_price": limit_price,
                           "status": "PENDING"})
 
-            result = self.account.close_option_position(position, order_type="limit", limit_price=limit_price)
+            # THE CLOSE RIDES THE TRANSACTION IT WAS DECIDED FOR (review 2026-09-25 I2). The
+            # resolved order belongs to exactly one transaction; passing its id makes the
+            # account book the close there instead of re-deriving "the" holder from the
+            # contract, which picks the FIRST open holder when two transactions hold the same
+            # contract (two experts, a merged lot) -- closing the wrong one and leaving the
+            # other open (a spread leg closed out of the wrong structure leaves its partner
+            # naked). Every account honours an explicit id (AlpacaAccount's close_option_position
+            # "an explicit transaction_id from a caller that has one still wins";
+            # _close_multi_leg already passes it); with one holder it is the same id as before.
+            result = self.account.close_option_position(
+                position, order_type="limit", limit_price=limit_price,
+                transaction_id=getattr(order, "transaction_id", None))
             if result is None:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
