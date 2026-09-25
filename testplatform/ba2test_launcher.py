@@ -5457,6 +5457,308 @@ def _build_strategy_option_group(kind: str):
     return s
 
 
+# --- STAGE-2 STYLE GROUPS ---------------------------------------------------------------------
+# docs/plans/2026-09-25-option-stage2-build.md, Tasks 3-7. ONE expert per trading style, built
+# from a JSON style spec (``--style-config F --style NAME``) rather than from a hard-coded
+# group: each member keeps its OWN single-job builder's entry rule, exit bands and genes, its
+# entry becomes toggleable, and its exits are scoped to it by an ``entry_tag`` leaf. This
+# section holds the spec side: the member -> tag table, what may be a member, and the
+# loader/validator. Every check is a ``ValueError`` naming the style, the member and the
+# reason; the CLI turns it into ``sys.exit`` (Task 7).
+
+_STYLE_KEY = "O_STYLE"
+#: Strategy keys whose builder needs a run input (a style spec) -- excluded from every test that
+#: builds "every registered key" with no spec (Task 7 lists them).
+_SPEC_DRIVEN_STRATEGIES = {_STYLE_KEY}
+_GRID1_FAMILY_KEYS = {"OS1", "OS2", "OS3", "OS4"}
+
+#: member -> entry_tag. APPEND-ONLY PERSISTED CONTRACT: the tag is written on live and backtest
+#: order rows and read back by every deployed style ruleset. Never renumber, never reuse a value.
+#: O_CC / O_PP joined on 2026-09-25 (plan revision E1: an equity entry is routed through the RM
+#: per entry, so a stock-plus-option member can share an expert with option members).
+_STYLE_MEMBER_TAGS = {
+    "O_LC": 1, "O_LP": 2, "O_VERT": 3, "O_BULLCS": 4, "O_BF": 5, "O_BEARCS": 6, "O_BULLPS": 7,
+    "O_IC": 8, "O_JL": 9, "O_RS": 10, "O_CSP": 11, "O_STRD": 12, "O_STRG": 13, "O_WHEEL": 14,
+    "O_LEAP": 15, "O_PMCC": 16, "O_CONVEX": 17, "O_ERN": 18, "O_CBS": 19, "O_PBS": 20,
+    "O_CC": 21, "O_PP": 22,
+}
+#: Members whose short leg is assigned PER LEG (not unit-settled as a defined-risk combo --
+#: BacktestAccount.defined_risk_combo_strategy returns None for them), so an assignment leaves
+#: STOCK behind. Since plan revision E2 the run holds that stock only for the members listed in
+#: ``hold_assigned_stock_tags`` (the wheel) and liquidates the others' at the next bar's open,
+#: so these members may share a style with O_WHEEL; the set stays the statement of which members
+#: can put stock on the book at all (Task 9 checks it against the settlement path).
+_STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL"}
+#: Members whose ENTRY is an equity buy (the S2 baseline in round lots) with an option overlay
+#: in their exits. Admissible (revision E1), but the option-entry ``action_overrides`` have
+#: nothing to act on for them.
+_STYLE_EQUITY_ENTRY = {"O_CC", "O_PP"}
+_STYLE_MEMBER_FIELDS = {"key", "action_overrides", "exit_overrides", "note"}
+_STYLE_FIELDS = {"status", "note", "members", "price_cap_policy", "convex_fitness_waiver"}
+_STYLE_STATUSES = {"candidate", "approved"}
+_STYLE_PRICE_CAP_POLICIES = {"group_min", "none"}
+_STYLE_ACTION_OVERRIDE_KEYS = {"option_dte_min", "option_dte_max", "option_dte_min_range",
+                               "option_dte_max_range", "option_dte_step"}
+_STYLE_EXIT_OVERRIDE_FIELDS = {"value", "value_min", "value_max", "value_step"}
+#: Condition-leaf ids two members may both carry: the deliberately SHARED gates (plan §0 --
+#: ``shared-rel_volume`` / ``shared-gate_confidence`` are one gene in singles and groups alike).
+_STYLE_SHARED_LEAF_PREFIX = "shared-"
+_STYLE_PLAN = "docs/plans/2026-09-25-option-stage2-build.md"
+
+
+def _style_admissible_members() -> set:
+    """Derived from the builders, never restated: every launchable option key whose builder is
+    a single, a non-grid-1 group (O_LEAP/O_CONVEX), the wheel, or a stock-plus-option overlay
+    (O_CC/O_PP, revision E1), minus the risk and phase exclusions."""
+    overlay_builders = (_build_strategy_covered_call, _build_strategy_protective_put)
+    out = set()
+    for k, b in _STRATEGY_BUILDERS.items():
+        if (b is _build_strategy_option or b is _build_strategy_wheel
+                or b in overlay_builders
+                or (b is _build_strategy_option_group and k not in _GRID1_FAMILY_KEYS)):
+            out.add(k)
+    return out - _UNDEFINED_RISK_MEMBERS - set(_PHASE_GATED_OPTION_STRATEGIES)
+
+
+def _style_tree_leaves(node, out=None) -> list:
+    """Every condition LEAF (a dict with ``field``) of a rule's condition tree, in order."""
+    out = [] if out is None else out
+    if isinstance(node, dict):
+        if "field" in node:
+            out.append(node)
+        for child in node.get("conditions") or []:
+            _style_tree_leaves(child, out)
+    elif isinstance(node, list):
+        for child in node:
+            _style_tree_leaves(child, out)
+    return out
+
+
+def _style_is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _style_member_group_of(key: str) -> "str | None":
+    """The group key an ARM belongs to (O_LEAPC -> O_LEAP), or None."""
+    for group, members in _OPTION_GROUPS_ALL.items():
+        if group not in _GRID1_FAMILY_KEYS and key in members:
+            return group
+    return None
+
+
+def _validate_style_member_key(where: str, key, admissible: set) -> None:
+    if not isinstance(key, str) or not key:
+        raise ValueError(f"{where}: member 'key' must be a non-empty strategy key, got {key!r}")
+    if key in _GRID1_FAMILY_KEYS:
+        raise ValueError(
+            f"{where}: {key} is a grid-1 FAMILY key, not a structure; list the members "
+            f"({', '.join(_OPTION_GROUPS[key])}) as separate style members instead")
+    group = _style_member_group_of(key)
+    if group is not None and key not in admissible:
+        raise ValueError(
+            f"{where}: {key} is an arm of the group key {group}, never launchable on its own; "
+            f"the member is {group} (both arms, each its own toggleable entry)")
+    if key in _UNDEFINED_RISK_MEMBERS:
+        raise ValueError(
+            f"{where}: {key} has unbounded risk (_UNDEFINED_RISK_MEMBERS: a net-uncovered short "
+            f"call) and left the searched set on 2026-08-31; it cannot be a style member")
+    if key in _PHASE_GATED_OPTION_STRATEGIES:
+        raise ValueError(
+            f"{where}: {key} is phase-gated ({_PHASE_GATED_OPTION_STRATEGIES[key]}); it cannot "
+            f"be a style member")
+    if key == "O_STK":
+        raise ValueError(
+            f"{where}: O_STK is a plain equity long with no option structure; the stock-plus-"
+            f"option members a style may hold are {sorted(_STYLE_EQUITY_ENTRY)}")
+    if key not in admissible:
+        raise ValueError(
+            f"{where}: {key!r} is not a style member (admissible: {sorted(admissible)})")
+
+
+def _validate_style_action_overrides(where: str, key: str, overrides) -> None:
+    if not isinstance(overrides, dict) or not overrides:
+        raise ValueError(f"{where}: action_overrides must be a non-empty object, "
+                         f"got {overrides!r}")
+    if key in _STYLE_EQUITY_ENTRY:
+        raise ValueError(
+            f"{where}: {key}'s entry is an equity buy, so option action_overrides "
+            f"{sorted(overrides)} would act on nothing (its option leg is an exit overlay)")
+    unknown = sorted(set(overrides) - _STYLE_ACTION_OVERRIDE_KEYS)
+    if unknown:
+        raise ValueError(f"{where}: action_overrides may only move the DTE band "
+                         f"({sorted(_STYLE_ACTION_OVERRIDE_KEYS)}); refused {unknown}")
+    for k, v in overrides.items():
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ValueError(f"{where}: action_overrides[{k!r}] must be a non-negative "
+                             f"integer, got {v!r}")
+    if overrides.get("option_dte_step") == 0:
+        raise ValueError(f"{where}: action_overrides option_dte_step must be > 0")
+    for lo, hi in (("option_dte_min", "option_dte_max"),
+                   ("option_dte_min_range", "option_dte_max_range")):
+        if lo in overrides and hi in overrides and overrides[lo] > overrides[hi]:
+            raise ValueError(f"{where}: action_overrides {lo}={overrides[lo]} > "
+                             f"{hi}={overrides[hi]}")
+
+
+def _validate_style_exit_overrides(where: str, overrides) -> None:
+    """Field names and internal consistency only. Whether each id names a real exit condition
+    of the member is checked where the member's exits are built (Task 6)."""
+    if not isinstance(overrides, dict) or not overrides:
+        raise ValueError(f"{where}: exit_overrides must be a non-empty object, got {overrides!r}")
+    for cid, band in overrides.items():
+        if not isinstance(band, dict) or not band:
+            raise ValueError(f"{where}: exit_overrides[{cid!r}] must be a non-empty object of "
+                             f"{sorted(_STYLE_EXIT_OVERRIDE_FIELDS)}, got {band!r}")
+        unknown = sorted(set(band) - _STYLE_EXIT_OVERRIDE_FIELDS)
+        if unknown:
+            raise ValueError(f"{where}: exit_overrides[{cid!r}] may only set "
+                             f"{sorted(_STYLE_EXIT_OVERRIDE_FIELDS)}; refused {unknown}")
+        bad = sorted(f for f, v in band.items() if not _style_is_number(v))
+        if bad:
+            raise ValueError(f"{where}: exit_overrides[{cid!r}] {bad} must be numbers")
+        if "value_step" in band and band["value_step"] <= 0:
+            raise ValueError(f"{where}: exit_overrides[{cid!r}] value_step must be > 0")
+        order = [f for f in ("value_min", "value", "value_max") if f in band]
+        for a, b in zip(order, order[1:]):
+            if band[a] > band[b]:
+                raise ValueError(f"{where}: exit_overrides[{cid!r}] {a}={band[a]} > "
+                                 f"{b}={band[b]}")
+
+
+def _style_entry_ids(key: str) -> set:
+    """The entry rule ids and non-shared entry condition ids ``key``'s own builder emits."""
+    ids = set()
+    for rule in _STRATEGY_BUILDERS[key](key).entry_rules or []:
+        ids.add(rule["id"])
+        for leaf in _style_tree_leaves(rule.get("conditions")):
+            cid = leaf.get("id")
+            if cid and not cid.startswith(_STYLE_SHARED_LEAF_PREFIX):
+                ids.add(cid)
+    return ids
+
+
+def _validate_style_price_caps(where: str, style: dict, keys: list) -> None:
+    """One screener gate per job (Q3): members whose ``screener_gate_base`` differ need an
+    explicit ``price_cap_policy``, and may differ on ``price_max`` only."""
+    if "price_cap_policy" in style and style["price_cap_policy"] not in _STYLE_PRICE_CAP_POLICIES:
+        raise ValueError(f"{where}: price_cap_policy must be one of "
+                         f"{sorted(_STYLE_PRICE_CAP_POLICIES)}, got {style['price_cap_policy']!r}")
+    bases = {k: _screener_gate_base_for_strategy(k) for k in keys}
+    if all(b == bases[keys[0]] for b in bases.values()):
+        return
+    missing = object()
+    for field in sorted({f for b in bases.values() for f in b} - {"price_max"}):
+        vals = {k: b.get(field, missing) for k, b in bases.items()}
+        if len({repr(v) for v in vals.values()}) > 1:
+            shown = {k: (None if v is missing else v) for k, v in vals.items()}
+            raise ValueError(
+                f"{where}: members' screener gate bases differ on {field!r} ({shown}); a style "
+                f"job has ONE screener gate and price_cap_policy only reconciles price_max")
+    if "price_cap_policy" not in style:
+        caps = {k: b.get("price_max") for k, b in bases.items()}
+        raise ValueError(
+            f"{where}: members carry different price caps {caps} and a style job has ONE "
+            f"screener gate; set price_cap_policy to 'none' (no price gate, sizing refuses "
+            f"unaffordable entries) or 'group_min' (every member capped at the lowest). "
+            f"See Q3 in {_STYLE_PLAN}.")
+
+
+def _validate_style(name: str, style: dict) -> None:
+    """Every rule of the style spec, refusing by name (plan Task 3, as revised 2026-09-25)."""
+    where = f"style {name!r}"
+    if not isinstance(style, dict):
+        raise ValueError(f"{where}: must be an object, got {type(style).__name__}")
+    unknown = sorted(set(style) - _STYLE_FIELDS)
+    if unknown:
+        raise ValueError(f"{where}: unknown style field(s) {unknown} "
+                         f"(allowed: {sorted(_STYLE_FIELDS)})")
+    if "status" not in style or style["status"] not in _STYLE_STATUSES:
+        raise ValueError(f"{where}: status must be one of {sorted(_STYLE_STATUSES)}, got "
+                         f"{style['status'] if 'status' in style else '<missing>'!r}")
+    if "note" in style and not isinstance(style["note"], str):
+        raise ValueError(f"{where}: note must be a string")
+    if "convex_fitness_waiver" in style and not (
+            isinstance(style["convex_fitness_waiver"], str)
+            and style["convex_fitness_waiver"].strip()):
+        raise ValueError(f"{where}: convex_fitness_waiver, when present, must be a non-empty "
+                         f"string recording who accepted it and when (Q5)")
+    if "members" not in style or not isinstance(style["members"], list):
+        raise ValueError(f"{where}: members must be a list of member objects")
+    members = style["members"]
+    if not members:
+        raise ValueError(f"{where}: no members")
+    admissible = _style_admissible_members()
+    keys: list = []
+    for i, mem in enumerate(members):
+        mwhere = f"{where} member #{i + 1}"
+        if not isinstance(mem, dict):
+            raise ValueError(f"{mwhere}: must be an object, got {mem!r}")
+        unknown = sorted(set(mem) - _STYLE_MEMBER_FIELDS)
+        if unknown:
+            raise ValueError(f"{mwhere}: unknown member key(s) {unknown} "
+                             f"(allowed: {sorted(_STYLE_MEMBER_FIELDS)})")
+        if "key" not in mem:
+            raise ValueError(f"{mwhere}: no 'key'")
+        key = mem["key"]
+        _validate_style_member_key(mwhere, key, admissible)
+        mwhere = f"{where} member {key}"
+        if key in keys:
+            raise ValueError(f"{mwhere}: listed twice; a member is one entry rule block and one "
+                             f"tag, so it can appear once")
+        keys.append(key)
+        if "note" in mem and not isinstance(mem["note"], str):
+            raise ValueError(f"{mwhere}: note must be a string")
+        if "action_overrides" in mem:
+            _validate_style_action_overrides(mwhere, key, mem["action_overrides"])
+        if "exit_overrides" in mem:
+            _validate_style_exit_overrides(mwhere, mem["exit_overrides"])
+    ids = {k: _style_entry_ids(k) for k in keys}
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            clash = sorted(ids[a] & ids[b])
+            if clash:
+                raise ValueError(
+                    f"{where}: {a} and {b} build the SAME entry rule/condition ids {clash}; one "
+                    f"expert cannot carry two entry rules under one id (their genes would be one "
+                    f"gene). Keep one of them"
+                    + (" -- O_WHEEL's entry IS O_CSP's" if {a, b} == {"O_WHEEL", "O_CSP"}
+                       else "") + ".")
+    _validate_style_price_caps(where, style, keys)
+
+
+def _load_style_spec(path: str, name: str) -> dict:
+    """Load a schema-1 style spec, validate EVERY style in it (a broken sibling is still a
+    broken file), and return ``{"name", **style, "spec_sha256"}`` for ``name``. The sha is over
+    the canonical JSON (sorted keys) of THIS style only, so it is the style's content identity
+    and a sibling's edit does not move it."""
+    import hashlib
+    from copy import deepcopy
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"style spec {path}: cannot be read as JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"style spec {path}: top level must be an object")
+    unknown = sorted(set(data) - {"schema", "styles"})
+    if unknown:
+        raise ValueError(f"style spec {path}: unknown top-level field(s) {unknown}")
+    if "schema" not in data or data["schema"] != 1 or isinstance(data["schema"], bool):
+        raise ValueError(f"style spec {path}: schema must be 1, got "
+                         f"{data['schema'] if 'schema' in data else '<missing>'!r}")
+    if "styles" not in data or not isinstance(data["styles"], dict) or not data["styles"]:
+        raise ValueError(f"style spec {path}: styles must be a non-empty object")
+    for style_name in sorted(data["styles"]):
+        _validate_style(style_name, data["styles"][style_name])
+    if name not in data["styles"]:
+        raise ValueError(f"style spec {path}: no style {name!r} "
+                         f"(styles: {sorted(data['styles'])})")
+    style = data["styles"][name]
+    sha = hashlib.sha256(
+        json.dumps(style, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {"name": name, **deepcopy(style), "spec_sha256": sha}
+
+
 def _with_round_lot_entry(s, lot: int = 100):
     """Force the strategy's equity ENTRY to size in whole ``lot``-share lots (in place).
 
