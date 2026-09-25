@@ -321,6 +321,36 @@ def _is_option_order(order) -> bool:
     return getattr(txn, 'asset_class', None) == AssetClass.OPTION
 
 
+def share_adjust_target_percent(action_type, action_config: Dict[str, Any]) -> Optional[float]:
+    """The target % of virtual equity for an increase/decrease-instrument-share action.
+
+    Two spellings reach here: the unified/tree rule format and the converters write
+    ``value``; the settings rule editor saves ``target_percent``. Before 2026-09-25 only
+    ``value`` was read, so every rule built in the editor reached execution with None and
+    failed. Either key is accepted now. When BOTH are set and disagree the rule is
+    ambiguous, so it is refused (None -> the action fails with its own message) rather
+    than guessing which one the author meant.
+    """
+    name = getattr(action_type, 'value', action_type)
+    value = action_config.get('value')
+    target = action_config.get('target_percent')
+    if value is not None and target is not None:
+        try:
+            same = float(value) == float(target)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            logger.error(f"{name} action has both value={value!r} and target_percent={target!r} "
+                         f"and they disagree -- refusing the ambiguous rule")
+            return None
+        return value
+    chosen = value if value is not None else target
+    if chosen is None:
+        logger.warning(f"{name} action has no 'value' or 'target_percent' configured -- "
+                       f"target_percent will be None and the action will fail at execution")
+    return chosen
+
+
 class TradeActionEvaluator:
     """
     Evaluates trade conditions and executes actions based on rulesets.
@@ -1356,16 +1386,9 @@ class TradeActionEvaluator:
                 kwargs['percent'] = action_config.get('value')  # 'value' in config is the percentage
                 # Also allow direct stop_loss_price if provided
                 kwargs['stop_loss_price'] = action_config.get('stop_loss_price')
-            elif action_type == ExpertActionType.INCREASE_INSTRUMENT_SHARE:
-                target_val = action_config.get('value')
-                if target_val is None:
-                    logger.warning(f"INCREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
-                kwargs['target_percent'] = target_val
-            elif action_type == ExpertActionType.DECREASE_INSTRUMENT_SHARE:
-                target_val = action_config.get('value')
-                if target_val is None:
-                    logger.warning(f"DECREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
-                kwargs['target_percent'] = target_val
+            elif action_type in (ExpertActionType.INCREASE_INSTRUMENT_SHARE,
+                                 ExpertActionType.DECREASE_INSTRUMENT_SHARE):
+                kwargs['target_percent'] = share_adjust_target_percent(action_type, action_config)
             elif action_type == ExpertActionType.CLOSE_OPTION:
                 # FORCED vs DISCRETIONARY exit (review 2026-08-30 F7): classified from
                 # the firing rule's triggers so the backtest's close concession knows
