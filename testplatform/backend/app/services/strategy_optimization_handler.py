@@ -1187,6 +1187,25 @@ def _resolve_parallel_individuals(ga: Dict[str, Any]) -> int:
     return 1 if raw is None else int(raw)
 
 
+def _resolve_lattice_anchor(ga: Dict[str, Any]) -> str:
+    """The GA step-lattice anchor a job runs under (``genetic.LATTICE_ANCHORS``).
+
+    OPTIONAL key, and its absence means ``"zero"`` -- deliberately: every job persisted before the
+    key existed (the running stage-1 grid, every equity grid, every row a TOP-N re-run replays)
+    was searched on the zero-anchored lattice, and must keep decoding its genomes the same way.
+    A present-but-unknown value is refused, never mapped to a default.
+    """
+    from app.services.genetic import LATTICE_ANCHORS
+
+    if "latticeAnchor" not in ga:
+        return "zero"
+    anchor = ga["latticeAnchor"]
+    if anchor not in LATTICE_ANCHORS:
+        raise ValueError(f"optimization_config.latticeAnchor must be one of {LATTICE_ANCHORS}, "
+                         f"got {anchor!r}")
+    return anchor
+
+
 class _FatalTrialError(RuntimeError):
     """A trial failed for a reason that will affect EVERY remaining trial (incomplete prewarm,
     missing OHLCV cache). Raised out of the fitness batch to stop the search immediately rather
@@ -1466,6 +1485,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "(engine/datasets/date-range/initial_capital/...)",
             )
         expert_cfg = ga.get("expert_params")  # may be None (expert frozen)
+        try:
+            lattice_anchor = _resolve_lattice_anchor(ga)
+        except ValueError as e:
+            return _fail(opt_id, db, str(e))
 
         # SCREENER + SCHEDULE genes share the expert_params dict (the launcher merges them in
         # pre-namespaced with ``screener:``/``schedule:``). Split them out so they route to their
@@ -1622,6 +1645,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             early_stopping_generations=int(ga["earlyStoppingGenerations"]),
             elitism_percent=float(ga["elitismPercent"]),
             parallel_individuals=parallel,
+            lattice_anchor=lattice_anchor,
         )
 
         gen_state = {"gen": 0}
@@ -2958,6 +2982,11 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
 
     ``expert_settings`` (see ``checkpoint_expert_settings_identity``) joins the payload ONLY when
     non-empty, so every run that carries none keeps the fingerprint its checkpoints already have.
+
+    The GA's ``latticeAnchor`` joins it the same way -- ONLY when it is not the legacy ``"zero"``:
+    the same chromosome decodes to a different genome under the other anchor, so a min-anchored
+    search must never resume a zero-anchored checkpoint (or vice versa), while every existing
+    job's fingerprint stays exactly what its checkpoints carry.
     """
     import hashlib
     import json
@@ -2970,6 +2999,9 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     }
     if expert_settings:
         payload["expert_settings"] = sorted(expert_settings.items())
+    lattice_anchor = _resolve_lattice_anchor(ga)
+    if lattice_anchor != "zero":
+        payload["lattice_anchor"] = lattice_anchor
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 

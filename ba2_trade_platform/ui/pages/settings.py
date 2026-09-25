@@ -5164,6 +5164,61 @@ class ExpertSettingsTab:
             ui.notify(f'Error deleting expert: {e}', type='negative')
 
 
+#: Action-config keys the rule editor has NO widget for, carried forward from the loaded rule
+#: by ``_save_rule`` when the action type is unchanged. The save rebuilds ``action_config``
+#: from the widgets alone, so without this a re-save silently stripped them -- the
+#: covered-call / wheel close (``cc_dte``) lost its ``close_target`` and went back to closing
+#: the evaluated order, which on those overlays is the STOCK.
+#:
+#: A NAMED list, not "every key the editor does not know": a widget-backed field the user
+#: cleared (``min_arc``, ``strike_param``, ...) must stay cleared, and a blanket carry-over
+#: would resurrect it. Every key here must be one no widget writes (pinned by test). Keys
+#: deliberately NOT listed: ``take_profit_price`` / ``stop_loss_price`` (a fixed price wins
+#: over the value/reference widgets, so carrying it would make the user's edit inert),
+#: ``value`` on the share actions (same: it would override the Target % widget), and
+#: ``min_volume`` (no live chain carries volume; see the note in ``_save_rule``).
+PRESERVED_HIDDEN_ACTION_KEYS = ('entry_tag', 'close_target', 'entry_cross', 'lot_size')
+
+#: The action-row widget refs and the action_config key each one writes. A key whose widget
+#: is RENDERED on the row at save time is one the user could see and clear, so its absence
+#: from the saved config is the user's choice. A loaded key with no rendered widget that is
+#: not carried by PRESERVED_HIDDEN_ACTION_KEYS is dropped by the save -- and ``_save_rule``
+#: says so rather than letting it vanish.
+ACTION_WIDGET_KEYS = (
+    ('value_input', 'value'),
+    ('reference_select', 'reference_value'),
+    ('target_percent_input', 'target_percent'),
+    ('strike_method_select', 'strike_method'),
+    ('strike_param_input', 'strike_param'),
+    ('dte_min_input', 'dte_min'),
+    ('dte_max_input', 'dte_max'),
+    ('sizing_input', 'sizing'),
+    ('min_oi_input', 'min_open_interest'),
+    ('max_spread_input', 'max_spread_pct'),
+    ('wing_width_input', 'wing_width_pct'),
+    ('short_dte_min_input', 'short_dte_min'),
+    ('short_dte_max_input', 'short_dte_max'),
+    ('min_arc_input', 'min_arc'),
+    ('min_one_contract_input', 'min_one_contract'),
+    ('w_premium_input', 'w_premium'),
+    ('w_iv_input', 'w_iv'),
+    ('w_rvol_input', 'w_rvol'),
+)
+
+#: The type key and its legacy spelling: rewritten by every save, never "dropped".
+_ACTION_TYPE_KEYS = ('action_type', 'type')
+
+
+def _first_unused_row_id(prefix: str, rows) -> str:
+    """A row id no current row holds. ``f"{prefix}_{len(rows)}"`` alone is not one: load
+    action_0 + action_1, delete action_0, Add -> a second action_1, whose refs REPLACE the
+    loaded row's while its card stays on screen, and the save writes the new row over it."""
+    n = len(rows)
+    while f"{prefix}_{n}" in rows:
+        n += 1
+    return f"{prefix}_{n}"
+
+
 class TradeSettingsTab:
     """
     UI tab for managing trading rules and rulesets.
@@ -5544,7 +5599,7 @@ class TradeSettingsTab:
             logger.error("Triggers container not initialized")
             return
             
-        trigger_id = trigger_key or f"trigger_{len(self.triggers)}"
+        trigger_id = trigger_key or _first_unused_row_id("trigger", self.triggers)
         
         with self.triggers_container:
             with ui.card().classes('w-full p-2') as trigger_card:
@@ -5674,7 +5729,7 @@ class TradeSettingsTab:
             logger.error("Actions container not initialized")
             return
             
-        action_id = action_key or f"action_{len(self.actions)}"
+        action_id = action_key or _first_unused_row_id("action", self.actions)
         
         with self.actions_container:
             with ui.card().classes('w-full p-2') as action_card:
@@ -6041,6 +6096,10 @@ class TradeSettingsTab:
                 self.actions[action_id] = {
                     'card': action_card,
                     'type_select': action_select,
+                    # The rule as loaded, so _save_rule can carry forward the keys no widget
+                    # renders (PRESERVED_HIDDEN_ACTION_KEYS). A copy: nothing here may mutate
+                    # the rule object before Save.
+                    'loaded_config': dict(action_config or {}),
                     'value_input': lambda: value_input,
                     'reference_select': lambda: reference_select,
                     'target_percent_input': lambda: target_percent_input,
@@ -6164,6 +6223,9 @@ class TradeSettingsTab:
 
             # Collect actions
             actions_data = {}
+            # Drop warnings, shown only once the rule is actually WRITTEN: a notice about a
+            # save that validation then refuses would describe something that never happened.
+            notices = []
             for action_id, action_refs in self.actions.items():
                 action_type = action_refs['type_select'].value
                 action_config = {'action_type': action_type}  # Use 'action_type' instead of 'type'
@@ -6317,6 +6379,34 @@ class TradeSettingsTab:
                         # and the gate could only ever raise OptionLiquidityDataUnavailable.
                         # A field whose every value is an error is worse than no field.
 
+                # KEYS NO WIDGET RENDERS: carried forward from the loaded rule, or they are
+                # stripped by this rebuild (see PRESERVED_HIDDEN_ACTION_KEYS). Only while the
+                # type is unchanged: after a type change they are dropped like any other
+                # key, and the user is told.
+                loaded = action_refs['loaded_config']
+                loaded_type = loaded.get('action_type') or loaded.get('type')
+                same_type = loaded_type == action_type
+                if same_type:
+                    for k in PRESERVED_HIDDEN_ACTION_KEYS:
+                        if k in loaded and k not in action_config:
+                            action_config[k] = loaded[k]
+                # NO SILENT DROP. A loaded key that no rendered widget could have cleared and
+                # that was not carried is gone after this save -- say which.
+                dropped = [k for k in loaded
+                           if k not in action_config and k not in _ACTION_TYPE_KEYS]
+                if dropped:
+                    editable = {key for ref, key in ACTION_WIDGET_KEYS
+                                if action_refs[ref]() is not None}
+                    dropped = [k for k in dropped if k not in editable]
+                if dropped:
+                    if same_type:
+                        notices.append(f'Action {action_id}: dropped {", ".join(dropped)} '
+                                       f'(no editor field)')
+                    else:
+                        notices.append(f'Action {action_id}: changing the type from '
+                                       f'{loaded_type} to {action_type} dropped '
+                                       f'{", ".join(dropped)}; re-author it for the new type')
+
                 actions_data[action_id] = action_config
 
             # BEFORE any write, and AFTER the actions are collected (what the rule DOES is half
@@ -6356,7 +6446,9 @@ class TradeSettingsTab:
             self.rules_dialog.close()
             self._update_rules_table()
             ui.notify('Rule saved successfully!', type='positive')
-            
+            for notice in notices:
+                ui.notify(notice, type='warning')
+
         except Exception as e:
             logger.error(f"Error saving rule: {e}", exc_info=True)
             ui.notify(f"Error saving rule: {e}", type='negative')

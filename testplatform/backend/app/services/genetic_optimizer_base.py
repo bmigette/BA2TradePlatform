@@ -404,16 +404,13 @@ class PyGADAdapter(GeneticOptimizerBase):
         }
 
     def decode_individual(self, individual: List) -> Dict:
+        # ONE lattice formula for every engine: genetic.snap_to_lattice (legacy "zero" anchor,
+        # which is what this placeholder has always decoded with).
+        from app.services.genetic import snap_to_lattice
+
         params = {}
         for i, (param_name, config) in enumerate(self.param_ranges.items()):
-            value = individual[i]
-            if config['type'] == 'int':
-                step = config.get('step', 1)
-                value = int(round(value / step) * step)
-            else:
-                step = config.get('step', 0.01)
-                value = round(value / step) * step
-            params[param_name] = value
+            params[param_name] = snap_to_lattice(individual[i], config, "zero")
         return params
 
     def encode_params(self, params: Dict) -> List:
@@ -465,16 +462,13 @@ class ShinkaEvolveAdapter(GeneticOptimizerBase):
         }
 
     def decode_individual(self, individual: List) -> Dict:
+        # ONE lattice formula for every engine: genetic.snap_to_lattice (legacy "zero" anchor,
+        # which is what this placeholder has always decoded with).
+        from app.services.genetic import snap_to_lattice
+
         params = {}
         for i, (param_name, config) in enumerate(self.param_ranges.items()):
-            value = individual[i]
-            if config['type'] == 'int':
-                step = config.get('step', 1)
-                value = int(round(value / step) * step)
-            else:
-                step = config.get('step', 0.01)
-                value = round(value / step) * step
-            params[param_name] = value
+            params[param_name] = snap_to_lattice(individual[i], config, "zero")
         return params
 
     def encode_params(self, params: Dict) -> List:

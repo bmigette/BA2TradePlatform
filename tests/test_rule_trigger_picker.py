@@ -578,7 +578,7 @@ def test_the_refused_rule_is_not_written_and_the_operator_is_told(editor, nicegu
     """End to end through the real save: the ValueError must reach the notification, not
     the log alone, or the Save button appears to do nothing at all."""
     editor.rule_subtype_select.value = 'open_positions'
-    editor.actions['a0'] = {'type_select': SimpleNamespace(value='buy')}
+    editor.actions['a0'] = {'type_select': SimpleNamespace(value='buy'), 'loaded_config': {}}
     picker = _row(editor, nicegui_client)
     dialog = _open(nicegui_client, picker, category='market')
     _click(_entry_card(dialog, ADX))
@@ -598,7 +598,7 @@ def test_a_gated_close_rule_is_written_through_the_real_save(editor, nicegui_cli
     """The other half, end to end: the same gate on an open-positions rule that CLOSES saves,
     carrying its gate and its action exactly as authored."""
     editor.rule_subtype_select.value = 'open_positions'
-    editor.actions['a0'] = {'type_select': SimpleNamespace(value='close')}
+    editor.actions['a0'] = {'type_select': SimpleNamespace(value='close'), 'loaded_config': {}}
     picker = _row(editor, nicegui_client)
     dialog = _open(nicegui_client, picker, category='market')
     _click(_entry_card(dialog, ADX))
@@ -892,7 +892,7 @@ def test_the_link_lookup_is_used_by_the_real_save(editor, nicegui_client, linked
     saved_rule = SimpleNamespace(id=41, name='was an exit rule', triggers={}, actions={},
                                  type=None, subtype=None, continue_processing=False)
     editor.rule_subtype_select.value = 'enter_market'
-    editor.actions['a0'] = {'type_select': SimpleNamespace(value='buy')}
+    editor.actions['a0'] = {'type_select': SimpleNamespace(value='buy'), 'loaded_config': {}}
     linked_rulesets[41] = [_ruleset('exit rules', 'open_positions')]
     picker = _row(editor, nicegui_client)
     dialog = _open(nicegui_client, picker, category='market')
