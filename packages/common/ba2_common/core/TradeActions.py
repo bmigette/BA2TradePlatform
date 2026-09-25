@@ -226,7 +226,120 @@ class TradeAction(ABC):
             absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error getting expert position for {self.instrument_name}: {e}", exc_info=True)
             return None
-    
+
+    # --- Netting: an opposite order only reduces or closes this expert's own position ----------
+
+    def _own_equity_transactions(self) -> Optional[List[Any]]:
+        """This expert's WAITING/OPENED EQUITY transactions in this symbol, or None when the
+        action has no expert (a manual action: nothing is owned, so nothing can be netted).
+
+        EQUITY only, unlike ``get_expert_position``: an option Transaction's ``symbol`` is the
+        UNDERLYING and its quantity is a contract count, so summing it into a share position
+        would make a covered call read as a short. A read failure propagates -- the callers
+        decide an order's direction on this and must not guess."""
+        expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if not expert_id:
+            return None
+        from ba2_common.core.trade_store import transactions_where
+        return [t for t in transactions_where(
+                    symbol=self.instrument_name, expert_id=expert_id,
+                    statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+                if getattr(t, "asset_class", AssetClass.EQUITY) in (None, AssetClass.EQUITY)]
+
+    @staticmethod
+    def _signed_quantity(transactions) -> float:
+        """Signed share quantity of ``transactions``: long positive, short negative."""
+        return sum(abs(float(t.quantity)) * (1.0 if t.side == OrderDirection.BUY else -1.0)
+                   for t in transactions)
+
+    @staticmethod
+    def _filled_quantity(transactions) -> float:
+        """Unsigned share quantity of the OPENED ``transactions``: what a close must sell or buy
+        back at the broker. A WAITING entry has not reached the book, and ``close_transaction``
+        cancels it rather than trading against it."""
+        return sum(abs(float(t.quantity)) for t in transactions
+                   if t.status == TransactionStatus.OPENED)
+
+    def resolve_expert(self):
+        """The expert instance whose settings govern this action, or None.
+
+        Read by the regime overlay (the regime_* scales), by ``ruleset_stop_policy``
+        (allow_ruleset_sl_loosen) and by ``SellAction`` (enable_sell).
+
+        TP/SL actions are usually constructed WITHOUT an expert_recommendation (the ruleset
+        adjusts an order that already exists -- see _create_order's "copy from existing_order"
+        branch), so the recommendation is only the first of two paths; ``get_expert_id()`` is the
+        canonical fallback and already handles both the transaction and recommendation linkage
+        under the backtest in-mem store.
+
+        Returns None -> neutral scale / setting off. A missing expert must degrade to today's
+        behaviour, never to a guessed multiplier or permission.
+        """
+        try:
+            expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+            if expert_id is None and self.existing_order is not None:
+                # getattr, not a direct call: an option/stub order object need not implement the
+                # full TradingOrder surface, and a missing linkage must read as "no expert".
+                getter = getattr(self.existing_order, "get_expert_id", None)
+                expert_id = getter() if callable(getter) else None
+            if not expert_id:
+                return None
+            from ba2_common.core.instance_resolver import get_instance_resolver
+            return get_instance_resolver().get_expert_instance(expert_id)
+        except Exception as e:  # a lookup failure must never break order placement
+            absorb_if_benign(e, InstanceNotFound, InstanceResolverNotConfigured)
+            logger.debug(f"{getattr(self, '_label', type(self).__name__)}: no expert resolved ({e})")
+            return None
+
+    def selling_enabled(self) -> bool:
+        """The expert's ``enable_sell`` setting: may a SELL open a short from flat?
+
+        No expert, or the setting absent -> False. Read through ``coerce_bool`` (the GA writes
+        bool genes as integers, older rows hold the JSON string "1"); a spelling it cannot mean
+        raises, because a garbled permission is a bug to surface, not a value to guess."""
+        expert = self.resolve_expert()
+        if expert is None:
+            return False
+        raw = expert.get_setting_with_interface_default('enable_sell', log_warning=False)
+        if raw is None:
+            return False
+        from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+        return coerce_bool(raw)
+
+    def _close_own_transactions(self, transactions, action_type: str, what: str) -> Dict[str, Any]:
+        """Close ``transactions`` (this expert's own position) through ``close_transaction``.
+
+        The netting rule's reducing half: a SELL while this expert is long, or a BUY while it is
+        short, closes the position instead of staging a new ENTRY order. ``close_transaction`` is
+        the shared, live-and-backtest close path: it closes exactly the transaction's quantity
+        (capped at what is held, so the order can never flip the position), submits it with
+        ``is_closing_order=True`` against the SAME transaction (no new Transaction, no RM sizing,
+        no safeguard stop) and cancels the position's protective legs.
+
+        Deferred like ``CloseAction`` when ``submit_to_broker`` is False (manual review). The
+        result carries no ``order_id`` on purpose: the evaluator would otherwise treat the close
+        order as a new ENTRY and hang a TP/SL bracket on it."""
+        ids = [t.id for t in transactions]
+        if not self.submit_to_broker:
+            logger.info(f"{type(self).__name__}: automated trade modification disabled - "
+                        f"not closing transactions {ids} for {self.instrument_name}")
+            return self.create_and_save_action_result(
+                action_type=action_type, success=True,
+                message=f"{what} deferred for {self.instrument_name} (awaiting manual review)",
+                data={"closing": True, "transaction_ids": ids, "status": "PENDING"})
+        results = []
+        for t in transactions:
+            logger.info(f"{type(self).__name__}: {what.lower()} - closing transaction {t.id} "
+                        f"({t.side.value} {t.quantity} {self.instrument_name}) via close_transaction")
+            results.append(self.account.close_transaction(t.id))
+        success = all(r.get("success", False) for r in results)
+        return self.create_and_save_action_result(
+            action_type=action_type, success=success,
+            message=(f"{what} for {self.instrument_name}: "
+                     + "; ".join(str(r.get("message", "")) for r in results)),
+            data={"closing": True, "transaction_ids": ids,
+                  "close_order_ids": [r.get("close_order_id") for r in results]})
+
     def _build_order_data(self, expert_recommendation_id: Optional[int]) -> Optional[Dict[str, Any]]:
         """
         Build order data field by copying expert recommendation data.
@@ -437,13 +550,32 @@ class TradeAction(ABC):
 
 
 class SellAction(TradeAction):
-    """Create a pending sell order for risk management review."""
-    
+    """A SELL, as at the broker: it reduces a long, or opens a short from flat.
+
+    Which one is decided by the expert's own position, gated on its ``enable_sell`` setting:
+
+    * ``enable_sell`` OFF (every live expert today): exactly the pre-short-selling action. A
+      broker long stages a PENDING sell for the risk manager (whose permission filter then drops
+      it, as it always has); a flat book is refused.
+    * ``enable_sell`` ON:
+        - this expert LONG  -> close that long (``close_transaction``: capped at the held
+          quantity, never flips to short, never sized as an entry);
+        - this expert SHORT -> refused (a sell would add to the short);
+        - this expert flat but the BROKER long (another expert's position) -> refused: the sell
+          would reduce that position rather than open a short;
+        - flat              -> an ENTRY: a PENDING sell the risk manager sizes like a buy entry,
+          with its safeguard stop ABOVE the price, recorded as a SELL-side Transaction.
+    * A position-fetch failure refuses in every case.
+    """
+
+    #: The flat-book refusal when shorting is not permitted for the expert.
+    SELLING_DISABLED_MESSAGE = ("No position to sell and selling is disabled for this expert "
+                                "(enable_sell is off)")
+
     def execute(self) -> "TradeActionResult":
-        """
-        Create a pending sell order for the instrument.
-        The RiskManager will review, set quantity, and submit the order.
-        
+        """Stage the sell (a PENDING order for risk-management review) or close this expert's
+        long; see the class docstring for which.
+
         Returns:
             TradeActionResult object containing execution results
         """
@@ -464,41 +596,16 @@ class SellAction(TradeAction):
                              f"(broker position fetch failed) - refusing to sell"),
                     data={"position_fetch_failed": True}
                 )
-            if current_position is None or current_position <= 0:
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.SELL.value,
-                    success=False,
-                    message=f"No long position to sell for {self.instrument_name}",
-                    data={}
-                )
+            if self.selling_enabled():
+                return self._execute_selling_enabled(current_position)
 
-            # Create PENDING order record with quantity=0 (to be set by risk management)
-            # Risk management will determine the actual quantity to sell
-            order_id = self.create_order_record(
-                side="sell",
-                quantity=0.0,  # 0 indicates pending review by risk management
-                order_type="market"
-            )
-            
-            if not order_id:
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.SELL.value,
-                    success=False,
-                    message="Failed to create order record",
-                    data={}
-                )
-            
-            # Order stays in PENDING status for risk management review
-            # RiskManager will call account.submit_order() after setting quantity
-            logger.info(f"Created PENDING sell order {order_id} for {self.instrument_name} - awaiting risk management review")
-            
-            return self.create_and_save_action_result(
-                action_type=ExpertActionType.SELL.value,
-                success=True,
-                message=f"Sell order created for {self.instrument_name} (pending risk management review)",
-                data={"order_id": order_id, "status": "PENDING"}
-            )
-                
+            # enable_sell OFF: the action exactly as it was before shorts could open.
+            if current_position is None or current_position == 0:
+                return self._refuse(self.SELLING_DISABLED_MESSAGE)
+            if current_position < 0:
+                return self._refuse(f"No long position to sell for {self.instrument_name}")
+            return self._stage_pending_sell()
+
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error creating sell order for {self.instrument_name}: {e}", exc_info=True)
@@ -508,7 +615,91 @@ class SellAction(TradeAction):
                 message=f"Error creating sell order: {str(e)}",
                 data={}
             )
-    
+
+    def _refuse(self, message: str, **data) -> "TradeActionResult":
+        logger.info(f"SellAction refused for {self.instrument_name}: {message}")
+        return self.create_and_save_action_result(
+            action_type=ExpertActionType.SELL.value, success=False, message=message, data=data)
+
+    def _execute_selling_enabled(self, broker_position: Optional[float]) -> "TradeActionResult":
+        """The netting rule with ``enable_sell`` on: reduce this expert's long, else open a short
+        from a flat book, else refuse. Never flips a position."""
+        own = self._own_equity_transactions()
+        if own is None:
+            return self._refuse(f"Cannot sell {self.instrument_name}: the action has no expert, "
+                                f"so it owns no position to reduce and may not open a short")
+        own_qty = self._signed_quantity(own)
+        # None is the confirmed "not held" of get_current_position's tri-state contract (a
+        # failed fetch raised before this point), so it is a real zero, not an unknown.
+        broker_qty = 0.0 if broker_position is None else float(broker_position)
+
+        if own_qty > 0:
+            # CLOSING sell. The broker must hold at least the FILLED quantity closed, or the close
+            # would sell through zero and leave a short nobody opened.
+            longs = [t for t in own if t.side == OrderDirection.BUY]
+            filled = self._filled_quantity(longs)
+            if broker_qty < filled:
+                return self._refuse(
+                    f"Refusing to sell {self.instrument_name}: this expert holds {filled:g} long "
+                    f"but the broker shows {broker_qty:g}; closing would flip the position",
+                    own_position=filled, broker_position=broker_qty)
+            return self._close_own_transactions(longs, ExpertActionType.SELL.value,
+                                                "Sell closes the long")
+        if own_qty < 0:
+            return self._refuse(
+                f"Refusing to sell {self.instrument_name}: this expert is already short "
+                f"{-own_qty:g}; a sell would add to the short, and a new position opens only "
+                f"from flat", own_position=own_qty)
+        if broker_qty > 0:
+            return self._refuse(
+                f"Refusing to sell {self.instrument_name}: the broker holds a long of "
+                f"{broker_qty:g} that this expert does not own; a sell would reduce that "
+                f"position instead of opening a short", broker_position=broker_qty)
+
+        # ENTRY sell (open a short). The enter pass sizes it on a candidate whose side comes
+        # from the RECOMMENDATION (trade_cycle.entry_side_for), and the entry bracket's TP/SL
+        # read their direction from it too. A short entry on any other recommendation would be
+        # sized, and protected, as a LONG (a safeguard stop below the price of a short).
+        from ba2_common.core.trade_cycle import entry_side_for
+        if (self.expert_recommendation is None
+                or entry_side_for(self.expert_recommendation) != OrderDirection.SELL):
+            return self._refuse(
+                f"Refusing to open a short in {self.instrument_name}: a short entry needs a "
+                f"SELL/UNDERWEIGHT recommendation (got {self.order_recommendation}); the risk "
+                f"manager and the entry bracket would otherwise size and protect it as a long")
+        return self._stage_pending_sell(opens_short=True)
+
+    def _stage_pending_sell(self, opens_short: bool = False) -> "TradeActionResult":
+        """Create the PENDING sell (quantity 0) the risk manager sizes and submits."""
+        order_id = self.create_order_record(
+            side="sell",
+            quantity=0.0,  # 0 indicates pending review by risk management
+            order_type="market"
+        )
+
+        if not order_id:
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.SELL.value,
+                success=False,
+                message="Failed to create order record",
+                data={}
+            )
+
+        # Order stays in PENDING status for risk management review
+        # RiskManager will call account.submit_order() after setting quantity
+        logger.info(f"Created PENDING sell order {order_id} for {self.instrument_name} - awaiting risk management review"
+                    + (" (opens a short from flat)" if opens_short else ""))
+
+        data = {"order_id": order_id, "status": "PENDING"}
+        if opens_short:
+            data["opens_short"] = True
+        return self.create_and_save_action_result(
+            action_type=ExpertActionType.SELL.value,
+            success=True,
+            message=f"Sell order created for {self.instrument_name} (pending risk management review)",
+            data=data
+        )
+
     def get_description(self) -> str:
         """Get description of sell action."""
         return f"Create pending sell order for {self.instrument_name} (awaiting risk management review)"
@@ -554,6 +745,16 @@ class BuyAction(TradeAction):
             TradeActionResult object containing execution results
         """
         try:
+            # NETTING: a BUY while this expert is SHORT covers the short and never flips it.
+            # Without this the buy became a fresh ENTRY: the risk manager sized it as a new long
+            # (not capped at the short), submit_order opened a second, BUY-side Transaction with
+            # a safeguard SELL stop under it, and at the backtest account the fill first bought
+            # the short back and then went long with the rest. Unreachable without a short, so
+            # flat and long books (every long-only run) take the path below exactly as before.
+            own = self._own_equity_transactions()
+            if own and self._signed_quantity(own) < 0:
+                return self._cover_own_short(own)
+
             # Create PENDING order with quantity=0 (to be determined by risk management)
             # Risk management will calculate quantity based on:
             # - Available buying power
@@ -608,6 +809,36 @@ class BuyAction(TradeAction):
                 data={}
             )
     
+    def _cover_own_short(self, own) -> "TradeActionResult":
+        """Buy back this expert's short through ``close_transaction`` (capped at the short).
+
+        The broker must be at least as short as the FILLED quantity covered, or the buy would pass
+        through zero and leave a long nobody opened; a fetch failure refuses, as for a sell."""
+        from ba2_common.core.portfolio_allocation import PositionFetchFailed
+
+        shorts = [t for t in own if t.side == OrderDirection.SELL]
+        short_qty = self._filled_quantity(shorts)
+        try:
+            broker_position = self.get_current_position()
+        except PositionFetchFailed as e:
+            logger.error(f"BuyAction refusing to cover {self.instrument_name}: {e}")
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.BUY.value, success=False,
+                message=(f"Position book unverified for {self.instrument_name} "
+                         f"(broker position fetch failed) - refusing to cover the short"),
+                data={"position_fetch_failed": True})
+        # None = confirmed "not held" (tri-state contract; a failed fetch raised above).
+        broker_qty = 0.0 if broker_position is None else float(broker_position)
+        if -broker_qty < short_qty:
+            message = (f"Refusing to buy {self.instrument_name}: this expert is short {short_qty:g} "
+                       f"but the broker shows {broker_qty:g}; covering would flip the position")
+            logger.info(f"BuyAction refused: {message}")
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.BUY.value, success=False, message=message,
+                data={"own_position": -short_qty, "broker_position": broker_qty})
+        return self._close_own_transactions(shorts, ExpertActionType.BUY.value,
+                                            "Buy covers the short")
+
     def get_description(self) -> str:
         """Get description of buy action."""
         return f"Create pending buy order for {self.instrument_name} (awaiting risk management review)"
@@ -863,37 +1094,7 @@ class _AdjustPriceLevelAction(TradeAction):
             f"={scale:g}, offset {self.percent:+.2f}% -> {scaled:+.2f}%")
         return scaled
 
-    def resolve_expert(self):
-        """The expert instance whose genome carries this action's settings, or None.
-
-        Read by the regime overlay (the regime_* scales) and by ``ruleset_stop_policy``
-        (allow_ruleset_sl_loosen), from this action and from TradeActionEvaluator's merged
-        TP+SL branch.
-
-        TP/SL actions are usually constructed WITHOUT an expert_recommendation (the ruleset
-        adjusts an order that already exists -- see _create_order's "copy from existing_order"
-        branch), so the recommendation is only the first of two paths; ``get_expert_id()`` is the
-        canonical fallback and already handles both the transaction and recommendation linkage
-        under the backtest in-mem store.
-
-        Returns None -> neutral scale. A missing expert must degrade to today's behaviour, never
-        to a guessed multiplier.
-        """
-        try:
-            expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
-            if expert_id is None and self.existing_order is not None:
-                # getattr, not a direct call: an option/stub order object need not implement the
-                # full TradingOrder surface, and a missing linkage must read as "no expert".
-                getter = getattr(self.existing_order, "get_expert_id", None)
-                expert_id = getter() if callable(getter) else None
-            if not expert_id:
-                return None
-            from ba2_common.core.instance_resolver import get_instance_resolver
-            return get_instance_resolver().get_expert_instance(expert_id)
-        except Exception as e:  # the overlay must never break order placement
-            absorb_if_benign(e, InstanceNotFound, InstanceResolverNotConfigured)
-            logger.debug(f"{self._label} regime overlay: no expert resolved ({e}); using neutral scale")
-            return None
+    # resolve_expert() is inherited from TradeAction (shared with SellAction's enable_sell read).
 
     def _regime_expert(self):
         """Former name of :meth:`resolve_expert`, kept as an alias."""

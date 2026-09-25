@@ -19,10 +19,31 @@ import pytest
 from ba2_trade_platform.core.TradeActions import SellAction, CloseAction
 from ba2_trade_platform.core.types import OrderRecommendation
 from ba2_common.core.portfolio_allocation import PositionFetchFailed
-from tests.conftest import MockAccount
+from tests.conftest import MockAccount, MockExpert
 from tests.factories import (
     create_account_definition, create_expert_instance, create_recommendation,
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_expert_resolver():
+    """SellAction reads the expert's ``enable_sell`` (equity short selling): resolve the
+    factory's ``MockExpert`` rows to the real test class, which the live registry does not
+    know. Its ``enable_sell`` is unset, i.e. the interface default (off)."""
+    from ba2_common.core import instance_resolver
+
+    previous = instance_resolver.get_instance_resolver()
+
+    class _Resolver:
+        def get_expert_instance(self, expert_id): return MockExpert(expert_id)
+        def get_account_instance(self, account_id): return None
+        def get_account_instance_from_transaction(self, transaction): return None
+
+    instance_resolver.set_instance_resolver(_Resolver())
+    try:
+        yield
+    finally:
+        instance_resolver.set_instance_resolver(previous)
 
 
 def _account(positions):
@@ -73,10 +94,13 @@ class TestSellDuringAnOutage:
         assert "unverified" in result["message"].lower()
 
     def test_a_confirmed_flat_book_still_says_no_position(self):
-        """The honest message must stay reachable for the case it describes."""
+        """The honest message must stay reachable for the case it describes. (Since equity
+        shorts: a flat book with the expert's enable_sell off -- the interface default -- is
+        refused with the message that names both reasons.)"""
         result = _sell(_account([])).execute()
         assert result["success"] is False
-        assert "No long position to sell" in result["message"]
+        assert "No position to sell" in result["message"]
+        assert "enable_sell is off" in result["message"]
 
 
 class TestCloseDuringAnOutage:
