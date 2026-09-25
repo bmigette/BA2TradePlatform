@@ -31,7 +31,7 @@ from ba2_common.core.TradeActions import (
     ruleset_stop_policy, stop_is_long_position,
 )
 from ba2_common.core.types import (
-    AssetClass, OrderDirection, OrderRecommendation, OrderStatus, TransactionStatus,
+    AssetClass, OrderDirection, OrderRecommendation, OrderStatus, OrderType, TransactionStatus,
 )
 
 EXPERT_ID = 42
@@ -121,10 +121,19 @@ def _rec(action=OrderRecommendation.SELL):
     return SimpleNamespace(instance_id=EXPERT_ID, id=7, recommended_action=action)
 
 
-def _hold(side, qty, status=TransactionStatus.OPENED, asset_class=AssetClass.EQUITY):
+def _hold(side, qty, status=TransactionStatus.OPENED, asset_class=AssetClass.EQUITY, filled=None):
+    """An open transaction of this expert. An OPENED one gets its FILLED entry order
+    (``filled`` shares, default all of ``qty``): the netting guard measures what a close will
+    actually trade (``get_current_open_qty``), not the ordered quantity."""
     txn = Transaction(symbol=SYMBOL, quantity=qty, side=side, status=status,
                       expert_id=EXPERT_ID, asset_class=asset_class)
-    return add_instance(txn)
+    txn_id = add_instance(txn)
+    if status == TransactionStatus.OPENED and asset_class == AssetClass.EQUITY:
+        add_instance(TradingOrder(
+            account_id=1, symbol=SYMBOL, quantity=qty, side=side, order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED, filled_qty=qty if filled is None else filled,
+            transaction_id=txn_id))
+    return txn_id
 
 
 def _sell(account, action=OrderRecommendation.SELL):
@@ -277,6 +286,26 @@ class TestSellWhileLong:
         assert result["success"] is True, result["message"]
         assert account.closed == [txn_id] and _pending_orders() == []
 
+    def test_a_partially_filled_entry_closes_what_filled(self, world):
+        """100 ordered, 60 filled, the broker holds 60: close_transaction sells the measured 60,
+        so the sell is not refused (the ordered 100 would have read as 'broker holds less')."""
+        world.configure(True)
+        txn_id = _hold(OrderDirection.BUY, 100.0, filled=60.0)
+        account = _StubAccount([{"symbol": SYMBOL, "qty": 60.0}])
+        result = _sell(account).execute()
+        assert result["success"] is True, result["message"]
+        assert account.closed == [txn_id]
+
+    def test_a_zero_quantity_waiting_long_still_counts_as_long(self, world):
+        """Classified by SIDE: a WAITING BUY at quantity 0 is a long entry in flight, so a sell
+        closes (cancels) it -- it must not read as flat and open a short beside it."""
+        world.configure(True)
+        txn_id = _hold(OrderDirection.BUY, 0.0, TransactionStatus.WAITING)
+        account = _StubAccount([])
+        result = _sell(account).execute()
+        assert result["success"] is True and result["data"]["closing"] is True
+        assert account.closed == [txn_id] and _pending_orders() == []
+
     def test_a_broker_holding_less_than_the_expert_refuses_rather_than_flip(self, world):
         world.configure(True)
         _hold(OrderDirection.BUY, 10.0)
@@ -375,6 +404,20 @@ class TestBuy:
         assert result["data"]["closing"] is True and "order_id" not in result["data"]
         assert _pending_orders() == [], "a pending BUY would be sized as a fresh long entry"
 
+    def test_a_zero_quantity_waiting_short_still_counts_as_short(self, world):
+        txn_id = _hold(OrderDirection.SELL, 0.0, TransactionStatus.WAITING)
+        account = _StubAccount([])
+        result = _buy(account).execute()
+        assert result["success"] is True and result["data"]["closing"] is True
+        assert account.closed == [txn_id] and _pending_orders() == []
+
+    def test_a_partially_filled_short_covers_what_filled(self, world):
+        txn_id = _hold(OrderDirection.SELL, 100.0, filled=60.0)
+        account = _StubAccount([{"symbol": SYMBOL, "qty": -60.0}])
+        result = _buy(account).execute()
+        assert result["success"] is True, result["message"]
+        assert account.closed == [txn_id]
+
     def test_an_unfilled_short_entry_is_cancelled_not_refused(self, world):
         txn_id = _hold(OrderDirection.SELL, 10.0, TransactionStatus.WAITING)
         account = _StubAccount([])
@@ -452,3 +495,63 @@ class TestShortEntryBracketDirection:
         txn = SimpleNamespace(id=1, side=OrderDirection.SELL, stop_loss=108.0, meta_data=None)
         price, why = ruleset_stop_policy(txn, requested, False, lambda: None)
         assert (price, why) == (applied, reason)
+
+
+# --------------------------------------------------------------------------- #
+# a legacy hedge (both sides held) is refused loudly, never netted by a sum
+# --------------------------------------------------------------------------- #
+
+class TestLegacyHedge:
+    """Classification is by SIDE: a long AND a short at once (only ``allow_hedging`` could make
+    one) must not be summed into a net and acted on."""
+
+    def _both(self):
+        return _hold(OrderDirection.BUY, 10.0), _hold(OrderDirection.SELL, 4.0)
+
+    def test_a_sell_refuses(self, world):
+        world.configure(True)
+        self._both()
+        account = _StubAccount([{"symbol": SYMBOL, "qty": 6.0}])
+        result = _sell(account).execute()
+        assert result["success"] is False and "legacy hedge" in result["message"]
+        assert account.closed == [] and _pending_orders() == []
+
+    def test_a_buy_refuses(self, world):
+        self._both()
+        account = _StubAccount([{"symbol": SYMBOL, "qty": 6.0}])
+        result = _buy(account).execute()
+        assert result["success"] is False and "legacy hedge" in result["message"]
+        assert account.closed == [] and _pending_orders() == []
+
+
+# --------------------------------------------------------------------------- #
+# get_expert_position: equity shares only, the expert found like resolve_expert
+# --------------------------------------------------------------------------- #
+
+class TestExpertPosition:
+    def test_a_covered_call_is_not_a_short_share(self, world):
+        _hold(OrderDirection.BUY, 100.0)
+        _hold(OrderDirection.SELL, 1.0, asset_class=AssetClass.OPTION)
+        assert _buy(_StubAccount([])).get_expert_position() == 100.0
+
+    def test_a_pure_option_position_holds_no_shares(self, world):
+        _hold(OrderDirection.BUY, 2.0, asset_class=AssetClass.OPTION)
+        assert _buy(_StubAccount([])).get_expert_position() == 0.0
+
+    def test_long_only_equity_is_unchanged(self, world):
+        _hold(OrderDirection.BUY, 30.0)
+        _hold(OrderDirection.BUY, 5.0, TransactionStatus.WAITING)
+        assert _buy(_StubAccount([])).get_expert_position() == 35.0
+
+    def test_no_expert_is_none(self, world):
+        action = SellAction(SYMBOL, _StubAccount([]), OrderRecommendation.SELL)
+        assert action.get_expert_position() is None
+
+    def test_the_existing_orders_expert_is_the_fallback(self, world):
+        """No recommendation (a TP/SL-style action): the expert comes from the existing order,
+        exactly as resolve_expert finds it."""
+        _hold(OrderDirection.BUY, 12.0)
+        order = SimpleNamespace(get_expert_id=lambda: EXPERT_ID)
+        action = SellAction(SYMBOL, _StubAccount([]), OrderRecommendation.SELL, existing_order=order)
+        assert action.get_expert_position() == 12.0
+        assert action.resolve_expert() is not None

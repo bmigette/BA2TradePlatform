@@ -190,38 +190,23 @@ class TradeAction(ABC):
         (shared across all experts), this returns only the quantity belonging
         to the expert that owns this action.
 
+        EQUITY transactions only (``_own_equity_transactions``): an option Transaction's
+        ``symbol`` is the UNDERLYING and its quantity a CONTRACT count, so the old sum over
+        every transaction read a covered call's short contract as a short share, and a pure
+        option position as a share position.
+
         Returns:
             Signed quantity (positive for long, negative for short), 0 if no
-            open transactions, or None if expert_id is unavailable.
+            open transactions, or None if expert_id is unavailable (or the read failed).
         """
-        expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
-        if not expert_id:
-            return None
         try:
-            from ba2_common.core.types import TransactionStatus
-            from ba2_common.core.trade_store import transactions_where
-
-            # transactions_where is the dual-path equivalent of the raw select() this
-            # replaced (review 2026-07-18, M2): a raw select(Transaction) silently finds
-            # nothing when the backtest in-mem store is active (Transaction is an in-mem
-            # model, see trade_store.IN_MEM_MODELS), so get_expert_position always returned
-            # 0.0/None in that mode instead of the real position.
-            transactions = transactions_where(
-                symbol=self.instrument_name, expert_id=expert_id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED],
-            )
-
-            if not transactions:
-                return 0.0
-
-            total = 0.0
-            for t in transactions:
-                qty = abs(float(t.quantity))
-                if t.side == OrderDirection.BUY:
-                    total += qty
-                else:
-                    total -= qty
-            return total
+            # transactions_where (inside _own_equity_transactions) is the dual-path equivalent of
+            # the raw select() this once used (review 2026-07-18, M2): a raw select(Transaction)
+            # silently finds nothing when the backtest in-mem store is active.
+            transactions = self._own_equity_transactions()
+            if transactions is None:
+                return None
+            return self._signed_quantity(transactions)
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error getting expert position for {self.instrument_name}: {e}", exc_info=True)
@@ -236,8 +221,10 @@ class TradeAction(ABC):
         EQUITY only, unlike ``get_expert_position``: an option Transaction's ``symbol`` is the
         UNDERLYING and its quantity is a contract count, so summing it into a share position
         would make a covered call read as a short. A read failure propagates -- the callers
-        decide an order's direction on this and must not guess."""
-        expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        decide an order's direction on this and must not guess.
+
+        The expert is found the same way ``resolve_expert`` finds it (``_owning_expert_id``)."""
+        expert_id = self._owning_expert_id()
         if not expert_id:
             return None
         from ba2_common.core.trade_store import transactions_where
@@ -253,12 +240,41 @@ class TradeAction(ABC):
                    for t in transactions)
 
     @staticmethod
-    def _filled_quantity(transactions) -> float:
-        """Unsigned share quantity of the OPENED ``transactions``: what a close must sell or buy
-        back at the broker. A WAITING entry has not reached the book, and ``close_transaction``
-        cancels it rather than trading against it."""
-        return sum(abs(float(t.quantity)) for t in transactions
+    def _open_filled_quantity(transactions) -> float:
+        """Unsigned FILLED share quantity of the OPENED ``transactions``: what their closes will
+        actually sell or buy back at the broker.
+
+        ``get_current_open_qty()`` -- the measured net of the executed orders -- is the SAME
+        quantity ``close_transaction`` trades (``submit_close_order_for_transaction``), not the
+        ORDERED ``Transaction.quantity``: an entry for 100 filled for 60 closes 60. A WAITING
+        entry has not reached the book, and ``close_transaction`` cancels it rather than trading
+        against it."""
+        return sum(abs(float(t.get_current_open_qty())) for t in transactions
                    if t.status == TransactionStatus.OPENED)
+
+    @staticmethod
+    def _split_by_side(transactions):
+        """``(longs, shorts)``: the BUY-side and SELL-side transactions.
+
+        The netting decisions classify by SIDE, not by the signed sum of quantities: any open
+        BUY transaction means this expert is long, any SELL means short, whatever its quantity
+        (a WAITING entry at quantity 0 still counts by its side). Both at once is a legacy
+        hedge, which the callers refuse."""
+        longs = [t for t in transactions if t.side == OrderDirection.BUY]
+        shorts = [t for t in transactions if t.side == OrderDirection.SELL]
+        return longs, shorts
+
+    def _owning_expert_id(self) -> Optional[int]:
+        """The id of the expert this action acts for: the recommendation's instance, else the
+        existing order's (``get_expert_id``). None when neither names one. Lookup errors
+        propagate; ``resolve_expert`` wraps this for its callers that must degrade instead."""
+        expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if expert_id is None and self.existing_order is not None:
+            # getattr, not a direct call: an option/stub order object need not implement the
+            # full TradingOrder surface, and a missing linkage must read as "no expert".
+            getter = getattr(self.existing_order, "get_expert_id", None)
+            expert_id = getter() if callable(getter) else None
+        return expert_id or None
 
     def resolve_expert(self):
         """The expert instance whose settings govern this action, or None.
@@ -276,12 +292,7 @@ class TradeAction(ABC):
         behaviour, never to a guessed multiplier or permission.
         """
         try:
-            expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
-            if expert_id is None and self.existing_order is not None:
-                # getattr, not a direct call: an option/stub order object need not implement the
-                # full TradingOrder surface, and a missing linkage must read as "no expert".
-                getter = getattr(self.existing_order, "get_expert_id", None)
-                expert_id = getter() if callable(getter) else None
+            expert_id = self._owning_expert_id()
             if not expert_id:
                 return None
             from ba2_common.core.instance_resolver import get_instance_resolver
@@ -294,17 +305,11 @@ class TradeAction(ABC):
     def selling_enabled(self) -> bool:
         """The expert's ``enable_sell`` setting: may a SELL open a short from flat?
 
-        No expert, or the setting absent -> False. Read through ``coerce_bool`` (the GA writes
-        bool genes as integers, older rows hold the JSON string "1"); a spelling it cannot mean
-        raises, because a garbled permission is a bug to surface, not a value to guess."""
-        expert = self.resolve_expert()
-        if expert is None:
-            return False
-        raw = expert.get_setting_with_interface_default('enable_sell', log_warning=False)
-        if raw is None:
-            return False
-        from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
-        return coerce_bool(raw)
+        No expert, or the setting absent -> False. Read through ``trading_permission`` -- the SAME
+        reader the risk manager's permission filter uses -- so a spelling ``coerce_bool`` cannot
+        mean raises: a garbled permission is a bug to surface, not a value to guess."""
+        from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission
+        return trading_permission(self.resolve_expert(), 'enable_sell')
 
     def _close_own_transactions(self, transactions, action_type: str, what: str) -> Dict[str, Any]:
         """Close ``transactions`` (this expert's own position) through ``close_transaction``.
@@ -628,16 +633,24 @@ class SellAction(TradeAction):
         if own is None:
             return self._refuse(f"Cannot sell {self.instrument_name}: the action has no expert, "
                                 f"so it owns no position to reduce and may not open a short")
-        own_qty = self._signed_quantity(own)
+        longs, shorts = self._split_by_side(own)
         # None is the confirmed "not held" of get_current_position's tri-state contract (a
         # failed fetch raised before this point), so it is a real zero, not an unknown.
         broker_qty = 0.0 if broker_position is None else float(broker_position)
 
-        if own_qty > 0:
-            # CLOSING sell. The broker must hold at least the FILLED quantity closed, or the close
-            # would sell through zero and leave a short nobody opened.
-            longs = [t for t in own if t.side == OrderDirection.BUY]
-            filled = self._filled_quantity(longs)
+        if longs and shorts:
+            logger.error(f"SellAction: expert holds BOTH long {[t.id for t in longs]} and short "
+                         f"{[t.id for t in shorts]} transactions in {self.instrument_name} (a "
+                         f"legacy hedge); refusing to guess which one a sell means")
+            return self._refuse(
+                f"Refusing to sell {self.instrument_name}: this expert holds both a long and a "
+                f"short (a legacy hedge); a sell cannot tell which to reduce",
+                long_transaction_ids=[t.id for t in longs],
+                short_transaction_ids=[t.id for t in shorts])
+        if longs:
+            # CLOSING sell. The broker must hold at least the FILLED quantity the closes will
+            # sell, or they would sell through zero and leave a short nobody opened.
+            filled = self._open_filled_quantity(longs)
             if broker_qty < filled:
                 return self._refuse(
                     f"Refusing to sell {self.instrument_name}: this expert holds {filled:g} long "
@@ -645,11 +658,12 @@ class SellAction(TradeAction):
                     own_position=filled, broker_position=broker_qty)
             return self._close_own_transactions(longs, ExpertActionType.SELL.value,
                                                 "Sell closes the long")
-        if own_qty < 0:
+        if shorts:
             return self._refuse(
                 f"Refusing to sell {self.instrument_name}: this expert is already short "
-                f"{-own_qty:g}; a sell would add to the short, and a new position opens only "
-                f"from flat", own_position=own_qty)
+                f"(transactions {[t.id for t in shorts]}); a sell would add to the short, and a "
+                f"new position opens only from flat",
+                short_transaction_ids=[t.id for t in shorts])
         if broker_qty > 0:
             return self._refuse(
                 f"Refusing to sell {self.instrument_name}: the broker holds a long of "
@@ -752,8 +766,20 @@ class BuyAction(TradeAction):
             # the short back and then went long with the rest. Unreachable without a short, so
             # flat and long books (every long-only run) take the path below exactly as before.
             own = self._own_equity_transactions()
-            if own and self._signed_quantity(own) < 0:
-                return self._cover_own_short(own)
+            if own:
+                longs, shorts = self._split_by_side(own)
+                if shorts and longs:
+                    message = (f"Refusing to buy {self.instrument_name}: this expert holds both a "
+                               f"long and a short (a legacy hedge); a buy cannot tell whether to "
+                               f"cover the short or add to the long")
+                    logger.error(f"BuyAction: {message} (long {[t.id for t in longs]}, short "
+                                 f"{[t.id for t in shorts]})")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.BUY.value, success=False, message=message,
+                        data={"long_transaction_ids": [t.id for t in longs],
+                              "short_transaction_ids": [t.id for t in shorts]})
+                if shorts:
+                    return self._cover_own_short(shorts)
 
             # Create PENDING order with quantity=0 (to be determined by risk management)
             # Risk management will calculate quantity based on:
@@ -809,15 +835,14 @@ class BuyAction(TradeAction):
                 data={}
             )
     
-    def _cover_own_short(self, own) -> "TradeActionResult":
+    def _cover_own_short(self, shorts) -> "TradeActionResult":
         """Buy back this expert's short through ``close_transaction`` (capped at the short).
 
         The broker must be at least as short as the FILLED quantity covered, or the buy would pass
         through zero and leave a long nobody opened; a fetch failure refuses, as for a sell."""
         from ba2_common.core.portfolio_allocation import PositionFetchFailed
 
-        shorts = [t for t in own if t.side == OrderDirection.SELL]
-        short_qty = self._filled_quantity(shorts)
+        short_qty = self._open_filled_quantity(shorts)
         try:
             broker_position = self.get_current_position()
         except PositionFetchFailed as e:
