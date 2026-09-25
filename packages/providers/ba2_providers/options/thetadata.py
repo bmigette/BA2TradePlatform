@@ -147,21 +147,46 @@ def _chunk_window(start: date, end: date,
 #: request window is split at the cutover, the earlier part asked for under the OLD root, and
 #: EVERY row is stored under the platform symbol with the platform symbol's OCC root
 #: (``_occ_symbol("META", ...)``), so one partition holds one company under one contract id.
-ROOT_HISTORY: Dict[str, Tuple[Tuple[date, str], ...]] = {
+#
+#: An old root of ``None`` means NO faithful chain before the cutover: the platform symbol's
+#: price history starts there (a new listing that took a ticker whose previous holder's chain
+#: ThetaData still serves under it), so nothing is fetched for that part of the window.
+#:
+#: Stage-2 universe (measured 2026-09-25 around each rename; the old root's last session, the
+#: new root's first one and the parity spot vs the FMP close -- evidence in
+#: packages/providers/tests/test_thetadata_root_history_stage2.py):
+#:   COHR  II-VI took Coherent's ticker (Coherent Inc acquired 2022-07): IIVI to 2022-09-07.
+#:   B     Barrick took Barnes Group's ticker (acquired 2025-01): GOLD to 2025-05-08.
+#:   IR    Gardner Denver took Ingersoll-Rand's ticker (now TT): GDI to 2020-02-28.
+#:   CZR   Eldorado took Caesars' ticker (merger 2020-07-20): ERI to 2020-07-20.
+#:   DOC   Healthpeak took Physicians Realty's ticker (merger 2024-03-01): PEAK to 2024-03-01.
+#:   BN    Brookfield Corp is the old Brookfield Asset Management (BAM root to 2022-12-09).
+#:   BAM   the new Brookfield Asset Management (listed 2022-12-12): no chain before that --
+#:         the BAM root is the OLD company (BN's) until then.
+ROOT_HISTORY: Dict[str, Tuple[Tuple[date, Optional[str]], ...]] = {
     "META": ((date(2022, 6, 9), "FB"),),
+    "COHR": ((date(2022, 9, 8), "IIVI"),),
+    "B": ((date(2025, 5, 9), "GOLD"),),
+    "IR": ((date(2020, 3, 2), "GDI"),),
+    "CZR": ((date(2020, 7, 21), "ERI"),),
+    "DOC": ((date(2024, 3, 4), "PEAK"),),
+    "BN": ((date(2022, 12, 12), "BAM"),),
+    "BAM": ((date(2022, 12, 12), None),),
 }
 
 
 def _root_segments(underlying: str, start: date, end: date) -> List[Tuple[str, date, date]]:
     """``[(vendor_root, seg_start, seg_end), ...]`` covering ``[start, end]`` (inclusive) in
     date order: the root ThetaData knew the underlying by over each part of the window
-    (``ROOT_HISTORY``). An underlying without history is one segment under its own name."""
+    (``ROOT_HISTORY``). An underlying without history is one segment under its own name. A
+    part covered by a ``None`` root has NO segment (nothing is fetched for it), so the result
+    may be empty or start after ``start``."""
     u = underlying.upper()
     out: List[Tuple[str, date, date]] = []
     cur = start
-    for cutover, old_root in sorted(ROOT_HISTORY.get(u, ())):
+    for cutover, old_root in sorted(ROOT_HISTORY.get(u, ()), key=lambda h: h[0]):
         seg_end = min(end, cutover - timedelta(days=1))
-        if cur <= seg_end:
+        if cur <= seg_end and old_root is not None:
             out.append((old_root.upper(), cur, seg_end))
         if cutover > cur:
             cur = cutover
@@ -566,6 +591,8 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             # it). option_list_dates answers that in one small call, so ask rather than scan.
             # Best-effort by construction: any failure leaves `group_start` at the caller's
             # own start, which is exactly today's behaviour.
+            if not _root_segments(underlying, start, group_end):
+                continue  # the whole window predates the symbol's chain (a None root)
             group_start = start
             try:
                 # The root the contract was LISTED under: the one covering the window's start.
