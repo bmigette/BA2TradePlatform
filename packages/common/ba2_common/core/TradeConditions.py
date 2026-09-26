@@ -3393,8 +3393,11 @@ class EntryTagCondition(CompareCondition):
 
     UNKNOWN NEVER FIRES: no order, no row data or no tag -> ``calculated_value`` None and False
     for EVERY operator (``!=`` included). That is safe by construction -- an untagged position
-    is not a style position, so no member's exit may close it -- and it is why the wheel's
-    stock-phase rules must stay UNSCOPED (the assigned stock lot has no entry tag).
+    is not a style position, so no member's exit may close it. The wheel's stock phase is
+    scoped like every other exit: the assigned stock lot inherits the assigned put's member
+    tag (``assignment_hold.assigned_stock_entry_data``) and a covered-call / protective-put
+    overlay inherits the covered position's, so a member's stock-phase and overlay rules only
+    ever see that member's own shares.
 
     A LABEL, NOT A QUANTITY. Only ``==`` / ``!=`` (``ENTRY_TAG_OPERATORS``), and the rule value
     must itself be a tag (a positive integer): an ordering operator or a value like ``2.5``

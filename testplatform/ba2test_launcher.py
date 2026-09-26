@@ -5462,9 +5462,10 @@ def _build_strategy_option_group(kind: str):
 # from a JSON style spec (``--style-config F --style NAME``) rather than from a hard-coded
 # group: each member keeps its OWN single-job builder's entry rule, exit bands and genes, its
 # entry becomes toggleable, and its exits are scoped to it by an ``entry_tag`` leaf. This
-# section holds the spec side: the member -> tag table, what may be a member, and the
-# loader/validator. Every check is a ``ValueError`` naming the style, the member and the
-# reason; the CLI turns it into ``sys.exit`` (Task 7).
+# section holds the spec side (the member -> tag table, what may be a member, the
+# loader/validator) and the builder (``_build_strategy_style``: member-namespaced ids, tagged
+# entries, tag-scoped exits, per-member id maps). Every check is a ``ValueError`` naming the
+# style, the member and the reason; the CLI turns it into ``sys.exit`` (Task 7).
 
 _STYLE_KEY = "O_STYLE"
 #: Strategy keys whose builder needs a run input (a style spec) -- excluded from every test that
@@ -5959,6 +5960,141 @@ def _style_entry_rules(key: str, tag: int, src_rules, action_overrides) -> "tupl
     return rules, {"entry_rules": rule_map, "entry_conds": cond_map}
 
 
+#: ``exit_overrides`` field -> every spelling a condition leaf may carry it under. A canonical
+#: leaf mirrors each band field in camelCase; moving only the snake_case copy would leave a
+#: STALE mirror for any alias-first reader (the ActionCfg incident in rule_models).
+_STYLE_EXIT_OVERRIDE_SPELLINGS = {"value": ("value",), "value_min": ("value_min", "valueMin"),
+                                  "value_max": ("value_max", "valueMax"),
+                                  "value_step": ("value_step", "valueStep")}
+
+
+def _style_apply_exit_overrides(key: str, rules: list, overrides) -> None:
+    """Apply ONE member's ``exit_overrides`` (in place, keyed by the ORIGINAL condition id,
+    before namespacing). Refused by name: an id that names no exit condition of the member, a
+    band on a condition the GA does not search (``optimize`` off: inert), and a merged band
+    that is inconsistent (``value_min <= value <= value_max``, ``value_step > 0``), and any
+    override of a FLAG condition (no threshold at all)."""
+    from ba2_common.core.rule_models import infer_field_type
+
+    if not overrides:
+        return
+    found = set()
+    for rule in rules:
+        for leaf in _style_tree_leaves(rule.get("conditions")):
+            cid = leaf.get("id")
+            if cid not in overrides:
+                continue
+            band = overrides[cid]
+            if infer_field_type(leaf.get("field"), leaf.get("field_type")
+                                or leaf.get("fieldType")) == "flag":
+                raise ValueError(f"{key}: exit_overrides[{cid!r}] names a flag condition "
+                                 f"({leaf.get('field')!r}), which has no threshold to move")
+            search_fields = sorted(set(band) - {"value"})
+            if search_fields and not leaf.get("optimize"):
+                raise ValueError(
+                    f"{key}: exit_overrides[{cid!r}] sets {search_fields} but the condition is "
+                    f"not searched (no optimize): the band would be inert")
+            for field, value in band.items():
+                for spelling in _STYLE_EXIT_OVERRIDE_SPELLINGS[field]:
+                    if spelling == field or spelling in leaf:
+                        leaf[spelling] = value
+            merged = [(f, leaf.get(f)) for f in ("value_min", "value", "value_max")
+                      if leaf.get(f) is not None]
+            for (fa, a), (fb, b) in zip(merged, merged[1:]):
+                if a > b:
+                    raise ValueError(f"{key}: exit_overrides[{cid!r}] leave {fa}={a:g} > "
+                                     f"{fb}={b:g}")
+            if leaf.get("value_step") is not None and leaf["value_step"] <= 0:
+                raise ValueError(f"{key}: exit_overrides[{cid!r}] leave value_step="
+                                 f"{leaf['value_step']} <= 0")
+            found.add(cid)
+    missing = sorted(set(overrides) - found)
+    if missing:
+        own = sorted({x.get("id") for r in rules
+                      for x in _style_tree_leaves(r.get("conditions")) if x.get("id")})
+        raise ValueError(f"{key}: exit_overrides name no exit condition of the member: "
+                         f"{missing} (its exit conditions: {own})")
+
+
+def _style_tag_leaf(leaf_id: str, tag: int) -> dict:
+    """The ``entry_tag == <tag>`` leaf, in the canonical leaf shape (both spellings)."""
+    from ba2_common.core.rule_models import normalize_tree
+    return normalize_tree({"id": leaf_id, "field": "entry_tag", "field_type": "numeric",
+                           "comparison": "==", "value": float(tag)})
+
+
+def _style_scope_exits(key: str, tag: int, src_rules, exit_overrides) -> "tuple[list, dict]":
+    """ONE member's exit rules inside a style: a deep copy of its OWN builder's exits (its own
+    debit/credit bands, authored-off rules, roll rules, overlay chain, in its own order), with
+    ``exit_overrides`` applied by original condition id, every rule and condition id namespaced,
+    and EVERY rule ANDed with an ``entry_tag == <tag>`` leaf -- appended LAST to the root AND,
+    so each authored leaf keeps its trigger index.
+
+    Every rule, the wheel's stock-phase rules (``has_assigned_shares`` / ``has_covered_call`` /
+    ``covered_call_days_to_expiry``) and O_CC's / O_PP's guard+overlay pairs included: since
+    plan revision E2 the assigned stock inherits the put's member tag and a CC/PP overlay the
+    covered position's, so the tag is what keeps one member's overlay off another member's
+    shares. The tag leaf is named after its rule (``<rule>-tag``), so it is unique per rule and
+    carries no gene. A root that is not an AND group is refused: ANDing into an OR would scope
+    nothing. Returns ``(rules, {"exit_rules": map, "exit_conds": map})``."""
+    from copy import deepcopy
+
+    rules = deepcopy(list(src_rules or []))
+    _style_apply_exit_overrides(key, rules, exit_overrides)
+    originals = [r.get("id") for r in rules]
+    rule_map: dict = {}
+    cond_map: dict = {}
+    _style_reid_rules(key, rules, "exit", rule_map, cond_map)
+    for original, rule in zip(originals, rules):
+        leaf = _style_tag_leaf(f"{rule['id']}-tag", tag)
+        tree = rule.get("conditions")
+        if tree is None:
+            rule["conditions"] = {"operator": "AND", "type": "AND", "conditions": [leaf]}
+        elif "field" in tree:            # a bare leaf root
+            rule["conditions"] = {"operator": "AND", "type": "AND", "conditions": [tree, leaf]}
+        else:
+            op = str(tree.get("type") or tree.get("operator") or "AND").upper()
+            if op != "AND":
+                raise ValueError(f"{key} exit rule {original!r}: its condition root is {op}, "
+                                 f"not AND; the member tag cannot scope it (tag {op} x would "
+                                 f"fire for any member)")
+            tree.setdefault("conditions", []).append(leaf)
+    return rules, {"exit_rules": rule_map, "exit_conds": cond_map}
+
+
+#: Gene-key namespaces that are not per-member: the run-level expert / schedule / screener
+#: genes and the per-half selection weights (``optsel:<half>:<w>``, shared by design).
+_STYLE_IDENTITY_GENE_NAMESPACES = ("optsel", "model", "schedule", "screener")
+
+
+def _style_translate_key(gene: str, id_map: dict, member: str) -> str:
+    """ONE member-level gene key -> the style's key, through the member's id map (identity for
+    ``shared-*`` conditions and the run-level/shared namespaces). Raises ``ValueError`` naming
+    the member and the key on anything the map cannot place -- never a silent drop. Task 13's
+    seed translator wraps this."""
+    ns, sep, rest = gene.partition(":")
+    if not sep or not rest:
+        raise ValueError(f"{member}: cannot place gene key {gene!r} (no namespace)")
+    if ns in _STYLE_IDENTITY_GENE_NAMESPACES:
+        return gene
+    ident, sep, tail = rest.partition(":")
+    if not sep or not tail:
+        raise ValueError(f"{member}: cannot place gene key {gene!r} (no id/field part)")
+    if ns == "cond":
+        hits = {m[ident] for m in (id_map["entry_conds"], id_map["exit_conds"]) if ident in m}
+        if len(hits) != 1:
+            raise ValueError(f"{member}: cannot place gene key {gene!r}: condition {ident!r} "
+                             f"is not one of the member's conditions")
+        return f"cond:{hits.pop()}:{tail}"
+    if ns in ("entry", "exit"):
+        table = id_map[f"{ns}_rules"]
+        if ident not in table:
+            raise ValueError(f"{member}: cannot place gene key {gene!r}: {ns} rule {ident!r} "
+                             f"is not one of the member's {ns} rules")
+        return f"{ns}:{table[ident]}:{tail}"
+    raise ValueError(f"{member}: cannot place gene key {gene!r}: unknown namespace {ns!r}")
+
+
 def _style_claim_ids(where: str, key: str, ns: str, rules, owners: dict, shared: dict) -> None:
     """Record which member owns each rule/condition id of the BUILT style, refusing an id two
     members claim (their genes would be one gene) and a ``shared-*`` condition two members
@@ -6006,18 +6142,24 @@ def _build_strategy_style(kind: str):
         sys.exit(f"{kind}: no style loaded -- pass --style-config FILE --style NAME")
     where = f"style {style['name']!r}"
     entry: list = []
+    exits: list = []
     id_maps: dict = {}
     owners: dict = {}
     shared: dict = {}
     for mem in style["members"]:
         key = mem["key"]
+        tag = _STYLE_MEMBER_TAGS[key]
         src = _STRATEGY_BUILDERS[key](key)
-        rules, idm = _style_entry_rules(key, _STYLE_MEMBER_TAGS[key], src.entry_rules,
-                                        mem.get("action_overrides"))
-        _style_claim_ids(where, key, "entry", rules, owners, shared)
-        entry += rules
-        id_maps[key] = idm
-    s = Strategy(name=f"{kind}-{style['name']}", entry_rules=entry, exit_rules=[])
+        e_rules, e_map = _style_entry_rules(key, tag, src.entry_rules,
+                                            mem.get("action_overrides"))
+        x_rules, x_map = _style_scope_exits(key, tag, src.exit_rules,
+                                            mem.get("exit_overrides"))
+        _style_claim_ids(where, key, "entry", e_rules, owners, shared)
+        _style_claim_ids(where, key, "exit", x_rules, owners, shared)
+        entry += e_rules
+        exits += x_rules
+        id_maps[key] = {**e_map, **x_map}
+    s = Strategy(name=f"{kind}-{style['name']}", entry_rules=entry, exit_rules=exits)
     option_entries = set(get_option_entry_action_values())
     first_option = next((a for r in entry for a in r["actions"]
                          if str(a.get("action_type") or a.get("action") or "") in option_entries),

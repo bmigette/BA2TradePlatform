@@ -272,3 +272,260 @@ def test_a_shared_leaf_two_members_author_differently_is_refused(tmp_path, monke
     monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LP", wider)
     with pytest.raises(ValueError, match=r"shared-rel_volume.*O_LC.*O_LP"):
         _custom(m, tmp_path, [{"key": "O_LC"}, {"key": "O_LP"}])
+
+
+# --- Task 6: member-namespaced, tag-scoped exits + id maps ------------------------------------
+def _block(s, key):
+    """The style's exit rules that belong to ``key`` (by its id map), in style order."""
+    ids = set(s.style_id_maps[key]["exit_rules"].values())
+    return [r for r in s.exit_rules if r["id"] in ids]
+
+
+def _tag_leaves(rule):
+    return [x for x in _leaves(rule["conditions"]) if x["field"] == "entry_tag"]
+
+
+def _named(m, tmp_path, name):
+    return _custom(m, tmp_path, _CLASHING) if name == "clashing" else _style(m, name)
+
+
+@pytest.mark.parametrize("name", _STYLES + ["clashing"])
+def test_each_members_exit_block_is_its_own_builders_exits_re_ided(tmp_path, name):
+    m = _launcher()
+    s = _named(m, tmp_path, name)
+    ids = [r["id"] for r in s.exit_rules]
+    assert len(ids) == len(set(ids))
+    expected = []
+    for mem in m._STYLE_ACTIVE["members"]:
+        p = mem["key"].lower()
+        own = [r["id"] for r in _own(m, mem["key"]).exit_rules]
+        # no exit id is own-prefixed today, so every one gets the member prefix
+        assert [r["id"] for r in _block(s, mem["key"])] == [f"{p}-{i}" for i in own]
+        expected += [f"{p}-{i}" for i in own]
+    assert ids == expected                         # member blocks concatenated in member order
+
+
+@pytest.mark.parametrize("name", _STYLES + ["clashing"])
+def test_every_exit_is_scoped_to_exactly_its_member_stock_phase_included(tmp_path, name):
+    """Since E2 the assigned stock inherits the put's member tag and a CC/PP overlay inherits
+    the covered position's, so EVERY exit rule is scoped -- the wheel's stock-phase rules and
+    O_CC's / O_PP's guard+overlay pairs included (that is what keeps them off another
+    member's shares)."""
+    m = _launcher()
+    s = _named(m, tmp_path, name)
+    for mem in m._STYLE_ACTIVE["members"]:
+        tag = m._STYLE_MEMBER_TAGS[mem["key"]]
+        for r in _block(s, mem["key"]):
+            tags = _tag_leaves(r)
+            assert len(tags) == 1, r["id"]
+            assert tags[0]["op"] == "==" and tags[0]["value"] == float(tag), r["id"]
+            assert tags[0]["id"] == f"{r['id']}-tag"
+            # appended LAST to the root AND: every authored leaf keeps its trigger index
+            assert r["conditions"]["type"] == "AND"
+            assert r["conditions"]["conditions"][-1] is tags[0]
+
+
+def test_the_stock_phase_and_overlay_rules_carry_their_own_members_tag(tmp_path):
+    m = _launcher()
+    s = _custom(m, tmp_path, _CLASHING)
+    rid = {r["id"]: r for r in s.exit_rules}
+    expect = {"o_wheel-cc_dte": "O_WHEEL", "o_wheel-cc_guard": "O_WHEEL",
+              "o_wheel-cc_sell": "O_WHEEL", "o_wheel-wheel_stock_guard": "O_WHEEL",
+              "o_cc-cc_guard": "O_CC", "o_cc-cc_sell": "O_CC",
+              "o_pp-pp_guard": "O_PP", "o_pp-pp_buy": "O_PP"}
+    for r, key in expect.items():
+        assert _tag_leaves(rid[r])[0]["value"] == float(m._STYLE_MEMBER_TAGS[key]), r
+    # the stock-phase leaf is still there, namespaced, with the tag after it
+    assert [x["id"] for x in _leaves(rid["o_wheel-cc_sell"]["conditions"])] == \
+        ["o_wheel-cc_assigned", "o_wheel-cc_sell-tag"]
+
+
+@pytest.mark.parametrize("name", _STYLES + ["clashing"])
+def test_every_scoped_exit_converts_through_the_shared_rule_converters(tmp_path, name):
+    """BT/live parity: the backtest seeder and the live export both turn a TradeRule into an
+    EventAction through these shared functions, so a tag leaf they refuse (or drop) would break
+    both runtimes alike. Each scoped rule yields exactly one entry_tag trigger."""
+    from ba2_common.core.rule_builders import rule_triggers_from_tree
+    from ba2_common.core.rules_convert import live_actions_from_trade_rule
+    from ba2_common.core.types import ExpertEventType
+    m = _launcher()
+    s = _named(m, tmp_path, name)
+    for r in s.exit_rules:
+        if r.get("enabled") is False:
+            continue
+        triggers = rule_triggers_from_tree(r["conditions"], r["id"])
+        tag_triggers = [t for t in triggers.values()
+                        if t["event_type"] == ExpertEventType.N_ENTRY_TAG.value]
+        assert len(tag_triggers) == 1, r["id"]
+        assert live_actions_from_trade_rule(r), r["id"]
+
+
+def test_debit_and_credit_members_keep_their_own_tp_bands_and_the_credit_stop():
+    m = _launcher()
+    s = _style(m, "premium")       # credit members
+    rid = {r["id"]: r for r in s.exit_rules}
+    tp = next(x for x in _leaves(rid["o_ic-opt_tp"]["conditions"]) if x["id"] == "o_ic-tp")
+    own = next(x for r in _own(m, "O_IC").exit_rules if r["id"] == "opt_tp"
+               for x in _leaves(r["conditions"]) if x["id"] == "tp")
+    assert (tp["value"], tp["value_min"], tp["value_max"]) == \
+        (own["value"], own["value_min"], own["value_max"])
+    assert "o_ic-opt_sl" in rid
+    s = _style(m, "short")         # debit members
+    rid = {r["id"]: r for r in s.exit_rules}
+    tp = next(x for x in _leaves(rid["o_lc-opt_tp"]["conditions"]) if x["id"] == "o_lc-tp")
+    assert (tp["value"], tp["value_min"], tp["value_max"]) == (100, 25, 200)
+    assert "o_lc-opt_sl" not in rid
+
+
+def test_grid2_members_keep_their_own_bands_and_authored_off_rules():
+    m = _launcher()
+    s = _style(m, "leaps_convex")
+    rid = {r["id"]: r for r in s.exit_rules}
+    dte = next(x for x in _leaves(rid["o_leap-opt_dte"]["conditions"]) if x["id"] == "o_leap-dte")
+    assert (dte["value"], dte["value_min"], dte["value_max"]) == (150, 90, 240)
+    assert rid["o_pmcc-opt_sl_ml"].get("enabled") is False
+    assert "o_pmcc-pmcc_roll_dte" in rid and "o_convex-opt_tp_mult" in rid
+    # the PMCC roll rules still come FIRST within the PMCC block (builder order preserved)
+    pmcc = [i for i in rid if i.startswith("o_pmcc-")]
+    assert pmcc[:3] == ["o_pmcc-pmcc_roll_dte", "o_pmcc-pmcc_roll_buyback",
+                        "o_pmcc-pmcc_delta_floor"]
+
+
+def test_exit_overrides_move_only_the_named_band_and_its_camelcase_mirror():
+    m = _launcher()
+    s = _style(m, "mid")
+    rid = {r["id"]: r for r in s.exit_rules}
+    td = next(x for x in _leaves(rid["o_lc-opt_time"]["conditions"]) if x["id"] == "o_lc-td")
+    assert (td["value"], td["value_min"], td["value_max"], td["value_step"]) == (45, 20, 90, 5)
+    # a stale camelCase mirror would be read by any alias-first reader
+    assert (td["valueMin"], td["valueMax"], td["valueStep"]) == (20, 90, 5)
+    own = {x["id"]: x for r in _own(m, "O_LC").exit_rules for x in _leaves(r["conditions"])}
+    tp = next(x for x in _leaves(rid["o_lc-opt_tp"]["conditions"]) if x["id"] == "o_lc-tp")
+    assert {k: v for k, v in tp.items() if k != "id"} == \
+        {k: v for k, v in own["tp"].items() if k != "id"}
+    # O_BULLCS carries no exit_overrides in "mid": its td band is its own builder's
+    own_bc = {x["id"]: x for r in _own(m, "O_BULLCS").exit_rules for x in _leaves(r["conditions"])}
+    bc = next(x for x in _leaves(rid["o_bullcs-opt_time"]["conditions"])
+              if x["id"] == "o_bullcs-td")
+    assert {k: v for k, v in bc.items() if k != "id"} == \
+        {k: v for k, v in own_bc["td"].items() if k != "id"}
+
+
+@pytest.mark.parametrize("member, overrides, msg", [
+    ("O_LC", {"nope": {"value": 1}}, r"nope"),
+    # the merged band: value above the authored max
+    ("O_LC", {"tp": {"value": 300}}, r"tp.*value=300.*value_max=200"),
+    # a flag condition has no threshold at all
+    ("O_WHEEL", {"wheel_assigned": {"value": 1}}, r"wheel_assigned.*flag"),
+])
+def test_an_exit_override_that_cannot_act_is_refused(tmp_path, member, overrides, msg):
+    m = _launcher()
+    with pytest.raises(ValueError, match=msg) as exc:
+        _custom(m, tmp_path, [{"key": member, "exit_overrides": overrides}])
+    assert member in str(exc.value)
+
+
+def test_a_band_on_an_exit_condition_the_GA_does_not_search_is_refused(tmp_path, monkeypatch):
+    """Inert: no gene reads value_min/value_max on a leaf without ``optimize``. No member has
+    such a numeric exit leaf today, so one is simulated."""
+    m = _launcher()
+    _pin_admissible(m, monkeypatch)
+    real = m._STRATEGY_BUILDERS["O_LP"]
+
+    def fixed_tp(kind):
+        s = real(kind)
+        for leaf in _leaves(s.exit_rules[0]["conditions"]):
+            leaf["optimize"] = leaf["optimizeEnabled"] = False
+        return s
+    monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LP", fixed_tp)
+    with pytest.raises(ValueError, match=r"O_LP: exit_overrides\['tp'\].*not searched"):
+        _custom(m, tmp_path, [{"key": "O_LP", "exit_overrides": {"tp": {"value_max": 300}}}])
+    # moving the fixed threshold itself is not inert, and is allowed
+    s = _custom(m, tmp_path, [{"key": "O_LP", "exit_overrides": {"tp": {"value": 150}}}])
+    assert next(x for x in _leaves(s.exit_rules[0]["conditions"])
+                if x["id"] == "o_lp-tp")["value"] == 150
+
+
+def test_an_exit_rule_whose_root_is_not_an_AND_is_refused(tmp_path, monkeypatch):
+    """ANDing the tag into an OR root would scope nothing (tag OR x fires for any member)."""
+    m = _launcher()
+    _pin_admissible(m, monkeypatch)
+    real = m._STRATEGY_BUILDERS["O_LP"]
+
+    def with_or(kind):
+        s = real(kind)
+        s.exit_rules[0]["conditions"]["type"] = s.exit_rules[0]["conditions"]["operator"] = "OR"
+        return s
+    monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LP", with_or)
+    with pytest.raises(ValueError, match=r"O_LP exit rule 'opt_tp'.*OR"):
+        _custom(m, tmp_path, [{"key": "O_LP"}])
+
+
+@pytest.mark.parametrize("gene", ["cond:nope:value", "exit:nope:enabled", "entry:nope:enabled",
+                                  "bogus:x", "cond"])
+def test_a_gene_key_the_id_map_cannot_place_is_refused(tmp_path, gene):
+    m = _launcher()
+    s = _custom(m, tmp_path, [{"key": "O_LC"}])
+    with pytest.raises(ValueError, match=r"O_LC.*cannot place"):
+        m._style_translate_key(gene, s.style_id_maps["O_LC"], "O_LC")
+
+
+def test_shared_and_run_level_keys_translate_by_identity(tmp_path):
+    m = _launcher()
+    s = _custom(m, tmp_path, _CLASHING)
+    idm = s.style_id_maps["O_WHEEL"]
+    for g in ("cond:shared-rel_volume:value", "optsel:credit:w_premium", "model:k_compress",
+              "schedule:monday", "screener:price_max"):
+        assert m._style_translate_key(g, idm, "O_WHEEL") == g
+    assert m._style_translate_key("cond:o_csp-iv_rank:enabled", idm, "O_WHEEL") == \
+        "cond:o_wheel-o_csp-iv_rank:enabled"
+    assert m._style_translate_key("exit:opt_tp:enabled", idm, "O_WHEEL") == \
+        "exit:o_wheel-opt_tp:enabled"
+    assert m._style_translate_key("entry:o_csp-entry:a0:option_dte", idm, "O_WHEEL") == \
+        "entry:o_wheel-o_csp-entry:a0:option_dte"
+
+
+def _genome_union_check(m, s):
+    """Every member's own strategy gene, translated through its id map, is in the style space
+    with the SAME domain unless the style overrides that member's bands; the only new keys are
+    the entry-rule toggles. Returns the style space."""
+    from app.services.strategy_param_space import collect_param_space
+    style_space = collect_param_space(s)
+    seen = set()
+    for mem in m._STYLE_ACTIVE["members"]:
+        key = mem["key"]
+        idm = s.style_id_maps[key]
+        own = collect_param_space(_own(m, key))
+        overridden = bool(mem.get("action_overrides") or mem.get("exit_overrides"))
+        for g in own:
+            t = m._style_translate_key(g, idm, key)      # the SAME function Task 13 wraps
+            assert t in style_space, f"{key}: {g} -> {t} missing from the style space"
+            assert overridden or style_space[t] == own[g], (key, g, t)
+            seen.add(t)
+    extra = set(style_space) - seen
+    assert all(g.startswith("entry:") and g.endswith(":enabled") for g in extra), sorted(extra)
+    return style_space
+
+
+@pytest.mark.parametrize("name", _STYLES)
+@pytest.mark.parametrize("profile", [(), ("ohlcv-v1", "ta-structure-v1")])
+def test_the_style_genome_is_the_disjoint_union_of_the_members_genomes(name, profile):
+    """No gene key collides and none is silently lost: every member's own strategy gene,
+    translated through the id map, is in the style space; the only NEW keys are the entry
+    toggles; shared keys (cond:shared-*, optsel:*) appear once."""
+    m = _launcher()
+    m._MARKET_CONDITION_PROFILES = profile
+    s = _style(m, name)
+    space = _genome_union_check(m, s)
+    print(f"{name} profile={','.join(profile) or 'none'}: {len(space)} strategy genes")
+
+
+def test_the_clashing_members_genomes_stay_disjoint(tmp_path):
+    m = _launcher()
+    s = _custom(m, tmp_path, _CLASHING)
+    space = _genome_union_check(m, s)
+    # the wheel's and the CSP's entry genes are separate genes now, as are O_CC's and O_PP's
+    assert "cond:o_csp-iv_rank:value" in space and "cond:o_wheel-o_csp-iv_rank:value" in space
+    assert "cond:o_cc-gate_confidence:value" in space
+    assert "cond:o_pp-gate_confidence:value" in space
+    assert "cond:gate_confidence:value" not in space
