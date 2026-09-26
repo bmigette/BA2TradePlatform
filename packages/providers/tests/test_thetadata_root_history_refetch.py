@@ -182,3 +182,13 @@ def test_a_plain_store_still_writes_empty(tmp_path):
     exp = date(2023, 6, 16)
     plain.write_partition("AAPL", exp, _bars("AAPL", exp, [date(2023, 6, 1)]), date(2020, 1, 1), exp)
     assert plain.write_partition("AAPL", exp, [], date(2020, 1, 1), exp)["status"] == "empty"
+
+
+def test_the_listing_horizon_covers_the_longest_lead_measured_on_the_tree():
+    """option_universe_preflight measured 1,059 days (2025-12-19 LEAPS first quoted 2023-01-25)
+    over the 774 non-alias stage-2 names; the first horizon (2.5 years = 912 days) was SHORTER,
+    so a ROOT_HISTORY change could have missed a long LEAPS partition. OCC lists LEAPS up to 39
+    months out: the horizon is that."""
+    assert T.MEASURED_MAX_LISTING_LEAD_DAYS == 1059
+    assert T.LISTING_HORIZON_DAYS >= T.MEASURED_MAX_LISTING_LEAD_DAYS
+    assert T.LISTING_HORIZON_DAYS == 1190

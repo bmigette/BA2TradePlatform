@@ -327,9 +327,15 @@ _validate_root_history(ROOT_HISTORY)
 # ``parquet_store_hooks`` into tools/warm_options_history.py). Nothing needs doing by hand when
 # an entry is added or corrected: the next warm of the symbol re-fetches what it changes.
 
-#: A contract lists at most this long before it expires (LEAPS run ~2.5 years), so only a
-#: partition expiring within this of a cutover can hold a bar from before it.
-LISTING_HORIZON_DAYS = int(365 * 2.5)
+#: The longest listing lead (expiry - first bar) on the tree, measured by
+#: tools/option_universe_preflight.py over the 774 non-alias stage-2 names on 2026-09-26: a
+#: 2025-12-19 LEAPS first quoted 2023-01-25. The first horizon here (2.5 years, 912 days) was
+#: shorter than that.
+MEASURED_MAX_LISTING_LEAD_DAYS = 1059
+#: A contract lists at most this long before it expires -- OCC lists LEAPS up to 39 months out --
+#: so only a partition expiring within this of a cutover can hold a bar from before it. The
+#: preflight reports the measured lead against it (a review finding when exceeded).
+LISTING_HORIZON_DAYS = 1190
 
 #: LEGACY manifests (written before signatures, 2026-09-26): the partitions of an ALIAS symbol
 #: written at or after this instant were fetched with its current entry in force -- the start of
