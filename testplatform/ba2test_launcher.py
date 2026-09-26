@@ -5606,8 +5606,13 @@ _STYLE_RETIRED_TAGS: set = set()
 #: ``hold_assigned_stock_tags`` (the wheel) and liquidates the others' at the next bar's open,
 #: so these members may share a style with O_WHEEL; the set stays the statement of which members
 #: can put stock on the book at all. READ BY TASK 9's tests (test_option_style_premium_wheel.py),
-#: which check it against BacktestAccount's per-leg settlement path.
-_STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL"}
+#: which DERIVE it from BacktestAccount's per-leg settlement path ("SHORT ITM: ALWAYS physical
+#: assignment at the strike, covered or naked") and the action classes' short legs.
+#: O_CBS / O_PBS / O_PMCC joined on 2026-09-26 (Task 9 found them missing): a backspread's single
+#: short and the PMCC's short call are settled PER LEG like the jade lizard's -- neither
+#: structure is in the unit-settled defined-risk combo sets -- so an ITM short at expiry is
+#: assigned into stock (the PMCC's only if its roll rules have not closed the short first).
+_STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL", "O_CBS", "O_PBS", "O_PMCC"}
 #: Members whose ENTRY is an equity buy (the S2 baseline in round lots) with an option overlay
 #: in their exits. Admissible (revision E1), but the option-entry ``action_overrides`` have
 #: nothing to act on for them.
