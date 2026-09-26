@@ -128,11 +128,12 @@ def test_a_stored_value_beats_the_default(tab, instance):
 
 # ------------------------------------------------------------------------- legacy migration
 def test_legacy_automatic_trading_is_never_migrated_into_live_permissions(tab, instance):
-    """LIVE SAFETY (review 2026-09-22). TradeManager gates ONLY on the two new keys; an expert
-    with an old automatic_trading=true row and no new-key rows trades with them at their
-    declared default (False). A reachable migration would tick both boxes and a no-edit save
-    would switch automated trading ON. The dialog must show -- and save -- the declared
-    defaults, never True."""
+    """LIVE SAFETY (review 2026-09-22). Only the two declared keys gate automated trading
+    (TradeManager, and -- since its legacy read was removed -- TradingAgents too, see
+    test_tradingagents_auto_trade_gate); an expert with an old automatic_trading=true row and
+    no new-key rows trades with them at their declared default (False). A reachable migration
+    would tick both boxes and a no-edit save would switch automated trading ON. The dialog
+    must show the declared defaults, never True, and a no-edit save writes nothing."""
     MockExpert(instance.id).save_setting("automatic_trading", "true", setting_type="str")
     defs = _defs()
     assert defs["allow_automated_trade_opening"]["default"] is False
@@ -141,9 +142,10 @@ def test_legacy_automatic_trading_is_never_migrated_into_live_permissions(tab, i
     assert tab.allow_automated_trade_opening_checkbox.value is False
     assert tab.allow_automated_trade_modification_checkbox.value is False
     tab._save_expert_settings(instance.id)
-    stored = MockExpert(instance.id).settings
-    assert stored["allow_automated_trade_opening"] is False
-    assert stored["allow_automated_trade_modification"] is False
+    assert [r[0] for r in _rows(instance.id)] == ["automatic_trading"]
+    expert = MockExpert(instance.id)
+    assert expert.get_setting_with_interface_default("allow_automated_trade_opening") is False
+    assert expert.get_setting_with_interface_default("allow_automated_trade_modification") is False
 
 
 def test_legacy_automatic_trading_is_ignored_once_the_new_keys_are_stored(tab, instance):
@@ -157,15 +159,15 @@ def test_legacy_automatic_trading_is_ignored_once_the_new_keys_are_stored(tab, i
 
 
 # ------------------------------------------------------------------------------ the save
-def test_load_then_save_writes_the_declared_defaults(tab, instance):
-    """The reported crash: load an instance with no rows, save it."""
+def test_load_then_save_with_no_rows_writes_nothing(tab, instance):
+    """The reported crash: load an instance with no rows, save it. It saves, and -- a no-edit
+    save being a no-op -- the declared defaults stay DECLARED, not frozen into rows."""
     tab._load_general_settings(instance)
     tab._save_expert_settings(instance.id)
-    stored = MockExpert(instance.id).settings
-    defs = _defs()
-    for key in BOOL_CONTROLS:
-        assert stored[key] is defs[key]["default"], key
-    assert stored["smart_risk_manager_max_iterations"] == defs["smart_risk_manager_max_iterations"]["default"]
+    assert _no_rows(instance.id)
+    expert = MockExpert(instance.id)
+    for key in list(BOOL_CONTROLS) + ["smart_risk_manager_max_iterations"]:
+        assert expert.get_setting_with_interface_default(key) == _defs()[key]["default"], key
 
 
 def test_a_checkbox_holding_None_is_refused_by_name_before_any_write(tab, instance, monkeypatch):
@@ -376,16 +378,15 @@ def fake_ui(monkeypatch):
     return f
 
 
-def test_expert_form_unreadable_bool_is_one_field_not_a_truncated_form(tab, instance, fake_ui, monkeypatch):
-    """The field after the bad one still renders; the bad one is unset with a visible error;
-    Save is refused before any write."""
+def test_expert_form_bool_without_a_default_is_one_field_not_a_truncated_form(tab, instance, fake_ui, monkeypatch):
+    """Through the real loader: a bool with no stored value and no declared default cannot be
+    shown. It is left indeterminate with a visible error, the field after it still renders,
+    and Save is refused before any write. (An unreadable stored spelling cannot reach the
+    form: the settings loader already reads it as False, loudly.)"""
     monkeypatch.setattr(MockExpert, "get_settings_definitions", classmethod(lambda cls: {
-        "flag_a": {"type": "bool", "required": False, "default": False, "description": "flag_a"},
+        "flag_a": {"type": "bool", "required": False, "description": "flag_a"},
         "after": {"type": "str", "required": False, "default": "x", "description": "after"},
     }))
-    real_settings = MockExpert.settings
-    monkeypatch.setattr(MockExpert, "settings", property(
-        lambda self: {**real_settings.fget(self), "flag_a": "maybe"}))
     tab.expert_settings_container = _El()
     tab._render_expert_settings(instance)
     assert set(tab.expert_settings_inputs) == {"flag_a", "after"}, "form was truncated"
@@ -535,10 +536,9 @@ def test_a_stored_retired_setting_neither_breaks_the_dialog_nor_is_rewritten(tab
 def test_a_whole_float_in_an_int_field_displays_as_an_int_and_saves(tab, instance):
     """GA deploys store int genes as floats (atr_period = 21.0). The field shows "21", and the
     save writes 21 -- it used to show "21.0", which the int parser then refused."""
-    tab._imported_expert_settings = {"atr_period": 21.0}
+    MockExpert(instance.id).save_setting("atr_period", 21.0, setting_type="float")
     tab._load_general_settings(instance)
     assert tab.atr_period_input.value == "21"
-    tab._imported_expert_settings = None
     tab._save_expert_settings(instance.id)
     assert MockExpert(instance.id).settings["atr_period"] == 21
 
@@ -673,3 +673,315 @@ def test_account_numeric_values_are_resolved_before_the_write(fake_ui, int_accou
     _int_account_form(port="", client_id="0").save_account(None)
     assert written["port"] == 7497
     assert written["client_id"] == 0 and isinstance(written["client_id"], int)
+
+
+# =================================================================== review of 57091294
+# A NO-EDIT SAVE IS A BYTE-FOR-BYTE NO-OP. A control filled from a DECLARED default (no row, or
+# a row whose value columns are all NULL) is not written back unless the operator edited it:
+# a missing row stays missing and a NULL row stays NULL. Prod experts 12/13 carry NULL
+# risk_manager_mode / risk_manager_model rows; 7-11 have no risk_manager_mode /
+# min_available_balance_pct / smart_risk_manager_max_iterations rows at all.
+def _null_row(instance_id, key):
+    """A row with every value column NULL/empty, as prod holds for experts 12/13."""
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import ExpertSetting
+    add_instance(ExpertSetting(instance_id=instance_id, key=key, value_str=None, value_float=None))
+
+
+def _instrument_select(value="static"):
+    el = _El("select", value=value)
+    el.options = ["static", "dynamic", "screener"]
+    return el
+
+
+NULL_KEYS = ["risk_manager_mode", "risk_manager_model", "smart_risk_manager_max_iterations",
+             "atr_multiplier", "enable_sell", "instrument_selection_method", "test_setting"]
+
+
+def test_a_no_edit_save_leaves_NULL_and_missing_rows_exactly_as_they_were(tab, instance, fake_ui):
+    expert = MockExpert(instance.id)
+    for key in NULL_KEYS:
+        _null_row(instance.id, key)
+    expert.save_setting("atr_period", 21)                       # one real stored value
+    before = _rows(instance.id)
+
+    tab.instrument_selection_method_select = _instrument_select()
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    tab._load_general_settings(instance)
+    tab._load_instrument_selection_method(instance)
+    assert not tab._general_settings_load_error and not tab._expert_settings_load_error
+    tab._save_expert_settings(instance.id)
+    assert _rows(instance.id) == before
+
+
+def test_an_edited_default_populated_field_IS_written(tab, instance, fake_ui):
+    _null_row(instance.id, "risk_manager_mode")                 # NULL row
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    tab._load_general_settings(instance)
+    tab.risk_manager_mode_select.value = "smart"               # NULL row, edited
+    tab.atr_period_input.value = "30"                          # missing row, edited
+    tab.enable_sell_checkbox.value = not tab.enable_sell_checkbox.value
+    tab.expert_settings_inputs["test_int_setting"].value = "77"
+    tab._save_expert_settings(instance.id)
+    stored = MockExpert(instance.id).settings
+    assert stored["risk_manager_mode"] == "smart"
+    assert stored["atr_period"] == 30
+    assert stored["enable_sell"] is (not _defs()["enable_sell"]["default"])
+    assert stored["test_int_setting"] == 77
+    written = {r[0] for r in _rows(instance.id)}
+    assert written == {"risk_manager_mode", "atr_period", "enable_sell", "test_int_setting"}
+
+
+def test_a_new_expert_still_writes_what_its_form_shows(tab, instance, fake_ui):
+    """Only an EDIT skips default-populated controls; a new expert's form is its definition."""
+    defs = _defs()
+    for attr in BOOL_CONTROLS.values():
+        getattr(tab, attr).value = False
+    for key, attr in VALUE_CONTROLS.items():      # what the constructor shows: the defaults
+        getattr(tab, attr).value = settings_page.display_text(defs, key, defs[key]["default"])
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(None)
+    tab._save_expert_settings(instance.id)
+    stored = MockExpert(instance.id).settings
+    assert stored["enable_buy"] is False
+    assert stored["test_int_setting"] == 24
+
+
+# ------------------------------------------------------------------- instrument_selection_method
+def test_an_unset_instrument_selection_method_shows_unset_and_stays_unset(tab, instance, fake_ui):
+    """FactorRanker reads an unset method as "defer to universe_source"; an explicit 'static'
+    forces a static universe. The select must be able to SHOW unset, and a no-edit save
+    must leave the NULL row NULL."""
+    _null_row(instance.id, "instrument_selection_method")
+    before = _rows(instance.id)
+    tab.instrument_selection_method_select = _instrument_select()
+    tab._load_general_settings(instance)
+    tab._load_instrument_selection_method(instance)
+    tab._update_instrument_selection_options()
+    select = tab.instrument_selection_method_select
+    assert select.value == settings_page.INSTRUMENT_METHOD_UNSET
+    assert settings_page.INSTRUMENT_METHOD_UNSET in select.options
+    assert "unset" in select.options[settings_page.INSTRUMENT_METHOD_UNSET]
+    tab._save_expert_settings(instance.id)
+    assert _rows(instance.id) == before
+
+
+def test_choosing_a_method_over_unset_is_written(tab, instance, fake_ui):
+    tab.instrument_selection_method_select = _instrument_select()
+    tab._load_general_settings(instance)
+    tab._load_instrument_selection_method(instance)            # no row -> unset
+    tab._update_instrument_selection_options()
+    tab.instrument_selection_method_select.value = "screener"
+    tab._save_expert_settings(instance.id)
+    assert MockExpert(instance.id).settings["instrument_selection_method"] == "screener"
+
+
+def test_a_stored_method_hides_the_unset_option(tab, instance, fake_ui):
+    MockExpert(instance.id).save_setting("instrument_selection_method", "dynamic")
+    tab.instrument_selection_method_select = _instrument_select()
+    tab._load_instrument_selection_method(instance)
+    tab._update_instrument_selection_options()
+    assert tab.instrument_selection_method_select.value == "dynamic"
+    assert settings_page.INSTRUMENT_METHOD_UNSET not in tab.instrument_selection_method_select.options
+
+
+def test_show_dialog_instrument_method_read_failure_refuses_the_save(tab, instance, fake_ui, monkeypatch):
+    """The REAL show_dialog catch block: a failed read of the method is shown, the Save
+    button is disabled, and _save_expert refuses before any write."""
+    real_resolve = settings_page.resolve_setting_for_display
+
+    def _resolve(defs, stored, key):
+        if key == "instrument_selection_method":
+            raise RuntimeError("method unreadable")
+        return real_resolve(defs, stored, key)
+    monkeypatch.setattr(settings_page, "resolve_setting_for_display", _resolve)
+    tab.dialog = _El()
+    tab.show_dialog(instance)
+    assert tab._instrument_selection_load_error
+    assert "method unreadable" in tab._instrument_selection_load_error
+    assert any("method unreadable" in m and kw.get("type") == "negative" for m, kw in fake_ui.notes)
+    assert tab._save_button_disabled
+
+    tab._save_expert(instance)
+    assert "could not be loaded" in fake_ui.notes[-1][0]
+    assert _no_rows(instance.id)
+
+
+# ------------------------------------------------------------------- the Save button
+def test_the_save_button_follows_a_re_render(tab, instance, fake_ui, monkeypatch):
+    """Decided once, it stayed disabled (or enabled) whatever the expert type became."""
+    tab._save_button = _El("button")
+    real_defs = MockExpert.__dict__["get_settings_definitions"]
+
+    def _boom(cls):
+        raise RuntimeError("definitions exploded")
+    monkeypatch.setattr(MockExpert, "get_settings_definitions", classmethod(_boom))
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    assert tab._save_button_disabled
+    monkeypatch.setattr(MockExpert, "get_settings_definitions", real_defs)
+    tab._render_expert_settings(instance)
+    assert not tab._save_button_disabled
+
+
+# ------------------------------------------------------------------- accounts
+def _account_rows(account_id):
+    from sqlmodel import select
+    from ba2_trade_platform.core.db import get_db
+    from ba2_trade_platform.core.models import AccountSetting
+    with get_db() as s:
+        rows = s.exec(select(AccountSetting).where(AccountSetting.account_id == account_id)).all()
+        return sorted((r.key, r.value_str, r.value_float, repr(r.value_json)) for r in rows)
+
+
+def _stored_alpaca_account(name="acc"):
+    acc = create_account_definition(provider="Alpaca", name=name)
+    cls = settings_page.providers["Alpaca"]
+    iface = cls.__new__(cls)
+    iface.id = acc.id
+    for key, value in (("api_key", "k"), ("api_secret", "s"), ("paper_account", True)):
+        iface.save_setting(key, value)
+    return acc
+
+
+def _account_edit_form(provider, acc):
+    t = _account_tab()
+    t.dialog = _El()
+    t._update_table_rows = lambda: None
+    t._render_dynamic_settings(provider, acc)
+    t.type_select = SimpleNamespace(value=provider)
+    t.name_input = SimpleNamespace(value=acc.name)
+    t.desc_input = SimpleNamespace(value=acc.description or "")
+    return t
+
+
+def test_an_account_no_edit_save_leaves_missing_rows_missing(fake_ui, monkeypatch):
+    monkeypatch.setattr(settings_page, "get_account_instance_from_id", lambda *a, **k: None)
+    acc = _stored_alpaca_account()
+    before = _account_rows(acc.id)
+    _account_edit_form("Alpaca", acc).save_account(acc)
+    assert not any(kw.get("type") == "negative" for _, kw in fake_ui.notes)
+    assert _account_rows(acc.id) == before     # margin_factor, data_feed... still missing
+
+
+def test_an_account_edited_default_field_is_written(fake_ui, monkeypatch):
+    monkeypatch.setattr(settings_page, "get_account_instance_from_id", lambda *a, **k: None)
+    acc = _stored_alpaca_account()
+    t = _account_edit_form("Alpaca", acc)
+    t.settings_inputs["margin_factor"].value = 1.5
+    t.save_account(acc)
+    assert [r for r in _account_rows(acc.id) if r[0] == "margin_factor"][0][2] == 1.5
+    assert {r[0] for r in _account_rows(acc.id)} == {"api_key", "api_secret", "paper_account",
+                                                     "margin_factor"}
+
+
+def _new_alpaca_form(**values):
+    from ba2_trade_platform.ui.pages.settings import AccountDefinitionsTab
+    t = object.__new__(AccountDefinitionsTab)
+    t.dialog = _El()
+    t._update_table_rows = lambda: None
+    t.type_select = SimpleNamespace(value=values.pop("_provider", "Alpaca"))
+    t.name_input = SimpleNamespace(value="acc")
+    t.desc_input = SimpleNamespace(value="")
+    base = {"paper_account": True, "api_key": "k", "api_secret": "s"}
+    base.update(values)
+    t.settings_inputs = {k: SimpleNamespace(value=v) for k, v in base.items()}
+    return t
+
+
+def _no_accounts():
+    from sqlmodel import select
+    from ba2_trade_platform.core.db import get_db
+    from ba2_trade_platform.core.models import AccountDefinition, AccountSetting
+    with get_db() as s:
+        return not s.exec(select(AccountDefinition)).all() and not s.exec(select(AccountSetting)).all()
+
+
+@pytest.mark.parametrize("key", ["api_key", "api_secret"])
+def test_account_save_allows_an_empty_credential(fake_ui, key):
+    """User decision (2026-09-26): an empty API key/secret is ALLOWED to stay empty -- no
+    refusal for empty str settings, required or not."""
+    from sqlmodel import select
+    from ba2_trade_platform.core.db import get_db
+    from ba2_trade_platform.core.models import AccountDefinition
+    _new_alpaca_form(**{key: ""}).save_account(None)
+    assert not any(key in m and kw.get("type") == "negative" for m, kw in fake_ui.notes)
+    with get_db() as s:
+        assert len(s.exec(select(AccountDefinition)).all()) == 1
+
+
+@pytest.fixture
+def abstract_account(monkeypatch):
+    import abc
+    alpaca = settings_page.providers["Alpaca"]
+
+    class HalfAccount(alpaca):
+        @abc.abstractmethod
+        def not_implemented_yet(self):
+            ...
+
+    monkeypatch.setitem(settings_page.providers, "HalfAccount", HalfAccount)
+    return HalfAccount
+
+
+def test_an_abstract_provider_is_refused_by_name_and_no_row_is_created(fake_ui, abstract_account):
+    """IBKRAccount lacks 10 abstract methods: add_instance ran, then provider_cls.__new__
+    raised, leaving an orphan AccountDefinition on every retry."""
+    _new_alpaca_form(_provider="HalfAccount").save_account(None)
+    msg, kw = fake_ui.notes[-1]
+    assert "HalfAccount" in msg and "not_implemented_yet" in msg and kw.get("type") == "negative"
+    assert _no_accounts()
+
+
+def test_abstract_providers_are_not_offered(abstract_account):
+    names, unavailable = settings_page.selectable_account_providers()
+    assert "HalfAccount" not in names and "Alpaca" in names
+    assert "not_implemented_yet" in unavailable["HalfAccount"]
+
+
+def test_real_ibkr_is_reported_unavailable_while_it_is_abstract():
+    import inspect
+    names, unavailable = settings_page.selectable_account_providers()
+    if inspect.isabstract(settings_page.providers["IBKR"]):
+        assert "IBKR" not in names and "IBKR" in unavailable
+    else:
+        assert "IBKR" in names
+
+
+def test_an_account_edit_whose_settings_fail_leaves_the_row_unchanged(fake_ui, monkeypatch):
+    """update_instance(account) used to commit name/provider BEFORE any setting was written."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import AccountDefinition
+    acc = _stored_alpaca_account(name="before")
+    before = _account_rows(acc.id)
+    t = _account_edit_form("Alpaca", acc)
+    t.name_input.value = "after"
+    t.settings_inputs["api_key"].value = "k2"
+    cls = settings_page.providers["Alpaca"]
+
+    def _fail(self, *a, **k):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(cls, "save_setting", _fail)
+    t.save_account(acc)
+    assert fake_ui.notes[-1][1].get("type") == "negative"
+    assert get_instance(AccountDefinition, acc.id).name == "before"
+    assert _account_rows(acc.id) == before
+
+
+def test_a_new_account_whose_settings_fail_leaves_no_row(fake_ui, monkeypatch):
+    cls = settings_page.providers["Alpaca"]
+
+    real_save = cls.save_setting
+    calls = []
+
+    def _fail_second(self, key, value, setting_type=None):
+        calls.append(key)
+        if len(calls) == 2:
+            raise RuntimeError("disk full")
+        return real_save(self, key, value, setting_type=setting_type)
+    monkeypatch.setattr(cls, "save_setting", _fail_second)
+    _new_alpaca_form().save_account(None)
+    assert fake_ui.notes[-1][1].get("type") == "negative"
+    assert _no_accounts()

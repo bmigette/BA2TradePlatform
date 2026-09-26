@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, List
 from sqlmodel import select
 
 
-from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, EventAction, Ruleset
+from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, ExpertSetting, EventAction, Ruleset
 from ...logger import logger
 from ...core.db import (get_db, get_all_instances, delete_instance, add_instance,
                         update_instance, get_instance, ruleset_event_actions,
@@ -269,9 +269,45 @@ OPERATOR_REFUSED_NOTE = '⚠ The engine refuses {operator} on this trigger; allo
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
 from ..utils.setting_display import (
-    NumericSettingNotSavable, SettingHasNoDisplayValue, display_text, numeric_setting_for_save,
-    resolve_setting_for_display, unset_bool_message, unset_bool_settings,
+    NumericSettingNotSavable, SettingHasNoDisplayValue, ShownDefaults, display_text,
+    has_stored_value, numeric_setting_for_save, resolve_setting_for_display, unset_bool_message,
+    unset_bool_settings,
 )
+
+#: The instrument-selection select's value for "no stored method". FactorRanker reads an unset
+#: method as "defer to universe_source" while an explicit 'static' forces a static universe, so
+#: the dialog must be able to SHOW unset and leave it unset.
+INSTRUMENT_METHOD_UNSET = '__unset__'
+
+
+def _null_setting_keys(setting_model, lookup_field: str, owner_id) -> set:
+    """Keys whose row EXISTS but holds no value (every value column NULL / empty / "None").
+
+    The settings loader reads such a bool row as False and a str/float row as None; the dialog
+    treats all of them as unset, so a no-edit save leaves the row exactly as it is.
+    """
+    with get_db() as session:
+        rows = session.exec(select(setting_model).filter_by(**{lookup_field: owner_id})).all()
+    return {r.key for r in rows
+            if r.value_float is None and r.value_str in (None, "None") and r.value_json in (None, {}, "")}
+
+
+def selectable_account_providers():
+    """The account providers the dialog may offer, and why each other one is not.
+
+    An ABSTRACT provider class (IBKRAccount today lacks 10 methods) can never be built: saving
+    it created the AccountDefinition row and then died in ``provider_cls.__new__``, leaving an
+    orphan row on every retry. Returns ``(names, {name: reason})``.
+    """
+    import inspect
+    names, unavailable = [], {}
+    for name, cls in providers.items():
+        missing = sorted(getattr(cls, '__abstractmethods__', ()) or ())
+        if inspect.isabstract(cls):
+            unavailable[name] = (f"{name} is not implemented yet (missing: {', '.join(missing)})")
+        else:
+            names.append(name)
+    return names, unavailable
 
 
 def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
@@ -1116,38 +1152,43 @@ class AccountDefinitionsTab:
         """
         
         try:
-            
             provider = self.type_select.value
             provider_cls = providers.get(provider, None)
             dynamic_settings = {}
             if hasattr(self, 'settings_inputs') and self.settings_inputs:
                 for key, inp in self.settings_inputs.items():
                     dynamic_settings[key] = inp.value
-            # Refused HERE, before a single setting is written: save_account writes the
-            # settings one by one and only then validates, so a value that got past this
-            # point would already be stored. ``ui.number`` hands back None when the field
-            # is cleared, and margin_factor_error(None) is an error message -- so a
-            # cleared factor is refused with a clear message rather than stored as None.
-            # That is intended: the 1.8 default applies only where the key was NEVER
-            # saved, and a stored None is not that.
+            raw_values = dict(dynamic_settings)   # what the controls show, before conversion
+
+            # EVERYTHING is validated HERE, before a single write. The old order committed the
+            # AccountDefinition row (new: add_instance; edit: update_instance) and only then
+            # met the failures -- an abstract provider (IBKRAccount lacks 10 methods) died in
+            # provider_cls.__new__ after add_instance, leaving an orphan row on every retry.
+            #
+            # ``ui.number`` hands back None when the field is cleared, and
+            # margin_factor_error(None) is an error message -- so a cleared factor is refused
+            # with a clear message rather than stored as None. That is intended: the 1.8
+            # default applies only where the key was NEVER saved, and a stored None is not that.
+            _, unavailable = selectable_account_providers()
             load_error = getattr(self, '_account_settings_load_error', None)
-            problem = (f"Not saved: this account's settings could not be loaded ({load_error}), "
-                       f"so the form shows defaults, not its real settings. Close the dialog "
-                       f"and reopen it; see the log." if load_error
-                       else account_settings_error(dynamic_settings))
+            if provider in unavailable:
+                problem = f"Not saved: {unavailable[provider]}."
+            elif load_error:
+                problem = (f"Not saved: the settings of this account could not be loaded "
+                           f"({load_error}), so the form shows defaults, not its real settings. "
+                           f"Close the dialog and reopen it; see the log.")
+            else:
+                problem = account_settings_error(dynamic_settings)
             if not problem and provider_cls:
                 account_defs = provider_cls.get_merged_settings_definitions()
                 unset = unset_bool_settings(dynamic_settings, account_defs)
                 if unset:
                     problem = unset_bool_message(unset)
                 else:
-                    # Numeric fields resolved BEFORE any write, exactly as the expert dialog
+                    # Numeric fields resolved before any write, exactly as the expert dialog
                     # does: a cleared field saves the DECLARED default, an unparsable one (or
-                    # an empty one with no default) is refused by name. save_setting's own
-                    # int("") used to raise halfway through the loop, after earlier settings
-                    # (and, for a new account, the AccountDefinition row) were written.
-                    # Runs after account_settings_error, so a cleared margin_factor is still
-                    # refused rather than defaulted (see the note above).
+                    # an empty one with no default) is refused by name. Runs after
+                    # account_settings_error, so a cleared margin_factor is still refused.
                     try:
                         for key, raw in list(dynamic_settings.items()):
                             kind = account_defs.get(key, {}).get("type")
@@ -1160,44 +1201,49 @@ class AccountDefinitionsTab:
                 ui.notify(problem, type='negative')
                 logger.warning(f"Refused to save account settings: {problem}")
                 return
-            logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, dynamic_settings_keys: {list(dynamic_settings.keys())}')
+
+            # A NO-EDIT SAVE IS A NO-OP: a field filled from its declared default (no stored
+            # value) is not written unless it was edited; a missing row stays missing. A stored
+            # value -- a credential included -- is shown, so an unedited save rewrites it as is.
+            # (Empty str settings, credentials included, stay ALLOWED: user decision 2026-09-26.)
+            shown = getattr(self, '_account_shown_defaults', None)
+            to_write = {key: value for key, value in dynamic_settings.items()
+                        if not (shown and shown.unedited(key, raw_values[key]))}
+            logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, keys to write: {list(to_write)}')
+
             if account:
+                # SETTINGS FIRST, then the definition row: a settings failure leaves the
+                # name/provider/description of the account exactly as they were.
+                if provider_cls and to_write:
+                    try:
+                        temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
+                        temp_acc_iface.id = account.id
+                        for key, value in to_write.items():
+                            temp_acc_iface.save_setting(key, value)
+                        logger.info(f"Saved {len(to_write)} settings for account {account.id}")
+                    except Exception as settings_error:
+                        logger.error(f"Failed to save settings for account {account.id}: {settings_error}", exc_info=True)
+                        ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
+                        return
                 account.provider = provider
                 account.name = self.name_input.value
                 account.description = self.desc_input.value
                 update_instance(account)
                 logger.info(f"Updated account: {account.name}")
-                
-                # Save dynamic settings FIRST, then validate
-                if provider_cls and dynamic_settings:
+
+                # Now try to validate credentials
+                if provider_cls and to_write:
                     try:
-                        # Save settings first
-                        temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
-                        temp_acc_iface.id = account.id
-                        
-                        # Save each setting individually using save_setting method
-                        for key, value in dynamic_settings.items():
-                            temp_acc_iface.save_setting(key, value)
-                            
-                        logger.info(f"Saved {len(dynamic_settings)} settings for account {account.id}")
-                        
-                        # Now try to validate credentials
-                        try:
-                            acc_iface = get_account_instance_from_id(account.id, use_cache=False)  # Force new instance to test fresh credentials
-                            if acc_iface:
-                                logger.info(f"Successfully validated credentials for account {account.id}")
-                            else:
-                                logger.warning(f"Account {account.id} updated but could not validate credentials")
-                                ui.notify(f"Account updated but could not validate credentials", type="warning")
-                        except Exception as auth_error:
-                            logger.warning(f"Account {account.id} updated but authentication failed: {auth_error}")
-                            ui.notify(f"Account updated but authentication failed: {str(auth_error)}", type="warning")
-                            # Account is still updated, just with authentication issues
-                            
-                    except Exception as settings_error:
-                        logger.error(f"Failed to save settings for account {account.id}: {settings_error}", exc_info=True)
-                        ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
-                        return
+                        acc_iface = get_account_instance_from_id(account.id, use_cache=False)  # Force new instance to test fresh credentials
+                        if acc_iface:
+                            logger.info(f"Successfully validated credentials for account {account.id}")
+                        else:
+                            logger.warning(f"Account {account.id} updated but could not validate credentials")
+                            ui.notify(f"Account updated but could not validate credentials", type="warning")
+                    except Exception as auth_error:
+                        logger.warning(f"Account {account.id} updated but authentication failed: {auth_error}")
+                        ui.notify(f"Account updated but authentication failed: {str(auth_error)}", type="warning")
+                        # Account is still updated, just with authentication issues
             else:
                 new_account = AccountDefinition(
                     provider=provider,
@@ -1206,40 +1252,49 @@ class AccountDefinitionsTab:
                 )
                 new_account_id = add_instance(new_account)
                 logger.info(f"Created new account: {self.name_input.value} with id {new_account_id}")
-                
+
                 # Save dynamic settings FIRST before creating AccountInterface
                 # This ensures credentials are in database before AccountInterface tries to use them
-                if provider_cls and dynamic_settings:
+                if provider_cls and to_write:
                     try:
                         # Create a temporary AccountInterface instance just for saving settings
-                        # Use a special flag to prevent immediate client initialization
                         temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
                         temp_acc_iface.id = new_account_id
-                        
-                        # Save each setting individually using save_setting method
-                        for key, value in dynamic_settings.items():
+                        for key, value in to_write.items():
                             temp_acc_iface.save_setting(key, value)
-                            
-                        logger.info(f"Saved {len(dynamic_settings)} settings for new account {new_account_id}")
-                        
-                        # Now try to create the full AccountInterface to validate credentials
-                        try:
-                            acc_iface = provider_cls(new_account_id)
-                            logger.info(f"Successfully validated credentials for account {new_account_id}")
-                        except Exception as auth_error:
-                            logger.warning(f"Account {new_account_id} created but authentication failed: {auth_error}")
-                            ui.notify(f"Account created but authentication failed: {str(auth_error)}", type="warning")
-                            # Account is still created, just with authentication issues
-                            
+                        logger.info(f"Saved {len(to_write)} settings for new account {new_account_id}")
                     except Exception as settings_error:
-                        logger.error(f"Failed to save settings for new account {new_account_id}: {settings_error}", exc_info=True)
+                        # Undo the half-created account (its row and whatever settings were
+                        # written), so a retry does not leave an orphan behind.
+                        logger.error(f"Failed to save settings for new account {new_account_id}: {settings_error}; "
+                                     f"removing the half-created account", exc_info=True)
+                        self._remove_half_created_account(new_account_id)
                         ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
                         return
+
+                    # Now try to create the full AccountInterface to validate credentials
+                    try:
+                        acc_iface = provider_cls(new_account_id)
+                        logger.info(f"Successfully validated credentials for account {new_account_id}")
+                    except Exception as auth_error:
+                        logger.warning(f"Account {new_account_id} created but authentication failed: {auth_error}")
+                        ui.notify(f"Account created but authentication failed: {str(auth_error)}", type="warning")
+                        # Account is still created, just with authentication issues
             self.dialog.close()
             self._update_table_rows()
         except Exception as e:
             logger.error(f"Error saving account: {str(e)}", exc_info=True)
             ui.notify("Error saving account", type="error")
+
+    def _remove_half_created_account(self, account_id: int) -> None:
+        """Delete a just-created AccountDefinition and any settings rows written for it."""
+        with get_db() as session:
+            for setting in session.exec(
+                    select(AccountSetting).where(AccountSetting.account_id == account_id)).all():
+                delete_instance(setting, session)
+        created = get_instance(AccountDefinition, account_id)
+        if created is not None:
+            delete_instance(created)
 
     def delete_account(self, account: AccountDefinition) -> None:
         try:
@@ -1272,7 +1327,12 @@ class AccountDefinitionsTab:
         logger.debug(f'Showing account dialog for account: {account.name if account else "new account"}')
         with self.dialog:
             self.dialog.clear()
-            provider_names = list(providers.keys())
+            # An abstract provider (IBKRAccount today) can never be built: it is not offered
+            # for a NEW account, and the reason is shown. An existing account keeps its
+            # provider listed so the dialog still opens -- save_account refuses it by name.
+            provider_names, unavailable = selectable_account_providers()
+            if account is not None and account.provider not in provider_names:
+                provider_names = provider_names + [account.provider]
             # WIDE AND COMPACT on purpose. Quasar caps a non-maximized dialog's card at
             # 560px, and one stacked, full-height field per setting made a dozen settings
             # a scrolling column. Dense outlined fields in a two-column grid fit the whole
@@ -1286,6 +1346,8 @@ class AccountDefinitionsTab:
                     self.name_input = ui.input(label='Account Name').props('dense outlined').classes('w-full')
                     self.desc_input = ui.input(label='Description').props('dense outlined').classes('w-full')
                 self.type_select.value = account.provider if account else provider_names[0]
+                for reason in unavailable.values():
+                    ui.label(f'Not offered: {reason}.').classes('text-caption text-grey-7')
                 self.name_input.value = account.name if account else ''
                 self.desc_input.value = account.description if account else ''
                 ui.separator().classes('my-1')
@@ -1360,6 +1422,7 @@ class AccountDefinitionsTab:
         # A read failure leaves the form on DEFAULTS, which Save would write over the real
         # settings: it is shown, and save_account refuses while it stands.
         self._account_settings_load_error = None
+        self._account_shown_defaults = ShownDefaults()
         settings_values = {}
         if account:
             try:
@@ -1439,6 +1502,11 @@ class AccountDefinitionsTab:
                         _help(tooltip_text)
 
                     self.settings_inputs[key] = inp
+                    if account:
+                        # EDIT: a field filled from its declared default (no stored value) is
+                        # not written back unless edited -- a no-edit save is a no-op.
+                        self._account_shown_defaults.record(
+                            key, not has_stored_value(settings_values, key), inp.value)
             else:
                 ui.label("No provider-specific settings available.").classes('col-span-2 text-sm text-gray-500')
 
@@ -1960,6 +2028,9 @@ class ExpertSettingsTab:
         self._imported_expert_settings = None
         self._general_settings_load_error = None   # set by _load_general_settings on failure
         self._instrument_selection_load_error = None   # set when editing, on a failed read
+        self._instrument_method_unset = False           # editing an expert with no stored method
+        self._shown_defaults = ShownDefaults()          # controls filled from a declared default
+        self._save_button = None
         self._imported_symbol_settings = None
         self._imported_enter_market_ruleset_name = None
         self._imported_open_positions_ruleset_name = None
@@ -2456,29 +2527,7 @@ class ExpertSettingsTab:
                     if account_instance:
                         self.account_select.value = f"{account_instance.name} ({account_instance.provider})"
 
-                    # A failure here used to set 'static' at DEBUG level, and _save_expert
-                    # writes the select back unconditionally: a no-edit save silently switched
-                    # a screener/dynamic expert to static. Now recorded, shown, and the save
-                    # refused (like _load_general_settings).
-                    self._instrument_selection_load_error = None
-                    try:
-                        from ...core.utils import get_expert_instance_from_id
-                        expert = get_expert_instance_from_id(expert_instance.id)
-                        if expert is None:
-                            raise ValueError(f'no live expert instance for id {expert_instance.id}')
-                        instrument_method = resolve_setting_for_display(
-                            type(expert).get_merged_settings_definitions(), expert.settings,
-                            'instrument_selection_method')
-                        self.instrument_selection_method_select.value = instrument_method
-                    except Exception as e:
-                        self._instrument_selection_load_error = f'{type(e).__name__}: {e}'
-                        logger.error(f'Could not load instrument_selection_method for expert '
-                                     f'{expert_instance.id}: {e}. Saving this dialog is refused.',
-                                     exc_info=True)
-                        ui.notify(f'Could not load the instrument selection method of expert '
-                                  f'{expert_instance.id} ({self._instrument_selection_load_error}). '
-                                  f'Save is disabled for this dialog.',
-                                  type='negative', timeout=0, close_button=True)
+                    self._load_instrument_selection_method(expert_instance)
 
                     # THE PROFILE IS READ IN ITS OWN TRY, and failing to read it is recorded.
                     # Sharing the handler above meant a failure left the select on its
@@ -2495,6 +2544,12 @@ class ExpertSettingsTab:
                         self._fill_market_condition_profile(
                             expert.settings.get(MARKET_CONDITION_PROFILE_SETTING))
                         self._market_condition_profile_loaded = True
+                        self._shown_defaults_tracker().record(
+                            MARKET_CONDITION_PROFILE_SETTING,
+                            (not has_stored_value(expert.settings, MARKET_CONDITION_PROFILE_SETTING)
+                             or MARKET_CONDITION_PROFILE_SETTING in _null_setting_keys(
+                                 ExpertSetting, 'instance_id', expert_instance.id)),
+                            self._market_condition_profile_value())
                     except Exception as e:
                         logger.error(
                             f'Could not read {MARKET_CONDITION_PROFILE_SETTING} for expert '
@@ -2522,13 +2577,8 @@ class ExpertSettingsTab:
                 # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
                     ui.button('Cancel', on_click=self.dialog.close).props('flat')
-                    save_button = ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
-                    if (self._general_settings_load_error
-                            or getattr(self, '_expert_settings_load_error', None)
-                            or getattr(self, '_instrument_selection_load_error', None)):
-                        # The form holds defaults, not this expert's settings (see
-                        # _load_general_settings); _save_expert refuses as well.
-                        save_button.disable()
+                    self._save_button = ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
+                    self._refresh_save_button()
         
         self.dialog.open()
     
@@ -2979,6 +3029,32 @@ class ExpertSettingsTab:
             def shown(key):
                 return resolve_setting_for_display(definitions, settings_source, key)
 
+            # A NO-EDIT SAVE IS A NO-OP: every control filled from a declared default (no row,
+            # or a row with every value column NULL) is recorded, and the save skips it unless
+            # the operator edited it -- a missing row stays missing, a NULL row stays NULL.
+            null_keys = (set() if getattr(self, '_imported_expert_settings', None)
+                         else _null_setting_keys(ExpertSetting, 'instance_id', expert_instance.id))
+            tracker = self._shown_defaults_tracker()
+
+            def unset(key):
+                return not has_stored_value(settings_source, key) or key in null_keys
+
+            def show(key, attr, value):
+                if hasattr(self, attr):
+                    control = getattr(self, attr)
+                    control.value = value
+                    tracker.record(key, unset(key), control.value)
+
+            # Schedules: shown from the stored config, else the form's own; recorded the same way.
+            if hasattr(self, 'enter_market_schedule_days') and hasattr(self, 'enter_market_execution_times'):
+                tracker.record('execution_schedule_enter_market',
+                               unset('execution_schedule_enter_market'),
+                               self._get_enter_market_schedule_config())
+            if hasattr(self, 'open_positions_schedule_days') and hasattr(self, 'open_positions_execution_times'):
+                tracker.record('execution_schedule_open_positions',
+                               unset('execution_schedule_open_positions'),
+                               self._get_open_positions_schedule_config())
+
             # Load trading permissions
             enable_buy = shown('enable_buy')
             enable_sell = shown('enable_sell')
@@ -2989,18 +3065,12 @@ class ExpertSettingsTab:
             # of it into the two new permissions existed here but could never fire (its
             # `key not in settings_source` test is always false -- every defined key is
             # pre-filled); making it reachable would have switched automated trading ON, on a
-            # no-edit save, for any expert with an old automatic_trading=true row, while
-            # TradeManager reads only the new keys (review 2026-09-22). The dialog shows the new
-            # keys from their stored value or declared default, nothing else.
+            # no-edit save, for any expert with an old automatic_trading=true row, while only
+            # the new keys gate trading (review 2026-09-22). The dialog shows the new keys from
+            # their stored value or declared default, nothing else.
 
-            if hasattr(self, 'enable_buy_checkbox'):
-                self.enable_buy_checkbox.value = enable_buy
-            if hasattr(self, 'enable_sell_checkbox'):
-                self.enable_sell_checkbox.value = enable_sell
-            if hasattr(self, 'allow_automated_trade_opening_checkbox'):
-                self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
-            if hasattr(self, 'allow_automated_trade_modification_checkbox'):
-                self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
+            for key, attr in self._BUILTIN_BOOL_CONTROLS.items():
+                show(key, attr, shown(key))
 
             # Position sizing (text inputs show str()).
             for key, attr in (
@@ -3011,12 +3081,10 @@ class ExpertSettingsTab:
                 ('atr_period', 'atr_period_input'),
                 ('min_stop_loss_pct', 'min_stop_loss_pct_input'),
             ):
-                if hasattr(self, attr):
-                    getattr(self, attr).value = display_text(definitions, key, shown(key))
+                show(key, attr, display_text(definitions, key, shown(key)))
 
             sizing_mode = shown('sizing_mode')
-            if hasattr(self, 'sizing_mode_select'):
-                self.sizing_mode_select.value = sizing_mode
+            show('sizing_mode', 'sizing_mode_select', sizing_mode)
 
             # Set risk_atr container visibility from the loaded sizing_mode so an
             # expert already in risk_atr shows the knobs when the dialog opens.
@@ -3030,19 +3098,21 @@ class ExpertSettingsTab:
                 ('risk_manager_mode', 'risk_manager_mode_select'),
                 ('smart_risk_manager_user_instructions', 'smart_risk_manager_user_instructions_input'),
             ):
-                if hasattr(self, attr):
-                    getattr(self, attr).value = shown(key)
+                show(key, attr, shown(key))
             for key, attr in (
                 ('smart_risk_manager_max_iterations', 'smart_risk_manager_max_iterations_input'),
                 ('smart_risk_manager_analysis_window_hours', 'smart_risk_manager_analysis_window_hours_input'),
             ):
-                if hasattr(self, attr):
-                    getattr(self, attr).value = int(shown(key))
+                show(key, attr, int(shown(key)))
 
-            # AI instrument prompt: an undeclared key, shown only when stored.
+            # AI instrument prompt: an undeclared key, shown only when stored (the textarea
+            # otherwise holds the generated default prompt, which is recorded as a default).
             ai_instrument_prompt = settings_source.get('ai_instrument_prompt')
             if ai_instrument_prompt and hasattr(self, 'ai_prompt_textarea'):
                 self.ai_prompt_textarea.value = ai_instrument_prompt
+            if hasattr(self, 'ai_prompt_textarea'):
+                tracker.record('ai_instrument_prompt', unset('ai_instrument_prompt'),
+                               self.ai_prompt_textarea.value)
 
             # Load ruleset assignments from ExpertInstance model or imported data
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
@@ -3388,8 +3458,9 @@ class ExpertSettingsTab:
                 self.instrument_selection_method_select.props('disable')
                 logger.debug(f'Instrument selection forced to "{required_method}" for {expert_type}')
             else:
-                # Build available options (no "expert" — only via required_instrument_selection_method)
-                options = ["static", "dynamic", "screener"]
+                # Build available options (no "expert" — only via required_instrument_selection_method);
+                # plus UNSET while the edited expert has no stored method.
+                options = self._instrument_method_options(["static", "dynamic", "screener"])
 
                 current_value = self.instrument_selection_method_select.value
                 self.instrument_selection_method_select.options = options
@@ -3429,7 +3500,7 @@ class ExpertSettingsTab:
         self.instruments_content_container.clear()
         
         # Get current selection method
-        selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+        selection_method = self._effective_instrument_method()
         
         # Get expert properties to check capabilities
         expert_type = getattr(self.expert_select, 'value', None) if hasattr(self, 'expert_select') else None
@@ -3534,11 +3605,15 @@ class ExpertSettingsTab:
 
         # Load current values if editing
         current_settings = {}
+        null_keys = set()
         if expert_instance:
             from ...core.utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance.id)
             if expert:
                 current_settings = expert.settings
+                null_keys = _null_setting_keys(ExpertSetting, 'instance_id', expert_instance.id)
+        tracker = self._shown_defaults_tracker()
+        tracker.forget(getattr(self, 'screener_settings_inputs', None) or ())
 
         self.screener_settings_inputs = {}
 
@@ -3602,6 +3677,9 @@ class ExpertSettingsTab:
                         _render_reset_default_button(inp, default_value, meta)
 
                     self.screener_settings_inputs[key] = inp
+                    if expert_instance:
+                        tracker.record(key, not has_stored_value(current_settings, key)
+                                       or key in null_keys, inp.value)
 
                 # Test Screener button + progress bar
                 with ui.row().classes('w-full justify-end mt-4'):
@@ -3844,6 +3922,9 @@ class ExpertSettingsTab:
         defaulted form must never be saved over the expert's real settings.
         """
         self._expert_settings_load_error = None
+        tracker = self._shown_defaults_tracker()
+        tracker.forget(getattr(self, '_expert_form_keys', ()))
+        self._expert_form_keys = set()
         self.expert_settings_container.clear()
         
         expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
@@ -3860,10 +3941,12 @@ class ExpertSettingsTab:
             # Get settings definitions (only expert-specific, not builtin)
             settings_def = expert_class.get_settings_definitions()
             current_settings = {}
+            null_keys = set()
             
             if expert_instance:
                 expert = expert_class(expert_instance.id)
                 current_settings = expert.settings  # This will include defaults for missing values
+                null_keys = _null_setting_keys(ExpertSetting, 'instance_id', expert_instance.id)
             
             self.expert_settings_inputs = {}
             
@@ -4029,6 +4112,12 @@ class ExpertSettingsTab:
                     setting_container.move(self.expert_settings_container)
                     
                     self.expert_settings_inputs[key] = inp
+                    if expert_instance:
+                        # EDIT: a field filled from a declared default is not written back
+                        # unless edited (a no-edit save is a no-op).
+                        self._expert_form_keys.add(key)
+                        tracker.record(key, not has_stored_value(current_settings, key)
+                                       or key in null_keys, inp.value)
             else:
                 ui.label("No expert-specific settings available.").move(self.expert_settings_container)
                 
@@ -4039,6 +4128,8 @@ class ExpertSettingsTab:
             logger.error(f'Error rendering expert settings: {e}', exc_info=True)
             ui.label(f"Error loading settings: {e}. Save is refused for this dialog.") \
                 .classes('text-negative').move(self.expert_settings_container)
+        # The expert type may have changed: Save follows the form's CURRENT load state.
+        self._refresh_save_button()
     
     def _on_expert_type_change(self, event, expert_instance):
         """Handle expert type change."""
@@ -4628,6 +4719,99 @@ class ExpertSettingsTab:
         from ...core.ExpertPriority import validate_expert_priority
         return validate_expert_priority(self.priority_input.value)
 
+    # ------------------------------------------------------------ a no-edit save is a no-op
+    def _shown_defaults_tracker(self) -> ShownDefaults:
+        tracker = getattr(self, '_shown_defaults', None)
+        if tracker is None:
+            tracker = self._shown_defaults = ShownDefaults()
+        return tracker
+
+    def _save_unless_unedited_default(self, expert, key, control_value, value, setting_type) -> bool:
+        """Write ``key`` -- unless its control was filled from a DECLARED default (no stored row,
+        or a NULL one) and still shows exactly that. Writing it would freeze today's default
+        into the row, so a later change of the declaration would no longer reach this expert;
+        a missing row stays missing and a NULL row stays NULL. Returns whether it wrote."""
+        if self._shown_defaults_tracker().unedited(key, control_value):
+            logger.debug(f'Not writing {key}: shown from its declared default and not edited')
+            return False
+        expert.save_setting(key, value, setting_type=setting_type)
+        return True
+
+    def _dialog_load_error(self):
+        """Why this dialog's form does not hold the expert's real settings; None when it does."""
+        return (getattr(self, '_general_settings_load_error', None)
+                or getattr(self, '_expert_settings_load_error', None)
+                or getattr(self, '_instrument_selection_load_error', None))
+
+    def _refresh_save_button(self):
+        """Enable/disable Save from the CURRENT load state. Re-run whenever a part of the form is
+        re-rendered (an expert-type change re-renders the expert-specific form), not decided
+        once when the dialog opens."""
+        self._save_button_disabled = bool(self._dialog_load_error())
+        button = getattr(self, '_save_button', None)
+        if button is None:
+            return
+        if self._save_button_disabled:
+            button.disable()
+        else:
+            button.enable()
+
+    # ------------------------------------------------------------ instrument selection method
+    def _instrument_method_options(self, methods: list):
+        """The select's options: ``methods``, plus the UNSET entry while this expert has no
+        stored method (then a dict value -> label, as the select accepts)."""
+        if not getattr(self, '_instrument_method_unset', False):
+            return list(methods)
+        default = _builtin_default('instrument_selection_method')
+        options = {INSTRUMENT_METHOD_UNSET: f"(unset -- the declared default '{default}' applies)"}
+        options.update({m: m for m in methods})
+        return options
+
+    def _effective_instrument_method(self) -> str:
+        """The method the instruments tab renders and saves by: the select's value, or the
+        DECLARED default while it shows unset (which is what the runtime applies)."""
+        value = getattr(getattr(self, 'instrument_selection_method_select', None), 'value', None)
+        if value in (None, '', INSTRUMENT_METHOD_UNSET):
+            return _builtin_default('instrument_selection_method')
+        return value
+
+    def _load_instrument_selection_method(self, expert_instance):
+        """Fill the method select for an EDIT.
+
+        No stored method (no row, or a NULL row) is shown as UNSET and saved as nothing: an
+        explicit 'static' would force FactorRanker's static universe where unset defers to its
+        universe_source. A failed read used to set 'static' at DEBUG level, and the save wrote
+        it back -- a no-edit save switched a screener expert to static. It is now recorded,
+        shown, Save is disabled and _save_expert refuses.
+        """
+        key = 'instrument_selection_method'
+        self._instrument_selection_load_error = None
+        self._instrument_method_unset = False
+        select_el = self.instrument_selection_method_select
+        try:
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance.id)
+            if expert is None:
+                raise ValueError(f'no live expert instance for id {expert_instance.id}')
+            shown = resolve_setting_for_display(
+                type(expert).get_merged_settings_definitions(), expert.settings, key)
+            if (not has_stored_value(expert.settings, key)
+                    or key in _null_setting_keys(ExpertSetting, 'instance_id', expert_instance.id)):
+                self._instrument_method_unset = True
+                select_el.options = self._instrument_method_options(
+                    [o for o in (select_el.options or []) if o != INSTRUMENT_METHOD_UNSET])
+                shown = INSTRUMENT_METHOD_UNSET
+            select_el.value = shown
+        except Exception as e:
+            self._instrument_selection_load_error = f'{type(e).__name__}: {e}'
+            logger.error(f'Could not load instrument_selection_method for expert '
+                         f'{expert_instance.id}: {e}. Saving this dialog is refused.',
+                         exc_info=True)
+            ui.notify(f'Could not load the instrument selection method of expert '
+                      f'{expert_instance.id} ({self._instrument_selection_load_error}). '
+                      f'Save is disabled for this dialog.',
+                      type='negative', timeout=0, close_button=True)
+
     #: The builtin permission checkboxes and the setting each one writes.
     _BUILTIN_BOOL_CONTROLS = {
         'enable_buy': 'enable_buy_checkbox',
@@ -4692,8 +4876,7 @@ class ExpertSettingsTab:
             if (key != 'instrument_selection_method' and meta.get('ui_editor_type') != 'ModelSelector'
                     and meta.get('type') in ('int', 'float')):
                 fields[key] = (inp.value, int if meta['type'] == 'int' else float)
-        method = getattr(getattr(self, 'instrument_selection_method_select', None), 'value', None)
-        if method == 'screener':
+        if self._effective_instrument_method() == 'screener':
             for key, inp in (getattr(self, 'screener_settings_inputs', None) or {}).items():
                 kind = definitions.get(key, {}).get('type')
                 if kind in ('int', 'float'):
@@ -4839,7 +5022,7 @@ class ExpertSettingsTab:
             self._save_expert_settings(expert_id)
             
             # Check if instruments are properly configured based on selection method
-            selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+            selection_method = self._effective_instrument_method()
             has_instruments = False
             
             if selection_method == 'static':
@@ -4915,20 +5098,21 @@ class ExpertSettingsTab:
         # Save general settings (schedules and trading permissions)
         if hasattr(self, 'enter_market_schedule_days') and hasattr(self, 'enter_market_execution_times'):
             schedule_config = self._get_enter_market_schedule_config()
-            expert.save_setting('execution_schedule_enter_market', schedule_config, setting_type="json")
+            self._save_unless_unedited_default(expert, 'execution_schedule_enter_market', schedule_config,
+                                               schedule_config, "json")
             logger.debug(f'Saved execution_schedule_enter_market: {schedule_config}')
         
         if hasattr(self, 'open_positions_schedule_days') and hasattr(self, 'open_positions_execution_times'):
             schedule_config_open = self._get_open_positions_schedule_config()
-            expert.save_setting('execution_schedule_open_positions', schedule_config_open, setting_type="json")
+            self._save_unless_unedited_default(expert, 'execution_schedule_open_positions', schedule_config_open,
+                                               schedule_config_open, "json")
             logger.debug(f'Saved execution_schedule_open_positions: {schedule_config_open}')
         
         if (hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox') and 
             hasattr(self, 'allow_automated_trade_opening_checkbox') and hasattr(self, 'allow_automated_trade_modification_checkbox')):
-            expert.save_setting('enable_buy', self.enable_buy_checkbox.value, setting_type="bool")
-            expert.save_setting('enable_sell', self.enable_sell_checkbox.value, setting_type="bool")
-            expert.save_setting('allow_automated_trade_opening', self.allow_automated_trade_opening_checkbox.value, setting_type="bool")
-            expert.save_setting('allow_automated_trade_modification', self.allow_automated_trade_modification_checkbox.value, setting_type="bool")
+            for key, attr in self._BUILTIN_BOOL_CONTROLS.items():
+                value = getattr(self, attr).value
+                self._save_unless_unedited_default(expert, key, value, value, "bool")
             logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
         
         # Numeric fields: resolved by _numeric_settings_to_save (a cleared field saves the
@@ -4936,35 +5120,35 @@ class ExpertSettingsTab:
         # before any write, so it cannot raise here for a dialog that got this far.
         numeric = self._numeric_settings_to_save()
         for key, (attr, kind) in self._BUILTIN_NUMERIC_CONTROLS.items():
-            if key in numeric:
-                expert.save_setting(key, numeric[key], setting_type=kind.__name__)
+            if key in numeric and self._save_unless_unedited_default(
+                    expert, key, getattr(self, attr).value, numeric[key], kind.__name__):
                 logger.debug(f'Saved {key}={numeric[key]}')
 
         # Save risk_atr (risk-based) sizing mode; an empty select saves the declared default.
         if hasattr(self, 'sizing_mode_select'):
-            sizing_mode_value = self.sizing_mode_select.value
+            shown_value = sizing_mode_value = self.sizing_mode_select.value
             if sizing_mode_value in (None, ''):
                 sizing_mode_value = _builtin_default('sizing_mode')
-            expert.save_setting('sizing_mode', str(sizing_mode_value), setting_type="str")
+            self._save_unless_unedited_default(expert, 'sizing_mode', shown_value, str(sizing_mode_value), "str")
             logger.debug(f'Saved risk management: sizing_mode={sizing_mode_value}')
 
         # Save AI model settings
         if hasattr(self, 'risk_manager_model_input'):
-            expert.save_setting('risk_manager_model', self.risk_manager_model_input.value, setting_type="str")
+            self._save_unless_unedited_default(expert, 'risk_manager_model', self.risk_manager_model_input.value, self.risk_manager_model_input.value, "str")
             logger.debug(f'Saved AI model setting: risk_manager_model={self.risk_manager_model_input.value}')
         
         if hasattr(self, 'dynamic_instrument_selection_model_input'):
-            expert.save_setting('dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_input.value, setting_type="str")
+            self._save_unless_unedited_default(expert, 'dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_input.value, self.dynamic_instrument_selection_model_input.value, "str")
             logger.debug(f'Saved AI model setting: dynamic_instrument_selection_model={self.dynamic_instrument_selection_model_input.value}')
         
         # Save risk manager mode
         if hasattr(self, 'risk_manager_mode_select'):
-            expert.save_setting('risk_manager_mode', self.risk_manager_mode_select.value, setting_type="str")
+            self._save_unless_unedited_default(expert, 'risk_manager_mode', self.risk_manager_mode_select.value, self.risk_manager_mode_select.value, "str")
             logger.debug(f'Saved risk manager mode: risk_manager_mode={self.risk_manager_mode_select.value}')
         
         # Save smart risk manager user instructions
         if hasattr(self, 'smart_risk_manager_user_instructions_input'):
-            expert.save_setting('smart_risk_manager_user_instructions', self.smart_risk_manager_user_instructions_input.value, setting_type="str")
+            self._save_unless_unedited_default(expert, 'smart_risk_manager_user_instructions', self.smart_risk_manager_user_instructions_input.value, self.smart_risk_manager_user_instructions_input.value, "str")
             logger.debug(f'Saved smart risk manager user instructions: {self.smart_risk_manager_user_instructions_input.value}')
         
         # Save the market-condition profile (a BUILTIN setting with its own widget next to the
@@ -4976,13 +5160,19 @@ class ExpertSettingsTab:
         # because of an unrelated read failure. Never write a default you did not read.
         if self._market_condition_profile_savable():
             profile_value = self._market_condition_profile_value()
-            expert.save_setting(MARKET_CONDITION_PROFILE_SETTING, profile_value, setting_type="str")
+            self._save_unless_unedited_default(expert, MARKET_CONDITION_PROFILE_SETTING, profile_value, profile_value, "str")
             logger.debug(f'Saved {MARKET_CONDITION_PROFILE_SETTING}: {profile_value!r}')
 
-        # Save instrument selection method (moved to main panel)
+        # Save instrument selection method (moved to main panel). UNSET (no stored method on
+        # an edited expert, left alone) writes NOTHING: an explicit 'static' would force
+        # FactorRanker's static universe where unset defers to universe_source.
         if hasattr(self, 'instrument_selection_method_select'):
-            expert.save_setting('instrument_selection_method', self.instrument_selection_method_select.value, setting_type="str")
-            logger.debug(f'Saved instrument_selection_method: {self.instrument_selection_method_select.value}')
+            method = self.instrument_selection_method_select.value
+            if method == INSTRUMENT_METHOD_UNSET:
+                logger.debug('instrument_selection_method left unset')
+            else:
+                expert.save_setting('instrument_selection_method', method, setting_type="str")
+                logger.debug(f'Saved instrument_selection_method: {method}')
         
         # Save expert-specific settings
         if hasattr(self, 'expert_settings_inputs') and self.expert_settings_inputs:
@@ -4994,6 +5184,8 @@ class ExpertSettingsTab:
                     continue
                     
                 meta = settings_def.get(key, {})
+                if self._shown_defaults_tracker().unedited(key, inp.value):
+                    continue   # filled from its declared default, not edited: no-op
                 
                 # Handle ModelSelector special case (ModelSelectorInput has .value property)
                 if meta.get("ui_editor_type") == "ModelSelector":
@@ -5028,13 +5220,13 @@ class ExpertSettingsTab:
             return
             
         expert = expert_class(expert_id)
-        selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+        selection_method = self._effective_instrument_method()
         
         if selection_method == 'dynamic':
             # Save AI prompt for dynamic selection
             if hasattr(self, 'ai_prompt_textarea'):
                 ai_prompt = self.ai_prompt_textarea.value
-                expert.save_setting('ai_instrument_prompt', ai_prompt, setting_type="str")
+                self._save_unless_unedited_default(expert, 'ai_instrument_prompt', ai_prompt, ai_prompt, "str")
                 logger.debug(f'Saved AI instrument prompt for expert {expert_id}')
             
             # For dynamic selection, we don't save static instrument configuration
@@ -5059,6 +5251,8 @@ class ExpertSettingsTab:
                 numeric = self._numeric_settings_to_save()
                 for key, inp in self.screener_settings_inputs.items():
                     meta = builtin.get(key, {})
+                    if self._shown_defaults_tracker().unedited(key, inp.value):
+                        continue   # filled from its declared default, not edited: no-op
                     if meta.get("type") in ("int", "float"):
                         expert.save_setting(key, numeric[key], setting_type=meta["type"])
                     else:
@@ -5081,6 +5275,10 @@ class ExpertSettingsTab:
                     'weight': inst['weight']
                 }
             
+            if not instrument_configs and not has_stored_value(expert.settings, 'enabled_instruments'):
+                # Nothing selected and nothing stored: writing {} would be a no-edit change.
+                logger.debug(f'No instruments selected and none stored for expert {expert_id}')
+                return
             expert.set_enabled_instruments(instrument_configs)
             logger.debug(f'Saved instrument configuration for expert {expert_id}: {len(instrument_configs)} instruments')
     

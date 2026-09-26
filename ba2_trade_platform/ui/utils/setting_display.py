@@ -28,6 +28,44 @@ class SettingHasNoDisplayValue(ValueError):
     """
 
 
+def has_stored_value(stored: Mapping[str, Any], key: str) -> bool:
+    """Whether ``stored`` holds a real value for ``key`` -- not absent, ``None``, nor the
+    historical string ``"None"`` (rows written as ``str(None)``)."""
+    value = stored.get(key)
+    return value is not None and value != "None"
+
+
+class ShownDefaults:
+    """The controls of an EDIT form that were filled from a DECLARED default, and what each
+    showed. A no-edit save must be a byte-for-byte no-op: writing those back would freeze
+    today's default into a row that was missing (or NULL) -- so a later change of the
+    declaration would no longer reach that instance. A save skips a recorded key while its
+    control still shows the recorded value; an edited one is validated and written as usual.
+    """
+
+    def __init__(self):
+        self._shown: Dict[str, Any] = {}
+
+    def record(self, key: str, unset: bool, control_value: Any) -> None:
+        """Note what ``key``'s control shows; ``unset`` = it had no stored value."""
+        if unset:
+            self._shown[key] = control_value
+        else:
+            self._shown.pop(key, None)
+
+    def forget(self, keys: Iterable[str]) -> None:
+        for key in keys:
+            self._shown.pop(key, None)
+
+    def unedited(self, key: str, control_value: Any) -> bool:
+        """True when ``key`` was filled from a default and still shows exactly that."""
+        if key not in self._shown:
+            return False
+        shown = self._shown[key]
+        # type() too: True == 1 must not pass for a checkbox that became a number, etc.
+        return type(shown) is type(control_value) and shown == control_value
+
+
 def resolve_setting_for_display(definitions: Mapping[str, Dict[str, Any]],
                                 stored: Mapping[str, Any], key: str) -> Any:
     """The value a form control should show for ``key``.
@@ -43,11 +81,9 @@ def resolve_setting_for_display(definitions: Mapping[str, Dict[str, Any]],
     caller asking is reading an undeclared key it should read directly.
     """
     definition = definitions[key]
-    value = stored.get(key)
-    if value == "None":
-        # Historical rows hold str(None); unset, exactly as get_setting_with_interface_default
-        # reads them.
-        value = None
+    # Historical rows hold str(None); unset, exactly as get_setting_with_interface_default
+    # reads them.
+    value = stored.get(key) if has_stored_value(stored, key) else None
     is_bool = definition.get("type") == "bool"
     if value is not None:
         return coerce_bool(value) if is_bool else value
