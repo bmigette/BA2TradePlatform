@@ -672,8 +672,10 @@ class WorkerQueue:
         except (ValueError, TypeError) as e:
             logger.warning(f"Invalid worker_count setting: {e}")
             
-        # Default to 4 workers and create the setting if it doesn't exist
-        default_count = 4
+        # The DECLARED default (core.app_settings, the value the App Settings tab shows), and
+        # create the setting if it doesn't exist
+        from .app_settings import app_setting_default
+        default_count = app_setting_default("worker_count")
         self._ensure_worker_count_setting(default_count)
         return default_count
         

@@ -242,7 +242,8 @@ def test_the_save_path_reads_the_guard_and_the_savable_flag():
 
     saved = inspect.getsource(ExpertSettingsTab._save_expert_settings)
     guard = saved.index("_market_condition_profile_savable()")
-    write = saved.index("save_setting(MARKET_CONDITION_PROFILE_SETTING")
+    # The write goes through the no-edit no-op helper (settings-display review 2026-09-26).
+    write = saved.index("_save_unless_unedited(expert, MARKET_CONDITION_PROFILE_SETTING")
     assert guard < write
 
 

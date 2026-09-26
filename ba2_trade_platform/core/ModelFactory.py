@@ -117,6 +117,18 @@ class ModelFactory:
         cls.clear_api_key_cache()
     
     @classmethod
+    def _aws_bedrock_region(cls) -> str:
+        """The configured AWS Bedrock region, else the DECLARED default (core.app_settings --
+        the value the App Settings tab shows)."""
+        region = cls._get_api_key("aws_bedrock_region")
+        if region:
+            return region
+        from .app_settings import app_setting_default
+        region = app_setting_default("aws_bedrock_region")
+        logger.warning(f"AWS region not configured, defaulting to {region}")
+        return region
+
+    @classmethod
     def _get_api_key(cls, setting_key: str) -> Optional[str]:
         """
         Get API key from app settings with caching.
@@ -706,7 +718,7 @@ class ModelFactory:
         # Get AWS credentials from app settings
         aws_access_key = cls._get_api_key("aws_access_key_id")
         aws_secret_key = cls._get_api_key("aws_secret_access_key")
-        aws_region = cls._get_api_key("aws_bedrock_region")
+        aws_region = cls._aws_bedrock_region()
         
         if not aws_access_key:
             raise ValueError(
@@ -718,10 +730,6 @@ class ModelFactory:
                 "AWS Secret Access Key not configured. "
                 "Please set 'aws_secret_access_key' in app settings."
             )
-        if not aws_region:
-            # Default to us-east-1 if not configured
-            aws_region = "us-east-1"
-            logger.warning(f"AWS region not configured, defaulting to {aws_region}")
         
         llm_params = {
             "model": model_name,
