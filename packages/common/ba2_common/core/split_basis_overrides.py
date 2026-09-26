@@ -90,7 +90,7 @@ __all__ = [
     "overrides_version_for",
 ]
 
-OVERRIDES_VERSION = "2026-09-26.4"
+OVERRIDES_VERSION = "2026-09-26.5"
 
 #: An anchor close may differ from the recorded one by at most this fraction (0.1%).
 ANCHOR_TOLERANCE = 0.001
@@ -326,6 +326,17 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
         "SMCI", date(2024, 10, 30), 0.673249, KIND_ACKNOWLEDGE_JUMP, ((_A2020, 2.36),),
         "Real -33% move (auditor resignation) 29 days after the 2024-10-01 10:1 split, in a "
         "full re-fetch; guard clean in 2020-2025."),
+    BasisOverride(
+        "RTX", date(2020, 4, 3), 1.589, KIND_EXCLUDE_CALENDAR_EVENT,
+        ((_A2020, 90.32), (date(2021, 6, 1), 88.99)),
+        "Carrier/Otis distribution + Raytheon merger (UTX -> RTX, ROOT_HISTORY RTX <- UTX): the "
+        "calendar says x1.589, the UTX chain carries x1.6963; replaced by the next entry."),
+    BasisOverride(
+        "RTX", date(2020, 4, 3), 1.6963, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 90.32), (date(2021, 6, 1), 88.99)),
+        "Replacement of the x1.589 row: tools/measure_basis_plateaus.py RTX 2020-04-03 (with the "
+        "row in place) r 1.0673 (p10-p90 1.0626-1.0685) over the 56 UTX sessions before / 0.9998 "
+        "over the 60 from it = 1.0675; 1.589 x 1.0675 = 1.6963. Residual 0 sessions >2% of 1558."),
 )
 
 

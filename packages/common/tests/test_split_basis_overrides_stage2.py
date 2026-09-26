@@ -100,12 +100,14 @@ EXPECTED = {
     "MARA": [(date(2017, 11, 22), 1.535211, ACK, _1), (date(2017, 11, 24), 2.729358, ACK, _1),
              (date(2017, 11, 28), 0.591398, ACK, _1), (date(2019, 4, 10), 1.424354, ACK, _1)],
     "SMCI": [(date(2024, 10, 30), 0.673249, ACK, _1)],
+    "RTX": [(date(2020, 4, 3), 1.589, EXCL, _a((date(2021, 6, 1), 88.99))),
+            (date(2020, 4, 3), 1.6963, ADD, _a((date(2021, 6, 1), 88.99)))],
 }
 #: The FMP close at 2020-01-02 each symbol's entries were measured on (ENLT: its own anchor).
 ANCHORS = {"TRP": 48.0, "MMM": 150.49, "SKM": 22.5, "MTCH": 84.19, "AMC": 74.6, "ARWR": 63.12,
            "ENLT": 17.75, "FCEL": 60.3, "GSK": 46.92, "QGEN": 34.18,
            "LBRDA": 125.19, "FTI": 17.46, "PHG": 44.87, "FLEX": 12.78, "CMCSA": 45.37,
-           "MARA": 1.05, "SMCI": 2.36}
+           "MARA": 1.05, "SMCI": 2.36, "RTX": 90.32}
 #: A stretch override carries a second anchor inside its stretch (review 2026-09-26).
 STRETCH = {"SKM": date(2021, 12, 15), "LBRDA": date(2025, 6, 24), "PHG": date(2022, 9, 7),
            "FLEX": date(2023, 12, 11), "CMCSA": date(2025, 12, 15), "QGEN": date(2025, 12, 16)}
@@ -147,6 +149,9 @@ CALENDARS = {
     "FLEX": ([_cs(1999, 1, 12, 2.0), _cs(1999, 12, 23, 2.0), _cs(2000, 10, 17, 2.0)],
              date(2011, 6, 22)),
     "CMCSA": ([_cs(2007, 2, 22, 1.5), _cs(2017, 2, 21, 2.0)], date(2011, 6, 20)),
+    "RTX": ([_cs(1976, 5, 19, 2.0), _cs(1984, 6, 11, 2.0), _cs(1996, 12, 11, 2.0),
+             _cs(1999, 5, 18, 2.0), _cs(2005, 6, 13, 2.0), _cs(2020, 4, 3, 1.589)],
+            date(2011, 9, 20)),
 }
 #: The part-2 files carry the full-fetch marker the forced re-fetch writes.
 REFETCHED = {"AMC", "FCEL", "GSK", "QGEN", "LBRDA", "FTI", "PHG", "FLEX", "CMCSA"}
@@ -199,6 +204,8 @@ SWEEP = [
     ("FLEX", date(2024, 3, 1), 29.075, 29.000),
     ("CMCSA", date(2020, 6, 1), 40.195, 40.180),
     ("CMCSA", date(2025, 12, 15), 28.250, 26.430),  # the ex-distribution stretch
+    ("RTX", date(2020, 1, 2), 153.195, 90.320),     # UTX (ROOT_HISTORY), before the spins
+    ("RTX", date(2020, 4, 6), 57.115, 57.560),      # RTX, after them
 ]
 #: AMC: hard-to-borrow through the APE period, parity runs 1.5-4% under the spot.
 TOLERANCE = {"AMC": 0.03}
@@ -208,7 +215,7 @@ OFF_WITHOUT = {("TRP", date(2020, 6, 1)), ("TRP", date(2024, 9, 3)), ("MMM", dat
                ("AMC", date(2022, 6, 1)), ("FCEL", date(2023, 6, 1)), ("GSK", date(2020, 6, 1)),
                ("QGEN", date(2020, 6, 1)), ("LBRDA", date(2021, 6, 1)), ("FTI", date(2020, 6, 1)),
                ("PHG", date(2022, 9, 7)), ("FLEX", date(2023, 12, 11)),
-               ("CMCSA", date(2025, 12, 15))}
+               ("CMCSA", date(2025, 12, 15)), ("RTX", date(2020, 1, 2))}
 
 
 def _no_ack(sym):
@@ -236,7 +243,7 @@ def test_the_module_under_test_is_the_worktree_copy():
 
 
 def test_the_version_was_bumped_for_this_edit():
-    assert ovr.OVERRIDES_VERSION >= "2026-09-26.4"
+    assert ovr.OVERRIDES_VERSION >= "2026-09-26.5"
 
 
 @pytest.mark.parametrize("sym", sorted(EXPECTED))
@@ -292,6 +299,14 @@ def test_mtch_excludes_only_the_separation_row():
     b = _resolve("MTCH")
     assert b.factor(date(2020, 6, 30)) == 1.0
     assert [s.date for s in b.splits] == []
+
+
+def test_rtx_replaces_the_spin_row_with_what_the_utx_chain_carries():
+    """UTX's chain (ROOT_HISTORY RTX <- UTX) sits x1.0675 above FMP's as-traded series before the
+    Carrier/Otis distribution: the x1.589 calendar row is replaced by 1.589 x 1.0675."""
+    rtx = _resolve("RTX")
+    assert rtx.factor(date(2020, 4, 2)) == pytest.approx(1.6963)
+    assert rtx.factor(date(2020, 4, 3)) == 1.0
 
 
 def test_fti_and_phg_replace_the_vendor_ratio_on_its_own_date():
