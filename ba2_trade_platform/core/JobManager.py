@@ -640,23 +640,25 @@ class JobManager:
         try:
             # Get the account refresh interval from AppSettings (in minutes)
             refresh_interval_str = get_setting("account_refresh_interval")
-            refresh_interval_minutes = 5  # Default to 5 minutes
+            # The DECLARED default (core.app_settings, the value the App Settings tab shows).
+            from .app_settings import app_setting_default
+            refresh_interval_minutes = app_setting_default("account_refresh_interval")
             
             if refresh_interval_str:
                 try:
                     refresh_interval_minutes = int(refresh_interval_str)
                 except ValueError:
-                    logger.warning(f"Invalid account_refresh_interval setting: {refresh_interval_str}, using default of 5 minutes")
+                    logger.warning(f"Invalid account_refresh_interval setting: {refresh_interval_str}, using default of {refresh_interval_minutes} minutes")
             else:
                 # Create the setting with default value if it doesn't exist
                 from .models import AppSetting
                 from .db import add_instance
                 setting = AppSetting(
                     key="account_refresh_interval",
-                    value_str="5"
+                    value_str=str(refresh_interval_minutes)
                 )
                 add_instance(setting)
-                logger.info("Created account_refresh_interval AppSetting with default value: 5 minutes")
+                logger.info(f"Created account_refresh_interval AppSetting with default value: {refresh_interval_minutes} minutes")
             
             # Create interval trigger
             trigger = IntervalTrigger(minutes=refresh_interval_minutes)
@@ -774,16 +776,20 @@ class JobManager:
             logger.error(f"Error executing account refresh: {e}", exc_info=True)
 
     def _get_account_refresh_interval_minutes(self) -> int:
-        """Configured account refresh interval in minutes (defaults to 5)."""
+        """Configured account refresh interval in minutes (else the DECLARED default,
+        core.app_settings -- the value the App Settings tab shows)."""
+        from .app_settings import app_setting_default
+        default_minutes = app_setting_default("account_refresh_interval")
         try:
             raw = get_setting("account_refresh_interval")
             if raw:
                 return max(1, int(raw))
         except (TypeError, ValueError):
             logger.warning(
-                f"Invalid account_refresh_interval setting: {raw!r}; watchdog assuming 5 minutes"
+                f"Invalid account_refresh_interval setting: {raw!r}; watchdog assuming "
+                f"{default_minutes} minutes"
             )
-        return 5
+        return default_minutes
 
     def account_refresh_health(self):
         """Report on account-refresh liveness: (healthy, job_present, seconds_since_last, threshold).

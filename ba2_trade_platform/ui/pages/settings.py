@@ -268,9 +268,11 @@ OPERATOR_REFUSED_NOTE = '⚠ The engine refuses {operator} on this trigger; allo
 
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
+from ...core.app_settings import APP_SETTINGS_DEFINITIONS
 from ..utils.setting_display import (
     NumericSettingNotSavable, SettingHasNoDisplayValue, ShownDefaults, display_text,
-    has_stored_value, numeric_setting_for_save, resolve_setting_for_display, unset_bool_message,
+    has_stored_value, numeric_setting_for_save, resolve_setting_for_display,
+    select_value_for_display, unpicked_selects, unpicked_selects_message, unset_bool_message,
     unset_bool_settings,
 )
 
@@ -290,6 +292,18 @@ def _null_setting_keys(setting_model, lookup_field: str, owner_id) -> set:
         rows = session.exec(select(setting_model).filter_by(**{lookup_field: owner_id})).all()
     return {r.key for r in rows
             if r.value_float is None and r.value_str in (None, "None") and r.value_json in (None, {}, "")}
+
+
+def _show_select_error(key: str, inp, error) -> None:
+    """Put ``error`` ON the dropdown (Quasar error state), log it and tell the operator. The
+    error clears once a value is picked; the save refuses until then (unpicked_selects)."""
+    if not error:
+        return
+    safe = str(error).replace('"', "'")
+    inp.props(f'error error-message="{safe}"')
+    inp.on_value_change(lambda e: inp.props(remove='error'))
+    logger.error(f"Setting '{key}': {error}")
+    ui.notify(f"Setting '{key}': {error}", type='negative', timeout=0, close_button=True)
 
 
 def selectable_account_providers():
@@ -776,40 +790,59 @@ class AppSettingsTab:
         self.account_refresh_interval_input = None
         self.render()
 
+    #: Every app setting the tab edits: key -> input attribute.
+    _APP_CONTROLS = {
+        'openai_api_key': 'openai_input', 'openai_admin_api_key': 'openai_admin_input',
+        'naga_ai_api_key': 'naga_ai_input', 'naga_ai_admin_api_key': 'naga_ai_admin_input',
+        'anthropic_api_key': 'anthropic_input', 'anthropic_admin_api_key': 'anthropic_admin_input',
+        'google_api_key': 'google_input', 'openrouter_api_key': 'openrouter_input',
+        'xai_api_key': 'xai_input', 'xai_admin_api_key': 'xai_admin_input',
+        'xai_team_id': 'xai_team_id_input', 'moonshot_api_key': 'moonshot_input',
+        'deepseek_api_key': 'deepseek_input', 'aws_access_key_id': 'aws_access_key_input',
+        'aws_secret_access_key': 'aws_secret_key_input', 'aws_bedrock_region': 'aws_region_input',
+        'finnhub_api_key': 'finnhub_input', 'fred_api_key': 'fred_input',
+        'alpha_vantage_api_key': 'alpha_vantage_input', 'FMP_API_KEY': 'fmp_input',
+        'alpaca_api_key': 'alpaca_key_input', 'alpaca_api_secret': 'alpaca_secret_input',
+        'worker_count': 'worker_count_input',
+        'account_refresh_interval': 'account_refresh_interval_input',
+    }
+
+    def _shown_value(self, key: str):
+        """The stored value, else the DECLARED default, else empty ('' for text, None for a
+        number). An unparsable stored number is shown empty, loudly."""
+        meta = APP_SETTINGS_DEFINITIONS[key]
+        stored = getattr(self, '_stored', {})
+        if has_stored_value(stored, key):
+            raw = stored[key]
+            if meta['type'] == 'int':
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    logger.error(f"App setting '{key}' holds an unreadable number {raw!r}")
+                    ui.notify(f"App setting '{key}' holds an unreadable number ({raw!r}); it is "
+                              f"shown empty -- a save with it empty writes the declared default",
+                              type='negative', timeout=0, close_button=True)
+                    return None
+            return raw
+        if 'default' in meta:
+            return meta['default']
+        return '' if meta['type'] == 'str' else None
+
     def render(self):
-        session = get_db()
+        # Every value comes from the stored row, else the DECLARED default
+        # (core.app_settings.APP_SETTINGS_DEFINITIONS -- the default the runtime readers use
+        # too), else empty. No literals here: they were second copies of the runtime's own.
+        with get_db() as session:
+            self._stored = {row.key: row.value_str
+                            for row in session.exec(select(AppSetting)).all()}
         
         # LLM Provider API Keys
-        openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
-        openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
-        naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
-        naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
-        anthropic = session.exec(select(AppSetting).where(AppSetting.key == 'anthropic_api_key')).first()
-        anthropic_admin = session.exec(select(AppSetting).where(AppSetting.key == 'anthropic_admin_api_key')).first()
-        google = session.exec(select(AppSetting).where(AppSetting.key == 'google_api_key')).first()
-        openrouter = session.exec(select(AppSetting).where(AppSetting.key == 'openrouter_api_key')).first()
-        xai = session.exec(select(AppSetting).where(AppSetting.key == 'xai_api_key')).first()
-        xai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'xai_admin_api_key')).first()
-        xai_team_id = session.exec(select(AppSetting).where(AppSetting.key == 'xai_team_id')).first()
-        moonshot = session.exec(select(AppSetting).where(AppSetting.key == 'moonshot_api_key')).first()
-        deepseek = session.exec(select(AppSetting).where(AppSetting.key == 'deepseek_api_key')).first()
-        aws_access_key = session.exec(select(AppSetting).where(AppSetting.key == 'aws_access_key_id')).first()
-        aws_secret_key = session.exec(select(AppSetting).where(AppSetting.key == 'aws_secret_access_key')).first()
-        aws_region = session.exec(select(AppSetting).where(AppSetting.key == 'aws_bedrock_region')).first()
         
         # Data Provider API Keys
-        finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
-        fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
-        alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
-        fmp = session.exec(select(AppSetting).where(AppSetting.key == 'FMP_API_KEY')).first()
         
         # Broker API Keys
-        alpaca_key = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_key')).first()
-        alpaca_secret = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_secret')).first()
         
         # System Settings
-        worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
-        account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
         
         # =================================================================
         # LLM Provider API Keys Section
@@ -820,68 +853,68 @@ class AppSettingsTab:
             
             with ui.expansion('OpenAI', icon='smart_toy').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
-                    self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '', password=True, password_toggle_button=True).classes('w-full')
+                    self.openai_input = ui.input(label='OpenAI API Key', value=self._shown_value('openai_api_key'), password=True, password_toggle_button=True).classes('w-full')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=openai_admin.value_str if openai_admin else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=self._shown_value('openai_admin_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('NagaAI', icon='waves').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.naga_ai_input = ui.input(label='NagaAI API Key', value=naga_ai.value_str if naga_ai else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.naga_ai_input = ui.input(label='NagaAI API Key', value=self._shown_value('naga_ai_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get NagaAI Key', 'https://naga.ac/', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.naga_ai_admin_input = ui.input(label='NagaAI Admin API Key (for usage data)', value=naga_ai_admin.value_str if naga_ai_admin else '', password=True, password_toggle_button=True).classes('w-full')
+                    self.naga_ai_admin_input = ui.input(label='NagaAI Admin API Key (for usage data)', value=self._shown_value('naga_ai_admin_api_key'), password=True, password_toggle_button=True).classes('w-full')
             
             with ui.expansion('Anthropic (Claude)', icon='psychology').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.anthropic_input = ui.input(label='Anthropic API Key', value=anthropic.value_str if anthropic else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.anthropic_input = ui.input(label='Anthropic API Key', value=self._shown_value('anthropic_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get Anthropic Key', 'https://console.anthropic.com/settings/keys', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.anthropic_admin_input = ui.input(label='Anthropic Admin API Key (sk-ant-admin..., for spend/usage data)', value=anthropic_admin.value_str if anthropic_admin else '', password=True, password_toggle_button=True).classes('w-full')
+                    self.anthropic_admin_input = ui.input(label='Anthropic Admin API Key (sk-ant-admin..., for spend/usage data)', value=self._shown_value('anthropic_admin_api_key'), password=True, password_toggle_button=True).classes('w-full')
             
             with ui.expansion('Google (Gemini)', icon='auto_awesome').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.google_input = ui.input(label='Google API Key', value=google.value_str if google else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.google_input = ui.input(label='Google API Key', value=self._shown_value('google_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get Google Key', 'https://aistudio.google.com/app/apikey', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('OpenRouter', icon='route').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.openrouter_input = ui.input(label='OpenRouter API Key', value=openrouter.value_str if openrouter else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.openrouter_input = ui.input(label='OpenRouter API Key', value=self._shown_value('openrouter_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get OpenRouter Key', 'https://openrouter.ai/keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('xAI (Grok)', icon='bolt').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.xai_input = ui.input(label='xAI API Key', value=xai.value_str if xai else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.xai_input = ui.input(label='xAI API Key', value=self._shown_value('xai_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get xAI Key', 'https://console.x.ai/', new_tab=True).classes('text-sm text-blue-600 underline')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.xai_admin_input = ui.input(label='xAI Admin API Key (for billing/usage data)', value=xai_admin.value_str if xai_admin else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.xai_admin_input = ui.input(label='xAI Admin API Key (for billing/usage data)', value=self._shown_value('xai_admin_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Management API Docs', 'https://docs.x.ai/docs/key-information/using-management-api', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.xai_team_id_input = ui.input(label='xAI Team ID (e.g., team-xxxxx)', value=xai_team_id.value_str if xai_team_id else '').classes('w-full')
+                    self.xai_team_id_input = ui.input(label='xAI Team ID (e.g., team-xxxxx)', value=self._shown_value('xai_team_id')).classes('w-full')
                     ui.label('Find your Team ID in the xAI console URL or account settings').classes('text-xs text-gray-500')
             
             with ui.expansion('Moonshot (Kimi)', icon='nightlight').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.moonshot_input = ui.input(label='Moonshot API Key', value=moonshot.value_str if moonshot else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.moonshot_input = ui.input(label='Moonshot API Key', value=self._shown_value('moonshot_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get Moonshot Key', 'https://platform.moonshot.ai/console/api-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('DeepSeek', icon='explore').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.deepseek_input = ui.input(label='DeepSeek API Key', value=deepseek.value_str if deepseek else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.deepseek_input = ui.input(label='DeepSeek API Key', value=self._shown_value('deepseek_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get DeepSeek Key', 'https://platform.deepseek.com/api_keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('AWS Bedrock', icon='cloud').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     ui.label('AWS credentials for Amazon Bedrock models (Claude, etc.)').classes('text-sm text-gray-500')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.aws_access_key_input = ui.input(label='AWS Access Key ID', value=aws_access_key.value_str if aws_access_key else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.aws_access_key_input = ui.input(label='AWS Access Key ID', value=self._shown_value('aws_access_key_id'), password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get AWS Keys', 'https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.aws_secret_key_input = ui.input(label='AWS Secret Access Key', value=aws_secret_key.value_str if aws_secret_key else '', password=True, password_toggle_button=True).classes('w-full')
-                    self.aws_region_input = ui.input(label='AWS Region (e.g., us-east-1)', value=aws_region.value_str if aws_region else 'us-east-1').classes('w-full')
+                    self.aws_secret_key_input = ui.input(label='AWS Secret Access Key', value=self._shown_value('aws_secret_access_key'), password=True, password_toggle_button=True).classes('w-full')
+                    self.aws_region_input = ui.input(label='AWS Region (e.g., us-east-1)', value=self._shown_value('aws_bedrock_region')).classes('w-full')
         
         # =================================================================
         # Data Provider API Keys Section
@@ -890,11 +923,11 @@ class AppSettingsTab:
             ui.label('📊 Data Provider API Keys').classes('text-xl font-bold mb-2')
             ui.label('Configure API keys for market data providers').classes('text-sm text-gray-500 mb-4')
             
-            self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '', password=True, password_toggle_button=True).classes('w-full')
-            self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '', password=True, password_toggle_button=True).classes('w-full')
-            self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=alpha_vantage.value_str if alpha_vantage else '', password=True, password_toggle_button=True).classes('w-full')
+            self.finnhub_input = ui.input(label='Finnhub API Key', value=self._shown_value('finnhub_api_key'), password=True, password_toggle_button=True).classes('w-full')
+            self.fred_input = ui.input(label='FRED API Key', value=self._shown_value('fred_api_key'), password=True, password_toggle_button=True).classes('w-full')
+            self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=self._shown_value('alpha_vantage_api_key'), password=True, password_toggle_button=True).classes('w-full')
             with ui.row().classes('w-full items-center gap-2 mt-2'):
-                self.fmp_input = ui.input(label='Financial Modeling Prep (FMP) API Key', value=fmp.value_str if fmp else '', password=True, password_toggle_button=True).classes('flex-1')
+                self.fmp_input = ui.input(label='Financial Modeling Prep (FMP) API Key', value=self._shown_value('FMP_API_KEY'), password=True, password_toggle_button=True).classes('flex-1')
                 ui.link('Get FMP Key', 'https://site.financialmodelingprep.com/developer/docs', new_tab=True).classes('text-sm text-blue-600 underline')
         
         # =================================================================
@@ -905,9 +938,9 @@ class AppSettingsTab:
             ui.label('Configure API keys for trading brokers').classes('text-sm text-gray-500 mb-4')
             
             with ui.row().classes('w-full items-center gap-2'):
-                self.alpaca_key_input = ui.input(label='Alpaca API Key', value=alpaca_key.value_str if alpaca_key else '', password=True, password_toggle_button=True).classes('flex-1')
+                self.alpaca_key_input = ui.input(label='Alpaca API Key', value=self._shown_value('alpaca_api_key'), password=True, password_toggle_button=True).classes('flex-1')
                 ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
-            self.alpaca_secret_input = ui.input(label='Alpaca API Secret', value=alpaca_secret.value_str if alpaca_secret else '', password=True, password_toggle_button=True).classes('w-full')
+            self.alpaca_secret_input = ui.input(label='Alpaca API Secret', value=self._shown_value('alpaca_api_secret'), password=True, password_toggle_button=True).classes('w-full')
         
         # =================================================================
         # System Settings Section
@@ -918,19 +951,26 @@ class AppSettingsTab:
             
             self.worker_count_input = ui.number(
                 label='Worker Count', 
-                value=int(worker_count.value_str) if worker_count and worker_count.value_str else 4,
+                value=self._shown_value('worker_count'),
                 min=1,
                 max=20,
                 step=1
             ).classes('w-full')
             self.account_refresh_interval_input = ui.number(
                 label='Account Refresh Interval (minutes)', 
-                value=int(account_refresh_interval.value_str) if account_refresh_interval and account_refresh_interval.value_str else 5,
+                value=self._shown_value('account_refresh_interval'),
                 min=1,
                 max=1440,  # Maximum 24 hours
                 step=1
             ).classes('w-full')
         
+        # A NO-EDIT SAVE IS A NO-OP: a control filled from its declared default (no stored
+        # row) is not written unless edited.
+        self._app_shown_defaults = ShownDefaults()
+        for key, attr in self._APP_CONTROLS.items():
+            self._app_shown_defaults.record(key, not has_stored_value(self._stored, key),
+                                            getattr(self, attr).value)
+
         ui.button('Save All Settings', on_click=self.save_settings, icon='save').classes('mt-4').props('color=primary')
 
     def _save_app_setting(self, session, key: str, value: str):
@@ -945,174 +985,58 @@ class AppSettingsTab:
 
     def save_settings(self):
         try:
+            # Validate BEFORE any write.
+            admin_key = (self.openai_admin_input.value or '').strip()
+            if admin_key and not admin_key.startswith("sk-admin"):
+                ui.notify('Invalid admin key format. Admin keys should start with "sk-admin".', type='negative')
+                return
+            # A NO-EDIT SAVE IS A NO-OP: a control still showing the declared default it was
+            # filled with (no stored row) is not written. A cleared number saves the declared
+            # default; an unparsable one is refused by name. Empty text stays allowed.
+            tracker = getattr(self, '_app_shown_defaults', None)
+            to_write = {}
+            try:
+                for key, attr in self._APP_CONTROLS.items():
+                    raw = getattr(self, attr).value
+                    if tracker is not None and tracker.unedited(key, raw):
+                        continue
+                    if APP_SETTINGS_DEFINITIONS[key]['type'] == 'int':
+                        to_write[key] = str(numeric_setting_for_save(
+                            APP_SETTINGS_DEFINITIONS, key, raw, int))
+                    else:
+                        to_write[key] = '' if raw is None else raw
+            except NumericSettingNotSavable as e:
+                ui.notify(f'Not saved: {e}', type='negative')
+                logger.warning(f'Refused to save app settings: {e}')
+                return
+
             session = get_db()
-            # OpenAI Regular Key
-            openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
-            if openai:
-                openai.value_str = self.openai_input.value
-                update_instance(openai, session)
-            else:
-                openai = AppSetting(key='openai_api_key', value_str=self.openai_input.value)
-                add_instance(openai, session)
-
-            # OpenAI Admin Key
-            if self.openai_admin_input.value.strip():
-                # Validate admin key format
-                if not self.openai_admin_input.value.strip().startswith("sk-admin"):
-                    ui.notify('Invalid admin key format. Admin keys should start with "sk-admin".', type='negative')
-                    return
-            
-            openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
-            if openai_admin:
-                openai_admin.value_str = self.openai_admin_input.value
-                update_instance(openai_admin, session)
-            else:
-                openai_admin = AppSetting(key='openai_admin_api_key', value_str=self.openai_admin_input.value)
-                add_instance(openai_admin, session)
-
-            # Naga AI Regular Key
-            naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
-            if naga_ai:
-                naga_ai.value_str = self.naga_ai_input.value
-                update_instance(naga_ai, session)
-            else:
-                naga_ai = AppSetting(key='naga_ai_api_key', value_str=self.naga_ai_input.value)
-                add_instance(naga_ai, session)
-
-            # Naga AI Admin Key
-            naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
-            if naga_ai_admin:
-                naga_ai_admin.value_str = self.naga_ai_admin_input.value
-                update_instance(naga_ai_admin, session)
-            else:
-                naga_ai_admin = AppSetting(key='naga_ai_admin_api_key', value_str=self.naga_ai_admin_input.value)
-                add_instance(naga_ai_admin, session)
-
-            # Anthropic API Key
-            self._save_app_setting(session, 'anthropic_api_key', self.anthropic_input.value)
-            self._save_app_setting(session, 'anthropic_admin_api_key', self.anthropic_admin_input.value)
-            
-            # Google API Key
-            self._save_app_setting(session, 'google_api_key', self.google_input.value)
-            
-            # OpenRouter API Key
-            self._save_app_setting(session, 'openrouter_api_key', self.openrouter_input.value)
-            
-            # xAI API Key
-            self._save_app_setting(session, 'xai_api_key', self.xai_input.value)
-            
-            # xAI Admin API Key
-            self._save_app_setting(session, 'xai_admin_api_key', self.xai_admin_input.value)
-            
-            # xAI Team ID
-            self._save_app_setting(session, 'xai_team_id', self.xai_team_id_input.value)
-            
-            # Moonshot API Key
-            self._save_app_setting(session, 'moonshot_api_key', self.moonshot_input.value)
-            
-            # DeepSeek API Key
-            self._save_app_setting(session, 'deepseek_api_key', self.deepseek_input.value)
-            
-            # AWS Bedrock Credentials
-            self._save_app_setting(session, 'aws_access_key_id', self.aws_access_key_input.value)
-            self._save_app_setting(session, 'aws_secret_access_key', self.aws_secret_key_input.value)
-            self._save_app_setting(session, 'aws_bedrock_region', self.aws_region_input.value)
-
-            # Finnhub
-            finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
-            if finnhub:
-                finnhub.value_str = self.finnhub_input.value
-                update_instance(finnhub, session)
-            else:
-                finnhub = AppSetting(key='finnhub_api_key', value_str=self.finnhub_input.value)
-                add_instance(finnhub, session)
-
-            # FRED
-            fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
-            if fred:
-                fred.value_str = self.fred_input.value
-                update_instance(fred, session)
-            else:
-                fred = AppSetting(key='fred_api_key', value_str=self.fred_input.value)
-                add_instance(fred, session)
-
-            # Alpha Vantage
-            alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
-            if alpha_vantage:
-                alpha_vantage.value_str = self.alpha_vantage_input.value
-                update_instance(alpha_vantage, session)
-            else:
-                alpha_vantage = AppSetting(key='alpha_vantage_api_key', value_str=self.alpha_vantage_input.value)
-                add_instance(alpha_vantage, session)
-            
-            # FMP (Financial Modeling Prep)
-            fmp = session.exec(select(AppSetting).where(AppSetting.key == 'FMP_API_KEY')).first()
-            if fmp:
-                fmp.value_str = self.fmp_input.value
-                update_instance(fmp, session)
-            else:
-                fmp = AppSetting(key='FMP_API_KEY', value_str=self.fmp_input.value)
-                add_instance(fmp, session)
-            
-            # Alpaca API Key
-            alpaca_key = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_key')).first()
-            if alpaca_key:
-                alpaca_key.value_str = self.alpaca_key_input.value
-                update_instance(alpaca_key, session)
-            else:
-                alpaca_key = AppSetting(key='alpaca_api_key', value_str=self.alpaca_key_input.value)
-                add_instance(alpaca_key, session)
-            
-            # Alpaca API Secret
-            alpaca_secret = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_secret')).first()
-            if alpaca_secret:
-                alpaca_secret.value_str = self.alpaca_secret_input.value
-                update_instance(alpaca_secret, session)
-            else:
-                alpaca_secret = AppSetting(key='alpaca_api_secret', value_str=self.alpaca_secret_input.value)
-                add_instance(alpaca_secret, session)
-            
-            # Worker Count
-            worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
-            if worker_count:
-                worker_count.value_str = str(int(self.worker_count_input.value))
-                update_instance(worker_count, session)
-            else:
-                worker_count = AppSetting(key='worker_count', value_str=str(int(self.worker_count_input.value)))
-                add_instance(worker_count, session)
-            
-            # Account Refresh Interval
-            account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
-            if account_refresh_interval:
-                account_refresh_interval.value_str = str(int(self.account_refresh_interval_input.value))
-                update_instance(account_refresh_interval, session)
-            else:
-                account_refresh_interval = AppSetting(key='account_refresh_interval', value_str=str(int(self.account_refresh_interval_input.value)))
-                add_instance(account_refresh_interval, session)
-            
+            for key, value in to_write.items():
+                self._save_app_setting(session, key, value)
             session.commit()
-            
+            logger.debug(f'Saved app settings: {sorted(to_write)}')
+
             # Clear the ModelBillingUsage cache so new API keys take effect
             try:
                 from ...core.ModelBillingUsage import ModelBillingUsage
                 ModelBillingUsage.clear_cache()
             except Exception as e:
                 logger.warning(f"Could not clear ModelBillingUsage cache: {e}")
-            
+
             # Clear the ModelFactory cache so new API keys take effect
             try:
                 from ...core.ModelFactory import ModelFactory
                 ModelFactory.clear_cache()
             except Exception as e:
                 logger.warning(f"Could not clear ModelFactory cache: {e}")
-            
+
             ui.notify('Settings saved successfully', type='positive')
-            
+
             # Notify user that worker count changes require restart
             ui.notify('Worker count changes will take effect after restart', type='info')
             # Notify user that account refresh interval changes require restart
             ui.notify('Account refresh interval changes will take effect after restart', type='info')
-            
+
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}", exc_info=True)
             ui.notify('Error saving settings', type='negative')
@@ -1182,8 +1106,11 @@ class AccountDefinitionsTab:
             if not problem and provider_cls:
                 account_defs = provider_cls.get_merged_settings_definitions()
                 unset = unset_bool_settings(dynamic_settings, account_defs)
+                unpicked = unpicked_selects(getattr(self, '_select_checks', None) or {})
                 if unset:
                     problem = unset_bool_message(unset)
+                elif unpicked:
+                    problem = unpicked_selects_message(unpicked)
                 else:
                     # Numeric fields resolved before any write, exactly as the expert dialog
                     # does: a cleared field saves the DECLARED default, an unparsable one (or
@@ -1423,6 +1350,7 @@ class AccountDefinitionsTab:
         # settings: it is shown, and save_account refuses while it stands.
         self._account_settings_load_error = None
         self._account_shown_defaults = ShownDefaults()
+        self._select_checks = {}
         settings_values = {}
         if account:
             try:
@@ -1460,11 +1388,17 @@ class AccountDefinitionsTab:
                     # floating label) grows, the help icon trails it.
                     with ui.row().classes('w-full items-center gap-1 no-wrap min-h-10'):
                         if meta["type"] == "str" and valid_values:
+                            # Never the first option as a silent fallback: an invalid stored
+                            # value (or none, with no default) is shown EMPTY with an error,
+                            # and save_account refuses until one is picked.
+                            select_value, select_error = select_value_for_display(valid_values, value)
                             inp = ui.select(
                                 label=label,
                                 options=list(valid_values),
-                                value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                value=select_value
                             ).props('dense outlined').classes('flex-grow')
+                            _show_select_error(key, inp, select_error)
+                            self._select_checks[key] = (inp, list(valid_values))
                         elif meta["type"] == "str":
                             inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         elif meta["type"] == "bool":
@@ -3083,8 +3017,21 @@ class ExpertSettingsTab:
             ):
                 show(key, attr, display_text(definitions, key, shown(key)))
 
-            sizing_mode = shown('sizing_mode')
-            show('sizing_mode', 'sizing_mode_select', sizing_mode)
+            self._select_checks_general = {}
+
+            def show_select(key, attr):
+                # A select: an invalid stored value is ONE field in error (shown empty, save
+                # refused until picked), not a load error for the whole tab -- and never a
+                # silent fallback to the first option.
+                if hasattr(self, attr):
+                    valid = definitions[key]['valid_values']
+                    value, error = select_value_for_display(valid, shown(key))
+                    show(key, attr, value)
+                    _show_select_error(key, getattr(self, attr), error)
+                    self._select_checks_general[key] = (getattr(self, attr), list(valid))
+
+            show_select('sizing_mode', 'sizing_mode_select')
+            sizing_mode = getattr(getattr(self, 'sizing_mode_select', None), 'value', None)
 
             # Set risk_atr container visibility from the loaded sizing_mode so an
             # expert already in risk_atr shows the knobs when the dialog opens.
@@ -3095,10 +3042,10 @@ class ExpertSettingsTab:
             for key, attr in (
                 ('risk_manager_model', 'risk_manager_model_input'),
                 ('dynamic_instrument_selection_model', 'dynamic_instrument_selection_model_input'),
-                ('risk_manager_mode', 'risk_manager_mode_select'),
                 ('smart_risk_manager_user_instructions', 'smart_risk_manager_user_instructions_input'),
             ):
                 show(key, attr, shown(key))
+            show_select('risk_manager_mode', 'risk_manager_mode_select')
             for key, attr in (
                 ('smart_risk_manager_max_iterations', 'smart_risk_manager_max_iterations_input'),
                 ('smart_risk_manager_analysis_window_hours', 'smart_risk_manager_analysis_window_hours_input'),
@@ -3614,6 +3561,7 @@ class ExpertSettingsTab:
                 null_keys = _null_setting_keys(ExpertSetting, 'instance_id', expert_instance.id)
         tracker = self._shown_defaults_tracker()
         tracker.forget(getattr(self, 'screener_settings_inputs', None) or ())
+        self._select_checks_screener = {}
 
         self.screener_settings_inputs = {}
 
@@ -3658,12 +3606,16 @@ class ExpertSettingsTab:
 
                         # Input field based on type
                         if meta["type"] == "str" and valid_values:
-                            value = current_value if current_value is not None else default_value or ""
+                            # No silent first-option fallback (see the expert-specific form).
+                            select_value, select_error = select_value_for_display(
+                                valid_values, resolve_setting_for_display(builtin, current_settings, key))
                             inp = ui.select(
                                 options=valid_values,
                                 label='',
-                                value=value if value in valid_values else valid_values[0]
+                                value=select_value
                             ).classes('w-full').props('dense')
+                            _show_select_error(key, inp, select_error)
+                            self._select_checks_screener[key] = (inp, list(valid_values))
                         elif meta["type"] in ("int", "float"):
                             # As the expert-specific form: stored, else DECLARED default, else
                             # empty (refused by name on save) -- never an invented 0.
@@ -3925,6 +3877,7 @@ class ExpertSettingsTab:
         tracker = self._shown_defaults_tracker()
         tracker.forget(getattr(self, '_expert_form_keys', ()))
         self._expert_form_keys = set()
+        self._select_checks_expert = {}
         self.expert_settings_container.clear()
         
         expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
@@ -4014,15 +3967,20 @@ class ExpertSettingsTab:
                                         new_value_mode='add-unique'  # Allow adding new custom values
                                     ).classes('w-full').props('use-input')  # Enable search
                                 else:
-                                    # Regular select - restricted to list
-                                    # Add search capability if there are many options (>10)
+                                    # Regular select - restricted to list. Never the first
+                                    # option as a silent fallback: invalid / no value -> EMPTY
+                                    # with an error, and the save refuses until one is picked.
+                                    select_value, select_error = select_value_for_display(
+                                        valid_values, resolve_setting_for_display(settings_def, current_settings, key))
                                     inp = ui.select(
                                         options=valid_values,
                                         label=display_label,
-                                        value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                        value=select_value
                                     ).classes('w-full')
                                     if len(valid_values) > 10:
                                         inp.props('use-input')  # Enable search for long lists
+                                    _show_select_error(key, inp, select_error)
+                                    self._select_checks_expert[key] = (inp, list(valid_values))
                             else:
                                 inp = ui.input(label=display_label, value=value).classes('w-full')
                         elif meta["type"] == "list":
@@ -4087,14 +4045,19 @@ class ExpertSettingsTab:
                                         new_value_mode='add-unique'
                                     ).classes('w-full').props('use-input')  # Enable search
                                 else:
-                                    # Regular select - restricted to list
+                                    # Regular select - restricted to list (no silent first-option
+                                    # fallback; see the str branch above).
+                                    select_value, select_error = select_value_for_display(
+                                        valid_values, resolve_setting_for_display(settings_def, current_settings, key))
                                     inp = ui.select(
                                         options=valid_values,
                                         label=display_label,
-                                        value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                        value=select_value
                                     ).classes('w-full')
                                     if len(valid_values) > 10:
                                         inp.props('use-input')  # Enable search for long lists
+                                    _show_select_error(key, inp, select_error)
+                                    self._select_checks_expert[key] = (inp, list(valid_values))
                             else:
                                 inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         
@@ -4812,6 +4775,15 @@ class ExpertSettingsTab:
                       f'Save is disabled for this dialog.',
                       type='negative', timeout=0, close_button=True)
 
+    def _unpicked_selects(self) -> list:
+        """Dropdowns (general tab, expert-specific form, screener form when the method is
+        screener) that do not hold one of their options -- refused by name."""
+        checks = dict(getattr(self, '_select_checks_general', None) or {})
+        checks.update(getattr(self, '_select_checks_expert', None) or {})
+        if self._effective_instrument_method() == 'screener':
+            checks.update(getattr(self, '_select_checks_screener', None) or {})
+        return unpicked_selects(checks)
+
     #: The builtin permission checkboxes and the setting each one writes.
     _BUILTIN_BOOL_CONTROLS = {
         'enable_buy': 'enable_buy_checkbox',
@@ -4908,6 +4880,12 @@ class ExpertSettingsTab:
         unset = self._unset_bool_controls()
         if unset:
             message = unset_bool_message(unset)
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=10000)
+            return
+        unpicked = self._unpicked_selects()
+        if unpicked:
+            message = unpicked_selects_message(unpicked)
             logger.error(f'Refused to save expert: {message}')
             ui.notify(message, type='negative', timeout=10000)
             return

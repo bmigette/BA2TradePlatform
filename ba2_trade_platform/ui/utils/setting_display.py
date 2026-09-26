@@ -97,6 +97,40 @@ def resolve_setting_for_display(definitions: Mapping[str, Dict[str, Any]],
     return None
 
 
+def select_value_for_display(options: Any, value: Any):
+    """``(value a dropdown shows, error or None)`` for an already-resolved ``value``.
+
+    A dropdown used to fall back SILENTLY to its first option for a value that is not one of
+    its options -- and a no-edit save wrote that. Now: a valid value is shown as is; anything
+    else (an invalid stored value, or no value at all -- the caller has already applied the
+    declared default) is shown EMPTY with an error, and the save must refuse until a value is
+    picked (:func:`unpicked_selects`). ``options`` is a list, or a dict value -> label.
+    """
+    valid = list(options.keys()) if isinstance(options, Mapping) else list(options)
+    if value is not None and value in valid:
+        return value, None
+    if value is None:
+        return None, "has no value and no declared default -- pick one"
+    return None, (f"stored value {value!r} is not one of the options "
+                  f"({', '.join(str(v) for v in valid)}) -- pick one")
+
+
+def unpicked_selects(checks: Mapping[str, Any]) -> List[str]:
+    """The keys of ``checks`` (key -> ``(control, options)``) whose control does not hold one
+    of its options -- what a save must refuse, by name."""
+    unpicked = []
+    for key, (control, options) in checks.items():
+        valid = list(options.keys()) if isinstance(options, Mapping) else list(options)
+        if control.value is None or control.value not in valid:
+            unpicked.append(key)
+    return unpicked
+
+
+def unpicked_selects_message(keys: List[str]) -> str:
+    return (f"Not saved: pick a value for {', '.join(keys)} (the stored value is missing or "
+            f"not one of the options).")
+
+
 def display_text(definitions: Mapping[str, Dict[str, Any]], key: str, value: Any) -> str:
     """``value`` as a text field shows it: a WHOLE float in an int-declared field shows as an
     int (``14.0`` -> ``"14"``; GA deploys store int genes as floats)."""

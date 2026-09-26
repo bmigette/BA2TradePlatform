@@ -985,3 +985,221 @@ def test_a_new_account_whose_settings_fail_leaves_no_row(fake_ui, monkeypatch):
     _new_alpaca_form().save_account(None)
     assert fake_ui.notes[-1][1].get("type") == "negative"
     assert _no_accounts()
+
+
+# =================================================================== dropdowns (user, 2026-09-26)
+# A dropdown whose stored value is not one of its options used to fall back SILENTLY to the
+# first option (and a no-edit save wrote that). Now the field is shown EMPTY with an error on
+# it, and the save is refused, naming it, until a value is picked. A stored None / missing
+# value with a declared default is not invalid: the default is shown (and, unedited, not
+# written). Missing with no declared default: shown empty, must be picked.
+def _select_error_props(inp):
+    return [a for a in inp.calls if a[0] == "props" and "error" in a[1]]
+
+
+class _RecEl(_El):
+    """An _El that records props() calls, to see the field-level error."""
+
+    def __init__(self, kind="", *args, **kwargs):
+        super().__init__(kind, *args, **kwargs)
+        self.calls = []
+
+    def props(self, *args, **kwargs):
+        self.calls.append(("props", " ".join(str(a) for a in args)))
+        return self
+
+
+class _RecUI(_FakeUI):
+    def select(self, *args, **kwargs):
+        return _RecEl("select", *args, **kwargs)
+
+
+@pytest.fixture
+def rec_ui(monkeypatch):
+    f = _RecUI()
+    monkeypatch.setattr(settings_page, "ui", f)
+    return f
+
+
+SELECT_DEFS = {
+    "mode": {"type": "str", "required": False, "default": "a", "valid_values": ["a", "b"],
+             "description": "mode"},
+    "choice": {"type": "str", "required": False, "valid_values": ["x", "y"],
+               "description": "choice"},
+}
+
+
+def test_expert_select_with_an_invalid_stored_value_is_empty_with_an_error(tab, instance, rec_ui, monkeypatch):
+    monkeypatch.setattr(MockExpert, "get_settings_definitions", classmethod(lambda cls: SELECT_DEFS))
+    MockExpert(instance.id).save_setting("mode", "zzz")
+    rows_before = _rows(instance.id)
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    mode, choice = tab.expert_settings_inputs["mode"], tab.expert_settings_inputs["choice"]
+    assert mode.value is None, "must not fall back to the first option"
+    assert _select_error_props(mode)
+    assert any("mode" in m and "zzz" in m and kw.get("type") == "negative" for m, kw in rec_ui.notes)
+    assert choice.value is None                  # missing, no declared default: must be picked
+
+    tab._load_general_settings(instance)
+    tab._save_expert(instance)
+    msg, kw = rec_ui.notes[-1]
+    assert "mode" in msg and "choice" in msg and kw.get("type") == "negative"
+    assert _rows(instance.id) == rows_before
+
+    mode.value, choice.value = "b", "x"
+    tab._save_expert_settings(instance.id)
+    stored = MockExpert(instance.id).settings
+    assert (stored["mode"], stored["choice"]) == ("b", "x")
+
+
+def test_expert_select_unset_with_a_default_shows_it_without_error(tab, instance, rec_ui, monkeypatch):
+    monkeypatch.setattr(MockExpert, "get_settings_definitions",
+                        classmethod(lambda cls: {"mode": SELECT_DEFS["mode"]}))
+    _null_row(instance.id, "mode")
+    before = _rows(instance.id)
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    mode = tab.expert_settings_inputs["mode"]
+    assert mode.value == "a" and not _select_error_props(mode)
+    tab._load_general_settings(instance)
+    tab._save_expert_settings(instance.id)
+    assert _rows(instance.id) == before
+
+
+def test_screener_select_with_an_invalid_stored_value_refuses_the_save(tab, instance, rec_ui):
+    MockExpert(instance.id).save_setting("screener_sort_metric", "bogus")
+    tab.instrument_selection_method_select = _instrument_select("screener")
+    tab.instruments_content_container = _El()
+    tab._render_screener_settings(instance)
+    metric = tab.screener_settings_inputs["screener_sort_metric"]
+    assert metric.value is None and _select_error_props(metric)
+    tab._load_general_settings(instance)
+    tab.expert_settings_inputs = {}
+    before = _rows(instance.id)
+    tab._save_expert(instance)
+    assert "screener_sort_metric" in rec_ui.notes[-1][0]
+    assert _rows(instance.id) == before
+
+
+def test_general_tab_select_with_an_invalid_stored_value_is_one_field_not_a_load_error(tab, instance, rec_ui):
+    MockExpert(instance.id).save_setting("sizing_mode", "bogus")
+    tab.sizing_mode_select = _RecEl("select", value="notional")
+    tab.sizing_mode_select.options = ["notional", "risk_atr"]
+    tab._load_general_settings(instance)
+    assert not tab._general_settings_load_error
+    assert tab.sizing_mode_select.value is None and _select_error_props(tab.sizing_mode_select)
+    tab.expert_settings_inputs = {}
+    before = _rows(instance.id)
+    tab._save_expert(instance)
+    assert "sizing_mode" in rec_ui.notes[-1][0] and rec_ui.notes[-1][1].get("type") == "negative"
+    assert _rows(instance.id) == before
+
+
+def test_account_select_with_an_invalid_stored_value_refuses_the_save(rec_ui, monkeypatch):
+    monkeypatch.setattr(settings_page, "get_account_instance_from_id", lambda *a, **k: None)
+    acc = _stored_alpaca_account()
+    cls = settings_page.providers["Alpaca"]
+    iface = cls.__new__(cls)
+    iface.id = acc.id
+    iface.save_setting("data_feed", "carrier-pigeon")
+    before = _account_rows(acc.id)
+    t = _account_edit_form("Alpaca", acc)
+    feed = t.settings_inputs["data_feed"]
+    assert feed.value is None and _select_error_props(feed)
+    assert t.settings_inputs["options_feed"].value == "indicative"   # missing -> declared default
+    t.save_account(acc)
+    assert "data_feed" in rec_ui.notes[-1][0] and rec_ui.notes[-1][1].get("type") == "negative"
+    assert _account_rows(acc.id) == before
+    feed.value = "iex"
+    t.save_account(acc)
+    assert ("data_feed", "iex") in [(r[0], r[1]) for r in _account_rows(acc.id)]
+    assert "options_feed" not in {r[0] for r in _account_rows(acc.id)}   # unedited default
+
+
+def test_select_helper_contract():
+    from ba2_trade_platform.ui.utils.setting_display import select_value_for_display
+    assert select_value_for_display(["a", "b"], "b") == ("b", None)
+    shown, error = select_value_for_display(["a", "b"], "zzz")
+    assert shown is None and "zzz" in error
+    shown, error = select_value_for_display(["a", "b"], None)
+    assert shown is None and error
+    assert select_value_for_display({"a": "A", "b": "B"}, "a") == ("a", None)   # dict options
+
+
+# =================================================================== app settings (user, 2026-09-26)
+# The App Settings tab showed literals (worker count 4, refresh 5 min, AWS region us-east-1)
+# that were second copies of the runtime's own literals. Both now read ONE declaration,
+# core.app_settings.APP_SETTINGS_DEFINITIONS; a no-edit save writes nothing.
+def _app_rows():
+    from sqlmodel import select
+    from ba2_trade_platform.core.db import get_db
+    from ba2_trade_platform.core.models import AppSetting
+    with get_db() as s:
+        return sorted((r.key, r.value_str) for r in s.exec(select(AppSetting)).all())
+
+
+def _app_tab():
+    t = object.__new__(settings_page.AppSettingsTab)
+    t.render()
+    return t
+
+
+APP_DEFAULT_CONTROLS = {"worker_count": "worker_count_input",
+                        "account_refresh_interval": "account_refresh_interval_input",
+                        "aws_bedrock_region": "aws_region_input"}
+
+
+def test_app_settings_show_the_declared_defaults(fake_ui, monkeypatch):
+    from ba2_trade_platform.core import app_settings
+    for key, value in (("worker_count", 7), ("account_refresh_interval", 9),
+                       ("aws_bedrock_region", "eu-west-3")):
+        monkeypatch.setitem(app_settings.APP_SETTINGS_DEFINITIONS[key], "default", value)
+    t = _app_tab()
+    assert t.worker_count_input.value == 7
+    assert t.account_refresh_interval_input.value == 9
+    assert t.aws_region_input.value == "eu-west-3"
+
+
+def test_app_settings_no_edit_save_writes_nothing(fake_ui):
+    assert _app_rows() == []
+    _app_tab().save_settings()
+    assert not any(kw.get("type") == "negative" for _, kw in fake_ui.notes)
+    assert _app_rows() == []
+
+
+def test_app_settings_no_edit_save_keeps_stored_rows_identical(fake_ui):
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AppSetting
+    for key, value in (("worker_count", "6"), ("openai_api_key", "sk-x"), ("fred_api_key", "")):
+        add_instance(AppSetting(key=key, value_str=value))
+    before = _app_rows()
+    _app_tab().save_settings()
+    assert _app_rows() == before
+
+
+def test_app_settings_edited_fields_are_written(fake_ui):
+    t = _app_tab()
+    t.worker_count_input.value = 3
+    t.openai_input.value = "sk-new"
+    t.save_settings()
+    assert _app_rows() == [("openai_api_key", "sk-new"), ("worker_count", "3")]
+
+
+def test_runtime_readers_use_the_same_declaration(monkeypatch):
+    """No row: WorkerQueue, JobManager and ModelFactory read the declared default -- the
+    value the UI shows -- not literals of their own."""
+    from ba2_trade_platform.core import app_settings
+    from ba2_trade_platform.core.JobManager import JobManager
+    from ba2_trade_platform.core.ModelFactory import ModelFactory
+    from ba2_trade_platform.core.WorkerQueue import WorkerQueue
+    monkeypatch.setitem(app_settings.APP_SETTINGS_DEFINITIONS["worker_count"], "default", 7)
+    monkeypatch.setitem(app_settings.APP_SETTINGS_DEFINITIONS["account_refresh_interval"], "default", 9)
+    monkeypatch.setitem(app_settings.APP_SETTINGS_DEFINITIONS["aws_bedrock_region"], "default", "eu-west-3")
+    wq = WorkerQueue.__new__(WorkerQueue)
+    monkeypatch.setattr(WorkerQueue, "_ensure_worker_count_setting", lambda self, v: None)
+    assert wq._get_worker_count() == 7
+    jm = JobManager.__new__(JobManager)
+    assert jm._get_account_refresh_interval_minutes() == 9
+    ModelFactory.clear_api_key_cache()
+    assert ModelFactory._aws_bedrock_region() == "eu-west-3"
