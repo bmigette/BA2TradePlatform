@@ -268,6 +268,10 @@ OPERATOR_REFUSED_NOTE = '⚠ The engine refuses {operator} on this trigger; allo
 
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
+from ..utils.setting_display import (
+    NumericSettingNotSavable, SettingHasNoDisplayValue, display_text, numeric_setting_for_save,
+    resolve_setting_for_display, unset_bool_message, unset_bool_settings,
+)
 
 
 def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
@@ -280,6 +284,18 @@ def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
     if "margin_factor" in dynamic_settings:
         return margin_factor_error(dynamic_settings["margin_factor"])
     return None
+
+
+def _builtin_default(key: str) -> Any:
+    """The DECLARED default of a MarketExpertInterface builtin setting -- the one source.
+
+    The expert dialog's constructor used literals that had drifted from the declaration
+    (smart RM max iterations 10 vs 20, model 'nagaai/gpt5' vs the declared model). Explicit
+    access: a builtin with no declared default is a KeyError here, not a guess.
+    """
+    from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+    MarketExpertInterface._ensure_builtin_settings()
+    return MarketExpertInterface._builtin_settings[key]["default"]
 
 
 def _render_reset_default_button(inp, default_value, meta):
@@ -1114,7 +1130,32 @@ class AccountDefinitionsTab:
             # cleared factor is refused with a clear message rather than stored as None.
             # That is intended: the 1.8 default applies only where the key was NEVER
             # saved, and a stored None is not that.
-            problem = account_settings_error(dynamic_settings)
+            load_error = getattr(self, '_account_settings_load_error', None)
+            problem = (f"Not saved: this account's settings could not be loaded ({load_error}), "
+                       f"so the form shows defaults, not its real settings. Close the dialog "
+                       f"and reopen it; see the log." if load_error
+                       else account_settings_error(dynamic_settings))
+            if not problem and provider_cls:
+                account_defs = provider_cls.get_merged_settings_definitions()
+                unset = unset_bool_settings(dynamic_settings, account_defs)
+                if unset:
+                    problem = unset_bool_message(unset)
+                else:
+                    # Numeric fields resolved BEFORE any write, exactly as the expert dialog
+                    # does: a cleared field saves the DECLARED default, an unparsable one (or
+                    # an empty one with no default) is refused by name. save_setting's own
+                    # int("") used to raise halfway through the loop, after earlier settings
+                    # (and, for a new account, the AccountDefinition row) were written.
+                    # Runs after account_settings_error, so a cleared margin_factor is still
+                    # refused rather than defaulted (see the note above).
+                    try:
+                        for key, raw in list(dynamic_settings.items()):
+                            kind = account_defs.get(key, {}).get("type")
+                            if kind in ("int", "float"):
+                                dynamic_settings[key] = numeric_setting_for_save(
+                                    account_defs, key, raw, int if kind == "int" else float)
+                    except NumericSettingNotSavable as e:
+                        problem = f"Not saved: {e}"
             if problem:
                 ui.notify(problem, type='negative')
                 logger.warning(f"Refused to save account settings: {problem}")
@@ -1303,8 +1344,10 @@ class AccountDefinitionsTab:
             return settings
             
         except Exception as e:
+            # RAISED, not `return {}`: an empty dict renders every field at its DEFAULT, and
+            # Save would then write those defaults over the account's real settings.
             logger.error(f"Error loading settings from database for account {account_id}: {e}", exc_info=True)
-            return {}
+            raise
 
     def _render_dynamic_settings(self, provider, account=None):
         # Render provider-specific fields dynamically inside the container
@@ -1313,10 +1356,20 @@ class AccountDefinitionsTab:
             return
         settings_def = provider_config.get_merged_settings_definitions()
         
-        # Get settings directly from database without creating AccountInterface
+        # Get settings directly from database without creating AccountInterface.
+        # A read failure leaves the form on DEFAULTS, which Save would write over the real
+        # settings: it is shown, and save_account refuses while it stands.
+        self._account_settings_load_error = None
         settings_values = {}
         if account:
-            settings_values = self._get_account_settings_from_db(account.id)
+            try:
+                settings_values = self._get_account_settings_from_db(account.id)
+            except Exception as e:
+                self._account_settings_load_error = f'{type(e).__name__}: {e}'
+                ui.notify(f'Could not load the settings of account {account.id} '
+                          f'({self._account_settings_load_error}). The form shows DEFAULTS, not '
+                          f'its real settings, and Save is refused for this dialog.',
+                          type='negative', timeout=0, close_button=True)
 
         self.settings_inputs = {}
 
@@ -1333,7 +1386,10 @@ class AccountDefinitionsTab:
             if settings_def and len(settings_def.keys()) > 0:
                 for key, meta in settings_def.items():
                     label = meta.get("description", key)
-                    value = settings_values.get(key, None) if settings_values else None
+                    # Stored value, else the DECLARED default (None when there is none);
+                    # bools are resolved in their own branch below.
+                    value = (None if meta["type"] == "bool"
+                             else resolve_setting_for_display(settings_def, settings_values, key))
                     tooltip_text = meta.get("tooltip")
                     valid_values = meta.get("valid_values")
 
@@ -1349,19 +1405,35 @@ class AccountDefinitionsTab:
                         elif meta["type"] == "str":
                             inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         elif meta["type"] == "bool":
-                            # Proper boolean conversion - handle string "false"/"true" and boolean values
-                            bool_value = False
-                            if value is not None:
-                                if isinstance(value, bool):
-                                    bool_value = value
-                                elif isinstance(value, str):
-                                    bool_value = value.lower() in ('true', '1', 'yes')
-                                else:
-                                    bool_value = bool(value)
+                            # Stored value (through coerce_bool), else the DECLARED default --
+                            # an unset bool used to show False whatever the definition said.
+                            # A bool with neither (AlpacaAccount.paper_account on a new
+                            # account) is shown INDETERMINATE: ticking False for it would be a
+                            # silent guess at paper-vs-live, and save_account refuses a bool
+                            # still left unset, naming it.
+                            # A stored spelling coerce_bool cannot read is shown the same way
+                            # (and logged) rather than taking the whole dialog down.
+                            try:
+                                bool_value = resolve_setting_for_display(settings_def, settings_values, key)
+                            except SettingHasNoDisplayValue:
+                                bool_value = None
+                            except ValueError as e:
+                                logger.error(f"Account setting '{key}' holds an unreadable "
+                                             f"boolean ({e}); shown unset -- set it explicitly")
+                                ui.notify(f"Account setting '{key}' holds an unreadable value "
+                                          f"({e}); it is shown unset -- set it explicitly",
+                                          type='negative', timeout=0, close_button=True)
+                                bool_value = None
                             inp = ui.checkbox(text=label, value=bool_value).props('dense').classes('flex-grow')
                         elif meta["type"] == "float":
-                            float_value = value if value is not None else meta.get("default", "")
-                            inp = ui.number(label=label, value=float_value).props('dense outlined').classes('flex-grow')
+                            inp = ui.number(label=label, value=value).props('dense outlined').classes('flex-grow')
+                        elif meta["type"] == "int":
+                            # `value or ""` blanked a stored 0 (IBKR client_id 0 is a real id);
+                            # only a value that is truly absent shows empty, and the save
+                            # refuses an empty int with no declared default by name.
+                            inp = ui.input(label=label, value="" if value is None
+                                           else display_text(settings_def, key, value)
+                                           ).props('dense outlined').classes('flex-grow')
                         else:
                             inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         _help(tooltip_text)
@@ -1886,6 +1958,8 @@ class ExpertSettingsTab:
         
         # Initialize import attributes
         self._imported_expert_settings = None
+        self._general_settings_load_error = None   # set by _load_general_settings on failure
+        self._instrument_selection_load_error = None   # set when editing, on a failed read
         self._imported_symbol_settings = None
         self._imported_enter_market_ruleset_name = None
         self._imported_open_positions_ruleset_name = None
@@ -2067,8 +2141,10 @@ class ExpertSettingsTab:
                         ui.label('Select which trading actions this expert can perform:').classes('text-body2 mb-2')
                         
                         with ui.row().classes('w-full gap-4'):
-                            self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=True)
-                            self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=False)
+                            # Initial values are the DECLARED defaults (a new expert shows and
+                            # saves exactly those); editing overwrites them in _load_general_settings.
+                            self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=_builtin_default('enable_buy'))
+                            self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=_builtin_default('enable_sell'))
                         ui.label('BUY opens longs; SELL opens shorts (a sell from flat). Closing a '
                                  'position needs the permission that opened it: a sell closing a long '
                                  'needs BUY, a buy covering a short needs SELL.').classes('text-body2 text-grey-7 ml-6')
@@ -2084,13 +2160,13 @@ class ExpertSettingsTab:
                         with ui.column().classes('w-full gap-2'):
                             self.allow_automated_trade_opening_checkbox = ui.checkbox(
                                 'Allow automated trade opening', 
-                                value=False
+                                value=_builtin_default('allow_automated_trade_opening')
                             )
                             ui.label('Allows the expert to automatically open new trading positions').classes('text-body2 text-grey-7 ml-6')
                             
                             self.allow_automated_trade_modification_checkbox = ui.checkbox(
                                 'Allow automated trade modification/closing', 
-                                value=False
+                                value=_builtin_default('allow_automated_trade_modification')
                             )
                             ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
                         
@@ -2106,8 +2182,8 @@ class ExpertSettingsTab:
                                 with ui.row().classes('items-center gap-2'):
                                     ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
                                     self.max_virtual_equity_per_instrument_input = ui.input(
-                                        value='10.0',
-                                        placeholder='10.0'
+                                        value=str(_builtin_default('max_virtual_equity_per_instrument_percent')),
+                                        placeholder=str(_builtin_default('max_virtual_equity_per_instrument_percent'))
                                     ).classes('w-20')
                                     ui.label('%').classes('text-sm')
                                 ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
@@ -2116,8 +2192,8 @@ class ExpertSettingsTab:
                                 with ui.row().classes('items-center gap-2 mt-2'):
                                     ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
                                     self.min_available_balance_pct_input = ui.input(
-                                        value='10.0',
-                                        placeholder='10.0'
+                                        value=str(_builtin_default('min_available_balance_pct')),
+                                        placeholder=str(_builtin_default('min_available_balance_pct'))
                                     ).classes('w-20')
                                     ui.label('%').classes('text-sm')
                                 ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
@@ -2128,20 +2204,16 @@ class ExpertSettingsTab:
                                 MarketExpertInterface._ensure_builtin_settings()
 
                                 sizing_mode_def = MarketExpertInterface._builtin_settings.get('sizing_mode', {})
-                                sizing_mode_default = sizing_mode_def.get('default', 'notional')
+                                sizing_mode_default = _builtin_default('sizing_mode')
                                 sizing_mode_values = sizing_mode_def.get('valid_values', ['notional', 'risk_atr'])
 
-                                risk_per_trade_pct_def = MarketExpertInterface._builtin_settings.get('risk_per_trade_pct', {})
-                                risk_per_trade_pct_default = risk_per_trade_pct_def.get('default', 1.0)
+                                risk_per_trade_pct_default = _builtin_default('risk_per_trade_pct')
 
-                                atr_multiplier_def = MarketExpertInterface._builtin_settings.get('atr_multiplier', {})
-                                atr_multiplier_default = atr_multiplier_def.get('default', 2.0)
+                                atr_multiplier_default = _builtin_default('atr_multiplier')
 
-                                atr_period_def = MarketExpertInterface._builtin_settings.get('atr_period', {})
-                                atr_period_default = atr_period_def.get('default', 14)
+                                atr_period_default = _builtin_default('atr_period')
 
-                                min_stop_loss_pct_def = MarketExpertInterface._builtin_settings.get('min_stop_loss_pct', {})
-                                min_stop_loss_pct_default = min_stop_loss_pct_def.get('default', 7.0)
+                                min_stop_loss_pct_default = _builtin_default('min_stop_loss_pct')
 
                                 # Sizing mode select - always shown
                                 with ui.row().classes('items-center gap-2 mt-2'):
@@ -2203,11 +2275,11 @@ class ExpertSettingsTab:
                             MarketExpertInterface._ensure_builtin_settings()
 
                             risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
-                            risk_manager_model_default = risk_manager_model_def.get('default', 'nagaai/gpt5')
+                            risk_manager_model_default = _builtin_default('risk_manager_model')
                             risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
 
                             dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
-                            dynamic_model_default = dynamic_model_def.get('default', 'nagaai/gpt5')
+                            dynamic_model_default = _builtin_default('dynamic_instrument_selection_model')
                             dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
 
                             # Import the ModelSelectorInput component and labels
@@ -2247,7 +2319,7 @@ class ExpertSettingsTab:
                                         'smart': 'Smart (Agentic)'
                                     },
                                     label='Risk Management Mode',
-                                    value='classic'
+                                    value=_builtin_default('risk_manager_mode')
                                 ).classes('w-full')
                                 ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
 
@@ -2255,7 +2327,7 @@ class ExpertSettingsTab:
                                 ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
                                 self.smart_risk_manager_user_instructions_input = ui.textarea(
                                     label='Instructions for Smart Risk Manager',
-                                    value='Maximize short term profit with medium risk taking',
+                                    value=_builtin_default('smart_risk_manager_user_instructions'),
                                     placeholder='Enter your risk management strategy instructions...'
                                 ).props('stack-label rows=3').classes('w-full')
                                 ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
@@ -2264,7 +2336,7 @@ class ExpertSettingsTab:
                                 ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
                                 self.smart_risk_manager_max_iterations_input = ui.number(
                                     label='Maximum Iterations',
-                                    value=10,
+                                    value=_builtin_default('smart_risk_manager_max_iterations'),
                                     min=1,
                                     max=50,
                                     step=1
@@ -2275,7 +2347,7 @@ class ExpertSettingsTab:
                                 ui.label('Analysis Window (hours):').classes('text-sm font-medium mt-2')
                                 self.smart_risk_manager_analysis_window_hours_input = ui.number(
                                     label='Analysis Discovery Window (hours)',
-                                    value=24,
+                                    value=_builtin_default('smart_risk_manager_analysis_window_hours'),
                                     min=1,
                                     max=168,
                                     step=1
@@ -2384,15 +2456,29 @@ class ExpertSettingsTab:
                     if account_instance:
                         self.account_select.value = f"{account_instance.name} ({account_instance.provider})"
 
+                    # A failure here used to set 'static' at DEBUG level, and _save_expert
+                    # writes the select back unconditionally: a no-edit save silently switched
+                    # a screener/dynamic expert to static. Now recorded, shown, and the save
+                    # refused (like _load_general_settings).
+                    self._instrument_selection_load_error = None
                     try:
                         from ...core.utils import get_expert_instance_from_id
                         expert = get_expert_instance_from_id(expert_instance.id)
-                        if expert:
-                            instrument_method = expert.settings.get('instrument_selection_method', 'static')
-                            self.instrument_selection_method_select.value = instrument_method
+                        if expert is None:
+                            raise ValueError(f'no live expert instance for id {expert_instance.id}')
+                        instrument_method = resolve_setting_for_display(
+                            type(expert).get_merged_settings_definitions(), expert.settings,
+                            'instrument_selection_method')
+                        self.instrument_selection_method_select.value = instrument_method
                     except Exception as e:
-                        logger.debug(f'Could not load instrument selection method: {e}')
-                        self.instrument_selection_method_select.value = 'static'
+                        self._instrument_selection_load_error = f'{type(e).__name__}: {e}'
+                        logger.error(f'Could not load instrument_selection_method for expert '
+                                     f'{expert_instance.id}: {e}. Saving this dialog is refused.',
+                                     exc_info=True)
+                        ui.notify(f'Could not load the instrument selection method of expert '
+                                  f'{expert_instance.id} ({self._instrument_selection_load_error}). '
+                                  f'Save is disabled for this dialog.',
+                                  type='negative', timeout=0, close_button=True)
 
                     # THE PROFILE IS READ IN ITS OWN TRY, and failing to read it is recorded.
                     # Sharing the handler above meant a failure left the select on its
@@ -2436,7 +2522,13 @@ class ExpertSettingsTab:
                 # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
                     ui.button('Cancel', on_click=self.dialog.close).props('flat')
-                    ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
+                    save_button = ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
+                    if (self._general_settings_load_error
+                            or getattr(self, '_expert_settings_load_error', None)
+                            or getattr(self, '_instrument_selection_load_error', None)):
+                        # The form holds defaults, not this expert's settings (see
+                        # _load_general_settings); _save_expert refuses as well.
+                        save_button.disable()
         
         self.dialog.open()
     
@@ -2827,12 +2919,19 @@ class ExpertSettingsTab:
             self._add_time_input('09:30')
     
     def _load_general_settings(self, expert_instance):
-        """Load general settings (schedule and trading permissions) for an existing expert."""
+        """Load general settings (schedule and trading permissions) for an existing expert.
+
+        A failure here leaves the form on its NEW-EXPERT defaults; saving that would write
+        them over the real settings. So a failure is recorded in
+        ``_general_settings_load_error`` (which ``_save_expert`` refuses on), logged with the
+        traceback, and shown to the operator as a persistent error.
+        """
+        self._general_settings_load_error = None
         try:
             from ...core.utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance.id)
             if not expert:
-                return
+                raise ValueError(f'no live expert instance for id {expert_instance.id}')
             
             # Check if we have imported settings to use instead
             settings_source = self._imported_expert_settings if hasattr(self, '_imported_expert_settings') and self._imported_expert_settings else expert.settings
@@ -2870,34 +2969,30 @@ class ExpertSettingsTab:
                 if open_positions_schedule:
                     self._load_open_positions_schedule_config(open_positions_schedule)
             
-            # Load trading permissions - convert to booleans if they're strings
-            enable_buy = settings_source.get('enable_buy', True)  # Default to True
-            enable_sell = settings_source.get('enable_sell', False)  # Default to False
-            
-            # Handle legacy automatic_trading setting by splitting it into new settings
-            legacy_automatic_trading = settings_source.get('automatic_trading', None)
-            allow_automated_trade_opening = settings_source.get('allow_automated_trade_opening', False)
-            allow_automated_trade_modification = settings_source.get('allow_automated_trade_modification', False)
-            
-            # If legacy setting exists and new settings don't, migrate the legacy setting
-            if legacy_automatic_trading is not None and 'allow_automated_trade_opening' not in settings_source and 'allow_automated_trade_modification' not in settings_source:
-                if isinstance(legacy_automatic_trading, str):
-                    legacy_value = legacy_automatic_trading.lower() == 'true'
-                else:
-                    legacy_value = bool(legacy_automatic_trading)
-                allow_automated_trade_opening = legacy_value
-                allow_automated_trade_modification = legacy_value
-            
-            # Convert string values to booleans if needed
-            if isinstance(enable_buy, str):
-                enable_buy = enable_buy.lower() == 'true'
-            if isinstance(enable_sell, str):
-                enable_sell = enable_sell.lower() == 'true'
-            if isinstance(allow_automated_trade_opening, str):
-                allow_automated_trade_opening = allow_automated_trade_opening.lower() == 'true'
-            if isinstance(allow_automated_trade_modification, str):
-                allow_automated_trade_modification = allow_automated_trade_modification.lower() == 'true'
-            
+            # EVERY displayed value is resolved against the DECLARED default
+            # (get_merged_settings_definitions, builtins included) -- never a literal here.
+            # settings_source holds every definition key, pre-filled with None when no row
+            # exists, so `.get(key, <literal>)` returned None: the checkboxes held None and
+            # Save died in coerce_bool(None) (bug report 2026-09-22). See setting_display.
+            definitions = type(expert).get_merged_settings_definitions()
+
+            def shown(key):
+                return resolve_setting_for_display(definitions, settings_source, key)
+
+            # Load trading permissions
+            enable_buy = shown('enable_buy')
+            enable_sell = shown('enable_sell')
+            allow_automated_trade_opening = shown('allow_automated_trade_opening')
+            allow_automated_trade_modification = shown('allow_automated_trade_modification')
+
+            # The undeclared legacy `automatic_trading` key is deliberately IGNORED. A migration
+            # of it into the two new permissions existed here but could never fire (its
+            # `key not in settings_source` test is always false -- every defined key is
+            # pre-filled); making it reachable would have switched automated trading ON, on a
+            # no-edit save, for any expert with an old automatic_trading=true row, while
+            # TradeManager reads only the new keys (review 2026-09-22). The dialog shows the new
+            # keys from their stored value or declared default, nothing else.
+
             if hasattr(self, 'enable_buy_checkbox'):
                 self.enable_buy_checkbox.value = enable_buy
             if hasattr(self, 'enable_sell_checkbox'):
@@ -2906,107 +3001,48 @@ class ExpertSettingsTab:
                 self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
             if hasattr(self, 'allow_automated_trade_modification_checkbox'):
                 self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
-            
-            # Load risk management settings.
-            # NOTE: settings_source contains every definition key (pre-filled with
-            # None when no DB row exists), so .get(key, default) returns None rather
-            # than the default. Treat a stored None as "use the interface default".
-            max_virtual_equity_per_instrument = settings_source.get('max_virtual_equity_per_instrument_percent')
-            if max_virtual_equity_per_instrument is None:
-                max_virtual_equity_per_instrument = 10.0
-            if isinstance(max_virtual_equity_per_instrument, str):
-                max_virtual_equity_per_instrument = float(max_virtual_equity_per_instrument)
 
-            if hasattr(self, 'max_virtual_equity_per_instrument_input'):
-                self.max_virtual_equity_per_instrument_input.value = str(max_virtual_equity_per_instrument)
+            # Position sizing (text inputs show str()).
+            for key, attr in (
+                ('max_virtual_equity_per_instrument_percent', 'max_virtual_equity_per_instrument_input'),
+                ('min_available_balance_pct', 'min_available_balance_pct_input'),
+                ('risk_per_trade_pct', 'risk_per_trade_pct_input'),
+                ('atr_multiplier', 'atr_multiplier_input'),
+                ('atr_period', 'atr_period_input'),
+                ('min_stop_loss_pct', 'min_stop_loss_pct_input'),
+            ):
+                if hasattr(self, attr):
+                    getattr(self, attr).value = display_text(definitions, key, shown(key))
 
-            min_available_balance_pct = settings_source.get('min_available_balance_pct')
-            if min_available_balance_pct is None:
-                min_available_balance_pct = 10.0
-            if isinstance(min_available_balance_pct, str):
-                min_available_balance_pct = float(min_available_balance_pct)
-
-            if hasattr(self, 'min_available_balance_pct_input'):
-                self.min_available_balance_pct_input.value = str(min_available_balance_pct)
-
-            # Load risk_atr (risk-based) sizing builtins. As above, a stored None
-            # means "use the interface default" (settings_source pre-fills None).
-            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-            MarketExpertInterface._ensure_builtin_settings()
-
-            sizing_mode = settings_source.get('sizing_mode')
-            if sizing_mode is None:
-                sizing_mode = MarketExpertInterface._builtin_settings.get('sizing_mode', {}).get('default', 'notional')
+            sizing_mode = shown('sizing_mode')
             if hasattr(self, 'sizing_mode_select'):
                 self.sizing_mode_select.value = sizing_mode
-
-            risk_per_trade_pct = settings_source.get('risk_per_trade_pct')
-            if risk_per_trade_pct is None:
-                risk_per_trade_pct = MarketExpertInterface._builtin_settings.get('risk_per_trade_pct', {}).get('default', 1.0)
-            if hasattr(self, 'risk_per_trade_pct_input'):
-                self.risk_per_trade_pct_input.value = str(risk_per_trade_pct)
-
-            atr_multiplier = settings_source.get('atr_multiplier')
-            if atr_multiplier is None:
-                atr_multiplier = MarketExpertInterface._builtin_settings.get('atr_multiplier', {}).get('default', 2.0)
-            if hasattr(self, 'atr_multiplier_input'):
-                self.atr_multiplier_input.value = str(atr_multiplier)
-
-            atr_period = settings_source.get('atr_period')
-            if atr_period is None:
-                atr_period = MarketExpertInterface._builtin_settings.get('atr_period', {}).get('default', 14)
-            if hasattr(self, 'atr_period_input'):
-                self.atr_period_input.value = str(atr_period)
-
-            min_stop_loss_pct = settings_source.get('min_stop_loss_pct')
-            if min_stop_loss_pct is None:
-                min_stop_loss_pct = MarketExpertInterface._builtin_settings.get('min_stop_loss_pct', {}).get('default', 7.0)
-            if hasattr(self, 'min_stop_loss_pct_input'):
-                self.min_stop_loss_pct_input.value = str(min_stop_loss_pct)
 
             # Set risk_atr container visibility from the loaded sizing_mode so an
             # expert already in risk_atr shows the knobs when the dialog opens.
             if hasattr(self, 'risk_atr_settings_container'):
                 self.risk_atr_settings_container.set_visibility(sizing_mode == 'risk_atr')
 
-            # Load AI model settings
-            risk_manager_model = settings_source.get('risk_manager_model', 'nagaai/gpt5')
-            if hasattr(self, 'risk_manager_model_input'):
-                self.risk_manager_model_input.value = risk_manager_model
-            
-            dynamic_instrument_selection_model = settings_source.get('dynamic_instrument_selection_model', 'nagaai/gpt5')
-            if hasattr(self, 'dynamic_instrument_selection_model_input'):
-                self.dynamic_instrument_selection_model_input.value = dynamic_instrument_selection_model
-            
-            # Load AI instrument prompt (for dynamic instrument selection)
+            # AI model settings, risk manager mode, smart risk manager
+            for key, attr in (
+                ('risk_manager_model', 'risk_manager_model_input'),
+                ('dynamic_instrument_selection_model', 'dynamic_instrument_selection_model_input'),
+                ('risk_manager_mode', 'risk_manager_mode_select'),
+                ('smart_risk_manager_user_instructions', 'smart_risk_manager_user_instructions_input'),
+            ):
+                if hasattr(self, attr):
+                    getattr(self, attr).value = shown(key)
+            for key, attr in (
+                ('smart_risk_manager_max_iterations', 'smart_risk_manager_max_iterations_input'),
+                ('smart_risk_manager_analysis_window_hours', 'smart_risk_manager_analysis_window_hours_input'),
+            ):
+                if hasattr(self, attr):
+                    getattr(self, attr).value = int(shown(key))
+
+            # AI instrument prompt: an undeclared key, shown only when stored.
             ai_instrument_prompt = settings_source.get('ai_instrument_prompt')
             if ai_instrument_prompt and hasattr(self, 'ai_prompt_textarea'):
                 self.ai_prompt_textarea.value = ai_instrument_prompt
-            
-            # Load risk manager mode
-            risk_manager_mode = settings_source.get('risk_manager_mode', 'classic')
-            if hasattr(self, 'risk_manager_mode_select'):
-                self.risk_manager_mode_select.value = risk_manager_mode
-            
-            # Load smart risk manager user instructions
-            smart_risk_manager_user_instructions = settings_source.get('smart_risk_manager_user_instructions', 'Maximize short term profit with medium risk taking')
-            if hasattr(self, 'smart_risk_manager_user_instructions_input'):
-                self.smart_risk_manager_user_instructions_input.value = smart_risk_manager_user_instructions
-            
-            # Load smart risk manager max iterations
-            smart_risk_manager_max_iterations = settings_source.get('smart_risk_manager_max_iterations', 10)
-            if hasattr(self, 'smart_risk_manager_max_iterations_input'):
-                # Handle None value gracefully (can happen if setting exists but value is None)
-                if smart_risk_manager_max_iterations is None:
-                    smart_risk_manager_max_iterations = 10
-                self.smart_risk_manager_max_iterations_input.value = int(smart_risk_manager_max_iterations)
-
-            # Load smart risk manager analysis window (hours)
-            smart_risk_manager_analysis_window_hours = settings_source.get('smart_risk_manager_analysis_window_hours', 24)
-            if hasattr(self, 'smart_risk_manager_analysis_window_hours_input'):
-                if smart_risk_manager_analysis_window_hours is None:
-                    smart_risk_manager_analysis_window_hours = 24
-                self.smart_risk_manager_analysis_window_hours_input.value = int(smart_risk_manager_analysis_window_hours)
 
             # Load ruleset assignments from ExpertInstance model or imported data
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
@@ -3040,7 +3076,13 @@ class ExpertSettingsTab:
             logger.debug(f'Loaded general settings for expert {expert_instance.id}: enter_market_schedule={enter_market_schedule}, open_positions_schedule={open_positions_schedule}, buy={enable_buy}, sell={enable_sell}, auto_open={allow_automated_trade_opening}, auto_modify={allow_automated_trade_modification}, enter_market_ruleset_id={expert_instance.enter_market_ruleset_id}, open_positions_ruleset_id={expert_instance.open_positions_ruleset_id}')
             
         except Exception as e:
-            logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}', exc_info=True)
+            self._general_settings_load_error = f'{type(e).__name__}: {e}'
+            logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}. '
+                         f'Saving this dialog is refused.', exc_info=True)
+            ui.notify(f'Could not load the settings of expert {expert_instance.id} '
+                      f'({self._general_settings_load_error}). The form shows DEFAULTS, not its '
+                      f'real settings, and Save is disabled for this dialog.',
+                      type='negative', timeout=0, close_button=True)
 
     def _add_time_input_enter_market(self, initial_time=''):
         """Add a new time input field to the enter market execution times container."""
@@ -3441,10 +3483,8 @@ class ExpertSettingsTab:
                         if expert:
                             model_for_prompt = expert.settings.get('dynamic_instrument_selection_model')
                     if not model_for_prompt:
-                        # Use default from MarketExpertInterface
-                        from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                        MarketExpertInterface._ensure_builtin_settings()
-                        model_for_prompt = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {}).get('default', 'NagaAI/gpt-5-2025-08-07')
+                        # The DECLARED default (no second copy of it here).
+                        model_for_prompt = _builtin_default('dynamic_instrument_selection_model')
                     
                     ai_selector = AIInstrumentSelector(model_string=model_for_prompt)
                     default_prompt = ai_selector.get_default_prompt()
@@ -3549,18 +3589,12 @@ class ExpertSettingsTab:
                                 label='',
                                 value=value if value in valid_values else valid_values[0]
                             ).classes('w-full').props('dense')
-                        elif meta["type"] == "int":
-                            if current_value is not None and current_value != "":
-                                try:
-                                    value = int(current_value)
-                                except (ValueError, TypeError):
-                                    value = default_value or 0
-                            else:
-                                value = default_value or 0
-                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
-                        elif meta["type"] == "float":
-                            value = current_value if current_value is not None else default_value or 0.0
-                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+                        elif meta["type"] in ("int", "float"):
+                            # As the expert-specific form: stored, else DECLARED default, else
+                            # empty (refused by name on save) -- never an invented 0.
+                            value = resolve_setting_for_display(builtin, current_settings, key)
+                            inp = ui.input(label='', value="" if value is None
+                                           else display_text(builtin, key, value)).classes('w-full').props('dense')
                         else:
                             value = current_value if current_value is not None else default_value or ""
                             inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
@@ -3751,10 +3785,8 @@ class ExpertSettingsTab:
                     if expert:
                         model_string = expert.settings.get('dynamic_instrument_selection_model')
                 if not model_string:
-                    # Use default from MarketExpertInterface
-                    from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                    MarketExpertInterface._ensure_builtin_settings()
-                    model_string = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {}).get('default', 'NagaAI/gpt-5-2025-08-07')
+                    # The DECLARED default (no second copy of it here).
+                    model_string = _builtin_default('dynamic_instrument_selection_model')
             
             # Initialize with the selected model (model_string is now guaranteed to exist)
             ai_selector = AIInstrumentSelector(model_string=model_string)
@@ -3805,7 +3837,13 @@ class ExpertSettingsTab:
             ui.notify(f'Error testing AI selection: {str(e)}', type='negative')
     
     def _render_expert_settings(self, expert_instance=None):
-        """Render expert-specific settings based on the selected expert type."""
+        """Render expert-specific settings based on the selected expert type.
+
+        A field (or the whole form) that cannot be read is shown as such and recorded in
+        ``_expert_settings_load_error``, which ``_save_expert`` refuses on: a truncated or
+        defaulted form must never be saved over the expert's real settings.
+        """
+        self._expert_settings_load_error = None
         self.expert_settings_container.clear()
         
         expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
@@ -3922,21 +3960,32 @@ class ExpertSettingsTab:
                                 import json
                                 inp = ui.input(label=display_label, value=json.dumps(value)).classes('w-full')
                         elif meta["type"] == "bool":
-                            value = current_value if current_value is not None else default_value or False
-                            inp = ui.checkbox(text=display_label, value=bool(value))
-                        elif meta["type"] == "int":
-                            # Handle empty strings and None values for integer fields
-                            if current_value is not None and current_value != "":
-                                try:
-                                    value = int(current_value)
-                                except (ValueError, TypeError):
-                                    value = default_value or 0
-                            else:
-                                value = default_value or 0
-                            inp = ui.input(label=display_label, value=str(value)).classes('w-full')
-                        elif meta["type"] == "float":
-                            value = current_value if current_value is not None else default_value or 0.0
-                            inp = ui.input(label=display_label, value=str(value)).classes('w-full')
+                            # Stored value (read through coerce_bool -- bool("false") is True),
+                            # else the declared default. A bool with neither raises: a
+                            # checkbox cannot show "unset", and False would be a silent guess.
+                            try:
+                                value = resolve_setting_for_display(settings_def, current_settings, key)
+                            except ValueError as e:
+                                # Unreadable stored value, or no default to show: this ONE
+                                # field is shown indeterminate with the error beside it; the
+                                # rest of the form still renders. Save is refused (flag).
+                                logger.error(f"Expert setting '{key}' cannot be shown: {e}")
+                                self._expert_settings_load_error = f"'{key}': {e}"
+                                value = None
+                                ui.notify(f"Expert setting '{key}' cannot be shown ({e}); it is "
+                                          f"left unset and Save is refused for this dialog.",
+                                          type='negative', timeout=0, close_button=True)
+                            inp = ui.checkbox(text=display_label, value=value)
+                        elif meta["type"] in ("int", "float"):
+                            # Stored value, else the DECLARED default; neither -> an EMPTY field,
+                            # which the save refuses by name. The old `default_value or 0`
+                            # showed an invented 0 that a no-edit save then wrote, and an
+                            # unparsable stored int was silently replaced by the default; it
+                            # is now shown as stored, and the save refuses it by name.
+                            value = resolve_setting_for_display(settings_def, current_settings, key)
+                            inp = ui.input(label=display_label,
+                                           value="" if value is None
+                                           else display_text(settings_def, key, value)).classes('w-full')
                         else:
                             value = current_value if current_value is not None else default_value or ""
                             if valid_values:
@@ -3984,8 +4033,12 @@ class ExpertSettingsTab:
                 ui.label("No expert-specific settings available.").move(self.expert_settings_container)
                 
         except Exception as e:
+            # The form is TRUNCATED at the failing field; saving it would write whatever
+            # rendered and silently skip the rest. Recorded so _save_expert refuses.
+            self._expert_settings_load_error = f'{type(e).__name__}: {e}'
             logger.error(f'Error rendering expert settings: {e}', exc_info=True)
-            ui.label(f"Error loading settings: {e}").move(self.expert_settings_container)
+            ui.label(f"Error loading settings: {e}. Save is refused for this dialog.") \
+                .classes('text-negative').move(self.expert_settings_container)
     
     def _on_expert_type_change(self, event, expert_instance):
         """Handle expert type change."""
@@ -4575,8 +4628,106 @@ class ExpertSettingsTab:
         from ...core.ExpertPriority import validate_expert_priority
         return validate_expert_priority(self.priority_input.value)
 
+    #: The builtin permission checkboxes and the setting each one writes.
+    _BUILTIN_BOOL_CONTROLS = {
+        'enable_buy': 'enable_buy_checkbox',
+        'enable_sell': 'enable_sell_checkbox',
+        'allow_automated_trade_opening': 'allow_automated_trade_opening_checkbox',
+        'allow_automated_trade_modification': 'allow_automated_trade_modification_checkbox',
+    }
+
+    def _unset_bool_controls(self) -> list:
+        """Bool settings whose control holds None -- a save must refuse them by name.
+
+        The loader resolves every checkbox from its declared default, so this should never
+        fire; it is here so that if something regresses the operator is told WHICH setting,
+        before anything is written, instead of a coerce_bool stack trace halfway through the
+        save. Never coerced to False: that would be a silent guess at a trading permission.
+        """
+        values = {key: getattr(self, attr).value
+                  for key, attr in self._BUILTIN_BOOL_CONTROLS.items() if hasattr(self, attr)}
+        definitions = {key: {'type': 'bool'} for key in values}
+        expert_inputs = getattr(self, 'expert_settings_inputs', None) or {}
+        if expert_inputs:
+            expert_class = self._get_expert_class(self.expert_select.value)
+            if expert_class:
+                expert_defs = expert_class.get_settings_definitions()
+                for key, inp in expert_inputs.items():
+                    if expert_defs.get(key, {}).get('type') == 'bool':
+                        values[key] = inp.value
+                        definitions[key] = expert_defs[key]
+        return unset_bool_settings(values, definitions)
+
+    #: The builtin numeric fields: setting -> (widget attribute, int|float).
+    _BUILTIN_NUMERIC_CONTROLS = {
+        'max_virtual_equity_per_instrument_percent': ('max_virtual_equity_per_instrument_input', float),
+        'min_available_balance_pct': ('min_available_balance_pct_input', float),
+        'risk_per_trade_pct': ('risk_per_trade_pct_input', float),
+        'atr_multiplier': ('atr_multiplier_input', float),
+        'atr_period': ('atr_period_input', int),
+        'min_stop_loss_pct': ('min_stop_loss_pct_input', float),
+        'smart_risk_manager_max_iterations': ('smart_risk_manager_max_iterations_input', int),
+        'smart_risk_manager_analysis_window_hours': ('smart_risk_manager_analysis_window_hours_input', int),
+    }
+
+    def _numeric_settings_to_save(self) -> dict:
+        """Every numeric field this dialog saves, resolved: setting key -> int/float.
+
+        A cleared field saves the DECLARED default (never a literal in this file -- the old
+        `or 10.0` / `else 10` / `else 0` fallbacks had drifted from the declarations and
+        swallowed parse errors). Raises NumericSettingNotSavable, naming the setting, for an
+        unparsable value or an empty field with no declared default.
+        """
+        expert_class = self._get_expert_class(self.expert_select.value)
+        if not expert_class:
+            return {}
+        definitions = expert_class.get_merged_settings_definitions()
+        fields = {}   # key -> (raw value, kind)
+        for key, (attr, kind) in self._BUILTIN_NUMERIC_CONTROLS.items():
+            if hasattr(self, attr):
+                fields[key] = (getattr(self, attr).value, kind)
+        expert_defs = expert_class.get_settings_definitions()
+        for key, inp in (getattr(self, 'expert_settings_inputs', None) or {}).items():
+            meta = expert_defs.get(key, {})
+            if (key != 'instrument_selection_method' and meta.get('ui_editor_type') != 'ModelSelector'
+                    and meta.get('type') in ('int', 'float')):
+                fields[key] = (inp.value, int if meta['type'] == 'int' else float)
+        method = getattr(getattr(self, 'instrument_selection_method_select', None), 'value', None)
+        if method == 'screener':
+            for key, inp in (getattr(self, 'screener_settings_inputs', None) or {}).items():
+                kind = definitions.get(key, {}).get('type')
+                if kind in ('int', 'float'):
+                    fields[key] = (inp.value, int if kind == 'int' else float)
+        return {key: numeric_setting_for_save(definitions, key, raw, kind)
+                for key, (raw, kind) in fields.items()}
+
     def _save_expert(self, expert_instance=None):
         """Save the expert instance."""
+        # A dialog whose stored settings could not be loaded is showing new-expert defaults;
+        # saving it would write those over the real settings. Refused, before any write.
+        load_error = (getattr(self, '_general_settings_load_error', None)
+                      or getattr(self, '_expert_settings_load_error', None)
+                      or getattr(self, '_instrument_selection_load_error', None))
+        if load_error:
+            message = (f"Not saved: this expert's settings could not be loaded ({load_error}), "
+                       f"so the form shows defaults, not its real settings. Close the dialog "
+                       f"and reopen it; see the log.")
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=15000)
+            return
+        try:
+            self._numeric_settings_to_save()
+        except NumericSettingNotSavable as e:
+            message = f'Not saved: {e}'
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=10000)
+            return
+        unset = self._unset_bool_controls()
+        if unset:
+            message = unset_bool_message(unset)
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=10000)
+            return
         try:
             is_edit = expert_instance is not None
             
@@ -4780,42 +4931,22 @@ class ExpertSettingsTab:
             expert.save_setting('allow_automated_trade_modification', self.allow_automated_trade_modification_checkbox.value, setting_type="bool")
             logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
         
-        # Save risk management settings
-        if hasattr(self, 'max_virtual_equity_per_instrument_input'):
-            max_equity_value = float(self.max_virtual_equity_per_instrument_input.value or 10.0)
-            expert.save_setting('max_virtual_equity_per_instrument_percent', max_equity_value, setting_type="float")
-            logger.debug(f'Saved risk management: max_virtual_equity_per_instrument_percent={max_equity_value}%')
-        
-        if hasattr(self, 'min_available_balance_pct_input'):
-            min_balance_value = float(self.min_available_balance_pct_input.value or 10.0)
-            expert.save_setting('min_available_balance_pct', min_balance_value, setting_type="float")
-            logger.debug(f'Saved risk management: min_available_balance_pct={min_balance_value}%')
+        # Numeric fields: resolved by _numeric_settings_to_save (a cleared field saves the
+        # DECLARED default; unparsable or default-less refuses). _save_expert already ran it
+        # before any write, so it cannot raise here for a dialog that got this far.
+        numeric = self._numeric_settings_to_save()
+        for key, (attr, kind) in self._BUILTIN_NUMERIC_CONTROLS.items():
+            if key in numeric:
+                expert.save_setting(key, numeric[key], setting_type=kind.__name__)
+                logger.debug(f'Saved {key}={numeric[key]}')
 
-        # Save risk_atr (risk-based) sizing builtins
+        # Save risk_atr (risk-based) sizing mode; an empty select saves the declared default.
         if hasattr(self, 'sizing_mode_select'):
-            sizing_mode_value = str(self.sizing_mode_select.value or 'notional')
-            expert.save_setting('sizing_mode', sizing_mode_value, setting_type="str")
+            sizing_mode_value = self.sizing_mode_select.value
+            if sizing_mode_value in (None, ''):
+                sizing_mode_value = _builtin_default('sizing_mode')
+            expert.save_setting('sizing_mode', str(sizing_mode_value), setting_type="str")
             logger.debug(f'Saved risk management: sizing_mode={sizing_mode_value}')
-
-        if hasattr(self, 'risk_per_trade_pct_input'):
-            risk_per_trade_pct_value = float(self.risk_per_trade_pct_input.value or 1.0)
-            expert.save_setting('risk_per_trade_pct', risk_per_trade_pct_value, setting_type="float")
-            logger.debug(f'Saved risk management: risk_per_trade_pct={risk_per_trade_pct_value}%')
-
-        if hasattr(self, 'atr_multiplier_input'):
-            atr_multiplier_value = float(self.atr_multiplier_input.value or 2.0)
-            expert.save_setting('atr_multiplier', atr_multiplier_value, setting_type="float")
-            logger.debug(f'Saved risk management: atr_multiplier={atr_multiplier_value}')
-
-        if hasattr(self, 'atr_period_input'):
-            atr_period_value = int(float(self.atr_period_input.value or 14))
-            expert.save_setting('atr_period', atr_period_value, setting_type="int")
-            logger.debug(f'Saved risk management: atr_period={atr_period_value}')
-
-        if hasattr(self, 'min_stop_loss_pct_input'):
-            min_stop_loss_pct_value = float(self.min_stop_loss_pct_input.value or 7.0)
-            expert.save_setting('min_stop_loss_pct', min_stop_loss_pct_value, setting_type="float")
-            logger.debug(f'Saved risk management: min_stop_loss_pct={min_stop_loss_pct_value}%')
 
         # Save AI model settings
         if hasattr(self, 'risk_manager_model_input'):
@@ -4836,26 +4967,6 @@ class ExpertSettingsTab:
             expert.save_setting('smart_risk_manager_user_instructions', self.smart_risk_manager_user_instructions_input.value, setting_type="str")
             logger.debug(f'Saved smart risk manager user instructions: {self.smart_risk_manager_user_instructions_input.value}')
         
-        # Save smart risk manager max iterations
-        if hasattr(self, 'smart_risk_manager_max_iterations_input'):
-            try:
-                value = self.smart_risk_manager_max_iterations_input.value
-                max_iterations = int(value) if value is not None else 10
-            except (ValueError, TypeError):
-                max_iterations = 10  # Default value
-            expert.save_setting('smart_risk_manager_max_iterations', max_iterations, setting_type="int")
-            logger.debug(f'Saved smart risk manager max iterations: {max_iterations}')
-
-        # Save smart risk manager analysis window (hours)
-        if hasattr(self, 'smart_risk_manager_analysis_window_hours_input'):
-            try:
-                value = self.smart_risk_manager_analysis_window_hours_input.value
-                analysis_window_hours = int(value) if value is not None else 24
-            except (ValueError, TypeError):
-                analysis_window_hours = 24  # Default value
-            expert.save_setting('smart_risk_manager_analysis_window_hours', analysis_window_hours, setting_type="int")
-            logger.debug(f'Saved smart risk manager analysis window: {analysis_window_hours}h')
-
         # Save the market-condition profile (a BUILTIN setting with its own widget next to the
         # ruleset assignment; _refuse_unserved_market_gates has already checked this value
         # against the ruleset's leaves, so nothing unserved reaches the DB).
@@ -4890,20 +5001,9 @@ class ExpertSettingsTab:
                     expert.save_setting(key, inp.value or "", setting_type="str")
                 elif meta.get("type") == "bool":
                     expert.save_setting(key, inp.value, setting_type="bool")
-                elif meta.get("type") == "int":
-                    # Handle empty strings and ensure proper type
-                    try:
-                        int_value = int(inp.value) if inp.value and inp.value.strip() != "" else 0
-                    except (ValueError, TypeError):
-                        int_value = 0
-                    expert.save_setting(key, int_value, setting_type="int")
-                elif meta.get("type") == "float":
-                    # Handle empty strings and ensure proper type
-                    try:
-                        float_value = float(inp.value) if inp.value and inp.value.strip() != "" else 0.0
-                    except (ValueError, TypeError):
-                        float_value = 0.0
-                    expert.save_setting(key, float_value, setting_type="float")
+                elif meta.get("type") in ("int", "float"):
+                    # Resolved (and validated) by _numeric_settings_to_save.
+                    expert.save_setting(key, numeric[key], setting_type=meta["type"])
                 elif meta.get("type") == "list":
                     # Handle list types - save as JSON
                     expert.save_setting(key, inp.value, setting_type="json")
@@ -4954,20 +5054,13 @@ class ExpertSettingsTab:
                 MarketExpertInterface._ensure_builtin_settings()
                 builtin = MarketExpertInterface._builtin_settings
 
+                # Numeric screener fields were resolved and validated by
+                # _numeric_settings_to_save before _save_expert wrote anything.
+                numeric = self._numeric_settings_to_save()
                 for key, inp in self.screener_settings_inputs.items():
                     meta = builtin.get(key, {})
-                    if meta.get("type") == "int":
-                        try:
-                            value = int(inp.value) if inp.value and str(inp.value).strip() != "" else 0
-                        except (ValueError, TypeError):
-                            value = 0
-                        expert.save_setting(key, value, setting_type="int")
-                    elif meta.get("type") == "float":
-                        try:
-                            value = float(inp.value) if inp.value and str(inp.value).strip() != "" else 0.0
-                        except (ValueError, TypeError):
-                            value = 0.0
-                        expert.save_setting(key, value, setting_type="float")
+                    if meta.get("type") in ("int", "float"):
+                        expert.save_setting(key, numeric[key], setting_type=meta["type"])
                     else:
                         expert.save_setting(key, inp.value or "", setting_type="str")
                 logger.debug(f'Saved screener settings for expert {expert_id}')
