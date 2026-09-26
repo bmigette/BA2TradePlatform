@@ -17,31 +17,30 @@ S_par away from the spot, and neither looks like that:
 Both only ever LOWER S_par. So carry can explain a parity spot BELOW the run's spot, never above
 it (the guard applies that one-sided rule), and every correction here only raises S_par back.
 
-TWO MEASURES, both shared and pure:
-
-* ``carry_free_spot`` (TERM): the known dividends added back to the two nearest usable expiries,
-  then a linear extrapolation in days to T = 0.
-* ``short_dated_spot`` (TIME): one session's nearest usable expiry when it is 2-7 days out,
-  dividends added back -- borrow has faded there. For thin chains that rarely carry two usable
-  expiries (IONQ March 2022, monthlies only: 23 DTE 0.9493, 7 DTE 0.9895, 3 DTE 0.9948).
-
-A basis error is a multiple of every S_par, so it survives both.
+ONE MEASURE, shared and pure: ``carry_free_spot`` -- the known dividends added back to the two
+nearest usable expiries, then a linear extrapolation in days to T = 0. A basis error is a
+multiple of every S_par, so it survives it. (A short-dated TIME measure existed briefly; review
+round 3 removed it: its lookback could reach clean sessions from before a stretch-type basis
+error that no split marks.)
 
 WHAT IS NEVER CARRY (a ``veto``: the guard refuses, naming it, rather than clearing):
 
-* a dividend of >= ``MAX_DIVIDEND_FRACTION`` (10%) of the spot -- OCC adjusts the strikes of a
-  special that large, so the chain does NOT price it, and adding it back would explain away a
-  real x1.25 error (ACI 2022-10-21 $6.85 on $27.50; the calendar also holds garbage such as AMX
-  2023-03-16 at 104% of the price);
+* dividends to add back totalling more than ``MAX_ADDBACK_FRACTION`` (2.5%, half the guard's
+  tolerance) of the spot. Nothing verifies that the chain priced them: a special OCC adjusts
+  the strikes for is NOT in the chain, so adding it back would hide a basis error of its own
+  size (ACI 2022-10-21 $6.85 on $27.50 at x1.25; a 9% special at x1.09). Capped at half the
+  tolerance, an unpriced add-back can shift the verdict by at most that much -- the simpler of
+  the two sound rules (the other: add back only when an expiry before the ex-date shows the
+  drop), and it costs no current name;
 * a dividend row whose declaration date is unknown (as-of: was it known on the session?) or
   whose split-adjusted amount is missing;
-* no dividend calendar at all.
+* no dividend calendar at all;
+* a term structure sloping UP (the later expiry above the earlier one beyond ``SLOPE_SLACK``,
+  the interest allowance): not the shape of carry.
 
 A dividend DECLARED after the session is not added back (it was not known yet), so the
 correction is causal. The two-point extrapolation is only used when its noise LEVERAGE
-t1 / (t2 - t1) is at most ``MAX_LEVERAGE`` (a further expiry is tried otherwise), and only when
-the term structure slopes the way carry does (the later expiry not above the earlier one beyond
-``SLOPE_SLACK``, the interest-rate allowance).
+t1 / (t2 - t1) is at most ``MAX_LEVERAGE`` (a further expiry is tried otherwise).
 
 Pure and shared: the backtest guard is its only caller today; live has no guard (Alpaca's
 spot and strikes are both as traded).
@@ -52,20 +51,17 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Optional, Sequence, Tuple
 
-__all__ = ["CarryFreeSpot", "DividendRow", "carry_free_spot", "short_dated_spot",
-           "MAX_DIVIDEND_FRACTION", "MAX_LEVERAGE", "SLOPE_SLACK", "SHORT_DTE_MIN",
-           "SHORT_DTE_MAX"]
+__all__ = ["CarryFreeSpot", "DividendRow", "carry_free_spot", "MAX_ADDBACK_FRACTION",
+           "MAX_LEVERAGE", "SLOPE_SLACK"]
 
-#: A dividend this large relative to the spot is a special OCC adjusts strikes for: never carry.
-MAX_DIVIDEND_FRACTION = 0.10
+#: The most (of the spot) the carry measure will add back UNVERIFIED: half the guard's 5%.
+MAX_ADDBACK_FRACTION = 0.025
 #: t1 / (t2 - t1) above this amplifies quote noise too much (2.5%-off pairs at 30/37 days give
 #: a carry-free spot 24% off); a further expiry is tried instead.
 MAX_LEVERAGE = 1.5
 #: How far the later expiry's (dividend-corrected) parity spot may sit ABOVE the earlier one's
 #: and still be carry (interest: ~0.5% over a few months).
 SLOPE_SLACK = 0.005
-#: The TIME measure's expiry window (days to expiry, inclusive).
-SHORT_DTE_MIN, SHORT_DTE_MAX = 2, 7
 
 
 @dataclass(frozen=True)
@@ -90,7 +86,7 @@ class CarryFreeSpot:
 def _dividends(session: date, until: date, dividends: Sequence[DividendRow], spot: float
                ) -> Tuple[float, Optional[str], int]:
     """(total to add back for session < ex <= until, veto or None, rows not yet declared)."""
-    total, pending = 0.0, 0
+    total, pending, used = 0.0, 0, []
     for r in dividends:
         if not (session < r.ex_date <= until):
             continue
@@ -103,12 +99,14 @@ def _dividends(session: date, until: date, dividends: Sequence[DividendRow], spo
             continue
         if r.amount is None or not (r.amount == r.amount):
             return total, f"{tag}: no split-adjusted amount", pending
-        if not (spot > 0) or r.amount / spot >= MAX_DIVIDEND_FRACTION:
-            return total, (f"{tag} of {r.amount:g} is {r.amount / spot:.0%} of the spot "
-                           f"{spot:g} (>= {MAX_DIVIDEND_FRACTION:.0%}): OCC adjusts strikes for "
-                           f"a special that large, so it is not carry"), pending
         if r.amount > 0:
             total += r.amount
+            used.append(f"{r.ex_date.isoformat()} {r.amount:g}")
+    if total > 0 and (not (spot > 0) or total / spot > MAX_ADDBACK_FRACTION):
+        return total, (f"dividends to add back ({', '.join(used)}) total {total / spot:.1%} of "
+                       f"the spot {spot:g} (> {MAX_ADDBACK_FRACTION:.1%}): unverified, an "
+                       f"add-back that large could hide a basis error of its size (a special "
+                       f"OCC strike-adjusts is not priced by the chain)"), pending
     return total, None, pending
 
 
@@ -146,28 +144,9 @@ def carry_free_spot(session: date, points: Sequence[Tuple[date, float]],
         return CarryFreeSpot(None, veto, veto=veto)
     s1, s2 = p1 + d1, p2 + d2
     if s2 > s1 * (1.0 + SLOPE_SLACK):
-        return CarryFreeSpot(None, f"the term structure slopes up ({t1}d {s1:.4g} -> {t2}d "
-                                   f"{s2:.4g}): not the shape of carry")
+        why = f"the term structure slopes up ({t1}d {s1:.4g} -> {t2}d {s2:.4g}): not the shape "               f"of carry"
+        return CarryFreeSpot(None, why, veto=why)
     est = s1 - t1 * (s2 - s1) / (t2 - t1)
     note = f"; {pending} dividend(s) not yet declared, not added" if pending else ""
     return CarryFreeSpot(est, f"extrapolated to T=0 from {t1}d and {t2}d, declared dividends "
                               f"added back{note}", expiries_used=2)
-
-
-def short_dated_spot(session: date, point: Tuple[date, float],
-                     dividends: Optional[Sequence[DividendRow]], *, spot: float) -> CarryFreeSpot:
-    """The TIME measure of ``session``: its nearest usable expiry's parity spot when it is
-    ``SHORT_DTE_MIN``..``SHORT_DTE_MAX`` days out, declared dividends up to it added back."""
-    if dividends is None:
-        return CarryFreeSpot(None, "dividend calendar unavailable",
-                             veto="no dividend calendar cached (tools/warm_dividend_calendars.py)")
-    e, p = point
-    dte = (e - session).days
-    if not (SHORT_DTE_MIN <= dte <= SHORT_DTE_MAX) or not (p == p and p > 0):
-        return CarryFreeSpot(None, f"nearest usable expiry {dte}d out, not {SHORT_DTE_MIN}-"
-                                   f"{SHORT_DTE_MAX}d")
-    d, veto, _ = _dividends(session, e, dividends, spot)
-    if veto:
-        return CarryFreeSpot(None, veto, veto=veto)
-    return CarryFreeSpot(p + d, f"{dte}-day expiry, declared dividends added back",
-                         expiries_used=1)

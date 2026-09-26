@@ -27,27 +27,26 @@ from earlier store sessions, as before. A persistent basis error is therefore re
 third sampled check that sees it at the latest (<= ~10 sessions), and it still aborts the run.
 
 CARRY IS NOT A BASIS ERROR (user decision 2026-09-26: fix the guard, no dated waivers; review
-round 2 the same day). A hard-to-borrow fee (AMC July 2023) lowers the parity spot more the
-longer the expiry and fades as it nears; a cash dividend (STLA April 2022, 7.5%) lowers every
-expiry after its ex-date. Both used to read as a 5-8% "basis error". When the uncorrected window
-median is off, the guard consults ``ba2_common.core.option_carry``:
+rounds 2 and 3 the same day). A hard-to-borrow fee (AMC July 2023) lowers the parity spot more
+the longer the expiry; a cash dividend lowers every expiry after its ex-date. Both could read as
+a 5-8% "basis error". When the uncorrected window median is off, the guard consults
+``ba2_common.core.option_carry``:
 
 * ONE-SIDED: carry only lowers the parity spot, so only a median BELOW 1 can be cleared; above
   1 + tolerance is refused as before.
 * TERM: every window session re-measured with the carry-free spot (declared dividends added
   back, two usable expiries extrapolated to T = 0 under a leverage cap, the term structure
   sloping the way carry does). Cleared when >= ``MIN_CARRY_SESSIONS`` (at least 2) are
-  measurable and their median is within the tolerance.
-* TIME, when TERM cannot be measured (thin chains, IONQ March 2022): up to ``TIME_LOOKBACK``
-  earlier store sessions, back to the last split in the run's basis, whose nearest usable
-  expiry is 2-7 days out (borrow has faded) -- cleared when >= 2 of them, declared dividends
-  added back, have a median within the tolerance.
-* A VETO refuses by name: no dividend calendar, a dividend >= 10% of the spot (a special OCC
-  adjusts strikes for -- adding it back would explain away a real x1.25 error), a dividend row
-  of unknown declaration date or amount.
+  measurable and their median is within the tolerance; otherwise the refusal stands.
+* A VETO refuses by name: no dividend calendar, dividends to add back above 2.5% of the spot
+  (unverified -- a special the chain does not price would hide an error of its size), a dividend
+  row of unknown declaration date or amount, a term structure sloping up.
 
-A basis error scales every expiry and every session alike, so it survives both measures; and
-since they are only consulted where the old check refused, every run that passed before passes.
+There is no look-back to other sessions (a short-dated TIME measure was removed in review
+round 3: a stretch-type basis error that no split marks would let it borrow clean sessions from
+before the stretch). A basis error scales every expiry of a session alike, so it survives the
+TERM measure; and since that is only consulted where the old check refused, every run that
+passed before passes.
 
 PURE FUNCTIONS OF THE STORE are memoised per worker (the parity spot of (underlying,
 session) never changes); the comparison itself is per run (the spot depends on the run's
@@ -106,10 +105,6 @@ MAX_QUOTE_UNCERTAINTY = TOLERANCE / 2
 MIN_CARRY_SESSIONS = 3
 #: ... and never fewer than this many, whatever the window (one session is not a median).
 MIN_CARRY_FLOOR = 2
-#: TIME measure: earlier store sessions scanned for a 2-7 day nearest expiry, and how many of
-#: them it needs.
-TIME_LOOKBACK = 25
-TIME_MIN_SESSIONS = 2
 #: A symbol the guard could not evaluate on more than this share of its checks is WARNED
 #: about in the run's results: it traded without the protection (plan Part E4 review).
 UNEVALUABLE_WARN_FRACTION = 0.90
@@ -315,9 +310,8 @@ class BasisGuard:
         self.spot_source = spot_source
         self.split_dates = split_dates
         self.dividends = dividends
-        #: would-be refusals cleared by the carry separation (TERM / TIME measure)
+        #: would-be refusals cleared by the carry separation
         self.carry_passed = 0
-        self.time_passed = 0
         self._checked: set = set()
         #: symbol -> _SymbolSampling
         self._sampling: Dict[str, "_SymbolSampling"] = {}
@@ -348,7 +342,6 @@ class BasisGuard:
         return {"checks": self.checks, "unevaluable": self.unevaluable,
                 "sampled_out": self.sampled_out,
                 "outliers_passed": self.outliers_passed, "carry_passed": self.carry_passed,
-                "time_passed": self.time_passed,
                 "seconds": round(self.seconds, 6),
                 "unevaluable_symbols": blind}
 
@@ -382,38 +375,6 @@ class BasisGuard:
         res = carry_free_spot(day, pts, self._dividends_at(underlying, day), spot=float(spot))
         return (None if res.spot is None else res.spot / float(spot)), res.reason, res.veto
 
-    def _time_ratios(self, u, underlying: str, session_ord: int):
-        """([(session, ratio)], veto or None): the TIME measure -- up to ``TIME_LOOKBACK``
-        store sessions ending at ``session_ord``, none before the last split in the run's
-        basis, whose nearest usable expiry is 2-7 days out."""
-        from ba2_common.core.option_carry import short_dated_spot
-
-        idx = _index_for(u.raw)
-        splits = sorted(d.toordinal() for d in (self.split_dates(underlying) or ())) \
-            if self.split_dates is not None else []
-        floor = max([e for e in splits if e <= session_ord], default=None)
-        k = int(np.searchsorted(idx.bar_ords, session_ord, side="right"))
-        out = []
-        for kk in range(k - 1, max(-1, k - 1 - TIME_LOOKBACK), -1):
-            o = int(idx.bar_ords[kk])
-            if floor is not None and o < floor:
-                break
-            pts = expiry_parities(u, o)
-            if not pts:
-                continue
-            day = self._session_date(u, o)
-            spot = self.spot_source(underlying, day)
-            if spot is None or not (spot > 0):
-                continue
-            e, par = pts[0]
-            res = short_dated_spot(day, (date.fromordinal(e), par),
-                                   self._dividends_at(underlying, day), spot=float(spot))
-            if res.veto:
-                return out, res.veto
-            if res.spot is not None:
-                out.append((day, res.spot / float(spot)))
-        return out, None
-
     def _carry_clears(self, u, underlying: str, ratios, med: float):
         """(cleared, text for a refusal). See the module docstring."""
         if med > 1.0 + TOLERANCE:
@@ -433,20 +394,8 @@ class BasisGuard:
             return False, (f"carry-free median {medc:.4f} over {len(avail)} of {len(carry)} "
                            f"window sessions (declared dividends added back, extrapolated to "
                            f"T=0) is off too")
-        term_txt = (f"carry-free ratio measurable on {len(avail)} of {len(carry)} window "
-                    f"sessions (>= {need} needed; checked session: {carry[0][1]})")
-        pts, veto = self._time_ratios(u, underlying, ratios[0][0].toordinal())
-        if veto:
-            return False, f"{term_txt}; short-dated check refused: {veto}"
-        if len(pts) >= TIME_MIN_SESSIONS:
-            medt = float(np.median([r for _, r in pts]))
-            if abs(medt - 1.0) <= TOLERANCE:
-                self.time_passed += 1
-                return True, ""
-            return False, (f"{term_txt}; the 2-7 day expiries of {len(pts)} earlier sessions "
-                           f"give {medt:.4f}, off too")
-        return False, (f"{term_txt}; only {len(pts)} of the last {TIME_LOOKBACK} store sessions "
-                       f"had a 2-7 day expiry (>= {TIME_MIN_SESSIONS} needed)")
+        return False, (f"carry-free ratio measurable on {len(avail)} of {len(carry)} window "
+                       f"sessions (>= {need} needed; checked session: {carry[0][1]})")
 
     def _due(self, underlying: str, d: int) -> bool:
         """Advance ``underlying``'s sampling state by one session; True when it is checked."""
