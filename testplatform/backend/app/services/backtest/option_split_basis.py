@@ -96,10 +96,8 @@ def load_cached_dividend_calendar(symbol: str
     ``dividend``: multiplying an as-declared amount by a split factor would be wrong by the
     split, so a row without ``adjDividend`` keeps None and the guard refuses to use it, naming
     it. The declaration date lets the guard read the calendar AS OF a session (a dividend not
-    yet declared was not known); an undated row may take its date from the operator record
-    (``dividend_declaration_overrides``), which refuses on any conflict with the vendor. An
-    unreadable file RAISES (a corrupt calendar is not an absent one). Read by the option basis
-    guard's carry separation only."""
+    yet declared was not known). An unreadable file RAISES (a corrupt calendar is not an absent
+    one). Read by the option basis guard's carry separation only."""
     from ba2_providers import symbol_info
 
     path = dividend_calendar_path(symbol)
@@ -127,10 +125,7 @@ def load_cached_dividend_calendar(symbol: str
         if ex is None:
             continue
         out.append((ex, _amount(r.get("adjDividend")), _day(r.get("declarationDate"))))
-    # Operator-maintained declaration dates for rows FMP leaves undated (never replacing a
-    # vendor date; a conflict REFUSES): ``ba2_common.core.dividend_declaration_overrides``.
-    from ba2_common.core.dividend_declaration_overrides import apply_declaration_overrides
-    return apply_declaration_overrides(symbol, sorted(out, key=lambda t: t[0]))
+    return sorted(out, key=lambda t: t[0])
 
 
 class RunSplitBasis:
