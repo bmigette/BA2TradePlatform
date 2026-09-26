@@ -33,7 +33,8 @@ DIVIDEND_CALENDAR_MAX_AGE_DAYS = 1.0
 
 
 class FMPWarmupSource:
-    def __init__(self, cache_root: str, provider: Optional[object] = None):
+    def __init__(self, cache_root: str, provider: Optional[object] = None, *,
+                 keep_newer_cached_tail: bool = False):
         from ba2_common.core import native_cache
 
         live = os.path.normcase(os.path.abspath(native_cache.CACHE_FOLDER))
@@ -44,6 +45,10 @@ class FMPWarmupSource:
                 "set CACHE_FOLDER so the provider fetches into the tree the warmup reads")
         self.cache_root = cache_root
         self._provider = provider
+        #: ``force_full_refetch`` keeps the cache's own bars after the vendor's last one (the
+        #: SATS case; opt-in, checked and logged by the provider) -- see
+        #: ``MarketDataProviderInterface._append_newer_cached_tail``.
+        self.keep_newer_cached_tail = bool(keep_newer_cached_tail)
 
     @property
     def provider(self):
@@ -103,4 +108,7 @@ class FMPWarmupSource:
         from ba2_providers.fmp_common import PURPOSE_WARM, fmp_purpose
 
         with fmp_purpose(PURPOSE_WARM):
-            self.provider.force_full_refetch(symbol.upper(), "1d")
+            if self.keep_newer_cached_tail:
+                self.provider.force_full_refetch(symbol.upper(), "1d", keep_newer_cached_tail=True)
+            else:
+                self.provider.force_full_refetch(symbol.upper(), "1d")

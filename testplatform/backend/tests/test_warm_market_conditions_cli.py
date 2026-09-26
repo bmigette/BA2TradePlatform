@@ -261,3 +261,44 @@ def test_unreadable_split_calendar_exits_one_until_exclusions_are_allowed(tool, 
     from ba2_common.core.market_condition_store import MarketConditionStore
     m = MarketConditionStore(root).read_manifest(report["manifest_digest"])
     assert m["coverage"]["BBB"]["exceptions"][0]["kind"] == "split_calendar_unavailable"
+
+
+# ----------------------------------------------------------------- repair (stage-2, 2026-09-26)
+def test_repair_with_nothing_to_repair_exits_zero_and_fetches_nothing(tool, root, universe_file,
+                                                                       tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tool, "us_session_open", lambda: False)
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out)) == 0
+    capsys.readouterr()
+    assert tool.main(["--quiet", "repair", "--plan", out]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["ok"] and rep["refetched"] == [] and rep["still_refused"] == {}
+
+
+def test_repair_refuses_while_the_us_session_is_open_unless_allowed(tool, root, universe_file,
+                                                                     tmp_path, monkeypatch, capsys):
+    """A full re-fetch during the session stores that day's PARTIAL bar (stage-2 pass A). The
+    repair waits for the close unless the operator says otherwise."""
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out)) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(tool, "us_session_open", lambda: True)
+    assert tool.main(["--quiet", "repair", "--plan", out]) == 2
+    assert "session" in capsys.readouterr().err
+    assert tool.main(["--quiet", "repair", "--plan", out, "--allow-open-session"]) == 0
+
+
+def test_repair_hands_the_tail_keep_to_the_source(tool, root, universe_file, tmp_path, monkeypatch, capsys):
+    seen = []
+
+    def make(cache_root, **kw):
+        seen.append(kw)
+        return _NoFetchSource()
+
+    monkeypatch.setattr(tool, "make_source", make)
+    monkeypatch.setattr(tool, "us_session_open", lambda: False)
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out)) == 0
+    seen.clear()
+    assert tool.main(["--quiet", "repair", "--plan", out, "--keep-newer-cached-tail"]) == 0
+    assert seen == [{"keep_newer_cached_tail": True}]

@@ -15,6 +15,13 @@ ONE preparation for a whole search (design section 4.4). Typical use:
     # 2b. Or let it fetch the missing coverage through the existing provider cache path.
     python tools/warm_market_conditions.py build --plan plan.json --fetch-missing --concurrency 4
 
+    # 1b. Repair ONLY (no build): full re-fetch of every split-basis-refused name, top-up of
+    #     missing coverage, then the re-check. Exit 1 names what still refuses (a human
+    #     decision: an override, --keep-newer-cached-tail for a vendor file that ends early, or
+    #     an exclusion). Refused while the US session is open (the re-fetch would store the
+    #     day's partial bar) unless --allow-open-session.
+    python tools/warm_market_conditions.py repair --plan plan.json [--keep-newer-cached-tail]
+
     # 2c. Publish anyway, recording the symbols that cannot be warmed (never the default).
     python tools/warm_market_conditions.py build --plan plan.json --cache-only --allow-exclusions
 
@@ -71,10 +78,48 @@ def _cache_root(arg):
     return config.CACHE_FOLDER
 
 
-def make_source(cache_root: str):
+def make_source(cache_root: str, **kw):
     """The provider the warmup fetches through (seam: tests replace this)."""
     from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
-    return FMPWarmupSource(cache_root)
+    return FMPWarmupSource(cache_root, **kw)
+
+
+def us_session_open() -> bool:
+    """True while a regular NYSE session is in progress (seam: tests replace this)."""
+    from datetime import timedelta, timezone
+    from ba2_common.core.market_calendar import nyse_regular_sessions
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    return any(o <= now < c for o, c in nyse_regular_sessions(today - timedelta(days=1),
+                                                                today + timedelta(days=1)))
+
+
+def cmd_repair(args) -> int:
+    from ba2_providers.market_conditions import warmup as W
+
+    if not os.path.isfile(args.plan):
+        print(f"plan file not found: {args.plan}", file=sys.stderr)
+        return EXIT_CONFIG
+    if us_session_open() and not args.allow_open_session:
+        print("refusing to re-fetch while the US regular session is open: the full re-fetch "
+              "would store today's PARTIAL bar. Re-run after the close, or pass "
+              "--allow-open-session and repeat the repair after the close.", file=sys.stderr)
+        return EXIT_CONFIG
+    try:
+        plan = W.MarketConditionWarmPlan.load(args.plan)
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"configuration error: {args.plan} is not a usable plan: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    try:
+        source = (make_source(plan.cache_root, keep_newer_cached_tail=True)
+                  if args.keep_newer_cached_tail else make_source(plan.cache_root))
+    except W.WarmupConfigError as e:
+        print(f"configuration error: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    report = W.repair(plan, source=source, concurrency=args.concurrency, log=_logger(args))
+    report["keep_newer_cached_tail"] = bool(args.keep_newer_cached_tail)
+    _out(report)
+    return EXIT_OK if report["ok"] else EXIT_ACTIONABLE
 
 
 def cmd_plan(args) -> int:
@@ -207,6 +252,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-root", default=None)
     p.add_argument("--out", default=None, help="where to write the plan JSON")
     p.set_defaults(func=cmd_plan)
+
+    r = sub.add_parser("repair", parents=[common],
+                       help="full re-fetch of the split-basis-refused names + top-up; no build")
+    r.add_argument("--plan", required=True)
+    r.add_argument("--concurrency", type=int, default=4)
+    r.add_argument("--keep-newer-cached-tail", action="store_true",
+                   help="when the vendor's full history ENDS before the cache's, keep the "
+                        "cache's own newer bars (at most a few, no split among them, the shared "
+                        "recent sessions agreeing) instead of refusing the re-fetch. Logged.")
+    r.add_argument("--allow-open-session", action="store_true",
+                   help="re-fetch although the US session is open (the day's partial bar is "
+                        "stored; repeat the repair after the close)")
+    r.set_defaults(func=cmd_repair)
 
     b = sub.add_parser("build", parents=[common], help="build and publish the manifest for a plan")
     b.add_argument("--plan", required=True)
