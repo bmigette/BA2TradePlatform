@@ -81,7 +81,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ba2_common.core.interfaces.OptionsDataProviderInterface import (
@@ -262,6 +262,105 @@ def _duplicate_root_history_keys(source_path: str) -> List[str]:
 
 
 _validate_root_history(ROOT_HISTORY)
+
+# --------------------------------------------------------------------------- partitions on disk
+# The provider honours ROOT_HISTORY on every NEW request, but the warm tool skips a partition
+# whose manifest says complete, so an entry added later never reached the partitions fetched
+# before it (the stage-2 repair had to select, stage and swap them by hand). The ThetaData warm
+# therefore records the symbol's signature in every manifest it writes and treats a partition
+# fetched under another root history as STALE (``root_history_refetch_reason``, wired through
+# ``parquet_store_hooks`` into tools/warm_options_history.py). Nothing needs doing by hand when
+# an entry is added or corrected: the next warm of the symbol re-fetches what it changes.
+
+#: A contract lists at most this long before it expires (LEAPS run ~2.5 years), so only a
+#: partition expiring within this of a cutover can hold a bar from before it.
+LISTING_HORIZON_DAYS = int(365 * 2.5)
+
+#: LEGACY manifests (written before signatures, 2026-09-26): the partitions of an ALIAS symbol
+#: written at or after this instant were fetched with its current entry in force -- the start of
+#: each symbol's re-fetch in the stage-2 repair (META: its 2026-09-23 parity re-fetch). Frozen:
+#: an entry added later needs nothing here (its legacy partitions are all re-fetched, and new
+#: ones carry the signature). None roots are judged by content instead (a bar before the
+#: cutover), which needs no date.
+ROOT_HISTORY_LEGACY_FETCHED: Dict[str, datetime] = {
+    "META": datetime(2026, 9, 23, 1, 21, 0, tzinfo=timezone.utc),
+    "IR": datetime(2026, 9, 25, 14, 25, 18, tzinfo=timezone.utc),
+    "CZR": datetime(2026, 9, 25, 14, 25, 18, tzinfo=timezone.utc),
+    "COHR": datetime(2026, 9, 25, 14, 44, 39, tzinfo=timezone.utc),
+    "BN": datetime(2026, 9, 25, 14, 44, 39, tzinfo=timezone.utc),
+    "B": datetime(2026, 9, 25, 15, 4, 0, tzinfo=timezone.utc),
+    "DOC": datetime(2026, 9, 25, 15, 4, 0, tzinfo=timezone.utc),
+    "LUMN": datetime(2026, 9, 26, 3, 14, 3, tzinfo=timezone.utc),
+    "VTRS": datetime(2026, 9, 26, 3, 14, 3, tzinfo=timezone.utc),
+    "BALL": datetime(2026, 9, 26, 3, 27, 44, tzinfo=timezone.utc),
+    "XYZ": datetime(2026, 9, 26, 3, 41, 24, tzinfo=timezone.utc),
+}
+
+
+def root_history_signature(symbol: str) -> str:
+    """``"cutover:root;..."`` (``-`` for a None root), ``""`` without a root history."""
+    return ";".join(f"{c.isoformat()}:{r or '-'}" for c, r in ROOT_HISTORY.get(symbol.upper(), ()))
+
+
+def _signature_cutovers(sig: str) -> List[date]:
+    out = []
+    for part in (sig or "").split(";"):
+        if part:
+            try:
+                out.append(date.fromisoformat(part.split(":", 1)[0]))
+            except ValueError:
+                pass
+    return out
+
+
+def _parse_written_at(value: Any) -> Optional[datetime]:
+    try:
+        t = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc)
+
+
+def root_history_refetch_reason(symbol: str, expiry: date, manifest: Dict[str, Any],
+                                first_bar) -> Optional[str]:
+    """Why a finished partition must be fetched again under today's ROOT_HISTORY, or None.
+
+    ``first_bar()`` returns the partition's earliest bar date (None when empty); it is only
+    called for a legacy partition under a None root. See the section comment above."""
+    u = symbol.upper()
+    hist = ROOT_HISTORY.get(u, ())
+    sig = root_history_signature(u)
+    horizon = timedelta(days=LISTING_HORIZON_DAYS)
+    recorded = manifest.get("root_history")
+    if recorded is not None:
+        if recorded == sig:
+            return None
+        cuts = _signature_cutovers(recorded) + [c for c, _r in hist]
+        if cuts and expiry <= max(cuts) + horizon:
+            return (f"root history changed since the partition was fetched "
+                    f"({recorded!r} -> {sig!r})")
+        return None
+    if not hist:
+        return None
+    written = _parse_written_at(manifest.get("written_at"))
+    applied = ROOT_HISTORY_LEGACY_FETCHED.get(u)
+    for cutover, old_root in hist:
+        if old_root is None:
+            fb = first_bar()
+            if fb is not None and fb < cutover:
+                return (f"holds bars from {fb}, before {cutover} where ROOT_HISTORY has no chain "
+                        f"for {u} (another company's)")
+        elif expiry <= cutover + horizon and (applied is None or written is None or written < applied):
+            return (f"fetched {manifest.get('written_at')} without ROOT_HISTORY {u} <- {old_root} "
+                    f"(cutover {cutover})")
+    return None
+
+
+def parquet_store_hooks() -> Dict[str, Any]:
+    """The ``OptionHistoryParquetStore`` writer hooks of the ThetaData warm: stamp the root
+    history signature, and re-fetch what a root history change makes stale."""
+    return {"manifest_extra": lambda u: {"root_history": root_history_signature(u)},
+            "stale_reason": root_history_refetch_reason}
 
 
 def _root_segments(underlying: str, start: date, end: date) -> List[Tuple[str, date, date]]:

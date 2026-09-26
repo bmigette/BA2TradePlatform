@@ -468,6 +468,26 @@ def build_provider(ns: argparse.Namespace):  # pragma: no cover - network
 # --------------------------------------------------------------------------- #
 # planning
 # --------------------------------------------------------------------------- #
+def make_store(ns: argparse.Namespace) -> OptionHistoryParquetStore:
+    """The store this run writes. Each provider writes to its OWN tree by default --
+    "ThetaDataOptionsProvider" is a SEPARATE folder from "TastyTradeOptionsProvider", never the
+    same one, so running --provider thetadata can never overwrite/erase the TastyTrade cache.
+
+    ThetaData's store carries the ROOT_HISTORY hooks (``thetadata.parquet_store_hooks``): every
+    partition records the symbol's root-history signature, and one fetched under another root
+    history (an alias or a None root added or corrected since) is STALE and fetched again."""
+    out_root = ns.out
+    if not out_root:
+        import ba2_common.config as _cfg
+        provider_dir = ("ThetaDataOptionsProvider" if ns.provider == "thetadata"
+                        else "TastyTradeOptionsProvider")
+        out_root = os.path.join(_cfg.CACHE_FOLDER, provider_dir)
+    if ns.provider == "thetadata":
+        from ba2_providers.options.thetadata import parquet_store_hooks
+        return OptionHistoryParquetStore(root=out_root, **parquet_store_hooks())
+    return OptionHistoryParquetStore(root=out_root)
+
+
 def discover(provider, store: OptionHistoryParquetStore, underlying: str,
              start: date, end: date, ns: argparse.Namespace,
              persist: bool) -> List[OptionContractMeta]:
@@ -575,9 +595,14 @@ def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str
         for c in contracts:
             by_expiry.setdefault(c.expiry, []).append(c)
 
-        done = empty = pending = 0
+        done = empty = pending = root_stale = 0
+        first_reason = None
         for expiry in sorted(by_expiry):
             state = store.partition_state(symbol, expiry, start, end)
+            why = getattr(store, "stale_reasons", {}).get((symbol.upper(), expiry))
+            if why and state is PartitionState.STALE:
+                root_stale += 1
+                first_reason = first_reason or f"{expiry}: {why}"
             if state is PartitionState.COMPLETE:
                 done += 1
                 continue
@@ -596,8 +621,11 @@ def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str
         plan.units_empty += empty
         plan.per_symbol[symbol] = {
             "expiries": len(by_expiry), "done": done, "empty": empty, "pending": pending,
-            "contracts": len(contracts),
+            "contracts": len(contracts), "root_history_stale": root_stale,
         }
+        if root_stale:
+            log(f"  [{symbol}] {root_stale} finished partition(s) fetched again for ROOT_HISTORY "
+                f"(e.g. {first_reason})")
         if budget is not None and len(plan.units) >= budget:
             break
     return plan
@@ -1385,16 +1413,7 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
         raise SystemExit(f"--end {end} is before --start {start}.")
 
     if store is None:
-        # Each provider writes to its OWN tree by default -- "ThetaDataOptionsProvider" is a
-        # SEPARATE folder from "TastyTradeOptionsProvider", never the same one, so running
-        # --provider thetadata can never overwrite/erase the existing TastyTrade cache.
-        out_root = ns.out
-        if not out_root:
-            import ba2_common.config as _cfg
-            provider_dir = ("ThetaDataOptionsProvider" if ns.provider == "thetadata"
-                            else "TastyTradeOptionsProvider")
-            out_root = os.path.join(_cfg.CACHE_FOLDER, provider_dir)
-        store = OptionHistoryParquetStore(root=out_root)
+        store = make_store(ns)
     if provider is None:
         provider = build_provider(ns)  # pragma: no cover - network
 
