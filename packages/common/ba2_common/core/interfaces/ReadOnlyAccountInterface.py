@@ -2548,10 +2548,18 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """True if a closing order for this transaction is already WORKING (submitted, not
         yet terminal).
 
-        A transaction's market-entry-level orders (``depends_on_order IS NULL`` - this
-        includes both the original entry and any subsequently-submitted closing order, whether
-        single-leg or a multi-leg parent) sort oldest-first to newest: the oldest is the entry,
-        so any LATER one still non-terminal is a close that hasn't resolved yet.
+        Read from the transaction's root orders (``depends_on_order IS NULL``) through
+        ``TransactionHelper.pending_closing_orders``: leaving out the position's own resting
+        protection (OCO/TP/SL legs, brackets and standalone TP/SL orders), the oldest root
+        order is the entry, and any LATER one still non-terminal is a close that hasn't
+        resolved yet - a submitted close/reduce, or the net-only parent of a multi-leg close.
+
+        Resting protection is NOT a pending close. Live Alpaca writes an OCO's stop leg as a
+        HELD root row (``parent_order_id`` -> the OCO, no ``depends_on_order``), and a TP/SL
+        re-placed on a filled entry as a root OCO/stop/limit. Counting those made every
+        protected live position read "close pending" for as long as its bracket rested, so
+        the open-positions pass silently skipped its exit rules (2026-09-26: 13 of 23 prod
+        expert positions). The backtest never writes such rows, so live diverged from it.
 
         Callers managing open positions (deciding whether to re-evaluate exit rules / submit a
         new closing order for a transaction) MUST check this first. Without it, a transaction
@@ -2565,19 +2573,10 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         limit-order multi-leg closes take a full bar to fill).
         """
         from ba2_common.core.trade_store import orders_where
-        from ba2_common.core.types import OrderStatus
+        from ba2_common.core.TransactionHelper import TransactionHelper
 
         orders = orders_where(account_id=self.id, transaction_id=transaction_id, depends_on_order=None)
-        if len(orders) <= 1:
-            return False
-        orders.sort(key=lambda o: (o.created_at or datetime.min.replace(tzinfo=timezone.utc), o.id or 0))
-        # "Resolved" = genuinely terminal (rejected/canceled/expired/...) OR fully FILLED.
-        # get_terminal_statuses() deliberately excludes FILLED (tracked separately as
-        # "executed") — a FILLED close IS resolved and must not be read as still pending.
-        # PARTIALLY_FILLED is intentionally left OUT of "resolved": the remainder is still
-        # working, so the close hasn't finished doing its job yet.
-        resolved = OrderStatus.get_terminal_statuses() | {OrderStatus.FILLED}
-        return any(o.status not in resolved for o in orders[1:])
+        return bool(TransactionHelper.pending_closing_orders(orders))
 
     def reconcile_externally_closed_transactions(self, grace_period_minutes: int = 5) -> int:
         """Close OPENED (or stuck-CLOSING) transactions whose symbol no longer has a position
