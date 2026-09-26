@@ -215,3 +215,19 @@ def test_protective_types_cover_both_sides():
     for expected in (OrderType.SELL_STOP, OrderType.SELL_LIMIT,
                      OrderType.BUY_STOP, OrderType.BUY_LIMIT):
         assert expected in t
+
+
+def test_a_resized_leg_with_no_sell_to_chain_on_is_classed_as_protection(monkeypatch):
+    """When the reduce produced no order row (``sell_order`` None) the replacement leg is
+    written at the ROOT, with no ``depends_on_order``. It must carry the TP/SL mark, or
+    ``has_pending_closing_order`` reads the resting stop as a close still working."""
+    from ba2_common.core.TransactionHelper import TransactionHelper
+
+    acct = _Account()
+    mgr = _mgr(monkeypatch, [_Leg(608, 11.0)], acct)
+    mgr._reprotect_remainder("SPCX", 4, [_Txn(open_qty=11.0)], [_Leg(608, 11.0)], None)
+
+    [(replacement, _kw)] = acct.submitted
+    assert replacement.depends_on_order is None
+    assert TransactionHelper.is_resting_protection(replacement), replacement.comment
+    assert "608" in replacement.comment, "the trace to the replaced leg is kept"

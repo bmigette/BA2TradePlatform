@@ -367,6 +367,8 @@ class TransactionHelper:
           comment its writer stamps: ``<ts>-TP-[`` / ``<ts>-SL-[`` / ``<ts>-TPSL-[``, or an
           OCO leg's ``<ts>-OCO-TP|SL|LEG-[`` (older leg rows lack ``parent_order_id``).
 
+        Never a MARKET order: see the check below.
+
         NOT ``data["sl_percent_target"]``: the ENTRY carries that key too (its safeguard
         stop), and reading the entry as protection would promote a real close to "entry"
         and let a second close through (measured on prod transaction 238 and 46 dev rows).
@@ -378,7 +380,29 @@ class TransactionHelper:
             return True
         if order.order_type in (OrderType.OCO, OrderType.OTO):
             return True
+        # A MARKET order is a close, whatever its comment says. A stop rejected as already
+        # breached is re-sent as MARKET on the SAME row and keeps its ``<ts>-SL-[`` comment
+        # (``AccountInterface._handle_order_submit_error``): that row is a full-size market
+        # sell, and reading it as resting protection would let a second close through.
+        if order.order_type == OrderType.MARKET:
+            return False
         return bool(order.comment) and _PROTECTIVE_COMMENT_RE.search(order.comment) is not None
+
+    @staticmethod
+    def tpsl_comment(kind: str, account_id: Optional[int], transaction_id: Optional[int],
+                     parent_order_id: Optional[int], note: Optional[str] = None) -> str:
+        """The comment every TP/SL writer stamps: ``<ts>-<kind>-[ACC:a/TR:t/PORD:p]``.
+
+        ``kind`` is TP, SL or TPSL (an OCO). The mark is what ``is_resting_protection``
+        recognises on a root row, so a writer that stamps anything else leaves its resting
+        leg looking like a pending close. ``note`` (free text, e.g. what the leg replaces) is
+        appended after the mark.
+        """
+        if kind not in ("TP", "SL", "TPSL"):
+            raise ValueError(f"tpsl_comment kind must be TP, SL or TPSL, got {kind!r}")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        mark = f"{timestamp}-{kind}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
+        return f"{mark} {note}" if note else mark
 
     @staticmethod
     def pending_closing_orders(root_orders: List[TradingOrder]) -> List[TradingOrder]:
@@ -872,6 +896,7 @@ class TransactionHelper:
             with Session(get_db().bind) as session:
                 # Get entry order to determine direction
                 entry_order = TransactionHelper.get_entry_order(transaction, session)
+                entry_order_id = entry_order.id if entry_order else None
                 if entry_order:
                     entry_direction = entry_order.side
                 else:
@@ -1075,7 +1100,9 @@ class TransactionHelper:
                             status=OrderStatus.WAITING_TRIGGER,
                             depends_on_order=close_order_id,
                             depends_order_status_trigger=OrderStatus.FILLED,
-                            comment="OCO TP/SL (triggered by close fill)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TPSL", account.id, transaction.id, entry_order_id,
+                                note="OCO TP/SL (triggered by close fill)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         oco_id = add_instance(oco_order)
@@ -1097,7 +1124,9 @@ class TransactionHelper:
                             status=OrderStatus.WAITING_TRIGGER,
                             depends_on_order=close_order_id,
                             depends_order_status_trigger=OrderStatus.FILLED,
-                            comment="Take Profit order (triggered by close fill)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TP", account.id, transaction.id, entry_order_id,
+                                note="Take Profit order (triggered by close fill)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         tp_id = add_instance(tp_order)
@@ -1119,7 +1148,9 @@ class TransactionHelper:
                             status=OrderStatus.WAITING_TRIGGER,
                             depends_on_order=close_order_id,
                             depends_order_status_trigger=OrderStatus.FILLED,
-                            comment="Stop Loss order (triggered by close fill)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "SL", account.id, transaction.id, entry_order_id,
+                                note="Stop Loss order (triggered by close fill)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         sl_id = add_instance(sl_order)
@@ -1240,7 +1271,9 @@ class TransactionHelper:
                             status=order_status,
                             depends_on_order=trigger_order_id,
                             depends_order_status_trigger=trigger_status,
-                            comment="OCO TP/SL (triggered by old TP/SL cancel)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TPSL", account.id, transaction.id, entry_order_id,
+                                note="OCO TP/SL (triggered by old TP/SL cancel)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         oco_id = add_instance(oco_order)
@@ -1262,7 +1295,9 @@ class TransactionHelper:
                             status=order_status,
                             depends_on_order=trigger_order_id,
                             depends_order_status_trigger=trigger_status,
-                            comment="Take Profit order (triggered by old TP/SL cancel)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TP", account.id, transaction.id, entry_order_id,
+                                note="Take Profit order (triggered by old TP/SL cancel)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         tp_id = add_instance(tp_order)
@@ -1284,7 +1319,9 @@ class TransactionHelper:
                             status=order_status,
                             depends_on_order=trigger_order_id,
                             depends_order_status_trigger=trigger_status,
-                            comment="Stop Loss order (triggered by old TP/SL cancel)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "SL", account.id, transaction.id, entry_order_id,
+                                note="Stop Loss order (triggered by old TP/SL cancel)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         sl_id = add_instance(sl_order)

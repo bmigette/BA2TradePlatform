@@ -219,7 +219,121 @@ def test_protection_is_recognised_only_by_its_writers_marks():
     assert not TH.is_resting_protection(_mem_order(1, at=T0, comment="TP hit - SL moved, closing"))
     assert not TH.is_resting_protection(_mem_order(1, at=T0, comment="FactorRanker rebalance sell"))
     assert not TH.is_resting_protection(_mem_order(1, at=T0, comment=None))
-    assert TH.is_resting_protection(_mem_order(1, at=T0, comment="20260910133559-TP-[ACC:1/TR:2/PORD:3]"))
-    assert TH.is_resting_protection(_mem_order(1, at=T0, comment="20260910133559-TPSL-[ACC:1/TR:2/PORD:3]"))
+    assert TH.is_resting_protection(_mem_order(1, at=T0, order_type="SELL_LIMIT",
+                                               comment="20260910133559-TP-[ACC:1/TR:2/PORD:3]"))
+    assert TH.is_resting_protection(_mem_order(1, at=T0, order_type="SELL_STOP",
+                                               comment="20260910133559-SL-[ACC:1/TR:2/PORD:3]"))
+    # A MARKET row is a close whatever its comment says (a breached stop re-sent as MARKET).
+    assert not TH.is_resting_protection(_mem_order(1, at=T0, order_type="MARKET",
+                                                   comment="20260910133559-SL-[ACC:1/TR:2/PORD:3]"))
     assert TH.is_resting_protection(_mem_order(1, at=T0, order_type="OCO"))
     assert TH.is_resting_protection(_mem_order(1, at=T0, parent=4))
+
+
+# ----------------------------------------------------- a breached stop re-sent as MARKET
+BREACHED = (" | [stop_through_market] stop price must be less than current price"
+            " — auto-converted to MARKET (stop already breached)")
+
+
+def test_a_breached_stop_resent_as_market_is_a_pending_close(db):
+    """``AccountInterface._handle_order_submit_error`` turns a stop rejected as already
+    breached into a MARKET order ON THE SAME ROW and keeps its ``<ts>-SL-[`` comment. That is
+    a real full-size market sell: while it works, a second close must be refused."""
+    txn = _txn(db)
+    _order(db, txn, side="BUY", status="FILLED")
+    _order(db, txn, order_type="MARKET", status="NEW", at=T0 + timedelta(days=2),
+           comment="20260709133017-SL-[ACC:1/TR:113/PORD:403]" + BREACHED)
+
+    assert _Account().has_pending_closing_order(txn) is True
+
+
+def test_the_real_breach_conversion_turns_protection_into_a_pending_close(db):
+    """Through the real ``_handle_order_submit_error``: the resting root stop is protection;
+    the same row, converted to MARKET and working, is a pending close."""
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.interfaces.AccountInterface import AccountInterface
+    from ba2_common.core.models import TradingOrder
+    from ba2_common.core.types import BrokerOrderErrorReason, OrderStatus, OrderType
+
+    class _Converting(_Account):
+        _STOP_ORDER_TYPES = AccountInterface._STOP_ORDER_TYPES
+        _handle_order_submit_error = AccountInterface._handle_order_submit_error
+
+        def _classify_order_error(self, exc):
+            return BrokerOrderErrorReason.STOP_THROUGH_MARKET
+
+        def _submit_order_impl(self, order, is_closing_order=False):
+            order.status = OrderStatus.NEW          # the broker took the market sell
+            db.update_instance(order)
+            return order
+
+    txn = _txn(db)
+    _order(db, txn, side="BUY", status="FILLED")
+    stop = _order(db, txn, order_type="SELL_STOP", status="PENDING", at=T0 + timedelta(days=2),
+                  comment=f"20260709133017-SL-[ACC:1/TR:{txn}/PORD:1]", stop_price=23.86)
+    account = _Converting()
+    assert account.has_pending_closing_order(txn) is False
+
+    account._handle_order_submit_error(get_instance(TradingOrder, stop),
+                                       RuntimeError("stop price must be less than current price"))
+
+    row = get_instance(TradingOrder, stop)
+    assert row.order_type == OrderType.MARKET and "-SL-[" in row.comment
+    assert account.has_pending_closing_order(txn) is True
+
+
+def test_the_tpsl_comment_helper_stamps_the_mark_the_classifier_reads():
+    from ba2_common.core.TransactionHelper import TransactionHelper as TH
+
+    for kind in ("TP", "SL", "TPSL"):
+        comment = TH.tpsl_comment(kind, 1, 2, 3, note="resized")
+        assert comment.endswith(f"-{kind}-[ACC:1/TR:2/PORD:3] resized")
+        assert TH.is_resting_protection(_mem_order(1, at=T0, order_type="SELL_STOP",
+                                                   comment=comment))
+    with pytest.raises(ValueError):
+        TH.tpsl_comment("CLOSE", 1, 2, 3)
+
+
+# ------------------------------------------- writers that used to stamp no protection mark
+class _AddAccount:
+    """The broker edge for ``adjust_quantity_with_tpsl``'s add-to-position branch."""
+
+    id = 1
+
+    def submit_order(self, order, **kw):
+        from ba2_common.core.db import add_instance, get_instance
+        from ba2_common.core.models import TradingOrder
+        from ba2_common.core.types import OrderStatus
+        order.status = OrderStatus.NEW
+        oid = add_instance(order)
+        return get_instance(TradingOrder, oid)
+
+    def cancel_order(self, order_id):
+        return True
+
+
+@pytest.mark.parametrize("tp,sl", [(31.0, None), (None, 24.0), (31.0, 24.0)],
+                         ids=["tp-only", "sl-only", "oco"])
+def test_add_to_position_protection_with_nothing_to_replace_is_protection(db, tp, sl):
+    """With no existing TP/SL there is no order to chain on, so the new leg is written at the
+    ROOT (no ``depends_on_order``). It must carry the TP/SL mark."""
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import Transaction, TradingOrder
+    from ba2_common.core.TransactionHelper import TransactionHelper as TH
+    from ba2_common.core.trade_store import orders_where
+
+    txn_id = _txn(db)
+    entry = _order(db, txn_id, side="BUY", status="FILLED")
+    txn = get_instance(Transaction, txn_id)
+    txn.take_profit = None
+    txn.stop_loss = None
+    db.update_instance(txn)
+
+    result = TH.adjust_quantity_with_tpsl(_AddAccount(), get_instance(Transaction, txn_id), 2.0,
+                                          tp_price=tp, sl_price=sl)
+    assert result["success"], result["message"]
+
+    legs = [o for o in orders_where(transaction_id=txn_id, depends_on_order=None)
+            if o.id != entry and o.comment != "Add-to-position order"]
+    assert len(legs) == 1
+    assert TH.is_resting_protection(legs[0]), legs[0].comment

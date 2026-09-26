@@ -26,6 +26,8 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 
 from tests.backtest.test_short_selling_bt_live_parity import (
     BUY, SELL, SYMBOL, PRICE, _as_decision, _bt_netting, _bt_txn_id, _live_world,
@@ -35,7 +37,7 @@ from tests.backtest.test_short_selling_engine import DAY1, _signal_rule
 RULE = _signal_rule("bearish", "sell")
 
 
-def _live_protected_long(monkeypatch, run_id, held, *, working_close=False):
+def _live_protected_long(monkeypatch, run_id, held, *, working_close=None):
     """One OPENED long of ``held`` shares with prod's OCO shape resting on it, then the live
     open-positions pass on a bearish recommendation."""
     from app.services.backtest.default_rulesets import seed_exit_ruleset_from_rules
@@ -81,10 +83,10 @@ def _live_protected_long(monkeypatch, run_id, held, *, working_close=False):
               created_at=now + timedelta(minutes=71))
         if working_close:
             order(order_type=OrderType.MARKET, status=OrderStatus.NEW, broker_order_id="brk-close",
-                  comment=f"Closing position for transaction {txn_id}",
+                  comment=working_close.format(txn=txn_id, entry=entry, acc=w.id),
                   created_at=now + timedelta(minutes=90))
 
-        assert w.account.has_pending_closing_order(txn_id) is working_close
+        assert w.account.has_pending_closing_order(txn_id) is bool(working_close)
         _write_recommendation(w.id, SELL, AnalysisUseCase.OPEN_POSITIONS)
         w.tm.process_open_positions_recommendations(w.id, lookback_days=1)
         return calls, txn_id
@@ -103,6 +105,14 @@ def test_an_oco_protected_long_is_evaluated_and_closed_in_both(monkeypatch):
         ("close_transaction", "the position", None)]
 
 
-def test_a_working_close_beside_the_oco_still_blocks_a_second_one(monkeypatch):
-    live_calls, _txn = _live_protected_long(monkeypatch, 1221, held=100.0, working_close=True)
+@pytest.mark.parametrize("working_close", [
+    "Closing position for transaction {txn}",
+    # A stop rejected as already breached, re-sent as MARKET on the same row: it keeps its SL
+    # mark, but it is a full-size market sell (AccountInterface._handle_order_submit_error).
+    "20260926133000-SL-[ACC:{acc}/TR:{txn}/PORD:{entry}] | [stop_through_market] stop price "
+    "must be less than current price — auto-converted to MARKET (stop already breached)",
+], ids=["close_transaction", "breached-stop-resent-as-market"])
+def test_a_working_close_beside_the_oco_still_blocks_a_second_one(monkeypatch, working_close):
+    live_calls, _txn = _live_protected_long(monkeypatch, 1221, held=100.0,
+                                            working_close=working_close)
     assert live_calls == [], "a second close was submitted over a working one"
