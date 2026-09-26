@@ -219,7 +219,7 @@ def initialize_warm_service(job_manager=None):
                     # past, which is the opposite of the tail extension it is for.
                     end_date_provider=lambda: datetime.now(timezone.utc),
                     fmp_key=_api_key("FMP_API_KEY", "FMP_API_KEY"),
-                    fred_key=_api_key("FRED_API_KEY", "fred_api_key"),
+                    fred_key=_fred_key(),
                 ),
             )
             queue.start()
@@ -285,6 +285,18 @@ def _indicator_ohlcv_provider() -> str:
     from .seam_helpers import DEFAULT_INDICATOR_OHLCV_PROVIDER
 
     return DEFAULT_INDICATOR_OHLCV_PROVIDER
+
+
+def _fred_key() -> Optional[str]:
+    """The FRED key through the ONE shared resolver (env ``FRED_API_KEY``, else the AppSetting
+    ``fred_api_key``); None when unconfigured -- the fetcher refuses a macro warm without it."""
+    try:
+        from ba2_common.core.fred_api_key import resolve_fred_api_key
+
+        return resolve_fred_api_key()
+    except Exception as e:  # noqa: BLE001 - a missing key is refused per requirement, loudly
+        logger.warning(f"warm service: fred_api_key unavailable: {e}")
+        return None
 
 
 def _api_key(env_name: str, setting_key: str) -> Optional[str]:

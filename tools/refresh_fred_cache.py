@@ -17,6 +17,14 @@ Usage:
     python tools/refresh_fred_cache.py --series VIXCLS UNRATE
     python tools/refresh_fred_cache.py --max-age-hours 24   # skip fresh files
     python tools/refresh_fred_cache.py --check              # report age, fetch nothing
+    python tools/refresh_fred_cache.py --check-rate-window 2020-01-01 2025-12-31
+        # CACHE ONLY: refuse (exit 1) unless DGS3MO covers the window (minus --lead-days),
+        # exactly as an option backtest reads it -- the option grids' preflight.
+
+OPTION BACKTESTS read DGS3MO (the 3-month Treasury) from this cache as their Black-Scholes
+risk-free rate (``ba2_providers.macro.risk_free_rate``), and refuse to start without it. A
+host that runs option backtests needs ``<CACHE_FOLDER>/fred/DGS3MO.json`` synced; it does
+NOT need the FRED key.
 """
 import argparse
 import json
@@ -33,14 +41,13 @@ from ba2_providers.macro import fred_series  # noqa: E402
 
 
 def _api_key() -> str:
-    """The FRED key lives in AppSetting, not .env (matching FREDMacroProvider)."""
-    from ba2_common.core.db import get_app_setting
-    key = get_app_setting("fred_api_key")
-    if not key:
-        raise SystemExit(
-            "FRED API key not configured. Set 'fred_api_key' in the AppSetting table "
-            "(Settings page in the live UI).")
-    return key
+    """The FRED key through the ONE shared resolver: env ``FRED_API_KEY`` if set, else the
+    AppSetting ``fred_api_key`` (``ba2_common.core.fred_api_key``)."""
+    from ba2_common.core.fred_api_key import FredApiKeyMisnamed, require_fred_api_key
+    try:
+        return require_fred_api_key("refreshing the FRED cache")
+    except (ValueError, FredApiKeyMisnamed) as e:
+        raise SystemExit(str(e))
 
 
 def _age_hours(path: str):
@@ -58,7 +65,31 @@ def main() -> None:
                     help="Skip series whose cached file is younger than this")
     ap.add_argument("--check", action="store_true",
                     help="Report cache state and exit without fetching")
+    ap.add_argument("--check-rate-window", nargs=2, metavar=("START", "END"), default=None,
+                    help="Cache-only: exit 1 unless DGS3MO covers [START - lead, END] the way an "
+                         "option backtest reads it (no network, no key needed)")
+    ap.add_argument("--lead-days", type=int, default=730,
+                    help="With --check-rate-window: days before START that must be covered "
+                         "too (a run's warmup -- 387 days on the stage-1 option jobs -- and "
+                         "bars read before its start). Default 730.")
     args = ap.parse_args()
+
+    if args.check_rate_window:
+        from datetime import date, timedelta
+
+        from ba2_providers.macro.risk_free_rate import (
+            RiskFreeRateUnavailable, cache_file, fred_dgs3mo_rate)
+        start = date.fromisoformat(args.check_rate_window[0]) - timedelta(days=args.lead_days)
+        end = date.fromisoformat(args.check_rate_window[1])
+        try:
+            rate = fred_dgs3mo_rate(start, end)
+        except RiskFreeRateUnavailable as e:
+            raise SystemExit(f"risk-free rate NOT available for {start}..{end}: {e}")
+        d = rate.describe()
+        print(f"DGS3MO covers {start}..{end} ({cache_file()}): min {d['min']:.4f} "
+              f"max {d['max']:.4f} mean {d['mean']:.4f}, fetched {d['cache_fetched_at']}, "
+              f"identity {d['identity']}")
+        return
 
     series = [s.upper() for s in (args.series or fred_series.SERIES_SPEC)]
     unknown = [s for s in series if s not in fred_series.SERIES_SPEC]

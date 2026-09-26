@@ -122,20 +122,16 @@ def resolve_keys() -> Dict[str, Optional[str]]:
 
 
 def resolve_fred_key() -> Optional[str]:
-    """The FRED key: env first, then the app-settings DB (the order FMP/Finnhub use).
+    """The FRED key through the ONE shared resolver (``ba2_common.core.fred_api_key``): env
+    ``FRED_API_KEY`` first, then the AppSetting ``fred_api_key`` (the order FMP/Finnhub use).
 
     ``None`` when unconfigured -- refused by :func:`prewarm_fred`, which is the only
     caller that needs it, rather than failing a 500-symbol FMP prewarm over a key
-    only DeterministicScorer's macro section uses.
+    only DeterministicScorer's macro section uses. A key stored only under the legacy name
+    ``FRED_API_KEY`` raises (``FredApiKeyMisnamed``) instead of reading as "no key".
     """
-    key = os.getenv("FRED_API_KEY")
-    if not key:
-        try:
-            from ba2_common.config import get_app_setting
-            key = get_app_setting("fred_api_key")
-        except Exception:  # noqa: BLE001 - no DB / no settings row: the env answer stands
-            key = None
-    return key
+    from ba2_common.core.fred_api_key import resolve_fred_api_key
+    return resolve_fred_api_key()
 
 
 def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] = None,

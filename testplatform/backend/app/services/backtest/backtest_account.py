@@ -1623,16 +1623,35 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # strictly off strike/spot/net_credit supplied at ORDER-SUBMIT time — they have no
     # bar/mark input for BS to reach through in the first place). Pinned structurally by
     # ``test_bs_mark_fallback.py``'s callers/import test.
-    @staticmethod
-    def _bs_mark_rate() -> float:
-        """The SAME flat risk-free rate the options store used to invert each bar's own
-        iv (see ``options_store.default_options_risk_free_rate``). BS pricing a contract
-        off its own last-known iv should use the identical rate that iv was extracted
-        with — otherwise the round trip (bar close -> invert to iv -> BS back to a price)
-        would not reproduce the bar it started from even when nothing about the mark is
-        stale, purely from a rate mismatch."""
-        from .options_store import default_options_risk_free_rate
-        return default_options_risk_free_rate()
+    def options_risk_free_rate_source(self):
+        """The run's ``RiskFreeRate``, held by its option reader (None without one)."""
+        if self._options is None:
+            return None
+        return getattr(self._options, "risk_free_rate_source", None)
+
+    def _bs_mark_rate(self) -> float:
+        """The rate the option reader would invert a bar dated TODAY with -- the same
+        ``RiskFreeRate`` object (``risk_free_rate_source``, resolved once per run by
+        ``options_store.build_options_provider``), read for the engine clock's date.
+
+        WHAT THAT GUARANTEES, precisely. On a given date the reader and the mark use one rate,
+        so a close inverted to an iv and priced back with BS on THAT date reproduces the close
+        exactly (pinned by ``test_option_risk_free_rate``). The mark itself runs on a day with
+        NO bar, off the lot's last iv -- which was inverted at ITS bar's date rate, up to
+        ``_BS_IV_STALENESS_DAYS`` earlier. Pricing that iv at today's rate is deliberate: the
+        mark is today's value of the contract, and a few days' move in the bill rate is part of
+        it, exactly as the spot and the DTE are today's. A flat rate would hide the difference
+        only by being wrong on both days.
+
+        REFUSES when the reader carries no rate (a fixture reader built without one): a mark
+        priced at a rate nobody chose is the silent default this replaced."""
+        source = self.options_risk_free_rate_source()
+        if source is None:
+            raise RuntimeError(
+                "Black-Scholes mark needs the run's risk-free rate, and this run's option reader "
+                "carries none (build it through options_store.build_options_provider, or pass "
+                "risk_free_rate= explicitly)")
+        return source.rate_on(self._as_of_date())
 
     def _update_lot_last_iv(self, lot: "_OptionLot", bar: Optional[Dict[str, Any]]) -> None:
         """Record ``bar``'s iv as the lot's LAST KNOWN iv (see ``_OptionLot``), for
@@ -1670,8 +1689,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         not a licence to skip the guard that protects every other stage (mutation (b)).
 
         Returns None on ANY missing/unresolvable/stale input — callers then fall through
-        to their existing intrinsic/entry stage, unchanged from before this task. Never
-        raises: a degenerate input here must degrade the mark chain, not the backtest.
+        to their existing intrinsic/entry stage, unchanged from before this task. A degenerate
+        INPUT never raises: it must degrade the mark chain, not the backtest. The one
+        exception is the RATE (``_bs_mark_rate``): a run with no stated risk-free rate, or a
+        FRED series that does not cover today, is a configuration error and refuses.
         """
         strike, spot, right = self._lot_strike_spot_right(lot.contract_symbol)
         if strike is None or spot is None or right is None:

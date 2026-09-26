@@ -82,7 +82,7 @@ ba2-test report                                                          # HTML 
 |---|---|---|---|
 | **FMP** (Financial Modeling Prep) | **Required** to warm the cache (not at run time) | Required | OHLCV, split/dividend calendars, statements, grades, price targets, earnings, insider, Senate/House, market cap |
 | **ThetaData** | **Required for option grids** (backfill only) | No | 2020+ option EOD history with greeks and open interest |
-| **FRED** | Required for DeterministicScorer's macro section (warm) | Required for DS live | `VIXCLS`, `UNRATE`, `BAA10Y`, `T10Y3M` (`DeterministicScorer/data.py:74`) |
+| **FRED** | Required to warm DeterministicScorer's macro series **and `DGS3MO`, the risk-free rate every option backtest prices with** (not at run time) | Required for DS live | `VIXCLS`, `UNRATE`, `BAA10Y`, `T10Y3M` (`DeterministicScorer/data.py:74`); `DGS3MO` (option Black-Scholes rate, `ba2_providers/macro/risk_free_rate.py`) |
 | **Finnhub** | Only for `FinnHubRating` | Only for `FinnHubRating` | Recommendation trends |
 | **Alpaca** | No (only the legacy `sqlite` option store, `ba2-test fetch-options`, floor 2024-01-18) | **Required** (the broker) | Orders, positions, live option snapshots |
 | **TastyTrade / dxfeed** | No (older `tastytrade` store, floor 2022-10-01) | No | Superseded by ThetaData for 2020 windows |
@@ -132,15 +132,26 @@ EOD option history with greeks (`option_history_greeks_eod`) and open interest b
 | Key | Test platform (reproducing) | Trade app (live) |
 |---|---|---|
 | FMP | AppSetting `FMP_API_KEY` in the test DB, or env `FMP_API_KEY`. The launcher mirrors the DB value into the env at startup (`ba2test_launcher.py:112-117`). Scripts that bypass the launcher need `DB_FILE`/`DATABASE_URL` pointed at the test DB, or they fail with "FMP API key not configured". | AppSetting `FMP_API_KEY` (Settings page) |
-| FRED | AppSetting **`fred_api_key`** (lower case, what `FREDMacroProvider.py:103` and `fred_series.py:227` read). Env `FRED_API_KEY` is read by `ba2-test prewarm` (`prewarm_fetchers.py:131`), `services/macro.py` and the option fetch's risk-free rate (`fetch_options.py:245`). | AppSetting `fred_api_key` |
+| FRED | AppSetting **`fred_api_key`** (the Settings -> API Keys page saves it under that name). Env `FRED_API_KEY` overrides it when set. Every reader in both apps goes through `ba2_common.core.fred_api_key`. | AppSetting `fred_api_key` (env `FRED_API_KEY` overrides) |
 | ThetaData | `tools/warm_options_history.py --api-key`, else env `THETADATA_API_KEY`, else AppSetting `thetadata_api_key` read from `--db <sqlite>` (`warm_options_history.py:416-440`) | — |
 | Finnhub | AppSetting `finnhub_api_key` | AppSetting / `.env` `FINNHUB_API_KEY` |
 | Alpaca | AppSettings `alpaca_market_api_key`/`_secret` (only for `fetch-options`) | Per account: `api_key`, `api_secret`, `paper_account` in the account's settings (`AlpacaAccount.py:486-488`) |
 | LLM | — | `.env` `OPENAI_API_KEY` and the Settings page |
 
-The test platform's **Settings -> API Keys** page lists `FRED_API_KEY` in upper case
-(`testplatform/backend/app/api/settings.py:902`), but the providers read `fred_api_key`, and
-AppSetting lookups are exact matches (`ba2_common/config.py:115`). Set the lower-case key.
+The FRED key has one canonical name, `fred_api_key`. Before 2026-09-26 the test platform's
+Settings page saved it as `FRED_API_KEY`, which nothing read (AppSetting lookups are exact). A
+row left under that name is now refused with a pointer to
+`python tools/migrate_fred_api_key.py --db <db>`, which moves it (idempotent). A backtest host
+needs **no** FRED key: runs read the synced `<CACHE_FOLDER>/fred/*.json` files only.
+
+**Option risk-free rate.** Every option backtest inverts its bars' greeks and prices its
+Black-Scholes marks at the **as-of 3-month Treasury (FRED `DGS3MO`)**, read cache-only from
+`<CACHE_FOLDER>/fred/DGS3MO.json`; a run refuses to start when that file is missing or does not
+cover `[start - warmup_days, end]`, and records the source in its results
+(`options_risk_free_rate_source`). `options_risk_free_rate` in the run config or env
+`BACKTEST_OPTIONS_RISK_FREE_RATE` set an explicit constant instead (recorded as `explicit`).
+**Option results produced before 2026-09-26 used a flat 4.5%** and do not reproduce on current
+code; the trade popup still shows their greeks at the 4.5% they used.
 
 ---
 
@@ -230,6 +241,7 @@ Window 2020-01-01..2025-12-31 on the `thetadata` store (history floor 2018-09-14
 | 1 | ThetaData backfill | `python tools/warm_options_history.py --provider thetadata --wide --symbols-file tools/options_universe_top100.txt --start 2020-01-01 --concurrency 3 [--db <sqlite with thetadata_api_key>]` | 857-name projection: ~6 days (**estimate**, assessment doc §3). 97 names: **(unverified)**. Run at concurrency 3 under a memory cap. The plan phase alone is ~6 GB. |
 | 2 | FMP 1d OHLCV | `ba2-test fetch-cache --provider fmp --timeframes 1d --start 2018-12-01 --end 2025-12-31 --symbols @tools/options_universe_top100.txt` | Start ~13 months early: DS needs 260 bars of warmup (×1.45 calendar days per bar, `daily_backtest_handler.py`) |
 | 3 | DS prewarm | `ba2-test prewarm --symbols @tools/options_universe_top100.txt --experts DeterministicScorer --end 2025-12-31` | — |
+| 3b | Risk-free rate | `python tools/refresh_fred_cache.py --series DGS3MO` (needs the FRED key), then on every grid host `python tools/refresh_fred_cache.py --check-rate-window 2020-01-01 2025-12-31` (cache only) | `stage1_run.sh` runs the check and refuses to launch without the series |
 | 4 | Screener gate store | `ba2-test build-screener-metrics --start 2020-01-01 --end 2025-12-31 --market-cap-min 10000000000 --cadence-days 7` | `stage1_run.sh` refuses to launch without it |
 | 5 | Market-condition manifests | `stage1_run.sh` runs `plan -> build --cache-only -> verify -> prepare-host` per profile (§4.3) | 45-70 min for both profiles cold (753 names, data runbook) |
 | 6 | Shared-array prewarm, **run twice** | `python tools/build_shared_arrays.py --options-store thetadata --universe-file tools/options_universe_top100.txt --ohlcv-provider FMPOHLCVProvider --interval 1d --start 2020-01-01 --end 2025-12-31 --warmup-days 60 --jobs 4` | The second run must report **0 built** and every symbol opened. Mandatory before a cold launch: 24 cold consumers building different keys can OOM the host. |
@@ -291,7 +303,9 @@ python tools/prepare_option_universe.py --universe-file <universe.txt> \
 
 The pipeline stops for a human at each decision: a still-refused name, a guard refusal, and
 review findings. The runbook says how to resolve each (override, `ROOT_HISTORY` entry, or
-exclusion). `prepare-host` on each grid host and syncing the tree are **not** part of it.
+exclusion). `prepare-host` on each grid host and syncing the tree are **not** part of it, and
+neither is the option risk-free rate: run `tools/refresh_fred_cache.py --series DGS3MO` and
+`--check-rate-window` (step 3b above) and sync `<CACHE_FOLDER>/fred/DGS3MO.json` to every host.
 
 The 753-name universe is the 820-name `tools/options_universe_large_cap.txt` minus 67 recorded
 exclusions: 55 with no listed options 2020-2025, CBUS, BNT, BMNR, QXO, RGC and 7 ex-SPACs. **The
