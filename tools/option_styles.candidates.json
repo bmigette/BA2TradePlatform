@@ -26,9 +26,9 @@
     },
     "premium": {
       "status": "candidate",
-      "note": "CANDIDATE: membership decided after stage 1 + the LEAPS grid. Credit/income holding stock + options (user decision 2026-09-25): O_CC is a member (revision E1) and O_JL/O_RS sit beside O_WHEEL (revision E2, member-scoped assigned-stock hold). O_CSP excluded for now: blocked by shared entry ids with O_WHEEL (re-id is Task 5/6; membership is decided after stage 1). price_cap_policy 'none' pending Q3; member order is precedence and a placeholder pending Q4 (defined-risk first, the wheel LAST).",
+      "note": "CANDIDATE: membership decided after stage 1 + the LEAPS grid. Credit/income holding stock + options (user decision 2026-09-25): O_CC is a member (revision E1) and O_JL/O_RS sit beside O_WHEEL (revision E2, member-scoped assigned-stock hold). O_CSP sits beside O_WHEEL (user decision 2026-09-26: member ids are namespaced inside a style, so the wheel's reused o_csp-* entry no longer clashes; a CSP liquidates its assignment, the wheel holds it). price_cap_policy 'none' pending Q3; member order is precedence and a placeholder pending Q4 (defined-risk first, the wheel LAST).",
       "price_cap_policy": "none",
-      "members": [{"key": "O_BULLPS"}, {"key": "O_BEARCS"}, {"key": "O_IC"}, {"key": "O_JL"}, {"key": "O_RS"}, {"key": "O_CC"}, {"key": "O_WHEEL"}]
+      "members": [{"key": "O_BULLPS"}, {"key": "O_BEARCS"}, {"key": "O_IC"}, {"key": "O_JL"}, {"key": "O_RS"}, {"key": "O_CC"}, {"key": "O_CSP"}, {"key": "O_WHEEL"}]
     }
   }
 }

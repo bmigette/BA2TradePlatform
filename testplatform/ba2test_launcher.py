@@ -5661,15 +5661,66 @@ def _validate_style_exit_overrides(where: str, overrides) -> None:
                                  f"{b}={band[b]}")
 
 
-def _style_entry_ids(key: str) -> set:
-    """The entry rule ids and non-shared entry condition ids ``key``'s own builder emits."""
+def _style_tree_nodes(node, out=None) -> list:
+    """Every condition NODE (leaf or group, any dict) of a rule's condition tree, in order.
+    Group ids matter as much as leaf ids: a group may carry a toggle gene, and O_CC / O_PP
+    both author their entry root as ``root``."""
+    out = [] if out is None else out
+    if isinstance(node, dict):
+        out.append(node)
+        for child in node.get("conditions") or []:
+            _style_tree_nodes(child, out)
+    elif isinstance(node, list):
+        for child in node:
+            _style_tree_nodes(child, out)
+    return out
+
+
+def _style_member_prefixes(key: str) -> tuple:
+    """The id prefixes ``key``'s own builder already owns: the member key, plus its arms for
+    a group key (O_LEAP emits ``o_leapc-*`` / ``o_leapp-*``), lower-cased."""
+    own = [key.lower()]
+    if key in _OPTION_GROUPS_ALL and key not in _GRID1_FAMILY_KEYS:
+        own += [arm.lower() for arm in _OPTION_GROUPS_ALL[key]]
+    return tuple(own)
+
+
+def _style_member_id(key: str, raw_id: str) -> str:
+    """ONE id ``key``'s builder emits -> its id inside a style (user decision 2026-09-26).
+
+    ``shared-*`` stays shared on purpose (plan §0: one gene in singles and groups alike). An id
+    the builder already prefixes with one of the member's own prefixes is KEPT, so every option
+    single's entry ids -- and so its stage-1 entry gene keys -- are the style's verbatim. Any
+    other id is prefixed ``<member>-``: the wheel's reused ``o_csp-entry`` becomes
+    ``o_wheel-o_csp-entry``, O_CC's S2 ``buy`` becomes ``o_cc-buy``, and every exit id
+    (``opt_tp`` -> ``o_lc-opt_tp``). A pure function of the MEMBER, never of its siblings, so a
+    member's style ids (and its seed translation) are the same in every style that holds it.
+    Strategy keys carry no ``-``, so the text up to the first ``-`` names exactly one owner and
+    two members can only collide if they own the same prefix."""
+    if not isinstance(raw_id, str) or not raw_id:
+        raise ValueError(f"{key}: a rule/condition id must be a non-empty string, got "
+                         f"{raw_id!r}; an unkeyed node cannot be namespaced or mapped")
+    if raw_id.startswith(_STYLE_SHARED_LEAF_PREFIX):
+        return raw_id
+    if any(raw_id.startswith(p + "-") for p in _style_member_prefixes(key)):
+        return raw_id
+    return f"{key.lower()}-{raw_id}"
+
+
+def _style_member_ids(key: str) -> set:
+    """Every NON-shared id ``key`` occupies inside a style, namespaced by ``_style_member_id``:
+    entry and exit rule ids (``entry:`` / ``exit:``, their gene namespaces) and condition node
+    ids (``cond:``, one global gene namespace). The per-rule tag leaves the exit scoping adds are
+    named after their (already namespaced) rule, so they are covered by the rule ids."""
+    built = _STRATEGY_BUILDERS[key](key)
     ids = set()
-    for rule in _STRATEGY_BUILDERS[key](key).entry_rules or []:
-        ids.add(rule["id"])
-        for leaf in _style_tree_leaves(rule.get("conditions")):
-            cid = leaf.get("id")
-            if cid and not cid.startswith(_STYLE_SHARED_LEAF_PREFIX):
-                ids.add(cid)
+    for ns, rules in (("entry", built.entry_rules), ("exit", built.exit_rules)):
+        for rule in rules or []:
+            ids.add(f"{ns}:{_style_member_id(key, rule.get('id'))}")
+            for node in _style_tree_nodes(rule.get("conditions")):
+                cid = node.get("id")
+                if cid and not cid.startswith(_STYLE_SHARED_LEAF_PREFIX):
+                    ids.add(f"cond:{_style_member_id(key, cid)}")
     return ids
 
 
@@ -5748,19 +5799,21 @@ def _validate_style(name: str, style: dict) -> None:
             _validate_style_action_overrides(mwhere, key, mem["action_overrides"])
         if "exit_overrides" in mem:
             _validate_style_exit_overrides(mwhere, mem["exit_overrides"])
-    ids = {k: _style_entry_ids(k) for k in keys}
+    # Inside a style every member's ids are namespaced (``_style_member_id``), which is what
+    # lets O_CSP + O_WHEEL and O_CC + O_PP coexist. What can STILL collide is two members that
+    # own the same id prefix (e.g. a group key beside one of its own arms): refused, because
+    # two rules or conditions under one id are one gene.
+    ids = {k: _style_member_ids(k) for k in keys}
     for i, a in enumerate(keys):
         for b in keys[i + 1:]:
             clash = sorted(ids[a] & ids[b])
             if clash:
                 raise ValueError(
-                    f"{where}: {a} and {b} build the SAME entry rule/condition ids {clash}; one "
-                    f"expert cannot carry two entry rules under one id (their genes would be one "
-                    f"gene). This is a MECHANISM limit, not a strategy verdict"
-                    + (" (O_WHEEL reuses O_CSP's entry ids by design; since E2 they are "
-                       "different strategies)" if {a, b} == {"O_WHEEL", "O_CSP"} else "")
-                    + f": re-identifying one member's entry is a Task 5/6 design question in "
-                    f"{_STYLE_PLAN}; until it is answered, list only one of them.")
+                    f"{where}: {a} and {b} build the SAME rule/condition ids {clash} even "
+                    f"after member-prefixing (they own a common id prefix: "
+                    f"{sorted(set(_style_member_prefixes(a)) & set(_style_member_prefixes(b)))}"
+                    f"); one expert cannot carry two rules or conditions under one id -- their "
+                    f"genes would be one gene")
     _validate_style_price_caps(where, style, keys)
 
 
@@ -5796,6 +5849,183 @@ def _load_style_spec(path: str, name: str) -> dict:
     sha = hashlib.sha256(
         json.dumps(style, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return {"name": name, **deepcopy(style), "spec_sha256": sha}
+
+
+# --- the style BUILDER (plan Tasks 5-6) ---------------------------------------------------------
+#: The resolved style (``_load_style_spec``) the ``O_STYLE`` builder builds; set from
+#: ``--style-config F --style NAME`` at command entry (Task 7). None = no style loaded.
+_STYLE_ACTIVE: "dict | None" = None
+
+
+def _style_reid_rules(key: str, rules: list, ns: str, rule_map: dict, cond_map: dict) -> None:
+    """Namespace (in place) every rule id and condition node id of ONE member's ``ns`` rule
+    list through ``_style_member_id``, recording ``original -> style`` in the two maps. A rule
+    whose id changed gets the same prefix on its name. ``value_offset_from`` (a reference to
+    another condition's id, resolved against the GLOBAL gene map) is refused rather than left
+    pointing at a pre-namespacing id: no builder uses it today."""
+    for rule in rules:
+        old = rule.get("id")
+        if old in rule_map:
+            raise ValueError(f"{key}: its builder emits two {ns} rules with id {old!r}")
+        new = _style_member_id(key, old)
+        rule_map[old] = rule["id"] = new
+        if new != old and rule.get("name"):
+            rule["name"] = f"{key.lower()}-{rule['name']}"
+        for node in _style_tree_nodes(rule.get("conditions")):
+            if node.get("value_offset_from") is not None or node.get("valueOffsetFrom") is not None:
+                raise ValueError(
+                    f"{key} {ns} rule {old!r}: condition {node.get('id')!r} uses "
+                    f"value_offset_from, whose base id the style namespacing would not rewrite")
+            cid = node.get("id")
+            if cid is not None:          # an unkeyed node (a legacy exit root) carries no gene
+                cond_map[cid] = node["id"] = _style_member_id(key, cid)
+
+
+def _style_check_dte_band(key: str, rid: str, action: dict, overrides: dict) -> None:
+    """An option entry action after its ``action_overrides``: still decodable, never inert.
+    The validator checked the overrides on their own; this checks them MERGED with the
+    member's authored band (a lone ``option_dte_min`` can pass the authored max)."""
+    where = f"{key} entry rule {rid!r}: action_overrides"
+    lo, hi = action.get("option_dte_min"), action.get("option_dte_max")
+    if lo is None or hi is None:
+        raise ValueError(f"{where} move a DTE band the action does not author "
+                         f"(option_dte_min={lo!r}, option_dte_max={hi!r})")
+    if lo > hi:
+        raise ValueError(f"{where} leave option_dte_min={lo} > option_dte_max={hi}")
+    searched = {"option_dte_min_range", "option_dte_max_range", "option_dte_step"}
+    if not action.get("option_dte_optimize"):
+        if searched & set(overrides):
+            raise ValueError(f"{where} set {sorted(searched & set(overrides))} on an action "
+                             f"that does not search its DTE (no option_dte_optimize): inert")
+        return
+    rlo, rhi, step = (action.get("option_dte_min_range"), action.get("option_dte_max_range"),
+                      action.get("option_dte_step"))
+    if rlo is None or rhi is None or step is None or rlo > rhi or step <= 0:
+        raise ValueError(f"{where} leave an undecodable DTE centre range "
+                         f"[{rlo}, {rhi}] step {step}")
+    centre = (lo + hi) / 2
+    if not rlo <= centre <= rhi:
+        raise ValueError(
+            f"{where} leave the authored window's centre {centre:g} ({lo}..{hi}) outside the "
+            f"searched centre range [{rlo}, {rhi}]: the template's own value would not be in "
+            f"its gene's domain")
+
+
+def _style_entry_rules(key: str, tag: int, src_rules, action_overrides) -> "tuple[list, dict]":
+    """ONE member's entry rules inside a style: a deep copy of its OWN builder's rules,
+    namespaced, each made toggleable, and every opening action tagged with the member's
+    ``entry_tag`` -- ``option_entry_tag`` on an option entry, ``entry_tag`` on the equity
+    ``buy`` of O_CC / O_PP (the spellings ``rule_builders.checked_entry_tag`` reads). Returns
+    ``(rules, {"entry_rules": map, "entry_conds": map})``."""
+    from copy import deepcopy
+    from ba2_common.core.trade_cycle import entry_route
+    from ba2_common.core.types import ExpertActionType, get_option_entry_action_values
+
+    rules = deepcopy(list(src_rules or []))
+    if not rules:
+        raise ValueError(f"{key}: its builder emits no entry rule, so the member could never "
+                         f"open a position")
+    rule_map: dict = {}
+    cond_map: dict = {}
+    _style_reid_rules(key, rules, "entry", rule_map, cond_map)
+    option_entries = set(get_option_entry_action_values())
+    for rule in rules:
+        rule["toggle_optimize"] = True
+        rule["toggleOptimize"] = True        # canonical rules carry the camelCase mirror
+        actions = list(rule.get("actions") or [])
+        types = [str(a.get("action_type") or a.get("action") or "") for a in actions]
+        if not actions:
+            raise ValueError(f"{key} entry rule {rule['id']!r}: no action")
+        entry_route(types)                   # a mixed option/equity rule is refused here
+        tagged = 0
+        for action, at in zip(actions, types):
+            if at in option_entries:
+                action["option_entry_tag"] = int(tag)
+                if action_overrides:
+                    action.update(action_overrides)
+                    _style_check_dte_band(key, rule["id"], action, action_overrides)
+                tagged += 1
+            elif at == ExpertActionType.BUY.value:
+                action["entry_tag"] = int(tag)
+                tagged += 1
+            elif at == ExpertActionType.SELL.value:
+                raise ValueError(
+                    f"{key} entry rule {rule['id']!r}: its 'sell' action opens a position but "
+                    f"cannot carry the member tag (only option entries and 'buy' write it), so "
+                    f"no member exit could ever match that position")
+        if not tagged:
+            raise ValueError(f"{key} entry rule {rule['id']!r}: none of its actions {types} "
+                             f"opens a position that carries the member tag")
+    return rules, {"entry_rules": rule_map, "entry_conds": cond_map}
+
+
+def _style_claim_ids(where: str, key: str, ns: str, rules, owners: dict, shared: dict) -> None:
+    """Record which member owns each rule/condition id of the BUILT style, refusing an id two
+    members claim (their genes would be one gene) and a ``shared-*`` condition two members
+    author differently (``collect_param_space`` would keep the last one silently)."""
+    def claim(gid: str) -> None:
+        if gid in owners and owners[gid] != key:
+            raise ValueError(f"{where}: {gid} is built by both {owners[gid]} and {key}")
+        owners[gid] = key
+
+    for rule in rules:
+        claim(f"{ns}:{rule['id']}")
+        for node in _style_tree_nodes(rule.get("conditions")):
+            cid = node.get("id")
+            if not cid:
+                continue
+            if cid.startswith(_STYLE_SHARED_LEAF_PREFIX):
+                blob = json.dumps(node, sort_keys=True, default=str)
+                if cid in shared and shared[cid][1] != blob:
+                    raise ValueError(
+                        f"{where}: shared condition {cid!r} is authored differently by "
+                        f"{shared[cid][0]} and {key}; a shared id is ONE gene, so one "
+                        f"definition would silently win")
+                shared.setdefault(cid, (key, blob))
+            else:
+                claim(f"cond:{cid}")
+
+
+def _build_strategy_style(kind: str):
+    """``O_STYLE``: ONE Strategy from the loaded style (``_STYLE_ACTIVE``). Each member keeps
+    its OWN single builder's entry rule(s) -- same gates, same action, same genes -- deep
+    copied, namespaced (``_style_member_id``), made toggleable and tagged with the member's
+    ``entry_tag``, in member order (member order is entry precedence, Q4).
+
+    ``entry_action`` (the run-level options-run marker) is a copy of the FIRST option entry
+    action in member order, never simply the first member's: an equity-entry member (O_CC /
+    O_PP) may lead. A style with no option entry sets none, exactly like O_CC's single build.
+    ``style_id_maps[member]`` records every ``original id -> style id``; seeding translates a
+    member's genes through it (``_style_translate_key``)."""
+    from copy import deepcopy
+    from app.models.strategy import Strategy
+    from ba2_common.core.types import get_option_entry_action_values
+
+    style = _STYLE_ACTIVE
+    if style is None:
+        sys.exit(f"{kind}: no style loaded -- pass --style-config FILE --style NAME")
+    where = f"style {style['name']!r}"
+    entry: list = []
+    id_maps: dict = {}
+    owners: dict = {}
+    shared: dict = {}
+    for mem in style["members"]:
+        key = mem["key"]
+        src = _STRATEGY_BUILDERS[key](key)
+        rules, idm = _style_entry_rules(key, _STYLE_MEMBER_TAGS[key], src.entry_rules,
+                                        mem.get("action_overrides"))
+        _style_claim_ids(where, key, "entry", rules, owners, shared)
+        entry += rules
+        id_maps[key] = idm
+    s = Strategy(name=f"{kind}-{style['name']}", entry_rules=entry, exit_rules=[])
+    option_entries = set(get_option_entry_action_values())
+    first_option = next((a for r in entry for a in r["actions"]
+                         if str(a.get("action_type") or a.get("action") or "") in option_entries),
+                        None)
+    if first_option is not None:
+        s.entry_action = deepcopy(first_option)  # type: ignore[attr-defined]
+    s.style_id_maps = id_maps                     # type: ignore[attr-defined]
+    return s
 
 
 def _with_round_lot_entry(s, lot: int = 100):

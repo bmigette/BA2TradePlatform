@@ -3,9 +3,10 @@
 Plan docs/plans/2026-09-25-option-stage2-build.md, Task 3 (and Task 4's candidate file), as
 revised after the user's answers: O_CC / O_PP are admissible members (E1 routes each entry by
 its own actions) and O_WHEEL may share a style with O_JL / O_RS (E2 holds assigned stock per
-member tag). What stays refused is what no revision answered: unbounded / phase-gated keys,
-grid-1 family keys, arms of a group key, two members that build the SAME entry ids, and mixed
-per-member price caps without an explicit policy (Q3).
+member tag). Since 2026-09-26 member ids are namespaced inside a style, so O_WHEEL + O_CSP and
+O_CC + O_PP coexist too. What stays refused is what no revision answered: unbounded / phase-gated
+keys, grid-1 family keys, arms of a group key, two members that own the SAME id prefix (still one
+gene after namespacing), and mixed per-member price caps without an explicit policy (Q3).
 """
 import json
 from pathlib import Path
@@ -94,10 +95,6 @@ def test_the_sha_covers_this_style_only_and_follows_its_content(tmp_path):
     ([{"key": "S2"}], "not a style member"),
     ([{"key": "NOPE"}], "not a style member"),
     ([{"key": "O_LC"}, {"key": "O_LC"}], "twice"),
-    # O_WHEEL's entry IS O_CSP's, ids included: two rules under one id collide in the genome.
-    ([{"key": "O_WHEEL"}, {"key": "O_CSP"}], "SAME entry"),
-    # O_CC and O_PP both enter through the S2 equity buy ("buy", "gate_confidence", ...).
-    ([{"key": "O_CC"}, {"key": "O_PP"}], "SAME entry"),
     ([], "no members"),
     ([{"key": "O_LC", "action_overrides": {"option_sizing": 9}}], "action_overrides"),
     ([{"key": "O_LC", "action_overrides": {"option_dte_min": 90, "option_dte_max": 60}}],
@@ -126,6 +123,12 @@ def test_invalid_members_are_refused_by_name(tmp_path, members, msg):
     [{"key": "O_BULLPS"}, {"key": "O_CC"}],           # E1: stock + option overlay members
     [{"key": "O_IC"}, {"key": "O_PP"}],
     [{"key": "O_CC"}, {"key": "O_WHEEL"}],
+    # User decision 2026-09-26: member-namespaced ids inside a style. The wheel reuses O_CSP's
+    # entry ids and O_CC / O_PP both enter through S2's "buy" / "gate_*"; inside a style each
+    # member's ids are its own, so the pairs coexist (tests/test_option_style_builder.py).
+    [{"key": "O_WHEEL"}, {"key": "O_CSP"}],
+    [{"key": "O_CC"}, {"key": "O_PP"}],
+    [{"key": "O_CSP"}, {"key": "O_CC"}, {"key": "O_PP"}, {"key": "O_WHEEL"}],
 ])
 def test_the_revisions_admit_what_they_answered(tmp_path, members):
     m = _launcher()
@@ -221,20 +224,32 @@ def test_the_premium_candidate_holds_stock_and_options_per_the_revision():
     assert style["price_cap_policy"] == "none"         # Q3 placeholder: mixed $100 / uncapped
 
 
-def test_premium_plus_O_CSP_is_refused_by_the_shared_entry_id_mechanism(tmp_path):
-    """O_CSP's absence from premium is NOT a strategy choice (membership is decided after
-    stage 1; since E2 a CSP and a wheel are different strategies). It is a MECHANISM limit: the
-    wheel reuses O_CSP's entry ids, and re-identifying one of them is a Task 5/6 design
-    question. Pinned here as the loader's refusal, so lifting it is a visible change."""
+def test_O_CSP_sits_beside_O_WHEEL_in_premium_now_that_ids_are_member_namespaced():
+    """O_CSP's absence from premium was a MECHANISM limit (the wheel reuses O_CSP's entry ids),
+    never a strategy verdict: since E2 a CSP (liquidates on assignment) and a wheel (holds and
+    writes calls) are different strategies. User decision 2026-09-26: namespace member ids inside
+    a style and put O_CSP back, next to the wheel. Membership is still decided after stage 1."""
     m = _launcher()
-    data = json.loads(Path(_CANDIDATES).read_text())
-    premium = data["styles"]["premium"]
-    premium["members"] = premium["members"][:-1] + [{"key": "O_CSP"}] + premium["members"][-1:]
-    path = tmp_path / "with_csp.json"
-    path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match=r"O_CSP and O_WHEEL build the SAME entry") as exc:
-        m._load_style_spec(str(path), "premium")
-    assert "o_csp-entry" in str(exc.value) and "Task 5/6" in str(exc.value)
+    keys = [x["key"] for x in m._load_style_spec(_CANDIDATES, "premium")["members"]]
+    assert keys[-2:] == ["O_CSP", "O_WHEEL"]
+
+
+def test_two_members_owning_one_id_prefix_still_collide_and_are_refused(tmp_path, monkeypatch):
+    """What member-prefixing CANNOT separate: two members that own the same id prefix (e.g. a
+    group key beside one of its own arms, were an arm ever admissible). Simulated by letting
+    O_LP own O_LC's prefix and build O_LC's rules."""
+    m = _launcher()
+    admissible = m._style_admissible_members()
+    monkeypatch.setattr(m, "_style_admissible_members", lambda: admissible)
+    real_prefixes = m._style_member_prefixes
+    monkeypatch.setattr(m, "_style_member_prefixes",
+                        lambda k: real_prefixes(k) + (("o_lc",) if k == "O_LP" else ()))
+    monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LP", lambda k: m._build_strategy_option("O_LC"))
+    path = _write(tmp_path, {"s": {"status": "candidate",
+                                   "members": [{"key": "O_LC"}, {"key": "O_LP"}]}})
+    with pytest.raises(ValueError, match=r"O_LC and O_LP build the SAME .*entry:o_lc-entry.*"
+                                         r"common id prefix: \['o_lc'\]"):
+        m._load_style_spec(path, "s")
 
 
 def test_the_leaps_convex_candidate_carries_no_convex_waiver():
