@@ -37,10 +37,19 @@ a 5-8% "basis error". When the uncorrected window median is off, the guard consu
 * TERM: every window session re-measured with the carry-free spot (declared dividends added
   back, two usable expiries extrapolated to T = 0 under a leverage cap, the term structure
   sloping the way carry does). Cleared when >= ``MIN_CARRY_SESSIONS`` (at least 2) are
-  measurable and their median is within the tolerance; otherwise the refusal stands.
+  measurable and their median lies in [``CARRY_BAND_LOW``, 1 + tolerance] -- the low side
+  tightened by the most that may be added back unverified (2.5%): 0.975 .. 1.05 today.
+  Otherwise the refusal stands.
 * A VETO refuses by name: no dividend calendar, dividends to add back above 2.5% of the spot
   (unverified -- a special the chain does not price would hide an error of its size), a dividend
   row of unknown declaration date or amount, a term structure sloping up.
+
+KNOWN RESIDUAL (accepted 2026-09-26, coordinator decision, REPAIR_LOG): a basis error within ~1%
+of the 5% line can still pass when an unpriced (OCC strike-adjusted) or uncalendared dividend
+falls in the same few sessions -- measured: a 2.5% unpriced special with a x1.051 error, a 5%
+dividend missing from the calendar with a x1.06 error, each on 2 of 3 start offsets. That is the
+same order of softness as the 5% line itself given its 2.5%-wide quote pairs. The stricter design
+(add a dividend back only when an expiry before the ex-date shows the drop) is not built.
 
 There is no look-back to other sessions (a short-dated TIME measure was removed in review
 round 3: a stretch-type basis error that no split marks would let it borrow clean sessions from
@@ -103,8 +112,20 @@ MAX_QUOTE_UNCERTAINTY = TOLERANCE / 2
 #: chain's checked session may lack a second usable expiry while its neighbours have one (IONQ
 #: 2022-03-28, monthlies only).
 MIN_CARRY_SESSIONS = 3
+#: The carry-free window median is only cleared inside [CARRY_BAND_LOW, 1 + TOLERANCE]. The low
+#: side is tightened by the most the carry measure may add back UNVERIFIED
+#: (``option_carry.MAX_ADDBACK_FRACTION``): an unpriced or uncalendared dividend can then carry an
+#: error at most about that far past the 5% line (module docstring, KNOWN RESIDUAL).
 #: ... and never fewer than this many, whatever the window (one session is not a median).
 MIN_CARRY_FLOOR = 2
+
+
+def _carry_band_low() -> float:
+    from ba2_common.core.option_carry import MAX_ADDBACK_FRACTION
+    return 1.0 - (TOLERANCE - MAX_ADDBACK_FRACTION)
+
+
+CARRY_BAND_LOW = _carry_band_low()
 #: A symbol the guard could not evaluate on more than this share of its checks is WARNED
 #: about in the run's results: it traded without the protection (plan Part E4 review).
 UNEVALUABLE_WARN_FRACTION = 0.90
@@ -388,12 +409,12 @@ class BasisGuard:
         need = max(MIN_CARRY_FLOOR, min(MIN_CARRY_SESSIONS, len(carry)))
         if len(avail) >= need:
             medc = float(np.median(avail))
-            if abs(medc - 1.0) <= TOLERANCE:
+            if CARRY_BAND_LOW <= medc <= 1.0 + TOLERANCE:
                 self.carry_passed += 1
                 return True, ""
             return False, (f"carry-free median {medc:.4f} over {len(avail)} of {len(carry)} "
                            f"window sessions (declared dividends added back, extrapolated to "
-                           f"T=0) is off too")
+                           f"T=0) is outside [{CARRY_BAND_LOW:.3f}, {1.0 + TOLERANCE:.3f}]")
         return False, (f"carry-free ratio measurable on {len(avail)} of {len(carry)} window "
                        f"sessions (>= {need} needed; checked session: {carry[0][1]})")
 

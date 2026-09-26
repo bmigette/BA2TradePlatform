@@ -373,3 +373,77 @@ def test_fewer_than_three_carry_sessions_in_a_full_window_is_refused(monkeypatch
     g, u, guard = _guard(monkeypatch, thin, dividends=lambda s, d: [])
     with pytest.raises(g.OptionSpotBasisMismatch, match="2 of 5"):
         guard.check(u, "X", date(2022, 3, 25))
+
+
+# ---- the carry band (final review, R1) ---------------------------------------------------------
+#: A carry-free median is only cleared inside [1 - (TOLERANCE - MAX_ADDBACK_FRACTION), 1 + TOLERANCE]
+#: (0.975 .. 1.05 today): an unverified add-back of up to MAX_ADDBACK_FRACTION can then never carry
+#: an error past the 5% line by more than the add-back's own headroom.
+def _verdicts(monkeypatch, table, divs, scale, phases=3):
+    import app.services.backtest.option_basis_guard as g0
+    out = []
+    for ph in range(phases):
+        g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: divs, scale=scale)
+        try:
+            _run(g, u, guard, sorted(table)[ph:])
+            out.append("PASS")
+        except g0.OptionSpotBasisMismatch:
+            out.append("REFUSE")
+    return out
+
+
+def _unpriced_special_table():
+    """Flat monthly chain, both usable expiries past the special's ex-date, which the chain
+    does NOT price (OCC strike-adjusted)."""
+    table = {}
+    for day in _monthly(date(2022, 10, 17), n=9):
+        t1, t2 = (date(2022, 11, 18) - day).days, (date(2022, 12, 16) - day).days
+        table[day] = (27.5, [(t1, 1 - 0.0002 * t1), (t2, 1 - 0.0002 * t2)])
+    return table
+
+
+def _missing_dividend_table(frac):
+    """A dividend of ``frac`` NOT in the calendar, between the two usable expiries."""
+    table = {}
+    for day in _monthly(date(2024, 3, 25), n=10):
+        t1, t2 = (date(2024, 4, 19) - day).days, (date(2024, 5, 17) - day).days
+        table[day] = (100.0, [(t1, 1.0), (t2, 1.0 - frac)])
+    return table
+
+
+def test_the_band_is_derived_from_the_constants():
+    import app.services.backtest.option_basis_guard as g
+    from ba2_common.core.option_carry import MAX_ADDBACK_FRACTION
+    assert g.CARRY_BAND_LOW == pytest.approx(1.0 - (g.TOLERANCE - MAX_ADDBACK_FRACTION))
+    assert g.CARRY_BAND_LOW == pytest.approx(0.975)
+
+
+@pytest.mark.parametrize("scale", [1.06, 1.07, 1.075, 1.08, 1.09, 1.10, 1.25])
+def test_an_unpriced_2_5_percent_special_cannot_hide_an_error_past_the_line(monkeypatch, scale):
+    divs = [DividendRow(date(2022, 10, 28), 27.5 * 0.025 * scale, date(2022, 10, 14))]
+    assert _verdicts(monkeypatch, _unpriced_special_table(), divs, scale) == ["REFUSE"] * 3
+
+
+@pytest.mark.parametrize("frac,scale", [(0.05, 1.08), (0.05, 1.10), (0.05, 1.25), (0.03, 1.06),
+                                        (0.03, 1.08), (0.01, 1.06)])
+def test_a_dividend_missing_from_the_calendar_cannot_hide_an_error(monkeypatch, frac, scale):
+    assert _verdicts(monkeypatch, _missing_dividend_table(frac), [], scale) == ["REFUSE"] * 3
+
+
+def test_amc_still_clears_inside_the_band(monkeypatch):
+    assert _phases(monkeypatch, AMC, lambda s, d: [], carry=False)
+    assert _phases(monkeypatch, AMC, lambda s, d: []) == []
+
+
+@pytest.mark.parametrize("case", ["special 2.5% + x1.051", "missing 5% dividend + x1.06"])
+def test_the_accepted_residual_edge_cases(monkeypatch, case):
+    """KNOWN RESIDUAL, accepted 2026-09-26 (coordinator decision, REPAIR_LOG): an error within
+    ~1% of the 5% line can still pass when an unpriced or uncalendared dividend falls in the
+    same few sessions -- the same order of softness as the 5% line itself given 2.5%-wide quote
+    pairs. Pinned so that any change to it is seen."""
+    if case.startswith("special"):
+        divs = [DividendRow(date(2022, 10, 28), 27.5 * 0.025 * 1.051, date(2022, 10, 14))]
+        got = _verdicts(monkeypatch, _unpriced_special_table(), divs, 1.051)
+    else:
+        got = _verdicts(monkeypatch, _missing_dividend_table(0.05), [], 1.06)
+    assert got == ["REFUSE", "PASS", "PASS"]

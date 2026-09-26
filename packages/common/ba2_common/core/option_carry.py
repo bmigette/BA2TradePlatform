@@ -144,7 +144,8 @@ def carry_free_spot(session: date, points: Sequence[Tuple[date, float]],
         return CarryFreeSpot(None, veto, veto=veto)
     s1, s2 = p1 + d1, p2 + d2
     if s2 > s1 * (1.0 + SLOPE_SLACK):
-        why = f"the term structure slopes up ({t1}d {s1:.4g} -> {t2}d {s2:.4g}): not the shape "               f"of carry"
+        why = (f"the term structure slopes up ({t1}d {s1:.4g} -> {t2}d {s2:.4g}): not the "
+               f"shape of carry")
         return CarryFreeSpot(None, why, veto=why)
     est = s1 - t1 * (s2 - s1) / (t2 - t1)
     note = f"; {pending} dividend(s) not yet declared, not added" if pending else ""
