@@ -59,6 +59,19 @@ EXPECTED = {
     "DOC": ((date(2024, 3, 4), "PEAK"),),
     "BN": ((date(2022, 12, 12), "BAM"),),
     "BAM": ((date(2022, 12, 12), None),),
+    # renames recovered 2026-09-26 (old root's last quoted session / the new root's first):
+    "XYZ": ((date(2025, 1, 21), "SQ"),),        # SQ to 2025-01-17 (82-87), XYZ from 01-21 (89.81)
+    "BALL": ((date(2022, 5, 10), "BLL"),),      # BLL to 05-09 (69.42), BALL from 05-10 (68.90)
+    "LUMN": ((date(2020, 9, 18), "CTL"),),      # CTL to 09-17 (11.00), LUMN from 09-18 (10.59)
+    "VTRS": ((date(2020, 11, 17), "MYL"),),     # MYL quoted to 11-16 (15.93), VTRS from 11-17 (16.20)
+    # no chain before the platform symbol's own listing (its FMP history's first bar): the
+    # ticker's earlier chain is another company's, with no FMP price to trade it against
+    "ECHO": ((date(2026, 5, 26), None),),       # Echo Global Logistics chain to 2021-11-22
+    "PS": ((date(2026, 4, 29), None),),         # Pluralsight chain to 2021-04-05
+    "VG": ((date(2025, 1, 24), None),),         # Vonage chain to 2022-07-20
+    "CAI": ((date(2025, 6, 18), None),),        # CAI International chain to 2021-11-22
+    "SAIL": ((date(2025, 2, 13), None),),       # old SailPoint chain to 2022-08-15
+    "LTM": ((date(2024, 7, 25), None),),        # old LATAM ADR chain to 2020-06-09
 }
 
 

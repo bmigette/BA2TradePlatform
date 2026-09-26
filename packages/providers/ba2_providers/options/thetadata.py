@@ -172,7 +172,69 @@ ROOT_HISTORY: Dict[str, Tuple[Tuple[date, Optional[str]], ...]] = {
     "DOC": ((date(2024, 3, 4), "PEAK"),),
     "BN": ((date(2022, 12, 12), "BAM"),),
     "BAM": ((date(2022, 12, 12), None),),
+    # Renames recovered 2026-09-26 -- the chain under the platform symbol started only at the
+    # rename, so 2020..rename had no option data at all (measured: old root's last quoted
+    # session / new root's first, parity vs FMP close within 0.5% on both sides):
+    #   XYZ  <- SQ   Block's ticker change: SQ to 2025-01-17, XYZ from 2025-01-21.
+    #   BALL <- BLL  Ball Corp: BLL to 2022-05-09, BALL from 2022-05-10.
+    #   LUMN <- CTL  CenturyLink -> Lumen: CTL to 2020-09-17, LUMN from 2020-09-18.
+    #   VTRS <- MYL  Mylan -> Viatris (1:1): MYL quoted to 2020-11-16, VTRS from 2020-11-17.
+    "XYZ": ((date(2025, 1, 21), "SQ"),),
+    "BALL": ((date(2022, 5, 10), "BLL"),),
+    "LUMN": ((date(2020, 9, 18), "CTL"),),
+    "VTRS": ((date(2020, 11, 17), "MYL"),),
+    # No chain before the platform symbol's own listing (the first bar of its FMP history): the
+    # ticker's earlier chain belongs to another company and has no FMP price to be traded
+    # against. Earlier holder, and the last session of its chain in ThetaData:
+    #   ECHO Echo Global Logistics (2021-11-22)   PS   Pluralsight (2021-04-05)
+    #   VG   Vonage (2022-07-20)                   CAI  CAI International (2021-11-22)
+    #   SAIL SailPoint before its 2022 buyout (2022-08-15)
+    #   LTM  the old LATAM ADR (2020-06-09; the new ADR's chain starts 2025-06-02)
+    "ECHO": ((date(2026, 5, 26), None),),
+    "PS": ((date(2026, 4, 29), None),),
+    "VG": ((date(2025, 1, 24), None),),
+    "CAI": ((date(2025, 6, 18), None),),
+    "SAIL": ((date(2025, 2, 13), None),),
+    "LTM": ((date(2024, 7, 25), None),),
 }
+
+# EARLY-2020 VENDOR GAP (user decision 2026-09-26: ACCEPTED). ThetaData serves NO option row --
+# EOD, greeks or intraday quotes -- before 2020-03-09 for LAMR LBRDA LDOS LEN LKQ LNT LOGI LRCX
+# LSCC LTM LUV LVS LW LYB LYG LYV MARA MAS MCHP VRT and LIN LLY MA MCD, although KO/KSS answer
+# normally and option_list_dates lists LRCX quotes back to 2017 (probed 2026-09-25; a full
+# re-fetch of LTM returned the same rows). 2020-03-09 is those names' effective options start:
+# a backtest simply finds no chain before it. Do not re-fetch to "repair" it.
+
+#: A wide fetch whose OLD-root segment spans at least this many days and returns no row at all
+#: raises ``RootHistorySegmentEmpty``: NoDataFound is also the vendor's answer for a mistyped or
+#: wrong old root, and skipping it silently would store a chain with a hole where the alias was.
+ALIAS_EMPTY_MIN_DAYS = 21
+
+
+class RootHistorySegmentEmpty(RuntimeError):
+    """An alias (old-root) segment of a wide fetch returned nothing: the alias is wrong."""
+
+
+def _validate_root_history(table) -> None:
+    """Refuse (``ValueError``) a ROOT_HISTORY whose cutovers are not dates in strictly
+    ascending order, whose old root is neither a non-empty str nor None, or whose old root is
+    the symbol itself. Run at import, so a bad table never reaches a fetch."""
+    for sym, hist in table.items():
+        prev = None
+        for entry in hist:
+            cut, root = entry
+            if not isinstance(cut, date):
+                raise ValueError(f"ROOT_HISTORY[{sym!r}]: cutover {cut!r} is not a date")
+            if prev is not None and not cut > prev:
+                raise ValueError(f"ROOT_HISTORY[{sym!r}]: cutovers out of order ({prev} then {cut})")
+            if root is not None and not (isinstance(root, str) and root.strip()):
+                raise ValueError(f"ROOT_HISTORY[{sym!r}]: old root {root!r} must be a str or None")
+            if isinstance(root, str) and root.strip().upper() == str(sym).upper():
+                raise ValueError(f"ROOT_HISTORY[{sym!r}]: old root {root!r} is its own symbol")
+            prev = cut
+
+
+_validate_root_history(ROOT_HISTORY)
 
 
 def _root_segments(underlying: str, start: date, end: date) -> List[Tuple[str, date, date]]:
@@ -481,11 +543,18 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
         # One listing per vendor ROOT (ROOT_HISTORY). A root only lists the contracts it could
         # have traded: an expiry before the root's first day belongs to an earlier root (or,
         # for META before 2022-06-09, to another company). Contracts carry the platform root.
-        for root, root_from, _root_to in _root_segments(underlying, date.min, date.max):
+        for root, root_from, root_to in _root_segments(underlying, date.min, date.max):
             exps = client.option_list_expirations(root)
             for row in exps.itertuples(index=False):
                 exp = _parse_date(getattr(row, "expiration", None))
                 if exp is None or exp < expiry_gte or exp > expiry_lte or exp < root_from:
+                    continue
+                # An OLD root's segment ends before the cutover: an expiry after that end is
+                # the root's NEXT holder's (the new BAM's 2024 expiries under BAM, for BN)
+                # unless the old root quoted it before the cutover -- keep only those strikes.
+                before = (self._strikes_live_before(client, root, exp, root_to)
+                          if root_to < date.max and exp > root_to else None)
+                if before is not None and not before:
                     continue
                 strikes = client.option_list_strikes(root, exp)
                 # A root that took over a ticker (META from 2022-06-09) may still LIST the
@@ -500,6 +569,8 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                     if strike is None:
                         continue
                     if live is not None and strike not in live:
+                        continue
+                    if before is not None and strike not in before:
                         continue
                     if strike_min is not None and strike < strike_min:
                         continue
@@ -527,6 +598,14 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
     #: How far back from an expiry's last session ``_strikes_live_under`` looks.
     _LIVE_STRIKE_PROBE_DAYS = 14
 
+    def _strikes_live_before(self, client, root: str, expiry: date, root_to: date) -> set:
+        """Strikes of ``expiry`` with a real quote or trade under ``root`` in the last
+        ``_LIVE_STRIKE_PROBE_DAYS`` up to ``root_to`` (the last day the root meant this
+        underlying) -- the mirror of ``_strikes_live_under``. One per-expiry request."""
+        end = min(root_to, _exchange_today() - timedelta(days=1))
+        return self._strikes_quoted(client, root, expiry,
+                                    end - timedelta(days=self._LIVE_STRIKE_PROBE_DAYS), end)
+
     def _strikes_live_under(self, client, root: str, expiry: date, root_from: date) -> set:
         """Strikes of ``expiry`` with a real quote or trade under ``root`` on or after
         ``root_from`` (the day the root started meaning this underlying).
@@ -542,6 +621,10 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
         cutover and always inside a live contract's quoting life. One per-expiry request."""
         end = min(expiry, _exchange_today() - timedelta(days=1))
         start = max(root_from, end - timedelta(days=self._LIVE_STRIKE_PROBE_DAYS))
+        return self._strikes_quoted(client, root, expiry, start, end)
+
+    def _strikes_quoted(self, client, root: str, expiry: date, start: date, end: date) -> set:
+        """Strikes of ``expiry`` with a trade or a quote under ``root`` in [start, end]."""
         if end < start:
             return set()
         try:
@@ -743,18 +826,26 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
         # ROOT_HISTORY: the window is split at every root change and each part asked for
         # under the root the chain traded as then (segments are date-ordered, so the ordering
         # contract below still holds across them). Rows are stored under ``underlying``.
-        windows = [(root, w_start, w_end)
-                   for root, seg_start, seg_end in _root_segments(underlying, start, end)
+        segments = _root_segments(underlying, start, end)
+        windows = [(root, w_start, w_end, k)
+                   for k, (root, seg_start, seg_end) in enumerate(segments)
                    for w_start, w_end in _chunk_window(seg_start, seg_end)]
-        for root, w_start, w_end in windows:
+        seg_rows = [0] * len(segments)
+        last_window_of = {k: i for i, (_r, _a, _b, k) in enumerate(windows)}
+        for i, (root, w_start, w_end, k) in enumerate(windows):
             try:
-                bars_df = client.option_history_eod(
-                    symbol=root, expiration="*", strike="*", right="both",
-                    start_date=w_start, end_date=w_end)
-            except self._no_data_exc:
-                continue  # no chain at all in this window -- normal, not an error
-            if bars_df is None or len(bars_df) == 0:
-                continue
+                try:
+                    bars_df = client.option_history_eod(
+                        symbol=root, expiration="*", strike="*", right="both",
+                        start_date=w_start, end_date=w_end)
+                except self._no_data_exc:
+                    continue  # no chain at all in this window -- normal, not an error
+                if bars_df is None or len(bars_df) == 0:
+                    continue
+                seg_rows[k] += len(bars_df)
+            finally:
+                if i == last_window_of[k]:
+                    self._refuse_an_empty_alias(underlying, segments[k], seg_rows[k])
 
             try:
                 oi_df = client.option_history_open_interest(
@@ -837,6 +928,20 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                     open_interest=oi_map.get(key),
                     iv=iv_map.get(key),
                 )
+
+    @staticmethod
+    def _refuse_an_empty_alias(underlying: str, segment, rows: int) -> None:
+        root, seg_start, seg_end = segment
+        if root.upper() == underlying.upper():
+            return
+        if rows or (seg_end - seg_start).days + 1 < ALIAS_EMPTY_MIN_DAYS:
+            return
+        msg = (f"thetadata: ROOT_HISTORY alias {underlying} <- {root} returned NO option row "
+               f"for {seg_start.isoformat()}..{seg_end.isoformat()} "
+               f"({(seg_end - seg_start).days + 1} days): the old root is wrong or the vendor "
+               f"lost it. Refusing rather than storing a chain with a hole there.")
+        logger.error(msg)
+        raise RootHistorySegmentEmpty(msg)
 
     def fetch_bars_detailed(self, contracts: Iterable[OptionContractMeta], *,
                             start: date, end: date) -> CandleBatch:
