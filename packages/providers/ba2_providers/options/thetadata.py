@@ -216,22 +216,49 @@ class RootHistorySegmentEmpty(RuntimeError):
 
 
 def _validate_root_history(table) -> None:
-    """Refuse (``ValueError``) a ROOT_HISTORY whose cutovers are not dates in strictly
-    ascending order, whose old root is neither a non-empty str nor None, or whose old root is
-    the symbol itself. Run at import, so a bad table never reaches a fetch."""
+    """Refuse (``ValueError``) a ROOT_HISTORY whose symbol keys or old roots are not upper-case
+    without surrounding spaces (lookups are by ``underlying.upper()``: a lower-case key would
+    never match), whose cutovers are not plain dates (a ``datetime`` compares unequal to a
+    date) in strictly ascending order, whose old root is neither a non-empty str nor None, or
+    whose old root is the symbol itself. Run at import, so a bad table never reaches a fetch.
+    Duplicate KEYS cannot be seen here (a dict literal keeps the last): see
+    ``_duplicate_root_history_keys``."""
     for sym, hist in table.items():
+        if not isinstance(sym, str) or sym != sym.strip().upper() or not sym:
+            raise ValueError(f"ROOT_HISTORY key {sym!r} must be an upper-case symbol without "
+                             f"surrounding spaces")
         prev = None
         for entry in hist:
             cut, root = entry
-            if not isinstance(cut, date):
-                raise ValueError(f"ROOT_HISTORY[{sym!r}]: cutover {cut!r} is not a date")
+            if isinstance(cut, datetime) or not isinstance(cut, date):
+                raise ValueError(f"ROOT_HISTORY[{sym!r}]: cutover {cut!r} must be a date, not a "
+                                 f"datetime or anything else")
             if prev is not None and not cut > prev:
                 raise ValueError(f"ROOT_HISTORY[{sym!r}]: cutovers out of order ({prev} then {cut})")
             if root is not None and not (isinstance(root, str) and root.strip()):
                 raise ValueError(f"ROOT_HISTORY[{sym!r}]: old root {root!r} must be a str or None")
-            if isinstance(root, str) and root.strip().upper() == str(sym).upper():
+            if isinstance(root, str) and root != root.strip():
+                raise ValueError(f"ROOT_HISTORY[{sym!r}]: old root {root!r} has surrounding spaces")
+            if isinstance(root, str) and root != root.upper():
+                raise ValueError(f"ROOT_HISTORY[{sym!r}]: old root {root!r} must be upper-case")
+            if isinstance(root, str) and root == sym:
                 raise ValueError(f"ROOT_HISTORY[{sym!r}]: old root {root!r} is its own symbol")
             prev = cut
+
+
+def _duplicate_root_history_keys(source_path: str) -> List[str]:
+    """Keys that appear more than once in the ``ROOT_HISTORY`` literal of ``source_path`` (a
+    dict literal silently keeps the last one). Checked by the test suite."""
+    import ast
+    tree = ast.parse(open(source_path, encoding="utf-8").read())
+    for node in ast.walk(tree):
+        target = getattr(node, "target", None) if isinstance(node, ast.AnnAssign) else None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        if getattr(target, "id", None) == "ROOT_HISTORY" and isinstance(node.value, ast.Dict):
+            keys = [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+            return sorted({k for k in keys if keys.count(k) > 1})
+    raise ValueError(f"no ROOT_HISTORY dict literal in {source_path}")
 
 
 _validate_root_history(ROOT_HISTORY)
@@ -833,19 +860,20 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
         seg_rows = [0] * len(segments)
         last_window_of = {k: i for i, (_r, _a, _b, k) in enumerate(windows)}
         for i, (root, w_start, w_end, k) in enumerate(windows):
+            # The empty-alias check runs only after a window COMPLETED (rows or a NoData answer);
+            # any other error propagates as itself, never masked by the check.
             try:
-                try:
-                    bars_df = client.option_history_eod(
-                        symbol=root, expiration="*", strike="*", right="both",
-                        start_date=w_start, end_date=w_end)
-                except self._no_data_exc:
-                    continue  # no chain at all in this window -- normal, not an error
-                if bars_df is None or len(bars_df) == 0:
-                    continue
+                bars_df = client.option_history_eod(
+                    symbol=root, expiration="*", strike="*", right="both",
+                    start_date=w_start, end_date=w_end)
+            except self._no_data_exc:
+                bars_df = None       # no chain at all in this window -- normal, not an error
+            if bars_df is not None:
                 seg_rows[k] += len(bars_df)
-            finally:
-                if i == last_window_of[k]:
-                    self._refuse_an_empty_alias(underlying, segments[k], seg_rows[k])
+            if i == last_window_of[k]:
+                self._refuse_an_empty_alias(underlying, segments[k], seg_rows[k])
+            if bars_df is None or len(bars_df) == 0:
+                continue
 
             try:
                 oi_df = client.option_history_open_interest(

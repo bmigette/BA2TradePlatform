@@ -45,7 +45,7 @@ def test_the_shipped_table_validates():
     ({"X": ((date(2022, 1, 3), "A"), (date(2022, 1, 3), "B"))}, "order"),
     ({"X": ((date(2022, 1, 3), 7),)}, "str or None"),
     ({"X": ((date(2022, 1, 3), ""),)}, "str or None"),
-    ({"X": ((date(2022, 1, 3), "x"),)}, "its own symbol"),
+    ({"X": ((date(2022, 1, 3), "X"),)}, "its own symbol"),
     ({"X": (("2022-01-03", "A"),)}, "date"),
 ])
 def test_a_bad_table_is_refused(table, match):
@@ -176,3 +176,48 @@ def test_bn_discovery_does_not_list_the_new_bam_expiries_under_the_bam_root():
     # LATE is the new BAM's: under BAM it has no row before the cutover -> only BN's strikes
     assert by[LATE] == {35.0}
     assert all(c.occ_symbol.startswith("BN") for c in out)
+
+
+# ---- review round 2 ---------------------------------------------------------------------------
+@pytest.mark.parametrize("table,match", [
+    ({"x": ((date(2022, 1, 3), "A"),)}, "upper-case"),
+    ({" X": ((date(2022, 1, 3), "A"),)}, "upper-case"),
+    ({"X": ((date(2022, 1, 3), " A"),)}, "surrounding spaces"),
+    ({"X": ((date(2022, 1, 3), "a"),)}, "upper-case"),
+    ({"X": ((date(2022, 1, 3), "x"),)}, "upper-case"),
+    ({"X": ((__import__("datetime").datetime(2022, 1, 3), "A"),)}, "date, not a datetime"),
+])
+def test_round_2_table_rules(table, match):
+    with pytest.raises(ValueError, match=match):
+        T._validate_root_history(table)
+
+
+def test_the_source_literal_has_no_duplicate_keys():
+    """A dict literal silently keeps the LAST of two equal keys; read the source instead."""
+    import ast
+    tree = ast.parse(open(T.__file__, encoding="utf-8").read())
+    lit = next(n.value for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))
+               and getattr(getattr(n, "target", None) or (n.targets[0] if getattr(n, "targets", None) else None), "id", None) == "ROOT_HISTORY")
+    keys = [k.value for k in lit.keys]
+    assert len(keys) == len(set(keys)) == len(T.ROOT_HISTORY)
+    assert T._duplicate_root_history_keys(T.__file__) == []
+
+
+class _Boom(Exception):
+    pass
+
+
+def test_a_network_error_in_an_alias_segment_is_not_masked():
+    """The empty-alias check ran in a ``finally``: a network error inside the old root's last
+    window was replaced by RootHistorySegmentEmpty. It now only runs after a window completes
+    normally, so the real error propagates."""
+    class _Failing(_Client):
+        def option_history_eod(self, **kw):
+            if kw["symbol"] == "BAM" and kw["end_date"] == CUT - timedelta(days=1):
+                raise _Boom("connection reset")          # the segment's LAST window
+            return super().option_history_eod(**kw)
+
+    client = _Failing({"BN": (CUT, date(2023, 1, 20), 35.0)})
+    with pytest.raises(_Boom):
+        list(_wired(client).fetch_underlying_eod_bars("BN", start=date(2022, 10, 3),
+                                                      end=date(2022, 12, 30)))
