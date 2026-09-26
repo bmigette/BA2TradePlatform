@@ -16,7 +16,7 @@ Part 1 (files not re-fetched):
   TRP   South Bow spin-off, ex 2024-10-02: 1.1007 before / 1.0024 after = x1.098.
   MMM   Solventum spin-off, ex 2024-04-01: 1.1971 before / 1.0009 after = x1.1961.
   SKM   the ADR left FMP's basis on 2021-11-30 (calendar 0.607, kept) and came back on
-        2021-12-27 (chain re-struck): 1.6494 before / 0.9963 after = x1.6555 on 2021-12-27.
+        2021-12-27 (chain re-struck): 1.6494 before / 0.9940 after = x1.6594 on 2021-12-27.
   MTCH  the 2020-07-01 row 1751/500 is IAC's separation ratio: 0.2848 x 3.502 = 0.9974 before.
 
 Part 2 (measured on the forced full re-fetch of 2026-09-25; interval medians of par/close):
@@ -30,7 +30,7 @@ Part 2 (measured on the forced full re-fetch of 2026-09-25; interval medians of 
         2026-01-08 0.95 row replaced by x0.9465.
   LBRDA FMP carries the 2025-07-15 x1.067 row only from 2025-06-16: x0.9374 on 06-16.
   FTI   replace the 2021-02-16 x1.344 row by x1.2213.
-  PHG   2022-05-13 x1.0769 and the 2023-05-11 row replaced by x0.966 (rows 2020-06-30 and
+  PHG   2022-05-13 x1.0764 and the 2023-05-11 row replaced by x0.966 (rows 2020-06-30 and
         2024-05-09 stay).
   FLEX  / CMCSA: FMP shows ex-distribution prices for the weeks before the spin's ex-date
         (1.3785 over 2023-12-04..2024-01-02; 1.0685 over 2025-12-08..2026-01-02): a pair of
@@ -75,7 +75,7 @@ _1 = _a()
 EXPECTED = {
     "TRP": [(date(2024, 10, 2), 1.098, ADD, _1)],
     "MMM": [(date(2024, 4, 1), 1.1961, ADD, _1)],
-    "SKM": [(date(2021, 12, 27), 1.6555, ADD, _a((date(2021, 12, 15), 26.9)))],
+    "SKM": [(date(2021, 12, 27), 1.6594, ADD, _a((date(2021, 12, 15), 26.9)))],
     "MTCH": [(date(2020, 7, 1), 3.502, EXCL, _1)],
     "AMC": [(date(2022, 8, 22), 2.0, EXCL, _1), (date(2023, 8, 14), 0.644487, ACK, _1),
             (date(2023, 9, 6), 0.631965, ACK, _1)],
@@ -90,7 +90,7 @@ EXPECTED = {
              (date(2026, 1, 8), 0.9465, ADD, _a((date(2025, 12, 16), 47.38)))],
     "LBRDA": [(date(2025, 6, 16), 0.9374, ADD, _a((date(2025, 6, 24), 89.03)))],
     "FTI": [(date(2021, 2, 16), 1.344, EXCL, _1), (date(2021, 2, 16), 1.2213, ADD, _1)],
-    "PHG": [(date(2022, 5, 13), 1.0769, ADD, _a((date(2022, 9, 7), 17.43))),
+    "PHG": [(date(2022, 5, 13), 1.0764, ADD, _a((date(2022, 9, 7), 17.43))),
             (date(2023, 5, 11), 1.045455, EXCL, _a((date(2022, 9, 7), 17.43))),
             (date(2023, 5, 11), 0.966, ADD, _a((date(2022, 9, 7), 17.43)))],
     "FLEX": [(date(2023, 12, 4), 0.727, ADD, _a((date(2023, 12, 11), 18.77))),
@@ -236,7 +236,7 @@ def test_the_module_under_test_is_the_worktree_copy():
 
 
 def test_the_version_was_bumped_for_this_edit():
-    assert ovr.OVERRIDES_VERSION >= "2026-09-26.3"
+    assert ovr.OVERRIDES_VERSION >= "2026-09-26.4"
 
 
 @pytest.mark.parametrize("sym", sorted(EXPECTED))
@@ -283,8 +283,8 @@ def test_without_the_overrides_the_session_is_off(sym, day, par, fmp):
 
 def test_skm_keeps_its_calendar_row_and_adds_the_return_leg():
     b = _resolve("SKM")
-    assert b.factor(date(2021, 11, 29)) == pytest.approx(0.607 * 1.6555)
-    assert b.factor(date(2021, 11, 30)) == pytest.approx(1.6555)
+    assert b.factor(date(2021, 11, 29)) == pytest.approx(0.607 * 1.6594)
+    assert b.factor(date(2021, 11, 30)) == pytest.approx(1.6594)
     assert b.factor(date(2021, 12, 27)) == 1.0
 
 
@@ -299,7 +299,7 @@ def test_fti_and_phg_replace_the_vendor_ratio_on_its_own_date():
     assert fti.factor(date(2021, 2, 12)) == pytest.approx(1.2213)
     assert fti.factor(date(2021, 2, 16)) == 1.0
     phg = _resolve("PHG")
-    assert phg.factor(date(2021, 6, 1)) == pytest.approx(1.0769 * 0.966 * 1.034)
+    assert phg.factor(date(2021, 6, 1)) == pytest.approx(1.0764 * 0.966 * 1.034)
     assert phg.factor(date(2022, 9, 7)) == pytest.approx(0.966 * 1.034)
     assert phg.factor(date(2023, 9, 7)) == pytest.approx(1.034)
 

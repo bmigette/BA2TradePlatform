@@ -90,7 +90,7 @@ __all__ = [
     "overrides_version_for",
 ]
 
-OVERRIDES_VERSION = "2026-09-26.3"
+OVERRIDES_VERSION = "2026-09-26.4"
 
 #: An anchor close may differ from the recorded one by at most this fraction (0.1%).
 ANCHOR_TOLERANCE = 0.001
@@ -174,13 +174,13 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
         "Solventum spin-off, ex 2024-04-01 (03-28 at 1.1968, 04-02 at 1.0024); in FMP prices, "
         "not in the calendar. r 1.1971 (p10-p90 1.1961-1.1979) before / 1.0009 after = 1.1961."),
     BasisOverride(
-        "SKM", date(2021, 12, 27), 1.6555, KIND_ADD_PRICE_ADJUSTMENT,
+        "SKM", date(2021, 12, 27), 1.6594, KIND_ADD_PRICE_ADJUSTMENT,
         ((_A2020, 22.5), (date(2021, 12, 15), 26.9)),
         "SK Telecom ADR: the as-traded ADR left FMP's basis on 2021-11-30 (the calendar row "
         "0.607, which STAYS) and returned to it on 2021-12-27, when the chain re-struck "
         "(strikes 20.74/25.74/... first listed that day). r (0.607 row in the factor): 1.6494 "
         "over the 60 sessions before 12-27 (1.6515 before 11-30, 1.6517 over 11-30..12-23) / "
-        "0.9963 after = 1.6555."),
+        "0.9940 after = 1.6594 (tools/measure_basis_plateaus.py)."),
     BasisOverride(
         "MTCH", date(2020, 7, 1), 3.502, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 84.19),),
         "The 2020-07-01 row 1751/500 is IAC's separation ratio; FMP's MTCH closes before it are "
@@ -272,12 +272,12 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
         "Replacement of the x1.344 row: r 1.2221 (p10-p90 1.2184-1.2279) over the 60 sessions "
         "before / 1.0006 over the 60 after = 1.2213."),
     BasisOverride(
-        "PHG", date(2022, 5, 13), 1.0769, KIND_ADD_PRICE_ADJUSTMENT,
+        "PHG", date(2022, 5, 13), 1.0764, KIND_ADD_PRICE_ADJUSTMENT,
         ((_A2020, 44.87), (date(2022, 9, 7), 17.43)),
         "FMP's closes 2022-05-13..2023-05-10 sit on another basis than the calendar implies "
         "(FMP's close jumps exactly x1.0455 = the 2023-05-11 row on 2022-05-13, the 2022 "
         "stock-dividend ex-date); rows 2020-06-30 x1.02 and 2024-05-09 x1.034 are right and "
-        "stay. r 1.0428 over the 60 sessions before / 0.9684 over the 60 from it = 1.0769."),
+        "stay. r 1.0423 over the 60 sessions before / 0.9683 over the 60 from it = 1.0764."),
     BasisOverride(
         "PHG", date(2023, 5, 11), 1.045455, KIND_EXCLUDE_CALENDAR_EVENT,
         ((_A2020, 44.87), (date(2022, 9, 7), 17.43)),
