@@ -90,7 +90,7 @@ __all__ = [
     "overrides_version_for",
 ]
 
-OVERRIDES_VERSION = "2026-09-26.2"
+OVERRIDES_VERSION = "2026-09-26.3"
 
 #: An anchor close may differ from the recorded one by at most this fraction (0.1%).
 ANCHOR_TOLERANCE = 0.001
@@ -239,11 +239,24 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
         "the 60 from it = 1.0190. Residual medians 1.0061 (2020-01..2025-01-28) and 1.0031 "
         "(2025-01-29..2025-12-31)."),
     BasisOverride(
-        "QGEN", date(2026, 1, 8), 0.95, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 34.18),),
-        "Synthetic share repurchase (capital repayment + consolidation) x0.95, not in FMP's "
-        "closes (par/close 1.0037 over 2025-02..11 and 1.0023 over 2026-01-16..03-31). The "
-        "capital repayment depresses the parity forward of the expiries spanning it (Dec 2025 "
-        "at 0.94-0.95): a carry effect, not a basis."),
+        "QGEN", date(2025, 12, 15), 1.0564, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 34.18), (date(2025, 12, 16), 47.38)),
+        "Synthetic share repurchase (capital repayment + 0.95 consolidation, ex 2026-01-08): "
+        "FMP's closes 2025-12-15..2026-01-07 sit on another basis -- FMP's close jumps x1.0577 "
+        "on 12-15 while the chain does not move (even the 4-day 12-19 expiry, before the event, "
+        "reads 0.9492 of it). NOT carry: re-measured 2026-09-26 (an earlier entry called it "
+        "the repayment's carry). r 1.0023 over the 60 sessions before 12-15 / 0.9487 over the "
+        "12-session stretch = 1.0564; closed by the 2026-01-08 replacement below."),
+    BasisOverride(
+        "QGEN", date(2026, 1, 8), 0.95, KIND_EXCLUDE_CALENDAR_EVENT,
+        ((_A2020, 34.18), (date(2025, 12, 16), 47.38)),
+        "The 0.95 consolidation row: FMP's closes carry it only over the 2025-12-15 stretch "
+        "(see that entry), not over the whole history; replaced by the next entry."),
+    BasisOverride(
+        "QGEN", date(2026, 1, 8), 0.9465, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 34.18), (date(2025, 12, 16), 47.38)),
+        "End of the stretch at the repurchase's ex-date: r 0.9487 over the stretch / 1.0023 "
+        "over the 27 sessions from 2026-01-08 = 0.9465 (x1.0564 before it: net 0.9999)."),
     BasisOverride(
         "LBRDA", date(2025, 6, 16), 0.9374, KIND_ADD_PRICE_ADJUSTMENT,
         ((_A2020, 125.19), (date(2025, 6, 24), 89.03)),

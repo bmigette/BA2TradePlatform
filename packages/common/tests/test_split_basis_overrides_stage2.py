@@ -25,7 +25,9 @@ Part 2 (measured on the forced full re-fetch of 2026-09-25; interval medians of 
   FCEL  add the missing 1:30 of 2024-11-11 at its nominal 1/30; acknowledge 2019-06-05 x0.6667.
   GSK   exclude the 2022-07-22 4:5 row (1.0000 before, 1.0007 after: no step at all).
   QGEN  the 2024-01-30 x0.97 row IS in the prices (kept); the 2025-01-29 x0.9722 row is
-        replaced by the measured x1.019; the 2026-01-08 x0.95 row stays excluded.
+        replaced by the measured x1.019; FMP's closes 2025-12-15..2026-01-07 sit on another
+        basis (x1.0577 jump on 12-15, the chain unmoved): bracketed by x1.0564 on 12-15 and the
+        2026-01-08 0.95 row replaced by x0.9465.
   LBRDA FMP carries the 2025-07-15 x1.067 row only from 2025-06-16: x0.9374 on 06-16.
   FTI   replace the 2021-02-16 x1.344 row by x1.2213.
   PHG   2022-05-13 x1.0769 and the 2023-05-11 row replaced by x0.966 (rows 2020-06-30 and
@@ -83,7 +85,9 @@ EXPECTED = {
     "GSK": [(date(2022, 7, 22), 0.8, EXCL, _1)],
     "QGEN": [(date(2025, 1, 29), 0.9722, EXCL, _a((date(2024, 6, 3), 43.0))),
              (date(2025, 1, 29), 1.019, ADD, _a((date(2024, 6, 3), 43.0))),
-             (date(2026, 1, 8), 0.95, EXCL, _1)],
+             (date(2025, 12, 15), 1.0564, ADD, _a((date(2025, 12, 16), 47.38))),
+             (date(2026, 1, 8), 0.95, EXCL, _a((date(2025, 12, 16), 47.38))),
+             (date(2026, 1, 8), 0.9465, ADD, _a((date(2025, 12, 16), 47.38)))],
     "LBRDA": [(date(2025, 6, 16), 0.9374, ADD, _a((date(2025, 6, 24), 89.03)))],
     "FTI": [(date(2021, 2, 16), 1.344, EXCL, _1), (date(2021, 2, 16), 1.2213, ADD, _1)],
     "PHG": [(date(2022, 5, 13), 1.0769, ADD, _a((date(2022, 9, 7), 17.43))),
@@ -104,7 +108,7 @@ ANCHORS = {"TRP": 48.0, "MMM": 150.49, "SKM": 22.5, "MTCH": 84.19, "AMC": 74.6, 
            "MARA": 1.05, "SMCI": 2.36}
 #: A stretch override carries a second anchor inside its stretch (review 2026-09-26).
 STRETCH = {"SKM": date(2021, 12, 15), "LBRDA": date(2025, 6, 24), "PHG": date(2022, 9, 7),
-           "FLEX": date(2023, 12, 11), "CMCSA": date(2025, 12, 15), "QGEN": date(2024, 6, 3)}
+           "FLEX": date(2023, 12, 11), "CMCSA": date(2025, 12, 15), "QGEN": date(2025, 12, 16)}
 
 
 def _anchors(sym):
@@ -178,6 +182,8 @@ SWEEP = [
     ("QGEN", date(2020, 6, 1), 43.575, 43.990),
     ("QGEN", date(2024, 6, 3), 44.225, 43.000),     # between the kept 0.97 and the 2025 step
     ("QGEN", date(2025, 6, 2), 45.050, 44.900),
+    ("QGEN", date(2025, 12, 16), 45.001, 47.380),   # FMP's stretch: its 3-day expiry is 0.9498
+    ("QGEN", date(2026, 1, 16), 47.123, 47.570),    # after the repurchase
     ("LBRDA", date(2021, 6, 1), 160.800, 159.830),
     ("LBRDA", date(2025, 6, 24), 95.350, 89.030),   # the early ex-distribution stretch
     ("LBRDA", date(2025, 9, 2), 60.700, 60.450),
@@ -230,7 +236,7 @@ def test_the_module_under_test_is_the_worktree_copy():
 
 
 def test_the_version_was_bumped_for_this_edit():
-    assert ovr.OVERRIDES_VERSION >= "2026-09-26.2"
+    assert ovr.OVERRIDES_VERSION >= "2026-09-26.3"
 
 
 @pytest.mark.parametrize("sym", sorted(EXPECTED))
@@ -298,11 +304,14 @@ def test_fti_and_phg_replace_the_vendor_ratio_on_its_own_date():
     assert phg.factor(date(2023, 9, 7)) == pytest.approx(1.034)
 
 
-def test_qgen_keeps_the_2024_row_and_replaces_the_2025_one():
+def test_qgen_keeps_the_2024_row_replaces_the_2025_one_and_brackets_the_december_stretch():
     b = _resolve("QGEN")
-    assert b.factor(date(2024, 1, 29)) == pytest.approx(0.97 * 1.019)
-    assert b.factor(date(2024, 6, 3)) == pytest.approx(1.019)
-    assert b.factor(date(2025, 6, 2)) == 1.0
+    stretch = 1.0564 * 0.9465
+    assert b.factor(date(2024, 1, 29)) == pytest.approx(0.97 * 1.019 * stretch)
+    assert b.factor(date(2024, 6, 3)) == pytest.approx(1.019 * stretch)
+    assert b.factor(date(2025, 6, 2)) == pytest.approx(stretch)
+    assert b.factor(date(2025, 12, 16)) == pytest.approx(0.9465)
+    assert b.factor(date(2026, 1, 8)) == 1.0
 
 
 def test_flex_and_cmcsa_bracket_the_ex_distribution_stretch():
