@@ -492,6 +492,10 @@ def _verify_overrides(symbol: str, d: np.ndarray, c: Any, calendar: Sequence[Cal
 
     if not entries:
         return set()
+    try:
+        ovr.validate_overrides(entries)
+    except ValueError as e:
+        raise SplitBasisRefused(f"{symbol}: {e}") from e
     close = np.asarray(c, dtype=np.float64)
     cal_dates = {s.date for s in calendar}
     # Exclusions first: an ``add_price_adjustment`` on the date of a row the same symbol's

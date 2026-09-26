@@ -36,6 +36,21 @@ THE ENTRY KINDS
     ``check_split_basis`` caller (the warmup preflight and the live drift report included), so
     an acknowledged jump also stops the warmup's re-fetch loop.
 
+THE PLATEAU CONVENTION (every ``add_price_adjustment`` ratio from OVERRIDES_VERSION 2026-09-26.1
+on). With r(d) = put-call-parity spot of the nearest expiry / (FMP close x the factor of every
+OTHER calendar row and entry of the symbol) on each evaluable session d, an add at event date c
+gets
+
+    ratio = median(r over the <= 60 evaluable sessions before c, after the previous event)
+          / median(r over the <= 60 evaluable sessions from c on, before the next event)
+
+rounded to 4 decimals (6 below 0.1). Adjacent plateaus, the same window on both sides, the same
+rule for a lone spin-off, a stretch bracket and a replacement -- so a re-measurement of any entry
+reproduces its number. (HON, NVS and SCCO predate the convention.) An exclusion's own ``ratio``
+is the vendor row's, informational only. A STRETCH override (two adds bracketing a few weeks of
+another basis, or an event whose effect FMP applies early) carries a second anchor INSIDE the
+stretch, so a vendor fix of the stretch alone refuses instead of double counting.
+
 VALID ONLY FOR THE BYTES THEY WERE MEASURED ON. Every entry names ``anchors``: (date, FMP close)
 pairs of the file it was measured against. A re-fetch that re-bases the history (FMP adding the
 missing event itself, a new dividend adjustment) moves those closes, and the entry would then
@@ -64,13 +79,14 @@ __all__ = [
     "KIND_EXCLUDE_CALENDAR_EVENT",
     "KIND_ACKNOWLEDGE_JUMP",
     "BasisOverride",
+    "validate_overrides",
     "acknowledged_jumps",
     "BASIS_OVERRIDES",
     "overrides_for",
     "overrides_version_for",
 ]
 
-OVERRIDES_VERSION = "2026-09-25.2"
+OVERRIDES_VERSION = "2026-09-26.1"
 
 #: An anchor close may differ from the recorded one by at most this fraction (0.1%).
 ANCHOR_TOLERANCE = 0.001
@@ -138,35 +154,35 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
                   ((_A2020, 40.18),), _SCCO_EVIDENCE + ". FMP closes 2025-10-20..2025-11-11 "
                   "already carry this adjustment (16 sessions ~0.85% off after the fix, below "
                   "the 5% guard tolerance); accepted"),
-    # ---- stage-2 universe, measured 2026-09-25 (parity spot of the nearest expiry / FMP close x
-    # factor, every session 2020-2025; tests/test_split_basis_overrides_stage2.py) ----------
+    # ---- stage-2 universe (2026-09-25/26). Ratios follow the PLATEAU CONVENTION of the module
+    # docstring; "r" = parity spot of the nearest expiry / (FMP close x factor without the entry),
+    # "par/close" = the same with no factor. Part-2 anchors are the bytes of the 2026-09-25
+    # forced full re-fetch; a stretch override carries a second anchor INSIDE its stretch.
+    # Measurements: tests/test_split_basis_overrides_stage2.py. ---------------------------------
     BasisOverride(
-        "TRP", date(2024, 10, 2), 1.1007, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 48.0),),
-        "South Bow spin-off, ex 2024-10-02 (last pre-event session 10-01 at 1.1013, 10-02 "
-        "unevaluable, 10-03 at 1.0023); in FMP prices, not in the calendar. Parity/FMP median "
-        "1.1007 over the 60 evaluable sessions before (p10-p90 1.0875-1.1028, the low tail being "
-        "ex-dividend weeks), 1.0024 after; 2020-2023 plateau 1.096-1.101."),
+        "TRP", date(2024, 10, 2), 1.098, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 48.0),),
+        "South Bow spin-off, ex 2024-10-02 (10-01 at 1.1013, 10-02 unevaluable, 10-03 at "
+        "1.0023); in FMP prices, not in the calendar. r median 1.1007 over the 60 sessions "
+        "before (p10-p90 1.0875-1.1028, the low tail being ex-dividend weeks) / 1.0024 over "
+        "the 60 after = 1.0980."),
     BasisOverride(
-        "MMM", date(2024, 4, 1), 1.1971, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 150.49),),
-        "Solventum spin-off, ex 2024-04-01 (last pre-event session 03-28 at 1.1968, 04-02 at "
-        "1.0024); in FMP prices, not in the calendar. Parity/FMP median 1.1971 (p10-p90 "
-        "1.1961-1.1979) over 60 sessions before, 1.0009 after; 2020-2024 plateau 1.195-1.197."),
+        "MMM", date(2024, 4, 1), 1.1961, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 150.49),),
+        "Solventum spin-off, ex 2024-04-01 (03-28 at 1.1968, 04-02 at 1.0024); in FMP prices, "
+        "not in the calendar. r 1.1971 (p10-p90 1.1961-1.1979) before / 1.0009 after = 1.1961."),
     BasisOverride(
-        "SKM", date(2021, 12, 27), 1.6517, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 22.5),),
+        "SKM", date(2021, 12, 27), 1.6555, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 22.5), (date(2021, 12, 15), 26.9)),
         "SK Telecom ADR: the as-traded ADR left FMP's basis on 2021-11-30 (the calendar row "
         "0.607, which STAYS) and returned to it on 2021-12-27, when the chain re-struck "
-        "(strikes 20.74/25.74/... first listed that day). Parity/(FMP x factor): 1.6515 over "
-        "60 sessions before 11-30 (x0.607 = 1.0025), 1.6517 over 11-30..12-23, 0.9965 from "
-        "12-29. This x1.6517 on 12-27 puts both plateaus at 1.000."),
+        "(strikes 20.74/25.74/... first listed that day). r (0.607 row in the factor): 1.6494 "
+        "over the 60 sessions before 12-27 (1.6515 before 11-30, 1.6517 over 11-30..12-23) / "
+        "0.9963 after = 1.6555."),
     BasisOverride(
         "MTCH", date(2020, 7, 1), 3.502, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 84.19),),
         "The 2020-07-01 row 1751/500 is IAC's separation ratio; FMP's MTCH closes before it are "
         "the OLD Match Group's own price, never adjusted by it. Parity (MTCH root) / (FMP x "
         "3.502) = 0.2848 over 60 sessions before (p10-p90 0.2828-0.2857: 0.9974 without the "
         "row), 1.0000 after. Not a root change: IAC's chain / FMP is 2.65-3.17, not constant."),
-    # ---- stage-2 universe, part 2: measured 2026-09-25 AFTER the forced full re-fetch of these
-    # files (the anchors are the re-fetched bytes). "par/close" = parity spot of the nearest
-    # expiry / FMP close with NO factor, median over the stated sessions. -----------------------
     BasisOverride(
         "AMC", date(2022, 8, 22), 2.0, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 74.6),),
         "The 2022-08-22 x2 row is the APE preferred-unit dividend: OCC left strikes alone and "
@@ -193,77 +209,90 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
         "FCEL", date(2019, 6, 5), 0.666667, KIND_ACKNOWLEDGE_JUMP, ((_A2020, 60.3),),
         "Real -33% move 27 days after the 2019-05-09 1:12 reverse split, in a full re-fetch."),
     BasisOverride(
-        "FCEL", date(2024, 11, 11), 0.03333, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 60.3),),
+        "FCEL", date(2024, 11, 11), 0.033532, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 60.3),),
         "1:30 reverse split effective 2024-11-11 (chain strike ladder 0.5-7 on 11-08, 1-12 from "
-        "11-12; no ThetaData row on 11-11); in FMP prices, missing from the calendar. "
-        "par/close 0.0333 over 2020-01..2024-11-08 (878 sessions), 0.9972 after."),
+        "11-12; no ThetaData row on 11-11); in FMP prices, missing from the calendar. r 0.0334 "
+        "over the 60 sessions before / 0.9949 over the 60 after = 0.033532 (the nominal 1/30 "
+        "= 0.03333 is within the plateau noise, residual 0.9941 over 2020-01..2024-11-08)."),
     BasisOverride(
         "GSK", date(2022, 7, 22), 0.8, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 46.92),),
         "The 4:5 share consolidation (with the Haleon demerger, 2022-07-18) is in the calendar "
         "but not in FMP's ADR closes: par/close 1.0000 over 2020-01..2022-07-18 (631 "
         "sessions) and 1.0007 after, i.e. no step; with the row the pre-event ratio was 1.25."),
     BasisOverride(
-        "QGEN", date(2024, 1, 30), 0.97, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 34.18),),
-        "Synthetic share repurchases (capital repayment + consolidation) listed as splits "
-        "0.97 / 0.9722 / 0.95 but not in FMP's closes: with all three the pre-2024 ratio is "
-        "1.109; without them par/close is 0.9942 (2020-01..2024-01-29), 1.0257 "
-        "(2024-01-31..2025-01-28) and 1.0033 (2025-01-30..2025-12-31). The capital repayment "
-        "also depresses the parity forward of an expiry spanning the event (Dec 2025 at "
-        "0.94-0.95, Jan 2025 at 0.96): a carry effect, not a basis."),
-    BasisOverride("QGEN", date(2025, 1, 29), 0.9722, KIND_EXCLUDE_CALENDAR_EVENT,
-                  ((_A2020, 34.18),), "See the 2024-01-30 entry."),
-    BasisOverride("QGEN", date(2026, 1, 8), 0.95, KIND_EXCLUDE_CALENDAR_EVENT,
-                  ((_A2020, 34.18),), "See the 2024-01-30 entry."),
+        "QGEN", date(2025, 1, 29), 0.9722, KIND_EXCLUDE_CALENDAR_EVENT,
+        ((_A2020, 34.18), (date(2024, 6, 3), 43.0)),
+        "Synthetic share repurchase listed as x35/36 = 0.9722, but FMP's closes step the other "
+        "way at it; replaced by the next entry. (The 2024-01-30 x0.97 row IS in the prices: "
+        "par/close 0.9957 over 2023-07..2024-01-29 vs 1.0263 over 2024-01-31..07-31, a step of "
+        "1.0307 = 1/0.97, so it stays.)"),
     BasisOverride(
-        "LBRDA", date(2025, 6, 16), 0.9391, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 125.19),),
+        "QGEN", date(2025, 1, 29), 1.019, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 34.18), (date(2024, 6, 3), 43.0)),
+        "Replacement of the x0.9722 row by the measured step: r (the 2024-01-30 x0.97 row in "
+        "the factor) 1.0253 (p10-p90 1.0152-1.0316) over the 60 sessions before / 1.0062 over "
+        "the 60 from it = 1.0190. Residual medians 1.0061 (2020-01..2025-01-28) and 1.0031 "
+        "(2025-01-29..2025-12-31)."),
+    BasisOverride(
+        "QGEN", date(2026, 1, 8), 0.95, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 34.18),),
+        "Synthetic share repurchase (capital repayment + consolidation) x0.95, not in FMP's "
+        "closes (par/close 1.0037 over 2025-02..11 and 1.0023 over 2026-01-16..03-31). The "
+        "capital repayment depresses the parity forward of the expiries spanning it (Dec 2025 "
+        "at 0.94-0.95): a carry effect, not a basis."),
+    BasisOverride(
+        "LBRDA", date(2025, 6, 16), 0.9374, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 125.19), (date(2025, 6, 24), 89.03)),
         "GCI Liberty spin (calendar row 2025-07-15 x1.067, kept): FMP's closes carry it only "
-        "from 2025-06-16 (ex-distribution prices a month early). par/close 1.0020 over "
-        "2020-01..2025-06-13 (522 sessions), 1.0697 over 06-16..07-11, 1.0025 after 07-17; "
-        "this x0.9391 (= 1.0020 / 1.067) cancels the row before 06-16."),
+        "from 2025-06-16 (ex-distribution prices a month early). r (the row in the factor) "
+        "0.9403 over the 60 sessions before 06-16 / 1.0031 over the 60 from it = 0.9374."),
     BasisOverride(
         "FTI", date(2021, 2, 16), 1.344, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 17.46),),
-        "Technip Energies spin: the calendar says x1.344, prices and chain carry x1.2216; "
+        "Technip Energies spin: the calendar says x1.344, prices and chain carry x1.2213; "
         "replaced by the next entry."),
     BasisOverride(
-        "FTI", date(2021, 2, 16), 1.2216, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 17.46),),
-        "Replacement of the x1.344 row: par/close 1.2216 (p10-p90 1.2176-1.2279) over "
-        "2020-01..2021-02-12 (222 sessions), 1.0019 after 2021-02-18."),
+        "FTI", date(2021, 2, 16), 1.2213, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 17.46),),
+        "Replacement of the x1.344 row: r 1.2221 (p10-p90 1.2184-1.2279) over the 60 sessions "
+        "before / 1.0006 over the 60 after = 1.2213."),
     BasisOverride(
-        "PHG", date(2022, 5, 13), 1.07836, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 44.87),),
+        "PHG", date(2022, 5, 13), 1.0769, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 44.87), (date(2022, 9, 7), 17.43)),
         "FMP's closes 2022-05-13..2023-05-10 sit on another basis than the calendar implies "
         "(FMP's close jumps exactly x1.0455 = the 2023-05-11 row on 2022-05-13, the 2022 "
-        "stock-dividend ex-date). par/close: 1.0803 over 2020-07..2022-05-04 (393 sessions), "
-        "1.0018 over 2022-05-25..2023-05-10, 1.0373 over 2023-05-11..2024-05-08, 1.0022 "
-        "after; rows 2020-06-30 x1.02 and 2024-05-09 x1.034 are right and stay. x1.07836 = "
-        "1.0803 / 1.0018."),
+        "stock-dividend ex-date); rows 2020-06-30 x1.02 and 2024-05-09 x1.034 are right and "
+        "stay. r 1.0428 over the 60 sessions before / 0.9684 over the 60 from it = 1.0769."),
     BasisOverride(
-        "PHG", date(2023, 5, 11), 1.045455, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 44.87),),
+        "PHG", date(2023, 5, 11), 1.045455, KIND_EXCLUDE_CALENDAR_EVENT,
+        ((_A2020, 44.87), (date(2022, 9, 7), 17.43)),
         "The x1.0455 row is not what the prices carry at 2023-05-11; replaced by the next "
         "entry."),
     BasisOverride(
-        "PHG", date(2023, 5, 11), 0.96886, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 44.87),),
-        "Replacement: x0.96886 = 1.0018 / 1.034 (the interval plateau over the kept 2024 "
-        "row)."),
+        "PHG", date(2023, 5, 11), 0.966, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 44.87), (date(2022, 9, 7), 17.43)),
+        "Replacement: r 0.9687 over the 60 sessions before / 1.0029 over the 60 from it = "
+        "0.9660."),
     BasisOverride(
-        "FLEX", date(2023, 12, 4), 0.72608, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 12.78),),
+        "FLEX", date(2023, 12, 4), 0.727, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 12.78), (date(2023, 12, 11), 18.77)),
         "Nextracker distribution (ex 2024-01-03): FMP's closes 2023-12-04..2024-01-02 are "
-        "ex-distribution prices (-29% on 12-04) while the chain trades regular way. par/close "
-        "1.0009 over 2020-01..2023-12-01 (960 sessions), 1.3785 (p10-p90 1.3752-1.3813) over "
-        "12-04..01-02, 1.0025 after. With the next entry: x0.72608 = 1.0009 / 1.3785."),
+        "ex-distribution prices (-29% on 12-04) while the chain trades regular way. r 1.0022 "
+        "over the 60 sessions before / 1.3785 (p10-p90 1.3752-1.3813) over the 20-session "
+        "stretch = 0.7270."),
     BasisOverride(
-        "FLEX", date(2024, 1, 3), 1.3785, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 12.78),),
-        "End of the ex-distribution stretch (see the 2023-12-04 entry): FMP back on the "
-        "chain's basis from 2024-01-03 (01-02 at 1.3782, 01-04 at 1.0019)."),
+        "FLEX", date(2024, 1, 3), 1.3748, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 12.78), (date(2023, 12, 11), 18.77)),
+        "End of the ex-distribution stretch: r 1.3785 over the stretch / 1.0027 over the 60 "
+        "sessions from 2024-01-03 = 1.3748."),
     BasisOverride(
-        "CMCSA", date(2025, 12, 8), 0.93627, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 45.37),),
+        "CMCSA", date(2025, 12, 8), 0.9364, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 45.37), (date(2025, 12, 15), 26.43)),
         "Versant spin-off: FMP's closes 2025-12-08..2026-01-02 are ex-distribution prices "
-        "(-8.6% on 12-08) while the chain trades regular way. par/close 1.0004 over "
-        "2020-01..2025-12-05 (1,489 sessions), 1.0685 (p10-p90 1.0678-1.0693) over "
-        "12-08..01-02, 1.0005 over 2026-01-06..03-31. x0.93627 = 1.0004 / 1.0685."),
+        "(-8.6% on 12-08) while the chain trades regular way. r 1.0006 over the 60 sessions "
+        "before / 1.0685 (p10-p90 1.0678-1.0693) over the 18-session stretch = 0.9364."),
     BasisOverride(
-        "CMCSA", date(2026, 1, 5), 1.0685, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 45.37),),
-        "End of the ex-distribution stretch (see the 2025-12-08 entry): 01-02 at 1.0685, "
-        "01-05 unevaluable, 01-06 at 0.9903."),
+        "CMCSA", date(2026, 1, 5), 1.068, KIND_ADD_PRICE_ADJUSTMENT,
+        ((_A2020, 45.37), (date(2025, 12, 15), 26.43)),
+        "End of the ex-distribution stretch: r 1.0685 over the stretch / 1.0005 over the 59 "
+        "sessions from 2026-01-05 (01-05 unevaluable, 01-06 at 0.9903) = 1.0680."),
     BasisOverride(
         "MARA", date(2017, 11, 22), 1.535211, KIND_ACKNOWLEDGE_JUMP, ((_A2020, 1.05),),
         "Real Nov-2017 crypto spike (+54% / +173% / -41%) 23-29 days after the 2017-10-30 "
@@ -280,6 +309,23 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
         "Real -33% move (auditor resignation) 29 days after the 2024-10-01 10:1 split, in a "
         "full re-fetch; guard clean in 2020-2025."),
 )
+
+
+def validate_overrides(entries: Tuple[BasisOverride, ...]) -> None:
+    """Refuse (``ValueError``) two entries of one symbol with the same event date AND kind: the
+    factor would silently apply both (or the second acknowledgement would shadow the first). A
+    REPLACEMENT -- an exclusion and an add on one date -- is two kinds and stays legal."""
+    seen = {}
+    for e in entries:
+        k = (e.symbol.upper(), e.event_date, e.kind)
+        if k in seen:
+            raise ValueError(
+                f"split-basis overrides: duplicate {e.kind} for {e.symbol} on "
+                f"{e.event_date.isoformat()} (x{seen[k]:g} and x{e.ratio:g}); keep one entry")
+        seen[k] = float(e.ratio)
+
+
+validate_overrides(BASIS_OVERRIDES)
 
 
 def overrides_for(symbol: str, overrides: Optional[Tuple[BasisOverride, ...]] = None

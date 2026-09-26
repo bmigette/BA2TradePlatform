@@ -22,7 +22,8 @@ Part 2 (measured on the forced full re-fetch of 2026-09-25; interval medians of 
   FCEL  add the missing 1:30 of 2024-11-11 (0.0333 before, 0.9972 after); acknowledge
         2019-06-05 x0.6667.
   GSK   exclude the 2022-07-22 4:5 row (1.0000 before, 1.0007 after: no step at all).
-  QGEN  exclude the three synthetic-buyback rows (0.9942 / 1.0257 / 1.0033).
+  QGEN  the 2024-01-30 x0.97 row IS in the prices (kept); the 2025-01-29 x0.9722 row is
+        replaced by the measured x1.019; the 2026-01-08 x0.95 row stays excluded.
   LBRDA FMP carries the 2025-07-15 x1.067 row only from 2025-06-16: x0.9391 on 06-16.
   FTI   replace the 2021-02-16 x1.344 row by x1.2216 (1.2216 before, 1.0019 after).
   PHG   2022-05-13 x1.07836 and the 2023-05-11 row replaced by x0.96886 (plateaus 1.0803,
@@ -60,40 +61,53 @@ ADD, EXCL, ACK = (ovr.KIND_ADD_PRICE_ADJUSTMENT, ovr.KIND_EXCLUDE_CALENDAR_EVENT
                   ovr.KIND_ACKNOWLEDGE_JUMP)
 A2020 = date(2020, 1, 2)
 
-#: symbol -> [(event_date, ratio, kind)] in event-date order.
+#: symbol -> [(event_date, ratio, kind, anchors)]. Ratios: the PLATEAU CONVENTION of
+#: split_basis_overrides (median r over <= 60 evaluable sessions before / from the event).
+def _a(*extra):
+    return lambda base: ((A2020, base),) + tuple(extra)
+
+
+_1 = _a()
 EXPECTED = {
-    "TRP": [(date(2024, 10, 2), 1.1007, ADD)],
-    "MMM": [(date(2024, 4, 1), 1.1971, ADD)],
-    "SKM": [(date(2021, 12, 27), 1.6517, ADD)],
-    "MTCH": [(date(2020, 7, 1), 3.502, EXCL)],
-    "AMC": [(date(2022, 8, 22), 2.0, EXCL), (date(2023, 8, 14), 0.644487, ACK),
-            (date(2023, 9, 6), 0.631965, ACK)],
-    "ARWR": [(date(2011, 11, 10), 1.401869, ACK)],
-    "ENLT": [(date(2023, 2, 10), 0.682692, ACK)],
-    "FCEL": [(date(2019, 6, 5), 0.666667, ACK), (date(2024, 11, 11), 0.03333, ADD)],
-    "GSK": [(date(2022, 7, 22), 0.8, EXCL)],
-    "QGEN": [(date(2024, 1, 30), 0.97, EXCL), (date(2025, 1, 29), 0.9722, EXCL),
-             (date(2026, 1, 8), 0.95, EXCL)],
-    "LBRDA": [(date(2025, 6, 16), 0.9391, ADD)],
-    "FTI": [(date(2021, 2, 16), 1.344, EXCL), (date(2021, 2, 16), 1.2216, ADD)],
-    "PHG": [(date(2022, 5, 13), 1.07836, ADD), (date(2023, 5, 11), 1.045455, EXCL),
-            (date(2023, 5, 11), 0.96886, ADD)],
-    "FLEX": [(date(2023, 12, 4), 0.72608, ADD), (date(2024, 1, 3), 1.3785, ADD)],
-    "CMCSA": [(date(2025, 12, 8), 0.93627, ADD), (date(2026, 1, 5), 1.0685, ADD)],
-    "MARA": [(date(2017, 11, 22), 1.535211, ACK), (date(2017, 11, 24), 2.729358, ACK),
-             (date(2017, 11, 28), 0.591398, ACK), (date(2019, 4, 10), 1.424354, ACK)],
-    "SMCI": [(date(2024, 10, 30), 0.673249, ACK)],
+    "TRP": [(date(2024, 10, 2), 1.098, ADD, _1)],
+    "MMM": [(date(2024, 4, 1), 1.1961, ADD, _1)],
+    "SKM": [(date(2021, 12, 27), 1.6555, ADD, _a((date(2021, 12, 15), 26.9)))],
+    "MTCH": [(date(2020, 7, 1), 3.502, EXCL, _1)],
+    "AMC": [(date(2022, 8, 22), 2.0, EXCL, _1), (date(2023, 8, 14), 0.644487, ACK, _1),
+            (date(2023, 9, 6), 0.631965, ACK, _1)],
+    "ARWR": [(date(2011, 11, 10), 1.401869, ACK, _1)],
+    "ENLT": [(date(2023, 2, 10), 0.682692, ACK, lambda base: ((date(2023, 2, 10), 17.75),))],
+    "FCEL": [(date(2019, 6, 5), 0.666667, ACK, _1), (date(2024, 11, 11), 0.033532, ADD, _1)],
+    "GSK": [(date(2022, 7, 22), 0.8, EXCL, _1)],
+    "QGEN": [(date(2025, 1, 29), 0.9722, EXCL, _a((date(2024, 6, 3), 43.0))),
+             (date(2025, 1, 29), 1.019, ADD, _a((date(2024, 6, 3), 43.0))),
+             (date(2026, 1, 8), 0.95, EXCL, _1)],
+    "LBRDA": [(date(2025, 6, 16), 0.9374, ADD, _a((date(2025, 6, 24), 89.03)))],
+    "FTI": [(date(2021, 2, 16), 1.344, EXCL, _1), (date(2021, 2, 16), 1.2213, ADD, _1)],
+    "PHG": [(date(2022, 5, 13), 1.0769, ADD, _a((date(2022, 9, 7), 17.43))),
+            (date(2023, 5, 11), 1.045455, EXCL, _a((date(2022, 9, 7), 17.43))),
+            (date(2023, 5, 11), 0.966, ADD, _a((date(2022, 9, 7), 17.43)))],
+    "FLEX": [(date(2023, 12, 4), 0.727, ADD, _a((date(2023, 12, 11), 18.77))),
+             (date(2024, 1, 3), 1.3748, ADD, _a((date(2023, 12, 11), 18.77)))],
+    "CMCSA": [(date(2025, 12, 8), 0.9364, ADD, _a((date(2025, 12, 15), 26.43))),
+              (date(2026, 1, 5), 1.068, ADD, _a((date(2025, 12, 15), 26.43)))],
+    "MARA": [(date(2017, 11, 22), 1.535211, ACK, _1), (date(2017, 11, 24), 2.729358, ACK, _1),
+             (date(2017, 11, 28), 0.591398, ACK, _1), (date(2019, 4, 10), 1.424354, ACK, _1)],
+    "SMCI": [(date(2024, 10, 30), 0.673249, ACK, _1)],
 }
-#: The FMP close each symbol's entries were measured on (2020-01-02 unless stated).
+#: The FMP close at 2020-01-02 each symbol's entries were measured on (ENLT: its own anchor).
 ANCHORS = {"TRP": 48.0, "MMM": 150.49, "SKM": 22.5, "MTCH": 84.19, "AMC": 74.6, "ARWR": 63.12,
-           "ENLT": (date(2023, 2, 10), 17.75), "FCEL": 60.3, "GSK": 46.92, "QGEN": 34.18,
+           "ENLT": 17.75, "FCEL": 60.3, "GSK": 46.92, "QGEN": 34.18,
            "LBRDA": 125.19, "FTI": 17.46, "PHG": 44.87, "FLEX": 12.78, "CMCSA": 45.37,
            "MARA": 1.05, "SMCI": 2.36}
+#: A stretch override carries a second anchor inside its stretch (review 2026-09-26).
+STRETCH = {"SKM": date(2021, 12, 15), "LBRDA": date(2025, 6, 24), "PHG": date(2022, 9, 7),
+           "FLEX": date(2023, 12, 11), "CMCSA": date(2025, 12, 15), "QGEN": date(2024, 6, 3)}
 
 
-def _anchor(sym):
-    a = ANCHORS[sym]
-    return a if isinstance(a, tuple) else (A2020, a)
+def _anchors(sym):
+    """Every distinct anchor of the symbol's shipped entries."""
+    return sorted({a for _d, _r, _k, fa in EXPECTED[sym] for a in fa(ANCHORS[sym])})
 
 
 def _cs(y, m, d, r):
@@ -160,7 +174,7 @@ SWEEP = [
     ("GSK", date(2022, 6, 1), 43.050, 43.040),
     ("GSK", date(2023, 6, 1), 33.850, 33.800),
     ("QGEN", date(2020, 6, 1), 43.575, 43.990),
-    ("QGEN", date(2024, 6, 3), 44.225, 43.000),     # the 2024 plateau: 2.6-2.9% high
+    ("QGEN", date(2024, 6, 3), 44.225, 43.000),     # between the kept 0.97 and the 2025 step
     ("QGEN", date(2025, 6, 2), 45.050, 44.900),
     ("LBRDA", date(2021, 6, 1), 160.800, 159.830),
     ("LBRDA", date(2025, 6, 24), 95.350, 89.030),   # the early ex-distribution stretch
@@ -178,8 +192,8 @@ SWEEP = [
     ("CMCSA", date(2020, 6, 1), 40.195, 40.180),
     ("CMCSA", date(2025, 12, 15), 28.250, 26.430),  # the ex-distribution stretch
 ]
-#: QGEN: the 2024 plateau sits 2.6% high; AMC: hard-to-borrow, parity runs 1.5-4% under the spot.
-TOLERANCE = {"QGEN": 0.03, "AMC": 0.03}
+#: AMC: hard-to-borrow through the APE period, parity runs 1.5-4% under the spot.
+TOLERANCE = {"AMC": 0.03}
 #: A sweep session the unfixed basis puts beyond 5% (the sessions an override exists for).
 OFF_WITHOUT = {("TRP", date(2020, 6, 1)), ("TRP", date(2024, 9, 3)), ("MMM", date(2022, 6, 1)),
                ("SKM", date(2020, 7, 1)), ("SKM", date(2021, 12, 15)), ("MTCH", date(2020, 6, 1)),
@@ -194,12 +208,16 @@ def _no_ack(sym):
     return tuple(e for e in ovr.overrides_for(sym) if e.kind != ACK)
 
 
-def _resolve(sym, overrides=None, anchor_close=None):
+def _resolve(sym, overrides=None, scale=1.0):
     cal, first = CALENDARS[sym]
     days = np.arange(np.datetime64(first), np.datetime64(LAST) + 1, dtype="datetime64[D]")
     days = days[np.is_busday(days)]
-    a_day, a_close = _anchor(sym)
-    px = np.full(len(days), float(a_close if anchor_close is None else anchor_close))
+    # Geometric ramp through the anchors (flat outside them): every anchor is hit exactly and no
+    # one-day move is split-sized, so the mixed-basis scan sees an ordinary series.
+    anchors = _anchors(sym)
+    xs = np.array([np.datetime64(d).astype("datetime64[D]").astype(np.int64) for d, _c in anchors])
+    ys = np.log([c * scale for _d, c in anchors])
+    px = np.exp(np.interp(days.astype(np.int64), xs, ys))
     marker = {"fetched_on_utc": "2026-09-25"} if sym in REFETCHED else None
     return resolve_symbol_split_basis(sym, days, px, px, px, px, cal, marker=marker,
                                       overrides=_no_ack(sym) if overrides is None else overrides)
@@ -210,16 +228,37 @@ def test_the_module_under_test_is_the_worktree_copy():
 
 
 def test_the_version_was_bumped_for_this_edit():
-    assert ovr.OVERRIDES_VERSION >= "2026-09-25.2"
+    assert ovr.OVERRIDES_VERSION >= "2026-09-26.1"
 
 
 @pytest.mark.parametrize("sym", sorted(EXPECTED))
 def test_the_shipped_entries_are_the_measured_ones(sym):
-    got = [(e.event_date, e.ratio, e.kind) for e in ovr.overrides_for(sym)]
-    assert sorted(got, key=lambda g: (g[0], g[2])) == sorted(EXPECTED[sym], key=lambda g: (g[0], g[2]))
+    got = sorted(((e.event_date, e.kind), (e.ratio, e.anchors)) for e in ovr.overrides_for(sym))
+    want = sorted(((d, k), (r, fa(ANCHORS[sym]))) for d, r, k, fa in EXPECTED[sym])
+    assert got == want
+    assert all(e.evidence for e in ovr.overrides_for(sym))
+
+
+@pytest.mark.parametrize("sym", sorted(STRETCH))
+def test_a_stretch_override_is_anchored_inside_its_stretch(sym):
+    inside = [e for e in ovr.overrides_for(sym) if e.kind == ADD
+              and any(d == STRETCH[sym] for d, _c in e.anchors)]
+    assert inside, sym
     for e in ovr.overrides_for(sym):
-        assert e.anchors == (_anchor(sym),)
-        assert e.evidence
+        if e.kind == ADD:
+            assert len(e.anchors) >= 2, (sym, e.event_date)
+
+
+def test_a_vendor_fix_of_only_the_stretch_refuses():
+    """FLEX: FMP re-states 2023-12-04..2024-01-02 on the chain's basis while 2020 stays: the
+    brackets would double count, and the stretch anchor refuses the symbol."""
+    with pytest.raises(SplitBasisRefused, match="2023-12-11"):
+        cal, first = CALENDARS["FLEX"]
+        days = np.arange(np.datetime64(first), np.datetime64(LAST) + 1, dtype="datetime64[D]")
+        days = days[np.is_busday(days)]
+        px = np.full(len(days), 12.78)
+        px[days == np.datetime64(date(2023, 12, 11))] = 18.77 * 1.3785
+        resolve_symbol_split_basis("FLEX", days, px, px, px, px, cal, overrides=_no_ack("FLEX"))
 
 
 @pytest.mark.parametrize("sym,day,par,fmp", SWEEP)
@@ -236,8 +275,8 @@ def test_without_the_overrides_the_session_is_off(sym, day, par, fmp):
 
 def test_skm_keeps_its_calendar_row_and_adds_the_return_leg():
     b = _resolve("SKM")
-    assert b.factor(date(2021, 11, 29)) == pytest.approx(0.607 * 1.6517)
-    assert b.factor(date(2021, 11, 30)) == pytest.approx(1.6517)
+    assert b.factor(date(2021, 11, 29)) == pytest.approx(0.607 * 1.6555)
+    assert b.factor(date(2021, 11, 30)) == pytest.approx(1.6555)
     assert b.factor(date(2021, 12, 27)) == 1.0
 
 
@@ -249,27 +288,34 @@ def test_mtch_excludes_only_the_separation_row():
 
 def test_fti_and_phg_replace_the_vendor_ratio_on_its_own_date():
     fti = _resolve("FTI")
-    assert fti.factor(date(2021, 2, 12)) == pytest.approx(1.2216)
+    assert fti.factor(date(2021, 2, 12)) == pytest.approx(1.2213)
     assert fti.factor(date(2021, 2, 16)) == 1.0
     phg = _resolve("PHG")
-    assert phg.factor(date(2021, 6, 1)) == pytest.approx(1.07836 * 0.96886 * 1.034)
-    assert phg.factor(date(2022, 9, 7)) == pytest.approx(0.96886 * 1.034)
+    assert phg.factor(date(2021, 6, 1)) == pytest.approx(1.0769 * 0.966 * 1.034)
+    assert phg.factor(date(2022, 9, 7)) == pytest.approx(0.966 * 1.034)
     assert phg.factor(date(2023, 9, 7)) == pytest.approx(1.034)
+
+
+def test_qgen_keeps_the_2024_row_and_replaces_the_2025_one():
+    b = _resolve("QGEN")
+    assert b.factor(date(2024, 1, 29)) == pytest.approx(0.97 * 1.019)
+    assert b.factor(date(2024, 6, 3)) == pytest.approx(1.019)
+    assert b.factor(date(2025, 6, 2)) == 1.0
 
 
 def test_flex_and_cmcsa_bracket_the_ex_distribution_stretch():
     flex = _resolve("FLEX")
-    assert flex.factor(date(2023, 12, 1)) == pytest.approx(0.72608 * 1.3785)
-    assert flex.factor(date(2023, 12, 4)) == pytest.approx(1.3785)
+    assert flex.factor(date(2023, 12, 1)) == pytest.approx(0.727 * 1.3748)
+    assert flex.factor(date(2023, 12, 4)) == pytest.approx(1.3748)
     assert flex.factor(date(2024, 1, 3)) == 1.0
     cmcsa = _resolve("CMCSA")
-    assert cmcsa.factor(date(2025, 12, 5)) == pytest.approx(0.93627 * 1.0685)
-    assert cmcsa.factor(date(2025, 12, 31)) == pytest.approx(1.0685)
+    assert cmcsa.factor(date(2025, 12, 5)) == pytest.approx(0.9364 * 1.068)
+    assert cmcsa.factor(date(2025, 12, 31)) == pytest.approx(1.068)
 
 
 def test_a_rebased_file_refuses():
     with pytest.raises(SplitBasisRefused, match="MMM"):
-        _resolve("MMM", anchor_close=150.49 * 1.0102)
+        _resolve("MMM", scale=1.0102)
 
 
 # ---- the machine's real cache (read-only; skipped where absent) ----------------------------

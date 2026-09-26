@@ -402,3 +402,25 @@ def test_an_add_on_a_calendar_date_that_is_not_excluded_still_refuses():
     with pytest.raises(SplitBasisRefused, match="double count"):
         resolve_symbol_split_basis("XYZ", days, px, px, px, px, cal, marker={"fetched_on_utc": "2025-01-02"},
                                    overrides=_replace(1.1, excl=False))
+
+
+# ---- duplicates (review 2026-09-26) -------------------------------------------------------------
+def _dup(kind=ovr.KIND_ADD_PRICE_ADJUSTMENT, r2=1.05):
+    a = ((date(2024, 1, 2), 100.0),)
+    return (ovr.BasisOverride("XYZ", date(2024, 6, 3), 1.05, kind, a, "one"),
+            ovr.BasisOverride("XYZ", date(2024, 6, 3), r2, kind, a, "two"))
+
+
+def test_duplicate_entries_for_one_symbol_date_and_kind_are_refused():
+    with pytest.raises(ValueError, match="duplicate"):
+        ovr.validate_overrides(_dup())
+    with pytest.raises(ValueError, match="duplicate"):
+        ovr.validate_overrides(_dup(r2=1.07))          # a different ratio is still a duplicate
+    days, px = _flat_series(date(2024, 1, 2), date(2024, 12, 31), {date(2024, 1, 2): 100.0})
+    with pytest.raises(SplitBasisRefused, match="duplicate"):
+        resolve_symbol_split_basis("XYZ", days, px, px, px, px, [], overrides=_dup())
+
+
+def test_a_replacement_is_not_a_duplicate_and_the_shipped_table_validates():
+    ovr.validate_overrides(_replace(1.1))
+    ovr.validate_overrides(ovr.BASIS_OVERRIDES)
