@@ -86,11 +86,19 @@ class MacroService:
         Initialize MacroService.
 
         Args:
-            api_key: FRED API key (if None, uses FRED_API_KEY env var)
+            api_key: FRED API key. None -> the ONE shared resolver
+                (``ba2_common.core.fred_api_key``: env ``FRED_API_KEY``, else the AppSetting
+                ``fred_api_key``).
+
+        Raises:
+            FredApiKeyMissing: no key is configured. This used to log a warning and return
+                empty frames, which became all-NaN macro columns in the dataset.
         """
-        self.api_key = api_key or os.getenv('FRED_API_KEY')
-        if not self.api_key:
-            logger.warning("FRED API key not set. Macro data will use fallback values.")
+        if api_key:
+            self.api_key = api_key
+        else:
+            from ba2_common.core.fred_api_key import require_fred_api_key
+            self.api_key = require_fred_api_key("macro dataset features (MacroService)")
 
         # Secondary re-source seam (Phase 5, Task 6), parallel to the OHLCV seam:
         # when FEATURES_SOURCE=ba2_providers is explicitly selected, macro series are
@@ -137,39 +145,32 @@ class MacroService:
         Returns:
             DataFrame with Date and value columns
         """
-        if not self.api_key:
-            logger.warning(f"No FRED API key, returning empty data for {series_id}")
+        # A failed request RAISES. It used to be logged and turned into an empty frame, which
+        # the dataset builders then filled with NaN -- a silent gap in a training set.
+        params = {
+            'series_id': series_id,
+            'api_key': self.api_key,
+            'file_type': 'json',
+            'observation_start': start_date.strftime('%Y-%m-%d'),
+            'observation_end': end_date.strftime('%Y-%m-%d'),
+            'sort_order': 'asc'
+        }
+
+        response = requests.get(self.FRED_API_URL, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        observations = data.get('observations', [])
+        if not observations:
             return pd.DataFrame(columns=['Date', 'value'])
 
-        try:
-            params = {
-                'series_id': series_id,
-                'api_key': self.api_key,
-                'file_type': 'json',
-                'observation_start': start_date.strftime('%Y-%m-%d'),
-                'observation_end': end_date.strftime('%Y-%m-%d'),
-                'sort_order': 'asc'
-            }
+        df = pd.DataFrame(observations)
+        df['Date'] = pd.to_datetime(df['date'])
+        df['value'] = pd.to_numeric(df['value'], errors='coerce')
+        df = df[['Date', 'value']].dropna()
 
-            response = requests.get(self.FRED_API_URL, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-
-            observations = data.get('observations', [])
-            if not observations:
-                return pd.DataFrame(columns=['Date', 'value'])
-
-            df = pd.DataFrame(observations)
-            df['Date'] = pd.to_datetime(df['date'])
-            df['value'] = pd.to_numeric(df['value'], errors='coerce')
-            df = df[['Date', 'value']].dropna()
-
-            logger.info(f"Fetched {len(df)} observations for {series_id}")
-            return df
-
-        except Exception as e:
-            logger.error(f"Error fetching FRED data for {series_id}: {e}")
-            return pd.DataFrame(columns=['Date', 'value'])
+        logger.info(f"Fetched {len(df)} observations for {series_id}")
+        return df
 
     def get_macro_data(
         self,

@@ -223,8 +223,8 @@ def _fill_cache_on_the_live_path(sid: str, path: str) -> bool:
     analysis dies.
     """
     try:
-        from ba2_common.config import get_app_setting
-        api_key = get_app_setting("fred_api_key")
+        from ba2_common.core.fred_api_key import resolve_fred_api_key
+        api_key = resolve_fred_api_key()
         if not api_key:
             logger.error(
                 "FRED series %s is missing and 'fred_api_key' is not configured, so it cannot "

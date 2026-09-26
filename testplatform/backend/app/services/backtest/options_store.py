@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 import pathlib
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, Optional
 
 SQLITE = "sqlite"
@@ -65,13 +65,20 @@ _STORE_DIRS = {TASTYTRADE: None, THETADATA: "ThetaDataOptionsProvider"}
 #: reader can never drift from it.
 _PARQUET_DIR_ENV = "BACKTEST_OPTIONS_PARQUET_ROOT"
 
-#: The ONE declared default for the Black-Scholes rate, at the wiring boundary rather than in
-#: the reader (which requires it explicitly). Taken from the cache BUILDER's own fallback so
-#: greeks derived at read time from the parquet and greeks baked into the sqlite at build time
-#: are inverted against the same assumption. A backtest is hermetic, so there is no per-day
-#: FRED series here the way ``fetch_options.build_cache`` has one — rho is the smallest greek
-#: for short-dated equity options, which is why the builder itself tolerates a flat rate.
+#: The Black-Scholes risk-free rate of an options run. NOT a flat default any more: every
+#: options run reads the as-of 3-month Treasury (FRED DGS3MO) from the FRED disk cache, the
+#: same series the options cache BUILDER inverts the sqlite store's greeks with
+#: (``fetch_options.build_cache``). See ``resolve_options_risk_free_rate``. This env var is the
+#: one deliberate override left (besides the run config's ``options_risk_free_rate``), and a
+#: run that uses it records so in its results. Its NAME is part of the option grids'
+#: discovery identity digest (``tools/run_options_matrix.py``): do not rename it.
 _RATE_ENV = "BACKTEST_OPTIONS_RISK_FREE_RATE"
+
+#: The flat rate EVERY options run before the as-of FRED rate (2026-09-26) priced with -- it
+#: was the unconditional default. Used ONLY to reproduce those runs' read-time greeks for
+#: display (``parquet_contract_detail``), for a run whose results carry no
+#: ``options_risk_free_rate_source``. Never a default for a new run.
+LEGACY_FLAT_RISK_FREE_RATE = 0.045
 
 
 def resolve_options_store(config: Optional[Dict[str, Any]] = None) -> str:
@@ -126,13 +133,66 @@ def default_options_parquet_root(store: str = TASTYTRADE) -> str:
     return str(pathlib.Path(cfg.CACHE_FOLDER) / provider_dir)
 
 
-def default_options_risk_free_rate() -> float:
-    """Flat risk-free rate for read-time Black-Scholes inversion. See ``_RATE_ENV``."""
-    explicit = os.environ.get(_RATE_ENV)
-    if explicit:
-        return float(explicit)
-    from .fetch_options import _FALLBACK_RISK_FREE_RATE
-    return float(_FALLBACK_RISK_FREE_RATE)
+def resolve_options_risk_free_rate(config: Dict[str, Any]):
+    """The run's ``RiskFreeRate`` (``ba2_providers.macro.risk_free_rate``). No fallback.
+
+    Resolution, most specific first:
+      1. ``config["options_risk_free_rate"]`` -- an explicit constant the run config states.
+      2. ``BACKTEST_OPTIONS_RISK_FREE_RATE`` -- an explicit constant for a whole worker/job.
+      3. The as-of FRED DGS3MO series over ``[start_date - warmup_days, end_date]``, read from
+         the FRED disk cache ONLY. Refuses (``RiskFreeRateUnavailable``) when the cache file
+         is missing or does not cover that window -- before the first bar.
+
+    The two explicit forms are recorded as such (``source="explicit"`` plus their origin) in
+    the run's results by ``apply_risk_free_rate_record``; nothing picks a rate silently.
+
+    This used to return a flat 4.5% unless the env var was set, and nothing set it: every
+    option backtest before this change priced 2020-21 (bills at ~0.1%) and 2023-24 (~5.3%)
+    at the same 4.5%.
+    """
+    from ba2_providers.macro.risk_free_rate import explicit_rate, fred_dgs3mo_rate
+
+    # ``.get`` is correct here: this key is an OPTIONAL explicit override, and its absence
+    # means "use the series", not "use a default number".
+    explicit = config.get("options_risk_free_rate")
+    if explicit is not None:
+        return explicit_rate(explicit, origin="config:options_risk_free_rate")
+    env = os.environ.get(_RATE_ENV)
+    if env:
+        return explicit_rate(env, origin=f"env:{_RATE_ENV}")
+    missing = [k for k in ("start_date", "end_date") if config.get(k) is None]
+    if missing:
+        raise ValueError(
+            f"an options run needs {missing} to read its risk-free rate (FRED DGS3MO over the "
+            f"run window); they are absent from this run config")
+    warmup_days = int(config.get("warmup_days") or 0)
+    start = _as_date(config["start_date"]) - timedelta(days=warmup_days)
+    return fred_dgs3mo_rate(start, _as_date(config["end_date"]))
+
+
+def _as_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def apply_risk_free_rate_record(results: Dict[str, Any], account: Any) -> None:
+    """Stamp which risk-free rate an OPTIONS run priced with on ``results``.
+
+    ``options_risk_free_rate_source`` = ``RiskFreeRate.describe()``: ``source`` is
+    ``"fred-dgs3mo"`` (the as-of series, with its window and min/max/mean) or ``"explicit"``
+    (with the constant and whether the run config or the env chose it). An equity run has no
+    option reader and its results are left byte-identical.
+    """
+    if not getattr(account, "has_options_provider", False):
+        return
+    source = account.options_risk_free_rate_source()
+    if source is None:
+        raise RuntimeError("an options run's reader carries no risk-free rate source; "
+                           "build it through options_store.build_options_provider")
+    results["options_risk_free_rate_source"] = source.describe()
 
 
 def price_source_spot(price_source: Any, split_basis: Any = None
@@ -237,6 +297,10 @@ def build_options_provider(config: Dict[str, Any], *, price_source: Any, split_b
     if not config.get("options_cache_db"):
         return None
     store = resolve_options_store(config)
+    # ONE rate object per run, held by the reader: the parquet reader inverts every bar with
+    # it and ``BacktestAccount._bs_mark_rate`` marks barless lots with the SAME object
+    # (``risk_free_rate_source``), so the inversion and the mark agree on every bar.
+    rate = resolve_options_risk_free_rate(config)
     if store == SQLITE:
         # NO E4 GUARD on this store, and its greeks are NOT in the as-traded basis: they were
         # inverted at BUILD time (fetch_options) against the FMP close of the day, which is
@@ -247,13 +311,12 @@ def build_options_provider(config: Dict[str, Any], *, price_source: Any, split_b
         # number on record came from this path. Use the thetadata store for split-affected
         # universes (plan Part E; the stage-1 grid reads thetadata).
         from .options_provider import HistoricalOptionsProvider
-        return HistoricalOptionsProvider(config["options_cache_db"])
+        return HistoricalOptionsProvider(config["options_cache_db"], risk_free_rate=rate)
     from .parquet_options_provider import ParquetOptionsProvider
     root = config.get("options_parquet_root") or default_options_parquet_root(store)
-    rate = config.get("options_risk_free_rate")
     return ParquetOptionsProvider(
         root, spot_source=price_source_spot(price_source, split_basis),
-        risk_free_rate=default_options_risk_free_rate() if rate is None else float(rate),
+        risk_free_rate=rate,
         spot_scope=spot_scope(config, split_basis),
         basis_guard=split_basis is not None,
         basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis))

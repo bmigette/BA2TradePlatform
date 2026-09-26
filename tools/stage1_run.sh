@@ -290,6 +290,20 @@ if [ -n "$STAGE1_ROBUST" ]; then
   esac
 fi
 
+# RISK-FREE RATE (2026-09-26). Every option backtest inverts its bars and prices its barless
+# marks at the as-of 3-month Treasury (FRED DGS3MO), read CACHE-ONLY from
+# $BA2_HOME/common/cache/fred/DGS3MO.json (CACHE_FOLDER/fred), and REFUSES to start without it.
+# This host needs that file synced (it needs no FRED key). Checked here, before any job, rather
+# than discovered by every trial of job 1. Not a digest input: job names are unchanged.
+RATE_CHECK=(/opt/ba2worker/ba2-venvs/test/bin/python tools/refresh_fred_cache.py   --check-rate-window "${STAGE1_START:-2020-01-01}" "${STAGE1_END:-2025-12-31}")
+case " $* " in
+  *" --dry-run "*) echo "stage1_run.sh: risk-free-rate preflight (cache only): ${RATE_CHECK[*]}" ;;
+  *) "${RATE_CHECK[@]}" || {
+       echo "stage1_run.sh: the FRED DGS3MO cache does not cover the window -- sync" >&2
+       echo "<CACHE_FOLDER>/fred/DGS3MO.json from a host that ran tools/refresh_fred_cache.py." >&2
+       exit 1; } ;;
+esac
+
 # ORDER-TIME SIZING (plan 2026-09-24 Task 11): --option-size-within-fill-volume cuts every OPENING
 # option order to what the backtest fill engine's 10%-of-bar-volume cap can fill (read on the
 # decision bar; a structure by its most constrained leg). Without it an oversized order simply

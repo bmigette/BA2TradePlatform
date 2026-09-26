@@ -204,7 +204,8 @@ def _harness(*, symbol, underlying_rows, chain_rows, bar_rows, entry_rules, exit
     cache = OptionsHistoryCache(cache_db)
     cache.write_chain_rows(symbol, start.date().isoformat(), chain_rows)
     cache.write_bar_rows(bar_rows)
-    provider = HistoricalOptionsProvider(cache_db)
+    # The run's risk-free rate, held by the reader for the account's Black-Scholes marks.
+    provider = HistoricalOptionsProvider(cache_db, risk_free_rate=0.045)
 
     resolver = wire_backtest_seams()
     ctx = backtest_trading_db(f"grid2-{account_id}")
@@ -509,7 +510,6 @@ def test_o_leapc_is_marked_on_bars_the_chain_does_not_cover():
         # carries (spot 100, strike 80, iv 0.30, r 0). The floor here is 20.00 and BS is
         # ~23.7, so the two are far enough apart that the account's own net liquidating
         # value tells them apart at 2 contracts.
-        from app.services.backtest.options_store import default_options_risk_free_rate
         from ba2_common.core.option_bs import bs_price
         pos = account.get_option_positions()[0]
         probe = barless[len(barless) // 2]
@@ -518,7 +518,8 @@ def test_o_leapc_is_marked_on_bars_the_chain_does_not_cover():
         dte = (_LEAP_EXPIRY - probe_day).days
         # The SAME rate seam the mark path uses (``BacktestAccount._bs_mark_rate``), not a
         # literal: a rate written twice is a rate that can disagree with itself.
-        bs = bs_price(100.0, 80.0, dte, 0.30, "call", r=default_options_risk_free_rate())
+        bs = bs_price(100.0, 80.0, dte, 0.30, "call",
+                      r=account.options_risk_free_rate_source().rate_on(probe_day))
         intrinsic = 20.0
         mv = float(probe["net_liquidating_value"]) - float(probe["cash_balance"])
         per_contract = mv / (pos.quantity * 100.0)

@@ -130,7 +130,8 @@ def engine_run(tmp_path):
     # is ``ps`` itself, so the greeks are inverted against the run's own underlying closes.
     provider = build_options_provider(
         {"options_cache_db": str(tmp_path / "unused.sqlite"),
-         "options_store": "parquet", "options_parquet_root": root},
+         "options_store": "parquet", "options_parquet_root": root,
+         "options_risk_free_rate": 0.045},
         price_source=ps)
 
     account = BacktestAccount(account_id, ps, CFG, options_provider=provider)

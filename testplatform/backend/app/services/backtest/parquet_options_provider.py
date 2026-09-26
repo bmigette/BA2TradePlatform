@@ -75,8 +75,10 @@ note). ``spot_source(underlying, bar_date) -> Optional[float]`` is supplied by t
 closes are the same FMP daily bars ``fetch_options`` inverted the sqlite store's greeks from.
 It is only ever asked for the date of a bar that is ALREADY clamped to <= the engine clock,
 so it cannot introduce lookahead. ``risk_free_rate`` is likewise a required constructor
-argument — a pricing assumption, not data — with the single declared default living at the
-wiring boundary.
+argument: the run's ``RiskFreeRate`` (the as-of FRED DGS3MO series, or an explicit constant
+the run chose and records), resolved at the wiring boundary
+(``options_store.resolve_options_risk_free_rate``) with NO default. Each bar is inverted at
+the rate of its OWN date.
 
 THE SPOT SOURCE LIVES ON THE PROVIDER, NOT IN THE CACHE. It is a closure over the RUN's
 ``AsOfPriceSource`` (``options_store.price_source_spot``), and that price source owns the
@@ -715,10 +717,14 @@ class _Underlying:
         "_g_memo", "_g_order", "_bar_memo", "_bar_order", "_spot_cache",
     )
 
-    def __init__(self, raw: "_RawUnderlying", rate: float):
+    def __init__(self, raw: "_RawUnderlying", rate: Any):
         self.raw = raw
         self.underlying = raw.underlying
-        self.rate = float(rate)
+        #: The run's ``RiskFreeRate``: ``rate_on(bar ordinal)`` is the as-of rate of the bar's
+        #: OWN date (FRED DGS3MO, or an explicit constant). Keyed by ``rate.identity``. A plain
+        #: number is taken as an explicit constant (fixture callers).
+        from ba2_providers.macro.risk_free_rate import as_risk_free_rate
+        self.rate = as_risk_free_rate(rate, origin="_Underlying(rate=...)")
 
         n = raw.n_rows
         self.n_rows = n
@@ -865,7 +871,7 @@ class _Underlying:
             t_days = self.raw.c_expiry_ord_l[ci] - bar_ord
             out = compute_iv_and_greeks(
                 None if px != px else float(px), spot, self.raw.c_strike_f[ci],
-                t_days / 365.0, self.rate, self.raw.c_right[ci])
+                t_days / 365.0, self.rate.rate_on(bar_ord), self.raw.c_right[ci])
             # ``_f`` HERE, on the MISS branch, not on every return. It is what preserves the
             # old columns' semantics exactly: they stored NaN for a None greek and `_f` mapped
             # NaN back to None on the way out, so a greek that came back as a COMPUTED NaN
@@ -1167,7 +1173,7 @@ def _open_raw_underlying_read_only(root: str, underlying: str) -> Optional["_Raw
     return _RawUnderlying.from_arrays(underlying, arrays)
 
 
-def read_only_overlay(root: str, underlying: str, rate: float) -> Optional[_Underlying]:
+def read_only_overlay(root: str, underlying: str, rate: Any) -> Optional[_Underlying]:
     """A PRIVATE greeks overlay for one read-only consumer (the backtest trade popup).
 
     The greeks it serves are this module's, unchanged: ``_Underlying.bar_dict`` ->
@@ -1205,9 +1211,15 @@ def _raw_underlying(root: str, underlying: str) -> "_RawUnderlying":
     return raw
 
 
-def _underlying(root: str, underlying: str, rate: float, spot_scope: str) -> _Underlying:
-    """The run-scoped greeks/bar overlay for (root, underlying, rate, spot_scope)."""
-    key = (root, underlying, rate, spot_scope)
+def _underlying(root: str, underlying: str, rate: Any, spot_scope: str) -> _Underlying:
+    """The run-scoped greeks/bar overlay for (root, underlying, rate, spot_scope).
+
+    ``rate`` is the run's ``RiskFreeRate``; it keys the cache by ``rate.identity`` (equal
+    identities are equal rates on every day), so two runs over the same series share an
+    overlay and a run at a different rate never reads another's greeks."""
+    from ba2_providers.macro.risk_free_rate import as_risk_free_rate
+    rate = as_risk_free_rate(rate, origin="_underlying(rate=...)")
+    key = (root, underlying, rate.identity, spot_scope)
     hist = _WORKER_UNDERLYING_CACHE.get(key)
     if hist is not None:
         _WORKER_UNDERLYING_CACHE.move_to_end(key)  # LRU: mark most-recently-used
@@ -1237,7 +1249,7 @@ class ParquetOptionsProvider:
     """The parquet backend of the option-reader seam. See the module docstring."""
 
     def __init__(self, root: str, *, spot_source: Callable[[str, date], Optional[float]],
-                 risk_free_rate: float, spot_scope: str, basis_guard: bool = False,
+                 risk_free_rate: Any, spot_scope: str, basis_guard: bool = False,
                  basis_guard_split_dates: Optional[Callable[[str], Any]] = None):
         """``spot_scope`` — the identity of what ``spot_source`` will answer.
 
@@ -1272,7 +1284,14 @@ class ParquetOptionsProvider:
         #: caches outlive it. See the module docstring.
         self.spot_source = spot_source
         self.spot_scope = str(spot_scope)
-        self.risk_free_rate = float(risk_free_rate)
+        #: The run's ``RiskFreeRate`` (``ba2_providers.macro.risk_free_rate``): every bar is
+        #: inverted at the as-of rate of its own date, and ``BacktestAccount._bs_mark_rate``
+        #: marks barless lots with this SAME object. A plain number is accepted as an explicit
+        #: constant (fixture readers); ``options_store.build_options_provider`` passes the
+        #: resolved series.
+        from ba2_providers.macro.risk_free_rate import as_risk_free_rate
+        self.risk_free_rate_source = as_risk_free_rate(
+            risk_free_rate, origin="ParquetOptionsProvider(risk_free_rate=...)")
         #: Parallel to HistoricalOptionsProvider.db_path: the identity this store's worker
         #: caches are keyed on.
         self.store_path = root
@@ -1399,8 +1418,8 @@ class ParquetOptionsProvider:
         ``options_provider.get_atm_iv`` for why that rule (and its divergence from live) is
         what it is — this reader must not answer a DIFFERENT question from the other backend.
         """
-        cache_key = (self.root, underlying, self.risk_free_rate, self.spot_scope,
-                     as_of.toordinal())
+        cache_key = (self.root, underlying, self.risk_free_rate_source.identity,
+                     self.spot_scope, as_of.toordinal())
         cached = _WORKER_ATM_IV_CACHE.get(cache_key, _MISSING)
         if cached is not _MISSING:
             _WORKER_ATM_IV_CACHE.move_to_end(cache_key)  # LRU: mark most-recently-used
@@ -1453,7 +1472,7 @@ class ParquetOptionsProvider:
 
     # -- internals ------------------------------------------------------
     def _u(self, underlying: str) -> _Underlying:
-        return _underlying(self.root, underlying, self.risk_free_rate, self.spot_scope)
+        return _underlying(self.root, underlying, self.risk_free_rate_source, self.spot_scope)
 
     def _compute_atm_iv(self, underlying: str, as_of: date) -> Optional[float]:
         u = self._u(underlying)

@@ -25,8 +25,8 @@ from app.services.backtest.options_store import (
     STORE_VENDOR,
     build_options_provider,
     default_options_parquet_root,
-    default_options_risk_free_rate,
     price_source_spot,
+    resolve_options_risk_free_rate,
     resolve_options_store,
 )
 
@@ -117,9 +117,12 @@ def test_default_builds_the_sqlite_reader(monkeypatch, tmp_path):
 
     monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
     db = _sqlite_cache(tmp_path)
-    p = build_options_provider({"options_cache_db": db}, price_source=None)
+    p = build_options_provider({"options_cache_db": db, "options_risk_free_rate": 0.03},
+                               price_source=None)
     assert isinstance(p, HistoricalOptionsProvider)
     assert p.db_path == db
+    # The sqlite reader HOLDS the run's rate for the account's Black-Scholes marks.
+    assert p.risk_free_rate_source.rate_on(date(2024, 3, 1)) == pytest.approx(0.03)
 
 
 def test_parquet_selection_builds_the_parquet_reader(monkeypatch, tmp_path):
@@ -134,22 +137,82 @@ def test_parquet_selection_builds_the_parquet_reader(monkeypatch, tmp_path):
 
     p = build_options_provider(
         {"options_cache_db": _sqlite_cache(tmp_path), "options_store": "parquet",
-         "options_parquet_root": str(root)},
+         "options_parquet_root": str(root), "options_risk_free_rate": 0.02},
         price_source=_PS())
     assert isinstance(p, ParquetOptionsProvider)
     assert p.root == str(root)
-    assert p.risk_free_rate == pytest.approx(default_options_risk_free_rate())
+    assert p.risk_free_rate_source.describe()["source"] == "explicit"
+    assert p.risk_free_rate_source.rate_on(date(2024, 3, 1)) == pytest.approx(0.02)
 
 
-def test_parquet_rate_is_overridable_and_defaults_to_the_cache_builders_own(monkeypatch, tmp_path):
-    """The read-time inversion must assume the same rate the sqlite store's build-time
-    inversion assumed, or the two backends' greeks differ for a reason nobody chose."""
-    from app.services.backtest.fetch_options import _FALLBACK_RISK_FREE_RATE
+# --------------------------------------------------------------------------- #
+# The risk-free rate: the as-of FRED DGS3MO series, or an explicit, recorded constant
+# --------------------------------------------------------------------------- #
+def _fred_cache(monkeypatch, tmp_path):
+    from ba2_providers.macro import fred_series
+
+    from tests.backtest.fixtures.fred_rate import install_dgs3mo
+
+    monkeypatch.setattr(fred_series, "CACHE_FOLDER", str(tmp_path))
+    return install_dgs3mo(tmp_path)
+
+
+_RUN = {"options_cache_db": "flag", "start_date": "2021-03-01", "end_date": "2024-06-28",
+        "warmup_days": 30}
+
+
+def test_the_default_rate_is_the_as_of_fred_series_not_a_flat_number(monkeypatch, tmp_path):
+    """No override -> the as-of 3-month Treasury. 2021 bills were ~0.0-0.1%, mid-2024 ~5.4%:
+    a flat 4.5% (the old default) is wrong in both years."""
+    monkeypatch.delenv("BACKTEST_OPTIONS_RISK_FREE_RATE", raising=False)
+    _fred_cache(monkeypatch, tmp_path)
+    rate = resolve_options_risk_free_rate(_RUN)
+    assert rate.describe()["source"] == "fred-dgs3mo"
+    assert rate.rate_on(date(2021, 3, 1)) == pytest.approx(0.0005)     # FRED: 0.05 on 2021-03-01
+    assert rate.rate_on(date(2024, 6, 28)) == pytest.approx(0.0548)    # FRED: 5.48 on 2024-06-28
+    assert rate.rate_on(date(2024, 6, 29)) == pytest.approx(0.0548)    # Saturday: forward-filled
+
+
+def test_a_missing_fred_cache_refuses_the_run(monkeypatch, tmp_path):
+    from ba2_providers.macro import fred_series
+    from ba2_providers.macro.risk_free_rate import RiskFreeRateUnavailable
 
     monkeypatch.delenv("BACKTEST_OPTIONS_RISK_FREE_RATE", raising=False)
-    assert default_options_risk_free_rate() == pytest.approx(_FALLBACK_RISK_FREE_RATE)
+    monkeypatch.setattr(fred_series, "CACHE_FOLDER", str(tmp_path))
+    with pytest.raises(RiskFreeRateUnavailable, match="DGS3MO is not in the cache"):
+        resolve_options_risk_free_rate(_RUN)
+    with pytest.raises(RiskFreeRateUnavailable):
+        build_options_provider({**_RUN, "options_cache_db": _sqlite_cache(tmp_path)},
+                               price_source=None)
+
+
+def test_a_series_short_of_the_window_refuses(monkeypatch, tmp_path):
+    from ba2_providers.macro.risk_free_rate import RiskFreeRateUnavailable
+
+    monkeypatch.delenv("BACKTEST_OPTIONS_RISK_FREE_RATE", raising=False)
+    _fred_cache(monkeypatch, tmp_path)          # the fixture ends 2025-12-31
+    with pytest.raises(RiskFreeRateUnavailable, match="more than 7 days before the window end"):
+        resolve_options_risk_free_rate({**_RUN, "end_date": "2026-03-31"})
+    with pytest.raises(RiskFreeRateUnavailable, match="does not cover the start"):
+        resolve_options_risk_free_rate({**_RUN, "start_date": "2018-06-01"})
+
+
+def test_explicit_overrides_are_constants_and_say_where_they_came_from(monkeypatch, tmp_path):
+    """The two deliberate overrides: the run config's key beats the env var; both are
+    recorded as ``explicit`` with their origin."""
     monkeypatch.setenv("BACKTEST_OPTIONS_RISK_FREE_RATE", "0.02")
-    assert default_options_risk_free_rate() == pytest.approx(0.02)
+    env = resolve_options_risk_free_rate(_RUN)
+    assert env.describe() == {"source": "explicit", "identity": "explicit:0.02", "rate": 0.02,
+                              "origin": "env:BACKTEST_OPTIONS_RISK_FREE_RATE"}
+    cfg = resolve_options_risk_free_rate({**_RUN, "options_risk_free_rate": 0.031})
+    assert cfg.describe()["origin"] == "config:options_risk_free_rate"
+    assert cfg.rate_on(date(2021, 3, 1)) == cfg.rate_on(date(2024, 6, 28)) == 0.031
+
+
+def test_a_rateless_run_config_is_refused_not_defaulted(monkeypatch):
+    monkeypatch.delenv("BACKTEST_OPTIONS_RISK_FREE_RATE", raising=False)
+    with pytest.raises(ValueError, match="start_date"):
+        resolve_options_risk_free_rate({"options_cache_db": "flag"})
 
 
 def test_parquet_root_default_follows_the_writer(monkeypatch):

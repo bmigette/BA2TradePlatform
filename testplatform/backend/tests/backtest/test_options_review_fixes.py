@@ -85,7 +85,7 @@ def _account(tmp_path, tag, ps, chain_underlying, chain, bar_rows, cfg=CFG):
         cache.write_chain_rows(chain_underlying, "2024-03-01", chain)
     if bar_rows:
         cache.write_bar_rows(bar_rows)
-    prov = HistoricalOptionsProvider(cache_db)
+    prov = HistoricalOptionsProvider(cache_db, risk_free_rate=0.045)
     wire_backtest_seams()
     ctx = backtest_trading_db(tag)
     ctx.__enter__()
