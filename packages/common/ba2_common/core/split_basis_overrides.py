@@ -46,7 +46,11 @@ gets
 
 rounded to 4 decimals (6 below 0.1). Adjacent plateaus, the same window on both sides, the same
 rule for a lone spin-off, a stretch bracket and a replacement -- so a re-measurement of any entry
-reproduces its number. (HON, NVS and SCCO predate the convention.) An exclusion's own ``ratio``
+reproduces its number: ``python tools/measure_basis_plateaus.py SYM CUT[,CUT...]`` (the guard's
+own parity spot, the symbol's adds at the cuts removed). EXCEPTION: a FIXED-RATIO corporate
+action the calendar lacks (a reverse split) takes its NOMINAL ratio -- its measured plateau
+carries borrow (FCEL: 0.033532 measured, 1/30 nominal). (HON, NVS and SCCO predate the
+convention.) An exclusion's own ``ratio``
 is the vendor row's, informational only. A STRETCH override (two adds bracketing a few weeks of
 another basis, or an event whose effect FMP applies early) carries a second anchor INSIDE the
 stretch, so a vendor fix of the stretch alone refuses instead of double counting.
@@ -86,7 +90,7 @@ __all__ = [
     "overrides_version_for",
 ]
 
-OVERRIDES_VERSION = "2026-09-26.1"
+OVERRIDES_VERSION = "2026-09-26.2"
 
 #: An anchor close may differ from the recorded one by at most this fraction (0.1%).
 ANCHOR_TOLERANCE = 0.001
@@ -209,11 +213,12 @@ BASIS_OVERRIDES: Tuple[BasisOverride, ...] = (
         "FCEL", date(2019, 6, 5), 0.666667, KIND_ACKNOWLEDGE_JUMP, ((_A2020, 60.3),),
         "Real -33% move 27 days after the 2019-05-09 1:12 reverse split, in a full re-fetch."),
     BasisOverride(
-        "FCEL", date(2024, 11, 11), 0.033532, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 60.3),),
+        "FCEL", date(2024, 11, 11), 1 / 30, KIND_ADD_PRICE_ADJUSTMENT, ((_A2020, 60.3),),
         "1:30 reverse split effective 2024-11-11 (chain strike ladder 0.5-7 on 11-08, 1-12 from "
-        "11-12; no ThetaData row on 11-11); in FMP prices, missing from the calendar. r 0.0334 "
-        "over the 60 sessions before / 0.9949 over the 60 after = 0.033532 (the nominal 1/30 "
-        "= 0.03333 is within the plateau noise, residual 0.9941 over 2020-01..2024-11-08)."),
+        "11-12; no ThetaData row on 11-11); in FMP prices, missing from the calendar. A fixed-"
+        "ratio action: the NOMINAL 1/30 (the plateau convention measures 0.033532 = r 0.0334 "
+        "before / 0.9949 after, the difference being borrow). Residual median 1.0000 over "
+        "2020-01..2024-11-08 (878 sessions), 0.9973 after."),
     BasisOverride(
         "GSK", date(2022, 7, 22), 0.8, KIND_EXCLUDE_CALENDAR_EVENT, ((_A2020, 46.92),),
         "The 4:5 share consolidation (with the Haleon demerger, 2022-07-18) is in the calendar "

@@ -8,29 +8,31 @@ ends at a dated event is a price adjustment FMP applies but its calendar lacks
 a row with the wrong ratio (both on one date: a replacement), or -- for a real one-day move near
 a split in a freshly re-fetched file -- ``acknowledge_jump``.
 
+Every add ratio follows the PLATEAU CONVENTION (median r over <= 60 sessions before / from the
+event; ``tools/measure_basis_plateaus.py`` reproduces each), except fixed-ratio actions, which
+take their nominal ratio.
+
 Part 1 (files not re-fetched):
-  TRP   South Bow spin-off, ex 2024-10-02: 1.1007 before (p10-p90 1.0875-1.1028), 1.0024 after.
-  MMM   Solventum spin-off, ex 2024-04-01: 1.1971 (p10-p90 1.1961-1.1979) before, 1.0009 after.
+  TRP   South Bow spin-off, ex 2024-10-02: 1.1007 before / 1.0024 after = x1.098.
+  MMM   Solventum spin-off, ex 2024-04-01: 1.1971 before / 1.0009 after = x1.1961.
   SKM   the ADR left FMP's basis on 2021-11-30 (calendar 0.607, kept) and came back on
-        2021-12-27 (chain re-struck): 1.6515 x 0.607 = 1.0025 before, 1.6517 between, 0.9965
-        after -> one added x1.6517 on 2021-12-27.
+        2021-12-27 (chain re-struck): 1.6494 before / 0.9963 after = x1.6555 on 2021-12-27.
   MTCH  the 2020-07-01 row 1751/500 is IAC's separation ratio: 0.2848 x 3.502 = 0.9974 before.
 
 Part 2 (measured on the forced full re-fetch of 2026-09-25; interval medians of par/close):
   AMC   exclude the 2022-08-22 x2 APE row (0.0998 before = the 1:10 alone); acknowledge
         2023-08-14 x0.6445 and 2023-09-06 x0.6320 (real moves near the 1:10).
-  FCEL  add the missing 1:30 of 2024-11-11 (0.0333 before, 0.9972 after); acknowledge
-        2019-06-05 x0.6667.
+  FCEL  add the missing 1:30 of 2024-11-11 at its nominal 1/30; acknowledge 2019-06-05 x0.6667.
   GSK   exclude the 2022-07-22 4:5 row (1.0000 before, 1.0007 after: no step at all).
   QGEN  the 2024-01-30 x0.97 row IS in the prices (kept); the 2025-01-29 x0.9722 row is
         replaced by the measured x1.019; the 2026-01-08 x0.95 row stays excluded.
-  LBRDA FMP carries the 2025-07-15 x1.067 row only from 2025-06-16: x0.9391 on 06-16.
-  FTI   replace the 2021-02-16 x1.344 row by x1.2216 (1.2216 before, 1.0019 after).
-  PHG   2022-05-13 x1.07836 and the 2023-05-11 row replaced by x0.96886 (plateaus 1.0803,
-        1.0018, 1.0373, 1.0022; rows 2020-06-30 and 2024-05-09 stay).
+  LBRDA FMP carries the 2025-07-15 x1.067 row only from 2025-06-16: x0.9374 on 06-16.
+  FTI   replace the 2021-02-16 x1.344 row by x1.2213.
+  PHG   2022-05-13 x1.0769 and the 2023-05-11 row replaced by x0.966 (rows 2020-06-30 and
+        2024-05-09 stay).
   FLEX  / CMCSA: FMP shows ex-distribution prices for the weeks before the spin's ex-date
         (1.3785 over 2023-12-04..2024-01-02; 1.0685 over 2025-12-08..2026-01-02): a pair of
-        adds bracketing the stretch.
+        adds bracketing the stretch (FLEX x0.727 / x1.3748, CMCSA x0.9364 / x1.068).
   ARWR, ENLT, MARA, SMCI: acknowledged real moves near a split (layer 1 only; guard clean).
 
 A flat series carries the real calendars and anchors; the local cache is read (read-only)
@@ -77,7 +79,7 @@ EXPECTED = {
             (date(2023, 9, 6), 0.631965, ACK, _1)],
     "ARWR": [(date(2011, 11, 10), 1.401869, ACK, _1)],
     "ENLT": [(date(2023, 2, 10), 0.682692, ACK, lambda base: ((date(2023, 2, 10), 17.75),))],
-    "FCEL": [(date(2019, 6, 5), 0.666667, ACK, _1), (date(2024, 11, 11), 0.033532, ADD, _1)],
+    "FCEL": [(date(2019, 6, 5), 0.666667, ACK, _1), (date(2024, 11, 11), 1 / 30, ADD, _1)],
     "GSK": [(date(2022, 7, 22), 0.8, EXCL, _1)],
     "QGEN": [(date(2025, 1, 29), 0.9722, EXCL, _a((date(2024, 6, 3), 43.0))),
              (date(2025, 1, 29), 1.019, ADD, _a((date(2024, 6, 3), 43.0))),
@@ -228,7 +230,7 @@ def test_the_module_under_test_is_the_worktree_copy():
 
 
 def test_the_version_was_bumped_for_this_edit():
-    assert ovr.OVERRIDES_VERSION >= "2026-09-26.1"
+    assert ovr.OVERRIDES_VERSION >= "2026-09-26.2"
 
 
 @pytest.mark.parametrize("sym", sorted(EXPECTED))
