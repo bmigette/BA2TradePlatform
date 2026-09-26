@@ -352,7 +352,9 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
     (``rules_convert.trade_rules_to_live_export``), so both refuse the same rules.
 
     * The tree has at least one leaf but ZERO triggers came out. Empty triggers are ALWAYS TRUE:
-      an exit rule would close every position on every pass. No author means that.
+      an exit rule would close every position on every pass. No author means that. A style
+      member's ``entry_tag`` leaf does not count on either side: it scopes, it does not gate, so
+      a tagged rule whose AUTHORED leaves all dropped is refused like its single-structure twin.
     * A MARKET-CONDITION leaf was dropped (fewer market triggers than market leaves). The rule
       would run without its gate: a different strategy under the same name.
 
@@ -370,12 +372,24 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
         # Name the RULE as well as the leaf (the shared converter only knows the leaf).
         raise ValueError(f"{where}: {e}") from e
     leaves = list(tree_leaves(tree))
-    if leaves and not triggers:
+    # The style-group MEMBER TAG leaf (``entry_tag``, ANDed into every member exit) is not an
+    # authored condition: it always converts, so counting it here would turn "every authored
+    # leaf dropped" into ``{entry_tag == N}`` -- ALWAYS TRUE for that member's positions, while
+    # the same rule built as a single structure is refused. So the check judges the AUTHORED
+    # leaves and triggers only. A rule without a tag leaf (every rule that predates the tag)
+    # compares exactly the lists it always compared.
+    tag_event = ExpertEventType.N_ENTRY_TAG.value
+    authored_leaves = [leaf for leaf in leaves if leaf.get("field") != ORDER_ENTRY_TAG_KEY]
+    authored_triggers = [t for t in triggers.values() if t.get("event_type") != tag_event]
+    if authored_leaves and not authored_triggers:
         raise ValueError(
-            f"{where}: none of the rule's {len(leaves)} condition leaf/leaves "
-            f"{[leaf.get('id') or leaf.get('field') for leaf in leaves]!r} produced a trigger "
-            f"(unknown field or missing value). A rule with no trigger is ALWAYS TRUE: it would "
-            f"fire on every position. Fix or remove the leaves.")
+            f"{where}: none of the rule's {len(authored_leaves)} condition leaf/leaves "
+            f"{[leaf.get('id') or leaf.get('field') for leaf in authored_leaves]!r} produced a "
+            f"trigger (unknown field or missing value). A rule with no trigger is ALWAYS TRUE: "
+            f"it would fire on every position"
+            + (" of its member (the entry_tag leaf alone scopes, it does not gate)"
+               if len(authored_leaves) < len(leaves) else "")
+            + ". Fix or remove the leaves.")
     # (A member-tag leaf that cannot be honoured never reaches this point: the shared
     # ``triggers_from_condition_tree`` above refuses it on every path.)
     fields = market_condition_fields()

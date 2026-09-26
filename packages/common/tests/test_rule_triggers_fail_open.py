@@ -71,3 +71,29 @@ def test_live_export_ignores_a_disabled_rule():
     (rs,) = out["rulesets"]
     assert [r["triggers"] for r in rs["rules"]] == [
         {"cond_0": {"event_type": "days_opened", "operator": ">", "value": 10}}]
+
+
+# --- a member-tag leaf must not rescue a rule whose AUTHORED leaves all dropped -------------
+# A style expert ANDs ``entry_tag == N`` into every member exit (ba2test_launcher O_STYLE). The
+# tag leaf always converts, so counted as an ordinary trigger it would turn "every authored leaf
+# dropped" into ``{entry_tag == N}`` -- ALWAYS TRUE for that member's positions -- while the same
+# rule built as a single structure is refused. The guard therefore judges the non-tag leaves.
+TAG = {"id": "t", "field": "entry_tag", "op": "==", "value": 7.0}
+
+
+@pytest.mark.parametrize("leaves", [(NO_VALUE, TAG), (UNKNOWN, TAG), (UNKNOWN, NO_VALUE, TAG)])
+def test_a_tag_leaf_does_not_rescue_a_rule_whose_authored_leaves_all_dropped(leaves):
+    with pytest.raises(ValueError, match="ALWAYS TRUE"):
+        rule_triggers_from_tree(_tree(*leaves), "rule 'x'")
+
+
+def test_a_tagged_rule_with_a_live_authored_leaf_converts_both():
+    triggers = rule_triggers_from_tree(_tree(DAYS, TAG), "rule 'x'")
+    assert [t["event_type"] for t in triggers.values()] == ["days_opened", "entry_tag"]
+
+
+def test_a_rule_whose_only_leaf_is_the_tag_is_not_refused():
+    """No authored leaf (a rule written with no condition, then scoped): the same "not this
+    check's to judge" as an empty tree -- it matches that member's positions only."""
+    triggers = rule_triggers_from_tree(_tree(TAG), "rule 'x'")
+    assert [t["event_type"] for t in triggers.values()] == ["entry_tag"]
