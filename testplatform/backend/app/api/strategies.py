@@ -839,7 +839,8 @@ def _opt_settings_summary(cfg: Optional[dict]) -> dict:
         k: cfg[k]
         for k in (
             "populationSize", "generations", "crossoverProb", "mutationProb",
-            "earlyStoppingGenerations", "elitismPercent", "seed",
+            "earlyStoppingGenerations", "earlyStoppingMinRelativeImprovement",
+            "elitismPercent", "seed",
         )
         if k in cfg
     }

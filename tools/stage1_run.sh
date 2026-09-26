@@ -304,6 +304,25 @@ if [ -n "$STAGE1_ROBUST" ]; then
   esac
 fi
 
+# MINIMUM-IMPROVEMENT EARLY STOP (2026-09-26). STAGE1_EARLY_STOP_MIN_REL=0.01 forwards
+# --early-stop-min-rel 0.01: a generation resets the patience clock only when its best beats the
+# best at the last COUNTED improvement by at least that fraction (1%); a smaller gain still
+# updates the best genome but counts as no improvement, so a search stops instead of creeping
+# forward on +0.1 gains for 40 generations. Unset (the default) passes NOTHING -- the launch line
+# is byte-identical and every job keeps its name and checkpoint. When set it is a
+# discovery-digest token, so the jobs get NEW names (intended: a different stopping rule never
+# resumes the other rule's checkpoint). Patience itself is still --early-stop 8 below; pass
+# `--early-stop 5` after it on the command line (argparse keeps the last value), e.g. for stage-1
+# jobs 2-16:
+#   STAGE1_EARLY_STOP_MIN_REL=0.01 tools/stage1_run.sh --early-stop 5 --strategies O_LP,...
+# The driver refuses a value that is not a fraction in (0, 1) -- 0 included: it is the legacy
+# rule under new job names, so leave the variable unset for the legacy rule.
+STAGE1_EARLY_STOP_MIN_REL="${STAGE1_EARLY_STOP_MIN_REL:-}"
+MINREL_ARGS=()
+if [ -n "$STAGE1_EARLY_STOP_MIN_REL" ]; then
+  MINREL_ARGS=(--early-stop-min-rel "$STAGE1_EARLY_STOP_MIN_REL")
+fi
+
 # ORDER-TIME SIZING (plan 2026-09-24 Task 11): --option-size-within-fill-volume cuts every OPENING
 # option order to what the backtest fill engine's 10%-of-bar-volume cap can fill (read on the
 # decision bar; a structure by its most constrained leg). Without it an oversized order simply
@@ -325,4 +344,5 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   ${FITNESS_ARGS[@]+"${FITNESS_ARGS[@]}"} \
   ${ROBUST_ARGS[@]+"${ROBUST_ARGS[@]}"} \
   ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
+  ${MINREL_ARGS[@]+"${MINREL_ARGS[@]}"} \
   "$@"

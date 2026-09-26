@@ -343,6 +343,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--early-stop", type=int, default=None,
                     help="Generations without improvement before a job stops (spec stage 1: 8). "
                          "Omitted -> launcher default.")
+    ap.add_argument("--early-stop-min-rel", type=float, default=None,
+                    help="Minimum RELATIVE improvement (a fraction in (0, 1): 0.01 = 1%%) that "
+                         "resets the --early-stop patience (launcher --early-stop-min-rel). "
+                         "Omitted -> nothing is forwarded and the legacy rule applies (any strict "
+                         "improvement resets), so every existing job name is unchanged. When "
+                         "given it is a discovery-digest token: a job under a different stopping "
+                         "rule gets its own name, and so never skips on or resumes the other's.")
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's).")
     ap.add_argument("--seed", type=int, default=42,
@@ -537,6 +544,12 @@ def resolve_args(ap, argv=None):
             ap.error(f"--{key.replace('_', '-')} must be finite and non-negative")
     if not math.isfinite(args.elitism_percent) or not 0 <= args.elitism_percent <= 100:
         ap.error("--elitism-percent must be in [0, 100]")
+    if args.early_stop_min_rel == 0:
+        ap.error("--early-stop-min-rel 0 is the legacy rule under new job names; omit the flag "
+                 "for the legacy rule")
+    if args.early_stop_min_rel is not None and (not math.isfinite(args.early_stop_min_rel)
+                                               or not 0 < args.early_stop_min_rel < 1):
+        ap.error("--early-stop-min-rel must be finite and in (0, 1) (a fraction: 0.01 means 1%)")
     if args.mutation_prob is not None and (not math.isfinite(args.mutation_prob)
                                           or not 0 <= args.mutation_prob <= 1):
         ap.error("--mutation-prob must be in [0, 1]")
@@ -574,7 +587,10 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
     cmd += _market_condition_passthrough(args)
     if neutral_entry_mode != "legacy":
         cmd += ["--neutral-entry-mode", neutral_entry_mode]
+    # --early-stop-min-rel is forwarded only when given (None -> no token), so every command --
+    # and therefore every discovery digest -- made without it is unchanged.
     for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
+                        ("early_stop_min_rel", "--early-stop-min-rel"),
                         ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
         value = getattr(args, field)
         if value is not None:
@@ -704,7 +720,10 @@ def main(argv=None) -> int:
               "Stage-1 rankings provide seeds, not a survival gate.")
         print("Risk-policy exclusions: O_SSTG, O_SSTD (2026-08-31; not performance exclusions).")
         print(f"Search budget: population={args.population}, generations={args.generations}, "
-              f"patience={args.early_stop}, seed={args.seed}; "
+              f"patience={args.early_stop}"
+              + (f" (min gain {args.early_stop_min_rel:.2%} per counted generation)"
+                 if args.early_stop_min_rel is not None else "")
+              + f", seed={args.seed}; "
               f"capital={args.initial_capital}, equity_cap={args.equity_cap}")
         if args.population < 200:
             print("PILOT BUDGET: population below the documented 200; precision equivalence is unmeasured.")
