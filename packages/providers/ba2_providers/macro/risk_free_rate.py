@@ -15,11 +15,20 @@ and says which source that was:
   * :data:`SOURCE_EXPLICIT` (``explicit``): a constant the caller chose on purpose (a run
     config value or an env override). Recorded as such in the run's results.
 
-NO LOOKAHEAD. ``rate_on(d)`` is the latest observation dated ON OR BEFORE ``d`` --
-``fred_series``' contract for the unrevised daily ``DGS*`` series, whose observation date is
-their publication date (they are never restated). Forward-filled over weekends and
-holidays. Observations after the run's end are not even loaded, so appending newer data to
-the cache file cannot change a finished run's rates (or its identity).
+AS OF WHICH DAY -- SAME-DAY, deliberately. ``rate_on(d)`` is the latest observation dated ON
+OR BEFORE ``d``, forward-filled over weekends and holidays. DGS3MO is never restated, but its
+observation date is NOT when FRED has it: the value dated ``d`` is the par yield the U.S.
+Treasury publishes on the EVENING of ``d`` (after the 4 pm close); FRED's copy arrives on
+``d+1`` (the H.15 release). Same-day is still the right cut HERE because of what the rate is
+used for: the option reader inverts bar ``d``'s OWN CLOSE, which is itself only known after
+``d``'s close, so the information set the greek describes already includes the evening of
+``d`` -- and the Black-Scholes mark on day ``d`` prices the contract at ``d``'s close too.
+Using ``d-1`` would pair each close with the previous evening's rate for no gain. (A decision
+made BEFORE ``d``'s close must not read this rate; nothing in the option path does -- entry
+decisions read the greeks of bars dated on or before the engine clock.)
+
+Observations after the run's end are not even loaded, so appending newer data to the cache
+file cannot change a finished run's rates (or its identity).
 
 FAIL LOUD. There is no fallback rate anywhere in here. The series REFUSES to build
 (:class:`RiskFreeRateUnavailable`) when the cache file is missing or unreadable, or when it

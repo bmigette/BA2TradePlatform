@@ -113,6 +113,47 @@ def test_as_of_lookup_has_no_lookahead_and_forward_fills(cache):
         d += timedelta(days=1)
 
 
+def test_a_literal_dot_row_is_no_observation_and_is_forward_filled(cache):
+    """FRED writes "." for a day with no print (a holiday the series still lists). It is not
+    a zero and not a parse error: the day takes the previous print."""
+    rows = _weekdays(date(2023, 12, 1), date(2024, 6, 28), lambda d: "5.25")
+    rows = [(d, "." if d == "2024-03-05" else ("5.30" if d == "2024-03-04" else v))
+            for d, v in rows]
+    _write(cache, rows)
+    rate = rfr.fred_dgs3mo_rate(date(2024, 1, 2), date(2024, 6, 28))
+    assert rate.rate_on(date(2024, 3, 5)) == pytest.approx(0.0530)
+    assert rate.rate_on(date(2024, 3, 6)) == pytest.approx(0.0525)
+
+
+def test_the_check_rate_window_tool_is_cache_only_and_exits_1_when_short(cache, capsys):
+    import importlib.util
+    import pathlib
+
+    tool = pathlib.Path(__file__).resolve().parents[3] / "tools" / "refresh_fred_cache.py"
+    spec = importlib.util.spec_from_file_location("_refresh_fred_cache", tool)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def run(*argv):
+        import sys
+        old = sys.argv
+        sys.argv = ["refresh_fred_cache.py", *argv]
+        try:
+            mod.main()
+            return 0
+        except SystemExit as e:
+            return e.code
+        finally:
+            sys.argv = old
+
+    _write(cache, _weekdays(date(2023, 1, 2), date(2024, 12, 31), lambda d: "5.0"))
+    assert run("--check-rate-window", "2024-01-02", "2024-12-31", "--lead-days", "30") in (0, None)
+    assert "DGS3MO covers 2023-12-03..2024-12-31" in capsys.readouterr().out
+    # The warmup lead reaches before the file's first print -> refused, exit status non-zero.
+    code = run("--check-rate-window", "2024-01-02", "2024-12-31", "--lead-days", "730")
+    assert code not in (0, None) and "NOT available" in str(code)
+
+
 def test_data_after_the_window_changes_neither_rates_nor_identity(cache, tmp_path):
     base = _weekdays(date(2023, 12, 1), date(2024, 6, 28), lambda d: "5.25")
     a = rfr.fred_dgs3mo_rate(date(2024, 1, 2), date(2024, 6, 28),

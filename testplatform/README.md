@@ -231,9 +231,10 @@ installer's default `~/ba2-venvs/test`.
   `frontend/src/lib/config.ts`).
 - On startup the backend creates its tables and runs `backend/scripts/migrate_db.py`.
 - Set provider API keys (FMP, Alpaca, Finnhub, ...) in **Settings -> API Keys**, or copy them from
-  the trade platform's DB. The FRED providers read the AppSetting `fred_api_key` (lower case);
-  the page lists `FRED_API_KEY`, but AppSetting lookups are exact, and upper-case `FRED_API_KEY`
-  is only read as an ENV var (by `ba2-test prewarm` and a few test-platform services). See
+  the trade platform's DB. The FRED key is the AppSetting `fred_api_key` (what the page saves;
+  env `FRED_API_KEY` overrides it); a row under the old name `FRED_API_KEY` is refused until
+  `tools/migrate_fred_api_key.py` moves it. Option backtests need no key but do need
+  `<CACHE_FOLDER>/fred/DGS3MO.json` (their risk-free rate). See
   [../docs/REPRODUCE-BACKTESTS.md](../docs/REPRODUCE-BACKTESTS.md) for which keys reproducing
   results needs.
 - Set `BA2_ADMIN_TOKEN` to enable the token-protected admin endpoints (`/api/admin/*`:

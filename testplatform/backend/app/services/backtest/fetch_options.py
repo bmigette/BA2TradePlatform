@@ -115,7 +115,7 @@ def contract_to_metadata_chain_row(c: Any, underlying: str,
                                    as_of_premium: Optional[float] = None, *,
                                    as_of_date: Optional[date] = None,
                                    underlying_close: Optional[float] = None,
-                                   risk_free_rate: float = 0.0) -> Dict[str, Any]:
+                                   risk_free_rate: float) -> Dict[str, Any]:
     """Map an Alpaca OptionContract (metadata) to a HISTORICAL chain row.
 
     Pure (no network). open_interest/volume are ALWAYS None — Alpaca has no as-of OI/volume for
@@ -124,6 +124,9 @@ def contract_to_metadata_chain_row(c: Any, underlying: str,
     IV is derived from the option's own price, not an independently-observed vendor quantity, so
     we don't need Alpaca (or anyone) to hand us historical greeks. Omit either kwarg (as the old
     call sites and most tests do) to get the prior None-filled behaviour unchanged.
+
+    ``risk_free_rate`` is REQUIRED (no default): the build's as-of rate for ``as_of_date``
+    (``fetch_risk_free_rate_series``). It used to default to 0.0.
 
     ``as_of_premium`` (the contract's CLOSE on the chain's as-of date, taken from the daily bar
     we already fetch) is used to fill bid/ask/last so the option ENTRY action — which requires a
@@ -171,12 +174,13 @@ def merge_contracts_by_symbol(*contract_lists: List[Any]) -> List[Any]:
 
 def bar_to_row(occ: str, d: str, bar: Any, underlying: str, opt_type: str, strike: float,
                expiry: str, *, underlying_close: Optional[float] = None,
-               risk_free_rate: float = 0.0) -> Dict[str, Any]:
+               risk_free_rate: float) -> Dict[str, Any]:
     """Map one daily option bar to a row. iv/delta/gamma/theta/vega are computed via
     Black-Scholes inversion of THIS bar's close (see ``option_greeks.py``) when
     ``underlying_close`` is supplied — the POINT-IN-TIME greeks for this specific trading day,
     not a single build-time snapshot. Omit it (as the pre-existing tests do) for the prior
-    None-filled behaviour."""
+    None-filled behaviour. ``risk_free_rate`` is REQUIRED (no default): the build's as-of rate
+    for THIS bar's date; it used to default to 0.0."""
     close = _g(bar, "close")
     greeks_out = {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
     if close is not None and underlying_close is not None:

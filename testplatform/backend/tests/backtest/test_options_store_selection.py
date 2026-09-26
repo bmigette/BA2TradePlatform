@@ -209,6 +209,18 @@ def test_explicit_overrides_are_constants_and_say_where_they_came_from(monkeypat
     assert cfg.rate_on(date(2021, 3, 1)) == cfg.rate_on(date(2024, 6, 28)) == 0.031
 
 
+def test_the_window_starts_warmup_days_before_the_run(monkeypatch, tmp_path):
+    """The series must cover the warmup too, and a config that lost ``warmup_days`` is
+    refused rather than read as 0 (which would silently shrink the checked window)."""
+    monkeypatch.delenv("BACKTEST_OPTIONS_RISK_FREE_RATE", raising=False)
+    _fred_cache(monkeypatch, tmp_path)
+    assert resolve_options_risk_free_rate(_RUN).describe()["window"] == [
+        "2021-01-30", "2024-06-28"]                         # 2021-03-01 minus 30 days
+    no_warmup = {k: v for k, v in _RUN.items() if k != "warmup_days"}
+    with pytest.raises(ValueError, match="warmup_days"):
+        resolve_options_risk_free_rate(no_warmup)
+
+
 def test_a_rateless_run_config_is_refused_not_defaulted(monkeypatch):
     monkeypatch.delenv("BACKTEST_OPTIONS_RISK_FREE_RATE", raising=False)
     with pytest.raises(ValueError, match="start_date"):

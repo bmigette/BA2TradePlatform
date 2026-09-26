@@ -429,11 +429,14 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # DETERMINISTIC: the run config (spread model, option_trade_records) or the market
         # calendar is wrong, or the clock stepped on a non-session date -- every trial refuses
         # identically, so scoring them 0 lets the GA "finish" on nothing.
+        # RiskFreeRateUnavailable (ba2_providers.macro.risk_free_rate): the FRED DGS3MO cache an
+        # options run prices with is missing or does not cover the window. Every trial reads the
+        # same file, so every trial refuses identically -- a sync problem, never a bad genome.
         fatal = type(e).__name__ in (
             "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
             "SharedArrayFdExhausted", "SplitBasisRefused", "OptionSpotBasisMismatch",
             "SpreadModelConfigError", "OptionTradeRecordsFlagMissing",
-            "MarketCalendarUnavailable", "NotARegularSession")
+            "MarketCalendarUnavailable", "NotARegularSession", "RiskFreeRateUnavailable")
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),

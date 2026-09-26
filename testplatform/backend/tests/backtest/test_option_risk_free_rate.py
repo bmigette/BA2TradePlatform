@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
-from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +26,7 @@ from ba2_providers.macro import risk_free_rate as rfr
 from app.services.backtest.option_greeks import compute_iv_and_greeks
 from app.services.backtest.parquet_options_provider import (
     ParquetOptionsProvider, clear_worker_parquet_options_cache)
+from tests.backtest.test_risk_free_rate_refusal_is_fatal import no_rate_cache  # noqa: F401
 from tests.backtest.test_parquet_options_provider import (  # noqa: F401 (fixtures)
     _C100, _EXP1, _SPOT, _UNDER, _spot_source, _wide, shared_arrays_enabled, store_root)
 
@@ -134,13 +134,48 @@ def test_an_equity_run_records_nothing():
     assert results == {"total_return": 1.0}
 
 
-def test_the_handler_stamps_the_rate_record_on_every_run():
-    import inspect
+def _real_run_config(tmp_path, **extra):
+    from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD
 
-    from app.services.backtest import daily_backtest_handler as h
+    return {"backtest_id": 1, "start_date": "2024-05-01", "end_date": "2024-05-31",
+            "enabled_instruments": ["NFLX"], "experts": [], "initial_capital": 20000.0,
+            "account_settings": {**LEGACY_ZERO_SPREAD, "starting_cash": 20000.0,
+                                 "commission_per_trade": 0.0, "slippage_bps": 0.0,
+                                 "fill_model": "next_bar_open"},
+            "warmup_days": 3, "seed": 1, "execution_interval": "1d",
+            "option_trade_records": False, "options_cache_db": str(tmp_path / "opt.sqlite"),
+            **extra}
 
-    assert "apply_risk_free_rate_record(results, account)" in inspect.getsource(
-        h.run_daily_backtest)
+
+def test_a_real_options_run_records_the_fred_series_it_priced_with(no_rate_cache):
+    """Behavioural, through the REAL run_daily_backtest: the results say which rate."""
+    from app.services.backtest.daily_backtest_handler import run_daily_backtest
+    from tests.backtest.fixtures.fred_rate import install_dgs3mo
+
+    install_dgs3mo(no_rate_cache)
+    results = run_daily_backtest(_real_run_config(no_rate_cache))
+    rec = results["options_risk_free_rate_source"]
+    assert rec["source"] == "fred-dgs3mo" and rec["series"] == "DGS3MO"
+    # The window is [start - warmup_days, end], resolved from the run config.
+    assert rec["window"] == ["2024-04-28", "2024-05-31"]
+    assert 0.05 < rec["min"] <= rec["max"] < 0.06          # May 2024 bills: ~5.4%
+
+
+def test_a_real_options_run_records_an_explicit_override(no_rate_cache):
+    from app.services.backtest.daily_backtest_handler import run_daily_backtest
+
+    results = run_daily_backtest(_real_run_config(no_rate_cache, options_risk_free_rate=0.03))
+    assert results["options_risk_free_rate_source"] == {
+        "source": "explicit", "identity": "explicit:0.03", "rate": 0.03,
+        "origin": "config:options_risk_free_rate"}
+
+
+def test_a_real_equity_run_records_no_rate(no_rate_cache):
+    from app.services.backtest.daily_backtest_handler import run_daily_backtest
+
+    cfg = _real_run_config(no_rate_cache)
+    del cfg["options_cache_db"], cfg["option_trade_records"]
+    assert "options_risk_free_rate_source" not in run_daily_backtest(cfg)
 
 
 # ------------------------------------------------------------------------ the cache builder

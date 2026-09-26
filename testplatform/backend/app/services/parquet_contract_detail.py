@@ -74,6 +74,10 @@ class ParquetRunInputs:
     #: results state it), "legacy-flat" (the run predates the rate record and the as-of
     #: series, so it priced at the flat default of that time).
     rate_origin: str = "recorded"
+    #: A ``fred-dgs3mo`` run's recorded ``RiskFreeRate.identity`` (a digest of every DGS3MO
+    #: print up to its end date). The rebuilt reader must produce the same one, or today's
+    #: FRED cache is not the one the run priced with and its greeks cannot be reproduced.
+    rate_identity: Optional[str] = None
 
     def run_config(self, underlying: str) -> Dict[str, Any]:
         """The run config, narrowed to ONE underlying.
@@ -151,6 +155,7 @@ def parquet_run_inputs(provenance: Any, backtest: Any) -> Tuple[Optional[Parquet
 
     rate = provenance.risk_free_rate
     rate_origin = "recorded"
+    rate_identity = None
     if rate is not None:
         try:
             rate = float(rate)
@@ -172,6 +177,11 @@ def parquet_run_inputs(provenance: Any, backtest: Any) -> Tuple[Optional[Parquet
             rate_origin = "legacy-flat"
         elif not (isinstance(record, dict) and record.get("source") == "fred-dgs3mo"):
             return None, f"its recorded risk-free rate source {record!r} is not recognised"
+        else:
+            rate_identity = record.get("identity")
+            if not rate_identity:
+                return None, ("its recorded FRED DGS3MO rate carries no identity, so whether "
+                              "today's FRED cache is the one it priced with cannot be told")
     if "option_basis_guard" in results:
         if not isinstance(results["option_basis_guard"], dict):
             return None, ("its results record no split-basis guard for a parquet reader, which "
@@ -184,7 +194,8 @@ def parquet_run_inputs(provenance: Any, backtest: Any) -> Tuple[Optional[Parquet
         store=store, options_cache_db=provenance.db_path or _OPTIONS_RUN_FLAG,
         parquet_root=provenance.parquet_root, risk_free_rate=rate,
         execution_interval=str(interval), warmup_days=warmup_days,
-        start=start, end=end, as_traded=as_traded, rate_origin=rate_origin), None
+        start=start, end=end, as_traded=as_traded, rate_origin=rate_origin,
+        rate_identity=rate_identity), None
 
 
 @dataclass
@@ -284,6 +295,12 @@ class ParquetContractReader:
         except ValueError as exc:
             raise ContractDetailRefused(f"the run's option reader cannot be rebuilt: {exc}")
 
+        if (inputs.rate_identity is not None
+                and provider.risk_free_rate_source.identity != inputs.rate_identity):
+            raise ContractDetailRefused(
+                f"the FRED DGS3MO series in this host's cache is not the one the run priced with "
+                f"(recorded {inputs.rate_identity}, cache gives "
+                f"{provider.risk_free_rate_source.identity}), so its greeks cannot be reproduced")
         overlay = read_only_overlay(provider.root, underlying, provider.risk_free_rate_source)
         if overlay is None:
             raise ContractDetailRefused(

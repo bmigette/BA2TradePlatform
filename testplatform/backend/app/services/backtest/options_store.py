@@ -160,13 +160,14 @@ def resolve_options_risk_free_rate(config: Dict[str, Any]):
     env = os.environ.get(_RATE_ENV)
     if env:
         return explicit_rate(env, origin=f"env:{_RATE_ENV}")
-    missing = [k for k in ("start_date", "end_date") if config.get(k) is None]
+    # All three EXPLICIT: the window the series must cover is [start - warmup, end], and a
+    # config that lost its warmup must not silently shrink it to the start date.
+    missing = [k for k in ("start_date", "end_date", "warmup_days") if config.get(k) is None]
     if missing:
         raise ValueError(
             f"an options run needs {missing} to read its risk-free rate (FRED DGS3MO over the "
             f"run window); they are absent from this run config")
-    warmup_days = int(config.get("warmup_days") or 0)
-    start = _as_date(config["start_date"]) - timedelta(days=warmup_days)
+    start = _as_date(config["start_date"]) - timedelta(days=int(config["warmup_days"]))
     return fred_dgs3mo_rate(start, _as_date(config["end_date"]))
 
 

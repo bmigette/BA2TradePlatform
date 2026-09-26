@@ -1630,13 +1630,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return getattr(self._options, "risk_free_rate_source", None)
 
     def _bs_mark_rate(self) -> float:
-        """The rate the option reader inverts TODAY's bars with -- the same ``RiskFreeRate``
-        object (``risk_free_rate_source``, resolved once per run by
-        ``options_store.build_options_provider``), read for the engine clock's date. BS pricing
-        a contract off its own last-known iv must use the rate that iv would be extracted with
-        on this bar -- otherwise the round trip (bar close -> invert to iv -> BS back to a
-        price) would not reproduce the bar it started from even when nothing about the mark is
-        stale, purely from a rate mismatch.
+        """The rate the option reader would invert a bar dated TODAY with -- the same
+        ``RiskFreeRate`` object (``risk_free_rate_source``, resolved once per run by
+        ``options_store.build_options_provider``), read for the engine clock's date.
+
+        WHAT THAT GUARANTEES, precisely. On a given date the reader and the mark use one rate,
+        so a close inverted to an iv and priced back with BS on THAT date reproduces the close
+        exactly (pinned by ``test_option_risk_free_rate``). The mark itself runs on a day with
+        NO bar, off the lot's last iv -- which was inverted at ITS bar's date rate, up to
+        ``_BS_IV_STALENESS_DAYS`` earlier. Pricing that iv at today's rate is deliberate: the
+        mark is today's value of the contract, and a few days' move in the bill rate is part of
+        it, exactly as the spot and the DTE are today's. A flat rate would hide the difference
+        only by being wrong on both days.
 
         REFUSES when the reader carries no rate (a fixture reader built without one): a mark
         priced at a rate nobody chose is the silent default this replaced."""

@@ -16,10 +16,14 @@ NO-LOOKAHEAD. Two regimes, chosen per series and verified against the live API:
     every observation with ``realtime_start`` -- its true first-publication date. We then
     filter on THAT. No lag heuristics, no guessing.
 
-  * UNREVISED daily series (VIXCLS, T10Y3M, BAMLH0A0HYM2, DGS*) are published same-day and
-    never restated, so the observation date IS the publication date. They also REJECT
-    vintage queries outright ("There are 3907 vintage dates in the specified real-time
-    period"), so plain date filtering is both correct and the only option.
+  * UNREVISED daily series (VIXCLS, T10Y3M, BAA10Y, DGS*) are never restated, so the value a
+    date carries never changes -- but it is NOT public on its observation date everywhere:
+    the source publishes after that day's close (Treasury's par yields the evening of ``d``,
+    Cboe's VIX close at 4:15 pm), and FRED's copy arrives on ``d+1``. They also REJECT vintage
+    queries outright ("There are 3907 vintage dates in the specified real-time period"), so
+    plain OBSERVATION-date filtering is the only option, and ``get_series_as_of(sid, d)``
+    includes the print dated ``d``. That is correct for a consumer acting at or after ``d``'s
+    close; a consumer deciding BEFORE ``d``'s close must cut at ``d - 1`` itself.
 
 HERMETIC BACKTESTS. The full history of a series is fetched ONCE and cached as JSON under
 ``CACHE_FOLDER/fred/<SERIES_ID>.json``. Because it lives under CACHE_FOLDER it is picked up
