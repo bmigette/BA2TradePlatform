@@ -428,6 +428,33 @@ def test_a_close_is_guarded_against_a_pending_close(wired):
     assert [d.reason for d in result.decisions] == [LIFECYCLE_PROFIT_CAPTURE]
 
 
+def test_stale_legs_of_a_resolved_close_do_not_block_the_next_close(wired):
+    """A structure's per-contract legs are children of its net-only parent, and the parent
+    carries the status. A CANCELED close whose leg rows never caught up (still PENDING) is
+    resolved: the guard used to read those leg rows as a close still working and skipped the
+    structure on every pass for good (2026-09-26 fix, ``TransactionHelper.pending_closing_orders``).
+    """
+    account, expert, expert_row = wired
+    txn, _parent, short, long = open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
+    dead_close = create_trading_order(
+        account.id, symbol="ACN", quantity=1, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, status=OrderStatus.CANCELED, transaction_id=txn.id,
+        asset_class=AssetClass.OPTION, option_strategy="close", multiplier=100)
+    for leg in (short, long):
+        create_trading_order(
+            account.id, symbol=leg.contract_symbol, quantity=1,
+            side=OrderDirection.BUY if leg.side == OrderDirection.SELL else OrderDirection.SELL,
+            order_type=OrderType.MARKET, status=OrderStatus.PENDING, transaction_id=txn.id,
+            asset_class=AssetClass.OPTION, contract_symbol=leg.contract_symbol,
+            multiplier=100, parent_order_id=dead_close.id)
+
+    result = run(expert_row)
+
+    assert txn.id not in result.skipped_pending_close
+    assert len(result.submitted) == 1, "the structure was never closed"
+
+
 def test_a_broker_that_cannot_answer_stops_the_pass_for_that_account(monkeypatch, wired):
     """Never act against a book you cannot see.
 
