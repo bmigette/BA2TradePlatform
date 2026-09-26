@@ -163,3 +163,20 @@ def test_the_contract_detail_view_builds_its_guard_from_the_provider(monkeypatch
     monkeypatch.setattr(reader, "_notes", lambda ctx, d, checked: [])
     row = reader.latest_bar_on_or_before("STLA220520C00015000", "2022-04-12")
     assert row["date"] == "2022-04-12" and made == [("STLA", date(2022, 4, 12))]
+
+
+def test_the_loader_applies_the_declaration_overrides(cache):
+    """QGEN's FMP row ex 2026-01-08 has an empty declarationDate; the operator record supplies
+    2025-12-18 (``dividend_declaration_overrides``). A conflicting vendor date refuses."""
+    from ba2_common.core.dividend_declaration_overrides import DeclarationOverrideConflict
+    from app.services.backtest.option_split_basis import load_cached_dividend_calendar
+    _write(cache, "QGEN", [{"date": "2026-01-08", "dividend": 2.29, "adjDividend": 2.29,
+                            "declarationDate": ""},
+                           {"date": "2025-07-02", "adjDividend": 0.25,
+                            "declarationDate": "2025-05-07"}])
+    assert load_cached_dividend_calendar("QGEN") == [
+        (date(2025, 7, 2), 0.25, date(2025, 5, 7)), (date(2026, 1, 8), 2.29, date(2025, 12, 18))]
+    _write(cache, "QGEN", [{"date": "2026-01-08", "adjDividend": 2.29,
+                            "declarationDate": "2025-12-01"}])
+    with pytest.raises(DeclarationOverrideConflict):
+        load_cached_dividend_calendar("QGEN")
