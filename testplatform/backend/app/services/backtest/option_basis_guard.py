@@ -42,14 +42,23 @@ a 5-8% "basis error". When the uncorrected window median is off, the guard consu
   Otherwise the refusal stands.
 * A VETO refuses by name: no dividend calendar, dividends to add back above 2.5% of the spot
   (unverified -- a special the chain does not price would hide an error of its size), a dividend
-  row of unknown declaration date or amount, a term structure sloping up.
+  row of unknown declaration date or amount, a term structure sloping up, and -- on a dividend
+  payer -- a drop between the two expiries that the calendar's dividends do not explain within
+  2.5% of the spot (an uncalendared dividend, not carry).
 
-KNOWN RESIDUAL (accepted 2026-09-26, coordinator decision, REPAIR_LOG): a basis error within ~1%
-of the 5% line can still pass when an unpriced (OCC strike-adjusted) or uncalendared dividend
-falls in the same few sessions -- measured: a 2.5% unpriced special with a x1.051 error, a 5%
-dividend missing from the calendar with a x1.06 error, each on 2 of 3 start offsets. That is the
-same order of softness as the 5% line itself given its 2.5%-wide quote pairs. The stricter design
-(add a dividend back only when an expiry before the ex-date shows the drop) is not built.
+KNOWN RESIDUAL (measured 2026-09-26 after the unexplained-drop veto; the first item accepted by
+the coordinator the same day, REPAIR_LOG):
+* a special of up to 2.5% of the spot that the chain does not price (OCC strike-adjusted) can
+  carry an error ~1% past the 5% line (x1.051 passes on 2 of 3 start offsets) -- the same order
+  of softness as the 5% line itself given its 2.5%-wide quote pairs;
+* on a dividend payer an uncalendared dividend hides nothing past the line (x1.055 refused on
+  every offset, dividends of 1-2.5%; larger ones are vetoed);
+* a symbol whose calendar lists NO dividend in the horizon is read as borrow, which AMC needs: a
+  dividend the chain prices but FMP's calendar lacks ENTIRELY hides an error of about its own
+  size (8% -> x1.08, 10% -> x1.10, 15-20% -> x1.15 pass on 4 of 5 offsets). Telling that apart
+  from a borrow fee needs more than the session's own term structure.
+The stricter design (add a dividend back only when an expiry before the ex-date shows the drop)
+is not built.
 
 There is no look-back to other sessions (a short-dated TIME measure was removed in review
 round 3: a stretch-type basis error that no split marks would let it borrow clean sessions from
@@ -112,10 +121,6 @@ MAX_QUOTE_UNCERTAINTY = TOLERANCE / 2
 #: chain's checked session may lack a second usable expiry while its neighbours have one (IONQ
 #: 2022-03-28, monthlies only).
 MIN_CARRY_SESSIONS = 3
-#: The carry-free window median is only cleared inside [CARRY_BAND_LOW, 1 + TOLERANCE]. The low
-#: side is tightened by the most the carry measure may add back UNVERIFIED
-#: (``option_carry.MAX_ADDBACK_FRACTION``): an unpriced or uncalendared dividend can then carry an
-#: error at most about that far past the 5% line (module docstring, KNOWN RESIDUAL).
 #: ... and never fewer than this many, whatever the window (one session is not a median).
 MIN_CARRY_FLOOR = 2
 
@@ -125,6 +130,10 @@ def _carry_band_low() -> float:
     return 1.0 - (TOLERANCE - MAX_ADDBACK_FRACTION)
 
 
+#: The carry-free window median is only cleared inside [CARRY_BAND_LOW, 1 + TOLERANCE]. The low
+#: side is tightened by the most the carry measure may add back UNVERIFIED
+#: (``option_carry.MAX_ADDBACK_FRACTION``): an unpriced special can then carry an error at most
+#: about that far past the 5% line (module docstring, KNOWN RESIDUAL).
 CARRY_BAND_LOW = _carry_band_low()
 #: A symbol the guard could not evaluate on more than this share of its checks is WARNED
 #: about in the run's results: it traded without the protection (plan Part E4 review).

@@ -179,3 +179,31 @@ def test_one_usable_expiry_cannot_separate_carry_and_says_so():
 def test_no_calendar_is_a_veto():
     res = carry_free_spot(D, _pts(4.44, [(1, 0.99), (8, 0.92)]), None, spot=4.44)
     assert res.spot is None and "no dividend calendar" in res.veto
+
+
+# ---- the unexplained-drop veto (review of 5178e625..90980f18, item 3) --------------------------
+_PAYER = [DividendRow(date(2024, 8, 15), 0.9, date(2024, 7, 25))]      # after both expiries
+
+
+def test_a_payers_drop_the_calendar_does_not_explain_is_vetoed():
+    s = date(2024, 4, 1)
+    pts = [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 92.0)]      # an 8% step between them
+    r = carry_free_spot(s, pts, _PAYER, spot=100.0)
+    assert r.spot is None and r.veto and "not explained by the dividend calendar" in r.veto
+
+
+def test_the_same_drop_explained_by_a_calendar_dividend_is_carry():
+    s = date(2024, 4, 1)
+    pts = [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 92.0)]
+    divs = _PAYER + [DividendRow(date(2024, 5, 1), 2.0, date(2024, 3, 20))]   # 2% explained
+    r = carry_free_spot(s, pts, divs, spot=100.0)
+    assert r.veto and "(2.0%)" in r.veto                                     # 6% left: still vetoed
+    small = [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 96.0)]         # 4% - 2% = 2%
+    assert carry_free_spot(s, small, divs, spot=100.0).veto is None
+
+
+def test_no_dividend_in_the_horizon_is_read_as_borrow():
+    s = date(2024, 4, 1)
+    pts = [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 92.0)]
+    r = carry_free_spot(s, pts, [], spot=100.0)
+    assert r.veto is None and r.spot is not None and r.spot > 100.0

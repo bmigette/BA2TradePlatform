@@ -376,9 +376,6 @@ def test_fewer_than_three_carry_sessions_in_a_full_window_is_refused(monkeypatch
 
 
 # ---- the carry band (final review, R1) ---------------------------------------------------------
-#: A carry-free median is only cleared inside [1 - (TOLERANCE - MAX_ADDBACK_FRACTION), 1 + TOLERANCE]
-#: (0.975 .. 1.05 today): an unverified add-back of up to MAX_ADDBACK_FRACTION can then never carry
-#: an error past the 5% line by more than the add-back's own headroom.
 def _verdicts(monkeypatch, table, divs, scale, phases=3):
     import app.services.backtest.option_basis_guard as g0
     out = []
@@ -400,6 +397,12 @@ def _unpriced_special_table():
         t1, t2 = (date(2022, 11, 18) - day).days, (date(2022, 12, 16) - day).days
         table[day] = (27.5, [(t1, 1 - 0.0002 * t1), (t2, 1 - 0.0002 * t2)])
     return table
+
+
+#: A dividend payer's calendar as seen from the sessions of ``_missing_dividend_table``: a later
+#: regular dividend (after both usable expiries, not yet declared -- nothing to add back). The
+#: dividend the chain prices between the two expiries is MISSING from it.
+PAYER_ROWS = [DividendRow(date(2024, 8, 15), 0.9, date(2024, 7, 25))]
 
 
 def _missing_dividend_table(frac):
@@ -435,15 +438,50 @@ def test_amc_still_clears_inside_the_band(monkeypatch):
     assert _phases(monkeypatch, AMC, lambda s, d: []) == []
 
 
-@pytest.mark.parametrize("case", ["special 2.5% + x1.051", "missing 5% dividend + x1.06"])
-def test_the_accepted_residual_edge_cases(monkeypatch, case):
-    """KNOWN RESIDUAL, accepted 2026-09-26 (coordinator decision, REPAIR_LOG): an error within
-    ~1% of the 5% line can still pass when an unpriced or uncalendared dividend falls in the
-    same few sessions -- the same order of softness as the 5% line itself given 2.5%-wide quote
-    pairs. Pinned so that any change to it is seen."""
+# ---- the unexplained-drop veto (review of 5178e625..90980f18, item 3) --------------------------
+@pytest.mark.parametrize("frac,scale", [(0.08, 1.08), (0.10, 1.10), (0.15, 1.15), (0.20, 1.15),
+                                        (0.05, 1.06), (0.03, 1.06)])
+def test_a_payers_uncalendared_dividend_cannot_hide_an_error_of_its_size(monkeypatch, frac, scale):
+    """A dividend payer whose calendar lacks the dividend the chain prices between the two
+    expiries: the drop between them is not carry the calendar explains, so the extrapolation
+    may not add it back. Before the veto 8%->x1.08 and 10%->x1.10 passed on 4 of 5 offsets."""
+    assert _verdicts(monkeypatch, _missing_dividend_table(frac), PAYER_ROWS, scale,
+                     phases=5) == ["REFUSE"] * 5
+
+
+def test_the_unexplained_drop_veto_names_itself(monkeypatch):
+    import app.services.backtest.option_basis_guard as g0
+    table = _missing_dividend_table(0.08)
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: PAYER_ROWS, scale=1.08)
+    with pytest.raises(g0.OptionSpotBasisMismatch, match="not explained by the dividend calendar"):
+        _run(g, u, guard, sorted(table))
+
+
+def test_amc_still_clears_with_the_veto(monkeypatch):
+    """AMC pays no dividend in the horizon: its term drop (up to 15% between two weeklies) is the
+    borrow fee, and the TERM measure stays the one that clears it."""
+    assert _phases(monkeypatch, AMC, lambda s, d: []) == []
+
+
+@pytest.mark.parametrize("case", ["special 2.5% + x1.051", "payer, missing 2.5% + x1.055",
+                                  "no dividend in the horizon, missing 8% + x1.08"])
+def test_the_residual_after_the_veto(monkeypatch, case):
+    """THE RESIDUAL as it stands after the unexplained-drop veto (measured 2026-09-26 over
+    missing dividends of 1-20% and errors of x1.051-x1.20, 5 start offsets):
+      * a special of up to 2.5% of the spot that the chain does not price (OCC strike-adjusted)
+        can carry an error ~1% past the 5% line (x1.051 passes on 2 of 3 offsets) -- accepted
+        2026-09-26 (coordinator decision, REPAIR_LOG);
+      * on a dividend PAYER an uncalendared dividend no longer hides anything past the line:
+        x1.055 is refused on every offset for every size;
+      * a symbol whose calendar lists NO dividend in the horizon is read as borrow (AMC must
+        clear): a dividend the chain prices but FMP's calendar lacks ENTIRELY hides an error of
+        about its own size (8% -> x1.08, 10% -> x1.10, 15-20% -> x1.15 pass on 4 of 5 offsets).
+    Pinned so that any change to it is seen."""
     if case.startswith("special"):
         divs = [DividendRow(date(2022, 10, 28), 27.5 * 0.025 * 1.051, date(2022, 10, 14))]
-        got = _verdicts(monkeypatch, _unpriced_special_table(), divs, 1.051)
+        assert _verdicts(monkeypatch, _unpriced_special_table(), divs, 1.051) ==             ["REFUSE", "PASS", "PASS"]
+    elif case.startswith("payer"):
+        assert _verdicts(monkeypatch, _missing_dividend_table(0.025), PAYER_ROWS, 1.055,
+                         phases=5) == ["REFUSE"] * 5
     else:
-        got = _verdicts(monkeypatch, _missing_dividend_table(0.05), [], 1.06)
-    assert got == ["REFUSE", "PASS", "PASS"]
+        assert _verdicts(monkeypatch, _missing_dividend_table(0.08), [], 1.08, phases=5) ==             ["REFUSE", "PASS", "PASS", "PASS", "PASS"]

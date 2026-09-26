@@ -36,7 +36,14 @@ WHAT IS NEVER CARRY (a ``veto``: the guard refuses, naming it, rather than clear
   whose split-adjusted amount is missing;
 * no dividend calendar at all;
 * a term structure sloping UP (the later expiry above the earlier one beyond ``SLOPE_SLACK``,
-  the interest allowance): not the shape of carry.
+  the interest allowance): not the shape of carry;
+* for a DIVIDEND PAYER (the calendar lists a dividend in the source's horizon after the
+  session), a drop between the two expiries that the calendar's dividends between them do not
+  explain by more than ``MAX_ADDBACK_FRACTION`` of the spot. The extrapolation would add that
+  drop back unverified, and on a payer the likeliest cause is a dividend the chain prices but the
+  calendar lacks -- which would hide a basis error of its own size (review of 5178e625, item 3:
+  8% -> x1.08 and 10% -> x1.10 passed on 4 of 5 start offsets). A symbol with NO dividend in the
+  horizon is read as borrow, the only other carry (AMC July 2023: up to 15% between weeklies).
 
 A dividend DECLARED after the session is not added back (it was not known yet), so the
 correction is causal. The two-point extrapolation is only used when its noise LEVERAGE
@@ -143,6 +150,12 @@ def carry_free_spot(session: date, points: Sequence[Tuple[date, float]],
     if veto:
         return CarryFreeSpot(None, veto, veto=veto)
     s1, s2 = p1 + d1, p2 + d2
+    if dividends and spot > 0 and (s1 - s2) / spot > MAX_ADDBACK_FRACTION:
+        why = (f"the parity drop between {t1}d and {t2}d ({(p1 - p2) / spot:.1%} of the spot "
+               f"{spot:g}) is not explained by the dividend calendar ({(d2 - d1) / spot:.1%}) "
+               f"within {MAX_ADDBACK_FRACTION:.1%}: on a dividend payer that is an uncalendared "
+               f"dividend, not carry")
+        return CarryFreeSpot(None, why, veto=why)
     if s2 > s1 * (1.0 + SLOPE_SLACK):
         why = (f"the term structure slopes up ({t1}d {s1:.4g} -> {t2}d {s2:.4g}): not the "
                f"shape of carry")
