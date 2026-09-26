@@ -5602,16 +5602,20 @@ _STYLE_MEMBER_TAGS = {
 _STYLE_RETIRED_TAGS: set = set()
 #: Members whose short leg is assigned PER LEG (not unit-settled as a defined-risk combo --
 #: BacktestAccount.defined_risk_combo_strategy returns None for them), so an assignment leaves
-#: STOCK behind. Since plan revision E2 the run holds that stock only for the members listed in
-#: ``hold_assigned_stock_tags`` (the wheel) and liquidates the others' at the next bar's open,
-#: so these members may share a style with O_WHEEL; the set stays the statement of which members
-#: can put stock on the book at all. READ BY TASK 9's tests (test_option_style_premium_wheel.py),
-#: which DERIVE it from BacktestAccount's per-leg settlement path ("SHORT ITM: ALWAYS physical
-#: assignment at the strike, covered or naked") and the action classes' short legs.
+#: STOCK behind, on EITHER side: an assigned short PUT delivers LONG stock (O_CSP, O_WHEEL,
+#: O_RS, O_PBS, O_JL's put) and an assigned short CALL delivers SHORT stock (O_CBS, O_PMCC,
+#: O_JL's call -- the long call beside it is sold to close at expiry, never exercised, so it
+#: does not cover the delivery). Since plan revision E2 the run holds that stock only for the
+#: members listed in ``hold_assigned_stock_tags`` (the wheel) and liquidates the others' at the
+#: next bar's open, so these members may share a style with O_WHEEL; the set stays the
+#: statement of which members can put stock on the book at all. READ BY TASK 9's tests
+#: (test_option_style_premium_wheel.py), which DERIVE it from BacktestAccount's per-leg
+#: settlement path ("SHORT ITM: ALWAYS physical assignment at the strike, covered or naked")
+#: and the legs each member's opening actions actually BUILD (a SELL / ``sell_to_open`` leg).
 #: O_CBS / O_PBS / O_PMCC joined on 2026-09-26 (Task 9 found them missing): a backspread's single
 #: short and the PMCC's short call are settled PER LEG like the jade lizard's -- neither
 #: structure is in the unit-settled defined-risk combo sets -- so an ITM short at expiry is
-#: assigned into stock (the PMCC's only if its roll rules have not closed the short first).
+#: assigned (the PMCC's only if its roll rules have not closed the short first).
 _STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL", "O_CBS", "O_PBS", "O_PMCC"}
 #: Members whose ENTRY is an equity buy (the S2 baseline in round lots) with an option overlay
 #: in their exits. Admissible (revision E1), but the option-entry ``action_overrides`` have
@@ -6285,6 +6289,43 @@ def _style_claim_ids(key: str, ns: str, rules, owners: dict, shared: dict) -> No
                 claim(f"cond:{cid}")
 
 
+class StyleBuildError(ValueError):
+    """A style build refusal whose original exception type cannot be rebuilt from a message (a
+    pydantic ``ValidationError`` takes line errors, not a string). Its message names the style
+    and the member; the original is its ``__cause__``."""
+
+
+def _style_refusal(e: ValueError, context: str) -> ValueError:
+    """``e`` again, with ``context`` leading its MESSAGE, as the same type when that type can be
+    rebuilt from a message, else as a :class:`StyleBuildError`. ``e``'s PEP-678 notes are
+    carried over. The caller raises it ``from e``.
+
+    WHY THE MESSAGE and not only a note (stage-2 Task 8 review M1): a note is invisible to
+    ``str(e)``, which is what every consumer but the optimize command prints, so a refusal
+    reached a log or an API response without saying which style or member it was about.
+    "Can be rebuilt" is tested, not assumed: the constructor must accept the message and give
+    back exactly that type and that text."""
+    message = f"{context}: {e}"
+    rebuilt = None
+    try:
+        candidate = type(e)(message)
+        if type(candidate) is type(e) and str(candidate) == message:
+            rebuilt = candidate
+    except Exception:  # noqa: BLE001 -- any constructor that refuses a message: not rebuildable
+        rebuilt = None
+    out = rebuilt if rebuilt is not None else StyleBuildError(message)
+    for note in getattr(e, "__notes__", []):
+        out.add_note(note)
+    return out
+
+
+def _refusal_text(e: BaseException) -> str:
+    """``str(e)`` plus any PEP-678 note it does not already say, for a one-line refusal."""
+    text = str(e)
+    extra = [n for n in getattr(e, "__notes__", []) if n not in text]
+    return f"{text} [{'; '.join(extra)}]" if extra else text
+
+
 def _build_strategy_style(kind: str):
     """``O_STYLE``: ONE Strategy from the loaded style (``_STYLE_ACTIVE``). Each member keeps
     its OWN single builder's entry rule(s) -- same gates, same action, same genes -- deep
@@ -6321,11 +6362,13 @@ def _build_strategy_style(kind: str):
             _style_claim_ids(key, "entry", e_rules, owners, shared)
             _style_claim_ids(key, "exit", x_rules, owners, shared)
         except ValueError as e:
-            # Every refusal names the style and the member as a PEP-678 note on the ORIGINAL
-            # exception: its type is kept (a MixedEntryActionsRefused stays one), and a pydantic
-            # ValidationError -- which cannot be rebuilt from a message -- survives intact.
-            e.add_note(f"{where} member {key}")
-            raise
+            # Every refusal names the style and the member IN ITS MESSAGE (``str(e)`` is all
+            # most consumers print) and as a PEP-678 note, chained from the original. The type
+            # is rebuilt where it can be (a MixedEntryActionsRefused stays one); a pydantic
+            # ValidationError cannot be, and becomes a StyleBuildError (``_style_refusal``).
+            context = f"{where} member {key}"
+            e.add_note(context)
+            raise _style_refusal(e, context) from e
         entry += e_rules
         exits += x_rules
         id_maps[key] = {**e_map, **x_map}
@@ -7056,8 +7099,8 @@ def _cmd_optimize(args) -> int:
         except ValueError as e:
             if args.strategy != _STYLE_KEY:
                 raise
-            # The builder names the style and the member in a PEP-678 note; keep it.
-            sys.exit(f"optimize: {e} [{'; '.join(getattr(e, '__notes__', []))}]")
+            # The builder's message names the style and the member (also a PEP-678 note).
+            sys.exit(f"optimize: {_refusal_text(e)}")
         # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
         # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
         # affect it, then thread it into the run config below so the handler's _build_experts (and

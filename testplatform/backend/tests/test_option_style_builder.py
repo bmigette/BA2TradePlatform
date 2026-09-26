@@ -588,10 +588,16 @@ def test_I3_action_overrides_on_a_member_with_its_own_dte_invariant_are_refused(
 
 
 def test_M1_a_builder_refusal_names_the_style_and_the_member(tmp_path):
+    """The context is IN the message (so ``str(e)`` -- every consumer but the optimize
+    command -- carries it), rides as a PEP-678 note too, and the type is rebuilt."""
     m = _launcher()
-    with pytest.raises(ValueError, match=r"^O_LC entry rule .*option_dte_min=50") as exc:
+    with pytest.raises(ValueError, match=r"^style 'x' member O_LC: O_LC entry rule "
+                                         r".*option_dte_min=50") as exc:
         _custom(m, tmp_path, [{"key": "O_LC", "action_overrides": {"option_dte_min": 50}}])
-    assert exc.value.__notes__ == ["style 'x' member O_LC"]   # PEP-678 note, type kept
+    assert type(exc.value) is ValueError                       # rebuilt, not wrapped
+    assert exc.value.__notes__ == ["style 'x' member O_LC"]   # PEP-678 note kept
+    assert isinstance(exc.value.__cause__, ValueError)         # chained from the original
+    assert str(exc.value.__cause__).startswith("O_LC entry rule ")
 
 
 def test_M1_M2_a_mixed_option_and_equity_entry_is_refused_naming_member_and_rule(
@@ -607,8 +613,10 @@ def test_M1_M2_a_mixed_option_and_equity_entry_is_refused_naming_member_and_rule
         return s
     monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LC", mixed)
     with pytest.raises(MixedEntryActionsRefused,
-                       match=r"O_LC entry rule 'o_lc-entry'.*mixes") as exc:
+                       match=r"^style 'x' member O_LC: O_LC entry rule 'o_lc-entry'.*mixes"
+                       ) as exc:
         _custom(m, tmp_path, [{"key": "O_LC"}])
+    assert type(exc.value) is MixedEntryActionsRefused       # the type is rebuilt
     assert exc.value.__notes__ == ["style 'x' member O_LC"]
 
 
@@ -649,10 +657,11 @@ def test_M3_given_the_style_space_a_translated_key_outside_it_is_refused(tmp_pat
         m._style_translate_key("cond:tp:enabled", idm, "O_LC", space)
 
 
-def test_M1_a_pydantic_ValidationError_from_a_bad_leaf_keeps_its_type_and_names_the_member(
+def test_M1_a_pydantic_ValidationError_from_a_bad_leaf_is_a_StyleBuildError_naming_the_member(
         tmp_path, monkeypatch):
     """A ValidationError cannot be rebuilt from a message (``type(e)(msg)`` raises TypeError),
-    so the style/member context rides as a PEP-678 note on the ORIGINAL exception."""
+    so it is refused as a ``StyleBuildError`` (a ValueError) whose MESSAGE names the style and
+    the member, chained from the original ValidationError, which is kept as ``__cause__``."""
     from pydantic import ValidationError
     from ba2_common.core.rule_models import normalize_trade_rules
     m = _launcher()
@@ -668,6 +677,20 @@ def test_M1_a_pydantic_ValidationError_from_a_bad_leaf_keeps_its_type_and_names_
     m._STYLE_ACTIVE = m._load_style_spec(_write(tmp_path, {"x": {
         "status": "candidate", "price_cap_policy": "none", "members": [{"key": "O_LC"}]}}), "x")
     monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LC", bad_leaf)
-    with pytest.raises(ValidationError) as exc:
+    with pytest.raises(m.StyleBuildError, match=r"^style 'x' member O_LC: .*validation error"
+                       ) as exc:
         m._build_strategy_style("O_STYLE")
+    assert isinstance(exc.value, ValueError)
+    assert isinstance(exc.value.__cause__, ValidationError)
     assert exc.value.__notes__ == ["style 'x' member O_LC"]
+
+
+def test_M1_the_optimize_command_prints_the_context_once(tmp_path, monkeypatch, capsys):
+    """The optimize command's refusal reads ``str(e)`` (which now carries the context) and
+    adds only notes the message does not already say."""
+    m = _launcher()
+    e = m._style_refusal(ValueError("boom"), "style 'x' member O_LC")
+    assert str(e) == "style 'x' member O_LC: boom"
+    assert m._refusal_text(e) == "style 'x' member O_LC: boom"
+    e.add_note("another fact")
+    assert m._refusal_text(e) == "style 'x' member O_LC: boom [another fact]"

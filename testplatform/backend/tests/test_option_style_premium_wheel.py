@@ -12,8 +12,9 @@ produce assigned stock" are both FLIPPED here: the chain is scoped to the wheel,
 that can deliver stock are named (``_STYLE_ASSIGNS_STOCK``, derived below from the settlement
 path) and liquidate, while only the wheel's assignment is held.
 """
-import inspect
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,68 +84,177 @@ def test_O_CCs_guard_and_overlay_are_scoped_to_O_CC():
 
 
 # --- who can put stock on the book, and who keeps it -------------------------------------------
-#: action type -> (the option_strategy its builder BOOKS, the action class). Each strategy is
-#: checked against the class source below, so a renamed booking fails here rather than silently
-#: moving a structure between the unit-settled and the per-leg path.
-_BOOKED = {
-    "buy_call": ("long_call", "BuyCallAction"),
-    "buy_put": ("long_put", "BuyPutAction"),
-    "open_bull_call_spread": ("bull_call_spread", "OpenBullCallSpreadAction"),
-    "open_bear_put_spread": ("bear_put_spread", "OpenBearPutSpreadAction"),
-    "sell_cash_secured_put": ("cash_secured_put", "SellCashSecuredPutAction"),
-    "open_bear_call_spread": ("bear_call_spread", "OpenBearCallSpreadAction"),
-    "open_bull_put_spread": ("bull_put_spread", "OpenBullPutSpreadAction"),
-    "open_straddle": ("straddle", "OpenStraddleAction"),
-    "open_strangle": ("strangle", "OpenStrangleAction"),
-    "open_iron_condor": ("iron_condor", "OpenIronCondorAction"),
-    "open_jade_lizard": ("jade_lizard", "OpenJadeLizardAction"),
-    "open_call_butterfly": ("call_butterfly", "OpenCallButterflyAction"),
-    "open_put_ratio_spread": ("put_ratio_spread", "OpenPutRatioSpreadAction"),
-    "open_call_backspread": ("call_backspread", "OpenCallBackspreadAction"),
-    "open_put_backspread": ("put_backspread", "OpenPutBackspreadAction"),
-    "open_pmcc": ("pmcc", "OpenPMCCAction"),
-    "roll_pmcc_short": ("pmcc_roll", "RollPMCCShortAction"),
-    "sell_covered_call": ("covered_call", "SellCoveredCallAction"),
-    "buy_protective_put": ("protective_put", "BuyProtectivePutAction"),
-}
 #: A covered call's short leg is covered by the member's own SHARES: ITM at expiry it is
 #: called away -- a CLOSING delivery of stock already held, never new stock (pinned end to end
 #: by test_member_scoped_assignment_hold's C1 tests). Every other short leg outside a
 #: defined-risk combo is assigned per leg INTO stock.
 _SHARE_COVERED = {"covered_call"}
+#: An opening action that does not open a structure of its own: it re-opens a leg ON another
+#: action's transaction, so its settlement path is that transaction's. ``roll_pmcc_short``
+#: writes the next short call on the PMCC's transaction, and the backtest decides per-leg vs
+#: unit settlement from the transaction's ENTRY order (``defined_risk_combo_strategy`` ->
+#: ``_entry_order_for_transaction``: the ``pmcc`` parent), never from the roll's own row.
+_RIDES_ON = {"roll_pmcc_short": "open_pmcc"}
+
+_TODAY = date(2024, 6, 3)
+_NEAR, _LEAP = date(2024, 7, 3), date(2025, 7, 7)            # 30 and 399 DTE
+#: Builder kwargs that make every opening action resolve on ``_ChainAccount``'s chain. The
+#: STRIKES and WINDOWS are irrelevant to the question (which legs are SHORT, and what the
+#: structure is booked as); they only have to select something.
+_GENERIC_KW = dict(strike_method="percent_otm", strike_param=5.0, wing_width_pct=5.0,
+                   dte_min=10, dte_max=45, sizing=1.0)
+_BUILD_KW = {"open_pmcc": dict(_GENERIC_KW, strike_param={"long": -10.0, "short": 5.0},
+                               dte_min=365, dte_max=450,
+                               short_dte_min=10, short_dte_max=45)}
 
 
-def _class_source(cls):
+def _chain_account():
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from ba2_common.core.option_types import OptionContract
+    from ba2_common.core.types import OptionRight
+
+    class _ChainAccount(OptionsAccountInterface):
+        """A chain for both rights at a near and a LEAPS expiry, a deep balance, no book.
+        Premium = intrinsic + a time value that decays away from the money (and is larger on
+        the LEAPS), so credit structures earn a credit and debit ones cost a debit."""
+
+        SPOT = 100.0
+
+        def __init__(self):
+            self.id = 1
+
+        def _as_of_date(self):
+            return _TODAY
+
+        def decision_label(self):
+            return _TODAY
+
+        def get_balance(self):
+            return 50_000_000.0
+
+        def get_tradable_balance(self):
+            return self.get_balance()
+
+        def get_option_tradable_balance(self):
+            return self.get_balance()
+
+        def available_option_buying_power(self):
+            return self.get_balance()
+
+        def get_account_snapshot(self):
+            from ba2_common.core.account_types import AccountSnapshot
+            b = self.get_balance()
+            return AccountSnapshot(cash=b, equity=b, net_liquidation=b)
+
+        def get_instrument_current_price(self, symbol, price_type=None):
+            return self.SPOT
+
+        def get_current_price(self, symbol=None):
+            return self.SPOT
+
+        def get_option_chain(self, underlying, expiry_min, expiry_max, option_type=None,
+                             strike_min=None, strike_max=None):
+            out = []
+            for expiry in (_NEAR, _LEAP):
+                if (expiry_min and expiry < expiry_min) or (expiry_max and expiry > expiry_max):
+                    continue
+                for k in range(50, 151, 5):
+                    call = option_type == OptionRight.CALL
+                    otm = max((k - self.SPOT) if call else (self.SPOT - k), 0.0)
+                    intrinsic = max((self.SPOT - k) if call else (k - self.SPOT), 0.0)
+                    tv = (5.0 if expiry == _NEAR else 14.0) * (0.9 ** (otm / 5.0))
+                    bid = round(tv + intrinsic, 4)
+                    out.append(OptionContract(
+                        symbol=f"{underlying}{expiry:%y%m%d}{'C' if call else 'P'}{k:05d}",
+                        underlying=underlying, option_type=option_type, strike=float(k),
+                        expiry=expiry, bid=bid, ask=round(bid + 0.05, 4), last=bid,
+                        open_interest=10_000, volume=10_000))
+            return out
+
+        def open_option_orders_book_wide(self):
+            return []
+
+        def get_option_positions(self):
+            return []
+
+        def get_option_quote(self, contract_symbol):
+            return None
+
+        def get_atm_implied_volatility(self, underlying):
+            return 0.3
+
+        def check_option_buying_power(self, required):
+            return True
+
+        def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
+            return trading_order
+
+        def close_option_position(self, position, order_type="limit", limit_price=None):
+            return None
+
+    return _ChainAccount()
+
+
+_BUILT: dict = {}
+
+
+def _built_structure(action_type):
+    """``(booked option_strategy, [OptionLeg])`` of the structure ``action_type`` OPENS, read off
+    a real build: the action runs against ``_ChainAccount`` and the legs it hands to the shared
+    ``_submit_option_order`` choke point are captured there. A leg is short because the builder
+    made it ``side=SELL, position_intent="sell_to_open"`` -- nothing reads source text, so no
+    comment or docstring can move a structure between the settlement paths."""
+    if action_type in _BUILT:
+        return _BUILT[action_type]
+    from app.services.backtest.backtest_db import backtest_trading_db
     from ba2_common.core import TradeActions as TA
-    return "".join(inspect.getsource(c) for c in cls.__mro__
-                   if c.__module__ == TA.__name__ and c is not TA._OptionEntryAction
-                   and c is not TA.TradeAction and issubclass(c, TA.TradeAction))
+    from ba2_common.core.types import ExpertActionType
+
+    captured = []
+
+    def capture(self, legs, quantity, limit_price, option_strategy, *a, **k):
+        captured.append((option_strategy, list(legs)))
+        return {"success": True, "message": "captured", "data": {}}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(TA._OptionEntryAction, "_submit_option_order", capture)
+        # the share overlays (covered call / protective put) need 100 held, uncommitted shares
+        mp.setattr(TA._OptionEntryAction, "_held_equity_shares", lambda self: 100.0)
+        mp.setattr(TA._OptionEntryAction, "_refuse_if_cover_is_short",
+                   lambda self, *a, **k: None)
+        rec = SimpleNamespace(id=1, instance_id=None, data=None, price_at_date=None,
+                              expected_profit_percent=None, recommended_action=None)
+        with backtest_trading_db(f"m4-build-{action_type}"):
+            action = TA.create_action(ExpertActionType(action_type), "XYZ", _chain_account(),
+                                      SimpleNamespace(), None, rec,
+                                      **_BUILD_KW.get(action_type, _GENERIC_KW))
+            action.submit_to_broker = True
+            result = action.execute()
+    assert len(captured) == 1, (
+        f"{action_type} built {len(captured)} structures on the test chain: "
+        f"{getattr(result, 'message', result)}")
+    _BUILT[action_type] = captured[0]
+    return captured[0]
 
 
-def _opening_short_leg(action_type):
-    """(booked strategy, opens a SHORT leg?) -- the short leg read off the class SOURCE
-    (``sell_to_open``), not restated."""
-    from ba2_common.core import TradeActions as TA
-    strategy, cls_name = _BOOKED[action_type]
-    cls = getattr(TA, cls_name)
-    src = _class_source(cls)
-    booked = getattr(cls, "OPTION_STRATEGY", None)
-    assert booked == strategy or f'"{strategy}"' in src or (
-        strategy == "pmcc_roll" and "PMCC_ROLL_STRATEGY" in src), (action_type, strategy)
-    return strategy, "sell_to_open" in src
+def _opens_a_short_leg(legs):
+    from ba2_common.core.types import OrderDirection
+    return any(leg.side == OrderDirection.SELL and leg.position_intent == "sell_to_open"
+               for leg in legs)
 
 
 def _assigns_stock_per_settlement_path(m, key):
     """Does member ``key`` open a short leg that the backtest settles PER LEG (so an ITM expiry
     is physically assigned into stock -- ``settle_single_leg_expiry``: "SHORT ITM: ALWAYS
     physical assignment at the strike, covered or naked"), rather than as a unit-settled
-    defined-risk combo (``BacktestAccount.defined_risk_combo_strategy``)?"""
+    defined-risk combo (``BacktestAccount.defined_risk_combo_strategy``)? Derived from the
+    structures the member's opening actions actually BUILD."""
     from app.services.backtest.backtest_account import BacktestAccount
     from ba2_common.core.types import get_option_entry_action_values
 
     combos = (BacktestAccount.DEFINED_RISK_LONG_STRATEGIES
               | BacktestAccount.DEFINED_RISK_SHORT_STRATEGIES)
-    opening = set(get_option_entry_action_values()) | {"roll_pmcc_short"}
+    opening = set(get_option_entry_action_values()) | set(_RIDES_ON)
     built = m._STRATEGY_BUILDERS[key](key)
     types = {str(a.get("action_type") or a.get("action") or "")
              for r in (built.entry_rules or []) + (built.exit_rules or [])
@@ -152,8 +262,12 @@ def _assigns_stock_per_settlement_path(m, key):
     types |= {str(r["action_type"]) for r in (built.exit_rules or []) if r.get("action_type")}
     out = False
     for at in sorted(types & opening):
-        assert at in _BOOKED, f"{key}: unmapped option-opening action {at!r}"
-        strategy, short = _opening_short_leg(at)
+        if at in _RIDES_ON:
+            assert _RIDES_ON[at] in types, (
+                f"{key}: {at} rides on {_RIDES_ON[at]}'s transaction, which {key} never opens")
+            continue
+        strategy, legs = _built_structure(at)
+        short = _opens_a_short_leg(legs)
         if short and strategy not in combos and strategy not in _SHARE_COVERED:
             out = True
     return out
@@ -163,7 +277,8 @@ def test_the_style_assigns_stock_set_matches_the_settlement_path():
     """``_STYLE_ASSIGNS_STOCK`` is exactly the admissible members whose structures the backtest
     settles per leg with a short leg -- jade_lizard / put_ratio_spread / the backspreads / the
     PMCC short call are NOT defined-risk combos, cash_secured_put is single-leg -- derived here
-    from the action classes and the account's combo sets, never restated."""
+    from the legs each member's opening actions BUILD (``_built_structure``) and the account's
+    combo sets, never restated and never read off source text."""
     m = _launcher()
     derived = {k for k in m._style_admissible_members()
                if _assigns_stock_per_settlement_path(m, k)}

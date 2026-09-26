@@ -1930,9 +1930,17 @@ def test_discovery_and_matrix_are_unchanged():
   - experts must be ⊆ {DeterministicScorer, FMPRating} (Q10);
   - load the style file with the launcher module's `_load_style_spec` (through `_launcher_module`,
     so validation is the launcher's own) and refuse any invalid selected style;
-  - refuse a selected style with no seed file under `--seed-dir`.
+  - refuse a selected style with no seed file under `--seed-dir`;
+  - refuse a selected style whose `status` is `candidate` unless the run passes an explicit
+    acknowledgement flag (e.g. `--allow-candidate-styles`), and print the acknowledgement in
+    the banner (Task 8 review M3). Every style in the candidates file is `candidate` today, so
+    the pilot passes the flag knowingly; an `approved` style needs none.
 - `planned_jobs` (style): for expert × style, name `optm-{expert}-O_STYLE-{style}{spread_tag}{suffix}`
-  → `discovery_name(..., extra_identity={"style": <resolved style dict without spec_sha256>, "seed_bundle_sha256": <sha or None>})`.
+  → `discovery_name(..., extra_identity={"style_sha256": <the loaded style's `spec_sha256`>, "seed_bundle_sha256": <sha or None>})`.
+  The identity digest uses `spec_sha256` (the canonical-JSON hash of the style's CONTENT,
+  `_load_style_spec`) and NEVER `spec_path`: the run config's `option_style` block carries
+  `spec_path` too, so hashing that block (or the path) would rename every job when the
+  file moves and keep the name when the content changes (Task 8 review M2).
 - `discovery_name`:
   - new kwarg `extra_identity=None`, merged into `identity` ONLY when given, so discovery digests
     stay byte-identical (Task 0's pin);
@@ -2396,3 +2404,31 @@ Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1
   precedes O_WHEEL with IDENTICAL entry gates (the wheel's entry is O_CSP's), so the wheel only
   trades once the GA moves its genes away from O_CSP's or toggles O_CSP off. The order is left
   as is (O_CSP, O_WHEEL last) pending the user's decision.
+
+### Task 8 review fixes (2026-09-26)
+
+- **I1, one entry-order read and one dup gate for both runtimes** (`3695e14a`).
+  - `ba2_common.core.entry_order.oldest_entry_order(transactions)`: the entry order of the oldest
+    OPENED transaction (UTC `open_date`, else `created_at`, then id). WAITING transactions are
+    not positions and are never picked.
+  - `entry_order_for_transaction(id)`: the first-written ROOT order (no `depends_on_order`, no
+    `parent_order_id`), UTC `created_at` then id, any status. That is the row every entry path
+    stamps `entry_tag` and its entry facts on (a combo's parent, never a leg child).
+  - `trade_cycle.open_or_waiting_position(expert, symbol)`: the one-position gate.
+  - The backtest engine, `BacktestAccount._entry_order_for_transaction`, live `TradeManager`
+    (open-positions pass, `resolve_entry_order`, the enter-market SAFETY CHECK) and
+    `AlpacaAccount._position_entry_tag` all call them. An OPENED position with no entry row
+    raises `EntryOrderUnresolved` (live: ERROR + skip the symbol; backtest: the run ends).
+  - Goldens and the stage-1 pin are unchanged. Live differs from the old code only where the
+    old code was wrong: an older WAITING transaction beside the open one, a partly filled then
+    cancelled entry, a same-side combo leg tied on `created_at`, mixed naive/aware timestamps
+    (old: TypeError), and a position with no entry row (old: evaluated against None).
+- **M1.** A style build refusal now carries `style '<name>' member <KEY>:` in its MESSAGE
+  (and still as a PEP-678 note), rebuilt as the same type where the type accepts a message,
+  else raised as `StyleBuildError(ValueError)` chained from the original (pydantic
+  `ValidationError`).
+- **M4.** `_STYLE_ASSIGNS_STOCK` is derived from the legs each member's opening actions actually
+  build (captured at `_submit_option_order`), not from source text. The set's comment now says
+  that short calls (O_CBS, O_PMCC, O_JL's call) deliver SHORT stock.
+- **M2/M3** are Task 17 notes (above): the identity digest uses `spec_sha256`, never
+  `spec_path`, and the driver refuses `status: candidate` styles unless acknowledged.

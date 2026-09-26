@@ -309,11 +309,12 @@ def test_style_flags_are_refused_without_o_style_and_required_with_it(argv, msg,
 
 def test_a_builder_refusal_reaches_the_cli_naming_style_and_member(tmp_path, monkeypatch):
     """A refusal the loader cannot see (an override merged with the authored band) is a clean
-    exit carrying the builder's PEP-678 note, not a traceback without it."""
+    exit naming the style and the member (in the builder's message, once), not a traceback."""
     p = tmp_path / "s.json"
     p.write_text(json.dumps({"schema": 1, "styles": {"x": {"status": "candidate", "members": [
         {"key": "O_LC", "action_overrides": {"option_dte_min": 50}}]}}}))
-    with pytest.raises(SystemExit, match=r"option_dte_min=50.*style 'x' member O_LC"):
+    with pytest.raises(SystemExit, match=r"^optimize: style 'x' member O_LC: .*option_dte_min=50"
+                       r"[^\[]*$"):
         _run(_argv("x", config=str(p)), monkeypatch)
 
 
