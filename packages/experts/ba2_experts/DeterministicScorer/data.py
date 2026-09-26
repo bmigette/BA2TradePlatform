@@ -511,9 +511,14 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
     ``+1 if SPY > SMA200 else -1``. The guard is gone: a missing series now raises out
     of ``get_series_as_of`` rather than degrading to a plausible-looking zero.
 
-    NO LOOKAHEAD. ``get_series_as_of`` cuts revised monthly series (UNRATE) on their
-    true first-publication date, so a bar on 2024-01-31 cannot see January's
-    unemployment rate -- it was not published until 2024-02-02.
+    NO LOOKAHEAD, BT == LIVE. ``get_series_as_of`` shows a decision only the rows FRED
+    had first published strictly before its decision label -- live, the New York date
+    of the decision; a daily backtest bar D, the next session N(D) (bar D decides on
+    D's close and fills at N(D)'s open, so it IS that live decision). One function, one
+    rule, both paths. So a bar on 2024-01-31 cannot see January's unemployment rate
+    (first published 2024-02-02), and a bar on d does not see BAA10Y's print for d
+    (first published on d+1). A payload that cannot establish availability is refused
+    (``MacroAvailabilityUnknown``), not degraded.
 
     There is no PMI input: ISM's NAPM no longer exists on FRED and every free
     stand-in is scaled differently from the 50-boundary ``pmi_score`` expects. See
@@ -535,7 +540,12 @@ def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
     # an instrument that changes what it measures is not an instrument -- and the
     # thing it was reaching for (every analysis's bundle carrying its macro reads)
     # is what ``_series`` records below, without touching the cache.
-    _key_suffix = str(as_of) if as_of is not None else "live"
+    #
+    # The live key carries the DECISION LABEL: what a live read may see changes when the
+    # label does (a row becomes visible the day after its first release), so a memo from
+    # yesterday's label must not serve today's decision. Within a label it is still ONE key.
+    _key_suffix = (str(as_of) if as_of is not None
+                   else f"live:{fred_series.decision_label(None).isoformat()}")
 
     def _series(series_id: str):
         """The series, and the observation that says this analysis read it.

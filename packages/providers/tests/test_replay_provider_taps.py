@@ -698,9 +698,14 @@ def _seed_fred(series_id="VIXCLS"):
     """
     from ba2_providers.macro import fred_series
 
-    rows = [{"date": "2026-06-11", "value": "14.5"},
-            {"date": "2026-06-12", "value": "15.5"}]
-    with mock.patch.dict(fred_series._MEM, {series_id: rows}, clear=True):
+    rows = [{"date": "2026-06-11", "value": "14.5", "realtime_start": "2026-06-11"},
+            {"date": "2026-06-12", "value": "15.5", "realtime_start": "2026-06-12"}]
+    # The header the first-release reader requires (format, first vintage, fetched today).
+    meta = {"series_id": series_id, "format": fred_series.CACHE_FORMAT_FIRST_RELEASE,
+            "availability": fred_series.AVAIL_FIRST_RELEASE, "first_vintage": "2010-11-22",
+            "fetched_at": datetime.now(timezone.utc).isoformat()}
+    with mock.patch.dict(fred_series._MEM, {series_id: rows}, clear=True), \
+            mock.patch.dict(fred_series._META, {series_id: meta}, clear=True):
         yield fred_series
 
 

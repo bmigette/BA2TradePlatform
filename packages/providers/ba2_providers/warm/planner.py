@@ -389,6 +389,15 @@ def _is_empty_sentinel(path: str, size: int) -> bool:
 # --------------------------------------------------------------------------- #
 # FRED series
 # --------------------------------------------------------------------------- #
+def _fred_needs_first_release_format(series_id: str, path: str) -> bool:
+    """True when *series_id* is read by first-release date but *path* is not in that format.
+
+    Reads the header only: ``refresh_series`` writes it before the observations."""
+    from ba2_providers.macro import fred_series
+
+    return not fred_series.is_current_format(series_id, path)
+
+
 def _inspect_series(req: Requirement, roots: Sequence[str], as_of_now: datetime,
                     fred_max_age_hours: float, measured: "_SizeIndex") -> PlanEntry:
     relpath = os.path.join("fred", f"{req.namespace.upper()}.json")
@@ -404,6 +413,12 @@ def _inspect_series(req: Requirement, roots: Sequence[str], as_of_now: datetime,
                              estimated_bytes=size,
                              detail=(f"age {age_hours:.1f}h exceeds the configured "
                                      f"{fred_max_age_hours:g}h macro freshness window"))
+        if _fred_needs_first_release_format(req.namespace, path):
+            return PlanEntry(requirement=req, status=STATUS_STALE, action=ACTION_REFRESH,
+                             source_root=root, path=path, size_bytes=size,
+                             estimated_bytes=size,
+                             detail=("old observation-date format: the reader refuses it "
+                                     "until it is re-warmed with first-release dates"))
         return PlanEntry(requirement=req, status=STATUS_PRESENT, action=ACTION_NONE,
                          source_root=root, path=path, size_bytes=size,
                          detail=f"age {age_hours:.1f}h")

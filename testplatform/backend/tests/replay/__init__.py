@@ -419,15 +419,27 @@ _SCORER_HISTORY = {
 #: The FRED files the macro section reads, seeded into the module's in-process memo
 #: so the REAL (tapped) point-in-time read runs with no disk and no network.
 _SCORER_FRED = {
-    "VIXCLS": [{"date": "2026-09-09", "value": "14.5"},
-               {"date": "2026-09-10", "value": "15.5"}],
+    "VIXCLS": [{"date": "2026-09-09", "value": "14.5", "realtime_start": "2026-09-09"},
+               {"date": "2026-09-10", "value": "15.5", "realtime_start": "2026-09-10"}],
     "UNRATE": [{"date": "2026-07-01", "value": "4.1", "realtime_start": "2026-08-02"},
                {"date": "2026-08-01", "value": "4.2", "realtime_start": "2026-09-05"}],
-    "BAA10Y": [{"date": "2026-09-09", "value": "1.8"},
-               {"date": "2026-09-10", "value": "1.9"}],
-    "T10Y3M": [{"date": "2026-09-09", "value": "0.4"},
-               {"date": "2026-09-10", "value": "0.5"}],
+    "BAA10Y": [{"date": "2026-09-09", "value": "1.8", "realtime_start": "2026-09-10"},
+               {"date": "2026-09-10", "value": "1.9", "realtime_start": "2026-09-11"}],
+    "T10Y3M": [{"date": "2026-09-09", "value": "0.4", "realtime_start": "2026-09-09"},
+               {"date": "2026-09-10", "value": "0.5", "realtime_start": "2026-09-10"}],
 }
+
+
+def _scorer_fred_meta():
+    """The cache headers the first-release reader requires, fetched NOW."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    from ba2_providers.macro import fred_series
+
+    return {sid: {"series_id": sid, "format": fred_series.CACHE_FORMAT_FIRST_RELEASE,
+                  "availability": fred_series.AVAIL_FIRST_RELEASE,
+                  "first_vintage": "1960-03-15",
+                  "fetched_at": _dt.now(_tz.utc).isoformat()} for sid in _SCORER_FRED}
 
 _SCORER_GRADES = [{"date": _days_ago_iso(6), "analystRatingsStrongBuy": 6,
                    "analystRatingsbuy": 4, "analystRatingsHold": 2,
@@ -497,6 +509,7 @@ def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400) -> Case:
         mock.patch.dict(fred_series._MEM,
                         {sid: [dict(row) for row in rows]
                          for sid, rows in _SCORER_FRED.items()}, clear=True),
+        mock.patch.dict(fred_series._META, _scorer_fred_meta(), clear=True),
     ]
     return Case(expert, settings, patches, FakeMarketAnalysis(analysis_id, "GOOG"))
 

@@ -163,8 +163,6 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
     stdout, where both are equally visible) and to ``logger.warning`` otherwise -- never
     to ``logger.info``.
     """
-    import time
-
     from ba2_providers.macro import fred_series
 
     say = log if log is not None else logger.info
@@ -177,8 +175,10 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
 
     refreshed = skipped = errors = 0
     for sid in fred_series.SERIES_SPEC:
-        path = fred_series.cache_path(sid)
-        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) / 3600.0 < max_age_hours:
+        # Young AND in the format its reader accepts: a young file in the old observation-date
+        # format is refused by the first-release reader, so it is not "fresh" (review
+        # 2026-09-26, item 4).
+        if fred_series.cache_is_fresh(sid, max_age_hours):
             skipped += 1
             continue
         try:

@@ -12,6 +12,12 @@ The files land under ``CACHE_FOLDER/fred/`` and are therefore picked up by
 ``cache_sync.build_manifest`` automatically -- remote GA workers receive them with the
 rest of the cache, no extra wiring.
 
+MACRO SIGNAL SERIES (every series but DGS3MO) are cached with each observation's FIRST-RELEASE
+date on FRED (ALFRED ``realtime_start``) and ``"format": "first_release_v1"``; the reader shows
+a decision only rows first published strictly before its decision label, and REFUSES a file in
+the old observation-date format. Re-warming them is several ALFRED requests per series (the
+vintage list, the first vintage, ``output_type=4`` windows); ``--check`` shows each file's format.
+
 Usage:
     python tools/refresh_fred_cache.py                  # refresh all series
     python tools/refresh_fred_cache.py --series VIXCLS UNRATE
@@ -97,15 +103,19 @@ def main() -> None:
         raise SystemExit(f"Unknown series {unknown}. Known: {sorted(fred_series.SERIES_SPEC)}")
 
     if args.check:
-        print(f"{'series':<12} {'obs':>8}  {'age(h)':>8}  range")
+        print(f"{'series':<12} {'obs':>8}  {'age(h)':>8}  {'format':<18} range")
         for sid in series:
             path = fred_series.cache_path(sid)
             age = _age_hours(path)
             if age is None:
                 print(f"{sid:<12} {'-':>8}  {'MISSING':>8}")
                 continue
-            rows = json.load(open(path, encoding="utf-8"))["observations"]
-            print(f"{sid:<12} {len(rows):>8,}  {age:>8.1f}  "
+            doc = json.load(open(path, encoding="utf-8"))
+            rows = doc["observations"]
+            want = fred_series.SERIES_SPEC[sid]["availability"]
+            fmt = doc.get("format") or ("same-day" if want == fred_series.AVAIL_SAME_DAY_CLOSE
+                                        else "OLD (refused)")
+            print(f"{sid:<12} {len(rows):>8,}  {age:>8.1f}  {fmt:<18} "
                   f"{rows[0]['date']} -> {rows[-1]['date']}")
         return
 
@@ -113,7 +123,10 @@ def main() -> None:
     refreshed = skipped = failed = 0
     for sid in series:
         age = _age_hours(fred_series.cache_path(sid))
-        if args.max_age_hours is not None and age is not None and age < args.max_age_hours:
+        # Young AND in the format its reader accepts: a young OLD-format signal file is
+        # refused by the reader, so it is refetched rather than skipped as fresh.
+        if args.max_age_hours is not None and fred_series.cache_is_fresh(sid,
+                                                                         args.max_age_hours):
             print(f"{sid:<12} skip (age {age:.1f}h)")
             skipped += 1
             continue
