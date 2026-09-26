@@ -25,7 +25,7 @@ from ba2_common.core import trade_store as ts
 from ba2_common.core.db import add_instance, get_db, update_instance
 from ba2_common.core.entry_order import (
     EntryOrderUnresolved, entry_order_for_transaction, oldest_entry_order,
-    oldest_open_transaction)
+    oldest_open_transaction, positions_to_manage)
 from ba2_common.core.models import TradingOrder, Transaction
 from ba2_common.core.trade_cycle import open_or_waiting_position
 from ba2_common.core.types import (
@@ -240,3 +240,31 @@ def test_the_dup_gate_counts_opened_and_waiting_per_expert_and_symbol(store):
     assert open_or_waiting_position(n, other_sym, session=session) is None
     _txn(n, other_sym, TransactionStatus.OPENED)
     assert open_or_waiting_position(n, other_sym, session=session) is not None
+
+
+# --------------------------------------------------------------------------------------------- #
+# positions_to_manage: the book an exit pass evaluates a symbol against
+# --------------------------------------------------------------------------------------------- #
+class _Pending:
+    def __init__(self, *closing):
+        self.closing = set(closing)
+
+    def has_pending_closing_order(self, transaction_id):
+        return transaction_id in self.closing
+
+
+def test_the_managed_book_is_OPENED_minus_a_pending_close_in_the_given_order():
+    a = _bare(3, TransactionStatus.OPENED, open_date=T0)
+    waiting = _bare(1, TransactionStatus.WAITING, open_date=T0)
+    closing = _bare(2, TransactionStatus.OPENED, open_date=T0)
+    b = _bare(4, TransactionStatus.OPENED, open_date=T0)
+    closed = _bare(5, TransactionStatus.CLOSED, open_date=T0)
+    got = positions_to_manage([a, waiting, closing, b, closed], _Pending(2))
+    assert [t.id for t in got] == [3, 4]
+
+
+def test_a_WAITING_only_book_is_not_managed():
+    """Filled at the broker but not promoted yet: not a position to exit (the caller skips the
+    symbol rather than evaluating it with no entry order)."""
+    assert positions_to_manage([_bare(1, TransactionStatus.WAITING, open_date=T0)],
+                               _Pending()) == []

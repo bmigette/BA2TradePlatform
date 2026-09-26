@@ -185,3 +185,30 @@ def test_an_open_position_without_an_entry_order_is_refused_by_name(style_world,
     assert _Account.closed == []
     assert any("ENTRY_ORDER_UNRESOLVED" in m and f"transaction {t.id} ({SYMBOL})" in m
                for m in errors), errors
+
+
+def test_a_WAITING_only_symbol_is_not_evaluated(style_world, monkeypatch):
+    """Filled at the broker, not yet promoted (up to one account refresh): the transaction is
+    still WAITING. Nothing is held on the platform's books, so -- as in the backtest, which
+    manages OPENED transactions only -- the symbol's exits are NOT evaluated. Old live code
+    evaluated it with ``existing_order=None``, and a close rule whose leaves need no entry
+    order (here: any confidence) took ``CloseAction``'s legacy broker-position branch, closing
+    the broker position without linking the close to the transaction."""
+    from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+
+    evaluated = []
+    real = TradeActionEvaluator.evaluate
+
+    def spy(self, *args, **kwargs):
+        evaluated.append(kwargs.get("existing_order"))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(TradeActionEvaluator, "evaluate", spy)
+    no_order_needed = [{"id": "any_close", "name": "any_close", "continue_processing": False,
+                        "actions": [{"action_type": "close"}],
+                        "conditions": {"type": "AND", "conditions": [
+                            {"id": "conf", "field": "confidence", "op": ">=", "value": 0.0}]}}]
+    w = style_world(no_order_needed)
+    _position(w, TAG_A, days_ago=1, status=TransactionStatus.WAITING)   # its order is FILLED
+    _pass(w.expert_id)
+    assert evaluated == [] and _Account.closed == []

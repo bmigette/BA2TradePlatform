@@ -7,9 +7,10 @@ different rows a member's exits fire in one and never in the other. Both now cal
 
 * BACKTEST: the real ``DailyBacktestEngine._held_transactions`` (OPENED only, minus a pending
   close) -> ``_oldest_entry_order``, over the backtest's in-memory trade store.
-* LIVE: the real ``TradeManager.process_open_positions_recommendations`` over SQLite (the
-  OPENED + WAITING query, minus a pending close), with ``TradeActionEvaluator.evaluate`` spied
-  to capture the ``existing_order`` it is handed.
+* LIVE: the real ``TradeManager.process_open_positions_recommendations`` over SQLite (OPENED
+  only, minus a pending close -- the shared ``entry_order.positions_to_manage``), with
+  ``TradeActionEvaluator.evaluate`` spied to capture the ``existing_order`` and the
+  ``existing_transactions`` it is handed.
 
 Each book is written by one builder into both stores, and the pick is compared by the label on
 the chosen row. The books are the cases where the old live code and the old backtest code
@@ -44,7 +45,7 @@ def _txn(label, *, days, status=TransactionStatus.OPENED, side=OrderDirection.SE
     when = T0 + timedelta(days=days)
     t = Transaction(symbol=SYM, quantity=1.0, side=side, status=status, open_price=1.0,
                     expert_id=EXPERT, created_at=when, open_date=when if open_date else None,
-                    multiplier=100, comment=label)
+                    multiplier=100, meta_data={"label": label})
     add_instance(t, expunge_after_flush=True)
     return t
 
@@ -125,10 +126,31 @@ def book_equal_open_times():
     return "a-entry"
 
 
+def book_waiting_only():
+    """Only a WAITING transaction, its entry already FILLED at the broker but not yet promoted
+    (the up-to-one-refresh window). Nothing is held on the platform's books, so NEITHER runtime
+    evaluates the symbol's exits. Old live evaluated it with ``existing_order=None``: a close
+    rule whose leaves need no entry order then took ``CloseAction``'s legacy broker-position
+    branch and closed the broker position unlinked to the transaction."""
+    w = _txn("w", days=1, status=TransactionStatus.WAITING, open_date=False)
+    _order(w, "w-entry", days=1)
+    return None
+
+
+def book_waiting_beside_open():
+    """A newer WAITING entry beside the held position: the evaluator's BOOK
+    (``existing_transactions``) is the OPENED position only, in both runtimes."""
+    a = _txn("a", days=1)
+    _order(a, "a-entry", days=1)
+    w = _txn("w", days=3, status=TransactionStatus.WAITING, open_date=False)
+    _order(w, "w-entry", days=3, status=OrderStatus.ACCEPTED)
+    return "a-entry"
+
+
 BOOKS = [book_normal, book_two_positions_newer_written_first, book_older_waiting_beside_open,
          book_combo_parent_and_net_side_leg,
          book_partly_filled_then_cancelled_entry_and_scale_in, book_older_dependent_leg,
-         book_equal_open_times]
+         book_equal_open_times, book_waiting_only, book_waiting_beside_open]
 
 
 class _NoPendingClose:
@@ -144,9 +166,12 @@ def _backtest_pick(book):
     eng.account = _NoPendingClose()
     with ts.inmem_trades():
         expected = book()
-        txns = eng._held_transactions(EXPERT)[SYM]
+        txns = eng._held_transactions(EXPERT).get(SYM)
+        if not txns:                      # the engine manages only symbols it holds
+            return expected, None
         order = eng._oldest_entry_order(txns)
-        return expected, (order.data or {}).get("mark")
+        labels = sorted(t.meta_data["label"] for t in txns)
+        return expected, ((order.data or {}).get("mark"), labels)
 
 
 class _LiveAccount(_NoPendingClose):
@@ -173,7 +198,8 @@ def _live_pick(book, monkeypatch, run):
     seen = []
 
     def spy(self, *args, **kwargs):
-        seen.append(kwargs["existing_order"])
+        seen.append((kwargs["existing_order"],
+                     [t.meta_data["label"] for t in self.existing_transactions]))
         return []
 
     rules = normalize_trade_rules([{
@@ -199,12 +225,23 @@ def _live_pick(book, monkeypatch, run):
                    return_value=_LiveAccount), \
              patch.object(TradeActionEvaluator, "evaluate", spy):
             TradeManager().process_open_positions_recommendations(EXPERT)
-    assert len(seen) == 1, f"the live pass evaluated {len(seen)} times, expected once"
-    return (seen[0].data or {}).get("mark") if seen[0] is not None else None
+    assert len(seen) <= 1, f"the live pass evaluated {len(seen)} times, expected at most once"
+    if not seen:
+        return None
+    order, book_labels = seen[0]
+    return ((order.data or {}).get("mark") if order is not None else None, sorted(book_labels))
 
 
 @pytest.mark.parametrize("book", BOOKS, ids=[b.__name__ for b in BOOKS])
-def test_the_backtest_and_live_pick_the_same_entry_order(book, monkeypatch):
+def test_the_backtest_and_live_evaluate_the_same_book_and_pick_the_same_entry_order(
+        book, monkeypatch):
+    """Per book: whether the symbol is evaluated at all, the transactions the evaluator is
+    handed (``existing_transactions``: OPENED only, minus a pending close) and the
+    ``existing_order`` -- identical in both runtimes."""
     expected, bt = _backtest_pick(book)
     live = _live_pick(book, monkeypatch, book.__name__)
-    assert bt == live == expected, f"backtest {bt!r}, live {live!r}, expected {expected!r}"
+    assert bt == live, f"backtest {bt!r}, live {live!r}"
+    if expected is None:
+        assert bt is None, f"a book with no OPENED position was evaluated: {bt!r}"
+    else:
+        assert bt[0] == expected and "w" not in bt[1], bt

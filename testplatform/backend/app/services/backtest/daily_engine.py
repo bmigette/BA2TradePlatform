@@ -1422,11 +1422,10 @@ class DailyBacktestEngine:
     def _held_transactions(self, expert_id: int) -> Dict[str, List[Any]]:
         """{symbol: [OPENED Transaction, ...]} for this expert.
 
-        OPENED only (not WAITING): the backtest enters with MARKET orders that fill on the NEXT
-        bar, so a WAITING transaction is just THIS bar's freshly-created, un-filled entry —
-        managing it now would cancel the entry before it ever opens. Live includes WAITING
-        because there a limit entry can genuinely sit working; here only a filled position is a
-        real open position to manage.
+        OPENED only (not WAITING): a WAITING transaction has not opened, so there is nothing to
+        exit -- managing it now would cancel the entry before it ever opens. Live manages the
+        same book: both runtimes filter through the SHARED ``entry_order.positions_to_manage``
+        (plan 2026-09-25 option-stage2-build, Task 8 review asymmetry (a)).
 
         Excludes a transaction that already has a closing order WORKING (submitted on an
         earlier bar, not yet filled/canceled) — see
@@ -1437,14 +1436,13 @@ class DailyBacktestEngine:
         may already be gone, compounding into runaway equity (the 2026-07-21 options-grid
         trillion-scale fitness anomaly).
         """
+        from ba2_common.core.entry_order import positions_to_manage
         from ba2_common.core.trade_store import transactions_where
         from ba2_common.core.types import TransactionStatus
 
         out: Dict[str, List[Any]] = {}
         rows = transactions_where(expert_id=expert_id, status=TransactionStatus.OPENED)
-        for t in rows:
-            if self.account.has_pending_closing_order(t.id):
-                continue
+        for t in positions_to_manage(rows, self.account):
             out.setdefault(t.symbol, []).append(t)
         return out
 

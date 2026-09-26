@@ -79,6 +79,28 @@ def oldest_open_transaction(transactions: Iterable[Any]) -> Optional[Any]:
     return min(opened, key=transaction_age_key)
 
 
+def positions_to_manage(transactions: Iterable[Any], account: Any) -> list:
+    """THE BOOK an OPEN_POSITIONS pass evaluates a symbol against (the evaluator's
+    ``existing_transactions``): the OPENED transactions, in the order given, minus any with a
+    closing order already working (``account.has_pending_closing_order``, so a close in flight
+    is not submitted again every cycle). An empty result means the symbol is NOT evaluated.
+
+    Shared by live ``TradeManager.process_open_positions_recommendations`` and the backtest
+    ``daily_engine._held_transactions`` (plan 2026-09-25 option-stage2-build, Task 8 review,
+    asymmetry (a)). Live used to hand the evaluator OPENED **and** WAITING transactions, so it
+    evaluated WAITING-only symbols the backtest never evaluates -- and in the filled-but-not-
+    yet-promoted window (up to one account refresh) that meant ``existing_order=None``: a close
+    rule whose leaves need no entry order then took ``CloseAction``'s legacy broker-position
+    branch and closed the broker position without linking the close to the transaction, which
+    could afterwards be promoted to OPENED while the broker was flat. WAITING transactions are
+    still counted by the ENTRY gate (``trade_cycle.open_or_waiting_position``); they are simply
+    not positions to exit.
+    """
+    return [t for t in transactions
+            if t.status == TransactionStatus.OPENED
+            and not account.has_pending_closing_order(t.id)]
+
+
 def entry_order_for_transaction(transaction_id: Any, *, session=None) -> Optional[Any]:
     """The transaction's entry order (its first-written root order), or None if it has none.
 

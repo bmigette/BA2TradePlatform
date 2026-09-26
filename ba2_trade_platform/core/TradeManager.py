@@ -3429,28 +3429,27 @@ class TradeManager:
                 # Process each recommendation through the open_positions ruleset
                 for recommendation in recommendations:
                     try:
-                        # Check if this symbol has existing transactions for THIS expert only
+                        # THE BOOK this symbol's exits are evaluated against: THIS expert's OPENED
+                        # transactions, minus any with a closing order already WORKING (else each
+                        # cycle could submit ANOTHER close for the same position; see
+                        # ReadOnlyAccountInterface.has_pending_closing_order). The SAME filter the
+                        # backtest engine applies (entry_order.positions_to_manage, plan 2026-09-25
+                        # option-stage2-build Task 8 review asymmetry (a)). WAITING transactions
+                        # are NOT positions to exit: evaluated in the filled-but-not-promoted
+                        # window with existing_order=None, a close rule needing no entry order took
+                        # CloseAction's legacy broker-position branch and closed the broker
+                        # position without linking the close to the transaction.
+                        from ba2_common.core.entry_order import positions_to_manage
                         statement = select(Transaction).where(
                             Transaction.symbol == recommendation.symbol,
-                            Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED]),
+                            Transaction.status == TransactionStatus.OPENED,
                             Transaction.expert_id == expert_instance_id
                         )
-                        existing_transactions = session.exec(statement).all()
-
-                        # Skip a transaction that already has a closing order WORKING
-                        # (submitted on an earlier cycle, not yet filled/canceled) — otherwise
-                        # this loop re-evaluates exit rules and can submit ANOTHER closing
-                        # order for the same position on every subsequent cycle until the
-                        # first one resolves. Shared with the backtest engine's equivalent
-                        # guard (found investigating the 2026-07-21 options-grid equity
-                        # runaway); see ReadOnlyAccountInterface.has_pending_closing_order.
-                        existing_transactions = [
-                            t for t in existing_transactions
-                            if not account.has_pending_closing_order(t.id)
-                        ]
+                        existing_transactions = positions_to_manage(
+                            session.exec(statement).all(), account)
 
                         if not existing_transactions:
-                            self.logger.debug(f"No existing transactions for {recommendation.symbol}, skipping recommendation {recommendation.id}")
+                            self.logger.debug(f"No OPENED transaction to manage for {recommendation.symbol}, skipping recommendation {recommendation.id}")
                             continue
                         
                         # Create TradeActionEvaluator with existing transactions for open_positions use case
@@ -3477,13 +3476,7 @@ class TradeManager:
                                 f"Skipping open_positions evaluation of recommendation "
                                 f"{recommendation.id} for {recommendation.symbol}: {e}")
                             continue
-                        if existing_order:
-                            self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
-                        else:
-                            # Only WAITING transactions: nothing has opened on this symbol yet.
-                            self.logger.debug(
-                                f"No OPENED transaction for {recommendation.symbol} (only "
-                                f"WAITING) - conditions needing an entry order read False")
+                        self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
 
                         # Evaluate recommendation through the open_positions ruleset
                         self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol} (open_positions)")
