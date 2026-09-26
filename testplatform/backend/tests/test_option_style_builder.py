@@ -252,7 +252,7 @@ def test_an_opening_action_that_cannot_carry_the_tag_is_refused(tmp_path, monkey
                                             action="sell", action_type="sell")]
         return s
     monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_PP", with_sell)
-    with pytest.raises(ValueError, match=r"O_PP.*'sell'.*tag"):
+    with pytest.raises(ValueError, match=r"O_PP.*'sell' action opens a position but cannot"):
         _custom(m, tmp_path, [{"key": "O_PP"}])
 
 
@@ -354,6 +354,9 @@ def test_every_scoped_exit_converts_through_the_shared_rule_converters(tmp_path,
         if r.get("enabled") is False:
             continue
         triggers = rule_triggers_from_tree(r["conditions"], r["id"])
+        # every leaf converts -- none is dropped on the way to the engine -- and exactly one of
+        # the triggers is the member tag
+        assert len(triggers) == len(_leaves(r["conditions"])), r["id"]
         tag_triggers = [t for t in triggers.values()
                         if t["event_type"] == ExpertEventType.N_ENTRY_TAG.value]
         assert len(tag_triggers) == 1, r["id"]
@@ -475,7 +478,7 @@ def test_shared_and_run_level_keys_translate_by_identity(tmp_path):
     s = _custom(m, tmp_path, _CLASHING)
     idm = s.style_id_maps["O_WHEEL"]
     for g in ("cond:shared-rel_volume:value", "optsel:credit:w_premium", "model:k_compress",
-              "schedule:monday", "screener:price_max"):
+              "schedule:monday"):
         assert m._style_translate_key(g, idm, "O_WHEEL") == g
     assert m._style_translate_key("cond:o_csp-iv_rank:enabled", idm, "O_WHEEL") == \
         "cond:o_wheel-o_csp-iv_rank:enabled"
@@ -529,3 +532,116 @@ def test_the_clashing_members_genomes_stay_disjoint(tmp_path):
     assert "cond:o_cc-gate_confidence:value" in space
     assert "cond:o_pp-gate_confidence:value" in space
     assert "cond:gate_confidence:value" not in space
+
+
+# --- review fixes (2026-09-26) -----------------------------------------------------------------
+def test_I1_a_valueless_exit_leaf_is_refused_in_the_style_exactly_as_in_the_single(
+        tmp_path, monkeypatch):
+    """The tag leaf always converts. Counted as an ordinary trigger it would turn a rule whose
+    AUTHORED leaves all dropped into ``{entry_tag == N}`` -- always true for that member --
+    while the single-structure rule is refused. Both must be refused."""
+    from ba2_common.core.rule_builders import rule_triggers_from_tree
+    m = _launcher()
+    _pin_admissible(m, monkeypatch)
+    real = m._STRATEGY_BUILDERS["O_LP"]
+
+    def valueless_tp(kind):
+        s = real(kind)
+        for leaf in _leaves(s.exit_rules[0]["conditions"]):
+            leaf.pop("value", None)
+        return s
+    monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LP", valueless_tp)
+    single = m._STRATEGY_BUILDERS["O_LP"]("O_LP").exit_rules[0]
+    with pytest.raises(ValueError, match="ALWAYS TRUE"):
+        rule_triggers_from_tree(single["conditions"], single["id"])
+    styled = _custom(m, tmp_path, [{"key": "O_LP"}]).exit_rules[0]
+    assert styled["id"] == "o_lp-opt_tp" and _tag_leaves(styled)
+    with pytest.raises(ValueError, match="ALWAYS TRUE"):
+        rule_triggers_from_tree(styled["conditions"], styled["id"])
+
+
+def test_I2_screener_genes_are_refused_not_passed_through(tmp_path):
+    """Screener genes are RUN-level: a stage-1 O_CSP seed's price cap would silently become the
+    whole style's (pre-empting Q3). Refused by name until a policy says otherwise."""
+    m = _launcher()
+    s = _custom(m, tmp_path, [{"key": "O_CSP"}])
+    with pytest.raises(ValueError, match=r"O_CSP.*screener:price_max.*run-level"):
+        m._style_translate_key("screener:price_max", s.style_id_maps["O_CSP"], "O_CSP")
+
+
+@pytest.mark.parametrize("member, overrides", [
+    # O_ERN 7..14 decodes dte_min down to 0, inside its 5-day before-earnings entry ceiling:
+    # an expiry that can settle BEFORE the print it bets on.
+    ("O_ERN", {"option_dte_min": 7, "option_dte_max": 14}),
+    # O_LEAP at 60..90 is no longer a LEAPS, and its own 90-240 DTE exit closes it at once.
+    ("O_LEAP", {"option_dte_min": 60, "option_dte_max": 90}),
+    ("O_PMCC", {"option_dte_min": 400, "option_dte_max": 480}),
+    ("O_CONVEX", {"option_dte_step": 5}),
+])
+def test_I3_action_overrides_on_a_member_with_its_own_dte_invariant_are_refused(
+        tmp_path, member, overrides):
+    m = _launcher()
+    path = _write(tmp_path, {"x": {"status": "candidate", "members": [
+        {"key": member, "action_overrides": overrides}]}})
+    with pytest.raises(ValueError, match=rf"{member}.*action_overrides.*DTE invariant"):
+        m._load_style_spec(path, "x")
+
+
+def test_M1_a_builder_refusal_names_the_style_and_the_member(tmp_path):
+    m = _launcher()
+    with pytest.raises(ValueError, match=r"^style 'x' member O_LC: .*option_dte_min=50"):
+        _custom(m, tmp_path, [{"key": "O_LC", "action_overrides": {"option_dte_min": 50}}])
+
+
+def test_M1_M2_a_mixed_option_and_equity_entry_is_refused_naming_member_and_rule(
+        tmp_path, monkeypatch):
+    from ba2_common.core.trade_cycle import MixedEntryActionsRefused
+    m = _launcher()
+    _pin_admissible(m, monkeypatch)
+    real = m._STRATEGY_BUILDERS["O_LC"]
+
+    def mixed(kind):
+        s = real(kind)
+        s.entry_rules[0]["actions"].append({"action": "buy", "action_type": "buy"})
+        return s
+    monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LC", mixed)
+    with pytest.raises(MixedEntryActionsRefused,
+                       match=r"style 'x' member O_LC: .*entry rule 'o_lc-entry'.*mixes"):
+        _custom(m, tmp_path, [{"key": "O_LC"}])
+
+
+def test_M2_a_sell_beside_a_buy_hits_the_sell_refusal_not_the_untagged_fallback(
+        tmp_path, monkeypatch):
+    """The ``sell`` refusal must fire on its own: a rule whose buy IS tagged would otherwise
+    pass with an untaggable short entry riding along."""
+    m = _launcher()
+    _pin_admissible(m, monkeypatch)
+    real = m._STRATEGY_BUILDERS["O_PP"]
+
+    def buy_and_sell(kind):
+        s = real(kind)
+        s.entry_rules[0]["actions"].append({"action": "sell", "action_type": "sell"})
+        return s
+    monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_PP", buy_and_sell)
+    with pytest.raises(ValueError, match=r"O_PP.*'sell' action opens a position but cannot"):
+        _custom(m, tmp_path, [{"key": "O_PP"}])
+
+
+@pytest.mark.parametrize("gene", ["cond:tp:bogus", "cond:tp:value:extra"])
+def test_M3_a_cond_gene_with_an_unknown_field_is_refused(tmp_path, gene):
+    m = _launcher()
+    s = _custom(m, tmp_path, [{"key": "O_LC"}])
+    with pytest.raises(ValueError, match=r"O_LC.*cannot place"):
+        m._style_translate_key(gene, s.style_id_maps["O_LC"], "O_LC")
+
+
+def test_M3_given_the_style_space_a_translated_key_outside_it_is_refused(tmp_path):
+    from app.services.strategy_param_space import collect_param_space
+    m = _launcher()
+    s = _custom(m, tmp_path, [{"key": "O_LC"}])
+    space = collect_param_space(s)
+    idm = s.style_id_maps["O_LC"]
+    assert m._style_translate_key("cond:tp:value", idm, "O_LC", space) == "cond:o_lc-tp:value"
+    # a well-formed key naming a gene the style does not have (tp has no toggle gene)
+    with pytest.raises(ValueError, match=r"O_LC.*cond:o_lc-tp:enabled.*not a gene"):
+        m._style_translate_key("cond:tp:enabled", idm, "O_LC", space)

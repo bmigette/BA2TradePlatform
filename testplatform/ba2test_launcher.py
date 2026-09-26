@@ -5506,6 +5506,18 @@ _STYLE_PRICE_CAP_POLICIES = {"group_min", "none"}
 _STYLE_ACTION_OVERRIDE_KEYS = {"option_dte_min", "option_dte_max", "option_dte_min_range",
                                "option_dte_max_range", "option_dte_step"}
 _STYLE_EXIT_OVERRIDE_FIELDS = {"value", "value_min", "value_max", "value_step"}
+#: Members whose DTE band carries an invariant of its OWN that a moved band would silently
+#: break, and that cannot be re-checked on a merged action (each is asserted only against the
+#: authored ``_OPTION_STRATS`` table or pinned in tests). ``action_overrides`` are refused on them.
+_STYLE_DTE_INVARIANT_MEMBERS = {
+    "O_ERN": "its expiry must land after the earnings print: the decoded dte_min must exceed "
+             "the entry gate's days-before-earnings ceiling "
+             "(_assert_option_expiry_clears_event_window checks the authored table only)",
+    "O_LEAP": "a LEAPS is opened at >= 365 DTE, and its own 90-240 DTE exit would close a "
+              "shorter one at once",
+    "O_PMCC": "its LEAPS leg is opened at >= 365 DTE against its own DTE exit and roll bands",
+    "O_CONVEX": "the convex-harvest windows are sized against its own DTE exit band",
+}
 #: Condition-leaf ids two members may both carry: the deliberately SHARED gates (plan §0 --
 #: ``shared-rel_volume`` / ``shared-gate_confidence`` are one gene in singles and groups alike).
 _STYLE_SHARED_LEAF_PREFIX = "shared-"
@@ -5620,6 +5632,11 @@ def _validate_style_action_overrides(where: str, key: str, overrides) -> None:
         raise ValueError(
             f"{where}: {key}'s entry is an equity buy, so option action_overrides "
             f"{sorted(overrides)} would act on nothing (its option leg is an exit overlay)")
+    if key in _STYLE_DTE_INVARIANT_MEMBERS:
+        raise ValueError(
+            f"{where}: action_overrides {sorted(overrides)} refused: {key} has a DTE invariant "
+            f"of its own that a moved band would silently break -- "
+            f"{_STYLE_DTE_INVARIANT_MEMBERS[key]}")
     unknown = sorted(set(overrides) - _STYLE_ACTION_OVERRIDE_KEYS)
     if unknown:
         raise ValueError(f"{where}: action_overrides may only move the DTE band "
@@ -5919,7 +5936,7 @@ def _style_entry_rules(key: str, tag: int, src_rules, action_overrides) -> "tupl
     ``buy`` of O_CC / O_PP (the spellings ``rule_builders.checked_entry_tag`` reads). Returns
     ``(rules, {"entry_rules": map, "entry_conds": map})``."""
     from copy import deepcopy
-    from ba2_common.core.trade_cycle import entry_route
+    from ba2_common.core.trade_cycle import MixedEntryActionsRefused, entry_route
     from ba2_common.core.types import ExpertActionType, get_option_entry_action_values
 
     rules = deepcopy(list(src_rules or []))
@@ -5937,7 +5954,16 @@ def _style_entry_rules(key: str, tag: int, src_rules, action_overrides) -> "tupl
         types = [str(a.get("action_type") or a.get("action") or "") for a in actions]
         if not actions:
             raise ValueError(f"{key} entry rule {rule['id']!r}: no action")
-        entry_route(types)                   # a mixed option/equity rule is refused here
+        try:
+            entry_route(types)               # a mixed option/equity rule is refused here
+        except MixedEntryActionsRefused as e:
+            raise MixedEntryActionsRefused(f"{key} entry rule {rule['id']!r}: {e}") from e
+        # BEFORE tagging: a 'sell' beside a taggable 'buy' would otherwise pass untagged.
+        if ExpertActionType.SELL.value in types:
+            raise ValueError(
+                f"{key} entry rule {rule['id']!r}: its 'sell' action opens a position but "
+                f"cannot carry the member tag (only option entries and 'buy' write it), so "
+                f"no member exit could ever match that position")
         tagged = 0
         for action, at in zip(actions, types):
             if at in option_entries:
@@ -5949,11 +5975,6 @@ def _style_entry_rules(key: str, tag: int, src_rules, action_overrides) -> "tupl
             elif at == ExpertActionType.BUY.value:
                 action["entry_tag"] = int(tag)
                 tagged += 1
-            elif at == ExpertActionType.SELL.value:
-                raise ValueError(
-                    f"{key} entry rule {rule['id']!r}: its 'sell' action opens a position but "
-                    f"cannot carry the member tag (only option entries and 'buy' write it), so "
-                    f"no member exit could ever match that position")
         if not tagged:
             raise ValueError(f"{key} entry rule {rule['id']!r}: none of its actions {types} "
                              f"opens a position that carries the member tag")
@@ -6062,46 +6083,70 @@ def _style_scope_exits(key: str, tag: int, src_rules, exit_overrides) -> "tuple[
     return rules, {"exit_rules": rule_map, "exit_conds": cond_map}
 
 
-#: Gene-key namespaces that are not per-member: the run-level expert / schedule / screener
-#: genes and the per-half selection weights (``optsel:<half>:<w>``, shared by design).
-_STYLE_IDENTITY_GENE_NAMESPACES = ("optsel", "model", "schedule", "screener")
+#: Gene-key namespaces that are not per-member: the run-level expert / schedule genes and the
+#: per-half selection weights (``optsel:<half>:<w>``, shared by design). NOT ``screener``:
+#: screener genes are run-level too, but a member's screener gene is that member's gate (a
+#: stage-1 O_CSP seed carries its $100 ``price_max``), so passing it through would impose one
+#: member's gate on the whole style and pre-empt Q3. It is refused until a policy decides.
+_STYLE_IDENTITY_GENE_NAMESPACES = ("optsel", "model", "schedule")
+#: Every field a ``cond:<id>:<field>`` gene can carry (strategy_param_space._walk_condition_nodes).
+_STYLE_COND_GENE_FIELDS = {"value", "confirmation_bars", "enabled", "mode"}
 
 
-def _style_translate_key(gene: str, id_map: dict, member: str) -> str:
+def _style_translate_key(gene: str, id_map: dict, member: str,
+                         style_space: "dict | None" = None) -> str:
     """ONE member-level gene key -> the style's key, through the member's id map (identity for
-    ``shared-*`` conditions and the run-level/shared namespaces). Raises ``ValueError`` naming
-    the member and the key on anything the map cannot place -- never a silent drop. Task 13's
-    seed translator wraps this."""
+    ``shared-*`` conditions and the ``optsel`` / ``model`` / ``schedule`` namespaces). Raises
+    ``ValueError`` naming the member and the key on anything it cannot place -- never a silent
+    drop: an unknown namespace (``screener`` included, see _STYLE_IDENTITY_GENE_NAMESPACES), an
+    id the member's map lacks, a ``cond`` field no gene carries. Given the style's gene space
+    (``collect_param_space`` of the built style), a translated key that is not a gene of it is
+    refused too -- the check Task 13's seed translator must always make."""
     ns, sep, rest = gene.partition(":")
     if not sep or not rest:
         raise ValueError(f"{member}: cannot place gene key {gene!r} (no namespace)")
     if ns in _STYLE_IDENTITY_GENE_NAMESPACES:
-        return gene
-    ident, sep, tail = rest.partition(":")
-    if not sep or not tail:
-        raise ValueError(f"{member}: cannot place gene key {gene!r} (no id/field part)")
-    if ns == "cond":
-        hits = {m[ident] for m in (id_map["entry_conds"], id_map["exit_conds"]) if ident in m}
-        if len(hits) != 1:
-            raise ValueError(f"{member}: cannot place gene key {gene!r}: condition {ident!r} "
-                             f"is not one of the member's conditions")
-        return f"cond:{hits.pop()}:{tail}"
-    if ns in ("entry", "exit"):
-        table = id_map[f"{ns}_rules"]
-        if ident not in table:
-            raise ValueError(f"{member}: cannot place gene key {gene!r}: {ns} rule {ident!r} "
-                             f"is not one of the member's {ns} rules")
-        return f"{ns}:{table[ident]}:{tail}"
-    raise ValueError(f"{member}: cannot place gene key {gene!r}: unknown namespace {ns!r}")
+        out = gene
+    elif ns == "screener":
+        raise ValueError(
+            f"{member}: cannot place gene key {gene!r}: screener genes are run-level, so one "
+            f"member's screener gate would become the whole style's (Q3 in {_STYLE_PLAN})")
+    else:
+        ident, sep, tail = rest.partition(":")
+        if not sep or not tail:
+            raise ValueError(f"{member}: cannot place gene key {gene!r} (no id/field part)")
+        if ns == "cond":
+            if tail not in _STYLE_COND_GENE_FIELDS:
+                raise ValueError(f"{member}: cannot place gene key {gene!r}: a condition gene "
+                                 f"field is one of {sorted(_STYLE_COND_GENE_FIELDS)}")
+            hits = {m[ident] for m in (id_map["entry_conds"], id_map["exit_conds"])
+                    if ident in m}
+            if len(hits) != 1:
+                raise ValueError(f"{member}: cannot place gene key {gene!r}: condition "
+                                 f"{ident!r} is not one of the member's conditions")
+            out = f"cond:{hits.pop()}:{tail}"
+        elif ns in ("entry", "exit"):
+            table = id_map[f"{ns}_rules"]
+            if ident not in table:
+                raise ValueError(f"{member}: cannot place gene key {gene!r}: {ns} rule "
+                                 f"{ident!r} is not one of the member's {ns} rules")
+            out = f"{ns}:{table[ident]}:{tail}"
+        else:
+            raise ValueError(f"{member}: cannot place gene key {gene!r}: unknown namespace "
+                             f"{ns!r}")
+    if style_space is not None and out not in style_space:
+        raise ValueError(f"{member}: cannot place gene key {gene!r}: it translates to {out!r}, "
+                         f"which is not a gene of the style")
+    return out
 
 
-def _style_claim_ids(where: str, key: str, ns: str, rules, owners: dict, shared: dict) -> None:
+def _style_claim_ids(key: str, ns: str, rules, owners: dict, shared: dict) -> None:
     """Record which member owns each rule/condition id of the BUILT style, refusing an id two
     members claim (their genes would be one gene) and a ``shared-*`` condition two members
     author differently (``collect_param_space`` would keep the last one silently)."""
     def claim(gid: str) -> None:
         if gid in owners and owners[gid] != key:
-            raise ValueError(f"{where}: {gid} is built by both {owners[gid]} and {key}")
+            raise ValueError(f"{gid} is built by both {owners[gid]} and {key}")
         owners[gid] = key
 
     for rule in rules:
@@ -6114,7 +6159,7 @@ def _style_claim_ids(where: str, key: str, ns: str, rules, owners: dict, shared:
                 blob = json.dumps(node, sort_keys=True, default=str)
                 if cid in shared and shared[cid][1] != blob:
                     raise ValueError(
-                        f"{where}: shared condition {cid!r} is authored differently by "
+                        f"shared condition {cid!r} is authored differently by "
                         f"{shared[cid][0]} and {key}; a shared id is ONE gene, so one "
                         f"definition would silently win")
                 shared.setdefault(cid, (key, blob))
@@ -6149,13 +6194,18 @@ def _build_strategy_style(kind: str):
     for mem in style["members"]:
         key = mem["key"]
         tag = _STYLE_MEMBER_TAGS[key]
-        src = _STRATEGY_BUILDERS[key](key)
-        e_rules, e_map = _style_entry_rules(key, tag, src.entry_rules,
-                                            mem.get("action_overrides"))
-        x_rules, x_map = _style_scope_exits(key, tag, src.exit_rules,
-                                            mem.get("exit_overrides"))
-        _style_claim_ids(where, key, "entry", e_rules, owners, shared)
-        _style_claim_ids(where, key, "exit", x_rules, owners, shared)
+        try:
+            src = _STRATEGY_BUILDERS[key](key)
+            e_rules, e_map = _style_entry_rules(key, tag, src.entry_rules,
+                                                mem.get("action_overrides"))
+            x_rules, x_map = _style_scope_exits(key, tag, src.exit_rules,
+                                                mem.get("exit_overrides"))
+            _style_claim_ids(key, "entry", e_rules, owners, shared)
+            _style_claim_ids(key, "exit", x_rules, owners, shared)
+        except ValueError as e:
+            # Every refusal names the style and the member (the exception type is kept, so a
+            # MixedEntryActionsRefused stays one).
+            raise type(e)(f"{where} member {key}: {e}") from e
         entry += e_rules
         exits += x_rules
         id_maps[key] = {**e_map, **x_map}
