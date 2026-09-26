@@ -42,6 +42,14 @@ IV_SNAPSHOT_JOB_ID = "option_iv_snapshot_job"
 # MARKET time and not an IntervalTrigger -- the series is an unweighted 252-day
 # percentile, so "one sample per trading day" is part of the statistic's definition.
 IV_SNAPSHOT_HOUR, IV_SNAPSHOT_MINUTE = 16, 30
+
+# Scheduler id of the pre-open FRED macro refresh (review 2026-09-26, I3).
+FRED_PREOPEN_JOB_ID = "fred_preopen_refresh_job"
+# 09:00 America/New_York, Mon-Fri: half an hour BEFORE the 09:30 analyses, so they read macro
+# files fetched that morning instead of depending on ~21 FRED/ALFRED requests succeeding at the
+# instant they run (entries are weekly: one failed 09:30 costs a week). A read that still finds
+# a file not covering today refetches it itself (guarded, with a backoff) and otherwise REFUSES.
+FRED_PREOPEN_HOUR, FRED_PREOPEN_MINUTE = 9, 0
 from .types import AnalysisUseCase
 
 
@@ -245,6 +253,9 @@ class JobManager:
         # Schedule the daily ATM-IV sampler that feeds IVRankCondition.
         self._schedule_iv_snapshot_job()
 
+        # Fetch the macro series before the open (DeterministicScorer's regime inputs).
+        self._schedule_fred_preopen_job()
+
         # Watch it for the rest of the process lifetime: losing this job is silent.
         self._start_account_refresh_watchdog()
 
@@ -365,6 +376,8 @@ class JobManager:
                 # Same trap, second occupant: the post-close warm and its daily
                 # close re-resolve are non-expert jobs too.
                 self._schedule_warm_jobs()
+                # Third: the pre-open FRED refresh.
+                self._schedule_fred_preopen_job()
 
         logger.info("Expert schedules refreshed successfully")
     
@@ -594,6 +607,8 @@ class JobManager:
         # non-expert "account_refresh_job" -- re-establish it or reconciliation
         # stops silently (see _refresh_expert_schedules_sync for the same trap).
         self._schedule_account_refresh_job()
+        # ...and the pre-open FRED refresh, which sits in _scheduled_jobs too.
+        self._schedule_fred_preopen_job()
         logger.info("Scheduled jobs refreshed")
         
     def _schedule_all_expert_jobs(self):
@@ -709,6 +724,56 @@ class JobManager:
                 f"{IV_SNAPSHOT_MINUTE:02d} America/New_York, Mon-Fri")
         except Exception as e:
             logger.error(f"Error scheduling ATM-IV snapshot job: {e}", exc_info=True)
+
+    def _schedule_fred_preopen_job(self):
+        """Schedule the 09:00 ET (Mon-Fri) refresh of the FRED macro series.
+
+        Same shape as the ATM-IV snapshot: a CRON in MARKET time, one instance, coalesced.
+        Re-established wherever the non-expert jobs are (``remove_all_jobs()`` and
+        ``refresh_scheduled_jobs`` both drop it otherwise).
+        """
+        try:
+            trigger = CronTrigger(hour=FRED_PREOPEN_HOUR, minute=FRED_PREOPEN_MINUTE,
+                                  day_of_week='mon-fri', timezone=_MARKET_TZ)
+            job = self._scheduler.add_job(
+                func=self._execute_fred_preopen_refresh,
+                trigger=trigger,
+                id=FRED_PREOPEN_JOB_ID,
+                name="Pre-open FRED Macro Refresh Job",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            self._scheduled_jobs[FRED_PREOPEN_JOB_ID] = job
+            logger.info(
+                f"Pre-open FRED macro refresh scheduled for {FRED_PREOPEN_HOUR:02d}:"
+                f"{FRED_PREOPEN_MINUTE:02d} America/New_York, Mon-Fri")
+        except Exception as e:
+            logger.error(f"Error scheduling the pre-open FRED refresh job: {e}", exc_info=True)
+
+    def _any_enabled_expert(self, expert_class_name: str) -> bool:
+        """True when an enabled ExpertInstance of *expert_class_name* exists."""
+        return any(inst.enabled and inst.expert == expert_class_name
+                   for inst in get_all_instances(ExpertInstance))
+
+    def _execute_fred_preopen_refresh(self):
+        """Refresh the macro series DeterministicScorer reads, if any instance of it is enabled.
+
+        The series list is the expert's own declaration (``MACRO_SERIES_IDS``), so the job
+        cannot drift from what the analyses read. A failure is logged at ERROR by
+        ``refresh_for_live_decision``; the 09:30 reads then retry once (guarded) and refuse.
+        """
+        try:
+            if not self._any_enabled_expert("DeterministicScorer"):
+                logger.debug("Pre-open FRED refresh: no enabled DeterministicScorer; skipped")
+                return
+            from ba2_experts.DeterministicScorer.data import MACRO_SERIES_IDS
+            from ba2_providers.macro import fred_series
+
+            result = fred_series.refresh_for_live_decision(list(MACRO_SERIES_IDS))
+            logger.info(f"Pre-open FRED refresh: {result}")
+        except Exception as e:
+            logger.error(f"Error executing the pre-open FRED refresh: {e}", exc_info=True)
 
     def _execute_iv_snapshot(self):
         """Run the daily ATM-IV recorder."""
