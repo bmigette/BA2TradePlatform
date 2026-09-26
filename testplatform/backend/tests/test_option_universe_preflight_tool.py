@@ -2,8 +2,8 @@
 
 A throwaway cache root (FMP daily files, split calendars, a ThetaData tree, fmp_history DS files,
 a screener metric store) exercises every section cache-only; the guard is exercised through its
-wiring (the real guard's replay over the 796-name universe is the tool's acceptance run, see
-REPAIR_LOG). No network.
+wiring (the tool's acceptance run on real data is the 753-name stage-2 universe, in the
+commit that added it). No network.
 """
 from __future__ import annotations
 
@@ -165,3 +165,16 @@ def test_the_cli_exit_codes(tool, root, tmp_path, monkeypatch, capsys):
                       "--out", out, "--sections", "bogus"]) == 2
     assert tool.main(["--universe-file", str(tmp_path / "none.txt"), "--start", "2024-01-02",
                       "--end", "2024-12-31", "--out", out]) == 2
+
+
+def test_a_late_option_start_is_flagged_only_against_the_stock_s_own_history(tool):
+    """STLA-like (stock history from 2011, options from 2021-01-19: a chain under an earlier
+    ticker, or a vendor gap) is a review finding; an IPO whose options follow its listing is not."""
+    def row(sym, fmp_first, first_bar):
+        return {"symbol": sym, "coverage": {"theta": True, "unfinished": [], "root_history_stale": [],
+                                            "fmp_first": fmp_first, "first_bar": first_bar}}
+    cfg = {"start": date(2020, 1, 1), "end": date(2025, 12, 31)}
+    f = tool._findings([row("RENAMED", "2011-06-22", "2021-01-19"), row("IPO", "2020-12-10", "2020-12-16"),
+                        row("EARLY", "2011-06-22", "2020-01-02")], None, None, cfg)
+    assert [(x["symbol"], x["severity"]) for x in f] == [("RENAMED", "review")]
+    assert "ROOT_HISTORY" in f[0]["what"]

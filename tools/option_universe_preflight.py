@@ -26,7 +26,8 @@ The checks the stage-2 data repair (2026-09-25/26) ran as scratch scripts, commi
 FINDINGS carry a severity: ``blocking`` (a job would abort or read wrong data: no option tree,
 unfinished or root-history-stale partitions, a refused split basis, a guard refusal, DS misses
 at or over the abort limit) or ``review`` (worth a look, not fatal: no option bar in the
-window, a late first bar, a missing DS file, a symbol absent from the gate store). Exit codes:
+window, a first option bar well after the stock's own history starts, a missing DS file, a
+symbol absent from the gate store). Exit codes:
 0 no blocking finding, 1 at least one, 2 a configuration error. The full report goes to
 ``--out``; a summary (counts + blocking findings) is printed.
 
@@ -54,8 +55,9 @@ SECTIONS = ("coverage", "split", "guard", "ds", "gate")
 #: --experts DeterministicScorer``; pinned against ``PrewarmFetchers`` by the tests).
 DS_NAMESPACES = ("income_statement_annual", "balance_sheet_annual", "cashflow_statement_annual",
                  "grades_historical", "past_earnings_quarterly", "price_target")
-#: A first option bar this long after the window start is worth a look (a late listing, or a
-#: vendor gap like the early-2020 one).
+#: A first option bar this long after BOTH the window start and the stock's own first FMP bar is
+#: worth a look: a vendor gap (the early-2020 one) or a chain listed under another ticker before
+#: (a missing ROOT_HISTORY alias). A recent listing whose options follow within this is not.
 LATE_FIRST_BAR_DAYS = 30
 
 
@@ -353,7 +355,6 @@ def _findings(rows, ds, gate, cfg):
     def add(sev, section, sym, what):
         out.append({"severity": sev, "section": section, "symbol": sym, "what": what})
 
-    late = cfg["start"] + timedelta(days=LATE_FIRST_BAR_DAYS)
     for r in rows:
         s = r["symbol"]
         if "error" in r:
@@ -372,8 +373,12 @@ def _findings(rows, ds, gate, cfg):
                         f"ThetaData warm")
                 if c["first_bar"] is None:
                     add("review", "coverage", s, "no option bar in the window")
-                elif date.fromisoformat(c["first_bar"]) > late:
-                    add("review", "coverage", s, f"first option bar {c['first_bar']}")
+                else:
+                    listed = max(cfg["start"], date.fromisoformat(c["fmp_first"])) if c.get("fmp_first")                         else cfg["start"]
+                    if date.fromisoformat(c["first_bar"]) > listed + timedelta(days=LATE_FIRST_BAR_DAYS):
+                        add("review", "coverage", s, f"first option bar {c['first_bar']}, stock "
+                            f"history from {c.get('fmp_first')}: a vendor gap or an earlier "
+                            f"ticker (ROOT_HISTORY)?")
         sp = r.get("split")
         if sp is not None and not sp["ok"]:
             add("blocking", "split", s, sp["refused"])
