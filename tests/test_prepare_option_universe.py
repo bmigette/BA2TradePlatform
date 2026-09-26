@@ -123,11 +123,12 @@ def test_from_step_and_steps_select_what_runs(universe, tmp_path):
 
 def test_the_operator_flags_reach_their_step(universe, tmp_path):
     r = FakeRunner()
-    assert prep.main(_args(universe, tmp_path, "--keep-newer-cached-tail", "--allow-open-session",
-                           "--allow-exclusions", "--db", "keys.sqlite", "--theta-end", "2026-09-25",
+    assert prep.main(_args(universe, tmp_path, "--keep-newer-cached-tail", "SATS", "--allow-exclusions",
+                           "--db", "keys.sqlite", "--theta-end", "2026-09-25",
                            "--guard-starts", "2020-01-01,2023-01-01", "--procs", "3"),
                      runner=r, log=lambda m: None) == 0
-    assert {"--keep-newer-cached-tail", "--allow-open-session"} <= set(r.argv("fmp-repair"))
+    rep_argv = r.argv("fmp-repair")
+    assert rep_argv[rep_argv.index("--keep-newer-cached-tail") + 1] == "SATS"
     assert "--allow-exclusions" in r.argv("build-ohlcv-v1")
     theta = r.argv("thetadata")
     assert theta[theta.index("--db") + 1] == "keys.sqlite"
@@ -155,3 +156,38 @@ def test_configuration_errors_exit_two(universe, tmp_path):
     # The repair reads the split-check plan: without it, refuse up front.
     assert prep.main(_args(universe, tmp_path, "--steps", "fmp-repair"), runner=FakeRunner(),
                      log=lambda m: None) == 2
+
+
+# ------------------------------------------------ review of 5178e625..90980f18
+def test_allow_exclusions_lets_the_build_decide_on_an_actionable_plan(universe, tmp_path):
+    """plan exits 1 exactly when a symbol cannot be warmed: with --allow-exclusions the build
+    must still run (it records the exclusion); without it the pipeline stops."""
+    r = FakeRunner(rc={"plan-ohlcv-v1": 1, "plan-ta-structure-v1": 1})
+    assert prep.main(_args(universe, tmp_path, "--allow-exclusions"), runner=r, log=lambda m: None) == 0
+    assert "build-ohlcv-v1" in r.labels() and "build-ta-structure-v1" in r.labels()
+    r = FakeRunner(rc={"plan-ohlcv-v1": 1})
+    assert prep.main(_args(universe, tmp_path), runner=r, log=lambda m: None) == 1
+    assert "build-ohlcv-v1" not in r.labels()
+
+
+def test_a_fatal_split_check_preflight_stops_before_the_repair(universe, tmp_path):
+    body = {"plan": {}, "preflight_errors": ["source certification failed for fmp-daily: [...]"],
+            "fatal_preflight_errors": ["source certification failed for fmp-daily: [...]"],
+            "inventory": []}
+    r = FakeRunner(rc={"split-check": 1}, stdout={"split-check": body})
+    assert prep.main(_args(universe, tmp_path), runner=r, log=lambda m: None) == 1
+    assert r.labels() == ["split-check"]
+    assert "certification" in _report(tmp_path)["stopped"]
+
+
+def test_an_open_session_repair_stops_the_pipeline_and_says_rerun(universe, tmp_path):
+    r = FakeRunner(stdout={"fmp-repair": {"ok": True, "rerun_after_close_required": True}})
+    assert prep.main(_args(universe, tmp_path, "--allow-open-session"), runner=r, log=lambda m: None) == 1
+    assert r.labels() == ["split-check", "dividends", "fmp-repair"]
+    assert "after the close" in _report(tmp_path)["stopped"]
+
+
+def test_the_repair_stop_advises_a_restart_at_split_check(universe, tmp_path):
+    r = FakeRunner(rc={"fmp-repair": 1}, stdout={"fmp-repair": {"ok": False, "still_refused": {"X": []}}})
+    assert prep.main(_args(universe, tmp_path), runner=r, log=lambda m: None) == 1
+    assert "--from-step split-check" in _report(tmp_path)["stopped"]

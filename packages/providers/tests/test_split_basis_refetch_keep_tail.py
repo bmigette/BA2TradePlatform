@@ -172,3 +172,46 @@ def test_the_opt_in_refuses_unless_the_tail_is_provably_on_the_same_basis(tmp_pa
 
 def test_the_overlap_window_is_the_plateau_convention():
     assert KEEP_TAIL_OVERLAP_SESSIONS == 60 and 1 <= KEEP_TAIL_MAX_BARS <= 10
+
+
+# ------------------------------------------------ review of 5178e625..90980f18 (minor items)
+def test_a_replacement_that_ends_earlier_is_refused_even_with_more_rows(tmp_path):
+    """The shorter-replacement guard compares the LAST bar too: more rows (an earlier start)
+    must not buy the right to drop the newest bars."""
+    sym = "XLAST"
+    truth = _truth(date.today() - timedelta(days=3))
+    cached = truth[truth["Date"] >= pd.Timestamp("2023-06-01")]
+    path = _write_cache(sym, cached)
+    before = open(path, "rb").read()
+    p = _LaggingVendor(truth, [], lag=2)          # starts 2023-01 (more rows), ends 2 bars early
+    with pytest.raises(RuntimeError, match="LESS history"):
+        p.force_full_refetch(sym, "1d", provider_name="FMPOHLCVProvider")
+    assert open(path, "rb").read() == before
+
+
+def test_the_kept_tail_is_recorded_per_symbol(tmp_path):
+    truth, cached, path = _sats_shape("XREC")
+    p = _LaggingVendor(truth, [CalendarSplit(SPLIT_DAY, 1.234)], lag=3)
+    p.force_full_refetch("XREC", "1d", provider_name="FMPOHLCVProvider", keep_newer_cached_tail=True)
+    rec = p.kept_tails["XREC"]
+    assert rec == {"count": 3, "first": truth["Date"].iloc[-3].date().isoformat(),
+                   "last": truth["Date"].iloc[-1].date().isoformat(),
+                   "vendor_last": truth["Date"].iloc[-4].date().isoformat()}
+
+
+def test_the_merged_frame_is_split_checked_before_it_is_written(tmp_path, monkeypatch):
+    """Defence in depth: whatever the overlap test let through, the merged frame must not show a
+    split-basis break (a drift or mixed-basis verdict) before it replaces the cache."""
+    import ba2_common.core.split_basis as sb
+    truth, _cached, path = _sats_shape("XCHK")
+    before = open(path, "rb").read()
+    real = sb.check_split_basis
+
+    def drifted(*a, **k):
+        return [c.__class__(**{**c.__dict__, "verdict": sb.VERDICT_DRIFT}) for c in real(*a, **k)] \
+            or real(*a, **k)
+    monkeypatch.setattr(sb, "check_split_basis", drifted)
+    p = _LaggingVendor(truth, [CalendarSplit(SPLIT_DAY, 1.234)], lag=4)
+    with pytest.raises(RuntimeError, match="split-basis"):
+        p.force_full_refetch("XCHK", "1d", provider_name="FMPOHLCVProvider", keep_newer_cached_tail=True)
+    assert open(path, "rb").read() == before and read_full_fetch_marker(path) is None

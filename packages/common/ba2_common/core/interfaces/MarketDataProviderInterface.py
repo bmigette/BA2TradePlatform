@@ -846,7 +846,12 @@ class MarketDataProviderInterface(DataProviderInterface):
         if in_gap:
             refuse(f"split event(s) {[(s.date.isoformat(), s.ratio) for s in in_gap]} fall among "
                    f"them: they are on another basis than the fresh file")
-        norm = lambda d: pd.to_datetime(d).dt.tz_localize(None).dt.normalize()             if getattr(pd.to_datetime(d).dt, 'tz', None) is not None else pd.to_datetime(d).dt.normalize()
+
+        def norm(d):
+            d = pd.to_datetime(d)
+            if getattr(d.dt, 'tz', None) is not None:
+                d = d.dt.tz_localize(None)
+            return d.dt.normalize()
         a = pd.DataFrame({'d': norm(old['Date']), 'c_old': old['Close'].astype(float)})
         b = pd.DataFrame({'d': norm(out['Date']), 'c_new': out['Close'].astype(float)})
         shared = a.merge(b, on='d').sort_values('d').tail(KEEP_TAIL_OVERLAP_SESSIONS)
@@ -861,6 +866,20 @@ class MarketDataProviderInterface(DataProviderInterface):
         tail['effective_date'] = tail['Date']
         merged = pd.concat([out, tail[list(out.columns)]], ignore_index=True)
         merged = merged.sort_values('Date').reset_index(drop=True)
+        # Defence in depth: the merged frame itself must show no split-basis break.
+        from ba2_common.core import split_basis as _sb
+        checks = _sb.check_split_basis(norm(merged['Date']).to_numpy(dtype='datetime64[ns]'),
+                                       merged['Open'], merged['High'], merged['Low'],
+                                       merged['Close'], splits, symbol=symbol, marker=None)
+        broken = [c for c in checks if c.verdict in (_sb.VERDICT_DRIFT, _sb.VERDICT_MIXED_BASIS)]
+        if broken:
+            refuse(f"the merged frame fails the split-basis check "
+                   f"({[(c.split_date.isoformat(), c.verdict) for c in broken]})")
+        if not hasattr(self, 'kept_tails'):
+            self.kept_tails = {}
+        self.kept_tails[str(symbol).upper()] = {
+            "count": int(len(tail)), "first": tail_first.date().isoformat(),
+            "last": tail_last.date().isoformat(), "vendor_last": new_last.date().isoformat()}
         logger.warning(
             f"full re-fetch of {symbol} ({interval}): the vendor's history ends {new_last.date()}; "
             f"kept {len(tail)} cached bar(s) {tail_first.date()}..{tail_last.date()} "
@@ -873,8 +892,10 @@ class MarketDataProviderInterface(DataProviderInterface):
                                     interval: str, provider_name: str) -> None:
         """Refuse a full-refetch replacement that holds LESS history than the file it replaces.
 
-        Compared on both axes, because either alone can be satisfied by a bad answer: the ROW
-        COUNT (a capped response) and the FIRST BAR (a vendor that shortened its history window).
+        Compared on three axes, because each alone can be satisfied by a bad answer: the ROW
+        COUNT (a capped response), the FIRST BAR (a vendor that shortened its history window) and
+        the LAST BAR (a vendor file that ends earlier -- more old rows must not buy the right to
+        drop the newest ones; ``keep_newer_cached_tail`` is the checked way to keep them).
         A file that cannot be read is not treated as "no history" -- that would turn the one
         failure this guards into a silent pass -- so an unreadable existing file refuses too.
         """
@@ -890,14 +911,19 @@ class MarketDataProviderInterface(DataProviderInterface):
         if existing.empty:
             return
         old_rows = len(existing)
-        old_first = pd.Timestamp(pd.to_datetime(existing['Date']).min()).date()
+        old_dates = pd.to_datetime(existing['Date'])
+        new_dates = pd.to_datetime(out['Date'])
+        old_first = pd.Timestamp(old_dates.min()).date()
+        old_last = pd.Timestamp(old_dates.max()).date()
         new_rows = len(out)
-        new_first = pd.Timestamp(pd.to_datetime(out['Date']).min()).date()
-        if new_rows >= old_rows and new_first <= old_first:
+        new_first = pd.Timestamp(new_dates.min()).date()
+        new_last = pd.Timestamp(new_dates.max()).date()
+        if new_rows >= old_rows and new_first <= old_first and new_last >= old_last:
             return
         raise RuntimeError(
             f"full re-fetch of {symbol} ({interval}) returned LESS history than the cache holds "
-            f"({new_rows} rows from {new_first}, cached {old_rows} rows from {old_first}) -- "
+            f"({new_rows} rows from {new_first}, cached {old_rows} rows from {old_first}; last "
+            f"bar {new_last} vs cached {old_last}) -- "
             f"refusing to replace {provider_name}'s cache and lose the difference. This is what "
             f"a capped plan, a partial payload or a shortened vendor window looks like; the "
             f"cache file and its split-basis marker are left untouched.")

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from datetime import date, datetime
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from ba2_common.core.split_basis import CalendarSplit
 
@@ -34,7 +34,7 @@ DIVIDEND_CALENDAR_MAX_AGE_DAYS = 1.0
 
 class FMPWarmupSource:
     def __init__(self, cache_root: str, provider: Optional[object] = None, *,
-                 keep_newer_cached_tail: bool = False):
+                 keep_newer_cached_tail: Iterable[str] = ()):
         from ba2_common.core import native_cache
 
         live = os.path.normcase(os.path.abspath(native_cache.CACHE_FOLDER))
@@ -45,10 +45,11 @@ class FMPWarmupSource:
                 "set CACHE_FOLDER so the provider fetches into the tree the warmup reads")
         self.cache_root = cache_root
         self._provider = provider
-        #: ``force_full_refetch`` keeps the cache's own bars after the vendor's last one (the
-        #: SATS case; opt-in, checked and logged by the provider) -- see
+        #: The symbols whose ``force_full_refetch`` keeps the cache's own bars after the vendor's
+        #: last one (the SATS case; opt-in PER SYMBOL, checked and logged by the provider) -- see
         #: ``MarketDataProviderInterface._append_newer_cached_tail``.
-        self.keep_newer_cached_tail = bool(keep_newer_cached_tail)
+        self.keep_newer_cached_tail = frozenset(str(s).strip().upper()
+                                                for s in keep_newer_cached_tail if str(s).strip())
 
     @property
     def provider(self):
@@ -61,6 +62,13 @@ class FMPWarmupSource:
     def _warm_stats():
         from ba2_providers.fmp_common import PURPOSE_WARM, get_purpose_stats
         return get_purpose_stats().get(PURPOSE_WARM, {"requests": 0, "bytes": 0})
+
+    @property
+    def kept_tails(self) -> dict:
+        """``{symbol: {count, first, last, vendor_last}}`` of every kept cached tail."""
+        if self._provider is None:
+            return {}
+        return dict(getattr(self._provider, "kept_tails", None) or {})
 
     @property
     def calls(self) -> int:
@@ -108,7 +116,7 @@ class FMPWarmupSource:
         from ba2_providers.fmp_common import PURPOSE_WARM, fmp_purpose
 
         with fmp_purpose(PURPOSE_WARM):
-            if self.keep_newer_cached_tail:
+            if symbol.upper() in self.keep_newer_cached_tail:
                 self.provider.force_full_refetch(symbol.upper(), "1d", keep_newer_cached_tail=True)
             else:
                 self.provider.force_full_refetch(symbol.upper(), "1d")

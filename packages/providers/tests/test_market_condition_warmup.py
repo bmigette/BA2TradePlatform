@@ -845,7 +845,7 @@ def test_repair_names_every_symbol_that_still_refuses(root):
     assert rep["still_refused"]["SPL"][0]["verdict"] == "drift"
 
 
-def test_the_fmp_source_passes_the_tail_keep_only_when_asked(tmp_path):
+def test_the_fmp_source_passes_the_tail_keep_only_for_the_named_symbols(tmp_path):
     from ba2_common.core import native_cache
     from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
 
@@ -854,14 +854,39 @@ def test_the_fmp_source_passes_the_tail_keep_only_when_asked(tmp_path):
 
         def __init__(self):
             self.refetches = []
+            self.kept_tails = {"SATS": {"count": 4}}
 
         def force_full_refetch(self, symbol, interval, **kw):
             self.refetches.append((symbol, interval, kw))
 
-    plain = StubProvider()
-    FMPWarmupSource(native_cache.CACHE_FOLDER, provider=plain).force_full_refetch("sats")
-    keep = StubProvider()
-    FMPWarmupSource(native_cache.CACHE_FOLDER, provider=keep,
-                    keep_newer_cached_tail=True).force_full_refetch("sats")
-    assert plain.refetches == [("SATS", "1d", {})]
-    assert keep.refetches == [("SATS", "1d", {"keep_newer_cached_tail": True})]
+    stub = StubProvider()
+    src = FMPWarmupSource(native_cache.CACHE_FOLDER, provider=stub, keep_newer_cached_tail=["sats"])
+    src.force_full_refetch("sats")
+    src.force_full_refetch("aapl")
+    assert stub.refetches == [("SATS", "1d", {"keep_newer_cached_tail": True}), ("AAPL", "1d", {})]
+    assert src.kept_tails == {"SATS": {"count": 4}}
+    assert FMPWarmupSource(native_cache.CACHE_FOLDER, provider=StubProvider()).keep_newer_cached_tail         == frozenset()
+
+
+def test_repair_refuses_a_plan_whose_source_certification_failed(root):
+    """Like build: a failed certification is fatal, nothing is fetched."""
+    _write(root, "AAPL", _unadjust(CERT["AAPL"], date(2020, 8, 31), 4.0))
+    src = FakeSource(root)
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    calls = src.calls
+    rep = W.repair(p, source=src)
+    assert not rep["ok"] and rep["fatal_preflight_errors"] and "AAPL" in rep["fatal_preflight_errors"][0]
+    assert src.calls == calls and src.fetches == [] and src.full_refetches == []
+
+
+def test_repair_reports_the_kept_tails(root):
+    split_day = date(2025, 2, 3)
+    truth = dict(TRUTH)
+    truth["SPL"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=79)
+    _write(root, "SPL", _unadjust(truth["SPL"], split_day, 2.0))
+    src = FakeSource(root, truth=truth, splits={"SPL": [CalendarSplit(split_day, 2.0)]})
+    src.kept_tails = {"SPL": {"count": 2, "first": "2025-06-27", "last": "2025-06-30",
+                              "vendor_last": "2025-06-26"}}
+    p = W.plan(PROFILE, ("SPL",), START, END, cache_root=root, source=src)
+    rep = W.repair(p, source=src)
+    assert rep["kept_tails"] == src.kept_tails

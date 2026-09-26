@@ -929,6 +929,15 @@ def repair(plan_: MarketConditionWarmPlan, *, source: Optional[WarmupSource] = N
     file that ends early), or an exclusion. A symbol whose split calendar cannot be read is
     listed under ``split_calendar_errors`` and is not fetched."""
     t0 = time.monotonic()
+    fatal = plan_.fatal_preflight_errors()
+    if fatal:
+        # Like ``build``: a failed source certification means nothing here can be trusted to fix
+        # it -- fetch nothing.
+        log(f"repair refused: preflight failed: {fatal}")
+        return {"ok": False, "profile": plan_.profile, "fatal_preflight_errors": fatal,
+                "refetched": [], "range_fetched": [], "fetch_errors": {}, "still_refused": {},
+                "split_calendar_errors": {}, "kept_tails": {}, "provider_calls": 0,
+                "provider_bytes": 0, "elapsed_s": round(time.monotonic() - t0, 3)}
     if source is None:
         from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
         source = FMPWarmupSource(plan_.cache_root)
@@ -947,6 +956,8 @@ def repair(plan_: MarketConditionWarmPlan, *, source: Optional[WarmupSource] = N
         "fetch_errors": dict(sorted(fetch_errors.items())),
         "still_refused": dict(sorted(still.items())),
         "split_calendar_errors": dict(sorted(cal_errors.items())),
+        "fatal_preflight_errors": [],
+        "kept_tails": dict(sorted((getattr(source, "kept_tails", None) or {}).items())),
         "provider_calls": int(source.calls - calls0),
         "provider_bytes": int(source.bytes - bytes0),
         "elapsed_s": round(time.monotonic() - t0, 3),

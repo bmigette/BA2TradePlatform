@@ -138,7 +138,14 @@ class Pipeline:
             return f"split-check exited {r['rc']} (configuration error): see {r['stderr']}"
         out = _read_json(r["stdout"]) or {}
         r["result"] = {"refetch_required": (out.get("plan") or {}).get("refetch_required"),
-                       "split_calendar_errors": (out.get("plan") or {}).get("split_calendar_errors")}
+                       "split_calendar_errors": (out.get("plan") or {}).get("split_calendar_errors"),
+                       "fatal_preflight_errors": out.get("fatal_preflight_errors")}
+        if out.get("fatal_preflight_errors"):
+            # Exit 1 means two things: work for fmp-repair, or a source certification that
+            # failed. Only the first is the repair's job.
+            return (f"split-check: the source certification failed "
+                    f"({out['fatal_preflight_errors']}); nothing downstream can be trusted -- "
+                    f"see {r['stdout']}")
         return None
 
     def dividends(self) -> Optional[str]:
@@ -152,21 +159,29 @@ class Pipeline:
     def fmp_repair(self) -> Optional[str]:
         argv = self._tool("warm_market_conditions.py", "repair", "--plan", self._p("plan.split-check.json"))
         if self.a.keep_newer_cached_tail:
-            argv.append("--keep-newer-cached-tail")
+            argv += ["--keep-newer-cached-tail", self.a.keep_newer_cached_tail]
         if self.a.allow_open_session:
             argv.append("--allow-open-session")
         r = self._call("fmp-repair", "fmp-repair", argv)
         rep = _read_json(r["stdout"]) or {}
         r["result"] = {k: rep.get(k) for k in ("refetched", "range_fetched", "fetch_errors",
                                                "still_refused", "split_calendar_errors",
-                                               "provider_calls", "keep_newer_cached_tail")}
+                                               "fatal_preflight_errors", "kept_tails",
+                                               "provider_calls", "keep_newer_cached_tail",
+                                               "rerun_after_close_required")}
         if r["rc"] == 1:
             return (f"fmp-repair: still refused {sorted(rep.get('still_refused') or {})}, fetch "
                     f"errors {sorted(rep.get('fetch_errors') or {})}, no split calendar "
-                    f"{sorted(rep.get('split_calendar_errors') or {})}. Decide per name: an "
-                    f"override, --keep-newer-cached-tail, or an exclusion; then --from-step fmp-repair")
+                    f"{sorted(rep.get('split_calendar_errors') or {})}, preflight "
+                    f"{rep.get('fatal_preflight_errors') or []}. Decide per name: an override "
+                    f"(then --from-step split-check, so the plan sees it), --keep-newer-cached-tail "
+                    f"SYM (then --from-step fmp-repair), or an exclusion")
         if r["rc"] not in (None, 0):
             return f"fmp-repair exited {r['rc']}: see {r['stderr']}"
+        if rep.get("rerun_after_close_required"):
+            return ("fmp-repair ran during the US session (--allow-open-session): today's partial "
+                    "bar is in the re-fetched files. A re-run after the close is REQUIRED: "
+                    "--from-step fmp-repair once the session has closed")
         return None
 
     def thetadata(self) -> Optional[str]:
@@ -208,9 +223,12 @@ class Pipeline:
             p = self._call("manifests", f"plan-{prof}", self._tool(
                 "warm_market_conditions.py", "plan", "--profile", prof, "--universe-file", self.u,
                 *self._window(), "--out", plan))
-            if p["rc"] not in (None, 0):
+            # plan exits 1 exactly when a symbol cannot be warmed: with --allow-exclusions that
+            # is the build's call (it records the exclusion), so only a config error stops here.
+            ok_rc = (None, 0, 1) if self.a.allow_exclusions else (None, 0)
+            if p["rc"] not in ok_rc:
                 return (f"manifests: the {prof} plan is not buildable cache-only (exit {p['rc']}): "
-                        f"see {p['stdout']}. Run --from-step fmp-repair.")
+                        f"see {p['stdout']}. Run --from-step fmp-repair, or --allow-exclusions.")
             argv = self._tool("warm_market_conditions.py", "--quiet", "build", "--plan", plan, "--cache-only")
             if self.a.allow_exclusions:
                 argv.append("--allow-exclusions")
@@ -278,10 +296,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--db", default=None, help="read-only platform DB holding the ThetaData key "
                                                "(else THETADATA_API_KEY)")
     ap.add_argument("--theta-concurrency", type=int, default=1)
-    ap.add_argument("--keep-newer-cached-tail", action="store_true",
-                    help="fmp-repair: keep the cache's newer bars when the vendor file ends early")
+    ap.add_argument("--keep-newer-cached-tail", default=None, metavar="SYM[,SYM...]",
+                    help="fmp-repair: for these symbols, keep the cache's newer bars when the "
+                         "vendor file ends early")
     ap.add_argument("--allow-open-session", action="store_true",
-                    help="fmp-repair: re-fetch although the US session is open")
+                    help="fmp-repair: re-fetch although the US session is open; the pipeline "
+                         "then STOPS after fmp-repair (a re-run after the close is required)")
     ap.add_argument("--allow-exclusions", action="store_true",
                     help="manifests: publish with unwarmable symbols recorded as exclusions")
     ap.add_argument("--profiles", default=",".join(PROFILES))

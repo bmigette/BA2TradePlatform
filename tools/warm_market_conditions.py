@@ -20,7 +20,7 @@ ONE preparation for a whole search (design section 4.4). Typical use:
     #     decision: an override, --keep-newer-cached-tail for a vendor file that ends early, or
     #     an exclusion). Refused while the US session is open (the re-fetch would store the
     #     day's partial bar) unless --allow-open-session.
-    python tools/warm_market_conditions.py repair --plan plan.json [--keep-newer-cached-tail]
+    python tools/warm_market_conditions.py repair --plan plan.json [--keep-newer-cached-tail SATS]
 
     # 2c. Publish anyway, recording the symbols that cannot be warmed (never the default).
     python tools/warm_market_conditions.py build --plan plan.json --cache-only --allow-exclusions
@@ -100,7 +100,8 @@ def cmd_repair(args) -> int:
     if not os.path.isfile(args.plan):
         print(f"plan file not found: {args.plan}", file=sys.stderr)
         return EXIT_CONFIG
-    if us_session_open() and not args.allow_open_session:
+    session_open = us_session_open()
+    if session_open and not args.allow_open_session:
         print("refusing to re-fetch while the US regular session is open: the full re-fetch "
               "would store today's PARTIAL bar. Re-run after the close, or pass "
               "--allow-open-session and repeat the repair after the close.", file=sys.stderr)
@@ -110,14 +111,18 @@ def cmd_repair(args) -> int:
     except (ValueError, KeyError, TypeError) as e:
         print(f"configuration error: {args.plan} is not a usable plan: {e}", file=sys.stderr)
         return EXIT_CONFIG
+    keep = [s.strip().upper() for s in (args.keep_newer_cached_tail or "").split(",") if s.strip()]
     try:
-        source = (make_source(plan.cache_root, keep_newer_cached_tail=True)
-                  if args.keep_newer_cached_tail else make_source(plan.cache_root))
+        source = (make_source(plan.cache_root, keep_newer_cached_tail=keep)
+                  if keep else make_source(plan.cache_root))
     except W.WarmupConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return EXIT_CONFIG
     report = W.repair(plan, source=source, concurrency=args.concurrency, log=_logger(args))
-    report["keep_newer_cached_tail"] = bool(args.keep_newer_cached_tail)
+    report["keep_newer_cached_tail"] = keep
+    # Re-fetched during the session: today's partial bar is in the files. Say so -- the repair
+    # must be run again after the close before anything is built from them.
+    report["rerun_after_close_required"] = bool(session_open)
     _out(report)
     return EXIT_OK if report["ok"] else EXIT_ACTIONABLE
 
@@ -140,7 +145,7 @@ def cmd_plan(args) -> int:
         plan.save(args.out)
     inventory = plan.blocking_inventory()
     _out({"plan": plan.summary(), "out": args.out, "preflight_errors": plan.preflight_errors,
-          "inventory": inventory})
+          "fatal_preflight_errors": plan.fatal_preflight_errors(), "inventory": inventory})
     # Nonzero means "action needed before this can be built", not "the plan failed": a failed
     # source preflight, or coverage that a cache-only build could not satisfy.
     return EXIT_ACTIONABLE if (plan.preflight_errors or inventory) else EXIT_OK
@@ -257,13 +262,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="full re-fetch of the split-basis-refused names + top-up; no build")
     r.add_argument("--plan", required=True)
     r.add_argument("--concurrency", type=int, default=4)
-    r.add_argument("--keep-newer-cached-tail", action="store_true",
-                   help="when the vendor's full history ENDS before the cache's, keep the "
-                        "cache's own newer bars (at most a few, no split among them, the shared "
-                        "recent sessions agreeing) instead of refusing the re-fetch. Logged.")
+    r.add_argument("--keep-newer-cached-tail", default=None, metavar="SYM[,SYM...]",
+                   help="for THESE symbols only: when the vendor's full history ENDS before the "
+                        "cache's, keep the cache's own newer bars (at most a few, no split among "
+                        "them, the shared recent sessions agreeing, the merged file passing the "
+                        "split-basis check) instead of refusing the re-fetch. Logged, and listed "
+                        "per symbol under kept_tails in the report.")
     r.add_argument("--allow-open-session", action="store_true",
                    help="re-fetch although the US session is open (the day's partial bar is "
-                        "stored; repeat the repair after the close)")
+                        "stored; the report then says rerun_after_close_required and the repair "
+                        "MUST be repeated after the close)")
     r.set_defaults(func=cmd_repair)
 
     b = sub.add_parser("build", parents=[common], help="build and publish the manifest for a plan")

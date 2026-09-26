@@ -61,9 +61,10 @@ the tools above apply.
 ### The US-session rule (step 3)
 
 A full refetch during the US regular session stores that day's partial bar. The repair
-therefore refuses while the session is open. Run it after the close, or pass
-`--allow-open-session` and run `--from-step fmp-repair` again after the close. During stage 2
-this was the pass A / pass B procedure.
+therefore refuses while the session is open. Run it after the close. With
+`--allow-open-session` it runs anyway, and the pipeline then STOPS after the step
+(`rerun_after_close_required` in its report). You must run `--from-step fmp-repair` again after
+the close. During stage 2 this was the pass A / pass B procedure.
 
 ## Decisions that need a human
 
@@ -71,11 +72,12 @@ The pipeline stops at each of these. It never guesses.
 
 1. **A name is still refused after its refetch** (step 3 `still_refused`, or preflight `split`).
    - The vendor's history ends a few bars before the cache (SATS in stage 2: step 3's
-     `fetch_errors` says "LESS history"). Re-run step 3 with `--keep-newer-cached-tail`. The
-     provider keeps at most 5 cached bars, and only if the split calendar can be read, no split
-     event falls among those bars, and the last 60 shared sessions agree within
-     `ANCHOR_TOLERANCE`. Otherwise it refuses and leaves the file byte-identical. The keep is
-     logged.
+     `fetch_errors` says "LESS history"). Re-run step 3 with `--keep-newer-cached-tail SATS`, naming
+     only those symbols. The provider keeps at most 5 cached bars, and only if the split calendar
+     can be read, no split event falls among those bars, the last 60 shared sessions agree within
+     `ANCHOR_TOLERANCE`, and the merged file passes the split-basis check. Otherwise it refuses
+     and leaves the file byte-identical. The keep is logged, and the step report lists it under
+     `kept_tails` (per symbol: count, first and last kept bar, the vendor's last bar).
    - A real basis step or a corporate action the calendar gets wrong. Add an override in
      `packages/common/ba2_common/core/split_basis_overrides.py` (`add_price_adjustment`,
      `exclude_calendar_event`, `acknowledge_jump`, or a replacement, which is an exclude plus an

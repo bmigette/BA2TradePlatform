@@ -275,6 +275,17 @@ def test_repair_with_nothing_to_repair_exits_zero_and_fetches_nothing(tool, root
     assert rep["ok"] and rep["refetched"] == [] and rep["still_refused"] == {}
 
 
+def test_repair_says_a_rerun_after_the_close_is_required_when_the_session_was_open(
+        tool, root, universe_file, tmp_path, monkeypatch, capsys):
+    out = str(tmp_path / "plan.json")
+    assert tool.main(_plan_args(root, universe_file, out)) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(tool, "us_session_open", lambda: True)
+    assert tool.main(["--quiet", "repair", "--plan", out, "--allow-open-session"]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["rerun_after_close_required"] is True
+
+
 def test_repair_refuses_while_the_us_session_is_open_unless_allowed(tool, root, universe_file,
                                                                      tmp_path, monkeypatch, capsys):
     """A full re-fetch during the session stores that day's PARTIAL bar (stage-2 pass A). The
@@ -300,5 +311,8 @@ def test_repair_hands_the_tail_keep_to_the_source(tool, root, universe_file, tmp
     out = str(tmp_path / "plan.json")
     assert tool.main(_plan_args(root, universe_file, out)) == 0
     seen.clear()
-    assert tool.main(["--quiet", "repair", "--plan", out, "--keep-newer-cached-tail"]) == 0
-    assert seen == [{"keep_newer_cached_tail": True}]
+    capsys.readouterr()
+    assert tool.main(["--quiet", "repair", "--plan", out, "--keep-newer-cached-tail", "sats,Xyz"]) == 0
+    assert seen == [{"keep_newer_cached_tail": ["SATS", "XYZ"]}]
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["keep_newer_cached_tail"] == ["SATS", "XYZ"] and rep["kept_tails"] == {}
