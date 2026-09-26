@@ -92,7 +92,8 @@ EXPECTED = {
     "RVTY": ((date(2023, 5, 16), "PKI"),),      # PKI to 05-15 (1.005), RVTY 05-16; 1.001 (14)
     "PR": ((date(2022, 9, 2), "CDEV"),),        # CDEV to 09-01 (1.001), PR 09-02; 1.000 (11)
     "CNH": ((date(2024, 5, 20), "CNHI"),),      # CNHI to 05-17 (0.993), CNH 05-20; 1.002 (18)
-    "PSKY": ((date(2022, 2, 17), "VIAC"), (date(2025, 8, 7), "PARA")),  # VIAC to 02-16, PARA to 08-06
+    "PSKY": ((date(2022, 2, 17), "VIAC"), (date(2025, 7, 17), "PARA"),   # VIAC to 02-16, PARA to 07-16,
+             (date(2025, 8, 7), None)),       # none in the Skydance deal stretch 07-17..08-06
     "PRMB": ((date(2024, 11, 11), "PRMW"),),    # PRMW to 11-08 (1.002), PRMB 11-11; 1.003 (20)
     "SGI": ((date(2025, 2, 18), "TPX"),),       # TPX to 02-14 (0.996), SGI 02-18; 1.002 (21)
     "EMBJ": ((date(2025, 11, 3), "ERJ"),),      # ERJ to 10-31 (1.002), EMBJ 11-03; 1.002 (24)
@@ -118,12 +119,17 @@ def test_every_alias_splits_the_window_at_its_cutover(sym, cut, old):
     assert _root_segments(sym, cut, b) == [(sym, cut, b)]
 
 
-def test_psky_walks_two_roots():
-    """Paramount: VIAC to 2022-02-16, PARA from 2022-02-17 to 2025-08-06, PSKY from 2025-08-07."""
+def test_psky_walks_two_roots_and_skips_the_deal_stretch():
+    """Paramount: VIAC to 2022-02-16, PARA 2022-02-17 to 2025-07-16, NOTHING 2025-07-17..08-06,
+    PSKY from 2025-08-07. From 2025-07-17 to the Skydance close the PARA chain sits 6-10% under
+    FMP's series on every expiry (parity / as-traded 0.904-0.943, 5-session median 0.93) -- the
+    deal's election/borrow, not the series FMP shows -- and the real guard refused every sampled
+    run of PSKY there (2025-08-05, 10 of 10) with the carry measurable on 1 of 5 sessions."""
     a, b = date(2021, 1, 4), date(2025, 9, 30)
     assert _root_segments("PSKY", a, b) == [("VIAC", a, date(2022, 2, 16)),
-                                            ("PARA", date(2022, 2, 17), date(2025, 8, 6)),
+                                            ("PARA", date(2022, 2, 17), date(2025, 7, 16)),
                                             ("PSKY", date(2025, 8, 7), b)]
+    assert _root_segments("PSKY", date(2025, 7, 20), date(2025, 8, 6)) == []
 
 
 def test_exe_has_no_chain_before_the_new_chesapeake_and_chk_until_the_rename():

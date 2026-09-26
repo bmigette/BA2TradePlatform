@@ -224,7 +224,11 @@ ROOT_HISTORY: Dict[str, Tuple[Tuple[date, Optional[str]], ...]] = {
     #   PR   <- CDEV  Centennial (the legal acquirer of Permian Resources): to 2022-09-01, 1.000 (11)
     #   CNH  <- CNHI  to 2024-05-17, 1.002 (18)
     #   PSKY <- PARA <- VIAC  ViacomCBS (VIAC to 2022-02-16) -> Paramount (PARA 2022-02-17 to
-    #                 2025-08-06; quote-less rows on 08-07) -> Paramount Skydance: 1.000 (9)
+    #                 2025-07-16) -> Paramount Skydance (PSKY from 2025-08-07): 1.000 (9). NO
+    #                 chain 2025-07-17..08-06: in the Skydance deal stretch every PARA expiry
+    #                 sits 6-10% under FMP's series (5-session median 0.93) -- the deal's
+    #                 election/borrow, not the series FMP shows -- and the real guard refused
+    #                 every sampled run there (carry measurable on 1 of 5 sessions)
     #   PRMB <- PRMW  Primo Water (1:1 into Primo Brands): to 2024-11-08, 1.003 (20)
     #   SGI  <- TPX   Tempur Sealy -> Somnigroup: to 2025-02-14, 1.002 (21)
     #   EMBJ <- ERJ   Embraer: to 2025-10-31, 1.002 (24)
@@ -246,7 +250,7 @@ ROOT_HISTORY: Dict[str, Tuple[Tuple[date, Optional[str]], ...]] = {
     "RVTY": ((date(2023, 5, 16), "PKI"),),
     "PR": ((date(2022, 9, 2), "CDEV"),),
     "CNH": ((date(2024, 5, 20), "CNHI"),),
-    "PSKY": ((date(2022, 2, 17), "VIAC"), (date(2025, 8, 7), "PARA")),
+    "PSKY": ((date(2022, 2, 17), "VIAC"), (date(2025, 7, 17), "PARA"), (date(2025, 8, 7), None)),
     "PRMB": ((date(2024, 11, 11), "PRMW"),),
     "SGI": ((date(2025, 2, 18), "TPX"),),
     "EMBJ": ((date(2025, 11, 3), "ERJ"),),
