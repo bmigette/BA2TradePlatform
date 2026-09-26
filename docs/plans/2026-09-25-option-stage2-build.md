@@ -2320,3 +2320,35 @@ Execution order: Task 0 → Q12 and Q13 fixes → Tasks 1-2 (`entry_tag`) → E1
   - Task 9: `test_no_other_premium_member_can_produce_assigned_stock` no longer holds (O_JL/O_RS
     are premium members). Replace it with: their assignments liquidate while the wheel's hold
     (the E2 tests pin the mechanism; Task 9 pins it on the built premium style).
+
+### Tasks 5-6 as built (2026-09-26)
+
+- **Member namespacing inside a style** (user decision 2026-09-26). `_style_member_id(member, id)`:
+  `shared-*` stays shared; an id the member's builder already prefixes with its own key (or, for
+  O_LEAP / O_CONVEX, an arm's key) is kept; anything else gets `<member>-`. So O_WHEEL's reused
+  `o_csp-entry` becomes `o_wheel-o_csp-entry`, O_CC / O_PP's S2 `buy` / `root` / `gate_*` become
+  `o_cc-*` / `o_pp-*`, and every exit id is prefixed (`opt_tp` -> `o_lc-opt_tp`). It depends on
+  the member only, never on its siblings, and only a style build applies it: all 37 registered
+  keys build byte-identically (222 digests: 3 market profiles x 2 experts), and every option
+  single's entry ids (so its stage-1 entry genes) are the style's verbatim.
+- **Loader:** the Task 3 entry-id clash refusal is relaxed to what still collides after
+  namespacing -- two members owning one id prefix -- checked over entry and exit rule ids and
+  every condition node id (group ids included). O_WHEEL + O_CSP and O_CC + O_PP load. The
+  builder also refuses a `shared-*` condition two members author differently.
+- **Premium candidate:** O_CSP is back, next to O_WHEEL (wheel still last). Still `candidate`.
+- **Entry side (Task 5):** no `normalize_trade_rules` pass over the members' rules (they are
+  already canonical; the builder sets both toggle spellings itself). Option entries carry
+  `option_entry_tag`, the O_CC / O_PP equity `buy` carries `entry_tag`. A mixed rule is refused
+  through `trade_cycle.entry_route`, an opening `sell` by name. `entry_action` is a copy of the
+  first OPTION entry in member order (none if the style has no option entry, like O_CC alone).
+  `action_overrides` are also checked merged with the authored band (centre inside the searched
+  range; no inert range keys on a non-searched DTE).
+- **Exit side (Task 6):** every exit rule is scoped, the wheel's stock-phase rules and the
+  CC/PP guard+overlay pairs included (E2). The tag leaf is appended last to the root AND and
+  named `<rule>-tag` (unique per rule, not `<member>-tag`); a non-AND root is refused.
+  `exit_overrides` move the camelCase mirror too and are refused on an unknown id, a flag leaf,
+  a non-searched leaf, or a merged band out of order. `_style_translate_key(gene, id_map,
+  member)` takes the member for its refusal messages.
+- **Strategy genes** (`collect_param_space`, no expert/schedule genes; profile none /
+  `ohlcv-v1,ta-structure-v1`): short 116 / 191, mid 140 / 230, leaps_convex 99 / 174,
+  premium (8 members) 216 / 336.
