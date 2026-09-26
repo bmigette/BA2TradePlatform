@@ -513,7 +513,8 @@ def test_every_dialog_setting_survives_a_no_edit_save_byte_identical(tab, instan
         return real_save(self, key, value, setting_type=setting_type)
     monkeypatch.setattr(MockExpert, "save_setting", _spy)
     tab._save_expert_settings(instance.id)
-    assert set(non_default) <= set(written), "the save did not rewrite every setting"
+    # Nothing is REWRITTEN (review of 2e4d3f1f): an unedited stored value keeps its bytes.
+    assert written == [], f"a no-edit save wrote {written}"
     assert _rows(instance.id) == before
 
 
@@ -1203,3 +1204,267 @@ def test_runtime_readers_use_the_same_declaration(monkeypatch):
     assert jm._get_account_refresh_interval_minutes() == 9
     ModelFactory.clear_api_key_cache()
     assert ModelFactory._aws_bedrock_region() == "eu-west-3"
+
+
+# =================================================================== re-review (prod/dev DB copies)
+# A no-edit save must be BYTE-FOR-BYTE. Stored values were written back through the shared bool
+# writer, which stores json.dumps(True) -- a JSON *string* "true" -- over the native JSON true
+# that tools/migrate_bool_settings.py wrote (107 prod rows): experts 1, 6-11 had their
+# permissions rewritten. Now EVERY control's shown value is recorded and an unedited control
+# is never written, stored or not. Rows are seeded RAW here, not through the writer.
+def _raw_rows(table, fk, owner_id):
+    from sqlalchemy import text
+    from ba2_trade_platform.core.db import get_db
+    with get_db() as s:
+        return sorted(tuple(r) for r in s.connection().execute(text(
+            f"SELECT key, value_str, value_float, CAST(value_json AS TEXT) FROM {table} "
+            f"WHERE {fk} = :i"), {"i": owner_id}).fetchall())
+
+
+def _seed_expert_row(instance_id, key, value_str=None, value_float=None, value_json=None):
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import ExpertSetting
+    row = ExpertSetting(instance_id=instance_id, key=key, value_str=value_str, value_float=value_float)
+    if value_json is not None:
+        row.value_json = value_json
+    add_instance(row)
+
+
+def _no_writes(monkeypatch, cls):
+    written = []
+    monkeypatch.setattr(cls, "save_setting",
+                        lambda self, key, *a, **k: written.append(key))
+    return written
+
+
+def test_a_no_edit_expert_save_leaves_native_json_bools_byte_identical(tab, instance, fake_ui, monkeypatch):
+    for key, value in (("enable_buy", True), ("enable_sell", False),
+                       ("allow_automated_trade_opening", True),
+                       ("allow_automated_trade_modification", False)):
+        _seed_expert_row(instance.id, key, value_json=value)        # native JSON, as the migration
+    _seed_expert_row(instance.id, "risk_manager_mode", value_str="smart")
+    _seed_expert_row(instance.id, "atr_period", value_float=21.0)
+    _seed_expert_row(instance.id, "test_int_setting", value_float=99.0)
+    _seed_expert_row(instance.id, "instrument_selection_method", value_str="static")
+    before = _raw_rows("expertsetting", "instance_id", instance.id)
+    assert ("enable_buy", None, None, "true") in before
+
+    tab.instrument_selection_method_select = _instrument_select()
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    tab._load_general_settings(instance)
+    tab._load_instrument_selection_method(instance)
+    tab._update_instrument_selection_options()
+    assert tab.enable_buy_checkbox.value is True
+    written = _no_writes(monkeypatch, MockExpert)
+    tab._save_expert_settings(instance.id)
+    assert written == [], f"a no-edit save wrote {written}"
+    monkeypatch.undo()
+    assert _raw_rows("expertsetting", "instance_id", instance.id) == before
+
+
+def test_an_edited_stored_value_is_still_written(tab, instance, fake_ui):
+    _seed_expert_row(instance.id, "enable_sell", value_json=False)
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    tab._load_general_settings(instance)
+    tab.enable_sell_checkbox.value = True
+    tab._save_expert_settings(instance.id)
+    assert MockExpert(instance.id).settings["enable_sell"] is True
+    assert {r[0] for r in _rows(instance.id)} == {"enable_sell"}
+
+
+def test_a_no_edit_account_save_rewrites_nothing(fake_ui, monkeypatch):
+    """Credentials and the native-JSON bool stay byte-identical: nothing is rewritten."""
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AccountSetting
+    monkeypatch.setattr(settings_page, "get_account_instance_from_id", lambda *a, **k: None)
+    acc = create_account_definition(provider="Alpaca")
+    for key, kw in (("api_key", {"value_str": "k"}), ("api_secret", {"value_str": "s"}),
+                    ("paper_account", {"value_json": True}), ("data_feed", {"value_str": "iex"})):
+        row = AccountSetting(account_id=acc.id, key=key, value_str=kw.get("value_str"), value_float=None)
+        if "value_json" in kw:
+            row.value_json = kw["value_json"]
+        add_instance(row)
+    before = _raw_rows("accountsetting", "account_id", acc.id)
+    t = _account_edit_form("Alpaca", acc)
+    written = _no_writes(monkeypatch, settings_page.providers["Alpaca"])
+    t.save_account(acc)
+    assert written == []
+    monkeypatch.undo()
+    assert _raw_rows("accountsetting", "account_id", acc.id) == before
+
+
+def test_an_account_NULL_bool_shows_what_the_runtime_reads_and_is_not_written(fake_ui, monkeypatch):
+    """The runtime reads a NULL bool row as False; the form showed the declared default (or,
+    for paper_account, nothing). It shows False now, and a no-edit save leaves the NULL."""
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AccountSetting
+    monkeypatch.setattr(settings_page, "get_account_instance_from_id", lambda *a, **k: None)
+    acc = _stored_alpaca_account()
+    for key in ("margin_enabled",):
+        add_instance(AccountSetting(account_id=acc.id, key=key, value_str=None, value_float=None))
+    with __import__("ba2_trade_platform.core.db", fromlist=["get_db"]).get_db() as s:
+        from sqlmodel import select
+        row = s.exec(select(AccountSetting).where(AccountSetting.account_id == acc.id,
+                                                  AccountSetting.key == "paper_account")).first()
+        row.value_json = {}
+        s.add(row)
+        s.commit()
+    before = _raw_rows("accountsetting", "account_id", acc.id)
+    t = _account_edit_form("Alpaca", acc)
+    assert t.settings_inputs["paper_account"].value is False
+    assert t.settings_inputs["margin_enabled"].value is False
+    t.save_account(acc)
+    assert not any(kw.get("type") == "negative" for _, kw in fake_ui.notes)
+    assert _raw_rows("accountsetting", "account_id", acc.id) == before
+
+
+def test_a_no_edit_app_save_rewrites_nothing(fake_ui, monkeypatch):
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AppSetting
+    for key, value in (("worker_count", "6"), ("openai_api_key", "sk-x"), ("aws_bedrock_region", "eu-west-3")):
+        add_instance(AppSetting(key=key, value_str=value))
+    t = _app_tab()
+    written = []
+    monkeypatch.setattr(settings_page.AppSettingsTab, "_save_app_setting",
+                        lambda self, session, key, value: written.append(key))
+    t.save_settings()
+    assert written == []
+
+
+def test_a_number_field_that_turned_int_into_float_is_not_an_edit(fake_ui, monkeypatch):
+    """A ui.number that gets and loses focus hands back 4.0 for 4."""
+    t = _app_tab()
+    t.worker_count_input.value = float(t.worker_count_input.value)
+    t.account_refresh_interval_input.value = float(t.account_refresh_interval_input.value)
+    written = []
+    monkeypatch.setattr(settings_page.AppSettingsTab, "_save_app_setting",
+                        lambda self, session, key, value: written.append(key))
+    t.save_settings()
+    assert written == []
+
+
+def test_shown_values_compare_numbers_by_value_but_never_bool_as_number():
+    from ba2_trade_platform.ui.utils.setting_display import ShownValues
+    shown = ShownValues()
+    shown.record("n", 4)
+    shown.record("b", True)
+    shown.record("s", "4")
+    assert shown.unedited("n", 4.0) and shown.unedited("n", 4)
+    assert not shown.unedited("n", 4.5)
+    assert not shown.unedited("b", 1) and shown.unedited("b", True)
+    assert not shown.unedited("s", 4)
+    assert not shown.unedited("never_recorded", None)
+
+
+# ------------------------------------------------------------------- risk_manager_mode options
+def test_the_risk_manager_mode_select_offers_every_declared_mode(tab, instance, fake_ui):
+    """It offered classic/smart only, so a stored classic_options showed BLANK and silent."""
+    declared = _defs()["risk_manager_mode"]["valid_values"]
+    assert "classic_options" in declared
+    tab.dialog = _El()
+    tab.show_dialog(instance)
+    assert set(tab.risk_manager_mode_select.kwargs["options"]) == set(declared)
+
+
+def test_a_stored_classic_options_mode_shows_without_error(tab, instance, rec_ui):
+    MockExpert(instance.id).save_setting("risk_manager_mode", "classic_options")
+    tab.risk_manager_mode_select = _RecEl("select", value="classic")
+    tab._load_general_settings(instance)
+    assert tab.risk_manager_mode_select.value == "classic_options"
+    assert not _select_error_props(tab.risk_manager_mode_select)
+
+
+def test_a_case_different_stored_value_is_refused_showing_the_stored_value(rec_ui, monkeypatch):
+    monkeypatch.setattr(settings_page, "get_account_instance_from_id", lambda *a, **k: None)
+    acc = _stored_alpaca_account()
+    cls = settings_page.providers["Alpaca"]
+    iface = cls.__new__(cls)
+    iface.id = acc.id
+    iface.save_setting("data_feed", "IEX")
+    t = _account_edit_form("Alpaca", acc)
+    assert t.settings_inputs["data_feed"].value is None
+    assert any("'IEX'" in m and kw.get("type") == "negative" for m, kw in rec_ui.notes)
+
+
+# ------------------------------------------------------------------- a FORCED selection method
+# FactorRanker, FMPSenateTraderWeight/Copy and PennyMomentumTrader require 'expert'. Forcing it on
+# an EDIT silently changed routing on a no-edit save: an unset method is dormant in JobManager
+# (it would be ACTIVATED), and a Senate 'static' instance was promised to stay static until an
+# operator switches it. Now: a NEW expert gets the forced value; an edit whose stored value
+# differs shows the field in error naming both and refuses the save until it is picked; an
+# edit whose stored value already is the forced one writes nothing.
+@pytest.fixture
+def forced_expert(monkeypatch):
+    props = dict(MockExpert.get_expert_properties())
+    props["required_instrument_selection_method"] = "expert"
+    monkeypatch.setattr(MockExpert, "get_expert_properties", classmethod(lambda cls: props))
+    return MockExpert
+
+
+def _forced_tab(tab, instance, stored):
+    if stored is _NULL:
+        _null_row(instance.id, "instrument_selection_method")
+    elif stored is not None:
+        MockExpert(instance.id).save_setting("instrument_selection_method", stored)
+    tab.instrument_selection_method_select = _RecEl("select", value="static")
+    tab.instrument_selection_method_select.options = ["static", "dynamic", "screener"]
+    tab.expert_settings_container = _El()
+    tab._render_expert_settings(instance)
+    tab._load_general_settings(instance)
+    tab._load_instrument_selection_method(instance)
+    tab._update_instrument_selection_options()
+    tab.expert_settings_inputs = tab.expert_settings_inputs or {}
+    return tab.instrument_selection_method_select
+
+
+_NULL = object()
+
+
+def test_a_new_forced_expert_gets_the_forced_method(tab, instance, rec_ui, forced_expert):
+    tab.instrument_selection_method_select = _RecEl("select", value="static")
+    tab._update_instrument_selection_options()
+    assert tab.instrument_selection_method_select.value == "expert"
+    for attr in BOOL_CONTROLS.values():
+        getattr(tab, attr).value = False
+    defs = _defs()
+    for key, attr in VALUE_CONTROLS.items():
+        getattr(tab, attr).value = settings_page.display_text(defs, key, defs[key]["default"])
+    tab._save_expert_settings(instance.id)
+    assert MockExpert(instance.id).settings["instrument_selection_method"] == "expert"
+
+
+@pytest.mark.parametrize("stored", [None, _NULL, "static"], ids=["missing", "NULL", "static"])
+def test_an_edit_whose_stored_method_differs_from_the_forced_one_is_refused(tab, instance, rec_ui, forced_expert, stored):
+    select = _forced_tab(tab, instance, stored)
+    before = _rows(instance.id)
+    assert select.value is None, "the forced method must not be applied silently"
+    assert _select_error_props(select)
+    msg = [m for m, kw in rec_ui.notes if "instrument_selection_method" in m and kw.get("type") == "negative"]
+    assert msg and "'expert'" in msg[-1]
+    if stored == "static":
+        assert "'static'" in msg[-1]
+    tab._save_expert(instance)
+    assert "instrument_selection_method" in rec_ui.notes[-1][0]
+    assert _rows(instance.id) == before
+
+    select.value = "expert"                       # the operator picks it explicitly
+    tab._save_expert_settings(instance.id)
+    assert MockExpert(instance.id).settings["instrument_selection_method"] == "expert"
+
+
+def test_an_edit_whose_stored_method_is_the_forced_one_writes_nothing(tab, instance, rec_ui, forced_expert):
+    select = _forced_tab(tab, instance, "expert")
+    before = _rows(instance.id)
+    assert select.value == "expert" and not _select_error_props(select)
+    tab._save_expert_settings(instance.id)
+    assert _rows(instance.id) == before
+
+
+def test_a_stored_method_the_expert_does_not_offer_is_an_error_not_a_silent_static(tab, instance, rec_ui):
+    """A non-forced expert with a stored 'expert' used to be reset to 'static' silently."""
+    select = _forced_tab(tab, instance, "expert")
+    assert select.value is None and _select_error_props(select)
+    tab._save_expert(instance)
+    assert "instrument_selection_method" in rec_ui.notes[-1][0]

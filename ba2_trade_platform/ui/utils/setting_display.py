@@ -35,35 +35,46 @@ def has_stored_value(stored: Mapping[str, Any], key: str) -> bool:
     return value is not None and value != "None"
 
 
-class ShownDefaults:
-    """The controls of an EDIT form that were filled from a DECLARED default, and what each
-    showed. A no-edit save must be a byte-for-byte no-op: writing those back would freeze
-    today's default into a row that was missing (or NULL) -- so a later change of the
-    declaration would no longer reach that instance. A save skips a recorded key while its
-    control still shows the recorded value; an edited one is validated and written as usual.
+class ShownValues:
+    """What each control of an EDIT form showed when it was filled -- stored value or declared
+    default alike. A no-edit save must be BYTE-FOR-BYTE a no-op, so a save writes only the
+    controls whose value CHANGED:
+
+    * a default written back would freeze it into a row that was missing (or NULL), and a
+      later change of the declaration would no longer reach that instance;
+    * a stored value written back is not the same bytes either: the shared bool writer
+      stores json.dumps(True) -- a JSON *string* -- over the native JSON true that
+      tools/migrate_bool_settings.py wrote (107 prod rows), and credentials would be
+      rewritten for nothing.
+
+    An edited control is validated and written as usual.
     """
 
     def __init__(self):
         self._shown: Dict[str, Any] = {}
 
-    def record(self, key: str, unset: bool, control_value: Any) -> None:
-        """Note what ``key``'s control shows; ``unset`` = it had no stored value."""
-        if unset:
-            self._shown[key] = control_value
-        else:
-            self._shown.pop(key, None)
+    def record(self, key: str, control_value: Any) -> None:
+        """Note what ``key``'s control shows as the form is filled."""
+        self._shown[key] = control_value
 
     def forget(self, keys: Iterable[str]) -> None:
         for key in keys:
             self._shown.pop(key, None)
 
     def unedited(self, key: str, control_value: Any) -> bool:
-        """True when ``key`` was filled from a default and still shows exactly that."""
+        """True when ``key``'s control still shows what it was filled with."""
         if key not in self._shown:
             return False
         shown = self._shown[key]
-        # type() too: True == 1 must not pass for a checkbox that became a number, etc.
+        if _is_number(shown) and _is_number(control_value):
+            # By VALUE: a ui.number that gets and loses focus hands back 4.0 for 4.
+            return shown == control_value
+        # Otherwise type() too: True == 1 must not pass for a checkbox, nor 4 for "4".
         return type(shown) is type(control_value) and shown == control_value
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def resolve_setting_for_display(definitions: Mapping[str, Dict[str, Any]],

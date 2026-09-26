@@ -361,20 +361,20 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:4352":
+    "ba2_trade_platform/ui/pages/settings.py:4374":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
         "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
         "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
-        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245; the equity-short netting rule removed a permission checkbox and its load/save, :4240; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298; its review fixes (no-edit no-op, unset method, account save order), :4389; the declared app settings + dropdown errors, :4352",
-    "ba2_trade_platform/ui/pages/settings.py:4402":
+        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245; the equity-short netting rule removed a permission checkbox and its load/save, :4240; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298; its review fixes (no-edit no-op, unset method, account save order), :4389; the declared app settings + dropdown errors, :4352; the re-review (no rewrite of stored values, forced-method errors), :4374",
+    "ba2_trade_platform/ui/pages/settings.py:4424":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
         "continuation line 3795, one past the outer .get(...)'s opening line 3794; plan "
         "Task 12's widget + guard then moved the pair to :3850/:3898, then :3889/:3939; the "
-        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289); the UI consistency pass added the shared refresh_button import, :4240/:4290; the pullback/market-exits merge with origin/dev, :4245/:4295; the equity-short netting rule, :4240/:4290; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298/:4348; its review fixes (no-edit no-op, unset method, account save order), :4389/:4439; the declared app settings + dropdown errors, :4352/:4402",
+        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289); the UI consistency pass added the shared refresh_button import, :4240/:4290; the pullback/market-exits merge with origin/dev, :4245/:4295; the equity-short netting rule, :4240/:4290; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298/:4348; its review fixes (no-edit no-op, unset method, account save order), :4389/:4439; the declared app settings + dropdown errors, :4352/:4402; the re-review (no rewrite of stored values, forced-method errors), :4374/:4424",
     "ba2_trade_platform/ui/components/performance_charts.py:475":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
         "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging)",
