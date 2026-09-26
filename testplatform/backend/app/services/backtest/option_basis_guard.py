@@ -29,10 +29,11 @@ third sampled check that sees it at the latest (<= ~10 sessions), and it still a
 CARRY IS NOT A BASIS ERROR (user decision 2026-09-26: fix the guard, no dated waivers). A
 hard-to-borrow fee (AMC July 2023) lowers the parity spot more the longer the expiry, and a cash
 dividend (STLA April 2022, a 7.5% dividend) lowers every expiry after its ex-date: both used to
-read as a 5-8% "basis error". When the nearest-expiry median is off, the SAME checked sessions
+read as a 5-8% "basis error". When the nearest-expiry median is off, the SAME window sessions
 are re-measured with the carry-free spot (``ba2_common.core.option_carry``: the run's dividend
 calendar added back, the two nearest usable expiries extrapolated to T = 0), and the run is
-refused only when that is off too, or cannot be computed -- the refusal names which. A basis
+refused unless >= ``MIN_CARRY_SESSIONS`` of them can be measured and their median is within
+the tolerance; the refusal names what was missing. A basis
 error scales every expiry alike, so it survives the carry separation; and since the second
 measure is only consulted where the first refused, every run that passed before passes the same.
 
@@ -86,6 +87,12 @@ MAX_STRIKE_DISTANCE = 0.10
 #: moneyness gate (spreads and the pair's own parity spot are both in the chain's basis).
 #: A store without quotes (close-only mids) has no spread and is not gated.
 MAX_QUOTE_UNCERTAINTY = TOLERANCE / 2
+#: The carry separation (module docstring) clears a would-be refusal only when at least this
+#: many sessions of the window (all of them, for a shorter window) have a carry-free ratio and
+#: their median is within ``TOLERANCE`` -- the same window rule as the uncorrected ratio. A thin
+#: chain's checked session may lack a second usable expiry while its neighbours have one (IONQ
+#: 2022-03-28, monthlies only).
+MIN_CARRY_SESSIONS = 3
 #: A symbol the guard could not evaluate on more than this share of its checks is WARNED
 #: about in the run's results: it traded without the protection (plan Part E4 review).
 UNEVALUABLE_WARN_FRACTION = 0.90
@@ -450,13 +457,16 @@ class BasisGuard:
             carry = [self._carry_ratio(u, underlying, d_.toordinal()) for d_, _ in ratios]
             rc0, why0 = carry[0]
             avail = [r for r, _ in carry if r is not None]
+            need = min(MIN_CARRY_SESSIONS, len(carry))
             medc = float(np.median(avail)) if avail else None
-            if rc0 is not None and abs(medc - 1.0) <= TOLERANCE:
+            if len(avail) >= need and abs(medc - 1.0) <= TOLERANCE:
                 self.carry_passed += 1
                 return
-            carry_txt = (f"carry-free ratio {rc0:.4f} (median {medc:.4f} over {len(avail)} of "
-                         f"{len(carry)} sessions; {why0})" if rc0 is not None else
-                         f"carry-free ratio unavailable: {why0}")
+            carry_txt = (f"carry-free ratio "
+                         f"{'unavailable' if rc0 is None else format(rc0, '.4f')} on the checked "
+                         f"session ({why0}); {len(avail)} of {len(carry)} window sessions "
+                         f"measurable (>= {need} needed)"
+                         + ("" if medc is None else f", carry-free median {medc:.4f}"))
             raise OptionSpotBasisMismatch(
                 f"{underlying} {session.isoformat()}: the option path's spot is not in the "
                 f"basis the chain is quoted in -- put-call-parity spot / as-traded spot = "

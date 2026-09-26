@@ -224,3 +224,40 @@ def test_without_a_dividend_source_the_guard_behaves_as_before(monkeypatch):
     g2, u2, guard2 = _guard(monkeypatch, STLA_APRIL)
     with pytest.raises(g2.OptionSpotBasisMismatch, match="dividend calendar unavailable"):
         _run(g2, u2, guard2, sorted(STLA_APRIL))
+
+
+#: A thin hard-to-borrow chain (IONQ March 2022 had monthlies only: 2022-03-28 carried ONE usable
+#: expiry, 109d, while its neighbours had two). Synthetic borrow of 50%/yr, spot 100: parity =
+#: 100 x exp(-0.5 T). The checked session has only its 108d expiry, so its own carry-free ratio
+#: cannot be stated -- the four window sessions before it can.
+def _borrow(t):
+    import math
+    return round(math.exp(-0.5 * t / 365.0), 4)
+
+
+IONQ = {d: (100.0, [(45, _borrow(45)), (108, _borrow(108))])
+        for d in (date(2022, 3, 21), date(2022, 3, 22), date(2022, 3, 23), date(2022, 3, 24))}
+IONQ[date(2022, 3, 25)] = (100.0, [(108, _borrow(108))])
+
+
+def test_a_session_without_its_own_carry_ratio_passes_on_its_window(monkeypatch):
+    """The window median decides, as for the uncorrected ratio: >= 3 window sessions with a
+    carry-free ratio, their median within 5%."""
+    g, u, guard = _guard(monkeypatch, IONQ, dividends=lambda s, d: [])
+    guard.check(u, "X", date(2022, 3, 25))            # first check: window filled backwards
+    assert guard.stats()["carry_passed"] == 1
+
+
+def test_the_same_window_with_a_basis_error_is_refused(monkeypatch):
+    g, u, guard = _guard(monkeypatch, IONQ, dividends=lambda s, d: [], scale=1.25)
+    with pytest.raises(g.OptionSpotBasisMismatch, match="carry-free"):
+        guard.check(u, "X", date(2022, 3, 25))
+
+
+def test_fewer_than_three_carry_sessions_in_a_full_window_is_refused(monkeypatch):
+    thin = {d: (v[0], v[1][-1:]) for d, v in IONQ.items()}
+    thin[date(2022, 3, 23)] = IONQ[date(2022, 3, 23)]
+    thin[date(2022, 3, 24)] = IONQ[date(2022, 3, 24)]    # 2 of 5 measurable
+    g, u, guard = _guard(monkeypatch, thin, dividends=lambda s, d: [])
+    with pytest.raises(g.OptionSpotBasisMismatch, match="2 of 5"):
+        guard.check(u, "X", date(2022, 3, 25))
