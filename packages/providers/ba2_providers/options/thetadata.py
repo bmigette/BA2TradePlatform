@@ -196,6 +196,61 @@ ROOT_HISTORY: Dict[str, Tuple[Tuple[date, Optional[str]], ...]] = {
     "CAI": ((date(2025, 6, 18), None),),
     "SAIL": ((date(2025, 2, 13), None),),
     "LTM": ((date(2024, 7, 25), None),),
+    # Renames found by the option-universe preflight's late-option-start review (2026-09-26).
+    # Probed live: the old root's last quoted session and the new root's first; the old root's
+    # put-call-parity spot / (the NEW symbol's FMP close x the run's as-traded factor) at that
+    # session and on one session per quarter since 2020-01-02 (median, n). Every one prices
+    # FMP's own pre-rename series (the series is the old company's, 1:1):
+    #   STLA <- FCAU  FCA -> Stellantis (FCA the legal acquirer, 1:1): FCAU to 2021-01-15, 1.000 (5)
+    #   SONY <- SNE   SNE to 2021-03-31, 1.000 (5)
+    #   TTE  <- TOT   TOT to 2021-06-10, 1.001 (6)
+    #   SHEL <- RDSA  Royal Dutch Shell A ADS (ThetaData root RDSA), 1:1: to 2022-01-28, 1.000 (9)
+    #   WBD  <- DISCA Discovery A (1:1 into WBD): to 2022-04-08, 1.000 (10)
+    #   RTX  <- UTX   UTX to 2020-04-02; its chain prices UTX x1.067 of FMP's as-traded series
+    #                 (FMP adjusts the Carrier/Otis spin by 1.589, the chain says ~1.70): the
+    #                 basis is fixed by a split-basis override at 2020-04-03, not here
+    #   BBWI <- LB    L Brands (Victoria's Secret spin 2021-08-03 in FMP's calendar): 0.999 (6)
+    #   DINO <- HFC   HollyFrontier -> HF Sinclair (1:1): to 2022-03-14, 1.000 (9)
+    #   FBIN <- FBHS  Fortune Brands (MasterBrand spin in FMP's calendar): 1.000 (12)
+    #   HWM  <- ARNC  Arconic Inc -> Howmet (FMP not adjusted for the Arconic Corp spin, and
+    #                 neither is the chain): ARNC to 2020-03-31, 1.001; the ARNC root from
+    #                 2020-04-01 is the spun-off Arconic Corp
+    #   WTRG <- WTR   Aqua America -> Essential Utilities: WTR to 2020-01-31, 1.001
+    #   NWG  <- RBS   RBS -> NatWest: to 2020-07-22, 0.998 (3)
+    #   GAP  <- GPS   to 2024-08-21, 0.993 (19)
+    #   EXE  <- CHK   Chesapeake -> Expand (1:1): CHK to 2024-10-01, 0.992 (14); before
+    #                 2021-02-11 (EXE's first FMP bar) the CHK chain is the bankrupt old equity
+    #   RVTY <- PKI   PerkinElmer -> Revvity: to 2023-05-15, 1.001 (14)
+    #   PR   <- CDEV  Centennial (the legal acquirer of Permian Resources): to 2022-09-01, 1.000 (11)
+    #   CNH  <- CNHI  to 2024-05-17, 1.002 (18)
+    #   PSKY <- PARA <- VIAC  ViacomCBS (VIAC to 2022-02-16) -> Paramount (PARA 2022-02-17 to
+    #                 2025-08-06; quote-less rows on 08-07) -> Paramount Skydance: 1.000 (9)
+    #   PRMB <- PRMW  Primo Water (1:1 into Primo Brands): to 2024-11-08, 1.003 (20)
+    #   SGI  <- TPX   Tempur Sealy -> Somnigroup: to 2025-02-14, 1.002 (21)
+    #   EMBJ <- ERJ   Embraer: to 2025-10-31, 1.002 (24)
+    #   GTM  <- ZI    ZoomInfo: to 2025-05-12, 1.001 (19)
+    "STLA": ((date(2021, 1, 19), "FCAU"),),
+    "SONY": ((date(2021, 4, 1), "SNE"),),
+    "TTE": ((date(2021, 6, 11), "TOT"),),
+    "SHEL": ((date(2022, 1, 31), "RDSA"),),
+    "WBD": ((date(2022, 4, 11), "DISCA"),),
+    "RTX": ((date(2020, 4, 3), "UTX"),),
+    "BBWI": ((date(2021, 8, 3), "LB"),),
+    "DINO": ((date(2022, 3, 15), "HFC"),),
+    "FBIN": ((date(2022, 12, 15), "FBHS"),),
+    "HWM": ((date(2020, 4, 1), "ARNC"),),
+    "WTRG": ((date(2020, 2, 3), "WTR"),),
+    "NWG": ((date(2020, 7, 23), "RBS"),),
+    "GAP": ((date(2024, 8, 22), "GPS"),),
+    "EXE": ((date(2021, 2, 11), None), (date(2024, 10, 2), "CHK")),
+    "RVTY": ((date(2023, 5, 16), "PKI"),),
+    "PR": ((date(2022, 9, 2), "CDEV"),),
+    "CNH": ((date(2024, 5, 20), "CNHI"),),
+    "PSKY": ((date(2022, 2, 17), "VIAC"), (date(2025, 8, 7), "PARA")),
+    "PRMB": ((date(2024, 11, 11), "PRMW"),),
+    "SGI": ((date(2025, 2, 18), "TPX"),),
+    "EMBJ": ((date(2025, 11, 3), "ERJ"),),
+    "GTM": ((date(2025, 5, 13), "ZI"),),
 }
 
 # EARLY-2020 VENDOR GAP (user decision 2026-09-26: ACCEPTED). ThetaData serves NO option row --

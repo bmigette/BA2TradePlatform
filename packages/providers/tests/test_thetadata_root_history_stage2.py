@@ -72,6 +72,31 @@ EXPECTED = {
     "CAI": ((date(2025, 6, 18), None),),        # CAI International chain to 2021-11-22
     "SAIL": ((date(2025, 2, 13), None),),       # old SailPoint chain to 2022-08-15
     "LTM": ((date(2024, 7, 25), None),),        # old LATAM ADR chain to 2020-06-09
+    # renames found by the preflight's late-option-start review (2026-09-26): old root's last
+    # quoted session (parity / as-traded FMP close of the NEW symbol) / the new root's first,
+    # and the median of the old root's quarterly samples since 2020-01-02 (n)
+    "STLA": ((date(2021, 1, 19), "FCAU"),),     # FCAU to 01-15 (1.009), STLA 01-19; 1.000 (5)
+    "SONY": ((date(2021, 4, 1), "SNE"),),       # SNE to 03-31 (1.001), SONY 04-01; 1.000 (5)
+    "TTE": ((date(2021, 6, 11), "TOT"),),       # TOT to 06-10 (1.001), TTE 06-11; 1.001 (6)
+    "SHEL": ((date(2022, 1, 31), "RDSA"),),     # RDSA to 01-28 (1.000), SHEL 01-31; 1.000 (9)
+    "WBD": ((date(2022, 4, 11), "DISCA"),),     # DISCA to 04-08 (0.992), WBD 04-11; 1.000 (10)
+    "RTX": ((date(2020, 4, 3), "UTX"),),        # UTX to 04-02 (1.064 x: a basis override), RTX 04-06
+    "BBWI": ((date(2021, 8, 3), "LB"),),        # LB to 08-02 (0.984), BBWI 08-04; 0.999 (6)
+    "DINO": ((date(2022, 3, 15), "HFC"),),      # HFC to 03-14 (1.000), DINO 03-15; 1.000 (9)
+    "FBIN": ((date(2022, 12, 15), "FBHS"),),    # FBHS to 12-14 (1.005), FBIN 12-16; 1.000 (12)
+    "HWM": ((date(2020, 4, 1), "ARNC"),),       # ARNC to 03-31 (1.002), HWM 04-02; ARNC after = Arconic Corp
+    "WTRG": ((date(2020, 2, 3), "WTR"),),       # WTR to 01-31 (0.999), WTRG 02-03; 1.001 (1)
+    "NWG": ((date(2020, 7, 23), "RBS"),),       # RBS to 07-22 (1.011), NWG 07-23; 0.998 (3)
+    "GAP": ((date(2024, 8, 22), "GPS"),),       # GPS to 08-21 (1.002), GAP 08-22; 0.993 (19)
+    "EXE": ((date(2021, 2, 11), None), (date(2024, 10, 2), "CHK")),   # new CHK (post-bankruptcy)
+    "RVTY": ((date(2023, 5, 16), "PKI"),),      # PKI to 05-15 (1.005), RVTY 05-16; 1.001 (14)
+    "PR": ((date(2022, 9, 2), "CDEV"),),        # CDEV to 09-01 (1.001), PR 09-02; 1.000 (11)
+    "CNH": ((date(2024, 5, 20), "CNHI"),),      # CNHI to 05-17 (0.993), CNH 05-20; 1.002 (18)
+    "PSKY": ((date(2022, 2, 17), "VIAC"), (date(2025, 8, 7), "PARA")),  # VIAC to 02-16, PARA to 08-06
+    "PRMB": ((date(2024, 11, 11), "PRMW"),),    # PRMW to 11-08 (1.002), PRMB 11-11; 1.003 (20)
+    "SGI": ((date(2025, 2, 18), "TPX"),),       # TPX to 02-14 (0.996), SGI 02-18; 1.002 (21)
+    "EMBJ": ((date(2025, 11, 3), "ERJ"),),      # ERJ to 10-31 (1.002), EMBJ 11-03; 1.002 (24)
+    "GTM": ((date(2025, 5, 13), "ZI"),),        # ZI to 05-12 (1.006), GTM 05-13; 1.001 (19)
 }
 
 
@@ -85,12 +110,28 @@ def test_the_shipped_root_history_is_the_measured_one():
 
 
 @pytest.mark.parametrize("sym,cut,old", [(s, h[0][0], h[0][1]) for s, h in EXPECTED.items()
-                                         if h[0][1] is not None])
+                                         if len(h) == 1 and h[0][1] is not None])
 def test_every_alias_splits_the_window_at_its_cutover(sym, cut, old):
     a, b = cut - timedelta(days=20), cut + timedelta(days=20)
     assert _root_segments(sym, a, b) == [(old, a, cut - timedelta(days=1)), (sym, cut, b)]
     assert _root_segments(sym, a, cut - timedelta(days=1)) == [(old, a, cut - timedelta(days=1))]
     assert _root_segments(sym, cut, b) == [(sym, cut, b)]
+
+
+def test_psky_walks_two_roots():
+    """Paramount: VIAC to 2022-02-16, PARA from 2022-02-17 to 2025-08-06, PSKY from 2025-08-07."""
+    a, b = date(2021, 1, 4), date(2025, 9, 30)
+    assert _root_segments("PSKY", a, b) == [("VIAC", a, date(2022, 2, 16)),
+                                            ("PARA", date(2022, 2, 17), date(2025, 8, 6)),
+                                            ("PSKY", date(2025, 8, 7), b)]
+
+
+def test_exe_has_no_chain_before_the_new_chesapeake_and_chk_until_the_rename():
+    """The CHK chain before 2021-02-11 is the bankrupt old Chesapeake, which FMP's EXE history
+    (first bar 2021-02-11) does not price: nothing is fetched for it."""
+    assert _root_segments("EXE", date(2020, 1, 2), date(2025, 1, 31)) == [
+        ("CHK", date(2021, 2, 11), date(2024, 10, 1)), ("EXE", date(2024, 10, 2), date(2025, 1, 31))]
+    assert _root_segments("EXE", date(2020, 1, 2), date(2021, 2, 10)) == []
 
 
 BAM_CUT = date(2022, 12, 12)

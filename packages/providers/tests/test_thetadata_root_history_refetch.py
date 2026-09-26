@@ -50,9 +50,13 @@ def test_the_signature_names_every_cutover_and_root():
     assert T.root_history_signature("AAPL") == ""
 
 
-def test_the_legacy_table_covers_every_alias_and_is_utc():
+def test_the_legacy_table_is_frozen_and_utc():
+    """Only the aliases whose partitions were re-fetched BEFORE signatures existed: an alias added
+    later is NOT listed, so every legacy partition of it in reach is re-fetched."""
+    assert set(T.ROOT_HISTORY_LEGACY_FETCHED) == {"META", "IR", "CZR", "COHR", "BN", "B", "DOC",
+                                                  "LUMN", "VTRS", "BALL", "XYZ"}
     aliases = {s for s, h in T.ROOT_HISTORY.items() if any(r is not None for _c, r in h)}
-    assert set(T.ROOT_HISTORY_LEGACY_FETCHED) == aliases
+    assert set(T.ROOT_HISTORY_LEGACY_FETCHED) <= aliases
     assert all(t.tzinfo is not None for t in T.ROOT_HISTORY_LEGACY_FETCHED.values())
 
 
