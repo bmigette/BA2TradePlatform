@@ -643,16 +643,18 @@ def decision_label(as_of: Any) -> date:
       * ``None`` -> LIVE: the New York date of the live decision instant
         (``market_calendar.live_decision_label``).
       * a DAILY backtest bar -- a stamp at exactly 00:00 UTC, or a plain date / date string --
-        -> ``market_calendar.backtest_decision_label(D)`` = the next regular session N(D).
+        -> the next regular session N(D) (``market_calendar.backtest_decision_label``'s rule).
         Bar D decides on D's close and fills at N(D)'s open, so it is the live decision of
-        N(D). A bar on a non-session day is refused (``NotARegularSession``): it is a data bug.
+        N(D). A stamp on a non-session day (a tool's date, a vendor bar on a closure) maps by
+        the same rule to the first session after it -- the decision that data would feed --
+        rather than failing a whole run over a macro overlay.
       * any other instant (an intraday backtest bar, a recorded live decision time) -> its New
         York date, as live. The engine's intraday stamps are New York wall-clock times labelled
         UTC (09:30-15:55), which convert to the same New York date.
 
     A naive datetime / string is read as UTC, the platform's backtest clock convention.
     """
-    from ba2_common.core.market_calendar import backtest_decision_label, live_decision_label
+    from ba2_common.core.market_calendar import live_decision_label, next_regular_session
 
     if as_of is None:
         return live_decision_label(_live_decision_instant())
@@ -661,7 +663,7 @@ def decision_label(as_of: Any) -> date:
         raise ValueError(f"as_of {as_of!r} is not a date")
     ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
     if ts == ts.normalize():
-        return backtest_decision_label(ts.date())
+        return next_regular_session(ts.date())
     return live_decision_label(ts.to_pydatetime())
 
 

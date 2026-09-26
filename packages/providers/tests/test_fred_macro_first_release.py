@@ -83,9 +83,17 @@ class TestTheDecisionLabel:
         # 2024-07-04 is a NYSE holiday: bar 07-03 is the decision of 07-05.
         assert fs.decision_label(_bar("2024-07-03")) == date(2024, 7, 5)
 
-    def test_a_non_session_daily_bar_is_refused(self):
-        with pytest.raises(NotARegularSession):
-            fs.decision_label(_bar("2026-09-26"))          # a Saturday
+    def test_a_non_session_stamp_is_the_next_sessions_decision(self):
+        """Same rule as a session bar (data through that day, next open) -- not a refusal:
+        a vendor bar on a closure must not fail a whole run over the macro overlay."""
+        assert fs.decision_label(_bar("2026-09-26")) == date(2026, 9, 28)   # a Saturday
+        assert fs.decision_label(_bar("2024-07-04")) == date(2024, 7, 5)    # a holiday
+
+    def test_the_label_agrees_with_the_platform_bt_label_on_every_session(self):
+        from ba2_common.core.market_calendar import (backtest_decision_label,
+                                                     regular_session_dates)
+        for d in regular_session_dates(date(2020, 1, 1), date(2025, 12, 31)):
+            assert fs.decision_label(_bar(d.isoformat())) == backtest_decision_label(d), d
 
     def test_an_intraday_instant_is_its_new_york_date(self):
         assert fs.decision_label(datetime(2026, 9, 25, 13, 30, tzinfo=timezone.utc)) == \
