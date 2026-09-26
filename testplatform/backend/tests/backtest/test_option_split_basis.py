@@ -155,7 +155,8 @@ def run(tmp_path, basis):
     ps = _price_source()
     cfg = {"options_cache_db": "unused", "options_store": "thetadata",
            "options_parquet_root": root, "enabled_instruments": ["NFLX"],
-           "start_date": date(2024, 4, 24), "end_date": date(2024, 5, 1)}
+           "start_date": date(2024, 4, 24), "end_date": date(2024, 5, 1),
+           "options_risk_free_rate": 0.045}
     provider = build_options_provider(cfg, price_source=ps, split_basis=basis)
     account = BacktestAccount(1, ps, CFG, options_provider=provider, split_basis=basis)
     yield account, provider, ps, root
@@ -215,7 +216,7 @@ def test_build_options_run_wires_a_basis_for_every_options_run_and_nothing_for_e
                              ohlcv_provider=cache[1]) == (None, None)
     provider, basis = build_options_run(
         {"options_cache_db": str(cache[0] / "o.sqlite"), "enabled_instruments": ["NFLX"],
-         "execution_interval": "1d"},
+         "execution_interval": "1d", "options_risk_free_rate": 0.045},
         price_source=_price_source(), ohlcv_provider=cache[1])
     assert provider is not None and basis.factor("NFLX", date(2024, 5, 1)) == 10.0
 

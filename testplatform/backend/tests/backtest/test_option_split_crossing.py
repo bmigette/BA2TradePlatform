@@ -70,7 +70,11 @@ class _Chain:
     """An AS-TRADED option store: one dict of (occ, day) -> bar."""
 
     def __init__(self, bars):
+        from ba2_providers.macro.risk_free_rate import explicit_rate
+
         self.bars = dict(bars)
+        #: The run's rate, held by the reader as the real ones do (BS marks read it).
+        self.risk_free_rate_source = explicit_rate(0.045, origin="test stub")
 
     def get_bar(self, occ, as_of):
         b = self.bars.get((occ, as_of))
@@ -172,9 +176,7 @@ def _lot_mark(acct, contract):
 
 
 def _bs_lot_basis(spot_contract_basis, strike, day, right):
-    from app.services.backtest.options_store import default_options_risk_free_rate
-    px = bs_price(spot_contract_basis, strike, (EXPIRY - day).days, IV, right,
-                  r=default_options_risk_free_rate())
+    px = bs_price(spot_contract_basis, strike, (EXPIRY - day).days, IV, right, r=0.045)
     intrinsic = max(0.0, (strike - spot_contract_basis) if right == OptionRight.PUT
                     else (spot_contract_basis - strike))
     return max(px, intrinsic)

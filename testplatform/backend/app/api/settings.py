@@ -797,6 +797,16 @@ class ImportKeysResponse(BaseModel):
     source_db: str
 
 
+def _canonical_credential_key(key: str) -> str:
+    """The name a credential is STORED under. Legacy spellings that nothing reads (the FRED
+    key used to be listed and saved here as ``FRED_API_KEY``, while every reader looks up
+    ``fred_api_key``; see ``ba2_common.core.fred_api_key``) are saved under the canonical name."""
+    from ba2_common.core.fred_api_key import (
+        FRED_API_KEY_SETTING, LEGACY_FRED_API_KEY_SETTINGS)
+
+    return FRED_API_KEY_SETTING if key in LEGACY_FRED_API_KEY_SETTINGS else key
+
+
 def _credential_like(key: str) -> bool:
     """True if an AppSetting key looks like a credential worth importing."""
     k = key.lower()
@@ -850,7 +860,7 @@ def import_keys_from_trade():
         )
     for key, value_str in rows:
         if key and _credential_like(key) and value_str:
-            pairs[key] = value_str
+            pairs[_canonical_credential_key(key)] = value_str
 
     if not pairs:
         return ImportKeysResponse(imported=[], count=0, source_db=trade_db)
@@ -899,7 +909,10 @@ KNOWN_CREDENTIAL_KEYS: List[str] = [
     "alpaca_trade_api_key",
     "alpaca_trade_api_secret",
     "OPENAI_API_KEY",
-    "FRED_API_KEY",
+    # Lower case: ``ba2_common.core.fred_api_key.FRED_API_KEY_SETTING``, the name every FRED
+    # reader looks up. It was listed here as ``FRED_API_KEY``, so a key saved from this page
+    # was never read by anything.
+    "fred_api_key",
 ]
 
 
@@ -995,6 +1008,7 @@ def update_credential_keys(payload: CredentialKeysUpdate):
         for key, value in payload.values.items():
             if not key or value is None or value == "":
                 continue
+            key = _canonical_credential_key(key)
             existing = session.exec(
                 select(AppSetting).where(AppSetting.key == key)
             ).first()

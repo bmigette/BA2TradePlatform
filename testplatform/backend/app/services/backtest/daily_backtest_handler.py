@@ -1037,6 +1037,10 @@ def run_daily_backtest(
             # How option fills were priced (plan Part F). Options runs only, so an equity
             # run's results are exactly what they were.
             apply_option_spread_record(results, account)
+            # Which risk-free rate the option greeks and Black-Scholes marks used: the as-of
+            # FRED DGS3MO series, or an explicit constant the run chose. Options runs only.
+            from app.services.backtest.options_store import apply_risk_free_rate_record
+            apply_risk_free_rate_record(results, account)
             if market_condition_record is not None:
                 # RESEARCH METADATA, added after the metrics are computed so it cannot reach
                 # any of them: the per-run counters, and the entry state attached to the trades

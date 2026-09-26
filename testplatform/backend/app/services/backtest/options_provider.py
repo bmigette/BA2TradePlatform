@@ -279,9 +279,20 @@ def _to_contract(r: dict, greeks_row: Optional[dict], volume: int) -> OptionCont
         volume=volume, greeks_source=greeks_source)
 
 class HistoricalOptionsProvider:
-    def __init__(self, cache_db: str):
+    def __init__(self, cache_db: str, *, risk_free_rate: Any = None):
+        """``risk_free_rate`` -- the run's ``RiskFreeRate`` (or an explicit number). This store's
+        greeks are baked in at build time, so the reader itself never uses it; it is HELD here
+        for ``BacktestAccount._bs_mark_rate``, which marks a barless held lot with Black-Scholes
+        and must use the run's rate (``options_store.build_options_provider`` passes it). ``None``
+        (fixture readers) means the run has no rate: a Black-Scholes mark then refuses loudly
+        rather than picking one."""
         self.cache = OptionsHistoryCache(cache_db)
         self.db_path = self.cache.db_path
+        self.risk_free_rate_source = None
+        if risk_free_rate is not None:
+            from ba2_providers.macro.risk_free_rate import as_risk_free_rate
+            self.risk_free_rate_source = as_risk_free_rate(
+                risk_free_rate, origin="HistoricalOptionsProvider(risk_free_rate=...)")
         #: Per-run (the provider is built once per run): see ``ChainStaleness``.
         self._staleness = ChainStaleness()
 

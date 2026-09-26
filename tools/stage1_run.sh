@@ -209,6 +209,20 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
            --market-condition-manifest "$MARKET_CONDITION_MANIFEST")
 fi
 
+# RISK-FREE RATE (2026-09-26). Every option backtest inverts its bars and prices its barless
+# marks at the as-of 3-month Treasury (FRED DGS3MO), read CACHE-ONLY from
+# $BA2_HOME/common/cache/fred/DGS3MO.json (CACHE_FOLDER/fred), and REFUSES to start without it.
+# This host needs that file synced (it needs no FRED key). Checked here, before any job, rather
+# than discovered by every trial of job 1. Not a digest input: job names are unchanged.
+RATE_CHECK=(/opt/ba2worker/ba2-venvs/test/bin/python tools/refresh_fred_cache.py   --check-rate-window "${STAGE1_START:-2020-01-01}" "${STAGE1_END:-2025-12-31}")
+case " $* " in
+  *" --dry-run "*) echo "stage1_run.sh: risk-free-rate preflight (cache only): ${RATE_CHECK[*]}" ;;
+  *) "${RATE_CHECK[@]}" || {
+       echo "stage1_run.sh: the FRED DGS3MO cache does not cover the window -- sync" >&2
+       echo "<CACHE_FOLDER>/fred/DGS3MO.json from a host that ran tools/refresh_fred_cache.py." >&2
+       exit 1; } ;;
+esac
+
 # FITNESS (2026-09-17). Unset -> run_options_matrix --profile discovery's own default,
 # ``option_consistent_annual_return``, which is what every -st1 job so far ran under; with it
 # unset this block is a no-op and the launch is byte-for-byte the one it has always been.
