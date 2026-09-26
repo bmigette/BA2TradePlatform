@@ -98,3 +98,18 @@ def test_unrate_respects_publication_date_through_the_expert_path():
 def test_pmi_key_is_gone_entirely():
     """pmi_score is hard-wired to ISM's 50 boundary; a rescaled stand-in would pin it."""
     assert "pmi" not in data.fetch_macro_series(None, "2024-03-20")
+
+
+@pytest.mark.parametrize("mode", ["enforce", "observe", "legacy"])
+def test_an_unestablishable_macro_read_is_never_absorbed(monkeypatch, mode):
+    """A cache in the old observation-date format cannot say what a decision could see. The
+    expert must not quietly fall back to the index trend alone -- in ANY error mode."""
+    monkeypatch.setenv("BA2_ERROR_MODE", mode)
+    with open(fs.cache_path("VIXCLS"), "w", encoding="utf-8") as fh:
+        json.dump({"series_id": "VIXCLS", "vintage": False,
+                   "observations": [{"date": "2024-01-02", "value": "18.5",
+                                     "realtime_start": "2026-09-23"}]}, fh)
+    fs.reset_cache()
+    data.reset_caches()
+    with pytest.raises(fs.MacroAvailabilityUnknown, match="first-release format"):
+        data.fetch_macro_series(None, "2024-03-20")

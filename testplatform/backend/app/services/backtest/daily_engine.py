@@ -957,7 +957,9 @@ class DailyBacktestEngine:
                 # skipped per-symbol — otherwise a missing pre-warm degrades results invisibly.
                 from app.services.backtest.price_source import BacktestCacheMiss
                 from ba2_providers.fmp_common import FMPHistoryCacheMiss
-                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
+                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
+                                  MacroAvailabilityUnknown)):
                     raise
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
@@ -1177,7 +1179,9 @@ class DailyBacktestEngine:
                                  # left at the gather step for a basket expert)
             from app.services.backtest.price_source import BacktestCacheMiss
             from ba2_providers.fmp_common import FMPHistoryCacheMiss
-            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+            from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
+            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
+                                  MacroAvailabilityUnknown)):
                 raise
             self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
             return False
@@ -1236,7 +1240,9 @@ class DailyBacktestEngine:
             except Exception as e:  # noqa: BLE001 — one bad list item must not abort the whole bar
                 from app.services.backtest.price_source import BacktestCacheMiss
                 from ba2_providers.fmp_common import FMPHistoryCacheMiss
-                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
+                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
+                                  MacroAvailabilityUnknown)):
                     raise
                 self._log(f"basket item staging failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
@@ -1310,7 +1316,9 @@ class DailyBacktestEngine:
                 # trader-skill feature's hermeticity).
                 from app.services.backtest.price_source import BacktestCacheMiss
                 from ba2_providers.fmp_common import FMPHistoryCacheMiss
-                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
+                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
+                                  MacroAvailabilityUnknown)):
                     raise
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
@@ -1501,7 +1509,9 @@ class DailyBacktestEngine:
         except Exception as e:  # noqa: BLE001 — one bar must not abort the run
             from app.services.backtest.price_source import BacktestCacheMiss
             from ba2_providers.fmp_common import FMPHistoryCacheMiss
-            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+            from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
+            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss,
+                                  MacroAvailabilityUnknown)):
                 raise
             self._log(f"bypass analyze_as_of failed @ {as_of:%Y-%m-%d}: {e}")
             return

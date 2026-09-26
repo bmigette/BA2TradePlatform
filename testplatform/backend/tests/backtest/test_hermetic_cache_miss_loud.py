@@ -21,6 +21,9 @@ import pytest
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.types import OrderRecommendation, Recommendation
 from ba2_providers.fmp_common import FMPHistoryCacheMiss
+# A macro FRED read whose publication dates cannot be established (2026-09-26): the same class of
+# setup bug -- every decision reads the same file -- so it aborts exactly like a cache miss.
+from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
 from app.services.backtest.price_source import BacktestCacheMiss
 
 from tests.backtest.test_daily_engine_unit import _build_run, BARS
@@ -60,7 +63,8 @@ class _RaisingExpert(MarketExpertInterface):
         raise self._exc
 
 
-@pytest.mark.parametrize("exc_cls", [FMPHistoryCacheMiss, BacktestCacheMiss])
+@pytest.mark.parametrize("exc_cls", [FMPHistoryCacheMiss, BacktestCacheMiss,
+                                     MacroAvailabilityUnknown])
 def test_enter_market_reraises_hermetic_cache_miss(exc_cls):
     """Baseline: confirms the ALREADY-correct ENTER_MARKET path (no fix needed here)."""
     engine, account, expert, ctx, ps = _build_run()
@@ -94,7 +98,8 @@ def _open_position_via_full_run(engine, account, expert, ps):
         "fixture must have an open AAPL position to exercise the OPEN_POSITIONS path"
 
 
-@pytest.mark.parametrize("exc_cls", [FMPHistoryCacheMiss, BacktestCacheMiss])
+@pytest.mark.parametrize("exc_cls", [FMPHistoryCacheMiss, BacktestCacheMiss,
+                                     MacroAvailabilityUnknown])
 def test_open_positions_reraises_hermetic_cache_miss(exc_cls):
     """Regression: this path was silently swallowing cache misses before the 2026-07-15 fix."""
     from app.services.backtest.default_rulesets import seed_open_positions_ruleset
@@ -138,7 +143,8 @@ def test_open_positions_swallows_ordinary_exception():
         ctx.__exit__(None, None, None)
 
 
-@pytest.mark.parametrize("exc_cls", [FMPHistoryCacheMiss, BacktestCacheMiss])
+@pytest.mark.parametrize("exc_cls", [FMPHistoryCacheMiss, BacktestCacheMiss,
+                                     MacroAvailabilityUnknown])
 def test_bypass_expert_reraises_hermetic_cache_miss(exc_cls):
     """Regression: the bypass path's own docstring claimed parity with ENTER_MARKET's
     handling but did not actually re-raise before the 2026-07-15 fix."""
@@ -159,3 +165,17 @@ def test_bypass_expert_swallows_ordinary_exception():
         assert raising.calls == 1
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_a_macro_availability_refusal_is_fatal_to_a_trial(monkeypatch):
+    """One FRED file every trial reads: scored as a failed trial it would be 0 fitness on every
+    genome and the GA would "finish" on nothing."""
+    import app.services.strategy_optimization_handler as H
+
+    def _refuse(cfg, **kw):
+        raise MacroAvailabilityUnknown("FRED VIXCLS: the cache is not in the first-release format")
+
+    monkeypatch.setattr("app.services.backtest.daily_backtest_handler.run_daily_backtest", _refuse)
+    out = H._trial_worker({"backtest_id": 1}, "calmar")
+    assert out["ok"] is False and out["fatal"] is True, out
+    assert "first-release format" in out["error"]
