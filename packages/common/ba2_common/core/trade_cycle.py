@@ -86,6 +86,32 @@ def entry_route(action_types: Iterable[Any]) -> str:
     return ENTRY_ROUTE_EQUITY
 
 
+def open_or_waiting_position(expert_id: Any, symbol: str, *, session=None) -> Optional[Transaction]:
+    """THE DUPLICATE-POSITION GATE: the expert's OPENED or WAITING transaction on ``symbol``
+    (the lowest id when there are several), or None when the entry may proceed.
+
+    Applied after the enter ruleset fired and before anything executes, by live ``TradeManager``
+    and the backtest ``daily_engine`` alike (plan 2026-09-25 option-stage2-build, Task 8 review
+    I1): ONE position per (expert, symbol). WAITING counts too, so a not-yet-filled entry from
+    an earlier cycle cannot be stacked (a ruleset's ``has_no_position`` leaf sees OPENED only).
+    Keyed on expert and symbol ONLY -- not on a style-group member tag -- so in a style expert
+    one member holds a symbol at a time, which is what keeps the members' exits apart (each
+    exit reads the one position's entry order, ``entry_order.oldest_entry_order``).
+
+    Reads through ``trade_store.transactions_where``: the backtest's in-memory store when it is
+    active, else SQLite (through ``session`` when given, preserving the live session's view).
+    """
+    from ba2_common.core.trade_store import transactions_where
+    from ba2_common.core.types import TransactionStatus
+
+    rows = transactions_where(expert_id=expert_id, symbol=symbol,
+                              statuses=[TransactionStatus.OPENED, TransactionStatus.WAITING],
+                              session=session)
+    if not rows:
+        return None
+    return min(rows, key=lambda t: t.id or 0)
+
+
 # Recommendation directions that open a SHORT (sell-entry); everything else opens a long (buy).
 _SHORT_ENTRY_ACTIONS = (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT)
 

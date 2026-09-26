@@ -5,16 +5,19 @@ built"). A style expert is ONE expert: all its members trade the same symbols ou
 ENTER_MARKET ruleset and are managed by one OPEN_POSITIONS ruleset. Two members cannot tangle on
 one symbol because of two engine rules, pinned here against the REAL ``DailyBacktestEngine``:
 
-1. ONE POSITION PER EXPERT PER SYMBOL (``daily_engine._has_open_or_waiting_position``, the
-   live-parity dup gate after the enter ruleset fires; live: TradeManager's enter_market SAFETY
-   CHECK, the same OPENED+WAITING query). While member A holds a symbol, member B's entry rule
-   may pass and B still never opens there -- whatever A's tag, since the gate is keyed on
-   (expert, symbol) only. The member entry rules below deliberately carry NO ``has_no_position``
-   leaf, so the engine gate is the only thing between them.
-2. EXITS READ THE OLDEST TRANSACTION'S ENTRY ORDER (``daily_engine._oldest_entry_order``; live:
-   ``oldest_transaction`` -> ``resolve_entry_order``). That order's ``entry_tag`` is what every
-   member exit compares against, so member B's exit -- here one that is ALWAYS true for B --
-   never closes A's position, and A's own exit does.
+1. ONE POSITION PER EXPERT PER SYMBOL (``daily_engine._has_open_or_waiting_position`` ->
+   the SHARED ``trade_cycle.open_or_waiting_position``, the dup gate after the enter ruleset
+   fires, which live TradeManager's enter_market SAFETY CHECK calls too). While member A holds a
+   symbol, member B's entry rule may pass and B still never opens there -- whatever A's tag,
+   since the gate is keyed on (expert, symbol) only. The member entry rules below deliberately
+   carry NO ``has_no_position`` leaf, so the engine gate is the only thing between them.
+2. EXITS READ THE OLDEST OPENED TRANSACTION'S ENTRY ORDER (``daily_engine._oldest_entry_order``
+   -> the SHARED ``entry_order.oldest_entry_order``, which live
+   ``process_open_positions_recommendations`` calls too). That order's ``entry_tag`` is what
+   every member exit compares against, so member B's exit -- here one that is ALWAYS true for
+   B -- never closes A's position, and A's own exit does. (The live half, and the BT/live
+   parity of the pick, are ``tests/test_style_member_exits_live.py`` and
+   ``tests/backtest/test_entry_order_bt_live_parity.py``.)
 
 Run from the backend dir:
     python -m pytest tests/backtest/test_style_member_isolation_engine.py -q
@@ -274,16 +277,24 @@ def test_exits_read_the_OLDEST_transactions_entry_order():
     position), the exit pass reads the OLDEST one's entry order -- whose tag every member exit
     compares -- whatever order the transactions are listed in."""
     from app.services.backtest.daily_engine import DailyBacktestEngine
+    from ba2_common.core import trade_store as ts
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import TradingOrder, Transaction
+    from ba2_common.core.types import OrderDirection, OrderType, TransactionStatus
 
-    class _Acct:
-        def _entry_order_for_transaction(self, txn):
-            return SimpleNamespace(id=txn.id, data={"entry_tag": txn.tag})
-
-    old = SimpleNamespace(id=1, tag=TAG_A, open_date=datetime(2024, 1, 3, tzinfo=timezone.utc),
-                          created_at=None)
-    new = SimpleNamespace(id=2, tag=TAG_B, open_date=datetime(2024, 1, 9, tzinfo=timezone.utc),
-                          created_at=None)
     eng = object.__new__(DailyBacktestEngine)
-    eng.account = _Acct()
-    for txns in ([old, new], [new, old]):
-        assert eng._oldest_entry_order(txns).data["entry_tag"] == TAG_A
+    with ts.inmem_trades():
+        txns = []
+        # the NEWER position is written first, so neither list order nor id decides it
+        for tag, day in ((TAG_B, 9), (TAG_A, 3)):
+            t = Transaction(symbol=SYM, quantity=-1.0, side=OrderDirection.SELL,
+                            status=TransactionStatus.OPENED, expert_id=1,
+                            open_date=datetime(2024, 1, day, tzinfo=timezone.utc))
+            add_instance(t)
+            add_instance(TradingOrder(account_id=1, symbol=SYM, quantity=1.0,
+                                      side=OrderDirection.SELL, order_type=OrderType.MARKET,
+                                      status=OrderStatus.FILLED, transaction_id=t.id,
+                                      data={"entry_tag": tag}))
+            txns.append(t)
+        for listed in (txns, list(reversed(txns))):
+            assert eng._oldest_entry_order(listed).data["entry_tag"] == TAG_A

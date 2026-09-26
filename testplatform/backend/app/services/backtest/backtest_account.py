@@ -77,7 +77,6 @@ from ba2_common.core.option_trade_record import (
     exit_record as option_exit_record, settlement_close_reason,
 )
 from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
-from ba2_common.core.utils import as_utc_key
 from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core import option_spread_model as _osm
@@ -88,6 +87,7 @@ from ba2_common.core.assignment_hold import (
     holds_assigned_stock,
     resolve_assigned_stock_hold_policy,
 )
+from ba2_common.core.entry_order import entry_order_for_transaction
 from ba2_common.core.entry_tag import order_entry_tag
 
 from .price_source import AsOfPriceSource
@@ -6844,20 +6844,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # TP/SL/OCO leg helpers
     # ======================================================================
     def _entry_order_for_transaction(self, transaction: Transaction) -> Optional[TradingOrder]:
-        """The market-entry order of a transaction: transaction_id matches + no parent.
+        """The market-entry order of a transaction: its first-written ROOT order.
 
-        (Transaction has no entry_order_id column; the entry order is the one with
-        ``depends_on_order IS NULL``. If several exist — e.g. scaled entries — the oldest
-        is returned so legs depend on the original entry.)
+        (Transaction has no entry_order_id column; the entry order is the oldest one with
+        neither ``depends_on_order`` nor ``parent_order_id`` -- so legs depend on the original
+        entry when there are scaled entries, and a combo's leg children never stand in for
+        its parent.) ONE definition, shared with live (``TradeManager.resolve_entry_order``):
+        ``ba2_common.core.entry_order.entry_order_for_transaction`` -- the row the OPEN_POSITIONS
+        pass hands ``EntryTagCondition`` and the one an assignment reads the member tag from.
         """
-        rows = orders_where(account_id=self.id, transaction_id=transaction.id,
-                            depends_on_order=None)
-        if not rows:
-            return None
-        # Same naive/aware hazard as daily_engine._oldest_entry_order: created_at may be
-        # either shape, and the aware fallback cannot be compared with a naive value.
-        rows.sort(key=lambda o: (as_utc_key(o.created_at, default=datetime.min), o.id or 0))
-        return rows[0]
+        return entry_order_for_transaction(transaction.id)
 
     # NOTE: the WAITING_TRIGGER/OCO leg factory (_replace_leg) + its helper (_existing_legs) were
     # REMOVED — the lean simulator stores TP/SL on the transaction and closes directly via

@@ -7593,11 +7593,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             input to covered-call / protective-put sizing. Assigned stock with no order
             row sizes to 0 contracts, so the wheel's second leg never gets written.
           * ``TradeManager``'s open-positions pass resolves ``existing_order`` as the
-            oldest FILLED order on the transaction matching its side, and hands it to
-            every condition. With no such order ``DaysOpenedCondition`` /
-            ``ProfitLossAmountCondition`` / ``ProfitLossPercentCondition`` all return
-            False unconditionally, and ``CloseAction`` falls through to its legacy
-            broker-position branch, whose order is NOT linked to the transaction — so
+            transaction's first-written root order (``entry_order.oldest_entry_order``,
+            shared with the backtest) and hands it to every condition. With no such
+            order the pass refuses the symbol (``EntryOrderUnresolved``): evaluated
+            against None, ``DaysOpenedCondition`` / ``ProfitLossAmountCondition`` /
+            ``ProfitLossPercentCondition`` would all return False unconditionally, and
+            ``CloseAction`` would fall through to its legacy broker-position branch,
+            whose order is NOT linked to the transaction — so
             ``has_pending_closing_order`` never sees it and a close is re-submitted every
             cycle.
 

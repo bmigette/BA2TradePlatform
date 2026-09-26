@@ -34,12 +34,13 @@ from ba2_common.core import market_condition_live as live
 from ba2_common.core.market_conditions import STATUS_NO_CONTEXT, STATUS_VALID
 from ba2_common.core.types import ExpertEventType
 
-from ba2_trade_platform.core.types import OrderRecommendation, TransactionStatus
+from ba2_trade_platform.core.types import OrderRecommendation, OrderStatus, TransactionStatus
 from tests.factories import (
     create_account_definition,
     create_expert_instance,
     create_recommendation,
     create_ruleset,
+    create_trading_order,
     create_transaction,
 )
 # The stub instance-resolver / dispatcher / clock fixtures of the live-context suite, reused so
@@ -133,6 +134,10 @@ def world(monkeypatch):
                                 subtype=AnalysisUseCase.OPEN_POSITIONS)
     txn = create_transaction(symbol=SYMBOL, status=TransactionStatus.OPENED,
                              expert_id=expert_instance.id)
+    # Its entry order: an OPENED position with no entry order row is refused by the pass
+    # (entry_order.EntryOrderUnresolved, plan 2026-09-25 option-stage2-build Task 8 review I1).
+    create_trading_order(account_id=account_def.id, symbol=SYMBOL, status=OrderStatus.FILLED,
+                         transaction_id=txn.id)
 
     state = {"expert": _FakeExpert(), "scope_depth": 0}
     recorder = _Recorder()

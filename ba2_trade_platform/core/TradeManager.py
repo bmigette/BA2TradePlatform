@@ -193,34 +193,31 @@ def rebase_price_to_fill(target_price, reference_price, fill_price):
 
 
 def resolve_entry_order(session, transaction):
-    """The transaction's ENTRY order: its oldest FILLED order on the transaction's own side.
+    """The transaction's ENTRY order: its first-written ROOT order (no ``depends_on_order``,
+    no ``parent_order_id``), by UTC ``created_at`` then id, any status.
 
-    This single row is what the open-positions pass hands to every condition as
-    ``existing_order``, and a surprising amount hangs off it being found:
-    ``DaysOpenedCondition``, ``ProfitLossAmountCondition`` and
-    ``ProfitLossPercentCondition`` each return False unconditionally without one, and
-    ``CloseAction`` only takes its ``close_transaction()`` path (the one that links the
-    close back to the transaction, so ``has_pending_closing_order`` can see it) when the
-    order carries a ``transaction_id``. A position whose shares arrived without an order
-    row — an option assignment used to be exactly that — is therefore unmanageable and
-    silently so. Extracted from ``process_open_positions_recommendations`` so that
-    property is directly testable.
+    ONE definition, shared with the backtest (``BacktestAccount._entry_order_for_transaction``):
+    ``ba2_common.core.entry_order.entry_order_for_transaction`` (plan 2026-09-25
+    option-stage2-build, Task 8 review I1). It is the row every entry path writes its facts and
+    its style-member tag onto (a combo's PARENT, never a leg child), so the tag an assignment
+    passes on (``AlpacaAccount._position_entry_tag``) and the tag the exits compare
+    (``entry_order.oldest_entry_order``) are read off the same row. It replaced "the oldest
+    FILLED order on the transaction's side", which is the same row on every normal position.
+
+    A surprising amount hangs off this row being found: ``DaysOpenedCondition``,
+    ``ProfitLossAmountCondition`` and ``ProfitLossPercentCondition`` each return False
+    unconditionally without one, and ``CloseAction`` only takes its ``close_transaction()``
+    path (the one that links the close back to the transaction, so
+    ``has_pending_closing_order`` can see it) when the order carries a ``transaction_id``. A
+    position whose shares arrived without an order row — an option assignment used to be
+    exactly that — is therefore unmanageable; the open-positions pass refuses it by name
+    (``EntryOrderUnresolved``).
     """
-    from sqlmodel import select
+    from ba2_common.core.entry_order import entry_order_for_transaction
 
     if transaction is None:
         return None
-    stmt = (
-        select(TradingOrder)
-        .where(
-            TradingOrder.transaction_id == transaction.id,
-            TradingOrder.side == transaction.side,
-            TradingOrder.status == OrderStatus.FILLED
-        )
-        .order_by(TradingOrder.created_at.asc())
-        .limit(1)
-    )
-    return session.exec(stmt).first()
+    return entry_order_for_transaction(transaction.id, session=session)
 
 
 class TradeManager:
@@ -2667,13 +2664,11 @@ class TradeManager:
                         self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
                         
                         # SAFETY CHECK: For enter_market, check if there's already an open/waiting transaction
-                        # for this symbol and expert to prevent duplicate positions
-                        existing_txn_statement = select(Transaction).where(
-                            Transaction.expert_id == expert_instance_id,
-                            Transaction.symbol == recommendation.symbol,
-                            Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING])
-                        )
-                        existing_txn = session.exec(existing_txn_statement).first()
+                        # for this symbol and expert to prevent duplicate positions. The SHARED gate
+                        # the backtest engine applies too (trade_cycle.open_or_waiting_position).
+                        from .trade_cycle import open_or_waiting_position
+                        existing_txn = open_or_waiting_position(
+                            expert_instance_id, recommendation.symbol, session=session)
                         
                         if existing_txn:
                             self.logger.warning(
@@ -3465,19 +3460,30 @@ class TradeManager:
                             existing_transactions=existing_transactions
                         )
 
-                        # Resolve the primary (entry) order from the oldest open transaction
-                        # This is needed for conditions like DaysOpenedCondition that use order.created_at
-                        oldest_transaction = min(existing_transactions, key=lambda t: t.open_date or t.created_at)
-                        existing_order = resolve_entry_order(session, oldest_transaction)
+                        # The entry order every condition reads (DaysOpened, P&L, the style-member
+                        # entry_tag): the entry order of the oldest OPENED transaction, by the ONE
+                        # definition the backtest engine uses too (entry_order.oldest_entry_order,
+                        # plan 2026-09-25 option-stage2-build Task 8 review I1). An OPENED position
+                        # with no entry order row is REFUSED by name: evaluated against None, every
+                        # P&L / days-opened / entry_tag condition would read False and CloseAction
+                        # would lose its transaction link.
+                        from ba2_common.core.entry_order import (EntryOrderUnresolved,
+                                                                 oldest_entry_order)
+                        try:
+                            existing_order = oldest_entry_order(existing_transactions,
+                                                                session=session)
+                        except EntryOrderUnresolved as e:
+                            self.logger.error(
+                                f"Skipping open_positions evaluation of recommendation "
+                                f"{recommendation.id} for {recommendation.symbol}: {e}")
+                            continue
                         if existing_order:
                             self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
                         else:
-                            # Not benign: every P&L / days-opened condition on this symbol will
-                            # now evaluate False and CloseAction loses its transaction link.
-                            self.logger.warning(
-                                f"No FILLED {oldest_transaction.side} order on transaction "
-                                f"{oldest_transaction.id} ({recommendation.symbol}) — exit "
-                                f"conditions needing an entry order cannot evaluate")
+                            # Only WAITING transactions: nothing has opened on this symbol yet.
+                            self.logger.debug(
+                                f"No OPENED transaction for {recommendation.symbol} (only "
+                                f"WAITING) - conditions needing an entry order read False")
 
                         # Evaluate recommendation through the open_positions ruleset
                         self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol} (open_positions)")

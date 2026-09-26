@@ -50,7 +50,6 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
-from ba2_common.core.utils import as_utc_key
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
@@ -1455,25 +1454,25 @@ class DailyBacktestEngine:
         The live-parity duplicate-position gate (mirrors TradeManager's enter_market safety
         check, which queries OPENED+WAITING). Unlike ``_held_transactions`` (OPENED-only, for
         MANAGEMENT), the dup gate must also count a WAITING (not-yet-filled) entry so a second
-        entry can't stack on it before it fills — exactly as live blocks it."""
-        from ba2_common.core.trade_store import transactions_where
-        from ba2_common.core.types import TransactionStatus
+        entry can't stack on it before it fills — exactly as live blocks it.
 
-        rows = transactions_where(
-            expert_id=expert_id, symbol=symbol,
-            statuses=[TransactionStatus.OPENED, TransactionStatus.WAITING])
-        return len(rows) > 0
+        ONE definition for both runtimes: ``trade_cycle.open_or_waiting_position``, which live
+        ``TradeManager`` calls too (plan 2026-09-25 option-stage2-build, Task 8 review I1)."""
+        from ba2_common.core.trade_cycle import open_or_waiting_position
+
+        return open_or_waiting_position(expert_id, symbol) is not None
 
     def _oldest_entry_order(self, txns: List[Any]) -> Optional[Any]:
-        """The FILLED entry order of the oldest transaction (for DaysOpened-style conditions)."""
-        if not txns:
-            return None
-        # as_utc_key, not an inline `or`: open_date/created_at come back from SQLite naive
-        # or aware depending on how the row was written, and mixing either with the aware
-        # fallback raises TypeError. It only bites when one run holds BOTH shapes, which is
-        # why this passed everywhere and failed in CI.  ba2_common.core.utils.as_utc_key
-        oldest = min(txns, key=lambda t: as_utc_key(t.open_date or t.created_at))
-        return self.account._entry_order_for_transaction(oldest)
+        """The ``existing_order`` this symbol's exits are evaluated against: the entry order of
+        the oldest OPENED transaction -- the row ``EntryTagCondition`` reads the member tag off.
+
+        ONE definition for both runtimes: ``entry_order.oldest_entry_order``, which live
+        ``TradeManager.process_open_positions_recommendations`` calls too (plan 2026-09-25
+        option-stage2-build, Task 8 review I1). An OPENED position with no entry order row
+        raises ``EntryOrderUnresolved`` and ends the run: its exits could never evaluate."""
+        from ba2_common.core.entry_order import oldest_entry_order
+
+        return oldest_entry_order(txns)
 
     def _run_bypass_expert_bar(
         self,
