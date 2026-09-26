@@ -7,6 +7,43 @@ A self-contained Python monorepo for algorithmic trading, shipping **two applica
 
 Both apps run the *same* expert/provider code, which is what makes a backtest predictive of live behaviour.
 
+## Quick start
+
+```bash
+# 1. Clone
+git clone https://github.com/bmigette/BA2TradePlatform.git
+cd BA2TradePlatform
+
+# 2. Install: both venvs under ~/ba2-venvs/{trade,test}, plus the ba2-trade / ba2-test commands
+./install.sh --editable          # Windows: .\install.ps1 -Editable
+
+#    or by hand, trade app only (the in-repo packages first, then requirements.txt)
+python -m venv .venv             # then activate it
+python -m pip install -e packages/common -e packages/providers -e "packages/experts[ui]"
+python -m pip install -r requirements.txt
+
+# 3. Run the live app: http://localhost:8080
+ba2-trade                        # or: python main.py
+python main.py --port 8081 --db-file ~/Documents/ba2/trade/dev.db   # a second instance
+```
+
+- **PyTorch on Windows:** the install scripts choose CPU or CUDA wheels for you. By hand, install the
+  CPU-only build first and pin a known working version such as `torch==2.6.0+cpu`; recent builds
+  (2.10+) can fail with `WinError 1114`. See [Troubleshooting](#-troubleshooting).
+- **Flags:** `--port` (default 8080), `--db-file`, `--log-folder`, `--cache-folder`.
+- **First-time setup:** enter API keys and broker accounts on the Settings page
+  (`/settings`). They are stored in the app's database, not in `.env`. See
+  [First-Time Configuration](#first-time-configuration).
+- **Configuration:** the live app does not read `.env`. The optional path overrides are the
+  environment variables `BA2_HOME` (data root, default `~/Documents/ba2`), `DB_FILE`, `LOG_FOLDER`
+  and `CACHE_FOLDER` (see `packages/common/ba2_common/config.py` and `ba2_trade_platform/config.py`).
+- **Test platform:** run `ba2-test serve` (API on :8000, UI on :5173), or `testplatform/start.bat` /
+  `start.sh`. See the [test platform quick start](testplatform/README.md#quick-start).
+- **Tests:** three suites, each run in its own invocation:
+  - `python -m pytest` from the repo root runs `tests/`;
+  - `python -m pytest packages/common/tests` runs a package suite (likewise `providers`, `experts`);
+  - `python -m pytest tests` from `testplatform/backend`, with the test venv, runs the backend suite.
+
 ## 📸 Screenshots
 
 ### Dashboard

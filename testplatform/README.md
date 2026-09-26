@@ -9,6 +9,28 @@ React/Vite UI, a `ba2-test` console command, and optional remote workers that sh
 
 ![Dashboard](docs/screenshots/01-dashboard.png)
 
+## Quick start
+
+From the monorepo root:
+
+```bash
+./install.sh --test-only --editable      # Windows: .\install.ps1 -TestOnly -Editable
+source ~/ba2-venvs/test/bin/activate     # Windows: ~\ba2-venvs\test\Scripts\Activate.ps1
+ba2-test serve                           # API on :8000, UI on :5173
+```
+
+Open http://localhost:5173 and enter provider API keys (FMP at least) under
+**Settings -> API Keys**. Then run a backtest or a GA job from the CLI:
+
+```bash
+ba2-test backtest --expert FMPRating --universe AAPL,MSFT,NVDA --start 2024-01-01 --end 2024-12-31 --save
+ba2-test optimize --expert FMPRating --strategy S2 --universe AAPL,MSFT,NVDA --start 2023-01-01 --end 2024-12-31
+```
+
+`start.bat` / `start.sh` wrap `ba2-test serve`. [QUICK_START.md](QUICK_START.md) has the longer
+walkthrough; [Install and first run](#install-and-first-run) and
+[Command-line tools](#command-line-tools) have the details.
+
 ## How it relates to the trade platform
 
 Both apps live in one monorepo and share three installable packages:
@@ -101,7 +123,8 @@ fill clock (`--interval`, e.g. `5min`, for intraday TP/SL). It uses as-of data o
 Supported experts are listed in `_SUPPORTED_EXPERTS` in
 `backend/app/services/backtest/daily_backtest_handler.py`. Today they are FMPRating,
 FMPEarningsDrift, FMPEarningsEvent, FMPInsiderClusterBuy, FMPSenateTraderWeight,
-FMPSenateTraderCopy, FinnHubRating, FactorRanker, DeterministicScorer and ETFTrend.
+FMPSenateTraderCopy, FinnHubRating, FactorRanker, DeterministicScorer, ETFTrend and
+PullbackReversion (research-only, backtest-registered).
 Classic-RM experts use enter/exit rulesets. Bypass experts such as FactorRanker rebalance to
 target weights. The Smart (agentic) risk manager is not modelled, and a run that asks for it is
 refused.
@@ -230,7 +253,11 @@ installer's default `~/ba2-venvs/test`.
   `frontend/src/lib/config.ts`).
 - On startup the backend creates its tables and runs `backend/scripts/migrate_db.py`.
 - Set provider API keys (FMP, Alpaca, Finnhub, ...) in **Settings -> API Keys**, or copy them from
-  the trade platform's DB.
+  the trade platform's DB. The FRED providers read the AppSetting `fred_api_key` (lower case);
+  the page lists `FRED_API_KEY`, but AppSetting lookups are exact, and upper-case `FRED_API_KEY`
+  is only read as an ENV var (by `ba2-test prewarm` and a few test-platform services). See
+  [../docs/REPRODUCE-BACKTESTS.md](../docs/REPRODUCE-BACKTESTS.md) for which keys reproducing
+  results needs.
 - Set `BA2_ADMIN_TOKEN` to enable the token-protected admin endpoints (`/api/admin/*`:
   version, update, logs, DB cleanup).
 

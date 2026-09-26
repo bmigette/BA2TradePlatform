@@ -3445,9 +3445,20 @@ class TradeManager:
                         # first one resolves. Shared with the backtest engine's equivalent
                         # guard (found investigating the 2026-07-21 options-grid equity
                         # runaway); see ReadOnlyAccountInterface.has_pending_closing_order.
+                        # A resting TP/SL (OCO legs, brackets) is protection, not a pending
+                        # close, and does not skip the transaction. Each skip is logged: a
+                        # silent skip here hid 13 prod positions' exit rules for weeks.
+                        pending_close_ids = {
+                            t.id for t in existing_transactions
+                            if account.has_pending_closing_order(t.id)
+                        }
+                        for t in existing_transactions:
+                            if t.id in pending_close_ids:
+                                self.logger.info(
+                                    f"Skipping exit-rule evaluation of transaction {t.id} "
+                                    f"({t.symbol}): a closing order is still working")
                         existing_transactions = [
-                            t for t in existing_transactions
-                            if not account.has_pending_closing_order(t.id)
+                            t for t in existing_transactions if t.id not in pending_close_ids
                         ]
 
                         if not existing_transactions:

@@ -39,6 +39,8 @@ what each drop reason means, and the run's own printed summary for counts.
 Usage:
     python tools/ba2_cache_export.py export --dest-dir "G:\\Mon Drive\\Work\\AiTrading\\Test ML Cache"
     python tools/ba2_cache_export.py export --dest-dir <dir> --name my_export.zip --overwrite
+    python tools/ba2_cache_export.py export --dest-dir <dir> --overwrite \\
+        --exclude _derived --exclude "_stale-*"     # skip rebuildable / retired cache folders
     python tools/ba2_cache_export.py export --dest-dir <dir> --scope db
     python tools/ba2_cache_export.py export --dest-dir <dir> --scope bt-ga
     python tools/ba2_cache_export.py export --dest-dir <dir> --scope bt --label goal2020 --label sen5min
@@ -194,8 +196,32 @@ def _robocopy_move(src_path: str, dest_dir: str, dest_name: str) -> None:
     os.remove(src_path)
 
 
-def _iter_cache_files(cache_dir: str):
+def _excluded_top_level(cache_dir: str, patterns) -> list:
+    """The top-level cache entries (folder or file names) matching any --exclude pattern
+    (fnmatch, case-sensitive). A pattern matching NOTHING is refused rather than ignored: a
+    typo would otherwise silently export the very folder the caller meant to leave out."""
+    import fnmatch
+    if not patterns:
+        return []
+    entries = sorted(os.listdir(cache_dir))
+    hits = []
+    for pat in patterns:
+        if "/" in pat or "\\" in pat:
+            raise SystemExit(f"--exclude {pat!r}: only top-level cache entries can be "
+                             f"excluded (a name or glob, no path separators).")
+        matched = [e for e in entries if fnmatch.fnmatchcase(e, pat)]
+        if not matched:
+            raise SystemExit(f"--exclude {pat!r} matches no top-level entry of {cache_dir}.")
+        hits.extend(m for m in matched if m not in hits)
+    return hits
+
+
+def _iter_cache_files(cache_dir: str, excluded=()):
+    excluded = set(excluded)
     for root, _dirs, files in os.walk(cache_dir):
+        if root == cache_dir:
+            _dirs[:] = [d for d in _dirs if d not in excluded]
+            files = [f for f in files if f not in excluded]
         for fname in files:
             # Every cache writer in this codebase (parquet_store.py, metric_store.py,
             # fmp_common.py) stages via "<path>.<pid>.<tid>.tmp" then os.replace()'s it
@@ -526,8 +552,12 @@ def cmd_export(args: argparse.Namespace) -> None:
         cache_kept_count = 0
         cache_kept_bytes = 0
         if include_cache:
+            excluded = _excluded_top_level(CACHE_FOLDER, args.exclude)
+            if excluded:
+                print(f"Excluding top-level cache entries: {', '.join(excluded)}")
+            manifest["cache_excluded_top_level"] = excluded
             print(f"Scanning {CACHE_FOLDER} ...")
-            cache_files = list(_iter_cache_files(CACHE_FOLDER))
+            cache_files = list(_iter_cache_files(CACHE_FOLDER, excluded))
             # A live cache is a moving target -- this export can (and, running alongside the
             # GA grid, routinely does) race a writer's own atomic write-then-replace on a
             # file the walk above already listed. Vanishing between the walk and this SIZE
@@ -737,6 +767,12 @@ def main() -> None:
                                "to a file whose format/date field can't be determined.")
     p_export.add_argument("--date-end", default=None, metavar="YYYY-MM-DD",
                           help="End of the window (inclusive). Requires --date-start.")
+    p_export.add_argument("--exclude", action="append", default=None, metavar="NAME_OR_GLOB",
+                          help="Leave a TOP-LEVEL cache entry out of the export (repeatable; "
+                               "fnmatch glob). E.g. --exclude _derived (the shared-array cache, "
+                               "rebuilt by tools/build_shared_arrays.py) --exclude '_stale-*'. "
+                               "A pattern matching nothing is refused. Recorded in the "
+                               "manifest as cache_excluded_top_level.")
     p_export.add_argument("--name", default=None,
                           help=f"Zip filename (default per scope: "
                                f"{' / '.join(DEFAULT_NAMES[s] for s in ('full', 'cache', 'db', 'bt-ga', 'bt'))}).")

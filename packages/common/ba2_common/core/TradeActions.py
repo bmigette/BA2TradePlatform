@@ -3292,7 +3292,7 @@ class _OptionEntryAction(TradeAction):
         contract costs ``premium * 100``.
 
         NO PRODUCTION CALLER REMAINS as of phase 2a -- the seven premium-sized builders go
-        through ``_size_and_submit`` now, and ``grep -rn "\._size\b"`` finds only tests. An
+        through ``_size_and_submit`` now, and ``grep -rn "._size("`` finds only tests. An
         earlier version of this line claimed "tests and the equity-side RM reference it", which
         was half wrong: the equity RM has its own sizer and never called this. It is kept for
         ``test_option_entry_sizing_cap.py``, which asserts the premium-side per-instrument cap

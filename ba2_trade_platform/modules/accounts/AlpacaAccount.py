@@ -548,8 +548,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         Returns:
             str: Formatted comment string
         """
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        return f"{timestamp}-{order_type}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        return TransactionHelper.tpsl_comment(order_type, account_id, transaction_id, parent_order_id)
+
+    def _generate_replacement_tpsl_comment(self, kind: str, replaced: TradingOrder) -> str:
+        """The TP/SL mark for a price replacement's NEW row, tracing the row it replaces."""
+        return self._generate_tpsl_comment(
+            kind, replaced.account_id, replaced.transaction_id, replaced.depends_on_order,
+        ) + f" (replaces order {replaced.id})"
 
     @staticmethod
     def _sanitize_enum_field(value, enum_class, field_name, nullable=True, default_value=None):
@@ -3877,7 +3883,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 depends_order_status_trigger=tp_order.depends_order_status_trigger,
                 expert_recommendation_id=tp_order.expert_recommendation_id,
                 open_type=tp_order.open_type,
-                comment=replacement_order.comment,  # Use new tracking comment from replacement
+                # The TP mark, not the broker mapping's comment (None): a replaced ROOT TP with
+                # no mark reads as a pending close and skips the exit rules.
+                comment=self._generate_replacement_tpsl_comment("TP", tp_order),
                 data=tp_order.data,  # Preserve TP/SL metadata
                 good_for=tp_order.good_for,
                 created_at=datetime.now(timezone.utc)
@@ -3976,6 +3984,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
             # Create NEW database record for the replacement order
             new_tp_order = TradingOrder(
+                # account_id is NOT NULL: without it this insert failed AFTER the broker had
+                # already replaced the stop, leaving the DB on the old, REPLACED row.
+                account_id=sl_order.account_id,
                 transaction_id=sl_order.transaction_id,
                 broker_order_id=replacement_order.broker_order_id,  # NEW broker order ID
                 symbol=sl_order.symbol,
@@ -3986,7 +3997,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 stop_price=new_sl_price,
                 limit_price=sl_order.limit_price,
                 status=replacement_order.status,  # Status from broker (typically NEW or ACCEPTED)
-                comment=replacement_order.comment,  # Tracking comment from broker
+                depends_on_order=sl_order.depends_on_order,
+                depends_order_status_trigger=sl_order.depends_order_status_trigger,
+                expert_recommendation_id=sl_order.expert_recommendation_id,
+                open_type=sl_order.open_type,
+                data=sl_order.data,  # Preserve TP/SL metadata (as the TP replacement does)
+                # The SL mark (see _update_broker_tp_order).
+                comment=self._generate_replacement_tpsl_comment("SL", sl_order),
+                created_at=datetime.now(timezone.utc),
             )
             
             # Add NEW order to database

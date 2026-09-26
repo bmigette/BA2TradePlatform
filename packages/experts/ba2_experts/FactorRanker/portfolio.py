@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from ba2_common.core.db import add_instance, get_instance, update_instance
 from ba2_common.core.models import ExpertInstance, TradingOrder, Transaction
+from ba2_common.core.TransactionHelper import TransactionHelper
 from ba2_common.core.types import (
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
@@ -546,8 +547,13 @@ class FactorPortfolioManager:
                 # and reproduce the very rejection this method exists to avoid.
                 depends_on_order=(sell_order.id if sell_order is not None else None),
                 depends_order_status_trigger=OrderStatus.FILLED,
-                comment=f"FactorRanker protective leg resized after partial reduce "
-                        f"(replaces order {source_leg.id})",
+                # The TP/SL mark: with no sell to chain on this leg is a ROOT row, and an
+                # unmarked resting root order reads as a close still working.
+                comment=TransactionHelper.tpsl_comment(
+                    "SL" if source_leg.stop_price else "TP", self.account_id,
+                    source_leg.transaction_id, sell_order.id if sell_order is not None else None,
+                    note=f"FactorRanker protective leg resized after partial reduce "
+                         f"(replaces order {source_leg.id})"),
             )
             add_instance(replacement)
             self.account.submit_order(replacement)
