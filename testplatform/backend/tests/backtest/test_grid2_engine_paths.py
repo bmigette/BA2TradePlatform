@@ -204,8 +204,11 @@ def _harness(*, symbol, underlying_rows, chain_rows, bar_rows, entry_rules, exit
     cache = OptionsHistoryCache(cache_db)
     cache.write_chain_rows(symbol, start.date().isoformat(), chain_rows)
     cache.write_bar_rows(bar_rows)
-    # The run's risk-free rate, held by the reader for the account's Black-Scholes marks.
-    provider = HistoricalOptionsProvider(cache_db, risk_free_rate=0.045)
+    # The run's risk-free rate, held by the reader for the account's Black-Scholes marks: the
+    # as-of FRED DGS3MO series over the run window (real values, from the test fixture) -- what
+    # options_store.resolve_options_risk_free_rate gives a production run.
+    from tests.backtest.fixtures.fred_rate import dgs3mo_rate
+    provider = HistoricalOptionsProvider(cache_db, risk_free_rate=dgs3mo_rate(start, end))
 
     resolver = wire_backtest_seams()
     ctx = backtest_trading_db(f"grid2-{account_id}")
