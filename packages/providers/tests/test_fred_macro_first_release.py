@@ -59,8 +59,14 @@ def _live_at(monkeypatch, instant: datetime):
 
 
 def _open_utc(session: date) -> datetime:
-    """~09:30 ET on *session*, the live DS schedule (13:30Z in summer)."""
-    return datetime(session.year, session.month, session.day, 13, 30, tzinfo=timezone.utc)
+    """09:30 America/New_York on *session* (the live DS schedule), as a UTC instant: 13:30Z
+    under EDT, 14:30Z under EST. Computed, not hard-coded, so a winter session is not
+    silently tested at 08:30 ET."""
+    from zoneinfo import ZoneInfo
+
+    ny = datetime(session.year, session.month, session.day, 9, 30,
+                  tzinfo=ZoneInfo("America/New_York"))
+    return ny.astimezone(timezone.utc)
 
 
 def _last_date(series):
@@ -399,3 +405,106 @@ def test_a_refresh_reuses_the_rows_it_already_walked(monkeypatch):
     assert not [c for c in fake.calls if "observation_start" in c], "walked again"
     doc = json.load(open(fs.cache_path("VIXCLS"), encoding="utf-8"))
     assert doc["observations"][0]["realtime_start"] == "2020-01-08"
+
+
+# --------------------------------------------------------------------------- #
+# Review 2026-09-26 (I2): a MISSING first-release file is refused, never an OSError that the
+# expert's broad handler absorbs into a trend-only regime.
+# --------------------------------------------------------------------------- #
+def test_a_missing_first_release_file_is_refused_not_an_oserror():
+    from ba2_providers.fmp_common import frozen_ttl_cache
+
+    with frozen_ttl_cache():
+        with pytest.raises(fs.MacroAvailabilityUnknown, match="prewarm") as info:
+            fs.get_series_as_of("VIXCLS", _bar("2024-03-15"))
+    assert not isinstance(info.value, OSError)
+
+
+def test_the_option_rate_series_keeps_its_missing_file_error():
+    """DGS3MO is not a signal input; its reader (risk_free_rate) has its own refusal."""
+    from ba2_providers.fmp_common import frozen_ttl_cache
+
+    with frozen_ttl_cache():
+        with pytest.raises(FileNotFoundError):
+            fs.get_series_as_of("DGS3MO", _bar("2024-03-15"))
+
+
+# --------------------------------------------------------------------------- #
+# Review 2026-09-26 (item 4): "young" is not "fresh" when the format is the old one.
+# --------------------------------------------------------------------------- #
+class TestFreshMeansCurrentFormat:
+    def test_a_young_old_format_signal_file_is_not_fresh(self):
+        _write("VIXCLS", [("2024-03-14", "14.4", "2024-03-14")], fmt=False)
+        assert fs.cache_is_fresh("VIXCLS", max_age_hours=24.0) is False
+
+    def test_a_young_current_format_file_is_fresh(self):
+        _write("VIXCLS", [("2024-03-14", "14.4", "2024-03-14")])
+        assert fs.cache_is_fresh("VIXCLS", max_age_hours=24.0) is True
+
+    def test_an_old_file_is_not_fresh(self):
+        _write("VIXCLS", [("2024-03-14", "14.4", "2024-03-14")])
+        old = datetime.now().timestamp() - 48 * 3600
+        os.utime(fs.cache_path("VIXCLS"), (old, old))
+        assert fs.cache_is_fresh("VIXCLS", max_age_hours=24.0) is False
+
+    def test_a_missing_file_is_not_fresh(self):
+        assert fs.cache_is_fresh("VIXCLS", max_age_hours=24.0) is False
+
+    def test_the_rate_series_is_judged_by_age_alone(self):
+        os.makedirs(os.path.join(fs.CACHE_FOLDER, "fred"), exist_ok=True)
+        with open(fs.cache_path("DGS3MO"), "w", encoding="utf-8") as fh:
+            json.dump({"series_id": "DGS3MO", "vintage": False, "observations": []}, fh)
+        assert fs.cache_is_fresh("DGS3MO", max_age_hours=24.0) is True
+
+    def test_the_refresh_tool_refetches_a_young_old_format_file(self, monkeypatch, capsys):
+        import importlib.util
+        import pathlib
+        import sys
+
+        tool = pathlib.Path(__file__).resolve().parents[3] / "tools" / "refresh_fred_cache.py"
+        spec = importlib.util.spec_from_file_location("_refresh_fred_cache_fmt", tool)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _write("VIXCLS", [("2024-03-14", "14.4", "2024-03-14")], fmt=False)
+        _write("BAA10Y", [("2024-03-14", "2.1", "2024-03-15")])
+        calls = []
+        monkeypatch.setattr(mod, "_api_key", lambda: "KEY")
+        monkeypatch.setattr(mod.fred_series, "refresh_series",
+                            lambda sid, key: (calls.append(sid), 1)[-1])
+        monkeypatch.setattr(sys, "argv", ["refresh_fred_cache.py", "--series", "VIXCLS",
+                                          "BAA10Y", "--max-age-hours", "24"])
+        mod.main()
+        assert calls == ["VIXCLS"], "a young OLD-format file was skipped as fresh"
+
+
+# --------------------------------------------------------------------------- #
+# Review 2026-09-26 (item 6): a first release BEFORE its observation date is only plausible
+# for FRED's pre-inserted non-session rows (VIXCLS on US holidays); elsewhere it is a data
+# defect worth a WARNING.
+# --------------------------------------------------------------------------- #
+def test_a_release_before_its_session_observation_is_warned(monkeypatch, caplog):
+    import logging
+
+    lg = logging.getLogger("ba2_common")
+    monkeypatch.setattr(lg, "propagate", True)
+    fake = _FakeFred(["2020-01-06", "2020-01-07"],
+                     {"2020-01-06": [("2020-01-06", "1.0")],
+                      "2020-01-08": [("2020-01-07", "2.0")]})     # a Wednesday session
+    monkeypatch.setattr(fs, "_fred_get", fake)
+    fs._fetch_first_release("VIXCLS", "KEY")
+    warned = [r for r in caplog.records if r.levelname == "WARNING"
+              and "before its observation date" in r.getMessage()]
+    assert warned and "2020-01-08" in warned[0].getMessage()
+
+
+def test_a_release_before_a_holiday_observation_is_not_warned(monkeypatch, caplog):
+    import logging
+
+    lg = logging.getLogger("ba2_common")
+    monkeypatch.setattr(lg, "propagate", True)
+    fake = _FakeFred(["2022-05-26", "2022-05-27"],
+                     {"2022-05-26": [("2022-05-26", "1.0")],
+                      "2022-05-30": [("2022-05-27", "26.54")]})   # Memorial Day
+    monkeypatch.setattr(fs, "_fred_get", fake)
+    fs._fetch_first_release("VIXCLS", "KEY")
+    assert not [r for r in caplog.records if "before its observation date" in r.getMessage()]

@@ -395,16 +395,7 @@ def _fred_needs_first_release_format(series_id: str, path: str) -> bool:
     Reads the header only: ``refresh_series`` writes it before the observations."""
     from ba2_providers.macro import fred_series
 
-    spec = fred_series.SERIES_SPEC.get(series_id.upper())
-    if not spec or spec["availability"] != fred_series.AVAIL_FIRST_RELEASE:
-        return False
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            head = fh.read(4096)
-    except OSError:
-        return False             # unreadable is reported by whatever reads it next
-    marker = f'"format": "{fred_series.CACHE_FORMAT_FIRST_RELEASE}"'
-    return marker not in head.split('"observations"', 1)[0]
+    return not fred_series.is_current_format(series_id, path)
 
 
 def _inspect_series(req: Requirement, roots: Sequence[str], as_of_now: datetime,

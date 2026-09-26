@@ -113,3 +113,19 @@ def test_an_unestablishable_macro_read_is_never_absorbed(monkeypatch, mode):
     data.reset_caches()
     with pytest.raises(fs.MacroAvailabilityUnknown, match="first-release format"):
         data.fetch_macro_series(None, "2024-03-20")
+
+
+@pytest.mark.parametrize("mode", ["enforce", "observe", "legacy"])
+def test_a_missing_macro_file_is_never_absorbed_either(monkeypatch, mode):
+    """Review 2026-09-26 (I2): an offline run with no FRED file used to raise
+    FileNotFoundError -- an OSError, which ``absorb_if_benign`` swallows -- so DS ran on the
+    index trend alone with a WARNING. Through the REAL fetch_macro_series path it must refuse."""
+    from ba2_providers.fmp_common import frozen_ttl_cache
+
+    monkeypatch.setenv("BA2_ERROR_MODE", mode)
+    os.remove(fs.cache_path("BAA10Y"))
+    fs.reset_cache()
+    data.reset_caches()
+    with frozen_ttl_cache():
+        with pytest.raises(fs.MacroAvailabilityUnknown, match="BAA10Y"):
+            data.fetch_macro_series(None, "2024-03-20")

@@ -69,3 +69,30 @@ def test_the_api_handler_separates_the_two_sinks(failing_fred, monkeypatch):
 
     assert [level for level, _ in seen] == ["warning", "warning"], (
         f"the API prewarm still reports a failed series as progress: {seen}")
+
+
+def test_a_young_old_format_macro_file_is_refetched_not_skipped(monkeypatch, tmp_path):
+    """Review 2026-09-26 (item 4): the first-release reader refuses a file in the old
+    observation-date format however young it is, so the prewarm must not call it fresh."""
+    import json
+
+    from ba2_providers.macro import fred_series
+
+    monkeypatch.setattr(fred_series, "CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setattr(prewarm_fetchers, "resolve_fred_key", lambda: "a-key")
+    (tmp_path / "fred").mkdir()
+    for sid, fmt in (("VIXCLS", None), ("BAA10Y", fred_series.CACHE_FORMAT_FIRST_RELEASE)):
+        doc = {"series_id": sid, "observations": []}
+        if fmt:
+            doc["format"] = fmt
+        (tmp_path / "fred" / f"{sid}.json").write_text(json.dumps(doc), encoding="utf-8")
+    monkeypatch.setattr(fred_series, "SERIES_SPEC",
+                        {sid: fred_series.SERIES_SPEC[sid] for sid in ("VIXCLS", "BAA10Y")})
+    calls = []
+    monkeypatch.setattr(fred_series, "refresh_series",
+                        lambda sid, key: (calls.append(sid), 1)[-1])
+
+    summary = prewarm_fetchers.prewarm_fred(24.0, log=lambda m: None)
+
+    assert calls == ["VIXCLS"], "a young OLD-format file was skipped as fresh"
+    assert summary == {"refreshed": 1, "fresh": 1, "errors": 0}

@@ -43,10 +43,17 @@ later), a per-row walk of their real-time periods. VALUES are the first-release 
 number that was on FRED the day the row became visible -- revisions are not applied (they were
 not for UNRATE before this either).
 
-REFUSED, never guessed (:class:`MacroAvailabilityUnknown`): a cache written in the old
+REFUSED, never guessed (:class:`MacroAvailabilityUnknown`): a missing cache file (not the
+OSError it used to be -- the expert's broad handler absorbs those); a cache written in the old
 observation-date format; a decision labelled on or before the series' first vintage (nothing
 is provably public yet); a decision labelled after the day the cache was fetched (vintages
 after the fetch are unknown -- a backtest cannot see them, a live run must refetch first).
+
+LIVE FETCHING. JobManager refreshes the series at 09:00 ET (``refresh_for_live_decision``) so
+the 09:30 analyses read a file fetched that morning. A read that still finds its file not
+covering today refetches it itself -- one fetch per series at a time (per-series lock with a
+double-check), with a ``LIVE_REFETCH_BACKOFF_SECONDS`` backoff after a failure -- and refuses
+if that does not succeed.
 
 THE ONE EXCEPTION: DGS3MO is the option Black-Scholes risk-free rate (``risk_free_rate``), not a
 signal. It inverts bar d's OWN close, known only after that close, so it stays SAME-DAY on the
@@ -93,9 +100,19 @@ AVAIL_SAME_DAY_CLOSE = "same_day_close"    # DGS3MO only: BS rate, observation-d
 #: observation-date format, whose ``realtime_start`` is the FETCH vintage for every row) is
 #: refused: reading it as first-release would hide every row before the fetch day.
 CACHE_FORMAT_FIRST_RELEASE = "first_release_v1"
-#: FRED's own calendar (St. Louis). A vintage dated V is released during V in this timezone,
-#: so a cache fetched on Chicago date F holds every vintage dated < F.
-FRED_TZ = ZoneInfo("America/Chicago")
+#: The calendar a cache's fetch DAY is read on: New York, the calendar of the decision label it
+#: is compared with (review 2026-09-26: comparing a Chicago fetch date with a New York label
+#: misjudged every fetch made 00:00-01:00 ET). A file fetched on New York date F holds every
+#: vintage FRED released before F began in New York; FRED's releases are daytime Central-time
+#: events, so none falls in the 23:00-00:00 CT hour this treats as "the next day".
+FETCH_DAY_TZ = ZoneInfo("America/New_York")
+
+#: After a failed LIVE refetch, how long every read of that series refuses without re-running
+#: the ~21-request ALFRED fetch (review 2026-09-26, I3). Each symbol of an analysis batch reads
+#: the macro series; without this, FRED being down meant one full refetch attempt (up to 120 s
+#: per request) PER SYMBOL. The reads still REFUSE loudly -- the backoff only stops the retry
+#: storm -- and the scheduled pre-open refresh (``refresh_for_live_decision``) ignores it.
+LIVE_REFETCH_BACKOFF_SECONDS = 300.0
 #: Vintage dates per ALFRED window. FRED refuses a request whose real-time period spans more
 #: than ~2000 ("There are 3907 vintage dates in the specified real-time period").
 _VINTAGE_WINDOW = 1500
@@ -179,11 +196,26 @@ _PARSED: Dict[str, Any] = {}
 #: ``_MEM`` and dropped with it. A series memoized WITHOUT a header (a test seeding ``_MEM``
 #: directly) is refused by the first-release reader exactly like an old-format file.
 _META: Dict[str, Dict[str, Any]] = {}
+#: One live FETCH per series at a time (separate from ``_locks``, which ``refresh_series`` holds
+#: around the atomic write: re-taking it here would deadlock).
+_FETCH_LOCKS: Dict[str, threading.Lock] = {}
+#: ``_monotonic()`` of each series' last failed live fetch -- the backoff clock.
+_FETCH_FAILED_AT: Dict[str, float] = {}
+
+
+def _monotonic() -> float:
+    """The backoff clock (a seam for tests)."""
+    return time.monotonic()
 
 
 def _lock_for(key: str) -> threading.Lock:
     with _locks_guard:
         return _locks.setdefault(key, threading.Lock())
+
+
+def _fetch_lock_for(key: str) -> threading.Lock:
+    with _locks_guard:
+        return _FETCH_LOCKS.setdefault(key, threading.Lock())
 
 
 def cache_path(series_id: str) -> str:
@@ -347,6 +379,7 @@ def _fetch_first_release(sid: str, api_key: str,
             for d, (rt, v) in sorted(known.items()) if _is_value(v)]
     if not rows:
         raise RuntimeError(f"FRED returned no usable observations for {sid}")
+    _warn_releases_before_their_session(sid, rows, first)
     header = {"first_vintage": first, "last_vintage": vintages[-1],
               "n_vintages": len(vintages), "late_filled": late_filled}
     return rows, header
@@ -366,6 +399,31 @@ def _prior_late_filled(sid: str) -> Dict[str, Tuple[str, str]]:
     late = set(doc.get("late_filled") or [])
     return {o["date"]: (o["realtime_start"], o["value"])
             for o in doc.get("observations", []) if o.get("date") in late}
+
+
+def _warn_releases_before_their_session(sid: str, rows: List[dict], first_vintage: str) -> None:
+    """WARN when a row was first released BEFORE its own observation date on a trading day.
+
+    Only plausible for FRED's pre-inserted rows dated on a non-session day (VIXCLS carries US
+    holidays, published the business day before -- 25 of them since 2020). On a regular session
+    it means the value could not have been the close it claims to be: worth a look, not a
+    refusal (the reader shows it no earlier than it was published either way). Rows stamped
+    with the first vintage are skipped -- that date is an upper bound, not a release.
+    """
+    from ba2_common.core.market_calendar import is_regular_session
+
+    odd: List[str] = []
+    for r in rows:
+        if r["realtime_start"] >= r["date"] or r["realtime_start"] == first_vintage:
+            continue
+        try:
+            if is_regular_session(date.fromisoformat(r["date"])):
+                odd.append(f"{r['date']} (first released {r['realtime_start']})")
+        except ValueError:
+            continue                  # outside the calendar table: nothing to compare with
+    if odd:
+        logger.warning("FRED %s: %d row(s) first released before its observation date on a "
+                       "trading day -- check the source: %s", sid, len(odd), ", ".join(odd[:10]))
 
 
 def _fetch_payload(series_id: str, api_key: str) -> Tuple[List[dict], Dict[str, Any]]:
@@ -428,41 +486,108 @@ def refresh_series(series_id: str, api_key: str) -> int:
     return len(rows)
 
 
-def _fill_cache_on_the_live_path(sid: str, path: str) -> bool:
-    """Fetch a missing OR STALE series and write it to the cache. True when the file exists.
+def _file_is_current_for_live(sid: str, path: str) -> bool:
+    """The file exists, is inside its live age window, and covers today's decision."""
+    if not os.path.exists(path) or _is_stale(sid, path):
+        return False
+    try:
+        return _covers_live_today(sid, _header(_read_doc(path)))
+    except (OSError, ValueError):
+        return False
+
+
+def _fill_cache_on_the_live_path(sid: str, path: str, *, ignore_backoff: bool = False) -> bool:
+    """Fetch a missing, STALE or not-today series and write it to the cache. True on success
+    (or when another thread just did it).
 
     LIVE ONLY, and that asymmetry is the point. A backtest must read a file that was already
     on disk before it started: fetching mid-run makes the run non-reproducible, un-syncable to
     a GA worker, and dependent on FRED being up -- which is why ``_load`` still raises there.
 
     Live has the opposite problem. The guard was refusing on a cache that nothing ever filled:
-    the live platform has no prewarm step (``tools/refresh_fred_cache.py`` says it should run
-    "on a schedule for the live platform" and nothing ever did), so prod's ``cache/fred`` was
-    EMPTY and every analysis logged a macro failure. Live is already allowed to reach the
-    network for every other provider; macro was the one that refused and then had no other way
-    to get the data.
+    the live platform had no prewarm step, so prod's ``cache/fred`` was EMPTY and every analysis
+    logged a macro failure. The scheduled pre-open refresh (``refresh_for_live_decision``, run
+    by JobManager at 09:00 ET) is now the normal filler; this is the fallback for a read that
+    finds the file still not covering today.
 
-    Best effort by design: a failure here returns False and the caller raises the same
-    FileNotFoundError it always did (a missing file), or -- for a first-release series whose
-    file no longer covers today's decision -- ``get_series_as_of`` refuses with
-    ``MacroAvailabilityUnknown``: a live decision must not run on fewer vintages than the
-    backtest of the same decision sees.
+    GUARDED (review 2026-09-26, I3), because a first-release fetch is ~21 ALFRED requests:
+      * ONE fetch per series at a time: the per-series lock, with a DOUBLE-CHECK after it is
+        acquired -- the worker threads that queued behind a fetch read its result instead of
+        repeating it;
+      * a BACKOFF of ``LIVE_REFETCH_BACKOFF_SECONDS`` after a failure: the reads in that window
+        do not refetch (each symbol would otherwise re-run the whole fetch against a FRED that
+        is down), but they still refuse -- ``get_series_as_of`` raises
+        ``MacroAvailabilityUnknown`` for a file that does not cover today, and a missing one.
+        ``ignore_backoff`` is for the scheduled refresh, which IS the retry.
+
+    A failure returns False and is logged at ERROR; it never raises out of here. The REFUSAL
+    is ``get_series_as_of``'s: a live decision must not run on fewer vintages than the backtest
+    of the same decision sees.
     """
-    try:
-        from ba2_common.core.fred_api_key import resolve_fred_api_key
-        api_key = resolve_fred_api_key()
-        if not api_key:
+    with _fetch_lock_for(sid):
+        if _file_is_current_for_live(sid, path):
+            return True                      # another thread fetched it while we waited
+        failed_at = _FETCH_FAILED_AT.get(sid)
+        if (not ignore_backoff and failed_at is not None
+                and _monotonic() - failed_at < LIVE_REFETCH_BACKOFF_SECONDS):
             logger.error(
-                "FRED series %s is missing and 'fred_api_key' is not configured, so it cannot "
-                "be fetched; the macro overlay is unavailable until one is set", sid)
+                "FRED %s: the last live fetch failed %.0fs ago; backing off for %.0fs before "
+                "trying again -- reads of it refuse until then", sid,
+                _monotonic() - failed_at, LIVE_REFETCH_BACKOFF_SECONDS)
             return False
-        logger.info("FRED %s missing, stale or older than today's decision; fetching it and "
-                    "writing the cache", sid)
-        refresh_series(sid, api_key)
+        try:
+            from ba2_common.core.fred_api_key import resolve_fred_api_key
+            api_key = resolve_fred_api_key()
+            if not api_key:
+                logger.error(
+                    "FRED series %s needs fetching and 'fred_api_key' is not configured, so it "
+                    "cannot be; the macro overlay refuses until one is set", sid)
+                return False
+            logger.info("FRED %s missing, stale or older than today's decision; fetching it "
+                        "and writing the cache", sid)
+            refresh_series(sid, api_key)
+        except Exception as e:  # noqa: BLE001 -- reported here; the READ is what refuses
+            _FETCH_FAILED_AT[sid] = _monotonic()
+            logger.error("FRED %s could not be fetched on the live path: %s", sid, e,
+                         exc_info=True)
+            return False
+        _FETCH_FAILED_AT.pop(sid, None)
         return os.path.exists(path)
-    except Exception as e:  # noqa: BLE001 -- see the docstring: never kill a live analysis
-        logger.error("FRED %s could not be fetched on the live path: %s", sid, e, exc_info=True)
-        return False
+
+
+def refresh_for_live_decision(series_ids: List[str]) -> Dict[str, List[str]]:
+    """Make every first-release series in *series_ids* cover today's live decision.
+
+    What the JobManager's 09:00 ET pre-open job runs, so the 09:30 analyses read files fetched
+    that morning instead of depending on ~21 ALFRED requests succeeding at the instant they run
+    (entries are weekly: one failed 09:30 costs a week). A series already current is left
+    alone; the rest are fetched through the same guarded path a read would use, ignoring a
+    backoff a failed read left behind (this IS the retry). Failures are logged at ERROR and
+    returned -- never raised, so one series cannot stop the others.
+
+    Returns ``{"refreshed": [...], "current": [...], "failed": [...]}``.
+
+    Raises:
+        ValueError: a series that is not read by first-release date (DGS3MO, the option BS
+            rate, has its own warm path and no live decision reads it).
+    """
+    sids = [sid.upper() for sid in series_ids]
+    wrong = [sid for sid in sids if _spec(sid)["availability"] != AVAIL_FIRST_RELEASE]
+    if wrong:
+        raise ValueError(f"not first-release macro series: {wrong}")
+    out: Dict[str, List[str]] = {"refreshed": [], "current": [], "failed": []}
+    for sid in sids:
+        path = cache_path(sid)
+        if _file_is_current_for_live(sid, path):
+            out["current"].append(sid)
+        elif _fill_cache_on_the_live_path(sid, path, ignore_backoff=True):
+            out["refreshed"].append(sid)
+        else:
+            out["failed"].append(sid)
+    if out["failed"]:
+        logger.error("FRED pre-open refresh FAILED for %s: today's decisions reading them will "
+                     "refuse unless a later read's refetch succeeds", out["failed"])
+    return out
 
 
 def _max_age_hours(sid: str) -> float:
@@ -500,8 +625,9 @@ def _header(doc: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in doc.items() if k != "observations"}
 
 
-def _fetched_fred_date(meta: Optional[Dict[str, Any]]) -> Optional[date]:
-    """The FRED (Chicago) calendar date the cache was fetched on, or None when unrecorded."""
+def _fetched_day(meta: Optional[Dict[str, Any]]) -> Optional[date]:
+    """The NEW YORK calendar date the cache was fetched on (the decision label's calendar), or
+    None when unrecorded."""
     raw = (meta or {}).get("fetched_at")
     if not raw:
         return None
@@ -511,18 +637,48 @@ def _fetched_fred_date(meta: Optional[Dict[str, Any]]) -> Optional[date]:
         return None
     if ts.tzinfo is None:
         return None                  # an instant with no timezone proves nothing
-    return ts.astimezone(FRED_TZ).date()
+    return ts.astimezone(FETCH_DAY_TZ).date()
 
 
 def _is_first_release_payload(meta: Optional[Dict[str, Any]]) -> bool:
     return bool(meta) and meta.get("format") == CACHE_FORMAT_FIRST_RELEASE
 
 
+def is_current_format(series_id: str, path: Optional[str] = None) -> bool:
+    """False when *series_id* is read by first-release date but its cache file is not in that
+    format (the reader refuses it). A series read some other way, or a missing/unreadable file,
+    is True here: this answers "is the FORMAT wrong", and absence is reported by whatever reads
+    it next. The whole document is parsed (not a header sniff): the tools and warm planner that
+    ask are not on a hot path, and key order is not part of the format."""
+    sid = series_id.upper()
+    spec = SERIES_SPEC.get(sid) or {}
+    if spec.get("availability") != AVAIL_FIRST_RELEASE:
+        return True
+    try:
+        doc = _read_doc(path or cache_path(sid))
+    except (OSError, ValueError):
+        return True
+    return isinstance(doc, dict) and _is_first_release_payload(_header(doc))
+
+
+def cache_is_fresh(series_id: str, max_age_hours: float) -> bool:
+    """For the warm/refresh tools: the file exists, is younger than *max_age_hours*, AND is in
+    the format its reader accepts. A young file in the old observation-date format is NOT fresh
+    -- skipping it as fresh left a file the reader refuses (review 2026-09-26, item 4)."""
+    path = cache_path(series_id)
+    if not os.path.exists(path):
+        return False
+    age = _age_hours(path)
+    if age is None or age >= max_age_hours:
+        return False
+    return is_current_format(series_id, path)
+
+
 def _covers_live_today(sid: str, meta: Optional[Dict[str, Any]]) -> bool:
     """LIVE: does this payload hold every vintage a decision made NOW may see?
 
     A first-release series must be in the current format and fetched on or after today's
-    decision label (FRED's calendar), else a vintage published since the fetch would be missing
+    decision label (both New York dates), else a vintage published since the fetch would be missing
     live while a backtest of the same decision sees it. A same-day series (DGS3MO) is governed by
     its age alone, as before.
     """
@@ -530,7 +686,7 @@ def _covers_live_today(sid: str, meta: Optional[Dict[str, Any]]) -> bool:
         return True
     if not _is_first_release_payload(meta):
         return False
-    fetched = _fetched_fred_date(meta)
+    fetched = _fetched_day(meta)
     return fetched is not None and fetched >= decision_label(None)
 
 
@@ -802,10 +958,10 @@ def _require_first_release_coverage(sid: str, meta: Optional[Dict[str, Any]],
         raise MacroAvailabilityUnknown(
             f"FRED {sid}: a decision labelled {label} is on or before the series' first "
             f"recorded vintage ({first_day}); nothing in it is provably public yet.")
-    fetched = _fetched_fred_date(meta)
+    fetched = _fetched_day(meta)
     if fetched is None or fetched < label:
         raise MacroAvailabilityUnknown(
-            f"FRED {sid}: the cache was fetched on {fetched} (FRED calendar), before the "
+            f"FRED {sid}: the cache was fetched on {fetched} (New York date), before the "
             f"decision label {label}; vintages published since are unknown. Refresh it "
             f"(tools/refresh_fred_cache.py) -- live refetches automatically and failed.")
 
@@ -834,7 +990,15 @@ def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
     # as a confusing "not in the cache" that sends you looking for a prewarm problem.
     first_release = _spec(sid)["availability"] == AVAIL_FIRST_RELEASE
     label = decision_label(as_of) if first_release else None
-    rows = _load(sid)
+    try:
+        rows = _load(sid)
+    except FileNotFoundError as e:
+        if not first_release:
+            raise
+        # NOT an OSError out of here (review 2026-09-26, I2): the expert's broad handler
+        # absorbs the OSError family as benign, which turned a missing macro file into a
+        # trend-only regime with a WARNING -- in a backtest as in live.
+        raise MacroAvailabilityUnknown(f"FRED {sid}: {e}") from e
     if first_release:
         _require_first_release_coverage(sid, _META.get(sid), label)
     # Parse once per payload (see _ParsedSeries); this call is then a filter + build.

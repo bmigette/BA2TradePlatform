@@ -112,9 +112,13 @@ def test_unknown_series_raises_rather_than_guessing_vintage_mode():
 
 
 def test_missing_cache_file_raises_pointing_at_prewarm():
-    """A backtest must fail loudly, not silently fetch or return an empty series."""
-    with pytest.raises(FileNotFoundError, match="prewarm"):
-        fs.get_series_as_of("UNRATE", None)
+    """A backtest must fail loudly, not silently fetch or return an empty series -- and not
+    with an OSError, which the expert's broad handler absorbs (review 2026-09-26, I2)."""
+    from ba2_providers.fmp_common import frozen_ttl_cache
+
+    with frozen_ttl_cache():
+        with pytest.raises(fs.MacroAvailabilityUnknown, match="prewarm"):
+            fs.get_series_as_of("UNRATE", "2024-03-15")
 
 
 def test_napm_is_not_in_the_spec():

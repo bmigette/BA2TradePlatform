@@ -123,7 +123,10 @@ def main() -> None:
     refreshed = skipped = failed = 0
     for sid in series:
         age = _age_hours(fred_series.cache_path(sid))
-        if args.max_age_hours is not None and age is not None and age < args.max_age_hours:
+        # Young AND in the format its reader accepts: a young OLD-format signal file is
+        # refused by the reader, so it is refetched rather than skipped as fresh.
+        if args.max_age_hours is not None and fred_series.cache_is_fresh(sid,
+                                                                         args.max_age_hours):
             print(f"{sid:<12} skip (age {age:.1f}h)")
             skipped += 1
             continue
