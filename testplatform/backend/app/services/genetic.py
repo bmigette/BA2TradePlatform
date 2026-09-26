@@ -53,6 +53,81 @@ FITNESS_EVALUATION_FAILED = -1.0e9
 LATTICE_ANCHORS = ("zero", "min")
 
 
+#: optimization_config key for the early-stopping MINIMUM RELATIVE IMPROVEMENT (see
+#: ``early_stop_counts``). Optional; absent (or None) keeps the legacy rule exactly.
+EARLY_STOP_MIN_REL_KEY = "earlyStoppingMinRelativeImprovement"
+
+
+def validate_early_stop_min_rel(value: Any) -> Optional[float]:
+    """``value`` as a float in ``[0, 1)``, or None when it is None. Anything else RAISES.
+
+    Refused, never clamped: a bool (``True`` is an int in Python and would read as 1.0), a
+    non-number, NaN (every comparison against it is False, so NO generation could ever count and
+    the search would stop after exactly ``patience`` generations whatever it found), a negative
+    value (it would count a generation that got WORSE) and anything >= 1 (a 100% gain per counted
+    generation is not a stopping rule, it is a typo for a percentage).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be a number in [0, 1), got {value!r}")
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{EARLY_STOP_MIN_REL_KEY} must be a number in [0, 1), got {value!r}") from None
+    if not math.isfinite(v) or v < 0.0 or v >= 1.0:
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be finite and in [0, 1) "
+                         f"(a FRACTION: 0.01 means 1%), got {value!r}")
+    return v
+
+
+def _fmt_fit(value: Optional[float]) -> str:
+    """A fitness for the early-stopping log lines (``n/a`` before any generation counted)."""
+    return "n/a" if value is None else f"{value:.4f}"
+
+
+def early_stop_threshold(baseline: float, min_rel: Optional[float]) -> float:
+    """The fitness a generation must reach to COUNT as an improvement over ``baseline``.
+
+    ``baseline + min_rel * |baseline|`` -- i.e. ``baseline * (1 + min_rel)`` for a positive
+    baseline, and a move of ``min_rel`` of the MAGNITUDE towards (and past) zero for a negative
+    one (-10 with 1% needs -9.9). ``min_rel`` None or 0 gives ``baseline`` itself. See
+    ``early_stop_counts`` for how it is compared.
+    """
+    if not min_rel:
+        return baseline
+    return baseline + min_rel * abs(baseline)
+
+
+def early_stop_counts(best_fit: float, baseline: Optional[float], min_rel: Optional[float]) -> bool:
+    """Does a generation whose best is ``best_fit`` RESET the early-stopping patience?
+
+    ``baseline`` is the best fitness at the LAST COUNTED improvement (None before the first
+    generation, which always counts).
+
+    ``min_rel`` None -- the legacy rule, unchanged: any STRICT improvement counts.
+
+    ``min_rel`` set -- the improvement must ALSO reach ``early_stop_threshold(baseline, min_rel)``:
+      * positive baseline: ``best_fit >= baseline * (1 + min_rel)``;
+      * negative baseline: ``best_fit >= baseline + min_rel * |baseline|`` (1% of -10 is -9.9) --
+        a relative gain measured on the magnitude, so "less bad by 1%" counts, and the fitness
+        sentinels (-1e9 for a failed/zero-trade trial) are left behind by ANY real score;
+      * zero baseline: the relative scale is undefined (1% of 0 is 0), so any STRICT improvement
+        counts -- the strict ``>`` is kept in every case, which is also what stops an equal
+        fitness from ever counting when the threshold collapses onto the baseline.
+
+    The baseline is NOT the running best: a non-qualifying gain (23.83 -> 23.95 at 1%) still
+    becomes the best individual, but the bar to reset patience stays 24.07, so a run cannot creep
+    forward forever on sub-threshold gains -- which is the whole point of the rule.
+    """
+    if baseline is None:
+        return True
+    if not best_fit > baseline:
+        return False
+    return min_rel is None or best_fit >= early_stop_threshold(baseline, min_rel)
+
+
 def _on_zero_lattice(x: float, step: float) -> bool:
     """Is ``x`` a multiple of ``step`` (to float noise)?"""
     r = x / step
@@ -225,6 +300,7 @@ class GeneticOptimizer:
         elitism_percent: float = 10.0,
         parallel_individuals: int = 1,
         lattice_anchor: str = "zero",
+        early_stopping_min_rel: Optional[float] = None,
     ):
         """
         Initialize GeneticOptimizer.
@@ -239,6 +315,10 @@ class GeneticOptimizer:
             elitism_percent: Percentage of best individuals to preserve unchanged (default 10%)
             lattice_anchor: where numeric genes' step lattice is counted from -- "zero"
                 (legacy default) or "min"; see LATTICE_ANCHORS
+            early_stopping_min_rel: minimum RELATIVE improvement (a fraction in [0, 1), 0.01 =
+                1%) a generation's best must make over the best at the last counted
+                improvement to reset the patience counter; see ``early_stop_counts``. None
+                (default) is the legacy rule: any strict improvement resets.
         """
         if not DEAP_AVAILABLE:
             raise RuntimeError("DEAP library not available. Install with: pip install deap")
@@ -246,6 +326,11 @@ class GeneticOptimizer:
             raise ValueError(
                 f"lattice_anchor must be one of {LATTICE_ANCHORS}, got {lattice_anchor!r}")
         self.lattice_anchor = lattice_anchor
+        self.early_stopping_min_rel = validate_early_stop_min_rel(early_stopping_min_rel)
+        # The best fitness at the LAST COUNTED improvement -- the bar early_stop_counts measures
+        # against. Only read when early_stopping_min_rel is set; restored on resume by
+        # resume_from_checkpoint (derived from history, like the patience counter).
+        self._es_baseline = None
 
         self.param_ranges = param_ranges or self.DEFAULT_PARAM_RANGES
         self.population_size = population_size
@@ -553,7 +638,20 @@ class GeneticOptimizer:
         # Restore the patience clock too. Without this every resume restarted it at 0
         # while best_fitness was restored, so a frequently-restarted search could never
         # early-stop. Derived from history -- see no_improvement_from_history.
-        self._resumed_no_improvement = self.no_improvement_from_history(self.history)
+        #
+        # Under a minimum-improvement rule the BASELINE (the best at the last counted
+        # improvement) is restored the same way and for the same reasons: derived from history
+        # under THIS run's rule, so it always matches the generation the checkpoint is at. It is
+        # NOT best_fitness -- after a sub-threshold gain the two differ, and resuming against the
+        # running best would silently raise the bar the interrupted run was measuring against.
+        min_rel = getattr(self, 'early_stopping_min_rel', None)
+        self._resumed_no_improvement, self._es_baseline = self.patience_state_from_history(
+            self.history, min_rel)
+        if min_rel is not None:
+            logger.warning(
+                f"Resumed early-stopping clock: patience {self._resumed_no_improvement}/"
+                f"{self.early_stopping_generations} (best {_fmt_fit(self._es_baseline)}, needs >= "
+                f"{_fmt_fit(None if self._es_baseline is None else early_stop_threshold(self._es_baseline, min_rel))})")
         self.best_fitness = checkpoint.get('best_fitness')
         self.best_individual = checkpoint.get('best_individual')
 
@@ -640,7 +738,34 @@ class GeneticOptimizer:
         return population
 
     @staticmethod
-    def no_improvement_from_history(history: list) -> int:
+    def patience_state_from_history(history: list, min_rel: Optional[float] = None
+                                    ) -> Tuple[int, Optional[float]]:
+        """``(no_improvement_count, baseline)`` at the end of ``history`` under the stopping rule
+        ``min_rel`` -- the exact state the live loop in ``optimize()`` holds after processing the
+        last entry, because both apply ``early_stop_counts`` to the same generation bests.
+
+        ``baseline`` is the best fitness at the last COUNTED improvement (None when no entry is
+        readable). With ``min_rel`` None it is simply the running maximum, and the count is
+        exactly ``no_improvement_from_history`` (which is defined through this). See that
+        method for why the clock is derived rather than stored.
+        """
+        baseline = None
+        last_counted = -1
+        for i, entry in enumerate(history or []):
+            try:
+                fitness = entry["best_fitness"]
+            except (KeyError, TypeError):
+                continue          # a malformed entry must not silently zero the streak
+            if fitness is None:
+                continue
+            if early_stop_counts(fitness, baseline, min_rel):
+                baseline, last_counted = fitness, i
+        if last_counted < 0:
+            return 0, None
+        return max(0, len(history) - 1 - last_counted), baseline
+
+    @staticmethod
+    def no_improvement_from_history(history: list, min_rel: Optional[float] = None) -> int:
         """Consecutive generations at the end of ``history`` that did not beat the ALL-TIME best.
 
         DERIVED, never stored-and-trusted, and that is deliberate. The counter itself is a local
@@ -659,21 +784,11 @@ class GeneticOptimizer:
         NOTE ``history[i]['best_fitness']`` is the GENERATION best, not the running best, so the
         running maximum is reconstructed here rather than assuming the series is monotonic --
         elitism usually makes it so, but nothing in this loop guarantees it.
+
+        ``min_rel`` applies the minimum-improvement rule (``early_stop_counts``); None, the
+        default, is the rule above unchanged.
         """
-        running = None
-        last_improved = -1
-        for i, entry in enumerate(history or []):
-            try:
-                fitness = entry["best_fitness"]
-            except (KeyError, TypeError):
-                continue          # a malformed entry must not silently zero the streak
-            if fitness is None:
-                continue
-            if running is None or fitness > running:
-                running, last_improved = fitness, i
-        if last_improved < 0:
-            return 0
-        return max(0, len(history) - 1 - last_improved)
+        return GeneticOptimizer.patience_state_from_history(history, min_rel)[0]
 
     def get_checkpoint_data(self, generation: int, population: list) -> Dict:
         """
@@ -686,7 +801,9 @@ class GeneticOptimizer:
         Returns:
             Checkpoint data dict
         """
-        return {
+        min_rel = getattr(self, 'early_stopping_min_rel', None)
+        no_improvement, baseline = self.patience_state_from_history(self.history, min_rel)
+        data = {
             'generation': generation,
             'population': [list(ind) for ind in population],
             # Fitness per individual, index-aligned with 'population'. None where the individual
@@ -702,7 +819,7 @@ class GeneticOptimizer:
             # Derived from history at write time, so it can never disagree with it. Resume
             # re-derives rather than trusting this; it is here so a monitor can READ the
             # patience clock, which was previously invisible outside the running process.
-            'no_improvement_count': self.no_improvement_from_history(self.history),
+            'no_improvement_count': no_improvement,
             'random_state': _py_state_to_jsonable(random.getstate()),
             'np_random_state': _np_state_to_jsonable(np.random.get_state()),
             # The GA's OWN generator (self._rng) -- the only one whose position decides the rest
@@ -711,6 +828,15 @@ class GeneticOptimizer:
             # the same offspring the uninterrupted run would have produced.
             'ga_random_state': _py_state_to_jsonable(self._rng.getstate()),
         }
+        if min_rel is not None:
+            # The minimum-improvement rule's state, published for monitors exactly like
+            # no_improvement_count (and, like it, re-derived rather than trusted on resume).
+            # Written ONLY under the rule, so a legacy run's checkpoint keeps its exact shape.
+            data['early_stop_min_rel'] = min_rel
+            data['early_stop_baseline'] = baseline
+            data['early_stop_needs'] = (None if baseline is None
+                                        else early_stop_threshold(baseline, min_rel))
+        return data
 
     def optimize(
         self,
@@ -855,19 +981,58 @@ class GeneticOptimizer:
                 checkpoint_callback(gen, population)
 
             # Update best overall and track early stopping
-            if self.best_fitness is None or best_fit > self.best_fitness:
-                self.best_fitness = best_fit
-                self.best_individual = list(best_ind)
-                no_improvement_count = 0
+            min_rel = getattr(self, 'early_stopping_min_rel', None)
+            if min_rel is None:
+                # LEGACY RULE, unchanged: any strict gain over the running best resets patience.
+                if self.best_fitness is None or best_fit > self.best_fitness:
+                    self.best_fitness = best_fit
+                    self.best_individual = list(best_ind)
+                    no_improvement_count = 0
+                    counted = True
+                else:
+                    no_improvement_count += 1
+                    counted = False
+                bar, bar_op = self.best_fitness, ">"
             else:
-                no_improvement_count += 1
+                # MINIMUM-IMPROVEMENT RULE. The best individual still follows ANY strict gain
+                # (it is the search's answer); only the patience reset needs the gain to clear
+                # min_rel over the best at the last COUNTED improvement (see early_stop_counts).
+                if self.best_fitness is None or best_fit > self.best_fitness:
+                    self.best_fitness = best_fit
+                    self.best_individual = list(best_ind)
+                counted = early_stop_counts(best_fit, self._es_baseline, min_rel)
+                if counted:
+                    self._es_baseline = best_fit
+                    no_improvement_count = 0
+                else:
+                    no_improvement_count += 1
+                bar, bar_op = early_stop_threshold(self._es_baseline, min_rel), ">="
+            # Read by monitors: one line per generation, whatever the rule. WARNING, not info():
+            # a strategy optimization installs a global logging.disable(INFO) for its whole run
+            # (strategy_optimization_handler), so an info() line here would never be emitted.
+            logger.warning(
+                f"Gen {gen}: {'improvement counted' if counted else 'no counted improvement'} "
+                f"(gen best {_fmt_fit(best_fit)}) -- patience {no_improvement_count}/"
+                f"{self.early_stopping_generations} (best "
+                f"{_fmt_fit(self.best_fitness if min_rel is None else self._es_baseline)}, "
+                f"needs {bar_op} {_fmt_fit(bar)}"
+                + ("" if min_rel is None or self.best_fitness == self._es_baseline
+                   else f", running best {_fmt_fit(self.best_fitness)}")
+                + (")" if min_rel is None else f", min_rel {min_rel:g})"))
 
             # Early stopping: stop if overall best hasn't improved for N generations
             if no_improvement_count >= self.early_stopping_generations:
-                logger.info(
-                    f"Early stopping at generation {gen} — no improvement for "
-                    f"{no_improvement_count} generations (best={self.best_fitness:.4f})"
-                )
+                if min_rel is None:
+                    logger.info(
+                        f"Early stopping at generation {gen} — no improvement for "
+                        f"{no_improvement_count} generations (best={self.best_fitness:.4f})"
+                    )
+                else:
+                    logger.warning(
+                        f"Early stopping at generation {gen} — no improvement of at least "
+                        f"{min_rel:.2%} over {self._es_baseline:.4f} for "
+                        f"{no_improvement_count} generations (best={self.best_fitness:.4f})"
+                    )
                 break
 
             best_fitness_history.append(best_fit)

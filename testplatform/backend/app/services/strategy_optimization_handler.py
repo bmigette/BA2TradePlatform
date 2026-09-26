@@ -1209,6 +1209,19 @@ def _resolve_lattice_anchor(ga: Dict[str, Any]) -> str:
     return anchor
 
 
+def _resolve_early_stop_min_rel(ga: Dict[str, Any]) -> Optional[float]:
+    """The early-stopping minimum RELATIVE improvement a job runs under (``genetic.
+    early_stop_counts``), or None for the legacy rule (any strict improvement resets patience).
+
+    OPTIONAL key, and absent (or explicitly None) means the legacy rule -- every job persisted
+    before the key existed must stop exactly as it always did. A present value outside [0, 1),
+    NaN, a bool or a non-number is REFUSED (ValueError), never mapped to a default.
+    """
+    from app.services.genetic import EARLY_STOP_MIN_REL_KEY, validate_early_stop_min_rel
+
+    return validate_early_stop_min_rel(ga.get(EARLY_STOP_MIN_REL_KEY))
+
+
 class _FatalTrialError(RuntimeError):
     """A trial failed for a reason that will affect EVERY remaining trial (incomplete prewarm,
     missing OHLCV cache). Raised out of the fitness batch to stop the search immediately rather
@@ -1490,6 +1503,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         expert_cfg = ga.get("expert_params")  # may be None (expert frozen)
         try:
             lattice_anchor = _resolve_lattice_anchor(ga)
+            early_stop_min_rel = _resolve_early_stop_min_rel(ga)
         except ValueError as e:
             return _fail(opt_id, db, str(e))
 
@@ -1649,7 +1663,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             elitism_percent=float(ga["elitismPercent"]),
             parallel_individuals=parallel,
             lattice_anchor=lattice_anchor,
+            early_stopping_min_rel=early_stop_min_rel,
         )
+        if early_stop_min_rel is not None:
+            logger.warning(
+                f"strategy_optimization {opt_id}: early stopping needs a gain of at least "
+                f"{early_stop_min_rel:.2%} over the best at the last counted improvement "
+                f"(patience {int(ga['earlyStoppingGenerations'])}, ceiling {int(ga['generations'])} "
+                f"generations)")
 
         gen_state = {"gen": 0}
 
@@ -2994,6 +3015,13 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     the same chromosome decodes to a different genome under the other anchor, so a min-anchored
     search must never resume a zero-anchored checkpoint (or vice versa), while every existing
     job's fingerprint stays exactly what its checkpoints carry.
+
+    The early-stopping minimum relative improvement joins it the same way -- ONLY when set, so a
+    legacy-rule job keeps its fingerprint byte for byte. A checkpoint is not unreadable under a
+    different stopping rule, but the run it continues would be a different experiment (the
+    patience clock and its baseline are derived under the rule in force), so it is refused like
+    any other identity change rather than silently re-interpreted. (The grid driver's job-name
+    digest carries the flag too, so in practice the checkpoint KEY already differs.)
     """
     import hashlib
     import json
@@ -3009,6 +3037,9 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor
+    early_stop_min_rel = _resolve_early_stop_min_rel(ga)
+    if early_stop_min_rel is not None:
+        payload["early_stop_min_rel"] = early_stop_min_rel
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
