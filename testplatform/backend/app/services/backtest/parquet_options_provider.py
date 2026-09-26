@@ -1238,7 +1238,8 @@ class ParquetOptionsProvider:
 
     def __init__(self, root: str, *, spot_source: Callable[[str, date], Optional[float]],
                  risk_free_rate: float, spot_scope: str, basis_guard: bool = False,
-                 basis_guard_split_dates: Optional[Callable[[str], Any]] = None):
+                 basis_guard_split_dates: Optional[Callable[[str], Any]] = None,
+                 basis_guard_dividends: Optional[Callable[[str, Any], Any]] = None):
         """``spot_scope`` — the identity of what ``spot_source`` will answer.
 
         REQUIRED, and it is the one non-obvious argument. The worker-level cache holds the
@@ -1285,7 +1286,8 @@ class ParquetOptionsProvider:
         self._basis_guard = None
         if basis_guard:
             from .option_basis_guard import BasisGuard
-            self._basis_guard = BasisGuard(spot_source, split_dates=basis_guard_split_dates)
+            self._basis_guard = BasisGuard(spot_source, split_dates=basis_guard_split_dates,
+                                           dividends=basis_guard_dividends)
 
     def basis_guard_stats(self) -> Optional[Dict[str, Any]]:
         """This run's E4 guard counters and time spent (None when the guard is off)."""

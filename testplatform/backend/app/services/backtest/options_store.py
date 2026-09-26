@@ -256,7 +256,40 @@ def build_options_provider(config: Dict[str, Any], *, price_source: Any, split_b
         risk_free_rate=default_options_risk_free_rate() if rate is None else float(rate),
         spot_scope=spot_scope(config, split_basis),
         basis_guard=split_basis is not None,
-        basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis))
+        basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis),
+        basis_guard_dividends=None if split_basis is None else _dividends_of(split_basis))
+
+
+#: How far past a session the guard's dividend source looks (the carry separation uses the two
+#: nearest usable expiries, well inside this).
+_DIVIDEND_HORIZON_DAYS = 400
+
+
+def _dividends_of(split_basis: Any):
+    """``(symbol, session) -> [(ex-date, amount per share in the session's as-traded basis)]``
+    for the guard's carry separation (``option_basis_guard``), or None when the symbol has no
+    cached dividend calendar. ``adjDividend`` is split-adjusted like the FMP close, so it is
+    converted with the run's as-traded factor of the session -- the spot's own conversion.
+    Calendars are read once per symbol per run."""
+    from datetime import timedelta
+    from .option_split_basis import load_cached_dividend_calendar
+
+    cache: Dict[str, Any] = {}
+
+    def dividends(symbol: str, session: date):
+        sym = str(symbol).upper()
+        if sym not in cache:
+            cache[sym] = load_cached_dividend_calendar(sym)
+        cal = cache[sym]
+        if cal is None:
+            return None
+        horizon = session + timedelta(days=_DIVIDEND_HORIZON_DAYS)
+        rows = [(d, a) for d, a in cal if session < d <= horizon]
+        if not rows:
+            return []
+        f = float(split_basis.factor(sym, session))
+        return [(d, a * f) for d, a in rows]
+    return dividends
 
 
 def _split_dates_of(split_basis: Any):

@@ -43,10 +43,13 @@ from ba2_common.core.split_basis_overrides import overrides_for, overrides_versi
 
 #: The warmup's own namespace, imported rather than retyped (a hand-copied cache key is how a
 #: reader drifts from its writer).
-from ba2_providers.market_conditions.fmp_source import SPLIT_CALENDAR_NAMESPACE
+from ba2_providers.market_conditions.fmp_source import (
+    DIVIDEND_CALENDAR_NAMESPACE, SPLIT_CALENDAR_NAMESPACE,
+)
 
 __all__ = ["RunSplitBasis", "build_run_split_basis", "split_calendar_path",
-           "load_cached_split_calendar", "clear_split_basis_memo"]
+           "load_cached_split_calendar", "clear_split_basis_memo", "dividend_calendar_path",
+           "load_cached_dividend_calendar"]
 
 _WARM_HINT = ("Fetch the calendars once (network) with the market-condition warmup's plan step, "
               "e.g. `python tools/warm_market_conditions.py plan --universe <SYMS> ...`, which "
@@ -75,6 +78,34 @@ def load_cached_split_calendar(symbol: str) -> Optional[List[CalendarSplit]]:
         payload = json.load(f)
     return [CalendarSplit(e.date, float(e.ratio) if e.ratio else float("nan"))
             for e in symbol_info.parse_splits(payload)]
+
+
+def dividend_calendar_path(symbol: str) -> str:
+    import ba2_common.config as cfg  # read at call time so tests that rebind CACHE_FOLDER win
+    return os.path.join(cfg.CACHE_FOLDER, "fmp_history",
+                        f"{DIVIDEND_CALENDAR_NAMESPACE}__{symbol.upper()}.json")
+
+
+def load_cached_dividend_calendar(symbol: str) -> Optional[List[Tuple[date, float]]]:
+    """[(ex-date, adjDividend)] of the cached FMP dividend calendar (ex-date ascending), or None
+    when no calendar is cached. ``adjDividend`` is split-adjusted like FMP's closes (so a
+    caller converts it with the run's as-traded factor, as it does the spot); a row without it
+    falls back to ``dividend``; a row without an amount is dropped. An unreadable file RAISES
+    (a corrupt calendar is not an absent one). Read by the option basis guard's carry
+    separation only."""
+    from ba2_providers import symbol_info
+
+    path = dividend_calendar_path(symbol)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    out = []
+    for e in symbol_info.parse_dividends(payload):
+        amount = e.adj_dividend if e.adj_dividend else e.dividend
+        if amount and amount == amount and amount > 0:
+            out.append((e.ex_date, float(amount)))
+    return sorted(out)
 
 
 class RunSplitBasis:

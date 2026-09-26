@@ -25,6 +25,11 @@ from ba2_common.core.split_basis import CalendarSplit
 
 SPLIT_CALENDAR_NAMESPACE = "mc_stock_split"
 SPLIT_CALENDAR_MAX_AGE_DAYS = 1.0
+#: The dividend calendar the option basis guard's carry separation reads (2026-09-26):
+#: FMP ``historical-price-full/stock_dividend``, cached per symbol by
+#: ``tools/warm_dividend_calendars.py``; a backtest only reads it.
+DIVIDEND_CALENDAR_NAMESPACE = "mc_stock_dividend"
+DIVIDEND_CALENDAR_MAX_AGE_DAYS = 1.0
 
 
 class FMPWarmupSource:
@@ -71,6 +76,21 @@ class FMPWarmupSource:
                 SPLIT_CALENDAR_NAMESPACE, sym, lambda: symbol_info.fetch_splits(api_key, sym),
                 max_age_days=SPLIT_CALENDAR_MAX_AGE_DAYS, retain=False)
         return [CalendarSplit(e.date, float(e.ratio)) for e in symbol_info.parse_splits(payload) if e.ratio]
+
+    def dividend_calendar(self, symbol: str) -> list:
+        """The FMP dividend calendar of ``symbol`` (``symbol_info.DividendEvent`` rows,
+        ex-date ascending), disk-cached under ``DIVIDEND_CALENDAR_NAMESPACE`` like the split
+        calendar, so the backtest reads it hermetically."""
+        from ba2_providers import symbol_info
+        from ba2_providers.fmp_common import PURPOSE_WARM, fmp_history_disk_cached, fmp_purpose, frozen_ttl_cache
+
+        sym = symbol.upper()
+        api_key = self.provider.api_key
+        with fmp_purpose(PURPOSE_WARM), frozen_ttl_cache():
+            payload = fmp_history_disk_cached(
+                DIVIDEND_CALENDAR_NAMESPACE, sym, lambda: symbol_info.fetch_dividends(api_key, sym),
+                max_age_days=DIVIDEND_CALENDAR_MAX_AGE_DAYS, retain=False)
+        return symbol_info.parse_dividends(payload)
 
     def fetch_daily(self, symbol: str, start: date, end: date) -> None:
         from ba2_providers.fmp_common import PURPOSE_WARM, fmp_purpose

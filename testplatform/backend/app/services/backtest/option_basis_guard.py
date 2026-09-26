@@ -26,6 +26,16 @@ sessions; only while fewer than ``WINDOW`` have been checked (the start of a run
 from earlier store sessions, as before. A persistent basis error is therefore refused by the
 third sampled check that sees it at the latest (<= ~10 sessions), and it still aborts the run.
 
+CARRY IS NOT A BASIS ERROR (user decision 2026-09-26: fix the guard, no dated waivers). A
+hard-to-borrow fee (AMC July 2023) lowers the parity spot more the longer the expiry, and a cash
+dividend (STLA April 2022, a 7.5% dividend) lowers every expiry after its ex-date: both used to
+read as a 5-8% "basis error". When the nearest-expiry median is off, the SAME checked sessions
+are re-measured with the carry-free spot (``ba2_common.core.option_carry``: the run's dividend
+calendar added back, the two nearest usable expiries extrapolated to T = 0), and the run is
+refused only when that is off too, or cannot be computed -- the refusal names which. A basis
+error scales every expiry alike, so it survives the carry separation; and since the second
+measure is only consulted where the first refused, every run that passed before passes the same.
+
 PURE FUNCTIONS OF THE STORE are memoised per worker (the parity spot of (underlying,
 session) never changes); the comparison itself is per run (the spot depends on the run's
 price source and split basis). Carry/dividend error is ignored: at the nearest expiry it is
@@ -99,7 +109,7 @@ class _StoreIndex:
     release, and it is keyed on the raw's identity AND shape so a recycled ``id`` cannot serve
     another store's index."""
 
-    __slots__ = ("order", "exp_values", "exp_starts", "bar_ords", "parity")
+    __slots__ = ("order", "exp_values", "exp_starts", "bar_ords", "parity", "term")
 
     def __init__(self, raw) -> None:
         exp = np.asarray(raw.c_expiry_ord)
@@ -111,6 +121,9 @@ class _StoreIndex:
         #: session ordinal -> parity spot (or None: not evaluable). Pure in the store; at most
         #: one float per distinct bar date.
         self.parity: Dict[int, Optional[float]] = {}
+        #: session ordinal -> [(expiry ordinal, parity spot)] of every usable expiry among the
+        #: nearest ``_MAX_EXPIRIES`` (``expiry_parities``); only filled on a would-be refusal.
+        self.term: Dict[int, List[Tuple[int, float]]] = {}
 
     def contracts_of(self, j: int) -> np.ndarray:
         return self.order[self.exp_starts[j]:self.exp_starts[j + 1]]
@@ -220,6 +233,58 @@ def parity_spot(u, session_ord: int) -> Optional[float]:
     return out
 
 
+def _best_pair(u, idx, j: int, session_ord: int) -> Optional[Tuple[float, float]]:
+    """(parity spot, strike) of expiry ``j``'s best call/put pair on the session -- the gates of
+    ``parity_spot`` (quote width, moneyness) applied -- or None."""
+    calls: Dict[float, Tuple[float, float]] = {}
+    puts: Dict[float, Tuple[float, float]] = {}
+    strike_f = u.raw.c_strike_f
+    is_call = u.c_is_call
+    for ci in idx.contracts_of(j).tolist():
+        i = u.exact_row(ci, session_ord)
+        if i < 0:
+            continue
+        m = _mid(u, i)
+        if m is None:
+            continue
+        (calls if is_call[ci] else puts)[strike_f[ci]] = (m, _half_spread(u, i))
+    best = None
+    for k in calls.keys() & puts.keys():
+        (cm, ch), (pm, ph) = calls[k], puts[k]
+        par = k + cm - pm
+        if not (par > 0) or ch + ph > MAX_QUOTE_UNCERTAINTY * par:
+            continue
+        gap = abs(cm - pm)
+        if best is None or gap < best[0]:
+            best = (gap, par, k)
+    if best is not None and best[1] > 0 and abs(best[2] / best[1] - 1.0) <= MAX_STRIKE_DISTANCE:
+        return float(best[1]), float(best[2])
+    return None
+
+
+#: Expiries the CARRY separation scans for its two usable ones (wider than ``_MAX_EXPIRIES``: a
+#: thin chain's second usable expiry is often the 5th-8th listed, AMC 2023-07-14's the 35-day).
+_CARRY_MAX_EXPIRIES = 8
+
+
+def expiry_parities(u, session_ord: int) -> List[Tuple[int, float]]:
+    """[(expiry ordinal, parity spot)] of EVERY usable expiry among the nearest
+    ``_CARRY_MAX_EXPIRIES`` with DTE >= ``_MIN_DTE``, same pair gates as ``parity_spot``. The
+    carry separation's input; memoised per worker."""
+    idx = _index_for(u.raw)
+    hit = idx.term.get(session_ord)
+    if hit is not None:
+        return hit
+    out: List[Tuple[int, float]] = []
+    j = int(np.searchsorted(idx.exp_values, session_ord + _MIN_DTE, side="left"))
+    for jj in range(j, min(j + _CARRY_MAX_EXPIRIES, len(idx.exp_values))):
+        best = _best_pair(u, idx, jj, session_ord)
+        if best is not None:
+            out.append((int(idx.exp_values[jj]), best[0]))
+    idx.term[session_ord] = out
+    return out
+
+
 class _SymbolSampling:
     __slots__ = ("events", "next_event", "forced", "since", "evaluated", "history")
 
@@ -237,11 +302,18 @@ class BasisGuard:
     """Per-run state: which (underlying, session) were checked, and what it cost."""
 
     def __init__(self, spot_source: Callable[[str, date], Optional[float]],
-                 split_dates: Optional[Callable[[str], Any]] = None):
+                 split_dates: Optional[Callable[[str], Any]] = None,
+                 dividends: Optional[Callable[[str, date], Any]] = None):
         """``split_dates(symbol)`` -> the ex-dates of the splits in the run's verified basis
-        for ``symbol`` (forced checks, see the module docstring); None = no forced checks."""
+        for ``symbol`` (forced checks, see the module docstring); None = no forced checks.
+        ``dividends(symbol, session)`` -> [(ex-date, amount per share in the session's
+        as-traded basis)], or None when the symbol's dividend calendar is unavailable; the
+        carry separation (module docstring) adds them back. No source = unavailable."""
         self.spot_source = spot_source
         self.split_dates = split_dates
+        self.dividends = dividends
+        #: would-be refusals cleared by the carry separation
+        self.carry_passed = 0
         self._checked: set = set()
         #: symbol -> _SymbolSampling
         self._sampling: Dict[str, "_SymbolSampling"] = {}
@@ -271,7 +343,8 @@ class BasisGuard:
                         "the split-basis check never ran for it this run.", sym, u, n, 100 * u / n)
         return {"checks": self.checks, "unevaluable": self.unevaluable,
                 "sampled_out": self.sampled_out,
-                "outliers_passed": self.outliers_passed, "seconds": round(self.seconds, 6),
+                "outliers_passed": self.outliers_passed, "carry_passed": self.carry_passed,
+                "seconds": round(self.seconds, 6),
                 "unevaluable_symbols": blind}
 
     def _ratio(self, u, underlying: str, session_ord: int) -> Optional[float]:
@@ -283,6 +356,26 @@ class BasisGuard:
         if spot is None or not (spot > 0):
             return None
         return par / float(spot)
+
+    def _session_date(self, u, session_ord: int) -> date:
+        return (u.raw.date_of_ord[session_ord] if session_ord in u.raw.date_of_ord
+                else date.fromordinal(session_ord))
+
+    def _carry_ratio(self, u, underlying: str, session_ord: int) -> Tuple[Optional[float], str]:
+        """(carry-free parity spot / as-traded spot, how) for one session; (None, why) when
+        it cannot be stated."""
+        from ba2_common.core.option_carry import carry_free_spot
+
+        day = self._session_date(u, session_ord)
+        spot = self.spot_source(underlying, day)
+        if spot is None or not (spot > 0):
+            return None, f"no as-traded spot on {day.isoformat()}"
+        divs = self.dividends(underlying, day) if self.dividends is not None else None
+        pts = [(date.fromordinal(e), p) for e, p in expiry_parities(u, session_ord)]
+        res = carry_free_spot(day, pts, divs)
+        if res.spot is None:
+            return None, res.reason
+        return res.spot / float(spot), res.reason
 
     def _due(self, underlying: str, d: int) -> bool:
         """Advance ``underlying``'s sampling state by one session; True when it is checked."""
@@ -353,13 +446,24 @@ class BasisGuard:
             if abs(med - 1.0) <= TOLERANCE:
                 self.outliers_passed += 1
                 return
+            # Carry separation (module docstring): the same sessions, carry removed.
+            carry = [self._carry_ratio(u, underlying, d_.toordinal()) for d_, _ in ratios]
+            rc0, why0 = carry[0]
+            avail = [r for r, _ in carry if r is not None]
+            medc = float(np.median(avail)) if avail else None
+            if rc0 is not None and abs(medc - 1.0) <= TOLERANCE:
+                self.carry_passed += 1
+                return
+            carry_txt = (f"carry-free ratio {rc0:.4f} (median {medc:.4f} over {len(avail)} of "
+                         f"{len(carry)} sessions; {why0})" if rc0 is not None else
+                         f"carry-free ratio unavailable: {why0}")
             raise OptionSpotBasisMismatch(
                 f"{underlying} {session.isoformat()}: the option path's spot is not in the "
                 f"basis the chain is quoted in -- put-call-parity spot / as-traded spot = "
                 f"{r0:.4f} (median {med:.4f} over "
                 f"{[(d_.isoformat(), round(r_, 4)) for d_, r_ in ratios]}), tolerance "
-                f"{TOLERANCE:.0%}. A split / spin-off missing from (or wrong in) the split "
-                f"calendar, a mixed-basis FMP cache or a mis-mapped option ticker; every strike, "
-                f"greek and intrinsic value of this run would be wrong. Refusing.")
+                f"{TOLERANCE:.0%}; {carry_txt}. A split / spin-off missing from (or wrong in) "
+                f"the split calendar, a mixed-basis FMP cache or a mis-mapped option ticker; "
+                f"every strike, greek and intrinsic value of this run would be wrong. Refusing.")
         finally:
             self.seconds += time.perf_counter() - t0
