@@ -1,5 +1,9 @@
 # BA2 Trade Platform - Comprehensive Test Plan
 
+> **Status:** last fully updated in October 2025. The plan does not yet cover options trading and
+> the option risk manager, portfolio allocation, margin trading, market-condition entry and exit
+> rules, equity short selling, or live capture and replay.
+
 **Last Updated**: 2025-10-07  
 **Version**: 1.0
 

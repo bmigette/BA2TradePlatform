@@ -4,6 +4,8 @@ A map of what is in `docs/`. It lists the documents worth reading first; it does
 summarise every file. Dated documents (plans, memos, reviews) record a decision or a finding
 at that date and are not kept up to date afterwards: check the code before relying on them.
 
+**To reproduce our backtest results**, start with [REPRODUCE-BACKTESTS.md](REPRODUCE-BACKTESTS.md).
+
 ## Start here (outside `docs/`)
 
 - [../README.md](../README.md) — the live trade platform (`ba2-trade`): features, install, run, architecture
@@ -28,7 +30,8 @@ at that date and are not kept up to date afterwards: check the code before relyi
 - [RUNBOOK-goal2020-grid.md](RUNBOOK-goal2020-grid.md) — start, watch, stop and resume the goal2020 optimization grid
 - [strategy_research/exploration/README.md](strategy_research/exploration/README.md) — the strategy exploration grid (driver `tools/strategy_research/exploration/run_exploration.py`)
   - [market_conditions.md](strategy_research/exploration/market_conditions.md) — market-condition entry gates in that grid
-  - [pullback_and_market_exits.md](strategy_research/exploration/pullback_and_market_exits.md) — proposed pullback expert and market-condition exits (not implemented)
+  - [pullback_and_market_exits.md](strategy_research/exploration/pullback_and_market_exits.md) — the pullback expert and market-condition exits and TP/SL adjustments (implemented; [plan](plans/2026-09-24-pullback-and-market-exits.md))
+- [strategy_research/atr_grid/](strategy_research/atr_grid/) — [S1–S7 relevance from the goal2020 grid](strategy_research/atr_grid/s1_s7_relevance.md) and the [2027 ATR grid design](strategy_research/atr_grid/atr_grid_2027_design.md) (draft, not approved)
 - [strategy_research/options/](strategy_research/options/) — option grid experiment contracts ([soft 30-trade fitness](strategy_research/options/option_stage1_soft30.md), [HOLD vs low-confidence entries](strategy_research/options/option_neutral_entry_experiments.md))
 
 ## Plans and designs
@@ -39,9 +42,19 @@ in [superpowers/](superpowers/) (`specs/` for designs, `plans/` for implementati
 
 - [Backtest platform roadmap](plans/2026-06-13-backtest-platform-ROADMAP.md) — the package split and backtest program, phase by phase
 - [Live/backtest engine unification](plans/2026-07-02-live-backtest-engine-unification.md) and [unified rule model](plans/2026-07-08-unified-rule-model.md) — why live and backtest share one decision path
-- [Options trading design](plans/2026-06-05-options-trading-design.md), [option risk manager](superpowers/specs/2026-08-27-option-risk-manager-design.md), [option model and lifecycle](superpowers/specs/2026-08-24-option-model-and-lifecycle-design.md)
+- [Options trading design](plans/2026-06-05-options-trading-design.md), [option model and lifecycle](superpowers/specs/2026-08-24-option-model-and-lifecycle-design.md)
+  - Option grid and option risk manager (`superpowers/specs/`, 2026-08-27 to 2026-08-31):
+    [option GA grid](superpowers/specs/2026-08-27-option-ga-grid-design.md),
+    [option risk manager](superpowers/specs/2026-08-27-option-risk-manager-design.md),
+    [ETF option universe investigation](superpowers/specs/2026-08-27-etf-option-universe-investigation.md),
+    [selection modes and max-loss exits](superpowers/specs/2026-08-29-option-selection-modes-and-max-loss-design.md),
+    [option program review findings](superpowers/specs/2026-08-30-option-program-review-findings.md),
+    [grid 2: LEAPS, PMCC, earnings, calendars](superpowers/specs/2026-08-31-leaps-grid-design.md),
+    [convex-harvest grid](superpowers/specs/2026-08-31-convex-harvest-grid-design.md)
+  - [Option backtest engine bug fixes](plans/2026-09-24-option-bt-engine-bug-fixes.md), from the [DeterministicScorer bearish-options findings](findings-2026-09-24-deterministicscorer-bearish-options.md)
 - [Options data and intraday roadmap](plans/2026-07-25-options-data-and-intraday-roadmap.md)
-- [Margin trading design](plans/2026-09-08-margin-trading-design.md)
+- [Margin trading design](plans/2026-09-08-margin-trading-design.md), with [live-only margin and backtest parity](plans/2026-09-09-margin-live-backtest-parity.md) and the [margin review fixes plan](plans/2026-09-09-margin-review-fixes-plan.md)
+- [Equity short selling design](plans/2026-09-24-equity-short-selling-design.md) and [plan](plans/2026-09-24-equity-short-selling.md)
 - [Portfolio allocation design](superpowers/specs/2026-08-20-portfolio-allocation-design.md)
 - [Live capture and backtest replay spec](plans/2026-09-10-live-capture-prewarm-backtest-replay-spec.md)
 - [Forward-test account allocation](plans/2026-09-13-forward-test-account-allocation.md)

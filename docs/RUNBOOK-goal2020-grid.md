@@ -1,7 +1,7 @@
 # Runbook — the goal2020 optimization grid
 
 Everything needed to start, watch, stop and resume the grid without help. Run every command from
-the repo root (`C:\Users\basti\Documents\dev\BA2TradePlatform`) in **Git Bash**.
+the repo root (`<repo>`, your BA2TradePlatform checkout) in **Git Bash**.
 
 Last verified 2026-08-04 against app_version 2026.08.1014. Job counts and the pace figure are
 measured, not estimated (`--dry-run` per band; job 1 of the live run). Worker defaults re-checked
@@ -253,7 +253,7 @@ os.environ["FMP_API_KEY"] = get_app_setting("FMP_API_KEY")
 ```bash
 # The password lives in the workers table -- never hardcode it in a script or doc.
 # NOTE the Windows-style path: Git Bash's $HOME is a POSIX path Windows Python cannot open.
-DB='C:\Users\basti\Documents\ba2\test\dl_forecasting.db'
+DB="$USERPROFILE\Documents\ba2\test\dl_forecasting.db"
 PW=$(.venv/Scripts/python.exe -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute(\"select password from workers where name='remote150'\").fetchone()[0])" "$DB")
 curl -s -m 10 -H "Authorization: Bearer $PW" http://192.168.1.150:8100/health
 ```

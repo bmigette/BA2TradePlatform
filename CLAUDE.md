@@ -237,13 +237,20 @@ class MyExpert(MarketExpertInterface):
 
 ## Environment Variables
 
-Configure in `.env` file:
-- `OPENAI_API_KEY` - Required for AI experts
-- `FINNHUB_API_KEY` - Market data and news
-- `ALPHA_VANTAGE_API_KEY` - Additional market data
-- `PRICE_CACHE_TIME` - Cache duration in seconds (default: 60)
+The live app never loads a `.env` file.
 
-Most configuration is done via the web UI Settings page rather than environment variables.
+- **API keys** (OpenAI, Anthropic, Finnhub, FMP, FRED, Alpha Vantage, Alpaca, ...) are entered on the
+  Settings page and stored in the app's DB (`AppSetting` table). TradingAgents copies the OpenAI,
+  Finnhub and FRED keys into `os.environ` at runtime.
+- **Path overrides** (optional environment variables):
+  - `BA2_HOME`: data root, default `~/Documents/ba2` (`packages/common/ba2_common/config.py`).
+  - `DB_FILE`, `LOG_FOLDER`, `CACHE_FOLDER`: override one path each (`ba2_trade_platform/config.py`).
+    The `--db-file`, `--log-folder` and `--cache-folder` flags of `main.py` override them in turn.
+- `PRICE_CACHE_TIME` is a constant in `ba2_trade_platform/config.py` (60 seconds), not an
+  environment variable.
+
+The test platform is different: `ba2-test` loads `testplatform/backend/.env` and the repo-root
+`.env` when they exist.
 
 ## Versioning
 
