@@ -86,13 +86,18 @@ def dividend_calendar_path(symbol: str) -> str:
                         f"{DIVIDEND_CALENDAR_NAMESPACE}__{symbol.upper()}.json")
 
 
-def load_cached_dividend_calendar(symbol: str) -> Optional[List[Tuple[date, float]]]:
-    """[(ex-date, adjDividend)] of the cached FMP dividend calendar (ex-date ascending), or None
-    when no calendar is cached. ``adjDividend`` is split-adjusted like FMP's closes (so a
-    caller converts it with the run's as-traded factor, as it does the spot); a row without it
-    falls back to ``dividend``; a row without an amount is dropped. An unreadable file RAISES
-    (a corrupt calendar is not an absent one). Read by the option basis guard's carry
-    separation only."""
+def load_cached_dividend_calendar(symbol: str
+                                  ) -> Optional[List[Tuple[date, Optional[float], Optional[date]]]]:
+    """[(ex-date, adjDividend or None, declarationDate or None)] of the cached FMP dividend
+    calendar (ex-date ascending), or None when no calendar is cached.
+
+    ``adjDividend`` is split-adjusted like FMP's closes, so a caller converts it with the run's
+    as-traded factor exactly as it does the spot. There is NO fallback to the unadjusted
+    ``dividend``: multiplying an as-declared amount by a split factor would be wrong by the
+    split, so a row without ``adjDividend`` keeps None and the guard refuses to use it, naming
+    it. The declaration date lets the guard read the calendar AS OF a session (a dividend not
+    yet declared was not known). An unreadable file RAISES (a corrupt calendar is not an absent
+    one). Read by the option basis guard's carry separation only."""
     from ba2_providers import symbol_info
 
     path = dividend_calendar_path(symbol)
@@ -100,12 +105,27 @@ def load_cached_dividend_calendar(symbol: str) -> Optional[List[Tuple[date, floa
         return None
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
+
+    def _day(v):
+        try:
+            return date.fromisoformat(str(v)[:10]) if v else None
+        except ValueError:
+            return None
+
+    def _amount(v):
+        try:
+            a = float(v)
+        except (TypeError, ValueError):
+            return None
+        return a if a == a and a >= 0 else None
+
     out = []
-    for e in symbol_info.parse_dividends(payload):
-        amount = e.adj_dividend if e.adj_dividend else e.dividend
-        if amount and amount == amount and amount > 0:
-            out.append((e.ex_date, float(amount)))
-    return sorted(out)
+    for r in symbol_info._historical_rows(payload):
+        ex = _day(r.get("date"))
+        if ex is None:
+            continue
+        out.append((ex, _amount(r.get("adjDividend")), _day(r.get("declarationDate"))))
+    return sorted(out, key=lambda t: t[0])
 
 
 class RunSplitBasis:

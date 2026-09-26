@@ -17,6 +17,8 @@ from datetime import date, timedelta
 
 import pytest
 
+from ba2_common.core.option_carry import DividendRow
+
 #: As-traded spot per session and (days to expiry, parity/spot) of the usable expiries among
 #: the nearest 8 (DTE >= 2; the first one is the nearest-expiry measure), from the store.
 AMC = {
@@ -112,9 +114,10 @@ STLA = {
     date(2022, 5, 5): (13.42, [(15, 0.9985), (43, 0.9985), (134, 1.0041)]),
     date(2022, 5, 6): (13.93, [(14, 0.9996), (42, 1.0014), (133, 1.0068)]),
 }
-STLA_DIVS = [(date(2022, 4, 19), 1.1221)]
-#: From 2022-04-05 every usable expiry is after the ex-date: only the calendar removes the step.
-STLA_APRIL = {d: v for d, v in STLA.items() if d >= date(2022, 4, 5)}
+#: FMP: ex 2022-04-19, adjDividend 1.1221, declared 2022-02-25 (7.5% of the spot: carry).
+STLA_DIVS = [DividendRow(date(2022, 4, 19), 1.1221, date(2022, 2, 25))]
+#: From 2022-03-17 every usable expiry is after the ex-date: only the calendar removes the step.
+STLA_APRIL = {d: v for d, v in STLA.items() if d >= date(2022, 4, 4)}
 
 
 def _guard(monkeypatch, table, dividends=None, scale=1.0):
@@ -176,19 +179,19 @@ def test_stla_march_may_2022_was_refused_and_now_passes_with_its_dividend(monkey
     assert _phases(monkeypatch, STLA, lambda s, d: STLA_DIVS) == []
 
 
-def test_stla_without_a_dividend_calendar_is_still_refused_and_says_why(monkeypatch):
+def test_stla_without_a_dividend_calendar_is_refused_and_says_why(monkeypatch):
     g, u, guard = _guard(monkeypatch, STLA_APRIL, dividends=lambda s, d: None)
-    with pytest.raises(g.OptionSpotBasisMismatch, match="dividend calendar unavailable"):
+    with pytest.raises(g.OptionSpotBasisMismatch, match="no dividend calendar cached"):
         _run(g, u, guard, sorted(STLA_APRIL))
     g, u, guard = _guard(monkeypatch, STLA_APRIL, dividends=lambda s, d: STLA_DIVS)
     _run(g, u, guard, sorted(STLA_APRIL))
 
 
-@pytest.mark.parametrize("scale", [2.0, 0.5, 1.25])
+@pytest.mark.parametrize("scale", [2.0, 0.5, 1.25, 1.3])
 @pytest.mark.parametrize("table,divs", [(AMC, []), (STLA, STLA_DIVS)])
 def test_a_basis_error_is_still_refused_with_or_without_carry(monkeypatch, scale, table, divs):
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: divs, scale=scale)
-    with pytest.raises(g.OptionSpotBasisMismatch, match="carry-free"):
+    with pytest.raises(g.OptionSpotBasisMismatch, match="carry"):
         _run(g, u, guard, sorted(table))
 
 
@@ -204,26 +207,88 @@ def test_a_synthetic_x125_error_on_a_dividend_payer_is_refused(monkeypatch):
     for day in days:
         dv = 2.0 if day < ex else 0.0         # every expiry is after the ex-date
         table[day] = (100.0, [(30, (100.0 - dv) / 100.0), (58, (100.0 - dv - 0.2) / 100.0)])
-    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [(ex, 2.0)], scale=1.25)
+    divs = [DividendRow(ex, 2.0 * 1.25, date(2024, 4, 1))]
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: divs, scale=1.25)
     with pytest.raises(g.OptionSpotBasisMismatch):
+        _run(g, u, guard, days)
+
+
+def _monthly(start, n=14):
+    days, d = [], start
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def test_an_occ_adjusted_special_cannot_explain_away_a_x125_error(monkeypatch):
+    """The reviewer's composite: ACI-like $6.85 special on $27.50 (25%, OCC strike-adjusts it,
+    so the chain past the ex-date is NOT lowered) and a run spot 1.25x off. Adding the special
+    back used to clear it; a >= 10% dividend is now a veto, refused by name."""
+    days = _monthly(date(2022, 10, 17), n=9)          # declared 10-14: known on every session
+    table = {}
+    for day in days:
+        t1, t2 = (date(2022, 11, 18) - day).days, (date(2022, 12, 16) - day).days
+        table[day] = (27.5, [(t1, 1.0 - 0.0002 * t1), (t2, 1.0 - 0.0002 * t2)])
+    special = [DividendRow(date(2022, 10, 28), 6.85 * 1.25, date(2022, 10, 14))]
+    for scale in (1.25, 1.30):
+        g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: special, scale=scale)
+        with pytest.raises(g.OptionSpotBasisMismatch, match="OCC adjusts strikes"):
+            _run(g, u, guard, days)
+
+
+@pytest.mark.parametrize("row,match", [
+    (DividendRow(date(2023, 3, 16), 21.6693, None), "declaration date unknown"),      # AMX garbage
+    (DividendRow(date(2023, 3, 16), 21.6693, date(2023, 2, 1)), ">= 10%"),
+    (DividendRow(date(2023, 3, 20), 0.875 * 0.95, date(2023, 2, 10)), ">= 10%"),      # HL-like
+    (DividendRow(date(2023, 3, 16), None, date(2023, 2, 1)), "no split-adjusted amount"),
+])
+def test_garbage_calendar_rows_refuse_by_name(monkeypatch, row, match):
+    days = _monthly(date(2023, 3, 1))
+    table = {d: (5.0, [(30, 0.93), (58, 0.925)]) for d in days}
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [row])
+    with pytest.raises(g.OptionSpotBasisMismatch, match=match):
+        _run(g, u, guard, days)
+
+
+def test_the_qgen_synthetic_repurchase_refuses_by_name(monkeypatch):
+    """QGEN 2026-01-08: a 0.95 'split' plus a 2.29 cash row with no declaration date, the
+    capital repayment depressing the Dec 2025 expiries' parity (0.94-0.95)."""
+    days = _monthly(date(2025, 12, 1))
+    table = {d: (45.0, [(20, 0.945), (48, 0.94)]) for d in days}
+    rows = [DividendRow(date(2026, 1, 8), 2.29, None)]
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: rows)
+    with pytest.raises(g.OptionSpotBasisMismatch, match="declaration date unknown"):
+        _run(g, u, guard, days)
+
+
+def test_the_carry_path_is_one_sided(monkeypatch):
+    """Borrow and dividends only LOWER the parity spot: a median above 1 + tolerance is never
+    cleared, whatever the term structure says."""
+    days = _monthly(date(2024, 2, 1))
+    table = {d: (100.0, [(10, 1.08), (40, 1.07)]) for d in days}
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [])
+    with pytest.raises(g.OptionSpotBasisMismatch, match="ABOVE the as-traded spot"):
         _run(g, u, guard, days)
 
 
 def test_too_few_expiries_keeps_the_old_refusal_and_says_so(monkeypatch):
     table = {d: (4.40, [(8, 0.90)]) for d in sorted(AMC)}
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [])
-    with pytest.raises(g.OptionSpotBasisMismatch, match="needs >= 2 expiries"):
+    with pytest.raises(g.OptionSpotBasisMismatch, match="2-7 day expiry"):
         _run(g, u, guard, sorted(table))
 
 
-def test_without_a_dividend_source_the_guard_behaves_as_before(monkeypatch):
-    """A caller that wires no dividend source (the contract-detail view) still gets the carry
-    separation for borrow; dividends are simply not added back, and the reason says so."""
+def test_without_a_dividend_source_the_carry_path_refuses(monkeypatch):
+    """A guard wired with no dividend source cannot tell a dividend from a basis error: it
+    keeps the refusal and names the missing calendar (the warm tool covers the universe)."""
     g, u, guard = _guard(monkeypatch, AMC)
-    _run(g, u, guard, sorted(AMC))
-    g2, u2, guard2 = _guard(monkeypatch, STLA_APRIL)
-    with pytest.raises(g2.OptionSpotBasisMismatch, match="dividend calendar unavailable"):
-        _run(g2, u2, guard2, sorted(STLA_APRIL))
+    assert _phases(monkeypatch, AMC, None)
+    with pytest.raises(g.OptionSpotBasisMismatch, match="no dividend calendar cached"):
+        for ph in range(5):
+            g, u, guard = _guard(monkeypatch, AMC)
+            _run(g, u, guard, sorted(AMC)[ph:])
 
 
 #: A thin hard-to-borrow chain (IONQ March 2022 had monthlies only: 2022-03-28 carried ONE usable
@@ -261,3 +326,69 @@ def test_fewer_than_three_carry_sessions_in_a_full_window_is_refused(monkeypatch
     g, u, guard = _guard(monkeypatch, thin, dividends=lambda s, d: [])
     with pytest.raises(g.OptionSpotBasisMismatch, match="2 of 5"):
         guard.check(u, "X", date(2022, 3, 25))
+
+
+# ---- TIME measure: IONQ 2022-03-28 (review round 2) ------------------------------------------
+#: The real store (nearest usable expiries per session, parity/spot): monthlies only, so most
+#: sessions carry ONE usable expiry and the TERM measure cannot be made on the sampled window.
+IONQ_REAL = {
+    date(2022, 2, 23): [(23, 0.9493)], date(2022, 2, 24): [(22, 0.9567)],
+    date(2022, 2, 25): [(21, 0.9652)], date(2022, 2, 28): [(18, 0.9590)],
+    date(2022, 3, 1): [(17, 0.9724)], date(2022, 3, 2): [(16, 0.9720)],
+    date(2022, 3, 3): [(15, 0.9808)], date(2022, 3, 4): [(14, 0.9826)],
+    date(2022, 3, 7): [(11, 0.9714)], date(2022, 3, 8): [(10, 0.9941)],
+    date(2022, 3, 9): [(9, 0.9880)], date(2022, 3, 10): [(8, 0.9902)],
+    date(2022, 3, 11): [(7, 0.9895)], date(2022, 3, 15): [(3, 0.9948)],
+    date(2022, 3, 16): [(2, 0.9946)], date(2022, 3, 21): [(60, 0.9443)],
+    date(2022, 3, 22): [(59, 0.9537), (115, 0.9234)], date(2022, 3, 23): [(58, 0.9454), (114, 0.9155)],
+    date(2022, 3, 24): [(57, 0.9552), (113, 0.9194)], date(2022, 3, 25): [(56, 0.9522)],
+    date(2022, 3, 28): [(109, 0.9189)],
+}
+#: The window the sampled replay refused on (median 0.9493): every 5th checked session.
+IONQ_WINDOW = [date(2022, 3, 28), date(2022, 3, 21), date(2022, 3, 7), date(2022, 2, 28),
+               date(2022, 2, 23)]
+
+
+def _ionq(monkeypatch, scale, split_dates=None):
+    import app.services.backtest.option_basis_guard as g0
+    table = {d: (100.0, pts) for d, pts in IONQ_REAL.items()}
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [], scale=scale)
+    guard.split_dates = split_dates
+    ratios = [(d, table[d][1][0][1] / scale) for d in IONQ_WINDOW]
+    med = float(__import__("numpy").median([r for _, r in ratios]))
+    return g, u, guard, ratios, med
+
+
+def test_ionq_2022_03_28_is_cleared_by_its_short_dated_sessions(monkeypatch):
+    """TERM cannot be measured on that window; the 2-7 day expiries of 03-11 (0.9895), 03-15
+    (0.9948) and 03-16 (0.9946) -- borrow faded -- clear it."""
+    g, u, guard, ratios, med = _ionq(monkeypatch, 1.0)
+    assert med < 0.95
+    cleared, _txt = guard._carry_clears(u, "X", ratios, med)
+    assert cleared and guard.time_passed == 1 and guard.carry_passed == 0
+
+
+@pytest.mark.parametrize("scale", [1.25, 1.10, 0.8])
+def test_the_same_term_structure_with_a_basis_error_is_refused(monkeypatch, scale):
+    g, u, guard, ratios, med = _ionq(monkeypatch, scale)
+    cleared, txt = guard._carry_clears(u, "X", ratios, med)
+    assert not cleared and ("2-7 day" in txt or "ABOVE" in txt)
+
+
+def test_the_time_measure_never_looks_across_a_split(monkeypatch):
+    g, u, guard, ratios, med = _ionq(monkeypatch, 1.0,
+                                     split_dates=lambda s: (date(2022, 3, 17),))
+    cleared, txt = guard._carry_clears(u, "X", ratios, med)
+    assert not cleared and "only 0 of the last" in txt
+
+
+def test_ionq_through_check_itself(monkeypatch):
+    """The real check() path: the window it builds from its own sampling, cleared by TIME."""
+    g, u, guard, ratios, med = _ionq(monkeypatch, 1.0)
+    for d, r in reversed(ratios[1:]):
+        guard._sampling.setdefault("X", g._SymbolSampling([]))
+        guard._sampling["X"].history.append((d, r))
+    guard._sampling["X"].evaluated = True
+    guard._sampling["X"].since = 99
+    guard.check(u, "X", date(2022, 3, 28))
+    assert guard.time_passed == 1
