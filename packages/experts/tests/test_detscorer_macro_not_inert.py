@@ -29,9 +29,17 @@ def _fred_cache(tmp_path, monkeypatch):
     os.makedirs(os.path.join(str(tmp_path), "fred"), exist_ok=True)
 
     def write(series_id, vintage, rows):
+        """The first-release format ``refresh_series`` writes; a daily row with no
+        ``realtime_start`` is stamped as published on its own date."""
+        from datetime import datetime, timezone
+
+        rows = [dict(r, realtime_start=r.get("realtime_start", r["date"])) for r in rows]
         with open(fs.cache_path(series_id), "w", encoding="utf-8") as fh:
-            json.dump({"series_id": series_id, "vintage": vintage,
-                       "observations": rows}, fh)
+            json.dump({"series_id": series_id,
+                       "fetched_at": datetime.now(timezone.utc).isoformat(),
+                       "availability": fs.AVAIL_FIRST_RELEASE,
+                       "format": fs.CACHE_FORMAT_FIRST_RELEASE,
+                       "first_vintage": "2000-01-03", "observations": rows}, fh)
 
     # 80 daily points is enough for credit_score (needs >= 60) and the yc average.
     daily = [{"date": f"2024-01-{d:02d}" if d <= 31 else f"2024-02-{d - 31:02d}",

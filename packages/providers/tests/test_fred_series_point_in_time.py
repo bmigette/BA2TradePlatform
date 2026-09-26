@@ -23,15 +23,40 @@ def _isolated_cache(tmp_path, monkeypatch):
     fs.reset_cache()
 
 
-def _write(series_id: str, vintage: bool, observations: list) -> None:
+def _write(series_id: str, vintage: bool, observations: list, *, stamp: bool = True,
+           first_vintage: str = "2000-01-03", fetched_at: str = None) -> None:
+    """A cache file in the format ``refresh_series`` writes.
+
+    A first-release series gets the ``first_release_v1`` header; a row with no
+    ``realtime_start`` is stamped with its own observation date (published the same day,
+    like T10Y3M) unless ``stamp=False``. DGS3MO (same-day) keeps the legacy header.
+    ``vintage`` is kept only so the call sites read as they always did.
+    """
     os.makedirs(os.path.join(fs.CACHE_FOLDER, "fred"), exist_ok=True)
+    if fs.SERIES_SPEC[series_id]["availability"] == fs.AVAIL_SAME_DAY_CLOSE:
+        doc = {"series_id": series_id, "vintage": False, "observations": observations}
+    else:
+        rows = []
+        for o in observations:
+            o = dict(o)
+            if stamp and "realtime_start" not in o:
+                o["realtime_start"] = o.get("date")
+            rows.append(o)
+        doc = {"series_id": series_id,
+               "fetched_at": fetched_at or pd.Timestamp.now(tz="UTC").isoformat(),
+               "availability": fs.AVAIL_FIRST_RELEASE, "format": fs.CACHE_FORMAT_FIRST_RELEASE,
+               "first_vintage": first_vintage, "observations": rows}
     with open(fs.cache_path(series_id), "w", encoding="utf-8") as fh:
-        json.dump({"series_id": series_id, "vintage": vintage,
-                   "observations": observations}, fh)
+        json.dump(doc, fh)
 
 
 def test_vintage_series_hides_observations_not_yet_published():
-    """UNRATE for January is dated 2024-01-01 but first published 2024-02-02."""
+    """UNRATE for January is dated 2024-01-01 but first published 2024-02-02.
+
+    Bar 2024-02-01 is the live decision of 2024-02-02 (it fills at that open); the release
+    came out at 08:30 ET THAT morning, and a vintage dated L is not visible on L -- so it is
+    still hidden. Bar 2024-02-02 is the decision of 2024-02-05, which sees it.
+    """
     _write("UNRATE", True, [
         {"date": "2023-12-01", "value": "3.7", "realtime_start": "2024-01-05"},
         {"date": "2024-01-01", "value": "3.9", "realtime_start": "2024-02-02"},
@@ -48,20 +73,21 @@ def test_vintage_series_hides_observations_not_yet_published():
     assert on_release.iloc[-1] == pytest.approx(3.9)
 
 
-def test_unrevised_series_cuts_on_observation_date():
-    """Daily series are published same-day, so the observation date is the cut."""
-    _write("VIXCLS", False, [
-        {"date": "2024-03-14", "value": "14.40"},
-        {"date": "2024-03-15", "value": "14.41"},
-        {"date": "2024-03-18", "value": "14.33"},
+def test_the_option_rate_series_still_cuts_on_observation_date():
+    """DGS3MO is the option BS rate: same-day by design (it inverts bar d's own close)."""
+    _write("DGS3MO", False, [
+        {"date": "2024-03-14", "value": "5.40"},
+        {"date": "2024-03-15", "value": "5.41"},
+        {"date": "2024-03-18", "value": "5.33"},
     ])
 
-    s = fs.get_series_as_of("VIXCLS", "2024-03-15")
+    s = fs.get_series_as_of("DGS3MO", "2024-03-15")
     assert len(s) == 2
-    assert s.iloc[-1] == pytest.approx(14.41)
+    assert s.iloc[-1] == pytest.approx(5.41)
 
 
-def test_as_of_none_returns_everything():
+def test_as_of_none_is_the_live_decision_made_now():
+    """Live sees every row first published before today's decision label."""
     _write("VIXCLS", False, [
         {"date": "2024-03-14", "value": "14.40"},
         {"date": "2024-03-15", "value": "14.41"},
@@ -172,7 +198,7 @@ def test_a_null_date_is_kept_as_nat_rather_than_cut_away():
     loop's ``if known_on > cut: continue`` KEPT such a row. Spelling the vectorized
     filter as ``known <= cut`` would silently start dropping it."""
     _write("VIXCLS", False, [
-        {"date": None, "value": "1.0"},
+        {"date": None, "value": "1.0", "realtime_start": "2024-03-14"},
         {"date": "2024-03-14", "value": "14.40"},
     ])
     assert len(fs.get_series_as_of("VIXCLS", "2024-03-14")) == 2
@@ -211,21 +237,25 @@ def test_vintage_cut_still_reads_realtime_start_after_memoization():
     ])
     assert len(fs.get_series_as_of("UNRATE", "2024-02-01")) == 1
     assert len(fs.get_series_as_of("UNRATE", "2024-02-02")) == 2
-    # A vintage row whose realtime_start cannot be parsed is dropped, as before.
+    # A row with no first-release date is REFUSED (it used to be dropped): when it became
+    # public is unknown, and dropping it would quietly hide a row live has.
     fs.reset_cache()
     _write("UNRATE", True, [
         {"date": "2023-12-01", "value": "3.7", "realtime_start": "2024-01-05"},
         {"date": "2024-01-01", "value": "3.9"},          # no realtime_start
-    ])
-    assert len(fs.get_series_as_of("UNRATE", None)) == 1
+    ], stamp=False)
+    with pytest.raises(fs.MacroAvailabilityUnknown, match="first-release date"):
+        fs.get_series_as_of("UNRATE", None)
 
 
-def test_a_tz_aware_as_of_is_normalized_the_same_way():
+def test_an_intraday_instant_is_labelled_by_its_new_york_date():
+    """A non-midnight instant (intraday bar, recorded live decision) is its NY date's decision:
+    14:00 UTC on 03-15 is 10:00 ET on 03-15, which sees the 03-14 print, not 03-15's."""
     _write("VIXCLS", False, [
         {"date": "2024-03-14", "value": "14.40"},
         {"date": "2024-03-15", "value": "14.41"},
     ])
-    aware = pd.Timestamp("2024-03-14 23:00", tz="UTC")
+    aware = pd.Timestamp("2024-03-15 14:00", tz="UTC")
     assert len(fs.get_series_as_of("VIXCLS", aware)) == 1
 
 

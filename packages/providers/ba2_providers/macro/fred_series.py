@@ -7,23 +7,51 @@ keyed by FRED series id, sliced to an ``as_of`` with no lookahead. That mismatch
 ``DeterministicScorer``'s macro section silently produced nothing (see
 docs/plans/2026-08-11-shared-news-cache-design.md section 4).
 
-NO-LOOKAHEAD. Two regimes, chosen per series and verified against the live API:
+NO-LOOKAHEAD: FIRST-RELEASE AVAILABILITY (2026-09-26). A macro SIGNAL input is known to a
+decision only once FRED had actually published it. Every signal series is therefore cached with
+the date each observation FIRST appeared on FRED -- its ALFRED ``realtime_start`` of initial
+release -- and read through ONE rule, shared by the backtest and live:
 
-  * REVISED series (UNRATE, CPIAUCSL, PAYEMS, GDP) are published with a lag AND revised
-    afterwards. Filtering on the observation date leaks: January's unemployment rate is
-    dated 2024-01-01 but was not public until 2024-02-02. These are fetched with
-    ``output_type=4`` (initial release only) over the full realtime range, which stamps
-    every observation with ``realtime_start`` -- its true first-publication date. We then
-    filter on THAT. No lag heuristics, no guessing.
+    a row is visible to a decision labelled L  <=>  first_release_date < L
 
-  * UNREVISED daily series (VIXCLS, T10Y3M, BAA10Y, DGS*) are never restated, so the value a
-    date carries never changes -- but it is NOT public on its observation date everywhere:
-    the source publishes after that day's close (Treasury's par yields the evening of ``d``,
-    Cboe's VIX close at 4:15 pm), and FRED's copy arrives on ``d+1``. They also REJECT vintage
-    queries outright ("There are 3907 vintage dates in the specified real-time period"), so
-    plain OBSERVATION-date filtering is the only option, and ``get_series_as_of(sid, d)``
-    includes the print dated ``d``. That is correct for a consumer acting at or after ``d``'s
-    close; a consumer deciding BEFORE ``d``'s close must cut at ``d - 1`` itself.
+``L`` is the platform's decision label (``market_calendar``): live, the New York date of the
+decision instant; a DAILY backtest bar D, ``backtest_decision_label(D)`` = the next regular
+session N(D), because bar D decides on D's close and fills at N(D)'s open -- it IS the live
+decision made at ~09:30 ET on N(D). See :func:`decision_label`.
+
+STRICTLY BEFORE L, because FRED's vintages are day-granular and a vintage dated L is released
+DURING L (measured: at 09:32 ET on 2026-09-25 BAA10Y's vintage of that day did not exist yet,
+nor DGS10's at 06:55 ET on 2026-08-11; T10Y3M/VIXCLS vintage d carries d's own close, so it
+cannot exist before that close). A
+release on the morning of L (UNRATE/CPI at 08:30 ET) is therefore NOT visible on L, in the
+backtest AND live -- one rule, so they cannot drift.
+
+WHY NOT THE OBSERVATION DATE. Until 2026-09-26 the daily series (VIXCLS, BAA10Y, T10Y3M) were
+cut on their observation date against the bar's midnight-UTC ``as_of``, so a backtest decision
+on bar d saw rows dated d. FRED publishes them later: BAA10Y/DGS10 obs d appear in the vintage
+of d+1 (or later), VIXCLS has stalled for days (on 2026-09-25 the live cache ended at 09-22).
+The measured live fetch at 13:32Z on 2026-09-25 held VIXCLS->09-22, BAA10Y->09-23,
+T10Y3M->09-24; the backtest bar 09-24 (same decision) saw 09-24 on all three.
+
+HOW THE FIRST-RELEASE DATE IS OBTAINED (``_fetch_first_release``). ALFRED refuses a vintage
+query spanning more than ~2000 vintage dates, so the history is assembled from: the series'
+vintage-date list; the FIRST vintage's full snapshot (every row it held is stamped with that
+vintage, the earliest date anything can be proven public); ``output_type=4`` (initial release
+only) over consecutive windows of the vintage list; and, for the handful of rows the current
+vintage holds but no initial release carries as a number (first published as "." and filled
+later), a per-row walk of their real-time periods. VALUES are the first-release values, the
+number that was on FRED the day the row became visible -- revisions are not applied (they were
+not for UNRATE before this either).
+
+REFUSED, never guessed (:class:`MacroAvailabilityUnknown`): a cache written in the old
+observation-date format; a decision labelled on or before the series' first vintage (nothing
+is provably public yet); a decision labelled after the day the cache was fetched (vintages
+after the fetch are unknown -- a backtest cannot see them, a live run must refetch first).
+
+THE ONE EXCEPTION: DGS3MO is the option Black-Scholes risk-free rate (``risk_free_rate``), not a
+signal. It inverts bar d's OWN close, known only after that close, so it stays SAME-DAY on the
+observation date (reviewed and accepted 2026-09-26). It keeps its plain-observation cache format
+and its ``as_of`` cut here is on the observation date.
 
 HERMETIC BACKTESTS. The full history of a series is fetched ONCE and cached as JSON under
 ``CACHE_FOLDER/fred/<SERIES_ID>.json``. Because it lives under CACHE_FOLDER it is picked up
@@ -37,8 +65,9 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, time as dtime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -55,25 +84,50 @@ API_URL = "https://api.stlouisfed.org/fred/series/observations"
 _REALTIME_MIN = "1776-07-04"
 _REALTIME_MAX = "9999-12-31"
 
+API_VINTAGEDATES_URL = "https://api.stlouisfed.org/fred/series/vintagedates"
+
+#: How a series' rows become known to a decision (see the module docstring).
+AVAIL_FIRST_RELEASE = "first_release"      # signal input: visible once first published, < L
+AVAIL_SAME_DAY_CLOSE = "same_day_close"    # DGS3MO only: BS rate, observation-date cut
+#: The cache-file marker of a first-release payload. A file without it (the pre-2026-09-26
+#: observation-date format, whose ``realtime_start`` is the FETCH vintage for every row) is
+#: refused: reading it as first-release would hide every row before the fetch day.
+CACHE_FORMAT_FIRST_RELEASE = "first_release_v1"
+#: FRED's own calendar (St. Louis). A vintage dated V is released during V in this timezone,
+#: so a cache fetched on Chicago date F holds every vintage dated < F.
+FRED_TZ = ZoneInfo("America/Chicago")
+#: Vintage dates per ALFRED window. FRED refuses a request whose real-time period spans more
+#: than ~2000 ("There are 3907 vintage dates in the specified real-time period").
+_VINTAGE_WINDOW = 1500
+
 # Series the platform consumes, and how each must be read point-in-time.
-#   vintage=True  -> published with a lag and revised; filter on first-publication date
-#   vintage=False -> daily, unrevised, same-day; filter on observation date
 SERIES_SPEC: Dict[str, Dict[str, Any]] = {
-    "VIXCLS":     {"vintage": False, "freq": "daily",   "desc": "CBOE VIX close"},
-    "T10Y3M":     {"vintage": False, "freq": "daily",   "desc": "10y-3m Treasury spread (percent)"},
+    "VIXCLS":     {"availability": AVAIL_FIRST_RELEASE, "freq": "daily",   "desc": "CBOE VIX close"},
+    "T10Y3M":     {"availability": AVAIL_FIRST_RELEASE, "freq": "daily",   "desc": "10y-3m Treasury spread (percent)"},
     # Credit spread. NOT the ICE BofA HY OAS (BAMLH0A0HYM2) the expert originally named:
     # FRED serves ICE indices under a rolling ~3-year licence (count=793, starting
     # 2023-08-11), which is useless for a 2020-start backtest. BAA10Y (Moody's Baa less
     # 10y Treasury) is daily, unrestricted and runs from 1986. ``credit_score`` z-scores
     # its input, so it is unit-agnostic and this is a clean drop-in.
-    "BAA10Y":     {"vintage": False, "freq": "daily",   "desc": "Moody's Baa - 10y Treasury spread"},
-    "DGS10":      {"vintage": False, "freq": "daily",   "desc": "10y Treasury constant maturity"},
-    "DGS3MO":     {"vintage": False, "freq": "daily",   "desc": "3m Treasury constant maturity"},
-    "UNRATE":     {"vintage": True,  "freq": "monthly", "desc": "Unemployment rate (Sahm rule input)"},
-    "CPIAUCSL":   {"vintage": True,  "freq": "monthly", "desc": "CPI, all urban consumers"},
-    "PAYEMS":     {"vintage": True,  "freq": "monthly", "desc": "Nonfarm payrolls"},
-    "FEDFUNDS":   {"vintage": True,  "freq": "monthly", "desc": "Federal funds effective rate"},
+    "BAA10Y":     {"availability": AVAIL_FIRST_RELEASE, "freq": "daily",   "desc": "Moody's Baa - 10y Treasury spread"},
+    "DGS10":      {"availability": AVAIL_FIRST_RELEASE, "freq": "daily",   "desc": "10y Treasury constant maturity"},
+    # The option BS rate, NOT a signal input: same-day by design (see the module docstring).
+    "DGS3MO":     {"availability": AVAIL_SAME_DAY_CLOSE, "freq": "daily",  "desc": "3m Treasury constant maturity"},
+    "UNRATE":     {"availability": AVAIL_FIRST_RELEASE, "freq": "monthly", "desc": "Unemployment rate (Sahm rule input)"},
+    "CPIAUCSL":   {"availability": AVAIL_FIRST_RELEASE, "freq": "monthly", "desc": "CPI, all urban consumers"},
+    "PAYEMS":     {"availability": AVAIL_FIRST_RELEASE, "freq": "monthly", "desc": "Nonfarm payrolls"},
+    "FEDFUNDS":   {"availability": AVAIL_FIRST_RELEASE, "freq": "monthly", "desc": "Federal funds effective rate"},
 }
+
+
+class MacroAvailabilityUnknown(RuntimeError):
+    """When a macro row became public cannot be established for this decision -- refused.
+
+    Not an ``OSError`` on purpose: ``absorb_if_benign`` treats the OSError family as benign
+    (a missing file), and this is not the world being uncooperative, it is a decision that would
+    otherwise be made on data it could not have had (or without data it would have had).
+    """
+
 
 # NO PMI INPUT -- deliberately, not an oversight.
 #
@@ -120,6 +174,11 @@ _MEM_AT: Dict[str, float] = {}
 # trading. ``reset_cache()`` and ``refresh_series()`` drop it alongside ``_MEM`` as well --
 # belt and braces, and it keeps the parse from outliving the rows it describes.
 _PARSED: Dict[str, Any] = {}
+#: The cache-file HEADER of each memoized series (everything but the observations): the format
+#: marker, ``first_vintage`` and ``fetched_at`` the first-release reader refuses on. Loaded with
+#: ``_MEM`` and dropped with it. A series memoized WITHOUT a header (a test seeding ``_MEM``
+#: directly) is refused by the first-release reader exactly like an old-format file.
+_META: Dict[str, Dict[str, Any]] = {}
 
 
 def _lock_for(key: str) -> threading.Lock:
@@ -139,9 +198,188 @@ def _spec(series_id: str) -> Dict[str, Any]:
     except KeyError:
         raise ValueError(
             f"Unknown FRED series {series_id!r}. Add it to SERIES_SPEC with an explicit "
-            f"vintage mode -- guessing whether a series is revised is exactly how lookahead "
-            f"gets in."
+            f"availability mode -- guessing when a series becomes public is exactly how "
+            f"lookahead gets in."
         ) from None
+
+
+def _fred_get(url: str, params: Dict[str, Any], sid: str) -> Dict[str, Any]:
+    """One FRED GET, counted in the SAME purpose counters as FMP (spec section 6: requests and
+    bytes by endpoint and purpose). A warm that refreshes the macro series is real background
+    traffic, and an allowance that could not see it was governing the wrong half."""
+    from ba2_providers.fmp_common import record_fmp_bytes, record_fmp_request
+
+    record_fmp_request("fred-observations")
+    resp = requests.get(url, params=params, timeout=120)
+    resp.raise_for_status()
+    record_fmp_bytes("fred-observations", len(getattr(resp, "content", b"") or b""))
+    payload = resp.json()
+    if "error_message" in payload:
+        raise RuntimeError(f"FRED rejected {sid}: {payload['error_message']}")
+    return payload
+
+
+def _is_value(v: Any) -> bool:
+    """FRED writes "." for a date with no print; that is no observation, never a zero."""
+    return v not in (".", None, "")
+
+
+def _fetch_plain(sid: str, api_key: str) -> List[dict]:
+    """The current vintage's observations, oldest first (no real-time window)."""
+    payload = _fred_get(API_URL, {"series_id": sid, "api_key": api_key, "file_type": "json",
+                                  "sort_order": "asc"}, sid)
+    return list(payload.get("observations", []))
+
+
+def _fetch_vintage_dates(sid: str, api_key: str) -> List[str]:
+    """Every vintage date FRED/ALFRED holds for *sid*, ascending (paged)."""
+    out: List[str] = []
+    while True:
+        payload = _fred_get(API_VINTAGEDATES_URL, {
+            "series_id": sid, "api_key": api_key, "file_type": "json",
+            "limit": 10000, "offset": len(out)}, sid)
+        page = list(payload.get("vintage_dates", []))
+        out.extend(page)
+        if not page or len(out) >= int(payload["count"]):
+            break
+    if not out:
+        raise RuntimeError(f"FRED returned no vintage dates for {sid}")
+    if out != sorted(out):
+        raise RuntimeError(f"FRED vintage dates for {sid} are not ascending")
+    return out
+
+
+def _vintage_windows(vintages: List[str]) -> List[Tuple[str, str]]:
+    """Consecutive, non-overlapping real-time windows covering every vintage, each under
+    FRED's vintage-count limit. The last one is open-ended."""
+    chunks = [vintages[i:i + _VINTAGE_WINDOW] for i in range(0, len(vintages), _VINTAGE_WINDOW)]
+    return [(c[0], c[-1] if i < len(chunks) - 1 else _REALTIME_MAX) for i, c in enumerate(chunks)]
+
+
+def _first_numeric_release(sid: str, api_key: str, obs_date: str,
+                           windows: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    """``(realtime_start, value)`` of the first vintage that carried *obs_date* as a NUMBER.
+
+    For the rows ``output_type=4`` cannot date: first published as "." and filled in a later
+    vintage, or absent from the initial releases altogether. Walks the row's real-time periods
+    window by window, oldest first. Within a window the periods are clamped to its start, but the
+    FIRST window holding a numeric period is the one that period began in, so its start is
+    exact. ``None`` when no vintage ever carried it as a number.
+    """
+    for w_start, w_end in windows:
+        payload = _fred_get(API_URL, {
+            "series_id": sid, "api_key": api_key, "file_type": "json", "sort_order": "asc",
+            "observation_start": obs_date, "observation_end": obs_date,
+            "realtime_start": w_start, "realtime_end": w_end}, sid)
+        numeric = sorted((o["realtime_start"], o["value"])
+                         for o in payload.get("observations", [])
+                         if o.get("date") == obs_date and _is_value(o.get("value")))
+        if numeric:
+            return numeric[0]
+    return None
+
+
+def _fetch_first_release(sid: str, api_key: str,
+                         prior_late: Optional[Dict[str, Tuple[str, str]]] = None,
+                         ) -> Tuple[List[dict], Dict[str, Any]]:
+    """Every observation with the date it FIRST appeared on FRED (see the module docstring).
+
+    Returns ``(rows, header)``: rows ``{"date", "value", "realtime_start"}`` ascending by date,
+    ``realtime_start`` = first-release vintage date and ``value`` = the value first published;
+    header ``{"first_vintage", "last_vintage", "n_vintages", "late_filled"}``.
+
+    Raises ``RuntimeError`` when a row of the current vintage cannot be dated: a row whose
+    availability is unknown is refused at fetch time, never cached as if it had always been
+    public.
+
+    ``prior_late`` -- ``{date: (realtime_start, value)}`` of rows the previous cache already
+    dated by the per-row walk (step 3). ALFRED's history is append-only, so a first release
+    found once never moves; reusing it keeps a live refresh from re-walking (each walk is up to
+    one request per vintage window, ~20 s apiece on FRED's side).
+    """
+    vintages = _fetch_vintage_dates(sid, api_key)
+    first = vintages[0]
+    known: Dict[str, Tuple[str, str]] = {}
+
+    # 1. The first vintage's full snapshot. output_type=4 only reports rows NEW in a vintage, so
+    #    every row the first vintage already held is read here, stamped with that vintage -- the
+    #    earliest date it can be proven public.
+    snap = _fred_get(API_URL, {"series_id": sid, "api_key": api_key, "file_type": "json",
+                               "sort_order": "asc", "realtime_start": first,
+                               "realtime_end": first}, sid)
+    for o in snap.get("observations", []):
+        known[o["date"]] = (first, o["value"])
+
+    # 2. Initial releases, window by window. A row is reported only by the window holding its
+    #    first release (verified 2026-09-26: a window starting the day after a release omits that
+    #    row rather than clamping it), so the windows neither overlap nor miss one. Min wins,
+    #    defensively.
+    windows = _vintage_windows(vintages)
+    for w_start, w_end in windows:
+        payload = _fred_get(API_URL, {
+            "series_id": sid, "api_key": api_key, "file_type": "json", "sort_order": "asc",
+            "output_type": 4, "realtime_start": w_start, "realtime_end": w_end}, sid)
+        for o in payload.get("observations", []):
+            cur = known.get(o["date"])
+            if cur is None or o["realtime_start"] < cur[0]:
+                known[o["date"]] = (o["realtime_start"], o["value"])
+
+    # 3. Rows the CURRENT vintage carries as a number whose first release was "." (or that no
+    #    initial release reported at all): dated by their own real-time periods.
+    late_filled: List[str] = []
+    for o in _fetch_plain(sid, api_key):
+        if not _is_value(o.get("value")):
+            continue
+        d = o["date"]
+        cur = known.get(d)
+        if cur is not None and _is_value(cur[1]):
+            continue
+        found = (prior_late or {}).get(d) or _first_numeric_release(sid, api_key, d, windows)
+        if found is None:
+            raise RuntimeError(
+                f"FRED {sid}: observation {d} is in the current vintage but no vintage records "
+                f"when it was first published -- its availability is unknown, so the series is "
+                f"not cached")
+        known[d] = found
+        late_filled.append(d)
+
+    rows = [{"date": d, "value": v, "realtime_start": rt}
+            for d, (rt, v) in sorted(known.items()) if _is_value(v)]
+    if not rows:
+        raise RuntimeError(f"FRED returned no usable observations for {sid}")
+    header = {"first_vintage": first, "last_vintage": vintages[-1],
+              "n_vintages": len(vintages), "late_filled": late_filled}
+    return rows, header
+
+
+def _prior_late_filled(sid: str) -> Dict[str, Tuple[str, str]]:
+    """The per-row-walked first releases of the CURRENT first-release cache file, if any."""
+    path = cache_path(sid)
+    if not os.path.exists(path):
+        return {}
+    try:
+        doc = _read_doc(path)
+    except (OSError, ValueError):
+        return {}
+    if doc.get("format") != CACHE_FORMAT_FIRST_RELEASE:
+        return {}
+    late = set(doc.get("late_filled") or [])
+    return {o["date"]: (o["realtime_start"], o["value"])
+            for o in doc.get("observations", []) if o.get("date") in late}
+
+
+def _fetch_payload(series_id: str, api_key: str) -> Tuple[List[dict], Dict[str, Any]]:
+    sid = series_id.upper()
+    spec = _spec(sid)
+    if spec["availability"] == AVAIL_FIRST_RELEASE:
+        rows, header = _fetch_first_release(sid, api_key, _prior_late_filled(sid))
+    else:
+        rows = [o for o in _fetch_plain(sid, api_key) if _is_value(o.get("value"))]
+        if not rows:
+            raise RuntimeError(f"FRED returned no usable observations for {sid}")
+        header = {}
+    logger.info("FRED %s: fetched %d observations", sid, len(rows))
+    return rows, header
 
 
 def fetch_full_history(series_id: str, api_key: str) -> List[dict]:
@@ -151,40 +389,10 @@ def fetch_full_history(series_id: str, api_key: str) -> List[dict]:
     series to its last 100 observations -- the credit z-score alone wants ~756. We take the
     whole series once and slice locally instead.
 
-    Vintage series return one row per observation stamped with ``realtime_start`` (its first
-    publication date); unrevised series return plain observations.
+    A first-release series returns rows stamped with their first-publication date (see
+    ``_fetch_first_release``); the same-day series (DGS3MO) returns plain observations.
     """
-    sid = series_id.upper()
-    spec = _spec(sid)
-    params = {
-        "series_id": sid,
-        "api_key": api_key,
-        "file_type": "json",
-        "sort_order": "asc",
-    }
-    if spec["vintage"]:
-        params["output_type"] = 4                    # initial release only
-        params["realtime_start"] = _REALTIME_MIN
-        params["realtime_end"] = _REALTIME_MAX
-
-    # Counted in the SAME purpose counters as FMP (spec section 6: requests and bytes by
-    # endpoint and purpose). A warm that refreshes nine macro series is real background
-    # traffic, and an allowance that could not see it was governing the wrong half.
-    from ba2_providers.fmp_common import record_fmp_bytes, record_fmp_request
-
-    record_fmp_request("fred-observations")
-    resp = requests.get(API_URL, params=params, timeout=60)
-    resp.raise_for_status()
-    record_fmp_bytes("fred-observations", len(getattr(resp, "content", b"") or b""))
-    payload = resp.json()
-    if "error_message" in payload:
-        raise RuntimeError(f"FRED rejected {sid}: {payload['error_message']}")
-
-    rows = [o for o in payload.get("observations", []) if o.get("value") not in (".", None, "")]
-    if not rows:
-        raise RuntimeError(f"FRED returned no usable observations for {sid}")
-    logger.info("FRED %s: fetched %d observations", sid, len(rows))
-    return rows
+    return _fetch_payload(series_id, api_key)[0]
 
 
 def refresh_series(series_id: str, api_key: str) -> int:
@@ -192,18 +400,30 @@ def refresh_series(series_id: str, api_key: str) -> int:
 
     This is the ONLY network path. Experts never call it -- the prewarm/refresh tool does,
     so a backtest reads a file that is already on disk (and already synced to the worker).
+
+    A first-release series is written with ``"format": CACHE_FORMAT_FIRST_RELEASE`` and its
+    vintage bounds; the same-day series (DGS3MO) keeps exactly the header it always had, so the
+    option risk-free-rate reader is untouched.
     """
     sid = series_id.upper()
-    rows = fetch_full_history(sid, api_key)
+    rows, header = _fetch_payload(sid, api_key)
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    if _spec(sid)["availability"] == AVAIL_FIRST_RELEASE:
+        doc = {"series_id": sid, "fetched_at": fetched_at,
+               "availability": AVAIL_FIRST_RELEASE, "format": CACHE_FORMAT_FIRST_RELEASE,
+               **header, "observations": rows}
+    else:
+        doc = {"series_id": sid, "fetched_at": fetched_at, "vintage": False,
+               "observations": rows}
     path = cache_path(sid)
     tmp = f"{path}.tmp"
     with _lock_for(sid):
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"series_id": sid, "fetched_at": datetime.now(timezone.utc).isoformat(),
-                       "vintage": _spec(sid)["vintage"], "observations": rows}, fh)
+            json.dump(doc, fh)
         os.replace(tmp, path)        # atomic: a concurrent reader never sees a partial file
         _MEM.pop(sid, None)
         _MEM_AT.pop(sid, None)
+        _META.pop(sid, None)
         _PARSED.pop(sid, None)       # the parse describes the rows we just replaced
     return len(rows)
 
@@ -223,8 +443,10 @@ def _fill_cache_on_the_live_path(sid: str, path: str) -> bool:
     to get the data.
 
     Best effort by design: a failure here returns False and the caller raises the same
-    FileNotFoundError it always did. Macro is an overlay -- it must never be the reason a live
-    analysis dies.
+    FileNotFoundError it always did (a missing file), or -- for a first-release series whose
+    file no longer covers today's decision -- ``get_series_as_of`` refuses with
+    ``MacroAvailabilityUnknown``: a live decision must not run on fewer vintages than the
+    backtest of the same decision sees.
     """
     try:
         from ba2_common.core.fred_api_key import resolve_fred_api_key
@@ -234,7 +456,8 @@ def _fill_cache_on_the_live_path(sid: str, path: str) -> bool:
                 "FRED series %s is missing and 'fred_api_key' is not configured, so it cannot "
                 "be fetched; the macro overlay is unavailable until one is set", sid)
             return False
-        logger.info("FRED %s not cached; fetching it once and writing the cache", sid)
+        logger.info("FRED %s missing, stale or older than today's decision; fetching it and "
+                    "writing the cache", sid)
         refresh_series(sid, api_key)
         return os.path.exists(path)
     except Exception as e:  # noqa: BLE001 -- see the docstring: never kill a live analysis
@@ -267,6 +490,50 @@ def _is_stale(sid: str, path: str) -> bool:
     return age is not None and age > _max_age_hours(sid)
 
 
+def _read_doc(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _header(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything in a cache document except its observations."""
+    return {k: v for k, v in doc.items() if k != "observations"}
+
+
+def _fetched_fred_date(meta: Optional[Dict[str, Any]]) -> Optional[date]:
+    """The FRED (Chicago) calendar date the cache was fetched on, or None when unrecorded."""
+    raw = (meta or {}).get("fetched_at")
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        return None                  # an instant with no timezone proves nothing
+    return ts.astimezone(FRED_TZ).date()
+
+
+def _is_first_release_payload(meta: Optional[Dict[str, Any]]) -> bool:
+    return bool(meta) and meta.get("format") == CACHE_FORMAT_FIRST_RELEASE
+
+
+def _covers_live_today(sid: str, meta: Optional[Dict[str, Any]]) -> bool:
+    """LIVE: does this payload hold every vintage a decision made NOW may see?
+
+    A first-release series must be in the current format and fetched on or after today's
+    decision label (FRED's calendar), else a vintage published since the fetch would be missing
+    live while a backtest of the same decision sees it. A same-day series (DGS3MO) is governed by
+    its age alone, as before.
+    """
+    if _spec(sid)["availability"] != AVAIL_FIRST_RELEASE:
+        return True
+    if not _is_first_release_payload(meta):
+        return False
+    fetched = _fetched_fred_date(meta)
+    return fetched is not None and fetched >= decision_label(None)
+
+
 def _load(series_id: str) -> List[dict]:
     sid = series_id.upper()
     from ba2_providers.fmp_common import _is_hermetic_fmp_history, _is_ttl_frozen
@@ -287,44 +554,115 @@ def _load(series_id: str) -> List[dict]:
         # touches neither disk nor network. Expiring an entry whose age is unknown turned
         # that seed into a real disk read of the operator's own cache, which is the opposite
         # of what seeding is for. Expiry requires positive evidence of age.
-        if loaded_at is None or (time.time() - loaded_at) / 3600.0 <= _max_age_hours(sid):
+        if loaded_at is None:
             return cached
-        # Fall through: the memo is past its window, so re-check the file underneath it.
-        # Without this the memo IS the staleness bug -- it short-circuits every check below,
-        # so a live process would serve its startup payload for its whole lifetime.
+        if ((time.time() - loaded_at) / 3600.0 <= _max_age_hours(sid)
+                and _covers_live_today(sid, _META.get(sid))):
+            return cached
+        # Fall through: the memo is past its window (or was loaded before today's decision
+        # label), so re-check the file underneath it. Without this the memo IS the staleness
+        # bug -- it short-circuits every check below, so a live process would serve its
+        # startup payload for its whole lifetime.
 
     path = cache_path(sid)
-    if not offline and (not os.path.exists(path) or _is_stale(sid, path)):
-        # MISSING or STALE, both on the live path only. Missing is the empty-cache case this
-        # was written for; stale is the one that makes it stay true -- VIXCLS is a daily
-        # series, so a cache filled once and never refreshed is right for a day and wrong
-        # after that, which is worse than obviously empty.
-        _fill_cache_on_the_live_path(sid, path)
+    doc: Optional[Dict[str, Any]] = None
+    if not offline:
+        if not os.path.exists(path) or _is_stale(sid, path):
+            # MISSING or STALE, both on the live path only. Missing is the empty-cache case this
+            # was written for; stale is the one that makes it stay true -- VIXCLS is a daily
+            # series, so a cache filled once and never refreshed is right for a day and wrong
+            # after that, which is worse than obviously empty.
+            _fill_cache_on_the_live_path(sid, path)
+        else:
+            doc = _read_doc(path)
+            if not _covers_live_today(sid, _header(doc)):
+                # Old format, or fetched before today's decision label: refetch, so live holds
+                # every vintage the same decision sees in a backtest.
+                if _fill_cache_on_the_live_path(sid, path):
+                    doc = None
 
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"FRED series {sid} is not in the cache ({path}). Run the FRED refresh/prewarm "
             f"before a backtest -- experts must never fetch macro data on the hot path."
         )
-    with open(path, "r", encoding="utf-8") as fh:
-        rows = json.load(fh).get("observations", [])
-    # A REFRESH THAT FAILED leaves the old file in place and we read it: stale macro degrades
-    # a regime overlay, a hard failure would stop the analysis, and macro is never worth that.
-    # Said out loud so it is a decision in the log rather than a silence.
-    if not offline and _is_stale(sid, path):
+    if doc is None:
+        doc = _read_doc(path)
+    rows = doc.get("observations", [])
+    meta = _header(doc)
+    # A REFRESH THAT FAILED leaves the old file in place and we read it. For the same-day
+    # series (DGS3MO) that is the documented degrade, said out loud. A FIRST-RELEASE series is
+    # then refused by ``get_series_as_of`` (fetched before the decision label, or old format):
+    # the rows it lacks are rows a backtest of this decision would see.
+    if not offline and (_is_stale(sid, path) or not _covers_live_today(sid, meta)):
         logger.warning(
-            "FRED %s is %.1fh old and could not be refreshed; using the stale copy",
-            sid, _age_hours(path) or -1.0)
+            "FRED %s is %.1fh old (fetched %s) and could not be refreshed; a first-release "
+            "series is refused for decisions after its fetch day",
+            sid, _age_hours(path) or -1.0, meta.get("fetched_at"))
     _MEM[sid] = rows
+    _META[sid] = meta
     _MEM_AT[sid] = time.time()
     return rows
 
 
 def reset_cache() -> None:
-    """Drop the in-process memos -- raw rows AND their parse (tests, live /api/reload)."""
+    """Drop the in-process memos -- raw rows, headers AND their parse (tests, /api/reload)."""
     _MEM.clear()
     _MEM_AT.clear()
+    _META.clear()
     _PARSED.clear()
+
+
+# --------------------------------------------------------------------------- #
+# THE decision label -- one rule for the backtest and live.
+# --------------------------------------------------------------------------- #
+
+def _live_decision_instant() -> datetime:
+    """The instant a live decision is made at.
+
+    Inside an enter-market decision pass it is the pass's frozen ``decision_time``; otherwise
+    the wall clock. Deliberately NOT ``replay_now``: that RECORDS a clock read under capture,
+    and this function runs inside the tapped ``get_series_as_of`` whose replay returns the
+    recorded payload without re-reading the clock -- a read recorded here would shift every
+    later clock read of the analysis by one.
+    """
+    from ba2_common.core.market_condition_live import current_decision
+
+    decision = current_decision()
+    if decision is not None:
+        return decision.decision_time
+    return datetime.now(timezone.utc)
+
+
+def decision_label(as_of: Any) -> date:
+    """The live session label of a decision at *as_of*: which day's 09:30 ET decision it IS.
+
+    THE function both paths use to decide which macro rows a decision may see (a row is
+    visible iff its first release is strictly before this label):
+
+      * ``None`` -> LIVE: the New York date of the live decision instant
+        (``market_calendar.live_decision_label``).
+      * a DAILY backtest bar -- a stamp at exactly 00:00 UTC, or a plain date / date string --
+        -> ``market_calendar.backtest_decision_label(D)`` = the next regular session N(D).
+        Bar D decides on D's close and fills at N(D)'s open, so it is the live decision of
+        N(D). A bar on a non-session day is refused (``NotARegularSession``): it is a data bug.
+      * any other instant (an intraday backtest bar, a recorded live decision time) -> its New
+        York date, as live. The engine's intraday stamps are New York wall-clock times labelled
+        UTC (09:30-15:55), which convert to the same New York date.
+
+    A naive datetime / string is read as UTC, the platform's backtest clock convention.
+    """
+    from ba2_common.core.market_calendar import backtest_decision_label, live_decision_label
+
+    if as_of is None:
+        return live_decision_label(_live_decision_instant())
+    ts = pd.Timestamp(as_of)
+    if ts is pd.NaT:
+        raise ValueError(f"as_of {as_of!r} is not a date")
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    if ts == ts.normalize():
+        return backtest_decision_label(ts.date())
+    return live_decision_label(ts.to_pydatetime())
 
 
 class _ParsedSeries:
@@ -343,9 +681,9 @@ class _ParsedSeries:
         ORDER. The order is load-bearing: ``get_series_as_of`` ends in
         ``.sort_index()``, pandas' default sort is not stable, so a different
         pre-sort order can reorder ties and change the returned series.
-      * ``known``  -- the date each surviving row became public: ``realtime_start``
-        for a vintage series, the observation date otherwise (``_spec(sid)``
-        decides, exactly as before).
+      * ``known``  -- the date each surviving row became public: its first-release
+        ``realtime_start`` for a first-release series, the observation date for the
+        same-day series (``_spec(sid)`` decides).
       * ``values`` -- the parsed floats, aligned with ``index``.
       * ``deferred_known`` / ``deferred_exc`` -- see SKIP SEMANTICS.
 
@@ -355,6 +693,10 @@ class _ParsedSeries:
     VALUE first, so a bad value skipped the row entirely rather than leaving the
     two lists misaligned. Both drops are unconditional (a dropped row is dropped
     for every cut), so they happen here.
+
+    EXCEPT a first-release row whose ``realtime_start`` is missing or unreadable:
+    its availability is unknown, so it is not dropped (the series would quietly
+    lose a row a live run has) -- the parse refuses (``MacroAvailabilityUnknown``).
 
     A row whose ``"value"`` KEY is missing is the one case that is NOT
     unconditional: ``row["value"]`` raises KeyError, which the original did not
@@ -371,7 +713,7 @@ class _ParsedSeries:
 
     __slots__ = ("index", "known", "values", "deferred_known", "deferred_exc")
 
-    def __init__(self, rows: List[dict], vintage: bool) -> None:
+    def __init__(self, rows: List[dict], first_release: bool, sid: str = "") -> None:
         dates: List[pd.Timestamp] = []
         known: List[pd.Timestamp] = []
         values: List[float] = []
@@ -380,9 +722,20 @@ class _ParsedSeries:
         for row in rows:
             try:
                 obs_date = pd.Timestamp(row["date"])
-                known_on = pd.Timestamp(row["realtime_start"]) if vintage else obs_date
             except (KeyError, ValueError):
                 continue
+            if first_release:
+                try:
+                    known_on = pd.Timestamp(row["realtime_start"])
+                except (KeyError, ValueError, TypeError):
+                    known_on = pd.NaT
+                if known_on is pd.NaT:
+                    raise MacroAvailabilityUnknown(
+                        f"FRED {sid} row {row.get('date')!r} carries no first-release date "
+                        f"(realtime_start={row.get('realtime_start')!r}); when it became public "
+                        f"is unknown. Re-warm the series (tools/refresh_fred_cache.py).")
+            else:
+                known_on = obs_date
             try:
                 value = float(row["value"])
             except (TypeError, ValueError):
@@ -398,20 +751,20 @@ class _ParsedSeries:
             dates.append(obs_date)
             known.append(known_on)
         self.index = pd.DatetimeIndex(dates)
-        # Non-vintage rows are known on their observation date -- the same objects,
-        # so the index is aliased rather than rebuilt.
-        self.known = pd.DatetimeIndex(known) if vintage else self.index
+        # Same-day rows are known on their observation date -- the same objects, so the index
+        # is aliased rather than rebuilt.
+        self.known = pd.DatetimeIndex(known) if first_release else self.index
         self.values = np.asarray(values, dtype="float64")
         self.deferred_known = pd.DatetimeIndex(deferred) if deferred else None
         self.deferred_exc = deferred_exc
 
 
-def _parsed(sid: str, rows: List[dict], vintage: bool) -> _ParsedSeries:
+def _parsed(sid: str, rows: List[dict], first_release: bool) -> _ParsedSeries:
     """The parse of *rows*, built once and served only back to that same object."""
     entry = _PARSED.get(sid)
     if entry is not None and entry[0] is rows:
         return entry[1]
-    parsed = _ParsedSeries(rows, vintage)
+    parsed = _ParsedSeries(rows, first_release, sid)
     _PARSED[sid] = (rows, parsed)
     return parsed
 
@@ -421,52 +774,92 @@ def series_identity(args):
 
     Named (not an inline lambda) because the offline replay tape imports it to
     look a recorded series up by exactly the identity the tap wrote. ``as_of`` is
-    taken AS THE CALLER PASSED IT (``None`` on the live path, which means "every
-    vintage published so far"): normalizing it here would build a key the caller
+    taken AS THE CALLER PASSED IT (``None`` on the live path, which means "what a
+    decision made now may see"): normalizing it here would build a key the caller
     cannot reproduce.
     """
     return {"series_id": args["series_id"], "as_of": args["as_of"]}
 
 
+def _require_first_release_coverage(sid: str, meta: Optional[Dict[str, Any]],
+                                    label: date) -> None:
+    """Refuse a decision whose macro availability this payload cannot establish."""
+    if not _is_first_release_payload(meta):
+        raise MacroAvailabilityUnknown(
+            f"FRED {sid}: the cache is not in the first-release format "
+            f"({CACHE_FORMAT_FIRST_RELEASE}); its rows carry no publication dates, so what a "
+            f"decision could see is unknown. Re-warm it with tools/refresh_fred_cache.py "
+            f"--series {sid} and sync <CACHE_FOLDER>/fred/{sid}.json to every host.")
+    first = meta.get("first_vintage")
+    try:
+        first_day = date.fromisoformat(str(first))
+    except ValueError:
+        raise MacroAvailabilityUnknown(
+            f"FRED {sid}: the cache records no first vintage ({first!r}); re-warm it.") from None
+    if label <= first_day:
+        raise MacroAvailabilityUnknown(
+            f"FRED {sid}: a decision labelled {label} is on or before the series' first "
+            f"recorded vintage ({first_day}); nothing in it is provably public yet.")
+    fetched = _fetched_fred_date(meta)
+    if fetched is None or fetched < label:
+        raise MacroAvailabilityUnknown(
+            f"FRED {sid}: the cache was fetched on {fetched} (FRED calendar), before the "
+            f"decision label {label}; vintages published since are unknown. Refresh it "
+            f"(tools/refresh_fred_cache.py) -- live refetches automatically and failed.")
+
+
 @observe_provider("macro", "get_series_as_of", identity=series_identity,
                   provenance=ReplayStatus.PROVENANCE_DISK_CACHE)
 def get_series_as_of(series_id: str, as_of: Optional[datetime]) -> pd.Series:
-    """Return the series as it was KNOWN at *as_of*, indexed by observation date.
+    """Return the series as a decision at *as_of* could see it, indexed by observation date.
 
     Recorded at this boundary (provenance ``disk_cache``): this function NEVER
-    reaches the network -- it reads the synced cache file (or the in-process memo
-    of it) and raises when the series was not warmed -- so every return here came
-    off disk by construction.
+    reaches the network on the backtest path -- it reads the synced cache file (or the
+    in-process memo of it) and raises when the series was not warmed -- so every return
+    here came off disk by construction.
 
-    ``as_of=None`` means "latest" (the live path). For vintage series the cut is on
-    first-publication date, so a backtest standing on 2024-01-31 cannot see January's
-    unemployment rate -- it was not published until 2024-02-02.
+    FIRST-RELEASE series (every macro signal input): rows whose first publication on FRED is
+    strictly before ``decision_label(as_of)``. ``as_of=None`` is the live decision made now;
+    a daily backtest bar D is the live decision of N(D). The SAME rule, the SAME function,
+    for both -- see the module docstring. Refuses (:class:`MacroAvailabilityUnknown`) when the
+    payload cannot establish availability for that label.
+
+    SAME-DAY series (DGS3MO, the option BS rate only): cut on the observation date
+    (``as_of=None`` -> every row), as it always was.
     """
     sid = series_id.upper()
     # Spec BEFORE load: an unknown series is a coding error and must say so, not surface
     # as a confusing "not in the cache" that sends you looking for a prewarm problem.
-    vintage = _spec(sid)["vintage"]
+    first_release = _spec(sid)["availability"] == AVAIL_FIRST_RELEASE
+    label = decision_label(as_of) if first_release else None
     rows = _load(sid)
+    if first_release:
+        _require_first_release_coverage(sid, _META.get(sid), label)
     # Parse once per payload (see _ParsedSeries); this call is then a filter + build.
-    parsed = _parsed(sid, rows, vintage)
+    parsed = _parsed(sid, rows, first_release)
 
-    cut = None
-    if as_of is not None:
-        cut = pd.Timestamp(as_of)
-        if cut.tz is not None:
-            cut = cut.tz_convert("UTC").tz_localize(None)
-
-    if cut is None:
-        if parsed.deferred_exc is not None:
+    if first_release:
+        cut = pd.Timestamp(label)
+        if parsed.deferred_known is not None and bool((parsed.deferred_known < cut).any()):
             raise parsed.deferred_exc
-        keep = np.ones(parsed.values.shape, dtype=bool)
+        keep = np.asarray(parsed.known < cut)
     else:
-        if parsed.deferred_known is not None and bool((~(parsed.deferred_known > cut)).any()):
-            raise parsed.deferred_exc
-        # ``~(known > cut)``, NOT ``known <= cut``. ``pd.Timestamp(None)`` is NaT, which
-        # compares False both ways -- and the original only skipped on ``known_on > cut``,
-        # so a NaT row was KEPT. Spelling this as <= would silently start dropping it.
-        keep = ~np.asarray(parsed.known > cut)
+        cut = None
+        if as_of is not None:
+            cut = pd.Timestamp(as_of)
+            if cut.tz is not None:
+                cut = cut.tz_convert("UTC").tz_localize(None)
+        if cut is None:
+            if parsed.deferred_exc is not None:
+                raise parsed.deferred_exc
+            keep = np.ones(parsed.values.shape, dtype=bool)
+        else:
+            if parsed.deferred_known is not None and bool((~(parsed.deferred_known > cut)).any()):
+                raise parsed.deferred_exc
+            # ``~(known > cut)``, NOT ``known <= cut``. ``pd.Timestamp(None)`` is NaT, which
+            # compares False both ways -- and the original only skipped on ``known_on > cut``,
+            # so a NaT row was KEPT. Spelling this as <= would silently start dropping it.
+            keep = ~np.asarray(parsed.known > cut)
 
     values = parsed.values[keep]
     if not values.size:

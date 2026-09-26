@@ -38,17 +38,30 @@ def _let_caplog_see_it():
 def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(fred_series, "CACHE_FOLDER", str(tmp_path), raising=False)
     monkeypatch.setattr(fred_series, "_MEM", {}, raising=False)
+    monkeypatch.setattr(fred_series, "_META", {}, raising=False)
+    monkeypatch.setattr(fred_series, "_MEM_AT", {}, raising=False)
     os.makedirs(os.path.join(str(tmp_path), "fred"), exist_ok=True)
     yield
 
 
-def _write(sid, rows):
+def _write(sid, rows, *, fetched_at=None, fmt=True):
+    """A cache file as ``refresh_series`` writes it: fetched NOW unless told otherwise, in the
+    first-release format unless ``fmt=False`` (the pre-2026-09-26 format)."""
+    from datetime import datetime, timezone
+
+    doc = {"series_id": sid,
+           "fetched_at": fetched_at or datetime.now(timezone.utc).isoformat(),
+           "observations": rows}
+    if fmt:
+        doc.update({"availability": fred_series.AVAIL_FIRST_RELEASE,
+                    "format": fred_series.CACHE_FORMAT_FIRST_RELEASE,
+                    "first_vintage": "2010-11-22"})
     with open(fred_series.cache_path(sid), "w", encoding="utf-8") as fh:
-        json.dump({"series_id": sid, "observations": rows}, fh)
+        json.dump(doc, fh)
 
 
 def _rows():
-    return [{"date": "2026-01-02", "value": "17.5"}]
+    return [{"date": "2026-01-02", "value": "17.5", "realtime_start": "2026-01-02"}]
 
 
 class TestTheLivePath:
@@ -163,18 +176,76 @@ class TestTheLiveCacheIsRefreshedWhenStale:
         assert fred_series._max_age_hours("PAYEMS") == 24.0
         assert fred_series._max_age_hours("VIXCLS") == 12.0
 
-    def test_a_failed_refresh_serves_the_STALE_copy_rather_than_dying(self, monkeypatch, caplog):
-        """Macro is an overlay. Stale degrades a regime; raising would stop the analysis."""
-        stale = [{"date": "2020-01-01", "value": "9"}]
-        _write("VIXCLS", stale)
+    def test_a_failed_refresh_leaves_the_stale_rows_and_the_reader_REFUSES(self, monkeypatch,
+                                                                        caplog):
+        """A failed refresh leaves the old file, and ``_load`` still reads it (said out loud).
+        But a first-release series fetched before today's decision lacks vintages a backtest
+        of the same decision sees, so ``get_series_as_of`` refuses rather than decide on it."""
+        stale = [{"date": "2020-01-01", "value": "9", "realtime_start": "2020-01-01"}]
+        _write("VIXCLS", stale, fetched_at="2020-01-02T12:00:00+00:00")
         _age_file("VIXCLS", 99)
         monkeypatch.setattr(fred_series, "refresh_series",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("FRED down")))
         monkeypatch.setattr("ba2_common.config.get_app_setting", lambda k: "KEY", raising=False)
 
         assert fred_series._load("VIXCLS") == stale
-        assert any("stale copy" in r.getMessage() for r in caplog.records), \
-            "serving stale data must be said out loud, not silently"
+        assert any("could not be refreshed" in r.getMessage() for r in caplog.records), \
+            "a failed refresh must be said out loud, not silently"
+        with pytest.raises(fred_series.MacroAvailabilityUnknown, match="before the decision"):
+            fred_series.get_series_as_of("VIXCLS", None)
+
+    def test_the_same_day_rate_series_still_serves_its_stale_copy(self, monkeypatch):
+        """DGS3MO keeps the documented degrade (it is not a first-release signal input)."""
+        stale = [{"date": "2020-01-01", "value": "1.5"}]
+        with open(fred_series.cache_path("DGS3MO"), "w", encoding="utf-8") as fh:
+            json.dump({"series_id": "DGS3MO", "vintage": False, "observations": stale}, fh)
+        _age_file("DGS3MO", 99)
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("FRED down")))
+        monkeypatch.setattr("ba2_common.config.get_app_setting", lambda k: "KEY", raising=False)
+        assert list(fred_series.get_series_as_of("DGS3MO", None)) == [1.5]
+
+
+class TestTheLiveCacheMustCoverTodaysDecision:
+    """A first-release file must hold every vintage published before today's decision label,
+    so live decides on exactly the rows a backtest of the same decision sees."""
+
+    def test_a_file_fetched_before_today_is_refetched_though_young(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1, hours=1)).isoformat()
+        _write("VIXCLS", [{"date": "2026-01-01", "value": "1", "realtime_start": "2026-01-01"}],
+               fetched_at=yesterday)
+        _age_file("VIXCLS", 1)                       # young by mtime: the age rule would pass
+        calls = []
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda sid, key: (calls.append(sid), _write(sid, _rows()), 1)[-1])
+        monkeypatch.setattr("ba2_common.config.get_app_setting", lambda k: "KEY", raising=False)
+        assert fred_series._load("VIXCLS") == _rows()
+        assert calls == ["VIXCLS"]
+
+    def test_an_old_format_file_is_refetched_on_the_live_path(self, monkeypatch):
+        """Deploying the fix must not leave live reading (and refusing) the old files."""
+        _write("VIXCLS", [{"date": "2026-01-01", "value": "1"}], fmt=False)
+        calls = []
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda sid, key: (calls.append(sid), _write(sid, _rows()), 1)[-1])
+        monkeypatch.setattr("ba2_common.config.get_app_setting", lambda k: "KEY", raising=False)
+        assert list(fred_series.get_series_as_of("VIXCLS", None)) == [17.5]
+        assert calls == ["VIXCLS"]
+
+    def test_a_memo_loaded_before_today_is_not_served(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+
+        _write("VIXCLS", _rows())
+        assert fred_series._load("VIXCLS") == _rows()
+        fred_series._META["VIXCLS"]["fetched_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        monkeypatch.setattr(fred_series, "refresh_series",
+                            lambda *a, **k: pytest.fail("the file underneath is today's"))
+        # The memo no longer covers today, so the file is re-read -- and it does.
+        assert fred_series._load("VIXCLS") == _rows()
+        assert fred_series._covers_live_today("VIXCLS", fred_series._META["VIXCLS"])
 
     def test_the_MEMO_expires_too(self, monkeypatch):
         """The memo short-circuits every file check, so without its own clock a live process
