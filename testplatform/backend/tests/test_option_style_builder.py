@@ -589,8 +589,9 @@ def test_I3_action_overrides_on_a_member_with_its_own_dte_invariant_are_refused(
 
 def test_M1_a_builder_refusal_names_the_style_and_the_member(tmp_path):
     m = _launcher()
-    with pytest.raises(ValueError, match=r"^style 'x' member O_LC: .*option_dte_min=50"):
+    with pytest.raises(ValueError, match=r"^O_LC entry rule .*option_dte_min=50") as exc:
         _custom(m, tmp_path, [{"key": "O_LC", "action_overrides": {"option_dte_min": 50}}])
+    assert exc.value.__notes__ == ["style 'x' member O_LC"]   # PEP-678 note, type kept
 
 
 def test_M1_M2_a_mixed_option_and_equity_entry_is_refused_naming_member_and_rule(
@@ -606,8 +607,9 @@ def test_M1_M2_a_mixed_option_and_equity_entry_is_refused_naming_member_and_rule
         return s
     monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LC", mixed)
     with pytest.raises(MixedEntryActionsRefused,
-                       match=r"style 'x' member O_LC: .*entry rule 'o_lc-entry'.*mixes"):
+                       match=r"O_LC entry rule 'o_lc-entry'.*mixes") as exc:
         _custom(m, tmp_path, [{"key": "O_LC"}])
+    assert exc.value.__notes__ == ["style 'x' member O_LC"]
 
 
 def test_M2_a_sell_beside_a_buy_hits_the_sell_refusal_not_the_untagged_fallback(
@@ -645,3 +647,27 @@ def test_M3_given_the_style_space_a_translated_key_outside_it_is_refused(tmp_pat
     # a well-formed key naming a gene the style does not have (tp has no toggle gene)
     with pytest.raises(ValueError, match=r"O_LC.*cond:o_lc-tp:enabled.*not a gene"):
         m._style_translate_key("cond:tp:enabled", idm, "O_LC", space)
+
+
+def test_M1_a_pydantic_ValidationError_from_a_bad_leaf_keeps_its_type_and_names_the_member(
+        tmp_path, monkeypatch):
+    """A ValidationError cannot be rebuilt from a message (``type(e)(msg)`` raises TypeError),
+    so the style/member context rides as a PEP-678 note on the ORIGINAL exception."""
+    from pydantic import ValidationError
+    from ba2_common.core.rule_models import normalize_trade_rules
+    m = _launcher()
+    _pin_admissible(m, monkeypatch)
+    real = m._STRATEGY_BUILDERS["O_LC"]
+
+    def bad_leaf(kind):
+        s = real(kind)
+        s.entry_rules[0]["conditions"]["conditions"].append({"id": "nofield", "value": 1})
+        s.entry_rules = normalize_trade_rules(s.entry_rules)   # a leaf without ``field``
+        return s
+    # load with the real builder (the loader builds every member too), then build with the bad one
+    m._STYLE_ACTIVE = m._load_style_spec(_write(tmp_path, {"x": {
+        "status": "candidate", "price_cap_policy": "none", "members": [{"key": "O_LC"}]}}), "x")
+    monkeypatch.setitem(m._STRATEGY_BUILDERS, "O_LC", bad_leaf)
+    with pytest.raises(ValidationError) as exc:
+        m._build_strategy_style("O_STYLE")
+    assert exc.value.__notes__ == ["style 'x' member O_LC"]

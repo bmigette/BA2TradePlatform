@@ -6203,9 +6203,11 @@ def _build_strategy_style(kind: str):
             _style_claim_ids(key, "entry", e_rules, owners, shared)
             _style_claim_ids(key, "exit", x_rules, owners, shared)
         except ValueError as e:
-            # Every refusal names the style and the member (the exception type is kept, so a
-            # MixedEntryActionsRefused stays one).
-            raise type(e)(f"{where} member {key}: {e}") from e
+            # Every refusal names the style and the member as a PEP-678 note on the ORIGINAL
+            # exception: its type is kept (a MixedEntryActionsRefused stays one), and a pydantic
+            # ValidationError -- which cannot be rebuilt from a message -- survives intact.
+            e.add_note(f"{where} member {key}")
+            raise
         entry += e_rules
         exits += x_rules
         id_maps[key] = {**e_map, **x_map}
